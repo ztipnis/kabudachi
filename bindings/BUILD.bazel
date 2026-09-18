@@ -1,0 +1,32 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
+load("@rules_rust_pyo3//:defs.bzl", "pyo3_extension")
+
+pyo3_extension(
+    name = "_native",
+    srcs = ["src/lib.rs"],
+    module_name = "kabudachi._native",
+    edition = "2021",
+    # Puts this package's own directory (bindings/) on sys.path so the
+    # compiled extension resolves as top-level `kabudachi._native` rather
+    # than `bindings.kabudachi._native`. runtime/src/kabudachi/__init__.py
+    # extends its own __path__ (pkgutil-style) so this merges into the
+    # same `kabudachi` package as the pure-Python sources.
+    imports = ["."],
+    deps = ["//core:core"],
+    visibility = ["//runtime:__subpackages__"],
+)
+
+# pyo3_extension(name = "_native") expands to a private `_native_shared`
+# rust_shared_library (the compiled crate itself) plus a public
+# py_pyo3_library wrapper. rust_shared_library provides
+# rust_common.test_crate_info (not a plain rust_library, so it can't be
+# `deps`-ed like one), which rust_test's `crate` attribute accepts to
+# pull in the crate's own `#[cfg(test)]` module. `_native_shared` is
+# `visibility = ["//visibility:private"]`, but that only restricts
+# cross-package access — same-package references (this file) are always
+# allowed, so this works without touching rules_rust_pyo3 internals.
+rust_test(
+    name = "bindings_test",
+    crate = ":_native_shared",
+    edition = "2021",
+)

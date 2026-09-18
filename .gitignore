@@ -1,0 +1,62 @@
+# --- Bazel ---
+bazel-*
+MODULE.bazel.lock.orig
+
+# --- Rust / Cargo ---
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.python-version
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# --- Linux ---
+*~
+.directory
+.Trash-*
+
+# --- Windows ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --- AI ---
+.claude
+docs/superpowers

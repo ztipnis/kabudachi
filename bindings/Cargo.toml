@@ -1,0 +1,12 @@
+[package]
+name = "kabudachi-bindings"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kabudachi_bindings"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kabudachi-core = { path = "../core" }
+pyo3 = "0.29.2"

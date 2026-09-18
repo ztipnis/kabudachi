@@ -1,0 +1,34 @@
+load("@aspect_rules_py//py:defs.bzl", "py_test")
+
+py_test(
+    name = "test_placeholder",
+    srcs = ["test_placeholder.py"],
+    # aspect_rules_py's py_test does not run pytest by default: it just
+    # executes the file as __main__, so plain `assert`-based pytest tests
+    # would silently "pass" without ever calling the test function. Gazelle
+    # does not set pytest_main or add the pytest dep on its own, so both are
+    # hand-added and kept.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_native",
+    srcs = ["test_native.py"],
+    # Same reasoning as test_placeholder above: without pytest_main, this
+    # would just execute as __main__ and silently "pass" without running
+    # the test function. //bindings:_native is a Rust-built (non-Python)
+    # target Gazelle cannot discover from the import statement, so it must
+    # be added by hand too.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)

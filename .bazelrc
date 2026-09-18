@@ -1,0 +1,2 @@
+# kabudachi Bazel configuration
+# Intentionally minimal — add flags here only when a real need arises (YAGNI).

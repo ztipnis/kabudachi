@@ -1,0 +1,3 @@
+# Package marker — required so //runtime:pyproject.toml and
+# //runtime:uv.lock are valid labels for uv.project() in MODULE.bazel.
+# Intentionally empty; Gazelle never touches this file (see CLAUDE.md).

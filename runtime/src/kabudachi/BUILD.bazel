@@ -1,0 +1,14 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+
+py_library(
+    name = "kabudachi",
+    srcs = ["__init__.py"],
+    imports = [".."],
+    visibility = ["//runtime:__subpackages__"],  # keep
+    # //bindings:_native is a Rust-built (non-Python) target Gazelle cannot
+    # discover from an import statement. It must live here (not only on
+    # individual test targets) so that every consumer of this py_library
+    # gets //bindings/ on sys.path via Bazel's imports propagation, and
+    # therefore can resolve `from kabudachi import _native`.
+    deps = ["//bindings:_native"],  # keep
+)

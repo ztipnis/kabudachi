@@ -1,0 +1,10 @@
+.git
+.claude
+bazel-*
+/target
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+.pytest_cache
+.DS_Store

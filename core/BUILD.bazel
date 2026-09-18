@@ -1,0 +1,15 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "core",
+    srcs = ["src/lib.rs"],
+    crate_name = "kabudachi_core",
+    edition = "2021",
+    visibility = ["//bindings:__pkg__"],
+)
+
+rust_test(
+    name = "core_test",
+    crate = ":core",
+    edition = "2021",
+)
