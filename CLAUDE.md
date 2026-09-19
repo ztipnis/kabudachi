@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `README.md` is the authoritative architecture spec for kabudachi (a peer-to-peer Python task queue with a compiled Rust native core). Do not implement functionality ahead of the current phase (README §27 — "Suggested implementation phases"). **As of now, no phase has started**: only build/test scaffolding exists (`core`/`bindings` each export one trivial placeholder function; `runtime` is an empty API surface). Don't take README's distributed-systems design (DHT, leader election, TaskRun state machine, etc.) as already implemented — it's the target design, not current code.
 
+`STYLE_GUIDE.md` is the authoritative coding-style guide. Apply it to any code you write or edit in this repo — CodeRabbit is configured to review PRs against it, and you should hold code to the same bar when writing it directly, not just when a PR bounces back. Its review-scope rule applies to you too: when reviewing or touching a file, judge pre-existing code you didn't just change on shape/correctness, not style nits — don't scrutinize or rewrite code outside the current change unless it's a real risk (a correctness bug, a security issue, a hard architecture-boundary violation).
+
 ## Commands
 
 Bazel is the source of truth for correctness; `cargo`/`uv` are for fast local iteration only — a change isn't done until it passes under Bazel.

@@ -1,0 +1,116 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit config for kabudachi. Reference: https://docs.coderabbit.ai/reference/configuration
+# The schema drifts over time — if a key here starts getting ignored, post
+# `@coderabbitai configuration` on any PR to have the bot dump its current
+# effective config back at you, and diff it against this file.
+#
+# One-time manual setup this file CANNOT do for you:
+#   1. Install the CodeRabbit GitHub App on this repo: https://github.com/marketplace/coderabbitai
+#      (or via the dashboard at https://app.coderabbit.ai) — without this, none
+#      of the below runs, no matter what's committed here.
+#   2. Set up branch protection / a ruleset on `main` (see CONTRIBUTING.md) so
+#      that CodeRabbit's review and unresolved-conversation state actually
+#      block merging instead of just being advisory comments.
+
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "chill"
+
+  # Formally files a GitHub "Request changes" review when it finds actionable
+  # issues, instead of just leaving comments. This is what gives branch
+  # protection something to key off of. Gotcha: it also means CodeRabbit's own
+  # review state can block a merge until it re-reviews and clears it — as a
+  # solo maintainer, lean on your admin-bypass ruleset (see CONTRIBUTING.md)
+  # rather than turning this off, so outside contributors still get real teeth.
+  request_changes_workflow: true
+
+  high_level_summary: true
+  sequence_diagrams: true
+  changed_files_summary: true
+  estimate_code_review_effort: true
+  poem: false # cute, but noisy on a solo/low-traffic repo — flip to true if you want it
+
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    base_branches:
+      - "main"
+
+  path_filters:
+    - "!**/*.lock"
+    - "!MODULE.bazel.lock"
+    - "!**/*.svg"
+
+  # Boundary rules from CLAUDE.md, spelled out for the reviewer per-path so it
+  # actually enforces them rather than just having read them once in context.
+  path_instructions:
+    - path: "core/**/*.rs"
+      instructions: |
+        This crate must never depend on pyo3, directly or transitively — flag
+        any pyo3 import or Cargo.toml dependency added here as a hard blocker.
+        Prefer Result/? over unwrap()/expect() outside tests. Test-only fakes,
+        mocks, or simulation harnesses must not live under core/src/ (not even
+        behind a feature flag) — they belong in core/tests/support/.
+    - path: "bindings/**/*.rs"
+      instructions: |
+        This crate is a thin PyO3 FFI seam. Real logic belongs in core, not
+        here — flag substantial business logic added directly in bindings/
+        rather than delegated to core.
+    - path: "runtime/src/kabudachi/**/*.py"
+      instructions: |
+        This is the public developer-facing API surface. Public functions/
+        classes should carry type hints and docstrings. Flag internal
+        core/bindings types leaking into this surface unwrapped.
+    - path: "runtime/tests/**/*.py"
+      instructions: |
+        Uses pytest. runtime/tests/test_native.py is expected to fail under
+        plain `uv run pytest` (it needs the Bazel-built native extension) —
+        don't flag that import failure as a bug in this file itself.
+
+  finishing_touches:
+    docstrings:
+      enabled: true
+
+  # Native linter integrations CodeRabbit runs itself, on top of its LLM
+  # review. Rust isn't listed below because it needs no entry: CodeRabbit runs
+  # Clippy natively and automatically whenever a Cargo.toml is present, so
+  # core/ and bindings/ get it for free. Still run `cargo clippy --workspace`
+  # yourself locally/in CI — don't rely on PR review as your only linter pass.
+  tools:
+    ruff:
+      enabled: true
+    markdownlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    yamllint:
+      enabled: true
+    actionlint:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  # Points CodeRabbit at the style guide (and CLAUDE.md, for the architecture
+  # rules) as review guidelines, rather than relying on generic defaults.
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "STYLE_GUIDE.md"
+      - "CLAUDE.md"
+  learnings:
+    scope: auto
+  issues:
+    scope: auto
+  pull_requests:
+    scope: auto

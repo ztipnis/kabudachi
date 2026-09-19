@@ -35,3 +35,39 @@ CI configuration itself is intentionally not set up yet (see the design spec's e
 - **Linux**: fully covered by the `Dockerfile` above, regardless of which OS the CI runner's host is — this is the easy case.
 - **macOS**: Docker on macOS runs Linux containers under a VM (e.g. Colima, Docker Desktop), so it does **not** exercise macOS-native toolchains. A macOS CI job needs to run natively on a `macos-latest`-style runner, replicating the manual setup this project's history went through: `bazelisk`/`bazel` via Homebrew, a Rust toolchain (rustup or Homebrew), and `uv`. Expect the macOS-only `.pth`-hiding bug documented in `CLAUDE.md` to be relevant for any job that runs `uv run pytest` directly (Bazel's own test execution is unaffected — it doesn't go through `uv`'s editable install).
 - **Windows**: also not covered by this Linux-based Dockerfile (Docker Desktop can run Windows containers, but that's a separate, unexplored path). A Windows CI job would need Bazel's Windows-specific setup (which has real differences from Linux/macOS — symlink support requires enabling Developer Mode or running as Administrator, and long-path support may need enabling), plus a Windows Rust toolchain and `uv` build. This hasn't been attempted or verified anywhere in this project yet — treat it as the highest-risk platform when the time comes, the same way PyO3-through-Bazel was treated as the highest-risk step during initial scaffolding.
+
+## PR review setup (CodeRabbit + branch protection on `main`)
+
+`.coderabbit.yaml` configures automatic CodeRabbit review for every PR into `main`, using `STYLE_GUIDE.md` (plus this repo's `CLAUDE.md`) as its review guidelines. None of that takes effect until two one-time, manual steps are done in GitHub's UI — neither can be done from a config file:
+
+### 1. Install the CodeRabbit GitHub App
+
+Install it on this repo (not just your account) at <https://github.com/marketplace/coderabbitai>, or via <https://app.coderabbit.ai>. Until this is installed, `.coderabbit.yaml` is inert.
+
+Once installed, open a throwaway PR to confirm it posts a review — you'll need that PR for step 2 below (GitHub only lets you pick a required status check from checks that have reported at least once).
+
+### 2. Set up a ruleset on `main`
+
+GitHub's newer **Rulesets** (Settings → Rules → Rulesets → New branch ruleset) are more precise than the legacy "branch protection rules" UI for exactly the situation of a solo maintainer, because bypass permissions are per-actor instead of one global "include administrators" checkbox. Configure:
+
+- **Target**: branch `main`
+- **Enforcement status**: Active
+- **Bypass list**: add yourself via the **Repository admin** role, bypass mode **Always**. This is what lets you merge your own PRs — GitHub never lets a PR author's own review count toward a required-approval count, so without this you'd lock yourself out.
+- **Rules to enable**:
+  - *Require a pull request before merging* — required approvals: **1**. Your admin bypass covers you; any future outside contributor still needs a real approval from you.
+  - *Require status checks to pass* — add the CodeRabbit check from step 1's throwaway PR (shows up as something like `CodeRabbit` in the picker).
+  - *Require conversation resolution before merging* — this is the actual mechanism for "all CodeRabbit comments must be resolved before merging." It applies to every review thread, not CodeRabbit-specific, which is fine since CodeRabbit's comments are ordinary review threads.
+  - *Block force pushes* and *Restrict deletions* — standard hygiene for a `main` that's otherwise easy to bypass as a solo admin.
+
+Because your bypass mode is "Always," these rules gate anyone else with write access but never block you — you'll still see CodeRabbit's review and can choose to address it before clicking merge, which is the "I approve every PR" behavior in practice, just not a GitHub-enforced deadlock against yourself.
+
+### CodeRabbit features worth trying
+
+- `@coderabbitai configuration` as a PR comment dumps CodeRabbit's *actual* effective config — useful to check `.coderabbit.yaml` is being read as intended, and to catch schema drift against this file.
+- `@coderabbitai generate docstrings` / `@coderabbitai generate unit tests` as PR comments (finishing-touches features) will push a follow-up commit.
+- `@coderabbitai resolve` resolves all of CodeRabbit's own review threads at once from a comment, instead of clicking through each one.
+- Sequence diagrams in the walkthrough are genuinely useful once anything protocol/state-machine-shaped from the README's design (leader election, `TaskRun` transitions) starts landing.
+
+### Gotcha
+
+CodeRabbit runs Clippy natively and automatically wherever it sees a `Cargo.toml` — no `.coderabbit.yaml` entry needed for `core`/`bindings`, unlike `ruff` for Python which is explicitly configured. That said, don't treat PR review as your only Clippy pass: keep running `cargo clippy --workspace` yourself locally/in CI, since it runs on every change rather than only at review time.
