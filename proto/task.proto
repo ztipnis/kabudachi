@@ -1,0 +1,26 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+
+enum TaskRunState {
+  TASK_RUN_STATE_UNSPECIFIED = 0;
+  SCHEDULED = 1;
+  QUEUED = 2;
+  CLAIMED = 3;
+  RUNNING = 4;
+  SUCCEEDED = 5;
+  FAILED = 6;
+  EXPIRED = 7;
+  SUPERSEDED = 8;
+  CANCELLED = 9;
+  LOST = 10;
+  ORPHANED = 11;
+}
+
+message TaskRunIdentity {
+  TaskRunId task_run_id = 1;
+  TaskId task_id = 2;
+  uint32 attempt_number = 3;
+  optional TaskRunId parent_task_run_id = 4;
+}

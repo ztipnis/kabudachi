@@ -1,3 +1,11 @@
+pub mod coordination_authority;
+pub mod election;
+pub mod hashing;
+pub mod membership;
+pub mod protocol;
+pub mod time;
+pub mod transport;
+
 pub fn version() -> &'static str {
     "0.1.0"
 }

@@ -12,6 +12,17 @@ If something here conflicts with `CLAUDE.md`, `CLAUDE.md` wins — it documents 
 - **Stop and clarify instead of guessing.** Don't invent a schema, widen a type, or add a branch just to make something compile or pass a test. If the right shape genuinely isn't clear from `README.md`/`CLAUDE.md`/the current phase's tests, that's a "ask" moment, not a "pick something reasonable and move on" moment.
 - **Name the lasting job, not the rollout state.** Don't name a module, type, or flag after a migration/rollout phase (`v2`, `_new`, `temporary`, `until_phaseN`) — name what it does once it's done. Phase sequencing lives in `README.md` §27 and PR history, not in identifiers.
 
+## Configurability
+
+Ship opinionated defaults, but make the implementation choices underneath them configurable wherever that costs little.
+
+- **Why.** A CVE, a critical bug or a better technology should be a configuration change rather than a rewrite, and users who want to work at the deepest level of the implementation should be able to swap core pieces to fit their requirements.
+- **Prefer runtime configuration.** A constructor argument, a `with_*` builder method or a trait implementation the user supplies at runtime. Where runtime is impractical, fall back to something chosen at recompilation (a cargo feature, or an env var read by `build.rs`). Avoid hard-coding a choice that has no override.
+- **What to make swappable.** Third-party choices (hash function, RNG, serializer, protobuf compiler, transport), tunables such as timeouts and fanouts, and the collaborators around the core logic (clock, transport, membership, authority). Depend on a broad trait or interface (for example the RustCrypto `digest` traits) rather than one concrete crate, so alternatives plug in without changes here.
+- **Defaults live in one place.** Each default is a named constant or a `Default` impl, and a `with_*` method overrides it, so existing constructors and call sites keep working.
+- **Where it stops.** Don't add configurability that brings undue bloat or scope creep: no new dependency or abstraction layer whose only purpose is hypothetical flexibility, and no knob for a safety invariant the design fixes (for example the majority-quorum rule).
+- **Say when peers must agree.** If a setting changes behaviour that different workers must compute identically (hash function, candidate ranking, digests), its documentation must say every worker in the shard has to use the same value.
+
 ## Readability target
 
 - Code should be skimmable by someone without deep distributed-systems background: they should be able to get the general gist — what a piece of code does, what it reads/writes, what it deliberately doesn't handle — without first learning the theory behind DHTs, consensus, or leader election. Depth belongs in `README.md`, tests, and well-named helpers; the top-level flow of a function stays plain regardless of how intricate the domain is.

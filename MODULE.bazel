@@ -8,9 +8,23 @@ bazel_dep(name = "rules_rust", version = "0.74.0")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
-    edition = "2021",
+    edition = "2024",
     versions = ["1.85.0"],
 )
+
+# --- Protobuf (Rust wire types from proto/ via prost) ---
+bazel_dep(name = "protobuf", version = "33.4")
+bazel_dep(name = "rules_rust_prost", version = "0.74.0")
+
+# --- crate_universe (third-party crates for core/bindings) ---
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml"],
+)
+
+use_repo(crate, "crates")
 
 # --- PyO3 extension support ---
 # `platforms` is required here (not just transitively via rules_rust)

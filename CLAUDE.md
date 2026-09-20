@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`README.md` is the authoritative architecture spec for kabudachi (a peer-to-peer Python task queue with a compiled Rust native core). Do not implement functionality ahead of the current phase (README §27 — "Suggested implementation phases"). **As of now, no phase has started**: only build/test scaffolding exists (`core`/`bindings` each export one trivial placeholder function; `runtime` is an empty API surface). Don't take README's distributed-systems design (DHT, leader election, TaskRun state machine, etc.) as already implemented — it's the target design, not current code.
+`README.md` is the authoritative architecture spec for kabudachi (a peer-to-peer Python task queue with a compiled Rust native core). Do not implement functionality ahead of the current phase (README §27 — "Suggested implementation phases"). **As of now, only Phase 0 (protocol model and simulator) is implemented**, entirely in `core/` (protobuf schemas, state tables, the worker election state machine, and the fake clock/network/authority simulation harness under `core/tests/`). `bindings` still exports one trivial placeholder function and `runtime` is an empty API surface. Everything in README beyond Phase 0 (DHT, task claiming, Redis authority, etc.) is the target design, not current code.
 
 `STYLE_GUIDE.md` is the authoritative coding-style guide. Apply it to any code you write or edit in this repo — CodeRabbit is configured to review PRs against it, and you should hold code to the same bar when writing it directly, not just when a PR bounces back. Its review-scope rule applies to you too: when reviewing or touching a file, judge pre-existing code you didn't just change on shape/correctness, not style nits — don't scrutinize or rewrite code outside the current change unless it's a real risk (a correctness bug, a security issue, a hard architecture-boundary violation).
 
@@ -40,8 +40,9 @@ To run any of the above the same way regardless of host OS, see `CONTRIBUTING.md
 
 ## Architecture
 
-Three directories, named by function rather than by implementation language:
+Four directories, named by function rather than by implementation language:
 
+- **`proto/`** — the `.proto` schemas and the generated Rust wire types.
 - **`core/`** — compiled native logic (Rust). **Never depends on `pyo3`.**
 - **`bindings/`** — the PyO3 FFI seam exposing `core` to Python, built as a Bazel `pyo3_extension` (`kabudachi._native`). The *only* crate that may depend on `pyo3`.
 - **`runtime/`** — the Python developer-facing `kabudachi` package.
@@ -58,7 +59,7 @@ Internal boundaries follow YAGNI ruthlessly: no speculative crate/package splits
 - `runtime/BUILD.bazel` (the top-level one) is *not* Gazelle-generated — it's a hand-written, permanently-empty placeholder that exists only so `//runtime:pyproject.toml`/`//runtime:uv.lock` are valid Bazel labels for `MODULE.bazel`'s `uv.project(...)` extension.
 - `core/BUILD.bazel` and `bindings/BUILD.bazel` are hand-authored too. The root `BUILD.bazel`'s Gazelle directives (`# gazelle:map_kind`, `# gazelle:exclude core`, `# gazelle:exclude bindings`) are what keep Gazelle from touching these Rust BUILD files.
 - `pyo3`'s version for the **Bazel** build comes from `rules_rust_pyo3`'s own vendored crate universe (pinned in `MODULE.bazel.lock`), *not* from `bindings/Cargo.toml` — bumping the version pinned in `Cargo.toml` has no effect on what Bazel actually builds, and vice versa.
-- Adding any new third-party crate dependency to `core` or `bindings` will require wiring a `crate_universe`/`crates_repository` extension into `MODULE.bazel` first — that isn't set up yet.
+- Third-party crates for `core` and `bindings` come from `crate_universe` (`crate.from_cargo` in `MODULE.bazel`, driven by `Cargo.lock`). After adding a dependency in a `Cargo.toml`, update `Cargo.lock` (e.g. `cargo update -p <crate>` or any cargo build) so Bazel picks it up. Protobuf schemas live in `proto/`, which is its own crate (`kabudachi-proto`): cargo generates the Rust wire types in `proto/build.rs` (pure-Rust `protox` by default, or a real `protoc` if `PROTOC` is set), and Bazel generates them with `proto_library` + `rust_prost_library` (`rules_rust_prost`, hermetic `protoc` from the `protobuf` module). `core` depends on it under both, re-exported as `protocol::generated`. Because the wire types live in another crate, ID accessors are extension traits (`protocol::messages::prelude`), not inherent impls.
 
 ### Local dev gotchas
 

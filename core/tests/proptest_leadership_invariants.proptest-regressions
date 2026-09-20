@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 07ca099ed2bad0ca09f7c81836e97c96413daef4f2cb4533dfda24496c49ded7 # shrinks to events = [Advance(Duration(3)), Advance(Duration(8)), Drain(WorkerId("worker-0")), Advance(Duration(1)), Advance(Duration(1)), Advance(Duration(1)), Advance(Duration(1))]

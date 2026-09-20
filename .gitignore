@@ -4,7 +4,6 @@ MODULE.bazel.lock.orig
 
 # --- Rust / Cargo ---
 /target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 

@@ -5,7 +5,7 @@ pyo3_extension(
     name = "_native",
     srcs = ["src/lib.rs"],
     module_name = "kabudachi._native",
-    edition = "2021",
+    edition = "2024",
     # Puts this package's own directory (bindings/) on sys.path so the
     # compiled extension resolves as top-level `kabudachi._native` rather
     # than `bindings.kabudachi._native`. runtime/src/kabudachi/__init__.py
@@ -28,5 +28,5 @@ pyo3_extension(
 rust_test(
     name = "bindings_test",
     crate = ":_native_shared",
-    edition = "2021",
+    edition = "2024",
 )

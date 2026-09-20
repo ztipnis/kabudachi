@@ -1,0 +1,16 @@
+load("@protobuf//bazel:proto_library.bzl", "proto_library")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_library")
+
+proto_library(
+    name = "kabudachi_proto",
+    srcs = glob(["*.proto"]),
+    strip_import_prefix = "/proto",
+    visibility = ["//visibility:public"],
+)
+
+# Same crate name (`kabudachi_proto`) as the cargo crate in this directory.
+rust_prost_library(
+    name = "kabudachi_prost",
+    proto = ":kabudachi_proto",
+    visibility = ["//visibility:public"],
+)

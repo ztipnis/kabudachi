@@ -1,0 +1,106 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+import "worker.proto";
+
+message WorkerHeartbeat {
+  WorkerId worker_id = 1;
+  IncarnationId incarnation_id = 2;
+  uint64 recovery_epoch_seen = 3;
+  uint64 term_seen = 4;
+  uint32 available_capacity = 5;
+  bytes active_task_runs_digest = 6;
+}
+
+message LeaderHeartbeatAck {
+  ShardId shard_id = 1;
+  WorkerId leader_id = 2;
+  uint64 recovery_epoch = 3;
+  uint64 term = 4;
+  uint64 membership_generation = 5;
+}
+
+message RollCallObservation {
+  WorkerId worker_id = 1;
+  WorkerState state = 2;
+  uint64 highest_term_seen = 3;
+  optional WorkerId current_leader_seen = 4;
+  uint64 leader_contact_age_ticks = 5;
+}
+
+message RollCall {
+  string roll_call_id = 1;
+  ShardId shard_id = 2;
+  uint64 recovery_epoch = 3;
+  uint64 membership_generation = 4;
+  bytes membership_digest = 5;
+  uint64 highest_term_seen = 6;
+  WorkerId initiator_id = 7;
+  repeated RollCallObservation responses = 8;
+}
+
+message VoteRequest {
+  ShardId shard_id = 1;
+  uint64 recovery_epoch = 2;
+  uint64 term = 3;
+  WorkerId candidate_id = 4;
+  uint64 membership_generation = 5;
+  bytes membership_digest = 6;
+  bytes roll_call_digest = 7;
+}
+
+enum VoteRejectReason {
+  VOTE_REJECT_REASON_UNSPECIFIED = 0;
+  NOT_VOTER = 1;
+  WRONG_RECOVERY_EPOCH = 2;
+  STALE_TERM = 3;
+  ALREADY_VOTED = 4;
+  LEADER_STILL_VALID = 5;
+}
+
+message VoteGrant {
+  ShardId shard_id = 1;
+  uint64 recovery_epoch = 2;
+  uint64 term = 3;
+  WorkerId candidate_id = 4;
+  WorkerId voter_id = 5;
+}
+
+message VoteReject {
+  ShardId shard_id = 1;
+  uint64 recovery_epoch = 2;
+  uint64 term = 3;
+  WorkerId candidate_id = 4;
+  WorkerId voter_id = 5;
+  VoteRejectReason reason = 6;
+}
+
+message ElectionCertificate {
+  ShardId shard_id = 1;
+  uint64 recovery_epoch = 2;
+  uint64 term = 3;
+  WorkerId leader_id = 4;
+  repeated WorkerId granting_voters = 5;
+  uint64 membership_generation = 6;
+}
+
+message SelfRemove {
+  WorkerId worker_id = 1;
+  IncarnationId incarnation_id = 2;
+  ShardId shard_id = 3;
+  uint64 membership_generation = 4;
+}
+
+message ElectionMessage {
+  oneof payload {
+    WorkerHeartbeat heartbeat = 1;
+    LeaderHeartbeatAck heartbeat_ack = 2;
+    RollCall roll_call = 3;
+    VoteRequest vote_request = 4;
+    VoteGrant vote_grant = 5;
+    VoteReject vote_reject = 6;
+    ElectionCertificate election_certificate = 7;
+    SelfRemove self_remove = 8;
+  }
+}

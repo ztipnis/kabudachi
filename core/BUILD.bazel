@@ -1,15 +1,36 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_test_suite")
+load("@crates//:defs.bzl", "all_crate_deps")
 
 rust_library(
     name = "core",
-    srcs = ["src/lib.rs"],
+    srcs = glob(["src/**/*.rs"]),
     crate_name = "kabudachi_core",
-    edition = "2021",
+    edition = "2024",
+    deps = all_crate_deps(normal = True) + ["//proto:kabudachi_prost"],
     visibility = ["//bindings:__pkg__"],
 )
 
 rust_test(
     name = "core_test",
     crate = ":core",
-    edition = "2021",
+    edition = "2024",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test_suite(
+    name = "core_integration_tests",
+    # Only top-level `tests/*.rs` files become independent test entry points;
+    # `tests/support/**` is shared source (see `shared_srcs` below) so it's
+    # excluded here from being treated as its own entry point.
+    srcs = glob(
+        ["tests/*.rs"],
+        allow_empty = True,
+    ),
+    # Compiled into every entry-point binary above so `mod support;` resolves
+    # from any top-level test file. New files under `tests/support/**` need no
+    # BUILD.bazel edit; neither does a new top-level `tests/*.rs` file — it's
+    # picked up by the `srcs` glob above automatically.
+    shared_srcs = glob(["tests/support/**/*.rs"], allow_empty = True),
+    deps = [":core"] + all_crate_deps(normal = True, normal_dev = True),
+    edition = "2024",
 )

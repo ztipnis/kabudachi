@@ -1,0 +1,18 @@
+syntax = "proto3";
+package kabudachi;
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  BOOTSTRAPPING = 1;
+  JOINING = 2;
+  ACTIVE = 3;
+  LEADER_SUSPECT = 4;
+  ROLL_CALL = 5;
+  CANDIDATE = 6;
+  LEADER_RECONCILING = 7;
+  LEADER = 8;
+  NO_QUORUM = 9;
+  DRAINING = 10;
+  FENCED = 11;
+  STOPPED = 12;
+}

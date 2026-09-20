@@ -1,7 +1,19 @@
 [package]
 name = "kabudachi-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 name = "kabudachi_core"
+
+[dependencies]
+digest = { version = "0.10", features = ["alloc"] }
+kabudachi-proto = { path = "../proto" }
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+rand = "0.9"
+rand_chacha = "0.9"
+sha3 = "0.10"
