@@ -1,0 +1,1699 @@
+"""The session: what happens between a task being called and its handle being
+settled, checked against a fake runtime so each guarantee can be provoked."""
+
+import asyncio
+import hashlib
+import logging
+import threading
+import time
+from datetime import timedelta
+
+import pytest
+
+from kabudachi.config import Configuration
+from kabudachi.errors import (
+    CertificationError,
+    RunStoppedError,
+    SerializationError,
+    TaskCancelledError,
+    TaskDefinitionError,
+    TaskExpiredError,
+    TaskInterruptedError,
+    TaskSupersededError,
+    TaskTimeoutError,
+    UnknownTaskError,
+)
+from kabudachi.options import SubmissionOptions
+from kabudachi.registry import TaskKind, TaskRegistry
+from kabudachi.serializers import SerializerRegistry
+from kabudachi.session import Session, validate_definitions
+from kabudachi.tasks import Task
+from fake_runtime import FakeRuntime
+from proto_messages import Greeting, Receipt
+from session_world import WAIT, World, run, with_events
+
+
+def echo(request: Greeting) -> Greeting:
+    return request
+
+
+async def echo_later(request: Greeting) -> Greeting:
+    return request
+
+
+def explode(request: Greeting) -> Greeting:
+    raise ValueError(f"cannot handle {request.text}")
+
+
+def to_receipt(request: Greeting) -> Receipt:
+    return Receipt(ok=request.times > 0)
+
+
+
+def test_a_called_task_runs_and_its_handle_gives_the_result():
+    world = World(echo)
+
+    async def body():
+        return await world.call("echo", Greeting(text="hi", times=2))
+
+    assert run(world.working(body)) == Greeting(text="hi", times=2)
+
+
+def test_the_result_type_is_the_declared_output_type():
+    world = World(to_receipt)
+
+    async def body():
+        return await world.call("to_receipt", Greeting(times=1))
+
+    assert run(world.working(body)) == Receipt(ok=True)
+
+
+def test_an_async_task_body_is_awaited():
+    world = World(echo_later)
+
+    async def body():
+        return await world.call("echo_later", Greeting(text="async"))
+
+    assert run(world.working(body)).text == "async"
+
+
+def test_submission_carries_the_task_definition_and_encoded_input():
+    world = World(echo)
+    argument = Greeting(text="hi", times=2)
+
+    world.call("echo", argument)
+
+    [(_task_id, definition_id, version, payload, queue)] = world.runtime.submitted
+    assert definition_id == "tests.echo"
+    assert version == 0
+    assert payload == argument.SerializeToString()
+    assert queue == "default"
+
+
+def test_a_tasks_own_queue_and_version_are_submitted():
+    world = World(echo, queue="gpu", version=4)
+
+    world.call("echo", Greeting())
+
+    [(_, _, version, _, queue)] = world.runtime.submitted
+    assert (version, queue) == (4, "gpu")
+
+
+def test_a_configured_default_queue_is_used_when_the_task_names_none():
+    world = World(echo)
+    world.configuration.configure(queue="emails")
+
+    world.call("echo", Greeting())
+
+    assert world.runtime.submitted[0][4] == "emails"
+
+
+def test_an_argument_of_the_wrong_type_is_refused_before_anything_is_submitted():
+    world = World(echo)
+
+    with pytest.raises(SerializationError):
+        world.call("echo", Receipt(ok=True))
+
+    assert world.runtime.submitted == []
+
+
+def test_the_handle_is_not_settled_before_the_leader_certifies():
+    world = World(echo)
+    seen = {}
+
+    async def body():
+        handle = world.call("echo", Greeting(text="x"))
+        world.runtime.on_complete = lambda run_id: seen.setdefault("done", handle.done())
+        return await handle
+
+    run(world.working(body))
+
+    assert seen == {"done": False}
+
+
+def test_the_run_is_reported_started_before_it_is_completed():
+    world = World(echo)
+
+    async def body():
+        return await world.call("echo", Greeting())
+
+    run(world.working(body))
+
+    assert [kind for kind, _ in world.runtime.events] == ["started", "complete"]
+
+
+def test_a_result_the_leader_refuses_to_certify_is_never_delivered():
+    world = World(echo)
+    world.runtime.refuse_completion = True
+
+    async def body():
+        return await world.call("echo", Greeting(text="secret"))
+
+    with pytest.raises(RuntimeError, match="does not belong"):
+        run(world.working(body))
+
+
+def test_a_certification_for_a_different_result_is_never_delivered():
+    world = World(echo)
+    world.runtime.altered_digest = hashlib.sha256(b"something else").digest()
+
+    async def body():
+        return await world.call("echo", Greeting(text="x"))
+
+    with pytest.raises(CertificationError):
+        run(world.working(body))
+
+
+def test_an_error_in_a_task_body_reaches_only_its_own_handle():
+    world = World(echo, explode)
+
+    async def body():
+        bad = world.call("explode", Greeting(text="bad"))
+        good = world.call("echo", Greeting(text="good"))
+        results = await asyncio.gather(bad, good, return_exceptions=True)
+        return results
+
+    bad, good = run(world.working(body))
+
+    assert isinstance(bad, ValueError) and "bad" in str(bad)
+    assert good == Greeting(text="good")
+
+
+def test_a_failing_task_is_reported_failed_by_its_error_type_before_its_handle_settles():
+    world = World(explode)
+    seen_by_handle = []
+
+    async def body():
+        handle = world.call("explode", Greeting(text="secret text"))
+        try:
+            await handle
+        except ValueError:
+            seen_by_handle.append(list(world.runtime.events))
+
+    run(world.working(body))
+
+    [events] = seen_by_handle
+    assert [event[0] for event in events] == ["started", "fail"]
+    assert events[1][2] == "ValueError"
+    assert all("secret text" not in str(event) for event in events)
+
+
+def test_a_failure_the_leader_refuses_does_not_hide_the_tasks_error():
+    world = World(explode)
+    world.runtime.refuse_failure = True
+
+    async def body():
+        with pytest.raises(ValueError, match="cannot handle"):
+            await world.call("explode", Greeting(text="x"))
+
+    run(world.working(body))
+
+
+def test_a_task_that_succeeds_is_not_reported_failed():
+    world = World(echo)
+
+    async def body():
+        await world.call("echo", Greeting())
+
+    run(world.working(body))
+
+    assert not any(event[0] == "fail" for event in world.runtime.events)
+
+
+def test_a_claim_that_cannot_run_is_still_started_and_then_reported_failed():
+    world = World(echo)
+    world.registry = TaskRegistry()
+    session = Session(world.runtime, world.registry, world.serializers, world.configuration)
+    world.session = session
+
+    async def body():
+        with pytest.raises(UnknownTaskError):
+            await session._submit_raw("tests.missing", b"", "default")
+
+    run(world.working(body))
+
+    assert [event[0] for event in world.runtime.events] == ["started", "fail"]
+    assert world.runtime.events[1][2] == "UnknownTaskError"
+
+
+def test_the_worker_keeps_going_after_a_task_fails():
+    world = World(echo, explode)
+
+    async def body():
+        with pytest.raises(ValueError):
+            await world.call("explode", Greeting(text="one"))
+        return await world.call("echo", Greeting(text="after"))
+
+    assert run(world.working(body)).text == "after"
+
+
+def test_a_run_that_cannot_be_started_fails_its_handle_and_runs_nothing():
+    ran = []
+
+    def recording(request: Greeting) -> Greeting:
+        ran.append(request)
+        return request
+
+    world = World(recording)
+    world.runtime.fail_start = True
+
+    async def body():
+        return await world.call("recording", Greeting())
+
+    with pytest.raises(RuntimeError, match="not the leader"):
+        run(world.working(body))
+    assert ran == []
+
+
+def test_a_claim_for_a_task_this_process_does_not_have_fails_its_handle():
+    world = World(echo)
+    world.registry = TaskRegistry()
+    session = Session(world.runtime, world.registry, world.serializers, world.configuration)
+    world.session = session
+
+    async def body():
+        handle = session._submit_raw("tests.missing", b"", "default")
+        return await handle
+
+    with pytest.raises(UnknownTaskError, match=r"tests\.missing"):
+        run(world.working(body))
+
+
+def test_input_bytes_that_do_not_decode_fail_the_handle():
+    world = World(echo)
+
+    async def body():
+        handle = world.session._submit_raw("tests.echo", b"\xff\xff\xff\xff\xff", "default")
+        return await handle
+
+    with pytest.raises(SerializationError):
+        run(world.working(body))
+
+
+def test_many_tasks_all_settle_with_their_own_results():
+    world = World(echo)
+
+    async def body():
+        handles = [world.call("echo", Greeting(text=str(n), times=n)) for n in range(200)]
+        return await asyncio.gather(*handles)
+
+    results = run(world.working(body))
+
+    assert [g.times for g in results] == list(range(200))
+
+
+def test_no_more_tasks_run_at_once_than_the_concurrency_limit_and_that_limit_is_used():
+    active = 0
+    peak = 0
+
+    async def slow(request: Greeting) -> Greeting:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        return request
+
+    world = World(slow, concurrency=3)
+
+    async def body():
+        return await asyncio.gather(*(world.call("slow", Greeting()) for _ in range(12)))
+
+    run(world.working(body))
+
+    assert peak == 3
+
+
+def test_a_synchronous_body_runs_off_the_event_loop_thread():
+    seen = {}
+
+    def note_thread(request: Greeting) -> Greeting:
+        seen["thread"] = threading.get_ident()
+        return request
+
+    world = World(note_thread)
+
+    async def body():
+        seen["loop"] = threading.get_ident()
+        await world.call("note_thread", Greeting())
+
+    run(world.working(body))
+
+    assert seen["thread"] != seen["loop"]
+
+
+def test_blocking_synchronous_bodies_run_side_by_side():
+    def blocking(request: Greeting) -> Greeting:
+        time.sleep(0.3)
+        return request
+
+    world = World(blocking, concurrency=4)
+
+    async def body():
+        started = time.monotonic()
+        await asyncio.gather(*(world.call("blocking", Greeting()) for _ in range(4)))
+        return time.monotonic() - started
+
+    assert run(world.working(body)) < 0.9
+
+
+def test_a_task_can_be_submitted_from_another_thread():
+    world = World(echo)
+
+    async def body():
+        handles = []
+        thread = threading.Thread(
+            target=lambda: handles.append(world.call("echo", Greeting(text="threaded")))
+        )
+        thread.start()
+        thread.join()
+        return await handles[0]
+
+    assert run(world.working(body)).text == "threaded"
+
+
+def test_a_task_that_finishes_before_its_submit_returns_is_still_settled():
+    world = World(echo)
+    world.runtime.submit_lingers_for = 0.15
+
+    async def body():
+        handles = []
+        thread = threading.Thread(
+            target=lambda: handles.append(world.call("echo", Greeting(text="fast")))
+        )
+        thread.start()
+        while thread.is_alive():
+            await asyncio.sleep(0.01)
+        return await handles[0]
+
+    assert run(world.working(body)).text == "fast"
+
+
+def test_finishing_waits_for_every_task_submitted_so_far():
+    finished = []
+
+    async def slow(request: Greeting) -> Greeting:
+        await asyncio.sleep(0.05)
+        finished.append(request.text)
+        return request
+
+    world = World(slow, concurrency=2)
+
+    async def body():
+        for n in range(6):
+            world.call("slow", Greeting(text=str(n)))
+        await world.session.wait_until_idle()
+
+    run(world.working(body))
+
+    assert sorted(finished) == ["0", "1", "2", "3", "4", "5"]
+
+
+def test_finishing_also_waits_for_work_that_running_tasks_submit():
+    finished = []
+
+    async def child(request: Greeting) -> Greeting:
+        finished.append("child")
+        return request
+
+    world = World(child)
+
+    async def parent(request: Greeting) -> Greeting:
+        world.call("child", Greeting())
+        finished.append("parent")
+        return request
+
+    parent_task = Task(
+        parent,
+        registry=world.registry,
+        serializers=world.serializers,
+        name="tests.parent",
+    )
+
+    async def body():
+        world.session.submit(parent_task.definition, Greeting())
+        await world.session.wait_until_idle()
+
+    run(world.working(body))
+
+    assert finished == ["parent", "child"]
+
+
+def test_stopping_lets_running_tasks_finish_but_starts_no_more():
+    started = []
+
+    async def slow(request: Greeting) -> Greeting:
+        started.append(request.text)
+        await asyncio.sleep(0.2)
+        return request
+
+    world = World(slow, concurrency=1)
+
+    async def body():
+        first = world.call("slow", Greeting(text="first"))
+        for name in ("second", "third"):
+            world.call("slow", Greeting(text=name))
+        await asyncio.sleep(0.05)
+        world.session.stop_claiming()
+        await world.session.wait_until_running_finish()
+        return await first
+
+    assert run(world.working(body)).text == "first"
+    assert started == ["first"]
+
+
+def test_the_concurrency_limit_is_read_from_the_configuration():
+    assert World(echo, concurrency=7).session.concurrency == 7
+    assert World(echo).session.concurrency == 16
+
+
+def test_a_valid_set_of_tasks_passes_validation():
+    world = World(echo, to_receipt)
+
+    validate_definitions(world.registry, world.serializers)
+
+
+def test_validation_names_every_task_that_cannot_work():
+    registry = TaskRegistry()
+    serializers = SerializerRegistry.with_defaults()
+
+    Task(echo, registry=registry, name="tests.unknown", serializer="nope")
+    Task(echo, registry=registry, name="tests.fine")
+
+    with pytest.raises(TaskDefinitionError) as failure:
+        validate_definitions(registry, serializers)
+
+    assert "tests.unknown" in str(failure.value)
+    assert "nope" in str(failure.value)
+    assert "tests.fine" not in str(failure.value)
+
+
+def test_validation_refuses_a_serializer_that_cannot_run_here():
+    class Unavailable:
+        name = "offline"
+
+        def available(self):
+            return False
+
+        def supports(self, value_type):
+            return True
+
+        def encode(self, value, value_type):
+            return b""
+
+        def decode(self, payload, target_type):
+            return None
+
+    registry = TaskRegistry()
+    serializers = SerializerRegistry.with_defaults()
+    serializers.register(Unavailable())
+    Task(echo, registry=registry, serializers=serializers, serializer="offline")
+
+    with pytest.raises(TaskDefinitionError, match="offline"):
+        validate_definitions(registry, serializers)
+
+
+def test_validation_refuses_types_the_serializer_cannot_handle():
+    class TextOnly:
+        name = "text"
+
+        def available(self):
+            return True
+
+        def supports(self, value_type):
+            return value_type is str
+
+        def encode(self, value, value_type):
+            return value.encode()
+
+        def decode(self, payload, target_type):
+            return payload.decode()
+
+    registry = TaskRegistry()
+    early = SerializerRegistry.with_defaults()
+    Task(echo, registry=registry, serializers=early, serializer="text", name="tests.text")
+    late = SerializerRegistry.with_defaults()
+    late.register(TextOnly())
+
+    with pytest.raises(TaskDefinitionError, match="input type"):
+        validate_definitions(registry, late)
+
+
+def test_a_body_that_is_cancelled_fails_its_handle_and_does_not_hang_the_run():
+    async def cancelled(request: Greeting) -> Greeting:
+        raise asyncio.CancelledError()
+
+    world = World(cancelled, echo)
+
+    async def body():
+        bad = world.call("cancelled", Greeting())
+        with pytest.raises(TaskInterruptedError, match="CancelledError"):
+            await bad
+        await world.session.wait_until_idle()
+        return await world.call("echo", Greeting(text="still works"))
+
+    assert run(world.working(body)).text == "still works"
+
+
+def test_a_task_waiting_for_a_task_it_called_does_not_hold_up_that_task():
+    async def inner(request: Greeting) -> Greeting:
+        return Greeting(times=request.times + 1)
+
+    world = World(inner, concurrency=1)
+
+    async def outer(request: Greeting) -> Greeting:
+        return await world.call("inner", request)
+
+    outer_task = Task(
+        outer, registry=world.registry, serializers=world.serializers, name="tests.outer"
+    )
+
+    async def body():
+        return await world.session.submit(outer_task.definition, Greeting(times=1))
+
+    assert run(world.working(body)).times == 2
+
+
+def test_many_tasks_that_each_wait_for_one_they_called_do_not_deadlock():
+    async def inner(request: Greeting) -> Greeting:
+        await asyncio.sleep(0.01)
+        return request
+
+    world = World(inner, concurrency=4)
+
+    async def outer(request: Greeting) -> Greeting:
+        return await world.call("inner", request)
+
+    outer_task = Task(
+        outer, registry=world.registry, serializers=world.serializers, name="tests.outer"
+    )
+
+    async def body():
+        handles = [
+            world.session.submit(outer_task.definition, Greeting(times=n)) for n in range(40)
+        ]
+        return await asyncio.gather(*handles)
+
+    assert [g.times for g in run(world.working(body))] == list(range(40))
+
+
+def test_a_task_waiting_on_several_tasks_gives_up_one_place_not_several():
+    peak = 0
+    active = 0
+
+    async def leaf(request: Greeting) -> Greeting:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.03)
+        active -= 1
+        return request
+
+    world = World(leaf, concurrency=2)
+
+    async def fan_out(request: Greeting) -> Greeting:
+        await asyncio.gather(*(world.call("leaf", Greeting()) for _ in range(6)))
+        return request
+
+    fan_out_task = Task(
+        fan_out, registry=world.registry, serializers=world.serializers, name="tests.fan_out"
+    )
+
+    async def body():
+        await world.session.submit(fan_out_task.definition, Greeting())
+
+    run(world.working(body))
+
+    # The parent waits and so is not counted, but it gave up one place, not six.
+    assert peak <= 2
+
+
+def test_stopping_fails_tasks_that_have_not_started_and_refuses_new_ones():
+    async def slow(request: Greeting) -> Greeting:
+        await asyncio.sleep(0.2)
+        return request
+
+    world = World(slow, concurrency=1)
+
+    async def body():
+        running = world.call("slow", Greeting(text="running"))
+        queued = world.call("slow", Greeting(text="queued"))
+        await asyncio.sleep(0.05)
+        world.session.stop_claiming()
+        with pytest.raises(RunStoppedError):
+            await queued
+        with pytest.raises(RunStoppedError):
+            world.call("slow", Greeting())
+        return await running
+
+    assert run(world.working(body)).text == "running"
+
+
+def test_a_claim_delivered_after_stopping_does_not_run_its_failed_task():
+    ran = []
+
+    async def record(request: Greeting) -> Greeting:
+        ran.append(request.text)
+        return request
+
+    world = World(record)
+
+    async def body():
+        # Let the worker block in `claim_pending`, then stop in the same step
+        # as the submission, so the claim arrives after the task was failed.
+        await asyncio.sleep(0.02)
+        handle = world.call("record", Greeting(text="late"))
+        world.session.stop_claiming()
+        await asyncio.sleep(0.05)
+        with pytest.raises(RunStoppedError):
+            await handle
+
+    run(world.working(body))
+
+    assert ran == []
+
+
+def test_stopping_frees_a_running_task_that_was_waiting_for_one_that_never_started():
+    async def inner(request: Greeting) -> Greeting:
+        return request
+
+    world = World(inner, concurrency=1)
+    order = []
+
+    async def outer(request: Greeting) -> Greeting:
+        child = world.call("inner", request)
+        order.append("waiting")
+        try:
+            await child
+        except RunStoppedError:
+            order.append("freed")
+            raise
+        return request
+
+    outer_task = Task(
+        outer, registry=world.registry, serializers=world.serializers, name="tests.outer"
+    )
+    world.runtime.hold_claims = True
+
+    async def body():
+        parent = world.session.submit(outer_task.definition, Greeting())
+        while "waiting" not in order:
+            await asyncio.sleep(0.005)
+        world.session.stop_claiming()
+        await world.session.wait_until_running_finish()
+        with pytest.raises(RunStoppedError):
+            await parent
+
+    run(world.working(body))
+
+    assert order == ["waiting", "freed"]
+
+
+def test_a_failure_is_logged_without_the_errors_own_text(caplog):
+    world = World(explode)
+
+    async def body():
+        with pytest.raises(ValueError):
+            await world.call("explode", Greeting(text="a secret payload"))
+
+    with caplog.at_level(logging.DEBUG, logger="kabudachi"):
+        run(world.working(body))
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings and all("secret" not in r.getMessage() for r in warnings)
+    assert any(r.exc_info for r in caplog.records if r.levelno == logging.DEBUG)
+
+
+def test_a_runtime_that_fails_ends_the_worker_loop_with_its_error():
+    world = World(echo)
+    world.runtime.claim_error = RuntimeError("the runtime broke")
+
+    with pytest.raises(RuntimeError, match="the runtime broke"):
+        run(world.session.work())
+
+
+def test_synchronous_tasks_run_as_many_at_once_as_the_concurrency_allows():
+    def blocking(request: Greeting) -> Greeting:
+        time.sleep(0.4)
+        return request
+
+    # More than the default thread pool ever has, so a small pool would take turns.
+    world = World(blocking, concurrency=48)
+
+    async def body():
+        started = time.monotonic()
+        await asyncio.gather(*(world.call("blocking", Greeting()) for _ in range(48)))
+        return time.monotonic() - started
+
+    assert run(world.working(body)) < 0.7
+
+
+def test_no_more_synchronous_bodies_run_at_once_than_the_concurrency_limit():
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def blocking(request: Greeting) -> Greeting:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return request
+
+    world = World(blocking, concurrency=3)
+
+    async def body():
+        return await asyncio.gather(*(world.call("blocking", Greeting()) for _ in range(12)))
+
+    run(world.working(body))
+
+    assert peak == 3
+
+
+def test_closing_twice_is_harmless_and_later_synchronous_work_is_refused():
+    world = World(echo)
+
+    world.session.close()
+    world.session.close()
+
+    async def body():
+        # The thread pool that ran synchronous bodies is gone.
+        with pytest.raises(RuntimeError):
+            await world.call("echo", Greeting())
+
+    run(world.working(body))
+
+
+def flaky(failures):
+    """A task body that raises `failures` times and then succeeds; `calls` counts its runs."""
+    calls = []
+
+    def body(request: Greeting) -> Greeting:
+        calls.append(request.text)
+        if len(calls) <= failures:
+            raise ValueError(f"attempt {len(calls)} failed")
+        return request
+
+    body.__name__ = "flaky_body"
+    return body, calls
+
+
+def test_a_task_with_retries_is_run_again_after_a_failure_and_its_handle_gets_the_final_result():
+    body, calls = flaky(failures=2)
+    world = World(body, retries=2)
+
+    async def body_():
+        return await world.call("flaky_body", Greeting(text="input"))
+
+    assert run(world.working(body_)).text == "input"
+    assert calls == ["input", "input", "input"]
+    assert [e[0] for e in world.runtime.events].count("fail") == 2
+
+
+def test_the_handle_is_not_settled_by_a_failure_that_will_be_retried():
+    release = asyncio.Event()
+    attempts = []
+
+    async def fails_then_waits(request: Greeting) -> Greeting:
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise ValueError("first attempt")
+        await release.wait()
+        return request
+
+    world = World(fails_then_waits, retries=1)
+    states = []
+
+    async def body_():
+        handle = world.call("fails_then_waits", Greeting())
+        while len(attempts) < 2:
+            await asyncio.sleep(0.001)
+        states.append(handle.done())
+        release.set()
+        await handle
+
+    run(world.working(body_))
+
+    assert states == [False]
+
+
+def test_a_task_that_keeps_failing_gives_its_handle_the_last_error_after_its_retries():
+    calls = []
+
+    def always_fails(request: Greeting) -> Greeting:
+        calls.append(True)
+        raise ValueError(f"failure {len(calls)}")
+
+    world = World(always_fails, retries=2)
+
+    async def body():
+        with pytest.raises(ValueError, match="failure 3"):
+            await world.call("always_fails", Greeting())
+
+    run(world.working(body))
+
+    assert len(calls) == 3
+
+
+def test_a_retry_the_leader_never_schedules_fails_the_handle_at_once():
+    body, calls = flaky(failures=5)
+    world = World(body, retries=3)
+    world.runtime.refuse_failure = True
+
+    async def body_():
+        with pytest.raises(ValueError):
+            await world.call("flaky_body", Greeting())
+
+    run(world.working(body_))
+
+    assert len(calls) == 1
+
+
+def test_stopping_fails_a_task_that_is_waiting_for_its_retry():
+    body, _ = flaky(failures=1)
+    world = World(body, retries=1)
+    world.runtime.hold_claims = True
+
+    async def body_():
+        handle = world.call("flaky_body", Greeting())
+        while not any(e[0] == "fail" for e in world.runtime.events):
+            await asyncio.sleep(0.001)
+        world.session.stop_claiming()
+        with pytest.raises(RunStoppedError):
+            await handle
+
+    run(world.working(body_))
+
+
+def test_finishing_waits_through_the_retries_of_a_task():
+    body, calls = flaky(failures=2)
+    world = World(body, retries=2)
+
+    async def body_():
+        world.call("flaky_body", Greeting())
+        await world.session.wait_until_idle()
+
+    run(world.working(body_))
+
+    assert len(calls) == 3
+
+
+def test_the_retries_of_a_task_are_submitted_with_it():
+    body, _ = flaky(failures=0)
+    world = World(body, retries=4)
+
+    async def body_():
+        await world.call("flaky_body", Greeting())
+
+    run(world.working(body_))
+
+    assert list(world.runtime.retries.values()) == [4]
+
+
+def test_a_task_the_runtime_says_expired_fails_its_handle_with_task_expired_error():
+    world = World(echo)
+    world.runtime.hold_claims = True
+    # The first task takes the only claim; the second is never claimed.
+
+    async def body():
+        await world.call("echo", Greeting(text="claimed"))
+        waiting = world.call("echo", Greeting(text="waiting"))
+        await asyncio.sleep(0.02)
+        world.runtime.expire(world.runtime.submitted[1][0])
+        with pytest.raises(TaskExpiredError):
+            await waiting
+
+    async def working():
+        events = asyncio.ensure_future(world.session.watch_events())
+        try:
+            await world.working(body)
+        finally:
+            events.cancel()
+            await asyncio.gather(events, return_exceptions=True)
+
+    run(working())
+
+
+def test_finishing_does_not_wait_for_a_task_that_expired():
+    world = World(echo)
+    world.runtime.hold_claims = True
+
+    async def body():
+        await world.call("echo", Greeting())
+        world.call("echo", Greeting())
+        await asyncio.sleep(0.02)
+        world.runtime.expire(world.runtime.submitted[1][0])
+        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+
+    async def working():
+        events = asyncio.ensure_future(world.session.watch_events())
+        try:
+            await world.working(body)
+        finally:
+            events.cancel()
+            await asyncio.gather(events, return_exceptions=True)
+
+    run(working())
+
+
+def test_an_event_for_a_task_this_session_does_not_have_is_ignored():
+    world = World(echo)
+
+    async def body():
+        world.runtime.expire("task-that-is-not-ours")
+        return await world.call("echo", Greeting(text="fine"))
+
+    async def working():
+        events = asyncio.ensure_future(world.session.watch_events())
+        try:
+            return await world.working(body)
+        finally:
+            events.cancel()
+            await asyncio.gather(events, return_exceptions=True)
+
+    assert run(working()).text == "fine"
+
+
+def test_serving_ends_with_the_error_of_whichever_loop_breaks():
+    world = World(echo)
+    world.runtime.event_error = RuntimeError("events broke")
+
+    with pytest.raises(RuntimeError, match="events broke"):
+        run(asyncio.wait_for(world.session.serve(), WAIT))
+
+
+def test_the_submission_options_reach_the_runtime():
+    world = World(echo)
+
+    async def body():
+        world.session.submit(
+            world.tasks["echo"].definition,
+            Greeting(),
+            SubmissionOptions(delay_ms=250, expires_in_ms=9000),
+        )
+
+    run(world.working(body))
+
+    assert world.runtime.submit_options == [
+        {"delay_ms": 250, "expires_in_ms": 9000, "coalescing_key": None}
+    ]
+
+
+SOFT = timedelta(milliseconds=60)
+GRACE = timedelta(milliseconds=150)
+
+
+def timed(function, **options):
+    """A world with `function` declared with a soft limit of `SOFT` and a grace of `GRACE`."""
+    return World(function, timeout=SOFT, cancel_grace=GRACE, **options)
+
+
+def test_a_body_that_finishes_within_its_timeout_is_not_disturbed():
+    async def quick(request: Greeting) -> Greeting:
+        await asyncio.sleep(0.01)
+        return request
+
+    world = timed(quick)
+
+    async def body():
+        return await world.call("quick", Greeting(text="ok"))
+
+    assert run(world.working(body)).text == "ok"
+    assert not any(event[0] == "fail" for event in world.runtime.events)
+
+
+def test_a_body_past_its_soft_limit_is_cancelled_and_its_run_fails_with_a_timeout():
+    saw = []
+
+    async def slow(request: Greeting) -> Greeting:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            saw.append("cancelled")
+            raise
+        return request
+
+    world = timed(slow)
+
+    async def body():
+        started = time.monotonic()
+        with pytest.raises(TaskTimeoutError):
+            await world.call("slow", Greeting())
+        return time.monotonic() - started
+
+    elapsed = run(world.working(body))
+
+    assert saw == ["cancelled"]
+    # A body that stops as asked does not make anyone wait out the grace.
+    assert SOFT.total_seconds() <= elapsed < (SOFT + GRACE).total_seconds()
+    assert [event[0] for event in world.runtime.events] == ["started", "fail"]
+    assert world.runtime.events[1][2] == "TaskTimeoutError"
+
+
+def test_a_body_that_ignores_cancellation_fails_at_the_hard_limit_and_is_abandoned():
+    state = {"still_running": False}
+
+    async def stubborn(request: Greeting) -> Greeting:
+        state["still_running"] = True
+        while True:
+            try:
+                await asyncio.sleep(0.4)
+                break
+            except asyncio.CancelledError:
+                continue  # refuses to stop
+        state["still_running"] = False
+        return request
+
+    world = timed(stubborn)
+
+    async def body():
+        started = time.monotonic()
+        with pytest.raises(TaskTimeoutError):
+            await world.call("stubborn", Greeting())
+        return time.monotonic() - started, state["still_running"]
+
+    elapsed, still_running = run(world.working(body))
+
+    assert elapsed >= (SOFT + GRACE).total_seconds()
+    assert still_running, "the body was abandoned, not killed"
+
+
+def test_an_abandoned_body_keeps_its_place_until_it_exits():
+    starts = []
+    release = threading.Event()
+
+    def stubborn(request: Greeting) -> Greeting:
+        starts.append(request.text)
+        release.wait(5)
+        return request
+
+    world = World(stubborn, concurrency=1, timeout=SOFT, cancel_grace=GRACE)
+
+    async def body():
+        first = world.call("stubborn", Greeting(text="first"))
+        second = world.call("stubborn", Greeting(text="second"))
+        with pytest.raises(TaskTimeoutError):
+            await first
+        await asyncio.sleep(0.2)
+        seen_before_exit = list(starts)
+        release.set()
+        assert (await second).text == "second"
+        return seen_before_exit
+
+    seen_before_exit = run(world.working(body))
+
+    # The abandoned first body still held the only place, so the second
+    # task had not started while it ran.
+    assert seen_before_exit == ["first"]
+
+
+def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit():
+    release = threading.Event()
+    calls = []
+
+    def stubborn_then_fine(request: Greeting) -> Greeting:
+        if not calls:
+            calls.append("first body started")
+            release.wait(5)
+            calls.append("first body exited")
+            return request
+        calls.append("second body ran")
+        return request
+
+    world = World(stubborn_then_fine, retries=1, timeout=SOFT, cancel_grace=GRACE)
+
+    async def body():
+        handle = world.call("stubborn_then_fine", Greeting(text="x"))
+        await asyncio.sleep((SOFT + GRACE).total_seconds() + 0.3)
+        assert not handle.done(), "the lineage stays pending while its retry waits"
+        assert len(calls) == 1, "no second body while the abandoned one runs"
+        release.set()
+        return await handle
+
+    assert run(world.working(body)).text == "x"
+    assert calls == ["first body started", "first body exited", "second body ran"]
+
+
+def test_what_an_abandoned_body_later_returns_or_raises_is_discarded(caplog):
+    release = threading.Event()
+
+    def raises_late(request: Greeting) -> Greeting:
+        release.wait(5)
+        raise ValueError("too late to matter")
+
+    world = World(raises_late, timeout=SOFT, cancel_grace=GRACE)
+
+    async def body():
+        with pytest.raises(TaskTimeoutError):
+            await world.call("raises_late", Greeting())
+        release.set()
+        await asyncio.sleep(0.1)
+
+    run(world.working(body))
+
+    assert not any(event[0] == "complete" for event in world.runtime.events)
+    assert "never retrieved" not in caplog.text
+
+
+def test_a_sync_body_that_outlives_the_grace_fails_at_the_hard_limit():
+    release = threading.Event()
+
+    def blocking(request: Greeting) -> Greeting:
+        release.wait(5)
+        return request
+
+    world = timed(blocking)
+
+    async def body():
+        started = time.monotonic()
+        with pytest.raises(TaskTimeoutError):
+            await world.call("blocking", Greeting())
+        elapsed = time.monotonic() - started
+        release.set()
+        return elapsed
+
+    assert run(world.working(body)) >= (SOFT + GRACE).total_seconds()
+
+
+def test_a_task_without_a_timeout_runs_as_long_as_it_needs():
+    async def patient(request: Greeting) -> Greeting:
+        await asyncio.sleep(0.3)
+        return request
+
+    world = World(patient)
+
+    async def body():
+        return await world.call("patient", Greeting(text="done"))
+
+    assert run(world.working(body)).text == "done"
+
+
+def test_cancel_grace_comes_from_the_process_unless_the_task_chose_its_own():
+    async def stubborn(request: Greeting) -> Greeting:
+        while True:
+            try:
+                await asyncio.sleep(0.5)
+                return request
+            except asyncio.CancelledError:
+                continue
+
+    process_default = World(stubborn, timeout=SOFT)
+    process_default.configuration.configure(cancel_grace=timedelta(milliseconds=50))
+    own_choice = World(stubborn, timeout=SOFT, cancel_grace=timedelta(milliseconds=250))
+    own_choice.configuration.configure(cancel_grace=timedelta(milliseconds=50))
+
+    async def elapsed_until_timeout(world):
+        async def body():
+            started = time.monotonic()
+            with pytest.raises(TaskTimeoutError):
+                await world.call("stubborn", Greeting())
+            return time.monotonic() - started
+
+        return await world.working(body)
+
+    quick = run(elapsed_until_timeout(process_default))
+    slow = run(elapsed_until_timeout(own_choice))
+
+    assert quick < 0.2 <= slow
+
+
+def test_a_running_task_that_fails_after_stopping_does_not_wait_for_a_retry_nobody_will_run():
+    release = threading.Event()
+    calls = []
+
+    def fails_once_released(request: Greeting) -> Greeting:
+        calls.append(True)
+        release.wait(5)
+        raise ValueError("failed while the run was stopping")
+
+    world = World(fails_once_released, retries=2)
+
+    async def body():
+        handle = world.call("fails_once_released", Greeting())
+        while not calls:
+            await asyncio.sleep(0.001)
+        world.session.stop_claiming()
+        release.set()
+        with pytest.raises(RunStoppedError):
+            await asyncio.wait_for(handle, WAIT)
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+
+    run(world.working(body))
+
+    assert len(calls) == 1
+
+
+def test_a_pending_task_can_be_cancelled_and_its_handle_says_so():
+    world = World(echo)
+    world.runtime.hold_claims = True
+
+    async def body():
+        await world.call("echo", Greeting())
+        waiting = world.call("echo", Greeting(text="never claimed"))
+        await asyncio.sleep(0.02)
+        assert waiting.cancel() is True
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(waiting, WAIT)
+        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+
+    run(with_events(world, body))
+
+
+def test_a_running_body_is_cancelled_and_nothing_it_does_is_reported():
+    saw = []
+
+    async def long(request: Greeting) -> Greeting:
+        saw.append("started")
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            saw.append("cancelled")
+            raise
+        return request
+
+    world = World(long)
+
+    async def body():
+        handle = world.call("long", Greeting())
+        while not saw:
+            await asyncio.sleep(0.001)
+        assert handle.cancel() is True
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(handle, WAIT)
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+
+    run(with_events(world, body))
+
+    assert saw == ["started", "cancelled"]
+    assert not any(event[0] in ("complete", "fail") for event in world.runtime.events)
+
+
+def test_a_cancelled_body_that_ignores_cancellation_still_certifies_nothing():
+    release = threading.Event()
+
+    def stubborn(request: Greeting) -> Greeting:
+        release.wait(5)
+        return request
+
+    world = World(stubborn)
+
+    async def body():
+        handle = world.call("stubborn", Greeting())
+        await asyncio.sleep(0.05)
+        handle.cancel()
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(handle, WAIT)
+        release.set()
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+
+    run(with_events(world, body))
+
+    assert not any(event[0] == "complete" for event in world.runtime.events)
+
+
+def test_cancelling_a_task_that_already_finished_changes_nothing():
+    world = World(echo)
+
+    async def body():
+        handle = world.call("echo", Greeting(text="done"))
+        result = await handle
+        assert handle.cancel() is False
+        return await handle, result
+
+    again, result = run(with_events(world, body))
+
+    assert again == result == Greeting(text="done")
+
+
+def test_a_task_can_be_cancelled_from_another_thread():
+    world = World(echo)
+    world.runtime.hold_claims = True
+    outcome = []
+
+    async def body():
+        await world.call("echo", Greeting())
+        waiting = world.call("echo", Greeting())
+        await asyncio.sleep(0.02)
+        thread = threading.Thread(target=lambda: outcome.append(waiting.cancel()))
+        thread.start()
+        thread.join()
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(waiting, WAIT)
+
+    run(with_events(world, body))
+
+    assert outcome == [True]
+
+
+def test_a_cancelled_task_is_not_retried():
+    release = threading.Event()
+    calls = []
+
+    def fails_when_released(request: Greeting) -> Greeting:
+        calls.append(True)
+        release.wait(5)
+        raise ValueError("failed after being cancelled")
+
+    world = World(fails_when_released, retries=3)
+
+    async def body():
+        handle = world.call("fails_when_released", Greeting())
+        while not calls:
+            await asyncio.sleep(0.001)
+        handle.cancel()
+        release.set()
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(handle, WAIT)
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+
+    run(with_events(world, body))
+
+    assert len(calls) == 1
+
+
+def test_an_async_body_that_swallows_the_cancellation_and_returns_certifies_nothing():
+    swallowed = []
+
+    async def swallows(request: Greeting) -> Greeting:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            swallowed.append(True)
+        return request
+
+    world = World(swallows)
+
+    async def body():
+        handle = world.call("swallows", Greeting())
+        await asyncio.sleep(0.05)
+        handle.cancel()
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(handle, WAIT)
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+
+    run(with_events(world, body))
+
+    assert swallowed == [True]
+    assert not any(event[0] == "complete" for event in world.runtime.events)
+
+
+def test_a_callback_runs_after_the_leader_has_certified_the_result():
+    world = World(echo)
+    order = []
+    world.runtime.on_complete = lambda run_id: order.append("certified")
+
+    async def body():
+        handle = world.call("echo", Greeting(text="hi"))
+        handle.callback(lambda result: order.append(("callback", result.text)))
+        await handle
+        await world.session.wait_until_idle()
+
+    run(world.working(body))
+
+    assert order == ["certified", ("callback", "hi")]
+
+
+def test_synchronous_and_async_callbacks_both_run_and_a_synchronous_one_may_block():
+    world = World(echo)
+    seen = []
+    threads = []
+
+    def blocking(result):
+        threads.append(threading.get_ident())
+        time.sleep(0.05)
+        seen.append("sync")
+
+    async def asynchronous(result):
+        await asyncio.sleep(0.01)
+        seen.append("async")
+
+    async def body():
+        loop_thread = threading.get_ident()
+        handle = world.call("echo", Greeting())
+        handle.callback(blocking).callback(asynchronous)
+        await handle
+        await world.session.wait_until_idle()
+        return loop_thread
+
+    loop_thread = run(world.working(body))
+
+    assert sorted(seen) == ["async", "sync"]
+    assert threads and threads[0] != loop_thread
+
+
+def test_a_callback_that_fails_is_logged_by_type_only_and_changes_nothing(caplog):
+    world = World(echo)
+
+    def broken(result):
+        raise KeyError(f"leaks {result.text}")
+
+    async def body():
+        handle = world.call("echo", Greeting(text="private"))
+        handle.callback(broken)
+        result = await handle
+        await world.session.wait_until_idle()
+        return result
+
+    assert run(world.working(body)).text == "private"
+    assert "private" not in caplog.text
+    assert "KeyError" in caplog.text
+
+
+def test_a_callback_is_kept_alive_by_the_run_even_if_the_handle_is_dropped():
+    import gc
+
+    world = World(echo)
+    seen = []
+
+    async def body():
+        world.call("echo", Greeting(text="unwatched")).callback(lambda r: seen.append(r.text))
+        gc.collect()
+        await world.session.wait_until_idle()
+        await asyncio.sleep(0.05)
+
+    run(world.working(body))
+
+    assert seen == ["unwatched"]
+
+
+def test_finishing_waits_for_a_callback_that_is_still_running():
+    world = World(echo)
+    finished = []
+
+    async def slow_callback(result):
+        await asyncio.sleep(0.1)
+        finished.append(True)
+
+    async def body():
+        world.call("echo", Greeting()).callback(slow_callback)
+        await world.session.wait_until_idle()
+
+    run(world.working(body))
+
+    assert finished == [True]
+
+
+def test_a_callback_is_not_called_for_a_task_that_failed_expired_or_was_cancelled():
+    world = World(echo, explode)
+    world.runtime.hold_claims = True
+    seen = []
+
+    async def body():
+        failing = world.call("explode", Greeting(text="x")).callback(seen.append)
+        with pytest.raises(ValueError):
+            await failing
+        await asyncio.sleep(0.02)
+        cancelled = world.call("echo", Greeting()).callback(seen.append)
+        cancelled.cancel()
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(cancelled, WAIT)
+        await world.session.wait_until_idle()
+
+    run(with_events(world, body))
+
+    assert seen == []
+
+
+def concatenate(older: Greeting, newer: Greeting) -> Greeting:
+    return Greeting(text=older.text + newer.text)
+
+
+def coalescing_world(function=echo, **options):
+    return World(function, kind=TaskKind.COALESCING, **options)
+
+
+def encoded(world, *texts):
+    serializer = world.serializers.get("protobuf")
+    return [serializer.encode(Greeting(text=text), Greeting) for text in texts]
+
+
+def test_the_worker_folds_the_superseded_payloads_oldest_first_before_running_the_task():
+    world = coalescing_world(merge=concatenate)
+    world.runtime.chains["task-1"] = encoded(world, "a", "b")
+
+    async def body():
+        return await world.call("echo", Greeting(text="c"))
+
+    assert run(world.working(body)).text == "abc"
+
+
+def test_without_a_reducer_the_newest_payload_wins():
+    world = coalescing_world()
+    world.runtime.chains["task-1"] = encoded(world, "a", "b")
+
+    async def body():
+        return await world.call("echo", Greeting(text="c"))
+
+    assert run(world.working(body)).text == "c"
+
+
+def test_a_generation_that_absorbed_nothing_runs_on_its_own_input_and_needs_no_reducer_call():
+    calls = []
+
+    def recording(older: Greeting, newer: Greeting) -> Greeting:
+        calls.append((older.text, newer.text))
+        return newer
+
+    world = coalescing_world(merge=recording)
+
+    async def body():
+        return await world.call("echo", Greeting(text="alone"))
+
+    assert run(world.working(body)).text == "alone"
+    assert calls == []
+
+
+def test_a_reducer_that_raises_fails_the_task_and_the_body_never_runs():
+    ran = []
+
+    def body_(request: Greeting) -> Greeting:
+        ran.append(True)
+        return request
+
+    def broken(older: Greeting, newer: Greeting) -> Greeting:
+        raise ValueError("cannot merge")
+
+    world = coalescing_world(body_, merge=broken)
+    world.runtime.chains["task-1"] = encoded(world, "a")
+
+    async def body():
+        with pytest.raises(ValueError, match="cannot merge"):
+            await world.call("body_", Greeting(text="b"))
+
+    run(world.working(body))
+
+    assert ran == []
+    assert world.runtime.events[-1][:1] == ("fail",)
+
+
+def test_a_coalescing_submission_carries_its_key_and_the_default_key_is_empty():
+    world = coalescing_world()
+
+    async def body():
+        world.session.submit(world.tasks["echo"].definition, Greeting())
+        world.session.submit(
+            world.tasks["echo"].definition, Greeting(), SubmissionOptions(key="tenant-1")
+        )
+
+    run(world.working(body))
+
+    assert [o["coalescing_key"] for o in world.runtime.submit_options] == ["", "tenant-1"]
+
+
+def test_an_ordinary_task_is_submitted_without_a_key():
+    world = World(echo)
+
+    async def body():
+        world.session.submit(world.tasks["echo"].definition, Greeting())
+
+    run(world.working(body))
+
+    assert world.runtime.submit_options[0]["coalescing_key"] is None
+
+
+def test_a_superseded_generation_fails_its_handle_and_says_by_which():
+    world = coalescing_world()
+    world.runtime.hold_claims = True
+
+    async def body():
+        await world.call("echo", Greeting())
+        older = world.call("echo", Greeting(text="older"))
+        await asyncio.sleep(0.02)
+        world.runtime.supersede(world.runtime.submitted[1][0], "task-99")
+        with pytest.raises(TaskSupersededError) as raised:
+            await asyncio.wait_for(older, WAIT)
+        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        return raised.value
+
+    error = run(with_events(world, body))
+
+    assert error.superseded_by == "task-99"
+
+
+def test_a_task_cancelled_before_it_ever_ran_leaves_nothing_behind_to_remember():
+    world = World(echo)
+    world.runtime.hold_claims = True
+
+    async def body():
+        await world.call("echo", Greeting())
+        waiting = world.call("echo", Greeting(text="never claimed"))
+        await asyncio.sleep(0.02)
+        assert waiting.cancel() is True
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(waiting, WAIT)
+
+    run(with_events(world, body))
+
+    assert world.session._cancelled == set()
+    assert world.session._active == set()
+
+
+def test_a_running_task_that_is_cancelled_leaves_nothing_behind_once_it_ends():
+    async def long(request: Greeting) -> Greeting:
+        await asyncio.sleep(30)
+        return request
+
+    world = World(long)
+
+    async def body():
+        handle = world.call("long", Greeting())
+        await asyncio.sleep(0.05)
+        handle.cancel()
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(handle, WAIT)
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+
+    run(with_events(world, body))
+
+    assert world.session._cancelled == set()
+    assert world.session._active == set()
+
+
+def test_a_body_that_starts_waiting_on_another_thread_wakes_the_worker_on_the_loops_own_thread():
+    world = World(echo, concurrency=1)
+    woken_on = []
+
+    class Recording(asyncio.Event):
+        def set(self):
+            woken_on.append(threading.get_ident())
+            super().set()
+
+    world.session._slot_freed = Recording()
+
+    async def body():
+        loop_thread = threading.get_ident()
+        await asyncio.sleep(0)  # the worker loop starts, and with it the session knows its loop
+        woken_on.clear()
+        thread = threading.Thread(target=world.session._body_blocked)
+        thread.start()
+        thread.join()
+        await asyncio.sleep(0.02)
+        return loop_thread, world.session._blocked
+
+    loop_thread, blocked = run(world.working(body))
+
+    assert blocked == 1
+    assert woken_on and set(woken_on) == {loop_thread}

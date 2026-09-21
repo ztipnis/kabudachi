@@ -7,13 +7,27 @@ authors = [
     { name = "Zach Tipnis", email = "4670561+ztipnis@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "asgiref>=3.8",
+    "wrapt>=1.16",
+]
+
+[project.optional-dependencies]
+protobuf = ["protobuf>=5.29"]
 
 [build-system]
 requires = ["uv_build>=0.8.3,<0.9.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+# Bazel's dependency hub only exposes this group, so what the tests need at run
+# time is repeated here even where it is also a runtime dependency or an extra.
 dev = [
+    "asgiref>=3.8",
+    # Newer releases ship compiled abi3/abi3t wheels, which the pinned
+    # aspect_rules_py cannot resolve; this range is pure Python.
+    "hypothesis>=6.135,<6.150",
+    "protobuf>=5.29",
     "pytest>=9.1.1",
+    "wrapt>=1.16",
 ]

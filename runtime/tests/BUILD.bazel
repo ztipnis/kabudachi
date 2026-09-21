@@ -1,4 +1,50 @@
-load("@aspect_rules_py//py:defs.bzl", "py_test")
+load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
+
+# Shared test helper: protobuf message classes built at runtime. Tests import it
+# as a top-level module, which Gazelle cannot infer.
+# gazelle:resolve py proto_messages //runtime/tests:proto_messages
+# Shared test double for the native runtime.
+# gazelle:resolve py fake_runtime //runtime/tests:fake_runtime
+py_library(
+    name = "fake_runtime",
+    testonly = True,
+    srcs = ["fake_runtime.py"],
+    imports = ["."],
+)
+
+# A session wired to a fake runtime, shared by the session and flow tests.
+# gazelle:resolve py session_world //runtime/tests:session_world
+py_library(
+    name = "session_world",
+    testonly = True,
+    srcs = ["session_world.py"],
+    imports = ["."],
+    deps = [
+        ":fake_runtime",
+        "//runtime/src/kabudachi",
+    ],
+)
+
+py_library(
+    name = "proto_messages",
+    testonly = True,
+    srcs = ["proto_messages.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = ["@pypi//protobuf"],
+)
+
+py_test(
+    name = "test_options",
+    srcs = ["test_options.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
 
 py_test(
     name = "test_placeholder",
@@ -17,6 +63,18 @@ py_test(
 )
 
 py_test(
+    name = "test_local",
+    srcs = ["test_local.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
     name = "test_native",
     srcs = ["test_native.py"],
     # Same reasoning as test_placeholder above: without pytest_main, this
@@ -29,6 +87,247 @@ py_test(
     deps = [
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_native_runtime",
+    srcs = ["test_native_runtime.py"],
+    # Same hand-kept settings as test_native above.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_native_scheduling",
+    srcs = ["test_native_scheduling.py"],
+    # Same hand-kept settings as test_native above.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_acceptance",
+    srcs = ["test_acceptance.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        ":session_world",
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//hypothesis",  # keep
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_config",
+    srcs = ["test_config.py"],
+    # Same hand-kept settings as test_native above.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_protobuf_serializer",
+    srcs = ["test_protobuf_serializer.py"],
+    # Same hand-kept settings as test_native above.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_readme_example",
+    srcs = ["test_readme_example.py"],
+    # The README the example is read from.
+    data = ["//runtime:README.md"],  # keep
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        ":fake_runtime",
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_registry",
+    srcs = ["test_registry.py"],
+    # Same hand-kept settings as test_native above.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_serializer_registry",
+    srcs = ["test_serializer_registry.py"],
+    # Same hand-kept settings as test_native above.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_task_decorator",
+    srcs = ["test_task_decorator.py"],
+    # Same hand-kept settings as test_native above.
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_without_protobuf",
+    srcs = ["test_without_protobuf.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        # Imported only inside the subprocess the test starts, so Gazelle cannot see it.
+        "//runtime/src/kabudachi",  # keep
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_continuation",
+    srcs = ["test_continuation.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        ":session_world",
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_flow",
+    srcs = ["test_flow.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        ":session_world",
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_handle",
+    srcs = ["test_handle.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_run",
+    srcs = ["test_run.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_session",
+    srcs = ["test_session.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        ":session_world",
+        "//runtime/src/kabudachi",
+        "//runtime/tests:fake_runtime",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_library(
+    name = "tests",
+    srcs = [
+        "fake_runtime.py",
+        "proto_messages.py",
+    ],
+    visibility = ["//:__subpackages__"],
+    deps = ["@pypi//protobuf"],
+)
+
+py_test(
+    name = "test_interrupt",
+    srcs = ["test_interrupt.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        # Imported only inside the subprocess the test starts, so Gazelle cannot see it.
+        "//runtime/src/kabudachi",  # keep
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_serve",
+    srcs = ["test_serve.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        # Imported only inside the subprocess the test starts, so Gazelle cannot see it.
+        ":proto_messages",  # keep
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",  # keep
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_runner",
+    srcs = ["test_runner.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:fake_runtime",
+        "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
     ],
 )

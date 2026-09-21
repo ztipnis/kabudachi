@@ -1,3 +1,5 @@
 # Package marker — required so //runtime:pyproject.toml and
 # //runtime:uv.lock are valid labels for uv.project() in MODULE.bazel.
-# Intentionally empty; Gazelle never touches this file (see CLAUDE.md).
+# It defines no targets and Gazelle never touches this file (see CLAUDE.md);
+# the only thing exported is the README, which a test runs the example of.
+exports_files(["README.md"])

@@ -24,3 +24,49 @@ message TaskRunIdentity {
   uint32 attempt_number = 3;
   optional TaskRunId parent_task_run_id = 4;
 }
+
+// An immutable submitted invocation. A retry never changes it; it creates a
+// new TaskRun instead.
+message Task {
+  TaskId task_id = 1;
+  TaskDefinitionId task_definition_id = 2;
+  uint32 source_version = 3;
+  bytes serialized_input = 4;
+  string queue = 5;
+  // Scheduler clock ticks at submission, not wall-clock time. Comparable only
+  // with ticks from the same clock.
+  uint64 created_at_ticks = 6;
+  // How many more attempts a failed run may be replaced by. Zero means the
+  // task is not retried.
+  uint32 max_retries = 7;
+  // The task is not started before this scheduler tick; unset means it may
+  // start at once.
+  optional uint64 not_before_ticks = 8;
+  // A task still pending at this scheduler tick expires instead of running
+  // late; unset means it never expires.
+  optional uint64 expires_at_ticks = 9;
+  // Set only on a coalescing task: the flat key that decides which pending
+  // generations supersede each other. The default key is the empty string.
+  optional string coalescing_key = 10;
+}
+
+// One execution attempt of a Task. `identity`, the versions and
+// `created_at_ticks` never change after creation; `state` and
+// `updated_at_ticks` are the mutable part.
+message TaskRun {
+  TaskRunIdentity identity = 1;
+  uint32 source_version = 2;
+  uint32 execution_version = 3;
+  uint64 created_at_ticks = 4;
+  TaskRunState state = 5;
+  uint64 updated_at_ticks = 6;
+  // The worker that claimed this run; the only one whose results the leader
+  // accepts. Unset while the run is still pending.
+  WorkerId selected_worker = 7;
+  // Digest of the certified result. Empty until the run succeeds, so a real
+  // digest is never empty.
+  bytes result_digest = 8;
+  // The type name of the error that failed the run (for example
+  // "ValueError"), never its message. Empty unless the run is FAILED.
+  string failure_kind = 9;
+}

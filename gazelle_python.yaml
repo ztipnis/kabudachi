@@ -1,11 +1,14 @@
 manifest:
   modules_mapping:
+    asgiref: asgiref
     colorama: colorama
+    google: protobuf
     iniconfig: iniconfig
     packaging: packaging
     pluggy: pluggy
     py: pytest
     pygments: pygments
     pytest: pytest
+    wrapt: wrapt
   pip_repository:
     name: pypi

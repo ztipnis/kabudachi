@@ -111,7 +111,11 @@ The following are intentionally outside the initial product boundary.
 
 **Not a durable workflow engine.** No deterministic workflow replay, no event-sourced Python program execution, and no generic intra-task checkpointing.
 
-**No exactly-once external side effects.** The scheduler can guarantee one authoritative TaskRun result at a time, but it cannot undo an HTTP POST or database commit performed by an execution that later loses authority.
+**No exactly-once external side effects.** The scheduler can guarantee one authoritative TaskRun result at a time, but it cannot undo an HTTP POST or database commit performed by an execution that later loses authority. The design bounds how long a lost execution and its replacement can overlap (§8.3) but does not fence external writes; side-effecting work belongs in non-retriable tasks or must be made idempotent or transactional by the application.
+
+**Not a task-submission deduplicator or inbox/outbox.** Submitting a task is not idempotent: every submission creates a distinct Task with its own `task_id`, and submitter semantics (deduplication, retry of the submit itself, transactional outbox patterns) belong entirely to the application. The single exception is `@coalescing_task`, where a newer generation supersedes an older pending one with the same key (§3.2.1). That is supersession, not deduplication: a submission made after the earlier generation was claimed still runs, and the application still owns idempotency of side effects.
+
+**Not a lock service or control-loop runtime.** There is no general lease/lock API, and no facility for user-level long-running loops, runners, or singleton services. Locks, control loops, and the jobs they trigger remain application responsibilities; kabudachi executes the tasks those controllers submit.
 
 **No 100,000-worker single-leader promise.** The design should be efficient, but the initial operational target is around 1,000 workers per leader. Larger installations shard.
 
@@ -183,11 +187,49 @@ Its baseline semantics are:
 - ordinary Python exception fails the task unless retry is explicitly requested/configured;
 - result persistence follows inherited application policy.
 
-`@ephemeral_task` is explicitly best effort. Complete cluster loss may lose it.
+`@ephemeral_task` is explicitly best effort. It is never replayed after worker loss (the caller observes `LOST`), and complete cluster loss may lose it.
 
-`@coalescing_task` represents continuously replaced work. A newer pending generation supersedes older pending generations with the same coalescing identity, but never cancels an already running generation. At most one running generation and one newest pending generation should generally exist per coalescing key.
+`@coalescing_task` represents continuously replaced work. A newer pending generation supersedes older pending generations with the same coalescing key, but never cancels an already running generation. At most one running generation and one newest pending generation exist per coalescing key. The rules are in §3.2.1.
 
 The task class is a semantic choice and therefore requires an explicit decorator. Tunable policies remain inherited.
+
+#### 3.2.1 Coalescing semantics
+
+**Key.** A coalescing key is a flat string. By default every submission of a coalescing task shares one key; a caller may supply a key per submission to partition the work (for example one key per tenant). Supersession requires an exact key match: keys are never hierarchical and there are no exclusion groups. Keys exist only on coalescing tasks; `@task` has no key.
+
+```python
+@coalescing_task(merge=merge_ids)
+async def refresh_index(ids: IdSet) -> None: ...
+
+refresh_index(ids)                         # default key
+refresh_index.options(key=tenant)(ids)     # per-submission key (illustrative spelling)
+```
+
+**Superseded handles.** A superseded generation never runs; awaiting its handle raises `TaskSupersededError`, which names the generation that absorbed its payload (`superseded_by`). Only the newest generation's handle carries a result.
+
+**Supersession cut-off.** Only pending (`SCHEDULED`/`QUEUED`) generations can be superseded. Once a generation is `CLAIMED` it is immune. Work that must never be superseded uses a different key.
+
+**Reducer.** When a newer generation supersedes a pending one, an optional pure reducer `(a: T, b: T) -> T`, passed as `merge=`, combines the payloads. The default reducer returns the newest payload (`b`), which is last-wins. The reducer runs on the worker that claims the generation, before the task body, and never inside the leader, because the leader is a native-core role and must not execute user Python.
+
+Until the claiming worker folds them, superseded payloads are retained as an ordered chain (§8.2). A left-fold of a prefix equals the plain left-fold of the whole chain, so compaction needs no associativity from the reducer, only that it is deterministic and side-effect free.
+
+**Bounded retention.** The retained chain is bounded by a memory budget derived from available memory, or from a configured target memory limit. Past a soft threshold the leader schedules an internal compaction run on an eligible worker that folds the oldest payloads into one. Past a hard threshold submission is backpressured. A task may opt in to lossy `drop_oldest` behavior instead; it is never the default.
+
+**One-node subset (Phase 1).** Before compaction exists, the two thresholds are absolute byte limits set with `configure(memory_soft_limit=..., memory_hard_limit=...)` and count the serialized bytes of every non-terminal Task payload, including retained chains. Past the soft limit the scheduler raises a `SlowDown` signal, cleared once usage falls a hysteresis margin below the limit; bulk submitters (`group`, `.map`) pause while it is raised, and a plain `task(x)` call proceeds. Past the hard limit `submit` raises `BackpressureError`, or, for a coalescing task that opted in to `drop_oldest`, drops that key's retained payloads oldest first until the new payload fits. If it still does not fit (the payload alone exceeds the limit, or the key has nothing left to drop), `submit` raises `BackpressureError` anyway, so `drop_oldest` never lets usage exceed the hard limit. Nothing is compacted, so a coalescing key that is never claimed can reach the hard limit from its own superseded payloads. `SlowDown` is a core-level event, so a later phase can carry it over the leader-to-client channel unchanged.
+
+**Running generation and worker loss.** A running generation is never cancelled by a newer submission. If the worker running it is lost, the generation is replayed when it was the newest for its key (at-least-once for the latest state). If a newer pending generation already exists, that generation runs and the lost one stays `LOST` and is not replayed (`SUPERSEDED` is reserved for pending generations). A timeout is different: it is an ordinary task failure and is not requeued, so work does not grow through repeated requeue and timeout; the next submission creates the newest generation.
+
+**Flow lifetime.** When a coalescing task returns a task-like value (§3.4), its running generation covers the entire resulting flow: the key is held until the flow is terminal.
+
+#### 3.2.2 Delivery semantics
+
+| Situation | `@task` retriable | `@task` non-retriable | `@ephemeral_task` | `@coalescing_task` |
+|---|---|---|---|---|
+| Worker lost while running (after the reconnect timeout, §8.3) | new TaskRun (at-least-once) | `ORPHANED` | `LOST`, not replayed | replayed if newest, else `LOST` and not replayed |
+| Task subprocess dies, worker alive | as worker lost, within one heartbeat interval | `ORPHANED` | `LOST`, not replayed | as worker lost |
+| Timeout | `FAILED`, retried per retry policy (in-process mode: retry deferred until the abandoned body exits, §6.2) | `FAILED`; hard-kill state is open (§28.13) | `FAILED` | `FAILED`, no special requeue |
+| Leader change | run continues, adopted at reconciliation | adopted | adopted | adopted |
+| Catastrophic shard loss | `ShardLostError`, may `resubmit()` | `ORPHANED` | lost | not replayed; next submission creates the newest (§16.3) |
 
 ### 3.3 Calling tasks
 
@@ -200,7 +242,9 @@ result = await handle
 
 The TaskHandle is awaitable and retains task/shard metadata needed for result delivery and later recovery.
 
-There is no `.delay()`.
+Submission is not idempotent: every call creates a distinct Task with its own `task_id` (§2.3). Applications that need deduplication implement it themselves; `@coalescing_task` is the only kind that supersedes earlier submissions, and it does so by key (§3.2.1).
+
+There is no `.delay()`. Delayed submission, timeouts, and expiry are covered in §3.8.
 
 For explicit local execution:
 
@@ -243,20 +287,58 @@ pipeline = flow(
 )
 ```
 
-Each stage receives the prior stage's output as its remaining unbound input. The framework should validate type compatibility when the active serializer/type backend exposes enough information to do so.
+Each stage receives the prior stage's output as its remaining unbound input. Awaiting a flow gives the list of every stage's result in stage order (the last entry is the final output). `.bind(value)` fixes a task's whole input, so the bound task is called with no argument and, as a flow stage, ignores the output before it; `.bind(field=value)` sets scalar fields on the protobuf message the task is called with, or the prior stage's output. Stages are submitted one at a time by the client runtime once their predecessor has finished; an implicit flow, whose continuation is committed atomically with certification, comes with the continuation rules below. The framework should validate type compatibility when the active serializer/type backend exposes enough information to do so.
 
-Parallel composition uses `group`.
+Parallel composition uses `group`. A group has an explicit failure policy:
+
+```python
+group(a, b, c, on_error="fail_fast")     # default
+group(a, b, c, on_error="collect_all")
+```
+
+The policies follow `asyncio.gather`:
+
+Every member of a group gets the same input (a fully bound member ignores it), and awaiting the group gives the list of the members' results in member order. Cancelling a group cancels every member that has not finished. `fail_fast` follows `asyncio.gather` and leaves the other members running after the first failure; the following stage never starts.
+
+- `fail_fast` (default): awaiting the group raises the first failure and the group is terminal `FAILED`. This matches the least-surprising behavior and Celery's chord semantics, where a failed header task does not run the chord body.
+- `collect_all`: like `gather(return_exceptions=True)`, awaiting returns the full array in which each entry is either a step's value or its failure.
+
+A continuation after a group is simply the next stage of a `flow`, for example `flow(group(a, b, c), cb)`; there is no separate `.then()` form. Under `fail_fast`, a failed group is terminal `FAILED`, the flow fails with it, and the following stage never starts. Under `collect_all` the following stage runs and receives the ordered array of per-member values and failures. The failures in that array reach the stage as input, so the stage's serializer has to be able to encode them; the protobuf serializer cannot, and a stage after a `collect_all` group then fails with a `SerializationError` unless it uses a serializer that can. That stage is an ordinary task and keeps what it was declared with: its own retry policy, timeout, queue and class (a `@task` stage is retried per its `retries`, an `@ephemeral_task` stage stays best-effort), and the group or flow imposes none of these on it (§3.4 "Independent tasks"). It runs as its own leader-certified TaskRun exactly once per group instance, across worker loss, leader change, and message reordering. "Exactly once" describes the certified completion run; side effects inside any TaskRun keep the at-least-once semantics of §3.6.
 
 Distributed functional operations use `task.map` and `task.reduce`.
 
 ```python
 results = await transform.map(inputs)
-result = await merge.reduce(results)
+result = await merge.reduce(results)                          # seedless: (T, T) -> T
+report = await add_to_report.reduce(results, initial=Report())  # seeded:   (T, P) -> P
 ```
 
-`map` creates independent distributed Tasks per input item; this is not one worker looping locally through the list. The result preserves ordering.
+`map` creates independent distributed Tasks per input item; this is not one worker looping locally through the list. The result preserves ordering. It is a `group` of one fully bound task per item (so it takes the group's `on_error` policy, `task.map(items, on_error=...)`), every item is checked against the task's serializer before any is submitted, and mapping an empty list returns `[]`. `task.map` is also a `flow` stage that takes the list the stage before it returns. Like any group, `map` submits its tasks one at a time and pauses while the scheduler's `SlowDown` signal is raised (memory use past `memory_soft_limit`, §3.2.1); a plain `task(x)` call is not paused, and past `memory_hard_limit` any submission raises `BackpressureError`.
 
-A reducer should normally have a binary shape similar to `(T, T) -> T`, and should be associative for robust distributed reduction. The implementation may construct a deterministic reduction tree.
+`reduce` approximates the semantics of JavaScript's `Array.prototype.reduce`: a left fold over the items, in input order, with a reducer that takes the current item and the result so far.
+
+```python
+ThisType = TypeVar("ThisType")  # type of each item of the input list
+PrevType = TypeVar("PrevType")  # type of the running result
+ReducerFunctionType = Callable[[ThisType, PrevType], PrevType]
+
+# The reducer is the task the method is called on. Seedless is (T, T) -> T, where
+# PrevType is ThisType; PrevType differs from ThisType only when `initial` is given,
+# and is then the type of `initial`.
+def reduce(
+    self: ReducerFunctionType,  # the reducer task the method is called on
+    items: list[ThisType],
+    initial: PrevType | Unset = UNSET,
+) -> PrevType: ...
+```
+
+- **Seeded.** With `initial`, the running result starts as `initial` and every item is folded in: `previous = reducer(item, previous)`. `PrevType` is inferred from `initial` and may differ from `ThisType`. An empty list returns `initial` without calling the reducer.
+- **Seedless.** Without `initial`, `PrevType` is `ThisType`: the first item is the starting result and the reducer is first called with the second item. A single item is returned as it is, without calling the reducer. An empty list with no `initial` fails the reduce with an error, as JavaScript throws a `TypeError`, rather than inventing a value.
+- **`None` is a value.** As in JavaScript, passing an initial value counts even when that value is `None`; only leaving `initial` out selects the seedless form (`UNSET`, §3.1).
+- **Order and determinism.** Items are folded strictly in input order and the reducer does not have to be associative. Given a deterministic reducer the result is deterministic.
+- **Two arguments only.** JavaScript's callback also receives the index and the whole array. A distributed reducer never holds the whole list, so it gets just the item and the result so far.
+- **A sequential chain.** Each step needs the previous step's result, so a fold runs as a chain: every step is an independent, retriable, leader-certified TaskRun whose input is the item and the serialized result so far. A step that fails after its retries fails the whole reduce and no later step starts, as an exception thrown by the callback ends a JavaScript reduce. Only a seedless reducer explicitly declared associative (illustrative spelling `associative=True` on its decorator) may be evaluated as a deterministic tree instead; that is an optimization that must give the same result as the chain.
+- **Not the coalescing reducer.** The `merge=` reducer of a coalescing task (§3.2.1) is a simpler seedless fold over superseded payloads whose arguments are (older, newer), the opposite order to the (item, previous) order above.
 
 A common pipeline becomes:
 
@@ -268,6 +350,27 @@ flow(
     persist,
 )
 ```
+
+#### Returning a task (implicit flow)
+
+A task may return another task-like value: a bound task, a `flow`, or a `group`. Kabudachi then schedules it as a continuation of the returning task, exactly as if the caller had written an explicit `flow`. This is an *implicit flow* and reuses the explicit-flow machinery; it is not a separate model.
+
+```python
+@task
+async def plan(req: Request) -> Flow:
+    return flow(fetch.bind(req.id), transform.map, persist)
+```
+
+Rules:
+
+- **Tasks are registered at package scope.** A returned value may only reference registered tasks (and bound forms of them). Lambdas and closures cannot be serialized across the FFI boundary, and workers can only execute tasks they know.
+- **Atomic continuation.** The returned value is committed together with the returning task's certified completion (§8.5); the digest that certifies the run is the digest of the returned step's description, and the continuation starts only once the leader has certified it. The returning task is declared with the step type as its return annotation (`-> Flow`, `-> Group` or `-> BoundTask`), and the step must not need an input (bind its first stage). The task is not over until its continuation is, so its coalescing key stays held (§3.2.1) and its handle resolves only then, to the continuation's results (a returned bound task gives a list of one). A lost or uncertified TaskRun therefore leaves no continuation behind, and a failing continuation never re-runs the returning task. The flow's state becomes `FAILED` and the caller may resubmit.
+- **Sequential stages.** A continuation stage starts only after its predecessor is terminal, so cancelling a flow targets the current stage; later stages never start. Cascading cancellation exists only for the members of a `group`.
+- **Independent tasks.** Each stage is an independent task with its own timeout, retry policy, and queue; nothing is inherited from the returning task. There is no flow-level deadline. If a stage has no timeout or a very long one, it holds any coalescing key of the flow until the flow is terminal (§3.2.1); this is a documented risk, not something the framework works around.
+- **Handle shape.** The handle of the original submission resolves to a flow handle whose result is an array with one entry per task or step, in step order. A step that itself returns a flow or group has its slot replaced by a nested array of that sub-flow's results, so nesting follows flow structure. Failures follow the group policy above.
+- **Orphans.** A flow with a non-retriable stage that ends `ORPHANED` is itself terminal `ORPHANED`.
+
+None of this adds workflow-engine semantics: there is no deterministic replay, no branching DSL, and no in-flow timers or signals (§2.3).
 
 ### 3.5 List-valued protobuf input and output
 
@@ -343,7 +446,7 @@ Task callbacks are client-runtime observers, not distributed continuations.
 task(req).callback(on_complete)
 ```
 
-A callback runs after the client runtime receives coordinator certification that the task's result is authoritative. It does not wait for user code to explicitly await or inspect the result.
+A callback runs after the client runtime receives coordinator certification that the task's result is authoritative, and is called with the result; it does not wait for user code to explicitly await or inspect the result. It runs only for a task that succeeded, may be async (a synchronous one runs off the event loop), and one that raises is logged by the error's type and changes nothing: not the task's outcome, not other callbacks (§25.1.8). `run()` waits for callbacks it has started before it returns.
 
 Callback registrations are held strongly by the client runtime even if the returned TaskHandle is garbage-collected. If the client runtime itself dies, callbacks are lost. If the callback is business-critical across runtime loss, it belongs in a `flow` as a normal Task.
 
@@ -355,6 +458,22 @@ non-critical reaction -> callback
 ```
 
 Metrics emission, best-effort notifications, UI reactions, cache warming, or non-critical Kafka publication are appropriate callback uses.
+
+
+### 3.8 Delayed submission, timeouts, expiry, and scheduling
+
+**Delayed submission.** A submission may carry a relative `delay` or an absolute `eta` (spelled `transform.options(delay=timedelta(minutes=5))(req)`, or `eta=` with an aware datetime). This sets the Task's `not_before`; the Task is `SCHEDULED` until then and only then becomes `QUEUED`. Neither form guarantees a start time, only that the Task is not started earlier.
+
+**Timeouts.** A task declares a `timeout` on its definition. Timeouts escalate softly to hard: at the soft limit the running task receives a cooperative cancellation signal; if it has not stopped by the hard limit, its subprocess is killed (in the in-process mode of §6.2, where nothing can be killed, the TaskRun is marked `FAILED` and abandoned). Timeouts are defined per task at package scope; child tasks of a flow are independent and never inherit them (§3.4). Coalescing tasks use the same knobs with no special requeue behavior (§3.2.1).
+
+**Expiry.** A pending Task may declare `expires` (a duration or an aware datetime, in `.options(...)` like `delay`); if it has not started by then it becomes `EXPIRED` and its handle raises `TaskExpiredError` rather than running late.
+
+**Periodic scheduling.** Cron-style scheduling is not part of the scheduler core but is in scope as a first-party plugin, with Celery beat as the parity baseline (§19.7):
+
+- it runs as a dedicated scheduler process (a client that runs the plugin) and is assumed to be a singleton; running exactly one is the deployer's responsibility, with the same single-point-of-failure profile as Celery beat;
+- schedules use standard cron expressions with IANA time zones and are registered in code;
+- missed ticks are skipped (no backfill) and v1 keeps no durable schedule state;
+- a firing is a plain submission. Because submission is not idempotent (§2.3), a second scheduler process will double-fire. A scheduled task may be declared `@coalescing_task` keyed by schedule so that a still-pending duplicate firing is superseded.
 
 ---
 
@@ -391,7 +510,8 @@ serialized_input
 not_before
 deadline/expiration
 logical queue/routing class
-coalescing identity if any
+coalescing key if any (coalescing tasks only)
+flow lineage if any (root task, parent step, step index)
 trace context
 durability metadata
 ```
@@ -399,6 +519,8 @@ durability metadata
 Tasks are disseminated through the DHT and, for durable tasks, copied to the disaster-recovery backend according to policy.
 
 A Task survives retries. Retry history belongs to TaskRuns.
+
+A Task superseded by a newer coalescing generation stays immutable. Its serialized input is retained until the claiming worker folds it into the generation that superseded it (§3.2.1, §8.2).
 
 ### 4.3 TaskRun
 
@@ -454,6 +576,10 @@ ORPHANED
 
 `ORPHANED` means a non-retriable execution may have completed irreversible effects, but the scheduler cannot prove success or failure. It must not be automatically replayed.
 
+`SUPERSEDED` applies only to a pending coalescing generation replaced by a newer generation with the same key. A generation that is `CLAIMED` or later is never superseded.
+
+A flow (explicit or implicit, §3.4) has a terminal state derived from its stages: `SUCCEEDED` when every stage succeeded, `FAILED` under the group policy, `CANCELLED` when cancelled, and `ORPHANED` if a non-retriable stage ended `ORPHANED`.
+
 ---
 
 ## 5. Logical queues, routing, and shards
@@ -470,7 +596,7 @@ high_priority
 emails
 ```
 
-A TaskDefinition or application routing policy may assign work to a logical queue. Workers can advertise queue subscriptions and capabilities. The leader only accepts a claim if the requesting worker is eligible for that Task's queue and requirements.
+A TaskDefinition or application routing policy may assign work to a logical queue. Workers advertise queue subscriptions, and the leader only accepts a claim if the requesting worker is subscribed to that Task's queue. There is no separate capability system: a scarce resource such as a GPU, a licensed library, or a heavyweight model is expressed as a queue, and only workers that have it subscribe.
 
 A shard is an internal coordination/failure-domain unit containing a leader, a DHT peer set, and a worker electorate. A deployment may have one or many logical queues inside one shard. A deployment may also have multiple shards for scale.
 
@@ -519,10 +645,14 @@ The last two should normally be equal. The initial implementation should impose 
 For a task subprocess:
 
 - async functions execute on the subprocess asyncio loop;
-- synchronous functions execute via `run_in_executor`;
+- synchronous functions execute in a worker thread through `asgiref.sync_to_async(..., thread_sensitive=False)`, which propagates `contextvars`; the default `thread_sensitive=True` would serialize every sync task on one thread and is never used;
 - both consume from the same bounded concurrency budget.
 
-If configured process count is `0`, the main Python runtime may execute task functions itself.
+If configured process count is `0`, the main Python runtime may execute task functions itself. In that mode only cooperative (soft) cancellation is enforceable: a synchronous body that ignores cancellation cannot be killed in-process, so at the hard limit the TaskRun is marked `FAILED` and the runtime stops waiting for it. Nothing is killed, so in this mode the outcome is `FAILED`, as in the delivery table (§3.2.2); that is a provisional choice for the in-process mode, and the state after a hard-timeout kill in the subprocess pool stays open (§28.13). An abandoned body of a non-retriable task may still complete irreversible effects, which is the ambiguity `ORPHANED` names in §4.4. The abandoned body may still be running, so a retry, if the retry policy calls for one, is not started until that body has actually exited; a lineage never has two bodies executing at once. The failed TaskRun itself is terminal. When a retry is due, the lineage stays pending until the body exits and the handle does not resolve meanwhile; when none is due (no retries configured, or the last attempt), the lineage is terminal `FAILED` at once. A coalescing generation's key stays occupied until its abandoned body exits, so no second generation of that key starts while a body for it is still running (§25.4.1). Whatever the abandoned body later returns or raises is discarded and can never certify (§25.1.5, §25.1.6). It keeps its concurrency slot until it exits. A body that never exits therefore blocks that lineage's retry and holds its slot indefinitely, and enough of them exhaust the bounded pool: this is a documented limitation of the in-process mode, removed by the subprocess pool's hard kill (Phase 5). The rule limits duplicate side effects from retries but does not fence writes the abandoned body still makes (§2.3).
+
+`kabudachi.run(main=None)` is the synchronous entry point, in the style of `asyncio.run`. It constructs and owns the event loop on the main thread, initializes the native runtime on it, runs `main()` if given (returning its result) and then drains and stops. Draining waits for every task that was called to finish, queued tasks and tasks started by other tasks included; if `main` raised or was interrupted, tasks already running are let finish, tasks that have not started fail with `RunStoppedError`, and the error propagates. A task that waits for another task does not occupy one of the `concurrency` places while it waits, so a task that waits for tasks it called cannot starve them. Before `main` starts, every registered task is checked against the serializers of the process, so a task that cannot work is reported at once; with no `main` it serves as a worker (on the main thread) until SIGINT/SIGTERM, then drains as above and returns; a second signal stops the waiting and raises `KeyboardInterrupt`, abandoning unfinished tasks (a synchronous task still in its thread keeps the interpreter from exiting until it returns). Submitting a task outside `run()` raises `RuntimeNotStartedError`; `.local()` (§3.3) needs no runtime.
+
+Hard timeouts (§3.8) kill the task subprocess. Whether a subprocess is recycled after a configured number of runs, for tasks that hold native memory, is deferred to the Phase 5 design (§28.12).
 
 The design does not encourage thousands of coroutines per worker process simply because asyncio technically permits it. Predictable bounded concurrency is more important.
 
@@ -589,6 +719,8 @@ The migrated Task is not written back over the original DHT record and is not pe
 
 If a worker cannot execute the current payload because no migration path exists, the Task remains queued/blocked rather than being destroyed immediately. A configurable TTL prevents permanent limbo. Expiry should alert and fail with an explicit version/migration reason.
 
+Mixed code versions during a rolling deployment are handled by this same migration schema. A migration may explicitly refuse an incompatible boundary by raising `MigrateRejectError`; the Task then stays queued for a worker that can execute it. Rollout policy beyond this (batch sizes, minimum shard size, election budgets) is left to the application and deployment tooling.
+
 ---
 
 ## 8. Task submission, discovery, claim, execution, and result protocol
@@ -605,6 +737,18 @@ shard_id
 ```
 
 plus local callback and result-delivery state.
+
+Submission is not idempotent (§2.3): each submission creates a new Task.
+
+A handle can report how durably its Task is held, and callers may await a stronger level before treating the submission as accepted:
+
+```text
+in_memory            held by the receiving peer
+replicated           replicated to k DHT peers
+dr_store_written     written to the disaster-recovery store (§9.2)
+```
+
+Kabudachi is not a transactional inbox/outbox. An application that must enqueue atomically with a database commit records the intent in its own store and submits after commit, handling repeat submission itself.
 
 ### 8.2 Worker-pull claim model
 
@@ -643,6 +787,14 @@ leader:
 
 The DHT handles data dissemination and discovery. The leader handles ownership serialization.
 
+#### Supersession and payload folding
+
+For coalescing tasks (§3.2.1), the leader also serializes supersession. A newer submission with the same key marks the older pending generation `SUPERSEDED` (a claim for it is answered `REJECT_SUPERSEDED`); a generation that is already `CLAIMED` cannot be superseded.
+
+The leader never executes the reducer. It keeps the superseded Tasks' payloads linked in order; the worker that claims the newest generation folds the chain oldest to newest with the task's reducer before running the task body. If the retained chain exceeds its memory budget, the leader schedules an internal compaction run that a worker executes to fold the oldest payloads into one; past the hard threshold, new submissions are backpressured (or dropped-oldest if the task opted in).
+
+After leader change, reconciliation (§13) rebuilds per-key occupancy, including the lifetime of any implicit flow, so a second running generation for the same key is never admitted.
+
 ### 8.3 Heartbeats
 
 Worker liveness is a dedicated worker-to-leader control path, separate from lifecycle pub/sub.
@@ -672,6 +824,23 @@ worker authority lost
     -> if completion cannot be proven: ORPHANED
     -> never automatic duplicate execution
 ```
+
+#### Reconnect timeout and worker self-abort
+
+A lost-but-alive worker could otherwise keep performing side effects while its replacement runs. Two timeouts bound this overlap:
+
+```text
+heartbeat_timeout     leader stops hearing from a worker
+reconnect_timeout     grace period after which a lost TaskRun is considered dead
+```
+
+- The leader marks a TaskRun `LOST` when heartbeats stop, but creates a replacement TaskRun only after `reconnect_timeout` elapses.
+- Workers monitor their connection to the leader (and client, where relevant) and abort the TaskRun, by cooperative cancellation and then subprocess kill, at or before `reconnect_timeout` if communication is not re-established. The worker's abort deadline is shorter than the leader's replacement deadline by a clock-skew margin, and both use monotonic time.
+- If the worker reconnects in time, a non-retriable TaskRun's result is adopted and certified (§8.5); a competing replacement cannot supersede it.
+
+The worst-case time from an abrupt kill (SIGKILL) to the replacement TaskRun starting is `heartbeat_timeout + reconnect_timeout`, plus an election if the leader was lost and the claim round trip. Defaults are on the order of tens of seconds and are configurable per queue and task. Heartbeats run in the native core, independent of the GIL and of any CPU-bound task subprocess, so a long native call cannot make a healthy worker look dead. If a task subprocess dies while its worker lives, the TaskRun is reported `LOST` within one heartbeat interval.
+
+This bounds overlap; it does not fence external writes (§2.3).
 
 ### 8.4 Reliable lifecycle/control messaging
 
@@ -712,6 +881,8 @@ This solves stale-worker result races at the scheduler level. If an old retriabl
 
 For a non-retriable TaskRun that survived leader replacement, the new leader may adopt the same TaskRun during reconciliation and certify its already-delivered result.
 
+When a task returns a task-like value (§3.4), the leader commits the continuation atomically with certification of the returning TaskRun. A TaskRun that is not certified therefore leaves no continuation behind.
+
 
 ---
 
@@ -732,6 +903,13 @@ Purpose:
 - initial bootstrap arbitration.
 
 It is not the task queue and is not on the normal execution path.
+
+Provider constraints, so that the default Redis provider coexists with other tenants of a shared instance:
+
+- a configurable key prefix and, outside cluster mode, a database number; Redis Cluster supports only database `0`, so cluster mode isolates tenants by key prefix alone and rejects a non-zero database selection;
+- never `SCAN` or `KEYS`; every key it reads is addressed by name;
+- a documented minimal command set, stating whether Lua scripting or `WATCH`/`MULTI` are required, with a fallback that avoids Lua where feasible;
+- tolerance of cluster mode through hash-tagged keys.
 
 ### 9.2 Disaster-recovery Task store
 
@@ -1482,7 +1660,7 @@ Becomes `ORPHANED`/unknown. Ordinary `.resubmit()` rejects because an irreversib
 
 ### 16.3 Coalescing task
 
-Usually do not replay the stale generation. The next normal producer invocation should create the newest generation.
+Usually do not replay the stale generation. The next normal producer invocation should create the newest generation. This concerns catastrophic shard loss only; within a live shard, worker loss replays the newest lost generation (§3.2.1).
 
 ### 16.4 `resubmit()` strategies
 
@@ -1591,6 +1769,8 @@ DRAINING
 STOPPED
 ```
 
+Termination is soft and then hard, similar to a warm/cold shutdown in Celery. A soft terminate starts the drain above and lets running TaskRuns finish within a configured grace period; when the grace period elapses, running task subprocesses are cancelled cooperatively and then killed, and their TaskRuns follow the worker-loss semantics of §3.2.2.
+
 ### 18.2 Leader shutdown
 
 A leader should proactively hand off instead of waiting for timeout:
@@ -1696,6 +1876,8 @@ customer_id
 
 High-cardinality IDs belong in traces/logs.
 
+Coalescing and scheduling metrics (superseded count, pending age, running duration, retained-payload memory, compaction runs, backpressure events) are labelled by `task_definition` and `logical_queue` only. There are no per-coalescing-key labels; applications needing per-key metrics emit their own through the shared registry (§19.3).
+
 ### 19.3 Shared Prometheus registry
 
 Users can add application-specific metrics to the same built-in endpoint.
@@ -1795,6 +1977,8 @@ Hooks receive immutable event DTOs.
 
 Hook failures never affect Task success or cluster correctness.
 
+Separately from these observer hooks, the runtime offers execution lifecycle hooks that run inside the task subprocess: worker-process initialization, and per-run before/after. They exist so applications can prepare and clean up per-process state (for example returning database connections after each run). They are registered where tasks are registered, at package scope, so every subprocess that imports the task modules also has them; they are scoped to the queues the worker subscribes to. Framework-specific recipes, such as connection handling for a particular web framework, belong in documentation and cookbooks, not in the architecture.
+
 ### 19.7 Plugin architecture
 
 Plugins are reserved for integrations requiring more than lifecycle callbacks or custom metrics:
@@ -1804,9 +1988,10 @@ Plugins are reserved for integrations requiring more than lifecycle callbacks or
 - persistent observer state;
 - high-volume event consumers;
 - custom collector behavior;
-- explicit startup/shutdown ownership.
+- explicit startup/shutdown ownership;
+- task-submitting plugins and processes, such as the first-party cron scheduler (§3.8).
 
-Plugins must be buffered, bounded, and failure-isolated.
+Plugins must be buffered, bounded, and failure-isolated. A task-submitting plugin acts as an ordinary client: it submits tasks through the public API and has no special authority over scheduling.
 
 ### 19.8 Reference dashboards
 
@@ -2086,7 +2271,9 @@ Responsibilities:
 - active selection state;
 - TaskRun creation;
 - retry decisions;
-- coalescing/supersession;
+- coalescing/supersession, payload-chain retention, and compaction scheduling (the reducer itself runs on workers);
+- reconnect-timeout handling and replacement TaskRun creation;
+- flow continuation commit and lineage;
 - expiration;
 - leader-side reconciliation.
 
@@ -2412,6 +2599,11 @@ typing
 importlib
 ```
 
+Two packages are required dependencies, each chosen over writing the same thing by hand:
+
+- `asgiref` for the sync/async boundary (`sync_to_async` runs synchronous task bodies on threads; `async_to_sync` backs blocking convenience forms);
+- `wrapt` for the object a task decorator returns, which must behave like the function it wraps.
+
 The Python layer should stay relatively small. Distributed scheduling belongs in the native core.
 
 ### 24.2 Protobuf
@@ -2429,7 +2621,7 @@ Do not require users to define duplicate Python dataclasses around protobuf mess
 
 ### 24.3 Pydantic
 
-Pydantic is an optional serializer/backend extra.
+Pydantic is an optional serializer/backend extra. It is not a dependency of the core package.
 
 It should be dynamically imported only when selected.
 
@@ -2457,15 +2649,7 @@ The implementation must still provide one coherent metrics endpoint with native 
 
 ### 24.7 Configuration helpers
 
-No hard dependency is needed.
-
-Applications should be able to call:
-
-```python
-kabudachi.configure(...)
-```
-
-with values loaded from any source. `python-decouple`, Pydantic settings, environment variables, or bespoke config systems are all valid caller concerns.
+Settings are one frozen dataclass, deliberately not a settings framework: there are few settings, and pulling in Pydantic for them would make it a required dependency. Adding a setting is adding a field with its default and a check in `__post_init__`. The framework default is the field's default, `KABUDACHI_<NAME>` in the environment can set it, and `kabudachi.configure(...)` overrides both (§3.1). Values can come from any source the caller likes (`python-decouple`, another settings library, environment variables) and be passed to `configure()`.
 
 ---
 
@@ -2483,6 +2667,7 @@ Peer review should focus heavily on invariants. If an implementation violates on
 6. Stale TaskRuns cannot become authoritative after replacement.
 7. Non-retriable ambiguous execution is never automatically replayed.
 8. Callbacks cannot alter Task success/failure state.
+9. A worker aborts a TaskRun by the reconnect timeout when it cannot reach its leader, and no replacement TaskRun starts before the reconnect timeout has elapsed (§8.3).
 
 ### 25.2 Leadership invariants
 
@@ -2503,7 +2688,18 @@ Peer review should focus heavily on invariants. If an implementation violates on
 4. Shard convergence preserves running authoritative TaskRuns until completion when possible.
 5. A retired shard redirects rather than silently accepting new work.
 
-### 25.4 External-service invariants
+### 25.4 Coalescing and flow invariants
+
+1. At most one generation per coalescing key is `RUNNING` by authority; any overlap with a replacement is bounded by the reconnect timeout (§8.3).
+2. Only pending generations are superseded; a `CLAIMED` generation never is.
+3. A superseded pending payload is folded, never silently dropped (except under an explicit `drop_oldest` opt-in).
+4. The reducer fold is order-preserving and its result does not depend on chain length or compaction points (except under an explicit `drop_oldest` opt-in).
+5. A lost generation that was the newest for its key is replayed; a lost stale generation is not.
+6. Per-key occupancy, including an implicit flow's lifetime, is rebuilt at reconciliation without admitting a second running generation.
+7. A continuation is committed atomically with the returning TaskRun's certification, and a continuation failure never re-runs the returning task.
+8. The stage after a group runs as one certified TaskRun per group instance under any single fault.
+
+### 25.5 External-service invariants
 
 1. Redis is not required for each claim.
 2. Redis is not required for each TaskRun state change.
@@ -2651,9 +2847,16 @@ Implement:
 - native FFI initialization;
 - local TaskRun execution;
 - result certification in a one-node shard;
-- callbacks/lifecycle hooks.
+- `.callback()` (§3.7);
+- automatic retries, `handle.cancel()`, and `@ephemeral_task`;
+- coalescing supersession and reducer folding in a one-node shard (§3.2.1);
+- delayed submission, timeouts, and expiry (§3.8); only soft timeouts are enforceable in-process (§6.2);
+- `.bind()`, `flow`, `group` with its failure policy, implicit flows, and `.map` (which hands off to `group`) in a one-node shard (§3.4);
+- memory-budget backpressure: a soft-limit `SlowDown` signal that bulk submitters (`group`/`.map`) honor, and a hard-limit `BackpressureError` or opt-in `drop_oldest` (§3.2.1, one-node subset).
 
-The one-worker cluster has quorum one and makes debugging the programming model easy.
+The one-worker cluster has quorum one, runs the real election state machine, and makes debugging the programming model easy.
+
+Deferred out of Phase 1: compaction of retained coalescing chains (Phase 3), observer hooks `kabudachi.events.*` (Phase 7), `.reduce` and type-compatibility validation (Phase 6), migrations (§7), and queue-subscription enforcement (Phase 2).
 
 ### Phase 2: multi-worker ordinary election
 
@@ -2697,18 +2900,19 @@ Implement:
 
 - configured process limit;
 - bounded asyncio concurrency;
-- sync `run_in_executor`;
-- cooperative cancellation;
+- sync bodies via the §6.2 `asgiref` mechanism, now inside the task subprocess;
+- cooperative cancellation and soft-to-hard timeout escalation;
+- execution lifecycle hooks in the task subprocess;
 - SIGTERM/SIGKILL behavior.
 
 ### Phase 6: flow/group/map/reduce
 
-Add:
+Phase 1 already delivers `flow`, `group`, implicit flows and `.map` in a one-node shard. Add:
 
 - typed compatibility validation;
-- distributed map;
-- reduction trees;
-- group ordered result collection;
+- multi-worker distributed map (one-node `.map` is Phase 1);
+- `.reduce` (a sequential chain of certified steps; a reduction tree only for a seedless reducer declared associative);
+- group ordered result collection across workers and leader changes;
 - durable flow continuations.
 
 ### Phase 7: observability
@@ -2719,7 +2923,8 @@ Prometheus and tracing should exist earlier for development, but this phase hard
 - OTel propagation;
 - dashboards;
 - lifecycle event API;
-- plugin interface;
+- plugin interface, including task-submitting plugins;
+- first-party cron scheduler plugin (§3.8);
 - shared custom metric registry;
 - autoscaling examples.
 
@@ -2736,6 +2941,26 @@ Only after one shard is trustworthy:
 - automatic shard convergence.
 
 Trying to implement sharding before single-shard elections are proven would multiply debugging complexity unnecessarily.
+
+### 27.1 Acceptance criteria by phase
+
+The coalescing, flow, and failure-detection invariants (§25.1 item 9 and §25.4) become named acceptance criteria. Those that exercise election and reconciliation extend the Phase 0 simulator; the rest are exit criteria of the phase that implements them.
+
+| Phase | Criteria |
+|---|---|
+| 0 (simulator extension) | 25.1.9 (abort before replacement), 25.4.1 (single running generation by authority), 25.4.2 (pending-only supersession), 25.4.6 (occupancy rebuilt at reconciliation) |
+| 1 | 25.4.3 and 25.4.4 (folding, order preservation), 25.4.7 (atomic continuation), 25.4.8 (stage after a group runs once), 25.4.5 in a one-node shard, and the one-node backpressure contract (`SlowDown` past the soft limit, `BackpressureError` past the hard limit, §3.2.1) |
+| 2 | 25.4.5 under leader and worker loss, the documented time from SIGKILL to replacement (§8.3), and abort-before-replacement under partition |
+| 3 | Retained-payload chain across DHT replicas and compaction (the one-node soft/hard-limit backpressure contract is a Phase 1 exit criterion) |
+| 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess |
+
+### 27.2 Production-readiness gate
+
+No real workload should adopt kabudachi until the following are closed:
+
+- peer and client authentication, and encrypted transport (§28.10);
+- a minimal orchestrator requirements document. The implementation should minimize what it demands of the deployment environment (no mandatory Kubernetes, §2.3) and then define the small set that remains: how peers discover each other, behavior under address churn, reachability between peers, graceful-termination signals, and health endpoints;
+- measured submit-to-start latency (§28.11).
 
 ---
 
@@ -2790,13 +3015,13 @@ The graceful "last holder does not exit until replica acknowledged" requirement 
 
 ### 28.7 Map cardinality and backpressure
 
-A million-element `task.map()` cannot simply submit a million Tasks synchronously from one client without bounded fan-out/backpressure.
+A million-element `task.map()` cannot simply submit a million Tasks synchronously from one client without bounded fan-out/backpressure. The one-node contract (a `SlowDown` signal that bulk submitters honor, §3.2.1) is the Phase 1 answer; the distributed design remains open.
 
 Map should likely stream task creation while preserving ordered result semantics.
 
 ### 28.8 Reduction failure behavior
 
-Define how a reduction tree reacts when one branch fails and retries, and what metadata lets observability reconstruct the reduction topology.
+Define how a reduction reacts when a step fails and retries, and what metadata lets observability reconstruct the chain of steps, or the tree when a declared-associative reducer is evaluated as one. §3.4 fixes the outcome once a step has exhausted its retries: the reduce fails and no later step starts.
 
 ### 28.9 Logical queue fairness
 
@@ -2823,6 +3048,22 @@ Before production use, the protocol needs:
 - encrypted transport.
 
 Do not use Python pickle as a production network serializer.
+
+### 28.11 Submit-to-start latency
+
+No latency target is committed. The path is DHT dissemination, worker pull, and a leader claim round trip. Phase 2 prototype measurements should establish a realistic p50/p99 on a warm idle worker in one healthy shard before any target is stated; a leader push-offer to idle workers is a possible optimization if the pull path is too slow.
+
+### 28.12 Subprocess recycling
+
+Whether task subprocesses can be recycled after a number of runs (for tasks that accumulate native memory), and whether that is per task or per queue, is deferred to the Phase 5 execution-pool design.
+
+### 28.13 State after a hard-timeout kill of a non-retriable task
+
+A non-retriable TaskRun killed at its hard timeout may or may not have performed irreversible work. Whether it becomes `FAILED` or `ORPHANED` needs a decision consistent with §4.4.
+
+### 28.14 Thresholds and margins
+
+Soft and hard fractions of the retained-payload memory budget (§3.2.1; in Phase 1 they are absolute byte limits), and the clock-skew margin between a worker's abort deadline and the leader's replacement deadline (§8.3), are implementation details to fix with measurements.
 
 ---
 

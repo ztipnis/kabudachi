@@ -39,6 +39,17 @@ register_toolchains(
 )
 
 # --- Python toolchain + uv-managed deps for runtime/ ---
+# The interpreter Bazel runs Python on. rules_python defaults to 3.11, but
+# runtime/ requires >=3.12 and uv.lock only holds wheels for 3.12+, so compiled
+# packages (pydantic-core, wrapt) could not be installed under 3.11.
+bazel_dep(name = "rules_python", version = "1.6.3")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.12",
+)
+
 bazel_dep(name = "aspect_rules_py", version = "1.12.1")
 
 interpreters = use_extension("@aspect_rules_py//py/unstable:extension.bzl", "python_interpreters")
@@ -63,8 +74,11 @@ uv = use_extension("@aspect_rules_py//uv/unstable:extension.bzl", "uv")
 uv.declare_hub(hub_name = "pypi")
 uv.project(
     hub_name = "pypi",
-    pyproject = "//runtime:pyproject.toml",
+    # Every dependency installs from a wheel, so no source build is ever made
+    # and no build tools need to be in the lock.
+    default_build_dependencies = [],
     lock = "//runtime:uv.lock",
+    pyproject = "//runtime:pyproject.toml",
 )
 use_repo(uv, "pypi")
 

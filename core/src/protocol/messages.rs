@@ -11,8 +11,8 @@ use crate::protocol::ids;
 
 pub use generated::{
     ElectionCertificate, ElectionMessage, LeaderHeartbeatAck, RollCall, RollCallObservation,
-    SelfRemove, VoteGrant, VoteReject, VoteRejectReason, VoteRequest, WorkerHeartbeat,
-    election_message,
+    SelfRemove, Task, TaskRun, TaskRunIdentity, VoteGrant, VoteReject, VoteRejectReason,
+    VoteRequest, WorkerHeartbeat, election_message,
 };
 
 /// Defines the extension trait `$ext` with typed accessors for `$msg`'s ID
@@ -107,12 +107,23 @@ id_accessors!(SelfRemoveIds for SelfRemove {
     optional: [],
     repeated: [],
 });
+id_accessors!(TaskIds for Task {
+    required: [task_id: TaskId, task_definition_id: TaskDefinitionId],
+    optional: [],
+    repeated: [],
+});
+id_accessors!(TaskRunIdentityIds for TaskRunIdentity {
+    required: [task_run_id: TaskRunId, task_id: TaskId],
+    optional: [parent_task_run_id: TaskRunId],
+    repeated: [],
+});
 
 /// Every accessor trait, for a single glob import.
 pub mod prelude {
     pub use super::{
         ElectionCertificateIds, LeaderHeartbeatAckIds, RollCallIds, RollCallObservationIds,
-        SelfRemoveIds, VoteGrantIds, VoteRejectIds, VoteRequestIds, WorkerHeartbeatIds,
+        SelfRemoveIds, TaskIds, TaskRunIdentityIds, VoteGrantIds, VoteRejectIds, VoteRequestIds,
+        WorkerHeartbeatIds,
     };
 }
 

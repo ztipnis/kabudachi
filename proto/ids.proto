@@ -6,3 +6,4 @@ message IncarnationId { string value = 1; }
 message ShardId { string value = 1; }
 message TaskId { string value = 1; }
 message TaskRunId { string value = 1; }
+message TaskDefinitionId { string value = 1; }

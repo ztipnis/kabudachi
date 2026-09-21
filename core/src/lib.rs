@@ -1,8 +1,11 @@
+pub(crate) mod coalescing;
 pub mod coordination_authority;
 pub mod election;
 pub mod hashing;
 pub mod membership;
 pub mod protocol;
+pub mod scheduler;
+pub mod single_node;
 pub mod time;
 pub mod transport;
 

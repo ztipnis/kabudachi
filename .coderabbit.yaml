@@ -67,17 +67,27 @@ reviews:
     - path: "runtime/src/kabudachi/**/*.py"
       instructions: |
         This is the public developer-facing API surface. Public functions/
-        classes should carry type hints and docstrings. Flag internal
-        core/bindings types leaking into this surface unwrapped.
+        classes should carry type hints. Docstrings follow STYLE_GUIDE.md: full
+        (intent, reason, tradeoff, Raises) or omitted where the name and
+        signature already say everything; do not ask for one-line
+        restatements. Flag internal core/bindings types leaking into this
+        surface unwrapped.
     - path: "runtime/tests/**/*.py"
       instructions: |
         Uses pytest. runtime/tests/test_native.py is expected to fail under
         plain `uv run pytest` (it needs the Bazel-built native extension) —
         don't flag that import failure as a bug in this file itself.
 
+  # STYLE_GUIDE.md ("Comments and docstrings") takes precedence over docstring
+  # coverage: a docstring is full or omitted, never a one-line restatement, so a
+  # coverage percentage would push toward exactly what the guide forbids.
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+
   finishing_touches:
     docstrings:
-      enabled: true
+      enabled: false
 
   # Native linter integrations CodeRabbit runs itself, on top of its LLM
   # review. Rust isn't listed below because it needs no entry: CodeRabbit runs

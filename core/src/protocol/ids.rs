@@ -56,6 +56,35 @@ id_newtype!(
     /// Identifies a single run (attempt) of a task.
     TaskRunId
 );
+id_newtype!(
+    /// Identifies a registered task definition (the code a Task invokes), by
+    /// a name that stays stable across processes and restarts.
+    TaskDefinitionId
+);
+
+/// Mints the IDs of new Tasks and TaskRuns. Clients and workers mint IDs
+/// independently, so an implementation must never hand out the same ID twice,
+/// even across processes.
+pub trait IdGenerator {
+    fn next_task_id(&self) -> TaskId;
+    fn next_task_run_id(&self) -> TaskRunId;
+}
+
+/// Random, time-ordered UUIDv7 IDs, for real deployments. It reads the system
+/// clock and a random source, so a simulation injects its own generator
+/// instead.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Uuid7Ids;
+
+impl IdGenerator for Uuid7Ids {
+    fn next_task_id(&self) -> TaskId {
+        TaskId::new(uuid::Uuid::now_v7().to_string())
+    }
+
+    fn next_task_run_id(&self) -> TaskRunId {
+        TaskRunId::new(uuid::Uuid::now_v7().to_string())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -92,6 +121,28 @@ mod tests {
         let raw: generated::TaskRunId = id.clone().into();
         let back: TaskRunId = raw.into();
         assert_eq!(id, back);
+    }
+
+    #[test]
+    fn task_definition_id_round_trips_through_generated_type() {
+        let id = TaskDefinitionId::new("billing.charge");
+        let raw: generated::TaskDefinitionId = id.clone().into();
+        let back: TaskDefinitionId = raw.into();
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn uuid7_ids_are_unique_and_valid_uuids() {
+        let ids = Uuid7Ids;
+        let task_ids: std::collections::HashSet<_> =
+            (0..1000).map(|_| ids.next_task_id()).collect();
+        let run_ids: std::collections::HashSet<_> =
+            (0..1000).map(|_| ids.next_task_run_id()).collect();
+
+        assert_eq!(task_ids.len(), 1000);
+        assert_eq!(run_ids.len(), 1000);
+        let parsed = uuid::Uuid::parse_str(ids.next_task_id().as_str()).unwrap();
+        assert_eq!(parsed.get_version_num(), 7);
     }
 
     #[test]

@@ -3,7 +3,7 @@ load("@rules_rust_pyo3//:defs.bzl", "pyo3_extension")
 
 pyo3_extension(
     name = "_native",
-    srcs = ["src/lib.rs"],
+    srcs = glob(["src/**/*.rs"]),
     module_name = "kabudachi._native",
     edition = "2024",
     # Puts this package's own directory (bindings/) on sys.path so the
@@ -12,7 +12,10 @@ pyo3_extension(
     # extends its own __path__ (pkgutil-style) so this merges into the
     # same `kabudachi` package as the pure-Python sources.
     imports = ["."],
-    deps = ["//core:core"],
+    deps = [
+        "//core:core",
+        "@crates//:tokio",
+    ],
     visibility = ["//runtime:__subpackages__"],
 )
 

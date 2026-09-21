@@ -11,6 +11,7 @@ digest = { version = "0.10", features = ["alloc"] }
 kabudachi-proto = { path = "../proto" }
 sha2 = "0.10"
 thiserror = "2"
+uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 proptest = "1"
