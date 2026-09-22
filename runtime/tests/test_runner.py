@@ -1,4 +1,4 @@
-"""`run()`'s lifecycle against a fake native runtime: the native runtime is
+"""`run()`'s lifecycle over a real native runtime: the native runtime is
 shut down and the session ended however the run ends, and a worker that dies
 is reported instead of waited on."""
 
@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import kabudachi
-from fake_runtime import FakeNative
+from faulting_runtime import FaultingNative
 from kabudachi import config as config_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
@@ -22,16 +22,16 @@ from proto_messages import Greeting
 
 
 @pytest.fixture(autouse=True)
-def fake_native(monkeypatch):
-    FakeNative.instances = []
+def faulting_native(monkeypatch):
+    FaultingNative.instances = []
     monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
     monkeypatch.setattr(config_module, "_process_configuration", Configuration())
-    monkeypatch.setattr(runner_module, "_native", SimpleNamespace(NativeRuntime=FakeNative))
-    return FakeNative
+    monkeypatch.setattr(runner_module, "_native", SimpleNamespace(NativeRuntime=FaultingNative))
+    return FaultingNative
 
 
 def only_native():
-    [native] = FakeNative.instances
+    [native] = FaultingNative.instances
     return native
 
 
@@ -82,13 +82,13 @@ def test_a_main_that_is_cancelled_still_shuts_down_and_ends_the_session():
 
 
 def test_a_runtime_that_never_becomes_leader_is_shut_down_and_the_error_raised(monkeypatch):
-    original_init = FakeNative.__init__
+    original_init = FaultingNative.__init__
 
     def failing_init(self, *arguments, **options):
         original_init(self, *arguments, **options)
         self.leader_error = RuntimeError("no leader")
 
-    monkeypatch.setattr(FakeNative, "__init__", failing_init)
+    monkeypatch.setattr(FaultingNative, "__init__", failing_init)
 
     async def main():
         raise AssertionError("main must not start without a leader")
@@ -101,13 +101,13 @@ def test_a_runtime_that_never_becomes_leader_is_shut_down_and_the_error_raised(m
 
 
 def test_a_worker_that_dies_cancels_main_and_raises_its_error(monkeypatch):
-    original_init = FakeNative.__init__
+    original_init = FaultingNative.__init__
 
     def failing_init(self, *arguments, **options):
         original_init(self, *arguments, **options)
         self.claim_error = RuntimeError("the runtime broke")
 
-    monkeypatch.setattr(FakeNative, "__init__", failing_init)
+    monkeypatch.setattr(FaultingNative, "__init__", failing_init)
     cancelled = []
 
     async def main():

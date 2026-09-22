@@ -3,16 +3,56 @@ load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
 # Shared test helper: protobuf message classes built at runtime. Tests import it
 # as a top-level module, which Gazelle cannot infer.
 # gazelle:resolve py proto_messages //runtime/tests:proto_messages
-# Shared test double for the native runtime.
-# gazelle:resolve py fake_runtime //runtime/tests:fake_runtime
+
+# Shared test adapter over the native runtime.
+# gazelle:resolve py faulting_runtime //runtime/tests:faulting_runtime
 py_library(
-    name = "fake_runtime",
+    name = "faulting_runtime",
     testonly = True,
-    srcs = ["fake_runtime.py"],
+    srcs = ["faulting_runtime.py"],
     imports = ["."],
+    deps = ["//bindings:_native"],  # keep
 )
 
-# A session wired to a fake runtime, shared by the session and flow tests.
+py_test(
+    name = "test_faulting_runtime",
+    srcs = ["test_faulting_runtime.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        ":faulting_runtime",
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_lifecycle",
+    srcs = ["test_lifecycle.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_test(
+    name = "test_runtime_protocol",
+    srcs = ["test_runtime_protocol.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        ":faulting_runtime",
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+# A session wired to a real native runtime, shared by the session, flow,
+# continuation and acceptance tests.
 # gazelle:resolve py session_world //runtime/tests:session_world
 py_library(
     name = "session_world",
@@ -20,7 +60,8 @@ py_library(
     srcs = ["session_world.py"],
     imports = ["."],
     deps = [
-        ":fake_runtime",
+        ":faulting_runtime",
+        "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
     ],
 )
@@ -164,7 +205,8 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
-        ":fake_runtime",
+        ":faulting_runtime",
+        "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
@@ -277,7 +319,6 @@ py_test(
     deps = [
         ":session_world",
         "//runtime/src/kabudachi",
-        "//runtime/tests:fake_runtime",
         "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
     ],
@@ -286,7 +327,6 @@ py_test(
 py_library(
     name = "tests",
     srcs = [
-        "fake_runtime.py",
         "proto_messages.py",
     ],
     visibility = ["//:__subpackages__"],
@@ -325,8 +365,9 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
+        "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
-        "//runtime/tests:fake_runtime",
+        "//runtime/tests:faulting_runtime",
         "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
     ],

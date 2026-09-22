@@ -21,6 +21,7 @@ use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::clock::RealClock;
 use crate::election::{Publisher, run_election};
 use crate::timers::run_timers;
+use crate::wakeups::Wakeups;
 use crate::work::{
     Closed, PyCertification, PyClaim, PyEvent, SharedScheduler, Wake, claim_when_available,
     events_when_available, lock_scheduler,
@@ -55,17 +56,12 @@ pub struct NativeRuntime {
     timers: Mutex<Option<JoinHandle<()>>>,
     stop: Arc<Notify>,
     stop_timers: Arc<Notify>,
-    /// Told whenever a deadline may have moved.
-    timers_changed: Arc<Notify>,
     state: watch::Receiver<WorkerState>,
     scheduler: SharedScheduler,
     worker_id: WorkerId,
-    /// Wakes claims that are waiting for work: on a submission, a change of
-    /// leadership, or a shutdown.
-    wake: Wake,
-    /// Wakes waits for events: when the scheduler decides something, or on a
-    /// shutdown.
-    events: Wake,
+    /// Everyone a change to the scheduler concerns: claims waiting for work,
+    /// waits for events, and the timer loop.
+    wakeups: Wakeups,
 }
 
 #[pymethods]
@@ -79,10 +75,12 @@ impl NativeRuntime {
     /// forgotten. `memory_soft_limit` and `memory_hard_limit` are in bytes of
     /// serialized task input: past the soft one `next_events()` reports
     /// `"slow_down"`, and past the hard one `submit` raises
-    /// `kabudachi.errors.BackpressureError`. Both or neither must be given.
+    /// `kabudachi.errors.BackpressureError`. Both or neither must be given,
+    /// and the soft one must not be above the hard one, which
+    /// `kabudachi.configure` checks before the values reach here.
     ///
-    /// Raises `ValueError` if a count is zero, the soft limit is above the
-    /// hard one, or only one of the two memory limits is given.
+    /// Raises `ValueError` if a count is zero or only one of the two memory
+    /// limits is given.
     #[new]
     #[pyo3(signature = (
         worker_id,
@@ -110,12 +108,7 @@ impl NativeRuntime {
         }
         let limits = match (memory_soft_limit, memory_hard_limit) {
             (None, None) => None,
-            (Some(soft), Some(hard)) if soft <= hard => Some(MemoryLimits { soft, hard }),
-            (Some(_), Some(_)) => {
-                return Err(PyValueError::new_err(
-                    "memory_soft_limit must not be above memory_hard_limit",
-                ));
-            }
+            (Some(soft), Some(hard)) => Some(MemoryLimits { soft, hard }),
             _ => {
                 return Err(PyValueError::new_err("give both memory limits or neither"));
             }
@@ -149,11 +142,11 @@ impl NativeRuntime {
         let stop = Arc::new(Notify::new());
         let stop_timers = Arc::new(Notify::new());
         let timers_changed = Arc::new(Notify::new());
+        let wakeups = Wakeups::new(wake.clone(), events.clone(), Arc::clone(&timers_changed));
         let publisher = Publisher {
             state: state_sender,
             scheduler: Arc::clone(&scheduler),
-            wake: wake.clone(),
-            timers: Arc::clone(&timers_changed),
+            wakeups: wakeups.clone(),
         };
         let election = tokio.spawn(run_election(
             node,
@@ -165,10 +158,9 @@ impl NativeRuntime {
         let timers = tokio.spawn(run_timers(
             Arc::clone(&scheduler),
             clock,
-            Arc::clone(&timers_changed),
+            timers_changed,
             Arc::clone(&stop_timers),
-            wake.clone(),
-            events.clone(),
+            Wakeups::within_the_timer_loop(wake, events),
         ));
 
         Ok(NativeRuntime {
@@ -178,12 +170,10 @@ impl NativeRuntime {
             timers: Mutex::new(Some(timers)),
             stop,
             stop_timers,
-            timers_changed,
             state,
             scheduler,
             worker_id,
-            wake,
-            events,
+            wakeups,
         })
     }
 
@@ -250,39 +240,31 @@ impl NativeRuntime {
         if !self.bridge.is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
-        let (task_id, has_events) = {
-            let mut scheduler = lock_scheduler(&self.scheduler);
-            scheduler.sweep();
-            let mut submission = Submission::new(
-                TaskDefinitionId::new(definition_id),
-                source_version,
-                serialized_input.to_vec(),
-                queue,
-            )
-            .with_retries(retries);
-            if let Some(delay_ms) = delay_ms {
-                submission = submission.with_delay(CoreDuration::from_ticks(delay_ms));
-            }
-            if let Some(expires_in_ms) = expires_in_ms {
-                submission = submission.with_expiry(CoreDuration::from_ticks(expires_in_ms));
-            }
-            if let Some(key) = coalescing_key {
-                submission = submission.with_coalescing_key(key);
-                if drop_oldest {
-                    submission = submission.with_drop_oldest();
+        let task_id = self
+            .wakeups
+            .with_scheduler(&self.scheduler, |scheduler| {
+                let mut submission = Submission::new(
+                    TaskDefinitionId::new(definition_id),
+                    source_version,
+                    serialized_input.to_vec(),
+                    queue,
+                )
+                .with_retries(retries);
+                if let Some(delay_ms) = delay_ms {
+                    submission = submission.with_delay(CoreDuration::from_ticks(delay_ms));
                 }
-            }
-            let task_id = scheduler
-                .submit(submission)
-                .map_err(|rejection| backpressure_error(py, rejection))?;
-            (task_id, scheduler.has_events())
-        };
-        if has_events {
-            // A newer generation superseded an older one.
-            self.events.notify();
-        }
-        self.wake.notify();
-        self.timers_changed.notify_one();
+                if let Some(expires_in_ms) = expires_in_ms {
+                    submission = submission.with_expiry(CoreDuration::from_ticks(expires_in_ms));
+                }
+                if let Some(key) = coalescing_key {
+                    submission = submission.with_coalescing_key(key);
+                    if drop_oldest {
+                        submission = submission.with_drop_oldest();
+                    }
+                }
+                scheduler.submit(submission)
+            })
+            .map_err(|rejection| backpressure_error(py, rejection))?;
         Ok(task_id.as_str().to_owned())
     }
 
@@ -300,9 +282,9 @@ impl NativeRuntime {
         let waiting = claim_when_available(
             Arc::clone(&self.scheduler),
             self.worker_id.clone(),
-            self.wake.subscribe(),
+            self.wakeups.claims().subscribe(),
             limit,
-            self.events.clone(),
+            self.wakeups.events().clone(),
         );
         self.bridge.spawn_into_py(py, async move {
             waiting
@@ -321,7 +303,10 @@ impl NativeRuntime {
     /// not delivered are lost. Raises `RuntimeError` if the runtime has shut
     /// down or shuts down while waiting.
     fn next_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let waiting = events_when_available(Arc::clone(&self.scheduler), self.events.subscribe());
+        let waiting = events_when_available(
+            Arc::clone(&self.scheduler),
+            self.wakeups.events().subscribe(),
+        );
         self.bridge.spawn_into_py(py, async move {
             waiting
                 .await
@@ -354,32 +339,24 @@ impl NativeRuntime {
         result_digest: &[u8],
         continues: bool,
     ) -> PyResult<PyCertification> {
-        let mut scheduler = lock_scheduler(&self.scheduler);
-        scheduler.sweep();
         let run_id = TaskRunId::new(task_run_id);
         let digest = result_digest.to_vec();
-        let certified = if continues {
-            scheduler.complete_and_continue(&self.worker_id, &run_id, digest)
-        } else {
-            scheduler.complete(&self.worker_id, &run_id, digest)
-        };
-        let certification = certified.map(Into::into).map_err(rejected);
-        // A finished task has a forgetting time, which may be the next
-        // deadline, and may have freed a coalescing key for a waiting generation.
-        self.timers_changed.notify_one();
-        self.wake.notify();
-        certification
+        let certified = self.wakeups.with_scheduler(&self.scheduler, |scheduler| {
+            if continues {
+                scheduler.complete_and_continue(&self.worker_id, &run_id, digest)
+            } else {
+                scheduler.complete(&self.worker_id, &run_id, digest)
+            }
+        });
+        certified.map(Into::into).map_err(rejected)
     }
 
     /// The continuation of a task completed with `continues` is over, however
     /// it ended. Returns whether there was one to end.
     fn end_continuation(&self, task_id: &str) -> bool {
-        let ended = lock_scheduler(&self.scheduler).end_continuation(&TaskId::new(task_id));
-        // Ending it may have freed a coalescing key, and starts the task's
-        // forgetting time.
-        self.wake.notify();
-        self.timers_changed.notify_one();
-        ended
+        self.wakeups.with_scheduler(&self.scheduler, |scheduler| {
+            scheduler.end_continuation(&TaskId::new(task_id))
+        })
     }
 
     /// Reports that a running run failed with an error of type
@@ -390,18 +367,13 @@ impl NativeRuntime {
     /// Raises `RuntimeError` if the run is unknown, is not running, or is not
     /// this worker's; the failure is then not recorded.
     fn fail(&self, task_run_id: &str, failure_kind: &str) -> PyResult<bool> {
-        let failure = {
-            let mut scheduler = lock_scheduler(&self.scheduler);
-            scheduler.sweep();
-            scheduler
-                .fail(&self.worker_id, &TaskRunId::new(task_run_id), failure_kind)
-                .map_err(rejected)?
-        };
-        // A retry can be claimed now, and a final failure frees a coalescing key.
-        self.wake.notify();
-        let will_retry = failure.retry.is_some();
-        self.timers_changed.notify_one();
-        Ok(will_retry)
+        let failure = self
+            .wakeups
+            .with_scheduler(&self.scheduler, |scheduler| {
+                scheduler.fail(&self.worker_id, &TaskRunId::new(task_run_id), failure_kind)
+            })
+            .map_err(rejected)?;
+        Ok(failure.retry.is_some())
     }
 
     /// Cancels a task, whatever it is doing: `"cancelled"` if it was, and the
@@ -411,19 +383,12 @@ impl NativeRuntime {
     ///
     /// Raises `RuntimeError` if this worker is not the leader.
     fn cancel(&self, task_id: &str) -> PyResult<&'static str> {
-        let (outcome, has_events) = {
-            let mut scheduler = lock_scheduler(&self.scheduler);
-            let outcome = scheduler
-                .cancel(&TaskId::new(task_id))
-                .map_err(|rejection| PyRuntimeError::new_err(rejection.to_string()))?;
-            (outcome, scheduler.has_events())
-        };
-        if has_events {
-            self.events.notify();
-        }
-        // A cancelled generation may have freed a coalescing key.
-        self.wake.notify();
-        self.timers_changed.notify_one();
+        let outcome = self
+            .wakeups
+            .with_scheduler(&self.scheduler, |scheduler| {
+                scheduler.cancel(&TaskId::new(task_id))
+            })
+            .map_err(|rejection| PyRuntimeError::new_err(rejection.to_string()))?;
         Ok(match outcome {
             Cancellation::Cancelled { .. } => "cancelled",
             Cancellation::AlreadyFinished => "finished",
@@ -475,8 +440,7 @@ impl NativeRuntime {
             };
             self.bridge.close();
             // Claims waiting for work, and waits for events, give up.
-            self.wake.close();
-            self.events.close();
+            self.wakeups.close();
             let election = self
                 .election
                 .lock()

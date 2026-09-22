@@ -145,6 +145,11 @@ def stages(world, *names):
     return [world.tasks[name] for name in names]
 
 
+async def until_submitted(world, count):
+    while len(world.runtime.submitted) < count:
+        await asyncio.sleep(0.005)
+
+
 def test_stages_run_in_order_each_receiving_the_prior_output_and_the_handle_is_the_array():
     world = flow_world(shout, wrap)
     pipeline = flow(*stages(world, "shout", "wrap"))
@@ -219,7 +224,7 @@ def test_a_stage_that_was_never_started_because_the_run_stopped_fails_the_flow()
     async def body():
         await world.call("shout", Greeting())  # takes the only claim
         handle = world.session.submit_flow(pipeline, Greeting())
-        await asyncio.sleep(0.05)
+        await until_submitted(world, 2)  # the first stage is waiting for a claim
         world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await asyncio.wait_for(handle, WAIT)
@@ -243,7 +248,7 @@ def test_cancelling_a_flow_cancels_the_current_stage_and_starts_no_later_one():
 
     async def body():
         handle = world.session.submit_flow(pipeline, Greeting())
-        await asyncio.sleep(0.05)
+        await until_submitted(world, 1)
         assert handle.cancel() is True
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
@@ -615,7 +620,7 @@ def test_a_group_with_a_member_the_run_stopped_before_starting_fails_the_group()
     async def body():
         await world.call("shout", Greeting())  # takes the only claim
         handle = world.session.submit_group(members, Greeting())
-        await asyncio.sleep(0.05)
+        await until_submitted(world, 3)  # both members are waiting for a claim
         world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await asyncio.wait_for(handle, WAIT)
@@ -749,23 +754,77 @@ def test_a_map_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_ta
 
 # --- backpressure -------------------------------------------------------
 
+# Bytes of serialized input. Past the soft limit the runtime raises SlowDown;
+# a submission that would go past the hard one is refused.
+SOFT_LIMIT = 100
+HARD_LIMIT = 1_000
+PAST_SOFT_LIMIT = Greeting(text="x" * 150)
+
+
+def held_world(*functions, hard_limit=HARD_LIMIT, **options):
+    """A world with real memory limits, and `hold`, a task that keeps its input
+    unfinished (so SlowDown stays raised) until the returned event is set."""
+    released = asyncio.Event()
+
+    async def hold(request: Greeting) -> Greeting:
+        await released.wait()
+        return request
+
+    world = World(
+        hold,
+        *functions,
+        memory_soft_limit=SOFT_LIMIT,
+        memory_hard_limit=hard_limit,
+        **options,
+    )
+    return world, released
+
+
+async def until_slow_down_seen(world):
+    """Waits until the session has acted on the runtime's SlowDown. Its own
+    flag is the only place that shows it; the runtime's event is consumed."""
+    while world.session._below_soft_limit.is_set():
+        await asyncio.sleep(0.005)
+
+
+async def with_watcher_only(world, body):
+    """Like `with_events`, but no worker claims anything, so every task the
+    body submits stays pending and its input stays counted."""
+    await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
+    events = asyncio.ensure_future(world.session.watch_events())
+    try:
+        return await asyncio.wait_for(body(), WAIT)
+    finally:
+        events.cancel()
+        await asyncio.gather(events, return_exceptions=True)
+
+
+def run_states(world):
+    """The state of each submitted task's latest run, in submission order."""
+    native = world.native
+    return [
+        native.task_run_state(native.task_run_ids(task_id)[-1])
+        for task_id, *_ in world.runtime.submitted
+    ]
+
 
 def test_a_group_pauses_submitting_while_slow_down_is_raised_but_a_plain_call_does_not():
-    world = group_world(shout)
+    world, released = held_world(shout)
     members = group(*([world.tasks["shout"]] * 3))
 
     async def body():
-        world.runtime.slow_down(True)
-        await asyncio.sleep(0.05)
+        holder = world.call("hold", PAST_SOFT_LIMIT)
+        await until_slow_down_seen(world)
+        before = len(world.runtime.submitted)
         handle = world.session.submit_group(members, Greeting(text="a"))
         await asyncio.sleep(0.15)
-        during = len(world.runtime.submitted)
-        plain = world.call("shout", Greeting(text="plain"))
-        await plain
-        while_slow = len(world.runtime.submitted)
-        world.runtime.slow_down(False)
+        during = len(world.runtime.submitted) - before
+        await world.call("shout", Greeting(text="plain"))
+        while_slow = len(world.runtime.submitted) - before
+        released.set()  # the held input finishes, which clears SlowDown
         await asyncio.wait_for(handle, WAIT)
-        return during, while_slow, len(world.runtime.submitted)
+        await holder
+        return during, while_slow, len(world.runtime.submitted) - before
 
     during, while_slow, after = run(with_events(world, body))
 
@@ -773,127 +832,141 @@ def test_a_group_pauses_submitting_while_slow_down_is_raised_but_a_plain_call_do
 
 
 def test_map_pauses_its_bulk_submission_on_slow_down_too():
-    world = group_world(shout)
+    world, released = held_world(shout)
 
     async def body():
-        world.runtime.slow_down(True)
-        await asyncio.sleep(0.05)
+        holder = world.call("hold", PAST_SOFT_LIMIT)
+        await until_slow_down_seen(world)
+        before = len(world.runtime.submitted)
         with activated(world):
             handle = world.tasks["shout"].map(greetings("a", "b"))
             await asyncio.sleep(0.15)
-            during = len(world.runtime.submitted)
-            world.runtime.slow_down(False)
-            await asyncio.wait_for(handle, WAIT)
-        return during
+            during = len(world.runtime.submitted) - before
+            released.set()
+            results = await asyncio.wait_for(handle, WAIT)
+        await holder
+        return during, results
 
-    assert run(with_events(world, body)) == 0
+    during, results = run(with_events(world, body))
+
+    assert during == 0
+    assert [g.text for g in results] == ["A", "B"]
 
 
 def test_stopping_ends_a_group_that_is_waiting_out_slow_down():
-    world = group_world(shout)
+    world = World(shout, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT)
     members = group(world.tasks["shout"], world.tasks["shout"])
 
     async def body():
-        world.runtime.slow_down(True)
-        await asyncio.sleep(0.05)
+        world.call("shout", PAST_SOFT_LIMIT)  # never claimed: its input stays counted
+        await until_slow_down_seen(world)
         handle = world.session.submit_group(members, Greeting())
         await asyncio.sleep(0.1)
         world.session.stop_claiming()
-        with pytest.raises(RunStoppedError):
+        with pytest.raises(RunStoppedError, match="waited to submit"):
             await asyncio.wait_for(handle, WAIT)
 
-    run(with_events(world, body))
+    run(with_watcher_only(world, body))
+
+    assert len(world.runtime.submitted) == 1, "only the task that raised SlowDown"
 
 
 def test_cancelling_a_group_that_is_waiting_out_slow_down_submits_nothing():
-    world = group_world(shout)
+    world = World(shout, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT)
     members = group(world.tasks["shout"], world.tasks["shout"])
 
     async def body():
-        world.runtime.slow_down(True)
-        await asyncio.sleep(0.05)
+        world.call("shout", PAST_SOFT_LIMIT)  # never claimed: its input stays counted
+        await until_slow_down_seen(world)
         handle = world.session.submit_group(members, Greeting())
         await asyncio.sleep(0.1)
         assert handle.cancel() is True
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
 
-    run(with_events(world, body))
+    run(with_watcher_only(world, body))
 
-    assert world.runtime.submitted == []
+    assert len(world.runtime.submitted) == 1, "only the task that raised SlowDown"
 
 
 def test_a_plain_call_past_the_hard_limit_raises_backpressure_error():
     from kabudachi.errors import BackpressureError
 
-    world = group_world(shout)
-    world.runtime.refuse_after = 1
+    world = World(shout, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT)
 
     async def body():
-        await world.call("shout", Greeting())
+        world.call("shout", Greeting(text="x" * 900))  # never claimed: it stays counted
         with pytest.raises(BackpressureError):
-            world.call("shout", Greeting())
+            world.call("shout", Greeting(text="x" * 900))
 
-    run(with_events(world, body))
+    run(with_watcher_only(world, body))
+
+    assert len(world.runtime.submitted) == 1
 
 
 def test_a_group_that_hits_the_hard_limit_midway_fails_and_cancels_the_members_it_started():
     from kabudachi.errors import BackpressureError
 
-    world = group_world(shout)
-    world.runtime.hold_claims = True
-    world.runtime.refuse_after = 2
-    members = group(*([world.tasks["shout"]] * 3))
+    # Two members fit and the third does not. With equal limits SlowDown is never
+    # raised first, so the group reaches the hard limit rather than pausing.
+    # Members hold rather than finish, so the cascade-cancel is guaranteed to
+    # reach a still-running member instead of racing its natural completion.
+    world, released = held_world(hard_limit=100)
+    members = group(*([world.tasks["hold"]] * 3))
 
     async def body():
         with pytest.raises(BackpressureError):
-            await world.session.submit_group(members, Greeting())
+            await world.session.submit_group(members, Greeting(text="x" * 40))
+        released.set()
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
 
     run(with_events(world, body))
 
     assert len(world.runtime.submitted) == 2
-    assert len(world.runtime.cancelled) == 2
+    assert run_states(world) == ["Cancelled", "Cancelled"]
 
 
 def test_a_bulk_submission_pauses_when_slow_down_is_raised_while_it_is_still_submitting():
-    world = group_world(shout, concurrency=8)
-    world.runtime.slow_down_after = 2
-    members = group(*([world.tasks["shout"]] * 6))
+    world, released = held_world(shout, concurrency=8)
+    members = group(*([world.tasks["hold"]] * 40))
 
     async def body():
-        handle = world.session.submit_group(members, Greeting(text="a"))
+        handle = world.session.submit_group(members, Greeting(text="x" * 60))
+        await until_slow_down_seen(world)
+        paused_at = len(world.runtime.submitted)
         await asyncio.sleep(0.2)
         while_slow = len(world.runtime.submitted)
-        world.runtime.slow_down(False)
+        released.set()  # the held members finish, which clears SlowDown
         await asyncio.wait_for(handle, WAIT)
-        return while_slow, len(world.runtime.submitted)
+        return paused_at, while_slow, len(world.runtime.submitted)
 
-    while_slow, after = run(with_events(world, body))
+    paused_at, while_slow, after = run(with_events(world, body))
 
-    assert while_slow == 2, "the group kept submitting past the soft limit"
-    assert after == 6
+    assert while_slow == paused_at, "the group kept submitting past the soft limit"
+    assert paused_at < 40
+    assert after == 40
 
 
 def test_cancelling_a_group_part_way_through_its_submission_starts_no_further_member():
-    world = group_world(shout, concurrency=8)
-    world.runtime.hold_claims = True
-    members = group(*([world.tasks["shout"]] * 6))
-    handles = []
+    # Members hold rather than finish, so the cascade-cancel is guaranteed to
+    # reach every submitted member instead of racing its natural completion.
+    world, released = held_world(concurrency=8)
+    members = group(*([world.tasks["hold"]] * 6))
 
     async def body():
-        handles.append(world.session.submit_group(members, Greeting()))
+        handle = world.session.submit_group(members, Greeting())
         while len(world.runtime.submitted) < 2:
             await asyncio.sleep(0)
-        assert handles[0].cancel() is True
+        assert handle.cancel() is True
         with pytest.raises(TaskCancelledError):
-            await asyncio.wait_for(handles[0], WAIT)
+            await asyncio.wait_for(handle, WAIT)
+        released.set()
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
 
     run(with_events(world, body))
 
     assert len(world.runtime.submitted) < 6
-    assert len(world.runtime.cancelled) == len(world.runtime.submitted)
+    assert set(run_states(world)) == {"Cancelled"}
 
 
 def test_a_flow_whose_orchestration_is_cancelled_before_it_starts_still_settles_and_is_not_leaked():
@@ -909,5 +982,24 @@ def test_a_flow_whose_orchestration_is_cancelled_before_it_starts_still_settles_
         with pytest.raises(TaskInterruptedError):
             await asyncio.wait_for(handle, WAIT)
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+
+    run(with_events(world, body))
+
+
+def test_a_flow_whose_orchestration_is_cancelled_while_it_runs_fails_as_interrupted():
+    world = flow_world(shout)
+    pipeline = flow(*stages(world, "shout"))
+    world.runtime.hold_claims = True
+
+    async def body():
+        await world.call("shout", Greeting())  # takes the only claim
+        handle = world.session.submit_flow(pipeline, Greeting())
+        await until_submitted(world, 2)  # the stage is waiting for a claim
+        for task in asyncio.all_tasks():
+            if "_run_flow" in repr(task.get_coro()):
+                task.cancel()
+        with pytest.raises(TaskInterruptedError, match="CancelledError"):
+            await asyncio.wait_for(handle, WAIT)
+        world.session.stop_claiming()  # fails the stage nothing ever claimed
 
     run(with_events(world, body))

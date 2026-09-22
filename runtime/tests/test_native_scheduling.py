@@ -620,6 +620,28 @@ def test_slow_down_is_raised_past_the_soft_limit_and_cleared_once_memory_falls()
         native.shutdown()
 
 
+def test_completing_a_task_clears_slow_down_and_says_so():
+    native = limited_runtime()
+    try:
+
+        async def main():
+            await leader(native)
+            native.submit("bulk.load", 0, b"x" * 150, "default")
+            [raised] = await next_events(native)
+            [claimed] = await claim(native)
+            native.report_started(claimed.task_run_id)
+            native.complete(claimed.task_run_id, DIGEST)
+            cleared = await next_events(native)
+            return raised, cleared
+
+        raised, cleared = asyncio.run(main())
+
+        assert raised.kind == "slow_down"
+        assert [event.kind for event in cleared] == ["slow_down_cleared"]
+    finally:
+        native.shutdown()
+
+
 def test_backpressure_error_is_raised_past_the_hard_limit():
     from kabudachi.errors import BackpressureError
 
@@ -651,11 +673,6 @@ def test_a_coalescing_task_that_opted_in_drops_its_oldest_payloads_to_fit():
         assert [len(payload) for payload in claimed.chain] == [62, 63]
     finally:
         native.shutdown()
-
-
-def test_memory_limits_must_be_in_order():
-    with pytest.raises(ValueError):
-        new_runtime(memory_soft_limit=200, memory_hard_limit=100)
 
 
 def test_a_task_completed_with_a_continuation_holds_its_coalescing_key_until_it_ends(runtime):

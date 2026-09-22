@@ -580,6 +580,17 @@ ORPHANED
 
 A flow (explicit or implicit, §3.4) has a terminal state derived from its stages: `SUCCEEDED` when every stage succeeded, `FAILED` under the group policy, `CANCELLED` when cancelled, and `ORPHANED` if a non-retriable stage ended `ORPHANED`.
 
+### 4.5 Terms
+
+These words recur below and in the runtime. Each keeps one meaning.
+
+- **Task**: one submitted unit of work (§4.2). It has one `task_id` for its whole life, however many attempts it takes.
+- **Task run**: one attempt to execute a task (§4.3), with its own `task_run_id` and attempt number. A retry is a new task run of the same task.
+- **Task lifecycle**: everything that happens to one task from submission to a settled handle: claimed, running, cancelled, certified, continued or waiting for a retry, and finally settled. It spans every task run of the task, where the states of §4.4 describe a single task run. A worker tracks one lifecycle per task it submitted.
+- **Claim**: a worker's request to execute a pending task run, which the leader accepts for one worker only (§8.2). While the claim stands, that task run is not handed to another worker; a retry is a new task run and can be claimed by any worker.
+- **Certification**: the leader's word that a task run's result is the authoritative one, given as the digest of the result (§8.5). A result is authoritative only once certified.
+- **Continuation**: what a task that returns another task (a step of a flow, §3.4) becomes once its own run is certified: the task is not over, and its coalescing key stays held, until the continuation ends.
+
 ---
 
 ## 5. Logical queues, routing, and shards
@@ -2871,6 +2882,8 @@ Implement:
 - worker-pull claim arbitration.
 
 Still avoid sharding.
+
+Phase 1 leaves `NoPeers` and `NoAuthority` (`core/src/single_node.rs`) and the election tick loop in place as single-node placeholders. Each has one adapter until this phase. When peer messaging and the coordination authority gain a second real adapter, decide whether the placeholders and the tick loop stay as they are, and whether the one-node window between startup and the worker becoming leader becomes testable.
 
 ### Phase 3: DHT task dissemination
 

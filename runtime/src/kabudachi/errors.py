@@ -87,3 +87,11 @@ class BackpressureError(KabudachiError, RuntimeError):
     """A task was not submitted because the scheduler holds as much pending
     work as its hard memory limit allows. Nothing was queued; submit again
     once running tasks have finished."""
+
+
+def interrupted(subject: str, error: BaseException) -> TaskInterruptedError:
+    """The error that settles a task, flow or group which something other than
+    its own failure ended: a cancellation, an interrupt, anything worse than
+    an exception. `subject` names what was interrupted, and only the type name
+    of `error` is repeated, never its message, which can hold task input."""
+    return TaskInterruptedError(f"{subject} was interrupted by {type(error).__name__}")

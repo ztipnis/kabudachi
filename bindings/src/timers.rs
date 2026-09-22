@@ -9,30 +9,28 @@ use kabudachi_core::time::Clock;
 use tokio::sync::Notify;
 
 use crate::clock::RealClock;
-use crate::work::{SharedScheduler, Wake, lock_scheduler};
+use crate::wakeups::Wakeups;
+use crate::work::SharedScheduler;
 
 /// Runs until `stop` is notified. `changed` is notified whenever a deadline
 /// may have moved: a submission, a report, or a change of leadership. It keeps
 /// a permit, so a change that happens while the loop is working is not lost.
 ///
-/// `claims` is woken when delayed tasks became pending, `events` when the
-/// scheduler has something to tell Python.
+/// `wakeups` wakes claims and waits for events, and is the loop's own, so
+/// letting time take effect here never notifies `changed` and spins the loop.
 pub async fn run_timers(
     scheduler: SharedScheduler,
     clock: RealClock,
     changed: Arc<Notify>,
     stop: Arc<Notify>,
-    claims: Wake,
-    events: Wake,
+    wakeups: Wakeups,
 ) {
     loop {
-        let (queued, has_events, wait) = {
-            let mut scheduler = lock_scheduler(&scheduler);
-            let advanced = scheduler.advance();
-            scheduler.sweep();
+        let wait = wakeups.with_scheduler(&scheduler, |scheduler| {
+            scheduler.advance();
             // Only a leader acts on deadlines, so any other worker has
             // nothing to wake for until its leadership changes.
-            let wait = scheduler
+            scheduler
                 .is_leading()
                 .then(|| scheduler.next_deadline())
                 .flatten()
@@ -40,15 +38,8 @@ pub async fn run_timers(
                     Duration::from_millis(
                         deadline.as_ticks().saturating_sub(clock.now().as_ticks()),
                     )
-                });
-            (advanced.queued, scheduler.has_events(), wait)
-        };
-        if queued > 0 {
-            claims.notify();
-        }
-        if has_events {
-            events.notify();
-        }
+                })
+        });
         tokio::select! {
             _ = sleep_for(wait) => {}
             _ = changed.notified() => {}

@@ -5,6 +5,7 @@ mod clock;
 mod election;
 mod runtime;
 mod timers;
+mod wakeups;
 mod work;
 
 pub fn native_version() -> String {

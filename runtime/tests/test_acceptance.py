@@ -11,7 +11,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from kabudachi.flow import flow, group
-from kabudachi.registry import TaskKind
+from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session
 from kabudachi.tasks import Task
@@ -31,15 +31,15 @@ def coalescing_definition():
     def refresh(request: Greeting) -> Greeting:
         return request
 
-    world_registry_task = Task(
+    coalescing_task = Task(
         refresh,
-        registry=World().registry,
+        registry=TaskRegistry(),
         serializers=SERIALIZERS,
         name="tests.refresh",
         kind=TaskKind.COALESCING,
         merge=fold_left,
     )
-    return world_registry_task.definition
+    return coalescing_task.definition
 
 
 def claim_of(texts):

@@ -22,6 +22,7 @@ build/
 dist/
 wheels/
 .pytest_cache/
+.hypothesis/
 .mypy_cache/
 .ruff_cache/
 .tox/

@@ -329,7 +329,7 @@ def test_an_async_callback_that_raises_is_logged_by_type_and_changes_nothing(cap
 
 
 def test_cancelling_a_flow_after_a_stage_that_failed_does_not_claim_to_have_cancelled_it():
-    from kabudachi.handle import FlowHandle
+    from kabudachi.composites import FlowHandle
 
     failed, succeeded = TaskHandle("stage-1"), TaskHandle("stage-2")
     failed._fail(ValueError("stage failed"))
@@ -344,3 +344,12 @@ def test_cancelling_a_flow_after_a_stage_that_failed_does_not_claim_to_have_canc
     assert flow_after_failure.cancel() is False
     assert flow_after_failure._cancel_requested is False
     assert flow_after_success.cancel() is True
+
+
+def test_the_three_handles_are_exported_from_the_package_wherever_they_live():
+    import kabudachi
+    from kabudachi.composites import FlowHandle, GroupHandle
+
+    assert (kabudachi.FlowHandle, kabudachi.GroupHandle) == (FlowHandle, GroupHandle)
+    assert kabudachi.TaskHandle is TaskHandle
+    assert {"FlowHandle", "GroupHandle", "TaskHandle"} <= set(kabudachi.__all__)

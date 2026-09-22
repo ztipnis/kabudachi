@@ -7,9 +7,10 @@ and nothing is inherited between stages (README §3.4).
 
 from typing import Any
 
+from kabudachi.composites import FlowHandle, GroupHandle
 from kabudachi.config import UNSET
 from kabudachi.errors import TaskDefinitionError
-from kabudachi.handle import FlowHandle, GroupHandle, TaskHandle
+from kabudachi.handle import TaskHandle
 from kabudachi.registry import TaskDefinition
 from kabudachi.session import Session, current_session
 

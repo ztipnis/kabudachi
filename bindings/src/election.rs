@@ -10,7 +10,8 @@ use kabudachi_core::single_node::SingleNode;
 use tokio::sync::{Notify, watch};
 
 use crate::clock::RealClock;
-use crate::work::{SharedScheduler, Wake, lock_scheduler};
+use crate::wakeups::Wakeups;
+use crate::work::SharedScheduler;
 
 /// Enough to walk a node from any state to `Stopped`: one tick can be needed
 /// to leave the single tick it spends suspecting a leader, then one drain.
@@ -18,13 +19,13 @@ const DRAIN_ATTEMPTS: usize = 4;
 
 /// Announces changes of the worker's state: to the scheduler first, so its
 /// leader gate has flipped before anyone who sees the new state acts on it,
-/// then to watchers, then to anyone waiting for something to change.
+/// and then to everyone watching.
 pub struct Publisher {
     pub state: watch::Sender<WorkerState>,
     pub scheduler: SharedScheduler,
-    pub wake: Wake,
-    /// Told when leadership changes, which decides whether deadlines matter.
-    pub timers: Arc<Notify>,
+    /// Leadership decides what claims and deadlines do, so the change wakes
+    /// everyone waiting on either.
+    pub wakeups: Wakeups,
 }
 
 impl Publisher {
@@ -33,10 +34,9 @@ impl Publisher {
         if *self.state.borrow() == new {
             return;
         }
-        lock_scheduler(&self.scheduler).set_worker_state(new);
+        self.wakeups
+            .with_scheduler(&self.scheduler, |scheduler| scheduler.set_worker_state(new));
         self.state.send_replace(new);
-        self.wake.notify();
-        self.timers.notify_one();
     }
 }
 

@@ -13,7 +13,7 @@ from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
 from kabudachi.config import Configuration
 from kabudachi.registry import TaskRegistry
-from fake_runtime import FakeNative
+from faulting_runtime import FaultingNative
 from proto_messages import make_message_class
 
 README = Path(__file__).resolve().parents[1] / "README.md"
@@ -28,10 +28,10 @@ def example_source():
 
 @pytest.fixture(autouse=True)
 def fresh_process(monkeypatch):
-    FakeNative.instances = []
+    FaultingNative.instances = []
     monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
     monkeypatch.setattr(config_module, "_process_configuration", Configuration())
-    monkeypatch.setattr(runner_module, "_native", SimpleNamespace(NativeRuntime=FakeNative))
+    monkeypatch.setattr(runner_module, "_native", SimpleNamespace(NativeRuntime=FaultingNative))
 
 
 def test_the_readme_example_runs_and_prints_what_it_says(monkeypatch, capsys):

@@ -1,5 +1,6 @@
 """The session: what happens between a task being called and its handle being
-settled, checked against a fake runtime so each guarantee can be provoked."""
+settled, checked against a real native runtime that a few faults can be
+provoked on."""
 
 import asyncio
 import hashlib
@@ -28,7 +29,6 @@ from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session, validate_definitions
 from kabudachi.tasks import Task
-from fake_runtime import FakeRuntime
 from proto_messages import Greeting, Receipt
 from session_world import WAIT, World, run, with_events
 
@@ -913,28 +913,31 @@ def test_the_retries_of_a_task_are_submitted_with_it():
     assert list(world.runtime.retries.values()) == [4]
 
 
+SHORT_LIFE = 30
+
+
+def submit_expiring(world, text=""):
+    """Submits an `echo` that the runtime gives only `SHORT_LIFE` to be claimed in."""
+    return world.session.submit(
+        world.tasks["echo"].definition,
+        Greeting(text=text),
+        SubmissionOptions(expires_in_ms=SHORT_LIFE),
+    )
+
+
 def test_a_task_the_runtime_says_expired_fails_its_handle_with_task_expired_error():
     world = World(echo)
     world.runtime.hold_claims = True
-    # The first task takes the only claim; the second is never claimed.
+    # The first task takes the only claim; the second is never claimed, so the
+    # runtime runs it out of the short life it was submitted with.
 
     async def body():
         await world.call("echo", Greeting(text="claimed"))
-        waiting = world.call("echo", Greeting(text="waiting"))
-        await asyncio.sleep(0.02)
-        world.runtime.expire(world.runtime.submitted[1][0])
+        waiting = submit_expiring(world, "waiting")
         with pytest.raises(TaskExpiredError):
-            await waiting
+            await asyncio.wait_for(waiting, WAIT)
 
-    async def working():
-        events = asyncio.ensure_future(world.session.watch_events())
-        try:
-            await world.working(body)
-        finally:
-            events.cancel()
-            await asyncio.gather(events, return_exceptions=True)
-
-    run(working())
+    run(with_events(world, body))
 
 
 def test_finishing_does_not_wait_for_a_task_that_expired():
@@ -943,38 +946,34 @@ def test_finishing_does_not_wait_for_a_task_that_expired():
 
     async def body():
         await world.call("echo", Greeting())
-        world.call("echo", Greeting())
-        await asyncio.sleep(0.02)
-        world.runtime.expire(world.runtime.submitted[1][0])
+        submit_expiring(world)
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
 
-    async def working():
-        events = asyncio.ensure_future(world.session.watch_events())
-        try:
-            await world.working(body)
-        finally:
-            events.cancel()
-            await asyncio.gather(events, return_exceptions=True)
-
-    run(working())
+    run(with_events(world, body))
 
 
 def test_an_event_for_a_task_this_session_does_not_have_is_ignored():
     world = World(echo)
 
-    async def body():
-        world.runtime.expire("task-that-is-not-ours")
-        return await world.call("echo", Greeting(text="fine"))
-
     async def working():
-        events = asyncio.ensure_future(world.session.watch_events())
+        watcher = asyncio.ensure_future(world.session.watch_events())
+        # No real event names a task this session never submitted, so this one
+        # is put in front of the watcher by hand.
+        world.runtime.inject_event("expired", task_id="task-that-is-not-ours")
+
+        async def body():
+            return await world.call("echo", Greeting(text="fine")), watcher.done()
+
         try:
             return await world.working(body)
         finally:
-            events.cancel()
-            await asyncio.gather(events, return_exceptions=True)
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
 
-    assert run(working()).text == "fine"
+    result, watcher_ended = run(working())
+
+    assert result.text == "fine"
+    assert not watcher_ended, "the event ended the watcher instead of being ignored"
 
 
 def test_serving_ends_with_the_error_of_whichever_loop_breaks():
@@ -1328,6 +1327,26 @@ def test_cancelling_a_task_that_already_finished_changes_nothing():
     assert again == result == Greeting(text="done")
 
 
+def test_a_task_cancelled_after_it_is_claimed_but_before_it_is_reported_started_says_cancelled():
+    world = World(echo)
+    handles = []
+    # The cancel lands after the worker claimed the run and before it told the
+    # leader the run started, which the leader then refuses.
+
+    def cancel_before_started(run_id):
+        # The fix depends on the leader answering "cancelled" here.
+        assert handles[0].cancel() is True
+
+    world.runtime.before_started = cancel_before_started
+
+    async def body():
+        handles.append(world.call("echo", Greeting(text="hello")))
+        with pytest.raises(TaskCancelledError):
+            await handles[0]
+
+    run(with_events(world, body))
+
+
 def test_a_task_can_be_cancelled_from_another_thread():
     world = World(echo)
     world.runtime.hold_claims = True
@@ -1364,6 +1383,10 @@ def test_a_cancelled_task_is_not_retried():
         while not calls:
             await asyncio.sleep(0.001)
         handle.cancel()
+        while not handle.done():
+            # The leader's cancellation has reached the session, so the body is
+            # released into a run that is already known to be cancelled.
+            await asyncio.sleep(0.001)
         release.set()
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
@@ -1525,29 +1548,33 @@ def coalescing_world(function=echo, **options):
     return World(function, kind=TaskKind.COALESCING, **options)
 
 
-def encoded(world, *texts):
-    serializer = world.serializers.get("protobuf")
-    return [serializer.encode(Greeting(text=text), Greeting) for text in texts]
+async def generations(world, name, *texts):
+    """Submits one generation of the default coalescing key per text, without
+    giving the worker a chance to claim any of them in between, and awaits the
+    supersession of all but the newest. Returns the newest generation's handle."""
+    handles = [world.call(name, Greeting(text=text)) for text in texts]
+    for older in handles[:-1]:
+        with pytest.raises(TaskSupersededError):
+            await asyncio.wait_for(older, WAIT)
+    return handles[-1]
 
 
 def test_the_worker_folds_the_superseded_payloads_oldest_first_before_running_the_task():
     world = coalescing_world(merge=concatenate)
-    world.runtime.chains["task-1"] = encoded(world, "a", "b")
 
     async def body():
-        return await world.call("echo", Greeting(text="c"))
+        return await (await generations(world, "echo", "a", "b", "c"))
 
-    assert run(world.working(body)).text == "abc"
+    assert run(with_events(world, body)).text == "abc"
 
 
 def test_without_a_reducer_the_newest_payload_wins():
     world = coalescing_world()
-    world.runtime.chains["task-1"] = encoded(world, "a", "b")
 
     async def body():
-        return await world.call("echo", Greeting(text="c"))
+        return await (await generations(world, "echo", "a", "b", "c"))
 
-    assert run(world.working(body)).text == "c"
+    assert run(with_events(world, body)).text == "c"
 
 
 def test_a_generation_that_absorbed_nothing_runs_on_its_own_input_and_needs_no_reducer_call():
@@ -1577,13 +1604,13 @@ def test_a_reducer_that_raises_fails_the_task_and_the_body_never_runs():
         raise ValueError("cannot merge")
 
     world = coalescing_world(body_, merge=broken)
-    world.runtime.chains["task-1"] = encoded(world, "a")
 
     async def body():
+        newest = await generations(world, "body_", "a", "b")
         with pytest.raises(ValueError, match="cannot merge"):
-            await world.call("body_", Greeting(text="b"))
+            await asyncio.wait_for(newest, WAIT)
 
-    run(world.working(body))
+    run(with_events(world, body))
 
     assert ran == []
     assert world.runtime.events[-1][:1] == ("fail",)
@@ -1619,18 +1646,18 @@ def test_a_superseded_generation_fails_its_handle_and_says_by_which():
     world.runtime.hold_claims = True
 
     async def body():
+        # The first generation takes the only claim; of the two that follow,
+        # the newer supersedes the older while neither can be claimed.
         await world.call("echo", Greeting())
         older = world.call("echo", Greeting(text="older"))
-        await asyncio.sleep(0.02)
-        world.runtime.supersede(world.runtime.submitted[1][0], "task-99")
+        world.call("echo", Greeting(text="newer"))
         with pytest.raises(TaskSupersededError) as raised:
             await asyncio.wait_for(older, WAIT)
-        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
-        return raised.value
+        return raised.value, world.runtime.submitted[2][0]
 
-    error = run(with_events(world, body))
+    error, newer_id = run(with_events(world, body))
 
-    assert error.superseded_by == "task-99"
+    assert error.superseded_by == newer_id
 
 
 def test_a_task_cancelled_before_it_ever_ran_leaves_nothing_behind_to_remember():
@@ -1647,8 +1674,7 @@ def test_a_task_cancelled_before_it_ever_ran_leaves_nothing_behind_to_remember()
 
     run(with_events(world, body))
 
-    assert world.session._cancelled == set()
-    assert world.session._active == set()
+    assert world.session._tasks == {}
 
 
 def test_a_running_task_that_is_cancelled_leaves_nothing_behind_once_it_ends():
@@ -1668,8 +1694,42 @@ def test_a_running_task_that_is_cancelled_leaves_nothing_behind_once_it_ends():
 
     run(with_events(world, body))
 
-    assert world.session._cancelled == set()
-    assert world.session._active == set()
+    assert world.session._tasks == {}
+
+
+def test_a_task_settled_between_its_claim_and_its_run_can_still_have_its_body_stopped():
+    """A run whose task was settled before it reached its first step is still
+    remembered while it runs, so a cancel notice finds its body."""
+
+    async def long(request: Greeting) -> Greeting:
+        await asyncio.sleep(30)
+        return request
+
+    world = World(long)
+
+    async def body():
+        handle = world.call("long", Greeting())
+        await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
+        [claim] = await world.runtime.claim_pending(1)
+        world.session._start(claim)
+        # Settled before the run it just started reaches its first step.
+        world.session._failed(claim.task_id, TaskExpiredError("expired"))
+        with pytest.raises(TaskExpiredError):
+            await asyncio.wait_for(handle, WAIT)
+        lifecycle = None
+        deadline = time.monotonic() + WAIT
+        while time.monotonic() < deadline:
+            lifecycle = world.session._tasks.get(claim.task_id)
+            if lifecycle is not None and lifecycle.body is not None:
+                break
+            await asyncio.sleep(0.005)
+        assert lifecycle is not None and lifecycle.body is not None
+        world.session._cancelled_by_leader(claim.task_id)
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+
+    run(body())
+
+    assert world.session._tasks == {}
 
 
 def test_a_body_that_starts_waiting_on_another_thread_wakes_the_worker_on_the_loops_own_thread():

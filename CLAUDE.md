@@ -49,3 +49,7 @@ Prefer a reputable maintained package to a generic utility. Weigh dependency cos
 ## Testing discipline
 
 Use TDD and small commits. Python tests use pytest; Rust tests use `#[test]` through Bazel `rust_test`.
+
+## Responding to CodeRabbit review comments
+
+After fixing a finding and pushing, reply on its thread with the fix commit and evidence, but do not call the resolve action yourself. CodeRabbit auto-resolves a thread once it confirms the fix on the next review pass.

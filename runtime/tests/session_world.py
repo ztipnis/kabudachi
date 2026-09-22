@@ -1,23 +1,43 @@
-"""A session wired to a fake runtime, for tests of what happens between a task
-being called and its handle being settled."""
+"""A session wired to a real native runtime, for tests of what happens between
+a task being called and its handle being settled."""
 
 import asyncio
 import contextlib
 import pickle
+import weakref
+
+from kabudachi import _native
 
 from kabudachi.config import Configuration
 from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session, activate, deactivate
 from kabudachi.tasks import Task
-from fake_runtime import FakeRuntime
+from faulting_runtime import FaultingRuntime
 
 WAIT = 5
 
 
 class World:
-    def __init__(self, *functions, concurrency=None, **task_options):
-        self.runtime = FakeRuntime()
+    def __init__(
+        self,
+        *functions,
+        concurrency=None,
+        memory_soft_limit=None,
+        memory_hard_limit=None,
+        **task_options,
+    ):
+        if (memory_soft_limit is None) != (memory_hard_limit is None):
+            raise ValueError("give both memory limits or neither")
+        limits = {}
+        if memory_soft_limit is not None:
+            limits = {
+                "memory_soft_limit": memory_soft_limit,
+                "memory_hard_limit": memory_hard_limit,
+            }
+        self.native = _native.NativeRuntime("worker-world", "incarnation-world", **limits)
+        weakref.finalize(self, self.native.shutdown)
+        self.runtime = FaultingRuntime(self.native)
         self.registry = TaskRegistry()
         self.serializers = SerializerRegistry.with_defaults()
         self.configuration = Configuration()
@@ -42,6 +62,7 @@ class World:
 
     async def working(self, body):
         """Runs `body` while the session's worker loop is claiming tasks."""
+        await asyncio.wait_for(self.native.wait_until_leader(), WAIT)
         worker = asyncio.ensure_future(self.session.work())
         try:
             return await asyncio.wait_for(body(), WAIT)

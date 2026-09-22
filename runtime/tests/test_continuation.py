@@ -50,6 +50,10 @@ def declare_planner(world, body, **options):
     return task
 
 
+def started_runs(world):
+    return [event[0] for event in world.runtime.events].count("started")
+
+
 def run_planner(world, planner, argument=None):
     async def body():
         return await world.session.submit(planner.definition, argument or Greeting(text="in"))
@@ -290,10 +294,9 @@ def test_cancelling_the_handle_during_the_continuation_cancels_its_current_stage
 
     async def body():
         handle = world.session.submit(planner.definition, Greeting())
-        while "end_continuation" not in [e[0] for e in world.runtime.events]:
+        while started_runs(world) < 2:  # the planning run, then the slow stage
             await asyncio.sleep(0.005)
-            if world.runtime.continuing and handle.cancel():
-                break
+        assert handle.cancel()
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
@@ -332,9 +335,8 @@ def test_stopping_fails_a_continuation_that_has_not_started_its_stage():
 
     async def body():
         handle = world.session.submit(planner.definition, Greeting())
-        while not world.runtime.continuing:
+        while len(world.runtime.submitted) < 2:  # the planning task, then its first stage
             await asyncio.sleep(0.005)
-        await asyncio.sleep(0.05)
         world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await asyncio.wait_for(handle, WAIT)

@@ -6,9 +6,10 @@ from pkgutil import extend_path
 
 __path__ = extend_path(__path__, __name__)
 
+from kabudachi.composites import FlowHandle, GroupHandle
 from kabudachi.config import configure
 from kabudachi.flow import BoundTask, Flow, Group, flow, group
-from kabudachi.handle import FlowHandle, GroupHandle, TaskHandle
+from kabudachi.handle import TaskHandle
 from kabudachi.runner import run
 from kabudachi.serializers import register_serializer
 from kabudachi.tasks import coalescing_task, ephemeral_task, task
