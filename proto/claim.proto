@@ -1,0 +1,57 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+import "task.proto";
+
+// The claim-arbitration protocol (`/kabudachi/claim/1`, README §27 Phase 2):
+// lets a follower ask whoever it currently believes is leader for permission
+// to run a specific pending task
+// (`core::scheduler::Scheduler::request_claim`).
+//
+// Like `JoinRequest`/`JoinResponse` (join.proto), this is a genuine
+// request/response exchange used directly as a `request_response::Codec`'s
+// `Request`/`Response` types (see `kabudachi_net::claim_codec`) — no
+// wrapping oneof envelope on the request, since there is only ever one
+// request shape, the same reasoning join.proto documents.
+
+message ClaimRequest {
+  TaskId task_id = 1;
+}
+
+// Mirrors `core::scheduler::Claim` field-for-field: the leader's grant of
+// permission to run a task.
+message Claim {
+  Task task = 1;
+  TaskRunId task_run_id = 2;
+  uint32 attempt_number = 3;
+  // The serialized inputs of coalescing generations this claim's run
+  // absorbed, oldest first (see `core::scheduler::Claim::chain`).
+  repeated bytes chain = 4;
+}
+
+// Mirrors `core::scheduler::ClaimRejection`'s seven variants, one enum value
+// each — the same enum-plus-reason shape `VoteRejectReason` (election.proto)
+// already uses in this codebase for "why was this request refused", rather
+// than seven separate empty message types.
+enum ClaimRejectReason {
+  CLAIM_REJECT_REASON_UNSPECIFIED = 0;
+  CLAIM_REJECT_NOT_LEADER = 1;
+  CLAIM_REJECT_TASK_UNKNOWN = 2;
+  CLAIM_REJECT_NOT_READY = 3;
+  CLAIM_REJECT_ALREADY_SELECTED = 4;
+  CLAIM_REJECT_FINISHED = 5;
+  CLAIM_REJECT_SUPERSEDED = 6;
+  CLAIM_REJECT_KEY_BUSY = 7;
+}
+
+message ClaimReject {
+  ClaimRejectReason reason = 1;
+}
+
+message ClaimResponse {
+  oneof result {
+    Claim accept = 1;
+    ClaimReject reject = 2;
+  }
+}

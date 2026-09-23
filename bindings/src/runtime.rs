@@ -9,7 +9,6 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
     Cancellation, MemoryLimits, ReportRejection, Scheduler, Submission, SubmitRejection,
 };
-use kabudachi_core::single_node::single_node;
 use kabudachi_core::time::Duration as CoreDuration;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -20,6 +19,7 @@ use tokio::task::JoinHandle;
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::clock::RealClock;
 use crate::election::{Publisher, run_election};
+use crate::local_node::local_node;
 use crate::timers::run_timers;
 use crate::wakeups::Wakeups;
 use crate::work::{
@@ -126,7 +126,7 @@ impl NativeRuntime {
         // One clock for everything: the scheduler's deadlines are ticks of
         // it, so the timer loop has to count the same ticks.
         let clock = RealClock::new();
-        let node = single_node(
+        let node = local_node(
             worker_id.clone(),
             IncarnationId::new(incarnation_id),
             ShardId::new(LOCAL_SHARD_ID),

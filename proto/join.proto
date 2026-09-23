@@ -1,0 +1,31 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+
+// The bootstrap join protocol (`/kabudachi/join/1`, README §27 Phase 2): lets
+// a fresh node discover the current shard membership from a seed peer
+// instead of being statically pre-configured with the full electorate.
+//
+// This is a genuine two-message request/response exchange, so `JoinRequest`
+// and `JoinResponse` are used directly as a `request_response::Codec`'s
+// `Request`/`Response` types (see `kabudachi_net::join_codec`) — unlike
+// `ElectionMessage` (election.proto), there is no wrapping oneof envelope,
+// because there is only ever exactly one request shape and one response
+// shape, already distinguished by the protocol's request/response framing
+// itself.
+
+message JoinRequest {}
+
+message JoinMember {
+  WorkerId worker_id = 1;
+  // The libp2p multiaddr (e.g. "/ip4/10.0.0.1/tcp/4001") the responder last
+  // observed this member reachable at. Best-effort: a member the responder
+  // has no known address for is still listed, with this field empty, so the
+  // joiner learns every member's WorkerId and skips dialing that one.
+  string multiaddr = 2;
+}
+
+message JoinResponse {
+  repeated JoinMember members = 1;
+}

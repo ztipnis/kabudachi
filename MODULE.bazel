@@ -9,19 +9,37 @@ bazel_dep(name = "rules_rust", version = "0.74.0")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
-    versions = ["1.85.0"],
+    versions = ["1.89.0"],
 )
 
 # --- Protobuf (Rust wire types from proto/ via prost) ---
 bazel_dep(name = "protobuf", version = "33.4")
 bazel_dep(name = "rules_rust_prost", version = "0.74.0")
 
+# rules_rust_prost self-registers a default toolchain bundling its own
+# pinned `prost`, separate from the workspace's crate_universe `prost` (see
+# tools/rust_prost_toolchain/BUILD.bazel for why that breaks net/, which
+# needs `prost::Message` to be the same trait for both proto-generated types
+# and its own encode/decode calls). A root module's own registration takes
+# priority over one a dependency (rules_rust_prost) registers for itself.
+register_toolchains("//tools/rust_prost_toolchain:prost_toolchain")
+
 # --- crate_universe (third-party crates for core/bindings) ---
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
-    manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml"],
+    manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml", "//net:Cargo.toml"],
+)
+
+# Not a direct Cargo dependency of any workspace member — pulled in only so
+# tools/rust_prost_toolchain:prost_toolchain can hand the prost codegen
+# plugin a `prost_types` from this same crate_universe (the toolchain rule
+# needs a value for it even though this workspace's .proto files don't use
+# google.protobuf's well-known types yet).
+crate.spec(
+    package = "prost-types",
+    version = "0.13",
 )
 
 use_repo(crate, "crates")

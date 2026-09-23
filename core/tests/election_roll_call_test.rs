@@ -331,20 +331,21 @@ fn process_roll_call_when_winning_but_already_candidate_forwards_instead_of_drop
     let clock = FakeClock::new();
     let suspect_timeout = Duration::from_ticks(10);
 
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let next_term = 1; // both observations below carry highest_term_seen: 0.
-    let winner = predict_winner(
-        &shard(SHARD),
-        0,
-        next_term,
-        &[candidate_a.clone(), candidate_b.clone()],
-    );
-    let (self_id, other_id) = if winner == candidate_a {
-        (candidate_a, candidate_b)
-    } else {
-        (candidate_b, candidate_a)
-    };
+    // Round 1 contests term 1 (call highest_term_seen 0); round 2 contests
+    // term 2 (call highest_term_seen 1), since a candidate at term 1 drops a
+    // call that would re-contest it. Pick a pair where this node wins both.
+    let labels: Vec<WorkerId> = (1..=40).map(|i| worker(&format!("w{i}"))).collect();
+    let (self_id, other_id) = labels
+        .iter()
+        .flat_map(|x| labels.iter().map(move |y| (x, y)))
+        .find(|(x, y)| {
+            x != y
+                && [1, 2].iter().all(|term| {
+                    predict_winner(&shard(SHARD), 0, *term, &[(*x).clone(), (*y).clone()]) == **x
+                })
+        })
+        .map(|(x, y)| (x.clone(), y.clone()))
+        .expect("some pair among the label pool must win at both terms");
 
     let network = make_network(&clock, &[self_id.clone(), other_id.clone()]);
     let mut node = make_node_with_ring(
@@ -380,11 +381,12 @@ fn process_roll_call_when_winning_but_already_candidate_forwards_instead_of_drop
     // but it is now Candidate. The table has no (Candidate, Candidate) or
     // (Candidate, Active) edge, so the state stays and the call must still be
     // forwarded.
-    let round_2 = roll_call(
+    let mut round_2 = roll_call(
         "round-2",
         other_id.clone(),
-        vec![observation(other_id.clone(), 0)],
+        vec![observation(other_id.clone(), 1)],
     );
+    round_2.highest_term_seen = 1;
     node.on_message(other_id.clone(), roll_call_message(round_2));
 
     assert_eq!(

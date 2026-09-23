@@ -1,0 +1,55 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_test_suite")
+load("@crates//:defs.bzl", "all_crate_deps")
+
+rust_library(
+    name = "net",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "kabudachi_net",
+    edition = "2024",
+    deps = all_crate_deps(normal = True) + ["//core"],
+)
+
+rust_test(
+    name = "net_test",
+    crate = ":net",
+    edition = "2024",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test_suite(
+    name = "net_integration_tests",
+    srcs = glob(
+        ["tests/*.rs"],
+        exclude = ["tests/ring_roll_call_leader_loss_test.rs"],
+        allow_empty = True,
+    ),
+    shared_srcs = glob(["tests/support/**/*.rs"], allow_empty = True),
+    # ":net" alone isn't enough for tests/*.rs files to `use kabudachi_core::...`
+    # directly: unlike Cargo (where an integration test can reach any of the
+    # tested crate's own [dependencies]), a Bazel rust_test_suite is a separate
+    # compilation unit that only sees what's explicitly in `deps`. "//core"
+    # mirrors the ":net" rust_library target's own `+ ["//core"]` above; this
+    # was unexercised until chunk C3 added the first real net/tests/*.rs files.
+    deps = [":net", "//core"] + all_crate_deps(normal = True, normal_dev = True),
+    edition = "2024",
+)
+
+# Split out of net_integration_tests (rather than sharing its default
+# `medium` (300s) size via rust_test_suite's uniform **kwargs) because its
+# retry loop (chunk C7/C7-fix; see the test file's own doc for the empirical
+# per-attempt failure rate that makes the retries necessary) can burn up to
+# MAX_ATTEMPTS = 30 attempts, each with several sequential TEST_TIMEOUT
+# (10s) windows across setup/leader-loss/re-election phases. That worst case
+# comfortably exceeds `medium`'s 300s, which would make Bazel kill the test
+# before its own retry loop reports an honest pass/fail — an infra timeout
+# masquerading as a test result. `large` is 900s; the worst case can exceed
+# even that, so the test also caps its own retries with RETRY_BUDGET (840s)
+# and fails on its own before Bazel's timeout.
+rust_test(
+    name = "ring_roll_call_leader_loss_test",
+    crate_root = "tests/ring_roll_call_leader_loss_test.rs",
+    srcs = ["tests/ring_roll_call_leader_loss_test.rs"] + glob(["tests/support/**/*.rs"], allow_empty = True),
+    edition = "2024",
+    size = "large",
+    deps = [":net", "//core"] + all_crate_deps(normal = True, normal_dev = True),
+)

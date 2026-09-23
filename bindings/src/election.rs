@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::single_node::SingleNode;
 use tokio::sync::{Notify, watch};
 
 use crate::clock::RealClock;
+use crate::local_node::LocalNode;
 use crate::wakeups::Wakeups;
 use crate::work::SharedScheduler;
 
@@ -43,7 +43,7 @@ impl Publisher {
 /// Advances the election every `tick` and publishes the worker's state, until
 /// told to stop; then drains the worker so it leaves the shard cleanly.
 pub async fn run_election(
-    mut node: SingleNode<RealClock>,
+    mut node: LocalNode<RealClock>,
     tick: Duration,
     stop: Arc<Notify>,
     publisher: Publisher,
@@ -68,7 +68,7 @@ pub async fn run_election(
 /// Drives `node` to `Stopped` from any state. A node that is suspecting a
 /// leader ignores a drain request, so it is ticked past that state and asked
 /// again.
-fn drain(node: &mut SingleNode<RealClock>) {
+fn drain(node: &mut LocalNode<RealClock>) {
     for _ in 0..DRAIN_ATTEMPTS {
         if node.state() == WorkerState::Stopped {
             return;
@@ -82,12 +82,12 @@ fn drain(node: &mut SingleNode<RealClock>) {
 #[cfg(test)]
 mod tests {
     use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
-    use kabudachi_core::single_node::single_node;
 
     use super::*;
+    use crate::local_node::local_node;
 
-    fn new_node() -> SingleNode<RealClock> {
-        single_node(
+    fn new_node() -> LocalNode<RealClock> {
+        local_node(
             WorkerId::new("worker-1"),
             IncarnationId::new("incarnation-1"),
             ShardId::new("local"),

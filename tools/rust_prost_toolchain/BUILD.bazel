@@ -1,0 +1,49 @@
+load("@rules_rust//rust:defs.bzl", "rust_library_group")
+load("@rules_rust_prost//:defs.bzl", "rust_prost_toolchain")
+
+# Bridges rules_rust_prost's protoc-gen-prost plugin to this workspace's own
+# crate_universe-managed `prost` (declared as a normal dependency of
+# proto/Cargo.toml and net/Cargo.toml) instead of the ruleset's bundled,
+# separately-pinned copy.
+#
+# Without this, //proto:kabudachi_prost's generated types (ElectionMessage
+# and friends) implement `prost::Message` from one build of the `prost`
+# crate, while net/ (which calls `ElectionMessage::encode`/`decode` to
+# implement the request_response codec) depends on a *different* build of
+# the same crate version via `@crates//:prost`. Those are two distinct
+# compiled rlibs even at an identical version, so rustc treats their
+# `Message` trait as two unrelated types and net's `use prost::Message`
+# doesn't apply to proto-generated types — "multiple different versions of
+# crate `prost` in the dependency graph". Routing both through
+# `@crates//:prost` makes it one trait, one build, everywhere.
+rust_library_group(
+    name = "prost_runtime",
+    deps = ["@crates//:prost"],
+)
+
+rust_library_group(
+    name = "prost_types",
+    deps = ["@crates//:prost-types"],
+)
+
+rust_prost_toolchain(
+    name = "prost_toolchain_impl",
+    prost_plugin = "@rules_rust_prost//private/3rdparty/crates:protoc-gen-prost__protoc-gen-prost",
+    prost_runtime = ":prost_runtime",
+    prost_types = ":prost_types",
+    # We don't use tonic/gRPC (no rust_tonic_library in this workspace), but
+    # rust_prost_toolchain's "when one tonic attribute is added, all must be
+    # added" validation fires as soon as any of the prost_* attributes above
+    # are set, even though none of them are tonic attributes. Blanking the
+    # plugin flag is the documented-in-the-wild workaround: it disables
+    # invoking the tonic plugin at all, so tonic_plugin/tonic_runtime never
+    # need values.
+    tonic_plugin_flag = "",
+)
+
+toolchain(
+    name = "prost_toolchain",
+    toolchain = ":prost_toolchain_impl",
+    toolchain_type = "@rules_rust_prost//:toolchain_type",
+    visibility = ["//visibility:public"],
+)

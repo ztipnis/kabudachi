@@ -657,7 +657,9 @@ fn stale_election_messages_after_new_epoch() {
     // A stale request: pre-recovery epoch 0 against the node's freshly bumped
     // epoch 2. The epoch check comes before any term logic, so it is rejected
     // WrongRecoveryEpoch.
-    let stale_term = 1;
+    // One past the term this node already led, so only the epoch (not the
+    // term) makes the first request stale.
+    let stale_term = node.term() + 1;
     node.on_vote_request(&vote_request(
         helper_peer.clone(),
         old_recovery_epoch,

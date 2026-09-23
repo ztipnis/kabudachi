@@ -1,4 +1,11 @@
-const PROTO_FILES: [&str; 4] = ["election.proto", "ids.proto", "task.proto", "worker.proto"];
+const PROTO_FILES: [&str; 6] = [
+    "claim.proto",
+    "election.proto",
+    "ids.proto",
+    "join.proto",
+    "task.proto",
+    "worker.proto",
+];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=PROTOC");

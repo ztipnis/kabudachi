@@ -2379,6 +2379,8 @@ The project should prototype both:
 
 libp2p is capable, but its abstractions may be heavier than necessary if our network protocol is tightly controlled.
 
+**Phase 2 design note:** Phase 2 chose between the two prototype paths above — libp2p as transport (TCP/Noise/Yamux, `identify`), but narrow: three `request_response` behaviours, for election, bootstrap join, and claim arbitration (`net/src/swarm.rs`'s `Behaviour`), with no Kademlia/DHT usage. The `net` crate implements this. This is an implementation decision, not a change to this section's candidate status.
+
 ### 23.5 Protocol Buffers: prost
 
 **Candidate:** `prost` and `prost-build`
@@ -2424,6 +2426,8 @@ HTTP/gRPC for local/client/admin interfaces
 ```
 
 but implementation should be decided by profiling and complexity rather than aesthetics.
+
+**Phase 2 design note:** the peer plane uses the libp2p `request_response` custom-protocol path above, not tonic — no gRPC dependency is planned for peer traffic. The `net` crate implements it. This is an implementation decision, not a change to this section's candidate status.
 
 ### 23.7 Redis: redis-rs
 
@@ -2883,7 +2887,17 @@ Implement:
 
 Still avoid sharding.
 
-Phase 1 leaves `NoPeers` and `NoAuthority` (`core/src/single_node.rs`) and the election tick loop in place as single-node placeholders. Each has one adapter until this phase. When peer messaging and the coordination authority gain a second real adapter, decide whether the placeholders and the tick loop stay as they are, and whether the one-node window between startup and the worker becoming leader becomes testable.
+Phase 1 left `NoPeers` and `NoAuthority` (`core/src/single_node.rs`) and the election tick loop in place as single-node placeholders, each with one adapter until this phase. Phase 2 gave peer messaging and the coordination authority their second real adapter and resolved that question, as follows.
+
+`core/src/single_node.rs` is gone. `NoPeers` moved to `bindings/src/local_node.rs`, scoped to the one runtime that actually wants it: the single-process Python runtime, whose instant (zero suspicion timeout) self-election is a deliberate product choice for that runtime, not the generic behaviour of a one-member electorate. `NoAuthority` was removed outright rather than moved: `core::election::WorkerNode` only consults its authority from `attempt_forced_recovery`, which runs only from `WorkerState::NoQuorum`, and a one-member electorate driven by `NoPeers` can never reach `NoQuorum` — so the path is unreachable and `InMemoryAuthority` (`core/src/in_memory_authority.rs`) serves as the type there without ever being called. The generic multi-node case is `net/src/bootstrap.rs`'s `bootstrap_node` cascade (seeds, then the coordination authority, then self-election), where a lone node still waits out whatever suspicion timeout it was configured with.
+
+There is no single election tick loop any more either: `bindings/src/election.rs`'s `run_election` drives the single-process node, and `net/src/driver.rs`'s `run_driver` drives a real-transport node, each on its own tick.
+
+The bootstrap join is one-way in Phase 2. `bootstrap_node` adds the joining worker to its own electorate, but the members that answer its `JOIN_RESPONSE` keep their existing electorate, and nothing admits the joiner into it. After `c` joins `{a, b}`, `c` believes the electorate is `{a, b, c}` while `a` and `b` still believe `{a, b}`, so the nodes disagree about quorum and ring neighbours. This does not yet meet the `JOINING` state's requirement that the cluster recognize a new worker as active. Admitting a joiner needs leader-driven membership propagation (the `membership_generation` and `membership_digest` fields already on the wire are unread), which is new election behaviour and is not assigned to a phase yet. Until then, a shard is safe only at its bootstrap electorate.
+
+The authority step of the bootstrap cascade does not yet produce a working node. `CoordinationAuthority::discover_workers` returns worker IDs without addresses, and `bootstrap_node` does not read the shard's recovery epoch, so a node that bootstraps this way is `Active` in an electorate it cannot reach, at recovery epoch 0. It fails safe (no quorum, so it never leads while other members exist) but does not recover on its own. Phase 4's real `CoordinationAuthority` must return addresses and the recovery epoch; until then, nodes join through seeds.
+
+The one-node window between startup and the worker becoming leader is still not testable, and is still recorded as such in `docs/superpowers/follow-ups.md` ("Test for a signal arriving during startup, before leadership" — the one-node election takes about 20 ms, too short to hit without a flaky test; picked up when startup is slow enough to test, i.e. DHT election). Phase 2's real transport did not change that: it makes multi-node startup slower, but the *one-node* window is exactly the case that has no network to wait on.
 
 ### Phase 3: DHT task dissemination
 
@@ -2963,7 +2977,7 @@ The coalescing, flow, and failure-detection invariants (§25.1 item 9 and §25.4
 |---|---|
 | 0 (simulator extension) | 25.1.9 (abort before replacement), 25.4.1 (single running generation by authority), 25.4.2 (pending-only supersession), 25.4.6 (occupancy rebuilt at reconciliation) |
 | 1 | 25.4.3 and 25.4.4 (folding, order preservation), 25.4.7 (atomic continuation), 25.4.8 (stage after a group runs once), 25.4.5 in a one-node shard, and the one-node backpressure contract (`SlowDown` past the soft limit, `BackpressureError` past the hard limit, §3.2.1) |
-| 2 | 25.4.5 under leader and worker loss, the documented time from SIGKILL to replacement (§8.3), and abort-before-replacement under partition |
+| 2 | 25.4.5 under leader and worker loss, the measured time from worker unreachable (connection loss) to replacement claim (§8.3), and abort-before-replacement under a simulated (connection-loss) partition |
 | 3 | Retained-payload chain across DHT replicas and compaction (the one-node soft/hard-limit backpressure contract is a Phase 1 exit criterion) |
 | 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess |
 

@@ -86,11 +86,72 @@ where
     V: MembershipView,
     A: CoordinationAuthority,
 {
-    /// Constructs a node in `WorkerState::Active`. `BOOTSTRAPPING`/`JOINING`
-    /// are not modelled yet, and the leader-contact timer starts now so a new
-    /// node isn't immediately suspicious.
+    /// Constructs a node in `WorkerState::Active` with a full membership
+    /// known up front. For a node that must discover its membership first,
+    /// see [`Self::bootstrapping`]. The leader-contact timer starts now so a
+    /// new node isn't immediately suspicious.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        my_id: WorkerId,
+        incarnation_id: IncarnationId,
+        shard_id: ShardId,
+        clock: C,
+        transport: M,
+        membership: V,
+        authority: A,
+        suspect_timeout: Duration,
+    ) -> Self {
+        Self::with_initial_state(
+            WorkerState::Active,
+            my_id,
+            incarnation_id,
+            shard_id,
+            clock,
+            transport,
+            membership,
+            authority,
+            suspect_timeout,
+        )
+    }
+
+    /// Constructs a node in `WorkerState::Bootstrapping` (README §27 Phase 2
+    /// bootstrap join protocol): for a fresh node that has not yet discovered
+    /// the shard's current membership, rather than being statically
+    /// pre-configured with it like [`Self::new`]. `membership` is typically
+    /// empty; call [`Self::finish_joining`] once something outside `core`
+    /// (`net`'s `/kabudachi/join/1` handshake) has resolved a membership list
+    /// to drive `Bootstrapping -> Joining -> Active`.
+    ///
+    /// `tick()` no-ops in both `Bootstrapping` and `Joining` (see its doc):
+    /// nothing here times out a stalled join, by design — that is left to
+    /// whatever drives the join handshake itself, not this state machine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bootstrapping(
+        my_id: WorkerId,
+        incarnation_id: IncarnationId,
+        shard_id: ShardId,
+        clock: C,
+        transport: M,
+        membership: V,
+        authority: A,
+        suspect_timeout: Duration,
+    ) -> Self {
+        Self::with_initial_state(
+            WorkerState::Bootstrapping,
+            my_id,
+            incarnation_id,
+            shard_id,
+            clock,
+            transport,
+            membership,
+            authority,
+            suspect_timeout,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_initial_state(
+        state: WorkerState,
         my_id: WorkerId,
         incarnation_id: IncarnationId,
         shard_id: ShardId,
@@ -105,7 +166,7 @@ where
             my_id,
             incarnation_id,
             shard_id,
-            state: WorkerState::Active,
+            state,
             recovery_epoch: 0,
             highest_term_seen: 0,
             last_leader_contact,
@@ -142,6 +203,17 @@ where
     /// [`Self::attempt_forced_recovery`].
     pub fn recovery_epoch(&self) -> u64 {
         self.recovery_epoch
+    }
+
+    /// The current effective electorate (README §11), as seen by this node's
+    /// [`MembershipView`]. Exposed so a driver outside `core` (e.g. `net`'s
+    /// `/kabudachi/join/1` request responder) can compose a bootstrap join
+    /// response without reaching into `core`'s private fields — `core` knows
+    /// the electorate but nothing about network addresses, and `net` is the
+    /// reverse, so composing a full `JOIN_RESPONSE` needs both sides
+    /// deliberately, in the driver, not in either one alone.
+    pub fn electorate(&self) -> BTreeSet<WorkerId> {
+        self.membership.effective_electorate()
     }
 
     /// Processes a leader heartbeat acknowledgement (README §12.2
@@ -182,7 +254,11 @@ where
     ///   §12.1), then moves to `NoQuorum` if fewer than a majority of the
     ///   electorate, counting itself, are reachable.
     ///
-    /// Every other state is a no-op.
+    /// Every other state is a no-op — deliberately so for `Bootstrapping` and
+    /// `Joining` (README §27 Phase 2 bootstrap join): nothing times out a
+    /// stalled join here, since the transition out of those states happens
+    /// once via [`Self::finish_joining`], driven by something outside `core`
+    /// that resolves a membership list, not by a per-tick check.
     pub fn tick(&mut self) {
         match self.state {
             WorkerState::Active => {
@@ -247,6 +323,42 @@ where
         self.seen_roll_calls.insert(roll_call_id);
         self.state = WorkerState::RollCall;
         self.process_roll_call(call);
+    }
+
+    /// Completes the bootstrap join handshake (README §27 Phase 2): adopts
+    /// `members` (plus this node's own id — [`Self::electorate`]'s doc notes
+    /// every other node's `effective_electorate` already includes itself, so
+    /// a joining node's adopted electorate must too, for quorum/ring math to
+    /// treat it consistently) and drives `Bootstrapping -> Joining ->
+    /// Active`. There is no direct `Bootstrapping -> Active` edge in
+    /// [`WorkerState::can_transition_to`], so this goes through `Joining`
+    /// explicitly, mirroring how [`Self::maybe_win_election`] passes through
+    /// `LeaderReconciling` on its way to `Leader`.
+    ///
+    /// A no-op outside `Bootstrapping`: a node constructed via [`Self::new`]
+    /// (already `Active`) or one that already finished joining has nothing
+    /// left to join.
+    ///
+    /// The wire handshake that produces `members` — dialing seed addresses,
+    /// sending `JOIN_REQUEST`, taking the first `JOIN_RESPONSE` — is entirely
+    /// `net`'s concern (a separate `/kabudachi/join/1` request_response
+    /// protocol, not routed through `ElectionMessage`/`on_message`); this
+    /// method only performs the resulting state transition, the same way
+    /// `on_message` itself never touches the network.
+    pub fn finish_joining(&mut self, mut members: BTreeSet<WorkerId>) {
+        if self.state != WorkerState::Bootstrapping {
+            return;
+        }
+        members.insert(self.my_id.clone());
+
+        self.state = WorkerState::Joining;
+        self.membership.rebuild(members);
+        // A freshly joined node hasn't heard from a leader yet; start the
+        // suspicion clock now so it isn't judged suspect the instant it
+        // ticks — the same reasoning `Self::new`'s doc gives for a freshly
+        // constructed node.
+        self.last_leader_contact = self.clock.now();
+        self.state = WorkerState::Active;
     }
 
     /// Dispatches an inbound message from `from` to its handler.
@@ -341,12 +453,21 @@ where
     /// is dropped; otherwise this node adds its observation and either
     /// becomes a candidate or forwards the call.
     ///
-    /// A call for another shard or recovery epoch is dropped.
+    /// A call for another shard or recovery epoch is dropped. So is a call
+    /// whose own origin-time `highest_term_seen` is already behind what this
+    /// node knows: this node has observed a term the call's originator had
+    /// not yet accounted for, so letting the call keep circulating would let
+    /// its contested term be recomputed from state the call's origin never
+    /// agreed to (see `choose_candidate`'s doc for the incoherent-escalation
+    /// bug this prevents).
     pub fn on_roll_call(&mut self, call: RollCall) {
         if call.shard_id() != self.shard_id || call.recovery_epoch != self.recovery_epoch {
             return;
         }
         if !self.seen_roll_calls.insert(call.roll_call_id.clone()) {
+            return;
+        }
+        if self.highest_term_seen > call.highest_term_seen {
             return;
         }
         self.process_roll_call(call);
@@ -363,10 +484,13 @@ where
         let observations = Self::electorate_observations(&call.responses, &electorate);
 
         if observations.len() >= quorum {
-            let (winner, next_term) = self.choose_candidate(&observations);
+            let (winner, next_term) = self.choose_candidate(call.highest_term_seen, &observations);
             if winner == self.my_id && self.state == WorkerState::RollCall {
                 self.state = WorkerState::Candidate;
                 self.term = next_term;
+                // A leader never acks itself, so nothing else raises its own
+                // `highest_term_seen` to the term it now contests.
+                self.highest_term_seen = self.highest_term_seen.max(next_term);
                 // A candidate counts its own vote without messaging itself.
                 self.votes_received = BTreeSet::from([self.my_id.clone()]);
                 self.send_vote_requests(observations.keys());
@@ -427,19 +551,26 @@ where
     }
 
     /// Picks the winner of the next election from `observations` (README
-    /// §12.5) and the term it is contested in: one past the highest term any
-    /// observation reports. The highest [`candidate_priority`] wins; an exact
-    /// tie goes to the lower `WorkerId`.
+    /// §12.5) and the term it is contested in: one past `call_highest_term_seen`
+    /// — the roll call's own `highest_term_seen`, fixed once at its origin
+    /// (`begin_roll_call`) and never mutated as the call is forwarded. This
+    /// deliberately does *not* derive the term from `observations`' own
+    /// `highest_term_seen` values: those are stamped with whatever a visited
+    /// node's local state happened to be at the moment it responded, which
+    /// can be bumped mid-flight by that node granting a vote for a
+    /// completely unrelated candidacy. Deriving the term from that would let
+    /// the same stale, still-circulating call retarget itself to a
+    /// different, higher term purely as an artifact of which nodes it
+    /// happened to pass through and when — an incoherent candidacy nobody
+    /// actually contested, which could win independently and produce a
+    /// second, live `Leader` (split brain). The highest [`candidate_priority`]
+    /// wins; an exact tie goes to the lower `WorkerId`.
     fn choose_candidate(
         &self,
+        call_highest_term_seen: u64,
         observations: &BTreeMap<WorkerId, &RollCallObservation>,
     ) -> (WorkerId, u64) {
-        let next_term = observations
-            .values()
-            .map(|observation| observation.highest_term_seen)
-            .max()
-            .unwrap_or(self.highest_term_seen)
-            + 1;
+        let next_term = call_highest_term_seen + 1;
 
         let winner = observations
             .keys()

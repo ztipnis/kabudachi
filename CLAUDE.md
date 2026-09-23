@@ -2,7 +2,7 @@
 
 ## Source of truth
 
-- `README.md` is the architecture and phased-delivery specification. Only Phases 0 and 1 are implemented; do not implement later-phase design.
+- `README.md` is the architecture and phased-delivery specification. Only Phases 0-2 are implemented; do not implement later-phase design.
 - `STYLE_GUIDE.md` governs every code change and review. Do not rewrite unrelated pre-existing code for style alone; address it only when it is a correctness, security, or architecture-boundary risk.
 - `CONTRIBUTING.md` is the source for Docker/devcontainer and platform-specific test guidance. `runtime/README.md` documents the Python runtime API.
 

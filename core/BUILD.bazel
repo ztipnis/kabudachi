@@ -7,7 +7,7 @@ rust_library(
     crate_name = "kabudachi_core",
     edition = "2024",
     deps = all_crate_deps(normal = True) + ["//proto:kabudachi_prost"],
-    visibility = ["//bindings:__pkg__"],
+    visibility = ["//bindings:__pkg__", "//net:__pkg__"],
 )
 
 rust_test(

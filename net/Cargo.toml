@@ -1,0 +1,21 @@
+[package]
+name = "kabudachi-net"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "kabudachi_net"
+
+[dependencies]
+kabudachi-core = { path = "../core" }
+libp2p = { version = "0.57", features = [
+    "tcp",
+    "noise",
+    "yamux",
+    "identify",
+    "request-response",
+    "macros",
+    "tokio",
+] }
+prost = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

@@ -435,6 +435,15 @@ fn attempt_forced_recovery_succeeds_and_begins_a_real_roll_call() {
                 call.recovery_epoch, 2,
                 "the RollCall must carry the freshly-updated recovery_epoch"
             );
+            // This node led a term before losing quorum. Its own call must
+            // start from that term, or it would re-contest the term its old
+            // voters already granted and they would drop the call.
+            assert!(node.term() >= 1, "setup invariant: the node led a real term");
+            assert_eq!(
+                call.highest_term_seen,
+                node.term(),
+                "the ex-leader's roll call must carry the term it led as highest_term_seen"
+            );
         }
         other => panic!("expected RollCall payload, got {other:?}"),
     }
@@ -518,8 +527,10 @@ fn attempt_forced_recovery_refuses_to_move_the_epoch_backwards() {
 
     // Win an election in the recovered 2-member electorate at epoch 3. The
     // helper's reported term is varied until this node is the predicted
-    // winner, since epoch and term both feed the candidate ranking.
-    let helper_term = (0..64)
+    // winner, since epoch and term both feed the candidate ranking. It starts
+    // at this node's own term: a call behind a term this node already holds
+    // is dropped as stale.
+    let helper_term = (node.term()..64)
         .find(|term| {
             predict_winner(
                 &shard(SHARD),
@@ -535,6 +546,7 @@ fn attempt_forced_recovery_refuses_to_move_the_epoch_backwards() {
         vec![observation(helper_peer.clone(), helper_term)],
     );
     call.recovery_epoch = 3;
+    call.highest_term_seen = helper_term;
     node.on_message(helper_peer.clone(), roll_call_message(call));
     assert_eq!(node.state(), WorkerState::Candidate, "test setup invariant");
     let mut grant = vote_grant(self_id.clone(), helper_peer.clone(), helper_term + 1);

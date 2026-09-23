@@ -78,11 +78,19 @@ pub fn elect_new_leader_among(
         .iter()
         .map(|id| observation(id.clone(), prior_highest_term_seen))
         .collect();
-    let call = roll_call(
+    let mut call = roll_call(
         "synthetic-reelection-call",
         synthetic_initiator.clone(),
         responses,
     );
+    // A real roll call's own `highest_term_seen` is fixed once at its origin
+    // (`begin_roll_call`) to the originator's `highest_term_seen` at that
+    // moment — this synthetic call must carry the same value, since
+    // `choose_candidate` now derives the contested term from exactly this
+    // field (chunk C7-fix), not from the accumulated observations' own
+    // values as it used to. `roll_call`'s default (0) would otherwise
+    // silently contest term 1 regardless of `prior_highest_term_seen`.
+    call.highest_term_seen = prior_highest_term_seen;
     cluster
         .node(&winner)
         .on_message(synthetic_initiator, roll_call_message(call));
