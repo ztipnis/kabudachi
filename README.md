@@ -2832,6 +2832,12 @@ Test:
 - async functions and contextvars;
 - subprocess crashes.
 
+### 26.7 TODO: fewer integration-test binaries
+
+Each file in `core/tests/` and `net/tests/` is its own test crate, so Cargo links one binary per file, and every one of those binaries links its crate (`kabudachi_core` or `kabudachi_net`) and all its dependencies again. There are 38 such files today. That multiplies link time and the debug info written to `target/`. Merge them into a few test crates, one per area, using the `tests/<area>/main.rs` pattern with one module per current file. Trade-off: Bazel's `rust_test_suite` currently makes one target per file, which keeps affected-only test runs fine-grained. A merged crate becomes one target, so a change to one test file reruns every test in that crate. Choose the groups so that one test crate still maps to one area of code.
+
+The merge also needs Bazel changes. `core/BUILD.bazel` and `net/BUILD.bazel` find integration tests with `glob(["tests/*.rs"])`, which does not match `tests/<area>/main.rs`. Replace that discovery with one `rust_test` per area, or Bazel silently stops running the moved tests. `//net:ring_roll_call_leader_loss_test` has its own `size = "large"` target for its retry loop. Keep it in its own target, or give its area target the same timeout.
+
 ---
 
 ## 27. Suggested implementation phases

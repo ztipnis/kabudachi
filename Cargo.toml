@@ -1,3 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["core", "bindings", "proto", "net"]
+
+# macOS defaults to split-debuginfo = "unpacked", which leaves every codegen
+# unit's object file in target/debug/deps as the binary's debug info. Codegen
+# unit names change on each edit and Cargo never deletes the old objects, so
+# with one binary per integration test the directory grows without limit.
+# "packed" gathers debug info into one .dSYM per binary (a .dwp on Linux),
+# rewritten on each build, and removes the objects.
+[profile.dev]
+split-debuginfo = "packed"

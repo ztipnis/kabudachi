@@ -13,6 +13,13 @@ docker build -t kabudachi-test .
 docker run --rm kabudachi-test bazel test //...
 ```
 
+**Keep Bazel's cache between runs:** `--rm` discards the container's cache, so each run rebuilds from scratch. To reuse it, mount one named volume as a disk cache. Share that one volume across all runs and worktrees; a volume per run or per worktree multiplies disk use. `.bazelrc` caps the disk cache at 10 GB, but Bazel only trims the cache while its server is idle, after the command ends. With `--rm`, the container stops as soon as `bazel test` returns, so the command below starts the trim at once and keeps the container up for 30 seconds before it returns the test result.
+
+```bash
+docker run --rm -v kabudachi-bazel-cache:/disk-cache kabudachi-test bash -c \
+  'bazel test //... --disk_cache=/disk-cache --experimental_disk_cache_gc_idle_delay=0; status=$?; sleep 30; exit $status'
+```
+
 **Run the other local-iteration commands the same way:**
 
 ```bash

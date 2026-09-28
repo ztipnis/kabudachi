@@ -1,2 +1,7 @@
 # kabudachi Bazel configuration
 # Intentionally minimal — add flags here only when a real need arises (YAGNI).
+
+# A --disk_cache has no size limit by default and grows with every changed
+# action. Cap it so a shared cache (for example a Docker volume) stays bounded.
+# The flag has no effect unless --disk_cache is set.
+common --experimental_disk_cache_gc_max_size=10G
