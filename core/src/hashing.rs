@@ -1,10 +1,12 @@
-//! The hash function behind values that every node must compute identically:
-//! candidate priorities and membership digests.
+//! The hash function behind deterministic values derived from fixed inputs,
+//! such as the suspicion jitter ADR-0001 decision 15 derives from a worker's
+//! ID and term.
 //!
 //! The function is chosen at runtime. SHA-256 is the default; any hash from
 //! the RustCrypto `digest` ecosystem (SHA-3, BLAKE2, ...) can be substituted
-//! with [`HashFunction::new`]. Every worker in a shard must use
-//! the same function, or they will disagree on election winners and digests.
+//! with [`HashFunction::new`]. Whether the workers of a shard must agree on
+//! it depends on the value: each worker computes only its own jitter, so for
+//! that they need not.
 
 use std::sync::Arc;
 
@@ -71,5 +73,51 @@ impl HashFunction {
 impl Default for HashFunction {
     fn default() -> Self {
         Self::new::<sha2::Sha256>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields() -> [Field<'static>; 4] {
+        [
+            Field::Text("shard-1"),
+            Field::Text("worker-1"),
+            Field::Number(0),
+            Field::Number(3),
+        ]
+    }
+
+    /// Pins the default (SHA-256) encoding. The expected value was computed
+    /// with Python's `hashlib` over length-prefixed strings and big-endian
+    /// integers; if this fails, every value derived from the hash has
+    /// changed for every build that doesn't share the change.
+    #[test]
+    fn the_default_hash_is_stable_across_builds() {
+        assert_eq!(
+            HashFunction::default().hash_to_u64(&fields()),
+            10_384_955_935_822_374_861
+        );
+    }
+
+    #[test]
+    fn the_hash_follows_the_configured_function() {
+        let sha3 = HashFunction::new::<sha3::Sha3_256>();
+        assert_eq!(sha3.hash_to_u64(&fields()), 18_294_837_748_612_206_051);
+    }
+
+    #[test]
+    fn the_hash_depends_on_every_field() {
+        let hash = HashFunction::default();
+        let base = hash.hash_to_u64(&fields());
+        for changed in 0..4 {
+            let mut other = fields();
+            other[changed] = match other[changed] {
+                Field::Text(_) => Field::Text("other"),
+                Field::Number(number) => Field::Number(number + 1),
+            };
+            assert_ne!(base, hash.hash_to_u64(&other), "field {changed}");
+        }
     }
 }

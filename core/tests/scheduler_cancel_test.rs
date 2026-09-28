@@ -7,12 +7,12 @@ mod support;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, ClaimRejection, Event, ReportRejection, Scheduler, Submission,
 };
 use kabudachi_core::time::{Duration, Instant};
 use support::clock::FakeClock;
+use support::grant::unbounded_grant;
 use support::ids::SequentialIds;
 
 fn worker() -> WorkerId {
@@ -31,7 +31,7 @@ struct Fixture {
 fn leading() -> Fixture {
     let clock = FakeClock::new();
     let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_worker_state(WorkerState::Leader);
+    scheduler.set_leadership_grant(Some(unbounded_grant()));
     Fixture { clock, scheduler }
 }
 
@@ -232,7 +232,7 @@ fn an_unknown_task_cannot_be_cancelled() {
 fn only_a_leader_decides_a_cancellation() {
     let mut fixture = leading();
     let task = fixture.scheduler.submit(plain()).unwrap();
-    fixture.scheduler.set_worker_state(WorkerState::Active);
+    fixture.scheduler.set_leadership_grant(None);
 
     let result = fixture.scheduler.cancel(&task);
 

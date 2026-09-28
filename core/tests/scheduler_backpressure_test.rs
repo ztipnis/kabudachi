@@ -6,10 +6,10 @@
 mod support;
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{Event, MemoryLimits, Scheduler, Submission, SubmitRejection};
 use kabudachi_core::time::Duration;
 use support::clock::FakeClock;
+use support::grant::unbounded_grant;
 use support::ids::SequentialIds;
 
 const SOFT: u64 = 100;
@@ -27,7 +27,7 @@ struct Fixture {
 fn limited() -> Fixture {
     let clock = FakeClock::new();
     let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_worker_state(WorkerState::Leader);
+    scheduler.set_leadership_grant(Some(unbounded_grant()));
     scheduler.set_memory_limits(Some(MemoryLimits {
         soft: SOFT,
         hard: HARD,
@@ -290,7 +290,7 @@ fn room_made_by_finishing_tasks_lets_submissions_through_again() {
 fn without_limits_nothing_is_refused_and_no_signal_is_raised() {
     let clock = FakeClock::new();
     let mut scheduler = Scheduler::new(clock, SequentialIds::new());
-    scheduler.set_worker_state(WorkerState::Leader);
+    scheduler.set_leadership_grant(Some(unbounded_grant()));
 
     for _ in 0..3 {
         scheduler.submit(payload(1_000_000)).unwrap();

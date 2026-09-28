@@ -1,61 +1,40 @@
-//! Scenario tests for partitions, isolation and ring topology (README §26.2),
-//! built on the `Cluster` harness.
-//!
-//! Known gap: with 4 or more mutually reachable nodes that start suspecting at
-//! the same instant, independent roll calls can compute different next terms
-//! from partial response sets and elect two leaders, because nothing demotes
-//! an elected `Leader`/`Candidate` on seeing a higher-term certificate. No two
-//! nodes start a roll call at the same instant here: either the partition caps
-//! the group at 3, or `elect_new_leader_among` starts exactly one pre-computed
-//! winner by hand and completes its election through real `VoteRequest`/
-//! `VoteGrant` traffic.
+//! Scenario tests for partitions and isolation (README §26.2), built on the
+//! `Cluster` harness, including the regression for the split brain the ring
+//! roll call produced when every survivor of a lost leader raced, and races
+//! of four or more roll calls started at the same instant.
 
 mod support;
 
 use support::scenarios::{
-    bootstrap_5_and_elect_leader, drain_pending_messages, elect_new_leader_among,
+    bootstrap_5_and_elect_leader, elect_new_leader_among, run_out_cut_off_leaders_lease,
+    suspect_leader_by_hand,
 };
 
-use support::builders::shard;
+use support::builders::{ack_message, configuration_of, g0, leader_ack};
 
-use support::candidate::predict_winner;
+use std::collections::{BTreeMap, BTreeSet};
 
-use std::collections::BTreeSet;
-
-use kabudachi_core::membership::{MembershipView, RingMembership};
-use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
-use kabudachi_core::protocol::messages::{ElectionMessage, LeaderHeartbeatAck, election_message};
+use kabudachi_core::election::Input;
+use kabudachi_core::protocol::ids::WorkerId;
+use kabudachi_core::protocol::messages::{ElectionMessage, LeaderHeartbeatAck};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
-use kabudachi_core::transport::PeerMessenger;
 use support::harness::Cluster;
-
-const SHARD: &str = "shard-1"; // Matches Cluster::bootstrap's own documented shard-1 scheme.
+use support::node::published_roll_calls;
 
 fn heartbeat_ack_message(leader_id: WorkerId, recovery_epoch: u64, term: u64) -> ElectionMessage {
-    ElectionMessage {
-        payload: Some(election_message::Payload::HeartbeatAck(
-            LeaderHeartbeatAck {
-                shard_id: Some(shard(SHARD).into()),
-                leader_id: Some(leader_id.into()),
-                recovery_epoch,
-                term,
-                membership_generation: 0,
-            },
-        )),
-    }
+    ack_message(LeaderHeartbeatAck {
+        recovery_epoch,
+        ..leader_ack(&leader_id, term, &configuration_of(5), Some(g0()))
+    })
 }
 
-/// Partitions `leader` from everyone else, crosses `suspect_timeout` for the
-/// 4-member majority, checks the isolated leader detects its peer loss (`Leader
-/// -> NoQuorum`), then elects a new leader among the majority with
-/// `elect_new_leader_among`. Returns the new leader.
-fn isolate_leader_and_elect_new(
-    cluster: &mut Cluster,
-    leader: &WorkerId,
-    prior_highest_term_seen: u64,
-    tick_size: Duration,
-) -> WorkerId {
+/// Partitions `leader` from everyone else, checks the isolated leader detects
+/// its peer loss once its lease runs out (`Leader -> NoQuorum`), crosses
+/// `suspect_timeout` for the 4-member majority by hand, then elects a new
+/// leader among the majority with `elect_new_leader_among`. Returns the new
+/// leader.
+fn isolate_leader_and_elect_new(cluster: &mut Cluster, leader: &WorkerId) -> WorkerId {
     let others: Vec<WorkerId> = cluster
         .node_ids()
         .into_iter()
@@ -65,27 +44,21 @@ fn isolate_leader_and_elect_new(
     let others_group: BTreeSet<WorkerId> = others.iter().cloned().collect();
     cluster.partition(leader_group, others_group);
 
-    // `partition()` only blocks new sends, so flush the heartbeat already scheduled before the cut.
-    cluster.advance(tick_size);
-
-    for _ in 0..3 {
-        cluster.advance(tick_size);
-    }
+    // Holds the end of the leader's lease but none of the others' suspicion
+    // deadlines.
+    run_out_cut_off_leaders_lease(cluster);
 
     assert_eq!(
         cluster.states()[leader],
         WorkerState::NoQuorum,
         "the isolated leader must detect its own peer loss (Leader -> NoQuorum)"
     );
-    for id in &others {
-        assert_eq!(
-            cluster.states()[id],
-            WorkerState::LeaderSuspect,
-            "isolate_leader_and_elect_new setup invariant"
-        );
-    }
 
-    elect_new_leader_among(cluster, &others, prior_highest_term_seen)
+    // Every one of the others is moved to LeaderSuspect by hand, and only
+    // the first goes further, so the scenario knows who wins.
+    suspect_leader_by_hand(cluster, &others);
+
+    elect_new_leader_among(cluster, &others)
 }
 
 #[test]
@@ -98,9 +71,7 @@ fn partition_50_50_neither_side_reaches_quorum() {
     let group_a: BTreeSet<WorkerId> = ids[..2].iter().cloned().collect();
     let group_b: BTreeSet<WorkerId> = ids[2..].iter().cloned().collect();
 
-    // Quorum for 4 nodes is 3, and each 2-node group caps at 2 responses. Only
-    // 2 nodes suspect on each side, so plain advance()/run_until_quiescent is
-    // safe.
+    // Quorum for 4 nodes is 3, and each 2-node group caps at 2 responses.
     cluster.partition(group_a.clone(), group_b.clone());
 
     for _ in 0..3 {
@@ -172,7 +143,7 @@ fn leader_isolated_alone() {
     let (mut cluster, original_leader) = bootstrap_5_and_elect_leader(suspect_timeout, tick_size);
 
     // Partition the leader from all 4 followers; the majority elects a new one.
-    let new_leader = isolate_leader_and_elect_new(&mut cluster, &original_leader, 1, tick_size);
+    let new_leader = isolate_leader_and_elect_new(&mut cluster, &original_leader);
 
     assert_ne!(
         new_leader, original_leader,
@@ -251,18 +222,18 @@ fn rapid_leader_crash_restart() {
 
     // "Crash" the leader by fully partitioning it, and let the remaining
     // 4-node majority elect a new one.
-    let new_leader = isolate_leader_and_elect_new(&mut cluster, &original_leader, 1, tick_size);
+    let new_leader = isolate_leader_and_elect_new(&mut cluster, &original_leader);
     assert_ne!(new_leader, original_leader);
 
-    // Heal, then "restart" the crashed worker as a fresh node: same WorkerId, new IncarnationId.
+    // Heal, then restart the crashed worker: its process comes back under a
+    // fresh WorkerId (ADR-0001, amended 2026-09-27), a pending joiner.
     cluster.heal();
-    let new_incarnation = IncarnationId::new(format!("{}-incarnation-1", original_leader.as_str()));
-    cluster.restart_node(&original_leader, new_incarnation);
+    let restarted = cluster.restart_node(&original_leader);
 
     // The fresh incarnation inherits none of the old election state; check the
     // one field observable through the public API.
     assert_eq!(
-        cluster.states()[&original_leader],
+        cluster.states()[&restarted],
         WorkerState::Active,
         "a freshly-restarted incarnation must start Active, not resume its old Leader/NoQuorum state"
     );
@@ -274,7 +245,7 @@ fn rapid_leader_crash_restart() {
         "the new leader elected during the crash must remain the sole leader after the restart rejoins"
     );
     assert_eq!(
-        cluster.states()[&original_leader],
+        cluster.states()[&restarted],
         WorkerState::Active,
         "the restarted worker must have settled into an ordinary Active follower via the new \
          leader's real heartbeats"
@@ -282,38 +253,29 @@ fn rapid_leader_crash_restart() {
 
     // Stale-message rejection through the full harness: `state()` cannot tell a
     // rejected ack from an accepted one for an Active/Leader node, so drive one
-    // follower ("probe") into RollCall first, where the difference is visible.
-    let probe = majority_non_leader(&cluster, &new_leader, &original_leader);
+    // follower ("probe") out of Active first, where the difference is visible.
+    let probe = majority_non_leader(&cluster, &new_leader, &restarted);
 
     // Cut probe off from the real leader only, so it stops receiving
-    // heartbeats and suspects but can still receive injected messages.
+    // heartbeats and suspects but can still receive injected messages. Past
+    // its suspicion timeout it starts its own roll call at once, which the
+    // other followers, still hearing from the leader, refuse, so the call
+    // closes short of a quorum.
     cluster.partition(
         [probe.clone()].into_iter().collect(),
         [new_leader.clone()].into_iter().collect(),
     );
-    // Flush the heartbeat already scheduled before the cut.
-    cluster.advance(tick_size);
-    for _ in 0..3 {
+    for _ in 0..4 {
         cluster.advance(tick_size);
     }
-    assert_eq!(
-        cluster.states()[&probe],
-        WorkerState::LeaderSuspect,
-        "setup invariant"
-    );
-    cluster.node(&probe).tick(); // LeaderSuspect -> RollCall (its own roll call is harmless here: see below).
-    assert_eq!(
-        cluster.states()[&probe],
-        WorkerState::RollCall,
-        "setup invariant"
-    );
-    let all_ids: Vec<WorkerId> = cluster.node_ids().into_iter().collect();
-    drain_pending_messages(&mut cluster, &all_ids);
 
-    assert_eq!(
-        cluster.states()[&probe],
-        WorkerState::RollCall,
-        "probe must still be in RollCall after its own (harmless) roll call dead-ends"
+    assert!(
+        matches!(
+            cluster.states()[&probe],
+            WorkerState::RollCall | WorkerState::NoQuorum
+        ),
+        "probe's own roll call is refused: {:?}",
+        cluster.states()
     );
 
     // A stale ack from the old leader (term 1) while every real participant's
@@ -324,11 +286,11 @@ fn rapid_leader_crash_restart() {
         heartbeat_ack_message(original_leader.clone(), 0, 1),
     );
     cluster.advance(tick_size);
-    assert_eq!(
+    assert_ne!(
         cluster.states()[&probe],
-        WorkerState::RollCall,
+        WorkerState::Active,
         "a stale LeaderHeartbeatAck (term 1, below the real current term 2) must be rejected \
-         outright and must NOT flip probe out of RollCall"
+         outright and must NOT return probe to Active"
     );
 
     // Positive control: a genuine current-term heartbeat still reaches probe.
@@ -337,7 +299,7 @@ fn rapid_leader_crash_restart() {
     assert_eq!(
         cluster.states()[&probe],
         WorkerState::Active,
-        "a genuine, current-term heartbeat must still correctly flip probe RollCall -> Active"
+        "a genuine, current-term ack must still return probe to Active"
     );
 
     cluster.assert_at_most_one_leader();
@@ -355,97 +317,211 @@ fn majority_non_leader(cluster: &Cluster, leader: &WorkerId, restarted: &WorkerI
         )
 }
 
+/// Advances `cluster` one tick at a time for `ticks` ticks, checking after
+/// every tick that at most one node is `Leader`, and records every leader
+/// seen under the term it leads in.
+fn advance_watching_leaders(
+    cluster: &mut Cluster,
+    ticks: u64,
+    leaders_by_term: &mut BTreeMap<u64, BTreeSet<WorkerId>>,
+) {
+    for _ in 0..ticks {
+        cluster.advance(Duration::from_ticks(1));
+        cluster.assert_at_most_one_leader();
+        if let Some(leader) = cluster.leader() {
+            leaders_by_term
+                .entry(cluster.node(&leader).term())
+                .or_default()
+                .insert(leader);
+        }
+    }
+}
+
+/// Panics unless `leader`, cut off from a quorum, has lost it: it is
+/// `NoQuorum`, or in one of the roll calls it retries from there.
+fn assert_cut_off_and_retrying(cluster: &Cluster, leader: &WorkerId) {
+    assert!(
+        matches!(
+            cluster.states()[leader],
+            WorkerState::NoQuorum | WorkerState::RollCall
+        ),
+        "{:?}",
+        cluster.states()
+    );
+}
+
+// The ring roll call's split brain (a since-deleted `net` test documented
+// it): with every survivor of a lost leader suspecting at the same instant,
+// independent ring calls elected a permanent second leader. With the gossip
+// roll call, the survivors' calls for the same term are ranked, every
+// survivor answers the best one, and exactly one of them leads; the same
+// holds when that one is lost in turn and three are left.
 #[test]
-fn ring_fragmentation() {
+fn every_survivor_of_a_lost_leader_racing_elects_exactly_one_leader() {
     let suspect_timeout = Duration::from_ticks(10);
     let tick_size = Duration::from_ticks(5);
+    let mut leaders_by_term = BTreeMap::new();
 
-    let mut cluster = Cluster::bootstrap(5, suspect_timeout);
-    let ids: Vec<WorkerId> = cluster.node_ids().into_iter().collect(); // worker-0..worker-4, ascending.
-    // The fragmented node must not win the final 5-response election at term 2, whatever the hash.
-    let term_2_winner = predict_winner(&shard(SHARD), 0, 2, &ids);
-    let w0 = ids.iter().find(|id| **id != term_2_winner).unwrap().clone();
-    let rest: Vec<WorkerId> = ids.iter().filter(|id| **id != w0).cloned().collect();
+    let (mut cluster, first_leader) = bootstrap_5_and_elect_leader(suspect_timeout, tick_size);
+    let survivors: BTreeSet<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != first_leader)
+        .collect();
 
-    // Worker-0's ring successors, from the same ring logic the nodes use.
-    let membership = RingMembership::new(ids.iter().cloned().collect());
-    let successors = membership.ring_successors(w0.clone());
-    assert_eq!(
-        successors.len(),
-        3,
-        "sanity check: a 5-node ring's RING_FANOUT=3 successors list should have exactly 3 entries"
+    // Cut the leader off. Every survivor last heard from it at the same
+    // instant, so each one's leader contact is stale by the time the first
+    // suspects it, after its jittered suspicion timeout.
+    cluster.partition(
+        [first_leader.clone()].into_iter().collect(),
+        survivors.clone(),
+    );
+    advance_watching_leaders(
+        &mut cluster,
+        6 * suspect_timeout.as_ticks(),
+        &mut leaders_by_term,
     );
 
-    // Sever worker-0 from every one of its ring successors, but not from
-    // worker-4, so its own roll call dead-ends while it can still receive one
-    // forwarded through worker-4.
-    let group_a: BTreeSet<WorkerId> = [w0.clone()].into_iter().collect();
-    let group_b: BTreeSet<WorkerId> = successors.iter().cloned().collect();
-    cluster.partition(group_a, group_b);
-
-    for _ in 0..3 {
-        cluster.advance(tick_size);
-    }
-    for id in &ids {
+    let second_leader = cluster
+        .leader()
+        .expect("the four survivors must elect a leader");
+    assert!(survivors.contains(&second_leader));
+    for survivor in survivors.iter().filter(|id| **id != second_leader) {
         assert_eq!(
-            cluster.states()[id],
-            WorkerState::LeaderSuspect,
+            cluster.states()[survivor],
+            WorkerState::Active,
+            "every other survivor follows the one leader"
+        );
+        assert_eq!(
+            cluster.node(survivor).known_leader().map(|(id, _)| id),
+            Some(second_leader.clone())
+        );
+    }
+    assert_cut_off_and_retrying(&cluster, &first_leader);
+
+    // Cut the second leader off too. The three left are exactly a quorum of
+    // the configuration of five, so all three must answer the one call that
+    // wins.
+    let last_three: BTreeSet<WorkerId> = survivors
+        .iter()
+        .filter(|id| **id != second_leader)
+        .cloned()
+        .collect();
+    cluster.partition(
+        [first_leader.clone(), second_leader.clone()]
+            .into_iter()
+            .collect(),
+        last_three.clone(),
+    );
+    advance_watching_leaders(
+        &mut cluster,
+        6 * suspect_timeout.as_ticks(),
+        &mut leaders_by_term,
+    );
+
+    let third_leader = cluster
+        .leader()
+        .expect("the three left must elect a leader");
+    assert!(last_three.contains(&third_leader));
+    for id in last_three.iter().filter(|id| **id != third_leader) {
+        assert_eq!(cluster.states()[id], WorkerState::Active);
+    }
+    assert_cut_off_and_retrying(&cluster, &second_leader);
+
+    for (term, leaders) in &leaders_by_term {
+        assert_eq!(
+            leaders.len(),
+            1,
+            "term {term} had more than one leader: {leaders:?}"
+        );
+    }
+    // A roll call that failed on the way takes its term, so the survivors'
+    // leaders need not lead the very next terms.
+    assert_eq!(
+        leaders_by_term.len(),
+        3,
+        "the first leader until its lease ran out, then one leader for the four survivors \
+         and one for the three: {leaders_by_term:?}"
+    );
+    assert_eq!(leaders_by_term.keys().next(), Some(&1));
+}
+
+/// Starts a roll call on every one of `initiators` at the same instant, by
+/// hand, then lets the cluster run for three suspicion timeouts, watching
+/// the leaders. Every initiator contests the same term, and the lowest
+/// `WorkerId` makes the best call (the nodes read one wall clock), so every
+/// other initiator abandons its own call for that one, and it alone wins.
+fn every_initiator_racing_at_once_elects_the_best_call(
+    cluster: &mut Cluster,
+    initiators: &[WorkerId],
+) {
+    suspect_leader_by_hand(cluster, initiators);
+    let mut contested_terms = BTreeSet::new();
+    for initiator in initiators {
+        let started = cluster.step(initiator, Input::Tick);
+        assert_eq!(
+            cluster.states()[initiator],
+            WorkerState::RollCall,
             "setup invariant"
         );
+        contested_terms.extend(published_roll_calls(&started).iter().map(|call| call.term));
     }
-
-    //
-    // A dead-ended roll call leaves a node parked in `RollCall`, where it can
-    // accept another node's later roll call once quorum is satisfied (intended).
-    // So worker-0 is the only node to start a real roll call here; the others
-    // take part through `elect_new_leader_among`.
-    cluster.node(&w0).tick();
-    drain_pending_messages(&mut cluster, &ids);
     assert_eq!(
-        cluster.states()[&w0],
-        WorkerState::RollCall,
-        "worker-0's own roll call must dead-end (no reachable successor to forward to), leaving \
-         it parked in RollCall — never Candidate/Leader from its OWN attempt"
+        contested_terms.len(),
+        1,
+        "setup invariant: every initiator contests the same term, {contested_terms:?}"
     );
-    for id in &rest {
+
+    let mut leaders_by_term = BTreeMap::new();
+    let suspect_ticks = cluster.suspect_timeout().as_ticks();
+    advance_watching_leaders(cluster, 3 * suspect_ticks, &mut leaders_by_term);
+
+    let best = initiators.iter().min().expect("at least one initiator");
+    assert_eq!(
+        cluster.leader().as_ref(),
+        Some(best),
+        "{:?}",
+        cluster.states()
+    );
+    for initiator in initiators.iter().filter(|id| *id != best) {
+        assert_eq!(cluster.states()[initiator], WorkerState::Active);
         assert_eq!(
-            cluster.states()[id],
-            WorkerState::LeaderSuspect,
-            "worker-0's dead-ended roll call must have zero observable effect on any other node"
+            cluster.node(initiator).known_leader().map(|(id, _)| id),
+            Some(best.clone())
         );
     }
-
-    //
-    // The remainder is elected through `elect_new_leader_among`. Its winner's
-    // own roll call is forwarded on to worker-0 (the worker-4 -> worker-0 link
-    // is intact).
-    let new_leader = elect_new_leader_among(&mut cluster, &rest, 0);
-    assert!(
-        rest.contains(&new_leader),
-        "the new leader must come from the healthy 4-node remainder"
-    );
-
-    // Deliver the winner's forwarded roll call to worker-0 too.
-    drain_pending_messages(&mut cluster, &ids);
-
-    // worker-0 sees all 5 responses at next_term 2. It was chosen not to win
-    // that set, so it declines, dead-ends again and stays parked in `RollCall`.
-    assert_ne!(
-        cluster.states()[&w0],
-        WorkerState::Candidate,
-        "worker-0 must correctly decline to become Candidate when it processes the healthy \
-         remainder's forwarded roll call — it isn't the deterministic winner over the resulting \
-         5-response set"
-    );
     assert_eq!(
-        cluster.states()[&w0],
-        WorkerState::RollCall,
-        "having correctly declined (not won the tie-break) and having no reachable successor of \
-         its own to forward to, worker-0 dead-ends again and remains parked in RollCall"
+        leaders_by_term.len(),
+        1,
+        "one election, won at the first try: {leaders_by_term:?}"
     );
+    assert_eq!(cluster.first_grant_overlap(), None);
+}
 
-    // worker-0's forwarding is broken, yet the rest of the ring converges on one leader.
-    assert_eq!(cluster.leader(), Some(new_leader.clone()));
-    assert_ne!(w0, new_leader);
-    cluster.assert_at_most_one_leader();
+#[test]
+fn four_survivors_starting_roll_calls_at_once_elect_exactly_one_leader() {
+    let suspect_timeout = Duration::from_ticks(10);
+    let tick_size = Duration::from_ticks(5);
+    let (mut cluster, old_leader) = bootstrap_5_and_elect_leader(suspect_timeout, tick_size);
+    let survivors: Vec<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != old_leader)
+        .collect();
+    cluster.partition(
+        [old_leader.clone()].into_iter().collect(),
+        survivors.iter().cloned().collect(),
+    );
+    run_out_cut_off_leaders_lease(&mut cluster);
+
+    every_initiator_racing_at_once_elects_the_best_call(&mut cluster, &survivors);
+    assert_cut_off_and_retrying(&cluster, &old_leader);
+}
+
+#[test]
+fn seven_nodes_starting_roll_calls_at_once_elect_exactly_one_leader() {
+    let mut cluster = Cluster::bootstrap(7, Duration::from_ticks(10));
+    let everyone: Vec<WorkerId> = cluster.node_ids().into_iter().collect();
+
+    every_initiator_racing_at_once_elects_the_best_call(&mut cluster, &everyone);
 }

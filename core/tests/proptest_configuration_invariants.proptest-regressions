@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7ec80679fec054a499e5bb9c03fcf6914f19afa9a9cd2b77376031db30241588 # shrinks to ([base, batch, current], workers) = ([Generation { recovery_epoch: 0, term: 0, counter: 0 }, Generation { recovery_epoch: 0, term: 0, counter: 0 }, Generation { recovery_epoch: 0, term: 0, counter: 0 }], [Worker { admission: None, in_first_set: false, in_second_set: false }]), old_slack = 0, new_slack = 0
+cc 2f0d73cf0d660dca25607e0fb5fd12d903d7b26d0ae310ea620d17b36f024210 # shrinks to ([base, _, current], workers) = ([Generation { recovery_epoch: 0, term: 0, counter: 0 }, Generation { recovery_epoch: 0, term: 0, counter: 0 }, Generation { recovery_epoch: 0, term: 0, counter: 0 }], [Worker { admission: None, in_first_set: false, in_second_set: false }]), slack = 0

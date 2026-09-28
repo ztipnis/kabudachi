@@ -34,7 +34,7 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
-    manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml", "//net:Cargo.toml"],
+    manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml", "//net:Cargo.toml", "//testkit:Cargo.toml"],
 )
 
 # Not a direct Cargo dependency of any workspace member — pulled in only so

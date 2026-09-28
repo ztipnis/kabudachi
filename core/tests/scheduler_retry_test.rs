@@ -7,10 +7,10 @@ mod support;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{ReportRejection, Scheduler, Submission};
 use kabudachi_core::time::Duration;
 use support::clock::FakeClock;
+use support::grant::unbounded_grant;
 use support::ids::SequentialIds;
 
 fn worker() -> WorkerId {
@@ -25,7 +25,7 @@ struct Fixture {
 fn leading() -> Fixture {
     let clock = FakeClock::new();
     let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_worker_state(WorkerState::Leader);
+    scheduler.set_leadership_grant(Some(unbounded_grant()));
     Fixture { clock, scheduler }
 }
 
@@ -225,7 +225,7 @@ fn a_failure_reported_by_a_non_leader_starts_no_retry() {
     let mut fixture = leading();
     let task_id = submit_with_retries(&mut fixture, 3);
     let first = start_attempt(&mut fixture, &task_id);
-    fixture.scheduler.set_worker_state(WorkerState::Active);
+    fixture.scheduler.set_leadership_grant(None);
 
     let result = fixture.scheduler.fail(&worker(), &first, "ValueError");
 

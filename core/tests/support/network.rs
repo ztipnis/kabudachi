@@ -1,33 +1,36 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::ElectionMessage;
 use kabudachi_core::time::{Clock, Duration, Instant};
-use kabudachi_core::transport::PeerMessenger;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::support::clock::FakeClock;
 
-struct ScheduledMessage {
-    deliver_at: Instant,
-    from: WorkerId,
-    to: WorkerId,
-    message: ElectionMessage,
+/// A message on its way through the network.
+pub struct ScheduledMessage {
+    pub deliver_at: Instant,
+    pub from: WorkerId,
+    pub to: WorkerId,
+    pub message: ElectionMessage,
 }
 
 struct Inner {
     clock: Rc<FakeClock>,
     registered: BTreeSet<WorkerId>,
-    inboxes: BTreeMap<WorkerId, VecDeque<(WorkerId, ElectionMessage)>>,
     scheduled: Vec<ScheduledMessage>,
     drop_rate: f64,
     duplicate_rate: f64,
     reorder: bool,
     delay: Duration,
+    /// The fraction of deliveries held back past `delay`, and the most
+    /// ticks one is held back.
+    late_rate: f64,
+    late_by_at_most: Duration,
     rng: ChaCha8Rng,
     partition: Option<(BTreeSet<WorkerId>, BTreeSet<WorkerId>)>,
 }
@@ -52,6 +55,41 @@ impl Inner {
         }
     }
 
+    /// Schedules one delivery of `message` after the configured delay,
+    /// unless the partition or the drop rate discards it; the duplicate rate
+    /// may schedule a second copy.
+    fn schedule(&mut self, from: WorkerId, to: WorkerId, message: ElectionMessage) {
+        if self.is_partitioned(&from, &to) || self.should_drop() {
+            return;
+        }
+
+        let deliver_at = self.clock.now() + self.delay + self.lateness();
+        self.scheduled.push(ScheduledMessage {
+            deliver_at,
+            from: from.clone(),
+            to: to.clone(),
+            message: message.clone(),
+        });
+
+        if self.should_duplicate() {
+            self.scheduled.push(ScheduledMessage {
+                deliver_at,
+                from,
+                to,
+                message,
+            });
+        }
+    }
+
+    /// How much longer than `delay` one delivery takes: nothing, or for the
+    /// `late_rate` share of them, 1 to `late_by_at_most` ticks, uniformly.
+    fn lateness(&mut self) -> Duration {
+        if self.late_by_at_most.as_ticks() == 0 || !self.chance(self.late_rate) {
+            return Duration::from_ticks(0);
+        }
+        Duration::from_ticks(self.rng.random_range(1..=self.late_by_at_most.as_ticks()))
+    }
+
     fn should_drop(&mut self) -> bool {
         self.chance(self.drop_rate)
     }
@@ -73,9 +111,10 @@ impl Inner {
     }
 }
 
-/// A shared, fully synchronous simulated network. Faults come from a seeded
-/// ChaCha8 PRNG, so runs are reproducible. `Clone` shares state: clones see each
-/// other's changes.
+/// A shared, fully synchronous simulated network: it holds sent messages
+/// until they are due and hands them to whoever drives the nodes. Faults come
+/// from a seeded ChaCha8 PRNG, so runs are reproducible. `Clone` shares state:
+/// clones see each other's changes.
 #[derive(Clone)]
 pub struct FakeNetwork {
     inner: Rc<RefCell<Inner>>,
@@ -87,43 +126,56 @@ impl FakeNetwork {
             inner: Rc::new(RefCell::new(Inner {
                 clock,
                 registered: BTreeSet::new(),
-                inboxes: BTreeMap::new(),
                 scheduled: Vec::new(),
                 drop_rate: 0.0,
                 duplicate_rate: 0.0,
                 reorder: false,
                 delay: Duration::from_ticks(0),
+                late_rate: 0.0,
+                late_by_at_most: Duration::from_ticks(0),
                 rng: ChaCha8Rng::seed_from_u64(0),
                 partition: None,
             })),
         }
     }
 
-    /// Must be called once per worker before it sends, receives or counts in `reachable_peers`.
+    /// Must be called once per worker before it sends, publishes or is sent to.
     pub fn register(&self, worker_id: WorkerId) {
-        let mut inner = self.inner.borrow_mut();
-        inner.inboxes.entry(worker_id.clone()).or_default();
-        inner.registered.insert(worker_id);
+        self.inner.borrow_mut().registered.insert(worker_id);
     }
 
-    /// Fraction of later sends that are dropped (`0.0..=1.0`).
+    /// Fraction of later deliveries that are dropped (`0.0..=1.0`): each
+    /// send, and each worker's copy of a publish, is dropped on its own.
     pub fn set_drop_rate(&self, rate: f64) {
         self.inner.borrow_mut().drop_rate = rate;
     }
 
-    /// Fraction of later sends also delivered a second time; a dropped message is never duplicated.
+    /// Fraction of later deliveries (sends, and each worker's copy of a
+    /// publish) also delivered a second time; a dropped one is never
+    /// duplicated.
     pub fn set_duplicate_rate(&self, rate: f64) {
         self.inner.borrow_mut().duplicate_rate = rate;
     }
 
-    /// Whether messages due in the same `pump()` are delivered in shuffled order.
+    /// Whether messages due in the same `take_due()` come back in shuffled order.
     pub fn set_reorder(&self, enabled: bool) {
         self.inner.borrow_mut().reorder = enabled;
     }
 
-    /// Delay applied to later sends.
+    /// Delay applied to later deliveries, sent or published.
     pub fn set_delay(&self, delay: Duration) {
         self.inner.borrow_mut().delay = delay;
+    }
+
+    /// Holds back a `rate` share of later deliveries (`0.0..=1.0`) by 1 to
+    /// `at_most` ticks past the configured delay, each drawn on its own: a
+    /// message that arrives long after others sent with it, even after a
+    /// partition that began since, as a real network can deliver one. A
+    /// rate of 0 draws nothing from the PRNG.
+    pub fn set_late_delivery(&self, rate: f64, at_most: Duration) {
+        let mut inner = self.inner.borrow_mut();
+        inner.late_rate = rate;
+        inner.late_by_at_most = at_most;
     }
 
     pub fn seed(&self, seed: u64) {
@@ -140,39 +192,84 @@ impl FakeNetwork {
         self.inner.borrow_mut().partition = None;
     }
 
-    /// Moves every message due by now into its recipient's inbox; returns how many.
-    pub fn pump(&self) -> usize {
+    /// Puts `new` wherever the current partition has `old`: a process
+    /// restarted under a new `WorkerId` keeps its host's place in the
+    /// network.
+    pub fn take_place_in_partition(&self, old: &WorkerId, new: &WorkerId) {
+        if let Some((group_a, group_b)) = self.inner.borrow_mut().partition.as_mut() {
+            for group in [group_a, group_b] {
+                if group.remove(old) {
+                    group.insert(new.clone());
+                }
+            }
+        }
+    }
+
+    /// Whether the current partition separates `a` and `b`.
+    pub fn is_partitioned(&self, a: &WorkerId, b: &WorkerId) -> bool {
+        self.inner.borrow().is_partitioned(a, b)
+    }
+
+    /// Schedules `message` for delivery after the configured delay, unless
+    /// the partition or the drop rate discards it; the duplicate rate may
+    /// schedule a second copy.
+    pub fn send(&self, from: WorkerId, to: WorkerId, message: ElectionMessage) {
+        let mut inner = self.inner.borrow_mut();
+
+        inner.assert_registered(&from, "send (from)");
+        inner.assert_registered(&to, "send (to)");
+
+        inner.schedule(from, to, message);
+    }
+
+    /// Sends `message` from `from` to every other registered worker, each
+    /// copy on its own as `send` would: the partition, drop rate, delay,
+    /// duplicate rate and reordering apply to each delivery separately. The
+    /// simulator models no gossip mesh; whoever `from` can reach hears it.
+    pub fn publish(&self, from: WorkerId, message: ElectionMessage) {
+        let mut inner = self.inner.borrow_mut();
+
+        inner.assert_registered(&from, "publish");
+
+        let recipients: Vec<WorkerId> = inner
+            .registered
+            .iter()
+            .filter(|to| **to != from)
+            .cloned()
+            .collect();
+        for to in recipients {
+            inner.schedule(from.clone(), to, message.clone());
+        }
+    }
+
+    /// Removes and returns every message due by now, in the order they were
+    /// sent (shuffled if reordering is on).
+    pub fn take_due(&self) -> Vec<ScheduledMessage> {
         let mut inner = self.inner.borrow_mut();
         let now = inner.clock.now();
 
-        let mut due = Vec::new();
-        let mut still_pending = Vec::new();
-        for scheduled in inner.scheduled.drain(..) {
-            if scheduled.deliver_at <= now {
-                due.push(scheduled);
-            } else {
-                still_pending.push(scheduled);
-            }
-        }
+        let (mut due, still_pending): (Vec<_>, Vec<_>) = inner
+            .scheduled
+            .drain(..)
+            .partition(|scheduled| scheduled.deliver_at <= now);
         inner.scheduled = still_pending;
 
         if inner.reorder {
             due.shuffle(&mut inner.rng);
         }
-
-        let count = due.len();
-        for scheduled in due {
-            inner
-                .inboxes
-                .entry(scheduled.to)
-                .or_default()
-                .push_back((scheduled.from, scheduled.message));
-        }
-        count
+        due
     }
-}
 
-impl FakeNetwork {
+    /// When the earliest message still on its way is due, if any is.
+    pub fn next_delivery_at(&self) -> Option<Instant> {
+        self.inner
+            .borrow()
+            .scheduled
+            .iter()
+            .map(|scheduled| scheduled.deliver_at)
+            .min()
+    }
+
     /// Every sent-but-not-yet-delivered message with its recipient.
     pub fn pending(&self) -> Vec<(WorkerId, ElectionMessage)> {
         self.inner
@@ -181,65 +278,5 @@ impl FakeNetwork {
             .iter()
             .map(|scheduled| (scheduled.to.clone(), scheduled.message.clone()))
             .collect()
-    }
-}
-
-impl PeerMessenger for FakeNetwork {
-    fn send(&self, from: WorkerId, to: WorkerId, message: ElectionMessage) {
-        let mut inner = self.inner.borrow_mut();
-
-        inner.assert_registered(&from, "send (from)");
-        inner.assert_registered(&to, "send (to)");
-
-        if inner.is_partitioned(&from, &to) {
-            return;
-        }
-
-        if inner.should_drop() {
-            return;
-        }
-
-        let deliver_at = inner.clock.now() + inner.delay;
-        inner.scheduled.push(ScheduledMessage {
-            deliver_at,
-            from: from.clone(),
-            to: to.clone(),
-            message: message.clone(),
-        });
-
-        if inner.should_duplicate() {
-            inner.scheduled.push(ScheduledMessage {
-                deliver_at,
-                from,
-                to,
-                message,
-            });
-        }
-    }
-
-    fn poll_inbox(&self, me: WorkerId) -> Vec<(WorkerId, ElectionMessage)> {
-        let mut inner = self.inner.borrow_mut();
-        inner.assert_registered(&me, "poll_inbox");
-        inner.inboxes.entry(me).or_default().drain(..).collect()
-    }
-
-    fn reachable_peers(&self, me: WorkerId) -> BTreeSet<WorkerId> {
-        let inner = self.inner.borrow();
-        let mut peers = inner.registered.clone();
-        peers.remove(&me);
-
-        if let Some((group_a, group_b)) = &inner.partition {
-            if group_a.contains(&me) {
-                for other in group_b {
-                    peers.remove(other);
-                }
-            } else if group_b.contains(&me) {
-                for other in group_a {
-                    peers.remove(other);
-                }
-            }
-        }
-
-        peers
     }
 }

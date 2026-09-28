@@ -66,15 +66,19 @@ impl Occupancy {
         self.holders.get(key).is_some_and(|holder| holder != task)
     }
 
-    /// `task` was claimed: it holds `key` now, and is no longer waiting.
-    /// Returns what it absorbed, for its worker to fold. The chain stays, so a
-    /// retry of `task` folds it again.
-    pub fn start(&mut self, key: &Key, task: &TaskId) -> Vec<TaskId> {
+    /// What `task` absorbed, oldest first, for its worker to fold once it
+    /// is claimed.
+    pub fn chain(&self, task: &TaskId) -> &[TaskId] {
+        self.chains.get(task).map_or(&[], Vec::as_slice)
+    }
+
+    /// `task` was claimed: it holds `key` now, and is no longer waiting. Its
+    /// chain stays, so a retry of `task` folds it again.
+    pub fn start(&mut self, key: &Key, task: &TaskId) {
         if self.waiting.get(key) == Some(task) {
             self.waiting.remove(key);
         }
         self.holders.insert(key.clone(), task.clone());
-        self.chains.get(task).cloned().unwrap_or_default()
     }
 
     /// `task` is over, however it ended: it frees `key`, and what it absorbed

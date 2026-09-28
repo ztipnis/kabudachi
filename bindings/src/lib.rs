@@ -1,7 +1,6 @@
 use pyo3::prelude::*;
 
 mod bridge;
-mod clock;
 mod election;
 mod local_node;
 mod runtime;

@@ -4,19 +4,28 @@ package kabudachi;
 import "ids.proto";
 import "task.proto";
 
-// The claim-arbitration protocol (`/kabudachi/claim/1`, README §27 Phase 2):
-// lets a follower ask whoever it currently believes is leader for permission
-// to run a specific pending task
-// (`core::scheduler::Scheduler::request_claim`).
+// The claim-arbitration protocol (`/kabudachi/claim/1`, README §8.2):
+// lets a worker ask the leader its node names for permission to run work,
+// either one specific pending task (`REQUEST_CLAIM`,
+// `core::scheduler::Scheduler::request_claim`) or up to a number of the
+// oldest pending ones (`CLAIM_OLDEST`, `Scheduler::claim_oldest`).
 //
 // Like `JoinRequest`/`JoinResponse` (join.proto), this is a genuine
 // request/response exchange used directly as a `request_response::Codec`'s
-// `Request`/`Response` types (see `kabudachi_net::claim_codec`) — no
-// wrapping oneof envelope on the request, since there is only ever one
-// request shape, the same reasoning join.proto documents.
+// `Request`/`Response` types (see `kabudachi_net::claim_codec`).
 
 message ClaimRequest {
-  TaskId task_id = 1;
+  oneof request {
+    // REQUEST_CLAIM(T): the one task the worker wants.
+    TaskId task_id = 1;
+    ClaimOldest oldest = 2;
+  }
+}
+
+// CLAIM_OLDEST: up to `limit` of the oldest pending tasks the leader can hand
+// out now. The leader may answer with fewer, or none.
+message ClaimOldest {
+  uint32 limit = 1;
 }
 
 // Mirrors `core::scheduler::Claim` field-for-field: the leader's grant of
@@ -49,9 +58,19 @@ message ClaimReject {
   ClaimRejectReason reason = 1;
 }
 
+// The answer to `CLAIM_OLDEST`: the claims granted, oldest task first.
+message ClaimBatch {
+  repeated Claim claims = 1;
+}
+
+// `accept` or `reject` answers `REQUEST_CLAIM`; `batch` or `reject` answers
+// `CLAIM_OLDEST`. A batch holds only as many claims as fit in one message.
+// Today the leader refuses `CLAIM_OLDEST` only as `CLAIM_REJECT_NOT_LEADER`,
+// but a claimant must handle any reason.
 message ClaimResponse {
   oneof result {
     Claim accept = 1;
     ClaimReject reject = 2;
+    ClaimBatch batch = 3;
   }
 }

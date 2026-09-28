@@ -1,193 +1,818 @@
-//! The worker-side election state machine (README §10-§14): leader liveness,
-//! ring roll call, candidate selection, voting, graceful draining and forced
-//! recovery through the coordination authority.
+//! The worker-side election state machine (README §10-§14, ADR-0001): leader
+//! liveness, the roll call and the vote, graceful draining, and the
+//! coordination authority's registration, fence and recovery path.
 //!
-//! Known gaps (see README §27 for the phase plan): leaders and candidates do
-//! not step down on seeing a higher term, `RollCall`/`Candidate` have no
-//! timeout or retry, `NoQuorum` is only exited through forced recovery, and
-//! there is no recovery fencing. Peer liveness comes from
-//! [`PeerMessenger::reachable_peers`] rather than observed heartbeats.
+//! A [`WorkerNode`] does no I/O of its own. Its driver feeds it [`Input`]s
+//! through [`WorkerNode::step`] and carries out the [`Output`]s each returned
+//! [`Step`] lists: it sends and publishes the messages, reports the state
+//! changes and hands the leadership grant to the worker's scheduler. The node
+//! keeps its timers against its own clock, and each step names the next
+//! instant at which a [`Input::Tick`] can change anything, so the driver can
+//! sleep until then.
+//!
+//! Followers never hold the member list. A node knows its shard's
+//! configuration only as a generation and a voter count (two, for a joint
+//! configuration), plus its own admission generation and, while a founding
+//! is uncommitted, the one it held before (see [`crate::configuration`]);
+//! only the leader holds a [`Roster`] of the members.
+//!
+//! Liveness comes from heartbeats alone (README §12.1, ADR-0001 decision 16),
+//! never from the connections the driver reports. Every follower heartbeats
+//! its leader, and the leader answers each heartbeat with an ack, which also
+//! carries the leader's configuration and the follower's admission
+//! generations. A follower suspects a leader whose acks stop. A leader keeps
+//! its quorum only while a quorum of its configuration (of both sides, for
+//! a joint one) keeps confirming its acks, which its followers do by echoing
+//! the newest one they accepted: it goes `NoQuorum` when its quorum-contact
+//! lease runs out, and its leadership grant ends where that lease does.
+//!
+//! A follower that suspects its leader, after a suspicion timeout jittered
+//! per worker and term, publishes a roll call to its shard (see the
+//! `roll_call` module); every worker that takes part answers it, or refuses
+//! it and says why (see the `ballot` module). If, at the call's deadline, the
+//! voters of its configuration among the respondents are a quorum, the
+//! initiator stands as the candidate, asks its respondents for their votes
+//! (see the `vote_round` module), and wins once those that grant it are a
+//! majority of its respondents and the voters among them a quorum of the
+//! configuration too. The winning roll call's respondents found the next
+//! configuration (ADR-0001 decision 8): a joint one, whose new side has one
+//! voter per respondent, every one admitted at its new generation, and
+//! whose old side is the configuration the roll call ran under, where each
+//! respondent still counts by the admission it held before. Every roll
+//! call, win and lease under it needs a majority of both sides, so no
+//! election under the old configuration alone can win beside it. The winner
+//! leads it, certifies it to every respondent, and commits it to the new
+//! side alone once a majority of each side says, in a heartbeat confirming
+//! one of its acks, that it holds exactly it; a worker that missed the call
+//! is no voter of the new side until the next election it answers. An
+//! election won under a joint configuration not yet committed founds
+//! nothing new: its winner re-stamps that one at a generation of its own
+//! term and commits it. Each such change, and a removal, re-bases the
+//! configuration at its new generation and re-admits there the members the
+//! leader counts on the new side (see the `configuration` module), so a
+//! member that misses the ack of a change is no voter of it until a later
+//! ack repairs its admission. A call short of a quorum at its
+//! deadline leaves the initiator `NoQuorum`, and a candidacy
+//! not won within as long again leaves it `LeaderSuspect`; either way it
+//! tries again later, at a later term, after a fresh jittered suspicion
+//! timeout. A `NoQuorum` node keeps taking part in other nodes' elections,
+//! and an ack from a leader returns it to `Active`.
+//!
+//! A leader also changes its configuration while it lives (ADR-0001
+//! decisions 9 and 10). It admits pending joiners in batches, one change at
+//! a time: a joint configuration at its next generation, whose new side
+//! takes in each joiner that has confirmed one of its acks, committed like a
+//! founding. It applies a departing worker's `SelfRemove`, which a follower
+//! sends to its leader alone, at once and with no commit round, unless the
+//! worker has seen a later term than the leader's (the term guard). A
+//! draining leader announces its own departure on final acks.
+//!
+//! A node that holds or contests a term steps down once it sees a later one
+//! (ADR-0001 decision 14): to `Active` under that term's leader when its ack
+//! is what told it, and otherwise to `LeaderSuspect`. Only a vote granted, an
+//! accepted ack, a refusal or an accepted election certificate raises the
+//! highest term a node has seen, never a roll call it answers, so a follower
+//! with a flaky link cannot depose a healthy leader by calling a roll.
+//!
+//! A node configured with a coordination authority (ADR-0001 decisions 11
+//! and 12) also keeps its registration there, through calls it asks its
+//! driver to make (see the `authority` module): it fences itself once it
+//! has failed to renew for a TTL less drift, and on reconnecting resumes if
+//! the shard's recovery epoch there is still its own, lineage included (see
+//! `RecoveryEpoch`), and otherwise rejoins. Its leader acts only
+//! while it holds the recovery fence, so its grant ends at the earlier of
+//! the fence and the quorum-contact lease. A roll call of its own that falls
+//! short of its returning quorum takes the authority path (see the
+//! `forced_recovery` module): with a majority of the authority's live
+//! registrations among its respondents it swaps the recovery epoch, waits
+//! out the fence, and leads a configuration founded at the new epoch; if
+//! the epoch is missing, the shard is abandoned and the node stops. A node
+//! that hears a leader of a later recovery epoch adopts that epoch, and
+//! that leader's configuration, from its ack. A leader also reports each
+//! worker it has not heard from for a suspicion timeout and a reconnect
+//! timeout as lost (README §8.3).
+//!
+//! Known gaps (see README §27 for the phase plan):
+//! - With no authority, no removal reaches a leaderless `NoQuorum` shard:
+//!   only a leader applies a departing worker's `SelfRemove`, so such a
+//!   shard leaves `NoQuorum` only once enough of its peers return. With an
+//!   authority, a departed worker's registration lapses and the authority
+//!   path counts it out.
+//! - A worker learns of a new leader from the ack that leader sends to every
+//!   connected peer when it wins or when a connection to the worker opens, or
+//!   from a roll-call refusal naming it. A worker whose ack is lost on a
+//!   connection that stays up, or that holds no connection to the new leader,
+//!   keeps following its old leader until one of those reaches it: for a
+//!   voter with no connection to the new leader, once it suspects its old
+//!   leader and a worker that follows the new one refuses its roll call.
 
-use std::cmp::Reverse;
+mod authority;
+mod authority_lease;
+mod ballot;
+mod forced_recovery;
+mod quorum_contact_lease;
+mod roll_call;
+mod vote_round;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::coordination_authority::CoordinationAuthority;
+pub use authority::{AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings};
+
+use crate::configuration::{Admission, Configuration, Generation, Roster, Tally};
+use crate::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
 use crate::hashing::{Field, HashFunction};
-use crate::membership::MembershipView;
-use crate::protocol::generated;
-use crate::protocol::ids::{IncarnationId, ShardId, WorkerId};
+use crate::protocol::ids::{IdGenerator, IncarnationId, ShardId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{
-    ElectionCertificate, ElectionMessage, LeaderHeartbeatAck, RollCall, RollCallObservation,
-    SelfRemove, VoteGrant, VoteReject, VoteRejectReason, VoteRequest, election_message,
+    AckEcho, ElectionCertificate, ElectionMessage, ElectionReject, ElectionRejectReason,
+    JoinResponse, KnownLeader, LeaderHeartbeatAck, RollCall, RollCallReply, SelfRemove, VoteGrant,
+    VoteRequest, WorkerHeartbeat, election_message,
 };
 use crate::protocol::worker_state::WorkerState;
+use crate::scheduler::{LeadershipGrant, LeaseEnd, Scheduler};
 use crate::time::{Clock, Duration, Instant};
-use crate::transport::PeerMessenger;
 
-pub struct WorkerNode<C, M, V, A>
+use authority_lease::{AuthorityLease, Reconnect};
+use ballot::{Ballot, RollCallVerdict, VoteVerdict, Voter};
+use forced_recovery::{ForcedRecovery, Next, cannot_recover_from};
+use quorum_contact_lease::QuorumContactLease;
+use roll_call::{CallRank, RollCallRound};
+use vote_round::VoteRound;
+
+/// How long a leader waits, after it would first suspect a silent worker,
+/// before it reports that worker lost and its TaskRuns are replayed; and,
+/// less drift, how long a worker cut off from its leader or orphaned has
+/// to abort its own (README §8.3). See
+/// [`WorkerNode::with_reconnect_timeout`].
+pub const DEFAULT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub struct WorkerNode<C>
 where
     C: Clock,
-    M: PeerMessenger,
-    V: MembershipView,
-    A: CoordinationAuthority,
 {
     my_id: WorkerId,
     incarnation_id: IncarnationId,
     shard_id: ShardId,
     state: WorkerState,
     recovery_epoch: u64,
+    /// The lineage of this node's recovery epoch (see
+    /// [`RecoveryEpoch`]); `None` for a node that has not yet joined a
+    /// shard.
+    recovery_lineage: Option<u64>,
     highest_term_seen: u64,
     last_leader_contact: Instant,
-    suspect_timeout: Duration,
+    timings: ElectionTimings,
     clock: C,
-    transport: M,
-    membership: V,
-    authority: A,
+    /// What the jitter on this node's suspicion timeout is derived from.
     hash_function: HashFunction,
-    /// Roll calls already processed by this node. Grows for the life of the
-    /// node; bounding it is deferred.
-    seen_roll_calls: BTreeSet<String>,
-    /// Makes this node's own roll-call IDs (`"{my_id}-{seq}"`) unique.
-    next_roll_call_seq: u64,
+    /// This node's standing with its coordination authority; `None` for a
+    /// node with no authority configured.
+    authority: Option<AuthorityLease>,
+    /// The authority-path attempt in progress, from the census of the roll
+    /// call that fell short, while `NoQuorum` or, waiting out the fence,
+    /// `Candidate`.
+    recovery: Option<ForcedRecovery>,
+    /// When this node asked for the one authority read or swap it now waits
+    /// on: its forced recovery's current step, or, while `Fenced`, its read
+    /// of the recovery epoch. Replies arrive whenever the driver gets them,
+    /// possibly out of order, so a reply to any earlier call is stale and
+    /// ignored.
+    awaited_reply: Option<Instant>,
+    /// Why this node stopped; `None` until it is `Stopped`.
+    stop_reason: Option<StopReason>,
+    /// See [`Self::with_reconnect_timeout`].
+    reconnect_timeout: Duration,
+    /// While `Leader`: when it last heard from each worker it has not yet
+    /// reported lost.
+    last_heard: BTreeMap<WorkerId, Instant>,
+    /// The latest instant, on this node's clock, before which every leader
+    /// that may yet replay this worker's TaskRuns had heard from it or had
+    /// not yet won; `None` until any has (see [`Self::abort_deadline`]).
+    contact_floor: Option<Instant>,
+    /// Since it last fenced itself, orphaned: by when it must have aborted
+    /// its TaskRuns (ADR-0001 decision 12). Cleared once it resumes, or once
+    /// a leader acks it after it rejoined.
+    orphan_abort_by: Option<Instant>,
+    /// The abort deadline this node last reported (see
+    /// [`Output::AbortDeadline`]), so it reports each change once.
+    reported_abort_deadline: Option<Instant>,
+    /// The configuration this node knows. `None` for a joiner until it
+    /// accepts its first leader ack.
+    configuration: Option<Configuration>,
+    /// The generation at which this node became a voter. `None` for a
+    /// pending member.
+    admission: Option<Generation>,
+    /// While this node holds a joint configuration an election founded,
+    /// the admission generation it held before that election admitted it;
+    /// `None` otherwise.
+    prior_admission: Option<Generation>,
     /// The term this node is contesting or holds. Meaningful from `Candidate`
     /// onward.
     term: u64,
-    /// term -> candidate this node voted for. One entry per term is what
-    /// enforces "at most one vote per term".
-    voted_for: BTreeMap<u64, WorkerId>,
-    /// Electorate members that granted this node's current candidacy,
-    /// starting with the implicit self-vote.
-    votes_received: BTreeSet<WorkerId>,
+    /// The roll calls this node answered and the votes it granted.
+    ballot: Ballot,
+    /// Until when this node starts no roll call of its own: a roll-call
+    /// deadline after it last answered another worker's roll call.
+    own_roll_calls_suppressed_until: Instant,
+    /// The earliest instant at which this node, while `LeaderSuspect` or
+    /// `NoQuorum`, may start its next roll call: when it began suspecting
+    /// its leader, or, after it gave up a term it held or contested or lost
+    /// its quorum, a fresh suspicion timeout later.
+    next_roll_call_at: Instant,
+    /// The roll call this node started last, while it is collecting
+    /// replies to it.
+    roll_call: Option<RollCallRound>,
+    /// The vote this node runs while it stands as the candidate.
+    vote: Option<VoteRound>,
+    /// The members and pending joiners this node leads. Set when it wins;
+    /// meaningful only while `Leader`.
+    roster: Option<Roster>,
+    /// The leader whose heartbeat ack this node last accepted, or that a JOIN
+    /// pointed it at, or that a roll-call refusal named, or this node itself
+    /// once it wins, with the term that leader was elected in.
+    leader: Option<(WorkerId, u64)>,
+    /// The term and send token of the ack this node accepted last, which its
+    /// heartbeats echo so the leader learns the ack arrived.
+    newest_accepted_ack: Option<AckEcho>,
+    /// The leader this node is heartbeating and when its next heartbeat is
+    /// due. `None` while it heartbeats no one.
+    next_heartbeat: Option<(WorkerId, Instant)>,
+    /// The peers the driver reports this node connected to.
+    connected: BTreeSet<WorkerId>,
+    /// The acks confirmed since this node last won. Meaningful only while
+    /// `Leader`.
+    lease: QuorumContactLease,
+    /// The grant this node last reported to its driver (see
+    /// [`Output::Grant`]), so it reports each change once.
+    reported_grant: Option<LeadershipGrant>,
+    /// A drain was asked for in a state that cannot drain yet.
+    drain_requested: bool,
+    /// While `Leader`: the workers whose SELF_REMOVE it has accepted since
+    /// it last changed its configuration, to take out together (see
+    /// [`Self::apply_pending_removals`]).
+    pending_removals: BTreeSet<WorkerId>,
+    /// What the step in progress has produced so far.
+    outputs: Vec<Output>,
 }
 
-/// The deterministic priority of `candidate` in the election for `term`
-/// (README §12.5); the highest among eligible workers wins. Workers using the
-/// same `hash_function` compute the same winner on any build.
-pub fn candidate_priority(
-    hash_function: &HashFunction,
-    shard_id: &ShardId,
-    recovery_epoch: u64,
-    term: u64,
-    candidate: &WorkerId,
-) -> u64 {
-    hash_function.hash_to_u64(&[
-        Field::Text(shard_id.as_str()),
-        Field::Text(candidate.as_str()),
-        Field::Number(recovery_epoch),
-        Field::Number(term),
-    ])
+/// The timers a [`WorkerNode`] runs its election on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElectionTimings {
+    /// The shortest time a node goes without an accepted leader ack before
+    /// it suspects its leader. Each node waits longer, by less than half of
+    /// this, by a share hashed from its `WorkerId` and the latest term it
+    /// knows of, so workers rarely suspect at the same instant (ADR-0001
+    /// decision 15). A leader's lease lasts at most its own
+    /// `suspect_timeout` less the drift margin (see
+    /// [`Self::clock_drift_divisor`]), which is safe only if no follower
+    /// suspects it sooner: every worker in the shard must use the same
+    /// value, or at least no follower a shorter one than its leader. A node
+    /// also refuses roll calls and votes for exactly this long after it last
+    /// heard from its leader (or, before it has one, after it was built or
+    /// joined).
+    pub suspect_timeout: Duration,
+    /// How often a follower heartbeats its leader, which answers each
+    /// heartbeat with an ack. A heartbeat confirms the ack that answered the
+    /// follower's previous one, so just before a confirmation arrives the
+    /// newest one a leader holds can be two intervals and a round trip old:
+    /// keep that well inside the lease length (see [`Self::lease_length`]),
+    /// or a leader whose followers are all alive runs out of lease. Must not
+    /// be zero, and twice it must be shorter than the lease length unless
+    /// the node starts alone a quorum (see [`WorkerNode::new`]).
+    pub heartbeat_interval: Duration,
+    /// How long a roll call runs before its initiator decides on it: it
+    /// stands as the candidate if the voters among its respondents are a
+    /// quorum by then, and goes `NoQuorum` otherwise (ADR-0001 decisions 13
+    /// and 15). A candidate then has as long again to win its vote. A node
+    /// that answered another worker's roll call starts none of its own until
+    /// twice this long after it answered, the longest that call's census and
+    /// vote can take while messages take less than this to arrive: that
+    /// worker is being elected meanwhile (ADR-0001 decision 5). An initiator
+    /// that keeps failing to find a quorum calls again every roll-call
+    /// deadline and suspicion timeout, so with a suspicion timeout no longer
+    /// than this it can hold one answerer back for as long as it keeps
+    /// calling (others may still call). Keep it well above the time a roll
+    /// call takes to reach the shard and its replies to come back, and below
+    /// `suspect_timeout`. Usually [`Self::DEFAULT_ROLL_CALL_DEADLINE`]. Must
+    /// not be zero (see [`WorkerNode::new`]).
+    pub roll_call_deadline: Duration,
+    /// How far apart the rates of two workers' clocks, or of a worker's
+    /// and its coordination authority's, may be, as a divisor: every
+    /// deadline a node keeps on its own clock for something another clock
+    /// times gives up `1 / clock_drift_divisor` of its length, rounded up to
+    /// a whole tick. Usually [`Self::DEFAULT_CLOCK_DRIFT_DIVISOR`].
+    ///
+    /// The clocks need not agree on the time, only on its rate. With a
+    /// divisor of 10, over one suspicion timeout on a follower's clock the
+    /// leader's clock advances at least nine tenths of it, so a leader whose
+    /// lease is a suspicion timeout less a tenth (see [`Self::lease_length`])
+    /// stops acting before any follower that received its last confirmed
+    /// ack can suspect it (ADR-0001 decision 16). The same share comes off a
+    /// registration or fence TTL (the node gives up before the authority
+    /// does), off the time a worker takes to fence itself and abort its
+    /// runs (ADR-0001 decision 12), and off the time before which no leader
+    /// can replay a cut-off worker's runs (see [`Output::AbortDeadline`]).
+    /// Lower it on hosts whose clock rates can differ more. Every worker in
+    /// the shard must use the same value. Must not be zero.
+    pub clock_drift_divisor: u64,
 }
 
-impl<C, M, V, A> WorkerNode<C, M, V, A>
+impl ElectionTimings {
+    /// The default `roll_call_deadline`, set from the census latency
+    /// measured in Phase 2 (ADR-0001 decision 15): over 30 leader losses in
+    /// a fully connected shard of five, all in one process on one loopback
+    /// host (a debug build), each of the 90 replies to the winning roll call
+    /// reached its initiator within 11 ms of the call (p50 6 ms; the p99 of
+    /// 90 is their maximum). 250 ms leaves over twenty times that for
+    /// replies crossing hosts, a publish relayed through the gossip mesh
+    /// rather than sent to a direct peer (not exercised there), and a loaded
+    /// host, and adds a quarter of a second to each election. A deadline
+    /// too short costs a `NoQuorum` and a retry, never safety. Deployments
+    /// whose round trips run to tens of milliseconds, or whose shards are
+    /// much larger, should measure their own and raise it.
+    pub const DEFAULT_ROLL_CALL_DEADLINE: Duration = Duration::from_millis(250);
+
+    /// The default `clock_drift_divisor`: clock rates within a tenth of
+    /// each other, so a lease lasts at most nine tenths of the suspicion
+    /// timeout.
+    pub const DEFAULT_CLOCK_DRIFT_DIVISOR: u64 = 10;
+
+    /// Timings with this suspicion timeout and heartbeat interval, which
+    /// have no default (they depend on the deployment's network), and every
+    /// other setting at its default: [`Self::DEFAULT_ROLL_CALL_DEADLINE`]
+    /// and [`Self::DEFAULT_CLOCK_DRIFT_DIVISOR`].
+    pub fn new(suspect_timeout: Duration, heartbeat_interval: Duration) -> Self {
+        ElectionTimings {
+            suspect_timeout,
+            heartbeat_interval,
+            roll_call_deadline: Self::DEFAULT_ROLL_CALL_DEADLINE,
+            clock_drift_divisor: Self::DEFAULT_CLOCK_DRIFT_DIVISOR,
+        }
+    }
+
+    /// Replaces [`Self::DEFAULT_ROLL_CALL_DEADLINE`] (see
+    /// [`Self::roll_call_deadline`]).
+    pub fn with_roll_call_deadline(mut self, roll_call_deadline: Duration) -> Self {
+        self.roll_call_deadline = roll_call_deadline;
+        self
+    }
+
+    /// Replaces [`Self::DEFAULT_CLOCK_DRIFT_DIVISOR`] (see
+    /// [`Self::clock_drift_divisor`]).
+    pub fn with_clock_drift_divisor(mut self, clock_drift_divisor: u64) -> Self {
+        self.clock_drift_divisor = clock_drift_divisor;
+        self
+    }
+
+    /// How long a leader's quorum-contact lease lasts after the
+    /// quorum-contact time: `suspect_timeout` less its drift share, a
+    /// `1 / clock_drift_divisor` of it rounded up to a whole tick (rounding
+    /// down would let the lease outlast the share it promises to keep).
+    pub fn lease_length(&self) -> Duration {
+        self.less_drift(self.suspect_timeout)
+    }
+
+    /// `duration` less its share for clock drift (see
+    /// [`Self::clock_drift_divisor`]).
+    pub(crate) fn less_drift(&self, duration: Duration) -> Duration {
+        authority::less_drift(duration, self.clock_drift_divisor)
+    }
+}
+
+/// The configuration a [`WorkerNode`] built by [`WorkerNode::new`] starts
+/// with, and its own place in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownConfiguration {
+    pub configuration: Configuration,
+    /// The node's admission generation; `None` for a pending member.
+    pub admission: Option<Generation>,
+}
+
+/// Something that happens to a [`WorkerNode`], fed in through
+/// [`WorkerNode::step`].
+// A message carrying a configuration makes `Message` far larger than the
+// other variants. An input is built and consumed within one step, never
+// stored in bulk, so boxing it would buy nothing but indirection at every
+// call site.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input {
+    /// Time has passed: the node checks its timers against its clock.
+    Tick,
+    /// An election message from another worker, sent to this node or
+    /// published to its shard.
+    Message {
+        from: WorkerId,
+        message: ElectionMessage,
+    },
+    /// This node now holds a connection to the peer. A leader acks any peer
+    /// it newly connects to, so the peer learns who leads. Reporting a peer
+    /// that is already connected, or this node itself, changes nothing.
+    PeerConnected(WorkerId),
+    /// This node no longer holds a connection to the peer. Reporting a peer
+    /// that is not connected changes nothing.
+    PeerDisconnected(WorkerId),
+    /// The coordination authority answered a call this node asked for (see
+    /// [`Output::Authority`]). A node with no authority ignores it.
+    Authority(AuthorityReply),
+    /// Leave the shard gracefully (README §12.3, §18, ADR-0001 decision
+    /// 10): send `SelfRemove` to the leader this node follows, if any, or as
+    /// the leader announce the configuration without itself on a final ack
+    /// to every connected peer, and end `Stopped`. From `Active` or `Leader`
+    /// this happens at once; from `Draining` or `Stopped` the request does
+    /// nothing; from any other state, `Fenced` among them, the node keeps it and
+    /// drains as soon as it reaches `Active` or `Leader`, in the same step. A
+    /// driver asks once.
+    ///
+    /// A drain kept in a state the node never leaves for `Active` or
+    /// `Leader` waits for good: a node whose peers never return, which keeps
+    /// retrying roll calls from `NoQuorum`, or a `Bootstrapping` node that
+    /// never joins. A driver that waits for `Stopped` must not rely on it
+    /// there.
+    Drain,
+}
+
+/// Something a [`WorkerNode`] asks its driver to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Output {
+    /// Send `message` to `to`. Delivery need not be immediate or reliable:
+    /// the election tolerates delayed, dropped, duplicated and reordered
+    /// messages.
+    Send {
+        to: WorkerId,
+        message: ElectionMessage,
+    },
+    /// Publish `message` to every worker subscribed to the node's shard.
+    /// Delivery is not guaranteed: the election tolerates a publish that
+    /// reaches some workers and not others, late, twice or out of order.
+    Publish { message: ElectionMessage },
+    /// The node moved into this state. A step that moves it more than once
+    /// reports each move, in order.
+    StateChanged(WorkerState),
+    /// The node's leadership grant, reported whenever it changes and whenever
+    /// the node leaves `Leader`, for its driver to hand to the node's
+    /// scheduler (see [`apply_to_scheduler`]): `Some` while the node is
+    /// `Leader` with a lease, ending where the lease does; `None` otherwise.
+    ///
+    /// A leader that is not alone a quorum first holds a lease once a quorum
+    /// has confirmed one of its acks, and its lease end moves as more
+    /// confirmations arrive. A node that leaves `Leader` reports `None` just
+    /// before that state change, so nothing it asks for after leaving can
+    /// let another leader act while its own grant stands.
+    Grant(Option<LeadershipGrant>),
+    /// Make this call on the node's coordination authority, and hand the
+    /// node the reply as [`Input::Authority`] (see [`AuthorityCall::perform`]).
+    /// Only a node with an authority asks.
+    Authority(AuthorityCall),
+    /// While `Leader`: the worker has not been heard from for a suspicion
+    /// timeout and then a reconnect timeout (README §8.3), so every TaskRun
+    /// it holds is lost and may be replayed (see [`apply_to_scheduler`]).
+    /// Reported once; a worker heard from again is watched afresh.
+    WorkerLost(WorkerId),
+    /// By when, on the node's clock, this worker must have aborted every
+    /// TaskRun it is running (README §8.3, §25.1.9): `Some` once it has gone
+    /// a suspicion timeout, less drift, without evidence that its leader
+    /// still hears it, or once it has fenced itself (ADR-0001 decision 12);
+    /// `None` while it has nothing to abort. Reported whenever it changes,
+    /// like [`Output::Grant`]: a later report replaces an earlier one, so a
+    /// worker that its leader hears again before the deadline withdraws it
+    /// and keeps its runs. For the worker's task executor; the scheduler has
+    /// nothing to do with it.
+    ///
+    /// The deadline comes before any leader can replay those runs. A leader
+    /// replays a worker's runs (see [`Output::WorkerLost`]) a suspicion
+    /// timeout and a reconnect timeout after it last heard the worker, or
+    /// after it won if it has not heard it since. An ack from a leader that
+    /// holds a grant echoes the send instant of the heartbeat it answers, so
+    /// the follower knows that leader heard it no earlier than that, and no
+    /// rival can win before that leader's grant ends, after it sent the ack;
+    /// a leader that stops leading knows no rival won before its own grant
+    /// ended. From
+    /// the latest such instant the deadline is the suspicion timeout plus the
+    /// reconnect timeout, less a tenth for clock drift (the same rate bound
+    /// the leader lease assumes). Every worker in the shard must use the same
+    /// `suspect_timeout` and reconnect timeout (see
+    /// [`WorkerNode::with_reconnect_timeout`]).
+    AbortDeadline(Option<Instant>),
+    /// An alert: the authority path found the shard's recovery epoch gone,
+    /// so the shard is abandoned (README §15.5) and the node has stopped
+    /// (see [`StopReason::Abandoned`]). A restart re-enters the bootstrap
+    /// cascade.
+    ShardAbandoned,
+}
+
+/// Why a node is `Stopped`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// It drained, leaving the shard gracefully.
+    Drained,
+    /// Its shard was abandoned (ADR-0001 decision 11.5): neither a quorum of
+    /// its configuration nor the authority's recovery epoch was left to
+    /// prove the shard's continuity.
+    Abandoned,
+}
+
+/// What one call into a [`WorkerNode`] produced. A driver that drops one
+/// loses the messages it asks to send and the deadline it reports, and can
+/// leave the node's scheduler with a stale grant. The node reports a grant
+/// only when it changes, so after a dropped `Grant(None)` an unbounded grant
+/// keeps the scheduler leading for ever: unlike a lost message, nothing in
+/// the election makes up for it.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use = "a Step carries messages to send, the node's next deadline and \
+              any change to its leadership grant"]
+pub struct Step {
+    /// In the order the node produced them.
+    pub outputs: Vec<Output>,
+    /// The earliest instant at which an [`Input::Tick`] can change anything.
+    /// `None` when only another input can. A `Tick` at this instant always
+    /// moves the node into another state or reports a later deadline (or
+    /// none), so a driver may tick the node again at once while its deadline
+    /// has come.
+    pub next_deadline: Option<Instant>,
+}
+
+/// Applies to `scheduler` what `outputs`, one step of a worker's election,
+/// ask of it, in order: each leadership grant the step reports, and each
+/// worker it reports lost, whose TaskRuns `Scheduler::lose_worker` replays.
+/// A lost worker reported to a scheduler that no longer leads changes
+/// nothing. Messages, authority calls, state changes, the abort deadline and
+/// alerts are the driver's to carry out and leave it alone.
+///
+/// `scheduler` must read the clock the node reads: a grant's lease ends at
+/// an instant of the node's clock, and the scheduler compares it with its
+/// own.
+pub fn apply_to_scheduler<C: Clock, I: IdGenerator>(
+    outputs: &[Output],
+    scheduler: &mut Scheduler<C, I>,
+) {
+    for output in outputs {
+        match output {
+            Output::Grant(grant) => scheduler.set_leadership_grant(*grant),
+            Output::WorkerLost(worker) => {
+                // Refused only when this scheduler no longer leads, and then
+                // the next leader decides what the worker held.
+                let _ = scheduler.lose_worker(worker);
+            }
+            Output::Send { .. }
+            | Output::Publish { .. }
+            | Output::StateChanged(_)
+            | Output::Authority(_)
+            | Output::AbortDeadline(_)
+            | Output::ShardAbandoned => {}
+        }
+    }
+}
+
+impl<C> WorkerNode<C>
 where
     C: Clock,
-    M: PeerMessenger,
-    V: MembershipView,
-    A: CoordinationAuthority,
 {
-    /// Constructs a node in `WorkerState::Active` with a full membership
-    /// known up front. For a node that must discover its membership first,
-    /// see [`Self::bootstrapping`]. The leader-contact timer starts now so a
-    /// new node isn't immediately suspicious.
-    #[allow(clippy::too_many_arguments)]
+    /// Constructs a node in `WorkerState::Active` that already knows its
+    /// shard's configuration and its own admission generation in it, at the
+    /// configuration's recovery epoch. For a node that must join its shard
+    /// first, see [`Self::bootstrapping`]; for the worker that creates a
+    /// shard, [`Self::genesis`]. The leader-contact timer starts now so a
+    /// new node isn't immediately suspicious. The node starts connected to
+    /// no one: its driver reports the connections it holds as
+    /// [`Input::PeerConnected`]. Its recovery epoch is of lineage 0 unless
+    /// [`Self::with_recovery_lineage`] names another.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timings.heartbeat_interval`, `timings.roll_call_deadline`
+    /// or `timings.clock_drift_divisor` is zero, or if the node is not alone
+    /// a quorum of `known.configuration` and twice `timings.heartbeat_interval`
+    /// is not shorter than `timings.lease_length()`: a caller bug. A lone
+    /// voter never needs a lease, so it may run with any suspicion timeout,
+    /// zero among them.
     pub fn new(
         my_id: WorkerId,
         incarnation_id: IncarnationId,
         shard_id: ShardId,
         clock: C,
-        transport: M,
-        membership: V,
-        authority: A,
-        suspect_timeout: Duration,
+        known: KnownConfiguration,
+        authority: Option<AuthorityTimings>,
+        timings: ElectionTimings,
     ) -> Self {
-        Self::with_initial_state(
+        let mut node = Self::with_initial_state(
             WorkerState::Active,
             my_id,
             incarnation_id,
             shard_id,
             clock,
-            transport,
-            membership,
             authority,
-            suspect_timeout,
+            timings,
+        );
+        let mut alone = Tally::against(&known.configuration);
+        alone.record(node.my_id.clone(), known.admission);
+        if !alone.has_quorum() {
+            assert_heartbeats_keep_a_lease(&timings);
+        }
+        node.recovery_epoch = known.configuration.generation().recovery_epoch();
+        node.recovery_lineage = Some(0);
+        node.configuration = Some(known.configuration);
+        node.admission = known.admission;
+        node
+    }
+
+    /// Constructs the node of the worker that creates a shard at
+    /// `recovery_epoch` (ADR-0001 decision 1): it starts `Active` as the only
+    /// voter of the genesis configuration, admitted at the genesis
+    /// generation. Like any other node it leads once its suspicion timeout
+    /// has passed and its own roll call, of one voter, has elected it at the
+    /// call's deadline.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Self::new`] does. The node starts alone a quorum, so its
+    /// heartbeat interval is not checked against its lease: a lone node may
+    /// run with any suspicion timeout, zero among them. Every worker that
+    /// joins its shard later is checked when it is built, and every worker
+    /// in a shard runs the same timings (see
+    /// [`ElectionTimings::suspect_timeout`]).
+    pub fn genesis(
+        my_id: WorkerId,
+        incarnation_id: IncarnationId,
+        shard_id: ShardId,
+        clock: C,
+        recovery_epoch: u64,
+        authority: Option<AuthorityTimings>,
+        timings: ElectionTimings,
+    ) -> Self {
+        Self::new(
+            my_id,
+            incarnation_id,
+            shard_id,
+            clock,
+            KnownConfiguration {
+                configuration: Configuration::genesis(recovery_epoch),
+                admission: Some(Generation::genesis(recovery_epoch)),
+            },
+            authority,
+            timings,
         )
     }
 
     /// Constructs a node in `WorkerState::Bootstrapping` (README §27 Phase 2
-    /// bootstrap join protocol): for a fresh node that has not yet discovered
-    /// the shard's current membership, rather than being statically
-    /// pre-configured with it like [`Self::new`]. `membership` is typically
-    /// empty; call [`Self::finish_joining`] once something outside `core`
-    /// (`net`'s `/kabudachi/join/1` handshake) has resolved a membership list
-    /// to drive `Bootstrapping -> Joining -> Active`.
+    /// bootstrap join protocol): for a fresh node joining a shard that already
+    /// exists. It knows no configuration and has no admission generation;
+    /// call [`Self::finish_joining`] once something outside `core` (`net`'s
+    /// `/kabudachi/join/1` handshake) has learned who leads the shard, to
+    /// drive `Bootstrapping -> Joining -> Active`. It learns the shard's
+    /// configuration from its leader's first ack.
     ///
-    /// `tick()` no-ops in both `Bootstrapping` and `Joining` (see its doc):
-    /// nothing here times out a stalled join, by design — that is left to
-    /// whatever drives the join handshake itself, not this state machine.
-    #[allow(clippy::too_many_arguments)]
+    /// A `Tick` does nothing in `Bootstrapping` or `Joining`, and neither
+    /// state has a deadline: nothing here times out a stalled join, by
+    /// design — that is left to whatever drives the join handshake itself,
+    /// not this state machine.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timings.heartbeat_interval`, `timings.roll_call_deadline`
+    /// or `timings.clock_drift_divisor` is zero, or if twice
+    /// `timings.heartbeat_interval` is not shorter than
+    /// `timings.lease_length()`: a caller bug. A joining node's electorate is
+    /// never itself alone.
     pub fn bootstrapping(
         my_id: WorkerId,
         incarnation_id: IncarnationId,
         shard_id: ShardId,
         clock: C,
-        transport: M,
-        membership: V,
-        authority: A,
-        suspect_timeout: Duration,
+        authority: Option<AuthorityTimings>,
+        timings: ElectionTimings,
     ) -> Self {
-        Self::with_initial_state(
+        let node = Self::with_initial_state(
             WorkerState::Bootstrapping,
             my_id,
             incarnation_id,
             shard_id,
             clock,
-            transport,
-            membership,
             authority,
-            suspect_timeout,
-        )
+            timings,
+        );
+        assert_heartbeats_keep_a_lease(&timings);
+        node
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn with_initial_state(
         state: WorkerState,
         my_id: WorkerId,
         incarnation_id: IncarnationId,
         shard_id: ShardId,
         clock: C,
-        transport: M,
-        membership: V,
-        authority: A,
-        suspect_timeout: Duration,
+        authority: Option<AuthorityTimings>,
+        timings: ElectionTimings,
     ) -> Self {
-        let last_leader_contact = clock.now();
+        // A zero interval would make a follower's next heartbeat due the
+        // instant it sent the last one, so it would never stop heartbeating.
+        assert!(
+            timings.heartbeat_interval.as_ticks() > 0,
+            "ElectionTimings::heartbeat_interval must not be zero"
+        );
+        // A zero deadline would close a roll call the instant it started,
+        // before any other worker could answer it.
+        assert!(
+            timings.roll_call_deadline.as_ticks() > 0,
+            "ElectionTimings::roll_call_deadline must not be zero"
+        );
+        // A zero divisor has no drift share to compute.
+        assert!(
+            timings.clock_drift_divisor > 0,
+            "ElectionTimings::clock_drift_divisor must not be zero"
+        );
+        let now = clock.now();
         WorkerNode {
             my_id,
             incarnation_id,
             shard_id,
             state,
             recovery_epoch: 0,
+            recovery_lineage: None,
             highest_term_seen: 0,
-            last_leader_contact,
-            suspect_timeout,
+            last_leader_contact: now,
+            timings,
             clock,
-            transport,
-            membership,
-            authority,
             hash_function: HashFunction::default(),
-            seen_roll_calls: BTreeSet::new(),
-            next_roll_call_seq: 0,
+            authority: authority.map(|authority_timings| {
+                AuthorityLease::starting_at(authority_timings, timings.clock_drift_divisor, now)
+            }),
+            recovery: None,
+            awaited_reply: None,
+            stop_reason: None,
+            reconnect_timeout: DEFAULT_RECONNECT_TIMEOUT,
+            last_heard: BTreeMap::new(),
+            contact_floor: None,
+            orphan_abort_by: None,
+            reported_abort_deadline: None,
+            configuration: None,
+            admission: None,
+            prior_admission: None,
             term: 0,
-            voted_for: BTreeMap::new(),
-            votes_received: BTreeSet::new(),
+            ballot: Ballot::default(),
+            own_roll_calls_suppressed_until: now,
+            next_roll_call_at: now,
+            roll_call: None,
+            vote: None,
+            roster: None,
+            leader: None,
+            newest_accepted_ack: None,
+            next_heartbeat: None,
+            connected: BTreeSet::new(),
+            lease: QuorumContactLease::starting_at(now),
+            reported_grant: None,
+            drain_requested: false,
+            pending_removals: BTreeSet::new(),
+            outputs: Vec::new(),
         }
     }
 
-    /// Replaces the hash function used to rank candidates. Every worker in
-    /// the shard must use the same one, or they will disagree on the winner.
+    /// Replaces the hash function this node derives the jitter on its
+    /// suspicion timeout from (see [`ElectionTimings::suspect_timeout`]).
+    /// Workers need not agree on it: the jitter only has to differ between
+    /// them.
     pub fn with_hash_function(mut self, hash_function: HashFunction) -> Self {
         self.hash_function = hash_function;
+        self
+    }
+
+    /// The node's registration was last asked for at `sent_at`, before the
+    /// node was built: its orphan deadline counts from then, not from its
+    /// construction. The bootstrap cascade registers a founder before it
+    /// takes ownership of the shard, and a founder that counted its
+    /// registration from later could still lead after it had lapsed, and
+    /// after another worker had found the shard with no one registered and
+    /// re-founded it. No effect on a node with no authority.
+    pub fn registered_at(mut self, sent_at: Instant) -> Self {
+        if let Some(lease) = self.authority.as_mut() {
+            lease.restart_at(sent_at);
+        }
+        self
+    }
+
+    /// Makes `lineage` the lineage of this node's recovery epoch (see
+    /// [`RecoveryEpoch`]): the one the bootstrap cascade drew when it
+    /// founded the shard, which a node with an authority must know to
+    /// recognise its own epoch there. Built by [`Self::new`] or
+    /// [`Self::genesis`], a node's epoch is otherwise of lineage 0. No
+    /// effect on a node that has not joined a shard yet.
+    pub fn with_recovery_lineage(mut self, lineage: u64) -> Self {
+        if self.recovery_lineage.is_some() {
+            self.recovery_lineage = Some(lineage);
+        }
+        self
+    }
+
+    /// Replaces [`DEFAULT_RECONNECT_TIMEOUT`] (README §8.3). A leader reports
+    /// a worker lost once it has not heard from it for its `suspect_timeout`
+    /// and then this long; a worker must abort its TaskRuns within nine
+    /// tenths of that span after its leader last provably heard it, and
+    /// within nine tenths of this after it fences itself (see
+    /// [`Output::AbortDeadline`]). Every worker in the shard must use the
+    /// same value, or a leader could replay the work of a worker that is
+    /// still running it.
+    pub fn with_reconnect_timeout(mut self, reconnect_timeout: Duration) -> Self {
+        self.reconnect_timeout = reconnect_timeout;
         self
     }
 
@@ -199,178 +824,959 @@ where
         self.term
     }
 
-    /// This node's recovery epoch, bumped only by a successful
-    /// [`Self::attempt_forced_recovery`].
+    /// The timers this node runs its election on.
+    pub fn timings(&self) -> ElectionTimings {
+        self.timings
+    }
+
+    pub fn shard_id(&self) -> &ShardId {
+        &self.shard_id
+    }
+
+    /// The highest term this node has seen: raised by a vote it granted, an
+    /// ack it accepted, a refusal, a certificate or a heartbeat naming a
+    /// later term, the leader a JOIN pointed it at, winning an election, and
+    /// standing through the authority path. Never by a roll call it
+    /// answered, nor by standing as a candidate in an election it has not
+    /// won (ADR-0001 decision 14 as amended 2026-09-28).
+    pub fn highest_term_seen(&self) -> u64 {
+        self.highest_term_seen
+    }
+
+    /// This node's recovery epoch: its configuration's when built with one
+    /// ([`Self::new`]), taken from the leader a JOIN pointed it at
+    /// ([`Self::finish_joining`]), moved on by an authority-path recovery of
+    /// its own, and adopted from the ack of a leader of a later epoch.
     pub fn recovery_epoch(&self) -> u64 {
         self.recovery_epoch
     }
 
-    /// The current effective electorate (README §11), as seen by this node's
-    /// [`MembershipView`]. Exposed so a driver outside `core` (e.g. `net`'s
-    /// `/kabudachi/join/1` request responder) can compose a bootstrap join
-    /// response without reaching into `core`'s private fields — `core` knows
-    /// the electorate but nothing about network addresses, and `net` is the
-    /// reverse, so composing a full `JOIN_RESPONSE` needs both sides
-    /// deliberately, in the driver, not in either one alone.
-    pub fn electorate(&self) -> BTreeSet<WorkerId> {
-        self.membership.effective_electorate()
+    /// The lineage of this node's recovery epoch (see [`RecoveryEpoch`]),
+    /// learned with the epoch; `None` until the node has joined a shard.
+    pub fn recovery_lineage(&self) -> Option<u64> {
+        self.recovery_lineage
+    }
+
+    /// This node's recovery epoch with its lineage, as the authority would
+    /// hold it; `None` until the node has joined a shard.
+    fn own_recovery_epoch(&self) -> Option<RecoveryEpoch> {
+        self.recovery_lineage
+            .map(|lineage| RecoveryEpoch::new(self.recovery_epoch, lineage))
+    }
+
+    /// Why this node stopped; `None` unless it is `Stopped`.
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.stop_reason
+    }
+
+    /// The configuration this node knows: the one it was built with or the
+    /// newest a leader's ack or election certificate has carried since.
+    /// `None` for a joiner that has accepted neither yet.
+    pub fn configuration(&self) -> Option<&Configuration> {
+        self.configuration.as_ref()
+    }
+
+    /// The generation at which this node became a voter; `None` for a
+    /// pending member.
+    pub fn admission(&self) -> Option<Generation> {
+        self.admission
+    }
+
+    /// The admission generation this node held before the election that
+    /// founded the joint configuration it holds admitted it; `None` once
+    /// that configuration is committed, and for any other configuration.
+    pub fn prior_admission(&self) -> Option<Generation> {
+        self.prior_admission
+    }
+
+    /// Both admission generations a quorum counts this node by.
+    fn counted_admission(&self) -> Admission {
+        Admission {
+            current: self.admission,
+            prior: self.prior_admission,
+        }
+    }
+
+    /// Whether this node has no admission generation: it joined through a
+    /// JOIN and neither a leader's ack nor an election certificate has
+    /// admitted it since. It claims work, and it answers roll calls and
+    /// grants votes as a new voter, but no quorum counts it.
+    pub fn is_pending_member(&self) -> bool {
+        self.admission.is_none()
+    }
+
+    /// The workers that have answered the roll call this node is running,
+    /// itself included: none unless it is `RollCall` with a call it has not
+    /// given up for a better one. For observing how long a census takes to
+    /// come back (the roll-call deadline must outlast it: see
+    /// [`ElectionTimings::roll_call_deadline`]).
+    pub fn roll_call_respondents(&self) -> impl Iterator<Item = &WorkerId> {
+        self.roll_call
+            .as_ref()
+            .filter(|round| self.state == WorkerState::RollCall && !round.is_abandoned())
+            .into_iter()
+            .flat_map(|round| round.respondents().keys())
+    }
+
+    /// The leader this node would point a joining worker at, with the term
+    /// that leader was elected in: itself while `Leader`, and while `Active`
+    /// the leader whose heartbeat ack it last accepted, or that a JOIN
+    /// pointed it at if no ack has arrived since.
+    ///
+    /// A node with no configuration (a joiner that has accepted no ack yet)
+    /// also keeps naming that leader while `LeaderSuspect`: it cannot elect a
+    /// replacement (it starts no roll call), it keeps heartbeating that
+    /// leader until an ack returns it to `Active`, and dropping its leader
+    /// would leave every joiner it answers with nowhere to go. If that leader
+    /// has since gone, the pointer costs a joiner time but nothing worse: the
+    /// joiner cannot connect to the named leader, so it passes the answer
+    /// over and keeps asking its seeds.
+    ///
+    /// `None` in every other state: a node that suspects its leader or is
+    /// electing a new one has no leader it can vouch for. `None` too once
+    /// this node has seen a term later than the named leader's (by granting
+    /// a vote in it, say): a newer leader may lead by then.
+    pub fn known_leader(&self) -> Option<(WorkerId, u64)> {
+        let named = match self.state {
+            WorkerState::Leader => Some((self.my_id.clone(), self.term)),
+            WorkerState::Active => self.leader.clone(),
+            WorkerState::LeaderSuspect if self.configuration.is_none() => self.leader.clone(),
+            _ => None,
+        };
+        named.filter(|(_, term)| *term >= self.highest_term_seen)
+    }
+
+    /// Handles one input and returns what the node asks its driver to do,
+    /// with the next instant at which a `Tick` can change anything.
+    ///
+    /// Whatever the input, a node with an authority whose registration has
+    /// lapsed first fences itself (see [`Self::orphan_if_unregistered`]),
+    /// and a leader whose quorum-contact lease has run out first gives up
+    /// leading (see [`Self::lose_quorum_if_its_lease_ended`]): a node paused
+    /// past either must not act on the inputs held while it was paused
+    /// before its next `Tick`. A paused leader would otherwise still lead,
+    /// and, finding the authority flushed, republish its old epoch over one
+    /// the shard recovered to meanwhile.
+    pub fn step(&mut self, input: Input) -> Step {
+        let orphaned = self.orphan_if_unregistered();
+        self.lose_quorum_if_its_lease_ended();
+        match input {
+            Input::Tick if orphaned => {}
+            Input::Tick => self.tick(),
+            Input::Message { from, message } => self.on_message(from, message),
+            // A connection to itself is no peer: a leader would ack itself.
+            Input::PeerConnected(peer) if peer != self.my_id => self.on_peer_connected(peer),
+            Input::PeerConnected(_) => {}
+            Input::PeerDisconnected(peer) => {
+                self.connected.remove(&peer);
+            }
+            Input::Authority(reply) => self.on_authority_reply(reply),
+            Input::Drain => self.request_drain(),
+        }
+        self.finish_step()
+    }
+
+    /// Completes the bootstrap join handshake: records the leader `pointer`
+    /// names, with its term and recovery epoch, and drives `Bootstrapping ->
+    /// Joining -> Active` as a pending member, with no configuration until
+    /// its leader's first ack carries one. There is no direct `Bootstrapping
+    /// -> Active` edge in [`WorkerState::can_transition_to`], so this goes
+    /// through `Joining` explicitly.
+    ///
+    /// A no-op outside `Bootstrapping` — a node constructed via [`Self::new`]
+    /// (already `Active`) or one that already finished joining has nothing
+    /// left to join — and for a pointer that names no leader ("no leader
+    /// known") or a leader of a recovery epoch older than the node's own,
+    /// which leaves the node `Bootstrapping` so its driver can ask again.
+    ///
+    /// The wire handshake that produces `pointer` — dialing seed addresses,
+    /// sending `JOIN_REQUEST`, taking the first `JOIN_RESPONSE` that names a
+    /// leader — is entirely `net`'s concern (a separate `/kabudachi/join/1`
+    /// request_response protocol, not an `ElectionMessage`); this method only
+    /// performs the resulting state transition. Joining publishes nothing.
+    pub fn finish_joining(&mut self, pointer: &JoinResponse) -> Step {
+        self.join(pointer);
+        self.finish_step()
+    }
+
+    /// Hands back everything this step produced, with the next deadline.
+    /// Whatever the input, a node with an authority first asks for any
+    /// registration or fence that has come due (see
+    /// [`Self::ask_authority_if_due`]), a follower heartbeats its leader if
+    /// that has come due (see [`Self::heartbeat_leader_if_due`]), and a
+    /// leader reports its grant if the step changed it.
+    fn finish_step(&mut self) -> Step {
+        self.ask_authority_if_due();
+        self.heartbeat_leader_if_due();
+        self.report_grant_if_changed();
+        self.report_abort_deadline_if_changed();
+        Step {
+            outputs: std::mem::take(&mut self.outputs),
+            next_deadline: self.next_deadline(),
+        }
+    }
+
+    /// The earliest instant at which a `Tick` can change anything.
+    ///
+    /// A `Tick` at the instant this returns must move the node into another
+    /// state or make this return a later instant or `None`: a driver ticks
+    /// the node while its deadline has come, without letting time pass in
+    /// between (as `net`'s `run_driver` does), and would otherwise never
+    /// stop. `election_step_test`'s
+    /// `a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one`
+    /// checks it.
+    ///
+    /// - `Active`: the first instant past its jittered suspicion timeout
+    ///   (see [`Self::jittered_suspect_timeout`]), or its next heartbeat to
+    ///   its leader if that comes first.
+    /// - `LeaderSuspect` and `NoQuorum`: when it may start a roll call (see
+    ///   [`Self::next_roll_call_due`]), or its next heartbeat to its leader
+    ///   if that comes first; `None` for a node with neither, a joiner with
+    ///   no configuration and no leader to heartbeat.
+    /// - `RollCall`: its roll call's deadline, or its next heartbeat to its
+    ///   leader if that comes first.
+    /// - `Candidate`: its vote's deadline.
+    /// - `Leader`: when it goes `NoQuorum` unless more confirmations arrive
+    ///   (never, for a leader that alone is a quorum), or when it next has a
+    ///   worker to report lost, whichever comes first.
+    /// - Every other state: `None`.
+    ///
+    /// With an authority, also the lease's next registration or fence
+    /// attempt and, until it is `Fenced`, when it fences itself, in every
+    /// state in which it keeps a registration. In every state, also when its
+    /// contact floor goes stale, while that is still ahead (see
+    /// [`Output::AbortDeadline`]): a `Tick` then reports the deadline.
+    fn next_deadline(&self) -> Option<Instant> {
+        let lease_deadline = self
+            .authority
+            .as_ref()
+            .filter(|_| self.registers_with_authority())
+            .map(|lease| lease.next_deadline(self.state == WorkerState::Fenced));
+        earliest(
+            earliest(self.election_deadline(), lease_deadline),
+            self.leader_contact_stale_at()
+                .filter(|stale_at| *stale_at > self.clock.now()),
+        )
+    }
+
+    /// What [`Self::next_deadline`] reports, leaving the authority lease
+    /// aside.
+    fn election_deadline(&self) -> Option<Instant> {
+        let next_heartbeat = self.next_heartbeat.as_ref().map(|(_, at)| *at);
+        match self.state {
+            WorkerState::Active => {
+                let suspicion = self.last_leader_contact
+                    + self.jittered_suspect_timeout()
+                    + Duration::from_ticks(1);
+                Some(next_heartbeat.map_or(suspicion, |at| at.min(suspicion)))
+            }
+            WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
+                earliest(next_heartbeat, self.next_roll_call_due())
+            }
+            WorkerState::RollCall => earliest(
+                next_heartbeat,
+                self.roll_call.as_ref().map(RollCallRound::deadline),
+            ),
+            WorkerState::Candidate => self.vote.as_ref().map(VoteRound::deadline),
+            WorkerState::Leader => earliest(
+                self.roster.as_ref().and_then(|roster| {
+                    self.lease
+                        .no_quorum_at(&self.my_id, roster, self.timings.lease_length())
+                }),
+                self.next_worker_lost_at(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Moves to `next` and reports the move. Leaving `Leader` first reports
+    /// that the node holds no grant (see [`Output::Grant`]), and leaving the
+    /// states that lead or stand to lead gives up any fence. Reaching
+    /// `Active` or `Leader` applies a drain kept from an earlier request at
+    /// once (see [`Input::Drain`]), so the node can come out of this
+    /// `Stopped`.
+    fn transition_to(&mut self, next: WorkerState) {
+        // Every caller moves along an edge of the transition table, checked
+        // by the state it guards on first; no input can reach an illegal
+        // edge, so one here is a bug in this module.
+        assert!(
+            self.state.can_transition_to(next),
+            "illegal election state transition {:?} -> {next:?}",
+            self.state
+        );
+        // No edge leads from `Leader` back to itself.
+        if self.state == WorkerState::Leader {
+            self.raise_contact_floor_to_grant();
+            self.reported_grant = None;
+            self.outputs.push(Output::Grant(None));
+            self.last_heard.clear();
+        }
+        if !matches!(
+            next,
+            WorkerState::Candidate | WorkerState::LeaderReconciling | WorkerState::Leader
+        ) && let Some(lease) = self.authority.as_mut()
+        {
+            lease.drop_fence();
+        }
+        self.state = next;
+        self.outputs.push(Output::StateChanged(next));
+
+        if self.drain_requested && matches!(next, WorkerState::Active | WorkerState::Leader) {
+            self.drain_requested = false;
+            self.drain();
+        }
+    }
+
+    fn send(&mut self, to: WorkerId, payload: election_message::Payload) {
+        self.outputs.push(Output::Send {
+            to,
+            message: ElectionMessage {
+                payload: Some(payload),
+            },
+        });
+    }
+
+    fn publish(&mut self, payload: election_message::Payload) {
+        self.outputs.push(Output::Publish {
+            message: ElectionMessage {
+                payload: Some(payload),
+            },
+        });
     }
 
     /// Processes a leader heartbeat acknowledgement (README §12.2
-    /// `on_leader_ack`). Acks for another shard, a different recovery epoch or
-    /// an older term are ignored without touching any state.
+    /// `on_leader_ack`). Acks for another shard, an older recovery epoch, or
+    /// a term of this node's own epoch below its floor (see
+    /// [`Self::ack_floor`]) are ignored without touching any state.
     ///
-    /// Differs from the README pseudocode, which ignores only older epochs: a
-    /// node cannot yet adopt a newer epoch, so following a newer-epoch leader
-    /// would leave it acting on its old epoch under that leader. An accepted ack
-    /// refreshes leader contact, and returns a node in `RollCall` to `Active`
-    /// because the leader is reachable again.
-    pub fn on_leader_ack(&mut self, ack: &LeaderHeartbeatAck) {
-        if ack.shard_id() != self.shard_id {
+    /// An ack from a later recovery epoch means the shard was recovered
+    /// through the authority: the node adopts that epoch (see
+    /// [`Self::adopt_recovery_epoch`]) and steps down from any term it holds
+    /// or contests, whatever the terms, which two epochs do not order. A
+    /// pending joiner that a stale JOIN pointer left on the old epoch finds
+    /// its way the same way. An accepted ack
+    /// refreshes leader contact, records its leader as [`Self::known_leader`]
+    /// and the ack itself for this node's heartbeats to echo, and returns a
+    /// node in `LeaderSuspect`, `RollCall` or `NoQuorum` to `Active` because
+    /// a leader is reachable again, whatever term its roll call contests. A
+    /// `Candidate` or `Leader` of a term earlier than the ack's steps down
+    /// to `Active` under the ack's leader (ADR-0001 decision 14); one of the
+    /// ack's own term keeps it.
+    ///
+    /// It also carries the leader's configuration and this node's admission
+    /// generations in the leader's roster, which this node adopts as
+    /// [`Self::adopt_configuration`] says. An ack that names no admission
+    /// generation (the leader holds this node as pending, or not at all)
+    /// leaves this node's own as they were. A node that adopts a newer
+    /// configuration heartbeats its leader at once, so its echo of it
+    /// reaches the leader without waiting out a heartbeat interval.
+    fn on_leader_ack(&mut self, ack: &LeaderHeartbeatAck) {
+        // A node back in `Bootstrapping` rejoins through JOIN alone: an ack
+        // from a leader of the epoch it left would take it back past the
+        // floor it rejoins at.
+        if self.state == WorkerState::Bootstrapping
+            || ack.shard_id() != self.shard_id
+            || ack.recovery_epoch < self.recovery_epoch
+        {
             return;
         }
-        if ack.recovery_epoch != self.recovery_epoch {
+        let later_epoch = ack.recovery_epoch > self.recovery_epoch;
+        // Its own epoch number in another lineage is another shard's.
+        let foreign = self
+            .recovery_lineage
+            .zip(ack.recovery_epoch_lineage)
+            .is_some_and(|(own, acked)| own != acked);
+        if !later_epoch && foreign {
             return;
         }
-        if ack.term < self.highest_term_seen {
+        if !later_epoch && ack.term < self.ack_floor() {
             return;
+        }
+        let outpaced = self
+            .term_in_play()
+            .is_some_and(|term| later_epoch || ack.term > term);
+        if later_epoch {
+            self.adopt_recovery_epoch(ack.recovery_epoch, ack.recovery_epoch_lineage, ack.term);
         }
 
         self.highest_term_seen = self.highest_term_seen.max(ack.term);
-        self.last_leader_contact = self.clock.now();
+        let now = self.clock.now();
+        self.last_leader_contact = now;
+        // A token from a later instant than this node's own clock reads was
+        // never sent by this node, and proves nothing.
+        if let Some(sent_at) = ack
+            .heartbeat_token
+            .filter(|token| *token <= now.as_ticks())
+            .map(Instant::at)
+        {
+            self.contact_floor = self.contact_floor.max(Some(sent_at));
+        }
+        // A leader acks it after it rejoined: it is a member again.
+        self.orphan_abort_by = None;
+        self.leader = Some((ack.leader_id(), ack.term));
+        self.newest_accepted_ack = Some(AckEcho {
+            term: ack.term,
+            send_token: ack.send_token,
+        });
+        let held = self.configuration.as_ref().map(Configuration::generation);
+        self.adopt_configuration(
+            ack.configuration(),
+            ack.recipient_admission(),
+            ack.recipient_prior_admission(),
+        );
+        if self.configuration.as_ref().map(Configuration::generation) != held {
+            // Heartbeat at once: the echo of the new generation is what
+            // commits it (see `Roster::commit_if_confirmed`).
+            self.next_heartbeat = None;
+        }
 
-        if self.state == WorkerState::RollCall {
-            self.state = WorkerState::Active;
+        if outpaced
+            || matches!(
+                self.state,
+                WorkerState::LeaderSuspect | WorkerState::RollCall | WorkerState::NoQuorum
+            )
+        {
+            self.roll_call = None;
+            self.vote = None;
+            self.recovery = None;
+            self.transition_to(WorkerState::Active);
         }
     }
 
-    /// Runs one periodic step of the state machine.
+    /// Adopts `offered`, a configuration a leader announced, when this node
+    /// has none or `offered` is newer than its own, and with it `admission`
+    /// and `prior_admission`, this node's admission generations there, when
+    /// an admission is given. When this node already holds `offered`, it
+    /// adopts only the admission generations, which repairs ones it missed.
+    /// Admission generations offered with an older configuration than its
+    /// own are ignored: they belong to a configuration this node has moved
+    /// past, where they would make it no voter of its own.
+    fn adopt_configuration(
+        &mut self,
+        offered: Configuration,
+        admission: Option<Generation>,
+        prior_admission: Option<Generation>,
+    ) {
+        let is_newer = self
+            .configuration
+            .as_ref()
+            .is_none_or(|own| offered.generation() > own.generation());
+        if !is_newer && self.configuration.as_ref() != Some(&offered) {
+            return;
+        }
+        if let Some(admission) = admission {
+            self.admission = Some(admission);
+            self.prior_admission = prior_admission;
+        }
+        self.configuration = Some(offered);
+    }
+
+    /// Sends this node's leader a heartbeat (README §12.1) once a heartbeat
+    /// interval has passed since the last one. A leader this node was not
+    /// already heartbeating hears from it at once, so a leader it has just
+    /// learned of does not wait a whole interval for its first heartbeat.
+    fn heartbeat_leader_if_due(&mut self) {
+        let Some(leader) = self.leader_to_heartbeat() else {
+            self.next_heartbeat = None;
+            return;
+        };
+        let now = self.clock.now();
+        let due = match &self.next_heartbeat {
+            Some((heartbeating, at)) => *heartbeating != leader || *at <= now,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+
+        let heartbeat = WorkerHeartbeat {
+            worker_id: Some(self.my_id.clone().into()),
+            incarnation_id: Some(self.incarnation_id.clone().into()),
+            recovery_epoch_seen: self.recovery_epoch,
+            term_seen: self.highest_term_seen,
+            // Nothing reports this node's capacity or running work yet.
+            available_capacity: 0,
+            active_task_runs_digest: Vec::new(),
+            shard_id: Some(self.shard_id.clone().into()),
+            newest_accepted_ack: self.newest_accepted_ack,
+            configuration_generation: self
+                .configuration
+                .as_ref()
+                .map(|configuration| configuration.generation().into()),
+            send_token: now.as_ticks(),
+        };
+        self.send(
+            leader.clone(),
+            election_message::Payload::Heartbeat(heartbeat),
+        );
+        self.next_heartbeat = Some((leader, now + self.timings.heartbeat_interval));
+    }
+
+    /// The leader this node heartbeats: the one it records, while it is
+    /// `Active`, `LeaderSuspect`, `RollCall` or `NoQuorum`, unless that is
+    /// itself.
+    fn leader_to_heartbeat(&self) -> Option<WorkerId> {
+        if !matches!(
+            self.state,
+            WorkerState::Active
+                | WorkerState::LeaderSuspect
+                | WorkerState::RollCall
+                | WorkerState::NoQuorum
+        ) {
+            return None;
+        }
+        let (leader, _) = self.leader.as_ref()?;
+        (*leader != self.my_id).then(|| leader.clone())
+    }
+
+    /// Checks this node's timers against its clock.
     ///
     /// - `Active`: moves to `LeaderSuspect` once no leader ack has arrived
-    ///   within the suspicion timeout (README §12.2).
-    /// - `LeaderSuspect`: starts a roll call. Each transition takes its own
-    ///   call, so a single tick never goes from `Active` to `RollCall`.
-    /// - `Leader`: acknowledges every reachable electorate member (README
-    ///   §12.1), then moves to `NoQuorum` if fewer than a majority of the
-    ///   electorate, counting itself, are reachable.
+    ///   within its jittered suspicion timeout (README §12.2).
+    /// - `LeaderSuspect` and `NoQuorum`: starts a roll call, if it can (see
+    ///   [`Self::can_start_roll_call`]). Each transition takes its own
+    ///   `Tick`, so a single one never goes from `Active` to `RollCall`.
+    /// - `RollCall`: at its roll call's deadline, stands as the candidate or
+    ///   goes `NoQuorum` (see [`Self::close_roll_call`]).
+    /// - `Candidate`: at its vote's deadline, not having won, suspects its
+    ///   leader again (see [`Self::suspect_again`]).
+    /// - `Leader`: reports every worker it has not heard from for too long
+    ///   as lost (see [`Self::report_lost_workers`]). Moving to `NoQuorum`
+    ///   once its quorum-contact lease has run out happens on every step,
+    ///   before the input (see [`Self::step`]).
     ///
     /// Every other state is a no-op — deliberately so for `Bootstrapping` and
     /// `Joining` (README §27 Phase 2 bootstrap join): nothing times out a
     /// stalled join here, since the transition out of those states happens
     /// once via [`Self::finish_joining`], driven by something outside `core`
-    /// that resolves a membership list, not by a per-tick check.
-    pub fn tick(&mut self) {
+    /// that learns who leads the shard, not by a timer.
+    fn tick(&mut self) {
         match self.state {
             WorkerState::Active => {
-                if self.clock.now() - self.last_leader_contact > self.suspect_timeout {
-                    self.state = WorkerState::LeaderSuspect;
+                if self.clock.now() - self.last_leader_contact > self.jittered_suspect_timeout() {
+                    self.next_roll_call_at = self.clock.now();
+                    self.transition_to(WorkerState::LeaderSuspect);
                 }
             }
-            WorkerState::LeaderSuspect => self.begin_roll_call(),
-            WorkerState::Leader => self.tick_as_leader(),
+            WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
+                if self.can_start_roll_call() {
+                    self.begin_roll_call();
+                }
+            }
+            WorkerState::RollCall => {
+                if self
+                    .roll_call
+                    .as_ref()
+                    .is_some_and(|round| self.clock.now() >= round.deadline())
+                {
+                    self.close_roll_call();
+                }
+            }
+            WorkerState::Candidate => {
+                if self
+                    .vote
+                    .as_ref()
+                    .is_some_and(|vote| self.clock.now() >= vote.deadline())
+                {
+                    self.suspect_again();
+                }
+            }
+            WorkerState::Leader => self.report_lost_workers(),
             _ => {}
         }
     }
 
-    fn tick_as_leader(&mut self) {
-        let electorate = self.membership.effective_electorate();
-        let quorum = electorate.len() / 2 + 1;
-        let reachable_electorate: BTreeSet<WorkerId> = self
-            .transport
-            .reachable_peers(self.my_id.clone())
-            .intersection(&electorate)
-            .cloned()
-            .collect();
+    /// Records a connection to `peer`. A leader also acks any peer it has
+    /// newly connected to, as it did every peer connected when it won (see
+    /// [`Self::announce_leadership`]): one that missed that announcement,
+    /// cut off at the win or joining since (a restarted process joins under
+    /// a new `WorkerId`), would otherwise never learn whom to heartbeat.
+    fn on_peer_connected(&mut self, peer: WorkerId) {
+        let newly_connected = self.connected.insert(peer.clone());
+        if newly_connected && self.state == WorkerState::Leader {
+            self.send_ack(peer, None);
+        }
+    }
 
+    /// Answers a follower's heartbeat (README §12.1) with one ack to its
+    /// sender, and records which of this leader's acks the heartbeat
+    /// confirms. Only a `Leader` answers, and only a heartbeat from its own
+    /// shard at its own recovery epoch or an earlier one: a worker left on an
+    /// earlier epoch adopts this leader's from the ack, but what it echoes
+    /// confirms nothing here. Any heartbeat also tells the leader its sender
+    /// is alive (see [`Self::report_lost_workers`]). A sender its roster does not hold is
+    /// added as a pending joiner, so its acks name it pending, until a batch
+    /// admits it (see [`Self::admit_waiting_joiners`]), which the ack
+    /// answering this heartbeat already carries. Every sender gets an ack,
+    /// though only members' confirmations count towards the lease, except
+    /// one whose heartbeat names a later term of this leader's epoch: this
+    /// leader steps down instead (ADR-0001 decision 14), and neither acks
+    /// it nor records it as heard.
+    ///
+    /// A confirmation counts only for an ack of this leader's own term, sent
+    /// no later than now: anything else names no ack this leader has sent in
+    /// this term. A heartbeat that confirms one also says which
+    /// configuration its sender holds, which counts toward committing a
+    /// joint configuration this leader leads when it is exactly that one
+    /// (see [`Roster::commit_if_confirmed`]). Granting a vote in a later term
+    /// clears neither `leader` nor the newest accepted ack, so a worker that
+    /// went on to vote there can still echo this leader's term-matching ack
+    /// and help commit its configuration; safety rests on the exact-
+    /// generation rule, not on that worker's vote. The term fence above only
+    /// keeps echoes of other leaderships' acks from counting here.
+    fn on_heartbeat(&mut self, from: WorkerId, heartbeat: &WorkerHeartbeat) {
+        if self.state != WorkerState::Leader
+            || heartbeat.shard_id() != self.shard_id
+            || heartbeat.recovery_epoch_seen > self.recovery_epoch
+        {
+            return;
+        }
+        // Decision 14 on the heartbeat's own term: its sender voted, or
+        // heard of a vote, in a later term. Some roll call of that term found
+        // a returning quorum of stale voters, so this leader is all but
+        // deposed, and the sender, whose floor is above this term, can never
+        // follow it. A heartbeat from an earlier epoch names a term of
+        // another count, and deposes no one.
+        if heartbeat.recovery_epoch_seen == self.recovery_epoch
+            && heartbeat.term_seen > self.term
+        {
+            self.highest_term_seen = self.highest_term_seen.max(heartbeat.term_seen);
+            self.step_down_if_outpaced();
+            return;
+        }
+
+        let now = self.clock.now();
+        self.last_heard.insert(from.clone(), now);
+        if heartbeat.recovery_epoch_seen == self.recovery_epoch
+            && let Some(echo) = heartbeat.newest_accepted_ack
+            && echo.term == self.term
+            && echo.send_token <= now.as_ticks()
+        {
+            self.lease
+                .confirm(from.clone(), Instant::at(echo.send_token));
+            if let Some(held) = heartbeat.configuration_generation()
+                && let Some(roster) = self.roster.as_mut()
+            {
+                roster.record_held_generation(&from, held);
+            }
+            self.commit_if_confirmed();
+        }
+        if let Some(roster) = self.roster.as_mut() {
+            roster.add_pending(from.clone());
+        }
+        self.admit_waiting_joiners();
+        // Only a leader that holds a grant vouches for when it heard the
+        // sender: no rival can win until that grant ends (see
+        // `Output::AbortDeadline`). Removals pending take effect first, as
+        // they can end the grant.
+        self.apply_pending_removals();
+        let heartbeat_token = self.holds_grant_at(now).then_some(heartbeat.send_token);
+        self.send_ack(from, heartbeat_token);
+    }
+
+    /// Sends `to` an ack naming this leader, its term, recovery epoch and
+    /// configuration, and `to`'s admission generation in its roster (none
+    /// for a pending joiner or a worker the roster does not hold), with the
+    /// instant it is sent as the token a heartbeat echoes back, and, when it
+    /// answers a heartbeat, that heartbeat's own token echoed. Removals
+    /// pending take effect first (see [`Self::apply_pending_removals`]); a
+    /// caller that vouches with `heartbeat_token` applies them before it
+    /// decides whether it still holds a grant.
+    fn send_ack(&mut self, to: WorkerId, heartbeat_token: Option<u64>) {
+        self.apply_pending_removals();
+        let Some(roster) = &self.roster else {
+            return;
+        };
         let ack = LeaderHeartbeatAck {
             shard_id: Some(self.shard_id.clone().into()),
             leader_id: Some(self.my_id.clone().into()),
             recovery_epoch: self.recovery_epoch,
             term: self.term,
-            membership_generation: self.membership.membership_generation(),
+            configuration: Some(roster.configuration().into()),
+            recipient_admission: roster.admission_of(&to).map(Into::into),
+            recipient_prior_admission: roster.prior_admission_of(&to).map(Into::into),
+            send_token: self.clock.now().as_ticks(),
+            heartbeat_token,
+            recovery_epoch_lineage: self.recovery_lineage,
         };
-        self.transport.broadcast(
-            self.my_id.clone(),
-            reachable_electorate.clone(),
-            ElectionMessage {
-                payload: Some(election_message::Payload::HeartbeatAck(ack)),
-            },
-        );
+        self.send(to, election_message::Payload::HeartbeatAck(ack));
+    }
 
-        let visible = 1 + reachable_electorate.len(); // +1 for self.
-        if visible < quorum {
-            self.state = WorkerState::NoQuorum;
+    /// Acks every connected peer once, unasked, so each learns that this
+    /// node now leads. A follower heartbeats only a leader it knows of, and
+    /// the election certificate does not name it one: it reaches only the
+    /// roll call's respondents, and tells them what they founded. A peer
+    /// outside this leader's roster, a voter that missed the winning roll
+    /// call say, is acked too: its ack names no admission generation, so it
+    /// keeps its own, older than the founded configuration's base, and is
+    /// no voter of the new side (it can still be a voter of the old side,
+    /// under the founded joint configuration, until the commit). A worker
+    /// this misses hears from the leader once a
+    /// connection to it opens (see [`Self::on_peer_connected`]).
+    fn announce_leadership(&mut self) {
+        for peer in self.connected.clone() {
+            self.send_ack(peer, None);
         }
     }
 
-    /// Starts a fresh roll call (README §12.4). The state becomes `RollCall`
-    /// first so a single-member electorate can go straight on to `Candidate`.
-    fn begin_roll_call(&mut self) {
-        let roll_call_id = format!("{}-{}", self.my_id.as_str(), self.next_roll_call_seq);
-        self.next_roll_call_seq += 1;
-
-        let call = RollCall {
-            roll_call_id: roll_call_id.clone(),
-            shard_id: Some(self.shard_id.clone().into()),
-            recovery_epoch: self.recovery_epoch,
-            membership_generation: self.membership.membership_generation(),
-            membership_digest: self.membership.membership_digest().to_vec(),
-            highest_term_seen: self.highest_term_seen,
-            initiator_id: Some(self.my_id.clone().into()),
-            responses: vec![],
+    /// The grant this node's lease gives it: `None` unless it is `Leader`
+    /// with a lease. With an authority it also needs the recovery fence, and
+    /// the grant ends at the earlier of the fence and the quorum-contact
+    /// lease (design 4.5). Read afresh at the end of every step, never kept,
+    /// so it follows every move of either end.
+    fn grant(&self) -> Option<LeadershipGrant> {
+        if self.state != WorkerState::Leader {
+            return None;
+        }
+        let roster = self.roster.as_ref()?;
+        let quorum_contact_end = self
+            .lease
+            .end(&self.my_id, roster, self.timings.lease_length())?;
+        let valid_until = match &self.authority {
+            None => quorum_contact_end,
+            Some(lease) => {
+                let fence_end = lease.fence_valid_until()?;
+                LeaseEnd::At(match quorum_contact_end {
+                    LeaseEnd::Unbounded => fence_end,
+                    LeaseEnd::At(end) => end.min(fence_end),
+                })
+            }
         };
-
-        self.seen_roll_calls.insert(roll_call_id);
-        self.state = WorkerState::RollCall;
-        self.process_roll_call(call);
+        Some(LeadershipGrant {
+            term: self.term,
+            recovery_epoch: self.recovery_epoch,
+            valid_until,
+        })
     }
 
-    /// Completes the bootstrap join handshake (README §27 Phase 2): adopts
-    /// `members` (plus this node's own id — [`Self::electorate`]'s doc notes
-    /// every other node's `effective_electorate` already includes itself, so
-    /// a joining node's adopted electorate must too, for quorum/ring math to
-    /// treat it consistently) and drives `Bootstrapping -> Joining ->
-    /// Active`. There is no direct `Bootstrapping -> Active` edge in
-    /// [`WorkerState::can_transition_to`], so this goes through `Joining`
-    /// explicitly, mirroring how [`Self::maybe_win_election`] passes through
-    /// `LeaderReconciling` on its way to `Leader`.
+    /// Reports this node's grant if it differs from the one last reported.
+    fn report_grant_if_changed(&mut self) {
+        let grant = self.grant();
+        if grant != self.reported_grant {
+            self.raise_contact_floor_to_grant();
+            self.reported_grant = grant;
+            self.outputs.push(Output::Grant(grant));
+        }
+    }
+
+    /// Whether a `LeaderSuspect` or `NoQuorum` node starts a roll call on
+    /// its next `Tick`: once [`Self::next_roll_call_due`] has come.
+    fn can_start_roll_call(&self) -> bool {
+        self.next_roll_call_due()
+            .is_some_and(|due| self.clock.now() >= due)
+    }
+
+    /// When a `LeaderSuspect` or `NoQuorum` node may start a roll call: at
+    /// `next_roll_call_at`, unless it answered another worker's roll call
+    /// less than two roll-call deadlines ago (ADR-0001 decision 5): that
+    /// worker is being elected, by its census and then its vote, so the
+    /// node waits until both could have ended.
     ///
-    /// A no-op outside `Bootstrapping`: a node constructed via [`Self::new`]
-    /// (already `Active`) or one that already finished joining has nothing
-    /// left to join.
-    ///
-    /// The wire handshake that produces `members` — dialing seed addresses,
-    /// sending `JOIN_REQUEST`, taking the first `JOIN_RESPONSE` — is entirely
-    /// `net`'s concern (a separate `/kabudachi/join/1` request_response
-    /// protocol, not routed through `ElectionMessage`/`on_message`); this
-    /// method only performs the resulting state transition, the same way
-    /// `on_message` itself never touches the network.
-    pub fn finish_joining(&mut self, mut members: BTreeSet<WorkerId>) {
-        if self.state != WorkerState::Bootstrapping {
+    /// `None` for a node with no configuration: it has nothing to count a
+    /// quorum against. It stays `LeaderSuspect`, still heartbeating its
+    /// leader, until an ack from a leader returns it to `Active`.
+    fn next_roll_call_due(&self) -> Option<Instant> {
+        self.configuration.as_ref().map(|_| {
+            self.next_roll_call_at
+                .max(self.own_roll_calls_suppressed_until)
+                .max(self.clock.now())
+        })
+    }
+
+    /// The earliest term whose leader's acks this node accepts: the highest
+    /// term it has seen, or, while it stands or leads, its own term if
+    /// later. A candidate never follows an earlier term's leader while its
+    /// candidacy can still win; once that lapses unwon, it can (ADR-0001
+    /// decision 14 as amended 2026-09-28).
+    fn ack_floor(&self) -> u64 {
+        // A leader's own term is already its term seen (see
+        // `Self::take_office`); the arm only keeps that from resting on it.
+        match self.state {
+            WorkerState::Candidate | WorkerState::Leader => self.highest_term_seen.max(self.term),
+            _ => self.highest_term_seen,
+        }
+    }
+
+    /// The term this node holds or contests: its roll call's while
+    /// `RollCall`, its candidacy's while `Candidate` and its leadership's
+    /// while `Leader`. `None` in every other state.
+    fn term_in_play(&self) -> Option<u64> {
+        match self.state {
+            WorkerState::RollCall => self.roll_call.as_ref().map(RollCallRound::term),
+            WorkerState::Candidate | WorkerState::Leader => Some(self.term),
+            _ => None,
+        }
+    }
+
+    /// Steps down (ADR-0001 decision 14) once this node has seen a term
+    /// later than the one it holds or contests: another worker is electing,
+    /// or has elected, a leader for it. An ack from that term's leader
+    /// returns the node to `Active` (see [`Self::on_leader_ack`]); anything
+    /// else leaves it suspecting its leader again (see
+    /// [`Self::suspect_again`]).
+    fn step_down_if_outpaced(&mut self) {
+        if self
+            .term_in_play()
+            .is_some_and(|term| self.highest_term_seen > term)
+        {
+            self.suspect_again();
+        }
+    }
+
+    /// Gives up the roll call or candidacy this node runs, if any, and moves
+    /// to `LeaderSuspect`, to start its next roll call only after a fresh
+    /// suspicion timeout, jittered for the latest term it knows of: the
+    /// wait gives the election that outpaced it time to finish, and the
+    /// jitter keeps rivals that failed together from retrying together.
+    fn suspect_again(&mut self) {
+        self.retry_after_a_fresh_suspicion_timeout();
+        self.transition_to(WorkerState::LeaderSuspect);
+    }
+
+    /// Moves to `NoQuorum` (ADR-0001 decision 13): the node's quorum is out
+    /// of reach, so it waits for its peers to return. Every jittered
+    /// suspicion timeout it tries a roll call again; meanwhile it answers
+    /// the roll calls and grants the votes of others, and an ack from a
+    /// leader returns it to `Active`. With an authority, the authority path
+    /// can take it out too (see [`Self::begin_forced_recovery`]).
+    /// A leader that has not heard from a quorum within its quorum-contact
+    /// lease gives up leading, to `NoQuorum`.
+    fn lose_quorum_if_its_lease_ended(&mut self) {
+        if self.state != WorkerState::Leader {
             return;
         }
-        members.insert(self.my_id.clone());
+        let quorum_lost = |node: &Self| {
+            node.roster.as_ref().is_some_and(|roster| {
+                node.lease
+                    .no_quorum_at(&node.my_id, roster, node.timings.lease_length())
+                    .is_some_and(|at| node.clock.now() >= at)
+            })
+        };
+        if quorum_lost(self) {
+            // The departed no longer confirm anything: the configuration
+            // without them may still have its quorum.
+            self.apply_pending_removals();
+            if quorum_lost(self) {
+                self.lose_quorum();
+            }
+        }
+    }
 
-        self.state = WorkerState::Joining;
-        self.membership.rebuild(members);
-        // A freshly joined node hasn't heard from a leader yet; start the
+    fn lose_quorum(&mut self) {
+        self.retry_after_a_fresh_suspicion_timeout();
+        self.transition_to(WorkerState::NoQuorum);
+    }
+
+    /// Gives up the roll call, candidacy or recovery this node runs, if any,
+    /// and puts its next roll call a fresh suspicion timeout away.
+    fn retry_after_a_fresh_suspicion_timeout(&mut self) {
+        self.roll_call = None;
+        self.vote = None;
+        self.recovery = None;
+        self.next_roll_call_at = self.clock.now() + self.jittered_suspect_timeout();
+    }
+
+    /// The latest term this node knows of: the highest it has seen, or that
+    /// of the latest roll call it accepted, its own included, if later.
+    fn latest_term(&self) -> u64 {
+        self.highest_term_seen
+            .max(self.ballot.highest_roll_call_term().unwrap_or(0))
+    }
+
+    /// The term this node's next roll call contests: the one after the
+    /// latest it knows of. A roll call that failed has taken its term, so
+    /// the next one contests a later term, where no answer or vote given to
+    /// the failed call stands in its way.
+    ///
+    /// # Panics
+    ///
+    /// If the latest term is already `u64::MAX`. Decode
+    /// ([`crate::protocol::messages::WellFormed`]) refuses that term from any
+    /// peer, so reaching it needs a peer bug that names `u64::MAX - 1`, plus
+    /// one roll call of this node's own. Wrapping instead would contest term
+    /// 0, below every term already seen, which is worse than a panic.
+    fn next_term(&self) -> u64 {
+        self.latest_term()
+            .checked_add(1)
+            .expect("a term overflowed u64::MAX")
+    }
+
+    /// Starts a roll call (ADR-0001 decisions 4 and 6) for the term after
+    /// the latest this node knows of, under its configuration: publishes it
+    /// to the shard, moves to `RollCall`, and records itself as its first
+    /// respondent. The call collects replies until its deadline (see
+    /// [`Self::close_roll_call`]), even one a single voter wins.
+    fn begin_roll_call(&mut self) {
+        let Some(configuration) = self.configuration.clone() else {
+            return;
+        };
+        self.recovery = None;
+        let term = self.next_term();
+        let round = RollCallRound::start(
+            term,
+            configuration,
+            self.clock.wall_clock_millis(),
+            self.my_id.clone(),
+            self.counted_admission(),
+            self.clock.now() + self.timings.roll_call_deadline,
+        );
+        self.ballot.record_own_roll_call(term, round.rank().clone());
+        let call = round.call(&self.shard_id);
+        self.roll_call = Some(round);
+
+        self.transition_to(WorkerState::RollCall);
+        self.publish(election_message::Payload::RollCall(call));
+    }
+
+    /// Records the leader `pointer` names and drives `Bootstrapping ->
+    /// Joining -> Active` (see [`Self::finish_joining`]).
+    fn join(&mut self, pointer: &JoinResponse) {
+        if !self.state.can_transition_to(WorkerState::Joining) {
+            return;
+        }
+        let Some(leader_id) = pointer.leader_id() else {
+            return;
+        };
+        // A leader of an epoch older than this node's own (one it rejoins
+        // after a recovery without it), or of another lineage whatever its
+        // number (one the authority lost), no longer leads the shard.
+        let stale_lineage = self
+            .recovery_lineage
+            .is_some_and(|lineage| lineage != pointer.recovery_epoch_lineage);
+        if pointer.recovery_epoch < self.recovery_epoch || stale_lineage {
+            return;
+        }
+
+        self.transition_to(WorkerState::Joining);
+        self.recovery_epoch = pointer.recovery_epoch;
+        self.recovery_lineage = Some(pointer.recovery_epoch_lineage);
+        self.highest_term_seen = self.highest_term_seen.max(pointer.term);
+        self.leader = Some((leader_id, pointer.term));
+        // A freshly joined node hasn't heard from its leader yet; start the
         // suspicion clock now so it isn't judged suspect the instant it
         // ticks — the same reasoning `Self::new`'s doc gives for a freshly
         // constructed node.
         self.last_leader_contact = self.clock.now();
-        self.state = WorkerState::Active;
+        // Its registration starts with its membership: until now it kept
+        // none, so its lease counts from the join.
+        let now = self.clock.now();
+        if let Some(lease) = self.authority.as_mut() {
+            lease.restart_at(now);
+        }
+        self.transition_to(WorkerState::Active);
     }
 
     /// Dispatches an inbound message from `from` to its handler.
     ///
     /// Nodes that are `Draining`, `Stopped` or `Fenced` take no part in
-    /// elections and drop everything. A heartbeat ack is only honoured when
-    /// the sender is the leader it names, and the same holds for a vote request
-    /// (the candidate), a vote grant (the voter) and a self-remove (the
-    /// departing worker): a message that names a different worker than the one
-    /// that sent it is dropped. Received election certificates are not used yet
-    /// and are ignored.
-    pub fn on_message(&mut self, from: WorkerId, msg: ElectionMessage) {
+    /// elections and drop everything. Every message is honoured only when
+    /// its sender is the worker it names as sending it: the leader of a
+    /// heartbeat ack, the follower of a heartbeat, the initiator of a roll
+    /// call, the responder of a reply, the candidate of a vote request, the
+    /// voter of a vote grant, the rejecter of a refusal, the departing
+    /// worker of a self-remove and the leader of an election certificate.
+    /// Anything else is dropped.
+    fn on_message(&mut self, from: WorkerId, msg: ElectionMessage) {
         if matches!(
             self.state,
             WorkerState::Draining | WorkerState::Stopped | WorkerState::Fenced
@@ -378,336 +1784,543 @@ where
             return;
         }
 
+        use election_message::Payload;
         match msg.payload {
-            Some(election_message::Payload::HeartbeatAck(ack)) => {
-                if ack.leader_id() == from {
-                    self.on_leader_ack(&ack);
-                }
+            Some(Payload::Heartbeat(heartbeat)) if heartbeat.worker_id() == from => {
+                self.on_heartbeat(from, &heartbeat);
             }
-            Some(election_message::Payload::RollCall(call)) => self.on_roll_call(call),
-            Some(election_message::Payload::VoteRequest(req)) if req.candidate_id() == from => {
-                self.on_vote_request(&req);
+            Some(Payload::HeartbeatAck(ack)) if ack.leader_id() == from => {
+                self.on_leader_ack(&ack);
             }
-            Some(election_message::Payload::VoteGrant(grant)) if grant.voter_id() == from => {
-                self.on_vote_grant(&grant);
+            Some(Payload::RollCall(call)) if call.initiator_id() == from => {
+                self.on_roll_call(from, &call);
             }
-            Some(election_message::Payload::VoteReject(reject)) => self.on_vote_reject(&reject),
-            Some(election_message::Payload::SelfRemove(msg)) if msg.worker_id() == from => {
-                self.on_self_remove(&msg);
+            Some(Payload::RollCallReply(reply)) if reply.responder_id() == from => {
+                self.on_roll_call_reply(from, &reply);
+            }
+            Some(Payload::VoteRequest(req)) if req.candidate_id() == from => {
+                self.on_vote_request(from, &req);
+            }
+            Some(Payload::VoteGrant(grant)) if grant.voter_id() == from => {
+                self.on_vote_grant(from, &grant);
+            }
+            Some(Payload::ElectionReject(reject)) if reject.rejecter_id() == from => {
+                self.on_election_reject(&reject);
+            }
+            Some(Payload::SelfRemove(msg)) if msg.worker_id() == from => {
+                self.on_self_remove(&from, &msg);
+            }
+            Some(Payload::ElectionCertificate(certificate)) if certificate.leader_id() == from => {
+                self.on_election_certificate(&from, &certificate);
             }
             _ => {}
         }
     }
 
-    /// Gracefully shuts this node down (README §12.3, §18): announces
-    /// `SelfRemove` to every reachable peer, removes itself from its own
-    /// electorate, and ends in `Stopped`.
+    /// Drains at once from `Active` or `Leader`. From a state that will
+    /// reach one of them later it keeps the request for
+    /// [`Self::transition_to`] to apply; a node already draining, or one
+    /// that can never drain again, ignores it.
+    fn request_drain(&mut self) {
+        match self.state {
+            WorkerState::Active | WorkerState::Leader => self.drain(),
+            WorkerState::Draining | WorkerState::Stopped => {}
+            _ => self.drain_requested = true,
+        }
+    }
+
+    /// Gracefully shuts an `Active` or `Leader` node down (README §12.3,
+    /// §18, ADR-0001 decision 10) and ends in `Stopped`.
     ///
-    /// Only `Active` and `Leader` nodes can drain; from any other state this
-    /// does nothing.
-    pub fn begin_drain(&mut self) {
-        if !self.state.can_transition_to(WorkerState::Draining) {
+    /// A follower sends `SelfRemove` to its leader alone, carrying the
+    /// highest term it has seen, for that leader's term guard (see
+    /// [`Self::on_self_remove`]).
+    /// Followers learn of the removal from the generation the leader then
+    /// announces. A node that knows no leader tells no one: the next
+    /// founding leaves it out, or the authority path counts it out.
+    ///
+    /// A leader applies its own removal, which no other leader can (ADR-0001
+    /// decision 10, amended 2026-09-27),
+    /// and sends every connected peer a final ack announcing the
+    /// configuration without it, together with every removal it has
+    /// accepted and not yet applied, so the survivors elect under the
+    /// shrunk one. A leader whose removal, with those, would leave no voter
+    /// announces nothing (see [`Roster::remove_all`]).
+    fn drain(&mut self) {
+        // Leaving `Leader` withdraws the grant first, so no departure
+        // message goes out while this node still holds one.
+        let was_leader = self.state == WorkerState::Leader;
+        self.transition_to(WorkerState::Draining);
+        if was_leader {
+            self.announce_own_departure();
+        } else {
+            self.tell_leader_of_departure();
+        }
+
+        // There is no outstanding work to wait for yet, so draining finishes
+        // immediately. The transition table has no direct `Active -> Stopped`
+        // edge, hence the two transitions.
+        self.stop_reason = Some(StopReason::Drained);
+        self.transition_to(WorkerState::Stopped);
+    }
+
+    /// The draining follower's half of [`Self::drain`]: one `SelfRemove`
+    /// to the leader it follows, if it knows one other than itself.
+    fn tell_leader_of_departure(&mut self) {
+        let Some((leader, leader_term)) = self.leader.clone() else {
+            return;
+        };
+        if leader == self.my_id {
             return;
         }
-        self.state = WorkerState::Draining;
-
         let msg = SelfRemove {
             worker_id: Some(self.my_id.clone().into()),
             incarnation_id: Some(self.incarnation_id.clone().into()),
             shard_id: Some(self.shard_id.clone().into()),
-            membership_generation: self.membership.membership_generation(),
+            configuration_generation: self
+                .configuration
+                .as_ref()
+                .map(|configuration| configuration.generation().into()),
+            term_seen: self.highest_term_seen,
+            leader_term,
         };
-        self.membership.apply_self_remove(&msg);
-        self.transport.broadcast(
-            self.my_id.clone(),
-            self.transport.reachable_peers(self.my_id.clone()),
-            ElectionMessage {
-                payload: Some(election_message::Payload::SelfRemove(msg)),
-            },
-        );
-
-        // There is no outstanding work to wait for yet, so draining finishes
-        // immediately. The transition table has no direct `Active -> Stopped`
-        // edge, hence the two assignments.
-        self.state = WorkerState::Stopped;
+        self.send(leader, election_message::Payload::SelfRemove(msg));
     }
 
-    /// Removes another node from this node's electorate (README §12.3). A
-    /// candidate also discards the removed worker's vote, and wins at once if
-    /// the smaller electorate's quorum is already met by the votes left.
-    pub fn on_self_remove(&mut self, msg: &SelfRemove) {
-        if msg.shard_id() != self.shard_id {
+    /// The draining leader's half of [`Self::drain`]: takes itself out of
+    /// its roster and, if that announced a change, acks every connected
+    /// peer with it.
+    fn announce_own_departure(&mut self) {
+        let Some(roster) = self.roster.as_mut() else {
             return;
-        }
-        self.membership.apply_self_remove(msg);
-
-        if self.state == WorkerState::Candidate {
-            let electorate = self.membership.effective_electorate();
-            self.votes_received
-                .retain(|voter| electorate.contains(voter));
-            self.maybe_win_election();
-        }
-    }
-
-    /// Handles an inbound roll call (README §12.4). A roll call already seen
-    /// is dropped; otherwise this node adds its observation and either
-    /// becomes a candidate or forwards the call.
-    ///
-    /// A call for another shard or recovery epoch is dropped. So is a call
-    /// whose own origin-time `highest_term_seen` is already behind what this
-    /// node knows: this node has observed a term the call's originator had
-    /// not yet accounted for, so letting the call keep circulating would let
-    /// its contested term be recomputed from state the call's origin never
-    /// agreed to (see `choose_candidate`'s doc for the incoherent-escalation
-    /// bug this prevents).
-    pub fn on_roll_call(&mut self, call: RollCall) {
-        if call.shard_id() != self.shard_id || call.recovery_epoch != self.recovery_epoch {
-            return;
-        }
-        if !self.seen_roll_calls.insert(call.roll_call_id.clone()) {
-            return;
-        }
-        if self.highest_term_seen > call.highest_term_seen {
-            return;
-        }
-        self.process_roll_call(call);
-    }
-
-    /// Adds this node's observation to `call`, then either becomes `Candidate`
-    /// (a majority responded, this node is the winner and is in `RollCall`) or
-    /// forwards the call so another node can act on the same result.
-    fn process_roll_call(&mut self, mut call: RollCall) {
-        call.responses.push(self.my_observation());
-
-        let electorate = self.membership.effective_electorate();
-        let quorum = electorate.len() / 2 + 1;
-        let observations = Self::electorate_observations(&call.responses, &electorate);
-
-        if observations.len() >= quorum {
-            let (winner, next_term) = self.choose_candidate(call.highest_term_seen, &observations);
-            if winner == self.my_id && self.state == WorkerState::RollCall {
-                self.state = WorkerState::Candidate;
-                self.term = next_term;
-                // A leader never acks itself, so nothing else raises its own
-                // `highest_term_seen` to the term it now contests.
-                self.highest_term_seen = self.highest_term_seen.max(next_term);
-                // A candidate counts its own vote without messaging itself.
-                self.votes_received = BTreeSet::from([self.my_id.clone()]);
-                self.send_vote_requests(observations.keys());
-                // A single-member electorate is already won by the self-vote.
-                self.maybe_win_election();
-                return;
-            }
-        }
-
-        self.forward_to_next_reachable_neighbor(call);
-    }
-
-    /// One observation per distinct electorate member: duplicates and
-    /// non-members never count towards quorum or candidacy.
-    fn electorate_observations<'a>(
-        responses: &'a [RollCallObservation],
-        electorate: &BTreeSet<WorkerId>,
-    ) -> BTreeMap<WorkerId, &'a RollCallObservation> {
-        let mut observations = BTreeMap::new();
-        for response in responses {
-            let worker_id = response.worker_id();
-            if electorate.contains(&worker_id) {
-                observations.entry(worker_id).or_insert(response);
-            }
-        }
-        observations
-    }
-
-    fn my_observation(&self) -> RollCallObservation {
-        RollCallObservation {
-            worker_id: Some(self.my_id.clone().into()),
-            state: generated::WorkerState::from(self.state) as i32,
-            highest_term_seen: self.highest_term_seen,
-            current_leader_seen: None,
-            leader_contact_age_ticks: (self.clock.now() - self.last_leader_contact).as_ticks(),
-        }
-    }
-
-    /// Sends `call` to the first reachable one of this node's ring successors.
-    /// If none is reachable the call stops here; the same election can still
-    /// be reached through another node's copy.
-    fn forward_to_next_reachable_neighbor(&self, call: RollCall) {
-        let successors = self.membership.ring_successors(self.my_id.clone());
-        let reachable = self.transport.reachable_peers(self.my_id.clone());
-
-        for successor in successors {
-            if reachable.contains(&successor) {
-                self.transport.send(
-                    self.my_id.clone(),
-                    successor,
-                    ElectionMessage {
-                        payload: Some(election_message::Payload::RollCall(call)),
-                    },
-                );
-                return;
-            }
-        }
-    }
-
-    /// Picks the winner of the next election from `observations` (README
-    /// §12.5) and the term it is contested in: one past `call_highest_term_seen`
-    /// — the roll call's own `highest_term_seen`, fixed once at its origin
-    /// (`begin_roll_call`) and never mutated as the call is forwarded. This
-    /// deliberately does *not* derive the term from `observations`' own
-    /// `highest_term_seen` values: those are stamped with whatever a visited
-    /// node's local state happened to be at the moment it responded, which
-    /// can be bumped mid-flight by that node granting a vote for a
-    /// completely unrelated candidacy. Deriving the term from that would let
-    /// the same stale, still-circulating call retarget itself to a
-    /// different, higher term purely as an artifact of which nodes it
-    /// happened to pass through and when — an incoherent candidacy nobody
-    /// actually contested, which could win independently and produce a
-    /// second, live `Leader` (split brain). The highest [`candidate_priority`]
-    /// wins; an exact tie goes to the lower `WorkerId`.
-    fn choose_candidate(
-        &self,
-        call_highest_term_seen: u64,
-        observations: &BTreeMap<WorkerId, &RollCallObservation>,
-    ) -> (WorkerId, u64) {
-        let next_term = call_highest_term_seen + 1;
-
-        let winner = observations
-            .keys()
-            .min_by_key(|candidate| {
-                let priority = candidate_priority(
-                    &self.hash_function,
-                    &self.shard_id,
-                    self.recovery_epoch,
-                    next_term,
-                    candidate,
-                );
-                (Reverse(priority), *candidate)
-            })
-            .expect("process_roll_call only chooses once observations reach a non-empty quorum");
-        (winner.clone(), next_term)
-    }
-
-    /// Asks every other worker in `voters` for its vote in this node's
-    /// current term. `roll_call_digest` stays empty: no handler checks it yet.
-    fn send_vote_requests<'a>(&self, voters: impl IntoIterator<Item = &'a WorkerId>) {
-        let request = VoteRequest {
-            shard_id: Some(self.shard_id.clone().into()),
-            recovery_epoch: self.recovery_epoch,
-            term: self.term,
-            candidate_id: Some(self.my_id.clone().into()),
-            membership_generation: self.membership.membership_generation(),
-            membership_digest: self.membership.membership_digest().to_vec(),
-            roll_call_digest: Vec::new(),
         };
-
-        for worker_id in voters {
-            if *worker_id != self.my_id {
-                self.transport.send(
-                    self.my_id.clone(),
-                    worker_id.clone(),
-                    ElectionMessage {
-                        payload: Some(election_message::Payload::VoteRequest(request.clone())),
-                    },
-                );
-            }
-        }
-    }
-
-    /// Handles a vote request (README §12.6 `on_vote_request`). A request for
-    /// another shard, or from a candidate outside the electorate, is ignored; every other refusal is answered with a
-    /// `VoteReject` carrying the reason.
-    ///
-    /// Differences from the README pseudocode:
-    /// - `LeaderSuspect` and `RollCall` nodes may vote, not only `Active`
-    ///   ones, since roll call is what leads to the vote.
-    /// - "already voted" is checked before "stale term". Granting a vote
-    ///   raises `highest_term_seen` to the request's term, so with the
-    ///   README's order a repeat request for that term would always report
-    ///   "stale term" and "already voted" could never be reached.
-    pub fn on_vote_request(&mut self, req: &VoteRequest) {
-        if req.shard_id() != self.shard_id {
-            return;
-        }
-        // A non-member must not be able to use up this node's vote for a term.
-        if !self
-            .membership
-            .effective_electorate()
-            .contains(&req.candidate_id())
+        let before = roster.configuration().generation();
+        self.pending_removals.insert(self.my_id.clone());
+        self.apply_pending_removals();
+        if self
+            .roster
+            .as_ref()
+            .is_none_or(|roster| roster.configuration().generation() == before)
         {
             return;
         }
-
-        let eligible_voter = matches!(
-            self.state,
-            WorkerState::Active | WorkerState::LeaderSuspect | WorkerState::RollCall
-        );
-        if !eligible_voter {
-            self.send_vote_reject(req, VoteRejectReason::NotVoter);
-            return;
+        for peer in self.connected.clone() {
+            // Unasked, and sent after the grant is withdrawn: no heartbeat
+            // token to vouch for.
+            self.send_ack(peer, None);
         }
-        if req.recovery_epoch != self.recovery_epoch {
-            self.send_vote_reject(req, VoteRejectReason::WrongRecoveryEpoch);
-            return;
-        }
-        if self.voted_for.contains_key(&req.term) {
-            // Applies even when the request comes from the candidate already
-            // voted for.
-            self.send_vote_reject(req, VoteRejectReason::AlreadyVoted);
-            return;
-        }
-        if req.term <= self.highest_term_seen {
-            self.send_vote_reject(req, VoteRejectReason::StaleTerm);
-            return;
-        }
-        if self.current_leader_still_valid() {
-            self.send_vote_reject(req, VoteRejectReason::LeaderStillValid);
-            return;
-        }
-
-        self.highest_term_seen = req.term;
-        self.voted_for.insert(req.term, req.candidate_id());
-        self.transport.send(
-            self.my_id.clone(),
-            req.candidate_id(),
-            ElectionMessage {
-                payload: Some(election_message::Payload::VoteGrant(VoteGrant {
-                    shard_id: Some(self.shard_id.clone().into()),
-                    recovery_epoch: self.recovery_epoch,
-                    term: req.term,
-                    candidate_id: Some(req.candidate_id().into()),
-                    voter_id: Some(self.my_id.clone().into()),
-                })),
-            },
-        );
     }
 
-    fn send_vote_reject(&self, req: &VoteRequest, reason: VoteRejectReason) {
-        self.transport.send(
-            self.my_id.clone(),
-            req.candidate_id(),
-            ElectionMessage {
-                payload: Some(election_message::Payload::VoteReject(VoteReject {
+    /// Accepts a departing worker's SELF_REMOVE (README §12.3, ADR-0001
+    /// decision 10), to take it out of this leader's roster with every
+    /// other one accepted since the last change, in one next generation and
+    /// with no commit round (see [`Self::apply_pending_removals`]).
+    ///
+    /// It accepts only a removal addressed to this leadership: to this
+    /// node, as the leader of this term. And the term guard (ADR-0001
+    /// decision 10, amended 2026-09-27): it accepts the removal only if the
+    /// worker has seen no term later than this leader's. A worker that has may
+    /// have voted in an election of that later term, whose quorum was
+    /// counted with it; shrinking N here as well could let two quorums of
+    /// one term miss each other. Granting a vote raises the voter's highest
+    /// term seen before the grant goes out, and a worker grants nothing
+    /// once it has stopped, so the term it sends covers every vote it can
+    /// have cast; a roll call it only answered counts for no quorum, so it
+    /// need not (and does not) raise it. Such a worker stays in the roster
+    /// until the next founding leaves it out, or the authority path counts
+    /// it out.
+    ///
+    /// Only a `Leader` honours it: every other node ignores it, and a
+    /// candidate keeps counting against its roll call's configuration.
+    fn on_self_remove(&mut self, departing: &WorkerId, msg: &SelfRemove) {
+        if self.state != WorkerState::Leader
+            || msg.shard_id() != self.shard_id
+            || msg.term_seen > self.term
+            || msg.leader_term != self.term
+        {
+            return;
+        }
+        self.pending_removals.insert(departing.clone());
+    }
+
+    /// Takes every worker whose SELF_REMOVE this leader has accepted since
+    /// its last change out of its roster together (ADR-0001 decision 10:
+    /// every pending SELF_REMOVE in the next generation; see
+    /// [`Roster::remove_all`]): a voter leaves a configuration shrunk at the
+    /// next generation, re-based there with every remaining voter
+    /// re-admitted, this leader included; during a founding or a batch the
+    /// joint configuration is re-announced with shrunk counts. A pending
+    /// joiner, or a member that is no voter, is only forgotten.
+    ///
+    /// It runs before anything the configuration changes or shows: before
+    /// an ack announces it, a commit or a batch changes it, the leader's
+    /// own drain, and before the leader would give up for want of a quorum
+    /// of it. Until then the leader counts the departing workers as it did,
+    /// their last confirmations included, which can hold its lease a little
+    /// longer than the shrunk configuration's would. That is safe: a
+    /// departed worker has stopped, grants no vote to anyone, and its leader
+    /// contact was fresh when it confirmed (the TLA+ model keeps a stopped
+    /// worker's confirmation until the lease runs past it). The same holds
+    /// of a removal the leader simply announces late.
+    fn apply_pending_removals(&mut self) {
+        if self.pending_removals.is_empty() {
+            return;
+        }
+        let departing = std::mem::take(&mut self.pending_removals);
+        let Some(roster) = self.roster.as_mut() else {
+            return;
+        };
+        roster.remove_all(&departing, self.term);
+        self.take_on_roster_configuration();
+    }
+
+    /// Takes on, as this leader's own, the configuration its roster leads
+    /// and its admission generations there.
+    fn take_on_roster_configuration(&mut self) {
+        let Some(roster) = &self.roster else {
+            return;
+        };
+        self.configuration = Some(roster.configuration().clone());
+        self.admission = roster.admission_of(&self.my_id);
+        self.prior_admission = roster.prior_admission_of(&self.my_id);
+    }
+
+    /// Starts an admission batch (ADR-0001 decision 9, see
+    /// [`Roster::begin_batch`]) of every worker waiting to join that has
+    /// confirmed one of this leader's acks recently enough to leave it a
+    /// lease worth having (see [`QuorumContactLease::admissible`]): sent
+    /// within the last two heartbeat intervals, or no earlier than the
+    /// lease's quorum-contact time. A worker that drained after its
+    /// last confirmation, its SELF_REMOVE not yet here, may be taken too: the
+    /// same as one that is admitted and then drains, which the removal
+    /// handles in turn. This leader itself, if its
+    /// configuration does not count it, joins too. Nothing starts while its
+    /// configuration is joint: joiners wait for the commit, which calls
+    /// this again.
+    fn admit_waiting_joiners(&mut self) {
+        if self.state != WorkerState::Leader {
+            return;
+        }
+        self.apply_pending_removals();
+        let Some(roster) = self.roster.as_ref() else {
+            return;
+        };
+        if roster.configuration().is_joint() {
+            return;
+        }
+        // A joiner heartbeats every heartbeat interval, echoing the ack that
+        // answered its previous heartbeat: two intervals cover that ack's
+        // age, and network delays within one.
+        let recent_since = Instant::at(
+            self.clock
+                .now()
+                .as_ticks()
+                .saturating_sub(2 * self.timings.heartbeat_interval.as_ticks()),
+        );
+        let mut waiting: BTreeSet<WorkerId> = self
+            .lease
+            .admissible(
+                roster
+                    .pending()
+                    .iter()
+                    .chain(roster.members().keys())
+                    .filter(|worker| roster.is_admissible(worker)),
+                &self.my_id,
+                roster,
+                self.timings.lease_length(),
+                recent_since,
+            )
+            .into_iter()
+            .cloned()
+            .collect();
+        if roster.is_admissible(&self.my_id) {
+            waiting.insert(self.my_id.clone());
+        }
+        let Some(roster) = self.roster.as_mut() else {
+            return;
+        };
+        if roster.begin_batch(&waiting, self.term) {
+            self.take_on_roster_configuration();
+        }
+    }
+
+    /// What the ballot needs to know of this node to decide on a roll call
+    /// or a vote request. Only `Active`, `LeaderSuspect`, `RollCall` and
+    /// `NoQuorum` take part, a pending member among them.
+    fn as_voter(&self) -> Voter {
+        Voter {
+            takes_part: matches!(
+                self.state,
+                WorkerState::Active
+                    | WorkerState::LeaderSuspect
+                    | WorkerState::RollCall
+                    | WorkerState::NoQuorum
+            ),
+            recovery_epoch: self.recovery_epoch,
+            // Its own candidacies count here though they raise no term
+            // seen: it votes in no term at or below one it stood in.
+            highest_term_seen: self
+                .highest_term_seen
+                .max(self.ballot.highest_granted_term().unwrap_or(0)),
+            configuration_generation: self.configuration.as_ref().map(Configuration::generation),
+            leader_contact_is_fresh: self.current_leader_still_valid(),
+        }
+    }
+
+    /// Handles a roll call published by `initiator` (see the `ballot` module
+    /// for the rules): answers it with this node's admission generation,
+    /// refuses it with the reason, or passes over a repeat of a call it
+    /// answered. A call for another shard is dropped. A call it answers is
+    /// electing someone, so the node starts no roll call of its own until a
+    /// roll-call deadline after it answered: a repeat of that call, passed
+    /// over, does not push that back.
+    ///
+    /// An initiator in `RollCall` that answers a better call for its own
+    /// term abandons its own call for it: it stays `RollCall` as that call's
+    /// respondent, and never stands as its own call's candidate.
+    fn on_roll_call(&mut self, initiator: WorkerId, call: &RollCall) {
+        if call.shard_id() != self.shard_id || initiator == self.my_id {
+            return;
+        }
+        let verdict = self.ballot.on_roll_call(
+            &self.as_voter(),
+            call.term,
+            call.configuration().generation(),
+            CallRank::of(call),
+        );
+        match verdict {
+            RollCallVerdict::Answer => {
+                // The call closes within a roll-call deadline of this
+                // answer, and its candidate's vote within another: a call of
+                // this node's own before then would only contest the next
+                // term against the worker it is helping elect.
+                let census_and_vote =
+                    Duration::from_ticks(self.timings.roll_call_deadline.as_ticks().saturating_mul(2));
+                let election_ends = self.clock.now() + census_and_vote;
+                self.own_roll_calls_suppressed_until =
+                    self.own_roll_calls_suppressed_until.max(election_ends);
+                let reply = RollCallReply {
+                    shard_id: Some(self.shard_id.clone().into()),
+                    term: call.term,
+                    initiator_id: Some(initiator.clone().into()),
+                    responder_id: Some(self.my_id.clone().into()),
+                    responder_address: String::new(),
+                    admission: self.admission.map(Into::into),
+                    prior_admission: self.prior_admission.map(Into::into),
+                };
+                self.send(initiator, election_message::Payload::RollCallReply(reply));
+                if self.state == WorkerState::RollCall
+                    && let Some(own) = self.roll_call.as_mut()
+                    && own.term() == call.term
+                {
+                    own.abandon();
+                }
+            }
+            RollCallVerdict::Reject(reason) => {
+                // A caller left on an earlier recovery epoch learns who leads
+                // the current one, whose ack then moves it on.
+                let name_leader = reason == ElectionRejectReason::LeaderStillValid
+                    || call.configuration().generation().recovery_epoch() < self.recovery_epoch;
+                self.send_reject(initiator, call.term, reason, name_leader);
+            }
+            RollCallVerdict::Pass | RollCallVerdict::Drop => {}
+        }
+    }
+
+    /// Refuses `initiator`'s roll call or vote request for `term`, naming
+    /// this node's highest term seen, its configuration, and,
+    /// with `name_leader`, the leader it follows, if any.
+    fn send_reject(
+        &mut self,
+        initiator: WorkerId,
+        term: u64,
+        reason: ElectionRejectReason,
+        name_leader: bool,
+    ) {
+        let leader = self
+            .leader
+            .as_ref()
+            .filter(|_| name_leader)
+            .map(|(leader, term)| KnownLeader {
+                leader_id: Some(leader.clone().into()),
+                term: *term,
+            });
+        let reject = ElectionReject {
+            shard_id: Some(self.shard_id.clone().into()),
+            term,
+            initiator_id: Some(initiator.clone().into()),
+            rejecter_id: Some(self.my_id.clone().into()),
+            reason: reason as i32,
+            // Not the vote floor the ballot refused against: a term this node
+            // only stood in, unwon, would lock the initiator out of the
+            // leader that outlasted it, as it once locked this node out.
+            highest_term_seen: self.highest_term_seen,
+            leader,
+            configuration: self.configuration.as_ref().map(Into::into),
+        };
+        self.send(initiator, election_message::Payload::ElectionReject(reject));
+    }
+
+    /// Records a reply to this node's current roll call from `responder`.
+    /// Ignored unless it answers that call (same shard, term and initiator)
+    /// and the call is not abandoned. While `RollCall` the call counts the
+    /// respondent at its deadline (see [`Self::close_roll_call`]); once this
+    /// node is the call's candidate, a new respondent is asked for its vote.
+    fn on_roll_call_reply(&mut self, responder: WorkerId, reply: &RollCallReply) {
+        if reply.shard_id() != self.shard_id || reply.initiator_id() != self.my_id {
+            return;
+        }
+        match self.state {
+            WorkerState::RollCall => {
+                let Some(round) = self.roll_call.as_mut() else {
+                    return;
+                };
+                if round.term() == reply.term {
+                    round.record(responder, answered_admission(reply));
+                }
+            }
+            WorkerState::Candidate => {
+                let Some(vote) = self.vote.as_mut() else {
+                    return;
+                };
+                if vote.term() == reply.term
+                    && vote.record_respondent(responder.clone(), answered_admission(reply))
+                {
+                    self.send_vote_request(responder);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Decides on this node's roll call once its deadline has come
+    /// (ADR-0001 decisions 13 and 15). If the returning voters among its
+    /// respondents are a quorum, the node stands as the candidate (see
+    /// [`Self::stand`]); if not, its quorum is out of reach and it goes
+    /// `NoQuorum` (see [`Self::lose_quorum`]), and with an authority takes
+    /// the authority path (see [`Self::begin_forced_recovery`]). A call it abandoned for a
+    /// better one, whose leader has not acked it by now, or a call for a
+    /// term it has already seen a vote or leader in, leaves it suspecting
+    /// its leader again (see [`Self::suspect_again`]).
+    fn close_roll_call(&mut self) {
+        let Some(round) = &self.roll_call else {
+            return;
+        };
+        if round.is_abandoned() || round.term() <= self.highest_term_seen {
+            self.suspect_again();
+        } else if round.has_returning_quorum() {
+            self.stand();
+        } else {
+            let round = round.clone();
+            self.lose_quorum();
+            if self.authority.is_some() {
+                self.begin_forced_recovery(&round);
+            }
+        }
+    }
+
+    /// Stands as the candidate of this node's roll call: moves to
+    /// `Candidate` for the call's term, grants itself its own vote, and asks
+    /// every other respondent for theirs, which must come in within a
+    /// roll-call deadline. A single-voter configuration is won there and
+    /// then.
+    fn stand(&mut self) {
+        let Some(round) = self.roll_call.take() else {
+            return;
+        };
+        let vote = VoteRound::stand(round, self.clock.now() + self.timings.roll_call_deadline);
+        let term = vote.term();
+        let voters = vote.voters_to_ask();
+
+        self.transition_to(WorkerState::Candidate);
+        self.term = term;
+        // Its own vote does not raise `highest_term_seen`: a candidacy that
+        // lapses unwon leaves no term anyone else voted in, and the leader
+        // that outlasted it must still be one this node can follow (ADR-0001
+        // decision 14 as amended 2026-09-28). The ballot records the vote,
+        // so this node answers and grants nothing for this term or an
+        // earlier one (see `Self::as_voter`), and a win raises the term
+        // seen (see `Self::take_office`).
+        self.ballot.record_own_grant(term, &self.my_id);
+        self.vote = Some(vote);
+        for voter in voters {
+            self.send_vote_request(voter);
+        }
+        self.win_if_quorum();
+    }
+
+    /// Asks `voter` for its vote in this node's current candidacy.
+    fn send_vote_request(&mut self, voter: WorkerId) {
+        let Some(vote) = &self.vote else {
+            return;
+        };
+        let request = vote.request(&self.shard_id, self.recovery_epoch);
+        self.send(voter, election_message::Payload::VoteRequest(request));
+    }
+
+    /// Handles `candidate`'s request for this node's vote (README §12.6
+    /// `on_vote_request`; see the `ballot` module for the rules). A request for
+    /// another shard is ignored; every refusal is answered with the reason.
+    /// Granting raises this node's highest term seen to the request's term,
+    /// which makes an initiator contesting an earlier one step down.
+    fn on_vote_request(&mut self, candidate: WorkerId, req: &VoteRequest) {
+        if req.shard_id() != self.shard_id {
+            return;
+        }
+        let verdict = self.ballot.on_vote_request(
+            &self.as_voter(),
+            req.recovery_epoch,
+            req.term,
+            req.roll_call_generation(),
+            &candidate,
+        );
+        match verdict {
+            VoteVerdict::Grant => {
+                self.highest_term_seen = self.highest_term_seen.max(req.term);
+                self.step_down_if_outpaced();
+                let grant = VoteGrant {
                     shard_id: Some(self.shard_id.clone().into()),
                     recovery_epoch: self.recovery_epoch,
                     term: req.term,
-                    candidate_id: Some(req.candidate_id().into()),
+                    candidate_id: Some(candidate.clone().into()),
                     voter_id: Some(self.my_id.clone().into()),
-                    reason: reason as i32,
-                })),
-            },
-        );
+                };
+                self.send(candidate, election_message::Payload::VoteGrant(grant));
+            }
+            VoteVerdict::Reject(reason) => self.send_reject(
+                candidate,
+                req.term,
+                reason,
+                reason == ElectionRejectReason::LeaderStillValid,
+            ),
+        }
+    }
+
+    /// How long this node, while `Active`, goes without an accepted leader
+    /// ack before it suspects its leader (ADR-0001 decision 15):
+    /// `suspect_timeout` lengthened by less than a half, by a share hashed
+    /// from this node's `WorkerId` and the latest term it knows of. Workers
+    /// thus rarely suspect at the same instant, and a worker waits a new
+    /// time once the term has moved on. Leader stickiness and a leader's
+    /// lease keep the unjittered `suspect_timeout`, the shortest this can
+    /// be.
+    fn jittered_suspect_timeout(&self) -> Duration {
+        let share = self.hash_function.hash_to_u64(&[
+            Field::Text(self.my_id.as_str()),
+            Field::Number(self.latest_term()),
+        ]);
+        lengthen_by_less_than_half(self.timings.suspect_timeout, share)
     }
 
     fn current_leader_still_valid(&self) -> bool {
-        self.clock.now() - self.last_leader_contact <= self.suspect_timeout
+        self.clock.now() - self.last_leader_contact <= self.timings.suspect_timeout
     }
 
-    /// Records a vote for this node's candidacy, then checks whether it has
-    /// won. Ignored unless this node is a `Candidate` and the grant is for
-    /// its own candidacy: same term, shard and recovery epoch, addressed to
-    /// this node, and cast by a member of the current electorate.
-    pub fn on_vote_grant(&mut self, grant: &VoteGrant) {
+    /// Records `voter`'s vote for this node's candidacy, then checks whether
+    /// it has won. Ignored unless this node is a `Candidate`, the grant is
+    /// for its own candidacy (same term, shard and recovery epoch, addressed
+    /// to this node), and the voter answered its roll call.
+    fn on_vote_grant(&mut self, voter: WorkerId, grant: &VoteGrant) {
         if self.state != WorkerState::Candidate || grant.term != self.term {
             return;
         }
@@ -717,105 +2330,836 @@ where
         {
             return;
         }
-        let voter = grant.voter_id();
-        if !self.membership.effective_electorate().contains(&voter) {
+        let Some(vote) = self.vote.as_mut() else {
             return;
-        }
-
-        self.votes_received.insert(voter);
-        self.maybe_win_election();
+        };
+        vote.record_grant(voter);
+        self.win_if_quorum();
     }
 
-    /// Deliberately does nothing: a candidate either collects enough grants
-    /// or the attempt does not converge and a later suspicion cycle retries.
-    pub fn on_vote_reject(&mut self, _reject: &VoteReject) {}
-
-    /// Once a majority of the electorate has granted this candidacy,
-    /// broadcasts an `ElectionCertificate` (README §12.6) to the granting
-    /// voters and becomes `Leader`. Leader reconciliation (README §13) needs
-    /// task data that does not exist yet, so `LeaderReconciling` is passed
-    /// through immediately; the transition table has no direct
-    /// `Candidate -> Leader` edge.
-    fn maybe_win_election(&mut self) {
-        let quorum = self.membership.effective_electorate().len() / 2 + 1;
-        if self.votes_received.len() < quorum {
+    /// Learns what a refusal of this node's roll call or vote request tells
+    /// it (ADR-0001 decision 4): a higher term raises its highest term seen,
+    /// and while `RollCall` a leader named at a term no older than that, or
+    /// named as still valid at any term, becomes its leader, which it
+    /// heartbeats until that leader's ack returns it to `Active` (or, if
+    /// that leader's term is below its own term seen, until the heartbeat
+    /// makes that leader step down). A refusal carrying the commit of the
+    /// joint configuration this node holds hands it that commit (see
+    /// [`Self::adopt_relayed_commit`]). A term later than the one it holds
+    /// or contests makes it step down (see [`Self::step_down_if_outpaced`]).
+    /// A refusal from a node at a later recovery epoch raises nothing (the
+    /// two epochs' terms do not compare) but, while `RollCall`, makes the
+    /// leader it names this node's, whose ack then moves it to that epoch.
+    /// The refusal itself is not counted.
+    fn on_election_reject(&mut self, reject: &ElectionReject) {
+        if reject.shard_id() != self.shard_id || reject.initiator_id() != self.my_id {
             return;
         }
-
-        let certificate = ElectionCertificate {
-            shard_id: Some(self.shard_id.clone().into()),
-            recovery_epoch: self.recovery_epoch,
-            term: self.term,
-            leader_id: Some(self.my_id.clone().into()),
-            granting_voters: self
-                .votes_received
-                .iter()
-                .cloned()
-                .map(Into::into)
-                .collect(),
-            membership_generation: self.membership.membership_generation(),
-        };
-        self.transport.broadcast(
-            self.my_id.clone(),
-            self.votes_received.clone(),
-            ElectionMessage {
-                payload: Some(election_message::Payload::ElectionCertificate(certificate)),
-            },
-        );
-
-        self.state = WorkerState::LeaderReconciling;
-        self.state = WorkerState::Leader;
+        let offered = reject.configuration();
+        let later_epoch = offered
+            .as_ref()
+            .is_some_and(|offered| offered.generation().recovery_epoch() > self.recovery_epoch);
+        if later_epoch {
+            // Its terms are not this epoch's, so they neither raise this
+            // node's nor outpace its roll call: the named leader's ack will.
+            if self.state == WorkerState::RollCall
+                && let Some(leader) = &reject.leader
+                && leader.leader_id() != self.my_id
+            {
+                self.leader = Some((leader.leader_id(), leader.term));
+            }
+            return;
+        }
+        self.highest_term_seen = self.highest_term_seen.max(reject.highest_term_seen);
+        // A leader named as still valid is heartbeated whatever its term:
+        // if this node's term seen is above that leader's, its acks stay
+        // ignored, but the heartbeat tells it of the later term, and it
+        // steps down (see `Self::on_heartbeat`).
+        if self.state == WorkerState::RollCall
+            && let Some(leader) = &reject.leader
+            && (leader.term >= self.highest_term_seen
+                || reject.reason() == ElectionRejectReason::LeaderStillValid)
+            && leader.leader_id() != self.my_id
+        {
+            self.leader = Some((leader.leader_id(), leader.term));
+        }
+        if let Some(offered) = offered {
+            self.adopt_relayed_commit(offered);
+        }
+        self.step_down_if_outpaced();
     }
 
-    /// Forced recovery of a `NoQuorum` node through the coordination authority
-    /// (README §14.3); a no-op in any other state.
-    ///
-    /// It intersects the authority's view with the peers this node can reach.
-    /// If that is empty, the authority is unavailable, the authority's epoch is
-    /// behind this node's own, or the authority rejects the compare-and-swap,
-    /// the node stays in `NoQuorum` and a later call retries.
-    /// Otherwise it adopts the new epoch and the reachable set as its
-    /// electorate and starts a roll call.
-    pub fn attempt_forced_recovery(&mut self) {
-        if self.state != WorkerState::NoQuorum {
+    /// Adopts `offered`, a refuser's configuration, when it is the commit of
+    /// the joint configuration this node holds and this node is on that
+    /// one's new side: the commit's ack never reached it, say because its
+    /// leader stopped just after committing. It is admitted at the commit's
+    /// generation, as that ack would have admitted it (see
+    /// [`Configuration::admission_after_commit`]). Without this, a survivor
+    /// holding the commit and one holding the joint configuration refuse
+    /// each other's roll calls term after term (ADR-0001 decision 4 as
+    /// amended 2026-09-28). Only a node that takes part in elections without
+    /// standing or leading adopts it.
+    fn adopt_relayed_commit(&mut self, offered: Configuration) {
+        if !self.as_voter().takes_part {
             return;
         }
-
-        let Ok(authority_view) = self.authority.discover_workers(&self.shard_id) else {
-            return;
-        };
-
-        let locally_reachable = self.transport.reachable_peers(self.my_id.clone());
-        let mut reachable: BTreeSet<WorkerId> = authority_view
-            .intersection(&locally_reachable)
-            .cloned()
-            .collect();
-
-        // Checked before adding this node: a lone node with no confirmed
-        // peer must not "recover" a shard on its own say-so.
-        if reachable.is_empty() {
-            return;
-        }
-        reachable.insert(self.my_id.clone());
-
-        let Ok(old_epoch) = self.authority.read_recovery_epoch(&self.shard_id) else {
-            return;
-        };
-        // An authority behind this node (wiped or restored from an old backup)
-        // would hand back an epoch this node has already used; adopting it
-        // would let peers still on the higher epoch be mistaken for stale.
-        if old_epoch < self.recovery_epoch {
-            return;
-        }
-        let Ok(new_epoch) =
-            self.authority
-                .force_reconfigure(&self.shard_id, old_epoch, reachable.clone())
+        let Some(admission) = self
+            .configuration
+            .as_ref()
+            .and_then(|own| own.admission_after_commit(&offered, self.admission))
         else {
             return;
         };
-
-        self.recovery_epoch = new_epoch;
-        self.membership.rebuild(reachable);
-        self.begin_roll_call();
+        self.configuration = Some(offered);
+        self.admission = Some(admission);
+        self.prior_admission = None;
     }
+
+    /// Once this candidacy has won (see the `vote_round` module), becomes
+    /// `Leader` of what its roll call's respondents found (see
+    /// [`Roster::after_election`]): under a single configuration, a joint
+    /// one whose new side is the respondents, each admitted at its new
+    /// generation, and whose old side is the configuration the roll call ran
+    /// under; under a joint configuration not yet committed, that one
+    /// re-stamped at a generation of this term and re-based there, each
+    /// respondent its new side counted re-admitted at it. It sends every
+    /// other respondent an `ElectionCertificate`
+    /// (README §12.6) naming that configuration and the respondent's
+    /// admission generations there, and takes office as the leader of a
+    /// roster of the respondents with no ack confirmed yet (see
+    /// [`Self::take_office`]).
+    fn win_if_quorum(&mut self) {
+        if !self.vote.as_ref().is_some_and(VoteRound::has_won) {
+            return;
+        }
+        let Some(vote) = self.vote.take() else {
+            return;
+        };
+        let census = vote.census();
+        let roster = Roster::after_election(
+            self.recovery_epoch,
+            self.term,
+            census.configuration(),
+            census.respondents(),
+        );
+        for respondent in census.respondents().keys() {
+            if *respondent != self.my_id {
+                let certificate = ElectionCertificate {
+                    shard_id: Some(self.shard_id.clone().into()),
+                    recovery_epoch: self.recovery_epoch,
+                    term: self.term,
+                    leader_id: Some(self.my_id.clone().into()),
+                    configuration: Some(roster.configuration().into()),
+                    recipient_admission: roster.admission_of(respondent).map(Into::into),
+                    recipient_prior_admission: roster
+                        .prior_admission_of(respondent)
+                        .map(Into::into),
+                };
+                self.send(
+                    respondent.clone(),
+                    election_message::Payload::ElectionCertificate(certificate),
+                );
+            }
+        }
+        self.take_office(roster);
+    }
+
+    /// Commits the joint configuration this leader leads once a majority of
+    /// each side holds it (see [`Roster::commit_if_confirmed`]): it then
+    /// leads the new side alone, which its acks carry from then on, with
+    /// each member's admission generation there, its own included, and
+    /// holds no prior admission generation any more. Joiners that waited
+    /// out the change are then admitted in the next batch (see
+    /// [`Self::admit_waiting_joiners`]).
+    fn commit_if_confirmed(&mut self) {
+        self.apply_pending_removals();
+        let Some(roster) = self.roster.as_mut() else {
+            return;
+        };
+        if roster.commit_if_confirmed(&self.my_id, self.term) {
+            self.take_on_roster_configuration();
+            self.admit_waiting_joiners();
+        }
+    }
+
+    /// Accepts `leader`'s certificate of what its election's winner leads
+    /// (ADR-0001 decision 8), sent to every respondent of its winning roll
+    /// call: this node adopts that configuration and its admission
+    /// generations there, as [`Self::adopt_configuration`] allows, and the
+    /// certificate's term raises its highest term seen, which makes a node
+    /// holding or contesting an earlier one step down (see
+    /// [`Self::step_down_if_outpaced`]).
+    ///
+    /// It accepts a certificate for its own shard and recovery epoch that is
+    /// from the leader it granted its vote in that term, or for a term no
+    /// earlier than the highest it has seen: a respondent whose vote request
+    /// never came granted nothing but is admitted too. A certificate for an
+    /// earlier term from a leader it did not vote for is ignored, as is one
+    /// reaching a node still joining, which answered no roll call.
+    fn on_election_certificate(&mut self, leader: &WorkerId, certificate: &ElectionCertificate) {
+        if matches!(
+            self.state,
+            WorkerState::Bootstrapping | WorkerState::Joining
+        ) || certificate.shard_id() != self.shard_id
+            || certificate.recovery_epoch != self.recovery_epoch
+        {
+            return;
+        }
+        let voted_for_it = self.ballot.granted_in(certificate.term) == Some(leader);
+        if certificate.term < self.ack_floor() && !voted_for_it {
+            return;
+        }
+        self.highest_term_seen = self.highest_term_seen.max(certificate.term);
+        self.adopt_configuration(
+            certificate.configuration(),
+            certificate.recipient_admission(),
+            certificate.recipient_prior_admission(),
+        );
+        self.step_down_if_outpaced();
+    }
+
+    /// Asks the authority for what this node's lease has come due for: a
+    /// registration, from every state but `Bootstrapping`, `Joining`,
+    /// `Draining` and `Stopped` (a fenced node keeps registering, to
+    /// reconnect), and, while it needs one, its recovery fence.
+    fn ask_authority_if_due(&mut self) {
+        let now = self.clock.now();
+        let registers = self.registers_with_authority();
+        let epoch = self.own_recovery_epoch();
+        let Some(lease) = self.authority.as_mut() else {
+            return;
+        };
+        if registers && lease.registration_due(now) {
+            lease.registration_asked(now);
+            self.outputs.push(Output::Authority(AuthorityCall {
+                request: AuthorityRequest::Register,
+                sent_at: now,
+            }));
+        }
+        // A node that has joined no shard has no epoch to hold a fence at,
+        // and never needs one.
+        if let Some(epoch) = epoch
+            && lease.fence_due(now)
+        {
+            lease.fence_asked(now);
+            self.outputs.push(Output::Authority(AuthorityCall {
+                request: AuthorityRequest::AcquireFence {
+                    recovery_epoch: epoch,
+                },
+                sent_at: now,
+            }));
+        }
+    }
+
+    /// Whether this node keeps a registration with its authority in its
+    /// current state.
+    fn registers_with_authority(&self) -> bool {
+        !matches!(
+            self.state,
+            WorkerState::Bootstrapping
+                | WorkerState::Joining
+                | WorkerState::Draining
+                | WorkerState::Stopped
+        )
+    }
+
+    /// Asks for `request` as the one read or swap this node now waits on
+    /// (see `awaited_reply`).
+    fn await_authority(&mut self, request: AuthorityRequest) {
+        self.awaited_reply = Some(self.clock.now());
+        self.ask_authority(request);
+    }
+
+    /// Whether a reply to a call asked at `sent_at` answers the one this
+    /// node waits on.
+    fn awaits(&self, sent_at: Instant) -> bool {
+        self.awaited_reply == Some(sent_at)
+    }
+
+    fn ask_authority(&mut self, request: AuthorityRequest) {
+        self.outputs.push(Output::Authority(AuthorityCall {
+            request,
+            sent_at: self.clock.now(),
+        }));
+    }
+
+    /// Handles what the authority answered to a call this node asked for.
+    fn on_authority_reply(&mut self, reply: AuthorityReply) {
+        if self.authority.is_none() {
+            return;
+        }
+        match reply {
+            AuthorityReply::Registered { sent_at, result } => {
+                if let (Ok(granted), Some(lease)) = (result, self.authority.as_mut()) {
+                    lease.registered(sent_at, granted);
+                    // A fenced node that can register again reads the epoch
+                    // to learn whether it may resume (ADR-0001 decision 12).
+                    if self.state == WorkerState::Fenced {
+                        self.await_authority(AuthorityRequest::ReadRecoveryEpoch);
+                    }
+                }
+            }
+            AuthorityReply::LiveRegistrations { sent_at, result } => {
+                if self.awaits(sent_at) {
+                    self.on_live_registrations(result);
+                }
+            }
+            AuthorityReply::RecoveryEpoch { sent_at, result } => {
+                if !self.awaits(sent_at) {
+                    return;
+                }
+                if self.state == WorkerState::Fenced {
+                    if let Ok(epoch) = result {
+                        self.reconnect(epoch);
+                    }
+                } else {
+                    self.on_recovery_epoch(result);
+                }
+            }
+            AuthorityReply::RecoveryEpochSwapped {
+                expected,
+                new,
+                sent_at,
+                result,
+            } => {
+                let awaited = self.awaits(sent_at);
+                self.on_recovery_epoch_swapped(expected, new, awaited, result);
+            }
+            AuthorityReply::Fence {
+                recovery_epoch,
+                sent_at,
+                result,
+            } => self.on_fence(recovery_epoch, sent_at, result),
+        }
+    }
+
+    /// Fences this node (ADR-0001 decision 12) if its registration has
+    /// lapsed, on its own clock, in a state that takes part in elections:
+    /// it drops any roll call, vote or recovery it runs and any grant it
+    /// holds, and asks its executor to abort its TaskRuns within the
+    /// reconnect timeout, less drift. It keeps its configuration and
+    /// admission generation. Returns whether it did.
+    fn orphan_if_unregistered(&mut self) -> bool {
+        let now = self.clock.now();
+        let lapsed = self
+            .authority
+            .as_ref()
+            .is_some_and(|lease| !lease.is_registered(now));
+        let takes_part = matches!(
+            self.state,
+            WorkerState::Active
+                | WorkerState::LeaderSuspect
+                | WorkerState::RollCall
+                | WorkerState::Candidate
+                | WorkerState::Leader
+                | WorkerState::NoQuorum
+        );
+        if !lapsed || !takes_part {
+            return false;
+        }
+        self.roll_call = None;
+        self.vote = None;
+        self.recovery = None;
+        self.transition_to(WorkerState::Fenced);
+        self.orphan_abort_by = Some(now + self.timings.less_drift(self.reconnect_timeout));
+        true
+    }
+
+    /// A fenced node that can reach its authority again, which reports the
+    /// shard's recovery epoch as `authority_epoch`, resumes, rejoins or stays
+    /// fenced (see [`Reconnect`]). Resuming restarts its leader contact, so it
+    /// does not at once suspect a leader it could not hear from while fenced.
+    /// Rejoining discards everything it knew of the shard, takes the
+    /// authority's epoch and returns it to `Bootstrapping`, for its driver to
+    /// join it again.
+    fn reconnect(&mut self, authority_epoch: Option<RecoveryEpoch>) {
+        let now = self.clock.now();
+        if !self
+            .authority
+            .as_ref()
+            .is_some_and(|lease| lease.is_registered(now))
+        {
+            return;
+        }
+        match Reconnect::decide(self.own_recovery_epoch(), authority_epoch) {
+            Reconnect::Resume => {
+                self.orphan_abort_by = None;
+                self.last_leader_contact = now;
+                self.transition_to(WorkerState::Active);
+            }
+            Reconnect::Rejoin(epoch) => self.rejoin_at(epoch),
+            Reconnect::StayFenced => {}
+        }
+    }
+
+    /// Forgets the configuration, admissions and election state this node
+    /// held under its recovery epoch, as it leaves that epoch behind.
+    fn forget_shard(&mut self) {
+        self.configuration = None;
+        self.admission = None;
+        self.prior_admission = None;
+        self.newest_accepted_ack = None;
+        self.ballot = Ballot::default();
+        self.roll_call = None;
+        self.vote = None;
+        self.recovery = None;
+        self.roster = None;
+    }
+
+    /// Adopts `epoch`, a later recovery epoch than this node's, whose
+    /// leader, elected in `term`, has acked it: the shard was recovered
+    /// through the authority. Terms of the two epochs are not comparable,
+    /// so the node takes `term` as the highest it has seen and starts a
+    /// fresh ballot, and it forgets what it held at the old epoch; the ack
+    /// then gives it the new configuration and its admission there. The
+    /// node takes the epoch's `lineage` with it when the ack names one: the
+    /// epoch is usually of its own lineage, as a recovery keeps it, but one
+    /// recovered from a shard founded afresh is not, and a node that kept
+    /// its old lineage would not recognise the epoch as its own when it
+    /// next reconnected, and would rejoin rather than resume.
+    fn adopt_recovery_epoch(&mut self, epoch: u64, lineage: Option<u64>, term: u64) {
+        self.forget_shard();
+        self.recovery_epoch = epoch;
+        if lineage.is_some() {
+            self.recovery_lineage = lineage;
+        }
+        self.highest_term_seen = term;
+    }
+
+    /// Takes the authority path once this node's roll call has fallen short
+    /// of its returning quorum (see the `forced_recovery` module): asks for
+    /// the shard's live registrations. The node is already `NoQuorum`.
+    fn begin_forced_recovery(&mut self, round: &RollCallRound) {
+        self.recovery = Some(ForcedRecovery::start(
+            round.term(),
+            round.configuration().clone(),
+            round.respondents().clone(),
+        ));
+        self.await_authority(AuthorityRequest::ReadLiveRegistrations);
+    }
+
+    /// Carries a recovery on as `next` says.
+    fn follow_recovery(&mut self, next: Next) {
+        match next {
+            Next::ReadEpoch => self.await_authority(AuthorityRequest::ReadRecoveryEpoch),
+            Next::Swap { from, to } => self.await_authority(AuthorityRequest::SwapRecoveryEpoch {
+                expected: Some(from),
+                new: to,
+            }),
+            Next::AwaitFence { epoch } => self.stand_through_authority(epoch),
+            Next::Abandon => self.abandon_shard(),
+            Next::Rejoin(epoch) => self.rejoin_at(epoch),
+            Next::GiveUp => self.recovery = None,
+        }
+    }
+
+    /// Leaves the shard this node held for the one the authority holds at
+    /// `epoch`, which it cannot resume or recover into: discards everything
+    /// it knew of its own and goes back to `Bootstrapping`, for its driver to
+    /// join it again (ADR-0001 decision 12). The epoch it rejoins is a
+    /// floor: a JOIN pointer to a leader left on an older one, or on another
+    /// lineage, must not take it back there.
+    fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
+        self.forget_shard();
+        self.awaited_reply = None;
+        self.recovery_epoch = epoch.number;
+        self.recovery_lineage = Some(epoch.lineage);
+        self.highest_term_seen = 0;
+        self.leader = None;
+        self.transition_to(WorkerState::Bootstrapping);
+    }
+
+    fn on_live_registrations(&mut self, result: Result<LiveRegistrations, AuthorityError>) {
+        if self.state != WorkerState::NoQuorum {
+            return;
+        }
+        let Some(recovery) = self.recovery.as_mut() else {
+            return;
+        };
+        let next = match result {
+            // A node the authority does not list as live has no standing
+            // to recover the shard on the authority's count.
+            Ok(live) if live.addresses().contains_key(&self.my_id) => {
+                recovery.on_live_registrations(&live)
+            }
+            _ => Next::GiveUp,
+        };
+        self.follow_recovery(next);
+    }
+
+    fn on_recovery_epoch(&mut self, result: Result<Option<RecoveryEpoch>, AuthorityError>) {
+        if self.state != WorkerState::NoQuorum {
+            return;
+        }
+        let own_epoch = self.own_recovery_epoch();
+        let Some(recovery) = self.recovery.as_mut() else {
+            return;
+        };
+        let next = match result {
+            Ok(epoch) => recovery.on_recovery_epoch(epoch, own_epoch),
+            Err(_) => Next::GiveUp,
+        };
+        self.follow_recovery(next);
+    }
+
+    /// A compare-and-swap of the recovery epoch came back: either this
+    /// node's authority path, or a leader republishing its epoch after the
+    /// authority lost it (README §15.3), which then asks for its fence
+    /// again at once.
+    fn on_recovery_epoch_swapped(
+        &mut self,
+        expected: Option<RecoveryEpoch>,
+        new: RecoveryEpoch,
+        awaited: bool,
+        result: Result<(), AuthorityError>,
+    ) {
+        if self.state == WorkerState::NoQuorum
+            && let Some(recovery) = self.recovery.as_mut()
+        {
+            if !awaited {
+                return;
+            }
+            let next = recovery.on_swapped(expected, new, result.is_ok());
+            self.follow_recovery(next);
+            return;
+        }
+        // The leader's republish (README §15.3): once the epoch is back, by
+        // this swap or another worker's, it asks for its fence at once.
+        // Otherwise it asks when the fence is next due, so an authority that
+        // keeps failing is not asked again within the same instant.
+        let republished = match &result {
+            Ok(()) => true,
+            Err(AuthorityError::EpochConflict { current }) => *current == Some(new),
+            Err(_) => false,
+        };
+        if self.state == WorkerState::Leader
+            && expected.is_none()
+            && Some(new) == self.own_recovery_epoch()
+            && republished
+        {
+            let now = self.clock.now();
+            if let Some(lease) = self.authority.as_mut() {
+                lease.retry_fence_at(now);
+            }
+        }
+    }
+
+    /// The authority path swapped the recovery epoch to `epoch`: this node
+    /// adopts it, and the configuration its recovery founds there, stands
+    /// as `Candidate` for its roll call's term, and asks for the fence, which
+    /// it must hold before it leads (ADR-0001 decision 11.4).
+    fn stand_through_authority(&mut self, epoch: RecoveryEpoch) {
+        let Some(recovery) = self.recovery.take() else {
+            return;
+        };
+        self.newest_accepted_ack = None;
+        self.recovery_epoch = epoch.number;
+        self.recovery_lineage = Some(epoch.lineage);
+        self.term = recovery.term();
+        self.highest_term_seen = self.highest_term_seen.max(recovery.term());
+        if let Some(roster) = recovery.founded_roster() {
+            self.configuration = Some(roster.configuration().clone());
+            self.admission = roster.admission_of(&self.my_id);
+            self.prior_admission = None;
+        }
+        self.recovery = Some(recovery);
+        self.transition_to(WorkerState::Candidate);
+        let now = self.clock.now();
+        if let Some(lease) = self.authority.as_mut() {
+            lease.need_fence(now);
+        }
+    }
+
+    /// The authority path found the recovery epoch missing: the shard is
+    /// abandoned (ADR-0001 decision 11.5), and this node stops for good,
+    /// raising an alert. A restart re-enters the bootstrap cascade.
+    fn abandon_shard(&mut self) {
+        self.recovery = None;
+        self.stop_reason = Some(StopReason::Abandoned);
+        self.transition_to(WorkerState::Stopped);
+        self.outputs.push(Output::ShardAbandoned);
+    }
+
+    /// Handles the authority's answer to this node's request for the
+    /// recovery fence at `epoch`, asked at `sent_at`. Only a `Leader`, or a
+    /// `Candidate` waiting out the fence after its authority path, holds or
+    /// seeks one; an answer for another epoch than its own is stale.
+    ///
+    /// - Granted: the fence lets it act until a TTL, less drift, after it
+    ///   asked. A waiting candidate now leads (see [`Self::lead_recovered`]).
+    /// - Held by another worker: it asks again once that fence has run out.
+    /// - The epoch is missing (the authority lost its data): a leader
+    ///   republishes it (README §15.3) and asks again; a waiting candidate
+    ///   gives up, its swap lost with the data.
+    /// - The epoch has moved on: the shard was recovered without it. A
+    ///   leader steps down, and a waiting candidate gives up; either
+    ///   adopts the new epoch from its leader's ack.
+    /// - Unavailable: it asks again at its next renewal.
+    fn on_fence(
+        &mut self,
+        epoch: RecoveryEpoch,
+        sent_at: Instant,
+        result: Result<Duration, AuthorityError>,
+    ) {
+        let seeking = match self.state {
+            WorkerState::Leader => true,
+            WorkerState::Candidate => self
+                .recovery
+                .as_ref()
+                .is_some_and(ForcedRecovery::is_awaiting_fence),
+            _ => false,
+        };
+        if !seeking || Some(epoch) != self.own_recovery_epoch() {
+            return;
+        }
+        let now = self.clock.now();
+        match result {
+            Ok(granted) => {
+                if let Some(lease) = self.authority.as_mut() {
+                    lease.fence_acquired(sent_at, granted);
+                }
+                if self.state == WorkerState::Candidate {
+                    self.lead_recovered();
+                }
+            }
+            Err(AuthorityError::FenceHeld { remaining }) => {
+                if let Some(lease) = self.authority.as_mut() {
+                    lease.retry_fence_at(now + remaining + Duration::from_ticks(1));
+                }
+            }
+            Err(AuthorityError::EpochConflict { current: None })
+                if self.state == WorkerState::Leader =>
+            {
+                self.ask_authority(AuthorityRequest::SwapRecoveryEpoch {
+                    expected: None,
+                    new: epoch,
+                });
+            }
+            // An epoch this node cannot recover from: it rejoins the shard
+            // at it, as a reconnecting fenced node and a `NoQuorum` node's
+            // recovery do, rather than win again and meet it again.
+            Err(AuthorityError::EpochConflict {
+                current: Some(held),
+            }) if cannot_recover_from(self.own_recovery_epoch(), held) => {
+                self.lose_quorum();
+                self.rejoin_at(held);
+            }
+            Err(AuthorityError::EpochConflict { .. }) => {
+                if self.state == WorkerState::Leader {
+                    self.suspect_again();
+                } else {
+                    self.lose_quorum();
+                }
+            }
+            Err(AuthorityError::Unavailable) => {}
+        }
+    }
+
+    /// Leads the configuration this node's authority path founded, now that
+    /// it holds the fence: becomes `Leader` of a roster of its counted
+    /// respondents, each admitted at the founded generation, and acks every
+    /// connected peer, which adopts the new epoch from that ack.
+    fn lead_recovered(&mut self) {
+        let Some(roster) = self
+            .recovery
+            .take()
+            .and_then(|recovery| recovery.founded_roster())
+        else {
+            return;
+        };
+        self.take_office(roster);
+    }
+
+    /// Becomes `Leader` of `roster` in this node's current term: holds its
+    /// configuration and its own admission generations there, commits it
+    /// at once if it alone is a majority of each side, starts its quorum-
+    /// contact lease and its watch over the workers it leads, records itself
+    /// as its own leader in place of any it followed before, and announces
+    /// itself to every connected peer (see [`Self::announce_leadership`]),
+    /// unless a drain kept from before stops it first. With an authority it
+    /// needs a fence to act; one it already holds is kept. Leader
+    /// reconciliation (README §13) needs task data that does not exist yet,
+    /// so `LeaderReconciling` is passed through immediately.
+    fn take_office(&mut self, roster: Roster) {
+        let now = self.clock.now();
+        // A leader never acks itself, so nothing else raises its own
+        // `highest_term_seen` to the term it won.
+        self.highest_term_seen = self.highest_term_seen.max(self.term);
+        self.pending_removals.clear();
+        self.configuration = Some(roster.configuration().clone());
+        self.admission = roster.admission_of(&self.my_id);
+        self.prior_admission = roster.prior_admission_of(&self.my_id);
+        self.last_heard = roster
+            .members()
+            .keys()
+            .chain(roster.pending())
+            .filter(|worker| **worker != self.my_id)
+            .map(|worker| (worker.clone(), now))
+            .collect();
+        self.roster = Some(roster);
+        self.commit_if_confirmed();
+
+        self.lease = QuorumContactLease::starting_at(now);
+        if let Some(lease) = self.authority.as_mut()
+            && lease.fence_valid_until().is_none()
+        {
+            lease.need_fence(now);
+        }
+        // The leader it followed before is replaced. Should this node lose
+        // its quorum and go back to electing, it must not heartbeat that
+        // leader again.
+        self.leader = Some((self.my_id.clone(), self.term));
+        self.newest_accepted_ack = None;
+        self.next_heartbeat = None;
+        self.transition_to(WorkerState::LeaderReconciling);
+        self.transition_to(WorkerState::Leader);
+        if self.state == WorkerState::Leader {
+            self.announce_leadership();
+        }
+    }
+
+    /// No rival leader can win before the grant this node last reported
+    /// ends (see [`Output::AbortDeadline`]): as that grant is replaced or
+    /// withdrawn, raises its contact floor to its end, or to now if it ends
+    /// later.
+    fn raise_contact_floor_to_grant(&mut self) {
+        let Some(grant) = self.reported_grant else {
+            return;
+        };
+        let now = self.clock.now();
+        let floor = match grant.valid_until {
+            LeaseEnd::Unbounded => now,
+            LeaseEnd::At(end) => end.min(now),
+        };
+        self.contact_floor = self.contact_floor.max(Some(floor));
+    }
+
+    /// Whether this node leads with a grant that has not ended at `now`.
+    fn holds_grant_at(&self, now: Instant) -> bool {
+        self.grant().is_some_and(|grant| match grant.valid_until {
+            LeaseEnd::Unbounded => true,
+            LeaseEnd::At(end) => end > now,
+        })
+    }
+
+    /// This node's contact floor, counting the end of the grant it holds,
+    /// which no rival leader can precede. `None` while that grant is
+    /// unbounded, since no rival can win at all, and before any leader has
+    /// heard this node.
+    fn effective_contact_floor(&self) -> Option<Instant> {
+        match self.reported_grant.map(|grant| grant.valid_until) {
+            Some(LeaseEnd::Unbounded) => None,
+            Some(LeaseEnd::At(end)) => Some(self.contact_floor.map_or(end, |floor| floor.max(end))),
+            None => self.contact_floor,
+        }
+    }
+
+    /// When this node goes a suspicion timeout, less drift, past its contact
+    /// floor: from then on a leader may already count it silent, and it
+    /// must be ready to abort.
+    fn leader_contact_stale_at(&self) -> Option<Instant> {
+        self.effective_contact_floor()
+            .map(|floor| floor + self.timings.lease_length())
+    }
+
+    /// The instant by which this node must have aborted its TaskRuns, if
+    /// any (see [`Output::AbortDeadline`]): the earlier of a suspicion
+    /// timeout and a reconnect timeout, less drift, past its contact floor,
+    /// once that floor is stale, and the deadline it took when it fenced
+    /// itself.
+    fn abort_deadline(&self) -> Option<Instant> {
+        let now = self.clock.now();
+        let out_of_contact = self
+            .leader_contact_stale_at()
+            .filter(|stale_at| *stale_at <= now)
+            .and(self.effective_contact_floor())
+            .map(|floor| floor + self.timings.less_drift(self.lost_after()));
+        earliest(out_of_contact, self.orphan_abort_by)
+    }
+
+    /// Reports this node's abort deadline if it differs from the one last
+    /// reported.
+    fn report_abort_deadline_if_changed(&mut self) {
+        let deadline = self.abort_deadline();
+        if deadline != self.reported_abort_deadline {
+            self.reported_abort_deadline = deadline;
+            self.outputs.push(Output::AbortDeadline(deadline));
+        }
+    }
+
+    /// When the leader next has a worker to report lost: a suspicion timeout
+    /// and a reconnect timeout after it last heard from the one it heard
+    /// from longest ago.
+    fn next_worker_lost_at(&self) -> Option<Instant> {
+        self.last_heard
+            .values()
+            .min()
+            .map(|heard| *heard + self.lost_after())
+    }
+
+    fn lost_after(&self) -> Duration {
+        Duration::from_ticks(
+            self.timings
+                .suspect_timeout
+                .as_ticks()
+                .saturating_add(self.reconnect_timeout.as_ticks()),
+        )
+    }
+
+    /// Reports every worker this leader has not heard from for a suspicion
+    /// timeout and a reconnect timeout as lost (README §8.3), once each.
+    fn report_lost_workers(&mut self) {
+        let now = self.clock.now();
+        let lost_after = self.lost_after();
+        let lost: Vec<WorkerId> = self
+            .last_heard
+            .iter()
+            .filter(|(_, heard)| now >= **heard + lost_after)
+            .map(|(worker, _)| worker.clone())
+            .collect();
+        for worker in lost {
+            self.last_heard.remove(&worker);
+            self.outputs.push(Output::WorkerLost(worker));
+        }
+    }
+}
+
+/// The admission generations `reply` answered a roll call with.
+fn answered_admission(reply: &RollCallReply) -> Admission {
+    Admission {
+        current: reply.admission(),
+        prior: reply.prior_admission(),
+    }
+}
+
+/// Panics unless a follower heartbeating every `timings.heartbeat_interval`
+/// keeps its leader's lease alive: just before a confirmation arrives, the
+/// newest one a leader holds can be two intervals old (and a round trip), so
+/// two intervals must fit inside the lease.
+fn assert_heartbeats_keep_a_lease(timings: &ElectionTimings) {
+    let two_intervals = timings.heartbeat_interval.as_ticks().saturating_mul(2);
+    assert!(
+        two_intervals < timings.lease_length().as_ticks(),
+        "twice ElectionTimings::heartbeat_interval ({:?}) must be shorter than the lease length \
+         ({:?}, ElectionTimings::lease_length)",
+        timings.heartbeat_interval,
+        timings.lease_length(),
+    );
+}
+
+/// The earlier of two optional instants; `None` only when both are.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// `timeout` × (1 + u/2), rounded down to a whole tick, where u is `share`
+/// read as a fraction of 2^64, so 0 ≤ u < 1.
+fn lengthen_by_less_than_half(timeout: Duration, share: u64) -> Duration {
+    let ticks = timeout.as_ticks();
+    // ticks × share / 2^65 is less than half of `ticks`, so it fits a u64.
+    let extra = ((u128::from(ticks) * u128::from(share)) >> 65) as u64;
+    Duration::from_ticks(ticks.saturating_add(extra))
 }

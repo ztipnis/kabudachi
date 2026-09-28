@@ -4,7 +4,8 @@
 //! messages the same way (a 4-byte big-endian length prefix followed by a
 //! prost-encoded body). The framing lives here once, so every codec enforces
 //! the same limit and error kinds (`STYLE_GUIDE.md`'s "defaults live in one
-//! place").
+//! place"). A gossip message's body goes through the same decoding
+//! ([`decode_well_formed`]); gossipsub frames it itself.
 
 use std::io;
 
@@ -16,12 +17,13 @@ use libp2p::futures::{AsyncRead, AsyncReadExt};
 /// prefix.
 pub(crate) const MAX_MESSAGE_BYTES: u32 = 1024 * 1024;
 
-/// Decodes a frame body and rejects a message missing a required ID
+/// Decodes a frame body and rejects a malformed message: one missing a
+/// required ID, or holding a field without the partner it needs
 /// (`core::protocol::messages::WellFormed`). The required ID accessors panic
 /// on an absent field, and any peer that completes the Noise handshake can
 /// send one, so a malformed message stops here as `InvalidData` instead of
 /// reaching `run_driver`.
-fn decode_well_formed<M>(body: &[u8]) -> io::Result<M>
+pub(crate) fn decode_well_formed<M>(body: &[u8]) -> io::Result<M>
 where
     M: prost::Message + Default + WellFormed,
 {
@@ -29,7 +31,7 @@ where
     if !message.is_well_formed() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} is missing a required id", std::any::type_name::<M>()),
+            format!("{} is not well formed", std::any::type_name::<M>()),
         ));
     }
     Ok(message)

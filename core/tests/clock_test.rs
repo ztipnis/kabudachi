@@ -62,3 +62,24 @@ fn now_never_moves_backward() {
         prev = current;
     }
 }
+
+#[test]
+fn wall_clock_millis_defaults_to_zero() {
+    let clock = FakeClock::new();
+    assert_eq!(clock.wall_clock_millis(), 0);
+}
+
+#[test]
+fn wall_clock_millis_is_settable_independently_of_the_monotonic_clock() {
+    let clock = FakeClock::new();
+
+    clock.advance(Duration::from_ticks(50));
+    clock.set_wall_clock_millis(12_345);
+
+    assert_eq!(
+        clock.now(),
+        Instant::at(50),
+        "setting the wall clock must not move the monotonic clock"
+    );
+    assert_eq!(clock.wall_clock_millis(), 12_345);
+}

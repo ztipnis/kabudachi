@@ -119,7 +119,7 @@ def test_shutting_down_twice_is_harmless():
 
 def test_shutdown_stops_the_worker_at_every_stage_of_its_election():
     for delay_seconds in (0, 0.001, 0.003, 0.01, 0.03):
-        native = new_runtime(election_tick_ms=1)
+        native = new_runtime()
         time.sleep(delay_seconds)
 
         native.shutdown()
@@ -139,7 +139,7 @@ def test_waiting_after_shutdown_is_an_error():
 
 
 def test_shutdown_releases_a_wait_that_leadership_never_reached():
-    native = new_runtime(election_tick_ms=60_000)
+    native = new_runtime(suspect_timeout_ms=60_000)
 
     async def main():
         waiter = asyncio.ensure_future(native.wait_until_leader())
@@ -167,7 +167,7 @@ def test_a_single_worker_thread_is_enough():
 
 
 def test_shutdown_fails_every_pending_wait():
-    native = new_runtime(election_tick_ms=60_000)
+    native = new_runtime(suspect_timeout_ms=60_000)
 
     async def main():
         waiters = [asyncio.ensure_future(native.wait_until_leader()) for _ in range(100)]
@@ -184,7 +184,7 @@ def test_shutdown_fails_every_pending_wait():
 
 
 def test_shutdown_with_pending_waits_is_prompt():
-    native = new_runtime(election_tick_ms=60_000)
+    native = new_runtime(suspect_timeout_ms=60_000)
 
     async def main():
         waiters = [asyncio.ensure_future(native.wait_until_leader()) for _ in range(100)]
@@ -200,7 +200,7 @@ def test_shutdown_with_pending_waits_is_prompt():
 
 def test_no_wait_is_lost_when_shutdown_races_new_waits():
     for delay_seconds in (0, 0.001, 0.002, 0.005, 0.01):
-        native = new_runtime(election_tick_ms=60_000)
+        native = new_runtime(suspect_timeout_ms=60_000)
         issued = []
         stranded = []
         started = threading.Event()
@@ -235,7 +235,7 @@ def test_no_wait_is_lost_when_shutdown_races_new_waits():
 
 
 def test_cancelled_waits_stop_counting():
-    native = new_runtime(election_tick_ms=60_000)
+    native = new_runtime(suspect_timeout_ms=60_000)
     try:
 
         async def main():
@@ -261,11 +261,6 @@ def test_a_finished_wait_stops_counting(runtime):
     asyncio.run(main())
 
     assert runtime.in_flight_waits() == 0
-
-
-def test_the_election_tick_must_be_positive():
-    with pytest.raises(ValueError, match="election_tick_ms"):
-        new_runtime(election_tick_ms=0)
 
 
 def test_a_runtime_that_is_never_shut_down_can_be_discarded():
@@ -296,7 +291,7 @@ def test_concurrent_shutdowns_both_finish_with_the_worker_stopped():
 
 
 def test_a_result_for_a_closed_loop_is_dropped_without_a_report():
-    native = new_runtime(election_tick_ms=100)
+    native = new_runtime(suspect_timeout_ms=100)
     reports = []
     previous_hook = sys.unraisablehook
     sys.unraisablehook = reports.append

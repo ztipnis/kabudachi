@@ -12,10 +12,16 @@ libp2p = { version = "0.57", features = [
     "tcp",
     "noise",
     "yamux",
+    "gossipsub",
     "identify",
+    "kad",
     "request-response",
     "macros",
     "tokio",
 ] }
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+kabudachi-testkit = { path = "../testkit" }

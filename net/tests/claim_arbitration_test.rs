@@ -1,221 +1,227 @@
-//! Chunk C6: the claim arbitration protocol (`/kabudachi/claim/1`) end to
-//! end over a real libp2p swarm — a real leader `WorkerNode`, a real
-//! `kabudachi_net::messenger::Net` per node, real loopback TCP sockets, no
-//! simulator, no fakes. Mirrors chunk C4's `three_node_join_test.rs` in
-//! spirit (prove the wire protocol against `core`'s existing, unmodified
-//! logic — here, `core::scheduler::Scheduler::request_claim` — not a new
-//! one written for this chunk).
+//! Claim arbitration (`/kabudachi/claim/1`, README §8.2) end to end over
+//! real sockets: a genesis leader and two joiners, every one a driven
+//! `WorkerNode` with its own `Net` and `Scheduler`.
 //!
-//! ## Topology: why only the leader is a `WorkerNode`
+//! The joiners are pending members (ADR-0001 decision 9.1): they claim work
+//! as soon as JOIN completes, before any admission makes them voters. Each
+//! asks the leader its own node names; the test never tells a claimant whom
+//! to ask. The leader decides from the leadership grant its election handed
+//! its scheduler, so a worker holding no grant refuses every claim.
 //!
-//! Chunk C6's worker-side "who do I ask" mechanism (peeking inbound
-//! `LeaderHeartbeatAck`s to remember a believed leader — see
-//! `kabudachi_net::driver`'s module doc) is covered by a dedicated unit test
-//! of `driver::observed_leader` in `net/src/driver.rs` itself, which needs no
-//! networking to exercise. This test's job is the other half: prove
-//! `Scheduler::request_claim` actually decides correctly over the real wire
-//! protocol, for both the accepted and the raced-and-rejected case. Nothing
-//! about that needs the *askers* to be full `WorkerNode`s running their own
-//! election — a bare `Net` sending `REQUEST_CLAIM` to a peer it already
-//! knows the `WorkerId` of (exactly like `join_via_seeds`'s test coverage
-//! doesn't require the *seed* to be anything more than a `Net` either) is
-//! already "a real follower over the real network", per this chunk's brief.
-//!
-//! Making the askers full `WorkerNode`s instead would reintroduce
-//! `two_node_election_test.rs`'s documented multi-node convergence race
-//! (which candidate wins is not under this test's control) for no added
-//! coverage — the claim arbitration path under test does not care whether
-//! the asker is `Active`, `Leader`-suspect, or anything else; `Scheduler`
-//! only sees a bare `WorkerId`.
-//!
-//! `node_a`'s own convergence to `Leader` is instead made fully
-//! deterministic by giving it a *single-member* electorate (`{a}`) —
-//! `bootstrap_self_elect_test.rs`'s proven pattern (README §27 Phase 2 step
-//! (c)): a lone node still waits out its configured `suspect_timeout`, then
-//! self-elects with no race against any peer.
-//!
-//! ## Two phases, one `Scheduler`
-//!
-//! `Scheduler::submit` (spec decision 9: no wire submission this phase) needs
-//! exclusive `&mut` access to `scheduler_a`, but `run_driver` also needs
-//! exclusive `&mut` access to it for as long as it runs. So this test drives
-//! `node_a` in two separate `tokio::select!` blocks: phase 1 races
-//! `run_driver` against "watch for `Leader`" (mirrors
-//! `bootstrap_self_elect_test.rs` exactly) — once the watch arm resolves,
-//! `tokio::select!` drops the *other*, still-pending `run_driver` future,
-//! releasing its borrow of `scheduler_a` back to this function. Only then
-//! does `scheduler_a.submit(..)` run. Phase 2 starts a fresh `run_driver`
-//! race for `node_a`/`scheduler_a`, this time against the two followers'
-//! `Net::request_claim` calls.
+//! The tasks are submitted before any node is driven: submission needs no
+//! leadership, and a scheduler that leads later finds them queued.
 
 mod support;
 
-use std::collections::BTreeSet;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::election::WorkerNode;
-use kabudachi_core::membership::RingMembership;
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, TaskDefinitionId, Uuid7Ids};
+use kabudachi_core::election::{ElectionTimings, WorkerNode};
+use kabudachi_core::protocol::ids::{
+    IncarnationId, ShardId, TaskDefinitionId, TaskId, Uuid7Ids, WorkerId,
+};
 use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::messages::{ClaimRejectReason, claim_response};
-use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::protocol::messages::{ClaimRejectReason, ClaimResponse, claim_response};
 use kabudachi_core::scheduler::{Scheduler, Submission};
-use kabudachi_core::time::Duration;
+use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::driver::run_driver;
-use kabudachi_net::messenger::Net;
+use kabudachi_net::messenger::{ClaimFailure, Net};
 use kabudachi_net::swarm::build_swarm;
-use libp2p::identity;
+use libp2p::{Multiaddr, identity};
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-use support::authority::AlwaysUnavailableAuthority;
-use support::clock::RealClock;
-use support::net::connect_to;
+use support::net::{ask_until_pointed_at_a_leader, connect_to};
 
 const SHARD: &str = "shard-1";
 
-/// Matches `bootstrap_self_elect_test.rs`'s own constants — same reasoning:
-/// a normal, nonzero suspect_timeout, comfortably exceeded by this test's
-/// overall timeout.
+/// How long a node goes without leader contact before it suspects its
+/// leader; the genesis leader waits this out before its lone roll call.
 const SUSPECT_TIMEOUT_MS: u64 = 300;
-const TICK_INTERVAL_MS: u64 = 30;
+
+/// How often a follower heartbeats its leader: well inside the suspicion
+/// timeout.
+const HEARTBEAT_INTERVAL_MS: u64 = 10;
+
+/// How long a roll call runs: well above a loopback round trip.
+const ROLL_CALL_DEADLINE_MS: u64 = 100;
+
+const JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(20);
 
+fn timings() -> ElectionTimings {
+    ElectionTimings::new(
+        Duration::from_millis(SUSPECT_TIMEOUT_MS),
+        Duration::from_millis(HEARTBEAT_INTERVAL_MS),
+    )
+    .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS))
+}
+
+type TestNode = WorkerNode<RealClock>;
+
+/// Big enough that two of them do not fit in one claim message
+/// (`/kabudachi/claim/1` caps a message at 1 MiB), small enough that one does.
+const LARGE_PAYLOAD_BYTES: usize = 600 * 1024;
+
+fn submit(scheduler: &mut Scheduler<RealClock, Uuid7Ids>, payload: Vec<u8>) -> TaskId {
+    scheduler
+        .submit(Submission::new(
+            TaskDefinitionId::new("demo.task"),
+            1,
+            payload,
+            "default",
+        ))
+        .expect("submitting with no memory limits configured never fails")
+}
+
+/// Joins the shard through `seed`, then drives the joiner's node for ever,
+/// reporting the leader it names to `known_leader`.
+async fn join_and_drive(
+    net: &Net,
+    seed: &Multiaddr,
+    clock: RealClock,
+    known_leader: &watch::Sender<Option<WorkerId>>,
+) {
+    let mut node: TestNode = WorkerNode::bootstrapping(
+        net.local_worker_id(),
+        IncarnationId::new(format!("{}-incarnation-0", net.local_worker_id().as_str())),
+        ShardId::new(SHARD),
+        clock,
+        None,
+        timings(),
+    );
+    let pointer = ask_until_pointed_at_a_leader(net, std::slice::from_ref(seed), JOIN_TIMEOUT).await;
+    let _ = node.finish_joining(&pointer);
+    let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+    run_driver(&mut node, net, &mut scheduler, clock, None, |node, _| {
+        let _ = known_leader.send(node.known_leader().map(|(leader, _)| leader));
+    })
+    .await;
+}
+
+fn claimed_tasks(response: Result<ClaimResponse, ClaimFailure>) -> Vec<TaskId> {
+    match response.expect("the leader answered").result {
+        Some(claim_response::Result::Batch(batch)) => batch
+            .claims
+            .into_iter()
+            .map(|claim| claim.task.expect("a claim carries its Task").task_id())
+            .collect(),
+        other => panic!("expected a batch of claims, got {other:?}"),
+    }
+}
+
+fn rejection(response: Result<ClaimResponse, ClaimFailure>) -> ClaimRejectReason {
+    match response.expect("the leader answered").result {
+        Some(claim_response::Result::Reject(reject)) => ClaimRejectReason::try_from(reject.reason)
+            .expect("the leader only ever sends a reason this build knows about"),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+}
+
 #[tokio::test]
-async fn a_follower_claims_a_seeded_task_and_a_racing_follower_is_rejected() {
+async fn pending_members_claim_from_the_leader_their_nodes_name() {
     let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
     let worker_a = net_a.local_worker_id();
-    let listen_addr = timeout(
+    let worker_b = net_b.local_worker_id();
+    let seed = timeout(
         TEST_TIMEOUT,
         net_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
     )
     .await
     .expect("net_a produced a listen address within the timeout");
+    let b_addr = timeout(
+        TEST_TIMEOUT,
+        net_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+    )
+    .await
+    .expect("net_b produced a listen address within the timeout");
 
-    let mut node_a = WorkerNode::new(
+    let clock = RealClock::new();
+    let mut node_a: TestNode = WorkerNode::genesis(
         worker_a.clone(),
         IncarnationId::new("a-incarnation-0"),
         ShardId::new(SHARD),
-        RealClock::new(),
-        &net_a,
-        RingMembership::new(BTreeSet::from([worker_a.clone()])),
-        AlwaysUnavailableAuthority,
-        Duration::from_ticks(SUSPECT_TIMEOUT_MS),
+        clock,
+        0,
+        None,
+        timings(),
     );
-    let mut scheduler_a = Scheduler::new(RealClock::new(), Uuid7Ids);
-    let tick_interval = StdDuration::from_millis(TICK_INTERVAL_MS);
+    let mut scheduler_a = Scheduler::new(clock, Uuid7Ids);
+    let small = || b"payload".to_vec();
+    let taken = submit(&mut scheduler_a, small());
+    let oldest = [
+        submit(&mut scheduler_a, small()),
+        submit(&mut scheduler_a, small()),
+        submit(&mut scheduler_a, vec![0; LARGE_PAYLOAD_BYTES]),
+    ];
+    // The first that does not fit ends the batch: the small task behind it
+    // waits too, so the oldest go out first.
+    let left_for_the_next_batch = [
+        submit(&mut scheduler_a, vec![1; LARGE_PAYLOAD_BYTES]),
+        submit(&mut scheduler_a, small()),
+    ];
 
-    // Phase 1: node_a self-elects alone (bootstrap_self_elect_test.rs's
-    // proven pattern — a single-member electorate races against no one).
-    let (tx_a, mut rx_a) = watch::channel(node_a.state());
-    timeout(TEST_TIMEOUT, async {
+    // A bare claimant that still names a worker holding no grant, as one
+    // whose node has not yet heard of a newer leader would.
+    let stale = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    connect_to(&net_b, &b_addr, &stale).await;
+    stale.set_leader(Some(worker_b));
+
+    let (b_leader, mut b_knows) = watch::channel(None);
+    let (c_leader, mut c_knows) = watch::channel(None);
+
+    let (claimed, taken_again, batch, next_batch, refused, own) = timeout(TEST_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(
-                &mut node_a,
-                &net_a,
-                tick_interval,
-                |s| { let _ = tx_a.send(s); },
-                |_| {},
-                &mut scheduler_a,
-            ) => {
+            _ = run_driver(&mut node_a, &net_a, &mut scheduler_a, clock, None, |_, _| {}) => {
                 unreachable!("run_driver never returns")
             }
-            _ = async {
-                loop {
-                    if *rx_a.borrow() == WorkerState::Leader {
-                        return;
-                    }
-                    rx_a.changed().await.expect("driver task is still running");
+            () = join_and_drive(&net_b, &seed, clock, &b_leader) => {
+                unreachable!("run_driver never returns")
+            }
+            () = join_and_drive(&net_c, &seed, clock, &c_leader) => {
+                unreachable!("run_driver never returns")
+            }
+            claims = async {
+                for knows in [&mut b_knows, &mut c_knows] {
+                    knows
+                        .wait_for(|leader| leader.as_ref() == Some(&worker_a))
+                        .await
+                        .expect("the joiner's driver is still running");
                 }
-            } => {}
+                let claimed = net_b.request_claim(taken.clone()).await;
+                let taken_again = net_c.request_claim(taken.clone()).await;
+                let batch = net_c.claim_oldest(5).await;
+                let next_batch = net_c.claim_oldest(5).await;
+                let refused = stale.request_claim(oldest[0].clone()).await;
+                // The leader's own driver names it as leader too.
+                let own = net_a.request_claim(oldest[0].clone()).await;
+                (claimed, taken_again, batch, next_batch, refused, own)
+            } => claims,
         }
     })
     .await
-    .expect("node_a self-elected Leader within the timeout");
-    assert_eq!(node_a.state(), WorkerState::Leader);
+    .expect("every claim was answered within the timeout");
 
-    // Between phases: select! above dropped its run_driver future once the
-    // watch arm resolved, releasing scheduler_a's borrow — see this file's
-    // module doc. Seed the leader's Scheduler directly (spec decision 9: no
-    // wire submission this phase).
-    let task_id = scheduler_a
-        .submit(Submission::new(
-            TaskDefinitionId::new("demo.task"),
-            1,
-            b"payload".to_vec(),
-            "default",
-        ))
-        .expect("submitting with no memory limits configured never fails");
-
-    // Two bare Nets — real swarms, real sockets, connected directly to
-    // node_a's — stand in for two followers racing for the same task. See
-    // this file's module doc for why they need not be full WorkerNodes.
-    let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-    let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-    connect_to(&net_a, &listen_addr, &net_b).await;
-    connect_to(&net_a, &listen_addr, &net_c).await;
-
-    // Phase 2: keep driving node_a (so it keeps answering claim requests)
-    // while both followers ask for the same task, one after the other so the
-    // outcome is deterministic: the first REQUEST_CLAIM is accepted, and the
-    // second — racing for a task that's now Claimed — is rejected. (The
-    // Scheduler's own contract already guarantees "first accepted, rest
-    // refused" regardless of arrival order; running them sequentially avoids
-    // this test depending on which concurrent request happens to arrive
-    // first, which nothing here controls.)
-    let (accept_response, reject_response) = timeout(TEST_TIMEOUT, async {
-        tokio::select! {
-            _ = run_driver(
-                &mut node_a,
-                &net_a,
-                tick_interval,
-                |_| {},
-                |_| {},
-                &mut scheduler_a,
-            ) => {
-                unreachable!("run_driver never returns")
-            }
-            responses = async {
-                let accept = net_b.request_claim(worker_a.clone(), task_id.clone()).await;
-                let reject = net_c.request_claim(worker_a.clone(), task_id.clone()).await;
-                (accept, reject)
-            } => responses,
-        }
-    })
-    .await
-    .expect("both claim requests completed within the test timeout");
-
-    let accept_response =
-        accept_response.expect("the leader answered the first follower's claim request");
-    match accept_response.result {
+    match claimed.expect("the leader answered").result {
         Some(claim_response::Result::Accept(claim)) => {
-            assert_eq!(
-                claim.task.expect("an accepted claim carries its Task").task_id(),
-                task_id,
-                "the accepted claim must be for the task seeded on the leader's Scheduler"
-            );
-            assert_eq!(
-                claim.attempt_number, 1,
-                "the first claim of a freshly submitted task is attempt 1"
-            );
+            let task = claim.task.expect("an accepted claim carries its Task");
+            assert_eq!(task.task_id(), taken);
+            assert_eq!(claim.attempt_number, 1);
         }
-        other => panic!("expected the first follower's claim to be accepted, got {other:?}"),
+        other => panic!("expected the first claim to be accepted, got {other:?}"),
     }
-
-    let reject_response =
-        reject_response.expect("the leader answered the second follower's claim request");
-    match reject_response.result {
-        Some(claim_response::Result::Reject(reject)) => {
-            assert_eq!(
-                ClaimRejectReason::try_from(reject.reason)
-                    .expect("the leader only ever sends a reason this build knows about"),
-                ClaimRejectReason::ClaimRejectAlreadySelected,
-                "a second follower racing for an already-claimed task must be rejected as such"
-            );
-        }
-        other => panic!(
-            "expected the second, racing follower's claim to be rejected as ALREADY_SELECTED, got {other:?}"
-        ),
-    }
+    assert_eq!(
+        rejection(taken_again),
+        ClaimRejectReason::ClaimRejectAlreadySelected
+    );
+    assert_eq!(
+        claimed_tasks(batch),
+        oldest,
+        "the oldest pending tasks, oldest first, as many as fit in one message"
+    );
+    assert_eq!(claimed_tasks(next_batch), left_for_the_next_batch);
+    assert_eq!(rejection(refused), ClaimRejectReason::ClaimRejectNotLeader);
+    assert_eq!(own, Err(ClaimFailure::ThisWorkerLeads));
 }

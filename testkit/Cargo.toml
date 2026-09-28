@@ -1,0 +1,10 @@
+[package]
+name = "kabudachi-testkit"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "kabudachi_testkit"
+
+[dependencies]
+kabudachi-core = { path = "../core" }

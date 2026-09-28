@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use kabudachi_core::protocol::ids::Uuid7Ids;
 use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::time::RealClock;
 use tokio::sync::Notify;
 
-use crate::clock::RealClock;
 use crate::work::{SharedScheduler, Wake, lock_scheduler};
 
 /// Everyone who waits on what the scheduler does: claims waiting for work,
@@ -104,13 +104,12 @@ mod tests {
     use std::time::Duration;
 
     use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskRunId, Uuid7Ids, WorkerId};
-    use kabudachi_core::protocol::worker_state::WorkerState;
     use kabudachi_core::scheduler::{Event, MemoryLimits, Scheduler, Submission};
     use tokio::runtime::Builder;
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::clock::RealClock;
+    use crate::work::tests::UNBOUNDED_GRANT;
     use crate::work::{SharedScheduler, Wake, lock_scheduler};
 
     const SOFT_LIMIT: u64 = 100;
@@ -145,7 +144,7 @@ mod tests {
 
     fn leading_scheduler() -> SharedScheduler {
         let mut scheduler = Scheduler::new(RealClock::new(), Uuid7Ids);
-        scheduler.set_worker_state(WorkerState::Leader);
+        scheduler.set_leadership_grant(Some(UNBOUNDED_GRANT));
         Arc::new(Mutex::new(scheduler))
     }
 
@@ -158,7 +157,7 @@ mod tests {
             soft: SOFT_LIMIT,
             hard: HARD_LIMIT,
         }));
-        scheduler.set_worker_state(WorkerState::Leader);
+        scheduler.set_leadership_grant(Some(UNBOUNDED_GRANT));
         scheduler
             .submit(submission())
             .expect("the payload is under the hard limit");

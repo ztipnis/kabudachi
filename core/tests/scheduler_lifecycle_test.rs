@@ -9,12 +9,13 @@ use kabudachi_core::protocol::messages::Task;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
-    Certification, ClaimRejection, ReportRejection, Scheduler, Submission,
+    Certification, ClaimRejection, LeadershipGrant, LeaseEnd, ReportRejection, Scheduler,
+    Submission,
 };
-use kabudachi_core::time::{Duration, Instant};
+use kabudachi_core::time::{Clock, Duration, Instant};
 use support::clock::FakeClock;
+use support::grant::unbounded_grant;
 use support::ids::SequentialIds;
 
 const DIGEST: &[u8] = b"digest-of-the-result";
@@ -28,11 +29,13 @@ struct Fixture {
     scheduler: Scheduler<FakeClock, SequentialIds>,
 }
 
-/// A scheduler that is already `Leader`, as the runtime leaves it once its
+/// A scheduler that already holds a grant, as the runtime leaves it once its
 /// election is won.
 fn leading() -> Fixture {
     let mut fixture = not_leading();
-    fixture.scheduler.set_worker_state(WorkerState::Leader);
+    fixture
+        .scheduler
+        .set_leadership_grant(Some(unbounded_grant()));
     fixture
 }
 
@@ -131,20 +134,51 @@ fn a_new_scheduler_refuses_claims_until_told_it_leads() {
 }
 
 #[test]
-fn a_claim_is_refused_in_every_state_but_leader() {
-    for state in WorkerState::ALL
-        .into_iter()
-        .filter(|s| *s != WorkerState::Leader)
-    {
-        let mut fixture = not_leading();
-        fixture.scheduler.set_worker_state(state);
-        let task_id = submit(&mut fixture.scheduler);
+fn a_withdrawn_grant_refuses_claims() {
+    let mut fixture = leading();
+    let task_id = submit(&mut fixture.scheduler);
+    fixture.scheduler.set_leadership_grant(None);
 
-        let result = fixture.scheduler.request_claim(&worker("w1"), &task_id);
+    let result = fixture.scheduler.request_claim(&worker("w1"), &task_id);
 
-        assert_eq!(result.unwrap_err(), ClaimRejection::NotLeader, "{state:?}");
-        assert_eq!(fixture.scheduler.pending_tasks(), vec![task_id]);
-    }
+    assert_eq!(result.unwrap_err(), ClaimRejection::NotLeader);
+    assert_eq!(fixture.scheduler.pending_tasks(), vec![task_id]);
+}
+
+#[test]
+fn a_grant_lets_claims_through_until_the_schedulers_clock_reaches_its_end() {
+    let mut fixture = not_leading();
+    let end = fixture.clock.now() + Duration::from_ticks(10);
+    let grant = LeadershipGrant {
+        valid_until: LeaseEnd::At(end),
+        ..unbounded_grant()
+    };
+    fixture.scheduler.set_leadership_grant(Some(grant));
+    let (before, at) = (
+        submit(&mut fixture.scheduler),
+        submit(&mut fixture.scheduler),
+    );
+
+    fixture.clock.advance(Duration::from_ticks(9));
+    let just_before_the_end = fixture.scheduler.request_claim(&worker("w1"), &before);
+    fixture.clock.advance(Duration::from_ticks(1));
+    let at_the_end = fixture.scheduler.request_claim(&worker("w1"), &at);
+
+    assert!(just_before_the_end.is_ok(), "{just_before_the_end:?}");
+    assert_eq!(at_the_end.unwrap_err(), ClaimRejection::NotLeader);
+    assert!(!fixture.scheduler.is_leading());
+    assert_eq!(fixture.scheduler.pending_tasks(), vec![at]);
+}
+
+#[test]
+fn an_unbounded_grant_never_runs_out() {
+    let mut fixture = leading();
+    let task_id = submit(&mut fixture.scheduler);
+    fixture.clock.advance(Duration::from_ticks(u64::MAX / 2));
+
+    let result = fixture.scheduler.request_claim(&worker("w1"), &task_id);
+
+    assert!(result.is_ok(), "{result:?}");
 }
 
 #[test]
@@ -360,7 +394,7 @@ fn a_scheduler_that_lost_leadership_certifies_nothing() {
     let mut fixture = leading();
     let (_, run_id) = running_task(&mut fixture);
 
-    fixture.scheduler.set_worker_state(WorkerState::Fenced);
+    fixture.scheduler.set_leadership_grant(None);
     let result = fixture
         .scheduler
         .complete(&worker("w1"), &run_id, DIGEST.to_vec());
@@ -400,7 +434,7 @@ fn a_scheduler_that_lost_leadership_starts_nothing() {
         .request_claim(&worker("w1"), &task_id)
         .unwrap();
 
-    fixture.scheduler.set_worker_state(WorkerState::Fenced);
+    fixture.scheduler.set_leadership_grant(None);
     let result = fixture
         .scheduler
         .report_started(&worker("w1"), &claim.task_run_id);

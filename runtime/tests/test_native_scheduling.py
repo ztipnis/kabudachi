@@ -189,7 +189,7 @@ def test_a_claim_limit_of_zero_is_refused(runtime):
 
 
 def test_a_claim_waits_for_leadership_before_handing_out_work():
-    native = new_runtime(election_tick_ms=60_000)
+    native = new_runtime(suspect_timeout_ms=60_000)
     try:
         submit(native)
 
@@ -231,7 +231,7 @@ def test_submitting_from_another_thread_wakes_a_waiting_claim(runtime):
 
 
 def test_a_report_before_leadership_is_refused():
-    native = new_runtime(election_tick_ms=60_000)
+    native = new_runtime(suspect_timeout_ms=60_000)
     try:
         with pytest.raises(RuntimeError, match="not the leader"):
             native.report_started("any-run")

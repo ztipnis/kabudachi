@@ -9,11 +9,11 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerI
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
     ClaimRejection, LoseRejection, ReportRejection, Scheduler, Submission,
 };
 use support::clock::FakeClock;
+use support::grant::unbounded_grant;
 use support::ids::SequentialIds;
 
 fn worker(name: &str) -> WorkerId {
@@ -22,7 +22,7 @@ fn worker(name: &str) -> WorkerId {
 
 fn leading() -> Scheduler<FakeClock, SequentialIds> {
     let mut scheduler = Scheduler::new(FakeClock::new(), SequentialIds::new());
-    scheduler.set_worker_state(WorkerState::Leader);
+    scheduler.set_leadership_grant(Some(unbounded_grant()));
     scheduler
 }
 
@@ -162,7 +162,7 @@ fn only_a_leader_decides_that_a_worker_is_lost() {
     let mut scheduler = leading();
     let task = scheduler.submit(plain("p")).unwrap();
     let run = running(&mut scheduler, &worker("w1"), &task);
-    scheduler.set_worker_state(WorkerState::Active);
+    scheduler.set_leadership_grant(None);
 
     assert_eq!(
         scheduler.lose_worker(&worker("w1")).unwrap_err(),

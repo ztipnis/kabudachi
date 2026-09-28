@@ -3,9 +3,9 @@ package kabudachi;
 
 import "ids.proto";
 
-// The bootstrap join protocol (`/kabudachi/join/1`, README §27 Phase 2): lets
-// a fresh node discover the current shard membership from a seed peer
-// instead of being statically pre-configured with the full electorate.
+// The bootstrap join protocol (`/kabudachi/join/1`): a fresh worker asks a
+// seed peer who leads the shard, then dials that leader and waits, as a
+// pending member no electorate counts yet, to be admitted.
 //
 // This is a genuine two-message request/response exchange, so `JoinRequest`
 // and `JoinResponse` are used directly as a `request_response::Codec`'s
@@ -17,15 +17,30 @@ import "ids.proto";
 
 message JoinRequest {}
 
-message JoinMember {
-  WorkerId worker_id = 1;
-  // The libp2p multiaddr (e.g. "/ip4/10.0.0.1/tcp/4001") the responder last
-  // observed this member reachable at. Best-effort: a member the responder
-  // has no known address for is still listed, with this field empty, so the
-  // joiner learns every member's WorkerId and skips dialing that one.
-  string multiaddr = 2;
-}
-
+// A pointer to the shard's current leader. A responder that knows no leader
+// it can point at right now (it is electing one, or has no address anything
+// can dial for it) answers with every field left empty — "no leader known".
+// The joiner then asks its next seed, and keeps asking its seeds until one
+// names a leader: an answer of any kind shows the shard exists. A response
+// naming a leader without an address, or an address without a leader, is
+// malformed.
 message JoinResponse {
-  repeated JoinMember members = 1;
+  // Field 1 carried the responder's whole member list before JOIN became a
+  // leader pointer. It stays reserved so a peer still sending that list is
+  // decoded as "no leader known" rather than having its members misread as
+  // a leader.
+  reserved 1;
+  reserved "members";
+
+  WorkerId leader_id = 2;
+  // The libp2p multiaddr (e.g. "/ip4/10.0.0.1/tcp/4001") the joiner dials to
+  // reach the leader.
+  string leader_multiaddr = 3;
+  // The term the leader was elected in.
+  uint64 term = 4;
+  uint64 recovery_epoch = 5;
+  // The lineage of that recovery epoch: which founding of the shard it
+  // descends from, since a flush of the coordination authority can reset
+  // epoch numbers. See `kabudachi_core::coordination_authority::RecoveryEpoch`.
+  uint64 recovery_epoch_lineage = 6;
 }

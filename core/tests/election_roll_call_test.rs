@@ -1,755 +1,1016 @@
+//! The roll call (ADR-0001 decisions 3 to 6), from both sides: the
+//! initiator that publishes it and collects replies until its deadline,
+//! when a returning quorum makes it the candidate, and the workers that
+//! answer it, pass over a repeat of it, or refuse it and say why.
+
 mod support;
 
-use support::builders::{make_network, observation, roll_call, roll_call_message, shard, worker};
-
-use support::candidate::predict_winner;
-
-use std::collections::BTreeSet;
-
-use kabudachi_core::election::{WorkerNode, candidate_priority};
-use kabudachi_core::hashing::HashFunction;
-use kabudachi_core::membership::RingMembership;
+use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::election::{Input, KnownConfiguration, Output, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::messages::{ElectionMessage, LeaderHeartbeatAck, election_message};
+use kabudachi_core::protocol::messages::{
+    ElectionMessage, ElectionReject, ElectionRejectReason, JoinResponse, KnownLeader, RollCall,
+    RollCallReply, election_message,
+};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::time::Duration;
-use kabudachi_core::transport::PeerMessenger;
+use kabudachi_core::time::{Clock, Duration};
+use support::builders::{
+    ack_message, configuration_of, g0, leader_ack, message, past_any_suspicion, roll_call,
+    roll_call_message, roll_call_reply, shard, timings, vote_request, vote_request_message, worker,
+};
 use support::clock::FakeClock;
-use support::coordination_authority::FakeCoordinationAuthority;
-use support::network::FakeNetwork;
+use support::node::{
+    TestNode, close_roll_call, deliver, elect, published_roll_calls, recipients_of,
+    rejects_sent_to, sent, sent_to, start_roll_call, state_changes, tick, voter_node,
+};
 
-const SHARD: &str = "shard-1";
+/// Every node here suspects its leader after this many ticks.
+const SUSPECT: u64 = 10;
 
-fn heartbeat_ack(shard_id: &str, recovery_epoch: u64, term: u64) -> LeaderHeartbeatAck {
-    LeaderHeartbeatAck {
-        shard_id: Some(shard(shard_id).into()),
-        leader_id: Some(worker("leader-1").into()),
-        recovery_epoch,
-        term,
-        membership_generation: 0,
-    }
+fn is_vote_request(payload: &election_message::Payload) -> bool {
+    matches!(payload, election_message::Payload::VoteRequest(_))
 }
 
-fn make_node_with_ring(
-    clock: &FakeClock,
-    network: &FakeNetwork,
-    my_id: WorkerId,
-    electorate: &[WorkerId],
-    suspect_timeout: Duration,
-) -> WorkerNode<FakeClock, FakeNetwork, RingMembership, FakeCoordinationAuthority> {
-    WorkerNode::new(
-        my_id,
-        IncarnationId::new("incarnation-1"),
-        shard(SHARD),
-        clock.clone(),
-        network.clone(),
-        RingMembership::new(electorate.iter().cloned().collect()),
-        FakeCoordinationAuthority::new(),
-        suspect_timeout,
+/// The replies among `outputs` addressed to `initiator`.
+fn replies_to(outputs: &[Output], initiator: &WorkerId) -> Vec<RollCallReply> {
+    sent_to(outputs, initiator)
+        .into_iter()
+        .filter_map(|message| match message.payload {
+            Some(election_message::Payload::RollCallReply(reply)) => Some(reply),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `me`, a voter of `voter_count`, whose leader contact has gone stale, so
+/// it takes part in the next roll call it hears. It stays `Active`.
+fn stale_voter(clock: &FakeClock, me: &WorkerId, voter_count: usize) -> TestNode {
+    let node = voter_node(clock, me, voter_count, SUSPECT);
+    clock.advance(past_any_suspicion(SUSPECT));
+    node
+}
+
+/// `me`, a voter of `voter_count`, in `RollCall` with its own call just
+/// published. Returns the node and its call.
+fn initiator(clock: &FakeClock, me: &WorkerId, voter_count: usize) -> (TestNode, RollCall) {
+    let mut node = voter_node(clock, me, voter_count, SUSPECT);
+    let outputs = start_roll_call(&mut node, clock, SUSPECT);
+    let calls = published_roll_calls(&outputs);
+    assert_eq!(calls.len(), 1, "setup invariant: one roll call published");
+    (node, calls.into_iter().next().unwrap())
+}
+
+fn reply_from(
+    node: &mut TestNode,
+    call: &RollCall,
+    responder: &WorkerId,
+    admission: Option<Generation>,
+) -> Vec<Output> {
+    deliver(
+        node,
+        responder,
+        roll_call_reply(&call.initiator_id(), call.term, responder, admission),
     )
 }
 
-#[test]
-fn tick_from_leader_suspect_begins_roll_call_and_sends_to_successor() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let successor = worker("w2");
-    let network = make_network(&clock, &[self_id.clone(), successor.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), successor.clone()],
-        suspect_timeout,
-    );
+// ---- The initiator ----
 
-    clock.advance(Duration::from_ticks(11));
-    node.tick(); // Active -> LeaderSuspect.
+#[test]
+fn a_suspecting_voter_publishes_a_roll_call_for_the_next_term_under_its_configuration() {
+    let clock = FakeClock::new();
+    clock.set_wall_clock_millis(1_700);
+    let me = worker("w1");
+    let mut node = voter_node(&clock, &me, 3, SUSPECT);
+    clock.advance(past_any_suspicion(SUSPECT));
+    tick(&mut node);
     assert_eq!(node.state(), WorkerState::LeaderSuspect);
 
-    node.tick(); // LeaderSuspect -> RollCall.
-    assert_eq!(node.state(), WorkerState::RollCall);
+    let outputs = tick(&mut node);
 
-    network.pump();
-    let inbox = network.poll_inbox(successor);
+    assert_eq!(state_changes(&outputs), vec![WorkerState::RollCall]);
     assert_eq!(
-        inbox.len(),
-        1,
-        "expected exactly one message sent to the ring successor"
+        published_roll_calls(&outputs),
+        vec![roll_call(&me, 1, &configuration_of(3), 1_700)],
+        "term = highest term seen + 1, the node's configuration, its wall clock, itself as \
+         initiator and no address"
     );
-    match &inbox[0].1.payload {
-        Some(election_message::Payload::RollCall(call)) => {
-            assert_eq!(call.initiator_id(), self_id);
-            assert_eq!(
-                call.responses.len(),
-                1,
-                "self's own observation must be included"
-            );
-        }
-        other => panic!("expected RollCall payload, got {other:?}"),
-    }
-}
-
-#[test]
-fn on_roll_call_fresh_call_appends_observation_and_forwards_to_ring_successor() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let succ1 = worker("w2");
-    let succ2 = worker("w3");
-    let network = make_network(&clock, &[self_id.clone(), succ1.clone(), succ2.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), succ1.clone(), succ2.clone()],
-        suspect_timeout,
-    );
-
-    let initiator = worker("initiator");
-    let call = roll_call("call-1", initiator, vec![]);
-    node.on_message(worker("someone"), roll_call_message(call));
-
-    network.pump();
-    let inbox = network.poll_inbox(succ1.clone());
-    assert_eq!(
-        inbox.len(),
-        1,
-        "expected the call forwarded to the immediate ring successor"
-    );
-    match &inbox[0].1.payload {
-        Some(election_message::Payload::RollCall(forwarded)) => {
-            assert_eq!(forwarded.roll_call_id, "call-1");
-            assert_eq!(forwarded.responses.len(), 1);
-            assert_eq!(forwarded.responses[0].worker_id(), self_id);
-        }
-        other => panic!("expected RollCall payload, got {other:?}"),
-    }
-
-    // Hop-by-hop relay, not a broadcast: the second successor gets nothing.
-    assert!(network.poll_inbox(succ2).is_empty());
-}
-
-#[test]
-fn on_roll_call_duplicate_id_is_a_no_op() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let succ1 = worker("w2");
-    let succ2 = worker("w3");
-    let network = make_network(&clock, &[self_id.clone(), succ1.clone(), succ2.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), succ1.clone(), succ2.clone()],
-        suspect_timeout,
-    );
-
-    let initiator = worker("initiator");
-    node.on_message(
-        worker("someone"),
-        roll_call_message(roll_call("dup-call", initiator.clone(), vec![])),
-    );
-    network.pump();
-    let first_delivery = network.poll_inbox(succ1.clone());
-    assert_eq!(
-        first_delivery.len(),
-        1,
-        "first delivery must forward normally"
-    );
-
-    // A duplicated delivery is a no-op: no re-append, no re-forward.
-    node.on_message(
-        worker("someone"),
-        roll_call_message(roll_call("dup-call", initiator, vec![])),
-    );
-    network.pump();
-    let second_delivery = network.poll_inbox(succ1);
     assert!(
-        second_delivery.is_empty(),
-        "duplicate roll_call_id must not be forwarded again"
+        sent(&outputs).is_empty(),
+        "a roll call is published, not sent"
     );
 }
 
-// A single-member electorate: quorum 1 is met by the node's own observation
-// and the self-vote alone wins, so the node goes all the way to `Leader` (via
-// an unobservable `LeaderReconciling`).
 #[test]
-fn tick_reaching_quorum_of_one_transitions_self_to_leader() {
+fn a_roll_call_contests_the_term_after_the_highest_the_node_has_seen() {
     let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let solo = worker("solo");
-    let network = make_network(&clock, std::slice::from_ref(&solo));
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        solo.clone(),
-        std::slice::from_ref(&solo),
-        suspect_timeout,
+    let me = worker("w1");
+    let mut node = voter_node(&clock, &me, 3, SUSPECT);
+    deliver(
+        &mut node,
+        &worker("leader"),
+        ack_message(leader_ack(
+            &worker("leader"),
+            4,
+            &configuration_of(3),
+            Some(g0()),
+        )),
     );
 
-    clock.advance(Duration::from_ticks(11));
-    node.tick(); // Active -> LeaderSuspect
+    let outputs = start_roll_call(&mut node, &clock, SUSPECT);
+
+    assert_eq!(published_roll_calls(&outputs)[0].term, 5);
+}
+
+#[test]
+fn a_node_with_no_configuration_starts_no_roll_call() {
+    let clock = FakeClock::new();
+    let me = worker("joiner");
+    let mut node: TestNode = WorkerNode::bootstrapping(
+        me.clone(),
+        IncarnationId::new("incarnation-1"),
+        shard("shard-1"),
+        clock.clone(),
+        None,
+        timings(Duration::from_ticks(SUSPECT)),
+    );
+    let _ = node.finish_joining(&JoinResponse {
+        leader_id: Some(worker("leader").into()),
+        leader_multiaddr: "/ip4/127.0.0.1/tcp/1".into(),
+        term: 1,
+        recovery_epoch: 0,
+        recovery_epoch_lineage: 0,
+    });
+    clock.advance(past_any_suspicion(SUSPECT));
+    tick(&mut node);
     assert_eq!(node.state(), WorkerState::LeaderSuspect);
 
-    node.tick();
-    assert_eq!(node.state(), WorkerState::Leader);
+    let outputs = tick(&mut node);
+
+    assert_eq!(node.state(), WorkerState::LeaderSuspect);
+    assert!(published_roll_calls(&outputs).is_empty());
+}
+
+/// Closes `node`'s roll call at its deadline and returns what that asked for.
+fn close(node: &mut TestNode, clock: &FakeClock) -> Vec<Output> {
+    close_roll_call(node, clock, SUSPECT)
 }
 
 #[test]
-fn on_roll_call_quorum_reached_but_not_winner_forwards_without_becoming_candidate() {
+fn the_initiator_stands_at_its_deadline_as_candidate_once_its_returning_voters_are_a_quorum() {
     let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
+    let (mut node, call) = initiator(&clock, &worker("w1"), 5);
+    let (p1, p2) = (worker("p1"), worker("p2"));
 
-    // Assign the node under test to whichever of two workers loses the
-    // priority comparison, so the "not the winner" branch is exercised
-    // deterministically.
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let next_term = 1;
-    let winner = predict_winner(
-        &shard(SHARD),
-        0,
-        next_term,
-        &[candidate_a.clone(), candidate_b.clone()],
-    );
-    let (self_id, other_id) = if winner == candidate_a {
-        (candidate_b, candidate_a)
-    } else {
-        (candidate_a, candidate_b)
-    };
+    let first = reply_from(&mut node, &call, &p1, Some(g0()));
+    let second = reply_from(&mut node, &call, &p2, Some(g0()));
+    assert!(sent(&first).is_empty() && sent(&second).is_empty());
 
-    let network = make_network(&clock, &[self_id.clone(), other_id.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), other_id.clone()],
-        suspect_timeout,
-    );
+    let stood = close(&mut node, &clock);
 
-    // Start the node's own roll call (its observation alone is short of quorum 2) and drain the forward.
-    clock.advance(Duration::from_ticks(11));
-    node.tick();
-    node.tick();
-    assert_eq!(node.state(), WorkerState::RollCall);
-    network.pump();
-    network.poll_inbox(other_id.clone());
-
-    // A separate roll call already carrying other_id's observation brings responses to quorum.
-    let call = roll_call(
-        "external-call-1",
-        other_id.clone(),
-        vec![observation(other_id.clone(), 0)],
-    );
-    node.on_message(other_id.clone(), roll_call_message(call));
-
-    assert_eq!(node.state(), WorkerState::RollCall);
-
-    // The call is still forwarded, now carrying both observations.
-    network.pump();
-    let inbox = network.poll_inbox(other_id);
-    assert_eq!(inbox.len(), 1);
-    match &inbox[0].1.payload {
-        Some(election_message::Payload::RollCall(forwarded)) => {
-            assert_eq!(forwarded.roll_call_id, "external-call-1");
-            assert_eq!(forwarded.responses.len(), 2);
-        }
-        other => panic!("expected RollCall payload, got {other:?}"),
-    }
-}
-
-// README §12.4: forward whenever quorum wasn't reached or this node isn't the
-// winner. A winner that can't accept (still `Active`, or already `Candidate`)
-// must forward too.
-
-#[test]
-fn process_roll_call_when_winning_but_still_active_forwards_instead_of_dropping() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-
-    // As above but inverted: the node under test is the winner, yet cannot currently accept.
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let next_term = 1; // both observations below carry highest_term_seen: 0.
-    let winner = predict_winner(
-        &shard(SHARD),
-        0,
-        next_term,
-        &[candidate_a.clone(), candidate_b.clone()],
-    );
-    let (self_id, other_id) = if winner == candidate_a {
-        (candidate_a, candidate_b)
-    } else {
-        (candidate_b, candidate_a)
-    };
-
-    let network = make_network(&clock, &[self_id.clone(), other_id.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), other_id.clone()],
-        suspect_timeout,
-    );
-
-    // Never ticked: the node is still Active when the call reaches it.
-    assert_eq!(node.state(), WorkerState::Active);
-
-    let call = roll_call(
-        "external-call-1",
-        other_id.clone(),
-        vec![observation(other_id.clone(), 0)],
-    );
-    node.on_message(other_id.clone(), roll_call_message(call));
-
-    // The winner, but the table has no (Active, Candidate) edge: it must stay Active...
-    assert_eq!(node.state(), WorkerState::Active);
-
-    // ...and still forward the call.
-    network.pump();
-    let inbox = network.poll_inbox(other_id);
+    assert_eq!(state_changes(&stood), vec![WorkerState::Candidate]);
+    assert_eq!(node.term(), 1);
     assert_eq!(
-        inbox.len(),
-        1,
-        "a roll call this node can't yet accept winning must still be forwarded onward"
+        recipients_of(&stood, is_vote_request),
+        vec![p1, p2],
+        "every respondent but itself is asked for its vote"
     );
-    match &inbox[0].1.payload {
-        Some(election_message::Payload::RollCall(forwarded)) => {
-            assert_eq!(forwarded.roll_call_id, "external-call-1");
-            assert_eq!(forwarded.responses.len(), 2);
-        }
-        other => panic!("expected RollCall payload, got {other:?}"),
-    }
 }
 
 #[test]
-fn process_roll_call_when_winning_but_already_candidate_forwards_instead_of_dropping() {
+fn a_pending_respondent_is_a_new_voter_and_does_not_count_toward_the_returning_quorum() {
     let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-
-    // Round 1 contests term 1 (call highest_term_seen 0); round 2 contests
-    // term 2 (call highest_term_seen 1), since a candidate at term 1 drops a
-    // call that would re-contest it. Pick a pair where this node wins both.
-    let labels: Vec<WorkerId> = (1..=40).map(|i| worker(&format!("w{i}"))).collect();
-    let (self_id, other_id) = labels
-        .iter()
-        .flat_map(|x| labels.iter().map(move |y| (x, y)))
-        .find(|(x, y)| {
-            x != y
-                && [1, 2].iter().all(|term| {
-                    predict_winner(&shard(SHARD), 0, *term, &[(*x).clone(), (*y).clone()]) == **x
-                })
-        })
-        .map(|(x, y)| (x.clone(), y.clone()))
-        .expect("some pair among the label pool must win at both terms");
-
-    let network = make_network(&clock, &[self_id.clone(), other_id.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), other_id.clone()],
-        suspect_timeout,
+    let (pending, returning) = (worker("pending"), worker("returning"));
+    let (mut short, short_call) = initiator(&clock, &worker("w1"), 3);
+    reply_from(&mut short, &short_call, &pending, None);
+    assert_eq!(
+        state_changes(&close(&mut short, &clock)),
+        vec![WorkerState::NoQuorum]
     );
 
-    // Start the node's own roll call and drain the forward.
-    clock.advance(Duration::from_ticks(11));
-    node.tick();
-    node.tick();
-    assert_eq!(node.state(), WorkerState::RollCall);
-    network.pump();
-    network.poll_inbox(other_id.clone());
+    let clock = FakeClock::new();
+    let (mut node, call) = initiator(&clock, &worker("w1"), 3);
+    reply_from(&mut node, &call, &pending, None);
+    reply_from(&mut node, &call, &returning, Some(g0()));
+    let stood = close(&mut node, &clock);
 
-    // Round 1: a call reaching quorum with this node as the winner, while it is RollCall, makes it Candidate.
-    let round_1 = roll_call(
-        "round-1",
-        other_id.clone(),
-        vec![observation(other_id.clone(), 0)],
-    );
-    node.on_message(other_id.clone(), roll_call_message(round_1));
     assert_eq!(node.state(), WorkerState::Candidate);
-
-    // Drain the VoteRequest sent on becoming Candidate.
-    network.pump();
-    network.poll_inbox(other_id.clone());
-
-    // Round 2: another call reaches quorum with this node still the winner,
-    // but it is now Candidate. The table has no (Candidate, Candidate) or
-    // (Candidate, Active) edge, so the state stays and the call must still be
-    // forwarded.
-    let mut round_2 = roll_call(
-        "round-2",
-        other_id.clone(),
-        vec![observation(other_id.clone(), 1)],
+    assert_eq!(
+        recipients_of(&stood, is_vote_request),
+        vec![pending, returning],
+        "a new voter is still asked for its vote"
     );
-    round_2.highest_term_seen = 1;
-    node.on_message(other_id.clone(), roll_call_message(round_2));
+}
+
+#[test]
+fn a_respondent_admitted_outside_the_configuration_is_no_returning_voter() {
+    let clock = FakeClock::new();
+    let (mut node, call) = initiator(&clock, &worker("w1"), 3);
+
+    reply_from(
+        &mut node,
+        &call,
+        &worker("left-out"),
+        Some(Generation::new(0, 0, 7)),
+    );
 
     assert_eq!(
-        node.state(),
-        WorkerState::Candidate,
-        "must remain Candidate, unaffected by an already-won subsequent round"
+        state_changes(&close(&mut node, &clock)),
+        vec![WorkerState::NoQuorum]
     );
+}
 
-    network.pump();
-    let inbox = network.poll_inbox(other_id);
+#[test]
+fn a_duplicate_reply_counts_once() {
+    let clock = FakeClock::new();
+    let (mut node, call) = initiator(&clock, &worker("w1"), 5);
+    let p1 = worker("p1");
+
+    reply_from(&mut node, &call, &p1, Some(g0()));
+    reply_from(&mut node, &call, &p1, Some(g0()));
+
     assert_eq!(
-        inbox.len(),
-        1,
-        "round 2's roll call must still be forwarded onward, not dropped"
+        state_changes(&close(&mut node, &clock)),
+        vec![WorkerState::NoQuorum]
     );
-    match &inbox[0].1.payload {
-        Some(election_message::Payload::RollCall(forwarded)) => {
-            assert_eq!(forwarded.roll_call_id, "round-2");
-        }
-        other => panic!("expected RollCall payload, got {other:?}"),
+}
+
+#[test]
+fn a_reply_to_another_call_or_from_another_sender_is_ignored() {
+    let clock = FakeClock::new();
+    let (mut node, call) = initiator(&clock, &worker("w1"), 3);
+    let p1 = worker("p1");
+    let me = call.initiator_id();
+
+    let wrong_term = roll_call_reply(&me, call.term + 1, &p1, Some(g0()));
+    let wrong_initiator = roll_call_reply(&worker("someone"), call.term, &p1, Some(g0()));
+    let mut wrong_shard = roll_call_reply(&me, call.term, &p1, Some(g0()));
+    if let Some(election_message::Payload::RollCallReply(reply)) = &mut wrong_shard.payload {
+        reply.shard_id = Some(shard("shard-2").into());
     }
-}
-
-#[test]
-fn forwarding_falls_back_to_second_successor_when_first_is_unreachable() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let succ1 = worker("w2");
-    let succ2 = worker("w3");
-    let network = make_network(&clock, &[self_id.clone(), succ1.clone(), succ2.clone()]);
-    network.partition(
-        BTreeSet::from([self_id.clone()]),
-        BTreeSet::from([succ1.clone()]),
+    for reply in [wrong_term, wrong_initiator, wrong_shard] {
+        deliver(&mut node, &p1, reply);
+    }
+    deliver(
+        &mut node,
+        &worker("impostor"),
+        roll_call_reply(&me, call.term, &p1, Some(g0())),
     );
 
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), succ1.clone(), succ2.clone()],
-        suspect_timeout,
-    );
-
-    let initiator = worker("initiator");
-    node.on_message(
-        worker("someone"),
-        roll_call_message(roll_call("call-1", initiator, vec![])),
-    );
-
-    network.pump();
-    assert!(
-        network.poll_inbox(succ1).is_empty(),
-        "must not send to the unreachable first successor"
-    );
-    let inbox = network.poll_inbox(succ2);
     assert_eq!(
-        inbox.len(),
-        1,
-        "must fall back to the second, reachable successor"
+        state_changes(&close(&mut node, &clock)),
+        vec![WorkerState::NoQuorum]
     );
 }
 
 #[test]
-fn on_leader_ack_returns_roll_call_to_active_but_never_from_candidate() {
-    // Part A: a valid ack while RollCall transitions to Active.
+fn a_reply_that_arrives_once_the_initiator_stands_is_asked_for_its_vote() {
     let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let successor = worker("w2");
-    let network = make_network(&clock, &[self_id.clone(), successor.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), successor.clone()],
-        suspect_timeout,
-    );
+    let (mut node, call) = initiator(&clock, &worker("w1"), 5);
+    reply_from(&mut node, &call, &worker("p1"), Some(g0()));
+    reply_from(&mut node, &call, &worker("p2"), Some(g0()));
+    close(&mut node, &clock);
+    assert_eq!(node.state(), WorkerState::Candidate, "setup invariant");
 
-    clock.advance(Duration::from_ticks(11));
-    node.tick();
-    node.tick();
-    assert_eq!(node.state(), WorkerState::RollCall);
+    let late = reply_from(&mut node, &call, &worker("p3"), Some(g0()));
 
-    node.on_leader_ack(&heartbeat_ack(SHARD, 0, 0));
-    assert_eq!(node.state(), WorkerState::Active);
+    assert_eq!(recipients_of(&late, is_vote_request), vec![worker("p3")]);
+}
 
-    // Part B: a Candidate is unaffected by an ack (no (Candidate, Active)
-    // edge). Staying Candidate needs a 2-member electorate, since with one
-    // member the self-vote wins outright.
-    let clock2 = FakeClock::new();
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let next_term = 1; // both observations below carry highest_term_seen: 0.
-    let winner = predict_winner(
-        &shard(SHARD),
+#[test]
+fn a_genesis_node_wins_its_own_roll_call_at_its_deadline() {
+    let clock = FakeClock::new();
+    let me = worker("founder");
+    let mut node: TestNode = WorkerNode::genesis(
+        me.clone(),
+        IncarnationId::new("incarnation-1"),
+        shard("shard-1"),
+        clock.clone(),
         0,
-        next_term,
-        &[candidate_a.clone(), candidate_b.clone()],
-    );
-    let (solo, peer) = if winner == candidate_a {
-        (candidate_a, candidate_b)
-    } else {
-        (candidate_b, candidate_a)
-    };
-    let network2 = make_network(&clock2, &[solo.clone(), peer.clone()]);
-    let mut candidate_node = make_node_with_ring(
-        &clock2,
-        &network2,
-        solo.clone(),
-        &[solo.clone(), peer.clone()],
-        suspect_timeout,
+        None,
+        timings(Duration::from_ticks(SUSPECT)),
     );
 
-    // Start the node's own roll call and drain the forward.
-    clock2.advance(Duration::from_ticks(11));
-    candidate_node.tick();
-    candidate_node.tick();
-    assert_eq!(candidate_node.state(), WorkerState::RollCall);
-    network2.pump();
-    network2.poll_inbox(peer.clone());
+    let started = start_roll_call(&mut node, &clock, SUSPECT);
+    assert_eq!(state_changes(&started), vec![WorkerState::RollCall]);
 
-    // A call reaching quorum 2 with this node as the winner makes it Candidate;
-    // the self-vote (1) is short of vote quorum 2.
-    let round_1 = roll_call("round-1", peer.clone(), vec![observation(peer.clone(), 0)]);
-    candidate_node.on_message(peer.clone(), roll_call_message(round_1));
-    assert_eq!(candidate_node.state(), WorkerState::Candidate);
-    network2.pump();
-    network2.poll_inbox(peer); // drain the VoteRequest it sends.
+    let outputs = close(&mut node, &clock);
 
-    candidate_node.on_leader_ack(&heartbeat_ack(SHARD, 0, 0));
     assert_eq!(
-        candidate_node.state(),
+        state_changes(&outputs),
+        vec![
+            WorkerState::Candidate,
+            WorkerState::LeaderReconciling,
+            WorkerState::Leader,
+        ]
+    );
+    assert_eq!(node.term(), 1);
+    assert_eq!(node.known_leader(), Some((me, 1)));
+}
+
+// ---- Suppression ----
+
+#[test]
+fn a_node_that_accepted_a_roll_call_starts_none_of_its_own_until_that_calls_vote_could_have_ended() {
+    let clock = FakeClock::new();
+    let me = worker("w2");
+    let mut node = stale_voter(&clock, &me, 3);
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::LeaderSuspect);
+    let other = worker("w1");
+    deliver(
+        &mut node,
+        &other,
+        roll_call_message(roll_call(&other, 1, &configuration_of(3), 0)),
+    );
+    // The call closes within a deadline, and its candidate's vote runs for
+    // up to another.
+    let accepted_at = clock.now();
+    let deadline = timings(Duration::from_ticks(SUSPECT)).roll_call_deadline;
+    let election_ends = accepted_at + deadline + deadline;
+
+    let suppressed = node.step(Input::Tick);
+
+    assert_eq!(node.state(), WorkerState::LeaderSuspect);
+    assert!(published_roll_calls(&suppressed.outputs).is_empty());
+    assert_eq!(suppressed.next_deadline, Some(election_ends));
+
+    clock.advance(election_ends - clock.now());
+    let started = tick(&mut node);
+
+    assert_eq!(state_changes(&started), vec![WorkerState::RollCall]);
+    assert_eq!(
+        published_roll_calls(&started)[0].term,
+        2,
+        "the term after the call it accepted"
+    );
+}
+
+#[test]
+fn a_repeat_of_an_accepted_roll_call_does_not_extend_its_suppression() {
+    let clock = FakeClock::new();
+    let me = worker("w2");
+    let mut node = stale_voter(&clock, &me, 3);
+    tick(&mut node);
+    let other = worker("w1");
+    let call = roll_call(&other, 1, &configuration_of(3), 0);
+    deliver(&mut node, &other, roll_call_message(call.clone()));
+    let deadline = timings(Duration::from_ticks(SUSPECT)).roll_call_deadline;
+    let election_ends = clock.now() + deadline + deadline;
+    clock.advance(Duration::from_ticks(1));
+
+    let repeated = deliver(&mut node, &other, roll_call_message(call));
+    let suppressed = node.step(Input::Tick);
+
+    assert!(sent(&repeated).is_empty(), "a repeat is not answered again");
+    assert_eq!(suppressed.next_deadline, Some(election_ends));
+}
+
+#[test]
+fn a_roll_call_contests_the_term_after_the_latest_roll_call_the_node_accepted() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("w2"), 3);
+    let other = worker("w1");
+    deliver(
+        &mut node,
+        &other,
+        roll_call_message(roll_call(&other, 4, &configuration_of(3), 0)),
+    );
+
+    let outputs = start_roll_call(&mut node, &clock, SUSPECT);
+
+    assert_eq!(published_roll_calls(&outputs)[0].term, 5);
+}
+
+#[test]
+fn a_roll_call_that_failed_does_not_hold_its_term() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_node(&clock, &me, 3, SUSPECT);
+    let first = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    // Its leader was alive after all: the call gathers no quorum.
+    let leader = worker("leader");
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 0, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::Active, "setup invariant");
+
+    let second = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+
+    assert_eq!((first.term, second.term), (1, 2));
+}
+
+#[test]
+fn a_roll_call_the_node_refused_does_not_suppress_its_own() {
+    let clock = FakeClock::new();
+    let mut node = voter_node(&clock, &worker("w2"), 3, SUSPECT);
+    let other = worker("w1");
+    // Its leader contact is still fresh, so it refuses the call.
+    let refused = deliver(
+        &mut node,
+        &other,
+        roll_call_message(roll_call(&other, 1, &configuration_of(3), 0)),
+    );
+    assert_eq!(
+        rejects_sent_to(&refused, &other).len(),
+        1,
+        "setup invariant"
+    );
+
+    let outputs = start_roll_call(&mut node, &clock, SUSPECT);
+
+    assert_eq!(published_roll_calls(&outputs).len(), 1);
+}
+
+// ---- The tie-break ----
+
+#[test]
+fn an_initiator_that_hears_a_better_call_for_its_term_answers_it_and_abandons_its_own() {
+    let clock = FakeClock::new();
+    clock.set_wall_clock_millis(500);
+    let (mut node, own) = initiator(&clock, &worker("w2"), 3);
+    let better = worker("w1");
+
+    let outputs = deliver(
+        &mut node,
+        &better,
+        roll_call_message(roll_call(&better, own.term, &configuration_of(3), 500)),
+    );
+
+    let replies = replies_to(&outputs, &better);
+    assert_eq!(replies.len(), 1, "it answers the better call");
+    assert_eq!(replies[0].admission(), Some(g0()));
+    assert_eq!(node.state(), WorkerState::RollCall, "it stays RollCall");
+    reply_from(&mut node, &own, &worker("w3"), Some(g0()));
+    assert_eq!(
+        state_changes(&close(&mut node, &clock)),
+        vec![WorkerState::LeaderSuspect],
+        "an abandoned call collects no more replies and never stands"
+    );
+}
+
+#[test]
+fn an_earlier_timestamp_beats_a_lower_worker_id() {
+    let clock = FakeClock::new();
+    clock.set_wall_clock_millis(900);
+    let (mut node, own) = initiator(&clock, &worker("w1"), 3);
+    let earlier = worker("w9");
+
+    let outputs = deliver(
+        &mut node,
+        &earlier,
+        roll_call_message(roll_call(&earlier, own.term, &configuration_of(3), 100)),
+    );
+
+    assert_eq!(replies_to(&outputs, &earlier).len(), 1);
+}
+
+/// The one refusal among `outputs`, addressed to `initiator` and nothing
+/// else to it, with the reason it gives.
+fn the_refusal(outputs: &[Output], initiator: &WorkerId) -> ElectionRejectReason {
+    let rejects = rejects_sent_to(outputs, initiator);
+    assert_eq!(sent_to(outputs, initiator).len(), 1, "one message");
+    assert_eq!(rejects.len(), 1, "a refusal");
+    rejects[0].reason()
+}
+
+#[test]
+fn an_initiator_refuses_a_worse_call_for_its_term_as_not_the_best_and_keeps_collecting() {
+    let clock = FakeClock::new();
+    let (mut node, own) = initiator(&clock, &worker("w1"), 3);
+    let worse = worker("w2");
+
+    let outputs = deliver(
+        &mut node,
+        &worse,
+        roll_call_message(roll_call(&worse, own.term, &configuration_of(3), 0)),
+    );
+
+    assert_eq!(
+        the_refusal(&outputs, &worse),
+        ElectionRejectReason::NotBestRollCall
+    );
+    reply_from(&mut node, &own, &worker("w3"), Some(g0()));
+    close(&mut node, &clock);
+    assert_eq!(node.state(), WorkerState::Candidate);
+}
+
+#[test]
+fn a_voter_answers_the_first_call_and_any_better_one_and_refuses_a_worse_one() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"), 3);
+    let (first, better, worse) = (worker("w5"), worker("w2"), worker("w7"));
+
+    let to_first = deliver(
+        &mut node,
+        &first,
+        roll_call_message(roll_call(&first, 1, &configuration_of(3), 10)),
+    );
+    let to_better = deliver(
+        &mut node,
+        &better,
+        roll_call_message(roll_call(&better, 1, &configuration_of(3), 10)),
+    );
+    let to_worse = deliver(
+        &mut node,
+        &worse,
+        roll_call_message(roll_call(&worse, 1, &configuration_of(3), 10)),
+    );
+
+    assert_eq!(replies_to(&to_first, &first).len(), 1);
+    assert_eq!(replies_to(&to_better, &better).len(), 1);
+    assert_eq!(
+        the_refusal(&to_worse, &worse),
+        ElectionRejectReason::NotBestRollCall
+    );
+}
+
+#[test]
+fn a_refusal_as_not_the_best_call_deposes_no_worse_initiator() {
+    let clock = FakeClock::new();
+    let mut voter = stale_voter(&clock, &worker("voter"), 3);
+    let (better, worse) = (worker("w1"), worker("w2"));
+    deliver(
+        &mut voter,
+        &better,
+        roll_call_message(roll_call(&better, 1, &configuration_of(3), 0)),
+    );
+    let (mut initiator, own) = initiator(&clock, &worse, 3);
+    let refused = deliver(
+        &mut voter,
+        &worse,
+        roll_call_message(roll_call(&worse, own.term, &configuration_of(3), 10)),
+    );
+
+    let outputs = deliver(
+        &mut initiator,
+        &worker("voter"),
+        sent_to(&refused, &worse).remove(0),
+    );
+
+    assert!(state_changes(&outputs).is_empty());
+    assert_eq!(initiator.state(), WorkerState::RollCall);
+}
+
+#[test]
+fn a_pending_member_answers_as_a_new_voter_with_no_admission() {
+    let clock = FakeClock::new();
+    let me = worker("pending");
+    let mut node: TestNode = WorkerNode::new(
+        me.clone(),
+        IncarnationId::new("incarnation-1"),
+        shard("shard-1"),
+        clock.clone(),
+        KnownConfiguration {
+            configuration: configuration_of(3),
+            admission: None,
+        },
+        None,
+        timings(Duration::from_ticks(SUSPECT)),
+    );
+    clock.advance(past_any_suspicion(SUSPECT));
+    let initiator = worker("w1");
+
+    let outputs = deliver(
+        &mut node,
+        &initiator,
+        roll_call_message(roll_call(&initiator, 1, &configuration_of(3), 0)),
+    );
+
+    let replies = replies_to(&outputs, &initiator);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].admission(), None);
+    assert_eq!(replies[0].responder_id(), me);
+    assert!(replies[0].responder_address.is_empty());
+}
+
+#[test]
+fn answering_a_roll_call_does_not_raise_the_highest_term_seen() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"), 3);
+    let initiator = worker("w1");
+    deliver(
+        &mut node,
+        &initiator,
+        roll_call_message(roll_call(&initiator, 3, &configuration_of(3), 0)),
+    );
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::LeaderSuspect);
+
+    // An ack at term 1 is accepted only if the highest term seen is still
+    // at most 1.
+    let leader = worker("leader");
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 1, &configuration_of(3), Some(g0()))),
+    );
+
+    assert_eq!(node.state(), WorkerState::Active);
+}
+
+// ---- Refusals ----
+
+/// The one refusal `node` sends `initiator` for `call`.
+fn refusal_of(node: &mut TestNode, initiator: &WorkerId, call: RollCall) -> ElectionReject {
+    let outputs = deliver(node, initiator, roll_call_message(call));
+    let mut rejects = rejects_sent_to(&outputs, initiator);
+    assert_eq!(
+        rejects.len(),
+        1,
+        "exactly one refusal, sent to the initiator"
+    );
+    assert_eq!(
+        sent_to(&outputs, initiator).len(),
+        1,
+        "and nothing else to the initiator"
+    );
+    rejects.remove(0)
+}
+
+#[test]
+fn a_call_for_a_term_already_seen_is_refused_as_stale_naming_the_highest_term_seen() {
+    let clock = FakeClock::new();
+    let me = worker("voter");
+    let mut node = voter_node(&clock, &me, 3, SUSPECT);
+    let leader = worker("leader");
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 2, &configuration_of(3), Some(g0()))),
+    );
+    clock.advance(past_any_suspicion(SUSPECT));
+    let initiator = worker("w1");
+
+    let reject = refusal_of(
+        &mut node,
+        &initiator,
+        roll_call(&initiator, 2, &configuration_of(3), 0),
+    );
+
+    assert_eq!(reject.reason(), ElectionRejectReason::StaleTerm);
+    assert_eq!(reject.term, 2);
+    assert_eq!(reject.initiator_id(), initiator);
+    assert_eq!(reject.rejecter_id(), me);
+    assert_eq!(reject.shard_id(), shard("shard-1"));
+    assert_eq!(reject.highest_term_seen, 2);
+    assert_eq!(reject.configuration(), Some(configuration_of(3)));
+    assert_eq!(reject.leader, None);
+}
+
+#[test]
+fn a_call_under_an_older_configuration_is_refused_carrying_the_newer_one() {
+    let clock = FakeClock::new();
+    let newer = Configuration::single(Single {
+        generation: Generation::new(0, 1, 2),
+        base: g0(),
+        voter_count: 3,
+    });
+    let mut node: TestNode = WorkerNode::new(
+        worker("voter"),
+        IncarnationId::new("incarnation-1"),
+        shard("shard-1"),
+        clock.clone(),
+        KnownConfiguration {
+            configuration: newer.clone(),
+            admission: Some(g0()),
+        },
+        None,
+        timings(Duration::from_ticks(SUSPECT)),
+    );
+    clock.advance(past_any_suspicion(SUSPECT));
+    let initiator = worker("w1");
+
+    let reject = refusal_of(
+        &mut node,
+        &initiator,
+        roll_call(&initiator, 1, &configuration_of(3), 0),
+    );
+
+    assert_eq!(reject.reason(), ElectionRejectReason::StaleGeneration);
+    assert_eq!(reject.configuration(), Some(newer));
+}
+
+#[test]
+fn a_call_from_an_older_recovery_epoch_is_refused_and_one_from_a_newer_is_dropped() {
+    let clock = FakeClock::new();
+    let mut node: TestNode = WorkerNode::new(
+        worker("voter"),
+        IncarnationId::new("incarnation-1"),
+        shard("shard-1"),
+        clock.clone(),
+        KnownConfiguration {
+            configuration: Configuration::genesis(1),
+            admission: Some(Generation::genesis(1)),
+        },
+        None,
+        timings(Duration::from_ticks(SUSPECT)),
+    );
+    clock.advance(past_any_suspicion(SUSPECT));
+    let initiator = worker("w1");
+
+    let reject = refusal_of(
+        &mut node,
+        &initiator,
+        roll_call(&initiator, 1, &Configuration::genesis(0), 0),
+    );
+    assert_eq!(reject.reason(), ElectionRejectReason::StaleGeneration);
+
+    let newer = deliver(
+        &mut node,
+        &initiator,
+        roll_call_message(roll_call(&initiator, 1, &Configuration::genesis(2), 0)),
+    );
+    assert!(sent(&newer).is_empty(), "a newer epoch's call is dropped");
+}
+
+#[test]
+fn a_node_with_fresh_leader_contact_refuses_naming_its_leader_and_term() {
+    let clock = FakeClock::new();
+    let mut node = voter_node(&clock, &worker("voter"), 3, SUSPECT);
+    let leader = worker("leader");
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 0, &configuration_of(3), Some(g0()))),
+    );
+    let initiator = worker("w1");
+
+    let reject = refusal_of(
+        &mut node,
+        &initiator,
+        roll_call(&initiator, 1, &configuration_of(3), 0),
+    );
+
+    assert_eq!(reject.reason(), ElectionRejectReason::LeaderStillValid);
+    let named = reject.leader.expect("the refusal names the leader");
+    assert_eq!((named.leader_id(), named.term), (leader, 0));
+}
+
+#[test]
+fn a_candidate_refuses_another_initiators_call_as_not_eligible() {
+    let clock = FakeClock::new();
+    let (mut node, call) = initiator(&clock, &worker("w1"), 5);
+    reply_from(&mut node, &call, &worker("p1"), Some(g0()));
+    reply_from(&mut node, &call, &worker("p2"), Some(g0()));
+    close(&mut node, &clock);
+    assert_eq!(node.state(), WorkerState::Candidate, "setup invariant");
+    let rival = worker("w0");
+
+    let reject = refusal_of(
+        &mut node,
+        &rival,
+        roll_call(&rival, 2, &configuration_of(5), 0),
+    );
+
+    assert_eq!(reject.reason(), ElectionRejectReason::NotEligible);
+}
+
+#[test]
+fn a_leader_refuses_a_roll_call_as_not_eligible() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_node(&clock, &me, 1, SUSPECT);
+    elect(&mut node, &clock, SUSPECT, &[]);
+    let rival = worker("w2");
+
+    let reject = refusal_of(
+        &mut node,
+        &rival,
+        roll_call(&rival, 2, &configuration_of(1), 0),
+    );
+
+    assert_eq!(reject.reason(), ElectionRejectReason::NotEligible);
+}
+
+#[test]
+fn a_roll_call_for_another_shard_or_not_from_its_initiator_is_dropped() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"), 3);
+    let initiator = worker("w1");
+    let mut other_shard = roll_call(&initiator, 1, &configuration_of(3), 0);
+    other_shard.shard_id = Some(shard("shard-2").into());
+
+    let from_other_shard = deliver(&mut node, &initiator, roll_call_message(other_shard));
+    let relayed = deliver(
+        &mut node,
+        &worker("relay"),
+        roll_call_message(roll_call(&initiator, 1, &configuration_of(3), 0)),
+    );
+
+    assert!(sent(&from_other_shard).is_empty());
+    assert!(sent(&relayed).is_empty());
+}
+
+#[test]
+fn a_stopped_node_drops_roll_calls() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"), 3);
+    let _ = node.step(Input::Drain);
+    assert_eq!(node.state(), WorkerState::Stopped, "setup invariant");
+    let initiator = worker("w1");
+
+    let outputs = deliver(
+        &mut node,
+        &initiator,
+        roll_call_message(roll_call(&initiator, 1, &configuration_of(3), 0)),
+    );
+
+    assert!(outputs.is_empty());
+}
+
+// ---- What a refusal tells the initiator ----
+
+fn reject_message(
+    call: &RollCall,
+    rejecter: &WorkerId,
+    reason: ElectionRejectReason,
+    highest_term_seen: u64,
+    leader: Option<(&WorkerId, u64)>,
+) -> ElectionMessage {
+    message(election_message::Payload::ElectionReject(ElectionReject {
+        shard_id: Some(shard("shard-1").into()),
+        term: call.term,
+        initiator_id: call.initiator_id.clone(),
+        rejecter_id: Some(rejecter.clone().into()),
+        reason: reason as i32,
+        highest_term_seen,
+        configuration: Some((&configuration_of(3)).into()),
+        leader: leader.map(|(leader, term)| KnownLeader {
+            leader_id: Some(leader.clone().into()),
+            term,
+        }),
+    }))
+}
+
+#[test]
+fn a_refusal_naming_a_leader_makes_the_initiator_heartbeat_it_until_its_ack_returns_it() {
+    let clock = FakeClock::new();
+    let (mut node, call) = initiator(&clock, &worker("w1"), 3);
+    let (rejecter, leader) = (worker("w2"), worker("leader"));
+
+    let outputs = deliver(
+        &mut node,
+        &rejecter,
+        reject_message(
+            &call,
+            &rejecter,
+            ElectionRejectReason::LeaderStillValid,
+            0,
+            Some((&leader, 0)),
+        ),
+    );
+
+    assert_eq!(node.state(), WorkerState::RollCall);
+    let to_leader = sent_to(&outputs, &leader);
+    assert_eq!(to_leader.len(), 1);
+    assert!(matches!(
+        to_leader[0].payload,
+        Some(election_message::Payload::Heartbeat(_))
+    ));
+
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 0, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::Active);
+    assert_eq!(node.known_leader(), Some((leader, 0)));
+}
+
+#[test]
+fn a_refusal_naming_a_higher_term_raises_the_initiators_highest_term_seen() {
+    let clock = FakeClock::new();
+    let (mut node, call) = initiator(&clock, &worker("w1"), 3);
+    let rejecter = worker("w2");
+    deliver(
+        &mut node,
+        &rejecter,
+        reject_message(&call, &rejecter, ElectionRejectReason::StaleTerm, 5, None),
+    );
+
+    // A term later than its own call's: it steps down.
+    assert_eq!(node.state(), WorkerState::LeaderSuspect);
+
+    // An ack below term 5 is now ignored; one at term 5 is accepted.
+    let leader = worker("leader");
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 4, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::LeaderSuspect);
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 5, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::Active);
+}
+
+/// A leader named as still valid at a term below this node's term seen is
+/// heartbeated (what that tells it: see `election_step_down_test`), but its
+/// acks stay below the node's floor.
+#[test]
+fn a_refusal_naming_a_leader_from_an_older_term_is_heartbeated_but_not_followed() {
+    let clock = FakeClock::new();
+    let (mut node, call) = initiator(&clock, &worker("w1"), 3);
+    let (rejecter, leader) = (worker("w2"), worker("leader"));
+
+    let outputs = deliver(
+        &mut node,
+        &rejecter,
+        reject_message(
+            &call,
+            &rejecter,
+            ElectionRejectReason::LeaderStillValid,
+            3,
+            Some((&leader, 2)),
+        ),
+    );
+    assert!(!sent_to(&outputs, &leader).is_empty(), "it heartbeats the named leader");
+
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 2, &configuration_of(3), Some(g0()))),
+    );
+    assert_ne!(node.state(), WorkerState::Active);
+    assert_eq!(node.known_leader(), None);
+}
+
+/// Decode refuses a term of `u64::MAX` from any peer, so only a peer bug
+/// reaches this: a node whose highest term seen is already `u64::MAX` has no
+/// next term to contest, and panics rather than wrap back to term 0.
+#[test]
+#[should_panic(expected = "term overflowed u64::MAX")]
+fn a_node_that_has_seen_the_highest_representable_term_panics_rather_than_contest_term_zero() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_node(&clock, &me, 3, SUSPECT);
+    let rejecter = worker("w2");
+    deliver(
+        &mut node,
+        &rejecter,
+        reject_message(
+            &roll_call(&me, 1, &configuration_of(3), 0),
+            &rejecter,
+            ElectionRejectReason::StaleTerm,
+            u64::MAX,
+            None,
+        ),
+    );
+
+    start_roll_call(&mut node, &clock, SUSPECT);
+}
+
+// ---- Leaving a roll call ----
+
+#[test]
+fn an_ack_returns_a_roll_call_to_active_but_never_a_candidate() {
+    let clock = FakeClock::new();
+    let leader = worker("leader");
+    let (mut in_roll_call, _) = initiator(&clock, &worker("w1"), 3);
+    deliver(
+        &mut in_roll_call,
+        &leader,
+        ack_message(leader_ack(&leader, 0, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(in_roll_call.state(), WorkerState::Active);
+
+    let clock = FakeClock::new();
+    let (mut candidate, call) = initiator(&clock, &worker("w1"), 5);
+    reply_from(&mut candidate, &call, &worker("p1"), Some(g0()));
+    reply_from(&mut candidate, &call, &worker("p2"), Some(g0()));
+    close(&mut candidate, &clock);
+    assert_eq!(candidate.state(), WorkerState::Candidate, "setup invariant");
+    deliver(
+        &mut candidate,
+        &leader,
+        ack_message(leader_ack(&leader, 1, &configuration_of(5), Some(g0()))),
+    );
+    assert_eq!(
+        candidate.state(),
         WorkerState::Candidate,
         "a valid ack must never move a Candidate node to Active"
     );
 }
 
-/// A 5-member electorate (quorum 3) whose node under test always wins at term
-/// 1, already in `RollCall`. Returns `(node, self_id, other_members, network)`.
-fn five_member_roll_call_node() -> (
-    WorkerNode<FakeClock, FakeNetwork, RingMembership, FakeCoordinationAuthority>,
-    WorkerId,
-    Vec<WorkerId>,
-    FakeNetwork,
-) {
+#[test]
+fn a_vote_request_before_any_roll_call_answered_is_refused_as_not_the_best_call() {
     let clock = FakeClock::new();
-    let members: Vec<WorkerId> = (1..=5).map(|i| worker(&format!("member-{i}"))).collect();
-    let self_id = predict_winner(&shard(SHARD), 0, 1, &members);
-    let others: Vec<WorkerId> = members.iter().filter(|m| **m != self_id).cloned().collect();
+    let mut node = stale_voter(&clock, &worker("voter"), 3);
+    let candidate = worker("w1");
 
-    let mut registered = members.clone();
-    registered.extend((1..=8).map(|i| worker(&format!("outsider-{i}"))));
-    let network = make_network(&clock, &registered);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &members,
-        Duration::from_ticks(10),
+    let outputs = deliver(
+        &mut node,
+        &candidate,
+        vote_request_message(vote_request(candidate.clone(), 0, 1)),
     );
 
-    clock.advance(Duration::from_ticks(11));
-    node.tick();
-    node.tick();
-    assert_eq!(node.state(), WorkerState::RollCall);
-    network.pump();
-    for member in &others {
-        network.poll_inbox(member.clone());
-    }
-    (node, self_id, others, network)
-}
-
-#[test]
-fn duplicate_observations_count_once_towards_quorum() {
-    let (mut node, self_id, others, _network) = five_member_roll_call_node();
-
-    let call = roll_call(
-        "duplicated",
-        others[0].clone(),
-        vec![
-            observation(others[0].clone(), 0),
-            observation(others[0].clone(), 0),
-        ],
-    );
-    node.on_message(others[0].clone(), roll_call_message(call));
-
-    assert_eq!(
-        node.state(),
-        WorkerState::RollCall,
-        "{self_id:?} saw only 2 distinct members of a 5-member electorate, short of quorum 3"
-    );
-}
-
-#[test]
-fn observations_from_non_members_do_not_count_towards_quorum() {
-    let (mut node, self_id, others, _network) = five_member_roll_call_node();
-    let outsider = (1..=8)
-        .map(|i| worker(&format!("outsider-{i}")))
-        .find(|o| predict_winner(&shard(SHARD), 0, 1, &[self_id.clone(), o.clone()]) == self_id)
-        .expect("some outsider must lose to the node under test");
-
-    let call = roll_call(
-        "with-outsider",
-        others[0].clone(),
-        vec![observation(others[0].clone(), 0), observation(outsider, 0)],
-    );
-    node.on_message(others[0].clone(), roll_call_message(call));
-
-    assert_eq!(
-        node.state(),
-        WorkerState::RollCall,
-        "an outsider's observation must not supply the third response needed for quorum"
-    );
-}
-
-#[test]
-fn stopped_node_drops_roll_calls_without_forwarding() {
-    let clock = FakeClock::new();
-    let members = [worker("w1"), worker("w2"), worker("w3")];
-    let network = make_network(&clock, &members);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        members[0].clone(),
-        &members,
-        Duration::from_ticks(10),
-    );
-
-    node.begin_drain();
-    assert_eq!(node.state(), WorkerState::Stopped);
-    network.pump();
-    for member in &members[1..] {
-        network.poll_inbox(member.clone());
-    }
-
-    node.on_message(
-        members[1].clone(),
-        roll_call_message(roll_call("after-stop", members[1].clone(), vec![])),
-    );
-
-    network.pump();
-    for member in &members[1..] {
-        assert!(network.poll_inbox(member.clone()).is_empty());
-    }
-    assert_eq!(node.state(), WorkerState::Stopped);
-}
-
-#[test]
-fn heartbeat_ack_from_someone_other_than_the_named_leader_is_ignored() {
-    let (mut node, _self_id, _others, _network) = five_member_roll_call_node();
-    let ack = ElectionMessage {
-        payload: Some(election_message::Payload::HeartbeatAck(heartbeat_ack(
-            SHARD, 0, 0,
-        ))),
-    };
-
-    node.on_message(worker("impostor"), ack.clone());
-    assert_eq!(
-        node.state(),
-        WorkerState::RollCall,
-        "ack sent by a non-leader must be ignored"
-    );
-
-    node.on_message(worker("leader-1"), ack);
-    assert_eq!(
-        node.state(),
-        WorkerState::Active,
-        "ack sent by the leader it names is honoured"
-    );
-}
-
-/// The node's state after it starts a roll call in a two-member electorate and
-/// receives `other`'s observation, ranking candidates with `hash_function`.
-fn state_after_two_member_roll_call(
-    me: &WorkerId,
-    other: &WorkerId,
-    hash_function: HashFunction,
-) -> WorkerState {
-    let clock = FakeClock::new();
-    let members = [me.clone(), other.clone()];
-    let network = make_network(&clock, &members);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        me.clone(),
-        &members,
-        Duration::from_ticks(10),
-    )
-    .with_hash_function(hash_function);
-
-    clock.advance(Duration::from_ticks(11));
-    node.tick();
-    node.tick();
-    assert_eq!(node.state(), WorkerState::RollCall);
-
-    let call = roll_call(
-        "external",
-        other.clone(),
-        vec![observation(other.clone(), 0)],
-    );
-    node.on_message(other.clone(), roll_call_message(call));
-    node.state()
-}
-
-#[test]
-fn candidate_choice_follows_the_configured_hash_function() {
-    let default_hash = HashFunction::default();
-    let sha3 = HashFunction::new::<sha3::Sha3_256>();
-    let winner = |hash: &HashFunction, x: &WorkerId, y: &WorkerId| {
-        let priority = |w: &WorkerId| candidate_priority(hash, &shard(SHARD), 0, 1, w);
-        if priority(x) > priority(y) {
-            x.clone()
-        } else {
-            y.clone()
-        }
-    };
-
-    let labels: Vec<WorkerId> = (1..=8).map(|i| worker(&format!("w{i}"))).collect();
-    let (x, y) = labels
-        .iter()
-        .flat_map(|x| labels.iter().map(move |y| (x, y)))
-        .find(|(x, y)| x < y && winner(&default_hash, x, y) != winner(&sha3, x, y))
-        .expect("some pair must be ranked differently by the two hash functions");
-    let sha3_winner = winner(&sha3, x, y);
-    let other = if sha3_winner == *x { y } else { x };
-
-    assert_eq!(
-        state_after_two_member_roll_call(&sha3_winner, other, sha3),
-        WorkerState::Candidate
-    );
-    assert_eq!(
-        state_after_two_member_roll_call(&sha3_winner, other, default_hash),
-        WorkerState::RollCall,
-        "under the default hash function this node is not the winner and only forwards"
-    );
-}
-
-#[test]
-fn roll_call_for_another_shard_or_recovery_epoch_is_ignored() {
-    let clock = FakeClock::new();
-    let self_id = worker("w1");
-    let succ = worker("w2");
-    let network = make_network(&clock, &[self_id.clone(), succ.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id, succ.clone()],
-        Duration::from_ticks(10),
-    );
-
-    let mut other_shard = roll_call("call-1", worker("initiator"), vec![]);
-    other_shard.shard_id = Some(shard("other-shard").into());
-    node.on_message(worker("someone"), roll_call_message(other_shard));
-
-    let mut other_epoch = roll_call("call-2", worker("initiator"), vec![]);
-    other_epoch.recovery_epoch = 1;
-    node.on_message(worker("someone"), roll_call_message(other_epoch));
-
-    network.pump();
-    assert!(
-        network.poll_inbox(succ).is_empty(),
-        "a roll call for another shard or epoch must be neither answered nor forwarded"
-    );
+    let rejects = rejects_sent_to(&outputs, &candidate);
+    assert_eq!(rejects.len(), 1);
+    assert_eq!(rejects[0].reason(), ElectionRejectReason::NotBestRollCall);
 }

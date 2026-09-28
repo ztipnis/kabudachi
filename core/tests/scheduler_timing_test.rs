@@ -9,10 +9,12 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::{ClaimRejection, Event, Scheduler, Submission};
+use kabudachi_core::scheduler::{
+    ClaimRejection, Event, LeadershipGrant, LeaseEnd, Scheduler, Submission,
+};
 use kabudachi_core::time::{Clock, Duration, Instant};
 use support::clock::FakeClock;
+use support::grant::unbounded_grant;
 use support::ids::SequentialIds;
 
 fn worker() -> WorkerId {
@@ -31,7 +33,7 @@ struct Fixture {
 fn leading() -> Fixture {
     let clock = FakeClock::new();
     let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_worker_state(WorkerState::Leader);
+    scheduler.set_leadership_grant(Some(unbounded_grant()));
     Fixture { clock, scheduler }
 }
 
@@ -293,6 +295,10 @@ impl Clock for TickingClock {
         self.now.set(now + 1);
         Instant::at(now)
     }
+
+    fn wall_clock_millis(&self) -> u64 {
+        0
+    }
 }
 
 #[test]
@@ -301,7 +307,7 @@ fn a_claim_never_fails_because_time_passed_between_its_own_steps() {
         now: std::cell::Cell::new(0),
     };
     let mut scheduler = Scheduler::new(clock, SequentialIds::new());
-    scheduler.set_worker_state(WorkerState::Leader);
+    scheduler.set_leadership_grant(Some(unbounded_grant()));
     // Every task expires a few ticks after it is submitted, which is soon
     // enough that some expire in the middle of a claim.
     for _ in 0..20 {
@@ -379,7 +385,34 @@ fn only_a_leader_decides_that_time_has_run_out() {
         .scheduler
         .submit(plain().with_delay(ticks(10)))
         .unwrap();
-    fixture.scheduler.set_worker_state(WorkerState::Active);
+    fixture.scheduler.set_leadership_grant(None);
+    fixture.clock.advance(ticks(1_000));
+
+    let outcome = fixture.scheduler.advance();
+
+    assert_eq!((outcome.queued, outcome.expired), (0, 0));
+    assert_eq!(state(&fixture, &task), TaskRunState::Queued);
+    assert_eq!(state(&fixture, &delayed), TaskRunState::Scheduled);
+    assert!(!fixture.scheduler.has_events());
+}
+
+#[test]
+fn a_leader_whose_grant_has_run_out_decides_nothing_about_time() {
+    let mut fixture = leading();
+    let end = fixture.clock.now() + ticks(5);
+    let grant = LeadershipGrant {
+        valid_until: LeaseEnd::At(end),
+        ..unbounded_grant()
+    };
+    fixture.scheduler.set_leadership_grant(Some(grant));
+    let task = fixture
+        .scheduler
+        .submit(plain().with_expiry(ticks(10)))
+        .unwrap();
+    let delayed = fixture
+        .scheduler
+        .submit(plain().with_delay(ticks(10)))
+        .unwrap();
     fixture.clock.advance(ticks(1_000));
 
     let outcome = fixture.scheduler.advance();

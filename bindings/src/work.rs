@@ -6,11 +6,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use kabudachi_core::protocol::ids::{Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::{Certification, Claim, ClaimRejection, Event, Scheduler};
+use kabudachi_core::time::RealClock;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use tokio::sync::watch;
-
-use crate::clock::RealClock;
 
 /// The scheduler, shared between the calls into it and the loops that drive it.
 pub type SharedScheduler = Arc<Mutex<Scheduler<RealClock, Uuid7Ids>>>;
@@ -287,25 +286,31 @@ pub async fn events_when_available(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use kabudachi_core::protocol::ids::TaskDefinitionId;
-    use kabudachi_core::protocol::worker_state::WorkerState;
-    use kabudachi_core::scheduler::Submission;
+    use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, Submission};
     use tokio::runtime::Builder;
 
     use super::*;
 
     const LIMIT: Duration = Duration::from_secs(5);
+    /// Lets a scheduler lead for as long as a test runs. Shared with the
+    /// other test modules of this crate that need a leading scheduler.
+    pub(crate) const UNBOUNDED_GRANT: LeadershipGrant = LeadershipGrant {
+        term: 1,
+        recovery_epoch: 0,
+        valid_until: LeaseEnd::Unbounded,
+    };
 
     fn worker() -> WorkerId {
         WorkerId::new("worker-1")
     }
 
-    fn scheduler(state: WorkerState) -> SharedScheduler {
+    fn scheduler(grant: Option<LeadershipGrant>) -> SharedScheduler {
         let mut scheduler = Scheduler::new(RealClock::new(), Uuid7Ids);
-        scheduler.set_worker_state(state);
+        scheduler.set_leadership_grant(grant);
         Arc::new(Mutex::new(scheduler))
     }
 
@@ -334,7 +339,7 @@ mod tests {
 
     #[test]
     fn a_leader_with_work_claims_it_at_once() {
-        let scheduler = scheduler(WorkerState::Leader);
+        let scheduler = scheduler(Some(UNBOUNDED_GRANT));
         submit(&scheduler);
         let wake = Wake::new();
 
@@ -352,7 +357,7 @@ mod tests {
 
     #[test]
     fn a_closed_wake_fails_a_claim_at_once() {
-        let scheduler = scheduler(WorkerState::Leader);
+        let scheduler = scheduler(Some(UNBOUNDED_GRANT));
         submit(&scheduler);
         let wake = Wake::new();
         let subscription = wake.subscribe();
@@ -371,7 +376,7 @@ mod tests {
 
     #[test]
     fn closing_fails_a_claim_that_is_waiting() {
-        let scheduler = scheduler(WorkerState::Leader);
+        let scheduler = scheduler(Some(UNBOUNDED_GRANT));
         let wake = Wake::new();
 
         let result = block_on(async {
@@ -392,7 +397,7 @@ mod tests {
 
     #[test]
     fn a_notification_lets_a_waiting_claim_take_new_work() {
-        let scheduler = scheduler(WorkerState::Leader);
+        let scheduler = scheduler(Some(UNBOUNDED_GRANT));
         let wake = Wake::new();
 
         let claims = block_on(async {
@@ -414,7 +419,7 @@ mod tests {
 
     #[test]
     fn a_submission_before_the_first_wait_is_not_missed() {
-        let scheduler = scheduler(WorkerState::Active);
+        let scheduler = scheduler(None);
         let wake = Wake::new();
         let subscription = wake.subscribe();
 
@@ -428,7 +433,7 @@ mod tests {
             ));
             // Becoming leader with work already queued, before the waiter has run.
             submit(&scheduler);
-            lock_scheduler(&scheduler).set_worker_state(WorkerState::Leader);
+            lock_scheduler(&scheduler).set_leadership_grant(Some(UNBOUNDED_GRANT));
             wake.notify();
             waiting.await.unwrap().unwrap()
         });
@@ -438,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_claim_waits_while_the_worker_is_not_leader() {
-        let scheduler = scheduler(WorkerState::Active);
+        let scheduler = scheduler(None);
         submit(&scheduler);
         let wake = Wake::new();
 

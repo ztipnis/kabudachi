@@ -9,7 +9,7 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
     Cancellation, MemoryLimits, ReportRejection, Scheduler, Submission, SubmitRejection,
 };
-use kabudachi_core::time::Duration as CoreDuration;
+use kabudachi_core::time::{Duration as CoreDuration, RealClock};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::runtime::{Builder, Runtime};
@@ -17,7 +17,6 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
-use crate::clock::RealClock;
 use crate::election::{Publisher, run_election};
 use crate::local_node::local_node;
 use crate::timers::run_timers;
@@ -28,7 +27,9 @@ use crate::work::{
 };
 
 const DEFAULT_WORKER_THREADS: usize = 2;
-const DEFAULT_ELECTION_TICK_MS: u64 = 10;
+/// A lone worker has no peer to wait for, so it starts electing itself at
+/// once, and leads once its one-voter roll call closes a millisecond later.
+const DEFAULT_SUSPECT_TIMEOUT_MS: u64 = 0;
 /// The shard of a process that runs no cluster: just this worker.
 const LOCAL_SHARD_ID: &str = "local";
 /// Finished tasks are kept this long unless the caller says otherwise.
@@ -69,8 +70,10 @@ impl NativeRuntime {
     /// Starts the runtime and begins electing this worker leader.
     ///
     /// `worker_id` and `incarnation_id` identify this worker and this start
-    /// of it. `worker_threads` sizes the Tokio thread pool and
-    /// `election_tick_ms` is how often the election is advanced.
+    /// of it. `worker_threads` sizes the Tokio thread pool.
+    /// `suspect_timeout_ms` is how long the worker waits, with no leader to
+    /// hear from, before it elects itself; with 0, the default, it leads a
+    /// millisecond after it starts, when its one-voter roll call closes.
     /// `result_ttl_ms` is how long a finished task is kept before it is
     /// forgotten. `memory_soft_limit` and `memory_hard_limit` are in bytes of
     /// serialized task input: past the soft one `next_events()` reports
@@ -79,14 +82,14 @@ impl NativeRuntime {
     /// and the soft one must not be above the hard one, which
     /// `kabudachi.configure` checks before the values reach here.
     ///
-    /// Raises `ValueError` if a count is zero or only one of the two memory
-    /// limits is given.
+    /// Raises `ValueError` if `worker_threads` is zero or only one of the two
+    /// memory limits is given.
     #[new]
     #[pyo3(signature = (
         worker_id,
         incarnation_id,
         worker_threads = DEFAULT_WORKER_THREADS,
-        election_tick_ms = DEFAULT_ELECTION_TICK_MS,
+        suspect_timeout_ms = DEFAULT_SUSPECT_TIMEOUT_MS,
         result_ttl_ms = DEFAULT_RESULT_TTL_MS,
         memory_soft_limit = None,
         memory_hard_limit = None,
@@ -95,16 +98,13 @@ impl NativeRuntime {
         worker_id: String,
         incarnation_id: String,
         worker_threads: usize,
-        election_tick_ms: u64,
+        suspect_timeout_ms: u64,
         result_ttl_ms: u64,
         memory_soft_limit: Option<u64>,
         memory_hard_limit: Option<u64>,
     ) -> PyResult<Self> {
         if worker_threads == 0 {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));
-        }
-        if election_tick_ms == 0 {
-            return Err(PyValueError::new_err("election_tick_ms must be at least 1"));
         }
         let limits = match (memory_soft_limit, memory_hard_limit) {
             (None, None) => None,
@@ -123,17 +123,20 @@ impl NativeRuntime {
         let bridge = Bridge::new(tokio.handle().clone());
 
         let worker_id = WorkerId::new(worker_id);
-        // One clock for everything: the scheduler's deadlines are ticks of
-        // it, so the timer loop has to count the same ticks.
+        // One clock for everything: the scheduler's and the election node's
+        // deadlines are ticks of it, so the timer and election loops have to
+        // count the same ticks, and the scheduler checks the end of each
+        // leadership grant the node hands it against its own reading of it.
         let clock = RealClock::new();
         let node = local_node(
             worker_id.clone(),
             IncarnationId::new(incarnation_id),
             ShardId::new(LOCAL_SHARD_ID),
             clock,
+            CoreDuration::from_millis(suspect_timeout_ms),
         );
         let mut new_scheduler = Scheduler::new(clock, Uuid7Ids);
-        new_scheduler.set_result_ttl(Some(CoreDuration::from_ticks(result_ttl_ms)));
+        new_scheduler.set_result_ttl(Some(CoreDuration::from_millis(result_ttl_ms)));
         new_scheduler.set_memory_limits(limits);
         let scheduler: SharedScheduler = Arc::new(Mutex::new(new_scheduler));
         let (state_sender, state) = watch::channel(node.state());
@@ -148,12 +151,7 @@ impl NativeRuntime {
             scheduler: Arc::clone(&scheduler),
             wakeups: wakeups.clone(),
         };
-        let election = tokio.spawn(run_election(
-            node,
-            Duration::from_millis(election_tick_ms),
-            Arc::clone(&stop),
-            publisher,
-        ));
+        let election = tokio.spawn(run_election(node, clock, Arc::clone(&stop), publisher));
 
         let timers = tokio.spawn(run_timers(
             Arc::clone(&scheduler),
@@ -251,10 +249,10 @@ impl NativeRuntime {
                 )
                 .with_retries(retries);
                 if let Some(delay_ms) = delay_ms {
-                    submission = submission.with_delay(CoreDuration::from_ticks(delay_ms));
+                    submission = submission.with_delay(CoreDuration::from_millis(delay_ms));
                 }
                 if let Some(expires_in_ms) = expires_in_ms {
-                    submission = submission.with_expiry(CoreDuration::from_ticks(expires_in_ms));
+                    submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
                 }
                 if let Some(key) = coalescing_key {
                     submission = submission.with_coalescing_key(key);

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "bindings", "proto", "net"]
+members = ["core", "bindings", "proto", "net", "testkit"]
 
 # macOS defaults to split-debuginfo = "unpacked", which leaves every codegen
 # unit's object file in target/debug/deps as the binary's debug info. Codegen

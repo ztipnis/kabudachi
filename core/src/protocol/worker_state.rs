@@ -1,8 +1,6 @@
-//! Domain `WorkerState` and its transition table (README §10.2, plus the
-//! `Leader -> Fenced` edge from §10.4). The wire enum's `UNSPECIFIED` sentinel
-//! has no domain meaning and is not represented.
-
-use crate::protocol::generated;
+//! Domain `WorkerState` and its transition table (README §10.2, plus
+//! ADR-0001's step-down, deadline, `NoQuorum` exit, authority-path and
+//! orphaning edges). No message carries a worker's state.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkerState {
@@ -37,17 +35,38 @@ impl WorkerState {
         WorkerState::Stopped,
     ];
 
-    /// A terminal state has no legal outgoing transition. `NoQuorum` and
-    /// `Candidate` are not terminal: each has one outgoing edge.
+    /// A terminal state has no legal outgoing transition.
     pub fn is_terminal(self) -> bool {
-        matches!(self, WorkerState::Fenced | WorkerState::Stopped)
+        self == WorkerState::Stopped
     }
 
     /// Whether `self -> next` is a legal edge.
     ///
-    /// The README draws no losing-candidate edge, and `NoQuorum` has a single
-    /// `-> RollCall` edge standing in for its several exit paths (the
-    /// `Abandoned` outcome is shard-level, not a worker state).
+    /// Beyond the README's sketch, `LeaderSuspect -> Active` lets an ack
+    /// from the leader end a suspicion before any roll call starts: a
+    /// pending member, which starts none, has no other way back. A node that
+    /// holds or contests a term steps down once it sees a later one
+    /// (ADR-0001 decision 14): from `RollCall`, `Candidate` or `Leader`, to
+    /// `Active` under that term's leader or to `LeaderSuspect` to contest
+    /// again. `LeaderReconciling` has no such edge: a winner passes through
+    /// it to `Leader` in one step, so no input ever finds a node there. A
+    /// roll call or a vote that misses its deadline leaves `RollCall` or
+    /// `Candidate` for `LeaderSuspect` too, or, short of a quorum, `RollCall`
+    /// for `NoQuorum` (ADR-0001 decisions 13 and 15). A `NoQuorum` node
+    /// leaves by a roll call of its own (`-> RollCall`) or by an ack from a
+    /// leader (`-> Active`).
+    ///
+    /// With a coordination authority (ADR-0001 decisions 11 and 12): a
+    /// `NoQuorum` node whose authority path swaps the recovery epoch stands
+    /// (`-> Candidate`) while it waits out the recovery fence, and goes back
+    /// (`Candidate -> NoQuorum`) if the fence is refused for good; one that
+    /// finds the epoch missing stops, its shard abandoned (`-> Stopped`). A
+    /// node that fails to renew its registration fences itself (`-> Fenced`)
+    /// from any state that takes part in elections, and on reconnecting
+    /// resumes (`Fenced -> Active`) or, if the epoch is no longer its own,
+    /// rejoins (`Fenced -> Bootstrapping`); a `NoQuorum` node whose
+    /// authority path finds an epoch it cannot recover from rejoins it the
+    /// same way (`NoQuorum -> Bootstrapping`).
     pub fn can_transition_to(self, next: WorkerState) -> bool {
         matches!(
             (self, next),
@@ -55,66 +74,36 @@ impl WorkerState {
                 | (WorkerState::Joining, WorkerState::Active)
                 | (WorkerState::Active, WorkerState::LeaderSuspect)
                 | (WorkerState::Active, WorkerState::Draining)
+                | (WorkerState::Active, WorkerState::Fenced)
+                | (WorkerState::LeaderSuspect, WorkerState::Active)
                 | (WorkerState::LeaderSuspect, WorkerState::RollCall)
+                | (WorkerState::LeaderSuspect, WorkerState::Fenced)
                 | (WorkerState::RollCall, WorkerState::Active)
+                | (WorkerState::RollCall, WorkerState::LeaderSuspect)
                 | (WorkerState::RollCall, WorkerState::Candidate)
+                | (WorkerState::RollCall, WorkerState::NoQuorum)
+                | (WorkerState::RollCall, WorkerState::Fenced)
+                | (WorkerState::Candidate, WorkerState::Active)
+                | (WorkerState::Candidate, WorkerState::LeaderSuspect)
                 | (WorkerState::Candidate, WorkerState::LeaderReconciling)
+                | (WorkerState::Candidate, WorkerState::NoQuorum)
+                | (WorkerState::Candidate, WorkerState::Fenced)
                 | (WorkerState::LeaderReconciling, WorkerState::Leader)
+                | (WorkerState::Leader, WorkerState::Active)
+                | (WorkerState::Leader, WorkerState::LeaderSuspect)
                 | (WorkerState::Leader, WorkerState::NoQuorum)
                 | (WorkerState::Leader, WorkerState::Draining)
                 | (WorkerState::Leader, WorkerState::Fenced)
+                | (WorkerState::NoQuorum, WorkerState::Active)
                 | (WorkerState::NoQuorum, WorkerState::RollCall)
+                | (WorkerState::NoQuorum, WorkerState::Candidate)
+                | (WorkerState::NoQuorum, WorkerState::Stopped)
+                | (WorkerState::NoQuorum, WorkerState::Bootstrapping)
+                | (WorkerState::NoQuorum, WorkerState::Fenced)
+                | (WorkerState::Fenced, WorkerState::Active)
+                | (WorkerState::Fenced, WorkerState::Bootstrapping)
                 | (WorkerState::Draining, WorkerState::Stopped)
         )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum WorkerStateConversionError {
-    #[error("WorkerState::Unspecified has no domain meaning")]
-    UnspecifiedVariant,
-}
-
-impl TryFrom<generated::WorkerState> for WorkerState {
-    type Error = WorkerStateConversionError;
-
-    fn try_from(raw: generated::WorkerState) -> Result<Self, Self::Error> {
-        match raw {
-            generated::WorkerState::Unspecified => {
-                Err(WorkerStateConversionError::UnspecifiedVariant)
-            }
-            generated::WorkerState::Bootstrapping => Ok(WorkerState::Bootstrapping),
-            generated::WorkerState::Joining => Ok(WorkerState::Joining),
-            generated::WorkerState::Active => Ok(WorkerState::Active),
-            generated::WorkerState::LeaderSuspect => Ok(WorkerState::LeaderSuspect),
-            generated::WorkerState::RollCall => Ok(WorkerState::RollCall),
-            generated::WorkerState::Candidate => Ok(WorkerState::Candidate),
-            generated::WorkerState::LeaderReconciling => Ok(WorkerState::LeaderReconciling),
-            generated::WorkerState::Leader => Ok(WorkerState::Leader),
-            generated::WorkerState::NoQuorum => Ok(WorkerState::NoQuorum),
-            generated::WorkerState::Draining => Ok(WorkerState::Draining),
-            generated::WorkerState::Fenced => Ok(WorkerState::Fenced),
-            generated::WorkerState::Stopped => Ok(WorkerState::Stopped),
-        }
-    }
-}
-
-impl From<WorkerState> for generated::WorkerState {
-    fn from(state: WorkerState) -> Self {
-        match state {
-            WorkerState::Bootstrapping => generated::WorkerState::Bootstrapping,
-            WorkerState::Joining => generated::WorkerState::Joining,
-            WorkerState::Active => generated::WorkerState::Active,
-            WorkerState::LeaderSuspect => generated::WorkerState::LeaderSuspect,
-            WorkerState::RollCall => generated::WorkerState::RollCall,
-            WorkerState::Candidate => generated::WorkerState::Candidate,
-            WorkerState::LeaderReconciling => generated::WorkerState::LeaderReconciling,
-            WorkerState::Leader => generated::WorkerState::Leader,
-            WorkerState::NoQuorum => generated::WorkerState::NoQuorum,
-            WorkerState::Draining => generated::WorkerState::Draining,
-            WorkerState::Fenced => generated::WorkerState::Fenced,
-            WorkerState::Stopped => generated::WorkerState::Stopped,
-        }
     }
 }
 
@@ -135,21 +124,40 @@ mod tests {
     }
 
     #[test]
-    fn legal_transitions_are_exactly_fourteen() {
+    fn legal_transitions_are_exactly_the_table() {
         let legal = [
             (WorkerState::Bootstrapping, WorkerState::Joining),
             (WorkerState::Joining, WorkerState::Active),
             (WorkerState::Active, WorkerState::LeaderSuspect),
             (WorkerState::Active, WorkerState::Draining),
+            (WorkerState::Active, WorkerState::Fenced),
+            (WorkerState::LeaderSuspect, WorkerState::Active),
             (WorkerState::LeaderSuspect, WorkerState::RollCall),
+            (WorkerState::LeaderSuspect, WorkerState::Fenced),
             (WorkerState::RollCall, WorkerState::Active),
+            (WorkerState::RollCall, WorkerState::LeaderSuspect),
             (WorkerState::RollCall, WorkerState::Candidate),
+            (WorkerState::RollCall, WorkerState::NoQuorum),
+            (WorkerState::RollCall, WorkerState::Fenced),
+            (WorkerState::Candidate, WorkerState::Active),
+            (WorkerState::Candidate, WorkerState::LeaderSuspect),
             (WorkerState::Candidate, WorkerState::LeaderReconciling),
+            (WorkerState::Candidate, WorkerState::NoQuorum),
+            (WorkerState::Candidate, WorkerState::Fenced),
             (WorkerState::LeaderReconciling, WorkerState::Leader),
+            (WorkerState::Leader, WorkerState::Active),
+            (WorkerState::Leader, WorkerState::LeaderSuspect),
             (WorkerState::Leader, WorkerState::NoQuorum),
             (WorkerState::Leader, WorkerState::Draining),
             (WorkerState::Leader, WorkerState::Fenced),
+            (WorkerState::NoQuorum, WorkerState::Active),
             (WorkerState::NoQuorum, WorkerState::RollCall),
+            (WorkerState::NoQuorum, WorkerState::Candidate),
+            (WorkerState::NoQuorum, WorkerState::Stopped),
+            (WorkerState::NoQuorum, WorkerState::Bootstrapping),
+            (WorkerState::NoQuorum, WorkerState::Fenced),
+            (WorkerState::Fenced, WorkerState::Active),
+            (WorkerState::Fenced, WorkerState::Bootstrapping),
             (WorkerState::Draining, WorkerState::Stopped),
         ];
 
@@ -181,67 +189,17 @@ mod tests {
     }
 
     #[test]
-    fn exactly_two_states_are_terminal() {
-        let terminal_states = [WorkerState::Fenced, WorkerState::Stopped];
-
-        for state in WorkerState::ALL.iter() {
-            let is_in_terminal_list = terminal_states.contains(state);
-            let result = state.is_terminal();
-            assert_eq!(
-                result, is_in_terminal_list,
-                "State {:?}: expected is_terminal() to return {}, got {}",
-                state, is_in_terminal_list, result
-            );
-        }
-
-        let terminal_count = WorkerState::ALL.iter().filter(|s| s.is_terminal()).count();
-        assert_eq!(
-            terminal_count, 2,
-            "Expected exactly 2 terminal states, got {}",
-            terminal_count
-        );
-
-        let non_terminal_count = WorkerState::ALL.iter().filter(|s| !s.is_terminal()).count();
-        assert_eq!(
-            non_terminal_count, 10,
-            "Expected exactly 10 non-terminal states, got {}",
-            non_terminal_count
-        );
-    }
-
-    #[test]
-    fn no_terminal_state_has_outgoing_transitions() {
-        let terminal_states = [WorkerState::Fenced, WorkerState::Stopped];
-
-        for terminal in terminal_states.iter() {
-            for target in WorkerState::ALL.iter() {
+    fn only_stopped_is_terminal() {
+        for state in WorkerState::ALL {
+            assert_eq!(state.is_terminal(), state == WorkerState::Stopped, "{state:?}");
+            if state.is_terminal() {
                 assert!(
-                    !terminal.can_transition_to(*target),
-                    "Terminal state {:?} should not have outgoing transition to {:?}",
-                    terminal,
-                    target
+                    WorkerState::ALL
+                        .iter()
+                        .all(|next| !state.can_transition_to(*next)),
+                    "terminal {state:?} has an outgoing transition"
                 );
             }
         }
-    }
-
-    #[test]
-    fn conversions_round_trip_successfully() {
-        for state in WorkerState::ALL.iter() {
-            let generated: generated::WorkerState = (*state).into();
-            let back: WorkerState = generated.try_into().expect("round-trip should succeed");
-            assert_eq!(*state, back, "Round-trip failed for {:?}", state);
-        }
-    }
-
-    #[test]
-    fn unspecified_conversion_returns_error() {
-        let unspecified = generated::WorkerState::Unspecified;
-        let result: Result<WorkerState, _> = unspecified.try_into();
-        assert!(result.is_err(), "Expected Unspecified to produce an error");
-        assert_eq!(
-            result.unwrap_err(),
-            WorkerStateConversionError::UnspecifiedVariant
-        );
     }
 }

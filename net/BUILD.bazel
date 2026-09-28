@@ -20,8 +20,8 @@ rust_test_suite(
     name = "net_integration_tests",
     srcs = glob(
         ["tests/*.rs"],
-        exclude = ["tests/ring_roll_call_leader_loss_test.rs"],
         allow_empty = True,
+        exclude = ["tests/admission_burst_test.rs"],
     ),
     shared_srcs = glob(["tests/support/**/*.rs"], allow_empty = True),
     # ":net" alone isn't enough for tests/*.rs files to `use kabudachi_core::...`
@@ -30,26 +30,19 @@ rust_test_suite(
     # compilation unit that only sees what's explicitly in `deps`. "//core"
     # mirrors the ":net" rust_library target's own `+ ["//core"]` above; this
     # was unexercised until chunk C3 added the first real net/tests/*.rs files.
-    deps = [":net", "//core"] + all_crate_deps(normal = True, normal_dev = True),
+    deps = [":net", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
     edition = "2024",
 )
 
-# Split out of net_integration_tests (rather than sharing its default
-# `medium` (300s) size via rust_test_suite's uniform **kwargs) because its
-# retry loop (chunk C7/C7-fix; see the test file's own doc for the empirical
-# per-attempt failure rate that makes the retries necessary) can burn up to
-# MAX_ATTEMPTS = 30 attempts, each with several sequential TEST_TIMEOUT
-# (10s) windows across setup/leader-loss/re-election phases. That worst case
-# comfortably exceeds `medium`'s 300s, which would make Bazel kill the test
-# before its own retry loop reports an honest pass/fail — an infra timeout
-# masquerading as a test result. `large` is 900s; the worst case can exceed
-# even that, so the test also caps its own retries with RETRY_BUDGET (840s)
-# and fails on its own before Bazel's timeout.
+# Twenty-two workers, each with its own swarm, in one process on a
+# four-thread runtime: reserve the CPUs it uses so parallel test targets do
+# not starve its timers (a starved leader loses its lease, and the test would
+# measure the host, not the protocol).
 rust_test(
-    name = "ring_roll_call_leader_loss_test",
-    crate_root = "tests/ring_roll_call_leader_loss_test.rs",
-    srcs = ["tests/ring_roll_call_leader_loss_test.rs"] + glob(["tests/support/**/*.rs"], allow_empty = True),
+    name = "admission_burst_test",
+    srcs = ["tests/admission_burst_test.rs"] + glob(["tests/support/**/*.rs"]),
+    crate_root = "tests/admission_burst_test.rs",
     edition = "2024",
-    size = "large",
-    deps = [":net", "//core"] + all_crate_deps(normal = True, normal_dev = True),
+    tags = ["cpu:4"],
+    deps = [":net", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
 )

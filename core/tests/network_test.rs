@@ -7,8 +7,7 @@ use std::rc::Rc;
 
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
 use kabudachi_core::protocol::messages::{self, ElectionMessage, SelfRemove};
-use kabudachi_core::time::Duration;
-use kabudachi_core::transport::PeerMessenger;
+use kabudachi_core::time::{Clock, Duration};
 use support::clock::FakeClock;
 use support::network::FakeNetwork;
 
@@ -19,10 +18,21 @@ fn self_remove_message(worker_id: &str) -> ElectionMessage {
                 worker_id: Some(worker(worker_id).into()),
                 incarnation_id: Some(IncarnationId::new("incarnation-1").into()),
                 shard_id: Some(ShardId::new("shard-1").into()),
-                membership_generation: 0,
+                configuration_generation: None,
+                term_seen: 0,
+                leader_term: 0,
             },
         )),
     }
+}
+
+/// Every message due now, as `(from, to, message)`, in delivery order.
+fn take_due(network: &FakeNetwork) -> Vec<(WorkerId, WorkerId, ElectionMessage)> {
+    network
+        .take_due()
+        .into_iter()
+        .map(|due| (due.from, due.to, due.message))
+        .collect()
 }
 
 #[test]
@@ -36,15 +46,11 @@ fn baseline_no_faults_delivers_message_once_and_drains() {
 
     let message = self_remove_message("a");
     network.send(a.clone(), b.clone(), message.clone());
-    let delivered = network.pump();
-    assert_eq!(delivered, 1);
 
-    let inbox = network.poll_inbox(b.clone());
-    assert_eq!(inbox, vec![(a, message)]);
+    assert_eq!(take_due(&network), vec![(a, b, message)]);
 
-    // Draining again with nothing new delivered returns empty.
-    let inbox_again = network.poll_inbox(b);
-    assert!(inbox_again.is_empty());
+    // Taking again with nothing new sent returns empty.
+    assert!(take_due(&network).is_empty());
 }
 
 #[test]
@@ -57,10 +63,10 @@ fn drop_rate_one_delivers_nothing() {
     network.register(b.clone());
     network.set_drop_rate(1.0);
 
-    network.send(a, b.clone(), self_remove_message("a"));
-    let delivered = network.pump();
-    assert_eq!(delivered, 0);
-    assert!(network.poll_inbox(b).is_empty());
+    network.send(a, b, self_remove_message("a"));
+
+    assert!(take_due(&network).is_empty());
+    assert!(network.pending().is_empty());
 }
 
 #[test]
@@ -76,11 +82,11 @@ fn duplicate_rate_one_delivers_exactly_twice() {
 
     let message = self_remove_message("a");
     network.send(a.clone(), b.clone(), message.clone());
-    let delivered = network.pump();
-    assert_eq!(delivered, 2);
 
-    let inbox = network.poll_inbox(b);
-    assert_eq!(inbox, vec![(a.clone(), message.clone()), (a, message)]);
+    assert_eq!(
+        take_due(&network),
+        vec![(a.clone(), b.clone(), message.clone()), (a, b, message)]
+    );
 }
 
 #[test]
@@ -92,23 +98,28 @@ fn delay_defers_delivery_until_clock_catches_up() {
     network.register(a.clone());
     network.register(b.clone());
     network.set_delay(Duration::from_ticks(5));
+    let sent_at = clock.now();
 
     let message = self_remove_message("a");
     network.send(a.clone(), b.clone(), message.clone());
 
-    // Immediate pump: nothing due yet.
-    assert_eq!(network.pump(), 0);
-    assert!(network.poll_inbox(b.clone()).is_empty());
+    // Nothing is due yet, and the network says when something will be.
+    assert!(take_due(&network).is_empty());
+    assert_eq!(
+        network.next_delivery_at(),
+        Some(sent_at + Duration::from_ticks(5))
+    );
+    assert_eq!(network.pending(), vec![(b.clone(), message.clone())]);
 
     // Advance by less than the delay: still nothing due.
     clock.advance(Duration::from_ticks(3));
-    assert_eq!(network.pump(), 0);
-    assert!(network.poll_inbox(b.clone()).is_empty());
+    assert!(take_due(&network).is_empty());
 
     // Advance the rest of the way (total 5): now it's due.
     clock.advance(Duration::from_ticks(2));
-    assert_eq!(network.pump(), 1);
-    assert_eq!(network.poll_inbox(b), vec![(a, message)]);
+    assert_eq!(take_due(&network), vec![(a, b, message)]);
+    assert_eq!(network.next_delivery_at(), None);
+    assert!(network.pending().is_empty());
 }
 
 #[test]
@@ -128,59 +139,33 @@ fn partition_blocks_cross_group_delivery_and_heal_restores_it() {
 
     // Cross-partition send is dropped.
     network.send(a.clone(), b.clone(), self_remove_message("a"));
-    assert_eq!(network.pump(), 0);
-    assert!(network.poll_inbox(b.clone()).is_empty());
+    assert!(take_due(&network).is_empty());
 
-    // A is cut off from both B and C (the other group).
-    let reachable_from_a = network.reachable_peers(a.clone());
-    assert!(!reachable_from_a.contains(&b));
-    assert!(!reachable_from_a.contains(&c));
+    // A is cut off from both B and C (the other group), in both directions.
+    assert!(network.is_partitioned(&a, &b));
+    assert!(network.is_partitioned(&c, &a));
 
-    // B and C remain mutually reachable (same partition group).
-    let reachable_from_b = network.reachable_peers(b.clone());
-    assert!(reachable_from_b.contains(&c));
+    // B and C remain connected (same partition group).
+    assert!(!network.is_partitioned(&b, &c));
 
     // Same-group send still succeeds.
     let same_group_message = self_remove_message("b");
     network.send(b.clone(), c.clone(), same_group_message.clone());
-    assert_eq!(network.pump(), 1);
     assert_eq!(
-        network.poll_inbox(c.clone()),
-        vec![(b.clone(), same_group_message)]
+        take_due(&network),
+        vec![(b.clone(), c.clone(), same_group_message)]
     );
 
     // Healing restores full connectivity.
     network.heal_partition();
     let healed_message = self_remove_message("a");
     network.send(a.clone(), b.clone(), healed_message.clone());
-    assert_eq!(network.pump(), 1);
     assert_eq!(
-        network.poll_inbox(b.clone()),
-        vec![(a.clone(), healed_message)]
+        take_due(&network),
+        vec![(a.clone(), b.clone(), healed_message)]
     );
-
-    let reachable_from_a_after_heal = network.reachable_peers(a);
-    assert!(reachable_from_a_after_heal.contains(&b));
-    assert!(reachable_from_a_after_heal.contains(&c));
-}
-
-#[test]
-fn broadcast_default_impl_reaches_all_recipients() {
-    let clock = Rc::new(FakeClock::new());
-    let network = FakeNetwork::new(clock);
-    let a = worker("a");
-    let b = worker("b");
-    let c = worker("c");
-    network.register(a.clone());
-    network.register(b.clone());
-    network.register(c.clone());
-
-    let message = self_remove_message("a");
-    network.broadcast(a.clone(), vec![b.clone(), c.clone()], message.clone());
-    assert_eq!(network.pump(), 2);
-
-    assert_eq!(network.poll_inbox(b), vec![(a.clone(), message.clone())]);
-    assert_eq!(network.poll_inbox(c), vec![(a, message)]);
+    assert!(!network.is_partitioned(&a, &b));
+    assert!(!network.is_partitioned(&a, &c));
 }
 
 /// Exercises `set_reorder`: delivery still works when enabled (reordering itself is not asserted).
@@ -197,8 +182,7 @@ fn reorder_enabled_still_delivers_every_message_exactly_once() {
     for i in 0..5 {
         network.send(a.clone(), b.clone(), self_remove_message(&format!("a{i}")));
     }
-    assert_eq!(network.pump(), 5);
-    assert_eq!(network.poll_inbox(b).len(), 5);
+    assert_eq!(take_due(&network).len(), 5);
 }
 
 /// The same seed reproduces the same drop decisions (mid-range rate; 0.0 and 1.0 skip the PRNG).
@@ -217,8 +201,7 @@ fn seeding_the_prng_makes_fault_injection_reproducible() {
         for i in 0..20 {
             network.send(a.clone(), b.clone(), self_remove_message(&format!("a{i}")));
         }
-        network.pump();
-        network.poll_inbox(b).len()
+        take_due(&network).len()
     };
 
     assert_eq!(run(42), run(42));
@@ -251,12 +234,96 @@ fn send_panics_when_recipient_is_unregistered() {
     network.send(a, b, self_remove_message("a"));
 }
 
+/// A network of registered workers `a`, `b`, `c` and `d`, with its clock.
+fn four_worker_network() -> (Rc<FakeClock>, FakeNetwork, [WorkerId; 4]) {
+    let clock = Rc::new(FakeClock::new());
+    let network = FakeNetwork::new(Rc::clone(&clock));
+    let workers = [worker("a"), worker("b"), worker("c"), worker("d")];
+    for id in &workers {
+        network.register(id.clone());
+    }
+    (clock, network, workers)
+}
+
+#[test]
+fn a_publish_reaches_every_registered_worker_but_the_publisher() {
+    let (_clock, network, [a, b, c, d]) = four_worker_network();
+
+    let message = self_remove_message("b");
+    network.publish(b.clone(), message.clone());
+
+    assert_eq!(
+        take_due(&network),
+        vec![
+            (b.clone(), a, message.clone()),
+            (b.clone(), c, message.clone()),
+            (b, d, message),
+        ]
+    );
+}
+
+#[test]
+fn a_publish_does_not_reach_a_worker_partitioned_from_the_publisher() {
+    let (_clock, network, [a, b, c, d]) = four_worker_network();
+    network.partition(
+        [a.clone(), b.clone()].into_iter().collect(),
+        [c.clone()].into_iter().collect(),
+    );
+
+    let message = self_remove_message("a");
+    network.publish(a.clone(), message.clone());
+
+    // `d` is in neither group, so the partition does not cut it off.
+    assert_eq!(
+        take_due(&network),
+        vec![(a.clone(), b, message.clone()), (a, d, message)]
+    );
+}
+
+#[test]
+fn a_publish_with_drop_rate_one_delivers_nothing() {
+    let (_clock, network, [a, ..]) = four_worker_network();
+    network.set_drop_rate(1.0);
+
+    network.publish(a, self_remove_message("a"));
+
+    assert!(take_due(&network).is_empty());
+    assert!(network.pending().is_empty());
+}
+
+#[test]
+fn duplication_and_delay_apply_to_each_delivery_of_a_publish() {
+    let (clock, network, [a, b, c, d]) = four_worker_network();
+    network.set_duplicate_rate(1.0);
+    network.set_delay(Duration::from_ticks(5));
+    let published_at = clock.now();
+
+    let message = self_remove_message("a");
+    network.publish(a.clone(), message.clone());
+
+    assert!(take_due(&network).is_empty());
+    assert_eq!(
+        network.next_delivery_at(),
+        Some(published_at + Duration::from_ticks(5))
+    );
+    clock.advance(Duration::from_ticks(5));
+    assert_eq!(
+        take_due(&network),
+        vec![
+            (a.clone(), b.clone(), message.clone()),
+            (a.clone(), b, message.clone()),
+            (a.clone(), c.clone(), message.clone()),
+            (a.clone(), c, message.clone()),
+            (a.clone(), d.clone(), message.clone()),
+            (a, d, message),
+        ]
+    );
+}
+
 #[test]
 #[should_panic(expected = "was never registered")]
-fn poll_inbox_panics_when_worker_is_unregistered() {
-    let clock = Rc::new(FakeClock::new());
-    let network = FakeNetwork::new(clock);
-    let unregistered = worker("ghost");
+fn publish_panics_when_the_publisher_is_unregistered() {
+    let (_clock, network, _) = four_worker_network();
 
-    network.poll_inbox(unregistered);
+    network.publish(worker("e"), self_remove_message("e"));
 }

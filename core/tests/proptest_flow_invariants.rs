@@ -21,10 +21,10 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{Claim, Scheduler, Submission};
 use proptest::prelude::*;
 use support::clock::FakeClock;
+use support::grant::unbounded_grant;
 use support::ids::SequentialIds;
 
 const KEYS: u8 = 2;
@@ -104,7 +104,7 @@ fn number_of(payload: &[u8]) -> u32 {
 impl Model {
     fn new() -> Self {
         let mut scheduler = Scheduler::new(FakeClock::new(), SequentialIds::new());
-        scheduler.set_worker_state(WorkerState::Leader);
+        scheduler.set_leadership_grant(Some(unbounded_grant()));
         Model {
             scheduler,
             worker: WorkerId::new("w1"),

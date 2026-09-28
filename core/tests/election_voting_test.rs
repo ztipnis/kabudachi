@@ -1,812 +1,696 @@
+//! The vote (ADR-0001 decisions 6 to 8), from both sides: a voter grants
+//! at most one vote per term, only to the initiator of the best roll call
+//! it answered, and refuses every other request with the reason; a
+//! candidate wins once its granters are a majority of that call's
+//! respondents and the voters of the call's configuration among them a
+//! quorum of it, and leads the configuration the respondents found, every
+//! one of them admitted at its generation.
+
 mod support;
 
-use support::builders::{
-    make_network, observation, roll_call, roll_call_message, shard, vote_grant, vote_request,
-    worker,
-};
-
-use support::candidate::predict_winner;
-
-use kabudachi_core::election::WorkerNode;
-use kabudachi_core::membership::RingMembership;
+use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::election::{KnownConfiguration, Output, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
-    ElectionMessage, SelfRemove, VoteGrant, VoteReject, VoteRejectReason, VoteRequest,
-    election_message,
+    ElectionRejectReason, LeaderHeartbeatAck, RollCall, VoteGrant, VoteRequest, election_message,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
-use kabudachi_core::transport::PeerMessenger;
+use support::builders::{
+    ack_message, configuration_of, founded_from_g0, g0, heartbeat, heartbeat_message, leader_ack,
+    past_any_suspicion, roll_call, roll_call_message, roll_call_reply, shard, timings, vote_grant,
+    vote_grant_message, vote_request, vote_request_message, worker,
+};
 use support::clock::FakeClock;
-use support::coordination_authority::FakeCoordinationAuthority;
-use support::network::FakeNetwork;
+use support::node::{
+    TestNode, close_roll_call, connect, deliver, published_roll_calls, rejects_sent_to, sent_to,
+    stand_as_candidate, start_roll_call, voter_node,
+};
 
-const SHARD: &str = "shard-1";
+/// Every node here suspects its leader after this many ticks.
+const SUSPECT: u64 = 10;
 
-fn vote_request_for_shard(candidate: WorkerId, shard_id: &str, term: u64) -> VoteRequest {
-    let mut req = vote_request(candidate, 0, term);
-    req.shard_id = Some(shard(shard_id).into());
-    req
+// ---- The voter ----
+
+/// `me`, a voter of 3 whose leader contact has gone stale.
+fn stale_voter(clock: &FakeClock, me: &WorkerId) -> TestNode {
+    let node = voter_node(clock, me, 3, SUSPECT);
+    clock.advance(past_any_suspicion(SUSPECT));
+    node
 }
 
-fn make_node_with_ring(
-    clock: &FakeClock,
-    network: &FakeNetwork,
-    my_id: WorkerId,
-    electorate: &[WorkerId],
-    suspect_timeout: Duration,
-) -> WorkerNode<FakeClock, FakeNetwork, RingMembership, FakeCoordinationAuthority> {
-    WorkerNode::new(
-        my_id,
-        IncarnationId::new("incarnation-1"),
-        shard(SHARD),
-        clock.clone(),
-        network.clone(),
-        RingMembership::new(electorate.iter().cloned().collect()),
-        FakeCoordinationAuthority::new(),
-        suspect_timeout,
-    )
-}
-
-fn expect_single_vote_reject(mut inbox: Vec<(WorkerId, ElectionMessage)>) -> VoteReject {
-    assert_eq!(inbox.len(), 1, "expected exactly one message in the inbox");
-    match inbox.remove(0).1.payload {
-        Some(election_message::Payload::VoteReject(reject)) => reject,
-        other => panic!("expected VoteReject payload, got {other:?}"),
-    }
-}
-
-fn expect_single_vote_grant(mut inbox: Vec<(WorkerId, ElectionMessage)>) -> VoteGrant {
-    assert_eq!(inbox.len(), 1, "expected exactly one message in the inbox");
-    match inbox.remove(0).1.payload {
-        Some(election_message::Payload::VoteGrant(grant)) => grant,
-        other => panic!("expected VoteGrant payload, got {other:?}"),
-    }
-}
-
-// A `Candidate` rejects vote requests as `NotVoter`. It needs a 2-member
-// electorate: with one member the self-vote would win outright.
-#[test]
-fn on_vote_request_rejects_not_voter_when_already_candidate() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let next_term = 1; // both observations below carry highest_term_seen: 0.
-    let winner = predict_winner(
-        &shard(SHARD),
-        0,
-        next_term,
-        &[candidate_a.clone(), candidate_b.clone()],
-    );
-    let (self_id, peer) = if winner == candidate_a {
-        (candidate_a, candidate_b)
-    } else {
-        (candidate_b, candidate_a)
-    };
-    let network = make_network(&clock, &[self_id.clone(), peer.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), peer.clone()],
-        suspect_timeout,
-    );
-
-    // Start the node's own roll call (quorum 2) and drain the forward.
-    clock.advance(Duration::from_ticks(11));
-    node.tick();
-    node.tick();
-    assert_eq!(node.state(), WorkerState::RollCall);
-    network.pump();
-    network.poll_inbox(peer.clone());
-
-    // A call reaching quorum 2 with this node as the winner makes it Candidate; the self-vote (1) is short of quorum 2.
-    let call = roll_call(
-        "external-call-1",
-        peer.clone(),
-        vec![observation(peer.clone(), 0)],
-    );
-    node.on_message(peer.clone(), roll_call_message(call));
-    assert_eq!(node.state(), WorkerState::Candidate);
-    network.pump();
-    network.poll_inbox(peer.clone()); // drain the VoteRequest it sends.
-
-    node.on_vote_request(&vote_request(peer.clone(), 0, 99));
-
-    network.pump();
-    let reject = expect_single_vote_reject(network.poll_inbox(peer));
-    assert_eq!(reject.reason, VoteRejectReason::NotVoter as i32);
-}
-
-#[test]
-fn on_vote_request_rejects_wrong_recovery_epoch() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let requester = worker("candidate-a");
-    let network = make_network(&clock, &[self_id.clone(), requester.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), requester.clone()],
-        suspect_timeout,
-    );
-
-    node.on_vote_request(&vote_request(requester.clone(), 1, 5));
-
-    network.pump();
-    let reject = expect_single_vote_reject(network.poll_inbox(requester));
-    assert_eq!(reject.reason, VoteRejectReason::WrongRecoveryEpoch as i32);
-}
-
-#[test]
-fn on_vote_request_rejects_stale_term() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let requester = worker("candidate-a");
-    let network = make_network(&clock, &[self_id.clone(), requester.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), requester.clone()],
-        suspect_timeout,
-    );
-
-    // Fresh node's highest_term_seen is 0; term 0 is <= that.
-    node.on_vote_request(&vote_request(requester.clone(), 0, 0));
-
-    network.pump();
-    let reject = expect_single_vote_reject(network.poll_inbox(requester));
-    assert_eq!(reject.reason, VoteRejectReason::StaleTerm as i32);
-}
-
-#[test]
-fn on_vote_request_rejects_already_voted_for_a_different_candidate() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let network = make_network(
-        &clock,
-        &[self_id.clone(), candidate_a.clone(), candidate_b.clone()],
-    );
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), candidate_a.clone(), candidate_b.clone()],
-        suspect_timeout,
-    );
-
-    // Age last_leader_contact so the first request can be granted.
-    clock.advance(Duration::from_ticks(11));
-
-    node.on_vote_request(&vote_request(candidate_a.clone(), 0, 5));
-    network.pump();
-    expect_single_vote_grant(network.poll_inbox(candidate_a));
-
-    node.on_vote_request(&vote_request(candidate_b.clone(), 0, 5));
-    network.pump();
-    let reject = expect_single_vote_reject(network.poll_inbox(candidate_b));
-    assert_eq!(reject.reason, VoteRejectReason::AlreadyVoted as i32);
-}
-
-#[test]
-fn on_vote_request_rejects_leader_still_valid() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let requester = worker("candidate-a");
-    let network = make_network(&clock, &[self_id.clone(), requester.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), requester.clone()],
-        suspect_timeout,
-    );
-
-    // Clock never advanced: last_leader_contact (set at construction) is
-    // still within suspect_timeout of "now".
-    node.on_vote_request(&vote_request(requester.clone(), 0, 1));
-
-    network.pump();
-    let reject = expect_single_vote_reject(network.poll_inbox(requester));
-    assert_eq!(reject.reason, VoteRejectReason::LeaderStillValid as i32);
-}
-
-#[test]
-fn on_vote_request_grants_when_all_guards_pass() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let candidate_a = worker("candidate-a");
-    let network = make_network(&clock, &[self_id.clone(), candidate_a.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), candidate_a.clone()],
-        suspect_timeout,
-    );
-
-    clock.advance(Duration::from_ticks(11));
-
-    node.on_vote_request(&vote_request(candidate_a.clone(), 0, 7));
-    network.pump();
-    let grant = expect_single_vote_grant(network.poll_inbox(candidate_a.clone()));
-    assert_eq!(grant.term, 7);
-    assert_eq!(grant.candidate_id(), candidate_a);
-    assert_eq!(grant.voter_id(), self_id);
-
-    // `voted_for` is private, so check it indirectly: a second request for the
-    // same term must now be AlreadyVoted.
-    node.on_vote_request(&vote_request(candidate_a.clone(), 0, 7));
-    network.pump();
-    let reject = expect_single_vote_reject(network.poll_inbox(candidate_a));
-    assert_eq!(reject.reason, VoteRejectReason::AlreadyVoted as i32);
-}
-
-#[test]
-fn on_vote_request_mismatched_shard_id_is_silently_ignored() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let candidate_a = worker("candidate-a");
-    let network = make_network(&clock, &[self_id.clone(), candidate_a.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), candidate_a.clone()],
-        suspect_timeout,
-    );
-
-    clock.advance(Duration::from_ticks(11));
-
-    node.on_vote_request(&vote_request_for_shard(
-        candidate_a.clone(),
-        "other-shard",
-        5,
-    ));
-    network.pump();
-    assert!(
-        network.poll_inbox(candidate_a.clone()).is_empty(),
-        "a shard_id mismatch must produce no reply at all"
-    );
-
-    // No state or vote was recorded: a correctly-scoped request for the same term still succeeds.
-    node.on_vote_request(&vote_request(candidate_a.clone(), 0, 5));
-    network.pump();
-    let grant = expect_single_vote_grant(network.poll_inbox(candidate_a));
-    assert_eq!(grant.term, 5);
-}
-
-/// A node in a 5-member electorate (quorum 3) that became `Candidate` for term
-/// 1 through a real 3-member roll call, having sent `VoteRequest`s to the two
-/// responders. The two other electorate members ("extra voters") are on the
-/// network so tests can grant votes from them to control how close the
-/// candidacy is to quorum. Returns `(node, self_id, responder_1, responder_2,
-/// extra_voter_1, extra_voter_2, network, term)`.
-#[allow(clippy::type_complexity)]
-fn candidate_with_five_member_electorate() -> (
-    WorkerNode<FakeClock, FakeNetwork, RingMembership, FakeCoordinationAuthority>,
-    WorkerId,
-    WorkerId,
-    WorkerId,
-    WorkerId,
-    WorkerId,
-    FakeNetwork,
-    u64,
-) {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-
-    // self_id is whichever of three labels wins at term 1.
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let candidate_c = worker("candidate-c");
-    let next_term = 1; // all observations below carry highest_term_seen: 0.
-    let winner = predict_winner(
-        &shard(SHARD),
-        0,
-        next_term,
-        &[
-            candidate_a.clone(),
-            candidate_b.clone(),
-            candidate_c.clone(),
-        ],
-    );
-    let mut others: Vec<WorkerId> = [candidate_a, candidate_b, candidate_c]
-        .into_iter()
-        .filter(|c| *c != winner)
-        .collect();
-    let self_id = winner;
-    let responder_1 = others.remove(0);
-    let responder_2 = others.remove(0);
-    let extra_voter_1 = worker("peer-4");
-    let extra_voter_2 = worker("peer-5");
-
-    let network = make_network(
-        &clock,
-        &[
-            self_id.clone(),
-            responder_1.clone(),
-            responder_2.clone(),
-            extra_voter_1.clone(),
-            extra_voter_2.clone(),
-        ],
-    );
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[
-            self_id.clone(),
-            responder_1.clone(),
-            responder_2.clone(),
-            extra_voter_1.clone(),
-            extra_voter_2.clone(),
-        ],
-        suspect_timeout,
-    );
-
-    // Start the node's own roll call (quorum 3 needs more than its own
-    // observation) and drain the forward from every other member's inbox.
-    clock.advance(Duration::from_ticks(11));
-    node.tick();
-    node.tick();
-    assert_eq!(node.state(), WorkerState::RollCall);
-    network.pump();
-    for member in [&responder_1, &responder_2, &extra_voter_1, &extra_voter_2] {
-        network.poll_inbox(member.clone());
-    }
-
-    // A roll call carrying the two responders' observations reaches quorum 3;
-    // self_id was chosen as the winner of {self, responder_1, responder_2}.
-    let call = roll_call(
-        "external-call-1",
-        responder_1.clone(),
-        vec![
-            observation(responder_1.clone(), 0),
-            observation(responder_2.clone(), 0),
-        ],
-    );
-    node.on_message(responder_1.clone(), roll_call_message(call));
-    assert_eq!(node.state(), WorkerState::Candidate);
-
-    // Drain the VoteRequests sent to the responders.
-    network.pump();
-    network.poll_inbox(responder_1.clone());
-    network.poll_inbox(responder_2.clone());
-
-    (
+fn answer(node: &mut TestNode, initiator: &WorkerId, term: u64, timestamp_millis: u64) {
+    let outputs = deliver(
         node,
-        self_id,
-        responder_1,
-        responder_2,
-        extra_voter_1,
-        extra_voter_2,
-        network,
-        next_term,
+        initiator,
+        roll_call_message(roll_call(
+            initiator,
+            term,
+            &configuration_of(3),
+            timestamp_millis,
+        )),
+    );
+    assert_eq!(
+        sent_to(&outputs, initiator).len(),
+        1,
+        "setup invariant: answered"
+    );
+}
+
+fn request(node: &mut TestNode, request: VoteRequest) -> Vec<Output> {
+    let candidate = request.candidate_id();
+    deliver(node, &candidate, vote_request_message(request))
+}
+
+fn the_grant(outputs: &[Output], candidate: &WorkerId) -> VoteGrant {
+    let grants: Vec<VoteGrant> = sent_to(outputs, candidate)
+        .into_iter()
+        .filter_map(|message| match message.payload {
+            Some(election_message::Payload::VoteGrant(grant)) => Some(grant),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        grants.len(),
+        1,
+        "expected exactly one grant to {candidate:?}"
+    );
+    grants.into_iter().next().unwrap()
+}
+
+fn the_refusal(outputs: &[Output], candidate: &WorkerId) -> ElectionRejectReason {
+    let rejects = rejects_sent_to(outputs, candidate);
+    assert_eq!(
+        rejects.len(),
+        1,
+        "expected exactly one refusal to {candidate:?}"
+    );
+    assert_eq!(
+        sent_to(outputs, candidate).len(),
+        1,
+        "and nothing else to {candidate:?}"
+    );
+    rejects[0].reason()
+}
+
+#[test]
+fn a_voter_grants_the_initiator_of_the_call_it_answered() {
+    let clock = FakeClock::new();
+    let me = worker("voter");
+    let mut node = stale_voter(&clock, &me);
+    let candidate = worker("w1");
+    answer(&mut node, &candidate, 1, 0);
+
+    let outputs = request(&mut node, vote_request(candidate.clone(), 0, 1));
+
+    let grant = the_grant(&outputs, &candidate);
+    assert_eq!(grant.voter_id(), me);
+    assert_eq!(grant.candidate_id(), candidate);
+    assert_eq!(grant.term, 1);
+    assert_eq!(grant.shard_id(), shard("shard-1"));
+}
+
+#[test]
+fn granting_raises_the_highest_term_seen_to_the_requests_term() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    let candidate = worker("w1");
+    answer(&mut node, &candidate, 2, 0);
+    request(&mut node, vote_request(candidate, 0, 2));
+
+    let late = worker("w2");
+    let outputs = deliver(
+        &mut node,
+        &late,
+        roll_call_message(roll_call(&late, 2, &configuration_of(3), 0)),
+    );
+
+    assert_eq!(
+        rejects_sent_to(&outputs, &late)[0].reason(),
+        ElectionRejectReason::StaleTerm
+    );
+}
+
+#[test]
+fn a_voter_refuses_a_candidate_whose_call_it_did_not_answer() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    answer(&mut node, &worker("w1"), 1, 0);
+    let stranger = worker("w9");
+
+    let outputs = request(&mut node, vote_request(stranger.clone(), 0, 1));
+
+    assert_eq!(
+        the_refusal(&outputs, &stranger),
+        ElectionRejectReason::NotBestRollCall
+    );
+}
+
+#[test]
+fn a_voter_grants_only_the_best_call_it_answered() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    let (first, better) = (worker("w5"), worker("w1"));
+    answer(&mut node, &first, 1, 0);
+    answer(&mut node, &better, 1, 0);
+
+    let to_first = request(&mut node, vote_request(first.clone(), 0, 1));
+    let to_better = request(&mut node, vote_request(better.clone(), 0, 1));
+
+    assert_eq!(
+        the_refusal(&to_first, &first),
+        ElectionRejectReason::NotBestRollCall
+    );
+    the_grant(&to_better, &better);
+}
+
+#[test]
+fn a_granted_vote_never_switches_even_to_a_better_call() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    let (granted, better) = (worker("w5"), worker("w1"));
+    answer(&mut node, &granted, 1, 0);
+    request(&mut node, vote_request(granted.clone(), 0, 1));
+    deliver(
+        &mut node,
+        &better,
+        roll_call_message(roll_call(&better, 1, &configuration_of(3), 0)),
+    );
+
+    let outputs = request(&mut node, vote_request(better.clone(), 0, 1));
+
+    assert_eq!(
+        the_refusal(&outputs, &better),
+        ElectionRejectReason::AlreadyVoted
+    );
+}
+
+#[test]
+fn a_repeat_request_from_the_granted_candidate_is_refused_as_already_voted() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    let candidate = worker("w1");
+    answer(&mut node, &candidate, 1, 0);
+    request(&mut node, vote_request(candidate.clone(), 0, 1));
+
+    let outputs = request(&mut node, vote_request(candidate.clone(), 0, 1));
+
+    assert_eq!(
+        the_refusal(&outputs, &candidate),
+        ElectionRejectReason::AlreadyVoted,
+        "already voted is checked before stale term"
+    );
+}
+
+#[test]
+fn a_request_at_another_recovery_epoch_is_refused_first() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    let candidate = worker("w1");
+
+    let outputs = request(&mut node, vote_request(candidate.clone(), 1, 1));
+
+    assert_eq!(
+        the_refusal(&outputs, &candidate),
+        ElectionRejectReason::WrongRecoveryEpoch
+    );
+}
+
+#[test]
+fn a_request_for_a_term_already_seen_is_refused_as_stale() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    let (earlier, later) = (worker("w1"), worker("w2"));
+    answer(&mut node, &later, 3, 0);
+    request(&mut node, vote_request(later, 0, 3));
+
+    let outputs = request(&mut node, vote_request(earlier.clone(), 0, 2));
+
+    assert_eq!(
+        the_refusal(&outputs, &earlier),
+        ElectionRejectReason::StaleTerm
+    );
+}
+
+#[test]
+fn a_request_for_a_call_under_a_configuration_older_than_the_voters_own_is_refused() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    let candidate = worker("w1");
+    answer(&mut node, &candidate, 1, 0);
+    // Between answering and the request, a leader's ack gives it a newer
+    // configuration; its contact with that leader then goes stale too.
+    let newer = Configuration::single(Single {
+        generation: Generation::new(0, 0, 1),
+        base: g0(),
+        voter_count: 3,
+    });
+    let leader = worker("leader");
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 0, &newer, Some(g0()))),
+    );
+    clock.advance(past_any_suspicion(SUSPECT));
+
+    let outputs = request(&mut node, vote_request(candidate.clone(), 0, 1));
+
+    assert_eq!(
+        the_refusal(&outputs, &candidate),
+        ElectionRejectReason::StaleGeneration
+    );
+}
+
+#[test]
+fn a_voter_with_fresh_leader_contact_grants_nothing() {
+    let clock = FakeClock::new();
+    let mut node = voter_node(&clock, &worker("voter"), 3, SUSPECT);
+    let candidate = worker("w1");
+
+    let outputs = request(&mut node, vote_request(candidate.clone(), 0, 1));
+
+    assert_eq!(
+        the_refusal(&outputs, &candidate),
+        ElectionRejectReason::LeaderStillValid
+    );
+}
+
+#[test]
+fn a_candidate_asked_by_another_candidate_refuses_as_not_eligible() {
+    let clock = FakeClock::new();
+    let (mut node, _) = candidate_of_five(&clock);
+    let rival = worker("rival");
+
+    let outputs = request(&mut node, vote_request(rival.clone(), 0, 1));
+
+    assert_eq!(
+        the_refusal(&outputs, &rival),
+        ElectionRejectReason::NotEligible
+    );
+}
+
+#[test]
+fn a_pending_member_grants_a_vote() {
+    let clock = FakeClock::new();
+    let mut node: TestNode = WorkerNode::new(
+        worker("pending"),
+        IncarnationId::new("incarnation-1"),
+        shard("shard-1"),
+        clock.clone(),
+        KnownConfiguration {
+            configuration: configuration_of(3),
+            admission: None,
+        },
+        None,
+        timings(Duration::from_ticks(SUSPECT)),
+    );
+    clock.advance(past_any_suspicion(SUSPECT));
+    let candidate = worker("w1");
+    answer(&mut node, &candidate, 1, 0);
+
+    let outputs = request(&mut node, vote_request(candidate.clone(), 0, 1));
+
+    the_grant(&outputs, &candidate);
+}
+
+#[test]
+fn a_request_for_another_shard_or_not_from_its_candidate_is_ignored() {
+    let clock = FakeClock::new();
+    let mut node = stale_voter(&clock, &worker("voter"));
+    let candidate = worker("w1");
+    answer(&mut node, &candidate, 1, 0);
+
+    let mut other_shard = vote_request(candidate.clone(), 0, 1);
+    other_shard.shard_id = Some(shard("shard-2").into());
+    let ignored_shard = request(&mut node, other_shard);
+    let relayed = deliver(
+        &mut node,
+        &worker("relay"),
+        vote_request_message(vote_request(candidate.clone(), 0, 1)),
+    );
+    assert!(sent_to(&ignored_shard, &candidate).is_empty());
+    assert!(
+        relayed
+            .iter()
+            .all(|output| !matches!(output, Output::Send { .. }))
+    );
+
+    // The vote is still there for the real request.
+    let outputs = request(&mut node, vote_request(candidate.clone(), 0, 1));
+    the_grant(&outputs, &candidate);
+}
+
+// ---- The candidate ----
+
+/// `w1`, a voter of 5, standing as `Candidate` for term 1 once `p1` and `p2`
+/// answered its roll call; connected to both. Returns the node and its call.
+fn candidate_of_five(clock: &FakeClock) -> (TestNode, RollCall) {
+    let me = worker("w1");
+    let mut node = voter_node(clock, &me, 5, SUSPECT);
+    connect(&mut node, &[worker("p1"), worker("p2")]);
+    let call = stand_as_candidate(&mut node, clock, SUSPECT, &[worker("p1"), worker("p2")]);
+    (node, call)
+}
+
+fn grant_from(node: &mut TestNode, voter: &WorkerId, term: u64) -> Vec<Output> {
+    deliver(
+        node,
+        voter,
+        vote_grant_message(vote_grant(worker("w1"), voter.clone(), term)),
     )
 }
 
-#[test]
-fn becoming_candidate_sends_vote_requests_to_every_roll_call_responder() {
-    let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let candidate_c = worker("candidate-c");
-    let next_term = 1;
-    let winner = predict_winner(
-        &shard(SHARD),
-        0,
-        next_term,
-        &[
-            candidate_a.clone(),
-            candidate_b.clone(),
-            candidate_c.clone(),
-        ],
-    );
-    let mut others: Vec<WorkerId> = [candidate_a, candidate_b, candidate_c]
+fn certificates_to(
+    outputs: &[Output],
+    voter: &WorkerId,
+) -> Vec<kabudachi_core::protocol::messages::ElectionCertificate> {
+    sent_to(outputs, voter)
         .into_iter()
-        .filter(|c| *c != winner)
-        .collect();
-    let self_id = winner;
-    let other_1 = others.remove(0);
-    let other_2 = others.remove(0);
-
-    let network = make_network(&clock, &[self_id.clone(), other_1.clone(), other_2.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), other_1.clone(), other_2.clone()],
-        suspect_timeout,
-    );
-
-    clock.advance(Duration::from_ticks(11));
-    node.tick();
-    node.tick();
-    assert_eq!(node.state(), WorkerState::RollCall);
-    network.pump();
-    // The roll call goes to whichever ring successor sorts first, so drain both.
-    network.poll_inbox(other_1.clone());
-    network.poll_inbox(other_2.clone());
-
-    let call = roll_call(
-        "external-call-1",
-        other_1.clone(),
-        vec![
-            observation(other_1.clone(), 0),
-            observation(other_2.clone(), 0),
-        ],
-    );
-    node.on_message(other_1.clone(), roll_call_message(call));
-    assert_eq!(node.state(), WorkerState::Candidate);
-
-    network.pump();
-    for other in [other_1, other_2] {
-        let inbox = network.poll_inbox(other.clone());
-        assert_eq!(
-            inbox.len(),
-            1,
-            "expected exactly one VoteRequest sent to roll-call responder {other:?}"
-        );
-        match &inbox[0].1.payload {
-            Some(election_message::Payload::VoteRequest(req)) => {
-                assert_eq!(req.candidate_id(), self_id);
-                assert_eq!(req.term, next_term);
-            }
-            other_payload => panic!("expected VoteRequest payload, got {other_payload:?}"),
-        }
-    }
+        .filter_map(|message| match message.payload {
+            Some(election_message::Payload::ElectionCertificate(certificate)) => Some(certificate),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
-fn reaching_quorum_via_vote_grant_transitions_to_leader_and_broadcasts_certificate() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, extra_voter_2, network, term) =
-        candidate_with_five_member_electorate();
-
-    // Self-vote (1) plus two grants reaches quorum 3.
-    node.on_vote_grant(&vote_grant(self_id.clone(), extra_voter_1.clone(), term));
-    assert_eq!(
-        node.state(),
-        WorkerState::Candidate,
-        "one grant (2 total votes) must not yet reach quorum-of-3"
-    );
-
-    node.on_vote_grant(&vote_grant(self_id.clone(), extra_voter_2.clone(), term));
-    assert_eq!(
-        node.state(),
-        WorkerState::Leader,
-        "the second grant (3 total votes) must reach quorum and elect a Leader directly, \
-         not leave the node sitting in LeaderReconciling"
-    );
-
-    network.pump();
-    for voter in [self_id, extra_voter_1, extra_voter_2] {
-        let inbox = network.poll_inbox(voter.clone());
-        assert_eq!(
-            inbox.len(),
-            1,
-            "expected exactly one ElectionCertificate broadcast to granting voter {voter:?}"
-        );
-        match &inbox[0].1.payload {
-            Some(election_message::Payload::ElectionCertificate(cert)) => {
-                assert_eq!(cert.term, term);
-            }
-            other => panic!("expected ElectionCertificate payload, got {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn not_reaching_quorum_leaves_candidate_in_candidate_state() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, _extra_voter_2, _network, term) =
-        candidate_with_five_member_electorate();
-
-    // Self-vote plus one grant (2) is short of quorum 3.
-    node.on_vote_grant(&vote_grant(self_id, extra_voter_1, term));
-
-    assert_eq!(node.state(), WorkerState::Candidate);
-}
-
-#[test]
-fn stale_term_vote_grant_is_ignored() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, extra_voter_2, _network, term) =
-        candidate_with_five_member_electorate();
-
-    // A grant for another term must not count.
-    node.on_vote_grant(&vote_grant(
-        self_id.clone(),
-        extra_voter_1.clone(),
-        term + 1,
-    ));
-    assert_eq!(node.state(), WorkerState::Candidate);
-
-    // It didn't count: both remaining correct-term grants are still needed for quorum 3.
-    node.on_vote_grant(&vote_grant(self_id.clone(), extra_voter_1, term));
-    assert_eq!(
-        node.state(),
-        WorkerState::Candidate,
-        "only one correctly-termed grant recorded so far (2 total votes) — the stale-term \
-         grant must not have silently contributed a vote"
-    );
-
-    node.on_vote_grant(&vote_grant(self_id, extra_voter_2, term));
-    assert_eq!(
-        node.state(),
-        WorkerState::Leader,
-        "the second correctly-termed grant should now reach quorum-of-3"
-    );
-}
-
-#[test]
-fn grant_from_a_worker_outside_the_electorate_is_ignored() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, _extra_voter_2, _network, term) =
-        candidate_with_five_member_electorate();
-
-    node.on_vote_grant(&vote_grant(self_id.clone(), extra_voter_1, term));
-    node.on_vote_grant(&vote_grant(self_id, worker("outsider"), term));
-
-    assert_eq!(
-        node.state(),
-        WorkerState::Candidate,
-        "an outsider's grant must not supply the third vote needed for quorum"
-    );
-}
-
-#[test]
-fn repeated_grant_from_the_same_voter_counts_once() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, _extra_voter_2, _network, term) =
-        candidate_with_five_member_electorate();
-
-    node.on_vote_grant(&vote_grant(self_id.clone(), extra_voter_1.clone(), term));
-    node.on_vote_grant(&vote_grant(self_id, extra_voter_1, term));
-
-    assert_eq!(node.state(), WorkerState::Candidate);
-}
-
-#[test]
-fn grant_addressed_to_another_candidate_is_ignored() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, extra_voter_2, _network, term) =
-        candidate_with_five_member_electorate();
-
-    node.on_vote_grant(&vote_grant(self_id, extra_voter_1, term));
-    node.on_vote_grant(&vote_grant(worker("someone-else"), extra_voter_2, term));
-
-    assert_eq!(node.state(), WorkerState::Candidate);
-}
-
-#[test]
-fn grant_for_another_shard_or_recovery_epoch_is_ignored() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, extra_voter_2, _network, term) =
-        candidate_with_five_member_electorate();
-    node.on_vote_grant(&vote_grant(self_id.clone(), extra_voter_1, term));
-
-    let mut other_shard = vote_grant(self_id.clone(), extra_voter_2.clone(), term);
-    other_shard.shard_id = Some(shard("other-shard").into());
-    node.on_vote_grant(&other_shard);
-
-    let mut other_epoch = vote_grant(self_id, extra_voter_2, term);
-    other_epoch.recovery_epoch = 1;
-    node.on_vote_grant(&other_epoch);
-
-    assert_eq!(node.state(), WorkerState::Candidate);
-}
-
-#[test]
-fn voted_for_keeps_first_candidate_even_on_repeat_request_from_it() {
+fn a_candidate_wins_once_its_returning_granters_are_a_quorum() {
     let clock = FakeClock::new();
-    let suspect_timeout = Duration::from_ticks(10);
-    let self_id = worker("w1");
-    let candidate_a = worker("candidate-a");
-    let candidate_b = worker("candidate-b");
-    let network = make_network(
-        &clock,
-        &[self_id.clone(), candidate_a.clone(), candidate_b.clone()],
+    let (mut node, call) = candidate_of_five(&clock);
+
+    grant_from(&mut node, &worker("p1"), call.term);
+    assert_eq!(
+        node.state(),
+        WorkerState::Candidate,
+        "two of five, itself included, are no quorum"
     );
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), candidate_a.clone(), candidate_b.clone()],
-        suspect_timeout,
-    );
-    clock.advance(Duration::from_ticks(11));
+    grant_from(&mut node, &worker("p2"), call.term);
 
-    node.on_vote_request(&vote_request(candidate_a.clone(), 0, 5));
-    network.pump();
-    expect_single_vote_grant(network.poll_inbox(candidate_a.clone()));
-
-    node.on_vote_request(&vote_request(candidate_b.clone(), 0, 5));
-    network.pump();
-    let reject = expect_single_vote_reject(network.poll_inbox(candidate_b));
-    assert_eq!(reject.reason, VoteRejectReason::AlreadyVoted as i32);
-
-    // The same candidate again is still rejected: there is no "same
-    // candidate" exception, and the first vote was never overwritten.
-    node.on_vote_request(&vote_request(candidate_a.clone(), 0, 5));
-    network.pump();
-    let reject = expect_single_vote_reject(network.poll_inbox(candidate_a));
-    assert_eq!(reject.reason, VoteRejectReason::AlreadyVoted as i32);
+    assert_eq!(node.state(), WorkerState::Leader);
+    assert_eq!(node.term(), 1);
 }
 
-fn self_remove_message(departing: &WorkerId) -> ElectionMessage {
-    ElectionMessage {
-        payload: Some(election_message::Payload::SelfRemove(SelfRemove {
-            worker_id: Some(departing.clone().into()),
-            incarnation_id: Some(IncarnationId::new("incarnation-1").into()),
-            shard_id: Some(shard(SHARD).into()),
-            membership_generation: 0,
-        })),
-    }
-}
-
-fn vote_request_message(request: VoteRequest) -> ElectionMessage {
-    ElectionMessage {
-        payload: Some(election_message::Payload::VoteRequest(request)),
-    }
-}
-
-fn vote_grant_message(grant: VoteGrant) -> ElectionMessage {
-    ElectionMessage {
-        payload: Some(election_message::Payload::VoteGrant(grant)),
-    }
+/// What an election for term 1 under `configuration_of(old_voter_count)`
+/// founds with `respondents` respondents: the joint configuration of the
+/// respondents, at (0, 1, 1), and that configuration.
+fn founded_in_term_1(old_voter_count: usize, respondents: usize) -> Configuration {
+    founded_from_g0(1, old_voter_count, respondents)
 }
 
 #[test]
-fn vote_request_from_a_sender_other_than_the_named_candidate_is_ignored() {
+fn the_winner_certifies_what_its_respondents_founded_to_each_of_them() {
     let clock = FakeClock::new();
-    let self_id = worker("w1");
-    let candidate = worker("candidate-a");
-    let impostor = worker("impostor");
-    let network = make_network(
+    let (granting, silent, pending) = (worker("w2"), worker("w3"), worker("p1"));
+    // Four respondents, itself included: three grants, two of them from
+    // voters of three, win.
+    let (mut node, call) = candidate_of_three_with(
         &clock,
-        &[self_id.clone(), candidate.clone(), impostor.clone()],
+        &[granting.clone(), silent.clone()],
+        std::slice::from_ref(&pending),
     );
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), candidate.clone(), impostor.clone()],
-        Duration::from_ticks(10),
-    );
-    // Past the suspect timeout, so the node would otherwise grant a vote.
-    clock.advance(Duration::from_ticks(11));
+    grant_from(&mut node, &granting, call.term);
 
-    node.on_message(
-        impostor,
-        vote_request_message(vote_request(candidate.clone(), 0, 5)),
-    );
+    let won = grant_from(&mut node, &pending, call.term);
 
-    network.pump();
+    assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+    for respondent in [&granting, &silent, &pending] {
+        let certificates = certificates_to(&won, respondent);
+        assert_eq!(certificates.len(), 1, "one certificate to {respondent:?}");
+        assert_eq!(certificates[0].term, 1);
+        assert_eq!(certificates[0].leader_id(), worker("w1"));
+        assert_eq!(certificates[0].configuration(), founded_in_term_1(3, 4));
+        assert_eq!(
+            certificates[0].recipient_admission(),
+            Some(Generation::new(0, 1, 1))
+        );
+    }
+    let prior_of =
+        |respondent: &WorkerId| certificates_to(&won, respondent)[0].recipient_prior_admission();
+    assert_eq!(prior_of(&granting), Some(g0()));
+    assert_eq!(prior_of(&silent), Some(g0()));
+    assert_eq!(prior_of(&pending), None, "a pending respondent had none");
     assert!(
-        network.poll_inbox(candidate.clone()).is_empty(),
-        "a request forged in another worker's name must get neither a grant nor a reject"
-    );
-
-    // Nothing was recorded: the genuine request for the same term is still granted.
-    node.on_message(
-        candidate.clone(),
-        vote_request_message(vote_request(candidate.clone(), 0, 5)),
-    );
-    network.pump();
-    expect_single_vote_grant(network.poll_inbox(candidate));
-}
-
-#[test]
-fn vote_grant_from_a_sender_other_than_the_named_voter_is_ignored() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, extra_voter_2, _network, term) =
-        candidate_with_five_member_electorate();
-
-    node.on_message(
-        extra_voter_1.clone(),
-        vote_grant_message(vote_grant(self_id.clone(), extra_voter_1, term)),
-    );
-    // Sent by `extra_voter_1`, but claims to be `extra_voter_2`'s vote.
-    let forger = worker("peer-4");
-    node.on_message(
-        forger,
-        vote_grant_message(vote_grant(self_id, extra_voter_2, term)),
-    );
-
-    assert_eq!(
-        node.state(),
-        WorkerState::Candidate,
-        "a forged grant must not supply the third vote needed for quorum"
+        certificates_to(&won, &worker("w1")).is_empty(),
+        "none to itself"
     );
 }
 
 #[test]
-fn self_remove_discards_the_departed_workers_vote() {
-    let (mut node, self_id, _r1, _r2, extra_voter_1, extra_voter_2, _network, term) =
-        candidate_with_five_member_electorate();
+fn a_candidate_short_of_a_quorum_stays_candidate() {
+    let clock = FakeClock::new();
+    let (mut node, call) = candidate_of_five(&clock);
 
-    // Self-vote plus extra_voter_1 is 2 of quorum 3.
-    node.on_vote_grant(&vote_grant(self_id.clone(), extra_voter_1.clone(), term));
-    // The electorate shrinks to 4 (quorum still 3), and that vote must go with it.
-    node.on_message(extra_voter_1.clone(), self_remove_message(&extra_voter_1));
-    node.on_vote_grant(&vote_grant(self_id, extra_voter_2, term));
+    grant_from(&mut node, &worker("p1"), call.term);
 
-    assert_eq!(
-        node.state(),
-        WorkerState::Candidate,
-        "a removed worker's vote must not count towards the current quorum"
-    );
+    assert_eq!(node.state(), WorkerState::Candidate);
 }
 
 #[test]
-fn self_remove_that_shrinks_quorum_lets_a_candidate_with_enough_votes_win() {
-    let (
-        mut node,
-        self_id,
-        responder_1,
-        responder_2,
-        extra_voter_1,
-        _extra_voter_2,
-        _network,
-        term,
-    ) = candidate_with_five_member_electorate();
+fn a_grant_from_a_worker_that_did_not_answer_the_roll_call_is_ignored() {
+    let clock = FakeClock::new();
+    let (mut node, call) = candidate_of_five(&clock);
 
-    // Self-vote plus extra_voter_1 is 2 votes; quorum is 3 of 5.
-    node.on_vote_grant(&vote_grant(self_id, extra_voter_1, term));
-    node.on_message(responder_1.clone(), self_remove_message(&responder_1));
+    grant_from(&mut node, &worker("p1"), call.term);
+    grant_from(&mut node, &worker("stranger"), call.term);
+
+    assert_eq!(node.state(), WorkerState::Candidate);
+}
+
+#[test]
+fn a_repeated_grant_counts_once() {
+    let clock = FakeClock::new();
+    let (mut node, call) = candidate_of_five(&clock);
+
+    grant_from(&mut node, &worker("p1"), call.term);
+    grant_from(&mut node, &worker("p1"), call.term);
+
+    assert_eq!(node.state(), WorkerState::Candidate);
+}
+
+#[test]
+fn a_grant_for_another_term_candidate_shard_or_epoch_or_from_another_sender_is_ignored() {
+    let clock = FakeClock::new();
+    let (mut node, call) = candidate_of_five(&clock);
+    grant_from(&mut node, &worker("p1"), call.term);
+    let p2 = worker("p2");
+
+    let mut other_candidate = vote_grant(worker("w1"), p2.clone(), call.term);
+    other_candidate.candidate_id = Some(worker("someone").into());
+    let mut other_shard = vote_grant(worker("w1"), p2.clone(), call.term);
+    other_shard.shard_id = Some(shard("shard-2").into());
+    let mut other_epoch = vote_grant(worker("w1"), p2.clone(), call.term);
+    other_epoch.recovery_epoch = 1;
+    let other_term = vote_grant(worker("w1"), p2.clone(), call.term + 1);
+    for grant in [other_candidate, other_shard, other_epoch, other_term] {
+        deliver(&mut node, &p2, vote_grant_message(grant));
+    }
+    deliver(
+        &mut node,
+        &worker("relay"),
+        vote_grant_message(vote_grant(worker("w1"), p2.clone(), call.term)),
+    );
+
+    assert_eq!(node.state(), WorkerState::Candidate);
+}
+
+#[test]
+fn a_pending_granter_does_not_count_toward_the_quorum() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_node(&clock, &me, 3, SUSPECT);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let (pending, returning) = (worker("pending"), worker("returning"));
+    deliver(
+        &mut node,
+        &pending,
+        roll_call_reply(&me, call.term, &pending, None),
+    );
+    deliver(
+        &mut node,
+        &returning,
+        roll_call_reply(&me, call.term, &returning, Some(g0())),
+    );
+    close_roll_call(&mut node, &clock, SUSPECT);
+    assert_eq!(node.state(), WorkerState::Candidate, "setup invariant");
+
+    grant_from(&mut node, &pending, call.term);
+    assert_eq!(node.state(), WorkerState::Candidate);
+    grant_from(&mut node, &returning, call.term);
+    assert_eq!(node.state(), WorkerState::Leader);
+}
+
+/// `w1`, a voter of 3, standing as `Candidate` once each of `returning`,
+/// admitted at `g0`, and each of `pending`, with no admission, answered its
+/// roll call. Returns the node and its call.
+fn candidate_of_three_with(
+    clock: &FakeClock,
+    returning: &[WorkerId],
+    pending: &[WorkerId],
+) -> (TestNode, RollCall) {
+    let me = worker("w1");
+    let mut node = voter_node(clock, &me, 3, SUSPECT);
+    let call = published_roll_calls(&start_roll_call(&mut node, clock, SUSPECT)).remove(0);
+    for respondent in returning {
+        deliver(
+            &mut node,
+            respondent,
+            roll_call_reply(&me, call.term, respondent, Some(g0())),
+        );
+    }
+    for respondent in pending {
+        deliver(
+            &mut node,
+            respondent,
+            roll_call_reply(&me, call.term, respondent, None),
+        );
+    }
+    close_roll_call(&mut node, clock, SUSPECT);
+    assert_eq!(node.state(), WorkerState::Candidate, "setup invariant");
+    (node, call)
+}
+
+#[test]
+fn a_win_needs_a_majority_of_the_respondents_even_once_the_returning_voters_are_a_quorum() {
+    let clock = FakeClock::new();
+    let pending = [worker("p1"), worker("p2"), worker("p3"), worker("p4")];
+    // Six respondents, itself included: a majority is four.
+    let (mut node, call) = candidate_of_three_with(&clock, &[worker("w2")], &pending);
+
+    grant_from(&mut node, &worker("w2"), call.term);
     assert_eq!(
         node.state(),
         WorkerState::Candidate,
-        "2 votes, quorum 3 of 4"
+        "two of three returning voters, but two of six respondents"
     );
-
-    // With 3 members left the quorum is 2, which the 2 recorded votes meet.
-    node.on_message(responder_2.clone(), self_remove_message(&responder_2));
+    grant_from(&mut node, &pending[0], call.term);
+    assert_eq!(node.state(), WorkerState::Candidate, "three of six");
+    grant_from(&mut node, &pending[1], call.term);
 
     assert_eq!(node.state(), WorkerState::Leader);
 }
 
 #[test]
-fn vote_request_from_a_candidate_outside_the_electorate_is_ignored() {
+fn a_win_needs_a_returning_quorum_even_once_a_majority_of_the_respondents_granted() {
     let clock = FakeClock::new();
-    let self_id = worker("w1");
-    let member = worker("candidate-a");
-    let outsider = worker("outsider");
-    let network = make_network(&clock, &[self_id.clone(), member.clone(), outsider.clone()]);
-    let mut node = make_node_with_ring(
-        &clock,
-        &network,
-        self_id.clone(),
-        &[self_id.clone(), member.clone()],
-        Duration::from_ticks(10),
-    );
-    // Past the suspect timeout, so the node would otherwise grant a vote.
-    clock.advance(Duration::from_ticks(11));
+    let returning = worker("w2");
+    let pending = [worker("p1"), worker("p2")];
+    // Four respondents, itself included: a majority is three.
+    let (mut node, call) =
+        candidate_of_three_with(&clock, std::slice::from_ref(&returning), &pending);
 
-    node.on_message(
-        outsider.clone(),
-        vote_request_message(vote_request(outsider.clone(), 0, 5)),
+    grant_from(&mut node, &pending[0], call.term);
+    grant_from(&mut node, &pending[1], call.term);
+    assert_eq!(
+        node.state(),
+        WorkerState::Candidate,
+        "three of four respondents, but one of three returning voters"
+    );
+    grant_from(&mut node, &returning, call.term);
+
+    assert_eq!(node.state(), WorkerState::Leader);
+}
+
+#[test]
+fn a_refusal_of_a_vote_request_changes_nothing() {
+    let clock = FakeClock::new();
+    let (mut node, call) = candidate_of_five(&clock);
+    let p1 = worker("p1");
+    let reject = kabudachi_core::protocol::messages::ElectionReject {
+        shard_id: Some(shard("shard-1").into()),
+        term: call.term,
+        initiator_id: Some(worker("w1").into()),
+        rejecter_id: Some(p1.clone().into()),
+        reason: ElectionRejectReason::AlreadyVoted as i32,
+        highest_term_seen: call.term,
+        configuration: Some((&configuration_of(5)).into()),
+        leader: None,
+    };
+
+    let outputs = deliver(
+        &mut node,
+        &p1,
+        support::builders::message(election_message::Payload::ElectionReject(reject)),
     );
 
-    network.pump();
-    assert!(
-        network.poll_inbox(outsider).is_empty(),
-        "a non-member candidate gets neither a grant nor a reject"
+    assert_eq!(node.state(), WorkerState::Candidate);
+    assert!(outputs.is_empty());
+}
+
+// ---- The winner's roster ----
+
+fn ack_to(outputs: &[Output], worker: &WorkerId) -> LeaderHeartbeatAck {
+    let acks: Vec<LeaderHeartbeatAck> = sent_to(outputs, worker)
+        .into_iter()
+        .filter_map(|message| match message.payload {
+            Some(election_message::Payload::HeartbeatAck(ack)) => Some(ack),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acks.len(), 1, "expected one ack to {worker:?}");
+    acks.into_iter().next().unwrap()
+}
+
+#[test]
+fn the_winner_leads_the_joint_configuration_its_respondents_found_each_admitted_at_its_generation()
+{
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_node(&clock, &me, 3, SUSPECT);
+    let (pending, returning) = (worker("pending"), worker("returning"));
+    connect(&mut node, &[pending.clone(), returning.clone()]);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    deliver(
+        &mut node,
+        &pending,
+        roll_call_reply(&me, call.term, &pending, None),
+    );
+    deliver(
+        &mut node,
+        &returning,
+        roll_call_reply(&me, call.term, &returning, Some(g0())),
+    );
+    close_roll_call(&mut node, &clock, SUSPECT);
+
+    let won = grant_from(&mut node, &returning, call.term);
+    assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+
+    let founded = founded_in_term_1(3, 3);
+    assert_eq!(node.configuration(), Some(&founded));
+    assert_eq!(node.admission(), Some(founded.generation()));
+    assert_eq!(node.prior_admission(), Some(g0()));
+    for respondent in [&returning, &pending] {
+        let ack = ack_to(&won, respondent);
+        assert_eq!(ack.configuration(), founded, "to {respondent:?}");
+        assert_eq!(
+            ack.recipient_admission(),
+            Some(founded.generation()),
+            "a pending respondent is admitted too: {respondent:?}"
+        );
+    }
+    assert_eq!(
+        ack_to(&won, &returning).recipient_prior_admission(),
+        Some(g0())
+    );
+    assert_eq!(ack_to(&won, &pending).recipient_prior_admission(), None);
+}
+
+#[test]
+fn a_worker_that_heartbeats_the_leader_without_being_in_its_roster_is_acked_with_no_admission() {
+    let clock = FakeClock::new();
+    let (mut node, call) = candidate_of_five(&clock);
+    grant_from(&mut node, &worker("p1"), call.term);
+    grant_from(&mut node, &worker("p2"), call.term);
+    assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+    let missed = worker("missed-the-call");
+
+    let outputs = deliver(
+        &mut node,
+        &missed,
+        heartbeat_message(heartbeat(&missed, None)),
     );
 
-    // No vote was recorded for term 5: a member's request for it is still granted.
-    node.on_message(
-        member.clone(),
-        vote_request_message(vote_request(member.clone(), 0, 5)),
-    );
-    network.pump();
-    expect_single_vote_grant(network.poll_inbox(member));
+    let ack = ack_to(&outputs, &missed);
+    assert_eq!(ack.recipient_admission(), None);
+    assert_eq!(ack.configuration(), founded_in_term_1(5, 3));
 }

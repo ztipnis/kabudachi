@@ -1,10 +1,9 @@
-const PROTO_FILES: [&str; 6] = [
+const PROTO_FILES: [&str; 5] = [
     "claim.proto",
     "election.proto",
     "ids.proto",
     "join.proto",
     "task.proto",
-    "worker.proto",
 ];
 
 fn main() {

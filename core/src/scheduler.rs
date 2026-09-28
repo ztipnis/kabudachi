@@ -3,8 +3,9 @@
 //!
 //! It only reacts to calls and never waits, sleeps or does I/O, so the runtime
 //! drives it and a test can drive it with a fake clock. It accepts claims and
-//! reports only while its worker is `Leader`: a node that has not won an
-//! election, or has lost leadership, must not decide anything.
+//! reports only while it holds a leadership grant whose lease has not ended
+//! by its own clock: a node that has not won an election, has lost
+//! leadership, or has outlived its lease must not decide anything.
 //!
 //! Tasks and runs are stored privately and handed out only as shared
 //! references or clones, so nothing outside can edit a submitted Task or move
@@ -18,7 +19,6 @@ use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task, retry_of};
 use crate::protocol::task::TaskRunState;
-use crate::protocol::worker_state::WorkerState;
 use crate::time::{Clock, Duration, Instant};
 
 /// When the scheduler asks for less work, and when it refuses it, counted in
@@ -262,12 +262,40 @@ pub enum ReportRejection {
     NotAuthoritative,
 }
 
+/// What lets a scheduler act as its shard's leader: its worker's election
+/// says the worker leads `term` at `recovery_epoch`, and may act until
+/// `valid_until`.
+///
+/// The election hands it over (see `election::apply_to_scheduler`), and the
+/// scheduler holds it until the election reports a change. The scheduler
+/// checks `valid_until` against its own clock on every leader-only call, so
+/// a grant that has run out stops it acting even before the election says
+/// anything more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeadershipGrant {
+    pub term: u64,
+    pub recovery_epoch: u64,
+    pub valid_until: LeaseEnd,
+}
+
+/// When a leader's lease ends, and with it the time it may act as leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseEnd {
+    /// Nothing ends it, as for a leader that alone is a majority of its
+    /// electorate.
+    Unbounded,
+    /// It ends at this instant of the election's clock, which the scheduler
+    /// must read too: the lease is over from this instant on.
+    At(Instant),
+}
+
 /// Owns all Tasks and TaskRuns and decides every claim and report. Drive it
 /// with calls; it never blocks or does I/O.
 pub struct Scheduler<C: Clock, I: IdGenerator> {
     clock: C,
     ids: I,
-    worker_state: WorkerState,
+    /// The leadership grant its worker's election last gave it, if any.
+    grant: Option<LeadershipGrant>,
     tasks: BTreeMap<TaskId, Task>,
     runs: BTreeMap<TaskRunId, TaskRun>,
     /// The run that is currently authoritative for each task.
@@ -312,13 +340,15 @@ pub struct Scheduler<C: Clock, I: IdGenerator> {
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
-    /// A scheduler that refuses every claim and report until
-    /// [`Self::set_worker_state`] says the worker is `Leader`.
+    /// A scheduler that refuses every claim and report until it is given a
+    /// leadership grant ([`Self::set_leadership_grant`]). `clock` must be the
+    /// clock its worker's election runs on, or a copy sharing its readings:
+    /// a grant's lease ends at an instant of that clock.
     pub fn new(clock: C, ids: I) -> Self {
         Scheduler {
             clock,
             ids,
-            worker_state: WorkerState::Active,
+            grant: None,
             tasks: BTreeMap::new(),
             runs: BTreeMap::new(),
             current_run: BTreeMap::new(),
@@ -401,16 +431,18 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         self.slow_down
     }
 
-    /// Whether this worker is the leader, and so decides claims, reports and
-    /// what time does to tasks.
+    /// Whether this worker leads right now, and so decides claims, reports and
+    /// what time does to tasks: it holds a leadership grant, and by its own
+    /// clock the grant's lease has not ended.
     pub fn is_leading(&self) -> bool {
         self.is_leader()
     }
 
-    /// Tells the scheduler what the election state machine says the worker
-    /// is now. Only `Leader` lets it decide anything.
-    pub fn set_worker_state(&mut self, state: WorkerState) {
-        self.worker_state = state;
+    /// Takes the leadership grant its worker's election reports, or `None`
+    /// once the worker does not lead. The scheduler keeps it until the next
+    /// call, but acts on it only until its lease ends.
+    pub fn set_leadership_grant(&mut self, grant: Option<LeadershipGrant>) {
+        self.grant = grant;
     }
 
     /// Records a new Task and queues its first run. Every call is a new Task
@@ -544,23 +576,56 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         worker: &WorkerId,
         limit: usize,
     ) -> Result<Vec<Claim>, ClaimRejection> {
+        self.claim_oldest_fitting(worker, limit, |_| true)
+    }
+
+    /// Like [`Self::claim_oldest`], but each candidate, oldest first, is
+    /// shown to `fits` before it is claimed. The first one `fits` refuses
+    /// ends the batch and stays pending, first in line for the next call;
+    /// except that one refused while nothing is claimed yet, which would
+    /// never fit, is passed over so the tasks behind it still go out. It is
+    /// how a caller that must deliver the claims keeps them within what it
+    /// can deliver.
+    pub fn claim_oldest_fitting(
+        &mut self,
+        worker: &WorkerId,
+        limit: usize,
+        mut fits: impl FnMut(&Claim) -> bool,
+    ) -> Result<Vec<Claim>, ClaimRejection> {
         if !self.is_leader() {
             return Err(ClaimRejection::NotLeader);
         }
         self.advance();
-        let oldest: Vec<TaskId> = self
-            .queue
-            .values()
-            .filter(|task_id| !self.is_blocked(task_id))
-            .take(limit)
-            .cloned()
-            .collect();
-        // Time is only allowed to take effect once per call: the tasks chosen
-        // above are claimed as they are, whatever the clock has done since.
-        Ok(oldest
-            .iter()
-            .map(|task_id| self.claim_queued(worker, task_id))
-            .collect())
+        let mut claims = Vec::new();
+        let mut after = None;
+        // Time is only allowed to take effect once per call: each candidate
+        // is claimed as it is, whatever the clock has done since.
+        while claims.len() < limit {
+            let Some((position, task_id)) = self.next_unblocked_after(after) else {
+                break;
+            };
+            after = Some(position);
+            let claim = self.claim_to_be(&task_id);
+            if fits(&claim) {
+                self.mark_claimed(worker, &task_id);
+                claims.push(claim);
+            } else if !claims.is_empty() {
+                break;
+            }
+        }
+        Ok(claims)
+    }
+
+    /// The oldest queued task, past queue position `after` if given, that
+    /// no other generation of its coalescing key holds back.
+    fn next_unblocked_after(&self, after: Option<u64>) -> Option<(u64, TaskId)> {
+        let rest = match after {
+            Some(position) => self.queue.range(position + 1..),
+            None => self.queue.range(..),
+        };
+        rest.into_iter()
+            .find(|(_, task_id)| !self.is_blocked(task_id))
+            .map(|(position, task_id)| (*position, task_id.clone()))
     }
 
     /// A worker asks for `task_id`. Of several workers asking for the same
@@ -590,8 +655,37 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     }
 
     /// Claims `task_id`, whose current run must be `Queued`, for `worker`.
-    /// Starting is what expiry is about, so the task's expiry is dropped.
     fn claim_queued(&mut self, worker: &WorkerId, task_id: &TaskId) -> Claim {
+        let claim = self.claim_to_be(task_id);
+        self.mark_claimed(worker, task_id);
+        claim
+    }
+
+    /// The claim that claiming `task_id`, whose current run must be
+    /// `Queued`, would hand out. Changes nothing.
+    fn claim_to_be(&self, task_id: &TaskId) -> Claim {
+        let run_id = self.current_run[task_id].clone();
+        let chain = match self.coalescing_key_of(task_id) {
+            Some(_) => self
+                .occupancy
+                .chain(task_id)
+                .iter()
+                .map(|absorbed| self.tasks[absorbed].serialized_input.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        Claim {
+            task: self.tasks[task_id].clone(),
+            attempt_number: self.runs[&run_id].attempt_number(),
+            task_run_id: run_id,
+            chain,
+        }
+    }
+
+    /// Records that `worker` claimed `task_id`, whose current run must be
+    /// `Queued`. Starting is what expiry is about, so the task's expiry is
+    /// dropped.
+    fn mark_claimed(&mut self, worker: &WorkerId, task_id: &TaskId) {
         let now = self.clock.now();
         let run_id = self.current_run[task_id].clone();
         let run = self
@@ -601,27 +695,13 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         run.transition_to(TaskRunState::Claimed, now)
             .expect("a Queued run can always be claimed");
         run.selected_worker = Some(worker.clone().into());
-        let attempt_number = run.attempt_number();
         self.dequeue(task_id);
-        let task = self.tasks[task_id].clone();
-        if let Some(expires_at) = task.expires_at_ticks {
+        if let Some(expires_at) = self.tasks[task_id].expires_at_ticks {
             self.expiries
                 .remove(&(Instant::at(expires_at), task_id.clone()));
         }
-        let chain = match self.coalescing_key_of(task_id) {
-            Some(key) => self
-                .occupancy
-                .start(&key, task_id)
-                .iter()
-                .map(|absorbed| self.tasks[absorbed].serialized_input.clone())
-                .collect(),
-            None => Vec::new(),
-        };
-        Claim {
-            task,
-            task_run_id: run_id,
-            attempt_number,
-            chain,
+        if let Some(key) = self.coalescing_key_of(task_id) {
+            self.occupancy.start(&key, task_id);
         }
     }
 
@@ -1053,9 +1133,14 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         }
     }
 
-    /// Whether this worker is the leader, the only one that decides anything.
+    /// Whether this worker leads, the only one that decides anything: it
+    /// holds a grant whose lease has not ended by this scheduler's clock.
     fn is_leader(&self) -> bool {
-        self.worker_state == WorkerState::Leader
+        match self.grant.map(|grant| grant.valid_until) {
+            None => false,
+            Some(LeaseEnd::Unbounded) => true,
+            Some(LeaseEnd::At(end)) => self.clock.now() < end,
+        }
     }
 
     /// `run_id`'s run, if this node is leader, the run exists, `worker`

@@ -9,10 +9,10 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerI
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{ClaimRejection, ReportRejection, Scheduler, Submission};
 use kabudachi_core::time::Duration;
 use support::clock::FakeClock;
+use support::grant::unbounded_grant;
 use support::ids::SequentialIds;
 
 fn worker() -> WorkerId {
@@ -27,7 +27,7 @@ struct Fixture {
 fn leading() -> Fixture {
     let clock = FakeClock::new();
     let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_worker_state(WorkerState::Leader);
+    scheduler.set_leadership_grant(Some(unbounded_grant()));
     Fixture { clock, scheduler }
 }
 
@@ -88,7 +88,7 @@ fn a_stale_or_foreign_run_cannot_be_completed_with_a_continuation() {
         fixture
             .scheduler
             .complete_and_continue(&WorkerId::new("w2"), &run, b"d".to_vec());
-    fixture.scheduler.set_worker_state(WorkerState::Active);
+    fixture.scheduler.set_leadership_grant(None);
     let non_leader = fixture
         .scheduler
         .complete_and_continue(&worker(), &run, b"d".to_vec());

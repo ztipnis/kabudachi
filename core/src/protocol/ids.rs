@@ -36,12 +36,19 @@ macro_rules! id_newtype {
 }
 
 id_newtype!(
-    /// Identifies a worker (a process participating in the cluster).
+    /// Identifies a worker: one process incarnation participating in the
+    /// cluster. A restarted process comes back under a new `WorkerId`, as a
+    /// pending joiner, and the old one only ever leaves (ADR-0001, amended
+    /// 2026-09-27): the
+    /// election's safety relies on no `WorkerId` voting again in a term it
+    /// has already voted in, and a process keeps no record of its votes
+    /// across a restart.
     WorkerId
 );
 id_newtype!(
-    /// Identifies a single worker incarnation (distinguishes restarts of the
-    /// same `WorkerId` from one another).
+    /// Identifies a single worker incarnation, carried on the wire beside
+    /// its `WorkerId`. Since a `WorkerId` already names one incarnation,
+    /// the two change together.
     IncarnationId
 );
 id_newtype!(

@@ -1,21 +1,27 @@
-//! A connection that carries no traffic must stay up. Followers exchange no
-//! messages with each other while the leader is stable, yet ring roll-call
-//! forwarding after leader loss needs them still connected
-//! (`PeerMessenger::reachable_peers`). libp2p-swarm closes a connection
-//! with no active streams after its idle timeout (10s by default), so
-//! `swarm::build_swarm` must set a longer one.
+//! A connection with no shared gossip topic must still survive past
+//! libp2p-swarm's own idle timeout (10s by default). A peer within this
+//! node's gossip mesh doesn't depend on `swarm::IDLE_CONNECTION_TIMEOUT` at
+//! all — gossipsub's own connection handler keeps that connection alive on
+//! its own (see that constant's doc comment) — but neither `net_a` nor
+//! `net_b` here ever subscribes to a shard, so that keep-alive never
+//! engages, and this timeout is the only thing keeping their connection up.
+//! That is the case of a JOIN seed dial or a claim's connection, which
+//! must not close between the steps that use it. The timeout is finite
+//! (60 s) so that such a connection, once nothing needs it, does close; it
+//! is not redialed then, since only gossip-mesh peers are (see
+//! `crate::messenger`'s "Which drops are redial-eligible").
 
 mod support;
 
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-use kabudachi_core::transport::PeerMessenger;
 use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
 use libp2p::identity;
 use tokio::time::timeout;
 
-use support::net::connect_to;
+use kabudachi_core::election::Input;
+use support::net::{connect_to, take_inputs_until};
 
 /// Longer than libp2p-swarm's 10s default idle timeout, with margin for
 /// streams still closing after Identify completes.
@@ -43,6 +49,7 @@ async fn an_idle_connection_stays_reachable_past_libp2ps_default_idle_timeout() 
     connect_to(&net_a, &listen_addr, &net_b).await;
     let worker_a = net_a.local_worker_id();
     let worker_b = net_b.local_worker_id();
+    take_inputs_until(&net_a, &Input::PeerConnected(worker_b.clone())).await;
 
     // libp2p's idle timer starts only once no stream is active, so the idle
     // period must not start before the initial Identify exchange finishes.
@@ -58,14 +65,20 @@ async fn an_idle_connection_stays_reachable_past_libp2ps_default_idle_timeout() 
     .await
     .expect("net_a received net_b's Identify within the timeout");
 
-    // Sample throughout, not just at the end: an auto-redial could hide a
-    // drop that happened in between.
+    // Check throughout, not just at the end, so a drop is reported when it
+    // happens. An auto-redial cannot hide one: each side reports every
+    // drop.
     let started = StdInstant::now();
     while started.elapsed() < IDLE_PERIOD {
-        assert!(
-            net_a.reachable_peers(worker_a.clone()).contains(&worker_b)
-                && net_b.reachable_peers(worker_b.clone()).contains(&worker_a),
-            "an idle connection dropped after {:?}",
+        let dropped = net_a
+            .take_inputs()
+            .into_iter()
+            .chain(net_b.take_inputs())
+            .find(|input| matches!(input, Input::PeerDisconnected(_)));
+        assert_eq!(
+            dropped,
+            None,
+            "an idle connection dropped after {:?} (net_a is {worker_a:?}, net_b is {worker_b:?})",
             started.elapsed()
         );
         tokio::time::sleep(StdDuration::from_millis(50)).await;

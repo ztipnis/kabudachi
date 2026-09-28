@@ -7,7 +7,7 @@ rust_library(
     crate_name = "kabudachi_core",
     edition = "2024",
     deps = all_crate_deps(normal = True) + ["//proto:kabudachi_prost"],
-    visibility = ["//bindings:__pkg__", "//net:__pkg__"],
+    visibility = ["//bindings:__pkg__", "//net:__pkg__", "//testkit:__pkg__"],
 )
 
 rust_test(
@@ -31,6 +31,17 @@ rust_test_suite(
     # BUILD.bazel edit; neither does a new top-level `tests/*.rs` file — it's
     # picked up by the `srcs` glob above automatically.
     shared_srcs = glob(["tests/support/**/*.rs"], allow_empty = True),
-    deps = [":core"] + all_crate_deps(normal = True, normal_dev = True),
+    # proptest replays the cases saved in a test's `.proptest-regressions`
+    # file before drawing new ones. It finds the file beside the test's
+    # source, which it locates by `file!()` from the working directory, so
+    # both must be in the runfiles.
+    data = glob(
+        [
+            "tests/*.proptest-regressions",
+            "tests/proptest_*.rs",
+        ],
+        allow_empty = True,
+    ),
+    deps = [":core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
     edition = "2024",
 )

@@ -2,7 +2,6 @@ syntax = "proto3";
 package kabudachi;
 
 import "ids.proto";
-import "worker.proto";
 
 message WorkerHeartbeat {
   WorkerId worker_id = 1;
@@ -11,6 +10,23 @@ message WorkerHeartbeat {
   uint64 term_seen = 4;
   uint32 available_capacity = 5;
   bytes active_task_runs_digest = 6;
+  ShardId shard_id = 7;
+  // The newest leader ack the sender accepted. Absent until it accepts one.
+  AckEcho newest_accepted_ack = 8;
+  // The generation of the configuration the sender holds, which a leader
+  // counts toward committing a joint configuration when it is exactly that
+  // configuration's generation. Absent while it holds none.
+  optional Generation configuration_generation = 9;
+  // The sender's monotonic clock reading when it sent this heartbeat, in
+  // ticks. The leader never interprets it; it only echoes it back in the ack
+  // that answers this heartbeat. 0 is a real reading.
+  uint64 send_token = 10;
+}
+
+// Names one leader ack a heartbeat confirms receiving.
+message AckEcho {
+  uint64 term = 1;
+  uint64 send_token = 2;
 }
 
 message LeaderHeartbeatAck {
@@ -18,26 +34,64 @@ message LeaderHeartbeatAck {
   WorkerId leader_id = 2;
   uint64 recovery_epoch = 3;
   uint64 term = 4;
-  uint64 membership_generation = 5;
+  // The leader's configuration, which a follower adopts when it is newer
+  // than its own.
+  Configuration configuration = 5;
+  // The recipient's admission generation in the leader's roster. Absent for
+  // a pending joiner, or a worker the roster does not hold.
+  optional Generation recipient_admission = 6;
+  // The leader's monotonic clock reading when it sent this ack, in ticks.
+  // Followers never interpret it; they only echo it back. 0 is a real
+  // reading.
+  uint64 send_token = 7;
+  // The admission generation the recipient held before the election that
+  // founded the leader's joint configuration admitted it. Absent otherwise.
+  optional Generation recipient_prior_admission = 8;
+  // The send token of the heartbeat this ack answers, echoed back unread.
+  // It tells the recipient that a leader holding a grant, which no rival can
+  // outlast, heard it no earlier than it sent that heartbeat. Absent while
+  // the leader holds no grant, and for an ack that answers no heartbeat,
+  // such as the one a new leader sends every connected peer.
+  optional uint64 heartbeat_token = 9;
+  // The lineage of the leader's recovery epoch (see the coordination
+  // authority's `RecoveryEpoch`), which a recipient that adopts that epoch
+  // takes with it. Absent from a leader that never learned its lineage.
+  optional uint64 recovery_epoch_lineage = 10;
 }
 
-message RollCallObservation {
-  WorkerId worker_id = 1;
-  WorkerState state = 2;
-  uint64 highest_term_seen = 3;
-  optional WorkerId current_leader_seen = 4;
-  uint64 leader_contact_age_ticks = 5;
-}
-
+// A census of the shard's workers ahead of a vote, published on the shard's
+// topic. Every worker that takes part answers the initiator directly.
 message RollCall {
-  string roll_call_id = 1;
-  ShardId shard_id = 2;
-  uint64 recovery_epoch = 3;
-  uint64 membership_generation = 4;
-  bytes membership_digest = 5;
-  uint64 highest_term_seen = 6;
-  WorkerId initiator_id = 7;
-  repeated RollCallObservation responses = 8;
+  ShardId shard_id = 1;
+  // The term the initiator contests: its highest term seen, plus one.
+  uint64 term = 2;
+  // The initiator's configuration, which the returning quorum is counted
+  // against.
+  Configuration configuration = 3;
+  // The initiator's wall clock, in milliseconds since the Unix epoch, when
+  // it started the call. Used only to break ties between calls for the same
+  // term.
+  uint64 timestamp_millis = 4;
+  WorkerId initiator_id = 5;
+  // The initiator's address, for the transport to fill in. Empty from core.
+  string initiator_address = 6;
+}
+
+// A worker's answer to a roll call, sent directly to its initiator. An
+// initiator runs at most one roll call per term, so the term and the
+// initiator name the call answered.
+message RollCallReply {
+  ShardId shard_id = 1;
+  uint64 term = 2;
+  WorkerId initiator_id = 3;
+  WorkerId responder_id = 4;
+  // The responder's address, for the transport to fill in. Empty from core.
+  string responder_address = 5;
+  // The responder's admission generation. Absent for a pending member.
+  optional Generation admission = 6;
+  // The admission generation the responder held before the election that
+  // founded its joint configuration admitted it. Absent otherwise.
+  optional Generation prior_admission = 7;
 }
 
 message VoteRequest {
@@ -45,18 +99,8 @@ message VoteRequest {
   uint64 recovery_epoch = 2;
   uint64 term = 3;
   WorkerId candidate_id = 4;
-  uint64 membership_generation = 5;
-  bytes membership_digest = 6;
-  bytes roll_call_digest = 7;
-}
-
-enum VoteRejectReason {
-  VOTE_REJECT_REASON_UNSPECIFIED = 0;
-  NOT_VOTER = 1;
-  WRONG_RECOVERY_EPOCH = 2;
-  STALE_TERM = 3;
-  ALREADY_VOTED = 4;
-  LEADER_STILL_VALID = 5;
+  // The generation of the configuration the candidate's roll call ran under.
+  Generation roll_call_generation = 5;
 }
 
 message VoteGrant {
@@ -67,29 +111,133 @@ message VoteGrant {
   WorkerId voter_id = 5;
 }
 
-message VoteReject {
-  ShardId shard_id = 1;
-  uint64 recovery_epoch = 2;
-  uint64 term = 3;
-  WorkerId candidate_id = 4;
-  WorkerId voter_id = 5;
-  VoteRejectReason reason = 6;
+// Why a worker refused a roll call or a vote request.
+enum ElectionRejectReason {
+  ELECTION_REJECT_REASON_UNSPECIFIED = 0;
+  // The call's or request's term is no later than the highest term the
+  // worker has seen.
+  STALE_TERM = 1;
+  // The configuration the call ran under (for a request, the candidate's
+  // call) is older than the worker's, or from an older recovery epoch.
+  STALE_GENERATION = 2;
+  // The worker heard from its leader within its suspicion timeout.
+  LEADER_STILL_VALID = 3;
+  // The worker already granted a vote in the request's term.
+  ALREADY_VOTED = 4;
+  // The roll call ranks below one the worker already answered for its
+  // term; or the request is for a roll call the worker did not answer, or
+  // not the best one it answered in that term.
+  NOT_BEST_ROLL_CALL = 5;
+  WRONG_RECOVERY_EPOCH = 6;
+  // The worker's state takes no part in elections (a candidate, a leader or
+  // one still joining).
+  NOT_ELIGIBLE = 7;
 }
 
+// A leader and the term it was elected in.
+message KnownLeader {
+  WorkerId leader_id = 1;
+  uint64 term = 2;
+}
+
+// A worker's refusal of a roll call or a vote request, sent directly to the
+// initiator of the call or the candidate of the request.
+message ElectionReject {
+  ShardId shard_id = 1;
+  // The term of the call or request refused.
+  uint64 term = 2;
+  // The initiator of the call or the candidate of the request.
+  WorkerId initiator_id = 3;
+  WorkerId rejecter_id = 4;
+  ElectionRejectReason reason = 5;
+  uint64 highest_term_seen = 6;
+  // The rejecter's configuration generation, which a refusal carried before
+  // it carried the whole configuration.
+  reserved 7;
+  reserved "configuration_generation";
+  // The leader the rejecter heard from within its suspicion timeout, when
+  // the reason is LEADER_STILL_VALID and it knows one.
+  optional KnownLeader leader = 8;
+  // The rejecter's configuration. Absent when it has none. A worker still
+  // on the joint configuration this one directly commits adopts it (ADR-0001
+  // decision 4 as amended 2026-09-28): the commit it missed.
+  optional Configuration configuration = 9;
+}
+
+// What an election's winner leads, sent to every respondent of its roll
+// call: the joint configuration the respondents founded, or, when the roll
+// call ran under a joint configuration not yet committed, that one
+// re-stamped at a generation of the winner's term and re-based there. A
+// respondent that accepts it adopts the configuration and its admission
+// generations there.
 message ElectionCertificate {
   ShardId shard_id = 1;
   uint64 recovery_epoch = 2;
   uint64 term = 3;
   WorkerId leader_id = 4;
-  repeated WorkerId granting_voters = 5;
-  uint64 membership_generation = 6;
+  // The granting voters, the roll call's generation, and the founded
+  // generation and voter count a certificate carried before it carried the
+  // whole configuration.
+  reserved 5, 6, 7, 8;
+  reserved "granting_voters", "generation", "founded_generation", "voter_count";
+  Configuration configuration = 9;
+  // The recipient's admission generation there. Absent for a pending member.
+  optional Generation recipient_admission = 10;
+  // The admission generation the recipient held before the election that
+  // founded the configuration admitted it. Absent otherwise.
+  optional Generation recipient_prior_admission = 11;
 }
 
 message SelfRemove {
   WorkerId worker_id = 1;
   IncarnationId incarnation_id = 2;
   ShardId shard_id = 3;
-  uint64 membership_generation = 4;
+  // The sender's configuration generation. Absent when it has none.
+  optional Generation configuration_generation = 4;
+  // The highest term the sender has seen (raised by a vote it granted, an
+  // ack or certificate it accepted, or a refusal; never by a roll call it
+  // answered). A leader applies the removal only when this is no later than
+  // its own term (ADR-0001 decision 10's term guard, amended 2026-09-27).
+  uint64 term_seen = 5;
+  // The term of the leader the sender follows, to which it sends this. A
+  // leader applies only a removal addressed to its own term.
+  uint64 leader_term = 6;
+}
+
+// The identity of a configuration (ADR-0001 decision 1), compared
+// lexicographically in field order.
+message Generation {
+  uint64 recovery_epoch = 1;
+  uint64 term = 2;
+  uint64 counter = 3;
+}
+
+// A voter configuration as every worker knows it: a generation, a base
+// generation and the voter count, or for a joint configuration (founded by
+// an election, or an admission batch) the old side's bounds and two counts.
+message Configuration {
+  Generation generation = 1;
+  Generation base = 2;
+  oneof electorate {
+    SingleElectorate single = 3;
+    JointElectorate joint = 4;
+  }
+}
+
+message SingleElectorate {
+  uint64 voter_count = 1;
+}
+
+// A move from one configuration (the old side) to another (the new side),
+// whose quorums need a majority of each. The old side is the voters of the
+// configuration moved from: those whose admission generation, or prior
+// admission generation, lies from old_base through old_generation.
+message JointElectorate {
+  Generation batch_generation = 1;
+  uint64 old_voter_count = 2;
+  uint64 new_voter_count = 3;
+  Generation old_base = 4;
+  Generation old_generation = 5;
 }
 
 message ElectionMessage {
@@ -97,10 +245,11 @@ message ElectionMessage {
     WorkerHeartbeat heartbeat = 1;
     LeaderHeartbeatAck heartbeat_ack = 2;
     RollCall roll_call = 3;
-    VoteRequest vote_request = 4;
-    VoteGrant vote_grant = 5;
-    VoteReject vote_reject = 6;
-    ElectionCertificate election_certificate = 7;
-    SelfRemove self_remove = 8;
+    RollCallReply roll_call_reply = 4;
+    VoteRequest vote_request = 5;
+    VoteGrant vote_grant = 6;
+    ElectionReject election_reject = 7;
+    ElectionCertificate election_certificate = 8;
+    SelfRemove self_remove = 9;
   }
 }
