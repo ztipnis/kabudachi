@@ -9,7 +9,12 @@ bazel_dep(name = "rules_rust", version = "0.74.0")
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
-    versions = ["1.89.0"],
+    # At least 1.98: older rustc strips Mach-O with an llvm-objcopy that
+    # leaves the symbol string table not 8-byte aligned. macOS 27's dyld
+    # refuses to load such a dylib, and every opt-mode (exec) proc-macro is
+    # stripped. 1.98.0 is the newest release rules_rust 0.74.0 has checksums
+    # for; a newer one downloads unverified.
+    versions = ["1.98.0"],
 )
 
 # --- Protobuf (Rust wire types from proto/ via prost) ---
