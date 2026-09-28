@@ -53,3 +53,31 @@ Use TDD and small commits. Python tests use pytest; Rust tests use `#[test]` thr
 ## Responding to CodeRabbit review comments
 
 After fixing a finding and pushing, reply on its thread with the fix commit and evidence, but do not call the resolve action yourself. CodeRabbit auto-resolves a thread once it confirms the fix on the next review pass.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships. graphify-out/ is gitignored, so each clone keeps its own graph.
+
+Rules:
+- Query the graph through the `graphify` MCP server (`.mcp.json`), not the CLI. For codebase questions, use `mcp__graphify__query_graph` first. Use `mcp__graphify__get_node` and `mcp__graphify__get_neighbors` for a symbol, `mcp__graphify__shortest_path` for how two concepts relate, and `mcp__graphify__get_community` or `mcp__graphify__god_nodes` for structure. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output. The server reloads graph.json after each rebuild.
+- Do not run `graphify query`, `graphify path` or `graphify explain` in the shell. Use them only if the MCP tools are unavailable, and say so. Subagents inherit the MCP tools; tell them to use them.
+- The server reads `graphify-out/graph.json` in the session's working directory. A worktree has no graph until you build one there: copy the main checkout's `graphify-out/` into it, then run the full rebuild below.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+
+### Rebuilding the graph
+
+Keep the graph current; a stale graph misleads every query.
+
+- Code-only rebuilds (`graphify update .`) run automatically from the local git hooks: `post-commit`, `post-checkout` on a branch switch, and `post-merge` after a merge or pull. They run in the background and log to `~/.cache/graphify-rebuild.log`. Hooks are per-clone. If `graphify hook status` shows them missing, run `graphify hook install`.
+- The hooks never re-extract docs. Run a full rebuild with the Claude CLI backend when a Markdown or YAML doc changes (README.md, STYLE_GUIDE.md, CONTRIBUTING.md, docs/, runtime/README.md), and at least once per work session:
+
+  ```bash
+  graphify extract . --backend claude-cli    # incremental: re-extracts changed files only
+  graphify label . --backend=claude-cli      # re-clusters, names communities, rewrites GRAPH_REPORT.md
+  ```
+
+  `claude-cli` uses the Claude Code login, so no API key is needed. Do not use `--backend claude`; it needs `ANTHROPIC_API_KEY`. `extract` alone does not rename communities or rewrite the report, so always run `label` after it.
+- After a PR merges into `main`, update local `main` (`git checkout main && git pull`), then run the full rebuild above before starting the next branch. Treat this as part of finishing the branch.
+- If a rebuild refuses to shrink `graph.json` after code was deliberately deleted, rerun it with `--force`.
