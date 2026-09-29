@@ -2,8 +2,25 @@ load("@aspect_rules_py//py:defs.bzl", "py_library")
 
 py_library(
     name = "kabudachi",
-    # Every module of the package, so adding one needs no BUILD edit.
-    srcs = glob(["*.py"]),  # keep
+    # Listed file by file, not globbed: Gazelle only indexes the modules a
+    # rule names in srcs, so with a glob no `kabudachi.*` import resolves.
+    srcs = [
+        "__init__.py",
+        "body.py",
+        "composites.py",
+        "config.py",
+        "errors.py",
+        "flow.py",
+        "handle.py",
+        "lifecycle.py",
+        "options.py",
+        "protobuf_serializer.py",
+        "registry.py",
+        "runner.py",
+        "serializers.py",
+        "session.py",
+        "tasks.py",
+    ],
     imports = [".."],
     visibility = ["//runtime:__subpackages__"],  # keep
     # //bindings:_native is a Rust-built (non-Python) target Gazelle cannot
@@ -11,9 +28,6 @@ py_library(
     # individual test targets) so that every consumer of this py_library
     # gets //bindings/ on sys.path via Bazel's imports propagation, and
     # therefore can resolve `from kabudachi import _native`.
-    # With srcs kept as a glob, Gazelle no longer reads the sources, so
-    # third-party imports are listed here by hand: add one whenever a module
-    # imports a new package.
     deps = [
         "//bindings:_native",  # keep
         "@pypi//asgiref",  # keep

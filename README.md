@@ -1509,7 +1509,7 @@ attempt_forced_recovery():
         return
 
     authority_view =
-        authority.discover_workers(shard_id)
+        authority.live_registrations(shard_id)
 
     reachable =
         intersect(
@@ -1524,19 +1524,20 @@ attempt_forced_recovery():
     old_epoch =
         authority.read_recovery_epoch(shard_id)
 
-    new_epoch =
-        authority.force_reconfigure(
+    new_epoch = old_epoch.next()
+
+    swapped =
+        authority.compare_and_swap_recovery_epoch(
             shard_id=shard_id,
-            expected_recovery_epoch=old_epoch,
-            replacement_members=reachable
+            expected=old_epoch,
+            new=new_epoch
         )
 
-    if compare_and_swap_failed:
+    if not swapped:
         reload_authority_state()
         return
 
     local.recovery_epoch = new_epoch
-    rebuild_ring(reachable)
     establish_new_effective_electorate(reachable)
 
     state = ROLL_CALL
@@ -2728,6 +2729,8 @@ Peer review should focus heavily on invariants. If an implementation violates on
 
 This system should not be validated primarily through happy-path integration tests.
 
+The tests are organised as one Bazel `rust_test` target per area, so a change reruns only the areas that depend on it. `core` has the crates `configuration`, `election`, `proptest`, `scenario` and `scheduler` (`core/tests/<area>/`), and `net` has `bootstrap`, `claim` and `election` (`net/tests/<area>/`), on top of each crate's in-crate unit tests (`core_test`, `net_test`). The `testkit` crate is the shared test seam: the faulting authority (`FaultingAuthority`) and the step record with the invariants asserted over it, which the core simulator and the real-socket net tests both use.
+
 ### 26.1 Deterministic state-machine tests
 
 The worker, TaskRun, and shard state machines should be modeled as pure state transitions wherever possible.
@@ -2832,12 +2835,6 @@ Test:
 - async functions and contextvars;
 - subprocess crashes.
 
-### 26.7 TODO: fewer integration-test binaries
-
-Each file in `core/tests/` and `net/tests/` is its own test crate, so Cargo links one binary per file, and every one of those binaries links its crate (`kabudachi_core` or `kabudachi_net`) and all its dependencies again. There are 38 such files today. That multiplies link time and the debug info written to `target/`. Merge them into a few test crates, one per area, using the `tests/<area>/main.rs` pattern with one module per current file. Trade-off: Bazel's `rust_test_suite` currently makes one target per file, which keeps affected-only test runs fine-grained. A merged crate becomes one target, so a change to one test file reruns every test in that crate. Choose the groups so that one test crate still maps to one area of code.
-
-The merge also needs Bazel changes. `core/BUILD.bazel` and `net/BUILD.bazel` find integration tests with `glob(["tests/*.rs"])`, which does not match `tests/<area>/main.rs`. Replace that discovery with one `rust_test` per area, or Bazel silently stops running the moved tests. `//net:ring_roll_call_leader_loss_test` has its own `size = "large"` target for its retry loop. Keep it in its own target, or give its area target the same timeout.
-
 ---
 
 ## 27. Suggested implementation phases
@@ -2895,13 +2892,15 @@ Still avoid sharding.
 
 Phase 1 left `NoPeers` and `NoAuthority` (`core/src/single_node.rs`) and the election tick loop in place as single-node placeholders, each with one adapter until this phase. Phase 2 gave peer messaging and the coordination authority their second real adapter and resolved that question, as follows.
 
-`core/src/single_node.rs` is gone. `NoPeers` moved to `bindings/src/local_node.rs`, scoped to the one runtime that actually wants it: the single-process Python runtime, whose instant (zero suspicion timeout) self-election is a deliberate product choice for that runtime, not the generic behaviour of a one-member electorate. `NoAuthority` was removed outright rather than moved: `core::election::WorkerNode` only consults its authority from `attempt_forced_recovery`, which runs only from `WorkerState::NoQuorum`, and a one-member electorate driven by `NoPeers` can never reach `NoQuorum` — so the path is unreachable and `InMemoryAuthority` (`core/src/in_memory_authority.rs`) serves as the type there without ever being called. The generic multi-node case is `net/src/bootstrap.rs`'s `bootstrap_node` cascade (seeds, then the coordination authority, then self-election), where a lone node still waits out whatever suspicion timeout it was configured with.
+`core/src/single_node.rs` is gone. Its message-sink placeholder became `core::election::DropMessages`, which drops every message for a node with no peers, and the single-process Python runtime's wiring lives in `bindings/src/local_node.rs`. That runtime's instant (zero suspicion timeout) self-election is a deliberate product choice for it, not the generic behaviour of a one-member electorate. The Phase 1 `NoAuthority` coordination authority was removed rather than moved: the single-process runtime starts its node with no authority timings, so the node never asks for an authority call. The name now belongs to `core::election::NoAuthority`, the authority performer that runtime hands `core::election::carry_out`, which answers any call at once as unavailable. The generic multi-node case is `net/src/bootstrap.rs`'s `bootstrap` cascade (seeds, then the coordination authority's registered peers, then ownership of the shard, or, with no authority, founding it alone), where a lone node still waits out whatever suspicion timeout it was configured with.
 
-There is no single election tick loop any more either: `bindings/src/election.rs`'s `run_election` drives the single-process node, and `net/src/driver.rs`'s `run_driver` drives a real-transport node, each on its own tick.
+Both runtimes drive the node through `core::election::carry_out`: `bindings/src/election.rs`'s `run_election` on the single-process node, and `net/src/driver.rs`'s `run_driver` on a real-transport node, each on its own tick.
 
-The bootstrap join is one-way in Phase 2. `bootstrap_node` adds the joining worker to its own electorate, but the members that answer its `JOIN_RESPONSE` keep their existing electorate, and nothing admits the joiner into it. After `c` joins `{a, b}`, `c` believes the electorate is `{a, b, c}` while `a` and `b` still believe `{a, b}`, so the nodes disagree about quorum and ring neighbours. This does not yet meet the `JOINING` state's requirement that the cluster recognize a new worker as active. Admitting a joiner needs leader-driven membership propagation (the `membership_generation` and `membership_digest` fields already on the wire are unread), which is new election behaviour and is not assigned to a phase yet. Until then, a shard is safe only at its bootstrap electorate.
+`kabudachi_net::worker::Worker` wires these together: its `run` calls `bootstrap`, starts the node with `WorkerNode::start` and hands it to `run_driver`.
 
-The authority step of the bootstrap cascade does not yet produce a working node. `CoordinationAuthority::discover_workers` returns worker IDs without addresses, and `bootstrap_node` does not read the shard's recovery epoch, so a node that bootstraps this way is `Active` in an electorate it cannot reach, at recovery epoch 0. It fails safe (no quorum, so it never leads while other members exist) but does not recover on its own. Phase 4's real `CoordinationAuthority` must return addresses and the recovery epoch; until then, nodes join through seeds.
+The bootstrap join changes no one's configuration by itself. `bootstrap` only returns an `Entry`: for a join, `Entry::Joining` with the leader a seed or registered peer pointed at, found through the net `join` module (`net/src/join.rs`: `ask_for_leader` asks peers who leads, `find_leader` asks the workers the authority lists when a node rejoins, and `pointer_for` builds the pointer a node hands a joiner). `WorkerNode::start` then makes the worker a pending member of that leader's shard, which no quorum counts; the members that answered it keep their configuration until an election admits the joiner (ADR-0001).
+
+The authority step of the bootstrap cascade reads `CoordinationAuthority::live_registrations`, which returns each registered worker's address, so a node asks the registered peers the way it asks seeds. A worker that finds no other worker registered registers itself and founds the shard only by winning a compare-and-swap of the shard's recovery epoch (created at 0, or one epoch on when re-founding), so two workers never found the same shard. Until a real remote `CoordinationAuthority` exists (Phase 4), the only production implementation is the in-memory one (tests also use `kabudachi_testkit::FaultingAuthority`), and nodes in tests join through seeds or a shared in-memory authority.
 
 The one-node window between startup and the worker becoming leader is still not testable, and is still recorded as such in `docs/superpowers/follow-ups.md` ("Test for a signal arriving during startup, before leadership" — the one-node election takes about 20 ms, too short to hit without a flaky test; picked up when startup is slow enough to test, i.e. DHT election). Phase 2's real transport did not change that: it makes multi-node startup slower, but the *one-node* window is exactly the case that has no network to wait on.
 

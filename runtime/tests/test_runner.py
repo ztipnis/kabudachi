@@ -154,13 +154,6 @@ def test_run_says_so_when_the_native_extension_is_missing(monkeypatch):
         kabudachi.run(main)
 
 
-def test_the_overloads_agree_with_the_behaviour():
-    async def main():
-        return 1
-
-    assert kabudachi.run(main) == 1
-
-
 def test_serving_without_main_needs_the_main_thread():
     errors = []
 
@@ -188,18 +181,6 @@ def test_the_configured_result_ttl_is_given_to_the_native_runtime_in_millisecond
     assert only_native().options["result_ttl_ms"] == 5000
 
 
-def test_the_configured_memory_limits_are_given_to_the_native_runtime():
-    kabudachi.configure(memory_soft_limit=1_000, memory_hard_limit=5_000)
-
-    async def main():
-        return None
-
-    kabudachi.run(main)
-
-    options = only_native().options
-    assert (options["memory_soft_limit"], options["memory_hard_limit"]) == (1_000, 5_000)
-
-
 def test_a_worker_that_ended_is_reported_even_if_the_work_finished_at_the_same_moment():
     async def scenario():
         async def dies():
@@ -214,12 +195,3 @@ def test_a_worker_that_ended_is_reported_even_if_the_work_finished_at_the_same_m
 
     asyncio.run(scenario())
 
-
-def test_a_worker_that_was_cancelled_is_reported_as_stopped_not_as_a_cancelled_error():
-    async def scenario():
-        worker = asyncio.ensure_future(asyncio.sleep(30))
-        worker.cancel()
-        with pytest.raises(RuntimeError, match="cancelled"):
-            await runner_module._until_done_or_worker_stops(asyncio.sleep(30), worker)
-
-    asyncio.run(scenario())

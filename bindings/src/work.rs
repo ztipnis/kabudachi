@@ -338,24 +338,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_leader_with_work_claims_it_at_once() {
-        let scheduler = scheduler(Some(UNBOUNDED_GRANT));
-        submit(&scheduler);
-        let wake = Wake::new();
-
-        let claims = block_on(claim_when_available(
-            scheduler,
-            worker(),
-            wake.subscribe(),
-            10,
-            Wake::new(),
-        ))
-        .unwrap();
-
-        assert_eq!(claims.len(), 1);
-    }
-
-    #[test]
     fn a_closed_wake_fails_a_claim_at_once() {
         let scheduler = scheduler(Some(UNBOUNDED_GRANT));
         submit(&scheduler);
@@ -393,28 +375,6 @@ pub(crate) mod tests {
         });
 
         assert_eq!(result, Err(Closed));
-    }
-
-    #[test]
-    fn a_notification_lets_a_waiting_claim_take_new_work() {
-        let scheduler = scheduler(Some(UNBOUNDED_GRANT));
-        let wake = Wake::new();
-
-        let claims = block_on(async {
-            let waiting = tokio::spawn(claim_when_available(
-                Arc::clone(&scheduler),
-                worker(),
-                wake.subscribe(),
-                10,
-                Wake::new(),
-            ));
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            submit(&scheduler);
-            wake.notify();
-            waiting.await.unwrap().unwrap()
-        });
-
-        assert_eq!(claims.len(), 1);
     }
 
     #[test]

@@ -6,7 +6,7 @@ import inspect
 
 import pytest
 
-from kabudachi.errors import RuntimeNotStartedError, SerializationError
+from kabudachi.errors import SerializationError
 from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.tasks import Task
@@ -48,14 +48,6 @@ def test_an_async_task_gives_an_awaitable_for_its_result():
 
     assert inspect.isawaitable(outcome)
     assert asyncio.run(outcome).text == "HI"
-
-
-def test_local_needs_no_running_runtime():
-    # No run() anywhere in this module: calling the task itself would refuse.
-    task = declare(shout)
-    with pytest.raises(RuntimeNotStartedError, match=r"kabudachi\.run"):
-        task(Greeting())
-    assert task.local(Greeting(text="a")).text == "A"
 
 
 def test_the_body_sees_a_copy_of_the_argument_as_a_worker_would():

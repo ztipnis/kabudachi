@@ -24,8 +24,8 @@
 //! due, ticks each node at the deadline the node last reported, tells every
 //! node which peers it is connected to (every other node, less those across
 //! a partition), and hands every grant a node reports, and every worker it
-//! reports lost, to that node's own `Scheduler` through
-//! `election::apply_to_scheduler`. Each scheduler reads the shared clock, so
+//! reports lost, to that node's own `Scheduler`, all through
+//! `election::carry_out`. Each scheduler reads the shared clock, so
 //! it stops leading once its grant's lease ends even while its node is
 //! stalled (see `stall`). It makes each authority call a node asks for at
 //! once, through that node's own handle (see `node_authority`), and hands
@@ -33,19 +33,20 @@
 //! stalled. It also answers JOIN for a node that goes back to
 //! `Bootstrapping` to rejoin its shard (see `run_pass`).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use kabudachi_core::configuration::Generation;
 use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
-    AuthorityTimings, Input, KnownConfiguration, Output, Step, WorkerNode, apply_to_scheduler,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, Entry, Identity, Input,
+    KnownConfiguration, MessageSink, Output, Step, WorkerNode, carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
-use kabudachi_core::protocol::messages::{ElectionMessage, JoinResponse, election_message};
+use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Clock, Duration, Instant};
+pub use kabudachi_testkit::StepRecord;
 use kabudachi_testkit::FaultingAuthority;
 
 use crate::support::authority::{authority_ttl, epoch, warmed_up_authority};
@@ -64,31 +65,6 @@ const MAX_PASSES_PER_INSTANT: usize = 1_000;
 pub type ClusterNode = WorkerNode<FakeClock>;
 
 pub type ClusterScheduler = Scheduler<FakeClock, SequentialIds>;
-
-/// The first instant at which the schedulers of more than one node held a
-/// valid leadership grant, and whose they were.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrantOverlap {
-    pub at: Instant,
-    pub holders: BTreeSet<WorkerId>,
-}
-
-/// One step of one node, as the harness carried it out (see
-/// `Cluster::record_steps`).
-#[derive(Debug, Clone)]
-pub struct StepRecord {
-    pub at: Instant,
-    pub node: WorkerId,
-    /// The input the step handled; `None` for a join the harness finished.
-    pub input: Option<Input>,
-    /// The node's term, recovery epoch, admission generation and prior
-    /// admission generation once the step was done.
-    pub term: u64,
-    pub recovery_epoch: u64,
-    pub admission: Option<Generation>,
-    pub prior_admission: Option<Generation>,
-    pub outputs: Vec<Output>,
-}
 
 /// A node whose driver hands it nothing until `until`.
 struct Stall {
@@ -126,7 +102,9 @@ pub struct Cluster {
     authority_timings: Option<AuthorityTimings>,
     /// Each node's scheduler, handed every grant its node reports.
     schedulers: BTreeMap<WorkerId, ClusterScheduler>,
-    first_grant_overlap: Option<GrantOverlap>,
+    /// Every step that reported a grant or its withdrawal, in order, for
+    /// `first_grant_overlap`.
+    grant_steps: Vec<StepRecord>,
     stalls: BTreeMap<WorkerId, Stall>,
     /// The steps taken since `record_steps` or the last `take_steps`;
     /// `None` while not recording.
@@ -218,7 +196,7 @@ impl Cluster {
             suspect_timeout,
             authority_timings,
             schedulers: BTreeMap::new(),
-            first_grant_overlap: None,
+            grant_steps: Vec::new(),
             stalls: BTreeMap::new(),
             recorded_steps: None,
         };
@@ -247,14 +225,18 @@ impl Cluster {
         } else {
             voter_of(self.voter_count)
         };
-        let node = WorkerNode::new(
-            id.clone(),
-            incarnation_id,
-            self.shard_id.clone(),
+        // A node that starts inside a known configuration asks for nothing
+        // first; the `Tick` below stands in for its first step.
+        let (node, _) = WorkerNode::start(
+            Identity {
+                id: id.clone(),
+                incarnation: incarnation_id,
+                shard: self.shard_id.clone(),
+                timings: timings(self.suspect_timeout),
+            },
+            Entry::Known(known_configuration),
             (*self.clock).clone(),
-            known_configuration,
             self.authority_timings,
-            timings(self.suspect_timeout),
         );
         self.nodes.insert(id.clone(), node);
         self.schedulers.insert(
@@ -616,40 +598,64 @@ impl Cluster {
         self.drive(id, Some(input), step)
     }
 
-    /// Records `first`, a step the named node took, and carries out the
-    /// authority calls it asks for as `step` describes.
+    /// Carries out `first`, a step the named node took on `input`, and every
+    /// step it leads to, through `election::carry_out`: each step's grant
+    /// and lost workers go to the node's scheduler, its messages into the
+    /// network, and its authority calls through the node's own handle, each
+    /// reply handed straight back unless the node is stalled, when it is
+    /// held for it like a message. Records each step (see `record_steps`)
+    /// and returns every output, in order.
     fn drive(&mut self, id: &WorkerId, input: Option<Input>, first: Step) -> Vec<Output> {
-        let mut all = self.record(id, input, first);
-        let mut replies: VecDeque<Input> = self.perform_authority_calls(id, &all).into();
-        while let Some(reply) = replies.pop_front() {
-            if self.is_stalled(id, self.clock.now()) {
-                self.hold(id, vec![reply]);
-                continue;
-            }
-            let step = self.node_mut(id, "step").step(reply.clone());
-            let outputs = self.record(id, Some(reply), step);
-            replies.extend(self.perform_authority_calls(id, &outputs));
-            all.extend(outputs);
-        }
+        let mut node = self
+            .nodes
+            .remove(id)
+            .unwrap_or_else(|| unknown_node("step", id));
+        let mut scheduler = self
+            .schedulers
+            .remove(id)
+            .unwrap_or_else(|| unknown_node("step", id));
+        let now = self.clock.now();
+        let mut sink = FromNode {
+            network: &self.network,
+            from: id.clone(),
+        };
+        let mut performer = HarnessPerformer {
+            authority: self
+                .node_authorities
+                .get(id)
+                .unwrap_or_else(|| unknown_node("step", id)),
+            shard_id: &self.shard_id,
+            me: id,
+            stall: self.stalls.get_mut(id).filter(|stall| now < stall.until),
+        };
+        let deadlines = &mut self.deadlines;
+        let grant_steps = &mut self.grant_steps;
+        let recorded_steps = &mut self.recorded_steps;
+        let mut all = Vec::new();
+        let mut first_input = input;
+        let _ = carry_out(
+            &mut node,
+            first,
+            &mut scheduler,
+            &mut sink,
+            &mut performer,
+            |node, _, reply, step| {
+                deadlines.insert(id.clone(), step.next_deadline);
+                let taken = first_input.take();
+                let input = reply.or(taken.as_ref());
+                let record = StepRecord::of(node, input, step, now);
+                if record.reports_grant() {
+                    grant_steps.push(record.clone());
+                }
+                if let Some(recorded) = recorded_steps.as_mut() {
+                    recorded.push(record);
+                }
+                all.extend(step.outputs.iter().cloned());
+            },
+        );
+        self.nodes.insert(id.clone(), node);
+        self.schedulers.insert(id.clone(), scheduler);
         all
-    }
-
-    /// Makes every authority call in `outputs` through the named node's own
-    /// handle, and returns the replies to hand it, in order.
-    fn perform_authority_calls(&self, id: &WorkerId, outputs: &[Output]) -> Vec<Input> {
-        let authority = self.node_authority(id);
-        outputs
-            .iter()
-            .filter_map(|output| match output {
-                Output::Authority(call) => Some(Input::Authority(call.perform(
-                    authority,
-                    &self.shard_id,
-                    id,
-                    id.as_str(),
-                ))),
-                _ => None,
-            })
-            .collect()
     }
 
     /// Answers JOIN for every node back in `Bootstrapping` to rejoin its
@@ -671,6 +677,8 @@ impl Cluster {
         let mut joined = BTreeSet::new();
         for id in rejoining {
             let own_epoch = self.nodes[&id].recovery_epoch();
+            // A leader names itself (see `WorkerNode::known_leader`), and
+            // the harness addresses each node by its id.
             let pointer = self
                 .nodes
                 .iter()
@@ -680,14 +688,12 @@ impl Cluster {
                         && !self.network.is_partitioned(&id, leader)
                         && !self.is_stalled(leader, now)
                 })
-                .max_by_key(|(_, node)| (node.recovery_epoch(), node.term()))
-                .map(|(leader, node)| JoinResponse {
-                    leader_id: Some(leader.clone().into()),
-                    leader_multiaddr: leader.as_str().to_string(),
-                    term: node.term(),
-                    recovery_epoch: node.recovery_epoch(),
-                    recovery_epoch_lineage: node.recovery_lineage().unwrap_or_default(),
-                });
+                .filter_map(|(leader, node)| {
+                    let pointer = node.join_response(leader.as_str().to_string())?;
+                    Some(((pointer.recovery_epoch, pointer.term), pointer))
+                })
+                .max_by_key(|(latest, _)| *latest)
+                .map(|(_, pointer)| pointer);
             if let Some(pointer) = pointer {
                 let step = self.node_mut(&id, "join").finish_joining(&pointer);
                 self.drive(&id, None, step);
@@ -695,44 +701,6 @@ impl Cluster {
             }
         }
         joined
-    }
-
-    fn record(&mut self, id: &WorkerId, input: Option<Input>, step: Step) -> Vec<Output> {
-        self.deadlines.insert(id.clone(), step.next_deadline);
-        self.carry_out(id, &step.outputs);
-        if let Some(scheduler) = self.schedulers.get_mut(id) {
-            apply_to_scheduler(&step.outputs, scheduler);
-        }
-        self.note_any_grant_overlap();
-        if let Some(recorded) = self.recorded_steps.as_mut() {
-            recorded.push(StepRecord {
-                at: self.clock.now(),
-                node: id.clone(),
-                input,
-                term: self.nodes[id].term(),
-                recovery_epoch: self.nodes[id].recovery_epoch(),
-                admission: self.nodes[id].admission(),
-                prior_admission: self.nodes[id].prior_admission(),
-                outputs: step.outputs.clone(),
-            });
-        }
-        step.outputs
-    }
-
-    /// Records the first instant at which more than one node holds a valid
-    /// grant. Checked after every step, where a grant can start; between
-    /// steps a grant can only run out.
-    fn note_any_grant_overlap(&mut self) {
-        if self.first_grant_overlap.is_some() {
-            return;
-        }
-        let holders = self.valid_grant_holders();
-        if holders.len() > 1 {
-            self.first_grant_overlap = Some(GrantOverlap {
-                at: self.clock.now(),
-                holders,
-            });
-        }
     }
 
     /// Whether the named node's scheduler holds a valid grant now: one its
@@ -763,10 +731,18 @@ impl Cluster {
             .collect()
     }
 
-    /// The first instant, after any step so far, at which more than one
-    /// node's scheduler held a valid grant; `None` if there was none.
-    pub fn first_grant_overlap(&self) -> Option<&GrantOverlap> {
-        self.first_grant_overlap.as_ref()
+    /// The steps that reported the first two grants of different nodes to
+    /// overlap so far (see `kabudachi_testkit::first_grant_overlap`); `None`
+    /// if none did. Each scheduler leads exactly while such a grant holds:
+    /// from the step that hands it the grant, all steps at one instant in the
+    /// order the harness ran them, until the grant's lease ends by the
+    /// shared clock or the node's next grant report, whichever is first.
+    /// A node `restart_node` removed never reports again, so its last grant
+    /// counts until its lease ends, and for ever if it was `Unbounded` (a
+    /// leader with no authority that alone is a quorum): the restarted node
+    /// comes back under a new id, so its reports never end the old one's.
+    pub fn first_grant_overlap(&self) -> Option<(StepRecord, StepRecord)> {
+        kabudachi_testkit::first_grant_overlap(&self.grant_steps)
     }
 
     /// Starts keeping a record of every step any node takes from now on,
@@ -782,22 +758,6 @@ impl Cluster {
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
-    }
-
-    /// Carries out `outputs` as the named node's step asked: sends each
-    /// message to its recipient and publishes each published one to every
-    /// other node, both through the network, for a later `advance` or
-    /// `deliver_messages` to deliver.
-    fn carry_out(&self, id: &WorkerId, outputs: &[Output]) {
-        for output in outputs {
-            match output {
-                Output::Send { to, message } => {
-                    self.network.send(id.clone(), to.clone(), message.clone());
-                }
-                Output::Publish { message } => self.network.publish(id.clone(), message.clone()),
-                _ => {}
-            }
-        }
     }
 
     /// Delivers every message due now, and every message those deliveries
@@ -886,8 +846,10 @@ impl Cluster {
             .collect()
     }
 
-    /// Panics, naming the offenders, if more than one node is `Leader`.
-    pub fn assert_at_most_one_leader(&self) {
+    /// Panics, naming the offenders, if more than one node is in
+    /// `WorkerState::Leader` now. Whether their grants overlapped is
+    /// `first_grant_overlap`'s question.
+    pub fn assert_at_most_one_in_leader_state(&self) {
         let leaders: Vec<&WorkerId> = self
             .nodes
             .iter()
@@ -934,6 +896,45 @@ impl Cluster {
         self.nodes
             .get_mut(id)
             .unwrap_or_else(|| unknown_node(context, id))
+    }
+}
+
+/// Where one node's messages go: into the shared network, from that node.
+struct FromNode<'a> {
+    network: &'a FakeNetwork,
+    from: WorkerId,
+}
+
+impl MessageSink for FromNode<'_> {
+    fn send(&mut self, to: WorkerId, message: ElectionMessage) {
+        self.network.send(self.from.clone(), to, message);
+    }
+
+    fn publish(&mut self, message: ElectionMessage) {
+        self.network.publish(self.from.clone(), message);
+    }
+}
+
+/// Performs one node's authority calls at once, through its own handle. A
+/// stalled node's replies are held for it with its messages, for it to
+/// handle once the stall ends.
+struct HarnessPerformer<'a> {
+    authority: &'a FaultingAuthority<FakeClock>,
+    shard_id: &'a ShardId,
+    me: &'a WorkerId,
+    stall: Option<&'a mut Stall>,
+}
+
+impl AuthorityPerformer for HarnessPerformer<'_> {
+    fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
+        let reply = call.perform(self.authority, self.shard_id, self.me, self.me.as_str());
+        match self.stall.as_mut() {
+            Some(stall) => {
+                stall.held.push(Input::Authority(reply));
+                None
+            }
+            None => Some(reply),
+        }
     }
 }
 

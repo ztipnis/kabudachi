@@ -108,15 +108,17 @@
 
 mod authority;
 mod authority_lease;
-mod ballot;
+mod carry_out;
+mod election_round;
+mod entry;
 mod forced_recovery;
-mod quorum_contact_lease;
-mod roll_call;
-mod vote_round;
+mod lease;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use authority::{AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings};
+pub use carry_out::{AuthorityPerformer, DropMessages, MessageSink, NoAuthority, carry_out};
+pub use entry::{Entry, Identity};
 
 use crate::configuration::{Admission, Configuration, Generation, Roster, Tally};
 use crate::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
@@ -125,19 +127,16 @@ use crate::protocol::ids::{IdGenerator, IncarnationId, ShardId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{
     AckEcho, ElectionCertificate, ElectionMessage, ElectionReject, ElectionRejectReason,
-    JoinResponse, KnownLeader, LeaderHeartbeatAck, RollCall, RollCallReply, SelfRemove, VoteGrant,
-    VoteRequest, WorkerHeartbeat, election_message,
+    JoinResponse, KnownLeader, LeaderHeartbeatAck, SelfRemove, WorkerHeartbeat, election_message,
 };
 use crate::protocol::worker_state::WorkerState;
 use crate::scheduler::{LeadershipGrant, LeaseEnd, Scheduler};
 use crate::time::{Clock, Duration, Instant};
 
 use authority_lease::{AuthorityLease, Reconnect};
-use ballot::{Ballot, RollCallVerdict, VoteVerdict, Voter};
+use election_round::{ElectionRound, Verdict, View};
 use forced_recovery::{ForcedRecovery, Next, cannot_recover_from};
-use quorum_contact_lease::QuorumContactLease;
-use roll_call::{CallRank, RollCallRound};
-use vote_round::VoteRound;
+use lease::{Lease, LeaseChange, Office};
 
 /// How long a leader waits, after it would first suspect a silent worker,
 /// before it reports that worker lost and its TaskRuns are replayed; and,
@@ -185,17 +184,6 @@ where
     /// While `Leader`: when it last heard from each worker it has not yet
     /// reported lost.
     last_heard: BTreeMap<WorkerId, Instant>,
-    /// The latest instant, on this node's clock, before which every leader
-    /// that may yet replay this worker's TaskRuns had heard from it or had
-    /// not yet won; `None` until any has (see [`Self::abort_deadline`]).
-    contact_floor: Option<Instant>,
-    /// Since it last fenced itself, orphaned: by when it must have aborted
-    /// its TaskRuns (ADR-0001 decision 12). Cleared once it resumes, or once
-    /// a leader acks it after it rejoined.
-    orphan_abort_by: Option<Instant>,
-    /// The abort deadline this node last reported (see
-    /// [`Output::AbortDeadline`]), so it reports each change once.
-    reported_abort_deadline: Option<Instant>,
     /// The configuration this node knows. `None` for a joiner until it
     /// accepts its first leader ack.
     configuration: Option<Configuration>,
@@ -209,21 +197,9 @@ where
     /// The term this node is contesting or holds. Meaningful from `Candidate`
     /// onward.
     term: u64,
-    /// The roll calls this node answered and the votes it granted.
-    ballot: Ballot,
-    /// Until when this node starts no roll call of its own: a roll-call
-    /// deadline after it last answered another worker's roll call.
-    own_roll_calls_suppressed_until: Instant,
-    /// The earliest instant at which this node, while `LeaderSuspect` or
-    /// `NoQuorum`, may start its next roll call: when it began suspecting
-    /// its leader, or, after it gave up a term it held or contested or lost
-    /// its quorum, a fresh suspicion timeout later.
-    next_roll_call_at: Instant,
-    /// The roll call this node started last, while it is collecting
-    /// replies to it.
-    roll_call: Option<RollCallRound>,
-    /// The vote this node runs while it stands as the candidate.
-    vote: Option<VoteRound>,
+    /// The roll calls this node answered, the votes it granted, and the
+    /// roll call or candidacy it runs.
+    round: ElectionRound,
     /// The members and pending joiners this node leads. Set when it wins;
     /// meaningful only while `Leader`.
     roster: Option<Roster>,
@@ -239,12 +215,9 @@ where
     next_heartbeat: Option<(WorkerId, Instant)>,
     /// The peers the driver reports this node connected to.
     connected: BTreeSet<WorkerId>,
-    /// The acks confirmed since this node last won. Meaningful only while
-    /// `Leader`.
-    lease: QuorumContactLease,
-    /// The grant this node last reported to its driver (see
-    /// [`Output::Grant`]), so it reports each change once.
-    reported_grant: Option<LeadershipGrant>,
+    /// Its grant while `Leader`, and its abort deadline (see
+    /// [`Output::Grant`] and [`Output::AbortDeadline`]).
+    lease: Lease,
     /// A drain was asked for in a state that cannot drain yet.
     drain_requested: bool,
     /// While `Leader`: the workers whose SELF_REMOVE it has accepted since
@@ -278,7 +251,7 @@ pub struct ElectionTimings {
     /// keep that well inside the lease length (see [`Self::lease_length`]),
     /// or a leader whose followers are all alive runs out of lease. Must not
     /// be zero, and twice it must be shorter than the lease length unless
-    /// the node starts alone a quorum (see [`WorkerNode::new`]).
+    /// the node starts alone a quorum (see [`WorkerNode::start`]).
     pub heartbeat_interval: Duration,
     /// How long a roll call runs before its initiator decides on it: it
     /// stands as the candidate if the voters among its respondents are a
@@ -294,7 +267,7 @@ pub struct ElectionTimings {
     /// calling (others may still call). Keep it well above the time a roll
     /// call takes to reach the shard and its replies to come back, and below
     /// `suspect_timeout`. Usually [`Self::DEFAULT_ROLL_CALL_DEADLINE`]. Must
-    /// not be zero (see [`WorkerNode::new`]).
+    /// not be zero (see [`WorkerNode::start`]).
     pub roll_call_deadline: Duration,
     /// How far apart the rates of two workers' clocks, or of a worker's
     /// and its coordination authority's, may be, as a divisor: every
@@ -379,7 +352,7 @@ impl ElectionTimings {
     }
 }
 
-/// The configuration a [`WorkerNode`] built by [`WorkerNode::new`] starts
+/// The configuration a [`WorkerNode`] started on [`Entry::Known`] starts
 /// with, and its own place in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownConfiguration {
@@ -451,7 +424,7 @@ pub enum Output {
     StateChanged(WorkerState),
     /// The node's leadership grant, reported whenever it changes and whenever
     /// the node leaves `Leader`, for its driver to hand to the node's
-    /// scheduler (see [`apply_to_scheduler`]): `Some` while the node is
+    /// scheduler (see [`carry_out`]): `Some` while the node is
     /// `Leader` with a lease, ending where the lease does; `None` otherwise.
     ///
     /// A leader that is not alone a quorum first holds a lease once a quorum
@@ -466,7 +439,7 @@ pub enum Output {
     Authority(AuthorityCall),
     /// While `Leader`: the worker has not been heard from for a suspicion
     /// timeout and then a reconnect timeout (README §8.3), so every TaskRun
-    /// it holds is lost and may be replayed (see [`apply_to_scheduler`]).
+    /// it holds is lost and may be replayed (see [`carry_out`]).
     /// Reported once; a worker heard from again is watched afresh.
     WorkerLost(WorkerId),
     /// By when, on the node's clock, this worker must have aborted every
@@ -542,7 +515,7 @@ pub struct Step {
 /// `scheduler` must read the clock the node reads: a grant's lease ends at
 /// an instant of the node's clock, and the scheduler compares it with its
 /// own.
-pub fn apply_to_scheduler<C: Clock, I: IdGenerator>(
+pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator>(
     outputs: &[Output],
     scheduler: &mut Scheduler<C, I>,
 ) {
@@ -586,7 +559,7 @@ where
     /// is not shorter than `timings.lease_length()`: a caller bug. A lone
     /// voter never needs a lease, so it may run with any suspicion timeout,
     /// zero among them.
-    pub fn new(
+    fn new(
         my_id: WorkerId,
         incarnation_id: IncarnationId,
         shard_id: ShardId,
@@ -631,7 +604,7 @@ where
     /// joins its shard later is checked when it is built, and every worker
     /// in a shard runs the same timings (see
     /// [`ElectionTimings::suspect_timeout`]).
-    pub fn genesis(
+    fn genesis(
         my_id: WorkerId,
         incarnation_id: IncarnationId,
         shard_id: ShardId,
@@ -674,7 +647,7 @@ where
     /// `timings.heartbeat_interval` is not shorter than
     /// `timings.lease_length()`: a caller bug. A joining node's electorate is
     /// never itself alone.
-    pub fn bootstrapping(
+    fn bootstrapping(
         my_id: WorkerId,
         incarnation_id: IncarnationId,
         shard_id: ShardId,
@@ -742,25 +715,17 @@ where
             stop_reason: None,
             reconnect_timeout: DEFAULT_RECONNECT_TIMEOUT,
             last_heard: BTreeMap::new(),
-            contact_floor: None,
-            orphan_abort_by: None,
-            reported_abort_deadline: None,
             configuration: None,
             admission: None,
             prior_admission: None,
             term: 0,
-            ballot: Ballot::default(),
-            own_roll_calls_suppressed_until: now,
-            next_roll_call_at: now,
-            roll_call: None,
-            vote: None,
+            round: ElectionRound::new(now),
             roster: None,
             leader: None,
             newest_accepted_ack: None,
             next_heartbeat: None,
             connected: BTreeSet::new(),
-            lease: QuorumContactLease::starting_at(now),
-            reported_grant: None,
+            lease: Lease::new(now),
             drain_requested: false,
             pending_removals: BTreeSet::new(),
             outputs: Vec::new(),
@@ -783,7 +748,7 @@ where
     /// registration from later could still lead after it had lapsed, and
     /// after another worker had found the shard with no one registered and
     /// re-founded it. No effect on a node with no authority.
-    pub fn registered_at(mut self, sent_at: Instant) -> Self {
+    fn registered_at(mut self, sent_at: Instant) -> Self {
         if let Some(lease) = self.authority.as_mut() {
             lease.restart_at(sent_at);
         }
@@ -796,7 +761,7 @@ where
     /// recognise its own epoch there. Built by [`Self::new`] or
     /// [`Self::genesis`], a node's epoch is otherwise of lineage 0. No
     /// effect on a node that has not joined a shard yet.
-    pub fn with_recovery_lineage(mut self, lineage: u64) -> Self {
+    fn with_recovery_lineage(mut self, lineage: u64) -> Self {
         if self.recovery_lineage.is_some() {
             self.recovery_lineage = Some(lineage);
         }
@@ -824,9 +789,20 @@ where
         self.term
     }
 
+    /// This node's clock's reading now: the time base of every instant it
+    /// reports, such as a grant's lease end.
+    pub fn now(&self) -> Instant {
+        self.clock.now()
+    }
+
     /// The timers this node runs its election on.
     pub fn timings(&self) -> ElectionTimings {
         self.timings
+    }
+
+    /// The id this node was started under (see [`Identity::id`]).
+    pub fn id(&self) -> &WorkerId {
+        &self.my_id
     }
 
     pub fn shard_id(&self) -> &ShardId {
@@ -844,7 +820,7 @@ where
     }
 
     /// This node's recovery epoch: its configuration's when built with one
-    /// ([`Self::new`]), taken from the leader a JOIN pointed it at
+    /// ([`Self::start`]), taken from the leader a JOIN pointed it at
     /// ([`Self::finish_joining`]), moved on by an authority-path recovery of
     /// its own, and adopted from the ack of a leader of a later epoch.
     pub fn recovery_epoch(&self) -> u64 {
@@ -911,11 +887,7 @@ where
     /// come back (the roll-call deadline must outlast it: see
     /// [`ElectionTimings::roll_call_deadline`]).
     pub fn roll_call_respondents(&self) -> impl Iterator<Item = &WorkerId> {
-        self.roll_call
-            .as_ref()
-            .filter(|round| self.state == WorkerState::RollCall && !round.is_abandoned())
-            .into_iter()
-            .flat_map(|round| round.respondents().keys())
+        self.round.respondents()
     }
 
     /// The leader this node would point a joining worker at, with the term
@@ -944,6 +916,24 @@ where
             _ => None,
         };
         named.filter(|(_, term)| *term >= self.highest_term_seen)
+    }
+
+    /// The `JOIN_RESPONSE` this node hands a joiner right now: the leader
+    /// [`Self::known_leader`] names (itself while `Leader`), with that
+    /// leader's term, at `leader_addr`, and this node's recovery epoch and
+    /// its lineage. `None` when it knows no leader.
+    ///
+    /// `leader_addr` is the named leader's address, which the node does not
+    /// know: its driver resolves it (see `known_leader` for whom to resolve).
+    pub fn join_response(&self, leader_addr: String) -> Option<JoinResponse> {
+        let (leader_id, term) = self.known_leader()?;
+        Some(JoinResponse {
+            leader_id: Some(leader_id.into()),
+            leader_multiaddr: leader_addr,
+            term,
+            recovery_epoch: self.recovery_epoch,
+            recovery_epoch_lineage: self.recovery_lineage.unwrap_or_default(),
+        })
     }
 
     /// Handles one input and returns what the node asks its driver to do,
@@ -983,9 +973,9 @@ where
     /// -> Active` edge in [`WorkerState::can_transition_to`], so this goes
     /// through `Joining` explicitly.
     ///
-    /// A no-op outside `Bootstrapping` — a node constructed via [`Self::new`]
-    /// (already `Active`) or one that already finished joining has nothing
-    /// left to join — and for a pointer that names no leader ("no leader
+    /// A no-op outside `Bootstrapping` — a node started as a founder or
+    /// inside a known configuration (already `Active`) or one that already
+    /// finished joining has nothing left to join — and for a pointer that names no leader ("no leader
     /// known") or a leader of a recovery epoch older than the node's own,
     /// which leaves the node `Bootstrapping` so its driver can ask again.
     ///
@@ -1008,8 +998,7 @@ where
     fn finish_step(&mut self) -> Step {
         self.ask_authority_if_due();
         self.heartbeat_leader_if_due();
-        self.report_grant_if_changed();
-        self.report_abort_deadline_if_changed();
+        self.report_lease_changes();
         Step {
             outputs: std::mem::take(&mut self.outputs),
             next_deadline: self.next_deadline(),
@@ -1054,8 +1043,7 @@ where
             .map(|lease| lease.next_deadline(self.state == WorkerState::Fenced));
         earliest(
             earliest(self.election_deadline(), lease_deadline),
-            self.leader_contact_stale_at()
-                .filter(|stale_at| *stale_at > self.clock.now()),
+            self.lease.next_deadline(&self.timings, self.clock.now()),
         )
     }
 
@@ -1073,16 +1061,12 @@ where
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
                 earliest(next_heartbeat, self.next_roll_call_due())
             }
-            WorkerState::RollCall => earliest(
-                next_heartbeat,
-                self.roll_call.as_ref().map(RollCallRound::deadline),
-            ),
-            WorkerState::Candidate => self.vote.as_ref().map(VoteRound::deadline),
+            WorkerState::RollCall => earliest(next_heartbeat, self.round.next_deadline()),
+            WorkerState::Candidate => self.round.next_deadline(),
             WorkerState::Leader => earliest(
-                self.roster.as_ref().and_then(|roster| {
-                    self.lease
-                        .no_quorum_at(&self.my_id, roster, self.timings.lease_length())
-                }),
+                self.roster
+                    .as_ref()
+                    .and_then(|roster| self.lease.no_quorum_at(&self.my_id, roster, &self.timings)),
                 self.next_worker_lost_at(),
             ),
             _ => None,
@@ -1106,8 +1090,7 @@ where
         );
         // No edge leads from `Leader` back to itself.
         if self.state == WorkerState::Leader {
-            self.raise_contact_floor_to_grant();
-            self.reported_grant = None;
+            self.lease.withdraw_grant(self.clock.now());
             self.outputs.push(Output::Grant(None));
             self.last_heard.clear();
         }
@@ -1204,15 +1187,11 @@ where
         self.last_leader_contact = now;
         // A token from a later instant than this node's own clock reads was
         // never sent by this node, and proves nothing.
-        if let Some(sent_at) = ack
-            .heartbeat_token
-            .filter(|token| *token <= now.as_ticks())
-            .map(Instant::at)
-        {
-            self.contact_floor = self.contact_floor.max(Some(sent_at));
-        }
-        // A leader acks it after it rejoined: it is a member again.
-        self.orphan_abort_by = None;
+        self.lease.acked(
+            ack.heartbeat_token
+                .filter(|token| *token <= now.as_ticks())
+                .map(Instant::at),
+        );
         self.leader = Some((ack.leader_id(), ack.term));
         self.newest_accepted_ack = Some(AckEcho {
             term: ack.term,
@@ -1236,8 +1215,7 @@ where
                 WorkerState::LeaderSuspect | WorkerState::RollCall | WorkerState::NoQuorum
             )
         {
-            self.roll_call = None;
-            self.vote = None;
+            self.round.stop();
             self.recovery = None;
             self.transition_to(WorkerState::Active);
         }
@@ -1337,7 +1315,7 @@ where
     ///   [`Self::can_start_roll_call`]). Each transition takes its own
     ///   `Tick`, so a single one never goes from `Active` to `RollCall`.
     /// - `RollCall`: at its roll call's deadline, stands as the candidate or
-    ///   goes `NoQuorum` (see [`Self::close_roll_call`]).
+    ///   goes `NoQuorum` (see [`ElectionRound::on_deadline`]).
     /// - `Candidate`: at its vote's deadline, not having won, suspects its
     ///   leader again (see [`Self::suspect_again`]).
     /// - `Leader`: reports every worker it has not heard from for too long
@@ -1354,32 +1332,20 @@ where
         match self.state {
             WorkerState::Active => {
                 if self.clock.now() - self.last_leader_contact > self.jittered_suspect_timeout() {
-                    self.next_roll_call_at = self.clock.now();
+                    self.round.may_call_from(self.clock.now());
                     self.transition_to(WorkerState::LeaderSuspect);
                 }
             }
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
                 if self.can_start_roll_call() {
-                    self.begin_roll_call();
+                    let now = self.clock.now();
+                    let timestamp_millis = self.clock.wall_clock_millis();
+                    self.decide(|round, view| round.begin_roll_call(view, timestamp_millis, now));
                 }
             }
-            WorkerState::RollCall => {
-                if self
-                    .roll_call
-                    .as_ref()
-                    .is_some_and(|round| self.clock.now() >= round.deadline())
-                {
-                    self.close_roll_call();
-                }
-            }
-            WorkerState::Candidate => {
-                if self
-                    .vote
-                    .as_ref()
-                    .is_some_and(|vote| self.clock.now() >= vote.deadline())
-                {
-                    self.suspect_again();
-                }
+            WorkerState::RollCall | WorkerState::Candidate => {
+                let now = self.clock.now();
+                self.decide(|round, view| round.on_deadline(view, now));
             }
             WorkerState::Leader => self.report_lost_workers(),
             _ => {}
@@ -1470,7 +1436,10 @@ where
         // `Output::AbortDeadline`). Removals pending take effect first, as
         // they can end the grant.
         self.apply_pending_removals();
-        let heartbeat_token = self.holds_grant_at(now).then_some(heartbeat.send_token);
+        let heartbeat_token = self
+            .lease
+            .holds_grant_at(self.office().as_ref(), &self.timings, now)
+            .then_some(heartbeat.send_token);
         self.send_ack(from, heartbeat_token);
     }
 
@@ -1519,43 +1488,41 @@ where
         }
     }
 
-    /// The grant this node's lease gives it: `None` unless it is `Leader`
-    /// with a lease. With an authority it also needs the recovery fence, and
-    /// the grant ends at the earlier of the fence and the quorum-contact
-    /// lease (design 4.5). Read afresh at the end of every step, never kept,
-    /// so it follows every move of either end.
-    fn grant(&self) -> Option<LeadershipGrant> {
+    /// What the lease reads of this node while it leads: `None` unless it
+    /// is `Leader`, and, with an authority, holds the recovery fence (design
+    /// 4.5), whose end also ends its grant.
+    fn office(&self) -> Option<Office<'_>> {
         if self.state != WorkerState::Leader {
             return None;
         }
-        let roster = self.roster.as_ref()?;
-        let quorum_contact_end = self
-            .lease
-            .end(&self.my_id, roster, self.timings.lease_length())?;
-        let valid_until = match &self.authority {
-            None => quorum_contact_end,
-            Some(lease) => {
-                let fence_end = lease.fence_valid_until()?;
-                LeaseEnd::At(match quorum_contact_end {
-                    LeaseEnd::Unbounded => fence_end,
-                    LeaseEnd::At(end) => end.min(fence_end),
-                })
-            }
+        let fence_end = match &self.authority {
+            None => LeaseEnd::Unbounded,
+            Some(lease) => LeaseEnd::At(lease.fence_valid_until()?),
         };
-        Some(LeadershipGrant {
+        Some(Office {
+            me: &self.my_id,
+            roster: self.roster.as_ref()?,
             term: self.term,
             recovery_epoch: self.recovery_epoch,
-            valid_until,
+            fence_end,
         })
     }
 
-    /// Reports this node's grant if it differs from the one last reported.
-    fn report_grant_if_changed(&mut self) {
-        let grant = self.grant();
-        if grant != self.reported_grant {
-            self.raise_contact_floor_to_grant();
-            self.reported_grant = grant;
-            self.outputs.push(Output::Grant(grant));
+    /// Reports this node's grant and abort deadline where they differ from
+    /// the ones last reported.
+    fn report_lease_changes(&mut self) {
+        let grant = self.lease.grant(self.office().as_ref(), &self.timings);
+        let changes = self.lease.report(
+            grant,
+            &self.timings,
+            self.lost_after(),
+            self.clock.now(),
+        );
+        for change in changes {
+            self.outputs.push(match change {
+                LeaseChange::Grant(grant) => Output::Grant(grant),
+                LeaseChange::AbortDeadline(deadline) => Output::AbortDeadline(deadline),
+            });
         }
     }
 
@@ -1566,21 +1533,16 @@ where
             .is_some_and(|due| self.clock.now() >= due)
     }
 
-    /// When a `LeaderSuspect` or `NoQuorum` node may start a roll call: at
-    /// `next_roll_call_at`, unless it answered another worker's roll call
-    /// less than two roll-call deadlines ago (ADR-0001 decision 5): that
-    /// worker is being elected, by its census and then its vote, so the
-    /// node waits until both could have ended.
+    /// When a `LeaderSuspect` or `NoQuorum` node may start a roll call (see
+    /// [`ElectionRound::roll_call_due`]).
     ///
     /// `None` for a node with no configuration: it has nothing to count a
     /// quorum against. It stays `LeaderSuspect`, still heartbeating its
     /// leader, until an ack from a leader returns it to `Active`.
     fn next_roll_call_due(&self) -> Option<Instant> {
-        self.configuration.as_ref().map(|_| {
-            self.next_roll_call_at
-                .max(self.own_roll_calls_suppressed_until)
-                .max(self.clock.now())
-        })
+        self.configuration
+            .as_ref()
+            .map(|_| self.round.roll_call_due(self.clock.now()))
     }
 
     /// The earliest term whose leader's acks this node accepts: the highest
@@ -1602,7 +1564,7 @@ where
     /// while `Leader`. `None` in every other state.
     fn term_in_play(&self) -> Option<u64> {
         match self.state {
-            WorkerState::RollCall => self.roll_call.as_ref().map(RollCallRound::term),
+            WorkerState::RollCall => self.round.roll_call_term(),
             WorkerState::Candidate | WorkerState::Leader => Some(self.term),
             _ => None,
         }
@@ -1648,7 +1610,7 @@ where
         let quorum_lost = |node: &Self| {
             node.roster.as_ref().is_some_and(|roster| {
                 node.lease
-                    .no_quorum_at(&node.my_id, roster, node.timings.lease_length())
+                    .no_quorum_at(&node.my_id, roster, &node.timings)
                     .is_some_and(|at| node.clock.now() >= at)
             })
         };
@@ -1670,62 +1632,15 @@ where
     /// Gives up the roll call, candidacy or recovery this node runs, if any,
     /// and puts its next roll call a fresh suspicion timeout away.
     fn retry_after_a_fresh_suspicion_timeout(&mut self) {
-        self.roll_call = None;
-        self.vote = None;
+        let retry_at = self.clock.now() + self.jittered_suspect_timeout();
+        self.round.retry_at(retry_at);
         self.recovery = None;
-        self.next_roll_call_at = self.clock.now() + self.jittered_suspect_timeout();
     }
 
     /// The latest term this node knows of: the highest it has seen, or that
     /// of the latest roll call it accepted, its own included, if later.
     fn latest_term(&self) -> u64 {
-        self.highest_term_seen
-            .max(self.ballot.highest_roll_call_term().unwrap_or(0))
-    }
-
-    /// The term this node's next roll call contests: the one after the
-    /// latest it knows of. A roll call that failed has taken its term, so
-    /// the next one contests a later term, where no answer or vote given to
-    /// the failed call stands in its way.
-    ///
-    /// # Panics
-    ///
-    /// If the latest term is already `u64::MAX`. Decode
-    /// ([`crate::protocol::messages::WellFormed`]) refuses that term from any
-    /// peer, so reaching it needs a peer bug that names `u64::MAX - 1`, plus
-    /// one roll call of this node's own. Wrapping instead would contest term
-    /// 0, below every term already seen, which is worse than a panic.
-    fn next_term(&self) -> u64 {
-        self.latest_term()
-            .checked_add(1)
-            .expect("a term overflowed u64::MAX")
-    }
-
-    /// Starts a roll call (ADR-0001 decisions 4 and 6) for the term after
-    /// the latest this node knows of, under its configuration: publishes it
-    /// to the shard, moves to `RollCall`, and records itself as its first
-    /// respondent. The call collects replies until its deadline (see
-    /// [`Self::close_roll_call`]), even one a single voter wins.
-    fn begin_roll_call(&mut self) {
-        let Some(configuration) = self.configuration.clone() else {
-            return;
-        };
-        self.recovery = None;
-        let term = self.next_term();
-        let round = RollCallRound::start(
-            term,
-            configuration,
-            self.clock.wall_clock_millis(),
-            self.my_id.clone(),
-            self.counted_admission(),
-            self.clock.now() + self.timings.roll_call_deadline,
-        );
-        self.ballot.record_own_roll_call(term, round.rank().clone());
-        let call = round.call(&self.shard_id);
-        self.roll_call = Some(round);
-
-        self.transition_to(WorkerState::RollCall);
-        self.publish(election_message::Payload::RollCall(call));
+        self.round.latest_term(self.highest_term_seen)
     }
 
     /// Records the leader `pointer` names and drives `Bootstrapping ->
@@ -1793,16 +1708,17 @@ where
                 self.on_leader_ack(&ack);
             }
             Some(Payload::RollCall(call)) if call.initiator_id() == from => {
-                self.on_roll_call(from, &call);
+                let now = self.clock.now();
+                self.decide(|round, view| round.on_roll_call(view, from, &call, now));
             }
             Some(Payload::RollCallReply(reply)) if reply.responder_id() == from => {
-                self.on_roll_call_reply(from, &reply);
+                self.decide(|round, view| round.on_roll_call_reply(view, from, &reply));
             }
             Some(Payload::VoteRequest(req)) if req.candidate_id() == from => {
-                self.on_vote_request(from, &req);
+                self.decide(|round, view| round.on_vote_request(view, from, &req));
             }
             Some(Payload::VoteGrant(grant)) if grant.voter_id() == from => {
-                self.on_vote_grant(from, &grant);
+                self.decide(|round, view| round.on_vote_grant(view, from, &grant));
             }
             Some(Payload::ElectionReject(reject)) if reject.rejecter_id() == from => {
                 self.on_election_reject(&reject);
@@ -1988,7 +1904,7 @@ where
     /// Starts an admission batch (ADR-0001 decision 9, see
     /// [`Roster::begin_batch`]) of every worker waiting to join that has
     /// confirmed one of this leader's acks recently enough to leave it a
-    /// lease worth having (see [`QuorumContactLease::admissible`]): sent
+    /// lease worth having (see [`Lease::admissible`]): sent
     /// within the last two heartbeat intervals, or no earlier than the
     /// lease's quorum-contact time. A worker that drained after its
     /// last confirmation, its SELF_REMOVE not yet here, may be taken too: the
@@ -2027,7 +1943,7 @@ where
                     .filter(|worker| roster.is_admissible(worker)),
                 &self.my_id,
                 roster,
-                self.timings.lease_length(),
+                &self.timings,
                 recent_since,
             )
             .into_iter()
@@ -2044,86 +1960,109 @@ where
         }
     }
 
-    /// What the ballot needs to know of this node to decide on a roll call
-    /// or a vote request. Only `Active`, `LeaderSuspect`, `RollCall` and
-    /// `NoQuorum` take part, a pending member among them.
-    fn as_voter(&self) -> Voter {
-        Voter {
-            takes_part: matches!(
-                self.state,
-                WorkerState::Active
-                    | WorkerState::LeaderSuspect
-                    | WorkerState::RollCall
-                    | WorkerState::NoQuorum
-            ),
-            recovery_epoch: self.recovery_epoch,
-            // Its own candidacies count here though they raise no term
-            // seen: it votes in no term at or below one it stood in.
-            highest_term_seen: self
-                .highest_term_seen
-                .max(self.ballot.highest_granted_term().unwrap_or(0)),
-            configuration_generation: self.configuration.as_ref().map(Configuration::generation),
-            leader_contact_is_fresh: self.current_leader_still_valid(),
-        }
+    /// Whether this node's state takes part in elections: only `Active`,
+    /// `LeaderSuspect`, `RollCall` and `NoQuorum` answer roll calls and
+    /// grant votes, a pending member among them.
+    fn takes_part_in_elections(&self) -> bool {
+        matches!(
+            self.state,
+            WorkerState::Active
+                | WorkerState::LeaderSuspect
+                | WorkerState::RollCall
+                | WorkerState::NoQuorum
+        )
     }
 
-    /// Handles a roll call published by `initiator` (see the `ballot` module
-    /// for the rules): answers it with this node's admission generation,
-    /// refuses it with the reason, or passes over a repeat of a call it
-    /// answered. A call for another shard is dropped. A call it answers is
-    /// electing someone, so the node starts no roll call of its own until a
-    /// roll-call deadline after it answered: a repeat of that call, passed
-    /// over, does not push that back.
-    ///
-    /// An initiator in `RollCall` that answers a better call for its own
-    /// term abandons its own call for it: it stays `RollCall` as that call's
-    /// respondent, and never stands as its own call's candidate.
-    fn on_roll_call(&mut self, initiator: WorkerId, call: &RollCall) {
-        if call.shard_id() != self.shard_id || initiator == self.my_id {
-            return;
-        }
-        let verdict = self.ballot.on_roll_call(
-            &self.as_voter(),
-            call.term,
-            call.configuration().generation(),
-            CallRank::of(call),
-        );
-        match verdict {
-            RollCallVerdict::Answer => {
-                // The call closes within a roll-call deadline of this
-                // answer, and its candidate's vote within another: a call of
-                // this node's own before then would only contest the next
-                // term against the worker it is helping elect.
-                let census_and_vote =
-                    Duration::from_ticks(self.timings.roll_call_deadline.as_ticks().saturating_mul(2));
-                let election_ends = self.clock.now() + census_and_vote;
-                self.own_roll_calls_suppressed_until =
-                    self.own_roll_calls_suppressed_until.max(election_ends);
-                let reply = RollCallReply {
-                    shard_id: Some(self.shard_id.clone().into()),
-                    term: call.term,
-                    initiator_id: Some(initiator.clone().into()),
-                    responder_id: Some(self.my_id.clone().into()),
-                    responder_address: String::new(),
-                    admission: self.admission.map(Into::into),
-                    prior_admission: self.prior_admission.map(Into::into),
-                };
-                self.send(initiator, election_message::Payload::RollCallReply(reply));
-                if self.state == WorkerState::RollCall
-                    && let Some(own) = self.roll_call.as_mut()
-                    && own.term() == call.term
-                {
-                    own.abandon();
+    /// Has this node's election round decide, through `decide`, with a view
+    /// of this node as it is now, and carries out what it decided (see
+    /// [`Self::apply`]).
+    fn decide(&mut self, decide: impl FnOnce(&mut ElectionRound, &View<'_>) -> Vec<Verdict>) {
+        let admission = self.counted_admission();
+        let takes_part = self.takes_part_in_elections();
+        let leader_contact_is_fresh = self.current_leader_still_valid();
+        let view = View {
+            me: &self.my_id,
+            shard: &self.shard_id,
+            recovery_epoch: self.recovery_epoch,
+            highest_term_seen: self.highest_term_seen,
+            configuration: self.configuration.as_ref(),
+            admission,
+            takes_part,
+            leader_contact_is_fresh,
+            roll_call_deadline: self.timings.roll_call_deadline,
+        };
+        let verdicts = decide(&mut self.round, &view);
+        self.apply(verdicts);
+    }
+
+    /// Carries out, in order, what this node's election round decided:
+    /// sends and publishes its messages, and moves this node's state, term
+    /// and highest term seen as each verdict says.
+    fn apply(&mut self, verdicts: Vec<Verdict>) {
+        use election_message::Payload;
+        for verdict in verdicts {
+            match verdict {
+                Verdict::Publish(call) => {
+                    self.recovery = None;
+                    self.transition_to(WorkerState::RollCall);
+                    self.publish(Payload::RollCall(call));
                 }
+                Verdict::Answer { initiator, reply } => {
+                    self.send(initiator, Payload::RollCallReply(reply));
+                }
+                Verdict::Reject {
+                    to,
+                    term,
+                    reason,
+                    name_leader,
+                } => self.send_reject(to, term, reason, name_leader),
+                Verdict::Stand { term } => {
+                    self.transition_to(WorkerState::Candidate);
+                    self.term = term;
+                }
+                Verdict::AskVotes { voters, request } => {
+                    for voter in voters {
+                        self.send(voter, Payload::VoteRequest(request.clone()));
+                    }
+                }
+                Verdict::Grant { candidate, grant } => {
+                    // Granting makes an initiator contesting an earlier term
+                    // step down.
+                    self.highest_term_seen = self.highest_term_seen.max(grant.term);
+                    self.step_down_if_outpaced();
+                    self.send(candidate, Payload::VoteGrant(grant));
+                }
+                Verdict::Certify {
+                    respondent,
+                    certificate,
+                } => self.send(respondent, Payload::ElectionCertificate(certificate)),
+                Verdict::Won { term, roster } => {
+                    self.term = term;
+                    self.take_office(roster);
+                }
+                Verdict::NoQuorum {
+                    term,
+                    configuration,
+                    respondents,
+                } => {
+                    self.lose_quorum();
+                    if self.authority.is_some() {
+                        self.begin_forced_recovery(term, configuration, respondents);
+                    }
+                }
+                Verdict::SuspectAgain => self.suspect_again(),
             }
-            RollCallVerdict::Reject(reason) => {
-                // A caller left on an earlier recovery epoch learns who leads
-                // the current one, whose ack then moves it on.
-                let name_leader = reason == ElectionRejectReason::LeaderStillValid
-                    || call.configuration().generation().recovery_epoch() < self.recovery_epoch;
-                self.send_reject(initiator, call.term, reason, name_leader);
-            }
-            RollCallVerdict::Pass | RollCallVerdict::Drop => {}
+            // The round's roll call and vote stand in for these states'
+            // checks (see `ElectionRound`), so they must move together.
+            debug_assert_eq!(
+                self.round.roll_call_term().is_some(),
+                self.state == WorkerState::RollCall,
+                "a roll call runs exactly while the node is RollCall"
+            );
+            debug_assert!(
+                !self.round.is_standing() || self.state == WorkerState::Candidate,
+                "a vote runs only while the node is Candidate"
+            );
         }
     }
 
@@ -2161,141 +2100,6 @@ where
         self.send(initiator, election_message::Payload::ElectionReject(reject));
     }
 
-    /// Records a reply to this node's current roll call from `responder`.
-    /// Ignored unless it answers that call (same shard, term and initiator)
-    /// and the call is not abandoned. While `RollCall` the call counts the
-    /// respondent at its deadline (see [`Self::close_roll_call`]); once this
-    /// node is the call's candidate, a new respondent is asked for its vote.
-    fn on_roll_call_reply(&mut self, responder: WorkerId, reply: &RollCallReply) {
-        if reply.shard_id() != self.shard_id || reply.initiator_id() != self.my_id {
-            return;
-        }
-        match self.state {
-            WorkerState::RollCall => {
-                let Some(round) = self.roll_call.as_mut() else {
-                    return;
-                };
-                if round.term() == reply.term {
-                    round.record(responder, answered_admission(reply));
-                }
-            }
-            WorkerState::Candidate => {
-                let Some(vote) = self.vote.as_mut() else {
-                    return;
-                };
-                if vote.term() == reply.term
-                    && vote.record_respondent(responder.clone(), answered_admission(reply))
-                {
-                    self.send_vote_request(responder);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Decides on this node's roll call once its deadline has come
-    /// (ADR-0001 decisions 13 and 15). If the returning voters among its
-    /// respondents are a quorum, the node stands as the candidate (see
-    /// [`Self::stand`]); if not, its quorum is out of reach and it goes
-    /// `NoQuorum` (see [`Self::lose_quorum`]), and with an authority takes
-    /// the authority path (see [`Self::begin_forced_recovery`]). A call it abandoned for a
-    /// better one, whose leader has not acked it by now, or a call for a
-    /// term it has already seen a vote or leader in, leaves it suspecting
-    /// its leader again (see [`Self::suspect_again`]).
-    fn close_roll_call(&mut self) {
-        let Some(round) = &self.roll_call else {
-            return;
-        };
-        if round.is_abandoned() || round.term() <= self.highest_term_seen {
-            self.suspect_again();
-        } else if round.has_returning_quorum() {
-            self.stand();
-        } else {
-            let round = round.clone();
-            self.lose_quorum();
-            if self.authority.is_some() {
-                self.begin_forced_recovery(&round);
-            }
-        }
-    }
-
-    /// Stands as the candidate of this node's roll call: moves to
-    /// `Candidate` for the call's term, grants itself its own vote, and asks
-    /// every other respondent for theirs, which must come in within a
-    /// roll-call deadline. A single-voter configuration is won there and
-    /// then.
-    fn stand(&mut self) {
-        let Some(round) = self.roll_call.take() else {
-            return;
-        };
-        let vote = VoteRound::stand(round, self.clock.now() + self.timings.roll_call_deadline);
-        let term = vote.term();
-        let voters = vote.voters_to_ask();
-
-        self.transition_to(WorkerState::Candidate);
-        self.term = term;
-        // Its own vote does not raise `highest_term_seen`: a candidacy that
-        // lapses unwon leaves no term anyone else voted in, and the leader
-        // that outlasted it must still be one this node can follow (ADR-0001
-        // decision 14 as amended 2026-09-28). The ballot records the vote,
-        // so this node answers and grants nothing for this term or an
-        // earlier one (see `Self::as_voter`), and a win raises the term
-        // seen (see `Self::take_office`).
-        self.ballot.record_own_grant(term, &self.my_id);
-        self.vote = Some(vote);
-        for voter in voters {
-            self.send_vote_request(voter);
-        }
-        self.win_if_quorum();
-    }
-
-    /// Asks `voter` for its vote in this node's current candidacy.
-    fn send_vote_request(&mut self, voter: WorkerId) {
-        let Some(vote) = &self.vote else {
-            return;
-        };
-        let request = vote.request(&self.shard_id, self.recovery_epoch);
-        self.send(voter, election_message::Payload::VoteRequest(request));
-    }
-
-    /// Handles `candidate`'s request for this node's vote (README §12.6
-    /// `on_vote_request`; see the `ballot` module for the rules). A request for
-    /// another shard is ignored; every refusal is answered with the reason.
-    /// Granting raises this node's highest term seen to the request's term,
-    /// which makes an initiator contesting an earlier one step down.
-    fn on_vote_request(&mut self, candidate: WorkerId, req: &VoteRequest) {
-        if req.shard_id() != self.shard_id {
-            return;
-        }
-        let verdict = self.ballot.on_vote_request(
-            &self.as_voter(),
-            req.recovery_epoch,
-            req.term,
-            req.roll_call_generation(),
-            &candidate,
-        );
-        match verdict {
-            VoteVerdict::Grant => {
-                self.highest_term_seen = self.highest_term_seen.max(req.term);
-                self.step_down_if_outpaced();
-                let grant = VoteGrant {
-                    shard_id: Some(self.shard_id.clone().into()),
-                    recovery_epoch: self.recovery_epoch,
-                    term: req.term,
-                    candidate_id: Some(candidate.clone().into()),
-                    voter_id: Some(self.my_id.clone().into()),
-                };
-                self.send(candidate, election_message::Payload::VoteGrant(grant));
-            }
-            VoteVerdict::Reject(reason) => self.send_reject(
-                candidate,
-                req.term,
-                reason,
-                reason == ElectionRejectReason::LeaderStillValid,
-            ),
-        }
-    }
-
     /// How long this node, while `Active`, goes without an accepted leader
     /// ack before it suspects its leader (ADR-0001 decision 15):
     /// `suspect_timeout` lengthened by less than a half, by a share hashed
@@ -2314,27 +2118,6 @@ where
 
     fn current_leader_still_valid(&self) -> bool {
         self.clock.now() - self.last_leader_contact <= self.timings.suspect_timeout
-    }
-
-    /// Records `voter`'s vote for this node's candidacy, then checks whether
-    /// it has won. Ignored unless this node is a `Candidate`, the grant is
-    /// for its own candidacy (same term, shard and recovery epoch, addressed
-    /// to this node), and the voter answered its roll call.
-    fn on_vote_grant(&mut self, voter: WorkerId, grant: &VoteGrant) {
-        if self.state != WorkerState::Candidate || grant.term != self.term {
-            return;
-        }
-        if grant.shard_id() != self.shard_id
-            || grant.recovery_epoch != self.recovery_epoch
-            || grant.candidate_id() != self.my_id
-        {
-            return;
-        }
-        let Some(vote) = self.vote.as_mut() else {
-            return;
-        };
-        vote.record_grant(voter);
-        self.win_if_quorum();
     }
 
     /// Learns what a refusal of this node's roll call or vote request tells
@@ -2400,7 +2183,7 @@ where
     /// amended 2026-09-28). Only a node that takes part in elections without
     /// standing or leading adopts it.
     fn adopt_relayed_commit(&mut self, offered: Configuration) {
-        if !self.as_voter().takes_part {
+        if !self.takes_part_in_elections() {
             return;
         }
         let Some(admission) = self
@@ -2413,55 +2196,6 @@ where
         self.configuration = Some(offered);
         self.admission = Some(admission);
         self.prior_admission = None;
-    }
-
-    /// Once this candidacy has won (see the `vote_round` module), becomes
-    /// `Leader` of what its roll call's respondents found (see
-    /// [`Roster::after_election`]): under a single configuration, a joint
-    /// one whose new side is the respondents, each admitted at its new
-    /// generation, and whose old side is the configuration the roll call ran
-    /// under; under a joint configuration not yet committed, that one
-    /// re-stamped at a generation of this term and re-based there, each
-    /// respondent its new side counted re-admitted at it. It sends every
-    /// other respondent an `ElectionCertificate`
-    /// (README §12.6) naming that configuration and the respondent's
-    /// admission generations there, and takes office as the leader of a
-    /// roster of the respondents with no ack confirmed yet (see
-    /// [`Self::take_office`]).
-    fn win_if_quorum(&mut self) {
-        if !self.vote.as_ref().is_some_and(VoteRound::has_won) {
-            return;
-        }
-        let Some(vote) = self.vote.take() else {
-            return;
-        };
-        let census = vote.census();
-        let roster = Roster::after_election(
-            self.recovery_epoch,
-            self.term,
-            census.configuration(),
-            census.respondents(),
-        );
-        for respondent in census.respondents().keys() {
-            if *respondent != self.my_id {
-                let certificate = ElectionCertificate {
-                    shard_id: Some(self.shard_id.clone().into()),
-                    recovery_epoch: self.recovery_epoch,
-                    term: self.term,
-                    leader_id: Some(self.my_id.clone().into()),
-                    configuration: Some(roster.configuration().into()),
-                    recipient_admission: roster.admission_of(respondent).map(Into::into),
-                    recipient_prior_admission: roster
-                        .prior_admission_of(respondent)
-                        .map(Into::into),
-                };
-                self.send(
-                    respondent.clone(),
-                    election_message::Payload::ElectionCertificate(certificate),
-                );
-            }
-        }
-        self.take_office(roster);
     }
 
     /// Commits the joint configuration this leader leads once a majority of
@@ -2505,7 +2239,7 @@ where
         {
             return;
         }
-        let voted_for_it = self.ballot.granted_in(certificate.term) == Some(leader);
+        let voted_for_it = self.round.granted_in(certificate.term) == Some(leader);
         if certificate.term < self.ack_floor() && !voted_for_it {
             return;
         }
@@ -2657,11 +2391,11 @@ where
         if !lapsed || !takes_part {
             return false;
         }
-        self.roll_call = None;
-        self.vote = None;
+        self.round.stop();
         self.recovery = None;
         self.transition_to(WorkerState::Fenced);
-        self.orphan_abort_by = Some(now + self.timings.less_drift(self.reconnect_timeout));
+        self.lease
+            .orphaned(now, &self.timings, self.reconnect_timeout);
         true
     }
 
@@ -2683,7 +2417,7 @@ where
         }
         match Reconnect::decide(self.own_recovery_epoch(), authority_epoch) {
             Reconnect::Resume => {
-                self.orphan_abort_by = None;
+                self.lease.resumed();
                 self.last_leader_contact = now;
                 self.transition_to(WorkerState::Active);
             }
@@ -2699,9 +2433,7 @@ where
         self.admission = None;
         self.prior_admission = None;
         self.newest_accepted_ack = None;
-        self.ballot = Ballot::default();
-        self.roll_call = None;
-        self.vote = None;
+        self.round.forget();
         self.recovery = None;
         self.roster = None;
     }
@@ -2726,15 +2458,17 @@ where
         self.highest_term_seen = term;
     }
 
-    /// Takes the authority path once this node's roll call has fallen short
-    /// of its returning quorum (see the `forced_recovery` module): asks for
-    /// the shard's live registrations. The node is already `NoQuorum`.
-    fn begin_forced_recovery(&mut self, round: &RollCallRound) {
-        self.recovery = Some(ForcedRecovery::start(
-            round.term(),
-            round.configuration().clone(),
-            round.respondents().clone(),
-        ));
+    /// Takes the authority path once this node's roll call for `term` under
+    /// `configuration` has fallen short of its returning quorum, with these
+    /// `respondents` (see the `forced_recovery` module): asks for the
+    /// shard's live registrations. The node is already `NoQuorum`.
+    fn begin_forced_recovery(
+        &mut self,
+        term: u64,
+        configuration: Configuration,
+        respondents: BTreeMap<WorkerId, Admission>,
+    ) {
+        self.recovery = Some(ForcedRecovery::start(term, configuration, respondents));
         self.await_authority(AuthorityRequest::ReadLiveRegistrations);
     }
 
@@ -2999,7 +2733,7 @@ where
         self.roster = Some(roster);
         self.commit_if_confirmed();
 
-        self.lease = QuorumContactLease::starting_at(now);
+        self.lease.won(now);
         if let Some(lease) = self.authority.as_mut()
             && lease.fence_valid_until().is_none()
         {
@@ -3018,75 +2752,6 @@ where
         }
     }
 
-    /// No rival leader can win before the grant this node last reported
-    /// ends (see [`Output::AbortDeadline`]): as that grant is replaced or
-    /// withdrawn, raises its contact floor to its end, or to now if it ends
-    /// later.
-    fn raise_contact_floor_to_grant(&mut self) {
-        let Some(grant) = self.reported_grant else {
-            return;
-        };
-        let now = self.clock.now();
-        let floor = match grant.valid_until {
-            LeaseEnd::Unbounded => now,
-            LeaseEnd::At(end) => end.min(now),
-        };
-        self.contact_floor = self.contact_floor.max(Some(floor));
-    }
-
-    /// Whether this node leads with a grant that has not ended at `now`.
-    fn holds_grant_at(&self, now: Instant) -> bool {
-        self.grant().is_some_and(|grant| match grant.valid_until {
-            LeaseEnd::Unbounded => true,
-            LeaseEnd::At(end) => end > now,
-        })
-    }
-
-    /// This node's contact floor, counting the end of the grant it holds,
-    /// which no rival leader can precede. `None` while that grant is
-    /// unbounded, since no rival can win at all, and before any leader has
-    /// heard this node.
-    fn effective_contact_floor(&self) -> Option<Instant> {
-        match self.reported_grant.map(|grant| grant.valid_until) {
-            Some(LeaseEnd::Unbounded) => None,
-            Some(LeaseEnd::At(end)) => Some(self.contact_floor.map_or(end, |floor| floor.max(end))),
-            None => self.contact_floor,
-        }
-    }
-
-    /// When this node goes a suspicion timeout, less drift, past its contact
-    /// floor: from then on a leader may already count it silent, and it
-    /// must be ready to abort.
-    fn leader_contact_stale_at(&self) -> Option<Instant> {
-        self.effective_contact_floor()
-            .map(|floor| floor + self.timings.lease_length())
-    }
-
-    /// The instant by which this node must have aborted its TaskRuns, if
-    /// any (see [`Output::AbortDeadline`]): the earlier of a suspicion
-    /// timeout and a reconnect timeout, less drift, past its contact floor,
-    /// once that floor is stale, and the deadline it took when it fenced
-    /// itself.
-    fn abort_deadline(&self) -> Option<Instant> {
-        let now = self.clock.now();
-        let out_of_contact = self
-            .leader_contact_stale_at()
-            .filter(|stale_at| *stale_at <= now)
-            .and(self.effective_contact_floor())
-            .map(|floor| floor + self.timings.less_drift(self.lost_after()));
-        earliest(out_of_contact, self.orphan_abort_by)
-    }
-
-    /// Reports this node's abort deadline if it differs from the one last
-    /// reported.
-    fn report_abort_deadline_if_changed(&mut self) {
-        let deadline = self.abort_deadline();
-        if deadline != self.reported_abort_deadline {
-            self.reported_abort_deadline = deadline;
-            self.outputs.push(Output::AbortDeadline(deadline));
-        }
-    }
-
     /// When the leader next has a worker to report lost: a suspicion timeout
     /// and a reconnect timeout after it last heard from the one it heard
     /// from longest ago.
@@ -3097,6 +2762,10 @@ where
             .map(|heard| *heard + self.lost_after())
     }
 
+    /// How long a leader goes without hearing from a worker before it
+    /// reports that worker lost: a suspicion timeout and then a reconnect
+    /// timeout. The worker's own abort deadline counts from the same span
+    /// (see [`Lease::report`]), so it aborts before any leader replays it.
     fn lost_after(&self) -> Duration {
         Duration::from_ticks(
             self.timings
@@ -3121,14 +2790,6 @@ where
             self.last_heard.remove(&worker);
             self.outputs.push(Output::WorkerLost(worker));
         }
-    }
-}
-
-/// The admission generations `reply` answered a roll call with.
-fn answered_admission(reply: &RollCallReply) -> Admission {
-    Admission {
-        current: reply.admission(),
-        prior: reply.prior_admission(),
     }
 }
 

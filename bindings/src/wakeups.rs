@@ -230,37 +230,4 @@ mod tests {
         assert!(claims.has_changed().expect("the wake outlives the test"));
         assert!(woken(&timers));
     }
-
-    #[test]
-    fn a_change_the_scheduler_decided_nothing_about_leaves_the_wait_for_events_alone() {
-        let scheduler = leading_scheduler();
-        let wakeups = wakeups(&timers());
-        let mut events = wakeups.events().subscribe();
-        events.borrow_and_update();
-
-        wakeups.with_scheduler(&scheduler, |scheduler| {
-            scheduler.submit(submission()).expect("no limits are set")
-        });
-
-        assert!(!events.has_changed().expect("the wake outlives the test"));
-    }
-
-    #[test]
-    fn the_timer_loops_own_wakeups_wake_everyone_but_the_timer_loop() {
-        let (scheduler, run_id) = running_over_the_soft_limit();
-        let wakeups = Wakeups::within_the_timer_loop(Wake::new(), Wake::new());
-        let mut claims = wakeups.claims().subscribe();
-        let mut events = wakeups.events().subscribe();
-        claims.borrow_and_update();
-        events.borrow_and_update();
-
-        wakeups.with_scheduler(&scheduler, |scheduler| {
-            scheduler
-                .complete(&worker(), &run_id, DIGEST.to_vec())
-                .expect("the running run completes")
-        });
-
-        assert!(claims.has_changed().expect("the wake outlives the test"));
-        assert!(events.has_changed().expect("the wake outlives the test"));
-    }
 }

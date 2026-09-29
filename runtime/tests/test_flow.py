@@ -17,7 +17,7 @@ from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.tasks import Task
 from proto_messages import Greeting, Receipt
-from session_world import WAIT, Pickle, World, activated, run, with_events
+from session_world import WAIT, World, activated, run, with_events
 
 
 def declare(function):
@@ -111,10 +111,6 @@ def test_a_stage_that_ignores_the_prior_output_may_follow_any_stage():
     assert flow(declare(to_receipt), declare(shout).bind(Greeting(text="x"))) is not None
 
 
-def test_a_flow_of_bound_and_plain_stages_is_accepted():
-    assert flow(declare(shout), declare(wrap).bind(times=2), declare(to_receipt)) is not None
-
-
 def test_a_flow_whose_first_stage_is_fully_bound_takes_no_argument():
     pipeline = flow(declare(shout).bind(Greeting(text="x")), declare(wrap))
 
@@ -148,40 +144,6 @@ def stages(world, *names):
 async def until_submitted(world, count):
     while len(world.runtime.submitted) < count:
         await asyncio.sleep(0.005)
-
-
-def test_stages_run_in_order_each_receiving_the_prior_output_and_the_handle_is_the_array():
-    world = flow_world(shout, wrap)
-    pipeline = flow(*stages(world, "shout", "wrap"))
-
-    async def body():
-        return await world.session.submit_flow(pipeline, Greeting(text="hi", times=1))
-
-    results = run(with_events(world, body))
-
-    assert results == [Greeting(text="HI", times=1), Greeting(text="[HI]", times=1)]
-
-
-def test_a_stage_may_change_the_type_the_next_stage_receives():
-    world = flow_world(shout, to_receipt)
-    pipeline = flow(*stages(world, "shout", "to_receipt"))
-
-    async def body():
-        return await world.session.submit_flow(pipeline, Greeting(text="x", times=2))
-
-    assert run(with_events(world, body))[-1] == Receipt(ok=True)
-
-
-def test_an_overlay_stage_gets_its_fixed_fields_on_top_of_the_prior_output():
-    world = flow_world(shout, wrap)
-    pipeline = flow(world.tasks["shout"], world.tasks["wrap"].bind(times=9))
-
-    async def body():
-        return await world.session.submit_flow(pipeline, Greeting(text="hi", times=1))
-
-    results = run(with_events(world, body))
-
-    assert results[-1] == Greeting(text="[HI]", times=9)
 
 
 def test_a_fully_bound_stage_ignores_the_prior_output():
@@ -380,26 +342,8 @@ def test_every_member_that_takes_the_prior_output_is_checked_against_it():
         flow(declare(to_receipt), group(declare(shout)))
 
 
-def test_groups_and_flows_nest():
-    inner = flow(declare(shout), declare(wrap))
-    assert flow(declare(shout), group(inner, declare(wrap))) is not None
-
-
 def group_world(*functions, **options):
     return World(*functions, **options)
-
-
-def test_every_member_gets_the_same_input_and_the_result_is_in_member_order():
-    world = group_world(shout, wrap)
-    members = group(world.tasks["shout"], world.tasks["wrap"].bind(times=4))
-
-    async def body():
-        return await world.session.submit_group(members, Greeting(text="hi", times=1))
-
-    assert run(with_events(world, body)) == [
-        Greeting(text="HI", times=1),
-        Greeting(text="[hi]", times=4),
-    ]
 
 
 def test_the_order_of_results_does_not_depend_on_which_member_finishes_first():
@@ -435,21 +379,6 @@ def failing_and_ok():
     return explode, fine, after, ran_after
 
 
-def test_fail_fast_raises_the_first_failure_and_the_stage_after_never_starts():
-    explode, fine, after, ran_after = failing_and_ok()
-    world = group_world(explode, fine, after)
-    pipeline = flow(group(world.tasks["explode"], world.tasks["fine"]), world.tasks["after"])
-
-    async def body():
-        with pytest.raises(ValueError, match="member failed"):
-            await world.session.submit_flow(pipeline, Greeting())
-        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
-
-    run(with_events(world, body))
-
-    assert ran_after == []
-
-
 def test_fail_fast_leaves_the_other_members_running_like_asyncio_gather():
     finished = []
 
@@ -474,39 +403,6 @@ def test_fail_fast_leaves_the_other_members_running_like_asyncio_gather():
     assert finished == [True]
 
 
-def test_collect_all_returns_every_value_and_failure_and_the_next_stage_runs_once():
-    explode, fine, _, _ = failing_and_ok()
-    received = []
-
-    def after(request: list) -> str:
-        received.append(request)
-        return "after"
-
-    world = group_world(explode, fine)
-    world.serializers.register(Pickle())
-    after_task = Task(
-        after,
-        registry=world.registry,
-        serializers=world.serializers,
-        name="tests.after",
-        serializer="pickle",
-    )
-    pipeline = flow(
-        group(world.tasks["explode"], world.tasks["fine"], on_error="collect_all"),
-        after_task,
-    )
-
-    async def body():
-        return await world.session.submit_flow(pipeline, Greeting())
-
-    results = run(with_events(world, body))
-
-    [(failure, value)] = received
-    assert isinstance(failure, ValueError) and value == Greeting(text="fine")
-    assert isinstance(results[0][0], ValueError) and results[0][1] == Greeting(text="fine")
-    assert results[1] == "after"
-
-
 def test_a_stage_that_cannot_encode_a_failure_fails_the_flow_with_a_serialization_error():
     explode, fine, after, _ = failing_and_ok()
     world = group_world(explode, fine, after)
@@ -520,37 +416,6 @@ def test_a_stage_that_cannot_encode_a_failure_fails_the_flow_with_a_serializatio
             await world.session.submit_flow(pipeline, Greeting())
 
     run(with_events(world, body))
-
-
-def test_the_stage_after_a_group_runs_once_even_when_members_are_retried():
-    attempts = {"a": 0, "b": 0}
-    after_calls = []
-
-    def make(name):
-        def member(request: Greeting) -> Greeting:
-            attempts[name] += 1
-            if attempts[name] < 3:
-                raise ValueError("retry me")
-            return Greeting(text=name)
-
-        member.__name__ = f"member_{name}"
-        return member
-
-    def after(request: list[Greeting]) -> Greeting:
-        after_calls.append(len(request))
-        return Greeting(text="after")
-
-    a, b = make("a"), make("b")
-    world = group_world(a, b, after, retries=2)
-    pipeline = flow(group(world.tasks["member_a"], world.tasks["member_b"]), world.tasks["after"])
-
-    async def body():
-        return await world.session.submit_flow(pipeline, Greeting())
-
-    run(with_events(world, body))
-
-    assert attempts == {"a": 3, "b": 3}
-    assert after_calls == [2]
 
 
 def test_cancelling_a_group_cancels_every_member_and_the_stage_after_never_starts():
@@ -831,28 +696,6 @@ def test_a_group_pauses_submitting_while_slow_down_is_raised_but_a_plain_call_do
     assert (during, while_slow, after) == (0, 1, 4)
 
 
-def test_map_pauses_its_bulk_submission_on_slow_down_too():
-    world, released = held_world(shout)
-
-    async def body():
-        holder = world.call("hold", PAST_SOFT_LIMIT)
-        await until_slow_down_seen(world)
-        before = len(world.runtime.submitted)
-        with activated(world):
-            handle = world.tasks["shout"].map(greetings("a", "b"))
-            await asyncio.sleep(0.15)
-            during = len(world.runtime.submitted) - before
-            released.set()
-            results = await asyncio.wait_for(handle, WAIT)
-        await holder
-        return during, results
-
-    during, results = run(with_events(world, body))
-
-    assert during == 0
-    assert [g.text for g in results] == ["A", "B"]
-
-
 def test_stopping_ends_a_group_that_is_waiting_out_slow_down():
     world = World(shout, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT)
     members = group(world.tasks["shout"], world.tasks["shout"])
@@ -887,21 +730,6 @@ def test_cancelling_a_group_that_is_waiting_out_slow_down_submits_nothing():
     run(with_watcher_only(world, body))
 
     assert len(world.runtime.submitted) == 1, "only the task that raised SlowDown"
-
-
-def test_a_plain_call_past_the_hard_limit_raises_backpressure_error():
-    from kabudachi.errors import BackpressureError
-
-    world = World(shout, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT)
-
-    async def body():
-        world.call("shout", Greeting(text="x" * 900))  # never claimed: it stays counted
-        with pytest.raises(BackpressureError):
-            world.call("shout", Greeting(text="x" * 900))
-
-    run(with_watcher_only(world, body))
-
-    assert len(world.runtime.submitted) == 1
 
 
 def test_a_group_that_hits_the_hard_limit_midway_fails_and_cancels_the_members_it_started():

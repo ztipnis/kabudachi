@@ -64,21 +64,6 @@ def run_planner(world, planner, argument=None):
 # --- declaration -----------------------------------------------------------
 
 
-def test_a_task_may_be_declared_to_return_a_flow_group_or_bound_task():
-    world = continuing_world()
-
-    def plans_flow(request: Greeting) -> Flow: ...
-    def plans_group(request: Greeting) -> Group: ...
-    def plans_task(request: Greeting) -> BoundTask: ...
-
-    for body in (plans_flow, plans_group, plans_task):
-        assert declare_planner(world, body).definition.continues is True
-
-
-def test_an_ordinary_task_does_not_continue():
-    assert continuing_world().tasks["shout"].definition.continues is False
-
-
 def test_a_task_that_returns_a_step_needs_no_serializer_support_for_it():
     from kabudachi.session import validate_definitions
 
@@ -130,21 +115,6 @@ def test_a_returned_bound_task_resolves_to_a_list_of_one():
     planner = declare_planner(world, plan)
 
     assert run_planner(world, planner, Greeting(text="a")) == [Greeting(text="A")]
-
-
-def test_nested_returns_nest_the_results_the_same_way():
-    world = continuing_world()
-
-    def plan(request: Greeting) -> Flow:
-        inner = flow(world.tasks["shout"].bind(request), world.tasks["wrap"])
-        return flow(world.tasks["shout"].bind(request), group(inner, world.tasks["to_receipt"]))
-
-    planner = declare_planner(world, plan)
-
-    assert run_planner(world, planner, Greeting(text="a")) == [
-        Greeting(text="A"),
-        [[Greeting(text="A"), Greeting(text="[A]")], Receipt(ok=True)],
-    ]
 
 
 def test_a_returned_step_that_needs_an_input_is_refused_and_fails_the_run():

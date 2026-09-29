@@ -7,6 +7,8 @@
 # reformatting pass.
 # gazelle:exclude core
 # gazelle:exclude bindings
+# gazelle:exclude net
+# gazelle:exclude testkit
 
 load("@aspect_gazelle_prebuilt//:def.bzl", "aspect_gazelle")
 load("@aspect_rules_py//uv/unstable:defs.bzl", "gazelle_python_manifest")

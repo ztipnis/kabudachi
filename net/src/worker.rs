@@ -28,15 +28,16 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Output, WorkerNode};
+use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::RealClock;
 use libp2p::{Multiaddr, identity};
 
-use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, bootstrap_node};
+use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, bootstrap};
 use crate::driver::{SharedAuthority, run_driver};
-use crate::messenger::{DEFAULT_JOIN_PEER_TIMEOUT, ListenRejected, Net};
+use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
+use crate::messenger::{ListenRejected, Net};
 use crate::swarm::build_swarm;
 
 /// A coordination authority and the timings a worker's node keeps its
@@ -152,14 +153,15 @@ impl Worker {
     }
 
     /// This worker's network, for what its node does not do itself, such as
-    /// claiming tasks from its leader (`Net::request_claim`). Only
+    /// claiming tasks from the leader its node names (`Net::request_claim`,
+    /// given the leader `observe` last saw in [`Self::run`]). Only
     /// [`Self::run`] drives a node on it.
     pub fn net(&self) -> Arc<Net> {
         Arc::clone(&self.net)
     }
 
     /// Bootstraps this worker into its shard, then drives its node for good.
-    /// `observe` is called after every batch the driver runs (see
+    /// `observe` is called after every step the driver carries out (see
     /// `run_driver`). Stop the worker by dropping the returned future; a
     /// worker stopped this way is gone, and a new one must be started.
     ///
@@ -167,31 +169,41 @@ impl Worker {
     /// it goes back to `Bootstrapping`; the driver rejoins it through the
     /// workers the authority lists (see `run_driver`), without founding
     /// anything: the epoch it rejoins shows the shard exists.
-    pub async fn run(self, observe: impl FnMut(&WorkerNode<RealClock>, &[Output])) -> Infallible {
+    pub async fn run(
+        self,
+        observe: impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
+    ) -> Infallible {
         let Worker { net, config } = self;
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
-        // The worker's id is already unique to this incarnation.
-        let incarnation_id = IncarnationId::new(my_id.as_str());
-        let mut node = bootstrap_node(
-            my_id,
-            incarnation_id,
-            config.shard_id,
-            clock,
+        let authority = config
+            .authority
+            .as_ref()
+            .map(|authority| &authority.authority);
+        let entry = bootstrap(
             &net,
-            config
-                .authority
-                .as_ref()
-                .map(|authority| (authority.authority.clone(), authority.timings)),
-            config.election_timings,
+            &clock,
+            authority,
+            &config.shard_id,
+            &my_id,
             &config.seeds,
             config.join_peer_timeout,
             config.retry_interval,
         )
         .await;
+        let identity = Identity {
+            id: my_id.clone(),
+            // The worker's id is already unique to this incarnation.
+            incarnation: IncarnationId::new(my_id.as_str()),
+            shard: config.shard_id.clone(),
+            timings: config.election_timings,
+        };
+        let authority_timings = config.authority.as_ref().map(|authority| authority.timings);
+        let (mut node, first) = WorkerNode::start(identity, entry, clock, authority_timings);
         let mut scheduler = Scheduler::new(clock, Uuid7Ids);
         run_driver(
             &mut node,
+            first,
             &net,
             &mut scheduler,
             clock,

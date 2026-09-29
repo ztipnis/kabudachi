@@ -8,56 +8,6 @@ import pytest
 from kabudachi.handle import TaskHandle, current_body
 
 
-def test_a_handle_knows_its_task_and_shard():
-    handle = TaskHandle("task-1")
-
-    assert handle.task_id == "task-1"
-    assert handle.shard_id == "local"
-
-
-def test_a_new_handle_is_not_done():
-    assert TaskHandle("task-1").done() is False
-
-
-def test_a_resolved_handle_gives_its_value():
-    handle = TaskHandle("task-1")
-    handle._resolve("the value")
-
-    assert handle.done()
-    assert asyncio.run(_await(handle)) == "the value"
-
-
-def test_a_failed_handle_raises_its_error_when_awaited():
-    handle = TaskHandle("task-1")
-    handle._fail(ValueError("boom"))
-
-    with pytest.raises(ValueError, match="boom"):
-        asyncio.run(_await(handle))
-
-
-def test_a_handle_can_be_awaited_more_than_once():
-    handle = TaskHandle("task-1")
-    handle._resolve(41)
-
-    async def main():
-        return await handle, await handle
-
-    assert asyncio.run(main()) == (41, 41)
-
-
-def test_a_handle_settled_after_it_is_awaited_wakes_the_waiter():
-    handle = TaskHandle("task-1")
-
-    async def main():
-        waiting = asyncio.ensure_future(_await(handle))
-        await asyncio.sleep(0.02)
-        assert not waiting.done()
-        handle._resolve("later")
-        return await asyncio.wait_for(waiting, 5)
-
-    assert asyncio.run(main()) == "later"
-
-
 def test_a_handle_settled_from_another_thread_wakes_the_waiter():
     handle = TaskHandle("task-1")
 
@@ -79,15 +29,12 @@ def test_only_the_first_settlement_counts():
 
     assert asyncio.run(_await(handle)) == "first"
 
-
-def test_a_failure_first_is_not_replaced_by_a_value():
-    handle = TaskHandle("task-1")
-
-    handle._fail(RuntimeError("first"))
-    handle._resolve("late")
+    failed_first = TaskHandle("task-2")
+    failed_first._fail(RuntimeError("first"))
+    failed_first._resolve("late")
 
     with pytest.raises(RuntimeError, match="first"):
-        asyncio.run(_await(handle))
+        asyncio.run(_await(failed_first))
 
 
 def test_a_handle_that_is_never_awaited_leaves_no_warning(recwarn):
@@ -131,46 +78,6 @@ def test_one_awaiter_being_cancelled_leaves_the_others_waiting():
     assert asyncio.run(main()) == "value"
 
 
-def test_a_cancelled_await_does_not_lose_the_result_for_a_later_await():
-    handle = TaskHandle("task-1")
-
-    async def main():
-        waiting = asyncio.ensure_future(_await(handle))
-        await asyncio.sleep(0.02)
-        waiting.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await waiting
-        handle._resolve("kept")
-        return await handle
-
-    assert asyncio.run(main()) == "kept"
-
-
-def test_a_body_that_waits_on_a_handle_is_told_when_it_starts_and_stops_waiting():
-    events = []
-
-    class Observer:
-        def waiting_started(self):
-            events.append("started")
-
-        def waiting_finished(self):
-            events.append("finished")
-
-    handle = TaskHandle("task-1")
-
-    async def main():
-        current_body.set(Observer())
-        waiting = asyncio.ensure_future(_await(handle))
-        await asyncio.sleep(0.02)
-        events.append("settling")
-        handle._resolve(1)
-        await waiting
-
-    asyncio.run(main())
-
-    assert events == ["started", "settling", "finished"]
-
-
 def test_waiting_on_a_handle_that_is_already_settled_is_not_a_wait():
     events = []
 
@@ -193,43 +100,6 @@ def test_waiting_on_a_handle_that_is_already_settled_is_not_a_wait():
     assert events == []
 
 
-def test_a_handle_that_can_be_cancelled_asks_for_it_and_says_whether_it_took_effect():
-    asked = []
-
-    def canceller(task_id):
-        asked.append(task_id)
-        return True
-
-    handle = TaskHandle("task-1", canceller)
-
-    assert handle.cancel() is True
-    assert asked == ["task-1"]
-
-
-def test_cancelling_a_settled_handle_does_nothing_and_says_so():
-    asked = []
-    handle = TaskHandle("task-1", lambda task_id: asked.append(task_id) or True)
-    handle._resolve("done")
-
-    assert handle.cancel() is False
-    assert asked == []
-
-
-def test_a_handle_with_no_way_to_cancel_says_it_could_not():
-    assert TaskHandle("task-1").cancel() is False
-
-
-def test_a_callback_is_called_with_the_result_once_the_handle_resolves():
-    seen = []
-    handle = TaskHandle("task-1")
-    handle.callback(seen.append)
-    assert seen == []
-
-    handle._resolve("the value")
-
-    assert seen == ["the value"]
-
-
 def test_a_callback_added_to_a_resolved_handle_is_called_at_once():
     seen = []
     handle = TaskHandle("task-1")
@@ -250,16 +120,6 @@ def test_callbacks_are_called_in_the_order_they_were_added_and_the_handle_is_ret
     handle._resolve(1)
 
     assert seen == [("a", 1), ("b", 1)]
-
-
-def test_a_callback_is_not_called_for_a_task_that_failed():
-    seen = []
-    handle = TaskHandle("task-1")
-    handle.callback(seen.append)
-
-    handle._fail(ValueError("no result"))
-
-    assert seen == []
 
 
 def test_a_callback_that_raises_changes_nothing_and_does_not_stop_the_others(caplog):

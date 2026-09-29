@@ -128,7 +128,7 @@ impl NativeRuntime {
         // count the same ticks, and the scheduler checks the end of each
         // leadership grant the node hands it against its own reading of it.
         let clock = RealClock::new();
-        let node = local_node(
+        let (node, first) = local_node(
             worker_id.clone(),
             IncarnationId::new(incarnation_id),
             ShardId::new(LOCAL_SHARD_ID),
@@ -151,7 +151,13 @@ impl NativeRuntime {
             scheduler: Arc::clone(&scheduler),
             wakeups: wakeups.clone(),
         };
-        let election = tokio.spawn(run_election(node, clock, Arc::clone(&stop), publisher));
+        let election = tokio.spawn(run_election(
+            node,
+            first,
+            clock,
+            Arc::clone(&stop),
+            publisher,
+        ));
 
         let timers = tokio.spawn(run_timers(
             Arc::clone(&scheduler),

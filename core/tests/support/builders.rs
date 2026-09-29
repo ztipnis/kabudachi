@@ -8,8 +8,8 @@ use kabudachi_core::protocol::ids::IncarnationId;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::{
     AckEcho, ElectionCertificate, ElectionMessage, ElectionReject, ElectionRejectReason,
-    KnownLeader, LeaderHeartbeatAck, RollCall, RollCallReply, SelfRemove, VoteGrant, VoteRequest,
-    WorkerHeartbeat, election_message,
+    JoinResponse, KnownLeader, LeaderHeartbeatAck, RollCall, RollCallReply, SelfRemove, VoteGrant,
+    VoteRequest, WorkerHeartbeat, election_message,
 };
 use kabudachi_core::time::Duration;
 
@@ -43,6 +43,13 @@ pub fn timings(suspect_timeout: Duration) -> ElectionTimings {
 /// a half.
 pub fn past_any_suspicion(suspect_timeout: u64) -> Duration {
     Duration::from_ticks(suspect_timeout + suspect_timeout.div_ceil(2))
+}
+
+/// A JOIN answer that names no leader. A node started on it stays
+/// `Bootstrapping` (see `WorkerNode::finish_joining`), for a test to join it
+/// later or watch it wait.
+pub fn no_leader_yet() -> JoinResponse {
+    JoinResponse::default()
 }
 
 /// The genesis generation at recovery epoch 0, which the tests' statically

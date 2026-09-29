@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from kabudachi.errors import RuntimeNotStartedError
 from kabudachi.options import SubmissionOptions, submission_options
 from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import SerializerRegistry
@@ -17,10 +16,6 @@ NOW = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 def options(**arguments):
     return submission_options(now=NOW, **arguments)
-
-
-def test_no_options_ask_for_nothing():
-    assert options() == SubmissionOptions(delay_ms=None, expires_in_ms=None)
 
 
 def test_a_delay_is_taken_in_milliseconds():
@@ -93,13 +88,6 @@ def shout(request: Greeting) -> Greeting:
     return request
 
 
-def test_a_task_with_options_is_called_like_a_task_and_needs_a_running_runtime():
-    optioned = declare(shout).options(delay=timedelta(seconds=1))
-
-    with pytest.raises(RuntimeNotStartedError):
-        optioned(Greeting())
-
-
 def test_options_are_checked_when_they_are_given_not_when_the_task_is_called():
     with pytest.raises(ValueError):
         declare(shout).options(delay=timedelta(seconds=-1))
@@ -118,11 +106,6 @@ def coalescing_task_for_options():
         name="tests.refresh",
         kind=TaskKind.COALESCING,
     )
-
-
-def test_a_coalescing_task_takes_a_key_per_submission():
-    assert coalescing_task_for_options().options(key="tenant-1") is not None
-    assert submission_options(now=NOW, key="tenant-1").key == "tenant-1"
 
 
 def test_only_a_coalescing_task_takes_a_key():

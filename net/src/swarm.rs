@@ -55,7 +55,7 @@
 //! (`request_response::Behaviour::send_request_with_addresses` always
 //! extends through behaviours, whether or not it was given an address of
 //! its own) and the dial to the leader a `JOIN_RESPONSE` names
-//! (`connect_to_leader`, which asks for that extension explicitly —
+//! (`crate::join`'s `connect_to_leader`, which asks for that extension explicitly —
 //! building a `DialOpts` with its own address list defaults it off). So a
 //! leader address a `JOIN_RESPONSE` names that turns out to be unreachable
 //! from where the joiner stands is not the only way it can reach that
@@ -68,9 +68,18 @@
 //! [`libp2p::kad::Behaviour`] is generic over a `RecordStore` — never
 //! actually holds one.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use libp2p::core::transport::{
+    DialOpts, ListenerId, PortUse, Transport, TransportError, TransportEvent,
+};
+use libp2p::core::upgrade::Version;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{Swarm, allow_block_list, gossipsub, identify, identity, kad, noise, tcp, yamux};
+use libp2p::{
+    Multiaddr, Swarm, allow_block_list, gossipsub, identify, identity, kad, noise, tcp, yamux,
+};
 
 use crate::claim_codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
 use crate::codec::{ElectionCodec, PROTOCOL};
@@ -118,6 +127,71 @@ pub struct Behaviour {
     pub blocked: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
 }
 
+/// libp2p's TCP transport, except that every dial it makes leaves from a
+/// port of its own ([`PortUse::New`]) instead of from this node's listen
+/// port.
+///
+/// libp2p-swarm's `DialOpts` default to [`PortUse::Reuse`], and every
+/// behaviour's own dials (`kad`'s crawl, `request_response`'s, a redial)
+/// take that default, so libp2p-tcp binds each dial to the listen address.
+/// Two listening nodes that dial each other at once, as joiners' lockstep
+/// routing crawls do (see `crate::driver::run_driver`), then open one TCP
+/// connection from both ends (a simultaneous open): both sides act as noise
+/// initiator and the handshake fails, and every later dial between the two
+/// listen ports fails with `EADDRINUSE` while that connection's 4-tuple sits
+/// in `TIME_WAIT` (tens of seconds). A dial from a port of its own has a
+/// 4-tuple no other connection shares. libp2p offers no setting for this:
+/// `tcp::Config::port_reuse` is deprecated and does nothing.
+///
+/// What is given up is port-reuse NAT hole punching (DCUtR), which this
+/// crate does not use. Nothing here depends on a dial's source port: a
+/// peer's dialable address comes from Identify, not from the connection
+/// (see `crate::messenger`'s "Where a peer's address comes from").
+/// Behaviours still see `ConnectedPoint::Dialer { port_use: Reuse }` for
+/// such a dial: the swarm records the dial options it asked for, not the
+/// ones this wrapper passed on.
+struct NewPortTcp(tcp::tokio::Transport);
+
+impl Transport for NewPortTcp {
+    type Output = <tcp::tokio::Transport as Transport>::Output;
+    type Error = <tcp::tokio::Transport as Transport>::Error;
+    type ListenerUpgrade = <tcp::tokio::Transport as Transport>::ListenerUpgrade;
+    type Dial = <tcp::tokio::Transport as Transport>::Dial;
+
+    fn listen_on(
+        &mut self,
+        id: ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
+        self.0.listen_on(id, addr)
+    }
+
+    fn remove_listener(&mut self, id: ListenerId) -> bool {
+        self.0.remove_listener(id)
+    }
+
+    fn dial(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        self.0.dial(
+            addr,
+            DialOpts {
+                port_use: PortUse::New,
+                ..opts
+            },
+        )
+    }
+
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
 /// Builds a `Swarm` over TCP+noise+yamux, identified by `keypair`, with
 /// every protocol of [`Behaviour`] enabled. Does not listen, dial or
 /// subscribe to any gossip topic; callers do that.
@@ -130,11 +204,14 @@ pub struct Behaviour {
 pub fn build_swarm(keypair: identity::Keypair) -> Swarm<Behaviour> {
     libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
+        .with_other_transport(|key| {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                NewPortTcp(tcp::tokio::Transport::new(tcp::Config::default()))
+                    .upgrade(Version::V1Lazy)
+                    .authenticate(noise::Config::new(key)?)
+                    .multiplex(yamux::Config::default()),
+            )
+        })
         .expect("TCP transport with noise/yamux upgrades is always constructible")
         .with_behaviour(|key| Behaviour {
             // `with_push_listen_addr_updates` is off by default, which would
@@ -206,67 +283,51 @@ pub fn build_swarm(keypair: identity::Keypair) -> Swarm<Behaviour> {
 mod tests {
     use std::time::Duration;
 
-    use libp2p::futures::StreamExt;
-    use libp2p::swarm::SwarmEvent;
-    use libp2p::{Multiaddr, identity};
+    use kabudachi_core::election::Input;
+    use kabudachi_core::protocol::ids::WorkerId;
+    use libp2p::identity;
     use tokio::time::timeout;
 
     use super::*;
+    use crate::messenger::Net;
 
-    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-    #[tokio::test]
-    async fn build_swarm_uses_the_given_keypairs_peer_id() {
-        let keypair = identity::Keypair::generate_ed25519();
-        let expected_peer_id = keypair.public().to_peer_id();
-
-        let swarm = build_swarm(keypair);
-
-        assert_eq!(*swarm.local_peer_id(), expected_peer_id);
-    }
-
-    async fn wait_for_new_listen_addr(swarm: &mut Swarm<Behaviour>) -> Multiaddr {
-        loop {
-            if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
-                return address;
-            }
+    /// Takes `net`'s inputs until one reports a connection to `peer`.
+    async fn wait_until_connected_to(net: &Net, peer: &WorkerId) {
+        let connected = Input::PeerConnected(peer.clone());
+        while !net.take_inputs().contains(&connected) {
+            net.wait_for_arrival().await;
         }
     }
 
-    async fn wait_for_identify_received(swarm: &mut Swarm<Behaviour>) {
-        loop {
-            if let SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
-                ..
-            })) = swarm.select_next_some().await
-            {
-                return;
-            }
-        }
-    }
-
+    /// Two listening nodes that dial each other's listen address at the same
+    /// instant, as joiners' lockstep routing crawls do, must still connect.
+    /// Each round uses fresh ports, so no round inherits another's
+    /// `TIME_WAIT`.
     #[tokio::test]
-    async fn two_nodes_complete_an_identify_handshake() {
-        let mut listener = build_swarm(identity::Keypair::generate_ed25519());
-        let mut dialer = build_swarm(identity::Keypair::generate_ed25519());
+    async fn two_listening_nodes_dialing_each_other_at_once_connect() {
+        const ROUNDS: usize = 20;
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+        let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
-        listener
-            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
-            .expect("listening on an ephemeral loopback port never fails");
-        let listen_addr = timeout(TEST_TIMEOUT, wait_for_new_listen_addr(&mut listener))
+        for round in 0..ROUNDS {
+            let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+            let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+            let addr_a = net_a.listen_on(loopback.clone()).await;
+            let addr_b = net_b.listen_on(loopback.clone()).await;
+
+            let (worker_a, worker_b) = (net_a.local_worker_id(), net_b.local_worker_id());
+
+            net_a.dial(addr_b);
+            net_b.dial(addr_a);
+
+            timeout(CONNECT_TIMEOUT, async {
+                tokio::join!(
+                    wait_until_connected_to(&net_a, &worker_b),
+                    wait_until_connected_to(&net_b, &worker_a),
+                )
+            })
             .await
-            .expect("listener produced a listen address within the timeout");
-
-        dialer
-            .dial(listen_addr)
-            .expect("dialing the listener's own address never fails");
-
-        timeout(TEST_TIMEOUT, async {
-            tokio::join!(
-                wait_for_identify_received(&mut listener),
-                wait_for_identify_received(&mut dialer),
-            )
-        })
-        .await
-        .expect("both sides received an identify::Event::Received within the timeout");
+            .unwrap_or_else(|_| panic!("round {round}: both nodes connected within the timeout"));
+        }
     }
 }

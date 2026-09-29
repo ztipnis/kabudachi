@@ -1,4 +1,4 @@
-//! Real-transport connection helpers shared by the `net/tests/*.rs` files.
+//! Real-transport connection helpers shared by the `net/tests/<area>/` crates.
 //!
 //! A `Net` queues its node's inputs, connection events among them, until its
 //! driver takes them. A helper that waits for a connection event by taking
@@ -10,13 +10,15 @@
 
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-use kabudachi_core::election::{Input, Output, WorkerNode};
+use super::election::due_now;
+use kabudachi_core::election::{Input, Output, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IdGenerator, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, JoinResponse, election_message};
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::Clock;
 use kabudachi_net::driver::run_driver;
-use kabudachi_net::messenger::{LeaderSearch, Net};
+use kabudachi_net::join::{LeaderSearch, ask_for_leader};
+use kabudachi_net::messenger::{Diagnostics, Net};
 use libp2p::Multiaddr;
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -68,21 +70,38 @@ pub async fn wait_until_disconnected(worker_net: &Net, peer: &WorkerId) -> StdIn
     take_inputs_until(worker_net, &Input::PeerDisconnected(peer.clone())).await
 }
 
-/// Waits until `net` has registered a connection to `peer`, taking nothing
-/// from it, so a node built on `net` afterwards is still fed the
-/// connection's `PeerConnected`. When its first connection to a peer opens,
-/// `net` queues that input and then records the peer's address, which it
-/// keeps (`Net::peer_addresses`); for a peer `net` never connected to
-/// before, and whose address no roll call or reply has carried to it yet, a
-/// recorded address means the input is queued.
-pub async fn wait_until_registered(net: &Net, peer: &WorkerId) {
+/// Reads `net`'s diagnostics until `condition` holds of them, and returns
+/// that reading; panics naming `what` if it does not within the timeout.
+pub async fn wait_for_diagnostics(
+    net: &Net,
+    what: &str,
+    condition: impl Fn(&Diagnostics) -> bool,
+) -> Diagnostics {
     timeout(WAIT_TIMEOUT, async {
-        while !net.peer_addresses().contains_key(peer) {
+        loop {
+            let diagnostics = net.diagnostics().await;
+            if condition(&diagnostics) {
+                return diagnostics;
+            }
             tokio::time::sleep(StdDuration::from_millis(5)).await;
         }
     })
     .await
-    .expect("the net registered its connection within the timeout");
+    .unwrap_or_else(|_| panic!("{what} within the timeout"))
+}
+
+/// Waits until `net` has registered a connection to `peer`, taking nothing
+/// from it, so a node built on `net` afterwards is still fed the
+/// connection's `PeerConnected`. When its first connection to a peer opens,
+/// `net` queues that input and then records the peer's address, which it
+/// keeps (`Diagnostics::peer_addresses`); for a peer `net` never connected
+/// to before, and whose address no roll call or reply has carried to it
+/// yet, a recorded address means the input is queued.
+pub async fn wait_until_registered(net: &Net, peer: &WorkerId) {
+    wait_for_diagnostics(net, "the net registered its connection", |diagnostics| {
+        diagnostics.peer_addresses.contains_key(peer)
+    })
+    .await;
 }
 
 /// Asks `seeds` who leads the shard, again and again, until one points at a
@@ -95,7 +114,7 @@ pub async fn ask_until_pointed_at_a_leader(
 ) -> JoinResponse {
     timeout(WAIT_TIMEOUT, async {
         loop {
-            if let LeaderSearch::Found(pointer) = net.ask_for_leader(seeds, per_seed_timeout).await
+            if let LeaderSearch::Found(pointer) = ask_for_leader(net, seeds, per_seed_timeout).await
             {
                 return pointer;
             }
@@ -108,16 +127,12 @@ pub async fn ask_until_pointed_at_a_leader(
 
 /// Waits until `net` has seen every one of `peers` subscribe to its shard.
 pub async fn wait_until_subscribed(net: &Net, peers: &[&WorkerId]) {
-    timeout(WAIT_TIMEOUT, async {
-        while !peers
+    wait_for_diagnostics(net, "every peer's subscription arrived", |diagnostics| {
+        peers
             .iter()
-            .all(|peer| net.shard_subscribers().contains(*peer))
-        {
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
+            .all(|peer| diagnostics.shard_subscribers.contains(*peer))
     })
-    .await
-    .expect("every peer's subscription arrived within the timeout");
+    .await;
 }
 
 /// Connects every one of `nets` to every other one over real loopback TCP,
@@ -170,7 +185,8 @@ pub async fn heartbeat_until_acked<C: Clock, I: IdGenerator>(
     let (acked_tx, mut acked_rx) = watch::channel(false);
     follower.send(leader_net.local_worker_id(), heartbeat);
     let sent_at = StdInstant::now();
-    let observe = |_: &WorkerNode<C>, outputs: &[Output]| {
+    let observe = |_: &WorkerNode<C>, _: Option<&Input>, step: &Step| {
+        let outputs = &step.outputs;
         let acked = outputs.iter().any(|output| {
             matches!(
                 output,
@@ -185,7 +201,7 @@ pub async fn heartbeat_until_acked<C: Clock, I: IdGenerator>(
     };
     timeout(WAIT_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(node, leader_net, scheduler, clock, None, observe) => {
+            _ = run_driver(node, due_now(&clock), leader_net, scheduler, clock, None, observe) => {
                 unreachable!("run_driver never returns")
             }
             _ = acked_rx.wait_for(|acked| *acked) => {}

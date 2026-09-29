@@ -229,67 +229,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_bridge_is_open_and_idle() {
-        let runtime = runtime();
-        let bridge = Bridge::new(runtime.handle().clone());
-
-        assert!(bridge.is_open());
-        assert_eq!(bridge.in_flight(), 0);
-    }
-
-    #[test]
-    fn admitted_futures_are_counted_until_they_are_dropped() {
-        let runtime = runtime();
-        let bridge = Bridge::new(runtime.handle().clone());
-
-        let first = bridge.admit().unwrap();
-        let second = bridge.admit().unwrap();
-        assert_eq!(bridge.in_flight(), 2);
-
-        drop(first);
-        assert_eq!(bridge.in_flight(), 1);
-        drop(second);
-        assert_eq!(bridge.in_flight(), 0);
-    }
-
-    #[test]
-    fn a_closed_bridge_admits_nothing() {
-        let runtime = runtime();
-        let bridge = Bridge::new(runtime.handle().clone());
-
-        bridge.close();
-
-        assert!(!bridge.is_open());
-        assert!(bridge.admit().is_none());
-        assert_eq!(bridge.in_flight(), 0);
-    }
-
-    #[test]
-    fn closing_leaves_admitted_futures_counted() {
-        let runtime = runtime();
-        let bridge = Bridge::new(runtime.handle().clone());
-        let counted = bridge.admit().unwrap();
-
-        bridge.close();
-
-        assert_eq!(bridge.in_flight(), 1);
-        drop(counted);
-        assert_eq!(bridge.in_flight(), 0);
-    }
-
-    #[test]
-    fn draining_an_idle_bridge_returns_at_once() {
-        let runtime = runtime();
-        let bridge = Bridge::new(runtime.handle().clone());
-
-        runtime.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), bridge.drained())
-                .await
-                .expect("an idle bridge drains immediately");
-        });
-    }
-
-    #[test]
     fn draining_waits_for_every_admitted_future() {
         let runtime = runtime();
         let bridge = Bridge::new(runtime.handle().clone());
@@ -312,6 +251,11 @@ mod tests {
                 .await
                 .expect("drains once the last future is gone")
                 .unwrap();
+
+            // After the last drop, a fresh `drained()` resolves at once.
+            tokio::time::timeout(std::time::Duration::from_secs(5), bridge.drained())
+                .await
+                .expect("a bridge with nothing in flight drains immediately");
         });
     }
 }

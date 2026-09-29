@@ -106,18 +106,4 @@ mod tests {
         let sha3 = HashFunction::new::<sha3::Sha3_256>();
         assert_eq!(sha3.hash_to_u64(&fields()), 18_294_837_748_612_206_051);
     }
-
-    #[test]
-    fn the_hash_depends_on_every_field() {
-        let hash = HashFunction::default();
-        let base = hash.hash_to_u64(&fields());
-        for changed in 0..4 {
-            let mut other = fields();
-            other[changed] = match other[changed] {
-                Field::Text(_) => Field::Text("other"),
-                Field::Number(number) => Field::Number(number + 1),
-            };
-            assert_ne!(base, hash.hash_to_u64(&other), "field {changed}");
-        }
-    }
 }

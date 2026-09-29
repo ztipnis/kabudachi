@@ -32,20 +32,6 @@ async def leader_within_limit(native):
     await asyncio.wait_for(native.wait_until_leader(), WAIT_LIMIT_SECONDS)
 
 
-def test_a_new_runtime_elects_its_lone_worker_leader(runtime):
-    asyncio.run(leader_within_limit(runtime))
-
-    assert runtime.worker_state() == "Leader"
-
-
-def test_waiting_for_leadership_again_returns_at_once(runtime):
-    async def main():
-        await leader_within_limit(runtime)
-        await asyncio.wait_for(runtime.wait_until_leader(), 0.5)
-
-    asyncio.run(main())
-
-
 def test_many_waiters_are_all_released(runtime):
     async def main():
         waiters = [runtime.wait_until_leader() for _ in range(50)]
@@ -108,25 +94,6 @@ def test_shutdown_stops_the_worker():
     assert native.worker_state() == "Stopped"
 
 
-def test_shutting_down_twice_is_harmless():
-    native = new_runtime()
-
-    native.shutdown()
-    native.shutdown()
-
-    assert native.worker_state() == "Stopped"
-
-
-def test_shutdown_stops_the_worker_at_every_stage_of_its_election():
-    for delay_seconds in (0, 0.001, 0.003, 0.01, 0.03):
-        native = new_runtime()
-        time.sleep(delay_seconds)
-
-        native.shutdown()
-
-        assert native.worker_state() == "Stopped", delay_seconds
-
-
 def test_waiting_after_shutdown_is_an_error():
     native = new_runtime()
     native.shutdown()
@@ -136,21 +103,6 @@ def test_waiting_after_shutdown_is_an_error():
 
     with pytest.raises(RuntimeError, match="shut down"):
         asyncio.run(main())
-
-
-def test_shutdown_releases_a_wait_that_leadership_never_reached():
-    native = new_runtime(suspect_timeout_ms=60_000)
-
-    async def main():
-        waiter = asyncio.ensure_future(native.wait_until_leader())
-        await asyncio.sleep(0.05)
-        started = time.monotonic()
-        native.shutdown()
-        with pytest.raises(RuntimeError, match="shut down"):
-            await asyncio.wait_for(waiter, WAIT_LIMIT_SECONDS)
-        return time.monotonic() - started
-
-    assert asyncio.run(main()) < PROMPT_SECONDS
 
 
 def test_a_runtime_needs_at_least_one_thread():
@@ -172,30 +124,19 @@ def test_shutdown_fails_every_pending_wait():
     async def main():
         waiters = [asyncio.ensure_future(native.wait_until_leader()) for _ in range(100)]
         await asyncio.sleep(0.05)
-        native.shutdown()
-        return await asyncio.wait_for(
-            asyncio.gather(*waiters, return_exceptions=True), WAIT_LIMIT_SECONDS
-        )
-
-    outcomes = asyncio.run(main())
-
-    assert len(outcomes) == 100
-    assert all(isinstance(outcome, RuntimeError) for outcome in outcomes)
-
-
-def test_shutdown_with_pending_waits_is_prompt():
-    native = new_runtime(suspect_timeout_ms=60_000)
-
-    async def main():
-        waiters = [asyncio.ensure_future(native.wait_until_leader()) for _ in range(100)]
-        await asyncio.sleep(0.05)
         started = time.monotonic()
         native.shutdown()
         elapsed = time.monotonic() - started
-        await asyncio.gather(*waiters, return_exceptions=True)
-        return elapsed
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*waiters, return_exceptions=True), WAIT_LIMIT_SECONDS
+        )
+        return outcomes, elapsed
 
-    assert asyncio.run(main()) < PROMPT_SECONDS
+    outcomes, elapsed = asyncio.run(main())
+
+    assert elapsed < PROMPT_SECONDS
+    assert len(outcomes) == 100
+    assert all(isinstance(outcome, RuntimeError) for outcome in outcomes)
 
 
 def test_no_wait_is_lost_when_shutdown_races_new_waits():

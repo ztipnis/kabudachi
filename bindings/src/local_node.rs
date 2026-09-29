@@ -8,7 +8,7 @@
 //! instant suspicion timeout is a legitimate, deliberate product choice for
 //! this specific single-process runtime (prompt self-election, no network to
 //! wait on) — but it is *not* the generic behavior of a one-voter
-//! configuration. `kabudachi_net::bootstrap::bootstrap_node` (the `net`-side
+//! configuration. `kabudachi_net::bootstrap::bootstrap` (the `net`-side
 //! bootstrap cascade) covers the generic case: a lone node that reaches
 //! self-election still waits out whatever `suspect_timeout` it was actually
 //! configured with, like any other node. Keeping the instant default here,
@@ -19,7 +19,8 @@
 //! `local_node` passes `None`: the node never registers, never fences itself
 //! and never needs a recovery fence to lead.
 
-use kabudachi_core::election::{ElectionTimings, WorkerNode};
+use kabudachi_core::coordination_authority::RecoveryEpoch;
+use kabudachi_core::election::{ElectionTimings, Entry, Identity, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
 use kabudachi_core::time::{Clock, Duration};
 
@@ -48,25 +49,31 @@ pub type LocalNode<C> = WorkerNode<C>;
 /// no peer to falsely suspect, so the single-process runtime passes 0 unless
 /// told otherwise (see the module doc for why that is specific to this
 /// runtime, not the generic one-voter case). The node only acts as `clock`
-/// advances and it is stepped.
+/// advances and it is stepped. Returns the node with its first step, for
+/// `election::run_election` to carry out.
+///
+/// The shard's recovery epoch is of lineage 0: with no authority, no other
+/// founding of this shard can exist to tell apart from this one.
 pub fn local_node<C: Clock>(
     worker_id: WorkerId,
     incarnation_id: IncarnationId,
     shard_id: ShardId,
     clock: C,
     suspect_timeout: Duration,
-) -> LocalNode<C> {
-    WorkerNode::genesis(
-        worker_id,
-        incarnation_id,
-        shard_id,
-        clock,
-        0,
-        None,
-        ElectionTimings::new(
+) -> (LocalNode<C>, Step) {
+    let identity = Identity {
+        id: worker_id,
+        incarnation: incarnation_id,
+        shard: shard_id,
+        timings: ElectionTimings::new(
             suspect_timeout,
             Duration::from_millis(HEARTBEAT_INTERVAL_MS),
         )
         .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS)),
-    )
+    };
+    let entry = Entry::Founding {
+        recovery_epoch: RecoveryEpoch::new(0, 0),
+        registered_at: None,
+    };
+    WorkerNode::start(identity, entry, clock, None)
 }

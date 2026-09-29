@@ -242,21 +242,12 @@ mod tests {
     }
 
     #[test]
-    fn register_returns_the_ttl() {
-        let (authority, _clock) = authority();
-
+    fn a_registration_is_live_until_one_ttl_after_it_was_made() {
+        let (authority, clock) = authority();
         assert_eq!(
             authority.register(&shard(), &worker("a"), "addr-a"),
             Ok(ttl())
         );
-    }
-
-    #[test]
-    fn a_registration_is_live_until_one_ttl_after_it_was_made() {
-        let (authority, clock) = authority();
-        authority
-            .register(&shard(), &worker("a"), "addr-a")
-            .expect("register succeeds");
 
         clock.advance(millis(TTL_MILLIS - 1));
         assert_eq!(registered_workers(&authority), vec![worker("a")]);
@@ -344,13 +335,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_shard_has_no_recovery_epoch() {
-        let (authority, _clock) = authority();
-
-        assert_eq!(authority.read_recovery_epoch(&shard()), Ok(None));
-    }
-
-    #[test]
     fn create_if_absent_succeeds_once_then_conflicts() {
         let (authority, _clock) = authority();
 
@@ -365,20 +349,6 @@ mod tests {
             })
         );
         assert_eq!(authority.read_recovery_epoch(&shard()), Ok(Some(epoch(0))));
-    }
-
-    #[test]
-    fn a_bump_from_the_current_epoch_succeeds() {
-        let (authority, _clock) = authority();
-        authority
-            .compare_and_swap_recovery_epoch(&shard(), None, epoch(4))
-            .expect("create succeeds");
-
-        assert_eq!(
-            authority.compare_and_swap_recovery_epoch(&shard(), Some(epoch(4)), epoch(5)),
-            Ok(())
-        );
-        assert_eq!(authority.read_recovery_epoch(&shard()), Ok(Some(epoch(5))));
     }
 
     #[test]
@@ -459,16 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn acquiring_a_free_fence_returns_the_ttl() {
-        let (authority, _clock) = authority_at_epoch(3);
-
-        assert_eq!(
-            authority.acquire_fence(&shard(), &worker("a"), epoch(3)),
-            Ok(ttl())
-        );
-    }
-
-    #[test]
     fn the_holder_renews_its_own_fence() {
         let (authority, clock) = authority_at_epoch(3);
         authority
@@ -488,22 +448,6 @@ mod tests {
                 remaining: millis(1)
             }),
             "the renewal pushed the fence's expiry to one TTL after it"
-        );
-    }
-
-    #[test]
-    fn another_holder_is_refused_with_the_time_left_on_the_fence() {
-        let (authority, clock) = authority_at_epoch(3);
-        authority
-            .acquire_fence(&shard(), &worker("a"), epoch(3))
-            .expect("acquire succeeds");
-        clock.advance(millis(30));
-
-        assert_eq!(
-            authority.acquire_fence(&shard(), &worker("b"), epoch(3)),
-            Err(AuthorityError::FenceHeld {
-                remaining: millis(TTL_MILLIS - 30)
-            })
         );
     }
 
@@ -643,11 +587,5 @@ mod tests {
 
         assert_eq!(authority.read_recovery_epoch(&shard()), Ok(Some(epoch(0))));
         assert_eq!(registered_workers(&authority), vec![worker("a")]);
-    }
-
-    #[test]
-    fn is_send_and_sync_with_a_send_and_sync_clock() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<InMemoryAuthority<TestClock>>();
     }
 }

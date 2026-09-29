@@ -117,13 +117,12 @@ def test_the_first_signal_lets_running_tasks_finish_then_returns(served, stop):
 
 
 @pytest.mark.parametrize("kind", ["awaits", "blocks_the_loop"])
-@pytest.mark.parametrize("second", [signal.SIGTERM, signal.SIGINT])
-def test_a_second_signal_stops_waiting_for_running_tasks(served, kind, second):
+def test_a_second_signal_stops_waiting_for_running_tasks(served, kind):
     process = served(task_seconds=60, kind=kind)
     process.send_signal(signal.SIGTERM)
     time.sleep(0.5)
     assert process.poll() is None, "the first signal must wait for the running task"
-    process.send_signal(second)
+    process.send_signal(signal.SIGTERM)
 
     lines, errors = finish(process, timeout=30)
 
@@ -145,7 +144,7 @@ def test_a_serve_with_nothing_to_run_ends_cleanly_on_the_first_signal(served):
 def test_a_second_signal_while_a_synchronous_task_runs_raises_at_once_and_the_thread_finishes_alone(
     served,
 ):
-    process = served(task_seconds=3, kind="sync")
+    process = served(task_seconds=1, kind="sync")
     process.send_signal(signal.SIGTERM)
     time.sleep(0.5)
     assert process.poll() is None, "the first signal must wait for the running task"

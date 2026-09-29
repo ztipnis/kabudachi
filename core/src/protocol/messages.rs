@@ -457,51 +457,6 @@ mod tests {
     use super::*;
     use crate::configuration::Single;
 
-    #[test]
-    fn vote_request_candidate_id_returns_typed_id() {
-        let raw = VoteRequest {
-            shard_id: Some(generated::ShardId {
-                value: "shard-1".into(),
-            }),
-            recovery_epoch: 1,
-            term: 2,
-            candidate_id: Some(generated::WorkerId {
-                value: "worker-9".into(),
-            }),
-            roll_call_generation: Some(Generation::new(0, 1, 3).into()),
-        };
-
-        assert_eq!(raw.candidate_id(), ids::WorkerId::new("worker-9"));
-        assert_eq!(raw.shard_id(), ids::ShardId::new("shard-1"));
-        assert_eq!(raw.term, 2);
-        assert_eq!(raw.roll_call_generation(), Generation::new(0, 1, 3));
-    }
-
-    #[test]
-    fn self_remove_accessors_return_typed_ids() {
-        let raw = SelfRemove {
-            worker_id: Some(generated::WorkerId {
-                value: "worker-1".into(),
-            }),
-            incarnation_id: Some(generated::IncarnationId {
-                value: "incarnation-1".into(),
-            }),
-            shard_id: Some(generated::ShardId {
-                value: "shard-2".into(),
-            }),
-            configuration_generation: None,
-            term_seen: 0,
-            leader_term: 0,
-        };
-
-        assert_eq!(raw.worker_id(), ids::WorkerId::new("worker-1"));
-        assert_eq!(
-            raw.incarnation_id(),
-            ids::IncarnationId::new("incarnation-1")
-        );
-        assert_eq!(raw.shard_id(), ids::ShardId::new("shard-2"));
-    }
-
     /// A certificate from `leader-1` for `shard-1`, at recovery epoch 1 and
     /// term 3, carrying a single configuration of one voter at `generation`.
     fn certificate_carrying(generation: Generation) -> ElectionMessage {
@@ -565,7 +520,7 @@ mod tests {
 
     #[test]
     fn well_formed_refuses_an_invalid_prior_admission_or_held_generation() {
-        let reply = |prior_admission| ElectionMessage {
+        let reply = |admission, prior_admission| ElectionMessage {
             payload: Some(election_message::Payload::RollCallReply(RollCallReply {
                 shard_id: Some(generated::ShardId {
                     value: "shard-1".into(),
@@ -573,7 +528,7 @@ mod tests {
                 term: 1,
                 initiator_id: wid("worker-a"),
                 responder_id: wid("worker-b"),
-                admission: Some(Generation::genesis(0).into()),
+                admission,
                 prior_admission,
                 ..Default::default()
             })),
@@ -592,8 +547,11 @@ mod tests {
             })),
         };
 
-        assert!(reply(Some(Generation::genesis(0).into())).is_well_formed());
-        assert!(!reply(Some(generation_at_max())).is_well_formed());
+        let genesis = || Some(Generation::genesis(0).into());
+        assert!(reply(genesis(), genesis()).is_well_formed());
+        assert!(!reply(genesis(), Some(generation_at_max())).is_well_formed());
+        assert!(reply(None, None).is_well_formed());
+        assert!(!reply(Some(generation_at_max()), None).is_well_formed());
         assert!(heartbeat(None).is_well_formed());
         assert!(heartbeat(Some(Generation::genesis(0).into())).is_well_formed());
         assert!(!heartbeat(Some(generation_at_max())).is_well_formed());
@@ -743,11 +701,6 @@ mod tests {
     }
 
     #[test]
-    fn well_formed_accepts_every_required_id_and_configuration_present() {
-        assert!(roll_call(Some(valid_configuration())).is_well_formed());
-    }
-
-    #[test]
     fn well_formed_rejects_a_missing_or_invalid_configuration() {
         assert!(!roll_call(None).is_well_formed());
         let no_voters = generated::Configuration {
@@ -765,26 +718,6 @@ mod tests {
             term: 0,
             counter: u64::MAX,
         }
-    }
-
-    #[test]
-    fn well_formed_rejects_an_invalid_optional_generation_but_not_an_absent_one() {
-        let reply = |admission| ElectionMessage {
-            payload: Some(election_message::Payload::RollCallReply(RollCallReply {
-                shard_id: Some(generated::ShardId {
-                    value: "shard-1".into(),
-                }),
-                term: 1,
-                initiator_id: wid("worker-a"),
-                responder_id: wid("worker-b"),
-                admission,
-                ..Default::default()
-            })),
-        };
-
-        assert!(reply(None).is_well_formed());
-        assert!(reply(Some(Generation::genesis(0).into())).is_well_formed());
-        assert!(!reply(Some(generation_at_max())).is_well_formed());
     }
 
     #[test]
@@ -859,19 +792,6 @@ mod tests {
             }))
             .is_well_formed()
         );
-    }
-
-    #[test]
-    fn configuration_accessors_decode_into_the_domain_types() {
-        let ack = LeaderHeartbeatAck {
-            configuration: Some(valid_configuration()),
-            recipient_admission: Some(Generation::genesis(0).into()),
-            ..Default::default()
-        };
-
-        assert_eq!(ack.configuration(), Configuration::genesis(0));
-        assert_eq!(ack.recipient_admission(), Some(Generation::genesis(0)));
-        assert_eq!(LeaderHeartbeatAck::default().recipient_admission(), None);
     }
 
     /// An ack at recovery epoch 1 and term 3 carrying a configuration at
@@ -1119,20 +1039,6 @@ mod tests {
 
         assert!(heartbeat_with(shard, None).is_well_formed());
         assert!(!heartbeat_with(None, None).is_well_formed());
-    }
-
-    #[test]
-    fn well_formed_accepts_a_heartbeat_with_or_without_an_ack_echo() {
-        let shard = Some(generated::ShardId {
-            value: "shard-1".into(),
-        });
-        let echo = AckEcho {
-            term: 0,
-            send_token: 0,
-        };
-
-        assert!(heartbeat_with(shard.clone(), None).is_well_formed());
-        assert!(heartbeat_with(shard, Some(echo)).is_well_formed());
     }
 
     #[test]

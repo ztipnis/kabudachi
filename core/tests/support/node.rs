@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use kabudachi_core::election::{Input, Output, WorkerNode};
+use kabudachi_core::election::{Entry, Identity, Input, Output, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
@@ -31,15 +31,18 @@ pub fn voter_node(
     voter_count: usize,
     suspect_timeout: u64,
 ) -> TestNode {
-    WorkerNode::new(
-        my_id.clone(),
-        IncarnationId::new("incarnation-1"),
-        shard("shard-1"),
+    WorkerNode::start(
+        Identity {
+            id: my_id.clone(),
+            incarnation: IncarnationId::new("incarnation-1"),
+            shard: shard("shard-1"),
+            timings: timings(Duration::from_ticks(suspect_timeout)),
+        },
+        Entry::Known(voter_of(voter_count)),
         clock.clone(),
-        voter_of(voter_count),
         None,
-        timings(Duration::from_ticks(suspect_timeout)),
     )
+    .0
 }
 
 /// The messages among `outputs`, each with its recipient, in the order the

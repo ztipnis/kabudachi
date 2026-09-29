@@ -14,17 +14,27 @@ Bazel is canonical for correctness; `cargo` and `uv` are fast local iteration. A
 bazel build //...
 bazel test //...
 
+bazel test //core:election_test
+bazel test //core:scenario_test
+bazel test //core:scheduler_test
+bazel test //core:configuration_test
+bazel test //core:proptest_test
 bazel test //core:core_test
+bazel test //net:bootstrap_test
+bazel test //net:claim_test
+bazel test //net:election_test
+bazel test //net:net_test
+bazel test //testkit:testkit_test
 bazel test //bindings:bindings_test
 bazel test //runtime/tests:test_native
-bazel test //runtime/tests:test_placeholder
+bazel test //runtime/tests:test_local
 
 cargo test --workspace
 cargo test -p kabudachi-core
 cargo test -p kabudachi-bindings
 
 cd runtime && uv run pytest --continue-on-collection-errors
-cd runtime && uv run pytest tests/test_placeholder.py -v
+cd runtime && uv run pytest tests/test_local.py -v
 bazel run //:gazelle
 ```
 

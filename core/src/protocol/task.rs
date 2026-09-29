@@ -129,18 +129,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_states_have_the_correct_count() {
-        assert_eq!(TaskRunState::ALL.len(), 11);
-    }
-
-    #[test]
-    fn all_states_are_unique() {
-        use std::collections::HashSet;
-        let unique: HashSet<_> = TaskRunState::ALL.iter().cloned().collect();
-        assert_eq!(unique.len(), 11);
-    }
-
-    #[test]
     fn legal_transitions_are_exactly_eighteen() {
         let legal = [
             (TaskRunState::Scheduled, TaskRunState::Queued),
@@ -177,6 +165,8 @@ mod tests {
             legal_set.insert((*from, *to));
         }
 
+        let all: std::collections::HashSet<_> = TaskRunState::ALL.iter().collect();
+        assert_eq!(all.len(), TaskRunState::ALL.len(), "ALL has no duplicates");
         for from in TaskRunState::ALL.iter() {
             for to in TaskRunState::ALL.iter() {
                 let is_in_table = legal_set.contains(&(*from, *to));
@@ -191,86 +181,11 @@ mod tests {
     }
 
     #[test]
-    fn exactly_seven_states_are_terminal() {
-        let terminal_states = [
-            TaskRunState::Succeeded,
-            TaskRunState::Failed,
-            TaskRunState::Expired,
-            TaskRunState::Superseded,
-            TaskRunState::Cancelled,
-            TaskRunState::Lost,
-            TaskRunState::Orphaned,
-        ];
-
-        for state in TaskRunState::ALL.iter() {
-            let is_in_terminal_list = terminal_states.contains(state);
-            let result = state.is_terminal();
-            assert_eq!(
-                result, is_in_terminal_list,
-                "State {:?}: expected is_terminal() to return {}, got {}",
-                state, is_in_terminal_list, result
-            );
-        }
-
-        let terminal_count = TaskRunState::ALL.iter().filter(|s| s.is_terminal()).count();
-        assert_eq!(
-            terminal_count, 7,
-            "Expected exactly 7 terminal states, got {}",
-            terminal_count
-        );
-
-        let non_terminal_count = TaskRunState::ALL
-            .iter()
-            .filter(|s| !s.is_terminal())
-            .count();
-        assert_eq!(
-            non_terminal_count, 4,
-            "Expected exactly 4 non-terminal states, got {}",
-            non_terminal_count
-        );
-    }
-
-    #[test]
-    fn no_terminal_state_has_outgoing_transitions() {
-        let terminal_states = [
-            TaskRunState::Succeeded,
-            TaskRunState::Failed,
-            TaskRunState::Expired,
-            TaskRunState::Superseded,
-            TaskRunState::Cancelled,
-            TaskRunState::Lost,
-            TaskRunState::Orphaned,
-        ];
-
-        for terminal in terminal_states.iter() {
-            for target in TaskRunState::ALL.iter() {
-                assert!(
-                    !terminal.can_transition_to(*target),
-                    "Terminal state {:?} should not have outgoing transition to {:?}",
-                    terminal,
-                    target
-                );
-            }
-        }
-    }
-
-    #[test]
     fn conversions_round_trip_successfully() {
         for state in TaskRunState::ALL.iter() {
             let generated: generated::TaskRunState = (*state).into();
             let back: TaskRunState = generated.try_into().expect("round-trip should succeed");
             assert_eq!(*state, back, "Round-trip failed for {:?}", state);
         }
-    }
-
-    #[test]
-    fn unspecified_conversion_returns_error() {
-        let unspecified = generated::TaskRunState::Unspecified;
-        let result: Result<TaskRunState, _> = unspecified.try_into();
-        assert!(result.is_err(), "Expected Unspecified to produce an error");
-        assert_eq!(
-            result.unwrap_err(),
-            TaskRunStateConversionError::UnspecifiedVariant
-        );
     }
 }

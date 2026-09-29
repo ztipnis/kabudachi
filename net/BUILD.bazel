@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_test_suite")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 
 rust_library(
@@ -13,36 +13,22 @@ rust_test(
     name = "net_test",
     crate = ":net",
     edition = "2024",
-    deps = all_crate_deps(normal_dev = True),
+    deps = ["//testkit"] + all_crate_deps(normal_dev = True),
 )
 
-rust_test_suite(
-    name = "net_integration_tests",
-    srcs = glob(
-        ["tests/*.rs"],
-        allow_empty = True,
-        exclude = ["tests/admission_burst_test.rs"],
-    ),
-    shared_srcs = glob(["tests/support/**/*.rs"], allow_empty = True),
-    # ":net" alone isn't enough for tests/*.rs files to `use kabudachi_core::...`
-    # directly: unlike Cargo (where an integration test can reach any of the
-    # tested crate's own [dependencies]), a Bazel rust_test_suite is a separate
-    # compilation unit that only sees what's explicitly in `deps`. "//core"
-    # mirrors the ":net" rust_library target's own `+ ["//core"]` above; this
-    # was unexercised until chunk C3 added the first real net/tests/*.rs files.
-    deps = [":net", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
-    edition = "2024",
-)
-
-# Twenty-two workers, each with its own swarm, in one process on a
-# four-thread runtime: reserve the CPUs it uses so parallel test targets do
-# not starve its timers (a starved leader loses its lease, and the test would
-# measure the host, not the protocol).
-rust_test(
-    name = "admission_burst_test",
-    srcs = ["tests/admission_burst_test.rs"] + glob(["tests/support/**/*.rs"]),
-    crate_root = "tests/admission_burst_test.rs",
-    edition = "2024",
-    tags = ["cpu:4"],
-    deps = [":net", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
-)
+# ":net" alone isn't enough for the tests to `use kabudachi_core::...`
+# directly: unlike Cargo (where an integration test can reach any of the
+# tested crate's own [dependencies]), a Bazel rust_test is a separate
+# compilation unit that only sees what's explicitly in `deps`. "//core"
+# mirrors the ":net" rust_library target's own `+ ["//core"]` above.
+# One integration-test crate per area of net; `tests/support/**` is shared.
+[
+    rust_test(
+        name = area + "_test",
+        srcs = glob(["tests/" + area + "/**/*.rs", "tests/support/**/*.rs"]),
+        crate_root = "tests/" + area + "/main.rs",
+        edition = "2024",
+        deps = [":net", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
+    )
+    for area in ["bootstrap", "election", "claim"]
+]

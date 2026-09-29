@@ -1,5 +1,7 @@
 load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
 
+# gazelle:python_generation_mode file
+
 # Shared test helper: protobuf message classes built at runtime. Tests import it
 # as a top-level module, which Gazelle cannot infer.
 # gazelle:resolve py proto_messages //runtime/tests:proto_messages
@@ -11,20 +13,8 @@ py_library(
     testonly = True,
     srcs = ["faulting_runtime.py"],
     imports = ["."],
+    visibility = ["//:__subpackages__"],
     deps = ["//bindings:_native"],  # keep
-)
-
-py_test(
-    name = "test_faulting_runtime",
-    srcs = ["test_faulting_runtime.py"],
-    pytest_main = True,  # keep
-    venv = "dev",  # keep
-    deps = [
-        ":faulting_runtime",
-        "//bindings:_native",  # keep
-        "//runtime/src/kabudachi",
-        "@pypi//pytest",  # keep
-    ],
 )
 
 py_test(
@@ -38,19 +28,6 @@ py_test(
     ],
 )
 
-py_test(
-    name = "test_runtime_protocol",
-    srcs = ["test_runtime_protocol.py"],
-    pytest_main = True,  # keep
-    venv = "dev",  # keep
-    deps = [
-        ":faulting_runtime",
-        "//bindings:_native",  # keep
-        "//runtime/src/kabudachi",
-        "@pypi//pytest",  # keep
-    ],
-)
-
 # A session wired to a real native runtime, shared by the session, flow,
 # continuation and acceptance tests.
 # gazelle:resolve py session_world //runtime/tests:session_world
@@ -59,10 +36,11 @@ py_library(
     testonly = True,
     srcs = ["session_world.py"],
     imports = ["."],
+    visibility = ["//:__subpackages__"],
     deps = [
-        ":faulting_runtime",
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
+        "//runtime/tests:faulting_runtime",
     ],
 )
 
@@ -88,22 +66,6 @@ py_test(
 )
 
 py_test(
-    name = "test_placeholder",
-    srcs = ["test_placeholder.py"],
-    # aspect_rules_py's py_test does not run pytest by default: it just
-    # executes the file as __main__, so plain `assert`-based pytest tests
-    # would silently "pass" without ever calling the test function. Gazelle
-    # does not set pytest_main or add the pytest dep on its own, so both are
-    # hand-added and kept.
-    pytest_main = True,  # keep
-    venv = "dev",  # keep
-    deps = [
-        "//runtime/src/kabudachi",
-        "@pypi//pytest",  # keep
-    ],
-)
-
-py_test(
     name = "test_local",
     srcs = ["test_local.py"],
     pytest_main = True,  # keep
@@ -118,9 +80,11 @@ py_test(
 py_test(
     name = "test_native",
     srcs = ["test_native.py"],
-    # Same reasoning as test_placeholder above: without pytest_main, this
-    # would just execute as __main__ and silently "pass" without running
-    # the test function. //bindings:_native is a Rust-built (non-Python)
+    # aspect_rules_py's py_test does not run pytest by default: it just
+    # executes the file as __main__, so plain `assert`-based pytest tests
+    # would silently "pass" without ever calling the test function. Gazelle
+    # does not set pytest_main or add the pytest dep on its own, so both are
+    # hand-added and kept. //bindings:_native is a Rust-built (non-Python)
     # target Gazelle cannot discover from the import statement, so it must
     # be added by hand too.
     pytest_main = True,  # keep
@@ -164,9 +128,9 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
-        ":session_world",
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "//runtime/tests:session_world",
         "@pypi//hypothesis",  # keep
         "@pypi//pytest",  # keep
     ],
@@ -205,22 +169,10 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
-        ":faulting_runtime",
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
+        "//runtime/tests:faulting_runtime",
         "//runtime/tests:proto_messages",
-        "@pypi//pytest",  # keep
-    ],
-)
-
-py_test(
-    name = "test_registry",
-    srcs = ["test_registry.py"],
-    # Same hand-kept settings as test_native above.
-    pytest_main = True,  # keep
-    venv = "dev",  # keep
-    deps = [
-        "//runtime/src/kabudachi",
         "@pypi//pytest",  # keep
     ],
 )
@@ -268,9 +220,9 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
-        ":session_world",
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "//runtime/tests:session_world",
         "@pypi//pytest",  # keep
     ],
 )
@@ -281,9 +233,9 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
-        ":session_world",
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "//runtime/tests:session_world",
         "@pypi//pytest",  # keep
     ],
 )
@@ -317,20 +269,11 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
-        ":session_world",
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "//runtime/tests:session_world",
         "@pypi//pytest",  # keep
     ],
-)
-
-py_library(
-    name = "tests",
-    srcs = [
-        "proto_messages.py",
-    ],
-    visibility = ["//:__subpackages__"],
-    deps = ["@pypi//protobuf"],
 )
 
 py_test(

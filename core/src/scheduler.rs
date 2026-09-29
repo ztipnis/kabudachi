@@ -266,7 +266,7 @@ pub enum ReportRejection {
 /// says the worker leads `term` at `recovery_epoch`, and may act until
 /// `valid_until`.
 ///
-/// The election hands it over (see `election::apply_to_scheduler`), and the
+/// The election hands it over (see `election::carry_out`), and the
 /// scheduler holds it until the election reports a change. The scheduler
 /// checks `valid_until` against its own clock on every leader-only call, so
 /// a grant that has run out stops it acting even before the election says

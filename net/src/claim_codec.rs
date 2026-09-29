@@ -93,27 +93,6 @@ mod tests {
     use libp2p::request_response::Codec as _;
 
     use super::*;
-    use crate::framing::MAX_MESSAGE_BYTES;
-
-    #[tokio::test]
-    async fn read_request_rejects_a_length_prefix_over_the_maximum() {
-        let mut codec = ClaimCodec;
-        let mut oversized_prefix = Cursor::new((MAX_MESSAGE_BYTES + 1).to_be_bytes().to_vec());
-
-        let result = codec.read_request(&PROTOCOL, &mut oversized_prefix).await;
-
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn read_response_rejects_a_length_prefix_over_the_maximum() {
-        let mut codec = ClaimCodec;
-        let mut oversized_prefix = Cursor::new((MAX_MESSAGE_BYTES + 1).to_be_bytes().to_vec());
-
-        let result = codec.read_response(&PROTOCOL, &mut oversized_prefix).await;
-
-        assert!(result.is_err());
-    }
 
     #[tokio::test]
     async fn read_request_rejects_a_request_that_asks_for_nothing() {

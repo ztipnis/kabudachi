@@ -1,4 +1,4 @@
-//! Membership-change helpers shared by the `net/tests/*.rs` files that grow,
+//! Membership-change helpers shared by the `net/tests/<area>/` crates that grow,
 //! shrink and replace a shard's workers (E10), on top of `super::worker`'s
 //! `RunningWorker`.
 
@@ -68,7 +68,7 @@ pub async fn spawn_member(
         .with_join_peer_timeout(PER_PEER_TIMEOUT)
         .with_retry_interval(RETRY_INTERVAL);
     let leaders = leaders.clone();
-    spawn_worker_observing(config, move |node, _| {
+    spawn_worker_observing(config, move |node, _, _| {
         // A leader names itself.
         if node.state() == WorkerState::Leader
             && let Some((me, term)) = node.known_leader()

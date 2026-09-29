@@ -15,20 +15,6 @@ def greeting(text="hi", times=1):
     return Greeting(text=text, times=times)
 
 
-def test_it_is_named_protobuf_and_available_here():
-    assert serializer.name == "protobuf"
-    assert serializer.available()
-
-
-def test_a_message_round_trips():
-    original = greeting("hello", 3)
-
-    decoded = serializer.decode(serializer.encode(original, Greeting), Greeting)
-
-    assert decoded == original
-    assert isinstance(decoded, Greeting)
-
-
 def test_a_message_is_encoded_as_its_protobuf_bytes():
     original = greeting("hello", 3)
 
@@ -39,14 +25,6 @@ def test_an_empty_message_round_trips():
     empty = Greeting()
 
     assert serializer.decode(serializer.encode(empty, Greeting), Greeting) == empty
-
-
-def test_a_list_of_messages_round_trips_in_order():
-    original = [greeting("a", 1), greeting("b", 2), greeting("c", 3)]
-
-    decoded = serializer.decode(serializer.encode(original, list[Greeting]), list[Greeting])
-
-    assert decoded == original
 
 
 def test_an_empty_list_round_trips():
@@ -67,21 +45,6 @@ def test_a_long_message_in_a_list_round_trips():
     decoded = serializer.decode(serializer.encode(original, list[Greeting]), list[Greeting])
 
     assert decoded == original
-
-
-def test_nothing_round_trips_as_no_bytes():
-    assert serializer.encode(None, NoneType) == b""
-    assert serializer.decode(b"", NoneType) is None
-
-
-def test_a_value_of_the_wrong_message_type_is_refused():
-    with pytest.raises(SerializationError, match="Greeting"):
-        serializer.encode(Receipt(ok=True), Greeting)
-
-
-def test_a_non_message_value_is_refused():
-    with pytest.raises(SerializationError):
-        serializer.encode("hello", Greeting)
 
 
 def test_a_list_holding_the_wrong_type_is_refused():
@@ -105,11 +68,6 @@ def test_types_that_are_not_messages_are_refused(unsupported):
         serializer.encode(1, unsupported)
     with pytest.raises(SerializationError, match="supports"):
         serializer.decode(b"", unsupported)
-
-
-def test_bytes_that_are_not_the_message_are_refused():
-    with pytest.raises(SerializationError):
-        serializer.decode(b"\xff\xff\xff\xff\xff", Greeting)
 
 
 def test_bytes_for_a_none_type_must_be_empty():

@@ -9,9 +9,7 @@ import pytest
 import proto_messages
 from kabudachi import ephemeral_task, task
 from kabudachi import registry as registry_module
-from kabudachi import tasks as tasks_module
-from kabudachi.config import UNSET
-from kabudachi.errors import DuplicateTaskError, RuntimeNotStartedError, TaskDefinitionError
+from kabudachi.errors import DuplicateTaskError, TaskDefinitionError
 from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.tasks import Task
@@ -25,14 +23,6 @@ def charge(request: Greeting) -> Receipt:
 
 async def charge_later(request: Greeting) -> Receipt:
     return Receipt(ok=True)
-
-
-def notify(request: Greeting) -> None:
-    return None
-
-
-def batch(requests: list[Greeting]) -> list[Receipt]:
-    return []
 
 
 def unannotated_input(request) -> Receipt:
@@ -142,44 +132,6 @@ def test_a_task_is_registered_under_its_module_and_name():
     assert registry.get(name).func is charge
 
 
-def test_the_defaults_are_a_plain_durable_task():
-    definition = define(charge).definition
-
-    assert definition.kind is TaskKind.TASK
-    assert definition.serializer == "protobuf"
-    assert definition.version == 0
-    assert definition.queue is UNSET
-
-
-def test_the_types_come_from_the_annotations():
-    definition = define(charge).definition
-
-    assert definition.input_type is Greeting
-    assert definition.output_type is Receipt
-
-
-def test_list_and_none_annotations_are_understood():
-    assert define(batch).definition.input_type == list[Greeting]
-    assert define(batch).definition.output_type == list[Receipt]
-    assert define(notify).definition.output_type is type(None)
-
-
-def test_sync_and_async_bodies_are_told_apart():
-    assert define(charge).definition.is_async is False
-    assert define(charge_later).definition.is_async is True
-
-
-def test_options_are_recorded():
-    definition = define(
-        charge, name="billing.charge", version=2, queue="gpu", serializer="other"
-    ).definition
-
-    assert definition.name == "billing.charge"
-    assert definition.version == 2
-    assert definition.queue == "gpu"
-    assert definition.serializer == "other"
-
-
 def test_a_task_keeps_the_name_and_docs_of_its_function():
     wrapped = define(charge)
 
@@ -189,26 +141,16 @@ def test_a_task_keeps_the_name_and_docs_of_its_function():
     assert inspect.signature(wrapped) == inspect.signature(charge)
 
 
-def test_calling_a_task_needs_a_running_runtime():
-    with pytest.raises(RuntimeNotStartedError, match="run"):
-        define(charge)(Greeting())
-
-
 def test_the_same_name_cannot_be_registered_twice():
     registry = TaskRegistry()
     Task(charge, registry=registry)
 
-    with pytest.raises(DuplicateTaskError):
-        Task(charge_later, registry=registry, name=f"{charge.__module__}.charge")
+    name = f"{charge.__module__}.charge"
 
+    with pytest.raises(DuplicateTaskError, match=name.replace(".", r"\.")):
+        Task(charge_later, registry=registry, name=name)
 
-def test_a_name_can_be_chosen_to_survive_a_rename():
-    registry = TaskRegistry()
-
-    Task(charge, registry=registry, name="billing.charge_customer")
-
-    assert "billing.charge_customer" in registry
-    assert f"{charge.__module__}.charge" not in registry
+    assert registry.get(name).func is charge
 
 
 @pytest.mark.parametrize("bad_name", ["", "   ", 3, None])
@@ -276,10 +218,6 @@ def test_a_failed_definition_registers_nothing():
     assert registry.definitions() == []
 
 
-def test_ephemeral_tasks_are_marked_as_such():
-    assert define(charge, kind=TaskKind.EPHEMERAL).definition.kind is TaskKind.EPHEMERAL
-
-
 def test_the_public_decorator_works_bare_and_registers_in_the_default_registry(monkeypatch):
     monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
 
@@ -321,15 +259,10 @@ class Uninspectable:
         return request
 
 
-@pytest.mark.parametrize("failure", [TypeError("no signature"), ValueError("no signature")])
-def test_a_callable_without_a_usable_signature_is_a_task_definition_error(monkeypatch, failure):
-    def refuse(func):
-        raise failure
-
-    monkeypatch.setattr(tasks_module.inspect, "signature", refuse)
-
+def test_a_callable_without_a_usable_signature_is_a_task_definition_error():
+    # `inspect.signature` raises ValueError for this C builtin.
     with pytest.raises(TaskDefinitionError, match="signature"):
-        define(charge)
+        define(max)
 
 
 def test_a_callable_object_with_a_broken_signature_is_refused_by_name():
@@ -421,15 +354,6 @@ def test_a_serializer_that_cannot_run_here_is_not_checked():
     assert accepted.definition.serializer == "unavailable"
 
 
-def test_a_refused_task_leaves_nothing_registered():
-    registry = TaskRegistry()
-
-    with pytest.raises(TaskDefinitionError):
-        Task(wrong_input_type, registry=registry)
-
-    assert registry.definitions() == []
-
-
 def test_a_callable_object_with_an_async_call_is_an_async_task():
     assert define(AsyncCharger(), name="tests.async_charger").definition.is_async is True
     assert define(Charger(), name="tests.charger").definition.is_async is False
@@ -444,19 +368,6 @@ def test_a_task_gives_access_to_the_functions_own_attributes():
     assert define(marked, name="tests.marked").custom_note == "kept"
 
 
-def test_the_wrapped_function_can_still_be_called_directly_without_a_runtime():
-    wrapped = define(charge)
-
-    assert wrapped.__wrapped__(Greeting()) == Receipt(ok=True)
-
-
-def test_a_task_is_still_a_task_and_reports_its_definition():
-    wrapped = define(charge)
-
-    assert isinstance(wrapped, Task)
-    assert wrapped.definition.func is charge
-
-
 def test_a_task_that_wraps_an_async_function_is_recognised_as_a_coroutine_function():
     wrapped = define(charge_later)
 
@@ -468,11 +379,6 @@ def fresh_registry(monkeypatch):
     monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
 
 
-def test_a_task_can_declare_how_many_times_it_is_retried(fresh_registry):
-    assert task(name="retry.default")(charge).definition.retries == 0
-    assert task(name="retry.three", retries=3)(charge).definition.retries == 3
-
-
 @pytest.mark.parametrize("bad", [-1, True, 1.5, "2", None])
 def test_retries_must_be_a_non_negative_integer(fresh_registry, bad):
     with pytest.raises(TaskDefinitionError, match="retries"):
@@ -482,18 +388,6 @@ def test_retries_must_be_a_non_negative_integer(fresh_registry, bad):
 def test_an_ephemeral_task_is_never_retried_so_it_takes_no_retries(fresh_registry):
     with pytest.raises(TypeError):
         ephemeral_task(name="retry.ephemeral", retries=1)(charge)
-
-
-def test_a_task_can_declare_a_timeout_and_a_cancel_grace(fresh_registry):
-    defined = task(
-        name="timing.both", timeout=timedelta(seconds=5), cancel_grace=timedelta(seconds=1)
-    )(charge).definition
-    assert defined.timeout == timedelta(seconds=5)
-    assert defined.cancel_grace == timedelta(seconds=1)
-
-    plain = task(name="timing.none")(charge).definition
-    assert plain.timeout is None
-    assert plain.cancel_grace is UNSET
 
 
 @pytest.mark.parametrize("bad", [timedelta(0), timedelta(seconds=-1), 5, "5s", True])

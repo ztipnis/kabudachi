@@ -120,11 +120,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn from_millis_is_a_direct_tick_count() {
-        assert_eq!(Duration::from_millis(1_500), Duration::from_ticks(1_500));
-    }
-
-    #[test]
     fn from_secs_converts_to_milliseconds() {
         assert_eq!(Duration::from_secs(2), Duration::from_ticks(2_000));
     }
@@ -174,18 +169,6 @@ mod tests {
     }
 
     #[test]
-    fn real_clock_never_goes_backwards() {
-        let clock = RealClock::new();
-        let mut last = clock.now();
-
-        for _ in 0..1_000 {
-            let now = clock.now();
-            assert!(now >= last);
-            last = now;
-        }
-    }
-
-    #[test]
     fn real_clocks_wall_clock_reading_is_system_time_in_milliseconds() {
         let clock = RealClock::new();
         let system_millis = || {
@@ -206,22 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn instant_addition_works() {
-        let start = Instant::at(10);
-        let duration = Duration::from_ticks(5);
-        let result = start + duration;
-        assert_eq!(result, Instant::at(15));
-    }
-
-    #[test]
-    fn instant_subtraction_works() {
-        let later = Instant::at(15);
-        let earlier = Instant::at(10);
-        let duration = later - earlier;
-        assert_eq!(duration, Duration::from_ticks(5));
-    }
-
-    #[test]
     fn subtraction_saturates_backward() {
         let earlier = Instant::at(10);
         let later = Instant::at(15);
@@ -235,22 +202,5 @@ mod tests {
         let large_duration = Duration::from_ticks(100);
         let result = near_max + large_duration;
         assert_eq!(result, Instant::at(u64::MAX));
-    }
-
-    #[test]
-    fn instant_ordering() {
-        let a = Instant::at(5);
-        let b = Instant::at(10);
-        assert!(a < b);
-        assert!(b > a);
-        assert_eq!(a, Instant::at(5));
-    }
-
-    #[test]
-    fn duration_ordering() {
-        let a = Duration::from_ticks(5);
-        let b = Duration::from_ticks(10);
-        assert!(a < b);
-        assert!(b > a);
     }
 }

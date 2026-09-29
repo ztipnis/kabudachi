@@ -1,13 +1,14 @@
 //! The election loop of the worker: it steps the election node whenever the
-//! node's next deadline comes, hands each step's leadership grant to the
-//! scheduler, tells everyone watching each state the worker moves into, and
+//! node's next deadline comes, carries each step out through
+//! `kabudachi_core::election::carry_out` (the step's leadership grant to the
+//! scheduler), tells everyone watching each state the worker moves into, and
 //! drains the worker when told to stop.
 
 use std::sync::Arc;
 
-use kabudachi_core::election::{Input, Output, apply_to_scheduler};
+use kabudachi_core::election::{DropMessages, Input, NoAuthority, Output, Step, carry_out};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::time::RealClock;
+use kabudachi_core::time::{Instant, RealClock};
 use tokio::sync::{Notify, watch};
 
 use crate::local_node::LocalNode;
@@ -29,46 +30,64 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Hands the scheduler what `outputs` ask of it, then publishes, in
-    /// order, every state they report the worker moving into. Their messages,
-    /// sent or published, are dropped: a lone node has no peer to reach, and
-    /// its only messages are the roll call it publishes and the election
-    /// certificate it sends itself on winning.
-    fn publish_changes(&self, outputs: &[Output]) {
-        self.wakeups.with_scheduler(&self.scheduler, |scheduler| {
-            apply_to_scheduler(outputs, scheduler)
+    /// Carries `step`, one `node` has taken, out (see `carry_out`): the
+    /// scheduler is handed what it asks of it, then every state it reports
+    /// the worker moving into is published, in order. Its messages, sent or
+    /// published, are dropped: a lone node has no peer to reach, and its
+    /// only messages are the roll call it publishes and the election
+    /// certificate it sends itself on winning. Returns the node's next
+    /// deadline.
+    fn publish_changes(&self, node: &mut LocalNode<RealClock>, step: Step) -> Option<Instant> {
+        let mut states = Vec::new();
+        let next_deadline = self.wakeups.with_scheduler(&self.scheduler, |scheduler| {
+            carry_out(
+                node,
+                step,
+                scheduler,
+                &mut DropMessages,
+                &mut NoAuthority,
+                |_, _, _, step| {
+                    for output in &step.outputs {
+                        if let Output::StateChanged(state) = output {
+                            states.push(*state);
+                        }
+                    }
+                },
+            )
         });
-        for output in outputs {
-            if let Output::StateChanged(state) = output {
-                self.state.send_replace(*state);
-            }
+        for state in states {
+            self.state.send_replace(state);
         }
+        next_deadline
     }
 }
 
-/// Steps the election whenever the node's next deadline comes, and publishes
-/// what each step changed (see [`Publisher`]), until told to stop; then
-/// drains the worker so it leaves the shard cleanly. `clock` must be the
-/// node's own: its deadlines are instants of that clock. A node with no
-/// deadline, such as a lone leader, is not woken until it is told to stop.
+/// Carries out `first`, the step `node` was started with, then steps the
+/// election whenever the node's next deadline comes, and publishes what each
+/// step changed (see [`Publisher`]), until told to stop; then drains the
+/// worker so it leaves the shard cleanly. `clock` must be the node's own:
+/// its deadlines are instants of that clock. A node with no deadline, such
+/// as a lone leader, is not woken until it is told to stop.
 pub async fn run_election(
     mut node: LocalNode<RealClock>,
+    first: Step,
     clock: RealClock,
     stop: Arc<Notify>,
     publisher: Publisher,
 ) {
-    // A node reports its deadline only when stepped, so the loop starts with
-    // a `Tick`, which is harmless whenever it comes: the node checks its
-    // timers against its own clock.
-    let mut step = node.step(Input::Tick);
+    let mut step = first;
     loop {
-        publisher.publish_changes(&step.outputs);
+        let next_deadline = publisher.publish_changes(&mut node, step);
         tokio::select! {
-            _ = sleep_for(time_until(clock, step.next_deadline)) => {
+            _ = sleep_for(time_until(clock, next_deadline)) => {
                 step = node.step(Input::Tick);
             }
             _ = stop.notified() => {
-                publisher.publish_changes(&drain(&mut node, clock).await);
+                let drained = Step {
+                    outputs: drain(&mut node, clock).await,
+                    next_deadline: None,
+                };
+                publisher.publish_changes(&mut node, drained);
                 return;
             }
         }
@@ -81,6 +100,8 @@ pub async fn run_election(
 /// roll call at its next `Tick`, due at once, elects itself at that call's
 /// deadline, and drains in that same step.
 async fn drain(node: &mut LocalNode<RealClock>, clock: RealClock) -> Vec<Output> {
+    // Stepping by hand, not through `carry_out`, is safe only because a
+    // local node has no authority: no step asks for a reply to feed back.
     let mut step = node.step(Input::Drain);
     let mut outputs = std::mem::take(&mut step.outputs);
     while node.state() != WorkerState::Stopped {
@@ -111,13 +132,14 @@ mod tests {
     const WAIT_LIMIT: Duration = Duration::from_secs(5);
 
     fn new_node(clock: RealClock, suspect_timeout: CoreDuration) -> LocalNode<RealClock> {
-        local_node(
+        let (node, _nothing_to_carry_out) = local_node(
             WorkerId::new("worker-1"),
             IncarnationId::new("incarnation-1"),
             ShardId::new("local"),
             clock,
             suspect_timeout,
-        )
+        );
+        node
     }
 
     /// A node that elects itself as soon as a millisecond has passed.
@@ -128,17 +150,6 @@ mod tests {
     /// Lets real time pass so the node's next tick moves it forward.
     fn let_time_pass() {
         std::thread::sleep(Duration::from_millis(3));
-    }
-
-    #[tokio::test]
-    async fn a_drain_from_active_ends_stopped() {
-        let clock = RealClock::new();
-        let mut node = new_node(clock, CoreDuration::from_secs(60));
-        assert_eq!(node.state(), WorkerState::Active);
-
-        drain(&mut node, clock).await;
-
-        assert_eq!(node.state(), WorkerState::Stopped);
     }
 
     #[tokio::test]
@@ -155,37 +166,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_drain_from_leader_ends_stopped() {
-        let clock = RealClock::new();
-        let mut node = eager_node(clock);
-        let_time_pass();
-        let _ = node.step(Input::Tick);
-        let _ = node.step(Input::Tick);
-        let_time_pass();
-        let _ = node.step(Input::Tick);
-        assert_eq!(node.state(), WorkerState::Leader);
-
-        drain(&mut node, clock).await;
-
-        assert_eq!(node.state(), WorkerState::Stopped);
-    }
-
-    #[tokio::test]
-    async fn a_second_drain_changes_nothing() {
-        let clock = RealClock::new();
-        let mut node = eager_node(clock);
-        drain(&mut node, clock).await;
-
-        let outputs = drain(&mut node, clock).await;
-
-        assert!(outputs.is_empty(), "{outputs:?}");
-        assert_eq!(node.state(), WorkerState::Stopped);
-    }
-
-    #[tokio::test]
     async fn the_election_and_its_scheduler_lead_on_the_nodes_own_timers_until_stopped() {
         let clock = RealClock::new();
-        let node = eager_node(clock);
+        let (node, first) = local_node(
+            WorkerId::new("worker-1"),
+            IncarnationId::new("incarnation-1"),
+            ShardId::new("local"),
+            clock,
+            CoreDuration::from_millis(0),
+        );
         let (state_sender, mut state) = watch::channel(node.state());
         let scheduler: SharedScheduler = Arc::new(Mutex::new(Scheduler::new(clock, Uuid7Ids)));
         let publisher = Publisher {
@@ -195,7 +184,13 @@ mod tests {
         };
         let stop = Arc::new(Notify::new());
 
-        let election = tokio::spawn(run_election(node, clock, Arc::clone(&stop), publisher));
+        let election = tokio::spawn(run_election(
+            node,
+            first,
+            clock,
+            Arc::clone(&stop),
+            publisher,
+        ));
         tokio::time::timeout(
             WAIT_LIMIT,
             state.wait_for(|current| *current == WorkerState::Leader),

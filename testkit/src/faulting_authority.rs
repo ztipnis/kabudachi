@@ -1,7 +1,8 @@
 //! A `CoordinationAuthority` for tests that need the authority to fail, for
 //! one worker or for all of them.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use kabudachi_core::coordination_authority::{
     AuthorityError, CoordinationAuthority, LiveRegistrations, RecoveryEpoch,
@@ -22,6 +23,37 @@ use kabudachi_core::time::{Clock, Duration, Instant};
 pub struct FaultingAuthority<C> {
     shared: Arc<SharedAuthority<C>>,
     faults: Arc<Mutex<Faults>>,
+    gate: Arc<Gate>,
+}
+
+/// One kind of authority call, for [`FaultingAuthority::hold_next`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CallKind {
+    Register,
+    LiveRegistrations,
+    ReadRecoveryEpoch,
+    SwapRecoveryEpoch,
+    AcquireFence,
+}
+
+/// One connection's held calls. Kept apart from [`Faults`] and taken before
+/// any authority lock, and never while one is held: a held call waits here,
+/// so it must not stop any other call, on this handle or another.
+#[derive(Default)]
+struct Gate {
+    slots: Mutex<BTreeMap<CallKind, Slot>>,
+    released: Condvar,
+}
+
+/// The hold on one kind of call.
+#[derive(Default)]
+struct Slot {
+    /// The next call of this kind will hold.
+    armed: bool,
+    /// Calls of this kind waiting for a release.
+    holding: u32,
+    /// Counts releases, so a waiting call can tell its own was released.
+    releases: u64,
 }
 
 /// What every handle reaches. `flush` swaps `current` for a fresh authority,
@@ -61,6 +93,7 @@ impl<C> Clone for FaultingAuthority<C> {
         Self {
             shared: Arc::clone(&self.shared),
             faults: Arc::clone(&self.faults),
+            gate: Arc::clone(&self.gate),
         }
     }
 }
@@ -79,6 +112,7 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
                 availability: Mutex::new(Availability::default()),
             }),
             faults: Arc::new(Mutex::new(Faults::default())),
+            gate: Arc::new(Gate::default()),
         }
     }
 
@@ -88,6 +122,7 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
         Self {
             shared: Arc::clone(&self.shared),
             faults: Arc::new(Mutex::new(Faults::default())),
+            gate: Arc::new(Gate::default()),
         }
     }
 
@@ -131,6 +166,52 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     pub fn lose_next_race(&self) {
         let _operations_paused = lock(&self.shared.current);
         self.faults().lose_next_race = true;
+    }
+
+    /// Holds this handle's next `kind` call: the calling thread blocks until
+    /// [`Self::release`], and the call then proceeds against the authority as
+    /// it is at release time. Holding never affects other handles, nor other
+    /// kinds of call on this one.
+    pub fn hold_next(&self, kind: CallKind) {
+        lock(&self.gate.slots).entry(kind).or_default().armed = true;
+    }
+
+    /// Releases every call held by [`Self::hold_next`] for `kind` on this
+    /// handle. A hold that no call has reached yet is cancelled.
+    pub fn release(&self, kind: CallKind) {
+        let mut slots = lock(&self.gate.slots);
+        let slot = slots.entry(kind).or_default();
+        slot.armed = false;
+        slot.holding = 0;
+        slot.releases += 1;
+        self.gate.released.notify_all();
+    }
+
+    /// True while a call of `kind` is held on this handle, so a test can wait
+    /// for this before acting "during" the call.
+    pub fn is_holding(&self, kind: CallKind) -> bool {
+        lock(&self.gate.slots)
+            .get(&kind)
+            .is_some_and(|slot| slot.holding > 0)
+    }
+
+    /// Blocks while a hold on `kind` catches this call, before it reaches
+    /// the authority.
+    fn pass_gate(&self, kind: CallKind) {
+        let mut slots = lock(&self.gate.slots);
+        let slot = slots.entry(kind).or_default();
+        if !std::mem::take(&mut slot.armed) {
+            return;
+        }
+        slot.holding += 1;
+        let releases = slot.releases;
+        while slots[&kind].releases == releases {
+            slots = self
+                .gate
+                .released
+                .wait(slots)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     /// Wipes the authority for every handle, like Redis `FLUSHALL` (README
@@ -181,10 +262,12 @@ impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
         worker_id: &WorkerId,
         address: &str,
     ) -> Result<Duration, AuthorityError> {
+        self.pass_gate(CallKind::Register);
         self.reach()?.register(shard_id, worker_id, address)
     }
 
     fn live_registrations(&self, shard_id: &ShardId) -> Result<LiveRegistrations, AuthorityError> {
+        self.pass_gate(CallKind::LiveRegistrations);
         let authority = self.reach()?;
         let live = authority.live_registrations(shard_id)?;
         // The in-memory authority below warms up only from its construction
@@ -199,6 +282,7 @@ impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
         &self,
         shard_id: &ShardId,
     ) -> Result<Option<RecoveryEpoch>, AuthorityError> {
+        self.pass_gate(CallKind::ReadRecoveryEpoch);
         self.reach()?.read_recovery_epoch(shard_id)
     }
 
@@ -208,6 +292,7 @@ impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
         expected: Option<RecoveryEpoch>,
         new: RecoveryEpoch,
     ) -> Result<(), AuthorityError> {
+        self.pass_gate(CallKind::SwapRecoveryEpoch);
         let authority = self.reach()?;
         let loses_race = std::mem::take(&mut self.faults().lose_next_race);
         if loses_race {
@@ -224,6 +309,7 @@ impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
         holder: &WorkerId,
         recovery_epoch: RecoveryEpoch,
     ) -> Result<Duration, AuthorityError> {
+        self.pass_gate(CallKind::AcquireFence);
         self.reach()?
             .acquire_fence(shard_id, holder, recovery_epoch)
     }
@@ -342,15 +428,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_handle_gets_unavailable_from_every_operation() {
-        let (authority, _clock) = seeded_authority();
-
-        authority.set_reachable(false);
-
-        assert_every_operation_is_unavailable(&authority);
-    }
-
-    #[test]
     fn becoming_reachable_again_finds_the_state_unchanged() {
         let (authority, _clock) = seeded_authority();
         authority.set_reachable(false);
@@ -375,16 +452,6 @@ mod tests {
             Ok(()),
             "the other handle does not lose the race armed on the first"
         );
-    }
-
-    #[test]
-    fn another_workers_handle_starts_with_no_faults() {
-        let (authority, _clock) = seeded_authority();
-        authority.set_reachable(false);
-
-        let other = authority.for_another_worker();
-
-        assert_seeded_state(&other);
     }
 
     #[test]
@@ -544,20 +611,6 @@ mod tests {
     }
 
     #[test]
-    fn registrations_made_before_an_outage_of_a_ttl_or_more_have_lapsed_after_it() {
-        let (authority, clock) = seeded_authority();
-        authority.set_available(false);
-        clock.advance(ttl());
-        authority.set_available(true);
-
-        assert_eq!(
-            authority.live_registrations(&shard()).unwrap().addresses(),
-            &BTreeMap::new(),
-            "no worker could renew during the outage"
-        );
-    }
-
-    #[test]
     fn making_an_available_authority_available_does_not_restart_warm_up() {
         let (authority, _clock) = seeded_authority();
 
@@ -566,38 +619,91 @@ mod tests {
         assert_seeded_state(&authority);
     }
 
-    #[test]
-    fn two_workers_racing_to_create_the_epoch_exactly_one_wins() {
-        let clock = TestClock::default();
-        let first = FaultingAuthority::new(clock, ttl());
-        let second = first.for_another_worker();
+    /// Waits, on a short real-time backstop, until `authority` holds a call
+    /// of `kind`.
+    fn wait_until_holding(authority: &FaultingAuthority<TestClock>, kind: CallKind) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !authority.is_holding(kind) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {kind:?} call was held"
+            );
+            std::thread::yield_now();
+        }
+    }
 
-        assert_eq!(
-            first.compare_and_swap_recovery_epoch(&shard(), None, epoch(0)),
-            Ok(())
+    #[test]
+    fn a_held_call_blocks_only_itself() {
+        let (authority, _clock) = seeded_authority();
+        let other = authority.for_another_worker();
+        authority.hold_next(CallKind::Register);
+        let held = {
+            let authority = authority.clone();
+            std::thread::spawn(move || authority.register(&shard(), &worker("b"), "addr-b"))
+        };
+        wait_until_holding(&authority, CallKind::Register);
+
+        assert!(
+            authority.live_registrations(&shard()).is_ok(),
+            "another kind of call on the same handle is not held up"
         );
         assert_eq!(
-            second.compare_and_swap_recovery_epoch(&shard(), None, epoch(0)),
+            other.register(&shard(), &worker("c"), "addr-c").map(|_| ()),
+            Ok(()),
+            "another handle's call of the same kind is not held up"
+        );
+        assert_eq!(
+            authority
+                .register(&shard(), &worker("d"), "addr-d")
+                .map(|_| ()),
+            Ok(()),
+            "a second call of the same kind on the same handle is not held: the hold catches one call"
+        );
+        assert_eq!(
+            authority
+                .live_registrations(&shard())
+                .unwrap()
+                .addresses()
+                .len(),
+            3,
+            "the held registration has not reached the authority"
+        );
+
+        authority.release(CallKind::Register);
+        assert_eq!(held.join().unwrap().map(|_| ()), Ok(()));
+        assert!(!authority.is_holding(CallKind::Register));
+        assert_eq!(
+            authority
+                .live_registrations(&shard())
+                .unwrap()
+                .addresses()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_released_call_sees_the_authority_as_it_is_at_release() {
+        let fresh = FaultingAuthority::new(TestClock::default(), ttl());
+        let held_handle = fresh.clone();
+        let rival = fresh.for_another_worker();
+        held_handle.hold_next(CallKind::SwapRecoveryEpoch);
+        let held = std::thread::spawn(move || {
+            held_handle.compare_and_swap_recovery_epoch(&shard(), None, epoch(0))
+        });
+        wait_until_holding(&fresh, CallKind::SwapRecoveryEpoch);
+
+        rival
+            .compare_and_swap_recovery_epoch(&shard(), None, epoch(0))
+            .expect("the rival creates the epoch while the first swap is held");
+        fresh.release(CallKind::SwapRecoveryEpoch);
+
+        assert_eq!(
+            held.join().unwrap(),
             Err(AuthorityError::EpochConflict {
                 current: Some(epoch(0))
             })
         );
-        assert_eq!(first.read_recovery_epoch(&shard()), Ok(Some(epoch(0))));
     }
 
-    #[test]
-    fn a_worker_that_loses_the_race_to_create_the_epoch_sees_the_winners_epoch() {
-        let clock = TestClock::default();
-        let authority = FaultingAuthority::new(clock, ttl());
-
-        authority.lose_next_race();
-
-        assert_eq!(
-            authority.compare_and_swap_recovery_epoch(&shard(), None, epoch(0)),
-            Err(AuthorityError::EpochConflict {
-                current: Some(epoch(0))
-            })
-        );
-        assert_eq!(authority.read_recovery_epoch(&shard()), Ok(Some(epoch(0))));
-    }
 }

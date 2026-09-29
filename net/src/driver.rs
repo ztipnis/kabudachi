@@ -33,15 +33,16 @@
 //! reply came, so a late reply costs it nothing it counts on, and it
 //! ignores a read or swap reply that answers anything but the call it now
 //! waits on, so replies arriving out of order are safe. At most one call of
-//! each kind is in flight (see [`Stepper::perform_later`]). With no
+//! each kind is in flight (see `PoolPerformer`). With no
 //! authority (`None`), every call gets
 //! [`kabudachi_core::election::AuthorityCall::unavailable`] at once instead,
 //! so a node built with no authority timings never waits on one that does
 //! not exist.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,10 +50,11 @@ use std::time::Duration;
 use kabudachi_core::configuration::{Configuration, Generation};
 use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityReply, AuthorityRequest, Input, Output, Step, WorkerNode,
-    apply_to_scheduler,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, Input, MessageSink,
+    Output, Step, WorkerNode, carry_out,
 };
 use kabudachi_core::protocol::ids::{IdGenerator, ShardId, TaskId, WorkerId};
+use kabudachi_core::protocol::messages::ElectionMessage;
 use kabudachi_core::protocol::messages::{
     Claim, ClaimBatch, ClaimReject, ClaimRejectReason, ClaimResponse, JoinResponse, claim_request,
     claim_response,
@@ -60,43 +62,45 @@ use kabudachi_core::protocol::messages::{
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{self, ClaimRejection, Scheduler};
 use kabudachi_core::time::{Clock, Instant};
-use libp2p::Multiaddr;
 
 use tokio::sync::mpsc;
 
-use crate::bootstrap::DEFAULT_RETRY_INTERVAL;
+use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, WaitLog};
 use crate::framing::MAX_MESSAGE_BYTES;
-use crate::messenger::{
-    DEFAULT_JOIN_PEER_TIMEOUT, DEFAULT_ROUTING_REFRESH_SUSPICIONS, LeaderSearch,
-    MIN_ROUTING_REFRESH_PERIOD, Net,
-};
+use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, find_leader, pointer_for};
+use crate::messenger::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD, Net};
 
 /// A coordination authority shared by every task that calls it: the
 /// driver's, and the blocking-pool tasks that perform its calls.
 pub type SharedAuthority = Arc<dyn CoordinationAuthority + Send + Sync>;
 
 /// Drives `node` over `net` for ever, in batches, after subscribing `net` to
-/// `node`'s shard (see `Net::subscribe_to_shard`). Each batch feeds `node`
+/// `node`'s shard (see `Net::subscribe_to_shard`). The first batch first
+/// carries out `first`, the step `node` still has to have carried out: the
+/// one `WorkerNode::start` returned with it, or, for a node driven before,
+/// one that asks for nothing and is due now. Each batch feeds `node`
 /// every input `net` has queued for it (see `Net::take_inputs`), answers the
-/// join and claim requests `net` holds, steps `node` with a `Tick` while
-/// the deadline it reports has come, and then tells `net` the leader `node`
-/// names (see `Net::set_leader`), for the worker's own claims. It carries out what every step asks,
-/// the grant first: the step's leadership grant goes to `scheduler`, then
-/// its messages go out through `net`, sent or published, so a grant the step
-/// withdraws is gone before any message the step sends can let another
-/// leader act. Between batches it sleeps until `node`'s next deadline or
-/// until something arrives on `net`, whichever is first, re-crawling peer
-/// routing meanwhile when that is due (see the module doc). Callers stop it by
+/// join and claim requests `net` holds, and steps `node` with a `Tick`
+/// while the deadline it reports has come. It carries out every step
+/// through `kabudachi_core::election::carry_out`, the grant first: the
+/// step's leadership grant goes to `scheduler`, then its messages
+/// go out through `net`, sent or published, so a grant the step withdraws is
+/// gone before any message the step sends can let another leader act.
+/// Between batches it sleeps until `node`'s next deadline or until something
+/// arrives on `net`, whichever is first, re-crawling peer routing meanwhile
+/// when that is due (see the module doc). Callers stop it by
 /// dropping (or aborting the task wrapping) the future it returns — there
 /// is no internal exit condition, mirroring `WorkerNode` itself having no
 /// concept of being "done".
 ///
-/// `observe` is called after every batch with `node` and every output the
-/// batch's steps produced, in order: the states `node` moved through, its
-/// grant and the messages it sent. It is how a caller watches `node` while
-/// this holds it by exclusive borrow, reading `state()` or `known_leader()`
-/// from `node` itself; pass `|_, _| {}` to ignore it. It runs on the
-/// driver's own task, so it should return quickly.
+/// `observe` is called after every step `node` takes, as `carry_out` calls
+/// its own (the step's grant already with `scheduler`, its messages not yet
+/// sent), with `node`, the input the step handled (`None` for `first` and
+/// for the step a rejoin starts with) and the step itself. It is how a
+/// caller watches `node` while this holds it by exclusive borrow, reading
+/// `state()` or `known_leader()` from `node` itself; pass `|_, _, _| {}` to
+/// ignore it. It runs on the driver's own task, so it should return
+/// quickly.
 ///
 /// Each batch first hands `node` the authority replies that have arrived
 /// (see the module doc), then the inputs `net` queued.
@@ -138,11 +142,12 @@ pub type SharedAuthority = Arc<dyn CoordinationAuthority + Send + Sync>;
 /// [`find_leader_to_rejoin`]); the driver keeps running meanwhile.
 pub async fn run_driver<C, I>(
     node: &mut WorkerNode<C>,
+    first: Step,
     net: &Net,
     scheduler: &mut Scheduler<C, I>,
     clock: C,
     authority: Option<SharedAuthority>,
-    mut observe: impl FnMut(&WorkerNode<C>, &[Output]),
+    mut observe: impl FnMut(&WorkerNode<C>, Option<&Input>, &Step),
 ) -> Infallible
 where
     C: Clock,
@@ -150,26 +155,23 @@ where
 {
     let my_id = net.local_worker_id();
     net.subscribe_to_shard(node.shard_id());
-    // A node reports its deadline only when stepped, so the first batch
-    // ticks it at once; a `Tick` is harmless whenever it comes, as the node
-    // checks its timers against its own clock.
-    let mut next_deadline = Some(clock.now());
+    let mut first = Some(first);
+    let mut next_deadline = None;
     let (replies, mut replied) = mpsc::unbounded_channel();
     // The reply whose arrival ended the last sleep, if one did.
     let mut woken_by = None;
     let mut in_flight = BTreeSet::new();
     // While the node is back in `Bootstrapping`: the search for a leader to
-    // rejoin (see [`find_leader_to_rejoin`]), how many have run, and the
-    // pointer the last one found.
-    let mut rejoin_search: Option<Pin<Box<dyn Future<Output = Option<JoinResponse>> + Send + '_>>> =
-        None;
+    // rejoin (see [`find_leader_to_rejoin`]), how many have run, the log of
+    // why none has found one yet, and the pointer the last one found.
+    let mut rejoin_search: Option<Pin<Box<dyn Future<Output = Rejoin> + Send + '_>>> = None;
+    let mut rejoin_log = Some(WaitLog::new(node.shard_id()));
     let mut rejoin_attempts = 0_usize;
     let mut rejoin_pointer = None;
     let mut rejoin_pointer_refused = false;
     let mut routing = RoutingRefresh::new(node, net, clock.now());
 
     loop {
-        let mut outputs = Vec::new();
         let mut stepper = Stepper {
             node: &mut *node,
             scheduler: &mut *scheduler,
@@ -178,8 +180,11 @@ where
             replies: &replies,
             in_flight: &mut in_flight,
             my_id: &my_id,
-            outputs: &mut outputs,
+            observe: &mut observe,
         };
+        if let Some(first) = first.take() {
+            next_deadline = stepper.carry(first, None);
+        }
         let arrived_replies =
             std::iter::from_fn(|| woken_by.take().or_else(|| replied.try_recv().ok()));
         for reply in arrived_replies {
@@ -195,7 +200,7 @@ where
             // another lineage's) is not asked for again at once.
             rejoin_pointer_refused = stepper.node.state() == WorkerState::Bootstrapping;
         }
-        respond_to_join_requests(stepper.node, net, &my_id);
+        respond_to_join_requests(stepper.node, net).await;
         respond_to_claim_requests(stepper.scheduler, net);
         // A step can report a deadline that has already come: a voter that
         // begins suspecting its leader starts a roll call at its next
@@ -204,11 +209,7 @@ where
         while next_deadline.is_some_and(|deadline| deadline <= clock.now()) {
             next_deadline = stepper.step(Input::Tick);
         }
-        // Before `observe`: an observer that sees the node name a leader
-        // may claim from it at once.
-        net.set_leader(node.known_leader().map(|(leader, _)| leader));
         let mut refresh_at = routing.after_batch(node, net, clock.now());
-        observe(node, &outputs);
 
         // A fenced node that found its shard recovered without it went back
         // to `Bootstrapping` to join again (ADR-0001 decision 12). Only a
@@ -218,6 +219,9 @@ where
             && rejoin_search.is_none()
             && let Some(authority) = &authority
         {
+            let log = rejoin_log
+                .take()
+                .unwrap_or_else(|| WaitLog::new(node.shard_id()));
             rejoin_search = Some(Box::pin(find_leader_to_rejoin(
                 net,
                 Arc::clone(authority),
@@ -225,6 +229,7 @@ where
                 my_id.clone(),
                 rejoin_attempts,
                 std::mem::take(&mut rejoin_pointer_refused),
+                log,
             )));
             rejoin_attempts += 1;
         }
@@ -246,7 +251,8 @@ where
                     }
                 } => {
                     rejoin_search = None;
-                    rejoin_pointer = found;
+                    rejoin_pointer = found.pointer;
+                    rejoin_log = Some(found.log);
                     break;
                 }
                 // `replies` lives as long as this loop, so the channel never
@@ -359,7 +365,7 @@ impl RoutingRefresh {
 }
 
 /// What one batch of [`run_driver`] steps its node with.
-struct Stepper<'a, C: Clock, I: IdGenerator> {
+struct Stepper<'a, C: Clock, I: IdGenerator, O> {
     node: &'a mut WorkerNode<C>,
     scheduler: &'a mut Scheduler<C, I>,
     net: &'a Net,
@@ -371,21 +377,21 @@ struct Stepper<'a, C: Clock, I: IdGenerator> {
     /// The kinds of call performed and not yet answered.
     in_flight: &'a mut BTreeSet<CallKind>,
     my_id: &'a WorkerId,
-    outputs: &'a mut Vec<Output>,
+    /// [`run_driver`]'s `observe`.
+    observe: &'a mut O,
 }
 
-impl<C: Clock, I: IdGenerator> Stepper<'_, C, I> {
-    /// Steps the node with `input`, carries out what that step asks (see
-    /// [`carry_out`]), appends its outputs to the batch's, and returns the
-    /// node's next deadline.
-    ///
-    /// Every `Output::Authority(call)` the step produces is sent off to be
-    /// performed (see the module doc). With no authority, its
-    /// `Unavailable` reply is fed back at once instead, carrying out that
-    /// step's outputs too, until a step asks for no more.
+impl<C, I, O> Stepper<'_, C, I, O>
+where
+    C: Clock,
+    I: IdGenerator,
+    O: FnMut(&WorkerNode<C>, Option<&Input>, &Step),
+{
+    /// Steps the node with `input`, carries that step out (see
+    /// [`Self::carry`]), and returns the node's next deadline.
     fn step(&mut self, input: Input) -> Option<Instant> {
-        let stepped = self.node.step(input);
-        self.carry_out_step(stepped)
+        let stepped = self.node.step(input.clone());
+        self.carry(stepped, Some(&input))
     }
 
     /// Joins the node, back in `Bootstrapping`, to the leader `pointer`
@@ -394,55 +400,94 @@ impl<C: Clock, I: IdGenerator> Stepper<'_, C, I> {
     /// asks for at once.
     fn rejoin(&mut self, pointer: &JoinResponse) -> Option<Instant> {
         let stepped = self.node.finish_joining(pointer);
-        self.carry_out_step(stepped)
+        self.carry(stepped, None)
     }
 
-    /// Carries out `stepped`, a step the node has just taken, as
-    /// [`Self::step`] says.
-    fn carry_out_step(&mut self, stepped: Step) -> Option<Instant> {
-        let mut pending = VecDeque::new();
-        pending.push_back(stepped);
-        let mut next_deadline = None;
-        while let Some(stepped) = pending.pop_front() {
-            carry_out(self.node, &stepped.outputs, self.scheduler, self.net);
-            next_deadline = stepped.next_deadline;
-            for output in &stepped.outputs {
-                if let Output::Authority(call) = output {
-                    match self.authority {
-                        Some(authority) => self.perform_later(authority, *call),
-                        None => {
-                            let reply = call.unavailable();
-                            pending.push_back(self.node.step(Input::Authority(reply)));
-                        }
-                    }
-                }
-            }
-            self.outputs.extend(stepped.outputs);
-        }
-        next_deadline
+    /// Carries out `stepped`, a step the node has just taken on `input`,
+    /// through `carry_out`: its messages go out through the `Net` and its
+    /// authority calls to a [`PoolPerformer`]. With no authority, each
+    /// call's `Unavailable` reply is fed back at once instead, carrying out
+    /// that step too, until a step asks for no more. Logs every step's
+    /// alerts (see [`log_alerts`]), hands every step to `observe`, and
+    /// returns the node's next deadline.
+    fn carry(&mut self, stepped: Step, input: Option<&Input>) -> Option<Instant> {
+        let mut performer = PoolPerformer {
+            authority: self.authority,
+            replies: self.replies,
+            in_flight: &mut *self.in_flight,
+            net: self.net,
+            my_id: self.my_id,
+            shard_id: self.node.shard_id().clone(),
+        };
+        let observe = &mut *self.observe;
+        carry_out(
+            &mut *self.node,
+            stepped,
+            &mut *self.scheduler,
+            &mut &*self.net,
+            &mut performer,
+            |node, _, reply, step| {
+                log_alerts(node, &step.outputs);
+                // Only the first step has no reply for its input.
+                observe(node, reply.or(input), step);
+            },
+        )
+    }
+}
+
+impl MessageSink for &Net {
+    fn send(&mut self, to: WorkerId, message: ElectionMessage) {
+        Net::send(self, to, message);
     }
 
-    /// Performs `call` on the blocking pool and sends its reply to the
-    /// driver's loop, which hands it to the node in the batch it arrives in.
-    ///
-    /// At most one call of each kind is in flight: while one is unanswered,
-    /// a later call of the same kind is dropped, as if the authority had not
-    /// answered it. So an authority that hangs holds at most one blocking
-    /// thread per kind, rather than one more at every renewal. The node asks
-    /// again on its own schedule: its renewals come round, a fenced node
-    /// reads the epoch again at its next registration, and a forced recovery
-    /// whose step was dropped is replaced at its next roll call.
-    fn perform_later(&mut self, authority: &SharedAuthority, call: AuthorityCall) {
+    fn publish(&mut self, message: ElectionMessage) {
+        Net::publish(self, message);
+    }
+}
+
+/// Performs authority calls for [`run_driver`]'s node, and for the
+/// bootstrap cascade before it (see `crate::bootstrap`): on Tokio's blocking
+/// pool, each reply sent to `replies`, whose reader removes the reply's kind
+/// from `in_flight` ([`CallKind::answered_by`]) as it takes it. The driver
+/// hands a reply to the node in the batch it arrives in. With no authority,
+/// it answers every call at once as `Unavailable` instead. A call that
+/// panics is answered as `Unavailable` too, so its kind is not left in
+/// flight for ever.
+///
+/// At most one call of each kind is in flight: while one is unanswered, a
+/// later call of the same kind is dropped, as if the authority had not
+/// answered it. So an authority that hangs holds at most one blocking thread
+/// per kind, rather than one more at every renewal. The node asks again on
+/// its own schedule: its renewals come round, a fenced node reads the epoch
+/// again at its next registration, and a forced recovery whose step was
+/// dropped is replaced at its next roll call.
+pub(crate) struct PoolPerformer<'a> {
+    pub(crate) authority: Option<&'a SharedAuthority>,
+    /// Where a call performed on the blocking pool sends its reply.
+    pub(crate) replies: &'a mpsc::UnboundedSender<AuthorityReply>,
+    /// The kinds of call performed and not yet answered.
+    pub(crate) in_flight: &'a mut BTreeSet<CallKind>,
+    /// Whose address a registration names.
+    pub(crate) net: &'a Net,
+    pub(crate) my_id: &'a WorkerId,
+    pub(crate) shard_id: ShardId,
+}
+
+impl AuthorityPerformer for PoolPerformer<'_> {
+    fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
+        let Some(authority) = self.authority else {
+            return Some(call.unavailable());
+        };
         if !self.in_flight.insert(CallKind::of(&call.request)) {
             tracing::debug!(
                 request = ?call.request,
                 "not asking the coordination authority again while the same kind of call is \
                  unanswered"
             );
-            return;
+            return None;
         }
         let authority = Arc::clone(authority);
-        let shard_id = self.node.shard_id().clone();
+        let shard_id = self.shard_id.clone();
         let my_id = self.my_id.clone();
         let address = self
             .net
@@ -451,17 +496,27 @@ impl<C: Clock, I: IdGenerator> Stepper<'_, C, I> {
             .unwrap_or_default();
         let replies = self.replies.clone();
         tokio::task::spawn_blocking(move || {
-            let reply = call.perform(&*authority, &shard_id, &my_id, &address);
-            // The driver has stopped: no node is left to hand it to.
+            let performed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                call.perform(&*authority, &shard_id, &my_id, &address)
+            }));
+            let reply = performed.unwrap_or_else(|_| {
+                tracing::error!(
+                    request = ?call.request,
+                    "a coordination authority call panicked; answering it as unavailable"
+                );
+                call.unavailable()
+            });
+            // Whoever asked has stopped: no one is left to hand it to.
             let _ = replies.send(reply);
         });
+        None
     }
 }
 
-/// A kind of authority call, for [`Stepper::perform_later`]'s one-in-flight
+/// A kind of authority call, for [`PoolPerformer`]'s one-in-flight
 /// rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum CallKind {
+pub(crate) enum CallKind {
     Register,
     ReadLiveRegistrations,
     ReadRecoveryEpoch,
@@ -480,7 +535,7 @@ impl CallKind {
         }
     }
 
-    fn answered_by(reply: &AuthorityReply) -> Self {
+    pub(crate) fn answered_by(reply: &AuthorityReply) -> Self {
         match reply {
             AuthorityReply::Registered { .. } => CallKind::Register,
             AuthorityReply::LiveRegistrations { .. } => CallKind::ReadLiveRegistrations,
@@ -491,24 +546,13 @@ impl CallKind {
     }
 }
 
-/// Carries out one step's `outputs`: hands `scheduler` what they ask of it,
-/// then sends and publishes every message among them through `net`. The
-/// scheduler goes first, so a grant the step withdraws is gone before any
-/// message the step sends can let another leader act. The state changes and
-/// authority calls among them need no action here (a call is performed by
-/// [`Stepper::step`], which already holds `node`); `AbortDeadline` and
-/// `ShardAbandoned` are logged.
-fn carry_out<C: Clock, I: IdGenerator>(
-    node: &WorkerNode<C>,
-    outputs: &[Output],
-    scheduler: &mut Scheduler<C, I>,
-    net: &Net,
-) {
-    apply_to_scheduler(outputs, scheduler);
+/// Logs what `outputs`, one step of `node`'s, report that an operator must
+/// know of and nothing yet acts on: the deadline by which the worker must
+/// abort its TaskRuns, or its lifting, and the shard's recovery epoch gone
+/// from the authority.
+fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
     for output in outputs {
         match output {
-            Output::Send { to, message } => net.send(to.clone(), message.clone()),
-            Output::Publish { message } => net.publish(message.clone()),
             Output::AbortDeadline(Some(by)) => tracing::warn!(
                 shard = node.shard_id().as_str(),
                 by = ?by,
@@ -526,7 +570,9 @@ fn carry_out<C: Clock, I: IdGenerator>(
                 "the shard's recovery epoch is gone from the coordination authority; this \
                  worker has stopped"
             ),
-            Output::StateChanged(_)
+            Output::Send { .. }
+            | Output::Publish { .. }
+            | Output::StateChanged(_)
             | Output::Grant(_)
             | Output::Authority(_)
             | Output::WorkerLost(_) => {}
@@ -547,18 +593,27 @@ async fn sleep_until<C: Clock>(clock: &C, deadline: Option<Instant>) {
     }
 }
 
+/// What one [`find_leader_to_rejoin`] found: the pointer to rejoin through,
+/// if any, and the log of why no search has found one, handed on to the
+/// next search.
+struct Rejoin {
+    pointer: Option<JoinResponse>,
+    log: WaitLog,
+}
+
 /// One search for the leader a node back in `Bootstrapping` rejoins, after
 /// a recovery that went on without it: asks the workers `authority` lists as
-/// live, at the addresses they registered, who leads (`Net::ask_for_leader`,
-/// which asks a worker this node is still connected to over that
-/// connection). `None`, after a retry interval, when the authority cannot
-/// be read, lists no one else, or no one points at a reachable leader; the
-/// driver then searches again. Each search starts `attempt` workers further
-/// along the list, so one worker the recovery also left behind, whose
-/// pointer the node rejects as older than the epoch it rejoins (see
-/// `WorkerNode::finish_joining`), cannot answer first for ever; a search
-/// after such a refused pointer first waits a retry interval. It never
-/// founds the shard: the epoch the node rejoins shows the shard exists.
+/// live, at the addresses they registered, who leads (see
+/// `crate::join::find_leader`, which asks a worker this node is still
+/// connected to over that connection). No pointer, after a retry interval,
+/// when the authority cannot be read, lists no one else, or no one points at
+/// a reachable leader; the driver then searches again. Each search starts
+/// `attempt` workers further along the list, so one worker the recovery also
+/// left behind, whose pointer the node rejects as older than the epoch it
+/// rejoins (see `WorkerNode::finish_joining`), cannot answer first for ever;
+/// a search after such a refused pointer first waits a retry interval. It
+/// never founds the shard: the epoch the node rejoins shows the shard
+/// exists.
 async fn find_leader_to_rejoin(
     net: &Net,
     authority: SharedAuthority,
@@ -566,37 +621,35 @@ async fn find_leader_to_rejoin(
     my_id: WorkerId,
     attempt: usize,
     after_a_refused_pointer: bool,
-) -> Option<JoinResponse> {
+    mut log: WaitLog,
+) -> Rejoin {
     if after_a_refused_pointer {
         tokio::time::sleep(DEFAULT_RETRY_INTERVAL).await;
     }
-    let registrations =
-        tokio::task::spawn_blocking(move || authority.live_registrations(&shard_id)).await;
-    let mut peers: Vec<Multiaddr> = match registrations {
-        Ok(Ok(registrations)) => registrations
-            .addresses()
-            .iter()
-            .filter(|(worker, _)| **worker != my_id)
-            .filter_map(|(_, address)| address.parse().ok())
-            .collect(),
-        _ => Vec::new(),
-    };
-    if !peers.is_empty() {
-        let len = peers.len();
-        peers.rotate_left(attempt % len);
-        if let LeaderSearch::Found(pointer) =
-            net.ask_for_leader(&peers, DEFAULT_JOIN_PEER_TIMEOUT).await
-        {
-            return Some(pointer);
-        }
+    let search = find_leader(
+        net,
+        &authority,
+        &shard_id,
+        &my_id,
+        attempt,
+        DEFAULT_JOIN_PEER_TIMEOUT,
+        &mut log,
+    )
+    .await;
+    log.end_round();
+    if let LeaderSearch::Found(pointer) = search {
+        return Rejoin {
+            pointer: Some(pointer),
+            log,
+        };
     }
     tokio::time::sleep(DEFAULT_RETRY_INTERVAL).await;
-    None
+    Rejoin { pointer: None, log }
 }
 
 /// Answers every inbound `/kabudachi/join/1` request queued on `net` with a
-/// pointer to the shard's leader (see [`leader_pointer`]).
-fn respond_to_join_requests<C>(node: &WorkerNode<C>, net: &Net, my_id: &WorkerId)
+/// pointer to the shard's leader (see `crate::join::pointer_for`).
+async fn respond_to_join_requests<C>(node: &WorkerNode<C>, net: &Net)
 where
     C: Clock,
 {
@@ -609,46 +662,9 @@ where
         return;
     }
 
-    let response = leader_pointer(node, net, my_id);
+    let response = pointer_for(node, net).await;
     for handle in pending {
         net.respond_join(handle, response.clone());
-    }
-}
-
-/// The `JOIN_RESPONSE` this node gives right now: the leader
-/// `node.known_leader()` names, at an address a joiner can dial, with that
-/// leader's term and this node's recovery epoch and its lineage. `core` knows who leads but
-/// nothing about addresses, and `Net` is the reverse, so the pointer is put
-/// together here.
-///
-/// "No leader known" (an empty response) when the node knows no leader, or
-/// has no dialable address for it: this node's own address before its first
-/// successful `listen_on`, or a leader known only by the source address of
-/// its inbound connection (see `Net::dialable_address`). A pointer the
-/// joiner cannot dial would strand it, so the joiner is sent on to its next
-/// seed instead.
-fn leader_pointer<C>(node: &WorkerNode<C>, net: &Net, my_id: &WorkerId) -> JoinResponse
-where
-    C: Clock,
-{
-    let Some((leader_id, term)) = node.known_leader() else {
-        return JoinResponse::default();
-    };
-    let leader_addr = if &leader_id == my_id {
-        net.local_multiaddr()
-    } else {
-        net.dialable_address(&leader_id)
-    };
-    let Some(leader_addr) = leader_addr else {
-        return JoinResponse::default();
-    };
-
-    JoinResponse {
-        leader_id: Some(leader_id.into()),
-        leader_multiaddr: leader_addr.to_string(),
-        term,
-        recovery_epoch: node.recovery_epoch(),
-        recovery_epoch_lineage: node.recovery_lineage().unwrap_or_default(),
     }
 }
 
@@ -756,16 +772,15 @@ fn claim_reject_reason(rejection: ClaimRejection) -> ClaimRejectReason {
 #[cfg(test)]
 mod tests {
     use kabudachi_core::configuration::{Configuration, Generation, Single};
-    use kabudachi_core::coordination_authority::{
-        AuthorityError, LiveRegistrations, RecoveryEpoch,
+    use kabudachi_core::election::{
+        AuthorityTimings, ElectionTimings, Entry, Identity, KnownConfiguration,
     };
-    use kabudachi_core::election::{AuthorityTimings, ElectionTimings, KnownConfiguration};
     use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids};
     use kabudachi_core::protocol::messages::{
         ElectionMessage, LeaderHeartbeatAck, election_message,
     };
-    use kabudachi_core::protocol::worker_state::WorkerState;
     use kabudachi_core::time::{Duration as TickDuration, RealClock};
+    use kabudachi_testkit::{CallKind, FaultingAuthority};
     use libp2p::identity;
     use tokio::sync::watch;
     use tokio::time::timeout;
@@ -774,59 +789,6 @@ mod tests {
     use crate::swarm::build_swarm;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-    #[tokio::test]
-    async fn a_pending_member_that_suspects_its_leader_still_points_joiners_at_it() {
-        let net_leader = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_joiner = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let leader_addr = timeout(
-            TEST_TIMEOUT,
-            net_leader.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_leader produced a listen address within the timeout");
-        let leader = net_leader.local_worker_id();
-        let joiner = net_joiner.local_worker_id();
-
-        // The joiner dials the leader it was pointed at, as ask_for_leader
-        // does, so it holds a dialable address for it.
-        net_joiner.dial(leader_addr.clone());
-        timeout(TEST_TIMEOUT, async {
-            while net_joiner.dialable_address(&leader).is_none() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("net_joiner connected to the leader within the timeout");
-
-        let pointer = JoinResponse {
-            leader_id: Some(leader.clone().into()),
-            leader_multiaddr: leader_addr.to_string(),
-            term: 3,
-            recovery_epoch: 0,
-            recovery_epoch_lineage: 0,
-        };
-        let mut node = WorkerNode::bootstrapping(
-            joiner.clone(),
-            IncarnationId::new("joiner-incarnation-0"),
-            ShardId::new("shard-1"),
-            RealClock::new(),
-            None,
-            // A short suspicion timeout whose lease still fits two heartbeat
-            // intervals, as a joining node's must.
-            ElectionTimings::new(TickDuration::from_millis(5), TickDuration::from_millis(1)),
-        );
-        let _ = node.finish_joining(&pointer);
-
-        // No leader node runs here to ack the pending member's heartbeats,
-        // so it suspects its leader once its suspicion timeout, lengthened
-        // by less than half by its jitter, has passed.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let _ = node.step(Input::Tick);
-        assert_eq!(node.state(), WorkerState::LeaderSuspect);
-
-        assert_eq!(leader_pointer(&node, &net_joiner, &joiner), pointer);
-    }
 
     fn ack_from(leader: &WorkerId) -> ElectionMessage {
         ElectionMessage {
@@ -859,8 +821,12 @@ mod tests {
     }
 
     /// `me`'s node, a voter of a configuration of two, suspecting a leader
-    /// only after `suspect_timeout`.
-    fn node_of_two(clock: RealClock, me: &WorkerId, suspect_timeout: TickDuration) -> TestNode {
+    /// only after `suspect_timeout`, and the first step it starts with.
+    fn node_of_two(
+        clock: RealClock,
+        me: &WorkerId,
+        suspect_timeout: TickDuration,
+    ) -> (TestNode, Step) {
         node_of_two_with(clock, me, suspect_timeout, None)
     }
 
@@ -870,22 +836,21 @@ mod tests {
         me: &WorkerId,
         suspect_timeout: TickDuration,
         authority: Option<AuthorityTimings>,
-    ) -> TestNode {
-        WorkerNode::new(
-            me.clone(),
-            IncarnationId::new("incarnation-0"),
-            ShardId::new("shard-1"),
-            clock,
-            KnownConfiguration {
-                configuration: two_voters(),
-                admission: Some(Generation::genesis(0)),
-            },
-            authority,
+    ) -> (TestNode, Step) {
+        let identity = Identity {
+            id: me.clone(),
+            incarnation: IncarnationId::new("incarnation-0"),
+            shard: ShardId::new("shard-1"),
             // Twice 40 ms fits inside the lease of the shortest suspicion
             // timeout the tests here use (100 ms, less a tenth).
-            ElectionTimings::new(suspect_timeout, TickDuration::from_millis(40))
+            timings: ElectionTimings::new(suspect_timeout, TickDuration::from_millis(40))
                 .with_roll_call_deadline(TickDuration::from_millis(100)),
-        )
+        };
+        let known = KnownConfiguration {
+            configuration: two_voters(),
+            admission: Some(Generation::genesis(0)),
+        };
+        WorkerNode::start(identity, Entry::Known(known), clock, authority)
     }
 
     /// Takes `net`'s queued inputs until one is `expected`.
@@ -925,26 +890,27 @@ mod tests {
         let (leader, me) = (net_leader.local_worker_id(), net_node.local_worker_id());
         let clock = RealClock::new();
         // Its deadline is a minute away, so only an arrival can wake it.
-        let mut node = node_of_two(clock, &me, TickDuration::from_secs(60));
+        let (mut node, first) = node_of_two(clock, &me, TickDuration::from_secs(60));
         let mut scheduler = Scheduler::new(clock, Uuid7Ids);
-        let (batches, mut observed) = watch::channel((0_usize, None));
+        let (steps, mut observed) = watch::channel((0_usize, None));
 
         timeout(TEST_TIMEOUT, async {
             tokio::select! {
-                _ = run_driver(&mut node, &net_node, &mut scheduler, clock, None, |node, _| {
-                    batches.send_modify(|(count, leader)| {
+                _ = run_driver(&mut node, first, &net_node, &mut scheduler, clock, None, |node, _, _| {
+                    steps.send_modify(|(count, leader)| {
                         *count += 1;
                         *leader = node.known_leader();
                     });
                 }) => unreachable!("run_driver never returns"),
                 () = async {
                     tokio::time::sleep(Duration::from_millis(300)).await;
-                    // Its first batch, and one more if the connection
-                    // reached its `Net` only after the driver started.
-                    let quiet_batches = observed.borrow().0;
+                    // The step it started with, the tick that is due at
+                    // once, and one for the connection to its stand-in
+                    // leader.
+                    let quiet_steps = observed.borrow().0;
                     assert!(
-                        quiet_batches <= 2,
-                        "the driver stepped the node {quiet_batches} times with nothing to do"
+                        quiet_steps <= 3,
+                        "the driver stepped the node {quiet_steps} times with nothing to do"
                     );
 
                     net_leader.send(me.clone(), ack_from(&leader));
@@ -983,59 +949,6 @@ mod tests {
         .expect("the node accepted its leader's ack within the timeout");
     }
 
-    /// An authority that takes `SLOW_AUTHORITY` to answer anything, and
-    /// then is unavailable.
-    struct SlowAuthority;
-
-    const SLOW_AUTHORITY: Duration = Duration::from_secs(1);
-
-    impl SlowAuthority {
-        fn answer<T>(&self) -> Result<T, AuthorityError> {
-            std::thread::sleep(SLOW_AUTHORITY);
-            Err(AuthorityError::Unavailable)
-        }
-    }
-
-    impl CoordinationAuthority for SlowAuthority {
-        fn register(
-            &self,
-            _: &ShardId,
-            _: &WorkerId,
-            _: &str,
-        ) -> Result<TickDuration, AuthorityError> {
-            self.answer()
-        }
-
-        fn live_registrations(&self, _: &ShardId) -> Result<LiveRegistrations, AuthorityError> {
-            self.answer()
-        }
-
-        fn read_recovery_epoch(
-            &self,
-            _: &ShardId,
-        ) -> Result<Option<RecoveryEpoch>, AuthorityError> {
-            self.answer()
-        }
-
-        fn compare_and_swap_recovery_epoch(
-            &self,
-            _: &ShardId,
-            _: Option<RecoveryEpoch>,
-            _: RecoveryEpoch,
-        ) -> Result<(), AuthorityError> {
-            self.answer()
-        }
-
-        fn acquire_fence(
-            &self,
-            _: &ShardId,
-            _: &WorkerId,
-            _: RecoveryEpoch,
-        ) -> Result<TickDuration, AuthorityError> {
-            self.answer()
-        }
-    }
-
     // A node registers at its first step. An authority slow to answer that
     // must not hold up the rest of what the node does, such as heartbeating
     // the leader whose ack it accepts meanwhile.
@@ -1044,24 +957,29 @@ mod tests {
         let (net_leader, net_node) = stand_in_leader_and_node_nets().await;
         let (leader, me) = (net_leader.local_worker_id(), net_node.local_worker_id());
         let clock = RealClock::new();
-        let mut node = node_of_two_with(
+        let (mut node, first) = node_of_two_with(
             clock,
             &me,
             TickDuration::from_secs(60),
             Some(AuthorityTimings::default()),
         );
         let mut scheduler = Scheduler::new(clock, Uuid7Ids);
-        let started = std::time::Instant::now();
+        // The authority is down, and its answer to the node's registration
+        // is held: the call is still in flight while everything else runs.
+        let authority = FaultingAuthority::new(clock, TickDuration::from_secs(60));
+        authority.set_available(false);
+        authority.hold_next(CallKind::Register);
 
-        let heard_at = timeout(TEST_TIMEOUT, async {
+        let heartbeated = timeout(TEST_TIMEOUT, async {
             tokio::select! {
                 _ = run_driver(
                     &mut node,
+                    first,
                     &net_node,
                     &mut scheduler,
                     clock,
-                    Some(Arc::new(SlowAuthority)),
-                    |_, _| {},
+                    Some(Arc::new(authority.clone())),
+                    |_, _, _| {},
                 ) => unreachable!("run_driver never returns"),
                 () = async {
                     net_leader.send(me.clone(), ack_from(&leader));
@@ -1082,15 +1000,19 @@ mod tests {
                         }
                         net_leader.wait_for_arrival().await;
                     }
-                } => started.elapsed(),
+                } => {}
             }
         })
-        .await
-        .expect("the node heartbeated its leader within the timeout");
+        .await;
 
+        // Released before anything can fail, so no path leaves the held
+        // thread parked and hangs the runtime's shutdown.
+        let held = authority.is_holding(CallKind::Register);
+        authority.release(CallKind::Register);
+        heartbeated.expect("the node heartbeated its leader within the timeout");
         assert!(
-            heard_at < SLOW_AUTHORITY / 2,
-            "the node heartbeated only {heard_at:?} in, as if it had waited on its authority"
+            held,
+            "the heartbeat arrived only after the authority call was released"
         );
     }
 
@@ -1101,44 +1023,43 @@ mod tests {
         let started = std::time::Instant::now();
         let clock = RealClock::new();
         let suspect_timeout = TickDuration::from_millis(100);
-        let mut node = node_of_two(clock, &me, suspect_timeout);
+        let (mut node, first) = node_of_two(clock, &me, suspect_timeout);
         let mut scheduler = Scheduler::new(clock, Uuid7Ids);
-        let (batches, mut observed) = watch::channel(Vec::<(Duration, Vec<Output>)>::new());
+        let (steps, mut observed) = watch::channel(Vec::<(Duration, Vec<Output>)>::new());
 
-        let batches = timeout(TEST_TIMEOUT, async {
+        let steps = timeout(TEST_TIMEOUT, async {
             tokio::select! {
-                _ = run_driver(&mut node, &net, &mut scheduler, clock, None, |_, outputs| {
-                    batches.send_modify(|batches| {
-                        batches.push((started.elapsed(), outputs.to_vec()));
+                _ = run_driver(&mut node, first, &net, &mut scheduler, clock, None, |_, _, step| {
+                    steps.send_modify(|steps| {
+                        steps.push((started.elapsed(), step.outputs.clone()));
                     });
                 }) => unreachable!("run_driver never returns"),
-                batches = observed.wait_for(|batches| batches.len() >= 2) => {
-                    batches.expect("the observer is still alive").clone()
+                steps = observed.wait_for(|steps| steps.iter().any(|(_, outputs)| !outputs.is_empty())) => {
+                    steps.expect("the observer is still alive").clone()
                 }
             }
         })
         .await
-        .expect("the driver stepped the node twice within the timeout");
+        .expect("the driver moved the node on within the timeout");
 
-        // Nothing arrives here, so the driver steps the node once to learn
-        // its deadline and then not until that deadline.
-        let (at, outputs) = &batches[1];
+        // Nothing arrives here, so the driver steps the node at once to
+        // learn its deadline (the step it started with, and the tick that
+        // is due at once) and then not until that deadline, whose tick
+        // moves it on.
+        let moved_at = steps
+            .iter()
+            .position(|(_, outputs)| !outputs.is_empty())
+            .expect("it waited for a step with outputs");
+        let (moved, before) = (&steps[moved_at], &steps[..moved_at]);
+        let deadline = Duration::from_millis(suspect_timeout.as_ticks());
         assert!(
-            *at >= Duration::from_millis(suspect_timeout.as_ticks()),
-            "the node was stepped {at:?} after it was built, before its deadline"
+            before.iter().all(|(at, _)| *at < deadline / 2),
+            "the node was stepped before its deadline: {before:?}"
         );
-        // A voter that begins suspecting its leader starts a roll call at
-        // its next tick, due at once, so both happen in the same batch.
         assert!(
-            matches!(
-                &outputs[..],
-                [
-                    Output::StateChanged(WorkerState::LeaderSuspect),
-                    Output::StateChanged(WorkerState::RollCall),
-                    Output::Publish { .. },
-                ]
-            ),
-            "{outputs:?}"
+            moved.0 >= deadline,
+            "the node was moved on {:?} after it was built, before its deadline",
+            moved.0
         );
     }
 
@@ -1157,17 +1078,16 @@ mod tests {
             .expect("the ack reached net_node within the timeout");
 
         let clock = RealClock::new();
-        let mut node = node_of_two(clock, &me, TickDuration::from_secs(60));
+        let (mut node, first) = node_of_two(clock, &me, TickDuration::from_secs(60));
         let mut scheduler = Scheduler::new(clock, Uuid7Ids);
-        let (first_batch, mut observed) = watch::channel(None);
+        let (known, mut observed) = watch::channel(None);
 
+        // Nothing arrives once it runs, and its deadline is a minute away,
+        // so only its first batch can feed it the ack.
         let known_leader = timeout(TEST_TIMEOUT, async {
             tokio::select! {
-                _ = run_driver(&mut node, &net_node, &mut scheduler, clock, None, |node, _| {
-                    first_batch.send_if_modified(|first| {
-                        first.get_or_insert(node.known_leader());
-                        true
-                    });
+                _ = run_driver(&mut node, first, &net_node, &mut scheduler, clock, None, |node, _, _| {
+                    known.send_replace(node.known_leader());
                 }) => unreachable!("run_driver never returns"),
                 known = observed.wait_for(Option::is_some) => {
                     known.expect("the observer is still alive").clone()
@@ -1175,75 +1095,9 @@ mod tests {
             }
         })
         .await
-        .expect("the driver ran its first batch within the timeout");
+        .expect("the driver fed the node the ack within the timeout");
 
-        assert_eq!(known_leader, Some(Some((leader, 1))));
+        assert_eq!(known_leader, Some((leader, 1)));
     }
 
-    #[tokio::test]
-    async fn run_driver_subscribes_its_net_to_the_nodes_shard() {
-        let (net_leader, net_node) = stand_in_leader_and_node_nets().await;
-        let me = net_node.local_worker_id();
-        net_leader.subscribe_to_shard(&ShardId::new("shard-1"));
-        let clock = RealClock::new();
-        let mut node = node_of_two(clock, &me, TickDuration::from_secs(60));
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
-
-        timeout(TEST_TIMEOUT, async {
-            tokio::select! {
-                _ = run_driver(&mut node, &net_node, &mut scheduler, clock, None, |_, _| {}) => {
-                    unreachable!("run_driver never returns")
-                }
-                () = async {
-                    while !net_leader.shard_subscribers().contains(&me) {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                } => {}
-            }
-        })
-        .await
-        .expect("the node's Net subscribed to shard-1 within the timeout");
-    }
-
-    #[tokio::test]
-    async fn run_driver_publishes_the_roll_call_its_node_starts_to_the_shard() {
-        let (net_leader, net_node) = stand_in_leader_and_node_nets().await;
-        let me = net_node.local_worker_id();
-        net_leader.subscribe_to_shard(&ShardId::new("shard-1"));
-        let clock = RealClock::new();
-        let mut node = node_of_two(clock, &me, TickDuration::from_millis(300));
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
-
-        let (from, call) = timeout(TEST_TIMEOUT, async {
-            tokio::select! {
-                _ = run_driver(&mut node, &net_node, &mut scheduler, clock, None, |_, _| {}) => {
-                    unreachable!("run_driver never returns")
-                }
-                published = async {
-                    loop {
-                        for input in net_leader.take_inputs() {
-                            if let Input::Message { from, message } = input
-                                && let Some(election_message::Payload::RollCall(call)) =
-                                    message.payload
-                            {
-                                return (from, call);
-                            }
-                        }
-                        net_leader.wait_for_arrival().await;
-                    }
-                } => published,
-            }
-        })
-        .await
-        .expect("the node's roll call reached the other subscriber within the timeout");
-
-        assert_eq!(from, me);
-        assert_eq!(call.initiator_id, Some(me.into()));
-        assert_eq!(call.term, 1);
-        assert_eq!(
-            Some(call.initiator_address),
-            net_node.local_multiaddr().map(|own| own.to_string()),
-            "the published roll call carries its initiator's listen address"
-        );
-    }
 }

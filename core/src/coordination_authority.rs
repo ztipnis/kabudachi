@@ -219,14 +219,8 @@ mod tests {
             error.to_string(),
             "recovery epoch conflict: the authority is at epoch 3 (lineage ab)"
         );
-    }
-
-    #[test]
-    fn an_epoch_conflict_on_a_missing_epoch_says_so() {
-        let error = AuthorityError::EpochConflict { current: None };
-
         assert_eq!(
-            error.to_string(),
+            AuthorityError::EpochConflict { current: None }.to_string(),
             "recovery epoch conflict: the authority has no recovery epoch"
         );
     }

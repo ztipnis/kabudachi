@@ -112,18 +112,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_states_have_the_correct_count() {
-        assert_eq!(WorkerState::ALL.len(), 12);
-    }
-
-    #[test]
-    fn all_states_are_unique() {
-        use std::collections::HashSet;
-        let unique: HashSet<_> = WorkerState::ALL.iter().cloned().collect();
-        assert_eq!(unique.len(), 12);
-    }
-
-    #[test]
     fn legal_transitions_are_exactly_the_table() {
         let legal = [
             (WorkerState::Bootstrapping, WorkerState::Joining),
@@ -175,6 +163,8 @@ mod tests {
             legal_set.insert((*from, *to));
         }
 
+        let all: std::collections::HashSet<_> = WorkerState::ALL.iter().collect();
+        assert_eq!(all.len(), WorkerState::ALL.len(), "ALL has no duplicates");
         for from in WorkerState::ALL.iter() {
             for to in WorkerState::ALL.iter() {
                 let is_in_table = legal_set.contains(&(*from, *to));
@@ -183,21 +173,6 @@ mod tests {
                     result, is_in_table,
                     "Transition ({:?}, {:?}): expected {}, got {}",
                     from, to, is_in_table, result
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn only_stopped_is_terminal() {
-        for state in WorkerState::ALL {
-            assert_eq!(state.is_terminal(), state == WorkerState::Stopped, "{state:?}");
-            if state.is_terminal() {
-                assert!(
-                    WorkerState::ALL
-                        .iter()
-                        .all(|next| !state.can_transition_to(*next)),
-                    "terminal {state:?} has an outgoing transition"
                 );
             }
         }

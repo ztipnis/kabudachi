@@ -4,7 +4,7 @@
 
 ## Testing with Docker (recommended)
 
-The repo ships a `Dockerfile` (Ubuntu 24.04, with `bazel` via bazelisk, a `rustup`-managed Rust toolchain, and `uv` preinstalled) so tests run the same way regardless of host OS. It's been verified end-to-end on linux/arm64: all four Bazel test targets, `cargo test --workspace`, and `uv run pytest` all pass inside it — and it also sidesteps a macOS-only `.pth`-hiding bug documented in `CLAUDE.md` that only affects `uv run pytest` on a macOS host.
+The repo ships a `Dockerfile` (Ubuntu 24.04, with `bazel` via bazelisk, a `rustup`-managed Rust toolchain, and `uv` preinstalled) so tests run the same way regardless of host OS. It's been verified end-to-end on linux/arm64: the Bazel test targets (four at the time; the per-area targets added since have not been re-run in it), `cargo test --workspace`, and `uv run pytest` all pass inside it — and it also sidesteps a macOS-only `.pth`-hiding bug documented in `CLAUDE.md` that only affects `uv run pytest` on a macOS host.
 
 **Build the image and run the full Bazel suite:**
 
@@ -12,6 +12,8 @@ The repo ships a `Dockerfile` (Ubuntu 24.04, with `bazel` via bazelisk, a `rustu
 docker build -t kabudachi-test .
 docker run --rm kabudachi-test bazel test //...
 ```
+
+**Run one area:** each area of `core` and `net` is its own Bazel test target, so a change reruns only the areas that depend on it: `bazel test //core:election_test` (also `//core:configuration_test`, `//core:proptest_test`, `//core:scenario_test`, `//core:scheduler_test`, and the in-crate unit tests `//core:core_test`), `bazel test //net:bootstrap_test` (also `//net:claim_test`, `//net:election_test`, and `//net:net_test`), `bazel test //testkit:testkit_test`, `bazel test //bindings:bindings_test`, and `bazel test //runtime/tests:test_native` (and the other Python targets under `//runtime/tests`). Run inside the container as `docker run --rm kabudachi-test bazel test //core:election_test`.
 
 **Keep Bazel's cache between runs:** `--rm` discards the container's cache, so each run rebuilds from scratch. To reuse it, mount one named volume as a disk cache. Share that one volume across all runs and worktrees; a volume per run or per worktree multiplies disk use. `.bazelrc` caps the disk cache at 10 GB, but Bazel only trims the cache while its server is idle, after the command ends. With `--rm`, the container stops as soon as `bazel test` returns, so the command below starts the trim at once and keeps the container up for 30 seconds before it returns the test result.
 

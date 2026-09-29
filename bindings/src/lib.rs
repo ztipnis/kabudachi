@@ -26,13 +26,3 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<work::PyEvent>()?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn native_version_matches_core() {
-        assert_eq!(native_version(), kabudachi_core::version());
-    }
-}

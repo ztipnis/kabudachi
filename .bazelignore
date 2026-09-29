@@ -1,0 +1,2 @@
+# Agent worktrees are full checkouts with their own bazel-* symlinks.
+.claude

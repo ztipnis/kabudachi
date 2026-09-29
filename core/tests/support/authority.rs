@@ -2,6 +2,9 @@
 //! `FaultingAuthority` on the tests' `FakeClock`.
 
 use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
+use kabudachi_core::election::{
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest,
+};
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::time::Duration;
 use kabudachi_testkit::FaultingAuthority;
@@ -18,8 +21,8 @@ pub fn authority_ttl() -> Duration {
     Duration::from_secs(30)
 }
 
-/// Recovery epoch `number` of lineage 0, the lineage of every node
-/// `WorkerNode::new` builds.
+/// Recovery epoch `number` of lineage 0, the lineage of every node started
+/// inside a known configuration.
 pub fn epoch(number: u64) -> RecoveryEpoch {
     RecoveryEpoch::new(number, 0)
 }
@@ -58,4 +61,36 @@ pub fn seed_shard<'a>(
         .compare_and_swap_recovery_epoch(shard_id, None, self::epoch(epoch))
         .expect("the shard has no epoch yet, so create-if-absent succeeds");
     register_all(authority, shard_id, workers);
+}
+
+/// Performs every authority call a node asks for at once, on `authority`, as
+/// `me` of `shard_id` registered at its own id, and keeps each request it
+/// performed, in order.
+pub struct AtOnce<'a> {
+    pub authority: &'a FaultingAuthority<FakeClock>,
+    pub shard_id: ShardId,
+    pub me: WorkerId,
+    pub performed: Vec<AuthorityRequest>,
+}
+
+impl<'a> AtOnce<'a> {
+    pub fn new(
+        authority: &'a FaultingAuthority<FakeClock>,
+        shard_id: ShardId,
+        me: WorkerId,
+    ) -> Self {
+        AtOnce {
+            authority,
+            shard_id,
+            me,
+            performed: Vec::new(),
+        }
+    }
+}
+
+impl AuthorityPerformer for AtOnce<'_> {
+    fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
+        self.performed.push(call.request);
+        Some(call.perform(self.authority, &self.shard_id, &self.me, self.me.as_str()))
+    }
 }

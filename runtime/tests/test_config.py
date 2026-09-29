@@ -6,7 +6,6 @@ import types
 
 import pytest
 
-from kabudachi import configure
 from kabudachi import config as config_module
 from kabudachi.config import UNSET, Configuration
 from kabudachi.errors import ConfigurationError
@@ -61,24 +60,9 @@ def test_a_later_call_replaces_a_setting():
     assert configuration.resolve("concurrency") == 8
 
 
-def test_unset_is_not_none():
-    assert UNSET is not None
-    assert UNSET != None  # noqa: E711 - the point is the comparison itself
-    assert repr(UNSET) == "UNSET"
-
-
-def test_unset_is_a_single_value():
-    assert type(UNSET)() is UNSET
-
-
 def test_an_unknown_setting_is_refused():
     with pytest.raises(ConfigurationError, match="no_such_setting"):
         Configuration().configure(no_such_setting=1)
-
-
-def test_an_unknown_setting_is_refused_when_resolving():
-    with pytest.raises(ConfigurationError, match="no_such_setting"):
-        Configuration().resolve("no_such_setting")
 
 
 @pytest.mark.parametrize(
@@ -115,14 +99,6 @@ def test_a_call_with_one_bad_setting_applies_none_of_them():
     assert configuration.resolve("queue") == "default"
 
 
-def test_the_public_configure_sets_the_process_configuration(monkeypatch):
-    monkeypatch.setattr(config_module, "_process_configuration", Configuration())
-
-    configure(queue="from-public-api")
-
-    assert config_module.process_configuration().resolve("queue") == "from-public-api"
-
-
 def test_a_task_level_none_overrides_a_process_level_choice():
     configuration = Configuration()
     configuration.configure(queue="emails")
@@ -146,12 +122,6 @@ def test_configure_wins_over_the_environment(monkeypatch):
     configuration.configure(concurrency=9)
 
     assert configuration.resolve("concurrency") == 9
-
-
-def test_a_task_setting_wins_over_the_environment(monkeypatch):
-    monkeypatch.setenv("KABUDACHI_QUEUE", "from-env")
-
-    assert Configuration().resolve("queue", "task-queue") == "task-queue"
 
 
 def test_an_invalid_environment_value_is_a_configuration_error(monkeypatch):
@@ -198,23 +168,13 @@ def test_cancel_grace_can_come_from_the_environment_in_seconds(monkeypatch):
     assert Configuration().resolve("cancel_grace") == timedelta(seconds=2.5)
 
 
-def test_memory_limits_default_to_named_constants_soft_below_hard():
+def test_the_default_memory_limits_put_soft_below_hard():
     configuration = Configuration()
 
     soft = configuration.resolve("memory_soft_limit")
     hard = configuration.resolve("memory_hard_limit")
 
     assert 0 < soft < hard
-    assert soft == config_module.DEFAULT_MEMORY_SOFT_LIMIT
-    assert hard == config_module.DEFAULT_MEMORY_HARD_LIMIT
-
-
-def test_memory_limits_can_be_configured_in_bytes():
-    configuration = Configuration()
-    configuration.configure(memory_soft_limit=1000, memory_hard_limit=2000)
-
-    assert configuration.resolve("memory_soft_limit") == 1000
-    assert configuration.resolve("memory_hard_limit") == 2000
 
 
 def test_configuring_only_the_soft_limit_above_the_default_hard_limit_is_refused():

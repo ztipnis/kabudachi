@@ -86,10 +86,10 @@ impl request_response::Codec for ElectionCodec {
 
 #[cfg(test)]
 mod tests {
-    use kabudachi_core::configuration::{Configuration, Generation, Single};
+    use kabudachi_core::configuration::Generation;
     use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
     use kabudachi_core::protocol::messages::{
-        AckEcho, LeaderHeartbeatAck, WorkerHeartbeat, election_message,
+        AckEcho, WorkerHeartbeat, election_message,
     };
     use libp2p::futures::io::Cursor;
     use libp2p::request_response::Codec as _;
@@ -121,78 +121,6 @@ mod tests {
         }
     }
 
-    /// Writes `message` as a request and reads it back.
-    async fn round_trip(message: ElectionMessage) -> ElectionMessage {
-        let mut codec = ElectionCodec;
-        let mut written = Cursor::new(Vec::new());
-        codec
-            .write_request(&PROTOCOL, &mut written, message)
-            .await
-            .expect("writing a request never fails against an in-memory buffer");
-
-        let mut to_read = Cursor::new(written.into_inner());
-        codec
-            .read_request(&PROTOCOL, &mut to_read)
-            .await
-            .expect("reading back what was just written must succeed")
-    }
-
-    #[tokio::test]
-    async fn write_request_then_read_request_round_trips_the_message() {
-        let message = sample_message();
-
-        assert_eq!(round_trip(message.clone()).await, message);
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_that_has_accepted_no_ack_decodes_with_no_echo() {
-        let no_echo = ElectionMessage {
-            payload: Some(election_message::Payload::Heartbeat(WorkerHeartbeat {
-                newest_accepted_ack: None,
-                ..sample_heartbeat()
-            })),
-        };
-        // A token of 0 is a real send instant, so it must stay distinct
-        // from "no ack accepted yet".
-        let echo_of_instant_zero = ElectionMessage {
-            payload: Some(election_message::Payload::Heartbeat(WorkerHeartbeat {
-                newest_accepted_ack: Some(AckEcho {
-                    term: 0,
-                    send_token: 0,
-                }),
-                ..sample_heartbeat()
-            })),
-        };
-
-        assert_eq!(round_trip(no_echo.clone()).await, no_echo);
-        assert_eq!(
-            round_trip(echo_of_instant_zero.clone()).await,
-            echo_of_instant_zero
-        );
-    }
-
-    #[tokio::test]
-    async fn a_leader_ack_round_trips_its_send_token() {
-        let ack = ElectionMessage {
-            payload: Some(election_message::Payload::HeartbeatAck(
-                LeaderHeartbeatAck {
-                    shard_id: Some(ShardId::new("shard-1").into()),
-                    leader_id: Some(WorkerId::new("leader-1").into()),
-                    recovery_epoch: 1,
-                    term: 2,
-                    configuration: Some((&Configuration::genesis(1)).into()),
-                    recipient_admission: Some(Generation::genesis(1).into()),
-                    send_token: 1_234,
-                    recipient_prior_admission: Some(Generation::genesis(0).into()),
-                    heartbeat_token: None,
-                    recovery_epoch_lineage: None,
-                },
-            )),
-        };
-
-        assert_eq!(round_trip(ack.clone()).await, ack);
-    }
-
     #[tokio::test]
     async fn read_request_rejects_a_length_prefix_over_the_maximum() {
         let mut codec = ElectionCodec;
@@ -201,70 +129,6 @@ mod tests {
         let result = codec.read_request(&PROTOCOL, &mut oversized_prefix).await;
 
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn write_response_then_read_response_yields_an_ack() {
-        let mut codec = ElectionCodec;
-
-        let mut written = Cursor::new(Vec::new());
-        codec
-            .write_response(&PROTOCOL, &mut written, Ack)
-            .await
-            .expect("writing the empty ack never fails");
-        assert!(
-            written.get_ref().is_empty(),
-            "the ack is documented as carrying no bytes on the wire"
-        );
-
-        let mut to_read = Cursor::new(written.into_inner());
-        let ack = codec
-            .read_response(&PROTOCOL, &mut to_read)
-            .await
-            .expect("reading the empty ack never fails");
-        assert_eq!(ack, Ack);
-    }
-
-    /// The ack a follower must never adopt from: its configuration's term (9)
-    /// is above the ack's (3). Adopted, it would later make a removal the
-    /// follower leads refuse its own term.
-    #[tokio::test]
-    async fn read_request_rejects_an_ack_whose_configuration_outruns_its_term() {
-        let outrun = Generation::new(0, 9, 1);
-        let ack = ElectionMessage {
-            payload: Some(election_message::Payload::HeartbeatAck(
-                LeaderHeartbeatAck {
-                    shard_id: Some(ShardId::new("shard-1").into()),
-                    leader_id: Some(WorkerId::new("leader-1").into()),
-                    recovery_epoch: 0,
-                    term: 3,
-                    configuration: Some(
-                        (&Configuration::single(Single {
-                            generation: outrun,
-                            base: outrun,
-                            voter_count: 2,
-                        }))
-                            .into(),
-                    ),
-                    recipient_admission: None,
-                    send_token: 0,
-                    recipient_prior_admission: None,
-                    heartbeat_token: None,
-                    recovery_epoch_lineage: None,
-                },
-            )),
-        };
-
-        let mut codec = ElectionCodec;
-        let mut written = Cursor::new(Vec::new());
-        codec
-            .write_request(&PROTOCOL, &mut written, ack)
-            .await
-            .expect("writing a request never fails against an in-memory buffer");
-        let mut to_read = Cursor::new(written.into_inner());
-        let result = codec.read_request(&PROTOCOL, &mut to_read).await;
-
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

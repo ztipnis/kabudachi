@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_test_suite")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 
 rust_library(
@@ -17,31 +17,27 @@ rust_test(
     deps = all_crate_deps(normal_dev = True),
 )
 
-rust_test_suite(
-    name = "core_integration_tests",
-    # Only top-level `tests/*.rs` files become independent test entry points;
-    # `tests/support/**` is shared source (see `shared_srcs` below) so it's
-    # excluded here from being treated as its own entry point.
-    srcs = glob(
-        ["tests/*.rs"],
-        allow_empty = True,
-    ),
-    # Compiled into every entry-point binary above so `mod support;` resolves
-    # from any top-level test file. New files under `tests/support/**` need no
-    # BUILD.bazel edit; neither does a new top-level `tests/*.rs` file — it's
-    # picked up by the `srcs` glob above automatically.
-    shared_srcs = glob(["tests/support/**/*.rs"], allow_empty = True),
-    # proptest replays the cases saved in a test's `.proptest-regressions`
-    # file before drawing new ones. It finds the file beside the test's
-    # source, which it locates by `file!()` from the working directory, so
-    # both must be in the runfiles.
-    data = glob(
-        [
-            "tests/*.proptest-regressions",
-            "tests/proptest_*.rs",
-        ],
-        allow_empty = True,
-    ),
-    deps = [":core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
+# One integration-test crate per area of core (README §26 testing strategy).
+# Each is one Bazel target, so a change to one source file reruns only the
+# areas that depend on it; `tests/support/**` is shared by every crate.
+[
+    rust_test(
+        name = area + "_test",
+        srcs = glob(["tests/" + area + "/**/*.rs", "tests/support/**/*.rs"]),
+        crate_root = "tests/" + area + "/main.rs",
+        edition = "2024",
+        deps = [":core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
+    )
+    for area in ["election", "scenario", "scheduler", "configuration"]
+]
+
+# proptest replays the cases saved beside each test's source, which it finds
+# by `file!()` from the working directory, so both are in the runfiles.
+rust_test(
+    name = "proptest_test",
+    srcs = glob(["tests/proptest/**/*.rs", "tests/support/**/*.rs"]),
+    crate_root = "tests/proptest/main.rs",
+    data = glob(["tests/proptest/*.proptest-regressions", "tests/proptest/*.rs"]),
     edition = "2024",
+    deps = [":core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
 )

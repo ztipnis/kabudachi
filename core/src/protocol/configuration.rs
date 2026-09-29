@@ -441,6 +441,11 @@ mod tests {
                 voter_count: 3,
             })
         );
+        assert_eq!(
+            generated::Configuration::from(&decoded),
+            wire,
+            "and encodes back"
+        );
     }
 
     #[test]
