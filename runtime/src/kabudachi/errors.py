@@ -1,8 +1,9 @@
 """The exceptions kabudachi raises on purpose."""
 
-
-class KabudachiError(Exception):
-    """Base class of every exception kabudachi raises on purpose."""
+# Defined by the native module, which raises BackpressureError itself;
+# re-exported so callers catch them as kabudachi.errors.*.
+from kabudachi._native import BackpressureError as BackpressureError
+from kabudachi._native import KabudachiError as KabudachiError
 
 
 class ConfigurationError(KabudachiError, ValueError):
@@ -81,12 +82,6 @@ class TaskSupersededError(KabudachiError, RuntimeError):
     def __init__(self, message: str, superseded_by: str) -> None:
         super().__init__(message)
         self.superseded_by = superseded_by
-
-
-class BackpressureError(KabudachiError, RuntimeError):
-    """A task was not submitted because the scheduler holds as much pending
-    work as its hard memory limit allows. Nothing was queued; submit again
-    once running tasks have finished."""
 
 
 def interrupted(subject: str, error: BaseException) -> TaskInterruptedError:

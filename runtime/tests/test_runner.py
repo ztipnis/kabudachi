@@ -144,16 +144,6 @@ def test_a_worker_that_dies_while_run_waits_for_tasks_is_reported():
     assert only_native().shutdowns == 1
 
 
-def test_run_says_so_when_the_native_extension_is_missing(monkeypatch):
-    monkeypatch.setattr(runner_module, "_native", None)
-
-    async def main():
-        return None
-
-    with pytest.raises(RuntimeError, match="native extension"):
-        kabudachi.run(main)
-
-
 def test_serving_without_main_needs_the_main_thread():
     errors = []
 

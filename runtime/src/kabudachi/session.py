@@ -19,6 +19,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from kabudachi._native import EventKind
 from kabudachi.body import RunningBody, run_within, start_body
 from kabudachi.composites import Composites
 from kabudachi.concurrency_places import ConcurrencyPlaces
@@ -161,25 +162,32 @@ class Session:
         self._hosted.attach(asyncio.get_running_loop())
         while True:
             for event in await self._runtime.next_events():
-                if event.kind == "expired":
-                    self._tasks.failed(
-                        event.task_id,
-                        TaskExpiredError(f"task {event.task_id} expired before it could start"),
-                    )
-                elif event.kind == "cancelled":
-                    self._tasks.cancelled_by_leader(event.task_id)
-                elif event.kind == "slow_down":
-                    self._below_soft_limit.clear()
-                elif event.kind == "slow_down_cleared":
-                    self._below_soft_limit.set()
-                elif event.kind == "superseded":
-                    self._tasks.failed(
-                        event.task_id,
-                        TaskSupersededError(
-                            f"task {event.task_id} was superseded by {event.superseded_by}",
-                            event.superseded_by,
-                        ),
-                    )
+                match event.kind:
+                    case EventKind.EXPIRED:
+                        self._tasks.failed(
+                            event.task_id,
+                            TaskExpiredError(
+                                f"task {event.task_id} expired before it could start"
+                            ),
+                        )
+                    case EventKind.CANCELLED:
+                        self._tasks.cancelled_by_leader(event.task_id)
+                    case EventKind.SLOW_DOWN if event.active:
+                        self._below_soft_limit.clear()
+                    case EventKind.SLOW_DOWN:
+                        self._below_soft_limit.set()
+                    case EventKind.SUPERSEDED:
+                        self._tasks.failed(
+                            event.task_id,
+                            TaskSupersededError(
+                                f"task {event.task_id} was superseded by {event.superseded_by}",
+                                event.superseded_by,
+                            ),
+                        )
+                    case unknown:
+                        raise RuntimeError(
+                            f"the native runtime reported an event of unknown kind {unknown!r}"
+                        )
 
     async def serve(self) -> None:
         """Runs `work` and `watch_events` together, until either ends. The
@@ -242,7 +250,6 @@ class Session:
         before its handle is failed with the error itself.
         """
         current_body.set(self._places.watch_body())
-        started = False
         body: RunningBody | None = None
         try:
             # A retry does not run beside the abandoned body it replaces.
@@ -254,7 +261,6 @@ class Session:
                 raise UnknownTaskError(f"this process has no task named {claim.definition_id!r}")
             serializer = self._serializers.get(definition.serializer)
             self._runtime.report_started(claim.task_run_id)
-            started = True
             argument = self._fold(definition, serializer, claim)
             body = start_body(definition, argument, self._threads)
             run.body_started(body)
@@ -298,7 +304,7 @@ class Session:
             abandoned = body is not None and not body.exited.done()
             if abandoned:
                 run.body_abandoned(body)
-            if self._report_failure(claim, error, started):
+            if self._report_failure(claim, error):
                 self._tasks.retry_queued(claim.task_id)
             else:
                 self._tasks.failed(claim.task_id, error)
@@ -370,16 +376,13 @@ class Session:
         merge = definition.merge or (lambda older, newer: newer)
         return functools.reduce(merge, values)
 
-    def _report_failure(self, claim: Any, error: Exception, started: bool) -> bool:
+    def _report_failure(self, claim: Any, error: Exception) -> bool:
         """Tells the leader the run failed and says whether it will be retried.
         Only the error's type name goes, never its message. A refusal is
         logged, counts as no retry, and does not replace `error`, which is
         what the handle's awaiter needs to see."""
         try:
-            if not started:
-                # A run has to be running before it can fail.
-                self._runtime.report_started(claim.task_run_id)
-            return self._runtime.fail(claim.task_run_id, type(error).__name__)
+            return self._runtime.report_failure(claim.task_run_id, type(error).__name__)
         except Exception as refusal:
             _logger.warning(
                 "the leader did not record the failure of task %s: %s",

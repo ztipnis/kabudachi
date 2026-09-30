@@ -148,12 +148,22 @@ impl<C: Clock> SchedulerDoor<C> {
         }))
     }
 
-    pub fn fail(
+    /// Reports that a run this worker claimed failed with an error of type
+    /// `failure_kind` (the type's name, never its message), whether or not its
+    /// body started. A run still `Claimed` is stepped through `Running`
+    /// first, under the same lock, so no other caller sees it started but not
+    /// failed.
+    pub fn report_failure(
         &self,
         run: &TaskRunId,
         failure_kind: &str,
     ) -> Result<Failure, Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
+            if scheduler.task_run(run).map(TaskRunRecord::current_state)
+                == Some(TaskRunState::Claimed)
+            {
+                scheduler.report_started(&self.worker, run)?;
+            }
             scheduler.fail(&self.worker, run, failure_kind)
         }))
     }
@@ -474,7 +484,7 @@ pub(crate) mod tests {
             door.complete(&run, DIGEST.to_vec(), Completion::Final),
             Err(Refusal::Closed)
         );
-        assert_eq!(door.fail(&run, "ValueError"), Err(Refusal::Closed));
+        assert_eq!(door.report_failure(&run, "ValueError"), Err(Refusal::Closed));
         assert_eq!(door.cancel(&task), Err(Refusal::Closed));
         assert_eq!(door.end_continuation(&task), Err(Closed));
         assert_eq!(door.run_state(&run), Err(Closed));

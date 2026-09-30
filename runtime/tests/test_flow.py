@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from kabudachi._native import RunState
 from kabudachi.errors import (
     RunStoppedError,
     RuntimeNotStartedError,
@@ -772,7 +773,7 @@ def test_a_group_that_hits_the_hard_limit_midway_fails_and_cancels_the_members_i
     run(with_events(world, body))
 
     assert len(world.runtime.submitted) == 2
-    assert run_states(world) == ["Cancelled", "Cancelled"]
+    assert run_states(world) == [RunState.CANCELLED, RunState.CANCELLED]
 
 
 def test_a_bulk_submission_pauses_when_slow_down_is_raised_while_it_is_still_submitting():
@@ -815,7 +816,7 @@ def test_cancelling_a_group_part_way_through_its_submission_starts_no_further_me
     run(with_events(world, body))
 
     assert len(world.runtime.submitted) < 6
-    assert set(run_states(world)) == {"Cancelled"}
+    assert set(run_states(world)) == {RunState.CANCELLED}
 
 
 def test_a_flow_whose_orchestration_is_cancelled_before_it_starts_still_settles_and_is_not_leaked():

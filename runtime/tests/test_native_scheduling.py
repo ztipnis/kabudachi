@@ -7,6 +7,7 @@ import time
 import pytest
 
 from kabudachi import _native
+from kabudachi._native import CancelOutcome, RunState
 
 WAIT_LIMIT_SECONDS = 5
 DIGEST = b"digest-of-the-result"
@@ -24,7 +25,7 @@ def runtime():
 
 
 def submit(native, payload=b"input-bytes", queue="default"):
-    return native.submit("billing.charge", 3, payload, queue)
+    return native.submit("billing.charge", 3, payload, queue, "task", None)
 
 
 async def leader(native):
@@ -58,7 +59,18 @@ def test_an_unknown_run_is_refused(runtime):
         runtime.report_started("no-such-run")
     with pytest.raises(RuntimeError, match="no such run"):
         runtime.complete("no-such-run", DIGEST)
+    with pytest.raises(RuntimeError, match="no such run"):
+        runtime.report_failure("no-such-run", "E")
     assert runtime.task_run_state("no-such-run") is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "key", "drop_oldest"),
+    [("task", "k", False), ("coalescing", None, False), ("task", None, True), ("durable", None, False)],
+)
+def test_a_submission_whose_kind_key_and_options_disagree_is_refused(runtime, kind, key, drop_oldest):
+    with pytest.raises(ValueError):
+        runtime.submit("billing.charge", 3, b"", "default", kind, key, drop_oldest=drop_oldest)
 
 
 def test_shutdown_fails_a_claim_that_is_waiting_for_work():
@@ -80,7 +92,7 @@ def test_shutdown_fails_a_claim_that_is_waiting_for_work():
         pytest.param(lambda native: submit(native), id="submit"),
         pytest.param(lambda native: native.report_started("some-run"), id="report_started"),
         pytest.param(lambda native: native.complete("some-run", DIGEST), id="complete"),
-        pytest.param(lambda native: native.fail("some-run", "ValueError"), id="fail"),
+        pytest.param(lambda native: native.report_failure("some-run", "ValueError"), id="report_failure"),
         pytest.param(lambda native: native.cancel("some-task"), id="cancel"),
         pytest.param(lambda native: native.end_continuation("some-task"), id="end_continuation"),
         pytest.param(lambda native: native.task_run_state("some-run"), id="task_run_state"),
@@ -134,12 +146,21 @@ def started_run(native):
     return claimed.task_run_id
 
 
+def test_cancelling_answers_cancelled_then_already_finished_and_unknown_for_no_such_task(runtime):
+    asyncio.run(leader(runtime))
+    task_id = submit(runtime)
+
+    assert runtime.cancel(task_id) == CancelOutcome.CANCELLED
+    assert runtime.cancel(task_id) == CancelOutcome.ALREADY_FINISHED
+    assert runtime.cancel("no-such-task") == CancelOutcome.UNKNOWN_TASK
+
+
 def test_a_finished_task_is_forgotten_once_the_result_ttl_has_passed():
     native = new_runtime(result_ttl_ms=50)
     try:
         run_id = started_run(native)
         native.complete(run_id, DIGEST)
-        assert native.task_run_state(run_id) == "Succeeded"
+        assert native.task_run_state(run_id) == RunState.SUCCEEDED
 
         # Nothing uses the scheduler now, so it is the timer that forgets it.
         deadline = time.monotonic() + 3
@@ -165,31 +186,7 @@ def test_shutdown_fails_a_wait_for_events():
 
 
 def generation(native, payload, key=""):
-    return native.submit("index.refresh", 0, payload, "default", coalescing_key=key)
-
-
-def limited_runtime():
-    return new_runtime(memory_soft_limit=100, memory_hard_limit=200)
-
-
-def test_a_coalescing_task_that_opted_in_drops_its_oldest_payloads_to_fit():
-    native = limited_runtime()
-    try:
-        for size in (61, 62, 63):
-            native.submit("index.refresh", 0, b"x" * size, "default", coalescing_key="k")
-
-        native.submit(
-            "index.refresh", 0, b"y" * 50, "default", coalescing_key="k", drop_oldest=True
-        )
-
-        async def main():
-            [claimed] = await claim(native)
-            return claimed
-
-        claimed = asyncio.run(main())
-        assert [len(payload) for payload in claimed.chain] == [62, 63]
-    finally:
-        native.shutdown()
+    return native.submit("index.refresh", 0, payload, "default", "coalescing", key)
 
 
 def test_a_task_completed_with_a_continuation_holds_its_coalescing_key_until_it_ends(runtime):
@@ -210,3 +207,4 @@ def test_a_task_completed_with_a_continuation_holds_its_coalescing_key_until_it_
     newer, second = asyncio.run(main())
 
     assert second.task_id == newer
+

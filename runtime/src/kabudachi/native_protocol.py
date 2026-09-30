@@ -5,7 +5,9 @@ satisfy them. They live apart from `session` so that `task_table` can name them
 without importing `session`, which imports `task_table`.
 """
 
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
+
+from kabudachi._native import CancelOutcome, EventKind
 
 
 class Claim(Protocol):
@@ -24,11 +26,13 @@ class Claim(Protocol):
 class Event(Protocol):
     """Something the runtime decided on its own, such as that a task expired."""
 
-    kind: str
+    kind: EventKind
     task_id: str
     task_run_id: str
     was_running: bool
     superseded_by: str | None
+    active: bool
+    """For `EventKind.SLOW_DOWN`: whether it was raised (`True`) or cleared."""
 
 
 class Certification(Protocol):
@@ -49,13 +53,18 @@ class Runtime(Protocol):
         source_version: int,
         serialized_input: bytes,
         queue: str,
+        kind: Literal["task", "ephemeral", "coalescing"],
+        key: str | None,
+        *,
         retries: int = 0,
         delay_ms: int | None = None,
         expires_in_ms: int | None = None,
-        coalescing_key: str | None = None,
         drop_oldest: bool = False,
     ) -> str:
-        ...
+        """Records a new task. `kind` is its `TaskKind` value; a coalescing
+        task always has a `key` (its default is ""), and no other kind has
+        one. Raises `ValueError` if they disagree, and `BackpressureError`
+        past the hard memory limit."""
 
     async def claim_pending(self, limit: int) -> list[Claim]:
         ...
@@ -66,11 +75,12 @@ class Runtime(Protocol):
     def report_started(self, task_run_id: str) -> None:
         ...
 
-    def cancel(self, task_id: str) -> str:
-        """Cancels a task: `"cancelled"`, `"finished"` or `"unknown"`."""
+    def cancel(self, task_id: str) -> CancelOutcome:
+        """Cancels a task, and says how that ended."""
 
-    def fail(self, task_run_id: str, failure_kind: str) -> bool:
-        """Reports that a running run failed, and whether it will be retried."""
+    def report_failure(self, task_run_id: str, failure_kind: str) -> bool:
+        """Reports that a claimed run failed, started or not; whether a retry
+        is now queued."""
 
     def complete(
         self, task_run_id: str, result_digest: bytes, continues: bool = False

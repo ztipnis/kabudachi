@@ -61,6 +61,9 @@ class Task(wrapt.ObjectProxy):
             that combines the payloads of superseded generations, oldest
             first, on the worker that claims the newest one. Without it the
             newest payload wins.
+        drop_oldest: For a coalescing task, whether a submission that would
+            pass the hard memory limit drops this key's oldest retained
+            payloads to fit, instead of being refused.
         serializers: Where the serializer is looked up to check the task's
             types. Defaults to the registry of this process.
 
@@ -84,6 +87,7 @@ class Task(wrapt.ObjectProxy):
         timeout: timedelta | None = None,
         cancel_grace: timedelta | Unset = UNSET,
         merge: Callable[[Any, Any], Any] | None = None,
+        drop_oldest: bool = False,
         serializers: SerializerRegistry | None = None,
     ) -> None:
         if not callable(func):
@@ -102,6 +106,7 @@ class Task(wrapt.ObjectProxy):
 
         self._check_timing(timeout, cancel_grace)
         self._check_merge(merge, kind)
+        self._check_drop_oldest(drop_oldest, kind)
 
         task_name = self._task_name(func, name)
         input_type, output_type = self._read_types(task_name, func)
@@ -119,6 +124,7 @@ class Task(wrapt.ObjectProxy):
             timeout=timeout,
             cancel_grace=cancel_grace,
             merge=merge,
+            drop_oldest=drop_oldest,
             continues=is_step_type(output_type),
         )
         self._check_serializer_supports(
@@ -251,6 +257,15 @@ class Task(wrapt.ObjectProxy):
             raise TaskDefinitionError(
                 f"the task merge must be a callable taking (older, newer), not {merge!r}"
             ) from None
+
+    @staticmethod
+    def _check_drop_oldest(drop_oldest: Any, kind: TaskKind) -> None:
+        if not isinstance(drop_oldest, bool):
+            raise TaskDefinitionError(
+                f"the task drop_oldest must be True or False, not {drop_oldest!r}"
+            )
+        if drop_oldest and kind is not TaskKind.COALESCING:
+            raise TypeError("only a coalescing task takes drop_oldest")
 
     @staticmethod
     def _check_timing(timeout: Any, cancel_grace: Any) -> None:
@@ -460,6 +475,7 @@ def coalescing_task(
     timeout: timedelta | None = ...,
     cancel_grace: timedelta | Unset = ...,
     merge: Callable[[Any, Any], Any] | None = ...,
+    drop_oldest: bool = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def coalescing_task(
     func: Any = None,
@@ -473,6 +489,7 @@ def coalescing_task(
     timeout: timedelta | None = None,
     cancel_grace: timedelta | Unset = UNSET,
     merge: Callable[[Any, Any], Any] | None = None,
+    drop_oldest: bool = False,
 ) -> Any:
     """Declares continuously replaced work: a newer pending submission with
     the same key supersedes an older one, but never a running one, and only
@@ -486,6 +503,11 @@ def coalescing_task(
     gives a submission its own. A timeout fails the generation and it is not
     requeued.
 
+    `drop_oldest=True` opts in to losing this key's oldest retained payloads,
+    oldest first, when a submission would pass the hard memory limit, instead
+    of refusing it with `BackpressureError` (README §3.2.1). It is never the
+    default: a dropped payload is never folded.
+
     Takes the other arguments, and raises the errors, of `task`.
     """
     options = {
@@ -497,5 +519,6 @@ def coalescing_task(
         "timeout": timeout,
         "cancel_grace": cancel_grace,
         "merge": merge,
+        "drop_oldest": drop_oldest,
     }
     return Task.declare(func, TaskKind.COALESCING, options)

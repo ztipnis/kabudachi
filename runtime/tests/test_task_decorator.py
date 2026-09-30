@@ -421,10 +421,13 @@ def add_greetings(older: Greeting, newer: Greeting) -> Greeting:
 def test_a_coalescing_task_is_registered_with_its_kind_and_reducer(fresh_registry):
     from kabudachi import coalescing_task
 
-    defined = coalescing_task(name="coalesce.merged", merge=add_greetings)(charge_greeting).definition
+    defined = coalescing_task(
+        name="coalesce.merged", merge=add_greetings, drop_oldest=True
+    )(charge_greeting).definition
 
     assert defined.kind is TaskKind.COALESCING
     assert defined.merge is add_greetings
+    assert defined.drop_oldest is True
 
 
 def test_a_coalescing_task_without_a_reducer_keeps_the_newest_payload(fresh_registry):
@@ -434,6 +437,14 @@ def test_a_coalescing_task_without_a_reducer_keeps_the_newest_payload(fresh_regi
 
     assert defined.kind is TaskKind.COALESCING
     assert defined.merge is None
+    assert defined.drop_oldest is False
+
+
+def test_only_a_coalescing_task_takes_drop_oldest():
+    # The message is matched: today `drop_oldest` is an unknown keyword, which
+    # is also a TypeError, so a bare `raises(TypeError)` would pass unbuilt.
+    with pytest.raises(TypeError, match="only a coalescing task takes drop_oldest"):
+        Task(charge_greeting, registry=TaskRegistry(), name="drop.no", drop_oldest=True)
 
 
 @pytest.mark.parametrize("bad", ["not callable", 3])

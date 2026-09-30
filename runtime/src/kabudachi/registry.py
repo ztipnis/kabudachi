@@ -45,6 +45,10 @@ class TaskDefinition:
     merge: Callable[[Any, Any], Any] | None = None
     """For a coalescing task: combines (older, newer) payloads; `None` keeps
     the newest."""
+    drop_oldest: bool = False
+    """For a coalescing task: whether a submission that would pass the hard
+    memory limit drops this key's oldest retained payloads to fit, instead of
+    being refused."""
 
     def types_unsupported_by(self, serializer: Serializer) -> list[tuple[str, Any]]:
         """The ("input" | "return", type) pairs `serializer` cannot encode. A

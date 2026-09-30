@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 
+from kabudachi._native import EventKind, RunState
 from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration
 from kabudachi.errors import (
@@ -161,18 +162,34 @@ def test_a_task_that_succeeds_is_not_reported_failed():
     assert not any(event[0] == "fail" for event in world.runtime.events)
 
 
-def test_a_claim_that_cannot_run_is_still_started_and_then_reported_failed():
+def test_a_claim_that_cannot_run_is_failed_by_its_error_type_without_a_started_report():
     world = World(echo)
     world.session = Session(world.runtime, TaskRegistry(), world.serializers, world.configuration)
 
     async def body():
+        handle = world.call("echo", Greeting())
         with pytest.raises(UnknownTaskError, match=r"tests\.echo"):
+            await handle
+        return handle.task_id
+
+    task_id = run(world.working(body))
+
+    assert [(event[0], event[2]) for event in world.runtime.events] == [("fail", "UnknownTaskError")]
+    [run_id] = world.native.task_run_ids(task_id)
+    assert world.native.task_run_state(run_id) == RunState.FAILED
+
+
+def test_a_claim_that_cannot_run_is_retried_like_any_failed_run():
+    world = World(echo, retries=1)
+    world.session = Session(world.runtime, TaskRegistry(), world.serializers, world.configuration)
+
+    async def body():
+        with pytest.raises(UnknownTaskError):
             await world.call("echo", Greeting())
 
     run(world.working(body))
 
-    assert [event[0] for event in world.runtime.events] == ["started", "fail"]
-    assert world.runtime.events[1][2] == "UnknownTaskError"
+    assert [event[0] for event in world.runtime.events] == ["fail", "fail"]
 
 
 def test_the_worker_keeps_going_after_a_task_fails():
@@ -718,7 +735,7 @@ def test_an_event_for_a_task_this_session_does_not_have_is_ignored():
         watcher = asyncio.ensure_future(world.session.watch_events())
         # No real event names a task this session never submitted, so this one
         # is put in front of the watcher by hand.
-        world.runtime.inject_event("expired", task_id="task-that-is-not-ours")
+        world.runtime.inject_event(EventKind.EXPIRED, task_id="task-that-is-not-ours")
 
         async def body():
             return await world.call("echo", Greeting(text="fine")), watcher.done()
@@ -732,10 +749,23 @@ def test_an_event_for_a_task_this_session_does_not_have_is_ignored():
     result, watcher_ended = run(working())
 
     assert result.text == "fine"
-    assert ("expired", "task-that-is-not-ours") in handed_to_the_session, (
+    assert (EventKind.EXPIRED, "task-that-is-not-ours") in handed_to_the_session, (
         "the injected event never reached the session, so nothing was ignored"
     )
     assert not watcher_ended, "the event ended the watcher instead of being ignored"
+
+
+def test_an_event_of_a_kind_the_session_does_not_know_ends_serving_with_an_error():
+    world = World(echo)
+
+    async def body():
+        await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
+        serving = asyncio.ensure_future(world.session.serve())
+        world.runtime.inject_event("mystery")
+        with pytest.raises(RuntimeError, match="mystery"):
+            await asyncio.wait_for(serving, WAIT)
+
+    run(body())
 
 
 def test_serving_ends_with_the_error_of_whichever_loop_breaks():
@@ -1286,6 +1316,22 @@ def test_the_worker_folds_the_superseded_payloads_oldest_first_before_running_th
     assert run(with_events(world, body)).text == "abc"
 
 
+def test_a_coalescing_task_declared_with_drop_oldest_drops_its_oldest_payloads_to_fit():
+    # Each Greeting encodes to 2 bytes plus its text, so the texts below are
+    # 61, 62, 63 and then 50 bytes: the fourth only fits once the oldest
+    # retained payload (61) is dropped, 186 + 50 > 200 >= 175.
+    world = World(
+        echo, kind=TaskKind.COALESCING, merge=concatenate, drop_oldest=True,
+        memory_soft_limit=100, memory_hard_limit=200,
+    )
+
+    async def body():
+        newest = await generations(world, "echo", "a" * 59, "b" * 60, "c" * 61, "d" * 48)
+        return await asyncio.wait_for(newest, WAIT)
+
+    assert run(with_events(world, body)).text == "b" * 60 + "c" * 61 + "d" * 48
+
+
 def test_without_a_reducer_the_newest_payload_wins():
     world = coalescing_world()
 
@@ -1345,7 +1391,10 @@ def test_a_coalescing_submission_carries_its_key_and_the_default_key_is_empty():
 
     run(world.working(body))
 
-    assert [o["coalescing_key"] for o in world.runtime.submit_options] == ["", "tenant-1"]
+    assert [(o["kind"], o["key"]) for o in world.runtime.submit_options] == [
+        ("coalescing", ""),
+        ("coalescing", "tenant-1"),
+    ]
 
 
 def test_a_superseded_generation_fails_its_handle_and_says_by_which():
@@ -1421,7 +1470,7 @@ def test_a_task_settled_while_its_run_is_starting_can_still_have_its_body_stoppe
     handles = []
     # Settled by another route after the claim, before the body starts.
     world.runtime.before_started = lambda _run_id: world.runtime.inject_event(
-        "expired", task_id=handles[0].task_id
+        EventKind.EXPIRED, task_id=handles[0].task_id
     )
 
     async def body():
@@ -1429,7 +1478,7 @@ def test_a_task_settled_while_its_run_is_starting_can_still_have_its_body_stoppe
         with pytest.raises(TaskExpiredError):
             await asyncio.wait_for(handles[0], WAIT)
         await asyncio.wait_for(started.wait(), WAIT)
-        world.runtime.inject_event("cancelled", task_id=handles[0].task_id)
+        world.runtime.inject_event(EventKind.CANCELLED, task_id=handles[0].task_id)
         await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
         # Settled once: the later cancel notice changed nothing for the handle.
         with pytest.raises(TaskExpiredError):

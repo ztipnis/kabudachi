@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import TypeVar, overload
 
+from kabudachi import _native
 from kabudachi.config import process_configuration
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
@@ -17,16 +18,6 @@ from kabudachi.session import (
     deactivate,
     validate_definitions,
 )
-
-try:
-    import kabudachi._native as _native
-except ModuleNotFoundError as error:
-    # Only the extension itself being absent is tolerated (so the pure-Python
-    # parts of the package can be used without it); a broken import inside it
-    # is not.
-    if error.name != "kabudachi._native":
-        raise
-    _native = None
 
 T = TypeVar("T")
 
@@ -67,8 +58,6 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
         raise RuntimeError(
             "kabudachi.run() without main handles signals, so it needs the main thread"
         )
-    if _native is None:
-        raise RuntimeError("the kabudachi native extension is not available")
     try:
         asyncio.get_running_loop()
     except RuntimeError:

@@ -22,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from kabudachi._native import CancelOutcome
 from kabudachi.body import RunningBody
 from kabudachi.errors import (
     CertificationError,
@@ -157,15 +158,27 @@ class TaskTable:
                 definition.version,
                 payload,
                 queue,
-                definition.retries,
-                options.delay_ms,
-                options.expires_in_ms,
+                definition.kind.value,
                 # A coalescing task always has a key: the default is "".
                 (options.key or "") if definition.kind is TaskKind.COALESCING else None,
+                retries=definition.retries,
+                delay_ms=options.delay_ms,
+                expires_in_ms=options.expires_in_ms,
+                drop_oldest=definition.drop_oldest,
             )
             handle = TaskHandle(task_id, self.cancel, self._run_callback)
             self._records[task_id] = _Record(handle, definition.name)
         return handle
+
+    @staticmethod
+    def _cancelled(outcome: CancelOutcome) -> bool:
+        match outcome:
+            case CancelOutcome.CANCELLED:
+                return True
+            case CancelOutcome.ALREADY_FINISHED | CancelOutcome.UNKNOWN_TASK:
+                return False
+            case unknown:
+                raise RuntimeError(f"the native runtime answered a cancel with {unknown!r}")
 
     # the handle's canceller
 
@@ -179,7 +192,7 @@ class TaskTable:
                 # Under the lock, so a completion that carries a continuation
                 # is either not accepted yet (this cancels the run) or already
                 # has its continuation registered (found above).
-                cancelled = self._runtime.cancel(task_id) == "cancelled"
+                cancelled = self._cancelled(self._runtime.cancel(task_id))
                 if cancelled and record is not None:
                     record.cancel_requested = True
                 return cancelled

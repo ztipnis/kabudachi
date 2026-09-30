@@ -6,7 +6,7 @@ use kabudachi_core::protocol::ids::{
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
-    Cancellation, Completion, MemoryLimits, ReportRejection, Scheduler, Submission, SubmitRejection,
+    Completion, MemoryLimits, ReportRejection, Scheduler, Submission,
 };
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -18,7 +18,9 @@ use tokio::task::JoinHandle;
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::door::{Closed, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
+use crate::errors;
 use crate::local_node::local_node;
+use crate::outcomes::{PyCancelOutcome, PyRunState, coalescing};
 use crate::timers::run_timers;
 use crate::work::{PyCertification, PyClaim, PyEvent};
 
@@ -70,8 +72,9 @@ impl NativeRuntime {
     /// `result_ttl_ms` is how long a finished task is kept before it is
     /// forgotten. `memory_soft_limit` and `memory_hard_limit` are in bytes of
     /// serialized task input: past the soft one `next_events()` reports
-    /// `"slow_down"`, and past the hard one `submit` raises
-    /// `kabudachi.errors.BackpressureError`. Both or neither must be given,
+    /// an `EventKind.SLOW_DOWN` event with `active` set,
+    /// and past the hard one `submit` raises `kabudachi._native.BackpressureError`
+    /// (re-exported by `kabudachi.errors`). Both or neither must be given,
     /// and the soft one must not be above the hard one, which
     /// `kabudachi.configure` checks before the values reach here.
     ///
@@ -185,26 +188,35 @@ impl NativeRuntime {
     }
 
     /// Records a new task and returns its ID. The task waits until a worker
-    /// claims it. Every call is a new task. A run that fails is replaced by a
-    /// new attempt up to `retries` times. With `delay_ms` the task is not
-    /// claimed before that long has passed; with `expires_in_ms` it expires
-    /// instead of running if it is still unclaimed after that long.
+    /// claims it. Every call is a new task. `kind` is the task's `TaskKind`
+    /// value (`"task"`, `"ephemeral"` or `"coalescing"`); a coalescing task
+    /// always has a `key` (its default is `""`), and no other kind has one. A
+    /// run that fails is replaced by a new attempt up to `retries` times. With
+    /// `delay_ms` the task is not claimed before that long has passed; with
+    /// `expires_in_ms` it expires instead of running if it is still unclaimed
+    /// after that long. With `drop_oldest`, a coalescing task that would pass
+    /// the hard memory limit loses its key's oldest retained payloads to fit
+    /// instead of being refused.
     ///
-    /// Raises `RuntimeError` if the runtime has shut down.
+    /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree,
+    /// `BackpressureError` if the task does not fit under the hard memory
+    /// limit, and `RuntimeError` if the runtime has shut down.
     #[pyo3(signature = (
         definition_id,
         source_version,
         serialized_input,
         queue,
+        kind,
+        key,
+        *,
         retries = 0,
         delay_ms = None,
         expires_in_ms = None,
-        coalescing_key = None,
         drop_oldest = false,
     ))]
     #[allow(
         clippy::too_many_arguments,
-        reason = "each argument is a Python keyword"
+        reason = "each argument is a Python parameter"
     )]
     fn submit(
         &self,
@@ -212,13 +224,16 @@ impl NativeRuntime {
         source_version: u32,
         serialized_input: &[u8],
         queue: &str,
+        kind: &str,
+        key: Option<String>,
         retries: u32,
         delay_ms: Option<u64>,
         expires_in_ms: Option<u64>,
-        coalescing_key: Option<String>,
         drop_oldest: bool,
         py: Python<'_>,
     ) -> PyResult<String> {
+        let coalescing =
+            coalescing(kind, key, drop_oldest).map_err(PyValueError::new_err)?;
         let mut submission = Submission::new(
             TaskDefinitionId::new(definition_id),
             source_version,
@@ -232,7 +247,7 @@ impl NativeRuntime {
         if let Some(expires_in_ms) = expires_in_ms {
             submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
         }
-        if let Some(key) = coalescing_key {
+        if let Some((key, drop_oldest)) = coalescing {
             submission = submission.with_coalescing_key(key);
             if drop_oldest {
                 submission = submission.with_drop_oldest();
@@ -241,7 +256,11 @@ impl NativeRuntime {
         let task_id = self
             .door
             .submit(submission)
-            .map_err(|refusal| refused(refusal, |rejection| backpressure_error(py, rejection)))?;
+            .map_err(|refusal| {
+                refused(refusal, |rejection| {
+                    errors::backpressure_error(py, rejection.to_string())
+                })
+            })?;
         Ok(task_id.as_str().to_owned())
     }
 
@@ -324,45 +343,41 @@ impl NativeRuntime {
         Ok(self.door.end_continuation(&TaskId::new(task_id))?)
     }
 
-    /// Reports that a running run failed with an error of type
-    /// `failure_kind` (the type's name, never the error's message). Returns
-    /// whether the task has retries left, so a new attempt is now waiting to
-    /// be claimed; `False` means the task has failed for good.
+    /// Reports that a claimed run failed with an error of type `failure_kind`
+    /// (the type's name, never the error's message), whether or not its body
+    /// started. Returns whether the task has retries left, so a new attempt
+    /// is now waiting to be claimed; `False` means the task has failed for
+    /// good.
     ///
-    /// Raises `RuntimeError` if the run is unknown, is not running, or is not
-    /// this worker's; the failure is then not recorded.
-    fn fail(&self, task_run_id: &str, failure_kind: &str) -> PyResult<bool> {
+    /// Raises `RuntimeError` if the run is unknown, is not this worker's, or
+    /// has already finished; the failure is then not recorded.
+    fn report_failure(&self, task_run_id: &str, failure_kind: &str) -> PyResult<bool> {
         let failure = self
             .door
-            .fail(&TaskRunId::new(task_run_id), failure_kind)
+            .report_failure(&TaskRunId::new(task_run_id), failure_kind)
             .map_err(|refusal| refused(refusal, rejected))?;
         Ok(failure.retry.is_some())
     }
 
-    /// Cancels a task, whatever it is doing: `"cancelled"` if it was, and the
-    /// worker running it (if any) is told through `next_events()` to stop;
-    /// `"finished"` if it had already finished; `"unknown"` if there is no
-    /// such task.
+    /// Cancels a task, whatever it is doing: `CancelOutcome.CANCELLED` if it
+    /// was, and the worker running it (if any) is told through `next_events()`
+    /// to stop; `ALREADY_FINISHED` if it had already finished; `UNKNOWN_TASK`
+    /// if there is no such task.
     ///
     /// Raises `RuntimeError` if this worker is not the leader.
-    fn cancel(&self, task_id: &str) -> PyResult<&'static str> {
+    fn cancel(&self, task_id: &str) -> PyResult<PyCancelOutcome> {
         let outcome = self.door.cancel(&TaskId::new(task_id)).map_err(|refusal| {
             refused(refusal, |rejection| {
                 PyRuntimeError::new_err(rejection.to_string())
             })
         })?;
-        Ok(match outcome {
-            Cancellation::Cancelled { .. } => "cancelled",
-            Cancellation::AlreadyFinished => "finished",
-            Cancellation::UnknownTask => "unknown",
-        })
+        Ok(outcome.into())
     }
 
-    /// The state of a run by name, for example `"Running"`, or `None` if the
-    /// run is unknown.
-    fn task_run_state(&self, task_run_id: &str) -> PyResult<Option<String>> {
+    /// The state of a run, or `None` if the run is unknown.
+    fn task_run_state(&self, task_run_id: &str) -> PyResult<Option<PyRunState>> {
         let state = self.door.run_state(&TaskRunId::new(task_run_id))?;
-        Ok(state.map(|state| format!("{state:?}")))
+        Ok(state.map(PyRunState::from))
     }
 
     /// The IDs of every run of a task, oldest attempt first. Empty if the
@@ -445,25 +460,6 @@ impl Drop for NativeRuntime {
             runtime.shutdown_background();
         }
     }
-}
-
-/// `kabudachi.errors.BackpressureError`, which Python code catches by that
-/// name, so it is built from the Python class instead of a second one here.
-#[inline(never)]
-fn backpressure_error(py: Python<'_>, rejection: SubmitRejection) -> PyErr {
-    let message = rejection.to_string();
-    py.import("kabudachi.errors")
-        .and_then(|errors| errors.getattr("BackpressureError"))
-        .and_then(|class| class.call1((message.clone(),)))
-        .map(PyErr::from_value)
-        // If BackpressureError itself could not be built (module missing,
-        // class renamed), say so rather than silently downgrading to a
-        // plain RuntimeError with no trace of why.
-        .unwrap_or_else(|build_error| {
-            PyRuntimeError::new_err(format!(
-                "{message} (and kabudachi.errors.BackpressureError could not be built: {build_error})"
-            ))
-        })
 }
 
 fn rejected(rejection: ReportRejection) -> PyErr {

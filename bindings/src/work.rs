@@ -5,6 +5,8 @@ use kabudachi_core::scheduler::{Certification, Claim, Event};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::outcomes::PyEventKind;
+
 /// A task handed to a worker to run, and the run that now belongs to it.
 #[pyclass(name = "Claim", frozen)]
 pub struct PyClaim {
@@ -92,9 +94,8 @@ impl From<Certification> for PyCertification {
 /// Something the scheduler decided because time passed, for Python to act on.
 #[pyclass(name = "Event", frozen)]
 pub struct PyEvent {
-    /// What happened, by name, for example `"expired"`.
     #[pyo3(get)]
-    kind: &'static str,
+    kind: PyEventKind,
     #[pyo3(get)]
     task_id: String,
     #[pyo3(get)]
@@ -105,53 +106,51 @@ pub struct PyEvent {
     /// For `"superseded"`: the generation that replaced it.
     #[pyo3(get)]
     superseded_by: Option<String>,
+    /// For `SLOW_DOWN`: whether the slow-down was raised (`True`) or cleared.
+    #[pyo3(get)]
+    active: bool,
 }
 
 impl From<Event> for PyEvent {
     fn from(event: Event) -> Self {
+        let kind = PyEventKind::from(&event);
+        let nothing = PyEvent {
+            kind,
+            task_id: String::new(),
+            task_run_id: String::new(),
+            was_running: false,
+            superseded_by: None,
+            active: false,
+        };
         match event {
             Event::Expired {
                 task_id,
                 task_run_id,
             } => PyEvent {
-                kind: "expired",
                 task_id: task_id.as_str().to_owned(),
                 task_run_id: task_run_id.as_str().to_owned(),
-                was_running: false,
-                superseded_by: None,
+                ..nothing
             },
             Event::Cancelled {
                 task_id,
                 task_run_id,
                 was_running,
             } => PyEvent {
-                kind: "cancelled",
                 task_id: task_id.as_str().to_owned(),
                 task_run_id: task_run_id.as_str().to_owned(),
                 was_running,
-                superseded_by: None,
+                ..nothing
             },
-            Event::SlowDown { active } => PyEvent {
-                kind: if active {
-                    "slow_down"
-                } else {
-                    "slow_down_cleared"
-                },
-                task_id: String::new(),
-                task_run_id: String::new(),
-                was_running: false,
-                superseded_by: None,
-            },
+            Event::SlowDown { active } => PyEvent { active, ..nothing },
             Event::Superseded {
                 task_id,
                 task_run_id,
                 by,
             } => PyEvent {
-                kind: "superseded",
                 task_id: task_id.as_str().to_owned(),
                 task_run_id: task_run_id.as_str().to_owned(),
-                was_running: false,
                 superseded_by: Some(by.as_str().to_owned()),
+                ..nothing
             },
         }
     }

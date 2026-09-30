@@ -25,7 +25,6 @@ class FaultingRuntime:
         self.events = []
         self.submitted = []
         self.submit_options = []
-        self.retries = {}
         self.refuse_completion = False
         self.altered_digest = None
         self.on_complete = None
@@ -44,34 +43,12 @@ class FaultingRuntime:
     def __getattr__(self, name):
         return getattr(self.native, name)
 
-    def submit(
-        self,
-        definition_id,
-        source_version,
-        serialized_input,
-        queue,
-        retries=0,
-        delay_ms=None,
-        expires_in_ms=None,
-        coalescing_key=None,
-        drop_oldest=False,
-    ):
+    def submit(self, definition_id, source_version, serialized_input, queue, kind, key, **options):
         task_id = self.native.submit(
-            definition_id,
-            source_version,
-            serialized_input,
-            queue,
-            retries,
-            delay_ms,
-            expires_in_ms,
-            coalescing_key,
-            drop_oldest,
+            definition_id, source_version, serialized_input, queue, kind, key, **options
         )
         self.submitted.append((task_id, definition_id, source_version, serialized_input, queue))
-        self.submit_options.append(
-            {"delay_ms": delay_ms, "expires_in_ms": expires_in_ms, "coalescing_key": coalescing_key}
-        )
-        self.retries[task_id] = retries
+        self.submit_options.append({"kind": kind, "key": key, **options})
         # Holds this call open after the task exists. `time.sleep` blocks the
         # event loop, so no worker on it can claim meanwhile: this only widens
         # the window for a cancel arriving from another thread.
@@ -88,7 +65,7 @@ class FaultingRuntime:
         return claims
 
     def inject_event(
-        self, kind, task_id="", task_run_id="", was_running=False, superseded_by=None
+        self, kind, task_id="", task_run_id="", was_running=False, superseded_by=None, active=False
     ):
         """Makes `next_events()` also return an event the real runtime did not
         produce, for one it could never cause (such as one for another session's task)."""
@@ -99,6 +76,7 @@ class FaultingRuntime:
                 task_run_id=task_run_id,
                 was_running=was_running,
                 superseded_by=superseded_by,
+                active=active,
             )
         )
 
@@ -133,11 +111,11 @@ class FaultingRuntime:
             raise RuntimeError("not the leader")
         return self.native.report_started(task_run_id)
 
-    def fail(self, task_run_id, failure_kind):
+    def report_failure(self, task_run_id, failure_kind):
         self.events.append(("fail", task_run_id, failure_kind))
         if self.refuse_failure:
             raise RuntimeError("the run does not belong to this worker")
-        return self.native.fail(task_run_id, failure_kind)
+        return self.native.report_failure(task_run_id, failure_kind)
 
     def complete(self, task_run_id, result_digest, continues=False):
         self.events.append(("complete", task_run_id))

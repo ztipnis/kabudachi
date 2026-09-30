@@ -540,7 +540,7 @@ def test_a_group_runs_its_members_side_by_side_through_the_real_runtime():
 
 
 def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
-    from kabudachi.errors import BackpressureError
+    from kabudachi.errors import BackpressureError, KabudachiError
 
     @declare
     def hold(request: Greeting) -> Greeting:
@@ -549,9 +549,13 @@ def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
     kabudachi.configure(memory_soft_limit=100, memory_hard_limit=200, concurrency=1)
 
     async def main():
-        with pytest.raises(BackpressureError):
+        with pytest.raises(BackpressureError) as refused:
             for _ in range(50):
                 hold(Greeting(text="x" * 40))
-        return "refused"
+        return refused.value
 
-    assert kabudachi.run(main) == "refused"
+    refused = kabudachi.run(main)
+
+    # A kabudachi error and a RuntimeError, as the pure-Python class was.
+    assert isinstance(refused, KabudachiError)
+    assert isinstance(refused, RuntimeError)
