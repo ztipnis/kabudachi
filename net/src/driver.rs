@@ -50,8 +50,8 @@ use std::time::Duration;
 use kabudachi_core::configuration::{Configuration, Generation};
 use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, Input, MessageSink,
-    Output, Step, WorkerNode, carry_out,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, CallKind, Input, MessageSink, Output, Step,
+    WorkerNode, carry_out,
 };
 use kabudachi_core::protocol::ids::{IdGenerator, ShardId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::ElectionMessage;
@@ -188,7 +188,7 @@ where
         let arrived_replies =
             std::iter::from_fn(|| woken_by.take().or_else(|| replied.try_recv().ok()));
         for reply in arrived_replies {
-            stepper.in_flight.remove(&CallKind::answered_by(&reply));
+            stepper.in_flight.remove(&reply.token().kind);
             next_deadline = stepper.step(Input::Authority(reply));
         }
         for input in net.take_inputs() {
@@ -448,7 +448,7 @@ impl MessageSink for &Net {
 /// Performs authority calls for [`run_driver`]'s node, and for the
 /// bootstrap cascade before it (see `crate::bootstrap`): on Tokio's blocking
 /// pool, each reply sent to `replies`, whose reader removes the reply's kind
-/// from `in_flight` ([`CallKind::answered_by`]) as it takes it. The driver
+/// from `in_flight` (`reply.token().kind`) as it takes it. The driver
 /// hands a reply to the node in the batch it arrives in. With no authority,
 /// it answers every call at once as `Unavailable` instead. A call that
 /// panics is answered as `Unavailable` too, so its kind is not left in
@@ -478,7 +478,7 @@ impl AuthorityPerformer for PoolPerformer<'_> {
         let Some(authority) = self.authority else {
             return Some(call.unavailable());
         };
-        if !self.in_flight.insert(CallKind::of(&call.request)) {
+        if !self.in_flight.insert(call.token.kind) {
             tracing::debug!(
                 request = ?call.request,
                 "not asking the coordination authority again while the same kind of call is \
@@ -510,39 +510,6 @@ impl AuthorityPerformer for PoolPerformer<'_> {
             let _ = replies.send(reply);
         });
         None
-    }
-}
-
-/// A kind of authority call, for [`PoolPerformer`]'s one-in-flight
-/// rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum CallKind {
-    Register,
-    ReadLiveRegistrations,
-    ReadRecoveryEpoch,
-    SwapRecoveryEpoch,
-    AcquireFence,
-}
-
-impl CallKind {
-    fn of(request: &AuthorityRequest) -> Self {
-        match request {
-            AuthorityRequest::Register => CallKind::Register,
-            AuthorityRequest::ReadLiveRegistrations => CallKind::ReadLiveRegistrations,
-            AuthorityRequest::ReadRecoveryEpoch => CallKind::ReadRecoveryEpoch,
-            AuthorityRequest::SwapRecoveryEpoch { .. } => CallKind::SwapRecoveryEpoch,
-            AuthorityRequest::AcquireFence { .. } => CallKind::AcquireFence,
-        }
-    }
-
-    pub(crate) fn answered_by(reply: &AuthorityReply) -> Self {
-        match reply {
-            AuthorityReply::Registered { .. } => CallKind::Register,
-            AuthorityReply::LiveRegistrations { .. } => CallKind::ReadLiveRegistrations,
-            AuthorityReply::RecoveryEpoch { .. } => CallKind::ReadRecoveryEpoch,
-            AuthorityReply::RecoveryEpochSwapped { .. } => CallKind::SwapRecoveryEpoch,
-            AuthorityReply::Fence { .. } => CallKind::AcquireFence,
-        }
     }
 }
 
@@ -780,7 +747,8 @@ mod tests {
         ElectionMessage, LeaderHeartbeatAck, election_message,
     };
     use kabudachi_core::time::{Duration as TickDuration, RealClock};
-    use kabudachi_testkit::{CallKind, FaultingAuthority};
+    use kabudachi_core::election::CallKind;
+    use kabudachi_testkit::FaultingAuthority;
     use libp2p::identity;
     use tokio::sync::watch;
     use tokio::time::timeout;

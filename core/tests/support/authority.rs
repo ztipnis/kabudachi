@@ -3,7 +3,7 @@
 
 use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, Output,
 };
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::time::Duration;
@@ -93,4 +93,15 @@ impl AuthorityPerformer for AtOnce<'_> {
         self.performed.push(call.request);
         Some(call.perform(self.authority, &self.shard_id, &self.me, self.me.as_str()))
     }
+}
+
+/// The call among `outputs` that asks for `request`; panics if there is none.
+pub fn asked(outputs: &[Output], request: AuthorityRequest) -> AuthorityCall {
+    outputs
+        .iter()
+        .find_map(|output| match output {
+            Output::Authority(call) if call.request == request => Some(*call),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no call asked for {request:?} in {outputs:?}"))
 }

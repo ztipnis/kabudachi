@@ -7,6 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use kabudachi_core::coordination_authority::{
     AuthorityError, CoordinationAuthority, LiveRegistrations, RecoveryEpoch,
 };
+use kabudachi_core::election::CallKind;
 use kabudachi_core::in_memory_authority::InMemoryAuthority;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::time::{Clock, Duration, Instant};
@@ -24,16 +25,6 @@ pub struct FaultingAuthority<C> {
     shared: Arc<SharedAuthority<C>>,
     faults: Arc<Mutex<Faults>>,
     gate: Arc<Gate>,
-}
-
-/// One kind of authority call, for [`FaultingAuthority::hold_next`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CallKind {
-    Register,
-    LiveRegistrations,
-    ReadRecoveryEpoch,
-    SwapRecoveryEpoch,
-    AcquireFence,
 }
 
 /// One connection's held calls. Kept apart from [`Faults`] and taken before
@@ -267,7 +258,7 @@ impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
     }
 
     fn live_registrations(&self, shard_id: &ShardId) -> Result<LiveRegistrations, AuthorityError> {
-        self.pass_gate(CallKind::LiveRegistrations);
+        self.pass_gate(CallKind::ReadLiveRegistrations);
         let authority = self.reach()?;
         let live = authority.live_registrations(shard_id)?;
         // The in-memory authority below warms up only from its construction

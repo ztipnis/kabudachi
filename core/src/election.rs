@@ -116,7 +116,10 @@ mod lease;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use authority::{AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings};
+pub use authority::{
+    AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, Issuer,
+    ReplyToken, ReplyTokens,
+};
 pub use carry_out::{AuthorityPerformer, DropMessages, MessageSink, NoAuthority, carry_out};
 pub use entry::{Entry, Identity};
 
@@ -171,12 +174,16 @@ where
     /// call that fell short, while `NoQuorum` or, waiting out the fence,
     /// `Candidate`.
     recovery: Option<ForcedRecovery>,
-    /// When this node asked for the one authority read or swap it now waits
-    /// on: its forced recovery's current step, or, while `Fenced`, its read
-    /// of the recovery epoch. Replies arrive whenever the driver gets them,
+    /// The token of the one authority read or swap this node now waits on:
+    /// its forced recovery's current step, or, while `Fenced`, its read of
+    /// the recovery epoch. Replies arrive whenever the driver gets them,
     /// possibly out of order, so a reply to any earlier call is stale and
     /// ignored.
-    awaited_reply: Option<Instant>,
+    awaited_reply: Option<ReplyToken>,
+    /// Mints the token of every authority call this node asks. It lives as
+    /// long as the node, a rejoin included, so the node never repeats a
+    /// number.
+    tokens: ReplyTokens,
     /// Why this node stopped; `None` until it is `Stopped`.
     stop_reason: Option<StopReason>,
     /// See [`Self::with_reconnect_timeout`].
@@ -712,6 +719,7 @@ where
             }),
             recovery: None,
             awaited_reply: None,
+            tokens: ReplyTokens::new(Issuer::Node),
             stop_reason: None,
             reconnect_timeout: DEFAULT_RECONNECT_TIMEOUT,
             last_heard: BTreeMap::new(),
@@ -2263,25 +2271,21 @@ where
         let Some(lease) = self.authority.as_mut() else {
             return;
         };
-        if registers && lease.registration_due(now) {
+        let register = registers && lease.registration_due(now);
+        if register {
             lease.registration_asked(now);
-            self.outputs.push(Output::Authority(AuthorityCall {
-                request: AuthorityRequest::Register,
-                sent_at: now,
-            }));
         }
         // A node that has joined no shard has no epoch to hold a fence at,
         // and never needs one.
-        if let Some(epoch) = epoch
-            && lease.fence_due(now)
-        {
+        let fence = epoch.filter(|_| lease.fence_due(now));
+        if fence.is_some() {
             lease.fence_asked(now);
-            self.outputs.push(Output::Authority(AuthorityCall {
-                request: AuthorityRequest::AcquireFence {
-                    recovery_epoch: epoch,
-                },
-                sent_at: now,
-            }));
+        }
+        if register {
+            self.ask_authority(AuthorityRequest::Register, now);
+        }
+        if let Some(recovery_epoch) = fence {
+            self.ask_authority(AuthorityRequest::AcquireFence { recovery_epoch }, now);
         }
     }
 
@@ -2300,21 +2304,22 @@ where
     /// Asks for `request` as the one read or swap this node now waits on
     /// (see `awaited_reply`).
     fn await_authority(&mut self, request: AuthorityRequest) {
-        self.awaited_reply = Some(self.clock.now());
-        self.ask_authority(request);
+        let now = self.clock.now();
+        self.awaited_reply = Some(self.ask_authority(request, now));
     }
 
-    /// Whether a reply to a call asked at `sent_at` answers the one this
-    /// node waits on.
-    fn awaits(&self, sent_at: Instant) -> bool {
-        self.awaited_reply == Some(sent_at)
+    /// Whether `token` is the one this node waits on, and if it is, stops
+    /// waiting. Whole-token equality: a reply of another issuer, kind or
+    /// number never empties the slot.
+    fn take_awaited(&mut self, token: ReplyToken) -> bool {
+        self.awaited_reply.take_if(|awaited| *awaited == token).is_some()
     }
 
-    fn ask_authority(&mut self, request: AuthorityRequest) {
-        self.outputs.push(Output::Authority(AuthorityCall {
-            request,
-            sent_at: self.clock.now(),
-        }));
+    /// Asks for `request` at `now`, and returns the token its reply carries.
+    fn ask_authority(&mut self, request: AuthorityRequest, now: Instant) -> ReplyToken {
+        let call = AuthorityCall::new(request, &mut self.tokens, now);
+        self.outputs.push(Output::Authority(call));
+        call.token
     }
 
     /// Handles what the authority answered to a call this node asked for.
@@ -2323,7 +2328,9 @@ where
             return;
         }
         match reply {
-            AuthorityReply::Registered { sent_at, result } => {
+            AuthorityReply::Registered {
+                sent_at, result, ..
+            } => {
                 if let (Ok(granted), Some(lease)) = (result, self.authority.as_mut()) {
                     lease.registered(sent_at, granted);
                     // A fenced node that can register again reads the epoch
@@ -2333,13 +2340,13 @@ where
                     }
                 }
             }
-            AuthorityReply::LiveRegistrations { sent_at, result } => {
-                if self.awaits(sent_at) {
+            AuthorityReply::LiveRegistrations { token, result, .. } => {
+                if self.take_awaited(token) {
                     self.on_live_registrations(result);
                 }
             }
-            AuthorityReply::RecoveryEpoch { sent_at, result } => {
-                if !self.awaits(sent_at) {
+            AuthorityReply::RecoveryEpoch { token, result, .. } => {
+                if !self.take_awaited(token) {
                     return;
                 }
                 if self.state == WorkerState::Fenced {
@@ -2351,18 +2358,20 @@ where
                 }
             }
             AuthorityReply::RecoveryEpochSwapped {
+                token,
                 expected,
                 new,
-                sent_at,
                 result,
+                ..
             } => {
-                let awaited = self.awaits(sent_at);
+                let awaited = self.take_awaited(token);
                 self.on_recovery_epoch_swapped(expected, new, awaited, result);
             }
             AuthorityReply::Fence {
                 recovery_epoch,
                 sent_at,
                 result,
+                ..
             } => self.on_fence(recovery_epoch, sent_at, result),
         }
     }
@@ -2664,10 +2673,13 @@ where
             Err(AuthorityError::EpochConflict { current: None })
                 if self.state == WorkerState::Leader =>
             {
-                self.ask_authority(AuthorityRequest::SwapRecoveryEpoch {
-                    expected: None,
-                    new: epoch,
-                });
+                self.ask_authority(
+                    AuthorityRequest::SwapRecoveryEpoch {
+                        expected: None,
+                        new: epoch,
+                    },
+                    now,
+                );
             }
             // An epoch this node cannot recover from: it rejoins the shard
             // at it, as a reconnecting fenced node and a `NoQuorum` node's

@@ -141,7 +141,8 @@ use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, Entry,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, CallKind, Entry, Issuer,
+    ReplyTokens,
 };
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
@@ -149,7 +150,7 @@ use kabudachi_core::time::{Clock, Instant};
 use libp2p::Multiaddr;
 use tokio::sync::mpsc;
 
-use crate::driver::{CallKind, PoolPerformer, SharedAuthority};
+use crate::driver::{PoolPerformer, SharedAuthority};
 use crate::join::{LeaderSearch, ask_for_leader, ask_registered_peers};
 use crate::messenger::Net;
 
@@ -448,7 +449,7 @@ pub(crate) fn decide_round(
                 then: Stage::Registering,
             }
         }
-        (Stage::Registering, AuthorityReply::Registered { sent_at, result }) => match result {
+        (Stage::Registering, AuthorityReply::Registered { sent_at, result, .. }) => match result {
             Ok(_) => Decision::Ask {
                 request: AuthorityRequest::SwapRecoveryEpoch {
                     expected: None,
@@ -563,6 +564,9 @@ struct AuthorityCalls<'a, C: Clock> {
     sender: mpsc::UnboundedSender<AuthorityReply>,
     replies: mpsc::UnboundedReceiver<AuthorityReply>,
     in_flight: BTreeSet<CallKind>,
+    /// Mints the token of every call the cascade asks. Its issuer is
+    /// [`Issuer::Cascade`], so no token of it equals a node's.
+    tokens: ReplyTokens,
 }
 
 impl<'a, C: Clock> AuthorityCalls<'a, C> {
@@ -583,15 +587,13 @@ impl<'a, C: Clock> AuthorityCalls<'a, C> {
             sender,
             replies,
             in_flight: BTreeSet::new(),
+            tokens: ReplyTokens::new(Issuer::Cascade),
         }
     }
 
     /// Asks for `request` now, unless a call of its kind is unanswered.
     fn ask(&mut self, request: AuthorityRequest) {
-        let call = AuthorityCall {
-            request,
-            sent_at: self.clock.now(),
-        };
+        let call = AuthorityCall::new(request, &mut self.tokens, self.clock.now());
         let mut performer = PoolPerformer {
             authority: Some(self.authority),
             replies: &self.sender,
@@ -615,7 +617,7 @@ impl<'a, C: Clock> AuthorityCalls<'a, C> {
                 .ok()??,
             None => self.replies.recv().await?,
         };
-        self.in_flight.remove(&CallKind::answered_by(&reply));
+        self.in_flight.remove(&reply.token().kind);
         Some(reply)
     }
 }
@@ -787,7 +789,8 @@ mod tests {
     use kabudachi_core::protocol::messages::election_message::Payload;
     use kabudachi_core::scheduler::Scheduler;
     use kabudachi_core::time::{Duration, RealClock};
-    use kabudachi_testkit::{CallKind, FaultingAuthority};
+    use kabudachi_core::election::{CallKind, ReplyToken};
+    use kabudachi_testkit::FaultingAuthority;
     use libp2p::identity;
     use tokio::time::timeout;
 
@@ -1229,6 +1232,11 @@ mod tests {
             .map(|worker| (WorkerId::new(*worker), format!("/memory/{worker}")))
             .collect();
         AuthorityReply::LiveRegistrations {
+            token: ReplyToken {
+                issuer: Issuer::Cascade,
+                kind: CallKind::ReadLiveRegistrations,
+                number: 0,
+            },
             sent_at,
             result: Ok(LiveRegistrations::new(addresses, warm)),
         }
@@ -1252,6 +1260,11 @@ mod tests {
                 registered_at: Instant::at(2),
             },
             AuthorityReply::RecoveryEpochSwapped {
+                token: ReplyToken {
+                    issuer: Issuer::Cascade,
+                    kind: CallKind::SwapRecoveryEpoch,
+                    number: 0,
+                },
                 expected: None,
                 new: RecoveryEpoch::founding(0),
                 sent_at: Instant::at(3),
@@ -1359,7 +1372,7 @@ mod tests {
         {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
-        authority.hold_next(CallKind::LiveRegistrations);
+        authority.hold_next(CallKind::ReadLiveRegistrations);
         // A seed that is up but answers no one: each round asks it once.
         let (seed_net, seed_addr) = listening_net().await;
         let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
@@ -1387,14 +1400,14 @@ mod tests {
                         asked += seed_net.poll_join_requests().len();
                         tokio::time::sleep(StdDuration::from_millis(5)).await;
                     }
-                    Ok(authority.is_holding(CallKind::LiveRegistrations))
+                    Ok(authority.is_holding(CallKind::ReadLiveRegistrations))
                 } => asked,
             }
         })
         .await;
         // Released before anything can fail, so no path leaves the held
         // thread parked and hangs the runtime's shutdown.
-        authority.release(CallKind::LiveRegistrations);
+        authority.release(CallKind::ReadLiveRegistrations);
 
         match asked_while_held.expect("the seed was asked three times within the timeout") {
             Ok(held) => assert!(held, "the first read was answered before the third round"),

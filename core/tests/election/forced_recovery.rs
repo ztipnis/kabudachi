@@ -15,8 +15,9 @@ use crate::support::builders::{
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::coordination_authority::{AuthorityError, CoordinationAuthority, RecoveryEpoch};
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, DropMessages, Entry,
-    Identity, Input, KnownConfiguration, Output, Step, WorkerNode, carry_out,
+    AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, DropMessages,
+    Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step, WorkerNode,
+    carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::election_message;
@@ -26,7 +27,7 @@ use kabudachi_core::scheduler::{LeaseEnd, Scheduler};
 use kabudachi_core::time::{Clock, Duration};
 use kabudachi_testkit::FaultingAuthority;
 use crate::support::authority::{
-    AtOnce, authority_ttl, epoch, register_all, seed_shard, warmed_up_authority,
+    AtOnce, asked, authority_ttl, epoch, register_all, seed_shard, warmed_up_authority,
 };
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
@@ -131,6 +132,15 @@ impl Driven {
     /// that call at its deadline, with a reply from each of `respondents`
     /// admitted at `g0` in between. Returns what the closing tick produced.
     fn run_roll_call(&mut self, respondents: &[WorkerId]) -> Vec<Output> {
+        self.answer_roll_call(respondents);
+        let deadline = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)).roll_call_deadline;
+        self.advance(deadline.as_ticks())
+    }
+
+    /// Lets the node suspect its leader and start a roll call, answered by
+    /// each of `respondents` admitted at `g0`, and stops short of its
+    /// deadline.
+    fn answer_roll_call(&mut self, respondents: &[WorkerId]) {
         self.advance(SUSPECT_TIMEOUT_TICKS * 2);
         assert_eq!(self.node.state(), WorkerState::LeaderSuspect);
         let started = self.tick();
@@ -142,8 +152,6 @@ impl Driven {
                 message: reply,
             });
         }
-        let deadline = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)).roll_call_deadline;
-        self.advance(deadline.as_ticks())
     }
 }
 
@@ -333,32 +341,38 @@ fn a_fenced_node_rejoins_as_pending_once_the_epoch_has_moved_on() {
 #[test]
 fn a_fenced_node_ignores_an_epoch_read_it_asked_for_before_reconnecting() {
     let mut driven = fenced_voter();
-    let stale_read_at = driven.clock.now();
     driven.clock.advance(Duration::from_ticks(1_000));
     let now = driven.clock.now();
-
-    let registered = driven.node.step(Input::Authority(AuthorityReply::Registered {
-        sent_at: now,
-        result: Ok(authority_ttl()),
-    }));
-    assert!(
-        registered.outputs.contains(&Output::Authority(AuthorityCall {
-            request: AuthorityRequest::ReadRecoveryEpoch,
+    // Straight into the node, not carried: two registrations answered, each
+    // making the fenced node ask for the epoch. Register replies are never
+    // matched, so any token serves.
+    let registered = || {
+        Input::Authority(AuthorityReply::Registered {
+            token: ReplyToken {
+                issuer: Issuer::Node,
+                kind: CallKind::Register,
+                number: 0,
+            },
             sent_at: now,
-        })),
-        "registered again, it reads the epoch"
-    );
+            result: Ok(authority_ttl()),
+        })
+    };
+    let registered_1 = driven.node.step(registered());
+    let first = asked(&registered_1.outputs, AuthorityRequest::ReadRecoveryEpoch);
+    let registered_2 = driven.node.step(registered());
+    let second = asked(&registered_2.outputs, AuthorityRequest::ReadRecoveryEpoch);
 
-    let _ = driven.node.step(Input::Authority(AuthorityReply::RecoveryEpoch {
-        sent_at: stale_read_at,
-        result: Ok(Some(epoch(0))),
-    }));
+    let answer = |call: AuthorityCall, epoch| {
+        Input::Authority(AuthorityReply::RecoveryEpoch {
+            token: call.token,
+            sent_at: call.sent_at,
+            result: Ok(Some(epoch)),
+        })
+    };
+    let _ = driven.node.step(answer(first, epoch(0)));
     assert_eq!(driven.node.state(), WorkerState::Fenced, "a stale read is ignored");
 
-    let _ = driven.node.step(Input::Authority(AuthorityReply::RecoveryEpoch {
-        sent_at: now,
-        result: Ok(Some(epoch(1))),
-    }));
+    let _ = driven.node.step(answer(second, epoch(1)));
     assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
 }
 
@@ -480,6 +494,11 @@ fn a_leader_whose_republish_fails_asks_for_its_fence_again_only_when_due() {
     let now = driven.clock.now();
 
     let refused = driven.node.step(Input::Authority(AuthorityReply::Fence {
+        token: ReplyToken {
+            issuer: Issuer::Node,
+            kind: CallKind::AcquireFence,
+            number: 0,
+        },
         recovery_epoch: epoch(0),
         sent_at: now,
         result: Err(AuthorityError::EpochConflict { current: None }),
@@ -490,9 +509,17 @@ fn a_leader_whose_republish_fails_asks_for_its_fence_again_only_when_due() {
             new: epoch(0)
         })
     );
+    let swap = asked(
+        &refused.outputs,
+        AuthorityRequest::SwapRecoveryEpoch {
+            expected: None,
+            new: epoch(0),
+        },
+    );
     let unreachable = driven
         .node
         .step(Input::Authority(AuthorityReply::RecoveryEpochSwapped {
+            token: swap.token,
             expected: None,
             new: epoch(0),
             sent_at: now,
@@ -525,6 +552,115 @@ fn a_leader_whose_fence_names_a_later_epoch_steps_down() {
 
     assert_eq!(state_changes(&outputs)[0], WorkerState::LeaderSuspect);
     assert_eq!(grants(&outputs).first(), Some(&None));
+}
+
+// `await_authority` read the clock once to remember the call and again to
+// stamp it: a tick between the two reads left the node waiting on an
+// instant no reply carries.
+#[test]
+fn a_fenced_node_resumes_on_its_epoch_read_even_when_its_clock_moves_while_it_asks() {
+    let mut driven = fenced_voter();
+    driven.authority.set_reachable(true);
+    driven.clock.advance_on_every_read(Duration::from_ticks(1));
+    for _ in 0..10 {
+        if driven.node.state() != WorkerState::Fenced {
+            break;
+        }
+        driven.advance(ttl_ticks() / 3);
+    }
+    assert_eq!(driven.node.state(), WorkerState::Active, "its epoch is still its own");
+}
+
+/// `w1` in `short_roll_call(&["w1", "w2"], Some(0), true)`'s recovery,
+/// stopped where it awaits its live-set read: that call, not yet performed.
+fn awaiting_its_live_set_read() -> (Driven, AuthorityCall) {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    authority
+        .compare_and_swap_recovery_epoch(&shard(SHARD), None, epoch(0))
+        .expect("the shard has no epoch yet");
+    register_all(&authority, &shard(SHARD), &[worker("w2")]);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
+    driven.answer_roll_call(&[worker("w2")]);
+    let deadline = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)).roll_call_deadline;
+    driven.clock.advance(deadline);
+    let closed = driven.node.step(Input::Tick);
+    let read = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
+    assert_eq!(driven.node.state(), WorkerState::NoQuorum, "setup invariant");
+    (driven, read)
+}
+
+// A reply is matched by its call's issuer, kind and number, not by when the
+// call was sent: a reply of another kind carrying the awaited number (a
+// stray or a duplicate) must not answer the recovery's live-set read.
+#[test]
+fn a_reply_of_another_kind_does_not_answer_the_awaited_call() {
+    let (mut driven, read) = awaiting_its_live_set_read();
+
+    let stray = driven.node.step(Input::Authority(AuthorityReply::RecoveryEpoch {
+        token: ReplyToken {
+            kind: CallKind::ReadRecoveryEpoch,
+            ..read.token
+        },
+        sent_at: read.sent_at,
+        result: Ok(Some(epoch(0))),
+    }));
+    assert!(authority_calls(&stray.outputs).is_empty(), "{:?}", stray.outputs);
+    assert_eq!(driven.node.state(), WorkerState::NoQuorum);
+
+    let answered = driven.node.step(Input::Authority(read.perform(
+        &driven.authority,
+        &shard(SHARD),
+        &worker("w1"),
+        "w1",
+    )));
+    assert!(
+        authority_calls(&answered.outputs).contains(&AuthorityRequest::ReadRecoveryEpoch),
+        "the recovery is still going: {:?}",
+        answered.outputs
+    );
+}
+
+// The bootstrap cascade numbers its calls from 0, as the node does, so a
+// reply to one of its calls can carry the node's awaited kind and number.
+// Its issuer tells them apart: the node never takes it for its own, whatever
+// net does with it at handover.
+#[test]
+fn a_reply_the_cascade_issued_does_not_answer_the_nodes_awaited_call() {
+    let (mut driven, read) = awaiting_its_live_set_read();
+    assert_eq!(read.token.issuer, Issuer::Node, "setup invariant");
+    let cascades = AuthorityCall {
+        token: ReplyToken {
+            issuer: Issuer::Cascade,
+            ..read.token
+        },
+        ..read
+    };
+
+    // A real live set, of the awaited kind and number, which would move the
+    // recovery on if it were taken.
+    let stray = driven.node.step(Input::Authority(cascades.perform(
+        &driven.authority,
+        &shard(SHARD),
+        &worker("w1"),
+        "w1",
+    )));
+    assert!(authority_calls(&stray.outputs).is_empty(), "{:?}", stray.outputs);
+    assert_eq!(driven.node.state(), WorkerState::NoQuorum);
+
+    // Had the cascade's reply been taken, it would have emptied the slot and
+    // this one would be ignored.
+    let answered = driven.node.step(Input::Authority(read.perform(
+        &driven.authority,
+        &shard(SHARD),
+        &worker("w1"),
+        "w1",
+    )));
+    assert!(
+        authority_calls(&answered.outputs).contains(&AuthorityRequest::ReadRecoveryEpoch),
+        "{:?}",
+        answered.outputs
+    );
 }
 
 /// `w1`, a voter of 5, its roll call answered by `w2` alone, with `live`
