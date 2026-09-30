@@ -6,11 +6,16 @@
 
 use std::collections::BTreeMap;
 
-use crate::protocol::ids::TaskId;
+use crate::protocol::ids::{TaskDefinitionId, TaskId};
 
 /// A coalescing key: the task definition and the flat key string, so two
 /// different tasks never share a key by coincidence.
 pub(crate) type Key = (String, String);
+
+/// The coalescing key of a task of `definition` with the flat key `key`.
+pub(crate) fn key(definition: &TaskDefinitionId, key: &str) -> Key {
+    (definition.as_str().to_owned(), key.to_owned())
+}
 
 #[derive(Default)]
 /// Which generation of each coalescing key waits, which holds the key, and what each absorbed.

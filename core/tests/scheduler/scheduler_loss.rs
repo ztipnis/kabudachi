@@ -8,7 +8,9 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerI
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{ClaimRejection, Completion, LoseRejection, Submission};
+use kabudachi_core::scheduler::{
+    ClaimRejection, Completion, LoseRejection, ReportRejection, Submission,
+};
 
 fn worker(name: &str) -> WorkerId {
     WorkerId::new(name)
@@ -226,4 +228,20 @@ fn a_task_whose_continuation_is_running_is_not_lost_with_its_worker() {
 
     assert!(lost.is_empty());
     assert_eq!(fixture.run_state(&run), TaskRunState::Succeeded);
+}
+
+#[test]
+fn a_lost_workers_report_on_its_lost_run_is_refused() {
+    let mut fixture = Fixture::leading();
+    let task = fixture.scheduler.submit(plain("p")).unwrap();
+    let run = running(&mut fixture, &worker("w1"), &task);
+    fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+
+    let completed = fixture
+        .scheduler
+        .complete(&worker("w1"), &run, b"d".to_vec(), Completion::Final);
+    let failed = fixture.scheduler.fail(&worker("w1"), &run, "ValueError");
+
+    assert_eq!(completed.unwrap_err(), ReportRejection::NotAuthoritative);
+    assert_eq!(failed.unwrap_err(), ReportRejection::NotAuthoritative);
 }

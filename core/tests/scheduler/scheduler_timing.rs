@@ -540,3 +540,46 @@ fn a_finished_tasks_forgetting_time_is_a_deadline_too() {
 
     assert_eq!(fixture.scheduler.next_deadline(), Some(Instant::at(540)));
 }
+
+#[test]
+fn a_cancelled_task_leaves_no_expiry_to_wake_for() {
+    let mut fixture = Fixture::leading();
+    let task = fixture.scheduler.submit(plain().with_expiry(ticks(100))).unwrap();
+    assert_eq!(fixture.scheduler.next_deadline(), Some(Instant::at(100)));
+
+    fixture.scheduler.cancel(&task).unwrap();
+
+    assert_eq!(fixture.scheduler.next_deadline(), None);
+}
+
+#[test]
+fn a_delayed_task_that_became_due_can_still_expire() {
+    let mut fixture = Fixture::leading();
+    let task = fixture
+        .scheduler
+        .submit(plain().with_delay(ticks(10)).with_expiry(ticks(50)))
+        .unwrap();
+    fixture.clock.advance(ticks(10));
+    assert_eq!(fixture.scheduler.catch_up().queued, 1);
+
+    fixture.clock.advance(ticks(40));
+
+    assert_eq!(fixture.scheduler.catch_up().expired, 1);
+    assert_eq!(fixture.state(&task), TaskRunState::Expired);
+}
+
+#[test]
+fn delayed_tasks_due_at_the_same_time_join_the_queue_in_submission_order() {
+    let mut fixture = Fixture::leading();
+    // Ten, so that ordering by task ID ("task-10" sorts before "task-2")
+    // would come out different from submission order.
+    let submitted: Vec<TaskId> = (0..10)
+        .map(|_| fixture.scheduler.submit(plain().with_delay(ticks(10))).unwrap())
+        .collect();
+    fixture.clock.advance(ticks(10));
+
+    let claims = fixture.scheduler.claim_oldest(&worker(), 10).unwrap();
+
+    let order: Vec<TaskId> = claims.iter().map(|claim| claim.task.task_id()).collect();
+    assert_eq!(order, submitted);
+}

@@ -138,49 +138,6 @@ fn a_superseded_payload_counts_until_the_generation_that_absorbed_it_finishes() 
 }
 
 #[test]
-fn slow_down_is_raised_past_the_soft_limit() {
-    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
-
-    fixture.scheduler.submit(payload(60)).unwrap();
-    assert!(slow_down_events(&mut fixture).is_empty());
-
-    // Exactly at the limit is not past it.
-    fixture.scheduler.submit(payload(40)).unwrap();
-
-    fixture.scheduler.submit(payload(1)).unwrap();
-    assert_eq!(slow_down_events(&mut fixture), vec![true]);
-}
-
-#[test]
-fn slow_down_is_raised_once_however_far_past_the_limit_it_goes() {
-    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
-
-    for _ in 0..5 {
-        fixture.scheduler.submit(payload(30)).unwrap();
-    }
-
-    assert_eq!(slow_down_events(&mut fixture), vec![true]);
-}
-
-#[test]
-fn slow_down_does_not_flap_just_below_the_soft_limit() {
-    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
-    fixture.scheduler.submit(payload(45)).unwrap();
-    let big = fixture.scheduler.submit(payload(46)).unwrap();
-    let small = fixture.scheduler.submit(payload(10)).unwrap();
-    assert_eq!(slow_down_events(&mut fixture), vec![true]);
-
-    // 91 is below the soft limit but inside the margin: still raised.
-    fixture.scheduler.cancel(&small).unwrap();
-    assert_eq!(fixture.spy.memory_in_use(), 91);
-    assert!(slow_down_events(&mut fixture).is_empty());
-
-    // 45 is well below it: cleared, once.
-    fixture.scheduler.cancel(&big).unwrap();
-    assert_eq!(slow_down_events(&mut fixture), vec![false]);
-}
-
-#[test]
 fn slow_down_can_be_raised_again_after_it_cleared() {
     let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     let first = fixture.scheduler.submit(payload(101)).unwrap();
