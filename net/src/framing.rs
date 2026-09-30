@@ -18,6 +18,13 @@ use libp2p::futures::{AsyncRead, AsyncReadExt};
 /// prefix.
 pub(crate) const MAX_MESSAGE_BYTES: u32 = 1024 * 1024;
 
+// The scheduler refuses a task too big for one claim message by this size, so
+// the two must agree.
+const _: () = assert!(
+    MAX_MESSAGE_BYTES as u64 == kabudachi_core::scheduler::MAX_CLAIM_FRAME_BYTES,
+    "the scheduler's claim frame size is not this crate's message limit"
+);
+
 /// Decodes a frame body and rejects a malformed message: one missing a
 /// required ID, or holding a field without the partner it needs
 /// (`core::protocol::messages::WellFormed`). The required ID accessors panic

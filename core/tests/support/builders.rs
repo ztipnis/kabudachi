@@ -190,7 +190,7 @@ pub fn ack_message(ack: LeaderHeartbeatAck) -> ElectionMessage {
 
 /// `rejecter`'s refusal, for `reason`, of `initiator`'s roll call or vote
 /// request for `term` in `shard-1`, naming the highest term it has seen,
-/// carrying its configuration `configuration_of(3)` and, if any, naming its
+/// carrying its configuration `configuration_of(3)` at recovery epoch 0 and, if any, naming its
 /// leader with that leader's term.
 pub fn election_reject(
     initiator: &WorkerId,
@@ -212,6 +212,8 @@ pub fn election_reject(
             leader_id: Some(leader.clone().into()),
             term,
         }),
+        recovery_epoch: Some(0),
+        recovery_epoch_lineage: None,
     }))
 }
 

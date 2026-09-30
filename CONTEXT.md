@@ -112,7 +112,7 @@ What the transport's swarm task alone observes about the peers around it and ans
 _Avoid_: peer table, connection state
 
 **Redial schedule**:
-When a lost mesh peer is dialled again, and when to give up on it: a bounded, exponentially backing-off series that the peer book works out from the observations and the time it is given (`RedialPolicy`).
+When a lost mesh peer is dialled again: a fast series of attempts followed by a slow, steady one, and the peer is never given up on. The peer book works it out from the observations and the time it is given (`RedialPolicy`).
 
 **Routing refresh**:
 When a driven node crawls peer routing again: after its view of its shard changes and settles, and every few suspicion timeouts otherwise. A pure function of what the node shows and the time (`net/src/routing_refresh.rs`).

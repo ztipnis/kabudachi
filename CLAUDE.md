@@ -40,8 +40,6 @@ No lint or format command is configured; do not add one speculatively.
 
 Python tests run through Bazel only, on the host or in the Linux container (`CONTRIBUTING.md`). `import kabudachi` needs the `kabudachi._native` extension, which only Bazel builds (`uv_build` packages the pure-Python sources alone), so `uv run pytest` cannot import the package or run the Python tests on any host.
 
-Every Bazel command adds a `direct-cargo-bazel-deps` stanza to `Cargo.lock`, which any cargo command strips again, and `MODULE.bazel.lock` records the churned hashes. Until the `crate_universe` splicing config is fixed, run `git checkout -- Cargo.lock MODULE.bazel.lock` after Bazel commands, and never commit that churn. That command discards every unstaged edit to those files, so first stage or stash any intentional change to them, and restore only files that were clean before Bazel ran.
-
 ## Architecture
 
 - `proto/`: schemas and generated Rust wire types.

@@ -17,10 +17,8 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::join::{LeaderSearch, ask_for_leader};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
 use kabudachi_net::worker::{AuthorityConfig, WorkerConfig};
 use libp2p::Multiaddr;
-use libp2p::identity;
 use libp2p::multiaddr::Protocol;
 use tokio::time::timeout;
 
@@ -235,7 +233,7 @@ async fn a_leader_bound_to_every_interface_points_joiners_at_a_non_loopback_addr
         .wait_until(|seen| seen.state == WorkerState::Leader)
         .await;
 
-    let joining_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let joining_net = Net::new();
     let search = timeout(
         TEST_TIMEOUT,
         ask_for_leader(&joining_net, std::slice::from_ref(&leader.address), PER_PEER_TIMEOUT),
@@ -254,7 +252,7 @@ async fn a_leader_bound_to_every_interface_points_joiners_at_a_non_loopback_addr
 
     // Another worker, asking at the address the pointer names,
     // reaches the leader there.
-    let remote_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let remote_net = Net::new();
     let search = timeout(
         TEST_TIMEOUT,
         ask_for_leader(&remote_net, &[pointed], PER_PEER_TIMEOUT),

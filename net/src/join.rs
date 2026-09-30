@@ -271,11 +271,10 @@ mod tests {
     use kabudachi_core::protocol::ids::{IncarnationId, ShardId};
     use kabudachi_core::protocol::worker_state::WorkerState;
     use kabudachi_core::time::{Duration as TickDuration, RealClock};
-    use libp2p::identity;
+    
     use tokio::time::timeout;
 
     use super::*;
-    use crate::swarm::build_swarm;
     use crate::test_support::{
         TEST_TIMEOUT, listening_net, spawn_join_responder, worker_that_never_runs,
     };
@@ -322,7 +321,7 @@ mod tests {
         let (net_a, addr_a) = listening_net().await;
         let (net_b, addr_b) = listening_net().await;
         let (net_z, addr_z) = listening_net().await;
-        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_c = Net::new();
         let worker_b = net_b.local_worker_id();
 
         // Seed A names a leader that never runs, at an address where some
@@ -362,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn a_pointer_only_to_an_undialable_leader_is_an_answer_with_no_reachable_leader() {
         let (net_a, addr_a) = listening_net().await;
-        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_c = Net::new();
 
         // Nothing listens at this address, so the pointed leader cannot be
         // reached; the seed did answer, so the shard exists.
@@ -387,7 +386,7 @@ mod tests {
     async fn ask_for_leader_dials_the_leader_it_is_pointed_at() {
         let (net_leader, leader_addr) = listening_net().await;
         let (net_a, seed_addr) = listening_net().await;
-        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_c = Net::new();
 
         let worker_leader = net_leader.local_worker_id();
 
@@ -411,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_for_leader_returns_none_when_the_only_seed_never_responds() {
-        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_c = Net::new();
         // Nothing listens here, so dialing it fails to connect.
         let unreachable_seed: Multiaddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
 
@@ -431,7 +430,7 @@ mod tests {
         // order, and a seed that doesn't answer doesn't stop the join —
         // the next seed in the list still gets a chance.
         let (net_a, listen_addr) = listening_net().await;
-        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_c = Net::new();
 
         let worker_a = net_a.local_worker_id();
 
@@ -481,7 +480,7 @@ mod tests {
     async fn ask_for_leader_ignores_a_late_connection_from_an_abandoned_seed() {
         let (net_a, addr_a) = listening_net().await;
         let (net_b, addr_b) = listening_net().await;
-        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_c = Net::new();
 
         let worker_a = net_a.local_worker_id();
         let worker_b = net_b.local_worker_id();
@@ -539,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn a_pending_member_that_suspects_its_leader_still_points_joiners_at_it() {
         let (net_leader, leader_addr) = listening_net().await;
-        let net_joiner = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_joiner = Net::new();
         let leader = net_leader.local_worker_id();
         let joiner = net_joiner.local_worker_id();
 
@@ -600,7 +599,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         });
-        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_c = Net::new();
 
         // Well under the per-peer timeout: a dropped request settles as a
         // failure, not a wait.

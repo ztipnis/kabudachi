@@ -598,6 +598,8 @@ fn a_call_for_a_term_already_seen_is_refused_as_stale_naming_the_highest_term_se
     assert_eq!(reject.shard_id(), shard("shard-1"));
     assert_eq!(reject.highest_term_seen, 2);
     assert_eq!(reject.configuration(), Some(configuration_of(3)));
+    assert_eq!(reject.recovery_epoch, Some(0));
+    assert_eq!(reject.recovery_epoch_lineage, node.recovery_lineage());
     assert_eq!(reject.leader, None);
 }
 
@@ -775,6 +777,8 @@ fn reject_message(
             leader_id: Some(leader.clone().into()),
             term,
         }),
+        recovery_epoch: Some(0),
+        recovery_epoch_lineage: None,
     }))
 }
 
@@ -920,22 +924,135 @@ fn a_refusal_from_a_lower_recovery_epoch_is_dropped() {
     assert_eq!(node.highest_term_seen(), 0);
 }
 
-// ruling 2026-09-29: a refusal names its refuser's epoch only through the
-// configuration it carries, so one without a configuration is read as the
-// node's own epoch's.
+fn epoch_1_configuration(voters: usize) -> Configuration {
+    let epoch_1 = Generation::new(1, 0, 0);
+    Configuration::single(Single {
+        generation: epoch_1,
+        base: epoch_1,
+        voter_count: voters,
+    })
+    .expect("valid")
+}
+
+/// `refusal` as `epoch` and `lineage` name the epoch its refuser stands in,
+/// carrying `configuration` instead of the builder's, or none.
+fn refusal_at(
+    mut refusal: ElectionMessage,
+    epoch: Option<u64>,
+    lineage: Option<u64>,
+    configuration: Option<Configuration>,
+) -> ElectionMessage {
+    let Some(election_message::Payload::ElectionReject(reject)) = refusal.payload.as_mut() else {
+        panic!("reject_message builds a refusal");
+    };
+    reject.recovery_epoch = epoch;
+    reject.recovery_epoch_lineage = lineage;
+    reject.configuration = configuration.as_ref().map(Into::into);
+    refusal
+}
+
+// ADR-0001 decision 4, amended 2026-09-29, and L6: a refusal names its
+// refuser's epoch and lineage itself, so one without a configuration is
+// placed too.
 #[test]
-fn a_refusal_carrying_no_configuration_is_read_as_the_nodes_own_epoch() {
+fn a_refusal_from_a_lower_epoch_is_dropped_even_without_a_configuration() {
     let clock = FakeClock::new();
     let me = worker("w1");
     let mut node = voter_at_epoch_1(&clock, &me, 3);
     let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
     let rejecter = worker("w2");
-    let mut refusal =
-        reject_message(&call, &rejecter, ElectionRejectReason::StaleTerm, 5, None);
-    let Some(election_message::Payload::ElectionReject(reject)) = refusal.payload.as_mut() else {
-        panic!("reject_message builds a refusal");
-    };
-    reject.configuration = None;
+    let refusal = refusal_at(
+        reject_message(&call, &rejecter, ElectionRejectReason::StaleTerm, 5, None),
+        Some(0),
+        None,
+        None,
+    );
+
+    deliver(&mut node, &rejecter, refusal);
+
+    assert_eq!(node.highest_term_seen(), 0);
+    assert_eq!(node.state(), WorkerState::RollCall);
+}
+
+// L6: another lineage's epoch is another shard's, so its terms and
+// configuration mean nothing here even when its number is this node's own.
+#[test]
+fn a_refusal_from_another_lineage_at_this_nodes_epoch_number_is_dropped() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_at_epoch_1(&clock, &me, 3);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let (rejecter, their_leader) = (worker("w2"), worker("foreign-leader"));
+    let own_lineage = node.recovery_lineage().expect("a joined node has one");
+    let refusal = refusal_at(
+        reject_message(
+            &call,
+            &rejecter,
+            ElectionRejectReason::LeaderStillValid,
+            9,
+            Some((&their_leader, 9)),
+        ),
+        Some(1),
+        Some(own_lineage + 1),
+        Some(epoch_1_configuration(3)),
+    );
+
+    let outputs = deliver(&mut node, &rejecter, refusal);
+
+    assert_eq!(node.highest_term_seen(), 0);
+    assert_eq!(node.state(), WorkerState::RollCall);
+    assert!(sent_to(&outputs, &their_leader).is_empty());
+}
+
+// L6, with E13-U1: a higher-numbered epoch of another lineage is taken on by
+// the leader's ack, as `on_leader_ack` does, so a refusal from it only names
+// that leader: no term is raised.
+#[test]
+fn a_refusal_from_a_higher_numbered_foreign_epoch_names_its_leader_and_raises_no_term() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_at_epoch_1(&clock, &me, 3);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let (rejecter, their_leader) = (worker("w2"), worker("foreign-leader"));
+    let own_lineage = node.recovery_lineage().expect("a joined node has one");
+    let refusal = refusal_at(
+        reject_message(
+            &call,
+            &rejecter,
+            ElectionRejectReason::LeaderStillValid,
+            9,
+            Some((&their_leader, 9)),
+        ),
+        Some(2),
+        Some(own_lineage + 1),
+        None,
+    );
+
+    let outputs = deliver(&mut node, &rejecter, refusal);
+
+    assert_eq!(node.highest_term_seen(), 0);
+    assert_eq!(node.state(), WorkerState::RollCall);
+    assert!(
+        !sent_to(&outputs, &their_leader).is_empty(),
+        "it heartbeats the named leader"
+    );
+}
+
+// Residual of the 2026-09-29 ruling: a refusal that names no epoch (its
+// rejecter has joined no shard) is still read as this node's own.
+#[test]
+fn a_refusal_naming_no_epoch_is_read_as_the_nodes_own() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_at_epoch_1(&clock, &me, 3);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let rejecter = worker("w2");
+    let refusal = refusal_at(
+        reject_message(&call, &rejecter, ElectionRejectReason::StaleTerm, 5, None),
+        None,
+        None,
+        None,
+    );
 
     deliver(&mut node, &rejecter, refusal);
 

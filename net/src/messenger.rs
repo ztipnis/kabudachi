@@ -113,7 +113,7 @@
 //!
 //! ## Reconnect/backoff and where a peer's address comes from
 //!
-//! What a `Net` knows about its peers, and the bounded redial of a dropped
+//! What a `Net` knows about its peers, and the fast-then-slow redial of a dropped
 //! one, belong to `crate::peers`: its module doc has the redial rules (which
 //! drops qualify, why the default policy is short) and how a peer's address
 //! of record is ranked by its source. This task tells the peer book what it
@@ -162,7 +162,7 @@ use crate::framing::decode_election;
 use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
-use crate::swarm::{Behaviour, BehaviourEvent};
+use crate::swarm::{Behaviour, BehaviourEvent, build_swarm};
 
 /// What [`Net::dial_for_connection`] dials.
 pub(crate) enum DialTarget {
@@ -404,24 +404,28 @@ pub struct Net {
 }
 
 impl Net {
-    /// Takes ownership of `swarm` and spawns the task that drives it. Does
-    /// not listen or dial; use `listen_on`/`dial` for that.
+    /// Builds a swarm under a fresh identity and spawns the task that drives
+    /// it. Does not listen or dial; use `listen_on`/`dial` for that.
     ///
-    /// Uses [`RedialPolicy::default`] for the bounded redial
-    /// -with-backoff policy applied to a peer that drops unexpectedly — see
-    /// [`Self::new_with_redial_policy`] to use different parameters (e.g.
-    /// short, test-scale ones).
-    pub fn new(swarm: Swarm<Behaviour>) -> Self {
-        Self::new_with_redial_policy(swarm, RedialPolicy::default())
+    /// The identity is generated here, never passed in: a worker's id is its
+    /// peer id and lives for one process incarnation (see `crate::worker`'s
+    /// "One identity per process"), so no caller has a keypair worth
+    /// choosing.
+    ///
+    /// Uses [`RedialPolicy::default`] for the redial policy applied to a peer
+    /// that drops unexpectedly; see [`Self::new_with_redial_policy`] to use
+    /// different parameters (e.g. short, test-scale ones).
+    pub fn new() -> Self {
+        Self::new_with_redial_policy(RedialPolicy::default())
     }
 
     /// Like [`Self::new`], but with an explicit [`RedialPolicy`] instead of
-    /// its default. Exists so a caller with different needs — chiefly, this
+    /// its default. Exists so a caller with different needs, chiefly this
     /// crate's own tests, which need much shorter backoff/check intervals
-    /// than the conservative production default to stay fast and
-    /// deterministic — doesn't have to change what every other `Net::new`
-    /// caller gets.
-    pub fn new_with_redial_policy(swarm: Swarm<Behaviour>, redial_policy: RedialPolicy) -> Self {
+    /// than the production default to stay fast and deterministic, doesn't
+    /// have to change what every other `Net::new` caller gets.
+    pub fn new_with_redial_policy(redial_policy: RedialPolicy) -> Self {
+        let swarm = build_swarm();
         let local_worker_id = WorkerId::new(swarm.local_peer_id().to_string());
         let (commands, command_rx) = mpsc::unbounded_channel();
         let inbound = Arc::new(Inbound::default());
@@ -1269,7 +1273,6 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::swarm::build_swarm;
     use crate::test_support::{TEST_TIMEOUT, worker_that_never_runs};
 
     /// The input `message` arriving from `from`, decoded as the edge decodes
@@ -1419,8 +1422,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_peer_that_goes_away_yields_peer_disconnected() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
+        let net_b = Net::new();
         let (_, worker_b) = connected_pair(&net_a, &net_b).await;
 
         drop(net_b); // aborts net_b's driver task, closing its connection
@@ -1438,8 +1441,8 @@ mod tests {
         // Unlike a peer going away entirely, both `Net`s and their driver
         // tasks stay alive here: only the connection closes. The side that
         // closes it reports that too, not only the side it was closed on.
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
+        let net_b = Net::new();
         let (worker_a, worker_b) = connected_pair(&net_a, &net_b).await;
 
         net_a.disconnect(worker_b.clone());
@@ -1477,7 +1480,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_dial_to_a_named_peer_yields_peer_disconnected() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
         // A port that was just bound and released, so nothing listens on it.
         let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr())
@@ -1509,7 +1512,8 @@ mod tests {
         RedialPolicy {
             initial_backoff: Duration::from_millis(20),
             max_backoff: Duration::from_millis(80),
-            max_attempts: 3,
+            fast_attempts: 3,
+            slow_interval: Duration::from_millis(160),
             check_interval: Duration::from_millis(5),
         }
     }
@@ -1532,8 +1536,8 @@ mod tests {
 
     #[tokio::test]
     async fn block_peer_isolates_a_peer_both_ways_until_unblocked() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
+        let net_b = Net::new();
         let (worker_a, worker_b) = connected_pair(&net_a, &net_b).await;
 
         net_a.block_peer(worker_b.clone());
@@ -1588,6 +1592,10 @@ mod tests {
         .expect("net_a heard net_b again once it unblocked it");
     }
 
+    // Accepted gap: this test runs only the fast phase of the redial schedule
+    // over real sockets. The slow phase (`slow_interval` attempts with no end)
+    // is covered by the peer book's own unit test in `crate::peers`, which is
+    // a pure function of the observations and the clock it is given.
     #[tokio::test]
     async fn the_swarm_task_redials_a_dropped_mesh_peer_but_not_one_it_hung_up_on() {
         // Chunk C8, "What to build" item 3: a peer that drops gets
@@ -1612,11 +1620,8 @@ mod tests {
         // *listening* side it would instead be the dialer's ephemeral source
         // port, which is never something the other side is listening on and
         // so could never be successfully redialed.
-        let net_a = Net::new_with_redial_policy(
-            build_swarm(identity::Keypair::generate_ed25519()),
-            short_redial_policy(),
-        );
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new_with_redial_policy(short_redial_policy());
+        let net_b = Net::new();
 
         let listen_addr_b = timeout(
             TEST_TIMEOUT,
@@ -1655,7 +1660,7 @@ mod tests {
                 Input::PeerDisconnected(worker_b.clone()),
                 Input::PeerConnected(worker_b.clone()),
             ],
-            "net_a reported the drop, then its own bounded redial policy reconnected to net_b \
+            "net_a reported the drop, then its own fast-then-slow redial policy reconnected to net_b \
              without any manual dial from the test itself,",
         )
         .await;
@@ -1679,8 +1684,8 @@ mod tests {
 
     #[tokio::test]
     async fn dialable_address_withholds_a_peer_known_only_by_its_inbound_source_address() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
+        let net_b = Net::new();
         // net_b dials net_a without listening itself, so all net_a knows of
         // net_b is the ephemeral source address of net_b's connection.
         let (worker_a, worker_b) = connected_pair(&net_a, &net_b).await;
@@ -1790,8 +1795,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_sent_reply_carries_its_senders_listen_address_and_none_without_one() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
+        let net_b = Net::new();
         // Only net_a listens.
         let (worker_a, worker_b) = connected_pair(&net_a, &net_b).await;
         let listen_addr_a = net_a.local_multiaddr().expect("net_a listens").to_string();
@@ -1825,8 +1830,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_reply_arriving_over_a_connection_records_its_senders_stamp() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
+        let net_b = Net::new();
         // net_b dials net_a without listening itself, so net_a knows net_b
         // only by the source address of its connection, which is not
         // dialable.
@@ -1858,8 +1863,8 @@ mod tests {
         // with this node's own address exactly as `Net::send` does (see
         // `stamp_own_address`), and that the stamp survives a real gossipsub
         // encode/decode round trip, not just a direct connection.
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
+        let net_b = Net::new();
         let (worker_a, worker_b) = connected_pair(&net_a, &net_b).await;
         let listen_addr_a = net_a.local_multiaddr().expect("net_a listens").to_string();
 
@@ -1885,8 +1890,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_dials_a_peer_it_holds_no_connection_to_at_its_stamped_address() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_a = Net::new();
+        let net_c = Net::new();
         let listen_addr_c = timeout(
             TEST_TIMEOUT,
             net_c.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),

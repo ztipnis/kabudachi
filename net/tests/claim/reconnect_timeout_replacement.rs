@@ -45,8 +45,6 @@ use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
-use libp2p::identity;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -116,7 +114,7 @@ fn heartbeat_from(worker: &WorkerId) -> ElectionMessage {
 #[tokio::test]
 async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_elapsed_under_a_partition()
  {
-    let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net_a = Net::new();
     let leader_id = net_a.local_worker_id();
     let listen_addr = timeout(
         TEST_TIMEOUT,
@@ -176,9 +174,9 @@ async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_e
         ))
         .expect("submitting with no memory limits configured never fails");
 
-    let net_w1 = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net_w1 = Net::new();
     let w1_id = net_w1.local_worker_id();
-    let net_w2 = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net_w2 = Net::new();
     connect_to(&net_a, &listen_addr, &net_w1).await;
     connect_to(&net_a, &listen_addr, &net_w2).await;
 

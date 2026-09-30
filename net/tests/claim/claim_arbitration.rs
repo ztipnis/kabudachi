@@ -27,8 +27,7 @@ use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::claim::ClaimFailure;
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
-use libp2p::{Multiaddr, identity};
+use libp2p::Multiaddr;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -112,9 +111,9 @@ fn claimed_tasks(response: Result<ClaimResponse, ClaimFailure>) -> Vec<TaskId> {
 
 #[tokio::test]
 async fn pending_members_claim_from_the_leader_their_nodes_name() {
-    let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-    let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-    let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net_a = Net::new();
+    let net_b = Net::new();
+    let net_c = Net::new();
     let worker_a = net_a.local_worker_id();
     let seed = timeout(
         TEST_TIMEOUT,

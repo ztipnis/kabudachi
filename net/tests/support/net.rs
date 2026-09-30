@@ -19,8 +19,7 @@ use kabudachi_core::time::Clock;
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::join::{LeaderSearch, ask_for_leader};
 use kabudachi_net::messenger::{Diagnostics, Net};
-use kabudachi_net::swarm::build_swarm;
-use libp2p::{Multiaddr, identity};
+use libp2p::Multiaddr;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -215,7 +214,7 @@ pub async fn heartbeat_until_acked<C: Clock, I: IdGenerator>(
 
 /// A `Net` listening on a loopback port, and that address.
 pub async fn listening_net() -> (Net, Multiaddr) {
-    let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net = Net::new();
     let listen_addr = timeout(
         WAIT_TIMEOUT,
         net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),

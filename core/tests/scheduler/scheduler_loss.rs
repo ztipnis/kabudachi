@@ -1,7 +1,8 @@
 //! A worker that is lost while it holds runs (README §3.2.1, §3.2.2, §25.4.5):
 //! its runs become `Lost`, and are replayed by a new run of the same task
 //! (at-least-once), except that a coalescing generation is only replayed if it
-//! is the newest for its key.
+//! is the newest for its key. An ephemeral task's lost run is not replayed, and a
+//! non-retriable task's running run is orphaned instead (README §3.2.2).
 
 use crate::support::scheduler::Fixture;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
@@ -244,4 +245,99 @@ fn a_lost_workers_report_on_its_lost_run_is_refused() {
 
     assert_eq!(completed.unwrap_err(), ReportRejection::NotAuthoritative);
     assert_eq!(failed.unwrap_err(), ReportRejection::NotAuthoritative);
+}
+
+#[test]
+fn an_ephemeral_tasks_lost_run_is_not_replayed_and_the_task_is_over() {
+    let mut fixture = Fixture::leading();
+    let task = fixture.scheduler.submit(plain("aaaa").ephemeral()).unwrap();
+    let run = running(&mut fixture, &worker("w1"), &task);
+
+    let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+
+    assert_eq!(lost[0].state, TaskRunState::Lost);
+    assert_eq!(lost[0].replayed, None);
+    assert_eq!(fixture.run_state(&run), TaskRunState::Lost);
+    assert_eq!(fixture.scheduler.runs_of(&task), vec![run]);
+    assert_eq!(fixture.spy.memory_in_use(), 0);
+    assert_eq!(
+        fixture
+            .scheduler
+            .request_claim(&worker("w2"), &task)
+            .unwrap_err(),
+        ClaimRejection::Finished
+    );
+}
+
+#[test]
+fn an_ephemeral_tasks_claimed_run_is_lost_and_not_replayed_either() {
+    let mut fixture = Fixture::leading();
+    let task = fixture.scheduler.submit(plain("p").ephemeral()).unwrap();
+    fixture
+        .scheduler
+        .request_claim(&worker("w1"), &task)
+        .unwrap();
+
+    let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+
+    assert_eq!(lost[0].state, TaskRunState::Lost);
+    assert_eq!(lost[0].replayed, None);
+}
+
+#[test]
+fn a_non_retriable_tasks_running_run_is_orphaned_and_not_replayed() {
+    let mut fixture = Fixture::leading();
+    let task = fixture
+        .scheduler
+        .submit(plain("aaaa").non_retriable())
+        .unwrap();
+    let run = running(&mut fixture, &worker("w1"), &task);
+
+    let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+
+    assert_eq!(lost[0].state, TaskRunState::Orphaned);
+    assert_eq!(lost[0].replayed, None);
+    assert_eq!(fixture.run_state(&run), TaskRunState::Orphaned);
+    assert_eq!(fixture.scheduler.runs_of(&task), vec![run.clone()]);
+    assert_eq!(fixture.spy.memory_in_use(), 0);
+    // What the lost worker reports afterwards is not authoritative.
+    assert_eq!(
+        fixture
+            .scheduler
+            .complete(&worker("w1"), &run, b"d".to_vec(), Completion::Final)
+            .unwrap_err(),
+        ReportRejection::NotAuthoritative
+    );
+}
+
+#[test]
+fn a_non_retriable_tasks_claimed_run_never_started_so_it_is_replayed() {
+    let mut fixture = Fixture::leading();
+    let task = fixture.scheduler.submit(plain("p").non_retriable()).unwrap();
+    fixture
+        .scheduler
+        .request_claim(&worker("w1"), &task)
+        .unwrap();
+
+    let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+
+    assert_eq!(lost[0].state, TaskRunState::Lost);
+    assert!(lost[0].replayed.is_some());
+}
+
+#[test]
+fn a_task_kind_and_retriable_flag_are_part_of_the_submitted_task() {
+    let mut fixture = Fixture::leading();
+    let task = fixture
+        .scheduler
+        .submit(plain("p").ephemeral().non_retriable())
+        .unwrap();
+
+    let claim = fixture
+        .scheduler
+        .request_claim(&worker("w1"), &task)
+        .unwrap();
+
+    assert!(claim.task.ephemeral);
+    assert!(claim.task.non_retriable);
 }

@@ -200,7 +200,8 @@ impl NativeRuntime {
     ///
     /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree,
     /// `BackpressureError` if the task does not fit under the hard memory
-    /// limit, and `RuntimeError` if the runtime has shut down.
+    /// limit or is too large to be claimed (about 1 MiB with its queue and
+    /// key), and `RuntimeError` if the runtime has shut down.
     #[pyo3(signature = (
         definition_id,
         source_version,
@@ -241,6 +242,9 @@ impl NativeRuntime {
             queue,
         )
         .with_retries(retries);
+        if kind == "ephemeral" {
+            submission = submission.ephemeral();
+        }
         if let Some(delay_ms) = delay_ms {
             submission = submission.with_delay(CoreDuration::from_millis(delay_ms));
         }

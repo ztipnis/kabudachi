@@ -240,11 +240,10 @@ mod tests {
     use kabudachi_core::protocol::messages::{
         ClaimOldest, ClaimRejectReason, claim_response,
     };
-    use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, Submission};
+    use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, MAX_SUBMISSION_BYTES, Submission};
     use kabudachi_core::time::{Duration, Instant};
     use kabudachi_core::protocol::messages::prelude::*;
-    use crate::swarm::build_swarm;
-    use libp2p::identity;
+    
     use prost::Message as _;
 
     /// A clock that never moves, so every task's `created_at_ticks` is 0 and
@@ -324,28 +323,53 @@ mod tests {
         }
     }
 
+    /// A claim of a coalescing task whose payload is `size` bytes and that
+    /// carries one retained payload of `CHAIN` bytes: how a claim outgrows a
+    /// message, since one task alone cannot (`MAX_SUBMISSION_BYTES`).
+    fn submit_with_chain(scheduler: &mut Leader, size: usize) -> TaskId {
+        const CHAIN: usize = 400_000;
+        scheduler
+            .submit(submission(CHAIN).with_coalescing_key("k"))
+            .expect("no memory limits are set");
+        scheduler
+            .submit(submission(size).with_coalescing_key("k"))
+            .expect("no memory limits are set")
+    }
+
     #[test]
     fn a_batch_that_fills_one_message_exactly_goes_out_and_one_a_byte_over_does_not() {
         // Calibrated at a payload whose nested length prefixes are as wide as at the limit
         // (three-byte varints cover 16 KiB..2 MiB), so the overhead is the same there.
-        const CALIBRATION: usize = 900_000;
+        const CALIBRATION: usize = 500_000;
         let mut scratch = leading();
-        submit(&mut scratch, CALIBRATION);
+        submit_with_chain(&mut scratch, CALIBRATION);
         let overhead = answer(&mut scratch, &claimant(), &oldest(1)).encoded_len() - CALIBRATION;
         let exact = MAX_MESSAGE_BYTES as usize - overhead;
 
         let mut fits = leading();
-        let task = submit(&mut fits, exact);
+        let task = submit_with_chain(&mut fits, exact);
         let response = answer(&mut fits, &claimant(), &oldest(1));
         assert_eq!(response.encoded_len(), MAX_MESSAGE_BYTES as usize, "calibration is exact");
         assert_eq!(claimed(&response), vec![task]);
 
         let mut over = leading();
-        submit(&mut over, exact + 1);
+        submit_with_chain(&mut over, exact + 1);
         let small = submit(&mut over, 16);
         // One that could never fit is passed over (Scheduler::claim_oldest_fitting), so
         // the task behind it still goes out.
         assert_eq!(claimed(&answer(&mut over, &claimant(), &oldest(2))), vec![small]);
+    }
+
+    #[test]
+    fn the_largest_task_the_scheduler_accepts_goes_out_in_one_message() {
+        let mut scheduler = leading();
+        let largest = MAX_SUBMISSION_BYTES as usize - "demo.task".len() - "default".len();
+        let task = submit(&mut scheduler, largest);
+
+        let response = answer(&mut scheduler, &claimant(), &by_id(&task));
+
+        assert!(matches!(response.result, Some(claim_response::Result::Accept(_))));
+        assert!(response.encoded_len() <= MAX_MESSAGE_BYTES as usize);
     }
 
     #[test]
@@ -417,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_that_names_itself_leader_is_told_to_decide_its_own_claims() {
-        let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net = Net::new();
         let itself = net.local_worker_id();
         assert_eq!(
             net.request_claim(itself.clone(), TaskId::new("any")).await,

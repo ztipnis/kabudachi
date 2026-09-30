@@ -781,8 +781,9 @@ REJECT_ALREADY_SELECTED
 REJECT_NOT_READY
 REJECT_TASK_UNKNOWN
 REJECT_SUPERSEDED
-REJECT_EXPIRED
-REJECT_QUEUE_MISMATCH
+REJECT_NOT_LEADER
+REJECT_FINISHED
+REJECT_KEY_BUSY
 ```
 
 Two workers racing for one Task are serialized at the leader:
@@ -2380,7 +2381,7 @@ The project should prototype both:
 
 libp2p is capable, but its abstractions may be heavier than necessary if our network protocol is tightly controlled.
 
-**Phase 2 design note:** Phase 2 chose between the two prototype paths above — libp2p as transport (TCP/Noise/Yamux, `identify`), but narrow: three `request_response` behaviours, for election, bootstrap join, and claim arbitration (`net/src/swarm.rs`'s `Behaviour`), with no Kademlia/DHT usage. The `net` crate implements this. This is an implementation decision, not a change to this section's candidate status.
+**Phase 2 design note:** Phase 2 chose between the two prototype paths above — libp2p as transport (TCP/Noise/Yamux, `identify`), but narrow: three `request_response` behaviours, for election, bootstrap join, and claim arbitration, plus `gossipsub` for the election roll call and `kad` for peer routing only (`net/src/swarm.rs`'s `Behaviour`; ADR-0001 decision 17), with no DHT record storage. The `net` crate implements this. This is an implementation decision, not a change to this section's candidate status.
 
 ### 23.5 Protocol Buffers: prost
 
@@ -2885,7 +2886,6 @@ Implement:
 - ring neighbors;
 - roll call;
 - voting;
-- leader reconciliation;
 - worker-pull claim arbitration.
 
 Still avoid sharding.
@@ -2908,6 +2908,7 @@ The one-node window between startup and the worker becoming leader is still not 
 
 Implement:
 
+- leader reconciliation (§13), moved here from Phase 2 because it rebuilds state from DHT task records;
 - immutable Task records;
 - TaskRun snapshots;
 - content hashes;
@@ -2982,8 +2983,8 @@ The coalescing, flow, and failure-detection invariants (§25.1 item 9 and §25.4
 |---|---|
 | 0 (simulator extension) | 25.1.9 (abort before replacement), 25.4.1 (single running generation by authority), 25.4.2 (pending-only supersession), 25.4.6 (occupancy rebuilt at reconciliation) |
 | 1 | 25.4.3 and 25.4.4 (folding, order preservation), 25.4.7 (atomic continuation), 25.4.8 (stage after a group runs once), 25.4.5 in a one-node shard, and the one-node backpressure contract (`SlowDown` past the soft limit, `BackpressureError` past the hard limit, §3.2.1) |
-| 2 | 25.4.5 under leader and worker loss, the measured time from worker unreachable (connection loss) to replacement claim (§8.3), and abort-before-replacement under a simulated (connection-loss) partition |
-| 3 | Retained-payload chain across DHT replicas and compaction (the one-node soft/hard-limit backpressure contract is a Phase 1 exit criterion) |
+| 2 | 25.4.5 under worker loss, the measured time from worker unreachable (connection loss) to replacement claim (§8.3), and abort-before-replacement under a simulated (connection-loss) partition |
+| 3 | 25.4.5 under leader loss (a new leader can replay only what reconciliation rebuilds), retained-payload chain across DHT replicas and compaction (the one-node soft/hard-limit backpressure contract is a Phase 1 exit criterion) |
 | 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess |
 
 ### 27.2 Production-readiness gate

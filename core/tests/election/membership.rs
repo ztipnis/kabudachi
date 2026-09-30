@@ -458,6 +458,48 @@ fn a_lone_leader_admits_no_joiner_on_a_stale_confirmation() {
     assert!(ack_to(&admitted, &joiner).recipient_admission().is_some());
 }
 
+/// While a leader's lease is bounded, a joiner is admitted on a confirmation
+/// older than two heartbeat intervals so long as it is no older than the
+/// quorum-contact time: the batch then still leaves the lease worth having,
+/// and a joiner heartbeating out of phase with the voters does not wait
+/// round after round (`Lease::admissible`).
+#[test]
+fn a_leader_admits_a_joiner_confirmed_before_two_heartbeat_intervals_but_since_the_quorum_contact() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let joiner = worker("joiner");
+    connect(&mut leader, std::slice::from_ref(&joiner));
+    // The voters confirmed the founding's ack now: the quorum-contact time.
+    let quorum_contact = clock.now().as_ticks();
+    let heartbeat_interval = crate::support::builders::timings(Duration::from_ticks(SUSPECT))
+        .heartbeat_interval
+        .as_ticks();
+    clock.advance(Duration::from_ticks(2 * heartbeat_interval + 1));
+    let term = leader.term();
+    let echoing = |send_token| {
+        heartbeat_message(heartbeat(
+            &joiner,
+            Some(AckEcho {
+                term,
+                send_token,
+            }),
+        ))
+    };
+
+    let before_contact = deliver(&mut leader, &joiner, echoing(quorum_contact - 1));
+    assert_eq!(
+        ack_to(&before_contact, &joiner).recipient_admission(),
+        None,
+        "older than the quorum contact: still pending"
+    );
+
+    let since_contact = deliver(&mut leader, &joiner, echoing(quorum_contact));
+    assert_eq!(
+        ack_to(&since_contact, &joiner).recipient_admission(),
+        Some(Generation::new(0, 1, 3))
+    );
+}
+
 /// A batch commits once a majority of each side holds it, and a joiner
 /// arriving meanwhile waits for the next batch, which the commit starts.
 #[test]

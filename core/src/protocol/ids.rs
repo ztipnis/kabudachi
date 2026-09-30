@@ -72,9 +72,39 @@ id_newtype!(
 /// Mints the IDs of new Tasks and TaskRuns. Clients and workers mint IDs
 /// independently, so an implementation must never hand out the same ID twice,
 /// even across processes.
+///
+/// An ID must be at most [`MAX_ID_BYTES`] long. The scheduler's fixed claim
+/// overhead reserve counts on it, so that a task admitted within
+/// `MAX_SUBMISSION_BYTES` always fits one claim message. The scheduler checks
+/// every ID it mints and panics on a longer one.
 pub trait IdGenerator {
     fn next_task_id(&self) -> TaskId;
     fn next_task_run_id(&self) -> TaskRunId;
+}
+
+/// The longest a generated task or run ID may be, in bytes. A UUID is 36.
+pub const MAX_ID_BYTES: usize = 256;
+
+/// A new task ID from `ids`, checked against [`MAX_ID_BYTES`].
+pub(crate) fn mint_task_id(ids: &impl IdGenerator) -> TaskId {
+    let id = ids.next_task_id();
+    assert!(
+        id.as_str().len() <= MAX_ID_BYTES,
+        "IdGenerator returned a task ID of {} bytes; the limit is {MAX_ID_BYTES}",
+        id.as_str().len()
+    );
+    id
+}
+
+/// A new run ID from `ids`, checked against [`MAX_ID_BYTES`].
+pub(crate) fn mint_task_run_id(ids: &impl IdGenerator) -> TaskRunId {
+    let id = ids.next_task_run_id();
+    assert!(
+        id.as_str().len() <= MAX_ID_BYTES,
+        "IdGenerator returned a task run ID of {} bytes; the limit is {MAX_ID_BYTES}",
+        id.as_str().len()
+    );
+    id
 }
 
 /// Random, time-ordered UUIDv7 IDs, for real deployments. It reads the system

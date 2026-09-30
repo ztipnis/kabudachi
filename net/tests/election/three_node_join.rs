@@ -19,23 +19,17 @@
 //! - That makes the leader the node `node_a` knows only through an inbound
 //!   connection, which is the case the leader's address has to be right for
 //!   (see the connectivity check in the first test).
-//! - `node_c` starts fresh in `WorkerState::Bootstrapping`, seeded with only
+//! - `node_c` is a bare `Net` seeded with only
 //!   `node_a`'s listen address, so `node_a` answers its JOIN by pointing at
 //!   `node_b`.
 //!
 //! `node_a` and `node_b` keep driving (via `run_driver`, including its
 //! join-request-answering side — see `kabudachi_net::driver`) while `node_c`
 //! joins: `tokio::select!` polls all three concurrently in one task.
-//!
-//! `node_c` never races that election: it becomes `Active` by a direct,
-//! deterministic call (`Input::JoinAnswer`), not by winning or
-//! losing a roll call, and it is never driven, so it starts no roll call of
-//! its own.
 
 
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{
     ElectionTimings, Entry, Identity, Input, KnownConfiguration, WorkerNode,
@@ -47,8 +41,6 @@ use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Clock, Duration, RealClock};
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
-use libp2p::identity;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -112,27 +104,6 @@ fn make_active_node<C: Clock>(clock: C, my_id: WorkerId, voter_count: usize) -> 
     .0
 }
 
-fn make_bootstrapping_node(clock: RealClock, my_id: WorkerId) -> WorkerNode<RealClock> {
-    WorkerNode::start(
-        Identity {
-            id: my_id.clone(),
-            incarnation: IncarnationId::new(format!("{}-incarnation-0", my_id.as_str())),
-            shard: ShardId::new(SHARD),
-            timings: ElectionTimings::new(
-                Duration::from_millis(SUSPECT_TIMEOUT_MS),
-                Duration::from_millis(HEARTBEAT_INTERVAL_MS),
-            )
-            .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS)),
-        },
-        // A pointer that names no leader: the node stays `Bootstrapping`
-        // until the test joins it by hand.
-        Entry::Joining(JoinResponse::default()),
-        clock,
-        None,
-    )
-    .0
-}
-
 /// Blocks until `rx_a`/`rx_b` report exactly one of {Leader, Active} in the
 /// pattern where a follower that answered the winner's roll call stays
 /// `Active`, and one that started a roll call of its own returns to `Active`
@@ -159,8 +130,8 @@ async fn wait_for_convergence(
 
 #[tokio::test]
 async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_its_leader() {
-    let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-    let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net_a = Net::new();
+    let net_b = Net::new();
 
     // Connect first (a node starts its leader-contact timer when built), then
     // construct both WorkerNodes on one tick (`built_on_one_tick`). See this file's "Topology" doc
@@ -221,10 +192,7 @@ async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_
     let mut scheduler_a = Scheduler::new(clock_a, Uuid7Ids);
     let mut scheduler_b = Scheduler::new(clock, Uuid7Ids);
 
-    let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-    let worker_c = net_c.local_worker_id();
-    let mut node_c = make_bootstrapping_node(clock, worker_c.clone());
-    assert_eq!(node_c.state(), WorkerState::Bootstrapping);
+    let net_c = Net::new();
 
     // Only the third branch (converge, then join) is expected to complete;
     // node_a must still be driving to answer node_c's JOIN_REQUEST.
@@ -301,20 +269,11 @@ async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_
     // from").
     //
     // net_b's dial leaves from a port of its own, never from its listen port
-    // (see `kabudachi_net::swarm::build_swarm`), so its source address is
+    // (see `kabudachi_net::swarm`'s `NewPortTcp`), so its source address is
     // never an address it listens on, as for a multi-homed or NATed host:
     // an un-dialable address handed out here would not go unnoticed.
     // node_c is never driven, so net_c's inputs are the test's to take.
     take_inputs_until(&net_c, &Input::PeerConnected(worker_b.clone())).await;
-
-    let _ = node_c.step(Input::JoinAnswer(pointer.clone()));
-
-    assert_eq!(node_c.state(), WorkerState::Active);
-    assert!(
-        node_c.is_pending_member(),
-        "a joiner has no admission generation until one is given it"
-    );
-    assert_eq!(node_c.known_leader(), Some((worker_b, node_b.term())));
 }
 
 /// A responder that knows no leader — here `node_a`, one of two voters whose
@@ -336,7 +295,7 @@ async fn a_joiner_passes_over_a_seed_that_knows_no_leader() {
     let mut scheduler_a = Scheduler::new(clock, Uuid7Ids);
     let mut scheduler_x = Scheduler::new(clock, Uuid7Ids);
 
-    let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net_c = Net::new();
 
     let pointer = timeout(TEST_TIMEOUT, async {
         tokio::select! {

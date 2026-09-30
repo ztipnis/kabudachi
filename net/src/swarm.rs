@@ -78,7 +78,7 @@ use libp2p::core::upgrade::Version;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{
-    Multiaddr, Swarm, allow_block_list, gossipsub, identify, identity, kad, noise, tcp, yamux,
+    Multiaddr, Swarm, allow_block_list, gossipsub, identify, kad, noise, tcp, yamux,
 };
 
 use crate::claim::codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
@@ -110,8 +110,13 @@ const IDENTIFY_PROTOCOL_VERSION: &str = "/kabudachi/1.0.0";
 /// gossip-mesh peers), so closing one costs nothing, and a node that meets
 /// many peers does not hold every connection it ever made. A later routing
 /// crawl (see `crate::driver::run_driver`) may open a crawl connection
-/// again, at most once per peer per crawl. It stays well above libp2p's 10 s so a connection opened for a JOIN
-/// or a claim is not closed between the steps that use it.
+/// again, at most once per peer per crawl.
+///
+/// The value stays well above libp2p's 10 s so a connection opened for a JOIN
+/// or a claim, which no gossip mesh keeps alive, is not closed between the
+/// steps that use it. No test waits out the timeout: the property is this
+/// constant's size, and a test that held a connection idle past 10 s to show
+/// it survives cost about 15 s of every run for it.
 const IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(NetworkBehaviour)]
@@ -192,17 +197,16 @@ impl Transport for NewPortTcp {
     }
 }
 
-/// Builds a `Swarm` over TCP+noise+yamux, identified by `keypair`, with
-/// every protocol of [`Behaviour`] enabled. Does not listen, dial or
-/// subscribe to any gossip topic; callers do that.
+/// Builds a `Swarm` over TCP+noise+yamux, identified by a keypair it
+/// generates, with every protocol of [`Behaviour`] enabled. Does not listen,
+/// dial or subscribe to any gossip topic; callers do that.
 ///
-/// `keypair` must be new to this process: a worker's id is its peer id, and
-/// it lives for one process incarnation (see `crate::worker`'s "One
-/// identity per process"). A worker process starts through
-/// `crate::worker::Worker::start`, which generates its keypair itself; this
-/// takes one only so tests can build swarms directly.
-pub fn build_swarm(keypair: identity::Keypair) -> Swarm<Behaviour> {
-    libp2p::SwarmBuilder::with_existing_identity(keypair)
+/// The keypair is new to this process: a worker's id is its peer id, and it
+/// lives for one process incarnation (see `crate::worker`'s "One identity
+/// per process"). Only `crate::messenger::Net` builds a swarm, so no caller
+/// can hand one a reused identity.
+pub(crate) fn build_swarm() -> Swarm<Behaviour> {
+    libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_other_transport(|key| {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
@@ -285,7 +289,6 @@ mod tests {
 
     use kabudachi_core::election::Input;
     use kabudachi_core::protocol::ids::WorkerId;
-    use libp2p::identity;
     use tokio::time::timeout;
 
     use super::*;
@@ -310,8 +313,8 @@ mod tests {
         let loopback: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
         for round in 0..ROUNDS {
-            let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-            let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+            let net_a = Net::new();
+            let net_b = Net::new();
             let addr_a = net_a.listen_on(loopback.clone()).await;
             let addr_b = net_b.listen_on(loopback.clone()).await;
 

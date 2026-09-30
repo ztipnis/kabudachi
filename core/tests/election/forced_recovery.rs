@@ -9,7 +9,7 @@
 
 use crate::support::builders::{
     message_input,
-    ack_message, configuration_of, g0, leader_ack, roll_call_reply, shard, timings, voter_of,
+    ack_message, configuration_of, g0, heartbeat, heartbeat_message, leader_ack, roll_call_reply, shard, timings, voter_of,
     worker,
 };
 
@@ -22,7 +22,7 @@ use kabudachi_core::election::{
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::election_message;
-use kabudachi_core::protocol::messages::{JoinResponse, LeaderHeartbeatAck};
+use kabudachi_core::protocol::messages::{JoinResponse, LeaderHeartbeatAck, WorkerHeartbeat};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeaseEnd, Scheduler};
 use kabudachi_core::time::{Clock, Duration};
@@ -806,6 +806,34 @@ fn a_roll_call_short_of_its_quorum_recovers_through_a_majority_of_the_live_regis
     assert_eq!(acks.len(), 1);
     assert_eq!(acks[0].recovery_epoch, 1);
     assert_eq!(acks[0].recipient_admission, Some(founded.into()));
+}
+
+#[test]
+fn a_leader_of_a_recovered_epoch_steps_down_only_for_a_later_term_at_its_own_epoch() {
+    let (mut driven, _) = short_roll_call(&["w1", "w2"], Some(0), true);
+    assert_eq!(driven.node.recovery_epoch(), 1, "setup invariant");
+    assert_eq!(driven.node.state(), WorkerState::Leader, "setup invariant");
+    let w2 = worker("w2");
+    let later_term = driven.node.term() + 1;
+    let heartbeat_at = |recovery_epoch_seen| {
+        message_input(
+            &w2,
+            heartbeat_message(WorkerHeartbeat {
+                recovery_epoch_seen,
+                term_seen: later_term,
+                ..heartbeat(&w2, None)
+            }),
+        )
+    };
+
+    // A term counted in the earlier epoch says nothing about this one.
+    driven.step(heartbeat_at(0));
+    assert_eq!(driven.node.state(), WorkerState::Leader);
+
+    let outputs = driven.step(heartbeat_at(1));
+
+    assert_eq!(state_changes(&outputs), vec![WorkerState::LeaderSuspect]);
+    assert_eq!(grants(&outputs), vec![None]);
 }
 
 #[test]

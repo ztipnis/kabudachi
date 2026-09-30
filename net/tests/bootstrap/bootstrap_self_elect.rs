@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use crate::support::election::due_now;
-use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, Uuid7Lineages};
 use kabudachi_core::election::{
     AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode,
 };
@@ -30,10 +30,8 @@ use kabudachi_net::authority::AuthorityClient;
 use kabudachi_net::bootstrap::bootstrap;
 use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
 use kabudachi_core::election::CallKind;
 use kabudachi_testkit::FaultingAuthority;
-use libp2p::identity;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -77,7 +75,7 @@ fn authority_timings() -> AuthorityTimings {
 }
 
 fn fresh_net() -> Net {
-    Net::new(build_swarm(identity::Keypair::generate_ed25519()))
+    Net::new()
 }
 
 /// Bootstraps `net`'s worker into `SHARD` with no seeds, on `clock`, and
@@ -358,7 +356,7 @@ async fn a_bootstrapper_re_founds_a_shard_whose_epoch_exists_with_no_live_regist
     // whose create-if-absent was applied with its reply lost: the epoch
     // exists, but nothing is live to ask.
     authority
-        .compare_and_swap_recovery_epoch(&shard(), None, RecoveryEpoch::founding(3))
+        .compare_and_swap_recovery_epoch(&shard(), None, RecoveryEpoch::founding(3, &mut Uuid7Lineages))
         .expect("creating the epoch directly succeeds against a warm, empty authority");
 
     let net = fresh_net();

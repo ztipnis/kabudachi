@@ -48,6 +48,12 @@ message Task {
   // Set only on a coalescing task: the flat key that decides which pending
   // generations supersede each other. The default key is the empty string.
   optional string coalescing_key = 10;
+  // An ephemeral task's run that is lost with its worker is LOST and never
+  // replayed (README §3.2.2).
+  bool ephemeral = 11;
+  // A non-retriable task's run that was running when its worker was lost is
+  // ORPHANED and never replayed, because its effects may have happened.
+  bool non_retriable = 12;
 }
 
 // One execution attempt of a Task. `identity`, the versions and

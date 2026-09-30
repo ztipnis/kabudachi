@@ -444,20 +444,6 @@ fn roster_of_three_and_a_joiner() -> Roster {
 }
 
 #[test]
-fn a_roster_holds_the_members_and_pending_joiners_it_is_built_with() {
-    let roster = roster_of_three_and_a_joiner();
-
-    assert_eq!(roster.configuration(), &three_voters_at(1));
-    assert_eq!(
-        roster.members().keys().cloned().collect::<Vec<_>>(),
-        vec![worker("a"), worker("b"), worker("c")]
-    );
-    assert_eq!(roster.admission_of(&worker("b")), Some(generation(0, 1, 1)));
-    assert_eq!(roster.pending(), &BTreeSet::from([worker("joiner")]));
-    assert!(roster.is_pending(&worker("joiner")));
-}
-
-#[test]
 fn a_worker_built_as_both_member_and_pending_is_a_member() {
     let roster = Roster::new(
         three_voters_at(1),

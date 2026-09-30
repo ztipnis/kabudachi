@@ -382,7 +382,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
+    use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, Uuid7Lineages};
     use kabudachi_core::election::{AuthorityRequest, CallKind};
     use kabudachi_core::time::Instant as CoreInstant;
     use kabudachi_testkit::FaultingAuthority;
@@ -512,7 +512,7 @@ mod tests {
         fixture
             .authority
             .for_another_worker()
-            .compare_and_swap_recovery_epoch(&ShardId::new("shard-1"), None, RecoveryEpoch::founding(3))
+            .compare_and_swap_recovery_epoch(&ShardId::new("shard-1"), None, RecoveryEpoch::founding(3, &mut Uuid7Lineages))
             .unwrap();
         let mut rejoin = rejoin_of(&fixture);
         let (mut found, mut wakes) = (Vec::new(), Vec::new());

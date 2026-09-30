@@ -47,9 +47,7 @@ use kabudachi_core::time::{Clock, Duration, Instant, RealClock};
 use kabudachi_net::authority::AuthorityClient;
 use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
 use kabudachi_testkit::{FaultingAuthority, StepRecord, first_grant_overlap};
-use libp2p::identity::Keypair;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -281,7 +279,7 @@ async fn with_elected_cluster(scenario: impl AsyncFnOnce(&Cluster, usize)) {
         .expect("a fresh authority holds no epoch, so create-if-absent succeeds");
 
     let nets: Vec<Net> = (0..VOTERS)
-        .map(|_| Net::new(build_swarm(Keypair::generate_ed25519())))
+        .map(|_| Net::new())
         .collect();
     let ids = connect_full_mesh(&nets.iter().collect::<Vec<_>>()).await;
     let handles: Vec<_> = ids.iter().map(|_| authority.for_another_worker()).collect();

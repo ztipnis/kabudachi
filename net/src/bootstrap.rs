@@ -139,7 +139,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::coordination_authority::{AuthorityError, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{
+    AuthorityError, LineageSource, RecoveryEpoch, Uuid7Lineages,
+};
 use kabudachi_core::election::{AuthorityReply, AuthorityRequest, Entry};
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
@@ -209,6 +211,7 @@ pub async fn bootstrap<C: Clock>(
             net,
             per_peer_timeout,
         },
+        &mut Uuid7Lineages,
         clock,
         authority,
         shard_id,
@@ -226,6 +229,7 @@ pub async fn bootstrap<C: Clock>(
 pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
     net: &Net,
     port: &mut P,
+    lineages: &mut impl LineageSource,
     clock: &C,
     mut authority: Option<&mut AuthorityClient>,
     shard_id: &ShardId,
@@ -246,14 +250,22 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
         match authority.as_deref_mut() {
             None if !search.shard_exists() => {
                 return Entry::Founding {
-                    recovery_epoch: RecoveryEpoch::founding(0),
+                    recovery_epoch: RecoveryEpoch::founding(0, lineages),
                     registered_at: None,
                 };
             }
             None => {}
             Some(calls) => {
-                match consult_authority(calls, port, &mut search, clock, my_id, retry_interval)
-                    .await
+                match consult_authority(
+                    calls,
+                    port,
+                    lineages,
+                    &mut search,
+                    clock,
+                    my_id,
+                    retry_interval,
+                )
+                .await
                 {
                     AuthorityRound::Joined(pointer) => return Entry::Joining(pointer),
                     AuthorityRound::OwnershipWon {
@@ -317,6 +329,7 @@ enum AuthorityRound {
 async fn consult_authority<C: Clock, P: AskWhoLeads>(
     calls: &mut AuthorityClient,
     port: &mut P,
+    lineages: &mut impl LineageSource,
     search: &mut SearchRounds,
     clock: &C,
     my_id: &WorkerId,
@@ -330,7 +343,7 @@ async fn consult_authority<C: Clock, P: AskWhoLeads>(
             search.log(WaitReason::AuthorityNotAnswering);
             return AuthorityRound::Wait;
         };
-        match decide_round(stage, reply, my_id, search.shard_exists()) {
+        match decide_round(stage, reply, my_id, search.shard_exists(), lineages) {
             Decision::Ask { request, then } => {
                 calls.ask(request, clock.now());
                 stage = then;
@@ -430,6 +443,7 @@ pub(crate) fn decide_round(
     reply: AuthorityReply,
     my_id: &WorkerId,
     shard_exists: bool,
+    lineages: &mut impl LineageSource,
 ) -> Decision {
     match (stage, reply) {
         (Stage::ReadingRegistrations, AuthorityReply::LiveRegistrations { result, .. }) => {
@@ -458,7 +472,7 @@ pub(crate) fn decide_round(
             Ok(_) => Decision::Ask {
                 request: AuthorityRequest::SwapRecoveryEpoch {
                     expected: None,
-                    new: RecoveryEpoch::founding(0),
+                    new: RecoveryEpoch::founding(0, lineages),
                 },
                 then: Stage::Creating {
                     registered_at: sent_at,
@@ -505,7 +519,7 @@ pub(crate) fn decide_round(
                     Some(next) => Decision::Ask {
                         request: AuthorityRequest::SwapRecoveryEpoch {
                             expected: Some(epoch),
-                            new: RecoveryEpoch::founding(next),
+                            new: RecoveryEpoch::founding(next, lineages),
                         },
                         then: Stage::ReFounding { registered_at },
                     },
@@ -545,11 +559,10 @@ mod tests {
     use kabudachi_core::election::{CallKind, Issuer, ReplyToken};
     use kabudachi_core::protocol::ids::{ShardId, WorkerId};
     use kabudachi_testkit::FaultingAuthority;
-    use libp2p::identity;
+    
     use tokio::time::timeout;
 
     use super::*;
-    use crate::swarm::build_swarm;
     use crate::test_support::{
         Answer, Scripted, TEST_TIMEOUT, TokioClock, address, epoch_number, pointer_to, register,
         wait_until_held, warm_authority,
@@ -582,6 +595,7 @@ mod tests {
         shard_id: ShardId,
         clock: TokioClock,
         port: Scripted,
+        lineages: Uuid7Lineages,
         client: Option<AuthorityClient>,
         seeds: Vec<Multiaddr>,
     }
@@ -594,7 +608,7 @@ mod tests {
             seeds: &[Multiaddr],
         ) -> Self {
             // Never listens, so no socket opens.
-            let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+            let net = Net::new();
             let shard_id = ShardId::new("shard-1");
             let client = authority.map(|authority| {
                 AuthorityClient::new(&net, shard_id.clone(), Arc::new(authority.clone()))
@@ -605,6 +619,7 @@ mod tests {
                 shard_id,
                 clock,
                 port: port.clone(),
+                lineages: Uuid7Lineages,
                 client,
                 seeds: seeds.to_vec(),
             }
@@ -614,6 +629,7 @@ mod tests {
             cascade(
                 &self.net,
                 &mut self.port,
+                &mut self.lineages,
                 &self.clock,
                 self.client.as_mut(),
                 &self.shard_id,
@@ -759,7 +775,7 @@ mod tests {
                 let shard = ShardId::new("shard-1");
                 rival.register(&shard, &WorkerId::new("rival"), "not a multiaddr").unwrap();
                 rival
-                    .compare_and_swap_recovery_epoch(&shard, None, RecoveryEpoch::founding(0))
+                    .compare_and_swap_recovery_epoch(&shard, None, RecoveryEpoch::founding(0, &mut Uuid7Lineages))
                     .unwrap();
                 authority.release(CallKind::SwapRecoveryEpoch);
             } => {}
@@ -868,7 +884,7 @@ mod tests {
         let Decision::Ask { then: stage, .. } = *decision else {
             panic!("the cascade asked for nothing");
         };
-        decide_round(stage, reply, &me(), shard_exists)
+        decide_round(stage, reply, &me(), shard_exists, &mut Uuid7Lineages)
     }
 
     // An ownerless epoch is re-founded one on (see
@@ -887,14 +903,15 @@ mod tests {
                     number: 0,
                 },
                 expected: None,
-                new: RecoveryEpoch::founding(0),
+                new: RecoveryEpoch::founding(0, &mut Uuid7Lineages),
                 sent_at: Instant::at(3),
                 result: Err(AuthorityError::EpochConflict {
-                    current: Some(RecoveryEpoch::founding(u64::MAX)),
+                    current: Some(RecoveryEpoch::founding(u64::MAX, &mut Uuid7Lineages)),
                 }),
             },
             &me(),
             false,
+            &mut Uuid7Lineages,
         );
 
         let reread = then(&conflict, listing(&["me"], true, Instant::at(4)), false);
@@ -903,5 +920,57 @@ mod tests {
             reread,
             Decision::Wait(Some(WaitReason::RecoveryEpochExhausted))
         ));
+    }
+
+    /// Hands out lineages 7, 8, 9, ... in order.
+    struct CountingLineages(u64);
+
+    impl LineageSource for CountingLineages {
+        fn fresh_lineage(&mut self) -> u64 {
+            self.0 += 1;
+            self.0 + 6
+        }
+    }
+
+    fn swap_asked(decision: &Decision) -> (Option<RecoveryEpoch>, RecoveryEpoch) {
+        match decision {
+            Decision::Ask {
+                request: AuthorityRequest::SwapRecoveryEpoch { expected, new },
+                ..
+            } => (*expected, *new),
+            other => panic!("the cascade asked for no swap: {other:?}"),
+        }
+    }
+
+    // A founder's lineage comes from the source the cascade is given, so a
+    // test can fix it: the create takes the first draw and a re-founding the
+    // next.
+    #[test]
+    fn a_founder_takes_the_lineage_of_a_new_epoch_from_the_source_it_is_given() {
+        let mut lineages = CountingLineages(0);
+        let registered = AuthorityReply::Registered {
+            token: ReplyToken {
+                issuer: Issuer::Cascade,
+                kind: CallKind::Register,
+                number: 0,
+            },
+            sent_at: Instant::at(1),
+            result: Ok(kabudachi_core::time::Duration::from_ticks(30)),
+        };
+        let create = decide_round(Stage::Registering, registered, &me(), false, &mut lineages);
+        assert_eq!(swap_asked(&create), (None, RecoveryEpoch::new(0, 7)));
+
+        let found = RecoveryEpoch::new(4, 99);
+        let refound = decide_round(
+            Stage::ReReading {
+                registered_at: Instant::at(1),
+                epoch: found,
+            },
+            listing(&["me"], true, Instant::at(4)),
+            &me(),
+            false,
+            &mut lineages,
+        );
+        assert_eq!(swap_asked(&refound), (Some(found), RecoveryEpoch::new(5, 8)));
     }
 }

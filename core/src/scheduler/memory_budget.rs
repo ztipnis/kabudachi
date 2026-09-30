@@ -68,9 +68,13 @@ impl MemoryBudget {
     }
 
     /// Raises `SlowDown` once usage is past the soft limit, and clears it
-    /// once usage is at most 80% of it; returns the event when either happens.
+    /// once usage is at most 80% of it, or at once when there are no limits;
+    /// returns the event when either happens.
     pub(super) fn update_pressure(&mut self) -> Option<Event> {
-        let limits = self.limits?;
+        let Some(limits) = self.limits else {
+            return std::mem::take(&mut self.slow_down)
+                .then_some(Event::SlowDown { active: false });
+        };
         if !self.slow_down && self.in_use > limits.soft {
             self.slow_down = true;
             Some(Event::SlowDown { active: true })

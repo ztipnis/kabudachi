@@ -5,7 +5,9 @@
 
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::scheduler::{Completion, Event, MemoryLimits, Submission, SubmitRejection};
+use kabudachi_core::scheduler::{
+    Completion, Event, MAX_SUBMISSION_BYTES, MemoryLimits, Submission, SubmitRejection,
+};
 use kabudachi_core::time::Duration;
 use crate::support::scheduler::Fixture;
 
@@ -194,6 +196,22 @@ fn room_made_by_finishing_tasks_lets_submissions_through_again() {
 }
 
 #[test]
+fn removing_the_limits_clears_a_raised_slow_down() {
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
+    fixture.scheduler.submit(payload(101)).unwrap();
+    assert_eq!(slow_down_events(&mut fixture), vec![true]);
+
+    fixture.scheduler.set_memory_limits(None);
+
+    assert_eq!(slow_down_events(&mut fixture), vec![false]);
+    fixture.scheduler.submit(payload(1_000)).unwrap();
+    assert!(
+        slow_down_events(&mut fixture).is_empty(),
+        "with no limits nothing raises it again"
+    );
+}
+
+#[test]
 fn without_limits_nothing_is_refused_and_no_signal_is_raised() {
     let mut fixture = Fixture::leading();
 
@@ -322,4 +340,43 @@ fn a_running_generations_payload_is_never_dropped() {
 
     assert!(rejected.is_err());
     assert_eq!(fixture.spy.memory_in_use(), 150);
+}
+
+#[test]
+fn a_task_too_large_for_a_claim_frame_is_refused_with_no_limits_set_and_leaves_nothing() {
+    let mut fixture = Fixture::leading();
+    let queue_bytes = "default".len();
+    let definition_bytes = "bulk.load".len();
+    let largest_input = MAX_SUBMISSION_BYTES as usize - queue_bytes - definition_bytes;
+
+    let fits = fixture.scheduler.submit(payload(largest_input));
+    let too_big = fixture.scheduler.submit(payload(largest_input + 1));
+
+    assert!(fits.is_ok());
+    assert_eq!(
+        too_big.unwrap_err(),
+        SubmitRejection::TooLarge {
+            size: MAX_SUBMISSION_BYTES + 1,
+            limit: MAX_SUBMISSION_BYTES,
+        }
+    );
+    // Only the accepted one is held.
+    assert_eq!(fixture.spy.memory_in_use(), largest_input as u64);
+    assert_eq!(fixture.spy.pending(), 1);
+}
+
+#[test]
+fn what_makes_a_task_too_large_for_a_claim_frame_is_its_queue_and_key_as_well_as_its_input() {
+    let mut fixture = Fixture::leading();
+    let long = "q".repeat(MAX_SUBMISSION_BYTES as usize);
+
+    let by_queue = fixture
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("d"), 0, Vec::new(), long.clone()));
+    let by_key = fixture
+        .scheduler
+        .submit(payload(1).with_coalescing_key(long));
+
+    assert!(matches!(by_queue, Err(SubmitRejection::TooLarge { .. })));
+    assert!(matches!(by_key, Err(SubmitRejection::TooLarge { .. })));
 }

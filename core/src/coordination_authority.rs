@@ -110,20 +110,37 @@ pub struct RecoveryEpoch {
     pub lineage: u64,
 }
 
+/// Where a founder draws the lineage of a shard it founds (see
+/// [`RecoveryEpoch::founding`]), so that a test can fix it.
+pub trait LineageSource {
+    /// A lineage no other founding, before or after any flush, is to pick.
+    fn fresh_lineage(&mut self) -> u64;
+}
+
+/// The production [`LineageSource`]: each lineage is drawn from a fresh
+/// UUIDv7, so no other founding picks the same one (short of a chance of
+/// about 1 in 2^62: the UUID's time and counter bits are not all random).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Uuid7Lineages;
+
+impl LineageSource for Uuid7Lineages {
+    fn fresh_lineage(&mut self) -> u64 {
+        let (high, low) = uuid::Uuid::now_v7().as_u64_pair();
+        high ^ low
+    }
+}
+
 impl RecoveryEpoch {
     pub const fn new(number: u64, lineage: u64) -> Self {
         RecoveryEpoch { number, lineage }
     }
 
-    /// The first epoch of a shard founded now, at `number`: of a new
-    /// lineage, drawn from a fresh UUIDv7 so that no other founding, before
-    /// or after any flush, picks the same one (short of a chance of about
-    /// 1 in 2^62: the UUID's time and counter bits are not all random).
-    pub fn founding(number: u64) -> Self {
-        let (high, low) = uuid::Uuid::now_v7().as_u64_pair();
+    /// The first epoch of a shard founded now, at `number`, of a new lineage
+    /// drawn from `lineages` (production draws from [`Uuid7Lineages`]).
+    pub fn founding(number: u64, lineages: &mut impl LineageSource) -> Self {
         RecoveryEpoch {
             number,
-            lineage: high ^ low,
+            lineage: lineages.fresh_lineage(),
         }
     }
 
@@ -223,5 +240,15 @@ mod tests {
             AuthorityError::EpochConflict { current: None }.to_string(),
             "recovery epoch conflict: the authority has no recovery epoch"
         );
+    }
+
+    #[test]
+    fn production_foundings_draw_distinct_lineages() {
+        let mut lineages = Uuid7Lineages;
+
+        let first = RecoveryEpoch::founding(0, &mut lineages);
+        let second = RecoveryEpoch::founding(0, &mut lineages);
+
+        assert_ne!(first.lineage, second.lineage);
     }
 }

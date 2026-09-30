@@ -15,9 +15,11 @@
 //!
 //! ## Reconnect/backoff
 //!
-//! A connection that drops is redialed: [`RedialPolicy`] governs a bounded,
-//! exponential-backoff redial that the swarm task runs on its own, at the
+//! A connection that drops is redialed by the swarm task on its own, at the
 //! address [`Diagnostics::peer_addresses`] keeps for a disconnected peer.
+//! [`RedialPolicy`] governs the schedule: a few fast attempts with
+//! exponential backoff, then a slow retry that continues for as long as the
+//! peer stays away.
 //! libp2p has no retry to defer to: in the pinned `libp2p-swarm` 0.48.0,
 //! `libp2p_swarm::dial_opts::DialOpts` (and its `PeerCondition`) configure
 //! only a single dial attempt, and nothing schedules a retry after a dial or
@@ -54,7 +56,7 @@
 //! again like any other unreachable peer. `disconnect` is not a way to
 //! isolate a peer; `Net::block_peer` is. A blocked peer stays redial-eligible,
 //! like one across a real partition: each attempt fails until the block
-//! lifts, and counts against the bounded budget.
+//! lifts, and keeps being retried.
 //!
 //! **Why the default is short.** A redial restores the gossip mesh after a
 //! transient drop, so it should land well within a suspicion timeout: a
@@ -65,6 +67,12 @@
 //! which is why the default was once 10 s); the gossip roll call, leader
 //! stickiness and terms make a reconnected ex-leader harmless. So
 //! `RedialPolicy::default` tries after one second, and backs off from there.
+//!
+//! The fast phase is bounded, roughly two minutes with the default policy,
+//! and then the slow phase takes over, one dial a minute with no end. A peer
+//! that is dead for good therefore costs one failed dial per minute for the
+//! life of the process; that is the price of reconnecting a mesh peer that
+//! returns after a long partition without waiting for this node's own sends.
 //! `Net::new_with_redial_policy` lets a caller, such as this crate's own
 //! tests, use other parameters.
 //!
@@ -176,35 +184,40 @@ struct KnownAddress {
     source: AddressSource,
 }
 
-/// Bounded, exponential-backoff redial policy for a peer in this node's
-/// gossip mesh that dropped without this `Net` itself asking to disconnect
-/// it (see the module doc's "Reconnect/backoff" section for why libp2p's own
+/// Fast-then-slow redial policy for a peer in this node's gossip mesh that
+/// dropped without this `Net` itself asking to disconnect it (see the module
+/// doc's "Reconnect/backoff" section for why libp2p's own
 /// `DialOpts`/`PeerCondition` don't already do this, and which drops are
 /// eligible at all).
 ///
 /// On each eligible drop, the swarm task schedules a first redial attempt
-/// after `initial_backoff`; each subsequent attempt (up to `max_attempts`
-/// total) doubles the wait, capped at `max_backoff`. `check_interval` is how
-/// often the swarm task polls for a due attempt — coarser than
-/// `initial_backoff` wastes time before the first attempt actually fires, so
-/// a caller using a short `initial_backoff` (this crate's own tests) should
-/// also shrink this.
+/// after `initial_backoff`; each subsequent fast attempt (`fast_attempts` in
+/// all) doubles the wait, capped at `max_backoff`. After the fast attempts
+/// the peer is retried once every `slow_interval`, for as long as it stays
+/// away: a peer gone for good costs one failed dial per interval, and a mesh
+/// peer that comes back after a long partition is reconnected without
+/// waiting for the node's own sends. `check_interval` is how often the swarm
+/// task polls for a due attempt; coarser than `initial_backoff` wastes time
+/// before the first attempt actually fires, so a caller using a short
+/// `initial_backoff` (this crate's own tests) should also shrink this.
 ///
 /// `Default` picks production-shaped values (see the module doc's "Why the
-/// default is short"): a first attempt one second after the drop, well
-/// within any suspicion timeout of seconds, doubling to at most 30 s, and
-/// eight attempts in all, so a peer gone for about two minutes is given up
-/// on and left to the node's own sends. A caller that wants test-scale
-/// retries should use `Net::new_with_redial_policy` instead of `Net::new`.
+/// default is short"): a first attempt one second after the drop, well within
+/// any suspicion timeout of seconds, doubling to at most 30 s, for eight fast
+/// attempts (about two minutes), then one attempt a minute. A caller that
+/// wants test-scale retries should use `Net::new_with_redial_policy` instead
+/// of `Net::new`.
 #[derive(Debug, Clone, Copy)]
 pub struct RedialPolicy {
     /// Delay before the first redial attempt after an eligible drop.
     pub initial_backoff: Duration,
     /// Ceiling the doubling backoff never exceeds.
     pub max_backoff: Duration,
-    /// Total attempts made before giving up on a peer for good (the
-    /// "bounded" half of "bounded redial policy" — spec decision 2.b).
-    pub max_attempts: u32,
+    /// Attempts on the doubling schedule before the slow retry takes over.
+    pub fast_attempts: u32,
+    /// Wait between attempts once the fast ones are used up: the bound on how
+    /// long a peer that stays away goes unretried.
+    pub slow_interval: Duration,
     /// How often the swarm task checks for a due attempt.
     pub check_interval: Duration,
 }
@@ -214,7 +227,8 @@ impl Default for RedialPolicy {
         Self {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
-            max_attempts: 8,
+            fast_attempts: 8,
+            slow_interval: Duration::from_secs(60),
             check_interval: Duration::from_millis(250),
         }
     }
@@ -292,7 +306,7 @@ pub struct Diagnostics {
     pub local_addr: Option<Multiaddr>,
     /// Every peer being redialed (see [`RedialPolicy`]) and how many
     /// attempts have been made so far. A peer leaves once it reconnects or
-    /// has used up `RedialPolicy::max_attempts`.
+    /// this node hangs up on it.
     pub redial_attempts: BTreeMap<WorkerId, u32>,
     /// The connected peers whose subscription to this node's shard topic
     /// has reached it. Empty before `Net::subscribe_to_shard`.
@@ -474,10 +488,11 @@ impl Peers {
         }
     }
 
-    /// The redials due at `now`, each a peer and the address to dial; each
-    /// counts as an attempt, and a peer whose attempts are spent is given up
-    /// on instead. Whether a redial worked shows as a later
-    /// [`Observation::ConnectionOpened`], which ends the redial.
+    /// The redials due at `now`, each a peer and the address to dial. A
+    /// peer is redialed on the policy's fast schedule (exponential backoff for
+    /// a fixed number of attempts), then once per slow interval for as long as
+    /// it stays away; it is never given up on. Whether a redial worked shows
+    /// as a later [`Observation::ConnectionOpened`], which ends the redial.
     pub(crate) fn redials_due(&mut self, now: Instant) -> Vec<(PeerId, Multiaddr)> {
         self.redial.due(now)
     }
@@ -639,7 +654,7 @@ fn is_loopback(addr: &Multiaddr) -> bool {
     })
 }
 
-/// The bounded redial schedule of [`RedialPolicy`]: which dropped peers are
+/// The redial schedule of [`RedialPolicy`]: which dropped peers are
 /// being redialed, and how far along each is (see the module doc's
 /// "Reconnect/backoff" for which drops qualify).
 struct RedialTracker {
@@ -648,7 +663,7 @@ struct RedialTracker {
     /// failure, so never redialed. A peer leaves the set once it is seen to
     /// reconnect, so a later drop of it is judged afresh.
     locally_disconnected: HashSet<PeerId>,
-    /// Every peer being redialed, working toward the policy's cap.
+    /// Every peer being redialed, until it reconnects or this node hangs up on it.
     pending: HashMap<PeerId, RedialAttempt>,
 }
 
@@ -702,20 +717,26 @@ impl RedialTracker {
     }
 
     fn due(&mut self, now: Instant) -> Vec<(PeerId, Multiaddr)> {
-        let max_attempts = self.policy.max_attempts;
-        let max_backoff = self.policy.max_backoff;
-        self.pending.retain(|_, attempt| {
-            attempt.next_attempt_at > now || attempt.attempts_made < max_attempts
-        });
+        let RedialPolicy {
+            max_backoff,
+            fast_attempts,
+            slow_interval,
+            ..
+        } = self.policy;
         let mut dials = Vec::new();
         for (peer, attempt) in &mut self.pending {
             if attempt.next_attempt_at > now {
                 continue;
             }
             dials.push((*peer, attempt.addr.clone()));
-            attempt.attempts_made += 1;
-            attempt.next_backoff = std::cmp::min(attempt.next_backoff * 2, max_backoff);
-            attempt.next_attempt_at = now + attempt.next_backoff;
+            attempt.attempts_made = attempt.attempts_made.saturating_add(1);
+            let wait = if attempt.attempts_made < fast_attempts {
+                attempt.next_backoff = std::cmp::min(attempt.next_backoff * 2, max_backoff);
+                attempt.next_backoff
+            } else {
+                slow_interval
+            };
+            attempt.next_attempt_at = now + wait;
         }
         dials
     }
@@ -736,12 +757,14 @@ mod tests {
         Duration::from_millis(millis)
     }
 
-    /// Test-scale: backoffs 20, 40, then capped at 60; four attempts.
+    /// Test-scale: backoffs 20, 40, then capped at 60; four fast attempts,
+    /// then one every 100.
     fn policy() -> RedialPolicy {
         RedialPolicy {
             initial_backoff: ms(20),
             max_backoff: ms(60),
-            max_attempts: 4,
+            fast_attempts: 4,
+            slow_interval: ms(100),
             check_interval: ms(5),
         }
     }
@@ -833,24 +856,27 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_mesh_peer_is_redialed_with_doubling_capped_backoff_then_given_up() {
+    fn a_dropped_mesh_peer_is_redialed_fast_then_slowly_and_never_given_up() {
         let (mut book, peer) = (book(), PeerId::random());
         let t0 = Instant::now();
         let at = addr("/ip4/192.0.2.7/tcp/4001");
         meshed_then_dropped(&mut book, peer, &at, t0);
 
         assert!(book.redials_due(t0 + ms(19)).is_empty());
-        for due in [20, 60, 120, 180] {
-            // 120, not 140: the third wait is capped at 60.
+        // 20, 60, 120, 180: the doubling waits, the third capped at 60. Then
+        // 280, 380, 480: the slow interval, for as long as the peer is away.
+        for due in [20, 60, 120, 180, 280, 380, 480] {
             assert_eq!(book.redials_due(t0 + ms(due)), vec![(peer, at.clone())], "{due} ms");
             assert!(book.redials_due(t0 + ms(due + 1)).is_empty(), "{due} ms, just after");
         }
         assert!(book.redials_due(t0 + ms(119)).is_empty());
         assert!(book.redials_due(t0 + ms(179)).is_empty());
-        assert_eq!(book.snapshot().redial_attempts[&worker_id_of(&peer)], 4);
+        assert!(book.redials_due(t0 + ms(579)).is_empty());
+        assert_eq!(book.snapshot().redial_attempts[&worker_id_of(&peer)], 7);
 
-        assert!(book.redials_due(t0 + ms(240)).is_empty());
-        assert!(book.snapshot().redial_attempts.is_empty(), "given up");
+        // A peer that comes back ends the schedule.
+        open(&mut book, peer, Side::Dialer, &at, t0 + ms(590));
+        assert!(book.snapshot().redial_attempts.is_empty());
     }
 
     #[test]

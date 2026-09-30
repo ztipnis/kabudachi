@@ -489,12 +489,10 @@ mod tests {
     use kabudachi_core::time::{Duration as TickDuration, RealClock};
     use kabudachi_core::election::CallKind;
     use kabudachi_testkit::FaultingAuthority;
-    use libp2p::identity;
     use tokio::sync::watch;
     use tokio::time::timeout;
 
     use super::*;
-    use crate::swarm::build_swarm;
     use crate::test_support::{TEST_TIMEOUT, listening_net, spawn_join_responder};
 
     fn ack_from(leader: &WorkerId) -> ElectionMessage {
@@ -574,8 +572,8 @@ mod tests {
     /// A `Net` standing in for the leader of the returned node's `Net`, and
     /// that node's `Net`, connected. Only the stand-in's inputs are taken.
     async fn stand_in_leader_and_node_nets() -> (Net, Net) {
-        let net_leader = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_node = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net_leader = Net::new();
+        let net_node = Net::new();
         let node_addr = timeout(
             TEST_TIMEOUT,
             net_node.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
@@ -730,7 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_driver_ticks_the_node_when_its_deadline_comes() {
-        let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let net = Net::new();
         let me = net.local_worker_id();
         let started = std::time::Instant::now();
         let clock = RealClock::new();
@@ -824,7 +822,7 @@ mod tests {
             recovery_epoch_lineage: 0,
         };
         let _responder = spawn_join_responder(Arc::clone(&leader_net), pointer);
-        let joining_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let joining_net = Net::new();
         let joiner = joining_net.local_worker_id();
         // A heartbeat that waited for its interval would come long after
         // this test gives up.

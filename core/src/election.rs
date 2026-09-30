@@ -1941,6 +1941,8 @@ where
             highest_term_seen: self.standing.highest_term_seen(),
             leader,
             configuration: self.led_or_followed_configuration().map(Into::into),
+            recovery_epoch: self.standing.epoch().map(|epoch| epoch.number),
+            recovery_epoch_lineage: self.standing.epoch().map(|epoch| epoch.lineage),
         };
         self.send(initiator, election_message::Payload::ElectionReject(reject));
     }
@@ -1977,25 +1979,28 @@ where
     /// or contests makes it step down (see [`Self::step_down_if_outpaced`]).
     /// A refusal from a node at a later recovery epoch raises nothing (the
     /// two epochs' terms do not compare) but, while `RollCall`, makes the
-    /// leader it names this node's, whose ack then moves it to that epoch.
-    /// A refusal from an earlier one is dropped (ADR-0001 decision 4, as
-    /// amended 2026-09-29). A refusal names its refuser's epoch only through
-    /// the configuration it carries, so one that carries none is read as
-    /// this node's own epoch's. The refusal itself is not counted.
+    /// leader it names this node's, whose ack then moves it to that epoch, as
+    /// does a higher-numbered epoch of another lineage. A refusal from an
+    /// earlier epoch, or from another lineage's epoch at or below this
+    /// node's number, is dropped (ADR-0001 decision 4, as amended
+    /// 2026-09-29, and L6). A refusal names its refuser's epoch and lineage
+    /// itself; one that names no epoch (its refuser has joined no shard) is
+    /// read as this node's own epoch's. The refusal itself is not counted.
     fn on_election_reject(&mut self, reject: &Checked<ElectionReject>) {
         if reject.shard_id() != self.shard_id || reject.initiator_id() != self.my_id {
             return;
         }
         let offered = reject.configuration();
-        let own = self.standing.epoch_number();
-        match offered
-            .as_ref()
-            .map(|offered| order_numbers(own, offered.generation().recovery_epoch()))
-        {
-            Some(EpochOrder::Later) => {
-                // Its terms are not this epoch's, so they neither raise this
-                // node's nor outpace its roll call: the named leader's ack
-                // will.
+        let refuser_epoch = reject.recovery_epoch.map(|number| HeardEpoch {
+            number,
+            lineage: reject.recovery_epoch_lineage,
+        });
+        match refuser_epoch.and_then(|heard| self.standing.order(heard)) {
+            // A later epoch of this lineage, or a higher-numbered foreign one
+            // (as `on_leader_ack` takes it): its terms are not this epoch's,
+            // so they neither raise this node's nor outpace its roll call:
+            // the named leader's ack will.
+            Some(EpochOrder::Later | EpochOrder::Foreign(Ordering::Greater)) => {
                 if self.state == WorkerState::RollCall
                     && let Some((leader, term)) = reject.named_leader()
                     && leader != self.my_id
@@ -2006,9 +2011,12 @@ where
             }
             // A refuser left on a lower epoch counts that epoch's terms,
             // which order nothing here, and names a leader of that epoch
-            // (ADR-0001 decision 4, amended 2026-09-29).
-            Some(EpochOrder::Stale) => return,
-            Some(EpochOrder::Mine | EpochOrder::Foreign(_)) | None => {}
+            // (ADR-0001 decision 4, amended 2026-09-29). Another lineage's
+            // epoch at or below this node's number is another shard's: its
+            // terms, leader and configuration mean nothing here, and its
+            // configuration must not be relayed.
+            Some(EpochOrder::Stale | EpochOrder::Foreign(_)) => return,
+            Some(EpochOrder::Mine) | None => {}
         }
         self.standing.saw_term(reject.highest_term_seen);
         // A leader named as still valid is heartbeated whatever its term:

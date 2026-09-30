@@ -162,6 +162,14 @@ message ElectionReject {
   // on the joint configuration this one directly commits adopts it (ADR-0001
   // decision 4 as amended 2026-09-28): the commit it missed.
   optional Configuration configuration = 9;
+  // The recovery epoch the rejecter stands in and its lineage (see the
+  // coordination authority), so the initiator can tell a refusal from a
+  // later, an earlier or another lineage's epoch, whose terms do not compare
+  // with its own. Absent from a rejecter that has joined no shard, and the
+  // lineage from one that never learned it; a refusal without an epoch is
+  // read as the initiator's own.
+  optional uint64 recovery_epoch = 10;
+  optional uint64 recovery_epoch_lineage = 11;
 }
 
 // What an election's winner leads, sent to every respondent of its roll

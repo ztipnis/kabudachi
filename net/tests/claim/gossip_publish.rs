@@ -9,8 +9,6 @@ use kabudachi_core::election::Input;
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, SelfRemove, election_message};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
-use libp2p::identity;
 use tokio::time::timeout;
 
 use crate::support::net::{connect_full_mesh, connect_to, wait_until_subscribed};
@@ -25,7 +23,7 @@ const WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(20);
 const QUIET_PERIOD: StdDuration = StdDuration::from_secs(3);
 
 fn new_net() -> Net {
-    Net::new(build_swarm(identity::Keypair::generate_ed25519()))
+    Net::new()
 }
 
 /// A well-formed message naming `worker` in `shard`.

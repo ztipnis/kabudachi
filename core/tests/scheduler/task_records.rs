@@ -5,16 +5,20 @@
 
 use std::collections::VecDeque;
 
-use kabudachi_core::protocol::ids::TaskDefinitionId;
+use kabudachi_core::protocol::ids::{IdGenerator, TaskDefinitionId};
 use kabudachi_core::protocol::messages::{Task, TaskRun};
 use kabudachi_core::protocol::records::{
     IllegalTransition, NewTask, TaskRunRecord, first_attempt, new_task,
 };
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::time::{Duration, Instant};
-use crate::support::ids::SequentialIds;
+use crate::support::ids::{OversizedIds, SequentialIds};
 
 fn submit(ids: &SequentialIds, now: Instant) -> Task {
+    submit_with(ids, now)
+}
+
+fn submit_with(ids: &impl IdGenerator, now: Instant) -> Task {
     new_task(
         ids,
         now,
@@ -118,4 +122,17 @@ fn a_run_cannot_be_created_in_a_state_it_could_only_reach_by_transition() {
     let task = submit(&ids, Instant::at(0));
 
     let _ = first_attempt(&task, &ids, Instant::at(0), TaskRunState::Running);
+}
+
+#[test]
+#[should_panic(expected = "task ID of")]
+fn a_task_cannot_be_created_under_an_oversized_id() {
+    submit_with(&OversizedIds, Instant::at(0));
+}
+
+#[test]
+#[should_panic(expected = "task run ID of")]
+fn a_run_cannot_be_created_under_an_oversized_id() {
+    let task = submit(&SequentialIds::new(), Instant::at(0));
+    first_attempt(&task, &OversizedIds, Instant::at(0), TaskRunState::Queued);
 }

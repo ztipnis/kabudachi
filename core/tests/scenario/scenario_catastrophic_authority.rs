@@ -20,7 +20,7 @@ use crate::support::authority::authority_ttl;
 use crate::support::builders::{past_any_suspicion, shard};
 use crate::support::harness::Cluster;
 use kabudachi_core::configuration::Admission;
-use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, Uuid7Lineages};
 use kabudachi_core::election::{AuthorityRequest, Input, Output, StopReason};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::election_message::Payload;
@@ -342,7 +342,7 @@ fn refound_while_fenced(cluster: &mut Cluster, cut_off: &BTreeSet<WorkerId>) -> 
         "the flushed authority lists no one"
     );
 
-    let refounded = RecoveryEpoch::founding(0);
+    let refounded = RecoveryEpoch::founding(0, &mut Uuid7Lineages);
     let bootstrapper = WorkerId::new("bootstrapper");
     cluster
         .authority()

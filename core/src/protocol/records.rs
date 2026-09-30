@@ -12,7 +12,9 @@
 //! only shared references and clones.
 
 use crate::protocol::generated;
-use crate::protocol::ids::{IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId};
+use crate::protocol::ids::{
+    IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId, mint_task_id, mint_task_run_id,
+};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun, TaskRunIdentity};
 use crate::protocol::task::TaskRunState;
@@ -33,6 +35,8 @@ pub struct NewTask {
     pub not_before: Option<Instant>,
     pub expires_at: Option<Instant>,
     pub coalescing_key: Option<String>,
+    pub ephemeral: bool,
+    pub non_retriable: bool,
 }
 
 impl NewTask {
@@ -52,6 +56,8 @@ impl NewTask {
             not_before: None,
             expires_at: None,
             coalescing_key: None,
+            ephemeral: false,
+            non_retriable: false,
         }
     }
 }
@@ -59,7 +65,7 @@ impl NewTask {
 /// A new Task, as submitted at `now`.
 pub fn new_task(ids: &impl IdGenerator, now: Instant, new: NewTask) -> Task {
     Task {
-        task_id: Some(ids.next_task_id().into()),
+        task_id: Some(mint_task_id(ids).into()),
         task_definition_id: Some(new.definition_id.into()),
         source_version: new.source_version,
         serialized_input: new.serialized_input,
@@ -69,6 +75,8 @@ pub fn new_task(ids: &impl IdGenerator, now: Instant, new: NewTask) -> Task {
         not_before_ticks: new.not_before.map(|instant| instant.as_ticks()),
         expires_at_ticks: new.expires_at.map(|instant| instant.as_ticks()),
         coalescing_key: new.coalescing_key,
+        ephemeral: new.ephemeral,
+        non_retriable: new.non_retriable,
     }
 }
 
@@ -92,7 +100,7 @@ pub fn first_attempt(
     );
     TaskRun {
         identity: Some(TaskRunIdentity {
-            task_run_id: Some(ids.next_task_run_id().into()),
+            task_run_id: Some(mint_task_run_id(ids).into()),
             task_id: Some(task.task_id().into()),
             attempt_number: FIRST_ATTEMPT,
             parent_task_run_id: None,
@@ -113,7 +121,7 @@ pub fn first_attempt(
 pub fn retry_of(failed: &TaskRun, ids: &impl IdGenerator, now: Instant) -> TaskRun {
     TaskRun {
         identity: Some(TaskRunIdentity {
-            task_run_id: Some(ids.next_task_run_id().into()),
+            task_run_id: Some(mint_task_run_id(ids).into()),
             task_id: Some(failed.task_id().into()),
             attempt_number: failed.attempt_number() + 1,
             parent_task_run_id: Some(failed.task_run_id().into()),

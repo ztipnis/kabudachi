@@ -32,14 +32,13 @@ use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Inpu
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::RealClock;
-use libp2p::{Multiaddr, identity};
+use libp2p::Multiaddr;
 
 use crate::authority::{AuthorityClient, SharedAuthority};
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, bootstrap};
 use crate::driver::{DriverConfig, run_driver};
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::{ListenRejected, Net};
-use crate::swarm::build_swarm;
 
 /// A coordination authority and the timings a worker's node keeps its
 /// registration and recovery fence there by (see
@@ -74,6 +73,10 @@ pub struct WorkerConfig {
     /// prompts it (see `crate::driver::DriverConfig`); `None` for the
     /// default.
     pub routing_refresh_period: Option<StdDuration>,
+    /// How many inputs the worker's network holds for its node while the
+    /// driver is not taking them (see `Net::with_input_limit`); `None` for
+    /// the default (`crate::messenger::DEFAULT_INPUT_LIMIT`).
+    pub input_limit: Option<usize>,
 }
 
 impl WorkerConfig {
@@ -90,6 +93,7 @@ impl WorkerConfig {
             join_peer_timeout: DEFAULT_JOIN_PEER_TIMEOUT,
             retry_interval: DEFAULT_RETRY_INTERVAL,
             routing_refresh_period: None,
+            input_limit: None,
         }
     }
 
@@ -122,6 +126,13 @@ impl WorkerConfig {
         self.routing_refresh_period = Some(period);
         self
     }
+
+    /// Bounds the inputs the worker's network holds while its driver is not taking them.
+    #[must_use]
+    pub fn with_input_limit(mut self, limit: usize) -> Self {
+        self.input_limit = Some(limit);
+        self
+    }
 }
 
 /// A worker that has its identity and is listening, ready to [`Self::run`].
@@ -135,7 +146,11 @@ impl Worker {
     /// (see this module's "One identity per process"), and listens on
     /// `config.listen_on`, or fails if it cannot.
     pub async fn start(config: WorkerConfig) -> Result<Worker, ListenRejected> {
-        let net = Arc::new(Net::new(build_swarm(identity::Keypair::generate_ed25519())));
+        let net = Net::new();
+        let net = Arc::new(match config.input_limit {
+            Some(limit) => net.with_input_limit(limit),
+            None => net,
+        });
         net.try_listen_on(config.listen_on.clone()).await?;
         Ok(Worker { net, config })
     }
@@ -212,5 +227,74 @@ impl Worker {
             observe,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kabudachi_core::protocol::messages::{ElectionMessage, WorkerHeartbeat, election_message};
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::test_support::{TEST_TIMEOUT, listening_net};
+
+    fn heartbeat_from(sender: &WorkerId, available_capacity: u32) -> ElectionMessage {
+        ElectionMessage {
+            payload: Some(election_message::Payload::Heartbeat(WorkerHeartbeat {
+                worker_id: Some(sender.clone().into()),
+                incarnation_id: Some(IncarnationId::new("incarnation-1").into()),
+                available_capacity,
+                shard_id: Some(ShardId::new("shard-1").into()),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// Sends a worker `count` messages before it runs, and returns how many of
+    /// them it still holds for its node.
+    async fn messages_held_after_receiving(config: WorkerConfig, count: u32) -> usize {
+        let worker = Worker::start(config).await.expect("the worker listens");
+        let (sender, _address) = listening_net().await;
+        sender.dial(worker.address().expect("the worker has an address"));
+        let mut connected = false;
+        while !connected {
+            worker.net().wait_for_arrival().await;
+            connected = worker
+                .net()
+                .take_inputs()
+                .contains(&Input::PeerConnected(sender.local_worker_id()));
+        }
+        for capacity in 0..count {
+            sender.send(worker.id(), heartbeat_from(&sender.local_worker_id(), capacity));
+        }
+        timeout(TEST_TIMEOUT, async {
+            while worker.net().diagnostics().await.traffic.messages_received < u64::from(count) {
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the worker received every message");
+        worker
+            .net()
+            .take_inputs()
+            .iter()
+            .filter(|input| matches!(input, Input::Message { .. }))
+            .count()
+    }
+
+    fn config() -> WorkerConfig {
+        WorkerConfig::new(
+            ShardId::new("shard-1"),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+            ElectionTimings::new(
+                kabudachi_core::time::Duration::from_millis(300),
+                kabudachi_core::time::Duration::from_millis(50),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_workers_input_limit_bounds_the_messages_held_for_its_node() {
+        assert_eq!(messages_held_after_receiving(config().with_input_limit(2), 5).await, 2);
     }
 }

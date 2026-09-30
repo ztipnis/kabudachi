@@ -36,9 +36,7 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Clock, Duration, Instant, RealClock};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
 use kabudachi_testkit::{FaultingAuthority, StepRecord};
-use libp2p::identity::Keypair;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -121,9 +119,9 @@ fn less_drift(duration: Duration) -> Duration {
 
 #[tokio::test]
 async fn a_follower_that_loses_the_authority_fences_itself_in_time_and_resumes_on_reconnect() {
-    let net_a = Net::new(build_swarm(Keypair::generate_ed25519()));
-    let net_b = Net::new(build_swarm(Keypair::generate_ed25519()));
-    let net_c = Net::new(build_swarm(Keypair::generate_ed25519()));
+    let net_a = Net::new();
+    let net_b = Net::new();
+    let net_c = Net::new();
     let nets = [&net_a, &net_b, &net_c];
     let ids = connect_full_mesh(&nets).await;
 

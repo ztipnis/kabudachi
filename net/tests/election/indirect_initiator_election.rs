@@ -38,8 +38,7 @@ use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::swarm::build_swarm;
-use libp2p::{Multiaddr, identity};
+use libp2p::Multiaddr;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -65,7 +64,7 @@ const ROLL_CALL_DEADLINE_MS: u64 = 100;
 const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(20);
 
 fn new_net() -> Net {
-    Net::new(build_swarm(identity::Keypair::generate_ed25519()))
+    Net::new()
 }
 
 async fn listen(net: &Net) -> Multiaddr {

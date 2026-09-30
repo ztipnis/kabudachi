@@ -17,7 +17,6 @@ use libp2p::{Multiaddr, identity};
 use crate::join::LeaderSearch;
 use crate::leader_search::AskWhoLeads;
 use crate::messenger::Net;
-use crate::swarm::build_swarm;
 
 /// How long a unit test waits for anything that should happen at once.
 pub(crate) const TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -177,7 +176,7 @@ pub(crate) fn worker_that_never_runs() -> WorkerId {
 
 /// A `Net` listening on a loopback port, and that address.
 pub(crate) async fn listening_net() -> (Net, Multiaddr) {
-    let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    let net = Net::new();
     let address = tokio::time::timeout(
         TEST_TIMEOUT,
         net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),

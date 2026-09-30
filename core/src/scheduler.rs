@@ -48,9 +48,33 @@ pub struct MemoryLimits {
     pub hard: u64,
 }
 
+/// The largest message a worker accepts, which bounds what one claim can
+/// carry. `net`'s framing limit is this size, and it checks that at compile
+/// time.
+pub const MAX_CLAIM_FRAME_BYTES: u64 = 1024 * 1024;
+
+/// What a claim needs besides what a submission chooses: the task's IDs,
+/// times and flags, the run's ID and the message wrapping. A generous bound
+/// (generated IDs are capped at `MAX_ID_BYTES`, which the scheduler checks),
+/// so a task within [`MAX_SUBMISSION_BYTES`] always fits a claim response.
+const CLAIM_OVERHEAD_BYTES: u64 = 4 * 1024;
+
+/// The most a task may weigh at submission: its input, queue, definition ID
+/// and coalescing key together. A task any bigger could never be handed to a
+/// worker, so it is refused at once instead of sitting pending for ever.
+///
+/// It does not bound a coalescing task's retained chain, which a claim also
+/// carries: many small superseded payloads can still add up past a frame.
+/// Bounding that is chain compaction, which stays Phase 3 (README §3.2.1); a
+/// claim that has outgrown a frame is passed over by the leader's batch
+/// claim until then.
+pub const MAX_SUBMISSION_BYTES: u64 = MAX_CLAIM_FRAME_BYTES - CLAIM_OVERHEAD_BYTES;
+
 /// Why a submission was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitRejection {
+    #[error("a task of {size} bytes could never be claimed: at most {limit} fit in one message")]
+    TooLarge { size: u64, limit: u64 },
     #[error(
         "{needed} bytes would take memory past the hard limit of {hard_limit} ({in_use} in use)"
     )]
@@ -82,6 +106,11 @@ pub struct Submission {
     /// For a coalescing task: past the hard limit, drop the key's oldest
     /// retained payloads to make room instead of refusing the submission.
     pub drop_oldest: bool,
+    /// An ephemeral task's run lost with its worker is not replayed.
+    pub ephemeral: bool,
+    /// A non-retriable task's run that was running when its worker was lost
+    /// is orphaned, not replayed.
+    pub non_retriable: bool,
 }
 
 impl Submission {
@@ -102,7 +131,23 @@ impl Submission {
             expiry: None,
             coalescing_key: None,
             drop_oldest: false,
+            ephemeral: false,
+            non_retriable: false,
         }
+    }
+
+    /// The task is ephemeral (README §3.2.2): a run lost with its worker
+    /// becomes `Lost` and the task is over.
+    pub fn ephemeral(mut self) -> Self {
+        self.ephemeral = true;
+        self
+    }
+
+    /// The task is not safe to run twice: a run that was running when its
+    /// worker was lost becomes `Orphaned` and the task is over.
+    pub fn non_retriable(mut self) -> Self {
+        self.non_retriable = true;
+        self
     }
 
     /// Past the hard memory limit, make room by dropping this coalescing
@@ -205,8 +250,12 @@ pub enum Event {
 pub struct LostRun {
     pub task_id: TaskId,
     pub task_run_id: TaskRunId,
-    /// The queued next attempt, or `None` for a coalescing generation that a
-    /// newer one had superseded in the meantime: it stays lost.
+    /// What the run became: `Lost`, or `Orphaned` for a running run of a
+    /// non-retriable task.
+    pub state: TaskRunState,
+    /// The queued next attempt, or `None` when the run is not replayed: an
+    /// ephemeral task's, an orphaned one, and a coalescing generation that a
+    /// newer one had superseded in the meantime.
     pub replayed: Option<TaskRunId>,
 }
 
@@ -450,6 +499,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     fn record_submission(&mut self, submission: Submission) -> Result<TaskId, SubmitRejection> {
         let needed = submission.serialized_input.len() as u64;
+        let size = needed
+            + (submission.queue.len()
+                + submission.definition_id.as_str().len()
+                + submission.coalescing_key.as_deref().map_or(0, str::len)) as u64;
+        if size > MAX_SUBMISSION_BYTES {
+            return Err(SubmitRejection::TooLarge {
+                size,
+                limit: MAX_SUBMISSION_BYTES,
+            });
+        }
         self.check_room(&submission, needed)?;
         let now = self.clock.now();
         let not_before = submission
@@ -469,6 +528,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 not_before,
                 expires_at,
                 coalescing_key: submission.coalescing_key,
+                ephemeral: submission.ephemeral,
+                non_retriable: submission.non_retriable,
             },
         );
         let first_state = if not_before.is_some() {
@@ -897,10 +958,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// afterwards counts. Each is replayed by a new queued attempt, which is
     /// at-least-once and does not use up a retry (a loss is not a failure), except a coalescing
     /// generation that a newer one is waiting behind: that one stays lost and
-    /// its payload is not folded into the newer one (README §3.2.1). Only a
-    /// leader decides. Everything is treated as an ordinary `@task`: whether a
-    /// non-retriable or ephemeral task would be orphaned or dropped instead
-    /// comes with those kinds.
+    /// its payload is not folded into the newer one (README §3.2.1). Two kinds
+    /// are not replayed (README §3.2.2): an ephemeral task's run stays `Lost`,
+    /// and the running run of a non-retriable task becomes `Orphaned`, since
+    /// its effects may have happened. A non-retriable task's claimed run never
+    /// started, so it is replayed. Either way the task is over. Only a leader
+    /// decides.
     pub fn lose_worker(&mut self, worker: &WorkerId) -> Result<Vec<LostRun>, LoseRejection> {
         let outcome = self.lose_runs_of(worker);
         self.forget_due();
@@ -927,16 +990,24 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let mut lost = Vec::new();
         for task_id in held {
             let run_id = self.current_run[&task_id].clone();
+            let was_running = self.runs[&run_id].current_state() == TaskRunState::Running;
+            let task = &self.tasks[&task_id];
+            let orphaned = task.non_retriable && !task.ephemeral && was_running;
+            let state = if orphaned {
+                TaskRunState::Orphaned
+            } else {
+                TaskRunState::Lost
+            };
             self.runs
                 .get_mut(&run_id)
                 .expect("every current run is stored")
-                .transition_to(TaskRunState::Lost, now)
-                .expect("a claimed or running run can be lost");
+                .transition_to(state, now)
+                .expect("a claimed run can be lost, and a running one lost or orphaned");
             self.notify_run(&run_id);
             let newer_waits = self
                 .coalescing_key_of(&task_id)
                 .is_some_and(|key| self.occupancy.has_waiting(&key));
-            let replayed = if newer_waits {
+            let replayed = if orphaned || self.tasks[&task_id].ephemeral || newer_waits {
                 self.record_finished(&task_id, now);
                 None
             } else {
@@ -946,6 +1017,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             lost.push(LostRun {
                 task_id,
                 task_run_id: run_id,
+                state,
                 replayed,
             });
         }

@@ -539,6 +539,8 @@ fn a_refusal_of_a_vote_request_changes_nothing() {
         highest_term_seen: call.term,
         configuration: Some((&configuration_of(5)).into()),
         leader: None,
+        recovery_epoch: Some(0),
+        recovery_epoch_lineage: None,
     };
 
     let outputs = deliver(
