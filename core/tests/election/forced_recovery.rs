@@ -16,7 +16,7 @@ use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::coordination_authority::{AuthorityError, CoordinationAuthority, RecoveryEpoch};
 use kabudachi_core::election::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, DropMessages,
-    Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step, WorkerNode,
+    ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step, WorkerNode,
     carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
@@ -35,6 +35,11 @@ use crate::support::node::{TestNode, grants, published_roll_calls, sent_to, stat
 
 const SHARD: &str = "shard-1";
 const SUSPECT_TIMEOUT_TICKS: u64 = 10;
+
+/// The timings every node here runs, unless a test sets its own.
+fn default_timings() -> ElectionTimings {
+    timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS))
+}
 
 /// A node and the authority its driver reaches for it.
 struct Driven {
@@ -60,6 +65,7 @@ impl Driven {
             authority,
             me,
             voter_of(voter_count),
+            default_timings(),
             Some(AuthorityTimings {
                 ttl: authority_ttl(),
             }),
@@ -71,6 +77,7 @@ impl Driven {
         authority: &FaultingAuthority<FakeClock>,
         me: &str,
         known: KnownConfiguration,
+        timings: ElectionTimings,
         authority_timings: Option<AuthorityTimings>,
     ) -> (Self, Vec<Output>) {
         let (node, started) = WorkerNode::start(
@@ -78,7 +85,7 @@ impl Driven {
                 id: worker(me),
                 incarnation: IncarnationId::new("incarnation-1"),
                 shard: shard(SHARD),
-                timings: timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)),
+                timings,
             },
             Entry::Known(known),
             clock.clone(),
@@ -133,7 +140,7 @@ impl Driven {
     /// admitted at `g0` in between. Returns what the closing tick produced.
     fn run_roll_call(&mut self, respondents: &[WorkerId]) -> Vec<Output> {
         self.answer_roll_call(respondents);
-        let deadline = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)).roll_call_deadline;
+        let deadline = default_timings().roll_call_deadline;
         self.advance(deadline.as_ticks())
     }
 
@@ -210,7 +217,17 @@ fn a_node_that_cannot_renew_fences_itself_before_its_registration_lapses() {
     let clock = FakeClock::new();
     let authority = warmed_up_authority(&clock);
     seed_shard(&authority, &shard(SHARD), 0, []);
-    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 1);
+    let reconnect_ticks = 50;
+    let (mut driven, _) = Driven::with(
+        &clock,
+        &authority,
+        "w1",
+        voter_of(1),
+        default_timings().with_reconnect_timeout(Duration::from_ticks(reconnect_ticks)),
+        Some(AuthorityTimings {
+            ttl: authority_ttl(),
+        }),
+    );
     // A lone voter leads once its own roll call closes, and takes the fence.
     driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
     driven.tick();
@@ -245,10 +262,9 @@ fn a_node_that_cannot_renew_fences_itself_before_its_registration_lapses() {
         })
         .next_back()
         .flatten();
-    let reconnect = kabudachi_core::election::DEFAULT_RECONNECT_TIMEOUT.as_ticks();
     assert_eq!(
         abort_by,
-        Some(fenced_at + Duration::from_ticks(reconnect - reconnect.div_ceil(10)))
+        Some(fenced_at + Duration::from_ticks(reconnect_ticks - reconnect_ticks.div_ceil(10)))
     );
     assert_eq!(
         driven.node.configuration().cloned(),
@@ -434,7 +450,14 @@ fn lone_winner(authority_timings: Option<AuthorityTimings>) -> (Driven, Vec<Outp
     let clock = FakeClock::new();
     let authority = warmed_up_authority(&clock);
     seed_shard(&authority, &shard(SHARD), 0, []);
-    let (mut driven, _) = Driven::with(&clock, &authority, "w1", voter_of(1), authority_timings);
+    let (mut driven, _) = Driven::with(
+        &clock,
+        &authority,
+        "w1",
+        voter_of(1),
+        default_timings(),
+        authority_timings,
+    );
     driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
     driven.tick();
     let won = driven.advance(SUSPECT_TIMEOUT_TICKS);
@@ -554,6 +577,45 @@ fn a_leader_whose_fence_names_a_later_epoch_steps_down() {
     assert_eq!(grants(&outputs).first(), Some(&None));
 }
 
+#[test]
+fn a_leader_that_steps_down_stops_renewing_its_fence() {
+    let (mut driven, won) = lone_winner(Some(AuthorityTimings {
+        ttl: authority_ttl(),
+    }));
+    assert!(
+        authority_calls(&won).contains(&AuthorityRequest::AcquireFence { recovery_epoch: epoch(0) }),
+        "setup invariant: it took the fence"
+    );
+    let won_at = driven.clock.now();
+    let later_leader = || Input::Message {
+        from: worker("leader-2"),
+        message: ack_message(leader_ack(
+            &worker("leader-2"),
+            2,
+            &configuration_of(3),
+            Some(g0()),
+        )),
+    };
+    let deposed = driven.step(later_leader());
+    assert_eq!(driven.node.state(), WorkerState::Active, "{deposed:?}");
+
+    // Keep it following past its next fence renewal.
+    let mut outputs = deposed;
+    while driven.clock.now() <= won_at + Duration::from_ticks(ttl_ticks() / 3 + 1) {
+        driven.clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS - 1));
+        outputs.extend(driven.step(later_leader()));
+    }
+
+    assert_eq!(driven.node.state(), WorkerState::Active);
+    assert!(
+        authority_calls(&outputs)
+            .iter()
+            .all(|request| *request == AuthorityRequest::Register),
+        "a node that no longer leads asks for no fence: {:?}",
+        authority_calls(&outputs)
+    );
+}
+
 // `await_authority` read the clock once to remember the call and again to
 // stamp it: a tick between the two reads left the node waiting on an
 // instant no reply carries.
@@ -582,7 +644,7 @@ fn awaiting_its_live_set_read() -> (Driven, AuthorityCall) {
     register_all(&authority, &shard(SHARD), &[worker("w2")]);
     let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
     driven.answer_roll_call(&[worker("w2")]);
-    let deadline = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)).roll_call_deadline;
+    let deadline = default_timings().roll_call_deadline;
     driven.clock.advance(deadline);
     let closed = driven.node.step(Input::Tick);
     let read = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
@@ -814,6 +876,7 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
                 }).expect("valid"),
                 admission: Some(Generation::genesis(5)),
             },
+            default_timings(),
             Some(AuthorityTimings {
                 ttl: authority_ttl(),
             }),
@@ -936,6 +999,7 @@ fn a_node_ignores_an_ack_from_a_lower_epoch_of_another_lineage() {
         &authority,
         "w1",
         known,
+        default_timings(),
         Some(AuthorityTimings {
             ttl: authority_ttl(),
         }),

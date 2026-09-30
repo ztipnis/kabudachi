@@ -13,8 +13,8 @@
 //!
 //! The leader detects the loss itself: it tracks when it last heard a
 //! `WorkerHeartbeat` from each worker, and reports `Output::WorkerLost` once
-//! a suspicion timeout and then `with_reconnect_timeout`'s
-//! `reconnect_timeout` have passed since (README §8.3's `heartbeat_timeout`
+//! a suspicion timeout and then `ElectionTimings::reconnect_timeout`
+//! have passed since (README §8.3's `heartbeat_timeout`
 //! is `suspect_timeout` here). `net::driver::run_driver` carries that output
 //! out through `core::election::carry_out`, which calls
 //! `Scheduler::lose_worker`.
@@ -64,7 +64,7 @@ const HEARTBEAT_INTERVAL_MS: u64 = 10;
 /// reach a loopback peer and its reply to come back.
 const ROLL_CALL_DEADLINE_MS: u64 = 100;
 
-/// `node_a`'s `with_reconnect_timeout` (README §8.3). Long enough that "just
+/// `node_a`'s `ElectionTimings::reconnect_timeout` (README §8.3). Long enough that "just
 /// before the detection window elapses" and "well after it elapses" are
 /// unambiguous real-time checkpoints, and comfortably smaller than
 /// `TEST_TIMEOUT`. No auto-redial can interfere: `net_w1` is a bare `Net`
@@ -135,7 +135,8 @@ async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_e
                 Duration::from_millis(SUSPECT_TIMEOUT_MS),
                 Duration::from_millis(HEARTBEAT_INTERVAL_MS),
             )
-            .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS)),
+            .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS))
+            .with_reconnect_timeout(Duration::from_millis(RECONNECT_TIMEOUT_MS)),
         },
         Entry::Founding {
             recovery_epoch: RecoveryEpoch::new(0, 0),
@@ -144,8 +145,7 @@ async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_e
         clock,
         None,
     )
-    .0
-    .with_reconnect_timeout(Duration::from_millis(RECONNECT_TIMEOUT_MS));
+    .0;
     let mut scheduler_a = Scheduler::new(clock, Uuid7Ids);
 
     let (tx_a, mut rx_a) = watch::channel(node_a.state());

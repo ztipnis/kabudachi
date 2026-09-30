@@ -60,7 +60,7 @@ const AUTHORITY_TTL_MS: u64 = 1_500;
 
 const SUSPECT_TIMEOUT_MS: u64 = 500;
 
-/// Every node's reconnect timeout (see `WorkerNode::with_reconnect_timeout`).
+/// Every node's reconnect timeout (see `ElectionTimings::reconnect_timeout`).
 const RECONNECT_TIMEOUT_MS: u64 = 500;
 
 const HEARTBEAT_INTERVAL_MS: u64 = 20;
@@ -84,7 +84,8 @@ fn make_node(clock: RealClock, my_id: WorkerId) -> WorkerNode<RealClock> {
                 Duration::from_millis(SUSPECT_TIMEOUT_MS),
                 Duration::from_millis(HEARTBEAT_INTERVAL_MS),
             )
-            .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS)),
+            .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS))
+            .with_reconnect_timeout(Duration::from_millis(RECONNECT_TIMEOUT_MS)),
         },
         Entry::Known(KnownConfiguration {
             configuration: Configuration::single(Single {
@@ -100,7 +101,6 @@ fn make_node(clock: RealClock, my_id: WorkerId) -> WorkerNode<RealClock> {
         }),
     )
     .0
-    .with_reconnect_timeout(Duration::from_millis(RECONNECT_TIMEOUT_MS))
 }
 
 /// What a node's `observe` saw the first time it found the node `Fenced`:

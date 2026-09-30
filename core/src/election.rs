@@ -83,7 +83,7 @@
 //! while it holds the recovery fence, so its grant ends at the earlier of
 //! the fence and the quorum-contact lease. A roll call of its own that falls
 //! short of its returning quorum takes the authority path (see the
-//! `forced_recovery` module): with a majority of the authority's live
+//! `authority_standing` module): with a majority of the authority's live
 //! registrations among its respondents it swaps the recovery epoch, waits
 //! out the fence, and leads a configuration founded at the new epoch; if
 //! the epoch is missing, the shard is abandoned and the node stops. A node
@@ -107,17 +107,16 @@
 //!   leader and a worker that follows the new one refuses its roll call.
 
 mod authority;
-mod authority_lease;
+mod authority_standing;
 mod carry_out;
 mod election_round;
 mod entry;
-mod forced_recovery;
 mod leader_office;
 mod lease;
 mod standing;
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 pub use authority::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, Issuer,
@@ -127,7 +126,7 @@ pub use carry_out::{AuthorityPerformer, DropMessages, MessageSink, NoAuthority, 
 pub use entry::{Entry, Identity};
 
 use crate::configuration::{Admission, Configuration, Generation, Roster, Tally};
-use crate::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
+use crate::coordination_authority::RecoveryEpoch;
 use crate::hashing::{Field, HashFunction};
 use crate::protocol::ids::{IdGenerator, IncarnationId, ShardId, WorkerId};
 use crate::protocol::messages::prelude::*;
@@ -139,19 +138,11 @@ use crate::protocol::worker_state::WorkerState;
 use crate::scheduler::{LeadershipGrant, LeaseEnd, Observer, Scheduler};
 use crate::time::{Clock, Duration, Instant};
 
-use authority_lease::{AuthorityLease, Reconnect};
+use authority_standing::{AuthorityStanding, AuthorityVerdict, AuthorityView};
 use election_round::{ElectionRound, Verdict, View};
-use forced_recovery::{ForcedRecovery, Next, cannot_recover_from};
 use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice};
 use lease::{Lease, LeaseChange, Office};
-use standing::{EpochOrder, HeardEpoch, ShardStanding, order, order_numbers};
-
-/// How long a leader waits, after it would first suspect a silent worker,
-/// before it reports that worker lost and its TaskRuns are replayed; and,
-/// less drift, how long a worker cut off from its leader or orphaned has
-/// to abort its own (README §8.3). See
-/// [`WorkerNode::with_reconnect_timeout`].
-pub const DEFAULT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+use standing::{EpochOrder, HeardEpoch, ShardStanding, order_numbers};
 
 pub struct WorkerNode<C>
 where
@@ -171,25 +162,9 @@ where
     hash_function: HashFunction,
     /// This node's standing with its coordination authority; `None` for a
     /// node with no authority configured.
-    authority: Option<AuthorityLease>,
-    /// The authority-path attempt in progress, from the census of the roll
-    /// call that fell short, while `NoQuorum` or, waiting out the fence,
-    /// `Candidate`.
-    recovery: Option<ForcedRecovery>,
-    /// The token of the one authority read or swap this node now waits on:
-    /// its forced recovery's current step, or, while `Fenced`, its read of
-    /// the recovery epoch. Replies arrive whenever the driver gets them,
-    /// possibly out of order, so a reply to any earlier call is stale and
-    /// ignored.
-    awaited_reply: Option<ReplyToken>,
-    /// Mints the token of every authority call this node asks. It lives as
-    /// long as the node, a rejoin included, so the node never repeats a
-    /// number.
-    tokens: ReplyTokens,
+    authority: Option<AuthorityStanding>,
     /// Why this node stopped; `None` until it is `Stopped`.
     stop_reason: Option<StopReason>,
-    /// See [`Self::with_reconnect_timeout`].
-    reconnect_timeout: Duration,
     /// The term this node is contesting or holds. Meaningful from `Candidate`
     /// onward.
     term: u64,
@@ -282,6 +257,14 @@ pub struct ElectionTimings {
     /// Lower it on hosts whose clock rates can differ more. Every worker in
     /// the shard must use the same value. Must not be zero.
     pub clock_drift_divisor: u64,
+    /// How long a leader waits, after it would first suspect a silent
+    /// worker, before it reports that worker lost and its TaskRuns are
+    /// replayed; and, less drift, how long a worker cut off from its leader
+    /// or fenced has to abort its own (README §8.3, ADR-0001 decision 12).
+    /// Every worker in the shard must use the same value, or a leader could
+    /// replay the work of a worker still running it. Usually
+    /// [`Self::DEFAULT_RECONNECT_TIMEOUT`].
+    pub reconnect_timeout: Duration,
 }
 
 impl ElectionTimings {
@@ -304,16 +287,21 @@ impl ElectionTimings {
     /// timeout.
     pub const DEFAULT_CLOCK_DRIFT_DIVISOR: u64 = 10;
 
+    /// The default `reconnect_timeout` (README §8.3).
+    pub const DEFAULT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Timings with this suspicion timeout and heartbeat interval, which
     /// have no default (they depend on the deployment's network), and every
-    /// other setting at its default: [`Self::DEFAULT_ROLL_CALL_DEADLINE`]
-    /// and [`Self::DEFAULT_CLOCK_DRIFT_DIVISOR`].
+    /// other setting at its default: [`Self::DEFAULT_ROLL_CALL_DEADLINE`],
+    /// [`Self::DEFAULT_CLOCK_DRIFT_DIVISOR`] and
+    /// [`Self::DEFAULT_RECONNECT_TIMEOUT`].
     pub fn new(suspect_timeout: Duration, heartbeat_interval: Duration) -> Self {
         ElectionTimings {
             suspect_timeout,
             heartbeat_interval,
             roll_call_deadline: Self::DEFAULT_ROLL_CALL_DEADLINE,
             clock_drift_divisor: Self::DEFAULT_CLOCK_DRIFT_DIVISOR,
+            reconnect_timeout: Self::DEFAULT_RECONNECT_TIMEOUT,
         }
     }
 
@@ -328,6 +316,13 @@ impl ElectionTimings {
     /// [`Self::clock_drift_divisor`]).
     pub fn with_clock_drift_divisor(mut self, clock_drift_divisor: u64) -> Self {
         self.clock_drift_divisor = clock_drift_divisor;
+        self
+    }
+
+    /// Replaces [`Self::DEFAULT_RECONNECT_TIMEOUT`] (see
+    /// [`Self::reconnect_timeout`]).
+    pub fn with_reconnect_timeout(mut self, reconnect_timeout: Duration) -> Self {
+        self.reconnect_timeout = reconnect_timeout;
         self
     }
 
@@ -474,7 +469,7 @@ pub enum Output {
     /// reconnect timeout, less a tenth for clock drift (the same rate bound
     /// the leader lease assumes). Every worker in the shard must use the same
     /// `suspect_timeout` and reconnect timeout (see
-    /// [`WorkerNode::with_reconnect_timeout`]).
+    /// [`ElectionTimings::reconnect_timeout`]).
     AbortDeadline(Option<Instant>),
     /// An alert: the authority path found the shard's recovery epoch gone,
     /// so the shard is abandoned (README §15.5) and the node has stopped
@@ -714,13 +709,9 @@ where
             clock,
             hash_function: HashFunction::default(),
             authority: authority.map(|authority_timings| {
-                AuthorityLease::starting_at(authority_timings, timings.clock_drift_divisor, now)
+                AuthorityStanding::starting_at(authority_timings, timings.clock_drift_divisor, now)
             }),
-            recovery: None,
-            awaited_reply: None,
-            tokens: ReplyTokens::new(Issuer::Node),
             stop_reason: None,
-            reconnect_timeout: DEFAULT_RECONNECT_TIMEOUT,
             term: 0,
             round: ElectionRound::new(now),
             office: None,
@@ -751,22 +742,9 @@ where
     /// after another worker had found the shard with no one registered and
     /// re-founded it. No effect on a node with no authority.
     fn registered_at(mut self, sent_at: Instant) -> Self {
-        if let Some(lease) = self.authority.as_mut() {
-            lease.restart_at(sent_at);
+        if let Some(authority) = self.authority.as_mut() {
+            authority.restart_at(sent_at);
         }
-        self
-    }
-
-    /// Replaces [`DEFAULT_RECONNECT_TIMEOUT`] (README §8.3). A leader reports
-    /// a worker lost once it has not heard from it for its `suspect_timeout`
-    /// and then this long; a worker must abort its TaskRuns within nine
-    /// tenths of that span after its leader last provably heard it, and
-    /// within nine tenths of this after it fences itself (see
-    /// [`Output::AbortDeadline`]). Every worker in the shard must use the
-    /// same value, or a leader could replay the work of a worker that is
-    /// still running it.
-    pub fn with_reconnect_timeout(mut self, reconnect_timeout: Duration) -> Self {
-        self.reconnect_timeout = reconnect_timeout;
         self
     }
 
@@ -1011,8 +989,7 @@ where
         let lease_deadline = self
             .authority
             .as_ref()
-            .filter(|_| self.registers_with_authority())
-            .map(|lease| lease.next_deadline(self.state == WorkerState::Fenced));
+            .and_then(|authority| authority.next_deadline(self.state));
         earliest(
             earliest(self.election_deadline(), lease_deadline),
             self.lease.next_deadline(&self.timings, self.clock.now()),
@@ -1069,12 +1046,8 @@ where
             self.outputs.push(Output::Grant(None));
             self.leave_office();
         }
-        if !matches!(
-            next,
-            WorkerState::Candidate | WorkerState::LeaderReconciling | WorkerState::Leader
-        ) && let Some(lease) = self.authority.as_mut()
-        {
-            lease.drop_fence();
+        if let Some(authority) = self.authority.as_mut() {
+            authority.state_changed(next);
         }
         self.state = next;
         self.outputs.push(Output::StateChanged(next));
@@ -1209,7 +1182,7 @@ where
             )
         {
             self.round.stop();
-            self.recovery = None;
+            self.drop_recovery();
             self.transition_to(WorkerState::Active);
         }
     }
@@ -1471,7 +1444,7 @@ where
         }
         let fence_end = match &self.authority {
             None => LeaseEnd::Unbounded,
-            Some(lease) => LeaseEnd::At(lease.fence_valid_until()?),
+            Some(authority) => LeaseEnd::At(authority.fence_valid_until()?),
         };
         Some(Office {
             me: &self.my_id,
@@ -1576,7 +1549,7 @@ where
     /// suspicion timeout it tries a roll call again; meanwhile it answers
     /// the roll calls and grants the votes of others, and an ack from a
     /// leader returns it to `Active`. With an authority, the authority path
-    /// can take it out too (see [`Self::begin_forced_recovery`]).
+    /// can take it out too (see [`AuthorityStanding::begin_recovery`]).
     /// A leader that has not heard from a quorum within its quorum-contact
     /// lease gives up leading, to `NoQuorum`.
     fn lose_quorum_if_its_lease_ended(&mut self) {
@@ -1608,7 +1581,7 @@ where
     fn retry_after_a_fresh_suspicion_timeout(&mut self) {
         let retry_at = self.clock.now() + self.jittered_suspect_timeout();
         self.round.retry_at(retry_at);
-        self.recovery = None;
+        self.drop_recovery();
     }
 
     /// The latest term this node knows of: the highest it has seen, or that
@@ -1647,8 +1620,8 @@ where
         // Its registration starts with its membership: until now it kept
         // none, so its lease counts from the join.
         let now = self.clock.now();
-        if let Some(lease) = self.authority.as_mut() {
-            lease.restart_at(now);
+        if let Some(authority) = self.authority.as_mut() {
+            authority.restart_at(now);
         }
         self.transition_to(WorkerState::Active);
     }
@@ -1871,7 +1844,7 @@ where
         for verdict in verdicts {
             match verdict {
                 Verdict::Publish(call) => {
-                    self.recovery = None;
+                    self.drop_recovery();
                     self.transition_to(WorkerState::RollCall);
                     self.publish(Payload::RollCall(call));
                 }
@@ -1914,8 +1887,10 @@ where
                     respondents,
                 } => {
                     self.lose_quorum();
-                    if self.authority.is_some() {
-                        self.begin_forced_recovery(term, configuration, respondents);
+                    let now = self.clock.now();
+                    if let Some(authority) = self.authority.as_mut() {
+                        let call = authority.begin_recovery(term, configuration, respondents, now);
+                        self.outputs.push(Output::Authority(call));
                     }
                 }
                 Verdict::SuspectAgain => self.suspect_again(),
@@ -2108,119 +2083,71 @@ where
         self.step_down_if_outpaced();
     }
 
-    /// Asks the authority for what this node's lease has come due for: a
-    /// registration, from every state but `Bootstrapping`, `Joining`,
-    /// `Draining` and `Stopped` (a fenced node keeps registering, to
-    /// reconnect), and, while it needs one, its recovery fence.
+    /// Asks the authority for what this node's standing has come due for
+    /// (see [`AuthorityStanding::calls_due`]).
     fn ask_authority_if_due(&mut self) {
         let now = self.clock.now();
-        let registers = self.registers_with_authority();
-        let epoch = self.standing.epoch();
-        let Some(lease) = self.authority.as_mut() else {
+        let Some(authority) = self.authority.as_mut() else {
             return;
         };
-        let register = registers && lease.registration_due(now);
-        if register {
-            lease.registration_asked(now);
-        }
-        // A node that has joined no shard has no epoch to hold a fence at,
-        // and never needs one.
-        let fence = epoch.filter(|_| lease.fence_due(now));
-        if fence.is_some() {
-            lease.fence_asked(now);
-        }
-        if register {
-            self.ask_authority(AuthorityRequest::Register, now);
-        }
-        if let Some(recovery_epoch) = fence {
-            self.ask_authority(AuthorityRequest::AcquireFence { recovery_epoch }, now);
-        }
-    }
-
-    /// Whether this node keeps a registration with its authority in its
-    /// current state.
-    fn registers_with_authority(&self) -> bool {
-        !matches!(
-            self.state,
-            WorkerState::Bootstrapping
-                | WorkerState::Joining
-                | WorkerState::Draining
-                | WorkerState::Stopped
-        )
-    }
-
-    /// Asks for `request` as the one read or swap this node now waits on
-    /// (see `awaited_reply`).
-    fn await_authority(&mut self, request: AuthorityRequest) {
-        let now = self.clock.now();
-        self.awaited_reply = Some(self.ask_authority(request, now));
-    }
-
-    /// Whether `token` is the one this node waits on, and if it is, stops
-    /// waiting. Whole-token equality: a reply of another issuer, kind or
-    /// number never empties the slot.
-    fn take_awaited(&mut self, token: ReplyToken) -> bool {
-        self.awaited_reply.take_if(|awaited| *awaited == token).is_some()
-    }
-
-    /// Asks for `request` at `now`, and returns the token its reply carries.
-    fn ask_authority(&mut self, request: AuthorityRequest, now: Instant) -> ReplyToken {
-        let call = AuthorityCall::new(request, &mut self.tokens, now);
-        self.outputs.push(Output::Authority(call));
-        call.token
+        let view = AuthorityView {
+            me: &self.my_id,
+            state: self.state,
+            own_epoch: self.standing.epoch(),
+        };
+        self.outputs
+            .extend(authority.calls_due(&view, now).into_iter().map(Output::Authority));
     }
 
     /// Handles what the authority answered to a call this node asked for.
     fn on_authority_reply(&mut self, reply: AuthorityReply) {
-        if self.authority.is_none() {
+        let now = self.clock.now();
+        let Some(authority) = self.authority.as_mut() else {
             return;
+        };
+        let view = AuthorityView {
+            me: &self.my_id,
+            state: self.state,
+            own_epoch: self.standing.epoch(),
+        };
+        let verdicts = authority.on_reply(reply, &view, now);
+        self.apply_authority(verdicts);
+    }
+
+    /// Carries out, in order, what this node's authority standing decided.
+    fn apply_authority(&mut self, verdicts: Vec<AuthorityVerdict>) {
+        for verdict in verdicts {
+            match verdict {
+                AuthorityVerdict::Ask(call) => self.outputs.push(Output::Authority(call)),
+                AuthorityVerdict::Resume => {
+                    self.lease.resumed();
+                    self.last_leader_contact = self.clock.now();
+                    self.transition_to(WorkerState::Active);
+                }
+                AuthorityVerdict::RejoinAt(epoch) => self.rejoin_at(epoch),
+                AuthorityVerdict::StandAt {
+                    epoch,
+                    term,
+                    roster,
+                } => {
+                    self.newest_accepted_ack = None;
+                    self.standing
+                        .recovered_to(epoch, term, Some(&roster), &self.my_id);
+                    self.term = term;
+                    self.transition_to(WorkerState::Candidate);
+                }
+                AuthorityVerdict::Lead(roster) => self.take_office(roster),
+                AuthorityVerdict::Abandon => self.abandon_shard(),
+                AuthorityVerdict::LoseQuorum => self.lose_quorum(),
+                AuthorityVerdict::SuspectAgain => self.suspect_again(),
+            }
         }
-        match reply {
-            AuthorityReply::Registered {
-                sent_at, result, ..
-            } => {
-                if let (Ok(granted), Some(lease)) = (result, self.authority.as_mut()) {
-                    lease.registered(sent_at, granted);
-                    // A fenced node that can register again reads the epoch
-                    // to learn whether it may resume (ADR-0001 decision 12).
-                    if self.state == WorkerState::Fenced {
-                        self.await_authority(AuthorityRequest::ReadRecoveryEpoch);
-                    }
-                }
-            }
-            AuthorityReply::LiveRegistrations { token, result, .. } => {
-                if self.take_awaited(token) {
-                    self.on_live_registrations(result);
-                }
-            }
-            AuthorityReply::RecoveryEpoch { token, result, .. } => {
-                if !self.take_awaited(token) {
-                    return;
-                }
-                if self.state == WorkerState::Fenced {
-                    if let Ok(epoch) = result {
-                        self.reconnect(epoch);
-                    }
-                } else {
-                    self.on_recovery_epoch(result);
-                }
-            }
-            AuthorityReply::RecoveryEpochSwapped {
-                token,
-                expected,
-                new,
-                result,
-                ..
-            } => {
-                let awaited = self.take_awaited(token);
-                self.on_recovery_epoch_swapped(expected, new, awaited, result);
-            }
-            AuthorityReply::Fence {
-                recovery_epoch,
-                sent_at,
-                result,
-                ..
-            } => self.on_fence(recovery_epoch, sent_at, result),
+    }
+
+    /// Gives up the authority path this node runs, if any.
+    fn drop_recovery(&mut self) {
+        if let Some(authority) = self.authority.as_mut() {
+            authority.drop_recovery();
         }
     }
 
@@ -2235,7 +2162,7 @@ where
         let lapsed = self
             .authority
             .as_ref()
-            .is_some_and(|lease| !lease.is_registered(now));
+            .is_some_and(|authority| !authority.is_registered(now));
         let takes_part = matches!(
             self.state,
             WorkerState::Active
@@ -2249,38 +2176,10 @@ where
             return false;
         }
         self.round.stop();
-        self.recovery = None;
+        self.drop_recovery();
         self.transition_to(WorkerState::Fenced);
-        self.lease
-            .orphaned(now, &self.timings, self.reconnect_timeout);
+        self.lease.orphaned(now, &self.timings);
         true
-    }
-
-    /// A fenced node that can reach its authority again, which reports the
-    /// shard's recovery epoch as `authority_epoch`, resumes, rejoins or stays
-    /// fenced (see [`Reconnect`]). Resuming restarts its leader contact, so it
-    /// does not at once suspect a leader it could not hear from while fenced.
-    /// Rejoining discards everything it knew of the shard, takes the
-    /// authority's epoch and returns it to `Bootstrapping`, for its driver to
-    /// join it again.
-    fn reconnect(&mut self, authority_epoch: Option<RecoveryEpoch>) {
-        let now = self.clock.now();
-        if !self
-            .authority
-            .as_ref()
-            .is_some_and(|lease| lease.is_registered(now))
-        {
-            return;
-        }
-        match Reconnect::decide(self.standing.epoch(), authority_epoch) {
-            Reconnect::Resume => {
-                self.lease.resumed();
-                self.last_leader_contact = now;
-                self.transition_to(WorkerState::Active);
-            }
-            Reconnect::Rejoin(epoch) => self.rejoin_at(epoch),
-            Reconnect::StayFenced => {}
-        }
     }
 
     /// Forgets the election state this node held under its recovery epoch,
@@ -2290,37 +2189,8 @@ where
     fn forget_election_state(&mut self) {
         self.newest_accepted_ack = None;
         self.round.forget();
-        self.recovery = None;
+        self.drop_recovery();
         self.office = None;
-    }
-
-    /// Takes the authority path once this node's roll call for `term` under
-    /// `configuration` has fallen short of its returning quorum, with these
-    /// `respondents` (see the `forced_recovery` module): asks for the
-    /// shard's live registrations. The node is already `NoQuorum`.
-    fn begin_forced_recovery(
-        &mut self,
-        term: u64,
-        configuration: Configuration,
-        respondents: BTreeMap<WorkerId, Admission>,
-    ) {
-        self.recovery = Some(ForcedRecovery::start(term, configuration, respondents));
-        self.await_authority(AuthorityRequest::ReadLiveRegistrations);
-    }
-
-    /// Carries a recovery on as `next` says.
-    fn follow_recovery(&mut self, next: Next) {
-        match next {
-            Next::ReadEpoch => self.await_authority(AuthorityRequest::ReadRecoveryEpoch),
-            Next::Swap { from, to } => self.await_authority(AuthorityRequest::SwapRecoveryEpoch {
-                expected: Some(from),
-                new: to,
-            }),
-            Next::AwaitFence { epoch } => self.stand_through_authority(epoch),
-            Next::Abandon => self.abandon_shard(),
-            Next::Rejoin(epoch) => self.rejoin_at(epoch),
-            Next::GiveUp => self.recovery = None,
-        }
     }
 
     /// Leaves the shard this node held for the one the authority holds at
@@ -2332,213 +2202,20 @@ where
     fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
         self.forget_election_state();
         self.standing.rejoin_at(epoch);
-        self.awaited_reply = None;
+        if let Some(authority) = self.authority.as_mut() {
+            authority.rejoined();
+        }
         self.leader = None;
         self.transition_to(WorkerState::Bootstrapping);
-    }
-
-    fn on_live_registrations(&mut self, result: Result<LiveRegistrations, AuthorityError>) {
-        if self.state != WorkerState::NoQuorum {
-            return;
-        }
-        let Some(recovery) = self.recovery.as_mut() else {
-            return;
-        };
-        let next = match result {
-            // A node the authority does not list as live has no standing
-            // to recover the shard on the authority's count.
-            Ok(live) if live.addresses().contains_key(&self.my_id) => {
-                recovery.on_live_registrations(&live)
-            }
-            _ => Next::GiveUp,
-        };
-        self.follow_recovery(next);
-    }
-
-    fn on_recovery_epoch(&mut self, result: Result<Option<RecoveryEpoch>, AuthorityError>) {
-        if self.state != WorkerState::NoQuorum {
-            return;
-        }
-        let own_epoch = self.standing.epoch();
-        let Some(recovery) = self.recovery.as_mut() else {
-            return;
-        };
-        let next = match result {
-            Ok(epoch) => recovery.on_recovery_epoch(epoch, own_epoch),
-            Err(_) => Next::GiveUp,
-        };
-        self.follow_recovery(next);
-    }
-
-    /// A compare-and-swap of the recovery epoch came back: either this
-    /// node's authority path, or a leader republishing its epoch after the
-    /// authority lost it (README §15.3), which then asks for its fence
-    /// again at once.
-    fn on_recovery_epoch_swapped(
-        &mut self,
-        expected: Option<RecoveryEpoch>,
-        new: RecoveryEpoch,
-        awaited: bool,
-        result: Result<(), AuthorityError>,
-    ) {
-        if self.state == WorkerState::NoQuorum
-            && let Some(recovery) = self.recovery.as_mut()
-        {
-            if !awaited {
-                return;
-            }
-            let next = recovery.on_swapped(expected, new, result.is_ok());
-            self.follow_recovery(next);
-            return;
-        }
-        // The leader's republish (README §15.3): once the epoch is back, by
-        // this swap or another worker's, it asks for its fence at once.
-        // Otherwise it asks when the fence is next due, so an authority that
-        // keeps failing is not asked again within the same instant.
-        let republished = match &result {
-            Ok(()) => true,
-            Err(AuthorityError::EpochConflict { current }) => {
-                current.is_some_and(|current| order(&new, current.into()) == EpochOrder::Mine)
-            }
-            Err(_) => false,
-        };
-        if self.state == WorkerState::Leader
-            && expected.is_none()
-            && self.standing.order(new.into()) == Some(EpochOrder::Mine)
-            && republished
-        {
-            let now = self.clock.now();
-            if let Some(lease) = self.authority.as_mut() {
-                lease.retry_fence_at(now);
-            }
-        }
-    }
-
-    /// The authority path swapped the recovery epoch to `epoch`: this node
-    /// adopts it, and the configuration its recovery founds there, stands
-    /// as `Candidate` for its roll call's term, and asks for the fence, which
-    /// it must hold before it leads (ADR-0001 decision 11.4).
-    fn stand_through_authority(&mut self, epoch: RecoveryEpoch) {
-        let Some(recovery) = self.recovery.take() else {
-            return;
-        };
-        self.newest_accepted_ack = None;
-        self.term = recovery.term();
-        self.standing.recovered_to(
-            epoch,
-            recovery.term(),
-            recovery.founded_roster().as_ref(),
-            &self.my_id,
-        );
-        self.recovery = Some(recovery);
-        self.transition_to(WorkerState::Candidate);
-        let now = self.clock.now();
-        if let Some(lease) = self.authority.as_mut() {
-            lease.need_fence(now);
-        }
     }
 
     /// The authority path found the recovery epoch missing: the shard is
     /// abandoned (ADR-0001 decision 11.5), and this node stops for good,
     /// raising an alert. A restart re-enters the bootstrap cascade.
     fn abandon_shard(&mut self) {
-        self.recovery = None;
         self.stop_reason = Some(StopReason::Abandoned);
         self.transition_to(WorkerState::Stopped);
         self.outputs.push(Output::ShardAbandoned);
-    }
-
-    /// Handles the authority's answer to this node's request for the
-    /// recovery fence at `epoch`, asked at `sent_at`. Only a `Leader`, or a
-    /// `Candidate` waiting out the fence after its authority path, holds or
-    /// seeks one; an answer for another epoch than its own is stale.
-    ///
-    /// - Granted: the fence lets it act until a TTL, less drift, after it
-    ///   asked. A waiting candidate now leads (see [`Self::lead_recovered`]).
-    /// - Held by another worker: it asks again once that fence has run out.
-    /// - The epoch is missing (the authority lost its data): a leader
-    ///   republishes it (README §15.3) and asks again; a waiting candidate
-    ///   gives up, its swap lost with the data.
-    /// - The epoch has moved on: the shard was recovered without it. A
-    ///   leader steps down, and a waiting candidate gives up; either
-    ///   adopts the new epoch from its leader's ack.
-    /// - Unavailable: it asks again at its next renewal.
-    fn on_fence(
-        &mut self,
-        epoch: RecoveryEpoch,
-        sent_at: Instant,
-        result: Result<Duration, AuthorityError>,
-    ) {
-        let seeking = match self.state {
-            WorkerState::Leader => true,
-            WorkerState::Candidate => self
-                .recovery
-                .as_ref()
-                .is_some_and(ForcedRecovery::is_awaiting_fence),
-            _ => false,
-        };
-        if !seeking || self.standing.order(epoch.into()) != Some(EpochOrder::Mine) {
-            return;
-        }
-        let now = self.clock.now();
-        match result {
-            Ok(granted) => {
-                if let Some(lease) = self.authority.as_mut() {
-                    lease.fence_acquired(sent_at, granted);
-                }
-                if self.state == WorkerState::Candidate {
-                    self.lead_recovered();
-                }
-            }
-            Err(AuthorityError::FenceHeld { remaining }) => {
-                if let Some(lease) = self.authority.as_mut() {
-                    lease.retry_fence_at(now + remaining + Duration::from_ticks(1));
-                }
-            }
-            Err(AuthorityError::EpochConflict { current: None })
-                if self.state == WorkerState::Leader =>
-            {
-                self.ask_authority(
-                    AuthorityRequest::SwapRecoveryEpoch {
-                        expected: None,
-                        new: epoch,
-                    },
-                    now,
-                );
-            }
-            // An epoch this node cannot recover from: it rejoins the shard
-            // at it, as a reconnecting fenced node and a `NoQuorum` node's
-            // recovery do, rather than win again and meet it again.
-            Err(AuthorityError::EpochConflict {
-                current: Some(held),
-            }) if cannot_recover_from(self.standing.epoch(), held) => {
-                self.lose_quorum();
-                self.rejoin_at(held);
-            }
-            Err(AuthorityError::EpochConflict { .. }) => {
-                if self.state == WorkerState::Leader {
-                    self.suspect_again();
-                } else {
-                    self.lose_quorum();
-                }
-            }
-            Err(AuthorityError::Unavailable) => {}
-        }
-    }
-
-    /// Leads the configuration this node's authority path founded, now that
-    /// it holds the fence: becomes `Leader` of a roster of its counted
-    /// respondents, each admitted at the founded generation, and acks every
-    /// connected peer, which adopts the new epoch from that ack.
-    fn lead_recovered(&mut self) {
-        let Some(roster) = self
-            .recovery
-            .take()
-            .and_then(|recovery| recovery.founded_roster())
-        else {
-            return;
-        };
-        self.take_office(roster);
     }
 
     /// Becomes `Leader` of `roster` in this node's current term: holds its
@@ -2565,10 +2242,8 @@ where
         self.office = Some(LeaderOffice::take(roster, self.term, &duties));
 
         self.lease.won(now);
-        if let Some(lease) = self.authority.as_mut()
-            && lease.fence_valid_until().is_none()
-        {
-            lease.need_fence(now);
+        if let Some(authority) = self.authority.as_mut() {
+            authority.took_office(now);
         }
         // The leader it followed before is replaced. Should this node lose
         // its quorum and go back to electing, it must not heartbeat that
@@ -2592,7 +2267,7 @@ where
             self.timings
                 .suspect_timeout
                 .as_ticks()
-                .saturating_add(self.reconnect_timeout.as_ticks()),
+                .saturating_add(self.timings.reconnect_timeout.as_ticks()),
         )
     }
 

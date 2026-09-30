@@ -101,13 +101,8 @@ impl Lease {
 
     /// The node fenced itself at `now`: it must abort within a reconnect
     /// timeout, less drift.
-    pub(crate) fn orphaned(
-        &mut self,
-        now: Instant,
-        timings: &ElectionTimings,
-        reconnect_timeout: Duration,
-    ) {
-        self.orphan_abort_by = Some(now + timings.less_drift(reconnect_timeout));
+    pub(crate) fn orphaned(&mut self, now: Instant, timings: &ElectionTimings) {
+        self.orphan_abort_by = Some(now + timings.less_drift(timings.reconnect_timeout));
     }
 
     /// The node resumed from its fence: it is no longer orphaned.

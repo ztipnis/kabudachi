@@ -28,7 +28,7 @@ use crate::support::node::{
 };
 use crate::support::scenarios::bootstrap_5_and_elect_leader;
 use kabudachi_core::election::{
-    DEFAULT_RECONNECT_TIMEOUT, ElectionTimings, Entry, Identity, Input, Output, Step, WorkerNode,
+    ElectionTimings, Entry, Identity, Input, Output, Step, WorkerNode,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
@@ -949,6 +949,42 @@ fn a_respondent_that_was_no_voter_of_the_roll_call_counts_toward_the_lease_on_th
 }
 
 #[test]
+fn a_reconnect_timeout_in_the_timings_times_lost_workers() {
+    const RECONNECT_TICKS: u64 = 7;
+    let clock = FakeClock::new();
+    let timings = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS))
+        .with_reconnect_timeout(Duration::from_ticks(RECONNECT_TICKS));
+    let mut won = leader_with_timings(&clock, 3, timings);
+    let (heard, silent) = (won.others[0].clone(), won.others[1].clone());
+    let lost_at = ticks_after(won.won_at, SUSPECT_TIMEOUT_TICKS + RECONNECT_TICKS);
+    let heartbeat_ticks = timings.heartbeat_interval.as_ticks();
+
+    // One follower confirms every ack, so the lease holds; the other is
+    // silent from the win on.
+    let mut last_ack = won.won_at;
+    let mut lost = Vec::new();
+    while clock.now() < lost_at {
+        clock.advance(Duration::from_ticks(1));
+        let outputs = if (clock.now() - won.won_at).as_ticks() % heartbeat_ticks == 0 {
+            let step = confirm(&mut won.node, &heard, last_ack);
+            last_ack = clock.now();
+            step.outputs
+        } else {
+            tick(&mut won.node)
+        };
+        if outputs.contains(&Output::WorkerLost(silent.clone())) {
+            lost.push(clock.now());
+        }
+    }
+
+    assert_eq!(
+        lost,
+        vec![lost_at],
+        "lost a suspicion timeout and the configured reconnect timeout after it was last heard"
+    );
+}
+
+#[test]
 fn a_follower_silent_past_suspicion_and_reconnect_timeouts_is_lost_and_its_runs_replayed() {
     // Seconds rather than ticks, so the reconnect timeout's 30 s is a few
     // dozen heartbeats rather than thousands.
@@ -993,7 +1029,7 @@ fn a_follower_silent_past_suspicion_and_reconnect_timeouts_is_lost_and_its_runs_
         .collect();
     cluster.record_steps();
     cluster.partition(rest, [cut_off.clone()].into_iter().collect());
-    let lost_after = suspect_timeout.as_ticks() + DEFAULT_RECONNECT_TIMEOUT.as_ticks();
+    let lost_after = suspect_timeout.as_ticks() + ElectionTimings::DEFAULT_RECONNECT_TIMEOUT.as_ticks();
     let run_state = |cluster: &mut Cluster, run| {
         cluster
             .scheduler_mut(&leader)
@@ -1088,7 +1124,7 @@ fn a_follower_cut_off_as_a_new_leader_takes_over_aborts_before_that_leader_repla
         [old_leader.clone(), cut_off.clone()].into_iter().collect(),
         rest.into_iter().filter(|id| *id != cut_off).collect(),
     );
-    let lost_after = suspect_timeout.as_ticks() + DEFAULT_RECONNECT_TIMEOUT.as_ticks();
+    let lost_after = suspect_timeout.as_ticks() + ElectionTimings::DEFAULT_RECONNECT_TIMEOUT.as_ticks();
     cluster.advance(Duration::from_ticks(lost_after + 1_000));
 
     let steps = cluster.take_steps();

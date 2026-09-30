@@ -149,7 +149,7 @@ impl ForcedRecovery {
     /// cannot recover into: a recovery from it would swap an epoch number
     /// this shard may already have used. The node rejoins the shard at it
     /// instead, as a fenced node that reconnects to another epoch does
-    /// (see `authority_lease::Reconnect`), rather than stay `NoQuorum`
+    /// (see `authority_standing::authority_lease::Reconnect`), rather than stay `NoQuorum`
     /// beside it for good. A node that never learned its lineage cannot tell
     /// its own epoch from another, and rejoins too. An epoch at `u64::MAX`
     /// cannot be swapped.

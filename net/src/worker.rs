@@ -61,7 +61,9 @@ pub struct WorkerConfig {
     pub seeds: Vec<Multiaddr>,
     /// The shard's coordination authority; `None` for none.
     pub authority: Option<AuthorityConfig>,
-    /// The node's election timers.
+    /// The node's election timers. The shard's reconnect timeout travels with
+    /// them (see `ElectionTimings::reconnect_timeout`): every worker of a shard
+    /// must use the same one.
     pub election_timings: ElectionTimings,
     /// How long bootstrap waits on each seed or registered peer it asks.
     pub join_peer_timeout: StdDuration,
