@@ -44,6 +44,7 @@ use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, Scheduler};
 use kabudachi_core::time::{Clock, Duration, Instant, RealClock};
+use kabudachi_net::authority::AuthorityClient;
 use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
@@ -311,8 +312,12 @@ async fn with_elected_cluster(scenario: impl AsyncFnOnce(&Cluster, usize)) {
             observations.send_modify(|observed| observed.record(node_index, record, node));
         }
     };
-    let authority_of = |node_index: usize| -> Option<SharedAuthority> {
-        Some(Arc::new(cluster.handles[node_index].clone()))
+    let authority_of = |node_index: usize| -> Option<AuthorityClient> {
+        Some(AuthorityClient::new(
+            &cluster.nets[node_index],
+            ShardId::new(SHARD),
+            Arc::new(cluster.handles[node_index].clone()) as SharedAuthority,
+        ))
     };
     let [node_0, node_1, node_2] = &mut nodes;
     let [scheduler_0, scheduler_1, scheduler_2] = &mut schedulers;

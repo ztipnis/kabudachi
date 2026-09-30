@@ -604,6 +604,12 @@ impl Net {
         self.local_addr.borrow().clone()
     }
 
+    /// A receiver that follows [`Self::local_multiaddr`], for a task that
+    /// must read it without holding this `Net`.
+    pub(crate) fn own_address_watch(&self) -> watch::Receiver<Option<Multiaddr>> {
+        self.local_addr.clone()
+    }
+
     /// One read of what this `Net`'s transport knows (see [`Diagnostics`]),
     /// for tests and logs. Empty if the swarm task has stopped.
     pub async fn diagnostics(&self) -> Diagnostics {
@@ -1254,14 +1260,7 @@ mod tests {
 
     use super::*;
     use crate::swarm::build_swarm;
-
-    /// The `WorkerId` of a fresh keypair no `Net` was ever built from.
-    fn worker_that_never_runs() -> WorkerId {
-        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
-        WorkerId::new(peer.to_string())
-    }
-
-    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    use crate::test_support::{TEST_TIMEOUT, worker_that_never_runs};
 
     fn queued_inputs(inbound: &Inbound) -> Vec<Input> {
         drain(&inbound.inputs)

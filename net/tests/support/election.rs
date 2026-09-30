@@ -8,6 +8,7 @@ use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Clock, Instant, RealClock};
+use kabudachi_net::authority::AuthorityClient;
 use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
 use kabudachi_testkit::StepRecord;
@@ -116,6 +117,12 @@ where
     let [scheduler_a, scheduler_b, scheduler_c] = schedulers;
     let [observe_a, observe_b, observe_c] = observers;
     let [authority_a, authority_b, authority_c] = authorities;
+    let client = |net: &Net, node: &WorkerNode<RealClock>, authority: Option<SharedAuthority>| {
+        authority.map(|authority| AuthorityClient::new(net, node.shard_id().clone(), authority))
+    };
+    let authority_a = client(nets[0], node_a, authority_a);
+    let authority_b = client(nets[1], node_b, authority_b);
+    let authority_c = client(nets[2], node_c, authority_c);
     tokio::select! {
         _ = run_driver(node_a, due_now(&clock), nets[0], scheduler_a, clock, authority_a, DriverConfig::default(), observe_a) => {
             unreachable!("run_driver never returns")

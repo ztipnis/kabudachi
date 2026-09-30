@@ -4,6 +4,7 @@
 //! carries its messages over the swarm built here). `bindings` also depends
 //! on `tokio`, to bridge the native runtime to Python, but not on `libp2p`.
 
+pub mod authority;
 pub mod bootstrap;
 pub mod claim;
 pub mod codec;
@@ -12,8 +13,12 @@ mod exchange;
 mod framing;
 pub mod join;
 pub mod join_codec;
+mod leader_search;
 pub mod messenger;
 mod peers;
 mod routing_refresh;
 pub mod swarm;
+#[cfg(test)]
+mod test_support;
+mod wait_log;
 pub mod worker;

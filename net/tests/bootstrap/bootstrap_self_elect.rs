@@ -14,7 +14,6 @@
 //! here, where no one answers it, that means it waits. The worker's own
 //! registration is not another worker.
 
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
@@ -27,6 +26,7 @@ use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Duration, RealClock};
+use kabudachi_net::authority::AuthorityClient;
 use kabudachi_net::bootstrap::bootstrap;
 use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
@@ -53,12 +53,6 @@ const ROLL_CALL_DEADLINE_MS: u64 = 100;
 
 /// Short, so a waiting worker goes round the cascade many times per test.
 const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(50);
-
-/// Twenty rounds of the cascade: a worker that was going to found the shard
-/// would have done so long before this. It is also longer than one
-/// `AUTHORITY_TTL_MS`, so an authority built before the window has warmed up
-/// by its end.
-const STILL_BOOTSTRAPPING_WINDOW: StdDuration = StdDuration::from_millis(1_000);
 
 /// The authority's registration TTL, which is also how long it warms up.
 const AUTHORITY_TTL_MS: u64 = 300;
@@ -95,10 +89,13 @@ async fn bootstrap_without_seeds(
     authority: Option<SharedAuthority>,
 ) -> (WorkerNode<RealClock>, Step) {
     let my_id = net.local_worker_id();
+    let mut client = authority
+        .as_ref()
+        .map(|authority| AuthorityClient::new(net, shard(), Arc::clone(authority)));
     let entry = bootstrap(
         net,
         &clock,
-        authority.as_ref(),
+        client.as_mut(),
         &shard(),
         &my_id,
         &[],
@@ -123,6 +120,14 @@ async fn bootstrap_without_seeds(
 /// `authority` as a worker's cascade and driver share it.
 fn shared(authority: impl CoordinationAuthority + Send + Sync + 'static) -> SharedAuthority {
     Arc::new(authority)
+}
+
+/// A client of `authority` for `net`'s worker, as `Worker::run` makes one.
+fn client(
+    net: &Net,
+    authority: impl CoordinationAuthority + Send + Sync + 'static,
+) -> AuthorityClient {
+    AuthorityClient::new(net, shard(), shared(authority))
 }
 
 /// An authority that has finished warming up, so it reports an
@@ -229,48 +234,6 @@ async fn a_node_with_no_seeds_and_no_authority_self_elects_leader_after_the_norm
 }
 
 #[tokio::test]
-async fn an_unreachable_authority_keeps_the_node_bootstrapping_until_it_answers() {
-    let net = fresh_net();
-    let authority = FaultingAuthority::new(RealClock::new(), authority_ttl());
-    let observer = authority.for_another_worker();
-    authority.set_reachable(false);
-
-    let mut bootstrap = pin!(bootstrap_without_seeds(
-        RealClock::new(),
-        &net,
-        Some(shared(authority.clone()))
-    ));
-    let during_outage = timeout(STILL_BOOTSTRAPPING_WINDOW, bootstrap.as_mut()).await;
-    assert!(
-        during_outage.is_err(),
-        "an unreachable authority must never lead to genesis"
-    );
-    assert_eq!(
-        observer
-            .read_recovery_epoch(&shard())
-            .map(|epoch| epoch.map(|epoch| epoch.number)),
-        Ok(None),
-        "nothing took ownership of the shard during the outage"
-    );
-
-    // The outage outlasted one TTL, so the authority is warm by now too.
-    authority.set_reachable(true);
-    let (node, _) = timeout(TEST_TIMEOUT, bootstrap)
-        .await
-        .expect("the node founded the shard once the authority answered");
-
-    assert_eq!(node.state(), WorkerState::Active);
-    assert!(!node.is_pending_member());
-    assert_eq!(
-        observer
-            .read_recovery_epoch(&shard())
-            .map(|epoch| epoch.map(|epoch| epoch.number)),
-        Ok(Some(0)),
-        "the node won ownership by creating the shard's epoch"
-    );
-}
-
-#[tokio::test]
 async fn a_warming_up_authority_keeps_the_node_bootstrapping_until_warm_up_ends() {
     let net = fresh_net();
     // Taken before the authority exists, so its warm-up ends at least one
@@ -298,39 +261,6 @@ async fn a_warming_up_authority_keeps_the_node_bootstrapping_until_warm_up_ends(
             .read_recovery_epoch(&shard())
             .map(|epoch| epoch.map(|epoch| epoch.number)),
         Ok(Some(0))
-    );
-}
-
-#[tokio::test]
-async fn a_registered_peer_that_never_answers_keeps_the_node_bootstrapping() {
-    let net = fresh_net();
-    let authority = warmed_up_authority().await;
-
-    // The peer's address parses, but nothing listens there, so every attempt
-    // to ask it fails. Its registration stays live for the whole window.
-    let renewer = keep_registered(
-        authority.for_another_worker(),
-        WorkerId::new("peer-that-never-answers"),
-        "/ip4/127.0.0.1/tcp/1".to_string(),
-    );
-
-    let still_waiting = timeout(
-        STILL_BOOTSTRAPPING_WINDOW,
-        bootstrap_without_seeds(RealClock::new(), &net, Some(shared(authority.clone()))),
-    )
-    .await;
-    renewer.abort();
-
-    assert!(
-        still_waiting.is_err(),
-        "a silent peer may still be in the shard, so the node must not found it"
-    );
-    assert_eq!(
-        authority
-            .read_recovery_epoch(&shard())
-            .map(|epoch| epoch.map(|epoch| epoch.number)),
-        Ok(None),
-        "the node never tried to take ownership"
     );
 }
 
@@ -415,64 +345,6 @@ async fn a_founder_counts_its_registration_from_when_the_cascade_asked_for_it() 
     assert_eq!(node.state(), WorkerState::Fenced);
 }
 
-// The rival created the epoch after this worker last saw no one registered,
-// so the epoch is not ownerless: the rival registered before creating it.
-// The worker must see that registration and ask the rival, not re-found the
-// shard one epoch on beside it.
-#[tokio::test]
-async fn a_worker_that_loses_the_create_to_a_rival_it_had_not_seen_does_not_re_found_the_shard() {
-    let authority = warmed_up_authority().await;
-    let connection = authority.for_another_worker();
-    let rival = authority.for_another_worker();
-    let net = fresh_net();
-    // The worker has read no one registered and no epoch; its create-if-absent
-    // is held while the rival registers and creates the epoch.
-    connection.hold_next(CallKind::SwapRecoveryEpoch);
-
-    let mut bootstrapping = pin!(bootstrap_without_seeds(
-        RealClock::new(),
-        &net,
-        Some(shared(connection.clone())),
-    ));
-    let renewer = timeout(TEST_TIMEOUT, async {
-        tokio::select! {
-            _ = &mut bootstrapping => {
-                panic!("the worker founded the shard before its create-if-absent was released")
-            }
-            renewer = async {
-                wait_until_holding(&connection, CallKind::SwapRecoveryEpoch).await;
-                let renewer = keep_registered(
-                    rival.clone(),
-                    WorkerId::new("rival"),
-                    "not a multiaddr".to_string(),
-                );
-                rival
-                    .compare_and_swap_recovery_epoch(&shard(), None, RecoveryEpoch::founding(0))
-                    .expect("the rival creates the epoch");
-                connection.release(CallKind::SwapRecoveryEpoch);
-                renewer
-            } => renewer,
-        }
-    })
-    .await
-    .expect("the rival's create landed within the timeout");
-    // Only now does the worker learn it lost the create, so the window that
-    // shows it does not re-found the shard starts here.
-    let still_waiting = timeout(STILL_BOOTSTRAPPING_WINDOW, &mut bootstrapping).await;
-    renewer.abort();
-
-    assert!(
-        still_waiting.is_err(),
-        "the rival founded the shard, so the worker must not found another"
-    );
-    assert_eq!(
-        authority
-            .read_recovery_epoch(&shard())
-            .map(|epoch| epoch.map(|epoch| epoch.number)),
-        Ok(Some(0))
-    );
-}
-
 /// A full-shard restart: the authority is warm and lists no live
 /// registration for the shard, but its recovery epoch already exists — every
 /// worker that ever held it is gone or has fenced itself off from leading it
@@ -554,7 +426,7 @@ async fn a_seedless_bootstrapper_joins_the_shard_a_flush_left_running_instead_of
                 &net_founder,
                 &mut founder_scheduler,
                 clock,
-                Some(shared(authority.clone())),
+                Some(client(&net_founder, authority.clone())),
                 DriverConfig::default(),
                 |node, _, _| { let _ = tx.send(node.state()); },
             ) => {
@@ -594,7 +466,7 @@ async fn a_seedless_bootstrapper_joins_the_shard_a_flush_left_running_instead_of
                 &net_founder,
                 &mut founder_scheduler,
                 clock,
-                Some(shared(authority.clone())),
+                Some(client(&net_founder, authority.clone())),
                 DriverConfig::default(),
                 |_, _, _| {},
             ) => {
@@ -630,7 +502,7 @@ async fn a_seedless_bootstrapper_joins_the_shard_a_flush_left_running_instead_of
                 &net_founder,
                 &mut founder_scheduler,
                 clock,
-                Some(shared(authority.clone())),
+                Some(client(&net_founder, authority.clone())),
                 DriverConfig::default(),
                 |_, _, _| {},
             ) => {

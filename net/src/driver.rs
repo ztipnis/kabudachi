@@ -24,7 +24,8 @@
 //!
 //! With a coordination authority configured, it is also the sole caller of
 //! [`kabudachi_core::election::AuthorityCall::perform`]. Each step's
-//! `Output::Authority(call)` is performed on Tokio's blocking pool
+//! `Output::Authority(call)` is performed by the worker's
+//! [`AuthorityClient`], on Tokio's blocking pool
 //! (`tokio::task::spawn_blocking`), since an authority is typically a remote
 //! service whose calls block, and the reply is fed back to the node as
 //! `Input::Authority` in whichever batch it arrives: a slow authority delays
@@ -33,36 +34,40 @@
 //! reply came, so a late reply costs it nothing it counts on, and it
 //! ignores a read or swap reply that answers anything but the call it now
 //! waits on, so replies arriving out of order are safe. At most one call of
-//! each kind is in flight (see `PoolPerformer`). With no
+//! each kind is in flight, whoever asked (see [`AuthorityClient`]). With no
 //! authority (`None`), every call gets
 //! [`kabudachi_core::election::AuthorityCall::unavailable`] at once instead,
 //! so a node built with no authority timings never waits on one that does
 //! not exist.
+//!
+//! The same client serves a node that fenced itself and found its shard
+//! recovered without it, and so went back to `Bootstrapping`: it rejoins
+//! through [`crate::leader_search::Rejoin`], which reads the authority's
+//! listing through the client and asks the listed workers who leads. The
+//! driver is the client's one reader, and hands each reply to whom asked for
+//! it: a reply under the node's own token steps the node, and one under
+//! net's own goes to the rejoin.
 
-use std::collections::BTreeSet;
 use std::convert::Infallible;
-use std::future::Future;
-use std::panic::AssertUnwindSafe;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
-use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, CallKind, Input, MessageSink, Output, Step,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, Input, Issuer, MessageSink, Output, Step,
     WorkerNode, carry_out,
 };
-use kabudachi_core::protocol::ids::{IdGenerator, ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{IdGenerator, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, JoinResponse};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Clock, Instant};
 
-use tokio::sync::mpsc;
+use tokio::time::Instant as TokioInstant;
 
-use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, WaitLog};
+use crate::authority::AuthorityClient;
+use crate::bootstrap::DEFAULT_RETRY_INTERVAL;
 use crate::claim;
-use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, find_leader, pointer_for};
+use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, pointer_for};
+use crate::leader_search::{JoinOverNet, Rejoin};
 use crate::messenger::Net;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
 use crate::routing_refresh::{RoutingRefresh, ShardView};
@@ -76,9 +81,7 @@ pub struct DriverConfig {
     pub routing_refresh_period: Option<Duration>,
 }
 
-/// A coordination authority shared by every task that calls it: the
-/// driver's, and the blocking-pool tasks that perform its calls.
-pub type SharedAuthority = Arc<dyn CoordinationAuthority + Send + Sync>;
+pub use crate::authority::SharedAuthority;
 
 /// Drives `node` over `net` for ever, in batches, after subscribing `net` to
 /// `node`'s shard (see `Net::subscribe_to_shard`). The first batch first
@@ -140,21 +143,23 @@ pub type SharedAuthority = Arc<dyn CoordinationAuthority + Send + Sync>;
 ///
 /// `config` says how the driver itself runs (see [`DriverConfig`]).
 ///
-/// `authority` is the coordination authority to perform `node`'s
-/// `Output::Authority` calls against (see the module doc); `None` for a node
-/// built with no authority timings, which never asks for one. It must be the
-/// authority whose TTL `node`'s authority timings name: a worker's entry
-/// point pairs the two (see `crate::worker`). It is also whom a node that
-/// fenced itself and found its shard recovered without it, and so went back
-/// to `Bootstrapping`, asks for the workers to rejoin through (see
-/// [`find_leader_to_rejoin`]); the driver keeps running meanwhile.
+/// `authority` is the client of the coordination authority to perform
+/// `node`'s `Output::Authority` calls against (see the module doc); `None`
+/// for a node built with no authority timings, which never asks for one. It
+/// must be a client of the authority whose TTL `node`'s authority timings
+/// name: a worker's entry point pairs the two (see `crate::worker`), and
+/// passes the client the bootstrap cascade used, so the one-call-per-kind cap
+/// holds across the handover. It is also what a node that fenced itself and
+/// found its shard recovered without it, and so went back to `Bootstrapping`,
+/// reads to learn whom to rejoin through (see
+/// [`crate::leader_search::Rejoin`]); the driver keeps running meanwhile.
 pub async fn run_driver<C, I>(
     node: &mut WorkerNode<C>,
     first: Step,
     net: &Net,
     scheduler: &mut Scheduler<C, I>,
     clock: C,
-    authority: Option<SharedAuthority>,
+    mut authority: Option<AuthorityClient>,
     config: DriverConfig,
     mut observe: impl FnMut(&WorkerNode<C>, Option<&Input>, &Step),
 ) -> Infallible
@@ -166,18 +171,12 @@ where
     net.subscribe_to_shard(node.shard_id());
     let mut first = Some(first);
     let mut next_deadline = None;
-    let (replies, mut replied) = mpsc::unbounded_channel();
     // The reply whose arrival ended the last sleep, if one did.
     let mut woken_by = None;
-    let mut in_flight = BTreeSet::new();
-    // While the node is back in `Bootstrapping`: the search for a leader to
-    // rejoin (see [`find_leader_to_rejoin`]), how many have run, the log of
-    // why none has found one yet, and the pointer the last one found.
-    let mut rejoin_search: Option<Pin<Box<dyn Future<Output = Rejoin> + Send + '_>>> = None;
-    let mut rejoin_log = Some(WaitLog::new(node.shard_id()));
-    let mut rejoin_attempts = 0_usize;
+    // While the node is back in `Bootstrapping`: its search for a leader to
+    // rejoin, and the pointer the last round found.
+    let mut rejoin: Option<Rejoin<'_, JoinOverNet<'_>>> = None;
     let mut rejoin_pointer = None;
-    let mut rejoin_pointer_refused = false;
     let mut routing = RoutingRefresh::new(
         node.timings().suspect_timeout,
         config.routing_refresh_period,
@@ -185,33 +184,42 @@ where
     );
 
     loop {
+        // Every reply that has arrived, read before the stepper borrows the
+        // client to perform the node's calls.
+        let mut arrived_replies: Vec<AuthorityReply> = woken_by.take().into_iter().collect();
+        if let Some(client) = authority.as_mut() {
+            arrived_replies.extend(std::iter::from_fn(|| client.try_reply()));
+        }
         let mut stepper = Stepper {
             node: &mut *node,
             scheduler: &mut *scheduler,
             net,
-            authority: authority.as_ref(),
-            replies: &replies,
-            in_flight: &mut in_flight,
-            my_id: &my_id,
+            calls: authority.as_mut(),
             observe: &mut observe,
         };
         if let Some(first) = first.take() {
             next_deadline = stepper.carry(first, None);
         }
-        let arrived_replies =
-            std::iter::from_fn(|| woken_by.take().or_else(|| replied.try_recv().ok()));
         for reply in arrived_replies {
-            stepper.in_flight.remove(&reply.token().kind);
-            next_deadline = stepper.step(Input::Authority(reply));
+            match reply.token().issuer {
+                Issuer::Node => next_deadline = stepper.step(Input::Authority(reply)),
+                // One net asked for itself: the rejoin's read, if this is it.
+                Issuer::Cascade => match rejoin.as_mut() {
+                    Some(rejoin) => rejoin.offer(reply, TokioInstant::now()),
+                    None => tracing::debug!(
+                        "dropping a reply to a call net asked for itself: no rejoin is running"
+                    ),
+                },
+            }
         }
         for input in net.take_inputs() {
             next_deadline = stepper.step(input);
         }
         if let Some(pointer) = rejoin_pointer.take() {
+            // A pointer the node would not take (to its old epoch's leader,
+            // or another lineage's) leaves it in `Bootstrapping`, and the
+            // rejoin, which has already paced its next round, goes on.
             next_deadline = stepper.rejoin(pointer);
-            // A pointer it would not take (to its old epoch's leader, or
-            // another lineage's) is not asked for again at once.
-            rejoin_pointer_refused = stepper.node.state() == WorkerState::Bootstrapping;
         }
         respond_to_join_requests(stepper.node, net).await;
         respond_to_claim_requests(stepper.scheduler, net);
@@ -234,24 +242,26 @@ where
         // to `Bootstrapping` to join again (ADR-0001 decision 12). Only a
         // node with an authority fences itself, and that authority lists
         // whom to ask.
-        if node.state() == WorkerState::Bootstrapping
-            && rejoin_search.is_none()
-            && let Some(authority) = &authority
-        {
-            let log = rejoin_log
-                .take()
-                .unwrap_or_else(|| WaitLog::new(node.shard_id()));
-            rejoin_search = Some(Box::pin(find_leader_to_rejoin(
-                net,
-                Arc::clone(authority),
-                node.shard_id().clone(),
-                my_id.clone(),
-                rejoin_attempts,
-                std::mem::take(&mut rejoin_pointer_refused),
-                log,
-            )));
-            rejoin_attempts += 1;
+        match authority.as_mut() {
+            Some(client) if node.state() == WorkerState::Bootstrapping => {
+                rejoin
+                    .get_or_insert_with(|| {
+                        Rejoin::new(
+                            node.shard_id(),
+                            my_id.clone(),
+                            JoinOverNet {
+                                net,
+                                per_peer_timeout: DEFAULT_JOIN_PEER_TIMEOUT,
+                            },
+                            DEFAULT_RETRY_INTERVAL,
+                            TokioInstant::now(),
+                        )
+                    })
+                    .tick(client, clock.now(), TokioInstant::now());
+            }
+            _ => rejoin = None,
         }
+        let rejoin_wake = rejoin.as_ref().and_then(Rejoin::wake_at);
 
         // A due routing crawl is made between batches, with no batch of its
         // own: the node is stepped only when something arrives or its
@@ -266,20 +276,14 @@ where
                     }
                 }
                 () = net.wait_for_arrival() => break,
-                found = async {
-                    match rejoin_search.as_mut() {
-                        Some(search) => search.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    rejoin_search = None;
-                    rejoin_pointer = found.pointer;
-                    rejoin_log = Some(found.log);
+                () = wake_at(rejoin_wake) => break,
+                found = ask_done(&mut rejoin) => {
+                    rejoin_pointer = rejoin
+                        .as_mut()
+                        .and_then(|rejoin| rejoin.asked(found, TokioInstant::now()));
                     break;
                 }
-                // `replies` lives as long as this loop, so the channel never
-                // closes.
-                Some(reply) = replied.recv() => {
+                Some(reply) = next_reply(&mut authority) => {
                     woken_by = Some(reply);
                     break;
                 }
@@ -293,14 +297,9 @@ struct Stepper<'a, C: Clock, I: IdGenerator, O> {
     node: &'a mut WorkerNode<C>,
     scheduler: &'a mut Scheduler<C, I>,
     net: &'a Net,
-    /// The authority to perform the node's calls against; `None` answers
-    /// each at once as `Unavailable`.
-    authority: Option<&'a SharedAuthority>,
-    /// Where a call performed on the blocking pool sends its reply.
-    replies: &'a mpsc::UnboundedSender<AuthorityReply>,
-    /// The kinds of call performed and not yet answered.
-    in_flight: &'a mut BTreeSet<CallKind>,
-    my_id: &'a WorkerId,
+    /// The client to perform the node's calls with; `None` answers each at
+    /// once as `Unavailable`.
+    calls: Option<&'a mut AuthorityClient>,
     /// [`run_driver`]'s `observe`.
     observe: &'a mut O,
 }
@@ -327,20 +326,13 @@ where
 
     /// Carries out `stepped`, a step the node has just taken on `input`,
     /// through `carry_out`: its messages go out through the `Net` and its
-    /// authority calls to a [`PoolPerformer`]. With no authority, each
+    /// authority calls to the [`AuthorityClient`]. With no authority, each
     /// call's `Unavailable` reply is fed back at once instead, carrying out
     /// that step too, until a step asks for no more. Logs every step's
     /// alerts (see [`log_alerts`]), hands every step to `observe`, and
     /// returns the node's next deadline.
     fn carry(&mut self, stepped: Step, input: Option<&Input>) -> Option<Instant> {
-        let mut performer = PoolPerformer {
-            authority: self.authority,
-            replies: self.replies,
-            in_flight: &mut *self.in_flight,
-            net: self.net,
-            my_id: self.my_id,
-            shard_id: self.node.shard_id().clone(),
-        };
+        let mut performer = Calls(self.calls.as_deref_mut());
         let observe = &mut *self.observe;
         carry_out(
             &mut *self.node,
@@ -357,6 +349,19 @@ where
     }
 }
 
+/// Performs the node's authority calls through its client, or, with none,
+/// answers each at once as `Unavailable`.
+struct Calls<'a>(Option<&'a mut AuthorityClient>);
+
+impl AuthorityPerformer for Calls<'_> {
+    fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
+        match self.0.as_deref_mut() {
+            Some(client) => client.perform(call),
+            None => Some(call.unavailable()),
+        }
+    }
+}
+
 impl MessageSink for &Net {
     fn send(&mut self, to: WorkerId, message: ElectionMessage) {
         Net::send(self, to, message);
@@ -364,74 +369,6 @@ impl MessageSink for &Net {
 
     fn publish(&mut self, message: ElectionMessage) {
         Net::publish(self, message);
-    }
-}
-
-/// Performs authority calls for [`run_driver`]'s node, and for the
-/// bootstrap cascade before it (see `crate::bootstrap`): on Tokio's blocking
-/// pool, each reply sent to `replies`, whose reader removes the reply's kind
-/// from `in_flight` (`reply.token().kind`) as it takes it. The driver
-/// hands a reply to the node in the batch it arrives in. With no authority,
-/// it answers every call at once as `Unavailable` instead. A call that
-/// panics is answered as `Unavailable` too, so its kind is not left in
-/// flight for ever.
-///
-/// At most one call of each kind is in flight: while one is unanswered, a
-/// later call of the same kind is dropped, as if the authority had not
-/// answered it. So an authority that hangs holds at most one blocking thread
-/// per kind, rather than one more at every renewal. The node asks again on
-/// its own schedule: its renewals come round, a fenced node reads the epoch
-/// again at its next registration, and a forced recovery whose step was
-/// dropped is replaced at its next roll call.
-pub(crate) struct PoolPerformer<'a> {
-    pub(crate) authority: Option<&'a SharedAuthority>,
-    /// Where a call performed on the blocking pool sends its reply.
-    pub(crate) replies: &'a mpsc::UnboundedSender<AuthorityReply>,
-    /// The kinds of call performed and not yet answered.
-    pub(crate) in_flight: &'a mut BTreeSet<CallKind>,
-    /// Whose address a registration names.
-    pub(crate) net: &'a Net,
-    pub(crate) my_id: &'a WorkerId,
-    pub(crate) shard_id: ShardId,
-}
-
-impl AuthorityPerformer for PoolPerformer<'_> {
-    fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
-        let Some(authority) = self.authority else {
-            return Some(call.unavailable());
-        };
-        if !self.in_flight.insert(call.token.kind) {
-            tracing::debug!(
-                request = ?call.request,
-                "not asking the coordination authority again while the same kind of call is \
-                 unanswered"
-            );
-            return None;
-        }
-        let authority = Arc::clone(authority);
-        let shard_id = self.shard_id.clone();
-        let my_id = self.my_id.clone();
-        let address = self
-            .net
-            .local_multiaddr()
-            .map(|address| address.to_string())
-            .unwrap_or_default();
-        let replies = self.replies.clone();
-        tokio::task::spawn_blocking(move || {
-            let performed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                call.perform(&*authority, &shard_id, &my_id, &address)
-            }));
-            let reply = performed.unwrap_or_else(|_| {
-                tracing::error!(
-                    request = ?call.request,
-                    "a coordination authority call panicked; answering it as unavailable"
-                );
-                call.unavailable()
-            });
-            // Whoever asked has stopped: no one is left to hand it to.
-            let _ = replies.send(reply);
-        });
-        None
     }
 }
 
@@ -482,58 +419,29 @@ async fn sleep_until<C: Clock>(clock: &C, deadline: Option<Instant>) {
     }
 }
 
-/// What one [`find_leader_to_rejoin`] found: the pointer to rejoin through,
-/// if any, and the log of why no search has found one, handed on to the
-/// next search.
-struct Rejoin {
-    pointer: Option<JoinResponse>,
-    log: WaitLog,
+/// Sleeps until `at`, or for ever when there is none.
+async fn wake_at(at: Option<TokioInstant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
-/// One search for the leader a node back in `Bootstrapping` rejoins, after
-/// a recovery that went on without it: asks the workers `authority` lists as
-/// live, at the addresses they registered, who leads (see
-/// `crate::join::find_leader`, which asks a worker this node is still
-/// connected to over that connection). No pointer, after a retry interval,
-/// when the authority cannot be read, lists no one else, or no one points at
-/// a reachable leader; the driver then searches again. Each search starts
-/// `attempt` workers further along the list, so one worker the recovery also
-/// left behind, whose pointer the node rejects as older than the epoch it
-/// rejoins (see `Input::JoinAnswer`), cannot answer first for ever;
-/// a search after such a refused pointer first waits a retry interval. It
-/// never founds the shard: the epoch the node rejoins shows the shard
-/// exists.
-async fn find_leader_to_rejoin(
-    net: &Net,
-    authority: SharedAuthority,
-    shard_id: ShardId,
-    my_id: WorkerId,
-    attempt: usize,
-    after_a_refused_pointer: bool,
-    mut log: WaitLog,
-) -> Rejoin {
-    if after_a_refused_pointer {
-        tokio::time::sleep(DEFAULT_RETRY_INTERVAL).await;
+/// The round's ask of a running rejoin, once it finishes; for ever when none
+/// runs. Cancel-safe.
+async fn ask_done<'a>(rejoin: &mut Option<Rejoin<'a, JoinOverNet<'a>>>) -> LeaderSearch {
+    match rejoin {
+        Some(rejoin) => rejoin.ask_done().await,
+        None => std::future::pending().await,
     }
-    let search = find_leader(
-        net,
-        &authority,
-        &shard_id,
-        &my_id,
-        attempt,
-        DEFAULT_JOIN_PEER_TIMEOUT,
-        &mut log,
-    )
-    .await;
-    log.end_round();
-    if let LeaderSearch::Found(pointer) = search {
-        return Rejoin {
-            pointer: Some(pointer),
-            log,
-        };
+}
+
+/// The client's next reply; for ever without a client. Cancel-safe.
+async fn next_reply(client: &mut Option<AuthorityClient>) -> Option<AuthorityReply> {
+    match client {
+        Some(client) => client.next_reply(None).await,
+        None => std::future::pending().await,
     }
-    tokio::time::sleep(DEFAULT_RETRY_INTERVAL).await;
-    Rejoin { pointer: None, log }
 }
 
 /// Answers every inbound `/kabudachi/join/1` request queued on `net` with a
@@ -568,6 +476,8 @@ fn respond_to_claim_requests<C: Clock, I: IdGenerator>(scheduler: &mut Scheduler
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use kabudachi_core::configuration::{Configuration, Generation, Single};
     use kabudachi_core::election::{
         AuthorityTimings, ElectionTimings, Entry, Identity, KnownConfiguration,
@@ -585,8 +495,7 @@ mod tests {
 
     use super::*;
     use crate::swarm::build_swarm;
-
-    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    use crate::test_support::{TEST_TIMEOUT, listening_net, spawn_join_responder};
 
     fn ack_from(leader: &WorkerId) -> ElectionMessage {
         ElectionMessage {
@@ -776,7 +685,11 @@ mod tests {
                     &net_node,
                     &mut scheduler,
                     clock,
-                    Some(Arc::new(authority.clone())),
+                    Some(AuthorityClient::new(
+                        &net_node,
+                        ShardId::new("shard-1"),
+                        Arc::new(authority.clone()),
+                    )),
                     DriverConfig::default(),
                     |_, _, _| {},
                 ) => unreachable!("run_driver never returns"),
@@ -899,4 +812,83 @@ mod tests {
         assert_eq!(known_leader, Some((leader, 1)));
     }
 
+    #[tokio::test]
+    async fn a_joiner_heartbeats_its_leader_at_once_rather_than_an_interval_later() {
+        let (leader_net, leader_addr) = listening_net().await;
+        let leader_net = Arc::new(leader_net);
+        let pointer = JoinResponse {
+            leader_id: Some(leader_net.local_worker_id().into()),
+            leader_multiaddr: leader_addr.to_string(),
+            term: 1,
+            recovery_epoch: 0,
+            recovery_epoch_lineage: 0,
+        };
+        let _responder = spawn_join_responder(Arc::clone(&leader_net), pointer);
+        let joining_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let joiner = joining_net.local_worker_id();
+        // A heartbeat that waited for its interval would come long after
+        // this test gives up.
+        let timings =
+            ElectionTimings::new(TickDuration::from_secs(120), TickDuration::from_secs(50));
+
+        let clock = RealClock::new();
+        let joined_and_heard = async {
+            let entry = crate::bootstrap::bootstrap(
+                &joining_net,
+                &clock,
+                None,
+                &ShardId::new("shard-1"),
+                &joiner,
+                std::slice::from_ref(&leader_addr),
+                Duration::from_secs(5),
+                DEFAULT_RETRY_INTERVAL,
+            )
+            .await;
+            let identity = Identity {
+                id: joiner.clone(),
+                incarnation: IncarnationId::new("incarnation-1"),
+                shard: ShardId::new("shard-1"),
+                timings,
+            };
+            let (mut node, first) = WorkerNode::start(identity, entry, clock, None);
+            let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+            let driven = run_driver(
+                &mut node,
+                first,
+                &joining_net,
+                &mut scheduler,
+                clock,
+                None,
+                DriverConfig::default(),
+                |_, _, _| {},
+            );
+            let heard = async {
+                loop {
+                    let heard = leader_net.take_inputs().into_iter().any(|input| {
+                        matches!(
+                            input,
+                            Input::Message { from, message }
+                                if from == joiner
+                                    && matches!(
+                                        message.payload,
+                                        Some(election_message::Payload::Heartbeat(_))
+                                    )
+                        )
+                    });
+                    if heard {
+                        return;
+                    }
+                    leader_net.wait_for_arrival().await;
+                }
+            };
+            tokio::select! {
+                _ = driven => unreachable!("run_driver never returns"),
+                () = heard => {}
+            }
+        };
+
+        timeout(TEST_TIMEOUT, joined_and_heard)
+            .await
+            .expect("the joiner's first heartbeat reached its leader within the timeout");
+    }
 }

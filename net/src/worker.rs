@@ -34,8 +34,9 @@ use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::RealClock;
 use libp2p::{Multiaddr, identity};
 
+use crate::authority::{AuthorityClient, SharedAuthority};
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, bootstrap};
-use crate::driver::{DriverConfig, SharedAuthority, run_driver};
+use crate::driver::{DriverConfig, run_driver};
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::{ListenRejected, Net};
 use crate::swarm::build_swarm;
@@ -174,14 +175,13 @@ impl Worker {
         let Worker { net, config } = self;
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
-        let authority = config
-            .authority
-            .as_ref()
-            .map(|authority| &authority.authority);
+        let mut authority = config.authority.as_ref().map(|authority| {
+            AuthorityClient::new(&net, config.shard_id.clone(), Arc::clone(&authority.authority))
+        });
         let entry = bootstrap(
             &net,
             &clock,
-            authority,
+            authority.as_mut(),
             &config.shard_id,
             &my_id,
             &config.seeds,
@@ -205,7 +205,7 @@ impl Worker {
             &net,
             &mut scheduler,
             clock,
-            config.authority.map(|authority| authority.authority),
+            authority,
             DriverConfig {
                 routing_refresh_period: config.routing_refresh_period,
             },

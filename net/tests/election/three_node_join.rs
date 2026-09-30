@@ -54,7 +54,7 @@ use tokio::time::timeout;
 
 use crate::support::election::{WallClockAhead, built_on_one_tick, due_now};
 use crate::support::net::{
-    ask_until_pointed_at_a_leader, take_inputs_until, wait_until_registered,
+    ask_until_pointed_at_a_leader, listening_net, take_inputs_until, wait_until_registered,
     wait_until_subscribed,
 };
 
@@ -84,51 +84,6 @@ const JOIN_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 /// second; this is a "something is actually broken" ceiling, not the
 /// expected runtime.
 const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
-
-/// Connects `net_a` and `net_b` over a real loopback TCP socket and returns
-/// each side's `WorkerId` plus `net_a`'s resolved listen address — the latter
-/// doubles as `node_c`'s seed address later in this test.
-async fn connected_pair(net_a: &Net, net_b: &Net) -> (WorkerId, WorkerId, libp2p::Multiaddr) {
-    let listen_addr = timeout(
-        TEST_TIMEOUT,
-        net_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-    )
-    .await
-    .expect("net_a produced a listen address within the timeout");
-
-    net_b.dial(listen_addr.clone());
-
-    let worker_a = net_a.local_worker_id();
-    let worker_b = net_b.local_worker_id();
-
-    // Neither net's inputs are taken: the nodes built afterwards are fed
-    // them.
-    wait_until_registered(net_a, &worker_b).await;
-    wait_until_registered(net_b, &worker_a).await;
-
-    // net_b starts listening only *after* its outbound connection to net_a is
-    // up. Nothing orders a real worker's listener against its outbound seed
-    // dial either, so this is a legitimate ordering, not a contrived one.
-    timeout(
-        TEST_TIMEOUT,
-        net_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-    )
-    .await
-    .expect("net_b produced a listen address within the timeout");
-
-    (worker_a, worker_b, listen_addr)
-}
-
-async fn listening_net() -> (Net, libp2p::Multiaddr) {
-    let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-    let listen_addr = timeout(
-        TEST_TIMEOUT,
-        net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-    )
-    .await
-    .expect("the net produced a listen address within the timeout");
-    (net, listen_addr)
-}
 
 /// `my_id`'s node, a voter of a configuration of `voter_count`.
 fn make_active_node<C: Clock>(clock: C, my_id: WorkerId, voter_count: usize) -> WorkerNode<C> {
@@ -210,7 +165,28 @@ async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_
     // Connect first (a node starts its leader-contact timer when built), then
     // construct both WorkerNodes on one tick (`built_on_one_tick`). See this file's "Topology" doc
     // for why node_a's wall clock reads ahead.
-    let (worker_a, worker_b, listen_addr_a) = connected_pair(&net_a, &net_b).await;
+    // `net_a` listens and `net_b` dials it. Neither net's inputs are taken:
+    // the nodes built afterwards are fed them. `listen_addr_a` doubles as
+    // `node_c`'s seed address later in this test.
+    let listen_addr_a = timeout(
+        TEST_TIMEOUT,
+        net_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+    )
+    .await
+    .expect("net_a produced a listen address within the timeout");
+    net_b.dial(listen_addr_a.clone());
+    let (worker_a, worker_b) = (net_a.local_worker_id(), net_b.local_worker_id());
+    wait_until_registered(&net_a, &worker_b).await;
+    wait_until_registered(&net_b, &worker_a).await;
+    // net_b starts listening only *after* its outbound connection to net_a is
+    // up. Nothing orders a real worker's listener against its outbound seed
+    // dial either, so this is a legitimate ordering, not a contrived one.
+    timeout(
+        TEST_TIMEOUT,
+        net_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+    )
+    .await
+    .expect("net_b produced a listen address within the timeout");
 
     // run_driver subscribes its net to the shard, but node_a's driver is
     // held back until node_b's roll call is out (see the gate below), so
@@ -317,7 +293,7 @@ async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_
     // whether the address it was told is one anything can dial.
     // `ask_for_leader` dials the leader it is pointed at, so an actual
     // connection to node_b is the end-to-end check of that, and it matters
-    // precisely here: `connected_pair` has net_b dial net_a, so from net_a's
+    // precisely here: net_b dials net_a, so from net_a's
     // side node_b is a `ConnectedPoint::Listener`, whose remote address is
     // node_b's ephemeral source address rather than anything node_b listens
     // on. Only Identify gives net_a node_b's real listen address to hand

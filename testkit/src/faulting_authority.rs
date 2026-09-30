@@ -1,5 +1,6 @@
 //! A `CoordinationAuthority` for tests that need the authority to fail, for
-//! one worker or for all of them.
+//! one worker or for all of them, and whose calls a test can hold or make
+//! panic.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -45,6 +46,8 @@ struct Slot {
     holding: u32,
     /// Counts releases, so a waiting call can tell its own was released.
     releases: u64,
+    /// The next call of this kind will panic, after any hold.
+    panics: bool,
 }
 
 /// What every handle reaches. `flush` swaps `current` for a fresh authority,
@@ -178,6 +181,13 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
         self.gate.released.notify_all();
     }
 
+    /// Makes this handle's next `kind` call panic, after any hold on it and
+    /// before it reaches the authority. No lock is held while it panics, so
+    /// nothing another handle waits on is poisoned.
+    pub fn panic_next(&self, kind: CallKind) {
+        lock(&self.gate.slots).entry(kind).or_default().panics = true;
+    }
+
     /// True while a call of `kind` is held on this handle, so a test can wait
     /// for this before acting "during" the call.
     pub fn is_holding(&self, kind: CallKind) -> bool {
@@ -186,22 +196,31 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
             .is_some_and(|slot| slot.holding > 0)
     }
 
-    /// Blocks while a hold on `kind` catches this call, before it reaches
-    /// the authority.
+    /// Blocks while a hold on `kind` catches this call, then panics if
+    /// [`Self::panic_next`] asked, all before the call reaches the authority.
     fn pass_gate(&self, kind: CallKind) {
         let mut slots = lock(&self.gate.slots);
         let slot = slots.entry(kind).or_default();
-        if !std::mem::take(&mut slot.armed) {
-            return;
+        if std::mem::take(&mut slot.armed) {
+            slot.holding += 1;
+            let releases = slot.releases;
+            while slots[&kind].releases == releases {
+                slots = self
+                    .gate
+                    .released
+                    .wait(slots)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
         }
-        slot.holding += 1;
-        let releases = slot.releases;
-        while slots[&kind].releases == releases {
-            slots = self
-                .gate
-                .released
-                .wait(slots)
-                .unwrap_or_else(PoisonError::into_inner);
+        let panics = std::mem::take(
+            &mut slots
+                .get_mut(&kind)
+                .expect("the slot was made above")
+                .panics,
+        );
+        drop(slots);
+        if panics {
+            panic!("a {kind:?} call panics, as FaultingAuthority::panic_next asked");
         }
     }
 

@@ -3,9 +3,8 @@
 //! rejoin alike:
 //!
 //! - the client: [`ask_for_leader`] asks peers in order who leads the shard
-//!   and connects to the first leader one points at; [`find_leader`] asks
-//!   the workers the coordination authority lists as live, for a node that
-//!   rejoins its shard;
+//!   and connects to the first leader one points at (the leader search,
+//!   `crate::leader_search`, decides whom to ask and when);
 //! - the responder's answer: [`pointer_for`], the pointer a node hands a
 //!   joiner. A pointer names the shard's leader, which only
 //!   `core::election::WorkerNode` knows, and its address, which only `Net`
@@ -17,21 +16,16 @@
 //! rather than by diffing the connected-peer set, so a late connection from
 //! an abandoned ask is never mistaken for a later one's.
 
-use std::collections::BTreeMap;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::coordination_authority::AuthorityError;
 use kabudachi_core::election::WorkerNode;
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::{JoinRequest, JoinResponse};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::time::Clock;
 use libp2p::{Multiaddr, PeerId};
 
-use crate::bootstrap::{WaitLog, WaitReason};
-use crate::driver::SharedAuthority;
 use crate::exchange::Asked;
 use crate::join_codec::JoinCodec;
 use crate::messenger::{DialTarget, Net};
@@ -133,88 +127,6 @@ pub async fn ask_for_leader(
     } else {
         LeaderSearch::NoAnswer
     }
-}
-
-/// Asks the workers `authority` lists as live for `shard_id`, other than
-/// `my_id`, who leads, at the addresses they registered (see
-/// [`ask_registered_peers`]), for a node that rejoins its shard after a
-/// recovery went on without it. The list is asked starting `start_at`
-/// workers along it, so one worker whose pointer the node keeps refusing
-/// cannot answer first every time. [`LeaderSearch::NoAnswer`] when the
-/// authority cannot be read or lists no one else; why is logged on `log`.
-/// An authority whose read panics counts as unreachable: the driver running
-/// this search keeps running, and searches again.
-pub(crate) async fn find_leader(
-    net: &Net,
-    authority: &SharedAuthority,
-    shard_id: &ShardId,
-    my_id: &WorkerId,
-    start_at: usize,
-    per_peer_timeout: StdDuration,
-    log: &mut WaitLog,
-) -> LeaderSearch {
-    let (reader, shard) = (Arc::clone(authority), shard_id.clone());
-    let read = tokio::task::spawn_blocking(move || reader.live_registrations(&shard)).await;
-    let registrations = match read {
-        Ok(Ok(registrations)) => registrations,
-        Ok(Err(error)) => {
-            log.log(WaitReason::AuthorityUnreachable(error));
-            return LeaderSearch::NoAnswer;
-        }
-        // The read panicked on the blocking pool.
-        Err(_) => {
-            log.log(WaitReason::AuthorityUnreachable(AuthorityError::Unavailable));
-            return LeaderSearch::NoAnswer;
-        }
-    };
-    let registered: BTreeMap<WorkerId, String> = registrations
-        .addresses()
-        .iter()
-        .filter(|(worker, _)| *worker != my_id)
-        .map(|(worker, address)| (worker.clone(), address.clone()))
-        .collect();
-    if registered.is_empty() {
-        return LeaderSearch::NoAnswer;
-    }
-    ask_registered_peers(net, &registered, start_at, per_peer_timeout, log).await
-}
-
-/// Asks `peers`, at their registered addresses, who leads the shard, the way
-/// seeds are asked ([`ask_for_leader`]), starting `start_at` peers along the
-/// list and wrapping round. An address that does not parse is skipped, and
-/// logged on `log`, as is a list none of whose addresses parse, or whose
-/// peers none answer.
-pub(crate) async fn ask_registered_peers(
-    net: &Net,
-    peers: &BTreeMap<WorkerId, String>,
-    start_at: usize,
-    per_peer_timeout: StdDuration,
-    log: &mut WaitLog,
-) -> LeaderSearch {
-    let mut addresses: Vec<Multiaddr> = Vec::new();
-    for (worker, address) in peers {
-        match address.parse() {
-            Ok(address) => addresses.push(address),
-            Err(error) => log.log(WaitReason::UnparseableAddress {
-                worker: worker.clone(),
-                address: address.clone(),
-                error: error.to_string(),
-            }),
-        }
-    }
-    let peer_ids: Vec<WorkerId> = peers.keys().cloned().collect();
-    if addresses.is_empty() {
-        log.log(WaitReason::NoRegisteredAddressParses { peers: peer_ids });
-        return LeaderSearch::NoAnswer;
-    }
-
-    let len = addresses.len();
-    addresses.rotate_left(start_at % len);
-    let search = ask_for_leader(net, &addresses, per_peer_timeout).await;
-    if search == LeaderSearch::NoAnswer {
-        log.log(WaitReason::RegisteredPeersSilent { peers: peer_ids });
-    }
-    search
 }
 
 /// The `JOIN_RESPONSE` `node`, running over `net`, gives a joiner right
@@ -352,10 +264,11 @@ fn pointed_leader(response: &JoinResponse) -> Option<(WorkerId, Multiaddr)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input};
-    use kabudachi_core::protocol::ids::IncarnationId;
+    use kabudachi_core::protocol::ids::{IncarnationId, ShardId};
     use kabudachi_core::protocol::worker_state::WorkerState;
     use kabudachi_core::time::{Duration as TickDuration, RealClock};
     use libp2p::identity;
@@ -363,14 +276,9 @@ mod tests {
 
     use super::*;
     use crate::swarm::build_swarm;
-
-    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-    /// The `WorkerId` of a fresh keypair no `Net` was ever built from.
-    fn worker_that_never_runs() -> WorkerId {
-        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
-        WorkerId::new(peer.to_string())
-    }
+    use crate::test_support::{
+        TEST_TIMEOUT, listening_net, spawn_join_responder, worker_that_never_runs,
+    };
 
     /// Takes `net`'s queued inputs until one is `expected`, failing the test
     /// with `what` if it does not arrive within the timeout.
@@ -409,48 +317,22 @@ mod tests {
         assert_eq!(pointed_leader(&garbled), None);
     }
 
-
-    /// Spawns a background task that answers every `/kabudachi/join/1`
-    /// request `net` receives with `response`, mirroring (at the messenger
-    /// level, not through `core::election::WorkerNode`) what
-    /// `crate::driver::run_driver`'s join responder does in production.
-    fn spawn_join_responder(net: Net, response: JoinResponse) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            loop {
-                for handle in net.poll_join_requests() {
-                    net.respond_join(handle, response.clone());
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-    }
-
     #[tokio::test]
     async fn ask_for_leader_passes_over_a_pointer_to_a_leader_it_cannot_reach() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_z = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let (net_a, addr_a) = listening_net().await;
+        let (net_b, addr_b) = listening_net().await;
+        let (net_z, addr_z) = listening_net().await;
         let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let mut addrs = Vec::new();
-        for net in [&net_a, &net_b, &net_z] {
-            let addr = timeout(
-                TEST_TIMEOUT,
-                net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-            )
-            .await
-            .expect("the net produced a listen address within the timeout");
-            addrs.push(addr);
-        }
-        let (addr_a, addr_b, addr_z) = (addrs[0].clone(), addrs[1].clone(), addrs[2].clone());
         let worker_b = net_b.local_worker_id();
 
         // Seed A names a leader that never runs, at an address where some
         // other worker (net_z) answers: the dial connects, but not to that
         // leader.
         let absent_leader = worker_that_never_runs();
-        let _responder_a = spawn_join_responder(net_a, pointer_to(&absent_leader, &addr_z));
+        let _responder_a =
+            spawn_join_responder(Arc::new(net_a), pointer_to(&absent_leader, &addr_z));
         let response_b = pointer_to(&worker_b, &addr_b);
-        let _responder_b = spawn_join_responder(net_b, response_b.clone());
+        let _responder_b = spawn_join_responder(Arc::new(net_b), response_b.clone());
 
         let pointer = timeout(
             TEST_TIMEOUT,
@@ -479,21 +361,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_pointer_only_to_an_undialable_leader_is_an_answer_with_no_reachable_leader() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let (net_a, addr_a) = listening_net().await;
         let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let addr_a = timeout(
-            TEST_TIMEOUT,
-            net_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_a produced a listen address within the timeout");
 
         // Nothing listens at this address, so the pointed leader cannot be
         // reached; the seed did answer, so the shard exists.
         let unreachable_leader_addr: Multiaddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
         let absent_leader = worker_that_never_runs();
-        let _responder =
-            spawn_join_responder(net_a, pointer_to(&absent_leader, &unreachable_leader_addr));
+        let _responder = spawn_join_responder(
+            Arc::new(net_a),
+            pointer_to(&absent_leader, &unreachable_leader_addr),
+        );
 
         let search = timeout(
             TEST_TIMEOUT,
@@ -507,25 +385,14 @@ mod tests {
 
     #[tokio::test]
     async fn ask_for_leader_dials_the_leader_it_is_pointed_at() {
-        let net_leader = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let (net_leader, leader_addr) = listening_net().await;
+        let (net_a, seed_addr) = listening_net().await;
         let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
 
-        let leader_addr = timeout(
-            TEST_TIMEOUT,
-            net_leader.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_leader produced a listen address within the timeout");
-        let seed_addr = timeout(
-            TEST_TIMEOUT,
-            net_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_a produced a listen address within the timeout");
         let worker_leader = net_leader.local_worker_id();
 
-        let _responder = spawn_join_responder(net_a, pointer_to(&worker_leader, &leader_addr));
+        let _responder =
+            spawn_join_responder(Arc::new(net_a), pointer_to(&worker_leader, &leader_addr));
 
         timeout(
             TEST_TIMEOUT,
@@ -563,19 +430,13 @@ mod tests {
         // Proves spec decision 5 step (a)'s cascade: seeds are dialed in
         // order, and a seed that doesn't answer doesn't stop the join —
         // the next seed in the list still gets a chance.
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let (net_a, listen_addr) = listening_net().await;
         let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
 
-        let listen_addr = timeout(
-            TEST_TIMEOUT,
-            net_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_a produced a listen address within the timeout");
         let worker_a = net_a.local_worker_id();
 
         let response = pointer_to(&worker_a, &listen_addr);
-        let _responder = spawn_join_responder(net_a, response.clone());
+        let _responder = spawn_join_responder(Arc::new(net_a), response.clone());
 
         let unreachable_seed: Multiaddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
         let seeds = vec![unreachable_seed, listen_addr];
@@ -618,33 +479,20 @@ mod tests {
     /// `ConnectionId` — which is what this test asserts.
     #[tokio::test]
     async fn ask_for_leader_ignores_a_late_connection_from_an_abandoned_seed() {
-        let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let (net_a, addr_a) = listening_net().await;
+        let (net_b, addr_b) = listening_net().await;
         let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-
-        let addr_a = timeout(
-            TEST_TIMEOUT,
-            net_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_a produced a listen address within the timeout");
-        let addr_b = timeout(
-            TEST_TIMEOUT,
-            net_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_b produced a listen address within the timeout");
 
         let worker_a = net_a.local_worker_id();
         let worker_b = net_b.local_worker_id();
 
         // Seed A would point at itself, which is obviously wrong for this
         // test, so a misattribution is easy to detect.
-        let _responder_a = spawn_join_responder(net_a, pointer_to(&worker_a, &addr_a));
+        let _responder_a = spawn_join_responder(Arc::new(net_a), pointer_to(&worker_a, &addr_a));
 
         // Seed B points at itself too: a distinct leader.
         let response_b = pointer_to(&worker_b, &addr_b);
-        let _responder_b = spawn_join_responder(net_b, response_b.clone());
+        let _responder_b = spawn_join_responder(Arc::new(net_b), response_b.clone());
 
         // Simulate `ask_peer_for_leader` abandoning seed A's dial once its
         // per-seed timeout elapses: a timeout of zero issues the dial and
@@ -690,14 +538,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_pending_member_that_suspects_its_leader_still_points_joiners_at_it() {
-        let net_leader = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let (net_leader, leader_addr) = listening_net().await;
         let net_joiner = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let leader_addr = timeout(
-            TEST_TIMEOUT,
-            net_leader.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_leader produced a listen address within the timeout");
         let leader = net_leader.local_worker_id();
         let joiner = net_joiner.local_worker_id();
 
@@ -749,13 +591,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_the_answering_side_drops_is_no_answer_at_once() {
-        let seed = Arc::new(Net::new(build_swarm(identity::Keypair::generate_ed25519())));
-        let seed_addr = timeout(
-            TEST_TIMEOUT,
-            seed.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("the seed produced a listen address within the timeout");
+        let (seed, seed_addr) = listening_net().await;
+        let seed = Arc::new(seed);
         let dropping = Arc::clone(&seed);
         let _dropper = tokio::spawn(async move {
             loop {

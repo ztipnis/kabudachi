@@ -126,7 +126,7 @@
 //!
 //! The cascade makes its calls as the driver makes its node's: each is an
 //! `AuthorityCall`, performed on Tokio's blocking pool, at most one of each
-//! kind in flight (see `crate::driver::PoolPerformer`). What it does with
+//! kind in flight (see `crate::authority::AuthorityClient`). What it does with
 //! each reply is [`decide_round`], a function of the replies alone. An
 //! authority that does not answer the round's read within a retry interval
 //! holds up no seed: the round ends, and the next asks the seeds again,
@@ -136,23 +136,20 @@
 //! over machinery `net` and `core` already have; it holds no election logic
 //! of its own.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
-use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, CallKind, Entry, Issuer,
-    ReplyTokens,
-};
+use kabudachi_core::coordination_authority::{AuthorityError, RecoveryEpoch};
+use kabudachi_core::election::{AuthorityReply, AuthorityRequest, Entry};
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::time::{Clock, Instant};
 use libp2p::Multiaddr;
-use tokio::sync::mpsc;
 
-use crate::driver::{PoolPerformer, SharedAuthority};
-use crate::join::{LeaderSearch, ask_for_leader, ask_registered_peers};
+use crate::authority::AuthorityClient;
+use crate::leader_search::{AskWhoLeads, JoinOverNet, SearchRounds, others_listed};
 use crate::messenger::Net;
+use crate::wait_log::WaitReason;
 
 /// How long [`bootstrap`] waits, by default, between rounds of its
 /// cascade.
@@ -199,31 +196,55 @@ pub const DEFAULT_RETRY_INTERVAL: StdDuration = StdDuration::from_millis(500);
 pub async fn bootstrap<C: Clock>(
     net: &Net,
     clock: &C,
-    authority: Option<&SharedAuthority>,
+    authority: Option<&mut AuthorityClient>,
     shard_id: &ShardId,
     my_id: &WorkerId,
     seeds: &[Multiaddr],
     per_peer_timeout: StdDuration,
     retry_interval: StdDuration,
 ) -> Entry {
-    let mut wait_log = WaitLog::new(shard_id);
-    let mut calls =
-        authority.map(|authority| AuthorityCalls::new(authority, net, clock, shard_id, my_id));
-    // Set once any seed or registered peer answers: the shard exists, so
-    // this worker must never found it.
-    let mut shard_exists = false;
+    cascade(
+        net,
+        &mut JoinOverNet {
+            net,
+            per_peer_timeout,
+        },
+        clock,
+        authority,
+        shard_id,
+        my_id,
+        seeds,
+        retry_interval,
+    )
+    .await
+}
+
+/// [`bootstrap`] over any [`AskWhoLeads`] port: the port asks the seeds and
+/// the registered peers, and `net` is only where unanswered join and claim
+/// requests are dropped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
+    net: &Net,
+    port: &mut P,
+    clock: &C,
+    mut authority: Option<&mut AuthorityClient>,
+    shard_id: &ShardId,
+    my_id: &WorkerId,
+    seeds: &[Multiaddr],
+    retry_interval: StdDuration,
+) -> Entry {
+    let mut search = SearchRounds::for_bootstrap(shard_id, my_id.clone(), seeds.to_vec());
     loop {
         refuse_requests(net);
 
         // With no seeds this finds no answer at once.
-        match ask_for_leader(net, seeds, per_peer_timeout).await {
-            LeaderSearch::Found(pointer) => return Entry::Joining(pointer),
-            LeaderSearch::NoReachableLeader => shard_exists = true,
-            LeaderSearch::NoAnswer => {}
+        let found = port.ask(search.seeds()).await;
+        if let Some(pointer) = search.heard_from_seeds(found) {
+            return Entry::Joining(pointer);
         }
 
-        match calls.as_mut() {
-            None if !shard_exists => {
+        match authority.as_deref_mut() {
+            None if !search.shard_exists() => {
                 return Entry::Founding {
                     recovery_epoch: RecoveryEpoch::founding(0),
                     registered_at: None,
@@ -231,16 +252,8 @@ pub async fn bootstrap<C: Clock>(
             }
             None => {}
             Some(calls) => {
-                match consult_authority(
-                    net,
-                    calls,
-                    my_id,
-                    shard_exists,
-                    per_peer_timeout,
-                    retry_interval,
-                    &mut wait_log,
-                )
-                .await
+                match consult_authority(calls, port, &mut search, clock, my_id, retry_interval)
+                    .await
                 {
                     AuthorityRound::Joined(pointer) => return Entry::Joining(pointer),
                     AuthorityRound::OwnershipWon {
@@ -252,16 +265,12 @@ pub async fn bootstrap<C: Clock>(
                             registered_at: Some(registered_at),
                         };
                     }
-                    AuthorityRound::ShardExists => shard_exists = true,
                     AuthorityRound::Wait => {}
                 }
             }
         }
 
-        if shard_exists {
-            wait_log.log(WaitReason::NoReachableLeader);
-        }
-        wait_log.end_round();
+        search.end_round();
         tokio::time::sleep(retry_interval).await;
     }
 }
@@ -287,9 +296,6 @@ enum AuthorityRound {
         recovery_epoch: RecoveryEpoch,
         registered_at: Instant,
     },
-    /// A registered peer answered without pointing at a leader this worker
-    /// reaches: the shard exists.
-    ShardExists,
     /// Stay in `Bootstrapping` until the next round. The reason is logged.
     Wait,
 }
@@ -303,39 +309,38 @@ enum AuthorityRound {
 /// The first read has one `retry_interval` to be answered; if it is not,
 /// the round ends and the next asks the seeds again rather than waiting on
 /// the authority. The read stays in flight meanwhile, and is not asked for
-/// again until it is answered (see [`AuthorityCalls`]): a later round
+/// again until it is answered (see [`AuthorityClient`]): a later round
 /// decides on its reply once it comes. Once ownership is being taken, each
 /// call waits for its reply however long it takes: the second read must
 /// follow the conflict it checks, and an epoch this worker won must not be
 /// left behind.
-async fn consult_authority<C: Clock>(
-    net: &Net,
-    calls: &mut AuthorityCalls<'_, C>,
+async fn consult_authority<C: Clock, P: AskWhoLeads>(
+    calls: &mut AuthorityClient,
+    port: &mut P,
+    search: &mut SearchRounds,
+    clock: &C,
     my_id: &WorkerId,
-    shard_exists: bool,
-    per_peer_timeout: StdDuration,
     retry_interval: StdDuration,
-    wait_log: &mut WaitLog,
 ) -> AuthorityRound {
     let mut stage = Stage::ReadingRegistrations;
-    calls.ask(AuthorityRequest::ReadLiveRegistrations);
+    calls.ask(AuthorityRequest::ReadLiveRegistrations, clock.now());
     loop {
         let within = (stage == Stage::ReadingRegistrations).then_some(retry_interval);
         let Some(reply) = calls.next_reply(within).await else {
-            wait_log.log(WaitReason::AuthorityNotAnswering);
+            search.log(WaitReason::AuthorityNotAnswering);
             return AuthorityRound::Wait;
         };
-        match decide_round(stage, reply, my_id, shard_exists) {
+        match decide_round(stage, reply, my_id, search.shard_exists()) {
             Decision::Ask { request, then } => {
-                calls.ask(request);
+                calls.ask(request, clock.now());
                 stage = then;
             }
             Decision::AskPeers(peers) => {
-                return match ask_registered_peers(net, &peers, 0, per_peer_timeout, wait_log).await
-                {
-                    LeaderSearch::Found(pointer) => AuthorityRound::Joined(pointer),
-                    LeaderSearch::NoReachableLeader => AuthorityRound::ShardExists,
-                    LeaderSearch::NoAnswer => AuthorityRound::Wait,
+                let addresses = search.to_ask(&peers);
+                let found = port.ask(&addresses).await;
+                return match search.heard_from_listed(found) {
+                    Some(pointer) => AuthorityRound::Joined(pointer),
+                    None => AuthorityRound::Wait,
                 };
             }
             Decision::OwnershipWon {
@@ -349,7 +354,7 @@ async fn consult_authority<C: Clock>(
             }
             Decision::Wait(reason) => {
                 if let Some(reason) = reason {
-                    wait_log.log(reason);
+                    search.log(reason);
                 }
                 return AuthorityRound::Wait;
             }
@@ -530,402 +535,27 @@ pub(crate) fn decide_round(
     }
 }
 
-/// The workers other than `my_id` that `registrations` lists, at the
-/// addresses they registered.
-fn others_listed(
-    registrations: &LiveRegistrations,
-    my_id: &WorkerId,
-) -> BTreeMap<WorkerId, String> {
-    registrations
-        .addresses()
-        .iter()
-        .filter(|(worker_id, _)| *worker_id != my_id)
-        .map(|(worker_id, address)| (worker_id.clone(), address.clone()))
-        .collect()
-}
-
-/// The cascade's calls on its authority, across its rounds, made as the
-/// driver makes its node's (`crate::driver::PoolPerformer`): each call is an
-/// `AuthorityCall` stamped on the node's clock, performed on Tokio's
-/// blocking pool, at most one of each kind in flight.
-///
-/// A round takes the reply to its first read before it asks for anything
-/// else, and each later call's reply before the next, so once the first
-/// read is answered no other call is in flight, and each reply answers the
-/// call the round last made. Only the first read can be left in flight
-/// from an earlier round, and a round that asks for it again takes that
-/// earlier one's reply instead.
-struct AuthorityCalls<'a, C: Clock> {
-    authority: &'a SharedAuthority,
-    net: &'a Net,
-    clock: &'a C,
-    shard_id: ShardId,
-    my_id: &'a WorkerId,
-    sender: mpsc::UnboundedSender<AuthorityReply>,
-    replies: mpsc::UnboundedReceiver<AuthorityReply>,
-    in_flight: BTreeSet<CallKind>,
-    /// Mints the token of every call the cascade asks. Its issuer is
-    /// [`Issuer::Cascade`], so no token of it equals a node's.
-    tokens: ReplyTokens,
-}
-
-impl<'a, C: Clock> AuthorityCalls<'a, C> {
-    fn new(
-        authority: &'a SharedAuthority,
-        net: &'a Net,
-        clock: &'a C,
-        shard_id: &ShardId,
-        my_id: &'a WorkerId,
-    ) -> Self {
-        let (sender, replies) = mpsc::unbounded_channel();
-        AuthorityCalls {
-            authority,
-            net,
-            clock,
-            shard_id: shard_id.clone(),
-            my_id,
-            sender,
-            replies,
-            in_flight: BTreeSet::new(),
-            tokens: ReplyTokens::new(Issuer::Cascade),
-        }
-    }
-
-    /// Asks for `request` now, unless a call of its kind is unanswered.
-    fn ask(&mut self, request: AuthorityRequest) {
-        let call = AuthorityCall::new(request, &mut self.tokens, self.clock.now());
-        let mut performer = PoolPerformer {
-            authority: Some(self.authority),
-            replies: &self.sender,
-            in_flight: &mut self.in_flight,
-            net: self.net,
-            my_id: self.my_id,
-            shard_id: self.shard_id.clone(),
-        };
-        // With an authority, every reply comes through `replies`.
-        if let Some(reply) = performer.perform(call) {
-            let _ = self.sender.send(reply);
-        }
-    }
-
-    /// The next reply, or `None` if none arrives `within` that long.
-    async fn next_reply(&mut self, within: Option<StdDuration>) -> Option<AuthorityReply> {
-        // `sender` lives as long as `replies`, so the channel never closes.
-        let reply = match within {
-            Some(within) => tokio::time::timeout(within, self.replies.recv())
-                .await
-                .ok()??,
-            None => self.replies.recv().await?,
-        };
-        self.in_flight.remove(&reply.token().kind);
-        Some(reply)
-    }
-}
-
-/// Why a round of the cascade left the worker in `Bootstrapping`.
-#[derive(Debug, PartialEq)]
-pub(crate) enum WaitReason {
-    AuthorityUnreachable(AuthorityError),
-    AuthorityWarmingUp,
-    /// The authority has not answered a read within a retry interval.
-    AuthorityNotAnswering,
-    /// The shard's recovery epoch is already at `u64::MAX`, so it has no
-    /// successor epoch to re-found at.
-    RecoveryEpochExhausted,
-    OwnershipFailed(AuthorityError),
-    UnparseableAddress {
-        worker: WorkerId,
-        address: String,
-        error: String,
-    },
-    NoRegisteredAddressParses {
-        peers: Vec<WorkerId>,
-    },
-    RegisteredPeersSilent {
-        peers: Vec<WorkerId>,
-    },
-    /// A seed or registered peer has answered, in this round or an earlier
-    /// one, but none has pointed at a leader this worker could reach.
-    NoReachableLeader,
-}
-
-/// Logs the reasons each round of the cascade, or each search of a rejoin
-/// (see `crate::join::find_leader`), leaves the worker in `Bootstrapping`.
-/// A reason is logged at its own level in the round it first
-/// appears, or changes, and at `debug` in each later round that repeats it
-/// unchanged, so a worker that waits for hours does not warn every round.
-pub(crate) struct WaitLog {
-    shard_id: ShardId,
-    previous_round: Vec<WaitReason>,
-    this_round: Vec<WaitReason>,
-}
-
-impl WaitLog {
-    pub(crate) fn new(shard_id: &ShardId) -> Self {
-        Self {
-            shard_id: shard_id.clone(),
-            previous_round: Vec::new(),
-            this_round: Vec::new(),
-        }
-    }
-
-    /// Whether `reason` was also logged in the previous round.
-    fn repeats(&self, reason: &WaitReason) -> bool {
-        self.previous_round.contains(reason)
-    }
-
-    pub(crate) fn log(&mut self, reason: WaitReason) {
-        let repeated = self.repeats(&reason);
-        log_wait_reason(&self.shard_id, &reason, repeated);
-        self.this_round.push(reason);
-    }
-
-    /// Makes this round's reasons the ones the next round is compared with.
-    pub(crate) fn end_round(&mut self) {
-        self.previous_round = std::mem::take(&mut self.this_round);
-    }
-}
-
-/// Logs at `$level`, or at `debug` when `$repeated`. `tracing` fixes an
-/// event's level where the event is written, so the choice is a branch.
-macro_rules! log_at_level_or_debug {
-    ($repeated:expr, $level:ident, $($fields_and_message:tt)+) => {
-        if $repeated {
-            tracing::debug!($($fields_and_message)+)
-        } else {
-            tracing::$level!($($fields_and_message)+)
-        }
-    };
-}
-
-fn log_wait_reason(shard_id: &ShardId, reason: &WaitReason, repeated: bool) {
-    let shard = shard_id.as_str();
-    match reason {
-        WaitReason::AuthorityUnreachable(error) => log_at_level_or_debug!(
-            repeated,
-            warn,
-            shard,
-            %error,
-            "staying in Bootstrapping: the coordination authority is unreachable"
-        ),
-        WaitReason::AuthorityWarmingUp => log_at_level_or_debug!(
-            repeated,
-            info,
-            shard,
-            "staying in Bootstrapping: the coordination authority is still warming up \
-             and may not know every live worker yet"
-        ),
-        WaitReason::AuthorityNotAnswering => log_at_level_or_debug!(
-            repeated,
-            warn,
-            shard,
-            "staying in Bootstrapping: the coordination authority has not answered a read \
-             of the live registrations within a retry interval; asking the seeds again \
-             meanwhile"
-        ),
-        WaitReason::RecoveryEpochExhausted => log_at_level_or_debug!(
-            repeated,
-            warn,
-            shard,
-            "staying in Bootstrapping: the shard's recovery epoch is already at u64::MAX, \
-             so it cannot be re-founded"
-        ),
-        WaitReason::OwnershipFailed(error) => log_at_level_or_debug!(
-            repeated,
-            warn,
-            shard,
-            %error,
-            "staying in Bootstrapping: could not take ownership of the shard \
-             at the coordination authority"
-        ),
-        WaitReason::UnparseableAddress {
-            worker,
-            address,
-            error,
-        } => log_at_level_or_debug!(
-            repeated,
-            warn,
-            shard,
-            worker = worker.as_str(),
-            address = address.as_str(),
-            %error,
-            "skipping a registered peer whose address does not parse"
-        ),
-        WaitReason::NoRegisteredAddressParses { peers } => log_at_level_or_debug!(
-            repeated,
-            warn,
-            shard,
-            peers = ?peers.iter().map(WorkerId::as_str).collect::<Vec<_>>(),
-            "staying in Bootstrapping: the authority lists registered peers, \
-             but none has an address that parses"
-        ),
-        WaitReason::RegisteredPeersSilent { peers } => log_at_level_or_debug!(
-            repeated,
-            warn,
-            shard,
-            peers = ?peers.iter().map(WorkerId::as_str).collect::<Vec<_>>(),
-            "staying in Bootstrapping: the authority lists registered peers, but none answered"
-        ),
-        WaitReason::NoReachableLeader => log_at_level_or_debug!(
-            repeated,
-            info,
-            shard,
-            "staying in Bootstrapping: the shard exists, but no one asked has pointed at a \
-             leader this worker could reach; asking again"
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
     use kabudachi_core::coordination_authority::{CoordinationAuthority, LiveRegistrations};
-    use kabudachi_core::election::{ElectionTimings, Identity, Input, WorkerNode};
-    use kabudachi_core::in_memory_authority::InMemoryAuthority;
-    use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
-    use kabudachi_core::protocol::messages::JoinResponse;
-    use kabudachi_core::protocol::messages::election_message::Payload;
-    use kabudachi_core::scheduler::Scheduler;
-    use kabudachi_core::time::{Duration, RealClock};
-    use kabudachi_core::election::{CallKind, ReplyToken};
+    use kabudachi_core::election::{CallKind, Issuer, ReplyToken};
+    use kabudachi_core::protocol::ids::{ShardId, WorkerId};
     use kabudachi_testkit::FaultingAuthority;
     use libp2p::identity;
     use tokio::time::timeout;
 
     use super::*;
-    use crate::driver::{DriverConfig, run_driver};
     use crate::swarm::build_swarm;
+    use crate::test_support::{
+        Answer, Scripted, TEST_TIMEOUT, TokioClock, address, epoch_number, pointer_to, register,
+        wait_until_held, warm_authority,
+    };
 
-    const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
     const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(50);
-
-    fn real_clock() -> RealClock {
-        RealClock::new()
-    }
-
-    /// Short, because the authority warms up for one TTL. A registration made
-    /// once it is warm still outlives the few milliseconds each test takes
-    /// to read it.
-    fn authority_ttl() -> Duration {
-        Duration::from_millis(300)
-    }
-
-    /// `authority`, as a worker's cascade and driver share it. Clones of an
-    /// `InMemoryAuthority` share its state, so the test keeps its own.
-    fn shared(authority: &InMemoryAuthority<RealClock>) -> SharedAuthority {
-        Arc::new(authority.clone())
-    }
-
-    /// An authority that has finished warming up, so it reports an
-    /// authoritative count of live registrations.
-    async fn warmed_up_authority(shard_id: &ShardId) -> InMemoryAuthority<RealClock> {
-        let authority = InMemoryAuthority::new(real_clock(), authority_ttl());
-        while authority
-            .live_registrations(shard_id)
-            .expect("the in-memory authority is always reachable")
-            .authoritative_count()
-            .is_none()
-        {
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        authority
-    }
-
-    /// Spawns a background task that answers every `/kabudachi/join/1`
-    /// request `net` receives with `response`, duplicated from
-    /// `messenger`'s own private `#[cfg(test)]` helper of the same name
-    /// rather than promoted to a shared dependency for two small test files.
-    fn spawn_join_responder(net: Net, response: JoinResponse) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            loop {
-                for handle in net.poll_join_requests() {
-                    net.respond_join(handle, response.clone());
-                }
-                tokio::time::sleep(StdDuration::from_millis(5)).await;
-            }
-        })
-    }
-
-    /// Starts a JOIN responder that names itself as the shard's leader (in
-    /// term 1) and returns its worker id and listen address.
-    async fn spawn_self_pointing_leader() -> (WorkerId, Multiaddr) {
-        let leader_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let leader_addr = timeout(
-            TEST_TIMEOUT,
-            leader_net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("the leader produced a listen address within the timeout");
-        let leader = leader_net.local_worker_id();
-
-        let response = JoinResponse {
-            leader_id: Some(leader.clone().into()),
-            leader_multiaddr: leader_addr.to_string(),
-            term: 1,
-            recovery_epoch: 0,
-            recovery_epoch_lineage: 0,
-        };
-        spawn_join_responder(leader_net, response);
-        (leader, leader_addr)
-    }
-
-    /// Like [`spawn_join_responder`], but answers "no leader known" to the
-    /// first request and `response` to every later one: a seed whose shard
-    /// is still electing its leader when a joiner first asks.
-    fn spawn_join_responder_that_learns_its_leader(
-        net: Net,
-        response: JoinResponse,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut knows_its_leader = false;
-            loop {
-                for handle in net.poll_join_requests() {
-                    if knows_its_leader {
-                        net.respond_join(handle, response.clone());
-                    } else {
-                        net.respond_join(handle, JoinResponse::default());
-                        knows_its_leader = true;
-                    }
-                }
-                tokio::time::sleep(StdDuration::from_millis(5)).await;
-            }
-        })
-    }
-
-    /// A `Net` listening on a loopback port, and that address.
-    async fn listening_net() -> (Net, Multiaddr) {
-        let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let addr = timeout(
-            TEST_TIMEOUT,
-            net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("the net produced a listen address within the timeout");
-        (net, addr)
-    }
-
-    /// Runs the cascade for a fresh worker on `net` into `shard-1` through
-    /// `seeds`, with `authority` if any, and returns how it enters.
-    async fn bootstrap_through(
-        net: &Net,
-        authority: Option<&InMemoryAuthority<RealClock>>,
-        seeds: &[Multiaddr],
-        per_peer_timeout: StdDuration,
-    ) -> Entry {
-        bootstrap(
-            net,
-            &real_clock(),
-            authority.map(shared).as_ref(),
-            &ShardId::new("shard-1"),
-            &net.local_worker_id(),
-            seeds,
-            per_peer_timeout,
-            RETRY_INTERVAL,
-        )
-        .await
-    }
 
     /// The leader `entry` joins, and that leader's term. Panics unless the
     /// worker joined rather than founded.
@@ -939,287 +569,277 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_seed_that_knows_no_leader_yet_is_asked_again_until_it_does() {
-        // With no authority, a seed that answers at all shows the shard
-        // exists, so the joiner waits for its leader rather than founding a
-        // second shard of its own.
-        let (seed_net, seed_addr) = listening_net().await;
-        let seed = seed_net.local_worker_id();
-        let response = JoinResponse {
-            leader_id: Some(seed.clone().into()),
-            leader_multiaddr: seed_addr.to_string(),
-            term: 1,
-            recovery_epoch: 0,
-            recovery_epoch_lineage: 0,
-        };
-        let _responder = spawn_join_responder_that_learns_its_leader(seed_net, response);
-        let joining_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+    // The in-process cascade tests run over `Scripted` seeds and peers and a
+    // `FaultingAuthority` on tokio's paused clock, so twenty rounds cost
+    // nothing. A call held on the blocking pool stops the clock's
+    // auto-advance until it is released, so tests that hold one move time by
+    // hand.
 
-        let entry = timeout(
-            TEST_TIMEOUT,
-            bootstrap_through(&joining_net, None, &[seed_addr], StdDuration::from_secs(1)),
-        )
-        .await
-        .expect("bootstrap completed within the timeout");
-
-        assert_eq!(joined_leader(entry), (seed, 1));
+    /// A cascade for a fresh worker over `port`, on `authority` if any.
+    struct InProcess {
+        net: Net,
+        me: WorkerId,
+        shard_id: ShardId,
+        clock: TokioClock,
+        port: Scripted,
+        client: Option<AuthorityClient>,
+        seeds: Vec<Multiaddr>,
     }
 
-    #[tokio::test]
-    async fn a_worker_whose_seed_has_answered_never_founds_the_shard_even_once_the_seed_goes_quiet()
-    {
-        let (seed_net, seed_addr) = listening_net().await;
-        // Answers the first request with "no leader known", gives the answer
-        // time to leave, then drops the seed's `Net`: its listener and
-        // connections close, so every later ask fails to connect.
-        let _responder = tokio::spawn(async move {
-            loop {
-                if let Some(handle) = seed_net.poll_join_requests().pop() {
-                    seed_net.respond_join(handle, JoinResponse::default());
-                    tokio::time::sleep(StdDuration::from_millis(200)).await;
-                    return;
-                }
-                tokio::time::sleep(StdDuration::from_millis(5)).await;
+    impl InProcess {
+        fn new(
+            port: &Scripted,
+            authority: Option<&FaultingAuthority<TokioClock>>,
+            clock: TokioClock,
+            seeds: &[Multiaddr],
+        ) -> Self {
+            // Never listens, so no socket opens.
+            let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+            let shard_id = ShardId::new("shard-1");
+            let client = authority.map(|authority| {
+                AuthorityClient::new(&net, shard_id.clone(), Arc::new(authority.clone()))
+            });
+            InProcess {
+                me: net.local_worker_id(),
+                net,
+                shard_id,
+                clock,
+                port: port.clone(),
+                client,
+                seeds: seeds.to_vec(),
             }
-        });
-        let joining_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        }
 
-        let still_bootstrapping = timeout(
-            RETRY_INTERVAL * 20,
-            bootstrap_through(&joining_net, None, &[seed_addr], StdDuration::from_secs(1)),
-        )
-        .await;
+        fn run(&mut self) -> impl Future<Output = Entry> + '_ {
+            cascade(
+                &self.net,
+                &mut self.port,
+                &self.clock,
+                self.client.as_mut(),
+                &self.shard_id,
+                &self.me,
+                &self.seeds,
+                RETRY_INTERVAL,
+            )
+        }
+    }
+
+    fn founded_at_epoch_0(entry: &Entry) -> bool {
+        matches!(entry, Entry::Founding { recovery_epoch, .. } if recovery_epoch.number == 0)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_seed_that_points_at_a_leader_wins_over_the_authority() {
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        let (seed, listed) = (address(1), address(2));
+        register(&authority, "other", &listed.to_string());
+        let port = Scripted::default();
+        port.script(&seed, [Answer::Pointer(pointer_to("seed-leader", &seed))]);
+        port.script(&listed, [Answer::Pointer(pointer_to("other", &listed))]);
+        let mut cascade = InProcess::new(&port, Some(&authority), clock, &[seed.clone()]);
+
+        let entry = cascade.run().await;
+
+        assert_eq!(joined_leader(entry), (WorkerId::new("seed-leader"), 1));
+        assert_eq!(port.passes(), vec![vec![seed]]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_seed_never_founds_even_once_it_goes_quiet() {
+        let seed = address(1);
+        let port = Scripted::default();
+        port.script(&seed, [Answer::NoLeader, Answer::Silent]);
+        let mut cascade = InProcess::new(&port, None, TokioClock::new(), &[seed]);
+
+        let still_bootstrapping = timeout(RETRY_INTERVAL * 20, cascade.run()).await;
 
         assert!(
             still_bootstrapping.is_err(),
             "the node founded a shard after its only seed had shown one exists"
         );
+        assert!(port.passes().len() >= 20, "it kept asking every round");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_seed_that_knows_no_leader_yet_is_asked_again_until_it_does() {
+        let seed = address(1);
+        let port = Scripted::default();
+        port.script(
+            &seed,
+            [Answer::NoLeader, Answer::Pointer(pointer_to("seed", &seed))],
+        );
+        let mut cascade = InProcess::new(&port, None, TokioClock::new(), &[seed]);
+
+        let entry = cascade.run().await;
+
+        assert_eq!(joined_leader(entry), (WorkerId::new("seed"), 1));
+        assert_eq!(port.passes().len(), 2);
     }
 
     // A seed that answered once, pointing at a leader long gone, must not
     // keep the worker asking only it: a worker the authority lists by now
     // knows the current leader.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_stale_seed_does_not_hide_a_registered_peer_that_knows_the_leader() {
-        let (stale_seed_net, stale_seed_addr) = listening_net().await;
-        // Nothing listens at the gone leader's address.
-        let gone_leader =
-            Net::new(build_swarm(identity::Keypair::generate_ed25519())).local_worker_id();
-        let stale_pointer = JoinResponse {
-            leader_id: Some(gone_leader.into()),
-            leader_multiaddr: "/ip4/127.0.0.1/tcp/1".to_string(),
-            term: 1,
-            recovery_epoch: 0,
-            recovery_epoch_lineage: 0,
-        };
-        let _stale_seed = spawn_join_responder(stale_seed_net, stale_pointer);
-
-        let (leader, leader_addr) = spawn_self_pointing_leader().await;
-        let shard_id = ShardId::new("shard-1");
-        let authority = warmed_up_authority(&shard_id).await;
-        let joining_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        let (seed, leader_at) = (address(1), address(2));
+        let port = Scripted::default();
+        port.script(&seed, [Answer::NoLeader]);
+        port.script(&leader_at, [Answer::Pointer(pointer_to("leader", &leader_at))]);
+        let mut cascade = InProcess::new(&port, Some(&authority), clock, &[seed]);
 
         // The leader registers only once the joiner has heard the stale
         // seed, so the joiner is already asking again when it appears.
-        let joined = async {
-            timeout(
-                TEST_TIMEOUT,
-                bootstrap_through(
-                    &joining_net,
-                    Some(&authority),
-                    &[stale_seed_addr],
-                    StdDuration::from_secs(1),
-                ),
-            )
-            .await
-            .expect("bootstrap completed within the timeout")
-        };
         let register_leader_later = async {
             tokio::time::sleep(RETRY_INTERVAL * 4).await;
-            authority
-                .register(&shard_id, &leader, &leader_addr.to_string())
-                .expect("the in-memory authority is always reachable");
-            std::future::pending::<()>().await;
+            register(&authority, "leader", &leader_at.to_string());
         };
-        let entry = tokio::select! {
-            entry = joined => entry,
-            () = register_leader_later => unreachable!("never returns"),
-        };
+        let (entry, ()) = tokio::join!(cascade.run(), register_leader_later);
 
-        assert_eq!(joined_leader(entry), (leader, 1));
+        assert_eq!(joined_leader(entry), (WorkerId::new("leader"), 1));
         assert_eq!(
-            authority
-                .read_recovery_epoch(&shard_id)
-                .map(|epoch| epoch.map(|epoch| epoch.number)),
-            Ok(None),
+            epoch_number(&authority),
+            None,
             "a node that knows the shard exists never takes ownership of it"
         );
     }
 
-    #[test]
-    fn a_wait_reason_is_news_only_in_the_round_it_first_appears_or_changes() {
-        let mut wait_log = WaitLog::new(&ShardId::new("shard-1"));
-        let unreachable = || WaitReason::AuthorityUnreachable(AuthorityError::Unavailable);
-        let silent = |peer: &str| WaitReason::RegisteredPeersSilent {
-            peers: vec![WorkerId::new(peer)],
-        };
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_authority_never_leads_to_founding_until_it_answers() {
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        authority.set_reachable(false);
+        let mut cascade = InProcess::new(&Scripted::default(), Some(&authority), clock, &[]);
+        let mut running = std::pin::pin!(cascade.run());
 
-        assert!(
-            !wait_log.repeats(&unreachable()),
-            "the first round's reason is news"
-        );
-        wait_log.log(unreachable());
-        wait_log.end_round();
+        let waiting = timeout(RETRY_INTERVAL * 20, &mut running).await;
+        assert!(waiting.is_err(), "the node entered while its authority was unreachable");
+        assert_eq!(epoch_number(&authority), None);
 
-        assert!(
-            wait_log.repeats(&unreachable()),
-            "the same reason as the previous round is a repeat"
-        );
-        wait_log.log(unreachable());
-        wait_log.end_round();
-
-        assert!(
-            !wait_log.repeats(&WaitReason::AuthorityWarmingUp),
-            "a different reason is news"
-        );
-        wait_log.log(WaitReason::AuthorityWarmingUp);
-        wait_log.end_round();
-
-        assert!(
-            !wait_log.repeats(&unreachable()),
-            "a reason that comes back after a round without it is news again"
-        );
-        wait_log.log(silent("peer-a"));
-        wait_log.end_round();
-
-        assert!(
-            !wait_log.repeats(&silent("peer-b")),
-            "the same kind of reason with different details is news"
-        );
+        authority.set_reachable(true);
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the node founded the shard once its authority answered");
+        assert!(founded_at_epoch_0(&entry));
     }
 
-    #[tokio::test]
-    async fn a_responding_seed_wins_over_the_authority() {
-        let joining_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let (seed_worker, seed_addr) = spawn_self_pointing_leader().await;
+    #[tokio::test(start_paused = true)]
+    async fn a_registered_peer_that_never_answers_keeps_the_worker_bootstrapping() {
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        let (a, b) = (address(1), address(2));
+        register(&authority, "peer-a", &a.to_string());
+        register(&authority, "peer-b", &b.to_string());
+        let port = Scripted::default();
+        let mut cascade = InProcess::new(&port, Some(&authority), clock, &[]);
 
-        // A warm authority listing a different leader that also answers
-        // JOINs: had the node asked the authority before its seed, it would
-        // have joined that leader instead.
-        let (other_leader, other_leader_addr) = spawn_self_pointing_leader().await;
-        let shard_id = ShardId::new("shard-1");
-        let authority = warmed_up_authority(&shard_id).await;
-        authority
-            .register(&shard_id, &other_leader, &other_leader_addr.to_string())
-            .expect("the in-memory authority is always reachable");
+        let waiting = timeout(RETRY_INTERVAL * 20, cascade.run()).await;
 
-        let entry = timeout(
-            TEST_TIMEOUT,
-            bootstrap_through(
-                &joining_net,
-                Some(&authority),
-                &[seed_addr],
-                StdDuration::from_secs(5),
-            ),
-        )
-        .await
-        .expect("bootstrap completed within the timeout");
-
-        assert_eq!(joined_leader(entry), (seed_worker, 1));
+        assert!(waiting.is_err(), "the node entered with peers listed and none answering");
+        assert_eq!(epoch_number(&authority), None);
+        let passes = port.passes();
+        assert!(passes.len() >= 20);
+        // The listing is ordered by worker id, and a bootstrap never rotates it.
+        assert!(passes.iter().all(|pass| *pass == [a.clone(), b.clone()]));
     }
 
-    #[tokio::test]
-    async fn a_joiner_heartbeats_its_leader_at_once_rather_than_an_interval_later() {
-        let leader_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let leader_addr = timeout(
-            TEST_TIMEOUT,
-            leader_net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("the leader produced a listen address within the timeout");
-        let leader = leader_net.local_worker_id();
-        let pointer = JoinResponse {
-            leader_id: Some(leader.clone().into()),
-            leader_multiaddr: leader_addr.to_string(),
-            term: 1,
-            recovery_epoch: 0,
-            recovery_epoch_lineage: 0,
-        };
-        let joining_net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let joiner = joining_net.local_worker_id();
-        // A heartbeat that waited for its interval would come long after
-        // this test gives up.
-        let timings = ElectionTimings::new(Duration::from_secs(120), Duration::from_secs(50));
+    #[tokio::test(start_paused = true)]
+    async fn losing_the_create_to_an_unseen_rival_does_not_re_found_the_shard() {
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        authority.hold_next(CallKind::SwapRecoveryEpoch);
+        let mut cascade = InProcess::new(&Scripted::default(), Some(&authority), clock, &[]);
+        let mut running = std::pin::pin!(cascade.run());
 
-        let clock = real_clock();
-        let entry = timeout(
-            TEST_TIMEOUT,
-            bootstrap_through(
-                &joining_net,
-                None,
-                std::slice::from_ref(&leader_addr),
-                StdDuration::from_secs(5),
-            ),
+        // The cascade registers and asks to create epoch 0: that call is
+        // held. A rival registers and creates it meanwhile, then the create
+        // is let through, and loses.
+        let rival = authority.for_another_worker();
+        tokio::select! {
+            entry = &mut running => panic!("the cascade entered while its create was held: {entry:?}"),
+            () = async {
+                wait_until_held(&authority, CallKind::SwapRecoveryEpoch).await;
+                let shard = ShardId::new("shard-1");
+                rival.register(&shard, &WorkerId::new("rival"), "not a multiaddr").unwrap();
+                rival
+                    .compare_and_swap_recovery_epoch(&shard, None, RecoveryEpoch::founding(0))
+                    .unwrap();
+                authority.release(CallKind::SwapRecoveryEpoch);
+            } => {}
+        }
+
+        let waiting = timeout(RETRY_INTERVAL * 20, &mut running).await;
+
+        assert!(waiting.is_err(), "the node entered after losing the create");
+        assert_eq!(epoch_number(&authority), Some(0), "no one re-founded the shard");
+    }
+
+    // A listed peer that answered shows the shard exists, and that stays
+    // shown when its registration lapses and the listing is warm and empty.
+    #[tokio::test(start_paused = true)]
+    async fn a_registered_peer_that_answered_keeps_the_worker_from_founding_after_it_leaves_the_listing()
+     {
+        let (authority, clock) = warm_authority(RETRY_INTERVAL * 4).await;
+        let a = address(1);
+        register(&authority, "peer-a", &a.to_string());
+        let port = Scripted::default();
+        port.script(&a, [Answer::NoLeader]);
+        let mut cascade = InProcess::new(&port, Some(&authority), clock, &[]);
+
+        // Well past the registration's lapse.
+        let waiting = timeout(RETRY_INTERVAL * 30, cascade.run()).await;
+
+        assert!(waiting.is_err(), "the node entered after its only peer left the listing");
+        assert_eq!(port.passes().first(), Some(&vec![a]), "the peer was asked while listed");
+        assert!(
+            authority
+                .for_another_worker()
+                .live_registrations(&ShardId::new("shard-1"))
+                .unwrap()
+                .addresses()
+                .is_empty(),
+            "the registration lapsed"
         );
-        let joined_and_heard = async {
-            let entry = entry.await.expect("bootstrap completed within the timeout");
-            let identity = Identity {
-                id: joiner.clone(),
-                incarnation: IncarnationId::new("incarnation-1"),
-                shard: ShardId::new("shard-1"),
-                timings,
-            };
-            let (mut node, first) = WorkerNode::start(identity, entry, clock, None);
-            let mut scheduler = Scheduler::new(clock, Uuid7Ids);
-            let driven = run_driver(
-                &mut node,
-                first,
-                &joining_net,
-                &mut scheduler,
-                clock,
-                None,
-                DriverConfig::default(),
-                |_, _, _| {},
-            );
-            let heard = async {
-                loop {
-                    let heard = leader_net.take_inputs().into_iter().any(|input| {
-                        matches!(
-                            input,
-                            Input::Message { from, message }
-                                if from == joiner
-                                    && matches!(message.payload, Some(Payload::Heartbeat(_)))
-                        )
-                    });
-                    if heard {
-                        return;
-                    }
-                    leader_net.wait_for_arrival().await;
-                }
-            };
-            tokio::select! {
-                _ = driven => unreachable!("run_driver never returns"),
-                () = heard => {}
-            }
-        };
-        let answer_joins = async {
-            loop {
-                for handle in leader_net.poll_join_requests() {
-                    leader_net.respond_join(handle, pointer.clone());
-                }
-                tokio::time::sleep(StdDuration::from_millis(5)).await;
-            }
-        };
+        assert_eq!(epoch_number(&authority), None);
+    }
 
-        timeout(TEST_TIMEOUT, async {
-            tokio::select! {
-                () = joined_and_heard => {}
-                () = answer_joins => unreachable!("the join responder never returns"),
-            }
-        })
-        .await
-        .expect("the joiner's first heartbeat reached its leader within the timeout");
+    // Review focus 5: an authority whose read hangs holds one blocking
+    // thread, not one more every round, and holds up no seed. The cascade
+    // keeps asking its seed each round; were a duplicate read made, it
+    // would not be held and would find the shard ownerless, so the worker
+    // would found it while the first read is still held.
+    #[tokio::test(start_paused = true)]
+    async fn the_cascade_drops_a_duplicate_in_flight_call() {
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        authority.hold_next(CallKind::ReadLiveRegistrations);
+        // A seed that is up but answers no one.
+        let seed = address(1);
+        let port = Scripted::default();
+        let mut cascade = InProcess::new(&port, Some(&authority), clock, &[seed]);
+        let mut running = std::pin::pin!(cascade.run());
+
+        let held = tokio::select! {
+            entry = &mut running => panic!("the worker entered while its first read was held: {entry:?}"),
+            held = async {
+                wait_until_held(&authority, CallKind::ReadLiveRegistrations).await;
+                // The third ask follows a whole round that ran while the
+                // first read was held. Time moves by hand: a held call stops
+                // auto-advance.
+                while port.passes().len() < 3 {
+                    tokio::time::advance(RETRY_INTERVAL).await;
+                    tokio::task::yield_now().await;
+                }
+                authority.is_holding(CallKind::ReadLiveRegistrations)
+            } => held,
+        };
+        // Released before anything can fail, so no path leaves the held
+        // thread parked and hangs the runtime's shutdown.
+        authority.release(CallKind::ReadLiveRegistrations);
+
+        assert!(held, "the first read was answered before the third round");
+        // The held read, answered at last, is the cascade's: it takes
+        // ownership of the ownerless shard.
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the worker founded the shard within the timeout");
+        assert!(founded_at_epoch_0(&entry));
     }
 
     fn me() -> WorkerId {
@@ -1282,146 +902,6 @@ mod tests {
         assert!(matches!(
             reread,
             Decision::Wait(Some(WaitReason::RecoveryEpochExhausted))
-        ));
-    }
-
-    /// An authority whose first read of the live registrations panics, and
-    /// which otherwise is `inner`.
-    struct PanicsOnFirstRead {
-        inner: InMemoryAuthority<RealClock>,
-        panicked: std::sync::atomic::AtomicBool,
-    }
-
-    impl CoordinationAuthority for PanicsOnFirstRead {
-        fn register(&self, shard: &ShardId, worker: &WorkerId, address: &str)
-        -> Result<Duration, AuthorityError> {
-            self.inner.register(shard, worker, address)
-        }
-        fn live_registrations(&self, shard: &ShardId) -> Result<LiveRegistrations, AuthorityError> {
-            if !self.panicked.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                panic!("the authority's first read panics");
-            }
-            self.inner.live_registrations(shard)
-        }
-        fn read_recovery_epoch(&self, shard: &ShardId)
-        -> Result<Option<RecoveryEpoch>, AuthorityError> {
-            self.inner.read_recovery_epoch(shard)
-        }
-        fn compare_and_swap_recovery_epoch(
-            &self,
-            shard: &ShardId,
-            expected: Option<RecoveryEpoch>,
-            new: RecoveryEpoch,
-        ) -> Result<(), AuthorityError> {
-            self.inner.compare_and_swap_recovery_epoch(shard, expected, new)
-        }
-        fn acquire_fence(&self, shard: &ShardId, holder: &WorkerId, epoch: RecoveryEpoch)
-        -> Result<Duration, AuthorityError> {
-            self.inner.acquire_fence(shard, holder, epoch)
-        }
-    }
-
-    // A call that panics on the blocking pool is answered as unavailable, so
-    // its kind is not left in flight for ever: the next round reads again,
-    // and the worker founds its ownerless shard. The driver performs its
-    // node's calls through the same performer.
-    #[tokio::test]
-    async fn an_authority_call_that_panics_is_retried_as_unavailable() {
-        let shard_id = ShardId::new("shard-1");
-        let authority: SharedAuthority = Arc::new(PanicsOnFirstRead {
-            inner: warmed_up_authority(&shard_id).await,
-            panicked: std::sync::atomic::AtomicBool::new(false),
-        });
-        let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-
-        let entry = timeout(
-            TEST_TIMEOUT,
-            bootstrap(
-                &net,
-                &real_clock(),
-                Some(&authority),
-                &shard_id,
-                &net.local_worker_id(),
-                &[],
-                StdDuration::from_secs(1),
-                RETRY_INTERVAL,
-            ),
-        )
-        .await
-        .expect("the worker founded the shard within the timeout");
-
-        assert!(matches!(
-            entry,
-            Entry::Founding { recovery_epoch, .. } if recovery_epoch.number == 0
-        ));
-    }
-
-    // Review focus 5: an authority whose read hangs holds one blocking
-    // thread, not one more every round, and holds up no seed. The cascade
-    // keeps asking its seed each round; were a duplicate read made, it
-    // would not be held and would find the shard ownerless, so the worker
-    // would found it while the first read is still held.
-    #[tokio::test]
-    async fn the_cascade_drops_a_duplicate_in_flight_call() {
-        let shard_id = ShardId::new("shard-1");
-        let authority = FaultingAuthority::new(real_clock(), authority_ttl());
-        while authority
-            .live_registrations(&shard_id)
-            .expect("the authority is reachable")
-            .authoritative_count()
-            .is_none()
-        {
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
-        }
-        authority.hold_next(CallKind::ReadLiveRegistrations);
-        // A seed that is up but answers no one: each round asks it once.
-        let (seed_net, seed_addr) = listening_net().await;
-        let net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let (clock, me, seeds) = (real_clock(), net.local_worker_id(), [seed_addr]);
-        let shared: SharedAuthority = Arc::new(authority.clone());
-
-        let mut bootstrapping = std::pin::pin!(bootstrap(
-            &net,
-            &clock,
-            Some(&shared),
-            &shard_id,
-            &me,
-            &seeds,
-            StdDuration::from_secs(1),
-            RETRY_INTERVAL,
-        ));
-        let asked_while_held = timeout(TEST_TIMEOUT, async {
-            tokio::select! {
-                entry = &mut bootstrapping => Err(entry),
-                asked = async {
-                    let mut asked = 0;
-                    // The third ask follows a whole round that ran while
-                    // the first read was held.
-                    while asked < 3 {
-                        asked += seed_net.poll_join_requests().len();
-                        tokio::time::sleep(StdDuration::from_millis(5)).await;
-                    }
-                    Ok(authority.is_holding(CallKind::ReadLiveRegistrations))
-                } => asked,
-            }
-        })
-        .await;
-        // Released before anything can fail, so no path leaves the held
-        // thread parked and hangs the runtime's shutdown.
-        authority.release(CallKind::ReadLiveRegistrations);
-
-        match asked_while_held.expect("the seed was asked three times within the timeout") {
-            Ok(held) => assert!(held, "the first read was answered before the third round"),
-            Err(entry) => panic!("the worker entered while its first read was held: {entry:?}"),
-        }
-        // The held read, answered at last, is the cascade's: it takes
-        // ownership of the ownerless shard.
-        let entry = timeout(TEST_TIMEOUT, bootstrapping)
-            .await
-            .expect("the worker founded the shard within the timeout");
-        assert!(matches!(
-            entry,
-            Entry::Founding { recovery_epoch, .. } if recovery_epoch.number == 0
         ));
     }
 }
