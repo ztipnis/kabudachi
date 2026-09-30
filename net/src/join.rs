@@ -28,12 +28,11 @@ use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::time::Clock;
-use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::{Multiaddr, PeerId};
 
 use crate::bootstrap::{WaitLog, WaitReason};
 use crate::driver::SharedAuthority;
-use crate::messenger::Net;
+use crate::messenger::{DialTarget, Net};
 
 /// How long [`ask_for_leader`] waits, per peer, for a connection and then a
 /// `JOIN_RESPONSE` before moving on to the next peer.
@@ -210,7 +209,7 @@ pub async fn pointer_for<C: Clock>(node: &WorkerNode<C>, net: &Net) -> JoinRespo
 /// the peer an earlier ask found at `address` is still connected, it is
 /// asked directly. Otherwise `address` is dialed and this waits, also
 /// bounded by `per_peer_timeout`, for that dial's own connection (see the
-/// module doc), and records the peer it finds there.
+/// module doc); the swarm task records the peer it finds there.
 async fn ask_peer_for_leader(
     net: &Net,
     address: &Multiaddr,
@@ -224,19 +223,15 @@ async fn ask_peer_for_leader(
     let peer = match connected_peer_at(net, address).await {
         Some(peer) => peer,
         None => {
-            let opts = DialOpts::unknown_peer_id().address(address.clone()).build();
-            let dialed = tokio::time::timeout(per_peer_timeout, net.dial_for_connection(opts))
-                .await
-                .ok()
-                .flatten();
-            // Remember whoever answered there, or forget whoever did before.
-            let address = address.clone();
-            net.with_peers(move |peers| match dialed {
-                Some(peer) => peers.asked.insert(address, peer),
-                None => peers.asked.remove(&address),
-            })
-            .await;
-            dialed?
+            // The swarm task records whoever answers there (or forgets whoever
+            // did before) as the dial ends.
+            tokio::time::timeout(
+                per_peer_timeout,
+                net.dial_for_connection(DialTarget::Address(address.clone())),
+            )
+            .await
+            .ok()
+            .flatten()?
         }
     };
 
@@ -250,22 +245,9 @@ async fn ask_peer_for_leader(
 /// address of record is `address`.
 async fn connected_peer_at(net: &Net, address: &Multiaddr) -> Option<PeerId> {
     let address = address.clone();
-    net.with_peers(move |peers| {
-        peers
-            .asked
-            .get(&address)
-            .copied()
-            .filter(|peer| peers.is_connected(peer))
-            .or_else(|| {
-                peers
-                    .addresses
-                    .iter()
-                    .find(|(peer, known)| known.addr == address && peers.is_connected(peer))
-                    .map(|(peer, _)| *peer)
-            })
-    })
-    .await
-    .flatten()
+    net.with_peers(move |peers| peers.peer_connected_at(&address))
+        .await
+        .flatten()
 }
 
 /// Whether this node ends up connected to `leader`: at once if it already
@@ -301,11 +283,11 @@ async fn connect_to_leader(
     {
         return true;
     }
-    let opts = DialOpts::peer_id(leader_peer)
-        .addresses(vec![leader_addr])
-        .extend_addresses_through_behaviour()
-        .build();
-    let dialed = tokio::time::timeout(per_peer_timeout, net.dial_for_connection(opts))
+    let target = DialTarget::Peer {
+        peer: leader_peer,
+        address: leader_addr,
+    };
+    let dialed = tokio::time::timeout(per_peer_timeout, net.dial_for_connection(target))
         .await
         .ok()
         .flatten();
@@ -625,8 +607,11 @@ mod tests {
         // drops its response channel at once, *before* seed B's dial is
         // issued, so seed A's real connection is free to keep completing in
         // the background while seed B's dial is in flight.
-        let opts_a = DialOpts::unknown_peer_id().address(addr_a.clone()).build();
-        let abandoned = timeout(Duration::ZERO, net_c.dial_for_connection(opts_a)).await;
+        let abandoned = timeout(
+            Duration::ZERO,
+            net_c.dial_for_connection(DialTarget::Address(addr_a.clone())),
+        )
+        .await;
         assert!(abandoned.is_err(), "seed A's dial cannot have connected at once");
 
         // Run the real cascade against seed B only. If seed A's abandoned

@@ -104,129 +104,30 @@
 //! (the answering side). Whether to grant a claim is
 //! `core::scheduler::Scheduler`'s decision, so the driver answers it too.
 //!
-//! ## Reconnect/backoff
+//! ## Reconnect/backoff and where a peer's address comes from
 //!
-//! A connection that drops is redialed: [`RedialPolicy`] governs a bounded,
-//! exponential-backoff redial that `drive` runs on its own, at the address
-//! [`Diagnostics::peer_addresses`] keeps for a disconnected peer. libp2p has no
-//! retry to defer to: in the pinned `libp2p-swarm` 0.48.0,
-//! `libp2p_swarm::dial_opts::DialOpts` (and its `PeerCondition`) configure
-//! only a single dial attempt, and nothing schedules a retry after a dial or
-//! an established connection fails.
+//! What a `Net` knows about its peers, and the bounded redial of a dropped
+//! one, belong to `crate::peers`: its module doc has the redial rules (which
+//! drops qualify, why the default policy is short) and how a peer's address
+//! of record is ranked by its source. This task tells the peer book what it
+//! saw (`crate::peers::Observation`) and dials what it says is due.
 //!
-//! **Which drops are redial-eligible.** Only a peer that this node still
-//! needs a connection to, and would not otherwise reach again, is redialed:
-//! one in its gossip mesh for its shard ([`Diagnostics::shard_mesh`]) when the
-//! connection dropped. The node's election needs that mesh, since a roll
-//! call is published and a peer cut off from the mesh never hears it, and
-//! nothing else reconnects it: gossipsub never dials. Every other
-//! connection either repairs itself or was never needed: a follower's
-//! heartbeat, a claim or any other [`Net::send`] dials its peer as it goes,
-//! and a connection that only a JOIN, a `kad` crawl or a peer's own dial
-//! opened has no reason to be reopened just because an address is on file.
-//! A peer in the mesh is never closed for being idle (gossipsub keeps it
-//! alive; see `crate::swarm`'s `IDLE_CONNECTION_TIMEOUT`), so an idle
-//! connection that times out is never redialed. Only the driver's routing
-//! crawls (see [`Net::refresh_peer_routing`]) open such a connection again,
-//! at most once per peer per crawl.
+//! What stays here is the outgoing half of address stamping. A relayed roll
+//! call can reach a worker that holds no connection to its initiator, and
+//! that worker answers the initiator directly, so a `Net` stamps its own
+//! address on every roll call it publishes and every roll call reply it
+//! sends (see `stamp_own_address`), and [`Net::send`] dials a peer it holds no
+//! connection to at the address the peer book has for it.
 //!
-//! A peer whose connection this `Net` itself asked to close
-//! ([`Net::disconnect`]) is not redialed either: a local hangup is a
-//! decision, not a failure to recover from. Only the closing side can tell
-//! the difference: its own `SwarmEvent::ConnectionClosed` reports `cause:
-//! None`, while the side being disconnected sees `cause:
-//! Some(IO(..Closed..))`, like any transport failure. So only the side that
-//! issued the disconnect excludes that peer (see `crate::peers`'s
-//! `RedialTracker`, which lifts the exclusion once the peer reconnects by
-//! any means); the other side, like any other dropped peer, redials.
-//!
-//! This exemption covers only the redial policy, not the peer itself: any
-//! later [`Net::send`] to it, a follower's heartbeat for example, dials it
-//! again like any other unreachable peer. `disconnect` is not a way to
-//! isolate a peer; [`Net::block_peer`] is. A blocked peer stays
-//! redial-eligible, like one across a real partition: each attempt fails
-//! until the block lifts, and counts against the bounded budget.
-//!
-//! **Why the default is short.** A redial restores the gossip mesh after a
-//! transient drop, so it should land well within a suspicion timeout: a
-//! follower that misses a roll call because its mesh has not come back is a
-//! follower the election cannot count. Nothing in the election needs a
-//! redial to stay away, either. The ring roll call did (a redial that landed
-//! mid-election reconnected survivors to the ex-leader they were replacing,
-//! which is why the default was once 10 s); the gossip roll call, leader
-//! stickiness and terms make a reconnected ex-leader harmless. So
-//! `RedialPolicy::default` tries after one second, and backs off from there.
-//! [`Net::new_with_redial_policy`] lets a caller, such as this crate's own
-//! tests, use other parameters.
-//!
-//! ## Where a peer's address comes from
-//!
-//! A peer's address of record is the leader address this node hands a
-//! joining node in a `JOIN_RESPONSE`, and the address [`Net::send`] dials a
-//! peer at when it holds no connection to it, so this node has to know which
-//! of its entries something can actually *dial*. Not every address a swarm
-//! event carries is:
-//! `ConnectedPoint::get_remote_address` (libp2p-core 0.44.0,
-//! `src/connection.rs`) returns the address this node dialed for
-//! `ConnectedPoint::Dialer`, but `send_back_addr` for
-//! `ConnectedPoint::Listener` — and `send_back_addr` is the *dialer's
-//! ephemeral source address*, which is generally not an address anything can
-//! connect back to.
-//!
-//! `identify::Event::Received`'s `info.listen_addrs` is exactly the peer's
-//! own advertised listen addresses, so it is the preferred source, ranked
-//! above both endpoint-derived ones by `AddressSource`: `Identify` >
-//! `DialedAddress` (a `ConnectedPoint::Dialer` address, dialable by
-//! construction, since this node just dialed it) > `SelfStamped` (below) >
-//! `InboundRemote` (a `send_back_addr`, kept only as a fallback for a peer
-//! whose Identify exchange has not completed yet: never handed to a joiner
-//! nor offered to [`Net::send`]'s dial — see [`Net::dialable_address`] —
-//! though a redial, which has nothing better, tries it). A new observation
-//! replaces the stored one whenever its source ranks at least as high, so a
-//! fresher Identify or a fresher successful dial still wins over a stale one
-//! of the same kind.
-//!
-//! A worker can also learn a peer's address with no connection to it at
-//! all: gossip delivers a roll call from an initiator it may never have
-//! connected to, and it answers with a direct reply. So a `Net` stamps its
-//! own address (chosen as described below) on every roll call it publishes
-//! and every roll call reply it sends, and records the address stamped on
-//! one that arrives as its sender's `SelfStamped` address — but only when the
-//! stamp names the sender `Net` vouches for (a gossip message's signed
-//! author, or the peer at the other end of a direct message's connection), so
-//! no peer can redirect traffic meant for another. A stamp is the peer's own
-//! choice among its listen addresses, not one this node has seen work, so it
-//! ranks below a dialed address and, being one address where Identify
-//! advertises them all, below Identify; it ranks above an inbound source
-//! address, which is usually not dialable at all.
-//!
-//! Of a peer's `listen_addrs`, entries with an unspecified IP
-//! (`0.0.0.0`/`::`) are skipped as undialable, and the first remaining one
-//! that is not loopback is taken; a loopback one only when nothing else is
-//! advertised. A node on another host that dialed a loopback leader address
-//! would reach itself, and a joiner that a seed has answered keeps asking
-//! for a leader it can reach. This node's own address, which it hands
-//! joiners when it leads ([`Net::local_multiaddr`]), follows the same rule:
-//! a node listening on a wildcard bind is told one listen address per
-//! interface, in no set order, and a later one replaces the recorded one
-//! unless it would swap a non-loopback address for loopback.
-//!
-//! Best-effort, deliberately: on a multi-homed host the chosen address may
-//! be one the particular asking peer cannot route to — a general
-//! address-selection problem this phase does not try to solve, consistent
-//! with [`Diagnostics::peer_addresses`]'s "best-effort and address-of-record only"
-//! contract.
-//!
-//! This module's own address book is not the only place a dial can find an
-//! address, though: [`Net::send`] hands `request_response` an empty address
-//! list whenever `dialable_address_of` has nothing, and the swarm underneath
-//! that call still asks `kad`'s routing table for one regardless — fed from
-//! the same Identify events, in `handle_event` below (see `crate::swarm`'s
-//! "kad: peer routing, not membership"). So a peer this node never itself
-//! connected to can still be reached, once some other peer's Identify has
-//! given `kad` a route to it.
+//! The peer book is not the only place a dial can find an address, though:
+//! [`Net::send`] hands `request_response` an empty address list whenever the
+//! book has nothing, and the swarm underneath that call still asks `kad`'s
+//! routing table for one regardless, fed from the same Identify events in
+//! `handle_event` below (see `crate::swarm`'s "kad: peer routing, not
+//! membership"). So a peer this node never itself connected to can still be
+//! reached, once some other peer's Identify has given `kad` a route to it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -238,11 +139,9 @@ use kabudachi_core::protocol::messages::{
     ClaimOldest, ClaimRequest, ClaimResponse, ElectionMessage, JoinRequest, JoinResponse,
     claim_request, election_message,
 };
-use kabudachi_core::protocol::messages::prelude::*;
 use libp2p::core::ConnectedPoint;
 use libp2p::core::transport::ListenerId;
 use libp2p::futures::StreamExt;
-use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId, ResponseChannel};
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
@@ -250,151 +149,23 @@ use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, identify};
 use prost::Message as _;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::codec::Ack;
 use crate::framing::decode_well_formed;
-use crate::peers::Peers;
+pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
+use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
 use crate::swarm::{Behaviour, BehaviourEvent};
 
-/// Where a `peer_addresses` entry came from, and so how far it can be trusted
-/// to be an address anything can dial. Ordered worst to best: `Ord` *is* the
-/// precedence rule — see the module doc's "Where a peer's address comes from".
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum AddressSource {
-    /// A `ConnectedPoint::Listener`'s `send_back_addr`: the remote's ephemeral
-    /// source address, usually *not* dialable. Kept only as a fallback for a
-    /// peer whose Identify exchange has not completed yet.
-    InboundRemote,
-    /// The address a peer stamped for itself on a roll call or roll call
-    /// reply it sent: one it listens on, by its own choice, but one this node
-    /// has not yet seen work.
-    SelfStamped,
-    /// A `ConnectedPoint::Dialer`'s address: one this node itself successfully
-    /// dialed, so dialable by construction.
-    DialedAddress,
-    /// One of `identify::Event::Received`'s `info.listen_addrs`: the peer's own
-    /// advertised listen address, the only source that is right by definition
-    /// rather than by circumstance.
-    Identify,
-}
-
-/// One peer's address of record plus the [`AddressSource`] it came from.
-#[derive(Clone, Debug)]
-pub(crate) struct KnownAddress {
-    pub(crate) addr: Multiaddr,
-    source: AddressSource,
-}
-
-/// Records `addr` for `peer` unless a strictly better-ranked source is already
-/// on file. An equal rank *does* overwrite, so a fresher observation of the
-/// same kind (a re-dial to a new address, a later Identify) still wins.
-fn record_peer_address(
-    addresses: &mut BTreeMap<PeerId, KnownAddress>,
-    peer: PeerId,
-    addr: Multiaddr,
-    source: AddressSource,
-) {
-    if addresses
-        .get(&peer)
-        .is_some_and(|known| known.source > source)
-    {
-        return;
-    }
-    addresses.insert(peer, KnownAddress { addr, source });
-}
-
-/// `peer`'s address of record in `peer_addresses`, unless it is only the
-/// source address of `peer`'s inbound connection, which `peer` need not
-/// listen on (see the module doc's "Where a peer's address comes from").
-fn dialable_address_of(
-    addresses: &BTreeMap<PeerId, KnownAddress>,
-    peer: &PeerId,
-) -> Option<Multiaddr> {
-    addresses
-        .get(peer)
-        .filter(|known| known.source > AddressSource::InboundRemote)
-        .map(|known| known.addr.clone())
-}
-
-/// Whether an address advertised by Identify is worth recording: an
-/// unspecified IP (`0.0.0.0`/`::`) is a wildcard bind, never a destination.
-fn is_dialable_listen_addr(addr: &Multiaddr) -> bool {
-    addr.iter().all(|protocol| match protocol {
-        Protocol::Ip4(ip) => !ip.is_unspecified(),
-        Protocol::Ip6(ip) => !ip.is_unspecified(),
-        _ => true,
-    })
-}
-
-/// The address, of `candidates` in order, to give other nodes to dial: the
-/// first that is neither a wildcard bind nor loopback, or else the first
-/// loopback one. A loopback address (`127.0.0.0/8`, `::1`) reaches only the
-/// host that dials it, so a node on another host handed one would dial
-/// itself; it is used only when there is nothing else.
-fn preferred_address(candidates: impl IntoIterator<Item = Multiaddr>) -> Option<Multiaddr> {
-    let mut first_loopback = None;
-    for candidate in candidates {
-        if !is_dialable_listen_addr(&candidate) {
-            continue;
-        }
-        if !is_loopback(&candidate) {
-            return Some(candidate);
-        }
-        first_loopback.get_or_insert(candidate);
-    }
-    first_loopback
-}
-
-fn is_loopback(addr: &Multiaddr) -> bool {
-    addr.iter().any(|protocol| match protocol {
-        Protocol::Ip4(ip) => ip.is_loopback(),
-        Protocol::Ip6(ip) => ip.is_loopback(),
-        _ => false,
-    })
-}
-
-/// Bounded, exponential-backoff redial policy for a peer in this node's
-/// gossip mesh that dropped without this `Net` itself asking to disconnect
-/// it (see the module doc's "Reconnect/backoff" section for why libp2p's own
-/// `DialOpts`/`PeerCondition` don't already do this, and which drops are
-/// eligible at all).
-///
-/// On each eligible drop, `drive` schedules a first redial attempt after
-/// `initial_backoff`; each subsequent attempt (up to `max_attempts` total)
-/// doubles the wait, capped at `max_backoff`. `check_interval` is how often
-/// `drive` polls for a due attempt — coarser than `initial_backoff` wastes
-/// time before the first attempt actually fires, so a caller using a short
-/// `initial_backoff` (this crate's own tests) should also shrink this.
-///
-/// `Default` picks production-shaped values (see the module doc's "Why the
-/// default is short"): a first attempt one second after the drop, well
-/// within any suspicion timeout of seconds, doubling to at most 30 s, and
-/// eight attempts in all, so a peer gone for about two minutes is given up
-/// on and left to the node's own sends. A caller that wants test-scale
-/// retries should use [`Net::new_with_redial_policy`] instead of
-/// [`Net::new`].
-#[derive(Debug, Clone, Copy)]
-pub struct RedialPolicy {
-    /// Delay before the first redial attempt after an eligible drop.
-    pub initial_backoff: StdDuration,
-    /// Ceiling the doubling backoff never exceeds.
-    pub max_backoff: StdDuration,
-    /// Total attempts made before giving up on a peer for good (the
-    /// "bounded" half of "bounded redial policy" — spec decision 2.b).
-    pub max_attempts: u32,
-    /// How often `drive` checks for a due attempt.
-    pub check_interval: StdDuration,
-}
-
-impl Default for RedialPolicy {
-    fn default() -> Self {
-        Self {
-            initial_backoff: StdDuration::from_secs(1),
-            max_backoff: StdDuration::from_secs(30),
-            max_attempts: 8,
-            check_interval: StdDuration::from_millis(250),
-        }
-    }
+/// What [`Net::dial_for_connection`] dials.
+pub(crate) enum DialTarget {
+    /// Whoever answers at this address (a seed or a registered peer asked who
+    /// leads). The swarm task records the peer it finds there
+    /// (`Observation::Dialed`).
+    Address(Multiaddr),
+    /// This peer, at `address` and any address the swarm's behaviours know for
+    /// it (`DialOpts::extend_addresses_through_behaviour`).
+    Peer { peer: PeerId, address: Multiaddr },
 }
 
 /// Instructions for the driver task. `Net`'s methods and setup
@@ -432,13 +203,14 @@ enum Command {
     },
     /// Like `Dial`, but the caller wants to know *which* connection this
     /// specific dial produces — see `Net::dial_for_connection`, the only
-    /// caller. `opts` carries a `ConnectionId` (`DialOpts::connection_id`)
-    /// that libp2p attaches to every `SwarmEvent::ConnectionEstablished` /
+    /// caller. The `DialOpts` built from `target` carries a `ConnectionId`
+    /// (`DialOpts::connection_id`) that libp2p attaches to every
+    /// `SwarmEvent::ConnectionEstablished` /
     /// `SwarmEvent::OutgoingConnectionError` this dial attempt produces, so
     /// the driver can correlate the outcome to this exact call instead of
     /// guessing from the connected-peer set.
     DialForConnection {
-        opts: DialOpts,
+        target: DialTarget,
         respond_to: oneshot::Sender<Option<PeerId>>,
     },
     ListenOn {
@@ -535,92 +307,6 @@ pub enum ClaimFailure {
     /// nothing could be sent (this `Net` has stopped, or the leader's id
     /// names no libp2p peer).
     Unanswered,
-}
-
-/// Running counts of what one [`Net`] has carried since it was created
-/// (see [`Diagnostics::traffic`]): how much of the shard's traffic goes
-/// through a worker, its leader say.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Traffic {
-    /// Election messages received, sent to this worker or published to its
-    /// shard, including any the input queue's bound later dropped.
-    pub messages_received: u64,
-    /// Election messages this worker handed to its swarm to send
-    /// ([`Net::send`]), whether or not they arrived.
-    pub messages_sent: u64,
-    /// Election messages this worker published to its shard
-    /// ([`Net::publish`]), each counted once however many workers it reaches.
-    pub messages_published: u64,
-    /// `/kabudachi/join/1` requests received.
-    pub join_requests_received: u64,
-    /// `/kabudachi/claim/1` requests received.
-    pub claim_requests_received: u64,
-}
-
-impl Traffic {
-    /// Everything this worker received or sent: election messages in and
-    /// out, and join and claim requests in (each answered once).
-    pub fn total(&self) -> u64 {
-        self.messages_received
-            + self.messages_sent
-            + self.messages_published
-            + self.join_requests_received
-            + self.claim_requests_received
-    }
-}
-
-/// One read of what a [`Net`]'s transport knows, for tests and logs (see
-/// [`Net::diagnostics`]). Nothing a node decides depends on it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Diagnostics {
-    /// The peers the swarm holds a connection to.
-    pub connected: BTreeSet<WorkerId>,
-    /// Every address of record, keyed by peer, including a peer's inbound
-    /// source address, which may not be dialable (see the module doc's
-    /// "Where a peer's address comes from"; for an address to give anyone
-    /// else, use [`Net::dialable_address`]). A peer that disconnects keeps
-    /// its last entry: that is where a redial finds the address to dial.
-    pub peer_addresses: BTreeMap<WorkerId, Multiaddr>,
-    /// The address this node gives other nodes (see [`Net::local_multiaddr`]).
-    pub local_addr: Option<Multiaddr>,
-    /// Every peer being redialed (see [`RedialPolicy`]) and how many
-    /// attempts have been made so far. A peer leaves once it reconnects or
-    /// has used up `RedialPolicy::max_attempts`.
-    pub redial_attempts: BTreeMap<WorkerId, u32>,
-    /// The connected peers whose subscription to this node's shard topic
-    /// has reached it. Empty before [`Net::subscribe_to_shard`].
-    pub shard_subscribers: BTreeSet<WorkerId>,
-    /// The peers in this node's gossip mesh for its shard: the subscribers
-    /// its shard's gossip actually runs through, whose dropped connection
-    /// the redial policy repairs (see the module doc's "Which drops are
-    /// redial-eligible").
-    pub shard_mesh: BTreeSet<WorkerId>,
-    /// What this `Net` has carried since it was created.
-    pub traffic: Traffic,
-}
-
-impl std::ops::Sub for Traffic {
-    type Output = Traffic;
-
-    /// The traffic carried between two readings, `self` the later (each
-    /// count saturates at zero if not).
-    fn sub(self, earlier: Traffic) -> Traffic {
-        Traffic {
-            messages_received: self
-                .messages_received
-                .saturating_sub(earlier.messages_received),
-            messages_sent: self.messages_sent.saturating_sub(earlier.messages_sent),
-            messages_published: self
-                .messages_published
-                .saturating_sub(earlier.messages_published),
-            join_requests_received: self
-                .join_requests_received
-                .saturating_sub(earlier.join_requests_received),
-            claim_requests_received: self
-                .claim_requests_received
-                .saturating_sub(earlier.claim_requests_received),
-        }
-    }
 }
 
 /// How many of its node's suspicion timeouts `crate::driver::run_driver`
@@ -926,12 +612,12 @@ impl Net {
         let _ = self.commands.send(Command::Block { peer, blocked });
     }
 
-    /// Makes the dial `opts` describes and resolves to the `PeerId` of the
+    /// Makes the dial `target` describes and resolves to the `PeerId` of the
     /// connection *this specific dial* establishes — never a connection some
     /// other dial (or an unrelated inbound connection) produced. `None` if
     /// the driver task is gone or this dial attempt fails
     /// (`SwarmEvent::OutgoingConnectionError`, including libp2p's `WrongPeerId`
-    /// when `opts` names a peer and another answers, or `Swarm::dial`
+    /// when `target` names a peer and another answers, or `Swarm::dial`
     /// rejecting it outright).
     ///
     /// Correlation is by `ConnectionId` (`DialOpts::connection_id`), not by
@@ -942,10 +628,10 @@ impl Net {
     /// resolve, if the caller already stopped awaiting it) that dial's own
     /// response channel — it can never be mistaken for a different, later
     /// dial's result.
-    pub(crate) async fn dial_for_connection(&self, opts: DialOpts) -> Option<PeerId> {
+    pub(crate) async fn dial_for_connection(&self, target: DialTarget) -> Option<PeerId> {
         let (respond_to, response) = oneshot::channel();
         self.commands
-            .send(Command::DialForConnection { opts, respond_to })
+            .send(Command::DialForConnection { target, respond_to })
             .ok()?;
         response.await.ok()?
     }
@@ -993,7 +679,7 @@ impl Net {
     /// from").
     pub async fn dialable_address(&self, peer: &WorkerId) -> Option<Multiaddr> {
         let peer = PeerId::from_str(peer.as_str()).ok()?;
-        self.with_peers(move |peers| dialable_address_of(&peers.addresses, &peer))
+        self.with_peers(move |peers| peers.dialable_address(&peer))
             .await
             .flatten()
     }
@@ -1241,11 +927,6 @@ impl Net {
     }
 }
 
-/// `peer`'s `WorkerId` (see the module doc's `WorkerId <-> PeerId` mapping).
-pub(crate) fn worker_id_of(peer: &PeerId) -> WorkerId {
-    WorkerId::new(peer.to_string())
-}
-
 /// The gossip topic `shard`'s workers publish election messages on. Every
 /// worker in the shard must name it the same way, or they cannot hear each
 /// other. It carries the same `ElectionMessage` schema as the direct
@@ -1298,47 +979,6 @@ fn stamp_own_address(message: &mut ElectionMessage, own: &Multiaddr) {
     }
 }
 
-/// The address `from` stamped on `message` for itself: the initiator's
-/// address on a roll call `from` initiated, or the responder's on a reply
-/// `from` wrote. `None` for any other message, for a stamp that names
-/// someone other than `from` (a peer relaying, or lying about, another
-/// worker's message must not redirect traffic meant for it), and for a stamp
-/// that is empty, does not parse, or is a wildcard bind.
-fn stamped_address(from: &WorkerId, message: &ElectionMessage) -> Option<Multiaddr> {
-    let (author, stamp) = match message.payload.as_ref()? {
-        election_message::Payload::RollCall(call) => {
-            (call.initiator_id(), call.initiator_address.as_str())
-        }
-        election_message::Payload::RollCallReply(reply) => {
-            (reply.responder_id(), reply.responder_address.as_str())
-        }
-        _ => return None,
-    };
-    if author != *from {
-        return None;
-    }
-    let address: Multiaddr = stamp.parse().ok()?;
-    // An empty string parses, as the empty multiaddr.
-    (!address.is_empty() && is_dialable_listen_addr(&address)).then_some(address)
-}
-
-/// Records, as its sender's address, the address an arriving message's
-/// sender stamped on it for itself (see [`stamped_address`]). The sender is
-/// the one `Net` vouches for: a gossip message's signed author, or the peer
-/// at the other end of the connection a direct message came over.
-fn record_stamped_address(addresses: &mut BTreeMap<PeerId, KnownAddress>, input: &Input) {
-    let Input::Message { from, message } = input else {
-        return;
-    };
-    let Some(address) = stamped_address(from, message) else {
-        return;
-    };
-    let Ok(peer) = PeerId::from_str(from.as_str()) else {
-        return;
-    };
-    record_peer_address(addresses, peer, address, AddressSource::SelfStamped);
-}
-
 /// The requests `drive` has made of the swarm on a caller's behalf and not
 /// yet answered, each keyed by what the swarm reports its outcome under.
 #[derive(Default)]
@@ -1346,12 +986,49 @@ struct Pending {
     listens: HashMap<ListenerId, oneshot::Sender<Multiaddr>>,
     join_requests: HashMap<OutboundRequestId, oneshot::Sender<Option<JoinResponse>>>,
     claim_requests: HashMap<OutboundRequestId, oneshot::Sender<Option<ClaimResponse>>>,
-    dials: HashMap<ConnectionId, oneshot::Sender<Option<PeerId>>>,
+    dials: HashMap<ConnectionId, PendingDial>,
+}
+
+/// A `Command::DialForConnection` in flight.
+struct PendingDial {
+    /// The address whoever answers is recorded at, for an
+    /// [`DialTarget::Address`] dial.
+    asked_at: Option<Multiaddr>,
+    respond_to: oneshot::Sender<Option<PeerId>>,
+}
+
+impl PendingDial {
+    /// Ends the dial: tells the peer book what it found (for a dial of
+    /// whoever answers at an address) and answers the caller, who may have
+    /// stopped waiting.
+    fn finish(self, outcome: Option<PeerId>, peers: &mut Peers, now: Instant) {
+        if let Some(address) = self.asked_at {
+            peers.observe(Observation::Dialed { address, outcome }, now);
+        }
+        let _ = self.respond_to.send(outcome);
+    }
+}
+
+/// What the swarm task's peer book has to learn from the swarm itself after
+/// each event or command: gossipsub raises no event for GRAFT/PRUNE, so the
+/// mesh and shard subscribers are read, not observed.
+fn gossip_of(swarm: &Swarm<Behaviour>) -> Observation<'static> {
+    let gossipsub = &swarm.behaviour().gossipsub;
+    let my_topics: BTreeSet<&gossipsub::TopicHash> = gossipsub.topics().collect();
+    Observation::Gossip {
+        mesh: gossipsub.all_mesh_peers().copied().collect(),
+        subscribers: gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.iter().any(|topic| my_topics.contains(topic)))
+            .map(|(peer, _)| *peer)
+            .collect(),
+    }
 }
 
 /// Owns `swarm` and `peers` exclusively and polls the swarm for ever,
-/// applying commands, queueing what arrives on `inbound`, and keeping
-/// `peers` current after every event and command.
+/// applying commands, queueing what arrives on `inbound`, and telling `peers`
+/// what it sees. Each loop iteration reads the clock once, and every
+/// observation of that iteration carries the reading.
 async fn drive(
     mut swarm: Swarm<Behaviour>,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -1359,24 +1036,29 @@ async fn drive(
     mut peers: Peers,
 ) {
     let mut pending = Pending::default();
-    let mut redial_ticker = tokio::time::interval(peers.redial.check_interval());
+    let mut redial_ticker = tokio::time::interval(peers.redial_check_interval());
     redial_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        tokio::select! {
+        let now = tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else {
                     return; // Every Net handle for this swarm was dropped.
                 };
-                handle_command(&mut swarm, command, &mut pending, &mut peers);
+                let now = Instant::now();
+                handle_command(&mut swarm, command, &mut pending, &mut peers, now);
+                now
             }
             event = swarm.select_next_some() => {
-                handle_event(&mut swarm, event, &mut pending, &inbound, &mut peers);
+                let now = Instant::now();
+                handle_event(&mut swarm, event, &mut pending, &inbound, &mut peers, now);
+                now
             }
             _ = redial_ticker.tick() => {
-                // Whether a redial worked shows in a later refresh, which
-                // stops redialing a peer once it is connected again.
-                for (peer, addr) in peers.redial.due(tokio::time::Instant::now()) {
+                let now = Instant::now();
+                // Whether a redial worked shows as the connection opening,
+                // which ends the redial.
+                for (peer, addr) in peers.redials_due(now) {
                     // Also asks kad's routing table for an address of its
                     // own, as `crate::join` does for a leader: the last-known
                     // address is not the only one that might still reach
@@ -1388,9 +1070,14 @@ async fn drive(
                             .build(),
                     );
                 }
+                now
             }
-        }
-        peers.refresh(&swarm);
+        };
+        // After the event's own observations: a connection that closed must be
+        // judged against the mesh as of before this read, or gossipsub having
+        // already dropped the peer from it would keep an organic drop from
+        // ever being redialed.
+        peers.observe(gossip_of(&swarm), now);
     }
 }
 
@@ -1399,18 +1086,19 @@ fn handle_command(
     command: Command,
     pending: &mut Pending,
     peers: &mut Peers,
+    now: Instant,
 ) {
     match command {
         Command::Send { to, mut message } => {
-            if let Some(own) = &*peers.local_addr.borrow() {
-                stamp_own_address(&mut message, own);
+            if let Some(own) = peers.own_address() {
+                stamp_own_address(&mut message, &own);
             }
-            peers.traffic.messages_sent += 1;
+            peers.observe(Observation::Carried(Carried::Sent), now);
             // Over a connection to `to` if there is one; else libp2p dials
             // `to` at this address of record (one stamped on a roll call
             // from a peer this node never connected to, say), along with any
             // its behaviours know.
-            let address = dialable_address_of(&peers.addresses, &to);
+            let address = peers.dialable_address(&to);
             swarm
                 .behaviour_mut()
                 .request_response
@@ -1426,10 +1114,10 @@ fn handle_command(
             }
         }
         Command::Publish { topic, mut message } => {
-            if let Some(own) = &*peers.local_addr.borrow() {
-                stamp_own_address(&mut message, own);
+            if let Some(own) = peers.own_address() {
+                stamp_own_address(&mut message, &own);
             }
-            peers.traffic.messages_published += 1;
+            peers.observe(Observation::Carried(Carried::Published), now);
             // Lost like any other unreliable message (see the module doc's
             // "Gossip").
             if let Err(error) = swarm
@@ -1445,8 +1133,9 @@ fn handle_command(
         }
         Command::Disconnect { peer } => {
             let _ = swarm.disconnect_peer_id(peer);
-            // See "Which drops are redial-eligible" in the module doc.
-            peers.redial.disconnected_locally(peer);
+            // Before the close is observed, which comes later: see "Which
+            // drops are redial-eligible" in `crate::peers`.
+            peers.observe(Observation::DisconnectedLocally(peer), now);
         }
         Command::RefreshPeerRouting => {
             // `NoKnownPeers`: nothing to crawl from yet; the next refresh
@@ -1461,19 +1150,34 @@ fn handle_command(
                 blocklist.unblock_peer(peer);
             }
         }
-        Command::DialForConnection { opts, respond_to } => {
+        Command::DialForConnection { target, respond_to } => {
+            let (opts, asked_at) = match target {
+                DialTarget::Address(address) => (
+                    DialOpts::unknown_peer_id().address(address.clone()).build(),
+                    Some(address),
+                ),
+                DialTarget::Peer { peer, address } => (
+                    DialOpts::peer_id(peer)
+                        .addresses(vec![address])
+                        .extend_addresses_through_behaviour()
+                        .build(),
+                    None,
+                ),
+            };
             let connection_id = opts.connection_id();
+            let dial = PendingDial {
+                asked_at,
+                respond_to,
+            };
             match swarm.dial(opts) {
                 Ok(()) => {
-                    pending.dials.insert(connection_id, respond_to);
+                    pending.dials.insert(connection_id, dial);
                 }
                 // Swarm::dial can fail synchronously (e.g. no addresses
                 // survive filtering) without ever producing a SwarmEvent for
                 // this connection_id — answer inline rather than leaving the
                 // caller to wait out the full timeout.
-                Err(_) => {
-                    let _ = respond_to.send(None);
-                }
+                Err(_) => dial.finish(None, peers, now),
             }
         }
         Command::ListenOn { addr, respond_to } => {
@@ -1515,6 +1219,7 @@ fn handle_event(
     pending: &mut Pending,
     inbound: &Inbound,
     peers: &mut Peers,
+    now: Instant,
 ) {
     match event {
         SwarmEvent::NewListenAddr {
@@ -1522,13 +1227,9 @@ fn handle_event(
             address,
         } => {
             // A node listening on a wildcard bind gets one of these per
-            // interface, in no set order, loopback among them. A later
-            // address replaces the recorded one unless that would swap a
-            // non-loopback address for loopback.
-            peers.local_addr.send_modify(|recorded| {
-                let previous = recorded.take();
-                *recorded = preferred_address(std::iter::once(address.clone()).chain(previous));
-            });
+            // interface, in no set order, loopback among them: the peer book
+            // keeps the best (see `crate::peers`).
+            peers.observe(Observation::ListeningOn(address.clone()), now);
             if let Some(respond_to) = pending.listens.remove(&listener_id) {
                 let _ = respond_to.send(address);
             }
@@ -1544,19 +1245,19 @@ fn handle_event(
                 inbound.queue_input(Input::PeerConnected(worker_id_of(&peer_id)));
             }
             // The two sides of a connection observe different addresses here
-            // (see the module doc's "Where a peer's address comes from"):
-            // only the dialing side's is dialable. Both are recorded, ranked,
-            // so an Identify exchange on this same connection can supersede
-            // either — but neither can silently displace a better one.
-            let source = match endpoint {
-                ConnectedPoint::Dialer { .. } => AddressSource::DialedAddress,
-                ConnectedPoint::Listener { .. } => AddressSource::InboundRemote,
+            // (see `crate::peers`'s "Where a peer's address comes from"), so
+            // the peer book is told which end this node is.
+            let side = match endpoint {
+                ConnectedPoint::Dialer { .. } => Side::Dialer,
+                ConnectedPoint::Listener { .. } => Side::Listener,
             };
-            record_peer_address(
-                &mut peers.addresses,
-                peer_id,
-                endpoint.get_remote_address().clone(),
-                source,
+            peers.observe(
+                Observation::ConnectionOpened {
+                    peer: peer_id,
+                    side,
+                    address: endpoint.get_remote_address().clone(),
+                },
+                now,
             );
             // Only ever resolves `Net::dial_for_connection`'s own oneshot
             // for *this* connection_id — see the module doc and that
@@ -1564,10 +1265,10 @@ fn handle_event(
             // than diffing the connected-peer set) is what makes a late
             // connection from an abandoned dial harmless: if the caller
             // already stopped awaiting this entry (timeout elapsed, cascade
-            // moved on), `send` below just fails silently instead of
+            // moved on), answering it just fails silently instead of
             // resolving some other, unrelated await.
-            if let Some(respond_to) = pending.dials.remove(&connection_id) {
-                let _ = respond_to.send(Some(peer_id));
+            if let Some(dial) = pending.dials.remove(&connection_id) {
+                dial.finish(Some(peer_id), peers, now);
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
@@ -1578,9 +1279,9 @@ fn handle_event(
             // The whole point of having `identify` in the swarm (spec
             // decision 2): `info.listen_addrs` is the peer's own advertised
             // listen address, which is what a joining node needs to dial —
-            // unlike either endpoint-derived address above. See the module
-            // doc's "Where a peer's address comes from" for the ranking and
-            // for which of the advertised addresses is taken.
+            // unlike either endpoint-derived address above. See
+            // `crate::peers`'s "Where a peer's address comes from" for the
+            // ranking and for which of the advertised addresses is taken.
             //
             // Every dialable one, not just the one taken below, feeds `kad`
             // (see `crate::swarm`'s "kad: peer routing, not membership"):
@@ -1594,15 +1295,20 @@ fn handle_event(
             {
                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
             }
-            if let Some(addr) = preferred_address(info.listen_addrs) {
-                record_peer_address(&mut peers.addresses, peer_id, addr, AddressSource::Identify);
-            }
+            peers.observe(
+                Observation::Identified {
+                    peer: peer_id,
+                    listen_addresses: info.listen_addrs,
+                },
+                now,
+            );
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
             num_established: 0,
             ..
         } => {
+            peers.observe(Observation::ConnectionClosed(peer_id), now);
             inbound.queue_input(Input::PeerDisconnected(worker_id_of(&peer_id)));
         }
         SwarmEvent::OutgoingConnectionError {
@@ -1610,8 +1316,8 @@ fn handle_event(
             peer_id,
             ..
         } => {
-            if let Some(respond_to) = pending.dials.remove(&connection_id) {
-                let _ = respond_to.send(None);
+            if let Some(dial) = pending.dials.remove(&connection_id) {
+                dial.finish(None, peers, now);
             }
             // A dial that names its peer and fails while no other connection
             // to that peer is open: the peer cannot be reached.
@@ -1635,8 +1341,7 @@ fn handle_event(
             };
             // Recorded before the node is told, so a direct answer the node
             // sends finds the address on file.
-            record_stamped_address(&mut peers.addresses, &input);
-            peers.traffic.messages_received += 1;
+            peers.observe(Observation::MessageArrived(&input), now);
             inbound.queue_input(input);
             // Best-effort: nothing reads this ack back (see module doc), and
             // a channel that is already closed just means the peer stopped
@@ -1652,8 +1357,7 @@ fn handle_event(
         })) => {
             if let Some(input) = gossip_input(message) {
                 // Same ordering as for a direct message above.
-                record_stamped_address(&mut peers.addresses, &input);
-                peers.traffic.messages_received += 1;
+                peers.observe(Observation::MessageArrived(&input), now);
                 inbound.queue_input(input);
             }
         }
@@ -1667,7 +1371,7 @@ fn handle_event(
                 },
             ..
         })) => {
-            peers.traffic.join_requests_received += 1;
+            peers.observe(Observation::Carried(Carried::JoinRequest), now);
             inbound.queue_join_request(JoinRequestHandle {
                 from: worker_id_of(&peer),
                 channel,
@@ -1697,7 +1401,7 @@ fn handle_event(
                 },
             ..
         })) => {
-            peers.traffic.claim_requests_received += 1;
+            peers.observe(Observation::Carried(Carried::ClaimRequest), now);
             inbound.queue_claim_request(ClaimRequestHandle {
                 from: worker_id_of(&peer),
                 request,
@@ -2064,60 +1768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_peer_outside_the_gossip_mesh_is_not_redialed() {
-        // A JOIN seed or a kad crawl connection: this Net has an address on
-        // file for the peer but no gossip runs through it, so an idle
-        // timeout closing it is no failure to repair (E6-R2's churn).
-        let net_a = Net::new_with_redial_policy(
-            build_swarm(identity::Keypair::generate_ed25519()),
-            short_redial_policy(),
-        );
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let listen_addr_b = timeout(
-            TEST_TIMEOUT,
-            net_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_b produced a listen address within the timeout");
-        net_a.dial(listen_addr_b);
-        let (worker_a, worker_b) = (net_a.local_worker_id(), net_b.local_worker_id());
-        expect_input(
-            &net_a,
-            Input::PeerConnected(worker_b.clone()),
-            "net_a reported its connection to net_b",
-        )
-        .await;
-        expect_input(
-            &net_b,
-            Input::PeerConnected(worker_a.clone()),
-            "net_b reported its connection to net_a",
-        )
-        .await;
-
-        net_b.disconnect(worker_a);
-        expect_input(
-            &net_a,
-            Input::PeerDisconnected(worker_b.clone()),
-            "net_a reported the drop",
-        )
-        .await;
-
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        while tokio::time::Instant::now() < deadline {
-            assert!(
-                !net_a
-                    .diagnostics()
-                    .await
-                    .redial_attempts
-                    .contains_key(&worker_b),
-                "net_a redialed a peer no gossip ran through"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn auto_redial_reconnects_a_passively_dropped_peer_within_the_bounded_policy() {
+    async fn the_swarm_task_redials_a_dropped_mesh_peer_but_not_one_it_hung_up_on() {
         // Chunk C8, "What to build" item 3: a peer that drops gets
         // automatically redialed and reconnects once it's reachable again.
         //
@@ -2181,140 +1832,28 @@ mod tests {
             &net_a,
             &[
                 Input::PeerDisconnected(worker_b.clone()),
-                Input::PeerConnected(worker_b),
+                Input::PeerConnected(worker_b.clone()),
             ],
             "net_a reported the drop, then its own bounded redial policy reconnected to net_b \
              without any manual dial from the test itself,",
         )
         .await;
-    }
 
-    #[tokio::test]
-    async fn auto_redial_gives_up_after_max_attempts_against_a_permanently_gone_peer() {
-        // Chunk C8, "What to build" item 4: the bounded cap actually bounds
-        // — a permanently-gone peer's redial attempts eventually stop,
-        // rather than continuing forever.
-        let net_a = Net::new_with_redial_policy(
-            build_swarm(identity::Keypair::generate_ed25519()),
-            short_redial_policy(),
-        );
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        let (_, worker_b) = connected_pair(&net_a, &net_b).await;
+        // The same two peers, meshed again: a hangup of this node's own is no failure.
         meshed(&net_a, &net_b).await;
-
-        // Process death, not a local disconnect: net_b is gone for good, and
-        // net_a never asked for this drop, so it's organic/redial-eligible
-        // (same simulation as a_peer_that_goes_away_yields_peer_disconnected
-        // above) — nothing will ever again answer at net_b's last-known
-        // address, so every redial attempt against it must fail.
-        drop(net_b);
-
-        timeout(
-            TEST_TIMEOUT,
-            wait_for_diagnostics(&net_a, |d| d.redial_attempts.contains_key(&worker_b)),
-        )
-        .await
-        .expect("net_a started redialing the permanently-gone peer within the timeout");
-
-        timeout(
-            TEST_TIMEOUT,
-            wait_for_diagnostics(&net_a, |d| !d.redial_attempts.contains_key(&worker_b)),
-        )
-        .await
-        .expect(
-            "net_a gave up redialing (its RedialPolicy::max_attempts budget was spent) within \
-             the timeout, rather than retrying forever",
-        );
-
-        assert!(
-            !net_a
-                .take_inputs()
-                .contains(&Input::PeerConnected(worker_b)),
-            "a permanently-gone peer must never actually reconnect"
-        );
-    }
-
-    /// Regression test for review finding 1 on this chunk:
-    /// `locally_disconnected`'s exclusion wasn't actually enforced.
-    /// `swarm.disconnect_peer_id` (called from `Command::Disconnect`) only
-    /// starts an async close by sending a `Close` command to the connection's
-    /// own task -- it has no synchronous effect on `Swarm::connected_peers()`
-    /// -- so on the *same* `drive()` loop iteration `Command::Disconnect` was
-    /// processed, the freshly-recomputed `newly_connected` snapshot still
-    /// showed the peer connected. The old
-    /// `locally_disconnected.retain(|peer| !newly_connected.contains(peer))`
-    /// read that stale "still connected" snapshot and evicted the peer's
-    /// exclusion entry immediately -- before the connection had actually
-    /// closed -- so by the time the real drop was observed on a later
-    /// iteration, `locally_disconnected` no longer contained the peer, and it
-    /// got scheduled for auto-redial like any organic drop. This proves
-    /// `net_a.disconnect(worker_b)` genuinely and durably excludes `worker_b`
-    /// from auto-redial: `net_a`'s diagnostics must never show a redial
-    /// attempt for it, and `net_a` must never reconnect to it on its own.
-    #[tokio::test]
-    async fn locally_disconnected_peer_is_never_auto_redialed() {
-        // net_a needs a short RedialPolicy so a broken exclusion would fire
-        // (and this test would fail) well within the assertion window below
-        // -- see auto_redial_reconnects_a_passively_dropped_peer_within_the_bounded_policy
-        // above, which proves this same policy *does* redial a genuinely
-        // organic drop fast, so a locally-disconnected drop surviving the
-        // same window is a real property, not just "didn't happen to fire
-        // yet".
-        let net_a = Net::new_with_redial_policy(
-            build_swarm(identity::Keypair::generate_ed25519()),
-            short_redial_policy(),
-        );
-        let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-
-        // net_a must be the dialer (same reasoning as
-        // auto_redial_reconnects_a_passively_dropped_peer_within_the_bounded_policy
-        // above): peer_addresses records the address net_a actually dialed
-        // (net_b's real, redialable listen address), so if the exclusion
-        // were broken, net_a's redial would have a real address to
-        // (wrongly) succeed against -- not fail for an unrelated reason.
-        let listen_addr_b = timeout(
-            TEST_TIMEOUT,
-            net_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-        )
-        .await
-        .expect("net_b produced a listen address within the timeout");
-        net_a.dial(listen_addr_b);
-        let worker_b = net_b.local_worker_id();
-        expect_input(
-            &net_a,
-            Input::PeerConnected(worker_b.clone()),
-            "net_a reported its connection to net_b",
-        )
-        .await;
-        // Meshed, so nothing but the exclusion keeps net_a from redialing.
-        meshed(&net_a, &net_b).await;
-
         net_a.disconnect(worker_b.clone());
-
         expect_input(
             &net_a,
             Input::PeerDisconnected(worker_b.clone()),
-            "net_a reported its own disconnect",
+            "net_a reported its own hangup",
         )
         .await;
-
-        // net_b never stops listening (`disconnect` only closes the
-        // connection, not the listener), so nothing but the exclusion itself
-        // stops net_a's short_redial_policy from scheduling a redial here.
-        // Whether the two reconnect at all is not the redial policy's alone
-        // to say: a `kad` query in flight may dial net_b on its own.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        while tokio::time::Instant::now() < deadline {
-            assert!(
-                !net_a
-                    .diagnostics()
-                    .await
-                    .redial_attempts
-                    .contains_key(&worker_b),
-                "net_a must never auto-redial a peer it locally disconnected"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // The close was observed in the same swarm-task iteration that queued the input,
+        // and a redial is scheduled at that observation, so this read is exact: no window.
+        assert!(
+            !net_a.diagnostics().await.redial_attempts.contains_key(&worker_b),
+            "net_a scheduled a redial of a peer it disconnected itself"
+        );
     }
 
     #[tokio::test]
@@ -2352,123 +1891,8 @@ mod tests {
         .expect("net_a learned net_b's advertised listen address within the timeout");
     }
 
-    /// The ranking rule behind final-review finding I1, on its own: a better
-    /// -ranked source always wins regardless of arrival order, and an equally
-    /// -ranked one is treated as a fresher observation and overwrites. See the
-    /// module doc's "Where a peer's address comes from"; the end-to-end
-    /// consequence is asserted in `net/tests/election/three_node_join.rs`.
-    #[test]
-    fn a_peer_address_is_only_replaced_by_an_equal_or_better_ranked_source() {
-        let peer = PeerId::random();
-        let send_back: Multiaddr = "/ip4/127.0.0.1/tcp/54321".parse().unwrap();
-        let dialed: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
-        let advertised: Multiaddr = "/ip4/127.0.0.1/tcp/4002".parse().unwrap();
-        let fresher_advertised: Multiaddr = "/ip4/127.0.0.1/tcp/4003".parse().unwrap();
-
-        let mut addresses = BTreeMap::new();
-        let stored = |addresses: &BTreeMap<PeerId, KnownAddress>| {
-            addresses
-                .get(&peer)
-                .expect("an address was recorded for this peer")
-                .addr
-                .clone()
-        };
-
-        record_peer_address(
-            &mut addresses,
-            peer,
-            send_back.clone(),
-            AddressSource::InboundRemote,
-        );
-        assert_eq!(stored(&addresses), send_back);
-
-        record_peer_address(&mut addresses, peer, dialed.clone(), AddressSource::DialedAddress);
-        assert_eq!(stored(&addresses), dialed, "a dialed address outranks a send_back_addr");
-
-        record_peer_address(&mut addresses, peer, advertised.clone(), AddressSource::Identify);
-        assert_eq!(stored(&addresses), advertised, "Identify outranks both");
-
-        record_peer_address(
-            &mut addresses,
-            peer,
-            send_back.clone(),
-            AddressSource::InboundRemote,
-        );
-        assert_eq!(
-            stored(&addresses),
-            advertised,
-            "a later inbound connection must not displace an Identify-advertised address"
-        );
-
-        record_peer_address(
-            &mut addresses,
-            peer,
-            fresher_advertised.clone(),
-            AddressSource::Identify,
-        );
-        assert_eq!(
-            stored(&addresses),
-            fresher_advertised,
-            "an equally-ranked observation is a fresher one and does replace"
-        );
-    }
-
     fn addr(text: &str) -> Multiaddr {
         text.parse().expect("a well-formed multiaddr")
-    }
-
-    #[test]
-    fn a_non_loopback_address_is_preferred_over_loopback_in_either_order() {
-        let loopback = addr("/ip4/127.0.0.1/tcp/4001");
-        let routable = addr("/ip4/192.0.2.7/tcp/4001");
-
-        assert_eq!(
-            preferred_address([loopback.clone(), routable.clone()]),
-            Some(routable.clone())
-        );
-        assert_eq!(
-            preferred_address([routable.clone(), loopback]),
-            Some(routable)
-        );
-    }
-
-    #[test]
-    fn a_loopback_address_is_taken_only_when_it_is_the_only_choice() {
-        let loopback = addr("/ip4/127.0.0.1/tcp/4001");
-        let wildcard = addr("/ip4/0.0.0.0/tcp/4001");
-
-        assert_eq!(
-            preferred_address([wildcard, loopback.clone()]),
-            Some(loopback)
-        );
-        assert_eq!(preferred_address([]), None);
-    }
-
-    #[test]
-    fn a_wildcard_address_is_never_preferred() {
-        assert_eq!(
-            preferred_address([addr("/ip4/0.0.0.0/tcp/4001"), addr("/ip6/::/tcp/4001")]),
-            None
-        );
-        assert_eq!(
-            preferred_address([
-                addr("/ip4/0.0.0.0/tcp/4001"),
-                addr("/ip4/192.0.2.7/tcp/4001"),
-            ]),
-            Some(addr("/ip4/192.0.2.7/tcp/4001"))
-        );
-    }
-
-    #[test]
-    fn ipv6_loopback_counts_as_loopback() {
-        let loopback = addr("/ip6/::1/tcp/4001");
-        let routable = addr("/ip6/2001:db8::7/tcp/4001");
-
-        assert_eq!(
-            preferred_address([loopback.clone(), routable.clone()]),
-            Some(routable)
-        );
-        assert_eq!(preferred_address([loopback.clone()]), Some(loopback));
     }
 
     /// A gossip message on `shard-1`'s topic from `source` carrying `data`.
@@ -2541,93 +1965,6 @@ mod tests {
                 prior_admission: None,
             })),
         }
-    }
-
-    #[test]
-    fn an_empty_unparsable_or_wildcard_stamp_is_no_address() {
-        let initiator = WorkerId::new("initiator");
-
-        for stamp in ["", "not a multiaddr", "/ip4/0.0.0.0/tcp/4001"] {
-            assert_eq!(
-                stamped_address(&initiator, &roll_call(&initiator, stamp)),
-                None,
-                "{stamp:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_stamped_address_is_recorded_below_identify_and_a_dialed_address() {
-        let peer = PeerId::random();
-        let sender = worker_id_of(&peer);
-        let stamped = addr("/ip4/192.0.2.7/tcp/4001");
-        let arrival = Input::Message {
-            from: sender.clone(),
-            message: roll_call(&sender, "/ip4/192.0.2.7/tcp/4001"),
-        };
-        let stored = |addresses: &BTreeMap<PeerId, KnownAddress>| {
-            addresses
-                .get(&peer)
-                .map(|known| (known.addr.clone(), known.source))
-        };
-
-        let mut addresses = BTreeMap::new();
-        record_stamped_address(&mut addresses, &arrival);
-        assert_eq!(
-            stored(&addresses),
-            Some((stamped.clone(), AddressSource::SelfStamped))
-        );
-
-        for better in [AddressSource::DialedAddress, AddressSource::Identify] {
-            let known = addr("/ip4/192.0.2.9/tcp/4001");
-            let mut addresses = BTreeMap::new();
-            record_peer_address(&mut addresses, peer, known.clone(), better);
-            record_stamped_address(&mut addresses, &arrival);
-            assert_eq!(stored(&addresses), Some((known, better)), "{better:?}");
-        }
-
-        let mut addresses = BTreeMap::new();
-        record_peer_address(
-            &mut addresses,
-            peer,
-            addr("/ip4/127.0.0.1/tcp/54321"),
-            AddressSource::InboundRemote,
-        );
-        record_stamped_address(&mut addresses, &arrival);
-        assert_eq!(
-            stored(&addresses),
-            Some((stamped, AddressSource::SelfStamped)),
-            "a stamp outranks an inbound connection's source address"
-        );
-    }
-
-    #[test]
-    fn an_arrival_whose_stamp_names_another_peer_records_nothing() {
-        let (relay, initiator, responder) = (
-            worker_id_of(&PeerId::random()),
-            worker_id_of(&PeerId::random()),
-            worker_id_of(&PeerId::random()),
-        );
-        let mut addresses = BTreeMap::new();
-
-        // A roll call's stamp is its initiator's, not whoever else sent it.
-        record_stamped_address(
-            &mut addresses,
-            &Input::Message {
-                from: relay,
-                message: roll_call(&initiator, "/ip4/192.0.2.7/tcp/4001"),
-            },
-        );
-        // A reply's stamp is its responder's, not its initiator's.
-        record_stamped_address(
-            &mut addresses,
-            &Input::Message {
-                from: initiator.clone(),
-                message: roll_call_reply(&initiator, &responder, "/ip4/192.0.2.8/tcp/4001"),
-            },
-        );
-
-        assert!(addresses.is_empty());
     }
 
     #[tokio::test]
@@ -2756,7 +2093,9 @@ mod tests {
             message: roll_call(&worker_c, &listen_addr_c.to_string()),
         };
         net_a
-            .with_peers(move |peers| record_stamped_address(&mut peers.addresses, &arrival))
+            .with_peers(move |peers| {
+                peers.observe(Observation::MessageArrived(&arrival), Instant::now());
+            })
             .await;
 
         let heartbeat = heartbeat_message(&worker_a);
