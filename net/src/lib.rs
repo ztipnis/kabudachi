@@ -14,5 +14,6 @@ pub mod join;
 pub mod join_codec;
 pub mod messenger;
 mod peers;
+mod routing_refresh;
 pub mod swarm;
 pub mod worker;

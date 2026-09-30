@@ -16,7 +16,7 @@ use kabudachi_core::protocol::ids::{IdGenerator, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, JoinResponse, election_message};
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::Clock;
-use kabudachi_net::driver::run_driver;
+use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::join::{LeaderSearch, ask_for_leader};
 use kabudachi_net::messenger::{Diagnostics, Net};
 use libp2p::Multiaddr;
@@ -201,7 +201,7 @@ pub async fn heartbeat_until_acked<C: Clock, I: IdGenerator>(
     };
     timeout(WAIT_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(node, due_now(&clock), leader_net, scheduler, clock, None, observe) => {
+            _ = run_driver(node, due_now(&clock), leader_net, scheduler, clock, None, DriverConfig::default(), observe) => {
                 unreachable!("run_driver never returns")
             }
             _ = acked_rx.wait_for(|acked| *acked) => {}

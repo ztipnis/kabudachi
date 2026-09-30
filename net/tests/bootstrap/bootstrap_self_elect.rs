@@ -28,7 +28,7 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::bootstrap::bootstrap;
-use kabudachi_net::driver::{SharedAuthority, run_driver};
+use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
 use kabudachi_core::election::CallKind;
@@ -204,6 +204,7 @@ async fn a_node_with_no_seeds_and_no_authority_self_elects_leader_after_the_norm
                 &mut scheduler,
                 clock,
                 None,
+                DriverConfig::default(),
                 |node, _, _| { let _ = tx.send(node.state()); },
             ) => {
                 unreachable!("run_driver never returns")
@@ -554,6 +555,7 @@ async fn a_seedless_bootstrapper_joins_the_shard_a_flush_left_running_instead_of
                 &mut founder_scheduler,
                 clock,
                 Some(shared(authority.clone())),
+                DriverConfig::default(),
                 |node, _, _| { let _ = tx.send(node.state()); },
             ) => {
                 unreachable!("run_driver never returns")
@@ -593,6 +595,7 @@ async fn a_seedless_bootstrapper_joins_the_shard_a_flush_left_running_instead_of
                 &mut founder_scheduler,
                 clock,
                 Some(shared(authority.clone())),
+                DriverConfig::default(),
                 |_, _, _| {},
             ) => {
                 unreachable!("run_driver never returns")
@@ -628,6 +631,7 @@ async fn a_seedless_bootstrapper_joins_the_shard_a_flush_left_running_instead_of
                 &mut founder_scheduler,
                 clock,
                 Some(shared(authority.clone())),
+                DriverConfig::default(),
                 |_, _, _| {},
             ) => {
                 unreachable!("run_driver never returns")

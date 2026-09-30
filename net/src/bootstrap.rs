@@ -795,7 +795,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::driver::run_driver;
+    use crate::driver::{DriverConfig, run_driver};
     use crate::swarm::build_swarm;
 
     const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(10);
@@ -1179,6 +1179,7 @@ mod tests {
                 &mut scheduler,
                 clock,
                 None,
+                DriverConfig::default(),
                 |_, _, _| {},
             );
             let heard = async {

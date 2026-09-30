@@ -24,7 +24,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{ClaimResponse, claim_response};
 use kabudachi_core::scheduler::{Scheduler, Submission};
 use kabudachi_core::time::{Duration, RealClock};
-use kabudachi_net::driver::run_driver;
+use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::claim::ClaimFailure;
 use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
@@ -93,7 +93,7 @@ async fn join_and_drive(
         None,
     );
     let mut scheduler = Scheduler::new(clock, Uuid7Ids);
-    run_driver(&mut node, first, net, &mut scheduler, clock, None, |node, _, _| {
+    run_driver(&mut node, first, net, &mut scheduler, clock, None, DriverConfig::default(), |node, _, _| {
         let _ = known_leader.send(node.known_leader().map(|(leader, _)| leader));
     })
     .await;
@@ -151,7 +151,7 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
 
     let (claimed, batch) = timeout(TEST_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, |_, _, _| {}) => {
+            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |_, _, _| {}) => {
                 unreachable!("run_driver never returns")
             }
             () = join_and_drive(&net_b, &seed, clock, &b_leader) => {

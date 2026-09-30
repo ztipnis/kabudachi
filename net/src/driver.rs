@@ -18,7 +18,7 @@
 //! with the scheduler's decision. And it tells `Net` which leader the node
 //! names, so the worker's own claims go to that leader. Between batches it
 //! re-crawls the worker's peer routing once the node's view of its shard
-//! has changed and settled, and periodically (see `RoutingRefresh`), so
+//! has changed and settled, and periodically (see `crate::routing_refresh`), so
 //! the shard's workers stay connected to one another and not only to their
 //! leader.
 //!
@@ -47,7 +47,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kabudachi_core::configuration::{Configuration, Generation};
 use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, CallKind, Input, MessageSink, Output, Step,
@@ -64,7 +63,18 @@ use tokio::sync::mpsc;
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, WaitLog};
 use crate::claim;
 use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, find_leader, pointer_for};
-use crate::messenger::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD, Net};
+use crate::messenger::Net;
+pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
+use crate::routing_refresh::{RoutingRefresh, ShardView};
+
+/// How [`run_driver`] runs, beyond the node, transport and scheduler it drives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriverConfig {
+    /// How often to re-crawl peer routing while nothing else prompts it; `None`
+    /// for [`DEFAULT_ROUTING_REFRESH_SUSPICIONS`] suspicion timeouts. Never
+    /// under [`MIN_ROUTING_REFRESH_PERIOD`].
+    pub routing_refresh_period: Option<Duration>,
+}
 
 /// A coordination authority shared by every task that calls it: the
 /// driver's, and the blocking-pool tasks that perform its calls.
@@ -128,6 +138,8 @@ pub type SharedAuthority = Arc<dyn CoordinationAuthority + Send + Sync>;
 /// That clock must advance in real time, one tick per millisecond, as a
 /// `RealClock` does.
 ///
+/// `config` says how the driver itself runs (see [`DriverConfig`]).
+///
 /// `authority` is the coordination authority to perform `node`'s
 /// `Output::Authority` calls against (see the module doc); `None` for a node
 /// built with no authority timings, which never asks for one. It must be the
@@ -143,6 +155,7 @@ pub async fn run_driver<C, I>(
     scheduler: &mut Scheduler<C, I>,
     clock: C,
     authority: Option<SharedAuthority>,
+    config: DriverConfig,
     mut observe: impl FnMut(&WorkerNode<C>, Option<&Input>, &Step),
 ) -> Infallible
 where
@@ -165,7 +178,11 @@ where
     let mut rejoin_attempts = 0_usize;
     let mut rejoin_pointer = None;
     let mut rejoin_pointer_refused = false;
-    let mut routing = RoutingRefresh::new(node, net, clock.now());
+    let mut routing = RoutingRefresh::new(
+        node.timings().suspect_timeout,
+        config.routing_refresh_period,
+        clock.now(),
+    );
 
     loop {
         let mut stepper = Stepper {
@@ -205,7 +222,13 @@ where
         while next_deadline.is_some_and(|deadline| deadline <= clock.now()) {
             next_deadline = stepper.step(Input::Tick);
         }
-        let mut refresh_at = routing.after_batch(node, net, clock.now());
+        // What the node showed after this batch: the timer arm below decides
+        // on this same view, since the node is not stepped between batches.
+        let view = ShardView::of(node);
+        let mut refresh = routing.decide(&view, clock.now());
+        if refresh.crawl {
+            net.refresh_peer_routing();
+        }
 
         // A fenced node that found its shard recovered without it went back
         // to `Bootstrapping` to join again (ADR-0001 decision 12). Only a
@@ -236,8 +259,11 @@ where
         loop {
             tokio::select! {
                 () = sleep_until(&clock, next_deadline) => break,
-                () = sleep_until(&clock, Some(refresh_at)) => {
-                    refresh_at = routing.crawl_if_due(net, clock.now());
+                () = sleep_until(&clock, Some(refresh.next_due)) => {
+                    refresh = routing.decide(&view, clock.now());
+                    if refresh.crawl {
+                        net.refresh_peer_routing();
+                    }
                 }
                 () = net.wait_for_arrival() => break,
                 found = async {
@@ -259,104 +285,6 @@ where
                 }
             }
         }
-    }
-}
-
-/// When [`run_driver`] re-crawls its node's peer routing
-/// (`Net::refresh_peer_routing`), so that the workers of a shard stay
-/// connected to one another and not only to their leader.
-///
-/// A worker's JOIN connects it to its seed and its leader alone, and `kad`'s
-/// own crawl on that first connection finds only the peers its leader knew
-/// by then: a burst joining through the leader would be left a star, which
-/// no roll call crosses once the leader is gone. So the driver crawls again
-/// once the node's view of its shard has changed (it names another leader,
-/// takes on another configuration, or is admitted: peers it should reach
-/// may have arrived) and then held still for [`ROUTING_SETTLE_DIVISOR`]th of
-/// a suspicion timeout, and, failing that, every
-/// [`DEFAULT_ROUTING_REFRESH_SUSPICIONS`] suspicion timeouts (see
-/// `Net::with_routing_refresh_period`).
-///
-/// Waiting for the view to settle bounds the cost. A crawl's first run
-/// connects the node to every peer it finds, a burst of connection
-/// handshakes; a burst of joiners that each crawled at every change of an
-/// admission in flight would spend them while the batch commits, and slow
-/// it by whole seconds on one host. Settled, each node crawls once after
-/// the burst, and a view that never settles still crawls within a period of
-/// its first unserved change. The routing table is never read as
-/// membership (see `crate::swarm`).
-struct RoutingRefresh {
-    /// The leader, configuration generation and admission last seen.
-    seen: Option<(Option<WorkerId>, Option<Generation>, bool)>,
-    /// When the view last changed.
-    last_change: Instant,
-    /// When the view first changed since the last crawl; `None` while no
-    /// change waits for one.
-    first_unserved: Option<Instant>,
-    last_crawl: Option<Instant>,
-    settle: kabudachi_core::time::Duration,
-    period: kabudachi_core::time::Duration,
-}
-
-/// See [`RoutingRefresh`]: a changed view is crawled once it has held still
-/// for this fraction of a suspicion timeout.
-const ROUTING_SETTLE_DIVISOR: u64 = 4;
-
-impl RoutingRefresh {
-    fn new<C: Clock>(node: &WorkerNode<C>, net: &Net, now: Instant) -> Self {
-        let suspect = node.timings().suspect_timeout.as_ticks();
-        let period_millis = match net.routing_refresh_period() {
-            Some(period) => u64::try_from(period.as_millis()).unwrap_or(u64::MAX),
-            // A tick is a millisecond.
-            None => suspect.saturating_mul(u64::from(DEFAULT_ROUTING_REFRESH_SUSPICIONS)),
-        };
-        let min_millis = u64::try_from(MIN_ROUTING_REFRESH_PERIOD.as_millis()).unwrap_or(u64::MAX);
-        let period = kabudachi_core::time::Duration::from_millis(period_millis.max(min_millis));
-        RoutingRefresh {
-            seen: None,
-            last_change: now,
-            first_unserved: None,
-            last_crawl: None,
-            settle: kabudachi_core::time::Duration::from_ticks(suspect / ROUTING_SETTLE_DIVISOR),
-            period,
-        }
-    }
-
-    /// Notes what `node` shows after a batch, crawls if a settled change or
-    /// the period calls for it, and returns when the next crawl is due.
-    fn after_batch<C: Clock>(&mut self, node: &WorkerNode<C>, net: &Net, now: Instant) -> Instant {
-        self.note(node, now);
-        self.crawl_if_due(net, now)
-    }
-
-    /// Notes what `node` shows.
-    fn note<C: Clock>(&mut self, node: &WorkerNode<C>, now: Instant) {
-        let view = (
-            node.known_leader().map(|(leader, _)| leader),
-            node.configuration().map(Configuration::generation),
-            node.admission().is_some(),
-        );
-        if self.seen.as_ref() != Some(&view) {
-            self.seen = Some(view);
-            self.last_change = now;
-            self.first_unserved.get_or_insert(now);
-        }
-    }
-
-    /// Crawls if a settled change or the period calls for it at `now`, and
-    /// returns when the next crawl is due.
-    fn crawl_if_due(&mut self, net: &Net, now: Instant) -> Instant {
-        let due = match self.first_unserved {
-            Some(first) => std::cmp::min(self.last_change + self.settle, first + self.period),
-            None => self.last_crawl.map_or(now, |last| last + self.period),
-        };
-        if due > now {
-            return due;
-        }
-        net.refresh_peer_routing();
-        self.last_crawl = Some(now);
-        self.first_unserved = None;
-        now + self.period
     }
 }
 
@@ -766,7 +694,7 @@ mod tests {
 
         timeout(TEST_TIMEOUT, async {
             tokio::select! {
-                _ = run_driver(&mut node, first, &net_node, &mut scheduler, clock, None, |node, _, _| {
+                _ = run_driver(&mut node, first, &net_node, &mut scheduler, clock, None, DriverConfig::default(), |node, _, _| {
                     steps.send_modify(|(count, leader)| {
                         *count += 1;
                         *leader = node.known_leader();
@@ -849,6 +777,7 @@ mod tests {
                     &mut scheduler,
                     clock,
                     Some(Arc::new(authority.clone())),
+                    DriverConfig::default(),
                     |_, _, _| {},
                 ) => unreachable!("run_driver never returns"),
                 () = async {
@@ -899,7 +828,7 @@ mod tests {
 
         let steps = timeout(TEST_TIMEOUT, async {
             tokio::select! {
-                _ = run_driver(&mut node, first, &net, &mut scheduler, clock, None, |_, _, step| {
+                _ = run_driver(&mut node, first, &net, &mut scheduler, clock, None, DriverConfig::default(), |_, _, step| {
                     steps.send_modify(|steps| {
                         steps.push((started.elapsed(), step.outputs.clone()));
                     });
@@ -956,7 +885,7 @@ mod tests {
         // so only its first batch can feed it the ack.
         let known_leader = timeout(TEST_TIMEOUT, async {
             tokio::select! {
-                _ = run_driver(&mut node, first, &net_node, &mut scheduler, clock, None, |node, _, _| {
+                _ = run_driver(&mut node, first, &net_node, &mut scheduler, clock, None, DriverConfig::default(), |node, _, _| {
                     known.send_replace(node.known_leader());
                 }) => unreachable!("run_driver never returns"),
                 known = observed.wait_for(Option::is_some) => {

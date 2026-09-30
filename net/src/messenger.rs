@@ -138,7 +138,6 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::Input;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
@@ -290,20 +289,6 @@ impl std::fmt::Display for ListenRejected {
 
 impl std::error::Error for ListenRejected {}
 
-/// How many of its node's suspicion timeouts `crate::driver::run_driver`
-/// waits, by default, between re-crawls of peer routing that nothing else
-/// prompted (see [`Net::refresh_peer_routing`]). It only backs up the
-/// crawls a change to the node's view of its shard starts (a new leader, a
-/// new configuration, its own admission), finding a peer those missed; a
-/// crawl costs a few `kad` queries, so a crawl every few suspicion timeouts
-/// is cheap.
-pub const DEFAULT_ROUTING_REFRESH_SUSPICIONS: u32 = 10;
-
-/// The shortest period between routing crawls nothing else prompted (see
-/// [`Net::with_routing_refresh_period`]), whatever the suspicion timeout: a
-/// lone node may run with a suspicion timeout of zero.
-pub const MIN_ROUTING_REFRESH_PERIOD: StdDuration = StdDuration::from_secs(1);
-
 /// How many inputs [`Net`] holds for its node, by default, before it drops
 /// the oldest election message to make room (see [`Net::with_input_limit`]).
 pub const DEFAULT_INPUT_LIMIT: usize = 1024;
@@ -414,8 +399,6 @@ pub struct Net {
     local_addr: watch::Receiver<Option<Multiaddr>>,
     /// The shard this `Net` subscribed to (see `Self::subscribe_to_shard`).
     shard: Mutex<Option<ShardId>>,
-    /// See [`Self::with_routing_refresh_period`].
-    routing_refresh_period: Option<StdDuration>,
     driver: JoinHandle<()>,
 }
 
@@ -452,7 +435,6 @@ impl Net {
             inbound,
             local_addr,
             shard: Mutex::new(None),
-            routing_refresh_period: None,
             driver,
         }
     }
@@ -791,27 +773,10 @@ impl Net {
     /// serve the same shard, so a roll call published after the leader is
     /// lost still reaches them. `crate::driver::run_driver` calls it when
     /// its node's view of the shard changes and periodically (see
-    /// [`Self::with_routing_refresh_period`]). Fire-and-forget; with no peer
+    /// `crate::driver::DriverConfig`). Fire-and-forget; with no peer
     /// known yet it does nothing.
     pub(crate) fn refresh_peer_routing(&self) {
         let _ = self.commands.send(Command::RefreshPeerRouting);
-    }
-
-    /// Sets how often `crate::driver::run_driver` re-crawls peer routing
-    /// (see [`Self::refresh_peer_routing`]) while nothing else prompts it.
-    /// By default it is [`DEFAULT_ROUTING_REFRESH_SUSPICIONS`] of the
-    /// node's suspicion timeouts. Either way it is never less than
-    /// [`MIN_ROUTING_REFRESH_PERIOD`]: a crawl every instant would only
-    /// spin.
-    #[must_use]
-    pub fn with_routing_refresh_period(mut self, period: StdDuration) -> Self {
-        self.routing_refresh_period = Some(period);
-        self
-    }
-
-    /// The period set by [`Self::with_routing_refresh_period`], if any.
-    pub(crate) fn routing_refresh_period(&self) -> Option<StdDuration> {
-        self.routing_refresh_period
     }
 
     /// Asks this worker's node to leave its shard gracefully (README §12.3,

@@ -36,7 +36,7 @@ use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Duration, RealClock};
-use kabudachi_net::driver::run_driver;
+use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
 use libp2p::{Multiaddr, identity};
@@ -193,6 +193,7 @@ async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_an
                 &mut scheduler_a,
                 clock,
                 None,
+                DriverConfig::default(),
                 |node, _, _| { let _ = tx_a.send(seen(node)); },
             ) => {
                 unreachable!("run_driver never returns")
@@ -204,6 +205,7 @@ async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_an
                 &mut scheduler_c,
                 clock,
                 None,
+                DriverConfig::default(),
                 |node, _, _| { let _ = tx_c.send(seen(node)); },
             ) => {
                 unreachable!("run_driver never returns")

@@ -8,7 +8,7 @@ use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Clock, Instant, RealClock};
-use kabudachi_net::driver::{SharedAuthority, run_driver};
+use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
 use kabudachi_testkit::StepRecord;
 use tokio::sync::watch;
@@ -117,13 +117,13 @@ where
     let [observe_a, observe_b, observe_c] = observers;
     let [authority_a, authority_b, authority_c] = authorities;
     tokio::select! {
-        _ = run_driver(node_a, due_now(&clock), nets[0], scheduler_a, clock, authority_a, observe_a) => {
+        _ = run_driver(node_a, due_now(&clock), nets[0], scheduler_a, clock, authority_a, DriverConfig::default(), observe_a) => {
             unreachable!("run_driver never returns")
         }
-        _ = run_driver(node_b, due_now(&clock), nets[1], scheduler_b, clock, authority_b, observe_b) => {
+        _ = run_driver(node_b, due_now(&clock), nets[1], scheduler_b, clock, authority_b, DriverConfig::default(), observe_b) => {
             unreachable!("run_driver never returns")
         }
-        _ = run_driver(node_c, due_now(&clock), nets[2], scheduler_c, clock, authority_c, observe_c) => {
+        _ = run_driver(node_c, due_now(&clock), nets[2], scheduler_c, clock, authority_c, DriverConfig::default(), observe_c) => {
             unreachable!("run_driver never returns")
         }
         output = until => output,

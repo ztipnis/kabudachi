@@ -44,7 +44,7 @@ use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, Scheduler};
 use kabudachi_core::time::{Clock, Duration, Instant, RealClock};
-use kabudachi_net::driver::{SharedAuthority, run_driver};
+use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
 use kabudachi_testkit::{FaultingAuthority, StepRecord, first_grant_overlap};
@@ -318,13 +318,13 @@ async fn with_elected_cluster(scenario: impl AsyncFnOnce(&Cluster, usize)) {
     let [scheduler_0, scheduler_1, scheduler_2] = &mut schedulers;
 
     tokio::select! {
-        _ = run_driver(node_0, due_now(&clock), &cluster.nets[0], scheduler_0, clock, authority_of(0), observer(0)) => {
+        _ = run_driver(node_0, due_now(&clock), &cluster.nets[0], scheduler_0, clock, authority_of(0), DriverConfig::default(), observer(0)) => {
             unreachable!("run_driver never returns")
         }
-        _ = run_driver(node_1, due_now(&clock), &cluster.nets[1], scheduler_1, clock, authority_of(1), observer(1)) => {
+        _ = run_driver(node_1, due_now(&clock), &cluster.nets[1], scheduler_1, clock, authority_of(1), DriverConfig::default(), observer(1)) => {
             unreachable!("run_driver never returns")
         }
-        _ = run_driver(node_2, due_now(&clock), &cluster.nets[2], scheduler_2, clock, authority_of(2), observer(2)) => {
+        _ = run_driver(node_2, due_now(&clock), &cluster.nets[2], scheduler_2, clock, authority_of(2), DriverConfig::default(), observer(2)) => {
             unreachable!("run_driver never returns")
         }
         () = async {

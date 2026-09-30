@@ -35,7 +35,7 @@ use kabudachi_core::time::RealClock;
 use libp2p::{Multiaddr, identity};
 
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, bootstrap};
-use crate::driver::{SharedAuthority, run_driver};
+use crate::driver::{DriverConfig, SharedAuthority, run_driver};
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::{ListenRejected, Net};
 use crate::swarm::build_swarm;
@@ -68,7 +68,7 @@ pub struct WorkerConfig {
     /// How long bootstrap waits between rounds of its cascade.
     pub retry_interval: StdDuration,
     /// How often the driver re-crawls peer routing while nothing else
-    /// prompts it (see `Net::with_routing_refresh_period`); `None` for the
+    /// prompts it (see `crate::driver::DriverConfig`); `None` for the
     /// default.
     pub routing_refresh_period: Option<StdDuration>,
 }
@@ -132,11 +132,7 @@ impl Worker {
     /// (see this module's "One identity per process"), and listens on
     /// `config.listen_on`, or fails if it cannot.
     pub async fn start(config: WorkerConfig) -> Result<Worker, ListenRejected> {
-        let mut net = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-        if let Some(period) = config.routing_refresh_period {
-            net = net.with_routing_refresh_period(period);
-        }
-        let net = Arc::new(net);
+        let net = Arc::new(Net::new(build_swarm(identity::Keypair::generate_ed25519())));
         net.try_listen_on(config.listen_on.clone()).await?;
         Ok(Worker { net, config })
     }
@@ -208,6 +204,9 @@ impl Worker {
             &mut scheduler,
             clock,
             config.authority.map(|authority| authority.authority),
+            DriverConfig {
+                routing_refresh_period: config.routing_refresh_period,
+            },
             observe,
         )
         .await

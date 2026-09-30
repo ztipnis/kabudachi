@@ -43,7 +43,7 @@ use kabudachi_core::protocol::messages::{
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Duration, RealClock};
-use kabudachi_net::driver::run_driver;
+use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
 use libp2p::identity;
@@ -151,7 +151,7 @@ async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_e
     let (tx_a, mut rx_a) = watch::channel(node_a.state());
     timeout(TEST_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, |node, _, _| { let _ = tx_a.send(node.state()); }) => {
+            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |node, _, _| { let _ = tx_a.send(node.state()); }) => {
                 unreachable!("run_driver never returns")
             }
             _ = async {
@@ -184,7 +184,7 @@ async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_e
 
     let claim = timeout(TEST_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, |_, _, _| {}) => {
+            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |_, _, _| {}) => {
                 unreachable!("run_driver never returns")
             }
             response = net_w1.request_claim(leader_id.clone(), task.clone()) => response,
@@ -240,7 +240,7 @@ async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_e
     let detection_deadline = heartbeat_sent_at + detection_window();
     timeout(TEST_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, |_, _, _| {}) => {
+            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |_, _, _| {}) => {
                 unreachable!("run_driver never returns")
             }
             _ = async {
@@ -289,7 +289,7 @@ async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_e
     let wait_until_definitely_detected = detection_deadline + DETECTION_SLACK;
     timeout(TEST_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, |_, _, _| {}) => {
+            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |_, _, _| {}) => {
                 unreachable!("run_driver never returns")
             }
             () = async {
@@ -310,7 +310,7 @@ async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_e
     // Only now does a replacement actually become claimable.
     let replacement = timeout(TEST_TIMEOUT, async {
         tokio::select! {
-            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, |_, _, _| {}) => {
+            _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |_, _, _| {}) => {
                 unreachable!("run_driver never returns")
             }
             response = net_w2.request_claim(leader_id.clone(), task.clone()) => response,

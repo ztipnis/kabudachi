@@ -45,7 +45,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Clock, Duration, RealClock};
-use kabudachi_net::driver::run_driver;
+use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
 use libp2p::identity;
@@ -270,6 +270,7 @@ async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_
                     &mut scheduler_a,
                     clock_a,
                     None,
+                    DriverConfig::default(),
                     |node, _, _| { let _ = tx_a.send(node.state()); },
                 )
                 .await
@@ -283,6 +284,7 @@ async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_
                 &mut scheduler_b,
                 clock,
                 None,
+                DriverConfig::default(),
                 |node, _, _| { let _ = tx_b.send(node.state()); },
             ) => {
                 unreachable!("run_driver never returns")
@@ -369,6 +371,7 @@ async fn a_joiner_passes_over_a_seed_that_knows_no_leader() {
                 &mut scheduler_a,
                 clock,
                 None,
+                DriverConfig::default(),
                 |_, _, _| {},
             ) => {
                 unreachable!("run_driver never returns")
@@ -380,6 +383,7 @@ async fn a_joiner_passes_over_a_seed_that_knows_no_leader() {
                 &mut scheduler_x,
                 clock,
                 None,
+                DriverConfig::default(),
                 |node, _, _| { let _ = tx_x.send(node.state()); },
             ) => {
                 unreachable!("run_driver never returns")
