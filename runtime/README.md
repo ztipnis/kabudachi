@@ -63,6 +63,7 @@ returns what it returns. Tasks can only be called while it is running.
 | `retries` | how many more times a run that raises or times out is tried again (not for `@ephemeral_task`) |
 | `timeout`, `cancel_grace` | ask the body to stop after `timeout`; fail the run if it has not stopped `cancel_grace` later |
 | `merge` | `@coalescing_task` only: a pure `(older, newer)` reducer for superseded payloads |
+| `drop_oldest` | `@coalescing_task` only: past `memory_hard_limit`, drop the key's oldest retained payloads when that frees enough bytes; otherwise the submission raises `BackpressureError` |
 
 The function takes exactly one argument, and both it and the return value must be annotated.
 Declaring a task refuses anything that could never work, where it is written.
@@ -106,7 +107,21 @@ handle raises `TaskSupersededError`. A running generation is never cancelled, an
 of a key runs at a time.
 
 The scheduler counts the bytes of task input that has not finished. Past `memory_soft_limit`, `group`
-and `map` pause; past `memory_hard_limit`, submitting raises `BackpressureError`.
+and `map` pause; past `memory_hard_limit`, submitting raises `BackpressureError`. A `@coalescing_task` declared with `drop_oldest=True` instead drops the key's oldest retained payloads until the submission fits, but still raises `BackpressureError` when dropping every retained payload for the key would not free enough bytes (for example an oversized payload).
+
+## Errors and native types
+
+`KabudachiError`, the base of the custom errors kabudachi exposes, and `BackpressureError` are
+defined by the compiled `kabudachi._native` module, which raises them itself; `kabudachi.errors`
+re-exports them, so catch them as `kabudachi.errors.*` like the rest. Some native calls (`submit`,
+`report_failure`, `cancel`) can also raise a plain `RuntimeError` for shutdown, ownership and state
+errors, which `except KabudachiError` does not catch.
+
+The native module reports what happened as typed values rather than strings, all in
+`kabudachi._native`: `EventKind` (`EXPIRED`, `SUPERSEDED`, `SLOW_DOWN`, `CANCELLED`) for scheduler
+events, `CancelOutcome` (`CANCELLED`, `ALREADY_FINISHED`, `UNKNOWN_TASK`) for how a cancel ended, and
+`RunState` (`SCHEDULED` through `ORPHANED`) for where a run is. The runtime turns these into the
+handle behaviour described above; you meet them only if you call the native module directly.
 
 ## Configuration
 

@@ -33,12 +33,14 @@ cargo test --workspace
 cargo test -p kabudachi-core
 cargo test -p kabudachi-bindings
 
-cd runtime && uv run pytest --continue-on-collection-errors
-cd runtime && uv run pytest tests/test_local.py -v
 bazel run //:gazelle
 ```
 
 No lint or format command is configured; do not add one speculatively.
+
+Python tests run through Bazel only, on the host or in the Linux container (`CONTRIBUTING.md`). `import kabudachi` needs the `kabudachi._native` extension, which only Bazel builds (`uv_build` packages the pure-Python sources alone), so `uv run pytest` cannot import the package or run the Python tests on any host.
+
+Every Bazel command adds a `direct-cargo-bazel-deps` stanza to `Cargo.lock`, which any cargo command strips again, and `MODULE.bazel.lock` records the churned hashes. Until the `crate_universe` splicing config is fixed, run `git checkout -- Cargo.lock MODULE.bazel.lock` after Bazel commands, and never commit that churn. That command discards every unstaged edit to those files, so first stage or stash any intentional change to them, and restore only files that were clean before Bazel ran.
 
 ## Architecture
 
@@ -50,7 +52,7 @@ No lint or format command is configured; do not add one speculatively.
 - Do not hand-edit Gazelle-generated runtime BUILD files. Run `bazel run //:gazelle` after Python-file changes; preserve manual BUILD dependencies with `# keep`.
 - Update `Cargo.lock` after Rust dependency changes. Add Python dependencies to the runtime package metadata and regenerate its lockfile/manifest as required.
 - Keep bindings Rust tests PyO3-free; exercise Python-facing behavior from Python tests.
-- For current macOS/Bazel-native-extension and `uv` test caveats, use the explicit procedures in `CONTRIBUTING.md` and the Phase 1 plan.
+- For current macOS/Bazel-native-extension caveats and running the Python tests in the Linux container, use the explicit procedures in `CONTRIBUTING.md` and the Phase 1 plan.
 
 ## Dependencies over homegrown code
 

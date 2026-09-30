@@ -4,7 +4,7 @@
 
 ## Testing with Docker (recommended)
 
-The repo ships a `Dockerfile` (Ubuntu 24.04, with `bazel` via bazelisk, a `rustup`-managed Rust toolchain, and `uv` preinstalled) so tests run the same way regardless of host OS. It's been verified end-to-end on linux/arm64: the Bazel test targets (four at the time; the per-area targets added since have not been re-run in it), `cargo test --workspace`, and `uv run pytest` all pass inside it — and it also sidesteps a macOS-only `.pth`-hiding bug documented in `CLAUDE.md` that only affects `uv run pytest` on a macOS host.
+The repo ships a `Dockerfile` (Ubuntu 24.04, with `bazel` via bazelisk, a `rustup`-managed Rust toolchain, and `uv` preinstalled) so tests run the same way regardless of host OS. It's been verified end-to-end on linux/arm64: the Bazel test targets (four at the time; the per-area targets added since have not been re-run in it), and `cargo test --workspace` pass inside it. Python tests run through Bazel there too (`bazel test //runtime/tests/...`), and the container needs no host-specific workaround.
 
 **Build the image and run the full Bazel suite:**
 
@@ -26,8 +26,10 @@ docker run --rm -v kabudachi-bazel-cache:/disk-cache kabudachi-test bash -c \
 
 ```bash
 docker run --rm kabudachi-test cargo test --workspace
-docker run --rm kabudachi-test bash -c "cd runtime && uv run pytest --continue-on-collection-errors"
+docker run --rm kabudachi-test bazel test //runtime/tests/...
 ```
+
+`import kabudachi` needs the `kabudachi._native` extension, which only Bazel builds, so `uv run pytest` cannot run the Python tests, in the container or anywhere else. Python tests go through their Bazel targets.
 
 **Interactive development:** open the repo in VS Code with the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) and reopen in container — `.devcontainer/devcontainer.json` builds from the same `Dockerfile` and mounts the live working tree, so edits outside the container are immediately visible inside it.
 
@@ -35,14 +37,14 @@ The Dockerfile also `COPY`'s the repo into the image at build time (see `.docker
 
 ## Testing without Docker
 
-See `CLAUDE.md`'s `Commands` section — the native (non-Docker) build/test commands and their known local gotchas (macOS `.pth` bug, pytest collection-abort behavior) are documented there, not repeated here.
+See `CLAUDE.md`'s `Commands` section for the native (non-Docker) build/test commands, including the note that Python tests run through Bazel and not `uv run pytest`, and the lockfile restore after Bazel commands.
 
 ## Cross-platform testing notes (for when CI is set up)
 
 CI configuration itself is intentionally not set up yet (see the design spec's explicitly-deferred scope). When it is, keep in mind what the Docker setup above does and doesn't cover:
 
 - **Linux**: fully covered by the `Dockerfile` above, regardless of which OS the CI runner's host is — this is the easy case.
-- **macOS**: Docker on macOS runs Linux containers under a VM (e.g. Colima, Docker Desktop), so it does **not** exercise macOS-native toolchains. A macOS CI job needs to run natively on a `macos-latest`-style runner, replicating the manual setup this project's history went through: `bazelisk`/`bazel` via Homebrew, a Rust toolchain (rustup or Homebrew), and `uv`. Expect the macOS-only `.pth`-hiding bug documented in `CLAUDE.md` to be relevant for any job that runs `uv run pytest` directly (Bazel's own test execution is unaffected — it doesn't go through `uv`'s editable install).
+- **macOS**: Docker on macOS runs Linux containers under a VM (e.g. Colima, Docker Desktop), so it does **not** exercise macOS-native toolchains. A macOS CI job needs to run natively on a `macos-latest`-style runner, replicating the manual setup this project's history went through: `bazelisk`/`bazel` via Homebrew, a Rust toolchain (rustup or Homebrew), and `uv`. Run the Python tests through their Bazel targets there too: `uv run pytest` cannot import `kabudachi` without the Bazel-built extension, whatever the host.
 - **Windows**: also not covered by this Linux-based Dockerfile (Docker Desktop can run Windows containers, but that's a separate, unexplored path). A Windows CI job would need Bazel's Windows-specific setup (which has real differences from Linux/macOS — symlink support requires enabling Developer Mode or running as Administrator, and long-path support may need enabling), plus a Windows Rust toolchain and `uv` build. This hasn't been attempted or verified anywhere in this project yet — treat it as the highest-risk platform when the time comes, the same way PyO3-through-Bazel was treated as the highest-risk step during initial scaffolding.
 
 ## PR review setup (CodeRabbit + branch protection on `main`)

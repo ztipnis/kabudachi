@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Test/dev container for kabudachi. Not a production image — this exists so
-# `bazel test //...`, `cargo test --workspace`, and `uv run pytest` all work
+# `bazel test //...` and `cargo test --workspace` work
 # the same way on any host OS (see CONTRIBUTING.md), and so the same image
 # doubles as the .devcontainer/ base for interactive VS Code development.
 FROM ubuntu:24.04
@@ -41,7 +41,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
 
-# uv, for `uv run pytest` (fast local iteration only) inside runtime/.
+# uv is available for interactive development. Python tests run through Bazel.
 ENV PATH=/root/.local/bin:$PATH
 RUN curl -fsSL https://astral.sh/uv/install.sh | sh
 
