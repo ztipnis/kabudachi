@@ -17,17 +17,6 @@ py_library(
     deps = ["//bindings:_native"],  # keep
 )
 
-py_test(
-    name = "test_lifecycle",
-    srcs = ["test_lifecycle.py"],
-    pytest_main = True,  # keep
-    venv = "dev",  # keep
-    deps = [
-        "//runtime/src/kabudachi",
-        "@pypi//pytest",  # keep
-    ],
-)
-
 # A session wired to a real native runtime, shared by the session, flow,
 # continuation and acceptance tests.
 # gazelle:resolve py session_world //runtime/tests:session_world

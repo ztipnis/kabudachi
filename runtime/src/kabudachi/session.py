@@ -12,23 +12,20 @@ import asyncio
 import concurrent.futures
 import contextvars
 import functools
-import hashlib
 import inspect
 import json
 import logging
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 from kabudachi.body import RunningBody, run_within, start_body
 from kabudachi.composites import Composites, FlowHandle, GroupHandle
 from kabudachi.config import Configuration
 from kabudachi.errors import (
-    CertificationError,
     RunStoppedError,
     RuntimeNotStartedError,
-    TaskCancelledError,
     TaskDefinitionError,
     TaskExpiredError,
     TaskSupersededError,
@@ -37,105 +34,16 @@ from kabudachi.errors import (
 )
 from kabudachi.config import UNSET
 from kabudachi.handle import TaskHandle, current_body, run_callback_inline
-from kabudachi.lifecycle import RetryOutcome, TaskLifecycle
+from kabudachi.native_protocol import Runtime
 from kabudachi.options import SubmissionOptions
-from kabudachi.registry import TaskDefinition, TaskKind, TaskRegistry
+from kabudachi.registry import TaskDefinition, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
+from kabudachi.task_table import Run, TaskTable, result_digest
 
 WAIT_POLL_SECONDS = 0.005
 SLOW_DOWN_POLL_SECONDS = 0.05
 
 _logger = logging.getLogger("kabudachi")
-
-
-class Claim(Protocol):
-    """A task run handed to this worker to execute."""
-
-    task_id: str
-    task_run_id: str
-    definition_id: str
-    source_version: int
-    queue: str
-    attempt_number: int
-    serialized_input: bytes
-    chain: list[bytes]
-
-
-class Event(Protocol):
-    """Something the runtime decided on its own, such as that a task expired."""
-
-    kind: str
-    task_id: str
-    task_run_id: str
-    was_running: bool
-    superseded_by: str | None
-
-
-class Certification(Protocol):
-    """The leader's word that a run's result is the authoritative one."""
-
-    task_id: str
-    task_run_id: str
-    result_digest: bytes
-
-
-@runtime_checkable
-class Runtime(Protocol):
-    """What a session needs of the native runtime."""
-
-    def submit(
-        self,
-        definition_id: str,
-        source_version: int,
-        serialized_input: bytes,
-        queue: str,
-        retries: int = 0,
-        delay_ms: int | None = None,
-        expires_in_ms: int | None = None,
-        coalescing_key: str | None = None,
-        drop_oldest: bool = False,
-    ) -> str:
-        ...
-
-    async def claim_pending(self, limit: int) -> list[Claim]:
-        ...
-
-    async def next_events(self) -> list[Event]:
-        ...
-
-    def report_started(self, task_run_id: str) -> None:
-        ...
-
-    def cancel(self, task_id: str) -> str:
-        """Cancels a task: `"cancelled"`, `"finished"` or `"unknown"`."""
-
-    def fail(self, task_run_id: str, failure_kind: str) -> bool:
-        """Reports that a running run failed, and whether it will be retried."""
-
-    def complete(
-        self, task_run_id: str, result_digest: bytes, continues: bool = False
-    ) -> Certification:
-        ...
-
-    def end_continuation(self, task_id: str) -> bool:
-        """Ends the continuation of a task that returned a step; whether there was one."""
-
-
-def _digest(result: bytes) -> bytes:
-    return hashlib.sha256(result).digest()
-
-
-class _StartingContinuation:
-    """Stands for a continuation between its run being certified and its first
-    stage being started, so a cancel in that window is not lost."""
-
-    def __init__(self) -> None:
-        self.cancel_requested = False
-
-    def cancel(self) -> bool:
-        """Remembers the cancel, for the continuation to act on once it exists."""
-        self.cancel_requested = True
-        return True
 
 
 class _BodyWaits:
@@ -174,10 +82,10 @@ class Session:
         self._serializers = serializers
         self._configuration = configuration
         self.concurrency: int = configuration.resolve("concurrency")
+        # Guards the callback, flow and blocked counters only; the tasks have
+        # their own lock, in the table.
         self._lock = threading.Lock()
-        # One lifecycle per task not yet forgotten: those submitted here, and
-        # a detached one for a run whose task was settled before it began.
-        self._tasks: dict[str, TaskLifecycle] = {}
+        self._tasks = TaskTable(runtime, self._run_callback, self._decode_result)
         self._running: set[asyncio.Task[None]] = set()
         self._blocked = 0
         # The loop this runs on: known now if built inside it (as `run()` does),
@@ -192,7 +100,6 @@ class Session:
         # Every flow and group started here, and what runs them.
         self._composites = Composites(self)
         self._slot_freed = asyncio.Event()
-        self._stopping = False
         # As many threads as tasks may run at once, or synchronous tasks
         # would queue behind the event loop's small default pool.
         self._threads = ThreadPoolExecutor(
@@ -221,45 +128,7 @@ class Session:
         serializer = self._serializers.get(definition.serializer)
         payload = serializer.encode(argument, definition.input_type)
         queue = self._configuration.resolve("queue", definition.queue)
-        return self._submit_raw(
-            definition.name,
-            payload,
-            queue,
-            definition.version,
-            definition.retries,
-            options or SubmissionOptions(),
-            coalescing=definition.kind is TaskKind.COALESCING,
-        )
-
-    def _submit_raw(
-        self,
-        definition_name: str,
-        payload: bytes,
-        queue: str,
-        version: int = 0,
-        retries: int = 0,
-        options: SubmissionOptions = SubmissionOptions(),
-        coalescing: bool = False,
-    ) -> TaskHandle:
-        # Held across submitting and recording, so a worker that claims the
-        # task at once cannot look for its handle before it exists.
-        with self._lock:
-            if self._stopping:
-                raise RunStoppedError("the run is stopping, so no more tasks are accepted")
-            task_id = self._runtime.submit(
-                definition_name,
-                version,
-                payload,
-                queue,
-                retries,
-                options.delay_ms,
-                options.expires_in_ms,
-                # A coalescing task always has a key: the default is "".
-                (options.key or "") if coalescing else None,
-            )
-            handle = TaskHandle(task_id, self._cancel, self._run_callback)
-            self._tasks[task_id] = TaskLifecycle(handle, definition_name)
-        return handle
+        return self._tasks.submit(definition, payload, queue, options or SubmissionOptions())
 
     async def work(self) -> None:
         """Claims pending tasks and runs them, up to the concurrency limit,
@@ -274,7 +143,7 @@ class Session:
         fails, the error ends this coroutine, and whoever awaits it sees it.
         """
         self._loop = asyncio.get_running_loop()
-        while not self._stopping:
+        while not self._tasks.stopping:
             free = self.concurrency - (len(self._running) - self._blocked)
             if free <= 0:
                 # No await since `free` was computed, so a slot freed from now
@@ -300,7 +169,12 @@ class Session:
     @property
     def stopping(self) -> bool:
         """Whether the run is stopping, so nothing new may be submitted."""
-        return self._stopping
+        return self._tasks.stopping
+
+    @property
+    def tasks(self) -> TaskTable:
+        """The table of every task this session submitted and has not forgotten."""
+        return self._tasks
 
     @property
     def callback_runner(self) -> Callable[[Callable[[Any], Any], Any], None]:
@@ -344,7 +218,7 @@ class Session:
                 "flows and groups can only be started while kabudachi.run() is serving"
             )
         with self._lock:
-            if self._stopping:
+            if self._tasks.stopping:
                 coroutine.close()
                 raise RunStoppedError("the run is stopping, so no more flows are accepted")
             self._flows_outstanding += 1
@@ -381,24 +255,6 @@ class Session:
         with self._lock:
             self._flows_outstanding -= 1
 
-    def _cancel(self, task_id: str) -> bool:
-        """Asks the runtime to cancel `task_id`, which then tells this session
-        through an event; says whether it was cancelled."""
-        with self._lock:
-            lifecycle = self._tasks.get(task_id)
-            continuation = lifecycle.continuation if lifecycle is not None else None
-            if continuation is None:
-                # Under the lock, so a completion that carries a continuation
-                # is either not accepted yet (this cancels the run) or already
-                # has its continuation registered (found above).
-                cancelled = self._runtime.cancel(task_id) == "cancelled"
-                if cancelled and lifecycle is not None:
-                    lifecycle.request_cancel()
-                return cancelled
-        # The run is certified and over; what can still be cancelled is its
-        # continuation, outside the lock because cancelling it takes the lock.
-        return continuation.cancel()
-
     async def watch_events(self) -> None:
         """Acts on what the runtime decides on its own: a task that expired
         fails its handle with `TaskExpiredError`. Runs until the runtime shuts
@@ -409,18 +265,18 @@ class Session:
         while True:
             for event in await self._runtime.next_events():
                 if event.kind == "expired":
-                    self._failed(
+                    self._tasks.failed(
                         event.task_id,
                         TaskExpiredError(f"task {event.task_id} expired before it could start"),
                     )
                 elif event.kind == "cancelled":
-                    self._cancelled_by_leader(event.task_id)
+                    self._tasks.cancelled_by_leader(event.task_id)
                 elif event.kind == "slow_down":
                     self._below_soft_limit.clear()
                 elif event.kind == "slow_down_cleared":
                     self._below_soft_limit.set()
                 elif event.kind == "superseded":
-                    self._failed(
+                    self._tasks.failed(
                         event.task_id,
                         TaskSupersededError(
                             f"task {event.task_id} was superseded by {event.superseded_by}",
@@ -442,32 +298,12 @@ class Session:
                 loop.cancel()
             await asyncio.gather(*loops, return_exceptions=True)
 
-    def _cancelled_by_leader(self, task_id: str) -> None:
-        """The task was cancelled: fail its handle, and ask its body, if it is
-        running here, to stop."""
-        with self._lock:
-            lifecycle = self._tasks.get(task_id)
-            if lifecycle is not None:
-                lifecycle.cancelled_by_leader()
-        self._failed(task_id, TaskCancelledError(f"task {task_id} was cancelled"))
-        body = lifecycle.body if lifecycle is not None else None
-        if body is not None:
-            body.outcome.cancel()
-
     def stop_claiming(self) -> None:
         """Stops the run: no more tasks start or are accepted, and every task
         that has not started fails with `RunStoppedError`, which also frees
         any running task that was waiting for one of them. Tasks already
         running are not interrupted."""
-        with self._lock:
-            self._stopping = True
-            dropped = []
-            for task_id, lifecycle in list(self._tasks.items()):
-                if lifecycle.stop_unstarted():
-                    dropped.append(lifecycle.handle)
-                    self._retire(task_id, lifecycle)
-        for handle in dropped:
-            handle._fail(RunStoppedError("the run stopped before this task could start"))
+        self._tasks.stop_unstarted()
         self._slot_freed.set()
 
     def close(self) -> None:
@@ -486,12 +322,10 @@ class Session:
             await asyncio.sleep(WAIT_POLL_SECONDS)
 
     def _has_pending(self) -> bool:
+        if self._tasks.pending():
+            return True
         with self._lock:
-            return (
-                any(not lifecycle.settled for lifecycle in self._tasks.values())
-                or self._callbacks_outstanding > 0
-                or self._flows_outstanding > 0
-            )
+            return self._callbacks_outstanding > 0 or self._flows_outstanding > 0
 
     def _run_callback(self, function: Any, value: Any) -> None:
         """Runs a task callback on the event loop, from whichever thread the
@@ -553,14 +387,13 @@ class Session:
             self._blocked -= 1
 
     def _start(self, claim: Any) -> None:
-        with self._lock:
-            lifecycle = self._tasks.get(claim.task_id)
-            if lifecycle is None or not lifecycle.claim():
-                # Already settled and forgotten (by `stop_claiming`, or any
-                # other route): its handle is settled, so running the body now
-                # would contradict that.
-                return
-        running = asyncio.get_running_loop().create_task(self._run(claim))
+        run = self._tasks.claimed(claim.task_id)
+        if run is None:
+            # Already settled and forgotten (by `stop_claiming`, or any other
+            # route): its handle is settled, so running the body now would
+            # contradict that.
+            return
+        running = asyncio.get_running_loop().create_task(self._run(claim, run))
         self._running.add(running)
         running.add_done_callback(self._finished)
 
@@ -572,19 +405,18 @@ class Session:
             running.exception()
         self._slot_freed.set()
 
-    async def _run(self, claim: Any) -> None:
+    async def _run(self, claim: Any, run: Run) -> None:
         """Runs one claimed task and settles its handle, whatever happens.
 
         A task that fails is reported to the leader, by its error's type,
         before its handle is failed with the error itself.
         """
         current_body.set(_BodyWaits(self))
-        lifecycle, generation = self._begin_run(claim.task_id, claim.definition_id)
         started = False
         body: RunningBody | None = None
         try:
             # A retry does not run beside the abandoned body it replaces.
-            previous = lifecycle.abandoned
+            previous = run.previous_body_exited
             if previous is not None:
                 await asyncio.wait({previous})
             definition = self._registry.get(claim.definition_id)
@@ -595,35 +427,35 @@ class Session:
             started = True
             argument = self._fold(definition, serializer, claim)
             body = start_body(definition, argument, self._threads)
-            lifecycle.body = body
+            run.body_started(body)
             value = await run_within(
                 body,
                 definition.timeout,
                 self._configuration.resolve("cancel_grace", definition.cancel_grace),
             )
-            if not lifecycle.outcome_counts:
+            if not run.outcome_counts:
                 # Cancelled, though the body carried on and returned anyway.
                 # The handle stays unsettled here on purpose: the leader's
                 # `cancelled` event settles it, pushed in the same call that
                 # answers "cancelled".
                 return
             if definition.continues:
-                self._continue(claim, lifecycle, serializer, value)
+                self._continue(claim, run, value)
                 return
             result = serializer.encode(value, definition.output_type)
-            self._hold_provisionally(claim.task_id, result)
-            certification = self._runtime.complete(claim.task_run_id, _digest(result))
-            self._certified(certification)
+            self._tasks.result_held(claim.task_id, result)
+            certification = self._runtime.complete(claim.task_run_id, result_digest(result))
+            self._tasks.certified(certification)
         except asyncio.CancelledError as error:
             current = asyncio.current_task()
-            if lifecycle.cancelled and current is not None and not current.cancelling():
+            if run.cancelled_by_leader and current is not None and not current.cancelling():
                 # Only the body was cancelled, because the task was: this is
                 # not this run being interrupted, and its handle is settled.
                 return
             self._interrupted(claim.task_id, error)
             raise
         except Exception as error:
-            if not lifecycle.outcome_counts:
+            if not run.outcome_counts:
                 # Cancelled, so its own failure no longer counts. The handle
                 # stays unsettled here on purpose: the leader's `cancelled`
                 # event settles it, pushed in the same call that answers
@@ -635,15 +467,15 @@ class Session:
             _logger.debug("task %s failed", claim.task_id, exc_info=error)
             abandoned = body is not None and not body.exited.done()
             if abandoned:
-                lifecycle.abandoned = body.exited
+                run.body_abandoned(body)
             if self._report_failure(claim, error, started):
-                self._awaiting_retry(claim.task_id)
+                self._tasks.retry_queued(claim.task_id)
             else:
-                self._failed(claim.task_id, error)
+                self._tasks.failed(claim.task_id, error)
             if abandoned:
                 # It keeps its place until it has really stopped.
                 await asyncio.wait({body.exited})
-                lifecycle.abandoned = None
+                run.abandoned_body_exited()
         except BaseException as error:
             # Worse than cancelled: the task has no result, and whoever waits
             # for it must not wait forever.
@@ -651,19 +483,14 @@ class Session:
             raise
         finally:
             # On the abandoned-body retry path a newer run of this task can
-            # begin while this one still awaits `body.exited`. `generation`
-            # is this run's own token, so if a newer run has already begun,
-            # `end_run` is a no-op here and leaves the newer run's state alone.
-            with self._lock:
-                lifecycle.end_run(generation)
-                self._retire(claim.task_id, lifecycle)
+            # begin while this one still awaits `body.exited`; the table
+            # leaves the newer run's state alone when this stale one ends.
+            self._tasks.run_ended(run)
 
     def _interrupted(self, task_id: str, error: BaseException) -> None:
-        self._failed(task_id, interrupted(f"task {task_id}", error))
+        self._tasks.failed(task_id, interrupted(f"task {task_id}", error))
 
-    def _continue(
-        self, claim: Any, lifecycle: TaskLifecycle, serializer: Any, step: Any
-    ) -> None:
+    def _continue(self, claim: Any, run: Run, step: Any) -> None:
         """The task returned `step`: certify the run, by the digest of the step,
         and only then start the step as the task's continuation, so a run the
         leader does not certify leaves no continuation behind (README §3.4).
@@ -681,57 +508,25 @@ class Session:
         for definition in step.definitions():
             if self._registry.get(definition.name) is None:
                 raise UnknownTaskError(f"this process has no task named {definition.name!r}")
-        digest = _digest(json.dumps(step.describe(self._serializers), sort_keys=True).encode())
-        starting = _StartingContinuation()
-        with self._lock:
-            self._runtime.complete(claim.task_run_id, digest, True)
-            # Registered in the same step as the certification, so a cancel of
-            # the task's handle always finds the continuation, or the run.
-            lifecycle.continuation = starting
+        description = json.dumps(step.describe(self._serializers), sort_keys=True)
+        digest = result_digest(description.encode())
+        self._tasks.complete_with_continuation(run, claim.task_run_id, digest)
         # Certified: from here on nothing may fail the run, only the continuation.
         try:
             handle = step.start(self, UNSET)
         except Exception as error:
-            self._continuation_over(claim.task_id, error, None)
+            self._tasks.continuation_over(claim.task_id, error, None)
             return
-        with self._lock:
-            lifecycle.continuation = handle
-        if starting.cancel_requested:
-            handle.cancel()  # cancelled while the first stage was being started
+        self._tasks.continuation_started(run, handle)
 
         def settled(outcome: "concurrent.futures.Future[Any]") -> None:
             error = outcome.exception()
             value = None if error is not None else outcome.result()
-            self._continuation_over(claim.task_id, error, [value] if step.is_task else value)
+            self._tasks.continuation_over(
+                claim.task_id, error, [value] if step.is_task else value
+            )
 
         handle._outcome.add_done_callback(settled)
-
-    def _continuation_over(self, task_id: str, error: BaseException | None, result: Any) -> None:
-        """The continuation of `task_id` ended: end it for the leader too, and
-        settle the task's handle with its results or its failure."""
-        with self._lock:
-            lifecycle = self._tasks.get(task_id)
-            if lifecycle is not None:
-                lifecycle.continuation = None
-                # Forgets the task if this was the last thing keeping it: a
-                # no-op while its run is still active, where `_run`'s
-                # `finally` forgets it instead.
-                self._retire(task_id, lifecycle)
-        try:
-            self._runtime.end_continuation(task_id)
-        except Exception as refusal:
-            _logger.warning(
-                "the leader did not end the continuation of task %s: %s",
-                task_id,
-                type(refusal).__name__,
-            )
-        handle = self._settle(task_id)
-        if handle is None:
-            return
-        if error is not None:
-            handle._fail(error)
-            return
-        handle._resolve(result)
 
     @staticmethod
     def _fold(definition: TaskDefinition, serializer: Any, claim: Any) -> Any:
@@ -763,88 +558,12 @@ class Session:
             )
             return False
 
-    def _awaiting_retry(self, task_id: str) -> None:
-        """The task's next attempt is queued: its handle stays open, and it
-        has not started again, so stopping fails it like any unstarted task."""
-        with self._lock:
-            lifecycle = self._tasks.get(task_id)
-            if lifecycle is None:
-                return
-            outcome = lifecycle.retry_queued(self._stopping)
-            if outcome is not RetryOutcome.STOPPED:
-                return
-            # `stop_claiming` had already failed everything not started,
-            # and nothing will claim this retry.
-            self._retire(task_id, lifecycle)
-        lifecycle.handle._fail(
-            RunStoppedError("the run stopped before this task's retry could start")
-        )
-
-    def _hold_provisionally(self, task_id: str, result: bytes) -> None:
-        with self._lock:
-            lifecycle = self._tasks.get(task_id)
-            if lifecycle is not None:
-                lifecycle.hold(result)
-
-    def _certified(self, certification: Any) -> None:
-        with self._lock:
-            lifecycle = self._tasks.get(certification.task_id)
-            if lifecycle is None or not lifecycle.settle():
-                return
-            self._retire(certification.task_id, lifecycle)
-        result = lifecycle.provisional_result
-        if result is None or _digest(result) != certification.result_digest:
-            _logger.warning(
-                "the leader certified a different result for %s", certification.task_id
-            )
-            lifecycle.handle._fail(
-                CertificationError(
-                    f"the leader certified a different result for task {certification.task_id}"
-                )
-            )
-            return
-        definition = self._registry.get(lifecycle.definition_name)
-        try:
-            serializer = self._serializers.get(definition.serializer)
-            value = serializer.decode(result, definition.output_type)
-        except Exception as error:
-            lifecycle.handle._fail(error)
-            return
-        lifecycle.handle._resolve(value)
-
-    def _failed(self, task_id: str, error: BaseException) -> None:
-        handle = self._settle(task_id)
-        if handle is not None:
-            handle._fail(error)
-
-    def _settle(self, task_id: str) -> TaskHandle | None:
-        """Settles the task, once: returns its handle if this call did, so the
-        caller can fail or resolve it outside the lock, and `None` if it was
-        settled already or is not known."""
-        with self._lock:
-            lifecycle = self._tasks.get(task_id)
-            if lifecycle is None or not lifecycle.settle():
-                return None
-            self._retire(task_id, lifecycle)
-            return lifecycle.handle
-
-    def _retire(self, task_id: str, lifecycle: TaskLifecycle) -> None:
-        """Forgets a settled task nothing of which is still going. Call with the lock held."""
-        if lifecycle.retirable:
-            self._tasks.pop(task_id, None)
-
-    def _begin_run(self, task_id: str, definition_name: str) -> tuple[TaskLifecycle, int]:
-        """Marks a run of the task as in progress and returns its lifecycle
-        and this run's generation token (pass it to `lifecycle.end_run`). A
-        task settled between its claim and this run's first step is no longer
-        known, so it is given a detached lifecycle, kept until the run ends, so
-        a cancel notice for it still finds the running body."""
-        with self._lock:
-            lifecycle = self._tasks.get(task_id)
-            if lifecycle is None:
-                lifecycle = self._tasks[task_id] = TaskLifecycle.detached(definition_name)
-            generation = lifecycle.begin_run()
-            return lifecycle, generation
+    def _decode_result(self, definition_name: str, payload: bytes) -> Any:
+        """Decodes a certified result with the serializer and output type of the
+        task named `definition_name`."""
+        definition = self._registry.get(definition_name)
+        serializer = self._serializers.get(definition.serializer)
+        return serializer.decode(payload, definition.output_type)
 
 
 def validate_definitions(registry: TaskRegistry, serializers: SerializerRegistry) -> None:

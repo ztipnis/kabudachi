@@ -161,13 +161,11 @@ def test_a_task_that_succeeds_is_not_reported_failed():
 
 def test_a_claim_that_cannot_run_is_still_started_and_then_reported_failed():
     world = World(echo)
-    world.registry = TaskRegistry()
-    session = Session(world.runtime, world.registry, world.serializers, world.configuration)
-    world.session = session
+    world.session = Session(world.runtime, TaskRegistry(), world.serializers, world.configuration)
 
     async def body():
-        with pytest.raises(UnknownTaskError, match=r"tests\.missing"):
-            await session._submit_raw("tests.missing", b"", "default")
+        with pytest.raises(UnknownTaskError, match=r"tests\.echo"):
+            await world.call("echo", Greeting())
 
     run(world.working(body))
 
@@ -204,12 +202,30 @@ def test_a_run_that_cannot_be_started_fails_its_handle_and_runs_nothing():
     assert ran == []
 
 
+class Garbled:
+    """Encodes anything as bytes that protobuf cannot decode back."""
+
+    name = "garbled"
+
+    def available(self):
+        return True
+
+    def supports(self, value_type):
+        return True
+
+    def encode(self, value, value_type):
+        return b"\xff\xff\xff\xff\xff"
+
+    def decode(self, payload, target_type):
+        return SerializerRegistry.with_defaults().get("protobuf").decode(payload, target_type)
+
+
 def test_input_bytes_that_do_not_decode_fail_the_handle():
-    world = World(echo)
+    world = World(echo, serializer="garbled")
+    world.serializers.register(Garbled())
 
     async def body():
-        handle = world.session._submit_raw("tests.echo", b"\xff\xff\xff\xff\xff", "default")
-        return await handle
+        return await world.call("echo", Greeting())
 
     with pytest.raises(SerializationError):
         run(world.working(body))
@@ -1363,7 +1379,7 @@ def test_a_task_cancelled_before_it_ever_ran_leaves_nothing_behind_to_remember()
 
     run(with_events(world, body))
 
-    assert world.session._tasks == {}
+    assert world.session.tasks.is_empty()
 
 
 def test_a_running_task_that_is_cancelled_leaves_nothing_behind_once_it_ends():
@@ -1383,42 +1399,119 @@ def test_a_running_task_that_is_cancelled_leaves_nothing_behind_once_it_ends():
 
     run(with_events(world, body))
 
-    assert world.session._tasks == {}
+    assert world.session.tasks.is_empty()
 
 
-def test_a_task_settled_between_its_claim_and_its_run_can_still_have_its_body_stopped():
-    """A run whose task was settled before it reached its first step is still
-    remembered while it runs, so a cancel notice finds its body."""
+def test_a_task_settled_while_its_run_is_starting_can_still_have_its_body_stopped():
+    stopped = []
+    started = asyncio.Event()
 
     async def long(request: Greeting) -> Greeting:
-        await asyncio.sleep(30)
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            stopped.append(True)
+            raise
         return request
 
     world = World(long)
+    handles = []
+    # Settled by another route after the claim, before the body starts.
+    world.runtime.before_started = lambda _run_id: world.runtime.inject_event(
+        "expired", task_id=handles[0].task_id
+    )
 
     async def body():
-        handle = world.call("long", Greeting())
-        await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
-        [claim] = await world.runtime.claim_pending(1)
-        world.session._start(claim)
-        # Settled before the run it just started reaches its first step.
-        world.session._failed(claim.task_id, TaskExpiredError("expired"))
+        handles.append(world.call("long", Greeting()))
         with pytest.raises(TaskExpiredError):
-            await asyncio.wait_for(handle, WAIT)
-        lifecycle = None
-        deadline = time.monotonic() + WAIT
-        while time.monotonic() < deadline:
-            lifecycle = world.session._tasks.get(claim.task_id)
-            if lifecycle is not None and lifecycle.body is not None:
-                break
-            await asyncio.sleep(0.005)
-        assert lifecycle is not None and lifecycle.body is not None
-        world.session._cancelled_by_leader(claim.task_id)
+            await asyncio.wait_for(handles[0], WAIT)
+        await asyncio.wait_for(started.wait(), WAIT)
+        world.runtime.inject_event("cancelled", task_id=handles[0].task_id)
         await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+        # Settled once: the later cancel notice changed nothing for the handle.
+        with pytest.raises(TaskExpiredError):
+            await asyncio.wait_for(handles[0], WAIT)
+
+    run(with_events(world, body))
+
+    assert stopped == [True]
+    assert world.session.tasks.is_empty()
+
+
+def test_a_cancel_this_process_asked_for_suppresses_the_runs_outcome_before_the_leaders_notice():
+    release = threading.Event()
+
+    def stubborn(request: Greeting) -> Greeting:
+        release.wait(5)
+        return request
+
+    world = World(stubborn)
+
+    async def body():
+        handle = world.call("stubborn", Greeting())
+        while not any(event[0] == "started" for event in world.runtime.events):
+            await asyncio.sleep(0.001)
+        assert handle.cancel() is True
+        release.set()
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+        return handle.done()
+
+    settled = run(world.working(body))
+
+    assert not any(event[0] in ("complete", "fail") for event in world.runtime.events)
+    assert settled is False  # only the leader's notice settles a cancelled task
+
+
+def test_a_stale_run_that_ends_after_its_retry_began_leaves_the_retry_remembered():
+    """An abandoned run and its retry both wait for the abandoned body to
+    exit, and the stale run ends first: it must not end the retry's run."""
+    world = World(echo)
+    tasks = world.session.tasks
+
+    async def body():
+        handle = world.call("echo", Greeting())
+        stale = tasks.claimed(handle.task_id)
+        tasks.retry_queued(handle.task_id)
+        retry = tasks.claimed(handle.task_id)
+        tasks.run_ended(stale)
+        tasks.cancelled_by_leader(handle.task_id)
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(handle, WAIT)
+        assert retry.cancelled_by_leader
+        assert not tasks.is_empty()  # still remembered while the retry runs
+        tasks.run_ended(retry)
+        assert tasks.is_empty()
 
     run(body())
 
-    assert world.session._tasks == {}
+
+def test_stopping_while_a_submission_is_in_flight_refuses_or_fails_it_and_never_leaves_it_open():
+    world = World(echo)
+    world.runtime.submit_lingers_for = 0.1  # the native call holds the table lock this long
+    outcome = []
+
+    def submit():
+        try:
+            outcome.append(world.call("echo", Greeting()))
+        except RunStoppedError as refused:
+            outcome.append(refused)
+
+    async def body():
+        submitter = threading.Thread(target=submit)
+        submitter.start()
+        await asyncio.sleep(0.02)  # usually inside the native call by now
+        world.session.stop_claiming()
+        while submitter.is_alive():
+            await asyncio.sleep(0.005)
+        [result] = outcome
+        if not isinstance(result, RunStoppedError):  # submitted first, so the stop failed it
+            with pytest.raises(RunStoppedError):
+                await asyncio.wait_for(result, WAIT)
+
+    run(body())
+
+    assert world.session.tasks.is_empty()
 
 
 def test_a_body_that_starts_waiting_on_another_thread_wakes_the_worker_on_the_loops_own_thread():
