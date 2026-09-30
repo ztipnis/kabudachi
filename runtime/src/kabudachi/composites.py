@@ -10,13 +10,23 @@ know their insides.
 
 import asyncio
 import contextlib
+import contextvars
 import functools
 import itertools
 from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any
 
-from kabudachi.errors import RunStoppedError, TaskCancelledError, TaskInterruptedError, interrupted
+from kabudachi.errors import (
+    RunStoppedError,
+    RuntimeNotStartedError,
+    TaskCancelledError,
+    TaskInterruptedError,
+    interrupted,
+)
+# TaskCancelledError, TaskInterruptedError, interrupted
 from kabudachi.handle import TaskHandle, run_callback_inline
+
+from kabudachi.hosted_work import LoopHostedWork
 
 if TYPE_CHECKING:
     from kabudachi.session import Session
@@ -131,37 +141,53 @@ class Composites:
 
     A flow's stages and a group's members are ordinary tasks, so this owns
     only the sequencing, the bulk submission and what a cancel does to what
-    was started. It reaches its session for five things and nothing else:
-    submitting a step (through the step itself), whether there is room to
-    submit, running an orchestration on the run's loop, whether the run is
-    stopping, and what handles run their callbacks with.
+    was started. It hosts its own orchestrations on the run's loop. For
+    everything else it reaches its session: submitting a stage (through the
+    step), room to submit, whether the run is stopping, and the callback
+    runner.
     """
 
-    def __init__(self, session: "Session") -> None:
+    def __init__(self, session: "Session", hosted: LoopHostedWork) -> None:
         self._session = session
+        self._hosted = hosted
         self._numbers = itertools.count(1)
 
     def submit_flow(self, flow: Any, previous: Any) -> FlowHandle:
         """Starts `flow`, whose stages run one after another, and returns its
         handle."""
         handle = FlowHandle(self._identifier("flow"), self._session.callback_runner)
-        self._start(self._run_flow(flow, previous, handle), handle)
+        self._host(self._run_flow(flow, previous, handle), handle)
         return handle
 
     def submit_group(self, group: Any, previous: Any) -> GroupHandle:
         """Starts every member of `group` on `previous`, and returns the
         group's handle."""
         handle = GroupHandle(self._identifier("group"), self._session.callback_runner)
-        self._start(self._run_group(group, previous, handle), handle)
+        self._host(self._run_group(group, previous, handle), handle)
         return handle
 
     def _identifier(self, kind: str) -> str:
         return f"{kind}-{next(self._numbers)}"
 
-    def _start(self, coroutine: Any, handle: TaskHandle) -> None:
-        """Runs one orchestration on the session's loop. Raises, leaving the
+    def _host(self, coroutine: Any, handle: TaskHandle) -> None:
+        """Runs one orchestration on the run's loop. Raises, leaving the
         handle to be dropped by the caller, if the run cannot take it."""
-        self._session.run_on_loop(coroutine, functools.partial(self._ended, handle))
+        if not self._hosted.has_loop():
+            coroutine.close()
+            raise RuntimeNotStartedError(
+                "flows and groups can only be started while kabudachi.run() is serving"
+            )
+        if self._session.stopping:
+            coroutine.close()
+            raise RunStoppedError("the run is stopping, so no more flows are accepted")
+        # Its own context, so awaiting its steps is not counted as the calling
+        # task body waiting.
+        if not self._hosted.spawn(
+            coroutine,
+            context=contextvars.Context(),
+            when_done=functools.partial(self._ended, handle),
+        ):
+            raise RuntimeNotStartedError("the run's event loop has closed")
 
     @staticmethod
     def _ended(handle: TaskHandle) -> None:

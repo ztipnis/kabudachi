@@ -109,7 +109,7 @@ def run_group_then_stage(failures, on_error):
 
     async def body():
         try:
-            return await world.session.submit_flow(pipeline, Greeting())
+            return await pipeline.start(world.session, Greeting())
         except ValueError as error:
             return error
 

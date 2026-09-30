@@ -10,7 +10,6 @@ delivered (README §8.5).
 
 import asyncio
 import concurrent.futures
-import contextvars
 import functools
 import inspect
 import json
@@ -21,10 +20,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from kabudachi.body import RunningBody, run_within, start_body
-from kabudachi.composites import Composites, FlowHandle, GroupHandle
+from kabudachi.composites import Composites
+from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration
 from kabudachi.errors import (
-    RunStoppedError,
     RuntimeNotStartedError,
     TaskDefinitionError,
     TaskExpiredError,
@@ -33,6 +32,7 @@ from kabudachi.errors import (
     interrupted,
 )
 from kabudachi.config import UNSET
+from kabudachi.hosted_work import LoopHostedWork
 from kabudachi.handle import TaskHandle, current_body, run_callback_inline
 from kabudachi.native_protocol import Runtime
 from kabudachi.options import SubmissionOptions
@@ -44,27 +44,6 @@ WAIT_POLL_SECONDS = 0.005
 SLOW_DOWN_POLL_SECONDS = 0.05
 
 _logger = logging.getLogger("kabudachi")
-
-
-class _BodyWaits:
-    """Tracks when one running task body is waiting for another task, so the
-    session can count it as not occupying a place while it does."""
-
-    def __init__(self, session: "Session") -> None:
-        self._session = session
-        self._waits = 0
-
-    def waiting_started(self) -> None:
-        """The body has started waiting for a task; its place is given up while it does."""
-        self._waits += 1
-        if self._waits == 1:
-            self._session._body_blocked()
-
-    def waiting_finished(self) -> None:
-        """The body has stopped waiting for a task; it takes its place back."""
-        self._waits -= 1
-        if self._waits == 0:
-            self._session._body_unblocked()
 
 
 class Session:
@@ -82,36 +61,24 @@ class Session:
         self._serializers = serializers
         self._configuration = configuration
         self.concurrency: int = configuration.resolve("concurrency")
-        # Guards the callback, flow and blocked counters only; the tasks have
-        # their own lock, in the table.
-        self._lock = threading.Lock()
         self._tasks = TaskTable(runtime, self._run_callback, self._decode_result)
-        self._running: set[asyncio.Task[None]] = set()
-        self._blocked = 0
-        # The loop this runs on: known now if built inside it (as `run()` does),
-        # otherwise once the worker loops start.
-        self._loop: asyncio.AbstractEventLoop | None = self._running_loop()
-        self._callback_tasks: set[asyncio.Task[None]] = set()
-        self._callbacks_outstanding = 0
-        self._flows_outstanding = 0
+        self._hosted = LoopHostedWork()
+        self._places = ConcurrencyPlaces(self.concurrency)
+        try:
+            # Built inside the run's loop, as `run()` does.
+            self._hosted.attach(asyncio.get_running_loop())
+        except RuntimeError:
+            pass
         # Set while memory use is below the soft limit, when bulk submission may go on.
         self._below_soft_limit = asyncio.Event()
         self._below_soft_limit.set()
         # Every flow and group started here, and what runs them.
-        self._composites = Composites(self)
-        self._slot_freed = asyncio.Event()
+        self._composites = Composites(self, self._hosted)
         # As many threads as tasks may run at once, or synchronous tasks
         # would queue behind the event loop's small default pool.
         self._threads = ThreadPoolExecutor(
             max_workers=self.concurrency, thread_name_prefix="kabudachi-task"
         )
-
-    @staticmethod
-    def _running_loop() -> asyncio.AbstractEventLoop | None:
-        try:
-            return asyncio.get_running_loop()
-        except RuntimeError:
-            return None
 
     def submit(
         self,
@@ -142,34 +109,24 @@ class Session:
         made it leaves those tasks claimed and never run. If the runtime
         fails, the error ends this coroutine, and whoever awaits it sees it.
         """
-        self._loop = asyncio.get_running_loop()
+        self._hosted.attach(asyncio.get_running_loop())
         while not self._tasks.stopping:
-            free = self.concurrency - (len(self._running) - self._blocked)
+            free = self._places.free()
             if free <= 0:
-                # No await since `free` was computed, so a slot freed from now
-                # on is not missed by clearing here.
-                self._slot_freed.clear()
-                await self._slot_freed.wait()
+                await self._places.wait_for_free()
                 continue
             for claim in await self._runtime.claim_pending(free):
                 self._start(claim)
-
-    def submit_flow(self, flow: Any, *arguments: Any) -> FlowHandle:
-        """Starts `flow`, whose stages run one after another, and returns its
-        handle. Safe to call from any thread once the run is serving; raises
-        `RuntimeNotStartedError` before that and `RunStoppedError` once the
-        run is stopping."""
-        return self._composites.submit_flow(flow, arguments[0] if arguments else UNSET)
-
-    def submit_group(self, group: Any, previous: Any = UNSET) -> GroupHandle:
-        """Starts every member of `group` on `previous`, and returns the
-        group's handle. Safe to call from any thread once the run is serving."""
-        return self._composites.submit_group(group, previous)
 
     @property
     def stopping(self) -> bool:
         """Whether the run is stopping, so nothing new may be submitted."""
         return self._tasks.stopping
+
+    @property
+    def composites(self) -> Composites:
+        """Every flow and group started here, and what runs them."""
+        return self._composites
 
     @property
     def tasks(self) -> TaskTable:
@@ -195,73 +152,13 @@ class Session:
         except TimeoutError:
             pass
 
-    def run_on_loop(self, coroutine: Any, when_done: Callable[[], None]) -> None:
-        """Runs `coroutine` on the run's event loop, in a context of its own,
-        and calls `when_done` when it ends, however it ends. Counted as
-        outstanding from now, so finishing cannot miss it. Safe to call from
-        any thread.
-
-        Raises `RuntimeNotStartedError` if the run is not serving, and
-        `RunStoppedError` once it is stopping; the coroutine is closed and
-        `when_done` is not called in either case.
-        """
-        loop = self._loop
-        if loop is None:
-            # Called on the loop's own thread before the worker loops started.
-            try:
-                loop = self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
-        if loop is None or loop.is_closed():
-            coroutine.close()
-            raise RuntimeNotStartedError(
-                "flows and groups can only be started while kabudachi.run() is serving"
-            )
-        with self._lock:
-            if self._tasks.stopping:
-                coroutine.close()
-                raise RunStoppedError("the run is stopping, so no more flows are accepted")
-            self._flows_outstanding += 1
-        # Its own context, so awaiting its steps is not counted as the
-        # calling task body waiting.
-        try:
-            loop.call_soon_threadsafe(self._spawn, coroutine, contextvars.Context(), when_done)
-        except RuntimeError:
-            coroutine.close()
-            self._flow_done()
-            raise RuntimeNotStartedError("the run's event loop has closed") from None
-
-    def _spawn(
-        self,
-        coroutine: Any,
-        context: contextvars.Context,
-        when_done: Callable[[], None],
-    ) -> None:
-        task = asyncio.get_running_loop().create_task(coroutine, context=context)
-        self._callback_tasks.add(task)
-        task.add_done_callback(self._callback_tasks.discard)
-        task.add_done_callback(lambda _: self._orchestration_ended(when_done))
-
-    def _orchestration_ended(self, when_done: Callable[[], None]) -> None:
-        """A flow or group's orchestration ended, however it did: its owner
-        settles whatever it left unsettled, and it stops counting as
-        outstanding whether that worked or not."""
-        try:
-            when_done()
-        finally:
-            self._flow_done()
-
-    def _flow_done(self) -> None:
-        with self._lock:
-            self._flows_outstanding -= 1
-
     async def watch_events(self) -> None:
         """Acts on what the runtime decides on its own: a task that expired
         fails its handle with `TaskExpiredError`. Runs until the runtime shuts
         down or the caller cancels it, which must only happen at shutdown
         because events the runtime has handed over but this has not acted on
         are lost. If the runtime fails, the error ends this coroutine."""
-        self._loop = asyncio.get_running_loop()
+        self._hosted.attach(asyncio.get_running_loop())
         while True:
             for event in await self._runtime.next_events():
                 if event.kind == "expired":
@@ -304,7 +201,7 @@ class Session:
         any running task that was waiting for one of them. Tasks already
         running are not interrupted."""
         self._tasks.stop_unstarted()
-        self._slot_freed.set()
+        self._places.wake()
 
     def close(self) -> None:
         """Releases the threads that ran synchronous tasks."""
@@ -312,8 +209,7 @@ class Session:
 
     async def wait_until_running_finish(self) -> None:
         """Waits for every task that is running now to finish."""
-        while self._running:
-            await asyncio.wait(set(self._running))
+        await self._places.wait_until_running_finish()
 
     async def wait_until_idle(self) -> None:
         """Waits until every task submitted so far, including any submitted by
@@ -322,69 +218,13 @@ class Session:
             await asyncio.sleep(WAIT_POLL_SECONDS)
 
     def _has_pending(self) -> bool:
-        if self._tasks.pending():
-            return True
-        with self._lock:
-            return self._callbacks_outstanding > 0 or self._flows_outstanding > 0
+        return self._tasks.pending() or self._hosted.outstanding > 0
 
     def _run_callback(self, function: Any, value: Any) -> None:
         """Runs a task callback on the event loop, from whichever thread the
-        task was settled on. Counted as outstanding from now, so finishing
-        cannot miss one that has been asked for but not yet started."""
-        loop = self._loop
-        if loop is None or loop.is_closed():
+        task was settled on; inline if there is no loop left to run it."""
+        if not self._hosted.spawn(_invoke_callback(function, value)):
             run_callback_inline(function, value)
-            return
-        with self._lock:
-            self._callbacks_outstanding += 1
-        try:
-            loop.call_soon_threadsafe(self._start_callback, function, value)
-        except RuntimeError:
-            # The loop closed between looking and asking.
-            self._callback_done()
-            run_callback_inline(function, value)
-
-    def _start_callback(self, function: Any, value: Any) -> None:
-        task = asyncio.get_running_loop().create_task(self._invoke_callback(function, value))
-        # Held here, so a callback whose handle was dropped still runs.
-        self._callback_tasks.add(task)
-        task.add_done_callback(self._callback_tasks.discard)
-
-    def _callback_done(self) -> None:
-        with self._lock:
-            self._callbacks_outstanding -= 1
-
-    async def _invoke_callback(self, function: Any, value: Any) -> None:
-        try:
-            if inspect.iscoroutinefunction(function):
-                await function(value)
-            else:
-                # Off the loop, so a callback that blocks does not stall tasks.
-                outcome = await asyncio.get_running_loop().run_in_executor(None, function, value)
-                if inspect.isawaitable(outcome):
-                    await outcome
-        except Exception as error:
-            _logger.warning("a task callback failed with %s", type(error).__name__)
-        finally:
-            self._callback_done()
-
-    def _body_blocked(self) -> None:
-        # A handle can be awaited from any event loop, so this can run off the
-        # session's loop: count under the lock and wake the worker loop on its own.
-        with self._lock:
-            self._blocked += 1
-        loop = self._loop
-        if loop is None:
-            self._slot_freed.set()
-            return
-        try:
-            loop.call_soon_threadsafe(self._slot_freed.set)
-        except RuntimeError:
-            pass  # the loop is closed, so there is no worker loop to wake
-
-    def _body_unblocked(self) -> None:
-        with self._lock:
-            self._blocked -= 1
 
     def _start(self, claim: Any) -> None:
         run = self._tasks.claimed(claim.task_id)
@@ -393,17 +233,7 @@ class Session:
             # route): its handle is settled, so running the body now would
             # contradict that.
             return
-        running = asyncio.get_running_loop().create_task(self._run(claim, run))
-        self._running.add(running)
-        running.add_done_callback(self._finished)
-
-    def _finished(self, running: asyncio.Task[None]) -> None:
-        self._running.discard(running)
-        # Whatever ended the task already reached its handle; retrieving it
-        # here keeps asyncio from logging it as never retrieved.
-        if not running.cancelled():
-            running.exception()
-        self._slot_freed.set()
+        self._places.occupy(asyncio.get_running_loop().create_task(self._run(claim, run)))
 
     async def _run(self, claim: Any, run: Run) -> None:
         """Runs one claimed task and settles its handle, whatever happens.
@@ -411,7 +241,7 @@ class Session:
         A task that fails is reported to the leader, by its error's type,
         before its handle is failed with the error itself.
         """
-        current_body.set(_BodyWaits(self))
+        current_body.set(self._places.watch_body())
         started = False
         body: RunningBody | None = None
         try:
@@ -566,6 +396,19 @@ class Session:
         return serializer.decode(payload, definition.output_type)
 
 
+async def _invoke_callback(function: Any, value: Any) -> None:
+    try:
+        if inspect.iscoroutinefunction(function):
+            await function(value)
+        else:
+            # Off the loop, so a callback that blocks does not stall tasks.
+            outcome = await asyncio.get_running_loop().run_in_executor(None, function, value)
+            if inspect.isawaitable(outcome):
+                await outcome
+    except Exception as error:
+        _logger.warning("a task callback failed with %s", type(error).__name__)
+
+
 def validate_definitions(registry: TaskRegistry, serializers: SerializerRegistry) -> None:
     """Checks that every registered task can be run with the serializers this
     process has, so a mistake is reported before any task runs rather than by
@@ -585,15 +428,11 @@ def validate_definitions(registry: TaskRegistry, serializers: SerializerRegistry
                 f"{definition.name}: the {definition.serializer!r} serializer cannot run here"
             )
         else:
-            checked = [("input", definition.input_type)]
-            if not definition.continues:  # a returned step is not encoded
-                checked.append(("return", definition.output_type))
-            for role, value_type in checked:
-                if not serializer.supports(value_type):
-                    problems.append(
-                        f"{definition.name}: the {definition.serializer!r} serializer "
-                        f"does not support the {role} type {value_type!r}"
-                    )
+            for role, value_type in definition.types_unsupported_by(serializer):
+                problems.append(
+                    f"{definition.name}: the {definition.serializer!r} serializer "
+                    f"does not support the {role} type {value_type!r}"
+                )
     if problems:
         raise TaskDefinitionError("; ".join(problems))
 

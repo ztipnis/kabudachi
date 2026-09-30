@@ -3,6 +3,7 @@ settled, checked against a real native runtime that a few faults can be
 provoked on."""
 
 import asyncio
+import gc
 import hashlib
 import logging
 import threading
@@ -11,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 
+from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration
 from kabudachi.errors import (
     CertificationError,
@@ -1514,28 +1516,76 @@ def test_stopping_while_a_submission_is_in_flight_refuses_or_fails_it_and_never_
     assert world.session.tasks.is_empty()
 
 
-def test_a_body_that_starts_waiting_on_another_thread_wakes_the_worker_on_the_loops_own_thread():
-    world = World(echo, concurrency=1)
-    woken_on = []
+def test_a_place_given_back_from_another_thread_wakes_the_worker_loop_on_its_own_thread():
+    places = ConcurrencyPlaces(1)
+    errors = []
 
-    class Recording(asyncio.Event):
-        def set(self):
-            woken_on.append(threading.get_ident())
-            super().set()
-
-    world.session._slot_freed = Recording()
+    def give_back():
+        try:
+            places.blocked()
+        except BaseException as error:  # a debug loop refuses a foreign-thread call
+            errors.append(error)
 
     async def body():
-        loop_thread = threading.get_ident()
-        await asyncio.sleep(0)  # the worker loop starts, and with it the session knows its loop
-        woken_on.clear()
-        thread = threading.Thread(target=world.session._body_blocked)
+        holder = asyncio.ensure_future(asyncio.Event().wait())
+        places.occupy(holder)
+        assert places.free() == 0
+        waiting = asyncio.ensure_future(places.wait_for_free())
+        await asyncio.sleep(0)  # the worker loop is waiting for a place now
+        thread = threading.Thread(target=give_back)
         thread.start()
         thread.join()
-        await asyncio.sleep(0.02)
-        return loop_thread, world.session._blocked
+        await asyncio.wait_for(waiting, WAIT)
+        free = places.free()
+        holder.cancel()
+        return free
 
-    loop_thread, blocked = run(world.working(body))
+    free = asyncio.run(body(), debug=True)
 
-    assert blocked == 1
-    assert woken_on and set(woken_on) == {loop_thread}
+    assert errors == []
+    assert free == 1
+
+
+def test_stopping_ends_a_worker_loop_that_is_waiting_for_a_free_place():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold(request: Greeting) -> Greeting:
+        started.set()
+        await release.wait()
+        return request
+
+    world = World(hold, concurrency=1)
+
+    async def body():
+        await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
+        worker = asyncio.ensure_future(world.session.work())
+        handle = world.call("hold", Greeting())
+        await asyncio.wait_for(started.wait(), WAIT)  # the only place is taken
+        world.session.stop_claiming()
+        await asyncio.wait_for(worker, WAIT)  # woke, saw the stop, and returned
+        release.set()
+        return await asyncio.wait_for(handle, WAIT)
+
+    assert run(body()).text == ""
+
+
+def test_a_callback_added_after_the_run_loop_closed_runs_at_once_and_leaves_nothing_to_wait_for(
+    recwarn,
+):
+    world = World(echo)
+    called = []
+
+    async def body():
+        handle = world.call("echo", Greeting(text="late"))
+        await handle
+        return handle
+
+    handle = run(world.working(body))  # the run's loop is closed once this returns
+    handle.callback(lambda result: called.append(result.text))
+
+    assert called == ["late"]  # run inline: there is no loop left to host it
+    # A refused callback must not stay counted, or this never returns.
+    run(asyncio.wait_for(world.session.wait_until_idle(), WAIT))
+    gc.collect()
+    assert not [w for w in recwarn if "was never awaited" in str(w.message)]

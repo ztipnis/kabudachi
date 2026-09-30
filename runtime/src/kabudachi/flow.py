@@ -177,10 +177,12 @@ class Flow:
 
     def __call__(self, *arguments: Any) -> FlowHandle:
         self.check_arguments(arguments)
-        return current_session().submit_flow(self, *arguments)
+        return current_session().composites.submit_flow(
+            self, arguments[0] if arguments else UNSET
+        )
 
     def start(self, session: Session, previous: Any) -> FlowHandle:
-        return session.submit_flow(self, *([previous] if self.needs_input else []))
+        return session.composites.submit_flow(self, previous if self.needs_input else UNSET)
 
 
 ON_ERROR_POLICIES = ("fail_fast", "collect_all")
@@ -232,10 +234,10 @@ class Group:
 
     def __call__(self, *arguments: Any) -> GroupHandle:
         self.check_arguments(arguments)
-        return current_session().submit_group(self, arguments[0] if arguments else UNSET)
+        return current_session().composites.submit_group(self, arguments[0] if arguments else UNSET)
 
     def start(self, session: Session, previous: Any) -> GroupHandle:
-        return session.submit_group(self, previous)
+        return session.composites.submit_group(self, previous)
 
 
 class MapStep:
@@ -268,10 +270,10 @@ class MapStep:
         _check_arguments(f"{self.definition.name}.map", True, arguments)
 
     def __call__(self, inputs: Any, *, on_error: str = "fail_fast") -> GroupHandle:
-        return current_session().submit_group(self._group(inputs, on_error), UNSET)
+        return current_session().composites.submit_group(self._group(inputs, on_error), UNSET)
 
     def start(self, session: Session, previous: Any) -> GroupHandle:
-        return session.submit_group(self._group(previous, "fail_fast"), UNSET)
+        return session.composites.submit_group(self._group(previous, "fail_fast"), UNSET)
 
     def _group(self, inputs: Any, on_error: str) -> "Group":
         """A group with one fully bound task per item. Every item is checked

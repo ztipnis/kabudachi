@@ -105,14 +105,6 @@ class Task(wrapt.ObjectProxy):
 
         task_name = self._task_name(func, name)
         input_type, output_type = self._read_types(task_name, func)
-        self._check_serializer_supports(
-            task_name,
-            serializer,
-            process_serializers() if serializers is None else serializers,
-            input_type,
-            output_type,
-            checks_output=not is_step_type(output_type),
-        )
         definition = TaskDefinition(
             name=task_name,
             func=func,
@@ -128,6 +120,9 @@ class Task(wrapt.ObjectProxy):
             cancel_grace=cancel_grace,
             merge=merge,
             continues=is_step_type(output_type),
+        )
+        self._check_serializer_supports(
+            definition, process_serializers() if serializers is None else serializers
         )
         super().__init__(func)
         registry.register(definition)
@@ -331,29 +326,20 @@ class Task(wrapt.ObjectProxy):
 
     @staticmethod
     def _check_serializer_supports(
-        name: str,
-        serializer: str,
-        serializers: SerializerRegistry,
-        input_type: Any,
-        output_type: Any,
-        checks_output: bool = True,
+        definition: TaskDefinition, serializers: SerializerRegistry
     ) -> None:
         """Refuses a task whose types its serializer cannot handle. A
         serializer that is not registered here, or cannot run here, is not
         checked: it may be registered later, and it is checked again before
         the task first runs."""
-        backend = serializers.find(serializer)
+        backend = serializers.find(definition.serializer)
         if backend is None or not backend.available():
             return
-        checked = [("input", input_type)]
-        if checks_output:  # a returned step is not encoded by the serializer
-            checked.append(("return", output_type))
-        for role, value_type in checked:
-            if not backend.supports(value_type):
-                raise TaskDefinitionError(
-                    f"task {name!r}: the {serializer!r} serializer does not support "
-                    f"the {role} type {value_type!r}"
-                )
+        for role, value_type in definition.types_unsupported_by(backend):
+            raise TaskDefinitionError(
+                f"task {definition.name!r}: the {definition.serializer!r} serializer "
+                f"does not support the {role} type {value_type!r}"
+            )
 
 
 class _OptionedTask:

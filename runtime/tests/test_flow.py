@@ -151,9 +151,30 @@ def test_a_fully_bound_stage_ignores_the_prior_output():
     pipeline = flow(world.tasks["shout"], world.tasks["wrap"].bind(Greeting(text="fixed")))
 
     async def body():
-        return await world.session.submit_flow(pipeline, Greeting(text="hi"))
+        return await pipeline.start(world.session, Greeting(text="hi"))
 
     assert run(with_events(world, body))[-1].text == "[fixed]"
+
+
+def test_a_flow_started_from_a_synchronous_task_bodys_thread_runs_on_the_run_loop():
+    world = flow_world(shout)
+    pipeline = flow(*stages(world, "shout"))
+    started = []
+
+    def starter(request: Greeting) -> Greeting:
+        started.append(pipeline(request))  # on the task's worker thread
+        return request
+
+    starter_task = Task(
+        starter, registry=world.registry, serializers=world.serializers, name="tests.starter"
+    )
+
+    async def body():
+        await world.session.submit(starter_task.definition, Greeting(text="a"))
+        return await asyncio.wait_for(started[0], WAIT)
+
+    with activated(world):
+        assert run(with_events(world, body)) == [Greeting(text="A")]
 
 
 def test_a_failed_stage_fails_the_flow_and_later_stages_never_start():
@@ -171,7 +192,7 @@ def test_a_failed_stage_fails_the_flow_and_later_stages_never_start():
 
     async def body():
         with pytest.raises(ValueError, match="stage failed"):
-            await world.session.submit_flow(pipeline, Greeting())
+            await pipeline.start(world.session, Greeting())
 
     run(with_events(world, body))
 
@@ -185,7 +206,7 @@ def test_a_stage_that_was_never_started_because_the_run_stopped_fails_the_flow()
 
     async def body():
         await world.call("shout", Greeting())  # takes the only claim
-        handle = world.session.submit_flow(pipeline, Greeting())
+        handle = pipeline.start(world.session, Greeting())
         await until_submitted(world, 2)  # the first stage is waiting for a claim
         world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
@@ -209,7 +230,7 @@ def test_cancelling_a_flow_cancels_the_current_stage_and_starts_no_later_one():
     pipeline = flow(*stages(world, "slow", "after"))
 
     async def body():
-        handle = world.session.submit_flow(pipeline, Greeting())
+        handle = pipeline.start(world.session, Greeting())
         await until_submitted(world, 1)
         assert handle.cancel() is True
         with pytest.raises(TaskCancelledError):
@@ -226,7 +247,7 @@ def test_cancelling_a_finished_flow_changes_nothing():
     pipeline = flow(*stages(world, "shout"))
 
     async def body():
-        handle = world.session.submit_flow(pipeline, Greeting(text="a"))
+        handle = pipeline.start(world.session, Greeting(text="a"))
         await handle
         return handle.cancel()
 
@@ -239,7 +260,7 @@ def test_finishing_waits_for_a_flow_that_is_still_running():
     handles = []
 
     async def body():
-        handles.append(world.session.submit_flow(pipeline, Greeting(text="a")))
+        handles.append(pipeline.start(world.session, Greeting(text="a")))
         # Nothing has been submitted yet, so only the flow itself is pending.
         await world.session.wait_until_idle()
         assert handles[0].done()
@@ -255,7 +276,7 @@ def test_a_task_that_waits_for_a_flow_gives_up_its_place_meanwhile():
     world = flow_world(inner_stage, concurrency=1)
 
     async def outer(request: Greeting) -> Greeting:
-        await world.session.submit_flow(flow(world.tasks["inner_stage"]), request)
+        await flow(world.tasks["inner_stage"]).start(world.session, request)
         return request
 
     outer_task = Task(
@@ -274,7 +295,7 @@ def test_a_flow_callback_gets_the_array_of_results():
     seen = []
 
     async def body():
-        handle = world.session.submit_flow(pipeline, Greeting(text="a"))
+        handle = pipeline.start(world.session, Greeting(text="a"))
         handle.callback(seen.append)
         await handle
         await world.session.wait_until_idle()
@@ -289,7 +310,7 @@ def test_a_flow_submitted_outside_a_running_loop_is_refused():
     pipeline = flow(*stages(world, "shout"))
 
     with pytest.raises(RuntimeNotStartedError):
-        world.session.submit_flow(pipeline, Greeting())
+        pipeline.start(world.session, Greeting())
 
 
 def test_a_flow_cancelled_before_its_first_stage_starts_submits_nothing():
@@ -297,7 +318,7 @@ def test_a_flow_cancelled_before_its_first_stage_starts_submits_nothing():
     pipeline = flow(*stages(world, "shout", "wrap"))
 
     async def body():
-        handle = world.session.submit_flow(pipeline, Greeting())
+        handle = pipeline.start(world.session, Greeting())
         assert handle.cancel() is True
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
@@ -358,7 +379,7 @@ def test_the_order_of_results_does_not_depend_on_which_member_finishes_first():
     members = group(world.tasks["slow"], world.tasks["quick"])
 
     async def body():
-        return await world.session.submit_group(members, Greeting())
+        return await members.start(world.session, Greeting())
 
     assert [g.text for g in run(with_events(world, body))] == ["slow", "quick"]
 
@@ -395,7 +416,7 @@ def test_fail_fast_leaves_the_other_members_running_like_asyncio_gather():
 
     async def body():
         with pytest.raises(ValueError):
-            await world.session.submit_group(members, Greeting())
+            await members.start(world.session, Greeting())
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
 
     run(with_events(world, body))
@@ -413,7 +434,7 @@ def test_a_stage_that_cannot_encode_a_failure_fails_the_flow_with_a_serializatio
 
     async def body():
         with pytest.raises(SerializationError):
-            await world.session.submit_flow(pipeline, Greeting())
+            await pipeline.start(world.session, Greeting())
 
     run(with_events(world, body))
 
@@ -437,7 +458,7 @@ def test_cancelling_a_group_cancels_every_member_and_the_stage_after_never_start
     )
 
     async def body():
-        handle = world.session.submit_flow(pipeline, Greeting())
+        handle = pipeline.start(world.session, Greeting())
         while len(started) < 3:
             await asyncio.sleep(0.005)
         assert handle.cancel() is True
@@ -455,7 +476,7 @@ def test_a_group_cancelled_before_its_members_start_submits_nothing():
     members = group(world.tasks["shout"], world.tasks["wrap"])
 
     async def body():
-        handle = world.session.submit_group(members, Greeting())
+        handle = members.start(world.session, Greeting())
         assert handle.cancel() is True
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
@@ -470,7 +491,7 @@ def test_cancelling_a_finished_group_changes_nothing():
     members = group(world.tasks["shout"], world.tasks["wrap"])
 
     async def body():
-        handle = world.session.submit_group(members, Greeting(text="a"))
+        handle = members.start(world.session, Greeting(text="a"))
         await handle
         return handle.cancel()
 
@@ -484,7 +505,7 @@ def test_a_group_with_a_member_the_run_stopped_before_starting_fails_the_group()
 
     async def body():
         await world.call("shout", Greeting())  # takes the only claim
-        handle = world.session.submit_group(members, Greeting())
+        handle = members.start(world.session, Greeting())
         await until_submitted(world, 3)  # both members are waiting for a claim
         world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
@@ -502,7 +523,7 @@ def test_flows_and_groups_nest_and_the_results_nest_the_same_way():
     )
 
     async def body():
-        return await world.session.submit_flow(pipeline, Greeting(text="a", times=1))
+        return await pipeline.start(world.session, Greeting(text="a", times=1))
 
     assert run(with_events(world, body)) == [
         Greeting(text="A", times=1),
@@ -518,7 +539,7 @@ def test_finishing_waits_for_a_group_that_is_still_running():
     members = group(world.tasks["shout"], world.tasks["wrap"])
 
     async def body():
-        handle = world.session.submit_group(members, Greeting(text="a"))
+        handle = members.start(world.session, Greeting(text="a"))
         await world.session.wait_until_idle()
         assert handle.done()
 
@@ -601,7 +622,7 @@ def test_map_is_a_flow_stage_that_takes_the_prior_stages_list():
     pipeline = flow(world.tasks["load"], world.tasks["shout"].map)
 
     async def body():
-        return await world.session.submit_flow(pipeline, Greeting(text="a b c"))
+        return await pipeline.start(world.session, Greeting(text="a b c"))
 
     loaded, mapped = run(with_events(world, body))
 
@@ -648,7 +669,7 @@ def held_world(*functions, hard_limit=HARD_LIMIT, **options):
 async def until_slow_down_seen(world):
     """Waits until the session has acted on the runtime's SlowDown. Its own
     flag is the only place that shows it; the runtime's event is consumed."""
-    while world.session._below_soft_limit.is_set():
+    while world.session.has_room():
         await asyncio.sleep(0.005)
 
 
@@ -681,7 +702,7 @@ def test_a_group_pauses_submitting_while_slow_down_is_raised_but_a_plain_call_do
         holder = world.call("hold", PAST_SOFT_LIMIT)
         await until_slow_down_seen(world)
         before = len(world.runtime.submitted)
-        handle = world.session.submit_group(members, Greeting(text="a"))
+        handle = members.start(world.session, Greeting(text="a"))
         await asyncio.sleep(0.15)
         during = len(world.runtime.submitted) - before
         await world.call("shout", Greeting(text="plain"))
@@ -703,7 +724,7 @@ def test_stopping_ends_a_group_that_is_waiting_out_slow_down():
     async def body():
         world.call("shout", PAST_SOFT_LIMIT)  # never claimed: its input stays counted
         await until_slow_down_seen(world)
-        handle = world.session.submit_group(members, Greeting())
+        handle = members.start(world.session, Greeting())
         await asyncio.sleep(0.1)
         world.session.stop_claiming()
         with pytest.raises(RunStoppedError, match="waited to submit"):
@@ -721,7 +742,7 @@ def test_cancelling_a_group_that_is_waiting_out_slow_down_submits_nothing():
     async def body():
         world.call("shout", PAST_SOFT_LIMIT)  # never claimed: its input stays counted
         await until_slow_down_seen(world)
-        handle = world.session.submit_group(members, Greeting())
+        handle = members.start(world.session, Greeting())
         await asyncio.sleep(0.1)
         assert handle.cancel() is True
         with pytest.raises(TaskCancelledError):
@@ -744,7 +765,7 @@ def test_a_group_that_hits_the_hard_limit_midway_fails_and_cancels_the_members_i
 
     async def body():
         with pytest.raises(BackpressureError):
-            await world.session.submit_group(members, Greeting(text="x" * 40))
+            await members.start(world.session, Greeting(text="x" * 40))
         released.set()
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
 
@@ -759,7 +780,7 @@ def test_a_bulk_submission_pauses_when_slow_down_is_raised_while_it_is_still_sub
     members = group(*([world.tasks["hold"]] * 40))
 
     async def body():
-        handle = world.session.submit_group(members, Greeting(text="x" * 60))
+        handle = members.start(world.session, Greeting(text="x" * 60))
         await until_slow_down_seen(world)
         paused_at = len(world.runtime.submitted)
         await asyncio.sleep(0.2)
@@ -782,7 +803,7 @@ def test_cancelling_a_group_part_way_through_its_submission_starts_no_further_me
     members = group(*([world.tasks["hold"]] * 6))
 
     async def body():
-        handle = world.session.submit_group(members, Greeting())
+        handle = members.start(world.session, Greeting())
         while len(world.runtime.submitted) < 2:
             await asyncio.sleep(0)
         assert handle.cancel() is True
@@ -802,7 +823,7 @@ def test_a_flow_whose_orchestration_is_cancelled_before_it_starts_still_settles_
     pipeline = flow(*stages(world, "shout"))
 
     async def body():
-        handle = world.session.submit_flow(pipeline, Greeting())
+        handle = pipeline.start(world.session, Greeting())
         await asyncio.sleep(0)  # the orchestration task exists now, and has not started
         for task in asyncio.all_tasks():
             if "_run_flow" in repr(task.get_coro()):
@@ -821,7 +842,7 @@ def test_a_flow_whose_orchestration_is_cancelled_while_it_runs_fails_as_interrup
 
     async def body():
         await world.call("shout", Greeting())  # takes the only claim
-        handle = world.session.submit_flow(pipeline, Greeting())
+        handle = pipeline.start(world.session, Greeting())
         await until_submitted(world, 2)  # the stage is waiting for a claim
         for task in asyncio.all_tasks():
             if "_run_flow" in repr(task.get_coro()):
