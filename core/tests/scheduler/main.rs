@@ -11,6 +11,7 @@ mod scheduler_continuation;
 mod scheduler_failure;
 mod scheduler_lifecycle;
 mod scheduler_loss;
+mod scheduler_observer;
 mod scheduler_retry;
 mod scheduler_timing;
 mod task_records;

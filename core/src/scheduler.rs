@@ -7,6 +7,13 @@
 //! by its own clock: a node that has not won an election, has lost
 //! leadership, or has outlived its lease must not decide anything.
 //!
+//! It owns what time does to its tasks. [`Scheduler::catch_up`] is the one
+//! time-driven entry: it forgets finished tasks whose result TTL has passed
+//! and, only while the scheduler leads, releases delayed tasks that are due
+//! and expires pending ones. [`Scheduler::next_deadline`] says when to call
+//! it next. Every call that changes the scheduler also forgets what has
+//! outlived its TTL, so a caller never sweeps.
+//!
 //! Tasks and runs are stored privately and handed out only as shared
 //! references or clones, so nothing outside can edit a submitted Task or move
 //! a run without going through the transition table (README §25.1.1).
@@ -20,6 +27,10 @@ use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task, retry_of};
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Duration, Instant};
+
+mod observer;
+
+pub use observer::{Change, Counts, NoObserver, Observer};
 
 /// When the scheduler asks for less work, and when it refuses it, counted in
 /// the serialized bytes of every task that has not finished.
@@ -223,13 +234,27 @@ pub enum CancelRejection {
     NotLeader,
 }
 
-/// What one call to [`Scheduler::advance`] did.
+/// What one call to [`Scheduler::catch_up`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Advanced {
-    /// Delayed tasks that became due and are now pending.
+pub struct CaughtUp {
+    /// Delayed tasks that became due and are now pending (only while leading).
     pub queued: usize,
-    /// Pending tasks that expired.
+    /// Pending tasks that expired (only while leading).
     pub expired: usize,
+    /// Finished tasks forgotten because their result TTL had passed.
+    pub forgotten: usize,
+}
+
+/// Whether a certified run ends its task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion {
+    /// The task is over: its coalescing key is freed, its payload stops
+    /// counting, and it is forgotten `result_ttl` later.
+    Final,
+    /// The result is a continuation (an implicit flow, README §3.4): the run
+    /// is certified, but the task holds its key and its memory until
+    /// [`Scheduler::end_continuation`].
+    Continues,
 }
 
 /// Why a claim request was refused.
@@ -291,9 +316,14 @@ pub enum LeaseEnd {
 
 /// Owns all Tasks and TaskRuns and decides every claim and report. Drive it
 /// with calls; it never blocks or does I/O.
-pub struct Scheduler<C: Clock, I: IdGenerator> {
+pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     clock: C,
     ids: I,
+    /// Told about every change the scheduler makes.
+    observer: O,
+    /// What the scheduler last told its observer about leadership: it tells
+    /// changes, not checks, and `next_deadline` reads it for the lease end.
+    noticed_leading: bool,
     /// The leadership grant its worker's election last gave it, if any.
     grant: Option<LeadershipGrant>,
     tasks: BTreeMap<TaskId, Task>,
@@ -339,15 +369,24 @@ pub struct Scheduler<C: Clock, I: IdGenerator> {
     slow_down: bool,
 }
 
-impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
+impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
     /// A scheduler that refuses every claim and report until it is given a
     /// leadership grant ([`Self::set_leadership_grant`]). `clock` must be the
     /// clock its worker's election runs on, or a copy sharing its readings:
     /// a grant's lease ends at an instant of that clock.
     pub fn new(clock: C, ids: I) -> Self {
+        Self::with_observer(clock, ids, NoObserver)
+    }
+}
+
+impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
+    /// Like [`Self::new`], telling `observer` about every change.
+    pub fn with_observer(clock: C, ids: I, observer: O) -> Self {
         Scheduler {
             clock,
             ids,
+            observer,
+            noticed_leading: false,
             grant: None,
             tasks: BTreeMap::new(),
             runs: BTreeMap::new(),
@@ -373,15 +412,16 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     }
 
     /// How long a task is kept after it finishes, or `None` to keep tasks
-    /// forever. Takes effect at the next [`Self::sweep`].
+    /// forever. Takes effect at once.
     pub fn set_result_ttl(&mut self, ttl: Option<Duration>) {
         self.result_ttl = ttl;
+        self.forget_due();
     }
 
     /// Forgets every task that finished at least `result_ttl` ago, with its
-    /// run, and returns how many. Cheap when nothing is due, so the runtime
-    /// can call it whenever the scheduler is used.
-    pub fn sweep(&mut self) -> usize {
+    /// run, and returns how many. Cheap when nothing is due, so every
+    /// mutating call ends with it.
+    fn forget_due(&mut self) -> usize {
         let Some(ttl) = self.result_ttl else {
             return 0;
         };
@@ -400,6 +440,9 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
                 self.runs.remove(&run_id);
             }
             self.tasks.remove(&task_id);
+            let counts = self.counts();
+            self.observer
+                .notify(Change::TaskForgotten(&task_id), counts);
             forgotten += 1;
         }
         forgotten
@@ -419,23 +462,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         }
         self.limits = limits;
         self.update_pressure();
-    }
-
-    /// The serialized bytes of every task that has not finished.
-    pub fn memory_in_use(&self) -> u64 {
-        self.memory_in_use
-    }
-
-    /// Whether `SlowDown` is raised now.
-    pub fn slow_down_active(&self) -> bool {
-        self.slow_down
-    }
-
-    /// Whether this worker leads right now, and so decides claims, reports and
-    /// what time does to tasks: it holds a leadership grant, and by its own
-    /// clock the grant's lease has not ended.
-    pub fn is_leading(&self) -> bool {
-        self.is_leader()
+        self.forget_due();
     }
 
     /// Takes the leadership grant its worker's election reports, or `None`
@@ -443,12 +470,20 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     /// call, but acts on it only until its lease ends.
     pub fn set_leadership_grant(&mut self, grant: Option<LeadershipGrant>) {
         self.grant = grant;
+        self.check_leader();
+        self.forget_due();
     }
 
     /// Records a new Task and queues its first run. Every call is a new Task
     /// (submission is not idempotent, README §2.3). Submitting decides
     /// nothing, so it does not require leadership; only claims and reports do.
     pub fn submit(&mut self, submission: Submission) -> Result<TaskId, SubmitRejection> {
+        let outcome = self.record_submission(submission);
+        self.forget_due();
+        outcome
+    }
+
+    fn record_submission(&mut self, submission: Submission) -> Result<TaskId, SubmitRejection> {
         let needed = submission.serialized_input.len() as u64;
         self.check_room(&submission, needed)?;
         let now = self.clock.now();
@@ -488,10 +523,17 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
             Some(due) => self.schedule(&task_id, due),
             None => self.enqueue(&task_id),
         }
+        let counts = self.counts();
+        self.observer
+            .notify(Change::TaskRecorded(&self.tasks[&task_id]), counts);
+        self.notify_current_run(&task_id);
         if let Some(expires_at) = expires_at {
             self.expiries.insert((expires_at, task_id.clone()), ());
         }
         self.memory_in_use += needed;
+        if needed > 0 {
+            self.notify_memory();
+        }
         let older = self
             .coalescing_key_of(&task_id)
             .and_then(|key| self.occupancy.submit(&key, &task_id));
@@ -503,16 +545,27 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         Ok(task_id)
     }
 
-    /// Lets time take effect: delayed tasks that are due become pending, and
-    /// pending tasks past their expiry expire, telling the caller through
-    /// [`Self::take_events`]. Only a leader decides this, so on any other
-    /// worker nothing happens. Claims do this themselves first, so a task
-    /// that ran out of time is never handed out.
-    pub fn advance(&mut self) -> Advanced {
-        let mut advanced = Advanced::default();
-        if !self.is_leader() {
-            return advanced;
-        }
+    /// Lets time take effect, and is the only call a runtime makes for time's
+    /// sake: it forgets every task that finished at least `result_ttl` ago,
+    /// and, only while this scheduler leads, makes due delayed tasks pending
+    /// and expires pending tasks past their expiry (reported through
+    /// [`Self::take_events`]). Call it when [`Self::next_deadline`] comes.
+    pub fn catch_up(&mut self) -> CaughtUp {
+        let mut caught_up = if self.check_leader() {
+            self.release_due()
+        } else {
+            CaughtUp::default()
+        };
+        caught_up.forgotten = self.forget_due();
+        caught_up
+    }
+
+    /// Delayed tasks that are due become pending, and pending tasks past
+    /// their expiry expire. Only a leader decides this, so its callers check.
+    /// Claims do this themselves first, so a task that ran out of time is
+    /// never handed out.
+    fn release_due(&mut self) -> CaughtUp {
+        let mut advanced = CaughtUp::default();
         let now = self.clock.now();
         while let Some((&(due, _), _)) = self.expiries.first_key_value() {
             if due > now {
@@ -536,21 +589,43 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
                 .transition_to(TaskRunState::Queued, now)
                 .expect("a Scheduled run can always be queued");
             self.enqueue(&task_id);
+            self.notify_run(&run_id);
             advanced.queued += 1;
         }
         advanced
     }
 
-    /// When [`Self::advance`] or [`Self::sweep`] next has something to do, or
-    /// `None` if nothing is waiting on time.
+    /// When [`Self::catch_up`] next has something to do, or `None`: the next
+    /// forgetting time always, and the next delay or expiry only while this
+    /// scheduler leads. Also the end of a bounded lease while this scheduler
+    /// has found itself leading: that end stays in the answer until a call
+    /// finds it passed, since finding the lapse is then `catch_up`'s to do.
+    /// An unbounded lease adds nothing.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let scheduled = self.scheduled.first_key_value().map(|(key, _)| key.0);
-        let expiry = self.expiries.first_key_value().map(|(key, _)| key.0);
         let forgetting = self
             .result_ttl
             .zip(self.finished.first_key_value())
             .map(|(ttl, (key, _))| key.0 + ttl);
-        [scheduled, expiry, forgetting].into_iter().flatten().min()
+        // A lapse is found by a call that reads the clock, so the lease end
+        // stays in the answer until one has: the caller that asks "is it due
+        // yet?" must still get to `catch_up`. That is why it reads what was
+        // noticed, not `is_leader`, which is false from the end's instant on.
+        let lease_end = match self.grant.map(|grant| grant.valid_until) {
+            Some(LeaseEnd::At(end)) if self.noticed_leading => Some(end),
+            _ => None,
+        };
+        let (scheduled, expiry) = if self.is_leader() {
+            (
+                self.scheduled.first_key_value().map(|(key, _)| key.0),
+                self.expiries.first_key_value().map(|(key, _)| key.0),
+            )
+        } else {
+            (None, None)
+        };
+        [scheduled, expiry, forgetting, lease_end]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Whether [`Self::take_events`] has anything to return.
@@ -561,12 +636,9 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     /// What the scheduler decided on its own since the last call, in the
     /// order it happened.
     pub fn take_events(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.events)
-    }
-
-    /// Tasks waiting for a worker to claim them, oldest first.
-    pub fn pending_tasks(&self) -> Vec<TaskId> {
-        self.queue.values().cloned().collect()
+        let events = std::mem::take(&mut self.events);
+        self.forget_due();
+        events
     }
 
     /// A worker asks for up to `limit` of the oldest pending tasks at once.
@@ -590,12 +662,23 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         &mut self,
         worker: &WorkerId,
         limit: usize,
+        fits: impl FnMut(&Claim) -> bool,
+    ) -> Result<Vec<Claim>, ClaimRejection> {
+        let outcome = self.claim_while_fitting(worker, limit, fits);
+        self.forget_due();
+        outcome
+    }
+
+    fn claim_while_fitting(
+        &mut self,
+        worker: &WorkerId,
+        limit: usize,
         mut fits: impl FnMut(&Claim) -> bool,
     ) -> Result<Vec<Claim>, ClaimRejection> {
-        if !self.is_leader() {
+        if !self.check_leader() {
             return Err(ClaimRejection::NotLeader);
         }
-        self.advance();
+        self.release_due();
         let mut claims = Vec::new();
         let mut after = None;
         // Time is only allowed to take effect once per call: each candidate
@@ -635,10 +718,16 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         worker: &WorkerId,
         task_id: &TaskId,
     ) -> Result<Claim, ClaimRejection> {
-        if !self.is_leader() {
+        let outcome = self.claim_task(worker, task_id);
+        self.forget_due();
+        outcome
+    }
+
+    fn claim_task(&mut self, worker: &WorkerId, task_id: &TaskId) -> Result<Claim, ClaimRejection> {
+        if !self.check_leader() {
             return Err(ClaimRejection::NotLeader);
         }
-        self.advance();
+        self.release_due();
         let run_id = self
             .current_run
             .get(task_id)
@@ -703,6 +792,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         if let Some(key) = self.coalescing_key_of(task_id) {
             self.occupancy.start(&key, task_id);
         }
+        self.notify_run(&run_id);
     }
 
     /// The worker that claimed `run_id` reports that it began executing.
@@ -711,36 +801,34 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         worker: &WorkerId,
         run_id: &TaskRunId,
     ) -> Result<(), ReportRejection> {
+        let outcome = self.start_run(worker, run_id);
+        self.forget_due();
+        outcome
+    }
+
+    fn start_run(&mut self, worker: &WorkerId, run_id: &TaskRunId) -> Result<(), ReportRejection> {
         let now = self.clock.now();
         let run = self.run_owned_by(worker, run_id, TaskRunState::Claimed)?;
         run.transition_to(TaskRunState::Running, now)
             .expect("a Claimed run can always start");
+        self.notify_run(run_id);
         Ok(())
     }
 
     /// The worker running `run_id` reports success with the digest of its
     /// result. Only a `Running` run owned by that worker can complete, so a
-    /// stale or repeated report is refused and certifies nothing.
+    /// stale or repeated report is refused and certifies nothing. `completion`
+    /// says whether that ends the task.
     pub fn complete(
         &mut self,
         worker: &WorkerId,
         run_id: &TaskRunId,
         result_digest: Vec<u8>,
+        completion: Completion,
     ) -> Result<Certification, ReportRejection> {
-        self.certify(worker, run_id, result_digest, false)
-    }
-
-    /// Like [`Self::complete`], for a task whose result is a continuation (an
-    /// implicit flow, README §3.4): the run is certified now, but the task is
-    /// not over. Its coalescing key stays held, its payload stays counted and
-    /// it is not forgotten until [`Self::end_continuation`].
-    pub fn complete_and_continue(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-        result_digest: Vec<u8>,
-    ) -> Result<Certification, ReportRejection> {
-        self.certify(worker, run_id, result_digest, true)
+        let outcome = self.certify(worker, run_id, result_digest, completion);
+        self.forget_due();
+        outcome
     }
 
     /// Certifies the result of a running run, and finishes its task unless it continues.
@@ -749,7 +837,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         worker: &WorkerId,
         run_id: &TaskRunId,
         result_digest: Vec<u8>,
-        continues: bool,
+        completion: Completion,
     ) -> Result<Certification, ReportRejection> {
         let now = self.clock.now();
         let run = self.run_owned_by(worker, run_id, TaskRunState::Running)?;
@@ -757,10 +845,12 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
             .expect("a Running run can always succeed");
         run.result_digest = result_digest.clone();
         let task_id = run.task_id();
-        if continues {
-            self.continuing.insert(task_id.clone());
-        } else {
-            self.record_finished(&task_id, now);
+        self.notify_run(run_id);
+        match completion {
+            Completion::Continues => {
+                self.continuing.insert(task_id.clone());
+            }
+            Completion::Final => self.record_finished(&task_id, now),
         }
         Ok(Certification {
             task_id,
@@ -773,6 +863,12 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     /// finished after all. Says whether it had a continuation to end, so
     /// ending twice, or a task with none, changes nothing.
     pub fn end_continuation(&mut self, task_id: &TaskId) -> bool {
+        let had_one = self.finish_continuation(task_id);
+        self.forget_due();
+        had_one
+    }
+
+    fn finish_continuation(&mut self, task_id: &TaskId) -> bool {
         if !self.continuing.remove(task_id) {
             return false;
         }
@@ -790,13 +886,25 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         run_id: &TaskRunId,
         failure_kind: impl Into<String>,
     ) -> Result<Failure, ReportRejection> {
+        let outcome = self.fail_run(worker, run_id, failure_kind.into());
+        self.forget_due();
+        outcome
+    }
+
+    fn fail_run(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        failure_kind: String,
+    ) -> Result<Failure, ReportRejection> {
         let now = self.clock.now();
         let run = self.run_owned_by(worker, run_id, TaskRunState::Running)?;
         run.transition_to(TaskRunState::Failed, now)
             .expect("a Running run can always fail");
-        run.failure_kind = failure_kind.into();
+        run.failure_kind = failure_kind;
         let task_id = run.task_id();
         let attempt = run.attempt_number();
+        self.notify_run(run_id);
         let retry = self.replace_failed_run(&task_id, run_id, attempt, now);
         if retry.is_none() {
             self.record_finished(&task_id, now);
@@ -808,10 +916,6 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         })
     }
 
-    pub fn task(&self, task_id: &TaskId) -> Option<&Task> {
-        self.tasks.get(task_id)
-    }
-
     pub fn task_run(&self, run_id: &TaskRunId) -> Option<&TaskRun> {
         self.runs.get(run_id)
     }
@@ -821,7 +925,13 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     /// its worker, whose later reports are refused. Only a leader decides.
     /// A cancelled task is not retried, and does not expire.
     pub fn cancel(&mut self, task_id: &TaskId) -> Result<Cancellation, CancelRejection> {
-        if !self.is_leader() {
+        let outcome = self.cancel_task(task_id);
+        self.forget_due();
+        outcome
+    }
+
+    fn cancel_task(&mut self, task_id: &TaskId) -> Result<Cancellation, CancelRejection> {
+        if !self.check_leader() {
             return Err(CancelRejection::NotLeader);
         }
         let Some(run_id) = self.current_run.get(task_id).cloned() else {
@@ -841,6 +951,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
             .expect("an unfinished run can always be cancelled");
         self.leave_pending(task_id);
         self.record_finished(task_id, now);
+        self.notify_run(&run_id);
         self.events.push(Event::Cancelled {
             task_id: task_id.clone(),
             task_run_id: run_id,
@@ -859,7 +970,13 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     /// non-retriable or ephemeral task would be orphaned or dropped instead
     /// comes with those kinds.
     pub fn lose_worker(&mut self, worker: &WorkerId) -> Result<Vec<LostRun>, LoseRejection> {
-        if !self.is_leader() {
+        let outcome = self.lose_runs_of(worker);
+        self.forget_due();
+        outcome
+    }
+
+    fn lose_runs_of(&mut self, worker: &WorkerId) -> Result<Vec<LostRun>, LoseRejection> {
+        if !self.check_leader() {
             return Err(LoseRejection::NotLeader);
         }
         let now = self.clock.now();
@@ -883,6 +1000,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
                 .expect("every current run is stored")
                 .transition_to(TaskRunState::Lost, now)
                 .expect("a claimed or running run can be lost");
+            self.notify_run(&run_id);
             let newer_waits = self
                 .coalescing_key_of(&task_id)
                 .is_some_and(|key| self.occupancy.has_waiting(&key));
@@ -906,13 +1024,6 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     /// unknown or has been forgotten.
     pub fn runs_of(&self, task_id: &TaskId) -> Vec<TaskRunId> {
         self.runs_of_task.get(task_id).cloned().unwrap_or_default()
-    }
-
-    /// The run that is currently authoritative for `task_id`.
-    pub fn run_of(&self, task_id: &TaskId) -> Option<&TaskRun> {
-        self.current_run
-            .get(task_id)
-            .and_then(|run_id| self.runs.get(run_id))
     }
 
     /// Queues the next attempt of `task_id` if it has retries left, and makes
@@ -951,6 +1062,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
             .push(next_id.clone());
         self.runs.insert(next_id.clone(), next);
         self.enqueue(task_id);
+        self.notify_run(&next_id);
         next_id
     }
 
@@ -982,6 +1094,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
             .expect("a pending run can always expire");
         self.leave_pending(task_id);
         self.record_finished(task_id, now);
+        self.notify_run(&run_id);
         self.events.push(Event::Expired {
             task_id: task_id.clone(),
             task_run_id: run_id,
@@ -1005,8 +1118,12 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
     /// `task_id`'s payload is no longer needed: it stops counting against
     /// memory, and the task is forgotten `result_ttl` from now.
     fn release(&mut self, task_id: &TaskId, now: Instant) {
-        self.memory_in_use -= self.payload_len(task_id);
+        let payload = self.payload_len(task_id);
+        self.memory_in_use -= payload;
         self.finished.insert((now, task_id.clone()), ());
+        if payload > 0 {
+            self.notify_memory();
+        }
     }
 
     /// The serialized bytes of the task's input, which is what memory use counts.
@@ -1068,11 +1185,13 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         };
         if !self.slow_down && self.memory_in_use > limits.soft {
             self.slow_down = true;
+            self.notify_slow_down(true);
             self.events.push(Event::SlowDown { active: true });
         } else if self.slow_down
             && self.memory_in_use * 100 <= limits.soft * SLOW_DOWN_CLEARS_AT_PERCENT
         {
             self.slow_down = false;
+            self.notify_slow_down(false);
             self.events.push(Event::SlowDown { active: false });
         }
     }
@@ -1100,6 +1219,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
             .transition_to(TaskRunState::Superseded, now)
             .expect("a pending run can always be superseded");
         self.leave_pending(older);
+        self.notify_run(&run_id);
         self.events.push(Event::Superseded {
             task_id: older.clone(),
             task_run_id: run_id,
@@ -1143,6 +1263,46 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         }
     }
 
+    /// Like `is_leader`, and tells the observer if the answer differs from
+    /// what it was last told, so the observer hears changes, not checks.
+    fn check_leader(&mut self) -> bool {
+        let leading = self.is_leader();
+        if leading != self.noticed_leading {
+            self.noticed_leading = leading;
+            let counts = self.counts();
+            self.observer.notify(Change::Leadership(leading), counts);
+        }
+        leading
+    }
+
+    /// The counts every notification carries, read after the change.
+    fn counts(&self) -> Counts {
+        Counts {
+            pending: self.queue.len(),
+            memory_in_use: self.memory_in_use,
+        }
+    }
+
+    fn notify_run(&mut self, run_id: &TaskRunId) {
+        let counts = self.counts();
+        self.observer.notify(Change::Run(&self.runs[run_id]), counts);
+    }
+
+    fn notify_current_run(&mut self, task_id: &TaskId) {
+        let run_id = self.current_run[task_id].clone();
+        self.notify_run(&run_id);
+    }
+
+    fn notify_memory(&mut self) {
+        let counts = self.counts();
+        self.observer.notify(Change::Memory, counts);
+    }
+
+    fn notify_slow_down(&mut self, active: bool) {
+        let counts = self.counts();
+        self.observer.notify(Change::SlowDown(active), counts);
+    }
+
     /// `run_id`'s run, if this node is leader, the run exists, `worker`
     /// claimed it and it is in `expected` state.
     fn run_owned_by(
@@ -1151,7 +1311,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I> {
         run_id: &TaskRunId,
         expected: TaskRunState,
     ) -> Result<&mut TaskRun, ReportRejection> {
-        if !self.is_leader() {
+        if !self.check_leader() {
             return Err(ReportRejection::NotLeader);
         }
         let run = self

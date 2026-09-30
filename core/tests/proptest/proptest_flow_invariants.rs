@@ -18,11 +18,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
+use crate::support::spy::Spy;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{Claim, Scheduler, Submission};
+use kabudachi_core::scheduler::{Claim, Completion, Scheduler, Submission};
 use proptest::prelude::*;
 
 const KEYS: u8 = 2;
@@ -81,7 +82,8 @@ struct Submitted {
 }
 
 struct Model {
-    scheduler: Scheduler<FakeClock, SequentialIds>,
+    scheduler: Scheduler<FakeClock, SequentialIds, Spy>,
+    spy: Spy,
     worker: WorkerId,
     next_number: u32,
     tasks: BTreeMap<TaskId, Submitted>,
@@ -101,10 +103,13 @@ fn number_of(payload: &[u8]) -> u32 {
 
 impl Model {
     fn new() -> Self {
-        let mut scheduler = Scheduler::new(FakeClock::new(), SequentialIds::new());
+        let spy = Spy::default();
+        let mut scheduler =
+            Scheduler::with_observer(FakeClock::new(), SequentialIds::new(), spy.clone());
         scheduler.set_leadership_grant(Some(unbounded_grant()));
         Model {
             scheduler,
+            spy,
             worker: WorkerId::new("w1"),
             next_number: 0,
             tasks: BTreeMap::new(),
@@ -120,7 +125,7 @@ impl Model {
     }
 
     fn state_of(&self, task: &TaskId) -> TaskRunState {
-        self.scheduler.run_of(task).unwrap().current_state()
+        self.spy.checked_state_of(&self.scheduler, task)
     }
 
     fn apply(&mut self, op: &Op) {
@@ -170,10 +175,15 @@ impl Model {
                     let claim = &self.claims[i];
                     let run = &claim.task_run_id;
                     let done = if *continues {
-                        self.scheduler
-                            .complete_and_continue(&self.worker, run, b"d".to_vec())
+                        self.scheduler.complete(
+                            &self.worker,
+                            run,
+                            b"d".to_vec(),
+                            Completion::Continues,
+                        )
                     } else {
-                        self.scheduler.complete(&self.worker, run, b"d".to_vec())
+                        self.scheduler
+                            .complete(&self.worker, run, b"d".to_vec(), Completion::Final)
                     };
                     if done.is_ok() {
                         let task = claim.task.task_id();
@@ -226,10 +236,10 @@ impl Model {
     /// waits for its key.
     fn lose_worker(&mut self) {
         let waiting_keys: BTreeSet<u8> = self
-            .scheduler
-            .pending_tasks()
+            .tasks
             .iter()
-            .filter_map(|task| self.tasks[task].key)
+            .filter(|(task, _)| self.state_of(task) == TaskRunState::Queued)
+            .filter_map(|(_, submitted)| submitted.key)
             .collect();
         let lost = self.scheduler.lose_worker(&self.worker).unwrap();
         for run in &lost {
@@ -323,12 +333,8 @@ impl Model {
             let _ = self.scheduler.cancel(&task);
         }
         // What was claimed and is running was just cancelled with the rest.
-        assert!(self.scheduler.pending_tasks().is_empty());
-        assert_eq!(
-            self.scheduler.memory_in_use(),
-            0,
-            "memory accounting drifted"
-        );
+        assert_eq!(self.spy.pending(), 0);
+        assert_eq!(self.spy.memory_in_use(), 0, "memory accounting drifted");
     }
 }
 

@@ -133,7 +133,7 @@ use crate::protocol::messages::{
     JoinResponse, KnownLeader, LeaderHeartbeatAck, SelfRemove, WorkerHeartbeat, election_message,
 };
 use crate::protocol::worker_state::WorkerState;
-use crate::scheduler::{LeadershipGrant, LeaseEnd, Scheduler};
+use crate::scheduler::{LeadershipGrant, LeaseEnd, Observer, Scheduler};
 use crate::time::{Clock, Duration, Instant};
 
 use authority_lease::{AuthorityLease, Reconnect};
@@ -522,9 +522,9 @@ pub struct Step {
 /// `scheduler` must read the clock the node reads: a grant's lease ends at
 /// an instant of the node's clock, and the scheduler compares it with its
 /// own.
-pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator>(
+pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator, O: Observer>(
     outputs: &[Output],
-    scheduler: &mut Scheduler<C, I>,
+    scheduler: &mut Scheduler<C, I, O>,
 ) {
     for output in outputs {
         match output {

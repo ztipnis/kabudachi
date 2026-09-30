@@ -8,26 +8,12 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerI
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{ClaimRejection, Scheduler, Submission};
+use kabudachi_core::scheduler::{Completion, ClaimRejection, Submission};
 use kabudachi_core::time::Duration;
-use crate::support::clock::FakeClock;
-use crate::support::grant::unbounded_grant;
-use crate::support::ids::SequentialIds;
+use crate::support::scheduler::Fixture;
 
 fn worker() -> WorkerId {
     WorkerId::new("w1")
-}
-
-struct Fixture {
-    clock: FakeClock,
-    scheduler: Scheduler<FakeClock, SequentialIds>,
-}
-
-fn leading() -> Fixture {
-    let clock = FakeClock::new();
-    let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_leadership_grant(Some(unbounded_grant()));
-    Fixture { clock, scheduler }
 }
 
 fn plain(size: usize) -> Submission {
@@ -60,13 +46,13 @@ fn running(fixture: &mut Fixture, task: &TaskId) -> TaskRunId {
 
 #[test]
 fn completing_with_a_continuation_certifies_the_run_like_any_other() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture.scheduler.submit(plain(1)).unwrap();
     let run = running(&mut fixture, &task);
 
     let certification = fixture
         .scheduler
-        .complete_and_continue(&worker(), &run, b"plan".to_vec())
+        .complete(&worker(), &run, b"plan".to_vec(), Completion::Continues)
         .unwrap();
 
     assert_eq!(certification.task_run_id, run);
@@ -79,23 +65,23 @@ fn completing_with_a_continuation_certifies_the_run_like_any_other() {
 
 #[test]
 fn a_task_with_a_continuation_still_counts_against_memory_until_it_ends() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture.scheduler.submit(plain(40)).unwrap();
     let run = running(&mut fixture, &task);
 
     fixture
         .scheduler
-        .complete_and_continue(&worker(), &run, b"d".to_vec())
+        .complete(&worker(), &run, b"d".to_vec(), Completion::Continues)
         .unwrap();
-    assert_eq!(fixture.scheduler.memory_in_use(), 40);
+    assert_eq!(fixture.spy.memory_in_use(), 40);
 
     assert!(fixture.scheduler.end_continuation(&task));
-    assert_eq!(fixture.scheduler.memory_in_use(), 0);
+    assert_eq!(fixture.spy.memory_in_use(), 0);
 }
 
 #[test]
 fn a_task_with_a_continuation_is_not_forgotten_until_it_ends() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture
         .scheduler
         .set_result_ttl(Some(Duration::from_ticks(100)));
@@ -103,28 +89,28 @@ fn a_task_with_a_continuation_is_not_forgotten_until_it_ends() {
     let run = running(&mut fixture, &task);
     fixture
         .scheduler
-        .complete_and_continue(&worker(), &run, b"d".to_vec())
+        .complete(&worker(), &run, b"d".to_vec(), Completion::Continues)
         .unwrap();
 
     fixture.clock.advance(Duration::from_ticks(10_000));
-    assert_eq!(fixture.scheduler.sweep(), 0);
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
 
     fixture.scheduler.end_continuation(&task);
     fixture.clock.advance(Duration::from_ticks(100));
-    assert_eq!(fixture.scheduler.sweep(), 1);
-    assert!(fixture.scheduler.task(&task).is_none());
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
+    assert!(fixture.spy.forgotten(&task));
 }
 
 #[test]
 fn a_coalescing_key_stays_held_for_the_life_of_the_continuation() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let first = fixture.scheduler.submit(generation()).unwrap();
     let run = running(&mut fixture, &first);
     let newer = fixture.scheduler.submit(generation()).unwrap();
 
     fixture
         .scheduler
-        .complete_and_continue(&worker(), &run, b"d".to_vec())
+        .complete(&worker(), &run, b"d".to_vec(), Completion::Continues)
         .unwrap();
 
     assert!(
@@ -151,13 +137,13 @@ fn a_coalescing_key_stays_held_for_the_life_of_the_continuation() {
 
 #[test]
 fn ending_a_continuation_is_once_only_and_ignores_tasks_that_have_none() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture.scheduler.submit(plain(1)).unwrap();
     let other = fixture.scheduler.submit(plain(1)).unwrap();
     let run = running(&mut fixture, &task);
     fixture
         .scheduler
-        .complete_and_continue(&worker(), &run, b"d".to_vec())
+        .complete(&worker(), &run, b"d".to_vec(), Completion::Continues)
         .unwrap();
 
     assert!(!fixture.scheduler.end_continuation(&other));
@@ -165,5 +151,5 @@ fn ending_a_continuation_is_once_only_and_ignores_tasks_that_have_none() {
     assert!(fixture.scheduler.end_continuation(&task));
     assert!(!fixture.scheduler.end_continuation(&task));
     // Nothing was double-released.
-    assert_eq!(fixture.scheduler.memory_in_use(), 1);
+    assert_eq!(fixture.spy.memory_in_use(), 1);
 }

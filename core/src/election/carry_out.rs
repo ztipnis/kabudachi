@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 
 use crate::protocol::ids::{IdGenerator, WorkerId};
 use crate::protocol::messages::ElectionMessage;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{Observer, Scheduler};
 use crate::time::{Clock, Instant};
 
 use super::{AuthorityCall, AuthorityReply, Input, Output, Step, WorkerNode, apply_to_scheduler};
@@ -72,18 +72,21 @@ impl AuthorityPerformer for NoAuthority {
 ///
 /// `scheduler` must read the clock the node reads: a grant's lease ends at
 /// an instant of the node's clock, and the scheduler compares it with its
-/// own.
-pub fn carry_out<C, I, S, P>(
+/// own. The scheduler may carry any [`Observer`]: `carry_out` only hands the
+/// step's grant and lost workers to it, and each of those changes is told to
+/// its observer as it happens.
+pub fn carry_out<C, I, O, S, P>(
     node: &mut WorkerNode<C>,
     first: Step,
-    scheduler: &mut Scheduler<C, I>,
+    scheduler: &mut Scheduler<C, I, O>,
     sink: &mut S,
     performer: &mut P,
-    mut observe: impl FnMut(&WorkerNode<C>, &Scheduler<C, I>, Option<&Input>, &Step),
+    mut observe: impl FnMut(&WorkerNode<C>, &Scheduler<C, I, O>, Option<&Input>, &Step),
 ) -> Option<Instant>
 where
     C: Clock,
     I: IdGenerator,
+    O: Observer,
     S: MessageSink,
     P: AuthorityPerformer,
 {

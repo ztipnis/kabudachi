@@ -25,13 +25,14 @@
 //! node which peers it is connected to (every other node, less those across
 //! a partition), and hands every grant a node reports, and every worker it
 //! reports lost, to that node's own `Scheduler`, all through
-//! `election::carry_out`. Each scheduler reads the shared clock, so
-//! it stops leading once its grant's lease ends even while its node is
-//! stalled (see `stall`). It makes each authority call a node asks for at
-//! once, through that node's own handle (see `node_authority`), and hands
-//! the node the reply at the same instant, or holds it while the node is
-//! stalled. It also answers JOIN for a node that goes back to
-//! `Bootstrapping` to rejoin its shard (see `run_pass`).
+//! `election::carry_out`. Each scheduler reads the shared clock, and the
+//! harness also catches each one up at its `next_deadline`, as its timer loop
+//! would, so a scheduler notices at its lease end that it stopped leading,
+//! even while its node is stalled (see `stall`). It makes each authority call
+//! a node asks for at once, through that node's own handle (see
+//! `node_authority`), and hands the node the reply at the same instant, or
+//! holds it while the node is stalled. It also answers JOIN for a node that
+//! goes back to `Bootstrapping` to rejoin its shard (see `run_pass`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -54,6 +55,7 @@ use crate::support::builders::{timings, voter_of};
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
 use crate::support::network::FakeNetwork;
+use crate::support::spy::Spy;
 
 const SHARD_ID: &str = "shard-1";
 
@@ -64,7 +66,7 @@ const MAX_PASSES_PER_INSTANT: usize = 1_000;
 
 pub type ClusterNode = WorkerNode<FakeClock>;
 
-pub type ClusterScheduler = Scheduler<FakeClock, SequentialIds>;
+pub type ClusterScheduler = Scheduler<FakeClock, SequentialIds, Spy>;
 
 /// A node whose driver hands it nothing until `until`.
 struct Stall {
@@ -102,6 +104,8 @@ pub struct Cluster {
     authority_timings: Option<AuthorityTimings>,
     /// Each node's scheduler, handed every grant its node reports.
     schedulers: BTreeMap<WorkerId, ClusterScheduler>,
+    /// The spy on each node's scheduler, which hears what it decides.
+    spies: BTreeMap<WorkerId, Spy>,
     /// Every step that reported a grant or its withdrawal, in order, for
     /// `first_grant_overlap`.
     grant_steps: Vec<StepRecord>,
@@ -196,6 +200,7 @@ impl Cluster {
             suspect_timeout,
             authority_timings,
             schedulers: BTreeMap::new(),
+            spies: BTreeMap::new(),
             grant_steps: Vec::new(),
             stalls: BTreeMap::new(),
             recorded_steps: None,
@@ -239,10 +244,12 @@ impl Cluster {
             self.authority_timings,
         );
         self.nodes.insert(id.clone(), node);
+        let spy = Spy::default();
         self.schedulers.insert(
             id.clone(),
-            Scheduler::new((*self.clock).clone(), SequentialIds::new()),
+            Scheduler::with_observer((*self.clock).clone(), SequentialIds::new(), spy.clone()),
         );
+        self.spies.insert(id.clone(), spy);
         self.deadlines.insert(id.clone(), None);
         // A node reports its deadline only when stepped. A `Tick` changes
         // nothing on a node this fresh, but a node no connection event ever
@@ -289,10 +296,11 @@ impl Cluster {
     }
 
     /// Runs the cluster through the next `dt` of simulated time. The clock
-    /// jumps from event to event — the next message delivery or the next
-    /// node deadline, whichever is earlier — and everything due at an
-    /// instant runs there before the clock moves on; the clock ends at
-    /// `now + dt`.
+    /// jumps from event to event — the next message delivery, node deadline
+    /// or scheduler deadline, whichever is earlier — and everything due at
+    /// an instant runs there before the clock moves on: the schedulers whose
+    /// deadline has come catch up first, then the passes run. The clock ends
+    /// at `now + dt`.
     ///
     /// Within one instant the harness works in passes, as `run_passes`
     /// describes, so a message sent at an instant with no network delay is
@@ -306,15 +314,19 @@ impl Cluster {
         let mut activity = Activity::default();
         while let Some(at) = self.next_event_at().filter(|at| *at <= end) {
             self.clock.advance(at - self.clock.now());
+            self.catch_up_due_schedulers();
             activity.progressed |= self.run_passes(true).progressed;
         }
         self.clock.advance(end - self.clock.now());
         activity
     }
 
-    /// The earliest message delivery, node deadline or end of a stall still
-    /// to come. A stalled node's deadline waits for the end of its stall. A
-    /// stall that `advance_clock_only` carried the clock past ends now.
+    /// The earliest message delivery, node deadline, scheduler deadline or
+    /// end of a stall still to come. A stalled node's deadline waits for the
+    /// end of its stall; its scheduler's deadline does not, because a stall
+    /// holds a node's driver, not its scheduler's timer. A stall, or a
+    /// scheduler deadline, that `advance_clock_only` carried the clock past
+    /// is due now.
     fn next_event_at(&self) -> Option<Instant> {
         let now = self.clock.now();
         let next_delivery = self.network.next_delivery_at();
@@ -324,12 +336,41 @@ impl Cluster {
             .filter(|(id, _)| !self.is_stalled(id, now))
             .filter_map(|(_, deadline)| *deadline)
             .min();
+        let next_scheduler_deadline = self
+            .schedulers
+            .values()
+            .filter_map(|scheduler| scheduler.next_deadline())
+            .map(|deadline| deadline.max(now))
+            .min();
         let next_stall_end = self.stalls.values().map(|stall| stall.until.max(now)).min();
         next_delivery
             .into_iter()
             .chain(next_deadline)
+            .chain(next_scheduler_deadline)
             .chain(next_stall_end)
             .min()
+    }
+
+    /// Catches up every scheduler whose `next_deadline` has come, as its
+    /// timer loop would. A stall holds a node's driver, not its scheduler's
+    /// timer, so a stalled node's scheduler is caught up too. A catch-up is
+    /// not node activity. Panics if a scheduler is still due afterwards,
+    /// because the clock would never move on.
+    fn catch_up_due_schedulers(&mut self) {
+        let now = self.clock.now();
+        for (id, scheduler) in &mut self.schedulers {
+            if scheduler
+                .next_deadline()
+                .is_some_and(|deadline| deadline <= now)
+            {
+                scheduler.catch_up();
+                assert!(
+                    scheduler.next_deadline().is_none_or(|deadline| deadline > now),
+                    "Cluster: node {id:?}'s scheduler is still due at {now:?} after catch_up, \
+                     so the clock would never move on"
+                );
+            }
+        }
     }
 
     /// Runs passes at the current instant until nothing more is due at it.
@@ -460,13 +501,14 @@ impl Cluster {
     /// Stalls the named node's driver for `dt`, as a paused process would
     /// be: until then the harness hands the node no message and no
     /// connection change, holding them for it, and does not tick it, while
-    /// the clock and every other node move on. Its scheduler keeps reading
-    /// the shared clock, so a grant it holds lapses at its lease end all the
-    /// same. Once the stall ends the node handles everything held, in order,
-    /// and then its `Tick` if its deadline has passed. Stalling a stalled
-    /// node again ends its stall at whichever end is later. A `drain` is
-    /// held like a message; only `step` still reaches a stalled node at
-    /// once. Panics on an unknown ID.
+    /// the clock and every other node move on. Its scheduler's timer is not
+    /// its driver: the harness still catches the scheduler up at its
+    /// deadlines, so a grant it holds lapses at its lease end all the same.
+    /// Once the stall ends the node handles everything held, in order, and
+    /// then its `Tick` if its deadline has passed. Stalling a stalled node
+    /// again ends its stall at whichever end is later. A `drain` is held
+    /// like a message; only `step` still reaches a stalled node at once.
+    /// Panics on an unknown ID.
     pub fn stall(&mut self, id: &WorkerId, dt: Duration) {
         if !self.nodes.contains_key(id) {
             unknown_node("stall", id);
@@ -703,14 +745,21 @@ impl Cluster {
         joined
     }
 
-    /// Whether the named node's scheduler holds a valid grant now: one its
-    /// node reported whose lease has not ended by the shared clock. Panics
-    /// on an unknown ID.
+    /// Whether the named node's scheduler leads now, as its spy last heard.
+    /// The harness catches every scheduler up at its deadlines, a bounded
+    /// lease's end among them, so after any `advance` or `run_until_quiescent`
+    /// the spy has heard every lapse up to the shared clock's now. After
+    /// `advance_clock_only`, which moves the clock alone, it may not have
+    /// yet. Panics on an unknown ID.
     pub fn holds_valid_grant(&self, id: &WorkerId) -> bool {
-        self.schedulers
+        self.scheduler_spy(id).leading()
+    }
+
+    /// The spy on the named node's scheduler. Panics on an unknown ID.
+    pub fn scheduler_spy(&self, id: &WorkerId) -> &Spy {
+        self.spies
             .get(id)
-            .unwrap_or_else(|| unknown_node("holds_valid_grant", id))
-            .is_leading()
+            .unwrap_or_else(|| unknown_node("scheduler_spy", id))
     }
 
     /// The named node's scheduler, which the harness hands every grant and
@@ -722,11 +771,11 @@ impl Cluster {
             .unwrap_or_else(|| unknown_node("scheduler_mut", id))
     }
 
-    /// Every node whose scheduler holds a valid grant now.
+    /// Every node whose scheduler leads now, as its spy last heard.
     pub fn valid_grant_holders(&self) -> BTreeSet<WorkerId> {
-        self.schedulers
+        self.spies
             .iter()
-            .filter(|(_, scheduler)| scheduler.is_leading())
+            .filter(|(_, spy)| spy.leading())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -804,6 +853,7 @@ impl Cluster {
         }
         self.nodes.remove(id);
         self.schedulers.remove(id);
+        self.spies.remove(id);
         self.deadlines.remove(id);
 
         self.restarts += 1;

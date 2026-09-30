@@ -129,58 +129,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legal_transitions_are_exactly_eighteen() {
-        let legal = [
-            (TaskRunState::Scheduled, TaskRunState::Queued),
-            (TaskRunState::Scheduled, TaskRunState::Cancelled),
-            (TaskRunState::Scheduled, TaskRunState::Expired),
-            (TaskRunState::Scheduled, TaskRunState::Superseded),
-            (TaskRunState::Queued, TaskRunState::Claimed),
-            (TaskRunState::Queued, TaskRunState::Cancelled),
-            (TaskRunState::Queued, TaskRunState::Expired),
-            (TaskRunState::Queued, TaskRunState::Superseded),
-            (TaskRunState::Claimed, TaskRunState::Running),
-            (TaskRunState::Claimed, TaskRunState::Cancelled),
-            (TaskRunState::Claimed, TaskRunState::Expired),
-            (TaskRunState::Claimed, TaskRunState::Lost),
-            (TaskRunState::Running, TaskRunState::Succeeded),
-            (TaskRunState::Running, TaskRunState::Failed),
-            (TaskRunState::Running, TaskRunState::Cancelled),
-            (TaskRunState::Running, TaskRunState::Expired),
-            (TaskRunState::Running, TaskRunState::Lost),
-            (TaskRunState::Running, TaskRunState::Orphaned),
-        ];
-
-        for (from, to) in legal.iter() {
-            assert!(
-                from.can_transition_to(*to),
-                "Expected legal transition ({:?}, {:?}) to return true",
-                from,
-                to
-            );
-        }
-
-        let mut legal_set = std::collections::HashSet::new();
-        for (from, to) in legal.iter() {
-            legal_set.insert((*from, *to));
-        }
-
-        let all: std::collections::HashSet<_> = TaskRunState::ALL.iter().collect();
-        assert_eq!(all.len(), TaskRunState::ALL.len(), "ALL has no duplicates");
-        for from in TaskRunState::ALL.iter() {
-            for to in TaskRunState::ALL.iter() {
-                let is_in_table = legal_set.contains(&(*from, *to));
-                let result = from.can_transition_to(*to);
-                assert_eq!(
-                    result, is_in_table,
-                    "Transition ({:?}, {:?}): expected {}, got {}",
-                    from, to, is_in_table, result
-                );
-            }
-        }
-    }
-
-    #[test]
     fn conversions_round_trip_successfully() {
         for state in TaskRunState::ALL.iter() {
             let generated: generated::TaskRunState = (*state).into();

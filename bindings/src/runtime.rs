@@ -4,10 +4,9 @@ use std::time::Duration;
 use kabudachi_core::protocol::ids::{
     IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
-use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
-    Cancellation, MemoryLimits, ReportRejection, Scheduler, Submission, SubmitRejection,
+    Cancellation, Completion, MemoryLimits, ReportRejection, Scheduler, Submission, SubmitRejection,
 };
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -17,14 +16,11 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
+use crate::door::{Closed, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
 use crate::local_node::local_node;
 use crate::timers::run_timers;
-use crate::wakeups::Wakeups;
-use crate::work::{
-    Closed, PyCertification, PyClaim, PyEvent, SharedScheduler, Wake, claim_when_available,
-    events_when_available, lock_scheduler,
-};
+use crate::work::{PyCertification, PyClaim, PyEvent};
 
 const DEFAULT_WORKER_THREADS: usize = 2;
 /// A lone worker has no peer to wait for, so it starts electing itself at
@@ -56,13 +52,10 @@ pub struct NativeRuntime {
     election: Mutex<Option<JoinHandle<()>>>,
     timers: Mutex<Option<JoinHandle<()>>>,
     stop: Arc<Notify>,
-    stop_timers: Arc<Notify>,
     state: watch::Receiver<WorkerState>,
-    scheduler: SharedScheduler,
-    worker_id: WorkerId,
-    /// Everyone a change to the scheduler concerns: claims waiting for work,
-    /// waits for events, and the timer loop.
-    wakeups: Wakeups,
+    /// The one way into the scheduler, which refuses everything once the
+    /// runtime has shut down.
+    door: Arc<SchedulerDoor<RealClock>>,
 }
 
 #[pymethods]
@@ -138,18 +131,12 @@ impl NativeRuntime {
         let mut new_scheduler = Scheduler::new(clock, Uuid7Ids);
         new_scheduler.set_result_ttl(Some(CoreDuration::from_millis(result_ttl_ms)));
         new_scheduler.set_memory_limits(limits);
-        let scheduler: SharedScheduler = Arc::new(Mutex::new(new_scheduler));
+        let door = Arc::new(SchedulerDoor::new(new_scheduler, worker_id));
         let (state_sender, state) = watch::channel(node.state());
-        let wake = Wake::new();
-        let events = Wake::new();
         let stop = Arc::new(Notify::new());
-        let stop_timers = Arc::new(Notify::new());
-        let timers_changed = Arc::new(Notify::new());
-        let wakeups = Wakeups::new(wake.clone(), events.clone(), Arc::clone(&timers_changed));
         let publisher = Publisher {
             state: state_sender,
-            scheduler: Arc::clone(&scheduler),
-            wakeups: wakeups.clone(),
+            door: Arc::clone(&door),
         };
         let election = tokio.spawn(run_election(
             node,
@@ -159,13 +146,7 @@ impl NativeRuntime {
             publisher,
         ));
 
-        let timers = tokio.spawn(run_timers(
-            Arc::clone(&scheduler),
-            clock,
-            timers_changed,
-            Arc::clone(&stop_timers),
-            Wakeups::within_the_timer_loop(wake, events),
-        ));
+        let timers = tokio.spawn(run_timers(Arc::clone(&door), clock));
 
         Ok(NativeRuntime {
             tokio: Mutex::new(Some(tokio)),
@@ -173,11 +154,8 @@ impl NativeRuntime {
             election: Mutex::new(Some(election)),
             timers: Mutex::new(Some(timers)),
             stop,
-            stop_timers,
             state,
-            scheduler,
-            worker_id,
-            wakeups,
+            door,
         })
     }
 
@@ -241,34 +219,29 @@ impl NativeRuntime {
         drop_oldest: bool,
         py: Python<'_>,
     ) -> PyResult<String> {
-        if !self.bridge.is_open() {
-            return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
+        let mut submission = Submission::new(
+            TaskDefinitionId::new(definition_id),
+            source_version,
+            serialized_input.to_vec(),
+            queue,
+        )
+        .with_retries(retries);
+        if let Some(delay_ms) = delay_ms {
+            submission = submission.with_delay(CoreDuration::from_millis(delay_ms));
+        }
+        if let Some(expires_in_ms) = expires_in_ms {
+            submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
+        }
+        if let Some(key) = coalescing_key {
+            submission = submission.with_coalescing_key(key);
+            if drop_oldest {
+                submission = submission.with_drop_oldest();
+            }
         }
         let task_id = self
-            .wakeups
-            .with_scheduler(&self.scheduler, |scheduler| {
-                let mut submission = Submission::new(
-                    TaskDefinitionId::new(definition_id),
-                    source_version,
-                    serialized_input.to_vec(),
-                    queue,
-                )
-                .with_retries(retries);
-                if let Some(delay_ms) = delay_ms {
-                    submission = submission.with_delay(CoreDuration::from_millis(delay_ms));
-                }
-                if let Some(expires_in_ms) = expires_in_ms {
-                    submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
-                }
-                if let Some(key) = coalescing_key {
-                    submission = submission.with_coalescing_key(key);
-                    if drop_oldest {
-                        submission = submission.with_drop_oldest();
-                    }
-                }
-                scheduler.submit(submission)
-            })
-            .map_err(|rejection| backpressure_error(py, rejection))?;
+            .door
+            .submit(submission)
+            .map_err(|refusal| refused(refusal, |rejection| backpressure_error(py, rejection)))?;
         Ok(task_id.as_str().to_owned())
     }
 
@@ -283,18 +256,12 @@ impl NativeRuntime {
         if limit == 0 {
             return Err(PyValueError::new_err("limit must be at least 1"));
         }
-        let waiting = claim_when_available(
-            Arc::clone(&self.scheduler),
-            self.worker_id.clone(),
-            self.wakeups.claims().subscribe(),
-            limit,
-            self.wakeups.events().clone(),
-        );
+        let waiting = Arc::clone(&self.door).claim_when_available(limit);
         self.bridge.spawn_into_py(py, async move {
             waiting
                 .await
                 .map(|claims| claims.into_iter().map(PyClaim::from).collect::<Vec<_>>())
-                .map_err(|Closed| PyRuntimeError::new_err(CLOSED_MESSAGE))
+                .map_err(PyErr::from)
         })
     }
 
@@ -307,15 +274,12 @@ impl NativeRuntime {
     /// not delivered are lost. Raises `RuntimeError` if the runtime has shut
     /// down or shuts down while waiting.
     fn next_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let waiting = events_when_available(
-            Arc::clone(&self.scheduler),
-            self.wakeups.events().subscribe(),
-        );
+        let waiting = Arc::clone(&self.door).events_when_available();
         self.bridge.spawn_into_py(py, async move {
             waiting
                 .await
                 .map(|events| events.into_iter().map(PyEvent::from).collect::<Vec<_>>())
-                .map_err(|Closed| PyRuntimeError::new_err(CLOSED_MESSAGE))
+                .map_err(PyErr::from)
         })
     }
 
@@ -324,9 +288,9 @@ impl NativeRuntime {
     /// Raises `RuntimeError` if the run is unknown or is not a claimed run of
     /// this worker.
     fn report_started(&self, task_run_id: &str) -> PyResult<()> {
-        lock_scheduler(&self.scheduler)
-            .report_started(&self.worker_id, &TaskRunId::new(task_run_id))
-            .map_err(rejected)
+        self.door
+            .report_started(&TaskRunId::new(task_run_id))
+            .map_err(|refusal| refused(refusal, rejected))
     }
 
     /// Reports that a running run succeeded, with the digest of its result,
@@ -343,24 +307,21 @@ impl NativeRuntime {
         result_digest: &[u8],
         continues: bool,
     ) -> PyResult<PyCertification> {
-        let run_id = TaskRunId::new(task_run_id);
-        let digest = result_digest.to_vec();
-        let certified = self.wakeups.with_scheduler(&self.scheduler, |scheduler| {
-            if continues {
-                scheduler.complete_and_continue(&self.worker_id, &run_id, digest)
-            } else {
-                scheduler.complete(&self.worker_id, &run_id, digest)
-            }
-        });
-        certified.map(Into::into).map_err(rejected)
+        let completion = if continues {
+            Completion::Continues
+        } else {
+            Completion::Final
+        };
+        self.door
+            .complete(&TaskRunId::new(task_run_id), result_digest.to_vec(), completion)
+            .map(Into::into)
+            .map_err(|refusal| refused(refusal, rejected))
     }
 
     /// The continuation of a task completed with `continues` is over, however
     /// it ended. Returns whether there was one to end.
-    fn end_continuation(&self, task_id: &str) -> bool {
-        self.wakeups.with_scheduler(&self.scheduler, |scheduler| {
-            scheduler.end_continuation(&TaskId::new(task_id))
-        })
+    fn end_continuation(&self, task_id: &str) -> PyResult<bool> {
+        Ok(self.door.end_continuation(&TaskId::new(task_id))?)
     }
 
     /// Reports that a running run failed with an error of type
@@ -372,11 +333,9 @@ impl NativeRuntime {
     /// this worker's; the failure is then not recorded.
     fn fail(&self, task_run_id: &str, failure_kind: &str) -> PyResult<bool> {
         let failure = self
-            .wakeups
-            .with_scheduler(&self.scheduler, |scheduler| {
-                scheduler.fail(&self.worker_id, &TaskRunId::new(task_run_id), failure_kind)
-            })
-            .map_err(rejected)?;
+            .door
+            .fail(&TaskRunId::new(task_run_id), failure_kind)
+            .map_err(|refusal| refused(refusal, rejected))?;
         Ok(failure.retry.is_some())
     }
 
@@ -387,12 +346,11 @@ impl NativeRuntime {
     ///
     /// Raises `RuntimeError` if this worker is not the leader.
     fn cancel(&self, task_id: &str) -> PyResult<&'static str> {
-        let outcome = self
-            .wakeups
-            .with_scheduler(&self.scheduler, |scheduler| {
-                scheduler.cancel(&TaskId::new(task_id))
+        let outcome = self.door.cancel(&TaskId::new(task_id)).map_err(|refusal| {
+            refused(refusal, |rejection| {
+                PyRuntimeError::new_err(rejection.to_string())
             })
-            .map_err(|rejection| PyRuntimeError::new_err(rejection.to_string()))?;
+        })?;
         Ok(match outcome {
             Cancellation::Cancelled { .. } => "cancelled",
             Cancellation::AlreadyFinished => "finished",
@@ -402,20 +360,19 @@ impl NativeRuntime {
 
     /// The state of a run by name, for example `"Running"`, or `None` if the
     /// run is unknown.
-    fn task_run_state(&self, task_run_id: &str) -> Option<String> {
-        lock_scheduler(&self.scheduler)
-            .task_run(&TaskRunId::new(task_run_id))
-            .map(|run| format!("{:?}", run.current_state()))
+    fn task_run_state(&self, task_run_id: &str) -> PyResult<Option<String>> {
+        let state = self.door.run_state(&TaskRunId::new(task_run_id))?;
+        Ok(state.map(|state| format!("{state:?}")))
     }
 
     /// The IDs of every run of a task, oldest attempt first. Empty if the
     /// task is unknown or has been forgotten.
-    fn task_run_ids(&self, task_id: &str) -> Vec<String> {
-        lock_scheduler(&self.scheduler)
-            .runs_of(&TaskId::new(task_id))
+    fn task_run_ids(&self, task_id: &str) -> PyResult<Vec<String>> {
+        let runs = self.door.run_ids(&TaskId::new(task_id))?;
+        Ok(runs
             .iter()
             .map(|run_id| run_id.as_str().to_owned())
-            .collect()
+            .collect())
     }
 
     /// The worker's election state by name, for example `"Leader"`.
@@ -443,8 +400,9 @@ impl NativeRuntime {
                 return;
             };
             self.bridge.close();
-            // Claims waiting for work, and waits for events, give up.
-            self.wakeups.close();
+            // Every later operation is refused, claims waiting for work and
+            // waits for events give up, and the timer loop ends.
+            self.door.close();
             let election = self
                 .election
                 .lock()
@@ -456,7 +414,6 @@ impl NativeRuntime {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
             self.stop.notify_one();
-            self.stop_timers.notify_one();
 
             runtime.block_on(async {
                 if let Some(election) = election {
@@ -511,4 +468,19 @@ fn backpressure_error(py: Python<'_>, rejection: SubmitRejection) -> PyErr {
 
 fn rejected(rejection: ReportRejection) -> PyErr {
     PyRuntimeError::new_err(rejection.to_string())
+}
+
+/// What a refused door operation raises: the closed error, or whatever
+/// `reject` makes of the scheduler's own rejection.
+fn refused<R>(refusal: Refusal<R>, reject: impl FnOnce(R) -> PyErr) -> PyErr {
+    match refusal {
+        Refusal::Closed => Closed.into(),
+        Refusal::Rejected(rejection) => reject(rejection),
+    }
+}
+
+impl From<Closed> for PyErr {
+    fn from(_: Closed) -> Self {
+        PyRuntimeError::new_err(CLOSED_MESSAGE)
+    }
 }

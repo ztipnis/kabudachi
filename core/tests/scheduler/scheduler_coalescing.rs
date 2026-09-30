@@ -5,32 +5,12 @@
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{ClaimRejection, Event, Scheduler, Submission};
-use kabudachi_core::time::Duration;
-use crate::support::clock::FakeClock;
-use crate::support::grant::unbounded_grant;
-use crate::support::ids::SequentialIds;
+use kabudachi_core::scheduler::{Completion, ClaimRejection, Event, Submission};
+use crate::support::scheduler::{Fixture, ticks};
 
 fn worker() -> WorkerId {
     WorkerId::new("w1")
-}
-
-fn ticks(n: u64) -> Duration {
-    Duration::from_ticks(n)
-}
-
-struct Fixture {
-    clock: FakeClock,
-    scheduler: Scheduler<FakeClock, SequentialIds>,
-}
-
-fn leading() -> Fixture {
-    let clock = FakeClock::new();
-    let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_leadership_grant(Some(unbounded_grant()));
-    Fixture { clock, scheduler }
 }
 
 fn generation(definition: &str, key: &str, payload: &str) -> Submission {
@@ -45,10 +25,6 @@ fn generation(definition: &str, key: &str, payload: &str) -> Submission {
 
 fn refresh(payload: &str) -> Submission {
     generation("index.refresh", "", payload)
-}
-
-fn state(fixture: &Fixture, task: &TaskId) -> TaskRunState {
-    fixture.scheduler.run_of(task).unwrap().current_state()
 }
 
 fn claim_one(fixture: &mut Fixture) -> kabudachi_core::scheduler::Claim {
@@ -73,20 +49,20 @@ fn superseded_events(fixture: &mut Fixture) -> Vec<(TaskId, TaskId)> {
 
 #[test]
 fn a_newer_pending_generation_supersedes_the_older_one() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let older = fixture.scheduler.submit(refresh("a")).unwrap();
 
     let newer = fixture.scheduler.submit(refresh("b")).unwrap();
 
-    assert_eq!(state(&fixture, &older), TaskRunState::Superseded);
-    assert_eq!(state(&fixture, &newer), TaskRunState::Queued);
-    assert_eq!(fixture.scheduler.pending_tasks(), vec![newer.clone()]);
+    assert_eq!(fixture.state(&older), TaskRunState::Superseded);
+    assert_eq!(fixture.state(&newer), TaskRunState::Queued);
+    assert_eq!(fixture.spy.pending(), 1);
     assert_eq!(superseded_events(&mut fixture), vec![(older, newer)]);
 }
 
 #[test]
 fn a_superseded_generation_is_never_handed_out() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let older = fixture.scheduler.submit(refresh("a")).unwrap();
     fixture.scheduler.submit(refresh("b")).unwrap();
 
@@ -97,7 +73,7 @@ fn a_superseded_generation_is_never_handed_out() {
 
 #[test]
 fn different_keys_and_different_tasks_do_not_supersede_each_other() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let tenant_a = fixture
         .scheduler
         .submit(generation("index.refresh", "a", "1"))
@@ -111,16 +87,16 @@ fn different_keys_and_different_tasks_do_not_supersede_each_other() {
         .submit(generation("cache.warm", "a", "3"))
         .unwrap();
 
-    assert_eq!(
-        fixture.scheduler.pending_tasks(),
-        vec![tenant_a, tenant_b, other_task]
-    );
+    assert_eq!(fixture.spy.pending(), 3);
+    for task in [&tenant_a, &tenant_b, &other_task] {
+        assert_eq!(fixture.state(task), TaskRunState::Queued);
+    }
     assert!(!fixture.scheduler.has_events());
 }
 
 #[test]
 fn a_delayed_pending_generation_is_superseded_too() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let older = fixture
         .scheduler
         .submit(refresh("a").with_delay(ticks(100)).with_expiry(ticks(50)))
@@ -128,19 +104,20 @@ fn a_delayed_pending_generation_is_superseded_too() {
 
     let newer = fixture.scheduler.submit(refresh("b")).unwrap();
 
-    assert_eq!(state(&fixture, &older), TaskRunState::Superseded);
+    assert_eq!(fixture.state(&older), TaskRunState::Superseded);
     // Nothing waits on time any more, before the clock could clear a leftover.
     assert_eq!(fixture.scheduler.next_deadline(), None);
     fixture.clock.advance(ticks(500));
-    let advanced = fixture.scheduler.advance();
+    let advanced = fixture.scheduler.catch_up();
     assert_eq!(advanced.queued, 0);
-    assert_eq!(fixture.scheduler.pending_tasks(), vec![newer]);
+    assert_eq!(fixture.spy.pending(), 1);
+    assert_eq!(fixture.state(&newer), TaskRunState::Queued);
     assert_eq!(fixture.scheduler.next_deadline(), None);
 }
 
 #[test]
 fn a_claimed_generation_is_never_superseded_and_the_newer_one_waits_for_it() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let running = fixture.scheduler.submit(refresh("a")).unwrap();
     let claim = claim_one(&mut fixture);
     fixture
@@ -150,8 +127,8 @@ fn a_claimed_generation_is_never_superseded_and_the_newer_one_waits_for_it() {
 
     let newer = fixture.scheduler.submit(refresh("b")).unwrap();
 
-    assert_eq!(state(&fixture, &running), TaskRunState::Running);
-    assert_eq!(state(&fixture, &newer), TaskRunState::Queued);
+    assert_eq!(fixture.state(&running), TaskRunState::Running);
+    assert_eq!(fixture.state(&newer), TaskRunState::Queued);
     assert!(!fixture.scheduler.has_events());
     // Only one generation of a key runs at a time.
     assert!(
@@ -171,7 +148,7 @@ fn a_claimed_generation_is_never_superseded_and_the_newer_one_waits_for_it() {
     // Its result is certified as usual, and then the key is free.
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec())
+        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
         .unwrap();
     assert_eq!(
         fixture.scheduler.claim_oldest(&worker(), 10).unwrap().len(),
@@ -181,7 +158,7 @@ fn a_claimed_generation_is_never_superseded_and_the_newer_one_waits_for_it() {
 
 #[test]
 fn the_claim_of_the_newest_generation_carries_the_superseded_payloads_oldest_first() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     for payload in ["a", "b", "c"] {
         fixture.scheduler.submit(refresh(payload)).unwrap();
     }
@@ -198,7 +175,7 @@ fn the_claim_of_the_newest_generation_carries_the_superseded_payloads_oldest_fir
 
 #[test]
 fn the_chain_keeps_growing_across_a_running_generation() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture.scheduler.submit(refresh("running")).unwrap();
     let running = claim_one(&mut fixture);
     fixture
@@ -218,13 +195,13 @@ fn the_chain_keeps_growing_across_a_running_generation() {
 fn start_and_complete_later(fixture: &mut Fixture, claim: &kabudachi_core::scheduler::Claim) {
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec())
+        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
         .unwrap();
 }
 
 #[test]
 fn superseded_tasks_are_kept_until_the_generation_that_absorbed_them_finishes() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture.scheduler.set_result_ttl(Some(ticks(100)));
     let older = fixture.scheduler.submit(refresh("a")).unwrap();
     let newest = fixture.scheduler.submit(refresh("b")).unwrap();
@@ -232,29 +209,29 @@ fn superseded_tasks_are_kept_until_the_generation_that_absorbed_them_finishes() 
     // While it waits, and while it runs (a retry would fold the chain again),
     // the payload is still needed.
     fixture.clock.advance(ticks(10_000));
-    assert_eq!(fixture.scheduler.sweep(), 0);
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
     let claim = claim_one(&mut fixture);
     fixture
         .scheduler
         .report_started(&worker(), &claim.task_run_id)
         .unwrap();
     fixture.clock.advance(ticks(10_000));
-    assert_eq!(fixture.scheduler.sweep(), 0);
-    assert!(fixture.scheduler.task(&older).is_some());
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
+    assert!(!fixture.spy.forgotten(&older));
 
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec())
+        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
         .unwrap();
     fixture.clock.advance(ticks(100));
-    assert_eq!(fixture.scheduler.sweep(), 2);
-    assert!(fixture.scheduler.task(&older).is_none());
-    assert!(fixture.scheduler.task(&newest).is_none());
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 2);
+    assert!(fixture.spy.forgotten(&older));
+    assert!(fixture.spy.forgotten(&newest));
 }
 
 #[test]
 fn a_failed_generation_holds_its_key_while_it_waits_for_a_retry() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture
         .scheduler
         .submit(refresh("a").with_retries(1))
@@ -297,7 +274,7 @@ fn a_failed_generation_holds_its_key_while_it_waits_for_a_retry() {
 
 #[test]
 fn cancelling_a_running_generation_frees_its_key() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let running = fixture.scheduler.submit(refresh("a")).unwrap();
     let claim = claim_one(&mut fixture);
     fixture
@@ -313,7 +290,7 @@ fn cancelling_a_running_generation_frees_its_key() {
 
 #[test]
 fn a_blocked_generation_does_not_hold_up_other_keys() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture
         .scheduler
         .submit(generation("index.refresh", "a", "running"))
@@ -338,12 +315,12 @@ fn a_blocked_generation_does_not_hold_up_other_keys() {
         claims.iter().map(|c| c.task.task_id()).collect::<Vec<_>>(),
         vec![free]
     );
-    assert_eq!(state(&fixture, &blocked), TaskRunState::Queued);
+    assert_eq!(fixture.state(&blocked), TaskRunState::Queued);
 }
 
 #[test]
 fn cancelling_the_newest_pending_generation_releases_the_chain() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture.scheduler.set_result_ttl(Some(ticks(100)));
     let older = fixture.scheduler.submit(refresh("a")).unwrap();
     let newest = fixture.scheduler.submit(refresh("b")).unwrap();
@@ -351,8 +328,8 @@ fn cancelling_the_newest_pending_generation_releases_the_chain() {
     fixture.scheduler.cancel(&newest).unwrap();
     fixture.clock.advance(ticks(100));
 
-    assert_eq!(fixture.scheduler.sweep(), 2);
-    assert!(fixture.scheduler.task(&older).is_none());
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 2);
+    assert!(fixture.spy.forgotten(&older));
     // A later submission starts a fresh generation with nothing chained.
     fixture.scheduler.submit(refresh("c")).unwrap();
     assert!(claim_one(&mut fixture).chain.is_empty());
@@ -360,7 +337,7 @@ fn cancelling_the_newest_pending_generation_releases_the_chain() {
 
 #[test]
 fn an_expired_newest_generation_releases_the_chain() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture.scheduler.set_result_ttl(Some(ticks(100)));
     fixture.scheduler.submit(refresh("a")).unwrap();
     fixture
@@ -369,8 +346,8 @@ fn an_expired_newest_generation_releases_the_chain() {
         .unwrap();
 
     fixture.clock.advance(ticks(10));
-    fixture.scheduler.advance();
+    fixture.scheduler.catch_up();
     fixture.clock.advance(ticks(100));
 
-    assert_eq!(fixture.scheduler.sweep(), 2);
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 2);
 }

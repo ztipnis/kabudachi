@@ -5,33 +5,15 @@
 
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::scheduler::{Event, MemoryLimits, Scheduler, Submission, SubmitRejection};
+use kabudachi_core::scheduler::{Completion, Event, MemoryLimits, Submission, SubmitRejection};
 use kabudachi_core::time::Duration;
-use crate::support::clock::FakeClock;
-use crate::support::grant::unbounded_grant;
-use crate::support::ids::SequentialIds;
+use crate::support::scheduler::Fixture;
 
 const SOFT: u64 = 100;
 const HARD: u64 = 200;
 
 fn worker() -> WorkerId {
     WorkerId::new("w1")
-}
-
-struct Fixture {
-    clock: FakeClock,
-    scheduler: Scheduler<FakeClock, SequentialIds>,
-}
-
-fn limited() -> Fixture {
-    let clock = FakeClock::new();
-    let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_leadership_grant(Some(unbounded_grant()));
-    scheduler.set_memory_limits(Some(MemoryLimits {
-        soft: SOFT,
-        hard: HARD,
-    }));
-    Fixture { clock, scheduler }
 }
 
 fn payload(size: usize) -> Submission {
@@ -73,29 +55,29 @@ fn finish(fixture: &mut Fixture, task: &TaskId) {
         .unwrap();
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec())
+        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
         .unwrap();
 }
 
 #[test]
 fn memory_in_use_counts_the_payload_of_every_task_that_has_not_finished() {
-    let mut fixture = limited();
-    assert_eq!(fixture.scheduler.memory_in_use(), 0);
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
+    assert_eq!(fixture.spy.memory_in_use(), 0);
 
     let first = fixture.scheduler.submit(payload(30)).unwrap();
     fixture
         .scheduler
         .submit(payload(20).with_delay(Duration::from_ticks(50)))
         .unwrap();
-    assert_eq!(fixture.scheduler.memory_in_use(), 50);
+    assert_eq!(fixture.spy.memory_in_use(), 50);
 
     finish(&mut fixture, &first);
-    assert_eq!(fixture.scheduler.memory_in_use(), 20);
+    assert_eq!(fixture.spy.memory_in_use(), 20);
 }
 
 #[test]
 fn a_failed_cancelled_or_expired_task_stops_counting() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     let failing = fixture.scheduler.submit(payload(10)).unwrap();
     let cancelled = fixture.scheduler.submit(payload(10)).unwrap();
     let expiring = fixture
@@ -117,14 +99,14 @@ fn a_failed_cancelled_or_expired_task_stops_counting() {
         .unwrap();
     fixture.scheduler.cancel(&cancelled).unwrap();
     fixture.clock.advance(Duration::from_ticks(5));
-    fixture.scheduler.advance();
+    fixture.scheduler.catch_up();
 
-    assert_eq!(fixture.scheduler.memory_in_use(), 0, "{expiring:?}");
+    assert_eq!(fixture.spy.memory_in_use(), 0, "{expiring:?}");
 }
 
 #[test]
 fn a_task_waiting_for_its_retry_still_counts() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     let task = fixture
         .scheduler
         .submit(payload(40).with_retries(1))
@@ -140,41 +122,38 @@ fn a_task_waiting_for_its_retry_still_counts() {
         .fail(&worker(), &claim.task_run_id, "ValueError")
         .unwrap();
 
-    assert_eq!(fixture.scheduler.memory_in_use(), 40);
+    assert_eq!(fixture.spy.memory_in_use(), 40);
 }
 
 #[test]
 fn a_superseded_payload_counts_until_the_generation_that_absorbed_it_finishes() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     fixture.scheduler.submit(generation(30, "k")).unwrap();
     let newest = fixture.scheduler.submit(generation(20, "k")).unwrap();
-    assert_eq!(fixture.scheduler.memory_in_use(), 50);
+    assert_eq!(fixture.spy.memory_in_use(), 50);
 
     finish(&mut fixture, &newest);
 
-    assert_eq!(fixture.scheduler.memory_in_use(), 0);
+    assert_eq!(fixture.spy.memory_in_use(), 0);
 }
 
 #[test]
 fn slow_down_is_raised_past_the_soft_limit() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
 
     fixture.scheduler.submit(payload(60)).unwrap();
-    assert!(!fixture.scheduler.slow_down_active());
     assert!(slow_down_events(&mut fixture).is_empty());
 
     // Exactly at the limit is not past it.
     fixture.scheduler.submit(payload(40)).unwrap();
-    assert!(!fixture.scheduler.slow_down_active());
 
     fixture.scheduler.submit(payload(1)).unwrap();
-    assert!(fixture.scheduler.slow_down_active());
     assert_eq!(slow_down_events(&mut fixture), vec![true]);
 }
 
 #[test]
 fn slow_down_is_raised_once_however_far_past_the_limit_it_goes() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
 
     for _ in 0..5 {
         fixture.scheduler.submit(payload(30)).unwrap();
@@ -185,7 +164,7 @@ fn slow_down_is_raised_once_however_far_past_the_limit_it_goes() {
 
 #[test]
 fn slow_down_does_not_flap_just_below_the_soft_limit() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     fixture.scheduler.submit(payload(45)).unwrap();
     let big = fixture.scheduler.submit(payload(46)).unwrap();
     let small = fixture.scheduler.submit(payload(10)).unwrap();
@@ -193,19 +172,17 @@ fn slow_down_does_not_flap_just_below_the_soft_limit() {
 
     // 91 is below the soft limit but inside the margin: still raised.
     fixture.scheduler.cancel(&small).unwrap();
-    assert_eq!(fixture.scheduler.memory_in_use(), 91);
-    assert!(fixture.scheduler.slow_down_active());
+    assert_eq!(fixture.spy.memory_in_use(), 91);
     assert!(slow_down_events(&mut fixture).is_empty());
 
     // 45 is well below it: cleared, once.
     fixture.scheduler.cancel(&big).unwrap();
-    assert!(!fixture.scheduler.slow_down_active());
     assert_eq!(slow_down_events(&mut fixture), vec![false]);
 }
 
 #[test]
 fn slow_down_can_be_raised_again_after_it_cleared() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     let first = fixture.scheduler.submit(payload(101)).unwrap();
     fixture.scheduler.cancel(&first).unwrap();
     assert_eq!(slow_down_events(&mut fixture), vec![true, false]);
@@ -217,9 +194,10 @@ fn slow_down_can_be_raised_again_after_it_cleared() {
 
 #[test]
 fn backpressure_error_is_raised_past_the_hard_limit() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     fixture.scheduler.submit(payload(150)).unwrap();
 
+    let mark = fixture.spy.mark();
     let rejected = fixture.scheduler.submit(payload(51));
 
     assert_eq!(
@@ -230,23 +208,26 @@ fn backpressure_error_is_raised_past_the_hard_limit() {
             needed: 51,
         }
     );
-    // Nothing was queued or counted.
-    assert_eq!(fixture.scheduler.memory_in_use(), 150);
-    assert_eq!(fixture.scheduler.pending_tasks().len(), 1);
+    assert!(
+        fixture.spy.since(mark).is_empty(),
+        "a refused submission changes nothing"
+    );
+    assert_eq!(fixture.spy.memory_in_use(), 150);
+    assert_eq!(fixture.spy.pending(), 1);
 }
 
 #[test]
 fn a_submission_that_exactly_fills_the_hard_limit_is_accepted() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     fixture.scheduler.submit(payload(150)).unwrap();
 
     assert!(fixture.scheduler.submit(payload(50)).is_ok());
-    assert_eq!(fixture.scheduler.memory_in_use(), HARD);
+    assert_eq!(fixture.spy.memory_in_use(), HARD);
 }
 
 #[test]
 fn room_made_by_finishing_tasks_lets_submissions_through_again() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     let first = fixture.scheduler.submit(payload(150)).unwrap();
     assert!(fixture.scheduler.submit(payload(100)).is_err());
 
@@ -257,24 +238,21 @@ fn room_made_by_finishing_tasks_lets_submissions_through_again() {
 
 #[test]
 fn without_limits_nothing_is_refused_and_no_signal_is_raised() {
-    let clock = FakeClock::new();
-    let mut scheduler = Scheduler::new(clock, SequentialIds::new());
-    scheduler.set_leadership_grant(Some(unbounded_grant()));
+    let mut fixture = Fixture::leading();
 
     for _ in 0..3 {
-        scheduler.submit(payload(1_000_000)).unwrap();
+        fixture.scheduler.submit(payload(1_000_000)).unwrap();
     }
 
-    assert!(!scheduler.slow_down_active());
-    assert!(!scheduler.has_events());
+    assert!(!fixture.scheduler.has_events());
 }
 
 #[test]
 fn a_coalescing_task_is_refused_at_the_hard_limit_and_never_silently_dropped() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     fixture.scheduler.submit(generation(90, "k")).unwrap();
     fixture.scheduler.submit(generation(90, "k")).unwrap();
-    assert_eq!(fixture.scheduler.memory_in_use(), 180);
+    assert_eq!(fixture.spy.memory_in_use(), 180);
 
     let rejected = fixture.scheduler.submit(generation(90, "k"));
 
@@ -290,12 +268,12 @@ fn a_coalescing_task_is_refused_at_the_hard_limit_and_never_silently_dropped() {
 
 #[test]
 fn drop_oldest_makes_room_by_dropping_the_keys_oldest_retained_payloads_first() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     // Retained payloads of 60, 60 and 60 (the last is the waiting generation).
     for size in [61, 62, 63] {
         fixture.scheduler.submit(generation(size, "k")).unwrap();
     }
-    assert_eq!(fixture.scheduler.memory_in_use(), 186);
+    assert_eq!(fixture.spy.memory_in_use(), 186);
 
     let accepted = fixture
         .scheduler
@@ -303,7 +281,7 @@ fn drop_oldest_makes_room_by_dropping_the_keys_oldest_retained_payloads_first() 
         .unwrap();
 
     // 186 + 50 = 236 > 200: the oldest payload (61) goes, which is enough.
-    assert_eq!(fixture.scheduler.memory_in_use(), 175);
+    assert_eq!(fixture.spy.memory_in_use(), 175);
     let claim = fixture
         .scheduler
         .request_claim(&worker(), &accepted)
@@ -316,7 +294,7 @@ fn drop_oldest_makes_room_by_dropping_the_keys_oldest_retained_payloads_first() 
 
 #[test]
 fn drop_oldest_drops_as_many_as_it_takes() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     for size in [70, 70] {
         fixture.scheduler.submit(generation(size, "k")).unwrap();
     }
@@ -326,7 +304,7 @@ fn drop_oldest_drops_as_many_as_it_takes() {
         .submit(generation(180, "k").with_drop_oldest())
         .unwrap();
 
-    assert_eq!(fixture.scheduler.memory_in_use(), 180);
+    assert_eq!(fixture.spy.memory_in_use(), 180);
     let claim = fixture
         .scheduler
         .request_claim(&worker(), &accepted)
@@ -336,7 +314,7 @@ fn drop_oldest_drops_as_many_as_it_takes() {
 
 #[test]
 fn drop_oldest_never_lets_usage_exceed_the_hard_limit() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     for size in [40, 40, 40] {
         fixture.scheduler.submit(generation(size, "k")).unwrap();
     }
@@ -348,7 +326,7 @@ fn drop_oldest_never_lets_usage_exceed_the_hard_limit() {
 
     assert!(rejected.is_err());
     assert_eq!(
-        fixture.scheduler.memory_in_use(),
+        fixture.spy.memory_in_use(),
         120,
         "nothing was dropped"
     );
@@ -356,7 +334,7 @@ fn drop_oldest_never_lets_usage_exceed_the_hard_limit() {
 
 #[test]
 fn drop_oldest_is_refused_when_the_key_has_too_little_to_drop() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     // Another key holds most of the memory; this key has nothing retained.
     fixture.scheduler.submit(generation(190, "other")).unwrap();
 
@@ -365,12 +343,12 @@ fn drop_oldest_is_refused_when_the_key_has_too_little_to_drop() {
         .submit(generation(50, "mine").with_drop_oldest());
 
     assert!(rejected.is_err());
-    assert_eq!(fixture.scheduler.memory_in_use(), 190);
+    assert_eq!(fixture.spy.memory_in_use(), 190);
 }
 
 #[test]
 fn a_running_generations_payload_is_never_dropped() {
-    let mut fixture = limited();
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     let running = fixture.scheduler.submit(generation(150, "k")).unwrap();
     let claim = fixture
         .scheduler
@@ -386,5 +364,5 @@ fn a_running_generations_payload_is_never_dropped() {
         .submit(generation(60, "k").with_drop_oldest());
 
     assert!(rejected.is_err());
-    assert_eq!(fixture.scheduler.memory_in_use(), 150);
+    assert_eq!(fixture.spy.memory_in_use(), 150);
 }

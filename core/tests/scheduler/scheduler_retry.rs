@@ -6,26 +6,12 @@
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{Scheduler, Submission};
+use kabudachi_core::scheduler::{Completion, Submission};
 use kabudachi_core::time::Duration;
-use crate::support::clock::FakeClock;
-use crate::support::grant::unbounded_grant;
-use crate::support::ids::SequentialIds;
+use crate::support::scheduler::Fixture;
 
 fn worker() -> WorkerId {
     WorkerId::new("w1")
-}
-
-struct Fixture {
-    clock: FakeClock,
-    scheduler: Scheduler<FakeClock, SequentialIds>,
-}
-
-fn leading() -> Fixture {
-    let clock = FakeClock::new();
-    let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_leadership_grant(Some(unbounded_grant()));
-    Fixture { clock, scheduler }
 }
 
 fn submit_with_retries(fixture: &mut Fixture, retries: u32) -> TaskId {
@@ -53,13 +39,9 @@ fn start_attempt(fixture: &mut Fixture, task_id: &TaskId) -> TaskRunId {
     claim.task_run_id
 }
 
-fn state_of(fixture: &Fixture, run: &TaskRunId) -> TaskRunState {
-    fixture.scheduler.task_run(run).unwrap().current_state()
-}
-
 #[test]
 fn a_failed_run_with_retries_left_is_replaced_by_a_queued_child_run() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task_id = submit_with_retries(&mut fixture, 2);
     let first = start_attempt(&mut fixture, &task_id);
 
@@ -69,42 +51,52 @@ fn a_failed_run_with_retries_left_is_replaced_by_a_queued_child_run() {
         .unwrap();
 
     let retry = failure.retry.expect("a retry was due");
-    assert_eq!(state_of(&fixture, &first), TaskRunState::Failed);
+    assert_eq!(fixture.run_state(&first), TaskRunState::Failed);
     let child = fixture.scheduler.task_run(&retry).unwrap();
     assert_eq!(child.current_state(), TaskRunState::Queued);
     assert_eq!(child.attempt_number(), 2);
     assert_eq!(child.parent_task_run_id(), Some(first.clone()));
     assert_eq!(child.task_id(), task_id);
-    assert_eq!(
-        fixture.scheduler.run_of(&task_id).unwrap().task_run_id(),
-        retry
-    );
-    assert_eq!(fixture.scheduler.pending_tasks(), vec![task_id]);
+    assert_eq!(fixture.spy.run_of(&task_id).task_run_id(), retry);
+    assert_eq!(fixture.spy.pending(), 1);
+    assert_eq!(fixture.state(&task_id), TaskRunState::Queued);
 }
 
 #[test]
 fn a_retry_does_not_change_the_task() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task_id = submit_with_retries(&mut fixture, 1);
-    let before = fixture.scheduler.task(&task_id).unwrap().clone();
+    let before = fixture.spy.task(&task_id);
     let first = start_attempt(&mut fixture, &task_id);
 
     fixture
         .scheduler
         .fail(&worker(), &first, "ValueError")
         .unwrap();
-    let second = start_attempt(&mut fixture, &task_id);
+    let claim = fixture
+        .scheduler
+        .request_claim(&worker(), &task_id)
+        .unwrap();
     fixture
         .scheduler
-        .complete(&worker(), &second, b"digest".to_vec())
+        .report_started(&worker(), &claim.task_run_id)
+        .unwrap();
+    fixture
+        .scheduler
+        .complete(
+            &worker(),
+            &claim.task_run_id,
+            b"digest".to_vec(),
+            Completion::Final,
+        )
         .unwrap();
 
-    assert_eq!(*fixture.scheduler.task(&task_id).unwrap(), before);
+    assert_eq!(claim.task, before, "a worker is handed the task as submitted");
 }
 
 #[test]
 fn a_task_gets_its_retries_plus_the_first_attempt_and_no_more() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task_id = submit_with_retries(&mut fixture, 2);
 
     let mut attempts = Vec::new();
@@ -123,14 +115,13 @@ fn a_task_gets_its_retries_plus_the_first_attempt_and_no_more() {
     }
 
     assert_eq!(attempts, vec![1, 2, 3]);
-    assert!(fixture.scheduler.pending_tasks().is_empty());
-    let last = fixture.scheduler.run_of(&task_id).unwrap();
-    assert_eq!(last.current_state(), TaskRunState::Failed);
+    assert_eq!(fixture.spy.pending(), 0);
+    assert_eq!(fixture.state(&task_id), TaskRunState::Failed);
 }
 
 #[test]
 fn a_retry_that_succeeds_certifies_its_own_result() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task_id = submit_with_retries(&mut fixture, 1);
     let first = start_attempt(&mut fixture, &task_id);
     let retry = fixture
@@ -143,12 +134,12 @@ fn a_retry_that_succeeds_certifies_its_own_result() {
     let second = start_attempt(&mut fixture, &task_id);
     let certification = fixture
         .scheduler
-        .complete(&worker(), &second, b"digest".to_vec())
+        .complete(&worker(), &second, b"digest".to_vec(), Completion::Final)
         .unwrap();
 
     assert_eq!(second, retry);
     assert_eq!(certification.task_run_id, retry);
-    assert_eq!(state_of(&fixture, &retry), TaskRunState::Succeeded);
+    assert_eq!(fixture.run_state(&retry), TaskRunState::Succeeded);
     assert!(
         fixture
             .scheduler
@@ -161,7 +152,7 @@ fn a_retry_that_succeeds_certifies_its_own_result() {
 
 #[test]
 fn a_finished_task_is_forgotten_with_every_run_counted_from_its_last() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture
         .scheduler
         .set_result_ttl(Some(Duration::from_ticks(100)));
@@ -180,18 +171,18 @@ fn a_finished_task_is_forgotten_with_every_run_counted_from_its_last() {
 
     // The first failure is 120 ticks old, but the task only finished now.
     fixture.clock.advance(Duration::from_ticks(40));
-    assert_eq!(fixture.scheduler.sweep(), 0);
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
 
     fixture.clock.advance(Duration::from_ticks(60));
-    assert_eq!(fixture.scheduler.sweep(), 1);
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
     assert!(fixture.scheduler.task_run(&first).is_none());
     assert!(fixture.scheduler.task_run(&second).is_none());
-    assert!(fixture.scheduler.task(&task_id).is_none());
+    assert!(fixture.spy.forgotten(&task_id));
 }
 
 #[test]
 fn a_task_that_is_waiting_for_its_retry_is_not_forgotten() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture
         .scheduler
         .set_result_ttl(Some(Duration::from_ticks(10)));
@@ -204,13 +195,14 @@ fn a_task_that_is_waiting_for_its_retry_is_not_forgotten() {
 
     fixture.clock.advance(Duration::from_ticks(1_000));
 
-    assert_eq!(fixture.scheduler.sweep(), 0);
-    assert_eq!(fixture.scheduler.pending_tasks(), vec![task_id]);
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
+    assert_eq!(fixture.spy.pending(), 1);
+    assert_eq!(fixture.state(&task_id), TaskRunState::Queued);
 }
 
 #[test]
 fn every_run_of_a_task_can_be_listed_oldest_attempt_first() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task_id = submit_with_retries(&mut fixture, 1);
     assert_eq!(fixture.scheduler.runs_of(&task_id).len(), 1);
     let first = start_attempt(&mut fixture, &task_id);

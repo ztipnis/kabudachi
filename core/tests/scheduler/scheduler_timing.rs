@@ -4,36 +4,20 @@
 //! whenever time is advanced or a claim is made.
 
 
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
-    ClaimRejection, Event, LeadershipGrant, LeaseEnd, Scheduler, Submission,
+    CaughtUp, ClaimRejection, Completion, Event, LeadershipGrant, LeaseEnd, Scheduler, Submission,
 };
-use kabudachi_core::time::{Clock, Duration, Instant};
-use crate::support::clock::FakeClock;
+use kabudachi_core::time::{Clock, Instant};
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
+use crate::support::scheduler::{Fixture, TestScheduler, ticks};
 
 fn worker() -> WorkerId {
     WorkerId::new("w1")
-}
-
-fn ticks(n: u64) -> Duration {
-    Duration::from_ticks(n)
-}
-
-struct Fixture {
-    clock: FakeClock,
-    scheduler: Scheduler<FakeClock, SequentialIds>,
-}
-
-fn leading() -> Fixture {
-    let clock = FakeClock::new();
-    let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
-    scheduler.set_leadership_grant(Some(unbounded_grant()));
-    Fixture { clock, scheduler }
 }
 
 fn plain() -> Submission {
@@ -45,30 +29,26 @@ fn plain() -> Submission {
     )
 }
 
-fn state(fixture: &Fixture, task: &TaskId) -> TaskRunState {
-    fixture.scheduler.run_of(task).unwrap().current_state()
-}
-
 #[test]
 fn a_delayed_task_waits_scheduled_and_is_not_pending() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
 
     let task = fixture
         .scheduler
         .submit(plain().with_delay(ticks(100)))
         .unwrap();
 
-    assert_eq!(state(&fixture, &task), TaskRunState::Scheduled);
-    assert!(fixture.scheduler.pending_tasks().is_empty());
+    assert_eq!(fixture.state(&task), TaskRunState::Scheduled);
+    assert_eq!(fixture.spy.pending(), 0);
     assert_eq!(
-        fixture.scheduler.task(&task).unwrap().not_before_ticks,
+        fixture.spy.task(&task).not_before_ticks,
         Some(100)
     );
 }
 
 #[test]
 fn a_task_that_is_not_yet_due_cannot_be_claimed() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_delay(ticks(100)))
@@ -83,27 +63,27 @@ fn a_task_that_is_not_yet_due_cannot_be_claimed() {
 
 #[test]
 fn a_delayed_task_becomes_queued_when_due_and_not_before() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_delay(ticks(100)))
         .unwrap();
 
     fixture.clock.advance(ticks(99));
-    let early = fixture.scheduler.advance();
+    let early = fixture.scheduler.catch_up();
     assert_eq!(early.queued, 0);
-    assert_eq!(state(&fixture, &task), TaskRunState::Scheduled);
+    assert_eq!(fixture.state(&task), TaskRunState::Scheduled);
 
     fixture.clock.advance(ticks(1));
-    let due = fixture.scheduler.advance();
+    let due = fixture.scheduler.catch_up();
     assert_eq!(due.queued, 1);
-    assert_eq!(state(&fixture, &task), TaskRunState::Queued);
-    assert_eq!(fixture.scheduler.pending_tasks(), vec![task]);
+    assert_eq!(fixture.state(&task), TaskRunState::Queued);
+    assert_eq!(fixture.spy.pending(), 1);
 }
 
 #[test]
 fn a_task_that_became_due_is_claimed_without_anyone_advancing_time() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_delay(ticks(50)))
@@ -118,19 +98,19 @@ fn a_task_that_became_due_is_claimed_without_anyone_advancing_time() {
 
 #[test]
 fn a_delay_of_nothing_queues_the_task_at_once() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
 
     let task = fixture
         .scheduler
         .submit(plain().with_delay(ticks(0)))
         .unwrap();
 
-    assert_eq!(state(&fixture, &task), TaskRunState::Queued);
+    assert_eq!(fixture.state(&task), TaskRunState::Queued);
 }
 
 #[test]
 fn delayed_tasks_join_the_queue_in_order_of_when_they_became_due() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let later = fixture
         .scheduler
         .submit(plain().with_delay(ticks(200)))
@@ -142,35 +122,36 @@ fn delayed_tasks_join_the_queue_in_order_of_when_they_became_due() {
     let immediate = fixture.scheduler.submit(plain()).unwrap();
 
     fixture.clock.advance(ticks(300));
-    fixture.scheduler.advance();
+    let mark = fixture.spy.mark();
+    fixture.scheduler.catch_up();
 
-    assert_eq!(
-        fixture.scheduler.pending_tasks(),
-        vec![immediate, sooner, later]
-    );
+    // `immediate` was queued at submit, before the delayed ones came due.
+    assert_eq!(fixture.spy.queued_since(mark), vec![sooner, later]);
+    assert_eq!(fixture.spy.pending(), 3);
+    assert_eq!(fixture.state(&immediate), TaskRunState::Queued);
 }
 
 #[test]
 fn a_pending_task_expires_instead_of_running_late() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_expiry(ticks(100)))
         .unwrap();
 
     fixture.clock.advance(ticks(99));
-    assert_eq!(fixture.scheduler.advance().expired, 0);
-    assert_eq!(state(&fixture, &task), TaskRunState::Queued);
+    assert_eq!(fixture.scheduler.catch_up().expired, 0);
+    assert_eq!(fixture.state(&task), TaskRunState::Queued);
 
     fixture.clock.advance(ticks(1));
-    assert_eq!(fixture.scheduler.advance().expired, 1);
-    assert_eq!(state(&fixture, &task), TaskRunState::Expired);
-    assert!(fixture.scheduler.pending_tasks().is_empty());
+    assert_eq!(fixture.scheduler.catch_up().expired, 1);
+    assert_eq!(fixture.state(&task), TaskRunState::Expired);
+    assert_eq!(fixture.spy.pending(), 0);
 }
 
 #[test]
 fn an_expired_task_is_never_handed_out_even_if_nobody_advanced_time() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_expiry(ticks(10)))
@@ -180,12 +161,12 @@ fn an_expired_task_is_never_handed_out_even_if_nobody_advanced_time() {
     let claims = fixture.scheduler.claim_oldest(&worker(), 10).unwrap();
 
     assert!(claims.is_empty());
-    assert_eq!(state(&fixture, &task), TaskRunState::Expired);
+    assert_eq!(fixture.state(&task), TaskRunState::Expired);
 }
 
 #[test]
 fn claiming_an_expired_task_says_it_finished() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_expiry(ticks(10)))
@@ -199,24 +180,24 @@ fn claiming_an_expired_task_says_it_finished() {
 
 #[test]
 fn a_scheduled_task_can_expire_before_it_is_ever_due() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_delay(ticks(100)).with_expiry(ticks(50)))
         .unwrap();
 
     fixture.clock.advance(ticks(200));
-    let outcome = fixture.scheduler.advance();
+    let outcome = fixture.scheduler.catch_up();
 
     assert_eq!(outcome.expired, 1);
     assert_eq!(outcome.queued, 0);
-    assert_eq!(state(&fixture, &task), TaskRunState::Expired);
-    assert!(fixture.scheduler.pending_tasks().is_empty());
+    assert_eq!(fixture.state(&task), TaskRunState::Expired);
+    assert_eq!(fixture.spy.pending(), 0);
 }
 
 #[test]
 fn expiry_is_only_about_starting_so_a_retry_never_expires() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_retries(2).with_expiry(ticks(100)))
@@ -232,10 +213,10 @@ fn expiry_is_only_about_starting_so_a_retry_never_expires() {
         .unwrap();
 
     fixture.clock.advance(ticks(1_000));
-    let outcome = fixture.scheduler.advance();
+    let outcome = fixture.scheduler.catch_up();
 
     assert_eq!(outcome.expired, 0);
-    assert_eq!(state(&fixture, &task), TaskRunState::Queued);
+    assert_eq!(fixture.state(&task), TaskRunState::Queued);
     assert_eq!(
         fixture.scheduler.claim_oldest(&worker(), 1).unwrap().len(),
         1
@@ -244,7 +225,7 @@ fn expiry_is_only_about_starting_so_a_retry_never_expires() {
 
 #[test]
 fn a_task_that_has_started_leaves_no_expiry_to_wake_for() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_expiry(ticks(10_000)))
@@ -295,21 +276,21 @@ fn a_claim_never_fails_because_time_passed_between_its_own_steps() {
 
 #[test]
 fn an_expiry_is_reported_once_as_an_event_and_then_drained() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let task = fixture
         .scheduler
         .submit(plain().with_expiry(ticks(10)))
         .unwrap();
     // The run that will expire, taken from the scheduler before it does.
-    let run_id = fixture.scheduler.run_of(&task).unwrap().task_run_id();
+    let run_id = fixture.spy.run_of(&task).task_run_id();
     let later = fixture
         .scheduler
         .submit(plain().with_expiry(ticks(20)))
         .unwrap();
-    let later_run_id = fixture.scheduler.run_of(&later).unwrap().task_run_id();
+    let later_run_id = fixture.spy.run_of(&later).task_run_id();
     assert!(!fixture.scheduler.has_events());
     fixture.clock.advance(ticks(20));
-    fixture.scheduler.advance();
+    fixture.scheduler.catch_up();
 
     assert!(fixture.scheduler.has_events());
     let events = fixture.scheduler.take_events();
@@ -333,7 +314,7 @@ fn an_expiry_is_reported_once_as_an_event_and_then_drained() {
 
 #[test]
 fn a_leader_whose_grant_has_run_out_decides_nothing_about_time() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     let end = fixture.clock.now() + ticks(5);
     let grant = LeadershipGrant {
         valid_until: LeaseEnd::At(end),
@@ -350,17 +331,159 @@ fn a_leader_whose_grant_has_run_out_decides_nothing_about_time() {
         .unwrap();
     fixture.clock.advance(ticks(1_000));
 
-    let outcome = fixture.scheduler.advance();
+    let outcome = fixture.scheduler.catch_up();
 
     assert_eq!((outcome.queued, outcome.expired), (0, 0));
-    assert_eq!(state(&fixture, &task), TaskRunState::Queued);
-    assert_eq!(state(&fixture, &delayed), TaskRunState::Scheduled);
+    assert_eq!(fixture.state(&task), TaskRunState::Queued);
+    assert_eq!(fixture.state(&delayed), TaskRunState::Scheduled);
     assert!(!fixture.scheduler.has_events());
+    assert_eq!(
+        fixture.scheduler.next_deadline(),
+        None,
+        "no TTL is set and the lease has run out, so nothing is left to wake for"
+    );
+}
+
+fn finished_task(fixture: &mut Fixture) -> TaskId {
+    let task = fixture.scheduler.submit(plain()).unwrap();
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    fixture
+        .scheduler
+        .report_started(&worker(), &claim.task_run_id)
+        .unwrap();
+    fixture
+        .scheduler
+        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
+        .unwrap();
+    task
+}
+
+#[test]
+fn a_scheduler_that_does_not_lead_still_forgets_finished_tasks_on_time() {
+    let mut fixture = Fixture::leading();
+    fixture.scheduler.set_result_ttl(Some(ticks(10)));
+    let delayed = fixture
+        .scheduler
+        .submit(plain().with_delay(ticks(5)))
+        .unwrap();
+    let task = finished_task(&mut fixture);
+    fixture.scheduler.set_leadership_grant(None);
+
+    // Only forgetting is left to wake for: the delay is a leader's to act on.
+    assert_eq!(fixture.scheduler.next_deadline(), Some(Instant::at(10)));
+    fixture.clock.advance(ticks(10));
+    let caught_up = fixture.scheduler.catch_up();
+
+    assert_eq!(
+        caught_up,
+        CaughtUp {
+            queued: 0,
+            expired: 0,
+            forgotten: 1
+        }
+    );
+    assert!(fixture.scheduler.runs_of(&task).is_empty());
+    assert_eq!(fixture.state(&delayed), TaskRunState::Scheduled);
+}
+
+#[test]
+fn every_mutating_call_forgets_what_has_outlived_its_ttl() {
+    type Call = fn(&mut TestScheduler);
+    let calls: [(&str, Call); 14] = [
+        ("submit", |s| {
+            s.submit(plain()).unwrap();
+        }),
+        ("claim_oldest", |s| {
+            let _ = s.claim_oldest(&worker(), 1);
+        }),
+        ("claim_oldest_fitting", |s| {
+            let _ = s.claim_oldest_fitting(&worker(), 1, |_| true);
+        }),
+        ("request_claim", |s| {
+            let _ = s.request_claim(&worker(), &TaskId::new("unknown"));
+        }),
+        ("report_started", |s| {
+            let _ = s.report_started(&worker(), &TaskRunId::new("unknown"));
+        }),
+        ("complete", |s| {
+            let _ = s.complete(
+                &worker(),
+                &TaskRunId::new("unknown"),
+                Vec::new(),
+                Completion::Final,
+            );
+        }),
+        ("fail", |s| {
+            let _ = s.fail(&worker(), &TaskRunId::new("unknown"), "E");
+        }),
+        ("end_continuation", |s| {
+            s.end_continuation(&TaskId::new("unknown"));
+        }),
+        ("cancel", |s| {
+            let _ = s.cancel(&TaskId::new("unknown"));
+        }),
+        ("lose_worker", |s| {
+            let _ = s.lose_worker(&WorkerId::new("gone"));
+        }),
+        ("set_leadership_grant", |s| {
+            s.set_leadership_grant(Some(unbounded_grant()))
+        }),
+        ("set_memory_limits", |s| s.set_memory_limits(None)),
+        ("set_result_ttl", |s| s.set_result_ttl(Some(ticks(10)))),
+        ("take_events", |s| {
+            s.take_events();
+        }),
+    ];
+    for (name, call) in calls {
+        let mut fixture = Fixture::leading();
+        fixture.scheduler.set_result_ttl(Some(ticks(10)));
+        let finished = finished_task(&mut fixture);
+        fixture.clock.advance(ticks(10));
+
+        call(&mut fixture.scheduler);
+
+        assert!(
+            fixture.scheduler.runs_of(&finished).is_empty(),
+            "{name} left a task past its TTL"
+        );
+    }
+}
+
+#[test]
+fn next_deadline_includes_the_lease_end_while_leading_and_not_once_the_lapse_is_found() {
+    let mut fixture = Fixture::not_leading();
+    fixture.scheduler.set_leadership_grant(Some(LeadershipGrant {
+        valid_until: LeaseEnd::At(Instant::at(10)),
+        ..unbounded_grant()
+    }));
+    fixture
+        .scheduler
+        .submit(plain().with_delay(ticks(50)))
+        .unwrap();
+    assert_eq!(
+        fixture.scheduler.next_deadline(),
+        Some(Instant::at(10)),
+        "while it leads, its lease end is the first thing to wake for"
+    );
+
+    fixture.clock.advance(ticks(10));
+    assert_eq!(
+        fixture.scheduler.next_deadline(),
+        Some(Instant::at(10)),
+        "at the lease end, finding the lapse is still catch_up's to do"
+    );
+    fixture.scheduler.catch_up();
+
+    assert_eq!(
+        fixture.scheduler.next_deadline(),
+        None,
+        "once the lapse is found, neither the lease end nor a leader's delay is left to wake for"
+    );
 }
 
 #[test]
 fn next_deadline_is_the_earliest_thing_that_will_happen() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     assert_eq!(fixture.scheduler.next_deadline(), None);
 
     fixture
@@ -384,7 +507,7 @@ fn next_deadline_is_the_earliest_thing_that_will_happen() {
 
 #[test]
 fn next_deadline_moves_on_once_a_deadline_has_been_handled() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture
         .scheduler
         .submit(plain().with_delay(ticks(50)))
@@ -394,14 +517,14 @@ fn next_deadline_moves_on_once_a_deadline_has_been_handled() {
         .submit(plain().with_delay(ticks(90)))
         .unwrap();
     fixture.clock.advance(ticks(60));
-    fixture.scheduler.advance();
+    fixture.scheduler.catch_up();
 
     assert_eq!(fixture.scheduler.next_deadline(), Some(Instant::at(90)));
 }
 
 #[test]
 fn a_finished_tasks_forgetting_time_is_a_deadline_too() {
-    let mut fixture = leading();
+    let mut fixture = Fixture::leading();
     fixture.scheduler.set_result_ttl(Some(ticks(500)));
     let task = fixture.scheduler.submit(plain()).unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
@@ -412,7 +535,7 @@ fn a_finished_tasks_forgetting_time_is_a_deadline_too() {
     fixture.clock.advance(ticks(40));
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec())
+        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
         .unwrap();
 
     assert_eq!(fixture.scheduler.next_deadline(), Some(Instant::at(540)));

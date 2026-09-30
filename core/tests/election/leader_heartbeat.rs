@@ -1018,9 +1018,15 @@ fn a_follower_silent_past_suspicion_and_reconnect_timeouts_is_lost_and_its_runs_
         TaskRunState::Running,
         "a follower that keeps heartbeating is never lost"
     );
+    let spy = cluster.scheduler_spy(&leader);
     assert_eq!(
-        cluster.scheduler_mut(&leader).pending_tasks(),
-        vec![cut_off_task],
+        spy.pending(),
+        1,
+        "the lost run's task is queued again for its replay"
+    );
+    assert_eq!(
+        spy.state_of(&cut_off_task),
+        TaskRunState::Queued,
         "the lost run's task is queued again for its replay"
     );
 

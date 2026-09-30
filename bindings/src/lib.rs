@@ -1,11 +1,11 @@
 use pyo3::prelude::*;
 
 mod bridge;
+mod door;
 mod election;
 mod local_node;
 mod runtime;
 mod timers;
-mod wakeups;
 mod work;
 
 pub fn native_version() -> String {

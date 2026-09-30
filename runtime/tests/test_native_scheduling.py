@@ -74,12 +74,25 @@ def test_shutdown_fails_a_claim_that_is_waiting_for_work():
     asyncio.run(main())
 
 
-def test_submitting_after_shutdown_is_refused():
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(lambda native: submit(native), id="submit"),
+        pytest.param(lambda native: native.report_started("some-run"), id="report_started"),
+        pytest.param(lambda native: native.complete("some-run", DIGEST), id="complete"),
+        pytest.param(lambda native: native.fail("some-run", "ValueError"), id="fail"),
+        pytest.param(lambda native: native.cancel("some-task"), id="cancel"),
+        pytest.param(lambda native: native.end_continuation("some-task"), id="end_continuation"),
+        pytest.param(lambda native: native.task_run_state("some-run"), id="task_run_state"),
+        pytest.param(lambda native: native.task_run_ids("some-task"), id="task_run_ids"),
+    ],
+)
+def test_every_scheduler_operation_after_shutdown_is_refused(operation):
     native = new_runtime()
     native.shutdown()
 
     with pytest.raises(RuntimeError, match="shut down"):
-        submit(native)
+        operation(native)
 
 
 def test_a_claim_limit_of_zero_is_refused(runtime):

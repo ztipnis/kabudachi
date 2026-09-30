@@ -14,7 +14,7 @@ use kabudachi_core::election::{
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::ElectionMessage;
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::scheduler::{Observer, Scheduler};
 use kabudachi_core::time::Duration;
 
 use crate::support::authority::{AtOnce, authority_ttl, warmed_up_authority};
@@ -23,11 +23,10 @@ use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
 use crate::support::node::{TestNode, connect, elect};
+use crate::support::spy::Spy;
 
 const SHARD: &str = "shard-1";
 const SUSPECT_TIMEOUT: u64 = 10;
-
-type TestScheduler = Scheduler<FakeClock, SequentialIds>;
 
 fn identity(me: &WorkerId) -> Identity {
     Identity {
@@ -86,7 +85,11 @@ impl AuthorityPerformer for Deferred {
 }
 
 /// Carries `first` out on `node` with no peers and no authority.
-fn carry(node: &mut TestNode, first: Step, scheduler: &mut TestScheduler) {
+fn carry<O: Observer>(
+    node: &mut TestNode,
+    first: Step,
+    scheduler: &mut Scheduler<FakeClock, SequentialIds, O>,
+) {
     let _ = carry_out(
         node,
         first,
@@ -107,7 +110,9 @@ fn grant_is_applied_before_any_message_leaves() {
         clock.clone(),
         None,
     );
-    let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
+    let spy = Spy::default();
+    let mut scheduler =
+        Scheduler::with_observer(clock.clone(), SequentialIds::new(), spy.clone());
     carry(&mut node, first, &mut scheduler);
     connect(&mut node, &peers);
     let _ = elect(&mut node, &clock, SUSPECT_TIMEOUT, &peers);
@@ -128,9 +133,9 @@ fn grant_is_applied_before_any_message_leaves() {
         &mut scheduler,
         &mut LoggingSink { log: &log },
         &mut NoAuthority,
-        |_, scheduler, _, _| {
+        |_, _, _, _| {
             log.borrow_mut()
-                .push(format!("scheduler leading: {}", scheduler.is_leading()));
+                .push(format!("scheduler leading: {}", spy.leading()));
         },
     );
 
@@ -236,9 +241,14 @@ fn a_step_without_a_grant_leaves_the_scheduler_as_it_was() {
         to: worker("w2"),
         message: ElectionMessage::default(),
     };
-    let mut leading = Scheduler::new(clock.clone(), SequentialIds::new());
+    let leading_spy = Spy::default();
+    let mut leading =
+        Scheduler::with_observer(clock.clone(), SequentialIds::new(), leading_spy.clone());
     leading.set_leadership_grant(Some(unbounded_grant()));
-    let mut not_leading = Scheduler::new(clock.clone(), SequentialIds::new());
+    let mark = leading_spy.mark();
+    let not_leading_spy = Spy::default();
+    let mut not_leading =
+        Scheduler::with_observer(clock.clone(), SequentialIds::new(), not_leading_spy.clone());
 
     carry(
         &mut node,
@@ -260,6 +270,13 @@ fn a_step_without_a_grant_leaves_the_scheduler_as_it_was() {
         &mut not_leading,
     );
 
-    assert!(leading.is_leading());
-    assert!(!not_leading.is_leading());
+    assert!(
+        leading_spy.since(mark).is_empty(),
+        "a step without a grant told the leading scheduler nothing"
+    );
+    assert!(leading_spy.leading());
+    assert!(
+        not_leading_spy.since(0).is_empty(),
+        "a step without a grant told the other scheduler nothing"
+    );
 }
