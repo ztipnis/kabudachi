@@ -195,7 +195,7 @@ where
             next_deadline = stepper.step(input);
         }
         if let Some(pointer) = rejoin_pointer.take() {
-            next_deadline = stepper.rejoin(&pointer);
+            next_deadline = stepper.rejoin(pointer);
             // A pointer it would not take (to its old epoch's leader, or
             // another lineage's) is not asked for again at once.
             rejoin_pointer_refused = stepper.node.state() == WorkerState::Bootstrapping;
@@ -395,12 +395,10 @@ where
     }
 
     /// Joins the node, back in `Bootstrapping`, to the leader `pointer`
-    /// names (see `WorkerNode::finish_joining`), and carries that step out
-    /// as [`Self::step`] does: joining restarts its registration, which it
-    /// asks for at once.
-    fn rejoin(&mut self, pointer: &JoinResponse) -> Option<Instant> {
-        let stepped = self.node.finish_joining(pointer);
-        self.carry(stepped, None)
+    /// names, as [`Self::step`] does with an [`Input::JoinAnswer`]: joining
+    /// restarts its registration, which it asks for at once.
+    fn rejoin(&mut self, pointer: JoinResponse) -> Option<Instant> {
+        self.step(Input::JoinAnswer(pointer))
     }
 
     /// Carries out `stepped`, a step the node has just taken on `input`,
@@ -577,7 +575,7 @@ struct Rejoin {
 /// a reachable leader; the driver then searches again. Each search starts
 /// `attempt` workers further along the list, so one worker the recovery also
 /// left behind, whose pointer the node rejects as older than the epoch it
-/// rejoins (see `WorkerNode::finish_joining`), cannot answer first for ever;
+/// rejoins (see `Input::JoinAnswer`), cannot answer first for ever;
 /// a search after such a refused pointer first waits a retry interval. It
 /// never founds the shard: the epoch the node rejoins shows the shard
 /// exists.

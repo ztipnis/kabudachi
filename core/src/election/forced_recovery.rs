@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 
 use crate::configuration::{Admission, Configuration, Generation, Roster, Single, Tally};
 use crate::coordination_authority::{LiveRegistrations, RecoveryEpoch};
+use crate::election::standing::{EpochOrder, order};
 use crate::protocol::ids::WorkerId;
 
 /// One attempt at the authority path, from the census of the roll call that
@@ -78,7 +79,13 @@ pub(crate) enum Next {
 /// so a recovery from it would swap an epoch number its shard may already
 /// have used. A node that never learned its lineage cannot tell.
 pub(crate) fn cannot_recover_from(own_epoch: Option<RecoveryEpoch>, held: RecoveryEpoch) -> bool {
-    own_epoch.is_none_or(|own| held.lineage != own.lineage || held.number < own.number)
+    match own_epoch {
+        None => true,
+        Some(own) => match order(&own, held.into()) {
+            EpochOrder::Stale | EpochOrder::Foreign(_) => true,
+            EpochOrder::Mine | EpochOrder::Later => false,
+        },
+    }
 }
 
 impl ForcedRecovery {
@@ -181,7 +188,10 @@ impl ForcedRecovery {
         let Phase::Swapping { counted, from, to } = &self.phase else {
             return Next::GiveUp;
         };
-        if expected != Some(*from) || new != *to || !succeeded {
+        let asked_for_this_swap = expected
+            .is_some_and(|expected| order(from, expected.into()) == EpochOrder::Mine)
+            && order(to, new.into()) == EpochOrder::Mine;
+        if !asked_for_this_swap || !succeeded {
             return Next::GiveUp;
         }
         let epoch = *to;

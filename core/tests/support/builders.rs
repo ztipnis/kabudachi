@@ -46,7 +46,7 @@ pub fn past_any_suspicion(suspect_timeout: u64) -> Duration {
 }
 
 /// A JOIN answer that names no leader. A node started on it stays
-/// `Bootstrapping` (see `WorkerNode::finish_joining`), for a test to join it
+/// `Bootstrapping` (see `Input::JoinAnswer`), for a test to join it
 /// later or watch it wait.
 pub fn no_leader_yet() -> JoinResponse {
     JoinResponse::default()

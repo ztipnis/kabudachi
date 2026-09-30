@@ -390,7 +390,7 @@ fn carries_a_configuration_its_leader_could_announce(
 /// Whether a prior admission present without an admission would decode: a
 /// prior admission records what a joint founding's respondent held *before*
 /// the admission it answers with, so it never stands alone. Honest nodes
-/// never send one without the other (`adopt_configuration` sets prior only
+/// never send one without the other (`ShardStanding` sets prior only
 /// together with an admission); this rejects the shape at the edge rather
 /// than let the old side's tally count a prior admission a peer never
 /// actually held together with an admission.
@@ -567,7 +567,7 @@ mod tests {
     /// answers with (`RollCallReply`) or a leader answers back with
     /// (`LeaderHeartbeatAck`, `ElectionCertificate`). Honest nodes never
     /// send a prior admission without an admission
-    /// (`adopt_configuration` sets them together), but the wire edge must
+    /// (`ShardStanding` sets them together), but the wire edge must
     /// still refuse the shape rather than let a peer bug feed a prior
     /// admission the old side's tally would otherwise count.
     #[test]

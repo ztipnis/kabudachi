@@ -21,7 +21,7 @@ use crate::support::builders::{past_any_suspicion, shard};
 use crate::support::harness::Cluster;
 use kabudachi_core::configuration::Admission;
 use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
-use kabudachi_core::election::{AuthorityRequest, Output, StopReason};
+use kabudachi_core::election::{AuthorityRequest, Input, Output, StopReason};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::election_message::Payload;
 use kabudachi_core::protocol::worker_state::WorkerState;
@@ -598,8 +598,10 @@ fn an_orphan_rejoins_as_pending_and_a_straggler_finds_the_recovered_leader_by_re
     assert!(
         steps.iter().any(|step| step.node == orphan
             && step.recovery_epoch == 1
-            && step.admission.is_none()),
-        "the orphan rejoined at the new epoch as a pending member"
+            && step.admission.is_none()
+            && matches!(step.input, Some(Input::JoinAnswer(_)))
+            && step.state == WorkerState::Active),
+        "the orphan rejoined at the new epoch as a pending member, on a JOIN answer"
     );
     let orphan_admission = Admission {
         current: cluster.node(&orphan).admission(),

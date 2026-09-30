@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use super::roll_call::CallRank;
 use crate::configuration::Generation;
+use crate::election::standing::{EpochOrder, order_numbers};
 use crate::protocol::ids::WorkerId;
 use crate::protocol::messages::ElectionRejectReason;
 
@@ -90,14 +91,18 @@ impl Ballot {
         configuration_generation: Generation,
         rank: CallRank,
     ) -> RollCallVerdict {
+        let epoch = order_numbers(
+            voter.recovery_epoch,
+            configuration_generation.recovery_epoch(),
+        );
         // A node cannot adopt a newer recovery epoch.
-        if configuration_generation.recovery_epoch() > voter.recovery_epoch {
+        if epoch == EpochOrder::Later {
             return RollCallVerdict::Drop;
         }
         if !voter.takes_part {
             return RollCallVerdict::Reject(ElectionRejectReason::NotEligible);
         }
-        if configuration_generation.recovery_epoch() < voter.recovery_epoch {
+        if epoch == EpochOrder::Stale {
             return RollCallVerdict::Reject(ElectionRejectReason::StaleGeneration);
         }
         if term <= voter.highest_term_seen {
@@ -149,7 +154,7 @@ impl Ballot {
         if !voter.takes_part {
             return VoteVerdict::Reject(ElectionRejectReason::NotEligible);
         }
-        if recovery_epoch != voter.recovery_epoch {
+        if order_numbers(voter.recovery_epoch, recovery_epoch) != EpochOrder::Mine {
             return VoteVerdict::Reject(ElectionRejectReason::WrongRecoveryEpoch);
         }
         // Read only: a refused request leaves no entry for its term.

@@ -7,7 +7,7 @@ use crate::protocol::ids::{IncarnationId, ShardId, WorkerId};
 use crate::protocol::messages::JoinResponse;
 use crate::time::{Clock, Instant};
 
-use super::{AuthorityTimings, ElectionTimings, KnownConfiguration, Step, WorkerNode};
+use super::{AuthorityTimings, ElectionTimings, Input, KnownConfiguration, Step, WorkerNode};
 
 /// Who a node is: its worker, that worker's process incarnation, the shard
 /// it belongs to, and the timers it runs its election on. Every worker in a
@@ -44,7 +44,7 @@ pub enum Entry {
     /// Join the leader this pointer names, as a pending member: one no
     /// quorum counts until an election admits it, which learns the shard's
     /// configuration from its leader's first ack. The pointer must name a
-    /// leader of the node's shard (see [`WorkerNode::finish_joining`]); one
+    /// leader of the node's shard (see [`Input::JoinAnswer`]); one
     /// that names none leaves the node `Bootstrapping`.
     Joining(JoinResponse),
     /// Start `Active` inside a configuration already known, at that
@@ -96,11 +96,10 @@ impl<C: Clock> WorkerNode<C> {
                     incarnation,
                     shard,
                     clock,
-                    recovery_epoch.number,
+                    recovery_epoch,
                     authority,
                     timings,
-                )
-                .with_recovery_lineage(recovery_epoch.lineage);
+                );
                 if let Some(sent_at) = registered_at {
                     node = node.registered_at(sent_at);
                 }
@@ -110,11 +109,11 @@ impl<C: Clock> WorkerNode<C> {
             Entry::Joining(pointer) => {
                 let mut node =
                     Self::bootstrapping(id, incarnation, shard, clock, authority, timings);
-                let first = node.finish_joining(&pointer);
+                let first = node.step(Input::JoinAnswer(pointer));
                 (node, first)
             }
             Entry::Known(known) => {
-                let node = Self::new(id, incarnation, shard, clock, known, authority, timings);
+                let node = Self::new(id, incarnation, shard, clock, known, 0, authority, timings);
                 let first = node.due_now();
                 (node, first)
             }

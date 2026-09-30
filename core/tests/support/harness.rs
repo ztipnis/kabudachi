@@ -737,8 +737,9 @@ impl Cluster {
                 .max_by_key(|(latest, _)| *latest)
                 .map(|(_, pointer)| pointer);
             if let Some(pointer) = pointer {
-                let step = self.node_mut(&id, "join").finish_joining(&pointer);
-                self.drive(&id, None, step);
+                let input = Input::JoinAnswer(pointer);
+                let step = self.node_mut(&id, "join").step(input.clone());
+                self.drive(&id, Some(input), step);
                 joined.insert(id);
             }
         }

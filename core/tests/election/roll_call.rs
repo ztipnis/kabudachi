@@ -834,6 +834,106 @@ fn a_refusal_naming_a_higher_term_raises_the_initiators_highest_term_seen() {
     assert_eq!(node.state(), WorkerState::Active);
 }
 
+/// `me`, a voter of `voters` at recovery epoch 1, whose leader contact has
+/// not yet gone stale.
+fn voter_at_epoch_1(clock: &FakeClock, me: &WorkerId, voters: usize) -> TestNode {
+    let epoch_1 = Generation::new(1, 0, 0);
+    WorkerNode::start(
+        Identity {
+            id: me.clone(),
+            incarnation: IncarnationId::new("incarnation-1"),
+            shard: shard("shard-1"),
+            timings: timings(Duration::from_ticks(SUSPECT)),
+        },
+        Entry::Known(KnownConfiguration {
+            configuration: Configuration::single(Single {
+                generation: epoch_1,
+                base: epoch_1,
+                voter_count: voters,
+            }),
+            admission: Some(epoch_1),
+        }),
+        clock.clone(),
+        None,
+    )
+    .0
+}
+
+// ADR-0001 decision 4, amended 2026-09-29: a refusal from a lower recovery
+// epoch counts that epoch's terms, which order nothing here.
+#[test]
+fn a_refusal_from_a_lower_recovery_epoch_is_dropped() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_at_epoch_1(&clock, &me, 3);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let (rejecter, their_leader) = (worker("w2"), worker("old-leader"));
+    // `reject_message` carries `configuration_of(3)`: epoch 0.
+    let outputs = deliver(
+        &mut node,
+        &rejecter,
+        reject_message(
+            &call,
+            &rejecter,
+            ElectionRejectReason::LeaderStillValid,
+            9,
+            Some((&their_leader, 9)),
+        ),
+    );
+
+    assert_eq!(
+        node.state(),
+        WorkerState::RollCall,
+        "no step-down on another epoch's term"
+    );
+    assert_eq!(node.highest_term_seen(), 0);
+    assert!(
+        sent_to(&outputs, &their_leader).is_empty(),
+        "no heartbeat to another epoch's leader"
+    );
+    assert_eq!(
+        node.configuration().map(Configuration::generation),
+        Some(Generation::new(1, 0, 0))
+    );
+
+    // As a candidate too: stand with two epoch-1 replies, then the same
+    // refusal of its vote request.
+    reply_from(&mut node, &call, &worker("w2"), Some(Generation::new(1, 0, 0)));
+    reply_from(&mut node, &call, &worker("w3"), Some(Generation::new(1, 0, 0)));
+    close(&mut node, &clock);
+    assert_eq!(node.state(), WorkerState::Candidate, "setup invariant");
+    deliver(
+        &mut node,
+        &rejecter,
+        reject_message(&call, &rejecter, ElectionRejectReason::StaleTerm, 9, None),
+    );
+    assert_eq!(node.state(), WorkerState::Candidate);
+    assert_eq!(node.highest_term_seen(), 0);
+}
+
+// ruling 2026-09-29: a refusal names its refuser's epoch only through the
+// configuration it carries, so one without a configuration is read as the
+// node's own epoch's.
+#[test]
+fn a_refusal_carrying_no_configuration_is_read_as_the_nodes_own_epoch() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let mut node = voter_at_epoch_1(&clock, &me, 3);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let rejecter = worker("w2");
+    let mut refusal =
+        reject_message(&call, &rejecter, ElectionRejectReason::StaleTerm, 5, None);
+    let Some(election_message::Payload::ElectionReject(reject)) = refusal.payload.as_mut() else {
+        panic!("reject_message builds a refusal");
+    };
+    reject.configuration = None;
+
+    deliver(&mut node, &rejecter, refusal);
+
+    assert_eq!(node.highest_term_seen(), 5);
+    assert_eq!(node.state(), WorkerState::LeaderSuspect);
+}
+
 /// A leader named as still valid at a term below this node's term seen is
 /// heartbeated (what that tells it: see `election_step_down_test`), but its
 /// acks stay below the node's floor.

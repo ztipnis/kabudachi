@@ -1,4 +1,4 @@
-//! `WorkerNode::start` on `Entry::Joining` and `WorkerNode::finish_joining`,
+//! `WorkerNode::start` on `Entry::Joining` and `Input::JoinAnswer`,
 //! the core-side half of the bootstrap join protocol, and what a joiner does
 //! once joined.
 //! The wire handshake that produces the leader pointer (dialing seeds,
@@ -69,7 +69,7 @@ fn bootstrapping_node(id: WorkerId, clock: &FakeClock) -> TestNode {
 /// A joiner that joined `leader`, elected in term 1 at recovery epoch 0.
 fn joined(clock: &FakeClock, leader: &str) -> TestNode {
     let mut node = bootstrapping_node(worker("joiner"), clock);
-    let _ = node.finish_joining(&pointer(leader, 1, 0));
+    let _ = node.step(Input::JoinAnswer(pointer(leader, 1, 0)));
     node
 }
 
@@ -89,11 +89,11 @@ fn ack_of(
 }
 
 #[test]
-fn finish_joining_makes_the_joiner_an_active_pending_member_of_the_leader_it_was_pointed_at() {
+fn a_join_answer_makes_the_joiner_an_active_pending_member_of_the_leader_it_was_pointed_at() {
     let clock = FakeClock::new();
     let mut node = bootstrapping_node(worker("joiner"), &clock);
 
-    let _ = node.finish_joining(&pointer("leader", 4, 2));
+    let _ = node.step(Input::JoinAnswer(pointer("leader", 4, 2)));
 
     assert_eq!(node.state(), WorkerState::Active);
     assert!(node.is_pending_member());
@@ -103,11 +103,11 @@ fn finish_joining_makes_the_joiner_an_active_pending_member_of_the_leader_it_was
 }
 
 #[test]
-fn finish_joining_without_a_leader_leaves_the_node_bootstrapping() {
+fn a_join_answer_without_a_leader_leaves_the_node_bootstrapping() {
     let clock = FakeClock::new();
     let mut node = bootstrapping_node(worker("joiner"), &clock);
 
-    let _ = node.finish_joining(&JoinResponse::default());
+    let _ = node.step(Input::JoinAnswer(JoinResponse::default()));
 
     assert_eq!(node.state(), WorkerState::Bootstrapping);
     assert_eq!(node.known_leader(), None);
@@ -119,11 +119,11 @@ fn finish_joining_without_a_leader_leaves_the_node_bootstrapping() {
 }
 
 #[test]
-fn finish_joining_is_a_noop_outside_bootstrapping() {
+fn a_join_answer_is_a_noop_outside_bootstrapping() {
     let clock = FakeClock::new();
     let mut node = voter_node(&clock, &worker("a"), 2, SUSPECT_TIMEOUT_TICKS);
 
-    let _ = node.finish_joining(&pointer("leader", 4, 2));
+    let _ = node.step(Input::JoinAnswer(pointer("leader", 4, 2)));
 
     assert_eq!(node.state(), WorkerState::Active);
     assert!(!node.is_pending_member());
@@ -133,14 +133,14 @@ fn finish_joining_is_a_noop_outside_bootstrapping() {
 }
 
 #[test]
-fn finish_joining_resets_the_leader_contact_timer_so_the_new_follower_is_not_immediately_suspect() {
+fn a_join_answer_resets_the_leader_contact_timer_so_the_new_follower_is_not_immediately_suspect() {
     let clock = FakeClock::new();
     let mut node = bootstrapping_node(worker("joiner"), &clock);
 
-    // If finish_joining did not reset last_leader_contact, this much elapsed
+    // If a join answer did not reset last_leader_contact, this much elapsed
     // time before joining would make the node suspect on its next Tick.
     clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS * 5));
-    let _ = node.finish_joining(&pointer("leader", 1, 0));
+    let _ = node.step(Input::JoinAnswer(pointer("leader", 1, 0)));
     tick(&mut node);
 
     assert_eq!(node.state(), WorkerState::Active);
@@ -173,7 +173,7 @@ fn a_joiner_accepts_its_leaders_acks_at_the_recovery_epoch_it_was_pointed_at() {
     let mut at_its_epoch = bootstrapping_node(worker("joiner-1"), &clock);
     let mut at_an_earlier_one = bootstrapping_node(worker("joiner-2"), &clock);
     for node in [&mut at_its_epoch, &mut at_an_earlier_one] {
-        let _ = node.finish_joining(&pointer("leader", 4, 2));
+        let _ = node.step(Input::JoinAnswer(pointer("leader", 4, 2)));
     }
 
     clock.advance(Duration::from_ticks(8));
@@ -370,7 +370,7 @@ fn an_election_admits_a_pending_joiner_that_answered_its_roll_call() {
 fn a_joiner_with_no_configuration_that_suspects_its_leader_still_names_it_to_joiners() {
     let clock = FakeClock::new();
     let mut joiner = bootstrapping_node(worker("joiner"), &clock);
-    let _ = joiner.finish_joining(&pointer("leader", 4, 2));
+    let _ = joiner.step(Input::JoinAnswer(pointer("leader", 4, 2)));
 
     // No leader runs here to ack this joiner, so it drifts to LeaderSuspect;
     // it cannot elect a replacement, so its recorded leader is still the

@@ -28,7 +28,7 @@
 //! joins: `tokio::select!` polls all three concurrently in one task.
 //!
 //! `node_c` never races that election: it becomes `Active` by a direct,
-//! deterministic call (`WorkerNode::finish_joining`), not by winning or
+//! deterministic call (`Input::JoinAnswer`), not by winning or
 //! losing a roll call, and it is never driven, so it starts no roll call of
 //! its own.
 
@@ -329,7 +329,7 @@ async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_
     // node_c is never driven, so net_c's inputs are the test's to take.
     take_inputs_until(&net_c, &Input::PeerConnected(worker_b.clone())).await;
 
-    let _ = node_c.finish_joining(&pointer);
+    let _ = node_c.step(Input::JoinAnswer(pointer.clone()));
 
     assert_eq!(node_c.state(), WorkerState::Active);
     assert!(

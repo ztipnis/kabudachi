@@ -15,6 +15,7 @@
 
 use crate::coordination_authority::RecoveryEpoch;
 use crate::election::authority::{AuthorityTimings, less_drift};
+use crate::election::standing::{EpochOrder, order};
 use crate::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -184,10 +185,14 @@ impl Reconnect {
         own_epoch: Option<RecoveryEpoch>,
         authority_epoch: Option<RecoveryEpoch>,
     ) -> Self {
-        match authority_epoch {
-            Some(epoch) if Some(epoch) == own_epoch => Reconnect::Resume,
-            Some(epoch) => Reconnect::Rejoin(epoch),
-            None => Reconnect::StayFenced,
+        match (own_epoch, authority_epoch) {
+            (_, None) => Reconnect::StayFenced,
+            // Never resumes: without a lineage it cannot tell its own epoch.
+            (None, Some(epoch)) => Reconnect::Rejoin(epoch),
+            (Some(own), Some(epoch)) => match order(&own, epoch.into()) {
+                EpochOrder::Mine => Reconnect::Resume,
+                _ => Reconnect::Rejoin(epoch),
+            },
         }
     }
 }

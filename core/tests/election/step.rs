@@ -246,13 +246,13 @@ fn a_voter_suspecting_its_leader_is_due_at_once() {
 fn a_pending_member_suspecting_its_leader_is_next_due_at_its_next_heartbeat() {
     let clock = FakeClock::new();
     let mut node = bootstrapping_node(&clock, &worker("joiner"));
-    let _ = node.finish_joining(&JoinResponse {
+    let _ = node.step(Input::JoinAnswer(JoinResponse {
         leader_id: Some(worker("leader-1").into()),
         leader_multiaddr: "/ip4/127.0.0.1/tcp/4001".into(),
         term: 1,
         recovery_epoch: 0,
         recovery_epoch_lineage: 0,
-    });
+    }));
 
     clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
     let step = node.step(Input::Tick);
@@ -443,14 +443,13 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
     // A joiner with no configuration whose leader stops acking: suspects it
     // and keeps heartbeating it.
     let mut joiner = bootstrapping_node(&clock, &worker("joiner"));
-    let first = joiner
-        .finish_joining(&JoinResponse {
+    let first = joiner.step(Input::JoinAnswer(JoinResponse {
             leader_id: Some(w2.clone().into()),
             leader_multiaddr: "/ip4/127.0.0.1/tcp/4001".into(),
             term: 1,
             recovery_epoch: 0,
             recovery_epoch_lineage: 0,
-        })
+        }))
         .next_deadline;
     assert_ticked_in(
         &tick_at_every_deadline(&mut joiner, &clock, first, 50),
@@ -593,13 +592,13 @@ fn a_drain_while_bootstrapping_applies_once_the_node_has_joined() {
     assert!(node.step(Input::Drain).outputs.is_empty());
     assert_eq!(node.state(), WorkerState::Bootstrapping);
 
-    let joined = node.finish_joining(&JoinResponse {
+    let joined = node.step(Input::JoinAnswer(JoinResponse {
         leader_id: Some(worker("leader-1").into()),
         leader_multiaddr: "/ip4/127.0.0.1/tcp/4001".into(),
         term: 1,
         recovery_epoch: 0,
         recovery_epoch_lineage: 0,
-    });
+    }));
     assert_eq!(
         state_changes(&joined.outputs),
         vec![

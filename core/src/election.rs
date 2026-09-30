@@ -113,7 +113,9 @@ mod election_round;
 mod entry;
 mod forced_recovery;
 mod lease;
+mod standing;
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use authority::{
@@ -140,6 +142,7 @@ use authority_lease::{AuthorityLease, Reconnect};
 use election_round::{ElectionRound, Verdict, View};
 use forced_recovery::{ForcedRecovery, Next, cannot_recover_from};
 use lease::{Lease, LeaseChange, Office};
+use standing::{EpochOrder, HeardEpoch, ShardStanding, order, order_numbers};
 
 /// How long a leader waits, after it would first suspect a silent worker,
 /// before it reports that worker lost and its TaskRuns are replayed; and,
@@ -156,12 +159,9 @@ where
     incarnation_id: IncarnationId,
     shard_id: ShardId,
     state: WorkerState,
-    recovery_epoch: u64,
-    /// The lineage of this node's recovery epoch (see
-    /// [`RecoveryEpoch`]); `None` for a node that has not yet joined a
-    /// shard.
-    recovery_lineage: Option<u64>,
-    highest_term_seen: u64,
+    /// What this node knows of its shard: its recovery epoch, the highest
+    /// term it has seen, and the configuration and admissions it follows.
+    standing: ShardStanding,
     last_leader_contact: Instant,
     timings: ElectionTimings,
     clock: C,
@@ -191,16 +191,6 @@ where
     /// While `Leader`: when it last heard from each worker it has not yet
     /// reported lost.
     last_heard: BTreeMap<WorkerId, Instant>,
-    /// The configuration this node knows. `None` for a joiner until it
-    /// accepts its first leader ack.
-    configuration: Option<Configuration>,
-    /// The generation at which this node became a voter. `None` for a
-    /// pending member.
-    admission: Option<Generation>,
-    /// While this node holds a joint configuration an election founded,
-    /// the admission generation it held before that election admitted it;
-    /// `None` otherwise.
-    prior_admission: Option<Generation>,
     /// The term this node is contesting or holds. Meaningful from `Candidate`
     /// onward.
     term: u64,
@@ -410,6 +400,21 @@ pub enum Input {
     /// never joins. A driver that waits for `Stopped` must not rely on it
     /// there.
     Drain,
+    /// The answer to this node's JOIN (README §27 Phase 2 bootstrap join):
+    /// the leader it names, with its term and recovery epoch. A node in
+    /// `Bootstrapping` records that leader and moves through `Joining` to
+    /// `Active` as a pending member. It learns the configuration from its
+    /// leader's first ack. It stays `Bootstrapping`, so its driver can ask
+    /// again, for an answer that names no leader, and for one that names a
+    /// leader of an epoch older than its own or of another lineage. Every
+    /// other state ignores it.
+    ///
+    /// The wire handshake that produces the answer, dialing seed addresses,
+    /// sending `JOIN_REQUEST`, taking the first `JOIN_RESPONSE` that names a
+    /// leader, is entirely `net`'s concern (a separate `/kabudachi/join/1`
+    /// request_response protocol, not an `ElectionMessage`); this input only
+    /// performs the resulting state transition. Joining publishes nothing.
+    JoinAnswer(JoinResponse),
 }
 
 /// Something a [`WorkerNode`] asks its driver to do.
@@ -555,8 +560,7 @@ where
     /// shard, [`Self::genesis`]. The leader-contact timer starts now so a
     /// new node isn't immediately suspicious. The node starts connected to
     /// no one: its driver reports the connections it holds as
-    /// [`Input::PeerConnected`]. Its recovery epoch is of lineage 0 unless
-    /// [`Self::with_recovery_lineage`] names another.
+    /// [`Input::PeerConnected`]. Its recovery epoch is of `lineage`.
     ///
     /// # Panics
     ///
@@ -572,6 +576,7 @@ where
         shard_id: ShardId,
         clock: C,
         known: KnownConfiguration,
+        lineage: u64,
         authority: Option<AuthorityTimings>,
         timings: ElectionTimings,
     ) -> Self {
@@ -589,15 +594,13 @@ where
         if !alone.has_quorum() {
             assert_heartbeats_keep_a_lease(&timings);
         }
-        node.recovery_epoch = known.configuration.generation().recovery_epoch();
-        node.recovery_lineage = Some(0);
-        node.configuration = Some(known.configuration);
-        node.admission = known.admission;
+        node.standing = ShardStanding::known(known, lineage);
         node
     }
 
     /// Constructs the node of the worker that creates a shard at
-    /// `recovery_epoch` (ADR-0001 decision 1): it starts `Active` as the only
+    /// `recovery_epoch`, of the lineage the founder drew (ADR-0001
+    /// decision 1): it starts `Active` as the only
     /// voter of the genesis configuration, admitted at the genesis
     /// generation. Like any other node it leads once its suspicion timeout
     /// has passed and its own roll call, of one voter, has elected it at the
@@ -616,7 +619,7 @@ where
         incarnation_id: IncarnationId,
         shard_id: ShardId,
         clock: C,
-        recovery_epoch: u64,
+        recovery_epoch: RecoveryEpoch,
         authority: Option<AuthorityTimings>,
         timings: ElectionTimings,
     ) -> Self {
@@ -626,9 +629,10 @@ where
             shard_id,
             clock,
             KnownConfiguration {
-                configuration: Configuration::genesis(recovery_epoch),
-                admission: Some(Generation::genesis(recovery_epoch)),
+                configuration: Configuration::genesis(recovery_epoch.number),
+                admission: Some(Generation::genesis(recovery_epoch.number)),
             },
+            recovery_epoch.lineage,
             authority,
             timings,
         )
@@ -637,7 +641,7 @@ where
     /// Constructs a node in `WorkerState::Bootstrapping` (README §27 Phase 2
     /// bootstrap join protocol): for a fresh node joining a shard that already
     /// exists. It knows no configuration and has no admission generation;
-    /// call [`Self::finish_joining`] once something outside `core` (`net`'s
+    /// step [`Input::JoinAnswer`] once something outside `core` (`net`'s
     /// `/kabudachi/join/1` handshake) has learned who leads the shard, to
     /// drive `Bootstrapping -> Joining -> Active`. It learns the shard's
     /// configuration from its leader's first ack.
@@ -707,9 +711,7 @@ where
             incarnation_id,
             shard_id,
             state,
-            recovery_epoch: 0,
-            recovery_lineage: None,
-            highest_term_seen: 0,
+            standing: ShardStanding::unjoined(),
             last_leader_contact: now,
             timings,
             clock,
@@ -723,9 +725,6 @@ where
             stop_reason: None,
             reconnect_timeout: DEFAULT_RECONNECT_TIMEOUT,
             last_heard: BTreeMap::new(),
-            configuration: None,
-            admission: None,
-            prior_admission: None,
             term: 0,
             round: ElectionRound::new(now),
             roster: None,
@@ -759,19 +758,6 @@ where
     fn registered_at(mut self, sent_at: Instant) -> Self {
         if let Some(lease) = self.authority.as_mut() {
             lease.restart_at(sent_at);
-        }
-        self
-    }
-
-    /// Makes `lineage` the lineage of this node's recovery epoch (see
-    /// [`RecoveryEpoch`]): the one the bootstrap cascade drew when it
-    /// founded the shard, which a node with an authority must know to
-    /// recognise its own epoch there. Built by [`Self::new`] or
-    /// [`Self::genesis`], a node's epoch is otherwise of lineage 0. No
-    /// effect on a node that has not joined a shard yet.
-    fn with_recovery_lineage(mut self, lineage: u64) -> Self {
-        if self.recovery_lineage.is_some() {
-            self.recovery_lineage = Some(lineage);
         }
         self
     }
@@ -824,28 +810,21 @@ where
     /// answered, nor by standing as a candidate in an election it has not
     /// won (ADR-0001 decision 14 as amended 2026-09-28).
     pub fn highest_term_seen(&self) -> u64 {
-        self.highest_term_seen
+        self.standing.highest_term_seen()
     }
 
     /// This node's recovery epoch: its configuration's when built with one
     /// ([`Self::start`]), taken from the leader a JOIN pointed it at
-    /// ([`Self::finish_joining`]), moved on by an authority-path recovery of
+    /// ([`Input::JoinAnswer`]), moved on by an authority-path recovery of
     /// its own, and adopted from the ack of a leader of a later epoch.
     pub fn recovery_epoch(&self) -> u64 {
-        self.recovery_epoch
+        self.standing.epoch_number()
     }
 
     /// The lineage of this node's recovery epoch (see [`RecoveryEpoch`]),
     /// learned with the epoch; `None` until the node has joined a shard.
     pub fn recovery_lineage(&self) -> Option<u64> {
-        self.recovery_lineage
-    }
-
-    /// This node's recovery epoch with its lineage, as the authority would
-    /// hold it; `None` until the node has joined a shard.
-    fn own_recovery_epoch(&self) -> Option<RecoveryEpoch> {
-        self.recovery_lineage
-            .map(|lineage| RecoveryEpoch::new(self.recovery_epoch, lineage))
+        self.standing.epoch().map(|epoch| epoch.lineage)
     }
 
     /// Why this node stopped; `None` unless it is `Stopped`.
@@ -857,28 +836,20 @@ where
     /// newest a leader's ack or election certificate has carried since.
     /// `None` for a joiner that has accepted neither yet.
     pub fn configuration(&self) -> Option<&Configuration> {
-        self.configuration.as_ref()
+        self.standing.configuration()
     }
 
     /// The generation at which this node became a voter; `None` for a
     /// pending member.
     pub fn admission(&self) -> Option<Generation> {
-        self.admission
+        self.standing.admission()
     }
 
     /// The admission generation this node held before the election that
     /// founded the joint configuration it holds admitted it; `None` once
     /// that configuration is committed, and for any other configuration.
     pub fn prior_admission(&self) -> Option<Generation> {
-        self.prior_admission
-    }
-
-    /// Both admission generations a quorum counts this node by.
-    fn counted_admission(&self) -> Admission {
-        Admission {
-            current: self.admission,
-            prior: self.prior_admission,
-        }
+        self.standing.prior_admission()
     }
 
     /// Whether this node has no admission generation: it joined through a
@@ -886,7 +857,7 @@ where
     /// admitted it since. It claims work, and it answers roll calls and
     /// grants votes as a new voter, but no quorum counts it.
     pub fn is_pending_member(&self) -> bool {
-        self.admission.is_none()
+        self.standing.admission().is_none()
     }
 
     /// The workers that have answered the roll call this node is running,
@@ -920,10 +891,10 @@ where
         let named = match self.state {
             WorkerState::Leader => Some((self.my_id.clone(), self.term)),
             WorkerState::Active => self.leader.clone(),
-            WorkerState::LeaderSuspect if self.configuration.is_none() => self.leader.clone(),
+            WorkerState::LeaderSuspect if self.standing.configuration().is_none() => self.leader.clone(),
             _ => None,
         };
-        named.filter(|(_, term)| *term >= self.highest_term_seen)
+        named.filter(|(_, term)| *term >= self.standing.highest_term_seen())
     }
 
     /// The `JOIN_RESPONSE` this node hands a joiner right now: the leader
@@ -939,8 +910,8 @@ where
             leader_id: Some(leader_id.into()),
             leader_multiaddr: leader_addr,
             term,
-            recovery_epoch: self.recovery_epoch,
-            recovery_epoch_lineage: self.recovery_lineage.unwrap_or_default(),
+            recovery_epoch: self.standing.epoch_number(),
+            recovery_epoch_lineage: self.recovery_lineage().unwrap_or_default(),
         })
     }
 
@@ -969,31 +940,9 @@ where
                 self.connected.remove(&peer);
             }
             Input::Authority(reply) => self.on_authority_reply(reply),
+            Input::JoinAnswer(pointer) => self.join(&pointer),
             Input::Drain => self.request_drain(),
         }
-        self.finish_step()
-    }
-
-    /// Completes the bootstrap join handshake: records the leader `pointer`
-    /// names, with its term and recovery epoch, and drives `Bootstrapping ->
-    /// Joining -> Active` as a pending member, with no configuration until
-    /// its leader's first ack carries one. There is no direct `Bootstrapping
-    /// -> Active` edge in [`WorkerState::can_transition_to`], so this goes
-    /// through `Joining` explicitly.
-    ///
-    /// A no-op outside `Bootstrapping` — a node started as a founder or
-    /// inside a known configuration (already `Active`) or one that already
-    /// finished joining has nothing left to join — and for a pointer that names no leader ("no leader
-    /// known") or a leader of a recovery epoch older than the node's own,
-    /// which leaves the node `Bootstrapping` so its driver can ask again.
-    ///
-    /// The wire handshake that produces `pointer` — dialing seed addresses,
-    /// sending `JOIN_REQUEST`, taking the first `JOIN_RESPONSE` that names a
-    /// leader — is entirely `net`'s concern (a separate `/kabudachi/join/1`
-    /// request_response protocol, not an `ElectionMessage`); this method only
-    /// performs the resulting state transition. Joining publishes nothing.
-    pub fn finish_joining(&mut self, pointer: &JoinResponse) -> Step {
-        self.join(pointer);
         self.finish_step()
     }
 
@@ -1142,7 +1091,7 @@ where
     ///
     /// An ack from a later recovery epoch means the shard was recovered
     /// through the authority: the node adopts that epoch (see
-    /// [`Self::adopt_recovery_epoch`]) and steps down from any term it holds
+    /// [`ShardStanding::accept_ack`]) and steps down from any term it holds
     /// or contests, whatever the terms, which two epochs do not order. A
     /// pending joiner that a stale JOIN pointer left on the old epoch finds
     /// its way the same way. An accepted ack
@@ -1156,7 +1105,7 @@ where
     ///
     /// It also carries the leader's configuration and this node's admission
     /// generations in the leader's roster, which this node adopts as
-    /// [`Self::adopt_configuration`] says. An ack that names no admission
+    /// [`ShardStanding::accept_ack`] says. An ack that names no admission
     /// generation (the leader holds this node as pending, or not at all)
     /// leaves this node's own as they were. A node that adopts a newer
     /// configuration heartbeats its leader at once, so its echo of it
@@ -1165,32 +1114,42 @@ where
         // A node back in `Bootstrapping` rejoins through JOIN alone: an ack
         // from a leader of the epoch it left would take it back past the
         // floor it rejoins at.
-        if self.state == WorkerState::Bootstrapping
-            || ack.shard_id() != self.shard_id
-            || ack.recovery_epoch < self.recovery_epoch
-        {
+        if self.state == WorkerState::Bootstrapping || ack.shard_id() != self.shard_id {
             return;
         }
-        let later_epoch = ack.recovery_epoch > self.recovery_epoch;
-        // Its own epoch number in another lineage is another shard's.
-        let foreign = self
-            .recovery_lineage
-            .zip(ack.recovery_epoch_lineage)
-            .is_some_and(|(own, acked)| own != acked);
-        if !later_epoch && foreign {
+        let heard = HeardEpoch {
+            number: ack.recovery_epoch,
+            lineage: ack.recovery_epoch_lineage,
+        };
+        // Never having joined a shard is `Bootstrapping`, returned above.
+        let Some(order) = self.standing.order(heard) else {
             return;
-        }
+        };
+        let later_epoch = match order {
+            // An earlier epoch, or another lineage's epoch at or below this
+            // node's number: its own epoch number in another lineage is
+            // another shard's.
+            EpochOrder::Stale | EpochOrder::Foreign(Ordering::Less | Ordering::Equal) => return,
+            EpochOrder::Later | EpochOrder::Foreign(Ordering::Greater) => true,
+            EpochOrder::Mine => false,
+        };
         if !later_epoch && ack.term < self.ack_floor() {
             return;
         }
         let outpaced = self
             .term_in_play()
             .is_some_and(|term| later_epoch || ack.term > term);
-        if later_epoch {
-            self.adopt_recovery_epoch(ack.recovery_epoch, ack.recovery_epoch_lineage, ack.term);
+        let change = self.standing.accept_ack(
+            heard,
+            ack.term,
+            ack.configuration(),
+            ack.recipient_admission(),
+            ack.recipient_prior_admission(),
+        );
+        if change.epoch_moved {
+            self.forget_election_state();
         }
 
-        self.highest_term_seen = self.highest_term_seen.max(ack.term);
         let now = self.clock.now();
         self.last_leader_contact = now;
         // A token from a later instant than this node's own clock reads was
@@ -1205,13 +1164,7 @@ where
             term: ack.term,
             send_token: ack.send_token,
         });
-        let held = self.configuration.as_ref().map(Configuration::generation);
-        self.adopt_configuration(
-            ack.configuration(),
-            ack.recipient_admission(),
-            ack.recipient_prior_admission(),
-        );
-        if self.configuration.as_ref().map(Configuration::generation) != held {
+        if change.generation_changed {
             // Heartbeat at once: the echo of the new generation is what
             // commits it (see `Roster::commit_if_confirmed`).
             self.next_heartbeat = None;
@@ -1227,34 +1180,6 @@ where
             self.recovery = None;
             self.transition_to(WorkerState::Active);
         }
-    }
-
-    /// Adopts `offered`, a configuration a leader announced, when this node
-    /// has none or `offered` is newer than its own, and with it `admission`
-    /// and `prior_admission`, this node's admission generations there, when
-    /// an admission is given. When this node already holds `offered`, it
-    /// adopts only the admission generations, which repairs ones it missed.
-    /// Admission generations offered with an older configuration than its
-    /// own are ignored: they belong to a configuration this node has moved
-    /// past, where they would make it no voter of its own.
-    fn adopt_configuration(
-        &mut self,
-        offered: Configuration,
-        admission: Option<Generation>,
-        prior_admission: Option<Generation>,
-    ) {
-        let is_newer = self
-            .configuration
-            .as_ref()
-            .is_none_or(|own| offered.generation() > own.generation());
-        if !is_newer && self.configuration.as_ref() != Some(&offered) {
-            return;
-        }
-        if let Some(admission) = admission {
-            self.admission = Some(admission);
-            self.prior_admission = prior_admission;
-        }
-        self.configuration = Some(offered);
     }
 
     /// Sends this node's leader a heartbeat (README §12.1) once a heartbeat
@@ -1278,16 +1203,16 @@ where
         let heartbeat = WorkerHeartbeat {
             worker_id: Some(self.my_id.clone().into()),
             incarnation_id: Some(self.incarnation_id.clone().into()),
-            recovery_epoch_seen: self.recovery_epoch,
-            term_seen: self.highest_term_seen,
+            recovery_epoch_seen: self.standing.epoch_number(),
+            term_seen: self.standing.highest_term_seen(),
             // Nothing reports this node's capacity or running work yet.
             available_capacity: 0,
             active_task_runs_digest: Vec::new(),
             shard_id: Some(self.shard_id.clone().into()),
             newest_accepted_ack: self.newest_accepted_ack,
             configuration_generation: self
-                .configuration
-                .as_ref()
+                .standing
+                .configuration()
                 .map(|configuration| configuration.generation().into()),
             send_token: now.as_ticks(),
         };
@@ -1334,7 +1259,7 @@ where
     /// Every other state is a no-op — deliberately so for `Bootstrapping` and
     /// `Joining` (README §27 Phase 2 bootstrap join): nothing times out a
     /// stalled join here, since the transition out of those states happens
-    /// once via [`Self::finish_joining`], driven by something outside `core`
+    /// once via [`Input::JoinAnswer`], driven by something outside `core`
     /// that learns who leads the shard, not by a timer.
     fn tick(&mut self) {
         match self.state {
@@ -1399,29 +1324,29 @@ where
     /// generation rule, not on that worker's vote. The term fence above only
     /// keeps echoes of other leaderships' acks from counting here.
     fn on_heartbeat(&mut self, from: WorkerId, heartbeat: &WorkerHeartbeat) {
+        let epoch = order_numbers(self.standing.epoch_number(), heartbeat.recovery_epoch_seen);
         if self.state != WorkerState::Leader
             || heartbeat.shard_id() != self.shard_id
-            || heartbeat.recovery_epoch_seen > self.recovery_epoch
+            || epoch == EpochOrder::Later
         {
             return;
         }
+        let same_epoch = epoch == EpochOrder::Mine;
         // Decision 14 on the heartbeat's own term: its sender voted, or
         // heard of a vote, in a later term. Some roll call of that term found
         // a returning quorum of stale voters, so this leader is all but
         // deposed, and the sender, whose floor is above this term, can never
         // follow it. A heartbeat from an earlier epoch names a term of
         // another count, and deposes no one.
-        if heartbeat.recovery_epoch_seen == self.recovery_epoch
-            && heartbeat.term_seen > self.term
-        {
-            self.highest_term_seen = self.highest_term_seen.max(heartbeat.term_seen);
+        if same_epoch && heartbeat.term_seen > self.term {
+            self.standing.saw_term(heartbeat.term_seen);
             self.step_down_if_outpaced();
             return;
         }
 
         let now = self.clock.now();
         self.last_heard.insert(from.clone(), now);
-        if heartbeat.recovery_epoch_seen == self.recovery_epoch
+        if same_epoch
             && let Some(echo) = heartbeat.newest_accepted_ack
             && echo.term == self.term
             && echo.send_token <= now.as_ticks()
@@ -1467,14 +1392,14 @@ where
         let ack = LeaderHeartbeatAck {
             shard_id: Some(self.shard_id.clone().into()),
             leader_id: Some(self.my_id.clone().into()),
-            recovery_epoch: self.recovery_epoch,
+            recovery_epoch: self.standing.epoch_number(),
             term: self.term,
             configuration: Some(roster.configuration().into()),
             recipient_admission: roster.admission_of(&to).map(Into::into),
             recipient_prior_admission: roster.prior_admission_of(&to).map(Into::into),
             send_token: self.clock.now().as_ticks(),
             heartbeat_token,
-            recovery_epoch_lineage: self.recovery_lineage,
+            recovery_epoch_lineage: self.standing.epoch().map(|epoch| epoch.lineage),
         };
         self.send(to, election_message::Payload::HeartbeatAck(ack));
     }
@@ -1511,7 +1436,7 @@ where
             me: &self.my_id,
             roster: self.roster.as_ref()?,
             term: self.term,
-            recovery_epoch: self.recovery_epoch,
+            recovery_epoch: self.standing.epoch_number(),
             fence_end,
         })
     }
@@ -1548,8 +1473,8 @@ where
     /// quorum against. It stays `LeaderSuspect`, still heartbeating its
     /// leader, until an ack from a leader returns it to `Active`.
     fn next_roll_call_due(&self) -> Option<Instant> {
-        self.configuration
-            .as_ref()
+        self.standing
+            .configuration()
             .map(|_| self.round.roll_call_due(self.clock.now()))
     }
 
@@ -1562,8 +1487,10 @@ where
         // A leader's own term is already its term seen (see
         // `Self::take_office`); the arm only keeps that from resting on it.
         match self.state {
-            WorkerState::Candidate | WorkerState::Leader => self.highest_term_seen.max(self.term),
-            _ => self.highest_term_seen,
+            WorkerState::Candidate | WorkerState::Leader => {
+                self.standing.highest_term_seen().max(self.term)
+            }
+            _ => self.standing.highest_term_seen(),
         }
     }
 
@@ -1587,7 +1514,7 @@ where
     fn step_down_if_outpaced(&mut self) {
         if self
             .term_in_play()
-            .is_some_and(|term| self.highest_term_seen > term)
+            .is_some_and(|term| self.standing.highest_term_seen() > term)
         {
             self.suspect_again();
         }
@@ -1648,11 +1575,11 @@ where
     /// The latest term this node knows of: the highest it has seen, or that
     /// of the latest roll call it accepted, its own included, if later.
     fn latest_term(&self) -> u64 {
-        self.round.latest_term(self.highest_term_seen)
+        self.round.latest_term(self.standing.highest_term_seen())
     }
 
     /// Records the leader `pointer` names and drives `Bootstrapping ->
-    /// Joining -> Active` (see [`Self::finish_joining`]).
+    /// Joining -> Active` (see [`Input::JoinAnswer`]).
     fn join(&mut self, pointer: &JoinResponse) {
         if !self.state.can_transition_to(WorkerState::Joining) {
             return;
@@ -1660,20 +1587,18 @@ where
         let Some(leader_id) = pointer.leader_id() else {
             return;
         };
-        // A leader of an epoch older than this node's own (one it rejoins
-        // after a recovery without it), or of another lineage whatever its
-        // number (one the authority lost), no longer leads the shard.
-        let stale_lineage = self
-            .recovery_lineage
-            .is_some_and(|lineage| lineage != pointer.recovery_epoch_lineage);
-        if pointer.recovery_epoch < self.recovery_epoch || stale_lineage {
-            return;
+        // A first join takes any pointer. After that, a leader of an epoch
+        // older than this node's own (one it rejoins after a recovery
+        // without it), or of another lineage whatever its number (one the
+        // authority lost), no longer leads the shard.
+        let named = RecoveryEpoch::new(pointer.recovery_epoch, pointer.recovery_epoch_lineage);
+        match self.standing.order(named.into()) {
+            None | Some(EpochOrder::Mine | EpochOrder::Later) => {}
+            Some(EpochOrder::Stale | EpochOrder::Foreign(_)) => return,
         }
 
         self.transition_to(WorkerState::Joining);
-        self.recovery_epoch = pointer.recovery_epoch;
-        self.recovery_lineage = Some(pointer.recovery_epoch_lineage);
-        self.highest_term_seen = self.highest_term_seen.max(pointer.term);
+        self.standing.joined(named, pointer.term);
         self.leader = Some((leader_id, pointer.term));
         // A freshly joined node hasn't heard from its leader yet; start the
         // suspicion clock now so it isn't judged suspect the instant it
@@ -1802,10 +1727,10 @@ where
             incarnation_id: Some(self.incarnation_id.clone().into()),
             shard_id: Some(self.shard_id.clone().into()),
             configuration_generation: self
-                .configuration
-                .as_ref()
+                .standing
+                .configuration()
                 .map(|configuration| configuration.generation().into()),
-            term_seen: self.highest_term_seen,
+            term_seen: self.standing.highest_term_seen(),
             leader_term,
         };
         self.send(leader, election_message::Payload::SelfRemove(msg));
@@ -1904,9 +1829,7 @@ where
         let Some(roster) = &self.roster else {
             return;
         };
-        self.configuration = Some(roster.configuration().clone());
-        self.admission = roster.admission_of(&self.my_id);
-        self.prior_admission = roster.prior_admission_of(&self.my_id);
+        self.standing.take_on_roster(roster, &self.my_id);
     }
 
     /// Starts an admission batch (ADR-0001 decision 9, see
@@ -1985,15 +1908,15 @@ where
     /// of this node as it is now, and carries out what it decided (see
     /// [`Self::apply`]).
     fn decide(&mut self, decide: impl FnOnce(&mut ElectionRound, &View<'_>) -> Vec<Verdict>) {
-        let admission = self.counted_admission();
+        let admission = self.standing.counted_admission();
         let takes_part = self.takes_part_in_elections();
         let leader_contact_is_fresh = self.current_leader_still_valid();
         let view = View {
             me: &self.my_id,
             shard: &self.shard_id,
-            recovery_epoch: self.recovery_epoch,
-            highest_term_seen: self.highest_term_seen,
-            configuration: self.configuration.as_ref(),
+            recovery_epoch: self.standing.epoch_number(),
+            highest_term_seen: self.standing.highest_term_seen(),
+            configuration: self.standing.configuration(),
             admission,
             takes_part,
             leader_contact_is_fresh,
@@ -2036,7 +1959,7 @@ where
                 Verdict::Grant { candidate, grant } => {
                     // Granting makes an initiator contesting an earlier term
                     // step down.
-                    self.highest_term_seen = self.highest_term_seen.max(grant.term);
+                    self.standing.saw_term(grant.term);
                     self.step_down_if_outpaced();
                     self.send(candidate, Payload::VoteGrant(grant));
                 }
@@ -2101,9 +2024,9 @@ where
             // Not the vote floor the ballot refused against: a term this node
             // only stood in, unwon, would lock the initiator out of the
             // leader that outlasted it, as it once locked this node out.
-            highest_term_seen: self.highest_term_seen,
+            highest_term_seen: self.standing.highest_term_seen(),
             leader,
-            configuration: self.configuration.as_ref().map(Into::into),
+            configuration: self.standing.configuration().map(Into::into),
         };
         self.send(initiator, election_message::Payload::ElectionReject(reject));
     }
@@ -2141,34 +2064,46 @@ where
     /// A refusal from a node at a later recovery epoch raises nothing (the
     /// two epochs' terms do not compare) but, while `RollCall`, makes the
     /// leader it names this node's, whose ack then moves it to that epoch.
-    /// The refusal itself is not counted.
+    /// A refusal from an earlier one is dropped (ADR-0001 decision 4, as
+    /// amended 2026-09-29). A refusal names its refuser's epoch only through
+    /// the configuration it carries, so one that carries none is read as
+    /// this node's own epoch's. The refusal itself is not counted.
     fn on_election_reject(&mut self, reject: &ElectionReject) {
         if reject.shard_id() != self.shard_id || reject.initiator_id() != self.my_id {
             return;
         }
         let offered = reject.configuration();
-        let later_epoch = offered
+        let own = self.standing.epoch_number();
+        match offered
             .as_ref()
-            .is_some_and(|offered| offered.generation().recovery_epoch() > self.recovery_epoch);
-        if later_epoch {
-            // Its terms are not this epoch's, so they neither raise this
-            // node's nor outpace its roll call: the named leader's ack will.
-            if self.state == WorkerState::RollCall
-                && let Some(leader) = &reject.leader
-                && leader.leader_id() != self.my_id
-            {
-                self.leader = Some((leader.leader_id(), leader.term));
+            .map(|offered| order_numbers(own, offered.generation().recovery_epoch()))
+        {
+            Some(EpochOrder::Later) => {
+                // Its terms are not this epoch's, so they neither raise this
+                // node's nor outpace its roll call: the named leader's ack
+                // will.
+                if self.state == WorkerState::RollCall
+                    && let Some(leader) = &reject.leader
+                    && leader.leader_id() != self.my_id
+                {
+                    self.leader = Some((leader.leader_id(), leader.term));
+                }
+                return;
             }
-            return;
+            // A refuser left on a lower epoch counts that epoch's terms,
+            // which order nothing here, and names a leader of that epoch
+            // (ADR-0001 decision 4, amended 2026-09-29).
+            Some(EpochOrder::Stale) => return,
+            Some(EpochOrder::Mine | EpochOrder::Foreign(_)) | None => {}
         }
-        self.highest_term_seen = self.highest_term_seen.max(reject.highest_term_seen);
+        self.standing.saw_term(reject.highest_term_seen);
         // A leader named as still valid is heartbeated whatever its term:
         // if this node's term seen is above that leader's, its acks stay
         // ignored, but the heartbeat tells it of the later term, and it
         // steps down (see `Self::on_heartbeat`).
         if self.state == WorkerState::RollCall
             && let Some(leader) = &reject.leader
-            && (leader.term >= self.highest_term_seen
+            && (leader.term >= self.standing.highest_term_seen()
                 || reject.reason() == ElectionRejectReason::LeaderStillValid)
             && leader.leader_id() != self.my_id
         {
@@ -2191,19 +2126,9 @@ where
     /// amended 2026-09-28). Only a node that takes part in elections without
     /// standing or leading adopts it.
     fn adopt_relayed_commit(&mut self, offered: Configuration) {
-        if !self.takes_part_in_elections() {
-            return;
+        if self.takes_part_in_elections() {
+            self.standing.adopt_relayed_commit(offered);
         }
-        let Some(admission) = self
-            .configuration
-            .as_ref()
-            .and_then(|own| own.admission_after_commit(&offered, self.admission))
-        else {
-            return;
-        };
-        self.configuration = Some(offered);
-        self.admission = Some(admission);
-        self.prior_admission = None;
     }
 
     /// Commits the joint configuration this leader leads once a majority of
@@ -2227,7 +2152,7 @@ where
     /// Accepts `leader`'s certificate of what its election's winner leads
     /// (ADR-0001 decision 8), sent to every respondent of its winning roll
     /// call: this node adopts that configuration and its admission
-    /// generations there, as [`Self::adopt_configuration`] allows, and the
+    /// generations there, as [`ShardStanding::adopt_certificate`] allows, and the
     /// certificate's term raises its highest term seen, which makes a node
     /// holding or contesting an earlier one step down (see
     /// [`Self::step_down_if_outpaced`]).
@@ -2243,7 +2168,8 @@ where
             self.state,
             WorkerState::Bootstrapping | WorkerState::Joining
         ) || certificate.shard_id() != self.shard_id
-            || certificate.recovery_epoch != self.recovery_epoch
+            || order_numbers(self.standing.epoch_number(), certificate.recovery_epoch)
+                != EpochOrder::Mine
         {
             return;
         }
@@ -2251,8 +2177,8 @@ where
         if certificate.term < self.ack_floor() && !voted_for_it {
             return;
         }
-        self.highest_term_seen = self.highest_term_seen.max(certificate.term);
-        self.adopt_configuration(
+        self.standing.adopt_certificate(
+            certificate.term,
             certificate.configuration(),
             certificate.recipient_admission(),
             certificate.recipient_prior_admission(),
@@ -2267,7 +2193,7 @@ where
     fn ask_authority_if_due(&mut self) {
         let now = self.clock.now();
         let registers = self.registers_with_authority();
-        let epoch = self.own_recovery_epoch();
+        let epoch = self.standing.epoch();
         let Some(lease) = self.authority.as_mut() else {
             return;
         };
@@ -2424,7 +2350,7 @@ where
         {
             return;
         }
-        match Reconnect::decide(self.own_recovery_epoch(), authority_epoch) {
+        match Reconnect::decide(self.standing.epoch(), authority_epoch) {
             Reconnect::Resume => {
                 self.lease.resumed();
                 self.last_leader_contact = now;
@@ -2435,36 +2361,15 @@ where
         }
     }
 
-    /// Forgets the configuration, admissions and election state this node
-    /// held under its recovery epoch, as it leaves that epoch behind.
-    fn forget_shard(&mut self) {
-        self.configuration = None;
-        self.admission = None;
-        self.prior_admission = None;
+    /// Forgets the election state this node held under its recovery epoch,
+    /// as it leaves that epoch behind. What its standing forgets goes with
+    /// the transition that moves it (see [`ShardStanding::accept_ack`] and
+    /// [`ShardStanding::rejoin_at`]).
+    fn forget_election_state(&mut self) {
         self.newest_accepted_ack = None;
         self.round.forget();
         self.recovery = None;
         self.roster = None;
-    }
-
-    /// Adopts `epoch`, a later recovery epoch than this node's, whose
-    /// leader, elected in `term`, has acked it: the shard was recovered
-    /// through the authority. Terms of the two epochs are not comparable,
-    /// so the node takes `term` as the highest it has seen and starts a
-    /// fresh ballot, and it forgets what it held at the old epoch; the ack
-    /// then gives it the new configuration and its admission there. The
-    /// node takes the epoch's `lineage` with it when the ack names one: the
-    /// epoch is usually of its own lineage, as a recovery keeps it, but one
-    /// recovered from a shard founded afresh is not, and a node that kept
-    /// its old lineage would not recognise the epoch as its own when it
-    /// next reconnected, and would rejoin rather than resume.
-    fn adopt_recovery_epoch(&mut self, epoch: u64, lineage: Option<u64>, term: u64) {
-        self.forget_shard();
-        self.recovery_epoch = epoch;
-        if lineage.is_some() {
-            self.recovery_lineage = lineage;
-        }
-        self.highest_term_seen = term;
     }
 
     /// Takes the authority path once this node's roll call for `term` under
@@ -2503,11 +2408,9 @@ where
     /// floor: a JOIN pointer to a leader left on an older one, or on another
     /// lineage, must not take it back there.
     fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
-        self.forget_shard();
+        self.forget_election_state();
+        self.standing.rejoin_at(epoch);
         self.awaited_reply = None;
-        self.recovery_epoch = epoch.number;
-        self.recovery_lineage = Some(epoch.lineage);
-        self.highest_term_seen = 0;
         self.leader = None;
         self.transition_to(WorkerState::Bootstrapping);
     }
@@ -2534,7 +2437,7 @@ where
         if self.state != WorkerState::NoQuorum {
             return;
         }
-        let own_epoch = self.own_recovery_epoch();
+        let own_epoch = self.standing.epoch();
         let Some(recovery) = self.recovery.as_mut() else {
             return;
         };
@@ -2572,12 +2475,14 @@ where
         // keeps failing is not asked again within the same instant.
         let republished = match &result {
             Ok(()) => true,
-            Err(AuthorityError::EpochConflict { current }) => *current == Some(new),
+            Err(AuthorityError::EpochConflict { current }) => {
+                current.is_some_and(|current| order(&new, current.into()) == EpochOrder::Mine)
+            }
             Err(_) => false,
         };
         if self.state == WorkerState::Leader
             && expected.is_none()
-            && Some(new) == self.own_recovery_epoch()
+            && self.standing.order(new.into()) == Some(EpochOrder::Mine)
             && republished
         {
             let now = self.clock.now();
@@ -2596,15 +2501,13 @@ where
             return;
         };
         self.newest_accepted_ack = None;
-        self.recovery_epoch = epoch.number;
-        self.recovery_lineage = Some(epoch.lineage);
         self.term = recovery.term();
-        self.highest_term_seen = self.highest_term_seen.max(recovery.term());
-        if let Some(roster) = recovery.founded_roster() {
-            self.configuration = Some(roster.configuration().clone());
-            self.admission = roster.admission_of(&self.my_id);
-            self.prior_admission = None;
-        }
+        self.standing.recovered_to(
+            epoch,
+            recovery.term(),
+            recovery.founded_roster().as_ref(),
+            &self.my_id,
+        );
         self.recovery = Some(recovery);
         self.transition_to(WorkerState::Candidate);
         let now = self.clock.now();
@@ -2652,7 +2555,7 @@ where
                 .is_some_and(ForcedRecovery::is_awaiting_fence),
             _ => false,
         };
-        if !seeking || Some(epoch) != self.own_recovery_epoch() {
+        if !seeking || self.standing.order(epoch.into()) != Some(EpochOrder::Mine) {
             return;
         }
         let now = self.clock.now();
@@ -2686,7 +2589,7 @@ where
             // recovery do, rather than win again and meet it again.
             Err(AuthorityError::EpochConflict {
                 current: Some(held),
-            }) if cannot_recover_from(self.own_recovery_epoch(), held) => {
+            }) if cannot_recover_from(self.standing.epoch(), held) => {
                 self.lose_quorum();
                 self.rejoin_at(held);
             }
@@ -2730,11 +2633,9 @@ where
         let now = self.clock.now();
         // A leader never acks itself, so nothing else raises its own
         // `highest_term_seen` to the term it won.
-        self.highest_term_seen = self.highest_term_seen.max(self.term);
+        self.standing.saw_term(self.term);
         self.pending_removals.clear();
-        self.configuration = Some(roster.configuration().clone());
-        self.admission = roster.admission_of(&self.my_id);
-        self.prior_admission = roster.prior_admission_of(&self.my_id);
+        self.standing.take_on_roster(&roster, &self.my_id);
         self.last_heard = roster
             .members()
             .keys()

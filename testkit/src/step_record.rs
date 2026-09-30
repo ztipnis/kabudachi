@@ -20,7 +20,7 @@ pub struct StepRecord {
     pub at: Instant,
     pub node: WorkerId,
     /// The input the step handled; `None` for a step no single input caused
-    /// (the one a node starts or joins with).
+    /// (the one a node starts with).
     pub input: Option<Input>,
     pub state: WorkerState,
     pub term: u64,

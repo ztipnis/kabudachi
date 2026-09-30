@@ -314,22 +314,22 @@ fn a_fenced_node_rejoins_as_pending_once_the_epoch_has_moved_on() {
     assert!(driven.node.is_pending_member());
     assert_eq!(driven.node.recovery_epoch(), 1);
     // A pointer to a leader left on the old epoch does not take it back.
-    let _ = driven.node.finish_joining(&JoinResponse {
+    let _ = driven.node.step(Input::JoinAnswer(JoinResponse {
         leader_id: Some(worker("w1").into()),
         leader_multiaddr: "w1".to_string(),
         term: 5,
         recovery_epoch: 0,
         recovery_epoch_lineage: 0,
-    });
+    }));
     assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
     // Its driver joins it again, to the leader of the new epoch.
-    let _ = driven.node.finish_joining(&JoinResponse {
+    let _ = driven.node.step(Input::JoinAnswer(JoinResponse {
         leader_id: Some(worker("w2").into()),
         leader_multiaddr: "w2".to_string(),
         term: 1,
         recovery_epoch: 1,
         recovery_epoch_lineage: 0,
-    });
+    }));
     assert_eq!(driven.node.state(), WorkerState::Active);
     assert_eq!(driven.node.recovery_epoch(), 1);
 }
@@ -403,14 +403,14 @@ fn a_node_rejoining_a_shard_founded_afresh_ignores_a_pointer_into_its_old_lineag
         recovery_epoch_lineage: lineage,
     };
     for number in [0, 5] {
-        let _ = driven.node.finish_joining(&pointer(number, 0));
+        let _ = driven.node.step(Input::JoinAnswer(pointer(number, 0)));
         assert_eq!(
             driven.node.state(),
             WorkerState::Bootstrapping,
             "a leader of the lost shard leads nothing, at epoch {number} or any other"
         );
     }
-    let _ = driven.node.finish_joining(&pointer(0, refounded.lineage));
+    let _ = driven.node.step(Input::JoinAnswer(pointer(0, refounded.lineage)));
     assert_eq!(driven.node.state(), WorkerState::Active);
     assert_eq!(driven.node.recovery_lineage(), Some(refounded.lineage));
 }
@@ -913,6 +913,50 @@ fn a_node_ignores_an_ack_at_its_epoch_number_from_another_lineage() {
         None,
         "a leader of another shard's epoch 0 is no leader of this one"
     );
+}
+
+#[test]
+fn a_node_ignores_an_ack_from_a_lower_epoch_of_another_lineage() {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    authority
+        .compare_and_swap_recovery_epoch(&shard(SHARD), None, RecoveryEpoch::new(1, 0))
+        .expect("the shard has no epoch yet");
+    let epoch_1 = Generation::new(1, 0, 0);
+    let known = KnownConfiguration {
+        configuration: Configuration::single(Single {
+            generation: epoch_1,
+            base: epoch_1,
+            voter_count: 3,
+        }),
+        admission: Some(epoch_1),
+    };
+    let (mut driven, _) = Driven::with(
+        &clock,
+        &authority,
+        "w1",
+        known,
+        Some(AuthorityTimings {
+            ttl: authority_ttl(),
+        }),
+    );
+    let stranger = worker("stranger");
+
+    driven.step(Input::Message {
+        from: stranger.clone(),
+        message: ack_message(LeaderHeartbeatAck {
+            recovery_epoch: 0,
+            recovery_epoch_lineage: Some(7),
+            ..leader_ack(&stranger, 4, &configuration_of(3), Some(g0()))
+        }),
+    });
+
+    assert_eq!(
+        driven.node.known_leader(),
+        None,
+        "a lower epoch of another lineage is no leader of this one"
+    );
+    assert_eq!(driven.node.recovery_epoch(), 1);
 }
 
 #[test]
