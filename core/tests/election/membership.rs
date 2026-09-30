@@ -57,7 +57,7 @@ fn single_at(generation: Generation, voter_count: usize) -> Configuration {
         generation,
         base: generation,
         voter_count,
-    })
+    }).expect("valid")
 }
 
 /// The acks among `outputs` sent to `to`.
@@ -318,6 +318,34 @@ fn a_leader_applies_pending_removals_before_it_would_lose_its_quorum() {
     );
 }
 
+/// A removal the leader accepted but has not applied was never announced, so
+/// a leader that a later term's heartbeat deposes keeps the last
+/// configuration it did announce, not the shrunk one.
+#[test]
+fn a_leader_deposed_with_a_removal_pending_keeps_its_last_announced_configuration() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let announced = leader.configuration().cloned().expect("a configuration");
+    deliver(
+        &mut leader,
+        &p2,
+        self_remove_message(self_remove(&p2, SHARD)),
+    );
+
+    deliver(
+        &mut leader,
+        &p1,
+        heartbeat_message(WorkerHeartbeat {
+            term_seen: 2,
+            ..heartbeat(&p1, None)
+        }),
+    );
+
+    assert_eq!(leader.state(), WorkerState::LeaderSuspect);
+    assert_eq!(leader.configuration(), Some(&announced));
+}
+
 #[test]
 fn a_self_remove_for_another_shard_or_not_from_the_departing_worker_is_ignored() {
     let clock = FakeClock::new();
@@ -353,7 +381,7 @@ fn batch_of_one_joiner() -> Configuration {
         old_generation: committed,
         old_voter_count: 3,
         new_voter_count: 4,
-    })
+    }).expect("valid")
 }
 
 /// A leader admits a pending joiner once the joiner has confirmed one of its
@@ -465,7 +493,7 @@ fn a_batch_commits_on_a_majority_of_each_side_and_the_next_one_admits_those_who_
             old_generation: committed,
             old_voter_count: 4,
             new_voter_count: 5,
-        })),
+        }).expect("valid")),
         "the commit of four, then at once the batch that admits `late`"
     );
 }

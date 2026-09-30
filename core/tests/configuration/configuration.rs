@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::configuration::{
-    Admission, Configuration, Generation, Joint, Roster, Single, Tally,
+    Admission, Configuration, Generation, InvalidConfiguration, Joint, Roster, Single, Tally,
 };
 use kabudachi_core::protocol::ids::WorkerId;
 
@@ -107,7 +107,7 @@ fn a_worker_is_a_voter_exactly_when_admitted_from_the_base_through_the_current_g
         generation: current,
         base,
         voter_count: 3,
-    });
+    }).expect("valid");
 
     let cases = [
         (None, false, "pending member"),
@@ -137,7 +137,7 @@ fn during_an_admission_batch_both_sides_are_voters() {
         old_generation: generation(1, 2, 2),
         old_voter_count: 3,
         new_voter_count: 5,
-    });
+    }).expect("valid");
 
     let cases = [
         (None, false, "pending member"),
@@ -163,7 +163,7 @@ fn a_single_configuration_needs_more_than_half_of_its_voters() {
             generation: base,
             base,
             voter_count,
-        }));
+        }).expect("valid"));
         assert!(!tally.has_quorum(), "no voters of {voter_count}");
         for fed_count in 1..=voter_count {
             tally.record(worker(&format!("voter-{fed_count}")), Some(base));
@@ -183,7 +183,7 @@ fn a_worker_fed_twice_counts_once_with_its_first_admission_generation() {
         generation: base,
         base,
         voter_count: 3,
-    });
+    }).expect("valid");
 
     let tally = fed(
         Tally::against(&configuration),
@@ -197,7 +197,7 @@ fn a_worker_fed_twice_counts_once_with_its_first_admission_generation() {
             generation: base,
             base,
             voter_count: 1,
-        })),
+        }).expect("valid")),
         &[("joiner", None), ("joiner", Some(base))],
     );
     assert!(!first_fed_pending.has_quorum());
@@ -211,7 +211,7 @@ fn workers_that_are_not_voters_never_count() {
         generation: current,
         base,
         voter_count: 3,
-    });
+    }).expect("valid");
 
     let tally = fed(
         Tally::against(&configuration),
@@ -241,7 +241,7 @@ fn during_an_admission_batch_a_quorum_needs_a_majority_of_both_sides() {
         old_generation: generation(1, 2, 2),
         old_voter_count: 3,
         new_voter_count: 5,
-    });
+    }).expect("valid");
 
     let old_side_only = fed(
         Tally::against(&configuration),
@@ -281,7 +281,7 @@ fn in_an_admission_batch_the_old_side_is_the_voters_admitted_before_it() {
         old_generation: generation(1, 2, 2),
         old_voter_count: 1,
         new_voter_count: 1,
-    });
+    }).expect("valid");
 
     let cases = [
         (None, false, "pending member"),
@@ -318,7 +318,7 @@ fn the_win_rule_needs_a_returning_quorum_and_a_majority_of_respondents() {
         generation: base,
         base,
         voter_count: 3,
-    });
+    }).expect("valid");
     let win_rule = || Tally::against(&roll_call).and(Tally::against_count(5));
 
     let returning_only = fed(
@@ -347,7 +347,7 @@ fn a_worker_fed_to_both_joined_tallies_counts_with_the_first_tallys_admission() 
         generation: base,
         base,
         voter_count: 1,
-    });
+    }).expect("valid");
     let returning = fed(Tally::against(&one_voter), &[("w1", Some(base))]);
     let respondents = fed(Tally::against_count(1), &[("w1", None)]);
     assert!(returning.and(respondents).has_quorum());
@@ -368,7 +368,7 @@ fn joining_tallies_keeps_the_workers_either_was_already_fed() {
             generation: base,
             base,
             voter_count: 3,
-        })),
+        }).expect("valid")),
         &[("returning-1", Some(base)), ("returning-2", Some(base))],
     );
     let respondents = fed(Tally::against_count(5), &[("new-1", admitted(1, 1, 0))]);
@@ -388,7 +388,7 @@ fn a_genesis_roster_holds_its_creator_as_the_only_voter() {
             generation: Generation::genesis(4),
             base: Generation::genesis(4),
             voter_count: 1,
-        })
+        }).expect("valid")
     );
     assert_eq!(creator_admission, Some(Generation::genesis(4)));
     let creator_alone = fed(
@@ -427,7 +427,7 @@ fn three_voters_at(counter: u64) -> Configuration {
         generation: generation(0, 1, counter),
         base: generation(0, 1, 1),
         voter_count: 3,
-    })
+    }).expect("valid")
 }
 
 /// A roster of three voters admitted at (0, 1, 1), plus one pending joiner.
@@ -484,7 +484,7 @@ fn removing_a_voter_announces_one_fewer_voter_at_the_next_generation() {
             generation: shrunk,
             base: shrunk,
             voter_count: 2,
-        }),
+        }).expect("valid"),
         "re-based at the removal's generation"
     );
     assert_eq!(roster.admission_of(&worker("a")), Some(shrunk));
@@ -585,7 +585,7 @@ fn removing_a_voter_from_a_joint_configuration_re_announces_it_with_shrunk_count
             old_generation: g0,
             old_voter_count: 2,
             new_voter_count: 2,
-        })
+        }).expect("valid")
     );
     assert_eq!(
         roster.counted_admission_of(&worker("a")),
@@ -612,7 +612,7 @@ fn a_removal_that_empties_the_old_side_collapses_the_joint_configuration() {
         generation: g0,
         base: g0,
         voter_count: 1,
-    });
+    }).expect("valid");
     let mut roster = Roster::after_election(
         0,
         1,
@@ -633,7 +633,7 @@ fn a_removal_that_empties_the_old_side_collapses_the_joint_configuration() {
             generation: collapsed,
             base: collapsed,
             voter_count: 2,
-        })
+        }).expect("valid")
     );
     assert_eq!(roster.prior_admission_of(&worker("p")), None);
 }
@@ -665,7 +665,7 @@ fn c0() -> Configuration {
         generation: generation(0, 0, 0),
         base: generation(0, 0, 0),
         voter_count: 3,
-    })
+    }).expect("valid")
 }
 
 /// The joint configuration an election for `term` under C0 founds with
@@ -680,7 +680,7 @@ fn founded_from_c0(term: u64, respondents: usize) -> Configuration {
         old_generation: generation(0, 0, 0),
         old_voter_count: 3,
         new_voter_count: respondents,
-    })
+    }).expect("valid")
 }
 
 fn re_admitted(at: Generation, prior: Option<Generation>) -> Admission {
@@ -736,7 +736,7 @@ fn a_worker_a_rival_election_from_the_same_configuration_admitted_is_no_old_side
         old_generation: g0,
         old_voter_count: 1,
         new_voter_count: 1,
-    });
+    }).expect("valid");
     let quorum_with = |old_side: Admission| {
         let mut tally = Tally::against(&configuration);
         tally.record(worker("new"), re_admitted(later, None));
@@ -806,7 +806,7 @@ fn an_election_under_a_joint_configuration_re_stamps_it_at_the_winners_term() {
             old_generation: g0,
             old_voter_count: 3,
             new_voter_count: 2,
-        })
+        }).expect("valid")
     );
     assert_eq!(
         roster.counted_admission_of(&worker("a")),
@@ -859,7 +859,7 @@ fn a_founding_commits_once_a_majority_of_each_side_holds_it() {
             generation: committed,
             base: committed,
             voter_count: 3,
-        }),
+        }).expect("valid"),
         "re-based at the commit's generation"
     );
     for member in ["a", "b", "joiner"] {
@@ -979,7 +979,7 @@ fn a_commit_counts_the_members_it_re_admits() {
             generation: generation(0, 1, 2),
             base: generation(0, 1, 2),
             voter_count: 3,
-        })
+        }).expect("valid")
     );
 }
 
@@ -1057,7 +1057,7 @@ fn removals_applied_together_during_a_founding_shrink_each_side_once() {
             old_generation: g0,
             old_voter_count: 2,
             new_voter_count: 1,
-        }),
+        }).expect("valid"),
         "b counted on both sides, the joiner on the new side alone"
     );
 }
@@ -1087,7 +1087,7 @@ fn removals_applied_together_change_the_configuration_if_any_counted() {
             generation: shrunk,
             base: shrunk,
             voter_count: 2,
-        })
+        }).expect("valid")
     );
     assert_eq!(roster.admission_of(&worker("left-out")), None);
 }
@@ -1105,13 +1105,13 @@ fn only_a_joint_configurations_own_commit_admits_a_member_of_its_new_side() {
         old_generation: generation(0, 0, 0),
         old_voter_count: 3,
         new_voter_count: 3,
-    });
+    }).expect("valid");
     let single_at = |at: Generation, base: Generation| {
         Configuration::single(Single {
             generation: at,
             base,
             voter_count: 3,
-        })
+        }).expect("valid")
     };
     let commit = single_at(generation(0, 1, 2), generation(0, 1, 2));
 
@@ -1137,7 +1137,7 @@ fn only_a_joint_configurations_own_commit_admits_a_member_of_its_new_side() {
             old_generation: generation(0, 0, 0),
             old_voter_count: 3,
             new_voter_count: 2,
-        }),
+        }).expect("valid"),
     ] {
         assert_eq!(joint.admission_after_commit(&other, admitted(0, 1, 1)), None, "{other:?}");
     }
@@ -1146,4 +1146,108 @@ fn only_a_joint_configurations_own_commit_admits_a_member_of_its_new_side() {
             .admission_after_commit(&commit, admitted(0, 1, 1)),
         None
     );
+}
+
+#[test]
+fn a_configuration_that_breaks_a_rule_is_refused_by_its_constructor() {
+    let g = |counter| generation(1, 1, counter);
+    let valid_joint = || Joint {
+        generation: g(4),
+        base: g(3),
+        batch_generation: g(3),
+        old_base: g(1),
+        old_generation: g(2),
+        old_voter_count: 3,
+        new_voter_count: 4,
+    };
+
+    assert!(Configuration::joint(valid_joint()).is_ok());
+    assert!(
+        Configuration::single(Single {
+            generation: g(4),
+            base: g(3),
+            voter_count: 1,
+        })
+        .is_ok()
+    );
+
+    let single = |generation, base, voter_count| {
+        Configuration::single(Single {
+            generation,
+            base,
+            voter_count,
+        })
+    };
+    assert_eq!(
+        single(g(3), g(4), 2),
+        Err(InvalidConfiguration::BaseAfterGeneration)
+    );
+    assert_eq!(
+        single(g(4), g(3), 0),
+        Err(InvalidConfiguration::ZeroVoterCount)
+    );
+
+    let joint_rows = [
+        (
+            InvalidConfiguration::BaseAfterGeneration,
+            Joint {
+                base: g(5),
+                ..valid_joint()
+            },
+        ),
+        (
+            InvalidConfiguration::BaseAfterBatchGeneration,
+            Joint {
+                base: g(4),
+                ..valid_joint()
+            },
+        ),
+        (
+            InvalidConfiguration::BatchGenerationAfterGeneration,
+            Joint {
+                batch_generation: g(4),
+                generation: g(3),
+                ..valid_joint()
+            },
+        ),
+        (
+            InvalidConfiguration::OldBaseAfterOldGeneration,
+            Joint {
+                old_base: g(2),
+                old_generation: g(1),
+                ..valid_joint()
+            },
+        ),
+        (
+            InvalidConfiguration::OldGenerationNotBeforeBatchGeneration,
+            Joint {
+                old_generation: g(3),
+                ..valid_joint()
+            },
+        ),
+        (
+            InvalidConfiguration::OldBaseAfterBase,
+            Joint {
+                base: g(0),
+                ..valid_joint()
+            },
+        ),
+        (
+            InvalidConfiguration::ZeroVoterCount,
+            Joint {
+                old_voter_count: 0,
+                ..valid_joint()
+            },
+        ),
+        (
+            InvalidConfiguration::ZeroVoterCount,
+            Joint {
+                new_voter_count: 0,
+                ..valid_joint()
+            },
+        ),
+    ];
+    for (rule, joint) in joint_rows {
+        assert_eq!(Configuration::joint(joint), Err(rule), "{rule}");
+    }
 }

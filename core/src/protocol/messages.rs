@@ -464,7 +464,7 @@ mod tests {
             generation,
             base: generation,
             voter_count: 1,
-        });
+        }).expect("valid");
         ElectionMessage {
             payload: Some(election_message::Payload::ElectionCertificate(
                 ElectionCertificate {
@@ -801,7 +801,7 @@ mod tests {
             generation,
             base: generation,
             voter_count: 1,
-        });
+        }).expect("valid");
         ElectionMessage {
             payload: Some(election_message::Payload::HeartbeatAck(
                 LeaderHeartbeatAck {

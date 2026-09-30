@@ -163,7 +163,7 @@ proptest! {
             generation: current,
             base,
             voter_count,
-        });
+        }).expect("valid");
 
         let first = fed(Tally::against(&configuration), &workers, |worker| worker.in_first_set);
         let second = fed(Tally::against(&configuration), &workers, |worker| worker.in_second_set);
@@ -205,7 +205,7 @@ proptest! {
             old_generation: bounds.old_generation,
             old_voter_count,
             new_voter_count,
-        });
+        }).expect("valid");
 
         let first = fed(Tally::against(&configuration), &workers, |worker| worker.in_first_set);
         let second = fed(Tally::against(&configuration), &workers, |worker| worker.in_second_set);

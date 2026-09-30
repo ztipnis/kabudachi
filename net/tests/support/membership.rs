@@ -87,5 +87,5 @@ pub fn is_committed_with(configuration: &Configuration, voter_count: usize) -> b
             generation: configuration.generation(),
             base: configuration.base(),
             voter_count,
-        })
+        }).expect("valid")
 }

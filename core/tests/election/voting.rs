@@ -235,7 +235,7 @@ fn a_request_for_a_call_under_a_configuration_older_than_the_voters_own_is_refus
         generation: Generation::new(0, 0, 1),
         base: g0(),
         voter_count: 3,
-    });
+    }).expect("valid");
     let leader = worker("leader");
     deliver(
         &mut node,

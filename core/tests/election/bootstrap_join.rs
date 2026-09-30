@@ -155,7 +155,7 @@ fn ack_at_epoch(recovery_epoch: u64) -> ElectionMessage {
         generation: founded,
         base: founded,
         voter_count: 2,
-    });
+    }).expect("valid");
     let ack = LeaderHeartbeatAck {
         recovery_epoch,
         term: 4,
@@ -353,7 +353,7 @@ fn an_election_admits_a_pending_joiner_that_answered_its_roll_call() {
             generation: committed.generation(),
             base: founded,
             voter_count: 3,
-        })
+        }).expect("valid")
     );
     for id in &ids {
         assert_eq!(nodes[id].configuration(), Some(&committed), "{id:?}");

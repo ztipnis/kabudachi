@@ -151,14 +151,6 @@ impl ShardStanding {
         self.configuration.as_ref()
     }
 
-    pub(crate) fn admission(&self) -> Option<Generation> {
-        self.admission
-    }
-
-    pub(crate) fn prior_admission(&self) -> Option<Generation> {
-        self.prior_admission
-    }
-
     /// Both admission generations a quorum counts this node by.
     pub(crate) fn counted_admission(&self) -> Admission {
         Admission {

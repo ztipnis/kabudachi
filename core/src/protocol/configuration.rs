@@ -3,52 +3,19 @@
 //! (ADR-0001 decision 1), and their infallible encode back to the wire.
 //!
 //! Decode is where untrusted configuration data from a peer is validated
-//! (STYLE_GUIDE "validate untrusted input at the edge"); the domain
-//! constructors it builds with only `debug_assert!` the same invariants, so
-//! this is the one place a malformed peer message is turned into an error
-//! instead of a panic. Encode is infallible and lives with the domain type
-//! (`impl From<&Configuration> for generated::Configuration` in
-//! `crate::configuration`), since it needs that type's private `Electorate`
-//! field.
+//! (STYLE_GUIDE "validate untrusted input at the edge"). It checks only what
+//! the wire can get wrong that a domain value cannot: a field left absent, a
+//! counter at `u64::MAX`, a voter count too large for `usize`. The
+//! configuration rules (ordering, no empty side) belong to the domain
+//! constructors ([`configuration::Configuration::single`] and
+//! [`configuration::Configuration::joint`]), which decode calls, so a peer's
+//! configuration is held to the same rules as a local one. Encode is
+//! infallible and lives with the domain type (`impl From<&Configuration> for
+//! generated::Configuration` in `crate::configuration`), since it needs that
+//! type's private `Electorate` field.
 
-use crate::configuration::{self, Joint, Single};
+use crate::configuration::{self, InvalidConfiguration, Joint, Single};
 use crate::protocol::generated;
-
-/// Why a wire [`generated::Generation`] or [`generated::Configuration`] failed
-/// to decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum InvalidConfiguration {
-    #[error("a generation's counter is u64::MAX")]
-    CounterAtMax,
-    #[error("Configuration.generation is required but was absent")]
-    MissingGeneration,
-    #[error("Configuration.base is required but was absent")]
-    MissingBase,
-    #[error("Configuration.electorate is required but was absent")]
-    MissingElectorate,
-    #[error("JointElectorate.batch_generation is required but was absent")]
-    MissingBatchGeneration,
-    #[error("JointElectorate.old_base is required but was absent")]
-    MissingOldBase,
-    #[error("JointElectorate.old_generation is required but was absent")]
-    MissingOldGeneration,
-    #[error("base is later than generation")]
-    BaseAfterGeneration,
-    #[error("a joint electorate's base is later than its batch generation")]
-    BaseAfterBatchGeneration,
-    #[error("a joint electorate's batch generation is later than generation")]
-    BatchGenerationAfterGeneration,
-    #[error("a joint electorate's old base is later than its old generation")]
-    OldBaseAfterOldGeneration,
-    #[error("a joint electorate's old generation is not earlier than its batch generation")]
-    OldGenerationNotBeforeBatchGeneration,
-    #[error("a joint electorate's old base is later than its base")]
-    OldBaseAfterBase,
-    #[error("a voter count is zero")]
-    ZeroVoterCount,
-    #[error("a voter count does not fit in usize")]
-    VoterCountTooLarge,
-}
 
 impl TryFrom<&generated::Generation> for configuration::Generation {
     type Error = InvalidConfiguration;
@@ -76,9 +43,6 @@ impl TryFrom<&generated::Configuration> for configuration::Configuration {
         let generation = configuration::Generation::try_from(generation)?;
         let base = raw.base.as_ref().ok_or(InvalidConfiguration::MissingBase)?;
         let base = configuration::Generation::try_from(base)?;
-        if base > generation {
-            return Err(InvalidConfiguration::BaseAfterGeneration);
-        }
 
         use generated::configuration::Electorate;
         match raw
@@ -87,12 +51,12 @@ impl TryFrom<&generated::Configuration> for configuration::Configuration {
             .ok_or(InvalidConfiguration::MissingElectorate)?
         {
             Electorate::Single(single) => {
-                let voter_count = checked_voter_count(single.voter_count)?;
-                Ok(configuration::Configuration::single(Single {
+                let voter_count = voter_count(single.voter_count)?;
+                configuration::Configuration::single(Single {
                     generation,
                     base,
                     voter_count,
-                }))
+                })
             }
             Electorate::Joint(joint) => {
                 let batch_generation = joint
@@ -100,12 +64,6 @@ impl TryFrom<&generated::Configuration> for configuration::Configuration {
                     .as_ref()
                     .ok_or(InvalidConfiguration::MissingBatchGeneration)?;
                 let batch_generation = configuration::Generation::try_from(batch_generation)?;
-                if base > batch_generation {
-                    return Err(InvalidConfiguration::BaseAfterBatchGeneration);
-                }
-                if batch_generation > generation {
-                    return Err(InvalidConfiguration::BatchGenerationAfterGeneration);
-                }
                 let old_base = joint
                     .old_base
                     .as_ref()
@@ -116,18 +74,9 @@ impl TryFrom<&generated::Configuration> for configuration::Configuration {
                     .as_ref()
                     .ok_or(InvalidConfiguration::MissingOldGeneration)?;
                 let old_generation = configuration::Generation::try_from(old_generation)?;
-                if old_base > old_generation {
-                    return Err(InvalidConfiguration::OldBaseAfterOldGeneration);
-                }
-                if old_generation >= batch_generation {
-                    return Err(InvalidConfiguration::OldGenerationNotBeforeBatchGeneration);
-                }
-                if old_base > base {
-                    return Err(InvalidConfiguration::OldBaseAfterBase);
-                }
-                let old_voter_count = checked_voter_count(joint.old_voter_count)?;
-                let new_voter_count = checked_voter_count(joint.new_voter_count)?;
-                Ok(configuration::Configuration::joint(Joint {
+                let old_voter_count = voter_count(joint.old_voter_count)?;
+                let new_voter_count = voter_count(joint.new_voter_count)?;
+                configuration::Configuration::joint(Joint {
                     generation,
                     base,
                     batch_generation,
@@ -135,20 +84,17 @@ impl TryFrom<&generated::Configuration> for configuration::Configuration {
                     old_generation,
                     old_voter_count,
                     new_voter_count,
-                }))
+                })
             }
         }
     }
 }
 
-/// A voter count as decoded from the wire: nonzero, and representable as
-/// `usize`. On every platform this ships on, `usize` is 64 bits wide, so
-/// `VoterCountTooLarge` cannot actually trigger here; the check exists so
-/// decode stays correct if that ever changes.
-fn checked_voter_count(raw: u64) -> Result<usize, InvalidConfiguration> {
-    if raw == 0 {
-        return Err(InvalidConfiguration::ZeroVoterCount);
-    }
+/// A voter count as decoded from the wire, representable as `usize`. On every
+/// platform this ships on, `usize` is 64 bits wide, so `VoterCountTooLarge`
+/// cannot actually trigger here; the check exists so decode stays correct if
+/// that ever changes. A zero count is the constructor's to refuse.
+fn voter_count(raw: u64) -> Result<usize, InvalidConfiguration> {
     usize::try_from(raw).map_err(|_| InvalidConfiguration::VoterCountTooLarge)
 }
 
@@ -267,33 +213,6 @@ mod tests {
                 InvalidConfiguration::MissingBatchGeneration,
             ),
             (
-                "base after generation",
-                generated::Configuration {
-                    generation: Some(base),
-                    base: Some(current),
-                    electorate: single_electorate(1),
-                },
-                InvalidConfiguration::BaseAfterGeneration,
-            ),
-            (
-                "joint base after batch_generation",
-                generated::Configuration {
-                    generation: Some(generation(1, 2, 5)),
-                    base: Some(generation(1, 2, 4)),
-                    electorate: joint_electorate(Some(generation(1, 2, 2)), 1, 1),
-                },
-                InvalidConfiguration::BaseAfterBatchGeneration,
-            ),
-            (
-                "joint batch_generation after generation",
-                generated::Configuration {
-                    generation: Some(generation(1, 2, 5)),
-                    base: Some(generation(1, 2, 0)),
-                    electorate: joint_electorate(Some(generation(1, 2, 6)), 1, 1),
-                },
-                InvalidConfiguration::BatchGenerationAfterGeneration,
-            ),
-            (
                 "joint missing old_base",
                 generated::Configuration {
                     generation: Some(current),
@@ -322,36 +241,6 @@ mod tests {
                     ),
                 },
                 InvalidConfiguration::MissingOldGeneration,
-            ),
-            (
-                "joint old_base after old_generation",
-                generated::Configuration {
-                    generation: Some(current),
-                    base: Some(base),
-                    electorate: joint_electorate_from(
-                        Some(generation(1, 1, 4)),
-                        Some(generation(1, 1, 0)),
-                        Some(base),
-                        1,
-                        1,
-                    ),
-                },
-                InvalidConfiguration::OldBaseAfterOldGeneration,
-            ),
-            (
-                "joint old_generation at the batch generation",
-                generated::Configuration {
-                    generation: Some(current),
-                    base: Some(base),
-                    electorate: joint_electorate_from(
-                        Some(generation(1, 1, 0)),
-                        Some(base),
-                        Some(base),
-                        1,
-                        1,
-                    ),
-                },
-                InvalidConfiguration::OldGenerationNotBeforeBatchGeneration,
             ),
             (
                 "joint old_base after base",
@@ -383,33 +272,6 @@ mod tests {
                 },
                 InvalidConfiguration::CounterAtMax,
             ),
-            (
-                "zero single voter count",
-                generated::Configuration {
-                    generation: Some(current),
-                    base: Some(base),
-                    electorate: single_electorate(0),
-                },
-                InvalidConfiguration::ZeroVoterCount,
-            ),
-            (
-                "zero joint old_voter_count",
-                generated::Configuration {
-                    generation: Some(current),
-                    base: Some(base),
-                    electorate: joint_electorate(Some(base), 0, 1),
-                },
-                InvalidConfiguration::ZeroVoterCount,
-            ),
-            (
-                "zero joint new_voter_count",
-                generated::Configuration {
-                    generation: Some(current),
-                    base: Some(base),
-                    electorate: joint_electorate(Some(base), 1, 0),
-                },
-                InvalidConfiguration::ZeroVoterCount,
-            ),
         ];
 
         for (case, wire, expected) in cases {
@@ -440,6 +302,7 @@ mod tests {
                 base: Generation::new(1, 2, 0),
                 voter_count: 3,
             })
+            .expect("valid")
         );
         assert_eq!(
             generated::Configuration::from(&decoded),
@@ -472,6 +335,7 @@ mod tests {
                 old_voter_count: 3,
                 new_voter_count: 5,
             })
+            .expect("valid")
         );
         assert_eq!(
             generated::Configuration::from(&decoded),

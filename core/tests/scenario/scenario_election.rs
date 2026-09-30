@@ -382,7 +382,7 @@ fn self_remove_duplicated() {
             generation: shrunk_at,
             base: shrunk_at,
             voter_count: 2,
-        })),
+        }).expect("valid")),
         "the configuration must have shrunk by EXACTLY one voter, at EXACTLY one generation, \
          despite the duplicate delivery"
     );

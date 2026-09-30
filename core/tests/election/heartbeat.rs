@@ -346,7 +346,7 @@ fn a_voter_adopts_a_later_recovery_epoch_from_its_leaders_ack() {
         generation: Generation::new(1, 2, 1),
         base: Generation::new(1, 2, 1),
         voter_count: 2,
-    });
+    }).expect("valid");
 
     receive_ack(
         &mut node,
@@ -453,7 +453,7 @@ fn configuration_at(counter: u64, voter_count: usize) -> Configuration {
         generation: Generation::new(0, 0, counter),
         base: g0(),
         voter_count,
-    })
+    }).expect("valid")
 }
 
 fn ack_carrying(

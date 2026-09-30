@@ -5,9 +5,10 @@
 //! leader again.
 
 use crate::support::builders::{
-    ack_message, configuration_of, election_certificate, election_certificate_message,
-    election_reject, founded_from_g0, g0, leader_ack, past_any_suspicion, roll_call,
-    roll_call_message, timings, vote_request, vote_request_message, worker,
+    ack_message, committed_from_g0, configuration_of, election_certificate,
+    election_certificate_message, election_reject, founded_from_g0, g0, leader_ack,
+    past_any_suspicion, roll_call, roll_call_message, timings, vote_request,
+    vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
@@ -77,7 +78,20 @@ fn a_leader_acked_by_a_later_terms_leader_follows_it_and_withdraws_its_grant_fir
     let clock = FakeClock::new();
     let mut node = leader_of_three(&clock);
 
-    let outputs = deliver(&mut node, &worker("leader-2"), ack_from_new_leader(2));
+    // A configuration above anything a term-1 leader leads: the deposed
+    // leader must follow it, not the roster it led.
+    let newer = committed_from_g0(2, 2, 3);
+
+    let outputs = deliver(
+        &mut node,
+        &worker("leader-2"),
+        ack_message(leader_ack(
+            &worker("leader-2"),
+            2,
+            &newer,
+            Some(newer.generation()),
+        )),
+    );
 
     assert_eq!(state_changes(&outputs), vec![WorkerState::Active]);
     assert_eq!(grants(&outputs), vec![None]);
@@ -92,6 +106,8 @@ fn a_leader_acked_by_a_later_terms_leader_follows_it_and_withdraws_its_grant_fir
     });
     assert!(grant_withdrawn < stepped_down, "{outputs:?}");
     assert_eq!(node.known_leader(), Some((worker("leader-2"), 2)));
+    assert_eq!(node.configuration(), Some(&newer));
+    assert_eq!(node.admission(), Some(newer.generation()));
 }
 
 #[test]

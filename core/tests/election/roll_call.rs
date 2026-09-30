@@ -602,7 +602,7 @@ fn a_call_under_an_older_configuration_is_refused_carrying_the_newer_one() {
         generation: Generation::new(0, 1, 2),
         base: g0(),
         voter_count: 3,
-    });
+    }).expect("valid");
     let mut node: TestNode = WorkerNode::start(
         Identity {
             id: worker("voter"),
@@ -850,7 +850,7 @@ fn voter_at_epoch_1(clock: &FakeClock, me: &WorkerId, voters: usize) -> TestNode
                 generation: epoch_1,
                 base: epoch_1,
                 voter_count: voters,
-            }),
+            }).expect("valid"),
             admission: Some(epoch_1),
         }),
         clock.clone(),

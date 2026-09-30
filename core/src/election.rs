@@ -112,6 +112,7 @@ mod carry_out;
 mod election_round;
 mod entry;
 mod forced_recovery;
+mod leader_office;
 mod lease;
 mod standing;
 
@@ -141,6 +142,7 @@ use crate::time::{Clock, Duration, Instant};
 use authority_lease::{AuthorityLease, Reconnect};
 use election_round::{ElectionRound, Verdict, View};
 use forced_recovery::{ForcedRecovery, Next, cannot_recover_from};
+use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice};
 use lease::{Lease, LeaseChange, Office};
 use standing::{EpochOrder, HeardEpoch, ShardStanding, order, order_numbers};
 
@@ -188,18 +190,17 @@ where
     stop_reason: Option<StopReason>,
     /// See [`Self::with_reconnect_timeout`].
     reconnect_timeout: Duration,
-    /// While `Leader`: when it last heard from each worker it has not yet
-    /// reported lost.
-    last_heard: BTreeMap<WorkerId, Instant>,
     /// The term this node is contesting or holds. Meaningful from `Candidate`
     /// onward.
     term: u64,
     /// The roll calls this node answered, the votes it granted, and the
     /// roll call or candidacy it runs.
     round: ElectionRound,
-    /// The members and pending joiners this node leads. Set when it wins;
-    /// meaningful only while `Leader`.
-    roster: Option<Roster>,
+    /// What this node holds only while `Leader`: the roster it leads, the
+    /// removals it has accepted and when it last heard from each worker.
+    /// While it is held it, not `standing`, holds the configuration and
+    /// admissions this node leads (see [`Self::led_or_followed_configuration`]).
+    office: Option<LeaderOffice>,
     /// The leader whose heartbeat ack this node last accepted, or that a JOIN
     /// pointed it at, or that a roll-call refusal named, or this node itself
     /// once it wins, with the term that leader was elected in.
@@ -217,10 +218,6 @@ where
     lease: Lease,
     /// A drain was asked for in a state that cannot drain yet.
     drain_requested: bool,
-    /// While `Leader`: the workers whose SELF_REMOVE it has accepted since
-    /// it last changed its configuration, to take out together (see
-    /// [`Self::apply_pending_removals`]).
-    pending_removals: BTreeSet<WorkerId>,
     /// What the step in progress has produced so far.
     outputs: Vec<Output>,
 }
@@ -724,17 +721,15 @@ where
             tokens: ReplyTokens::new(Issuer::Node),
             stop_reason: None,
             reconnect_timeout: DEFAULT_RECONNECT_TIMEOUT,
-            last_heard: BTreeMap::new(),
             term: 0,
             round: ElectionRound::new(now),
-            roster: None,
+            office: None,
             leader: None,
             newest_accepted_ack: None,
             next_heartbeat: None,
             connected: BTreeSet::new(),
             lease: Lease::new(now),
             drain_requested: false,
-            pending_removals: BTreeSet::new(),
             outputs: Vec::new(),
         }
     }
@@ -836,20 +831,20 @@ where
     /// newest a leader's ack or election certificate has carried since.
     /// `None` for a joiner that has accepted neither yet.
     pub fn configuration(&self) -> Option<&Configuration> {
-        self.standing.configuration()
+        self.led_or_followed_configuration()
     }
 
     /// The generation at which this node became a voter; `None` for a
     /// pending member.
     pub fn admission(&self) -> Option<Generation> {
-        self.standing.admission()
+        self.counted_admission().current
     }
 
     /// The admission generation this node held before the election that
     /// founded the joint configuration it holds admitted it; `None` once
     /// that configuration is committed, and for any other configuration.
     pub fn prior_admission(&self) -> Option<Generation> {
-        self.standing.prior_admission()
+        self.counted_admission().prior
     }
 
     /// Whether this node has no admission generation: it joined through a
@@ -857,7 +852,25 @@ where
     /// admitted it since. It claims work, and it answers roll calls and
     /// grants votes as a new voter, but no quorum counts it.
     pub fn is_pending_member(&self) -> bool {
-        self.standing.admission().is_none()
+        self.counted_admission().current.is_none()
+    }
+
+    /// The configuration this node leads while it leads, and the one it
+    /// follows otherwise.
+    fn led_or_followed_configuration(&self) -> Option<&Configuration> {
+        led_or_followed(&self.office, &self.standing)
+    }
+
+    /// The admission generations a quorum counts this node by: those of the
+    /// roster it leads while it leads, and those it follows otherwise.
+    fn counted_admission(&self) -> Admission {
+        match &self.office {
+            Some(office) => Admission {
+                current: office.admission_of(&self.my_id),
+                prior: office.prior_admission_of(&self.my_id),
+            },
+            None => self.standing.counted_admission(),
+        }
     }
 
     /// The workers that have answered the roll call this node is running,
@@ -891,7 +904,9 @@ where
         let named = match self.state {
             WorkerState::Leader => Some((self.my_id.clone(), self.term)),
             WorkerState::Active => self.leader.clone(),
-            WorkerState::LeaderSuspect if self.standing.configuration().is_none() => self.leader.clone(),
+            WorkerState::LeaderSuspect if self.led_or_followed_configuration().is_none() => {
+                self.leader.clone()
+            }
             _ => None,
         };
         named.filter(|(_, term)| *term >= self.standing.highest_term_seen())
@@ -1021,10 +1036,13 @@ where
             WorkerState::RollCall => earliest(next_heartbeat, self.round.next_deadline()),
             WorkerState::Candidate => self.round.next_deadline(),
             WorkerState::Leader => earliest(
-                self.roster
+                self.office.as_ref().and_then(|office| {
+                    self.lease
+                        .no_quorum_at(&self.my_id, office.roster(), &self.timings)
+                }),
+                self.office
                     .as_ref()
-                    .and_then(|roster| self.lease.no_quorum_at(&self.my_id, roster, &self.timings)),
-                self.next_worker_lost_at(),
+                    .and_then(|office| office.next_lost_at(self.lost_after())),
             ),
             _ => None,
         }
@@ -1049,7 +1067,7 @@ where
         if self.state == WorkerState::Leader {
             self.lease.withdraw_grant(self.clock.now());
             self.outputs.push(Output::Grant(None));
-            self.last_heard.clear();
+            self.leave_office();
         }
         if !matches!(
             next,
@@ -1064,6 +1082,17 @@ where
         if self.drain_requested && matches!(next, WorkerState::Active | WorkerState::Leader) {
             self.drain_requested = false;
             self.drain();
+        }
+    }
+
+    /// Hands the office back to the standing, if this node holds one: the
+    /// standing then follows the configuration the roster led, as it stands
+    /// (see [`LeaderOffice::hand_back`]). Call it before anything that writes
+    /// the standing while this node still leads, so what it writes is not
+    /// overwritten by the configuration this node led.
+    fn leave_office(&mut self) {
+        if let Some(office) = self.office.take() {
+            office.hand_back(&mut self.standing, &self.my_id);
         }
     }
 
@@ -1139,6 +1168,9 @@ where
         let outpaced = self
             .term_in_play()
             .is_some_and(|term| later_epoch || ack.term > term);
+        if outpaced {
+            self.leave_office();
+        }
         let change = self.standing.accept_ack(
             heard,
             ack.term,
@@ -1305,7 +1337,7 @@ where
     /// confirms nothing here. Any heartbeat also tells the leader its sender
     /// is alive (see [`Self::report_lost_workers`]). A sender its roster does not hold is
     /// added as a pending joiner, so its acks name it pending, until a batch
-    /// admits it (see [`Self::admit_waiting_joiners`]), which the ack
+    /// admits it (see [`LeaderOffice::take_heartbeat`]), which the ack
     /// answering this heartbeat already carries. Every sender gets an ack,
     /// though only members' confirmations count towards the lease, except
     /// one whose heartbeat names a later term of this leader's epoch: this
@@ -1345,7 +1377,7 @@ where
         }
 
         let now = self.clock.now();
-        self.last_heard.insert(from.clone(), now);
+        let mut heard = Heard::Alive;
         if same_epoch
             && let Some(echo) = heartbeat.newest_accepted_ack
             && echo.term == self.term
@@ -1353,22 +1385,23 @@ where
         {
             self.lease
                 .confirm(from.clone(), Instant::at(echo.send_token));
-            if let Some(held) = heartbeat.configuration_generation()
-                && let Some(roster) = self.roster.as_mut()
-            {
-                roster.record_held_generation(&from, held);
-            }
-            self.commit_if_confirmed();
+            heard = Heard::Confirmed {
+                held: heartbeat.configuration_generation(),
+            };
         }
-        if let Some(roster) = self.roster.as_mut() {
-            roster.add_pending(from.clone());
+        if let Some(office) = self.office.as_mut() {
+            let duties = Duties {
+                me: &self.my_id,
+                lease: &self.lease,
+                timings: &self.timings,
+                now,
+            };
+            office.take_heartbeat(from.clone(), heard, &duties);
         }
-        self.admit_waiting_joiners();
         // Only a leader that holds a grant vouches for when it heard the
         // sender: no rival can win until that grant ends (see
-        // `Output::AbortDeadline`). Removals pending take effect first, as
+        // `Output::AbortDeadline`). The office applied removals pending, as
         // they can end the grant.
-        self.apply_pending_removals();
         let heartbeat_token = self
             .lease
             .holds_grant_at(self.office().as_ref(), &self.timings, now)
@@ -1381,22 +1414,27 @@ where
     /// for a pending joiner or a worker the roster does not hold), with the
     /// instant it is sent as the token a heartbeat echoes back, and, when it
     /// answers a heartbeat, that heartbeat's own token echoed. Removals
-    /// pending take effect first (see [`Self::apply_pending_removals`]); a
+    /// pending take effect first (see [`LeaderOffice::ack_for`]); a
     /// caller that vouches with `heartbeat_token` applies them before it
     /// decides whether it still holds a grant.
     fn send_ack(&mut self, to: WorkerId, heartbeat_token: Option<u64>) {
-        self.apply_pending_removals();
-        let Some(roster) = &self.roster else {
+        let Some(office) = self.office.as_mut() else {
             return;
         };
+        let content = office.ack_for(&to);
+        self.send_ack_with(to, content, heartbeat_token);
+    }
+
+    /// Sends `to` an ack carrying `content` from this leader.
+    fn send_ack_with(&mut self, to: WorkerId, content: AckContent, heartbeat_token: Option<u64>) {
         let ack = LeaderHeartbeatAck {
             shard_id: Some(self.shard_id.clone().into()),
             leader_id: Some(self.my_id.clone().into()),
             recovery_epoch: self.standing.epoch_number(),
             term: self.term,
-            configuration: Some(roster.configuration().into()),
-            recipient_admission: roster.admission_of(&to).map(Into::into),
-            recipient_prior_admission: roster.prior_admission_of(&to).map(Into::into),
+            configuration: Some((&content.configuration).into()),
+            recipient_admission: content.recipient_admission.map(Into::into),
+            recipient_prior_admission: content.recipient_prior_admission.map(Into::into),
             send_token: self.clock.now().as_ticks(),
             heartbeat_token,
             recovery_epoch_lineage: self.standing.epoch().map(|epoch| epoch.lineage),
@@ -1416,8 +1454,11 @@ where
     /// this misses hears from the leader once a
     /// connection to it opens (see [`Self::on_peer_connected`]).
     fn announce_leadership(&mut self) {
-        for peer in self.connected.clone() {
-            self.send_ack(peer, None);
+        let Some(office) = self.office.as_mut() else {
+            return;
+        };
+        for (peer, content) in office.announce(&self.connected) {
+            self.send_ack_with(peer, content, None);
         }
     }
 
@@ -1434,7 +1475,7 @@ where
         };
         Some(Office {
             me: &self.my_id,
-            roster: self.roster.as_ref()?,
+            roster: self.office.as_ref()?.roster(),
             term: self.term,
             recovery_epoch: self.standing.epoch_number(),
             fence_end,
@@ -1542,20 +1583,18 @@ where
         if self.state != WorkerState::Leader {
             return;
         }
-        let quorum_lost = |node: &Self| {
-            node.roster.as_ref().is_some_and(|roster| {
-                node.lease
-                    .no_quorum_at(&node.my_id, roster, &node.timings)
-                    .is_some_and(|at| node.clock.now() >= at)
-            })
+        let now = self.clock.now();
+        let Some(office) = self.office.as_mut() else {
+            return;
         };
-        if quorum_lost(self) {
-            // The departed no longer confirm anything: the configuration
-            // without them may still have its quorum.
-            self.apply_pending_removals();
-            if quorum_lost(self) {
-                self.lose_quorum();
-            }
+        let duties = Duties {
+            me: &self.my_id,
+            lease: &self.lease,
+            timings: &self.timings,
+            now,
+        };
+        if office.has_lost_quorum(&duties) {
+            self.lose_quorum();
         }
     }
 
@@ -1699,9 +1738,13 @@ where
         // Leaving `Leader` withdraws the grant first, so no departure
         // message goes out while this node still holds one.
         let was_leader = self.state == WorkerState::Leader;
+        let departure = self
+            .office
+            .take()
+            .and_then(|office| office.depart(&self.my_id, &mut self.standing));
         self.transition_to(WorkerState::Draining);
         if was_leader {
-            self.announce_own_departure();
+            self.announce_own_departure(departure);
         } else {
             self.tell_leader_of_departure();
         }
@@ -1736,34 +1779,25 @@ where
         self.send(leader, election_message::Payload::SelfRemove(msg));
     }
 
-    /// The draining leader's half of [`Self::drain`]: takes itself out of
-    /// its roster and, if that announced a change, acks every connected
+    /// The draining leader's half of [`Self::drain`]: if taking itself out
+    /// of its roster announced a change (`departure`), acks every connected
     /// peer with it.
-    fn announce_own_departure(&mut self) {
-        let Some(roster) = self.roster.as_mut() else {
+    fn announce_own_departure(&mut self, departure: Option<Departure>) {
+        let Some(departure) = departure else {
             return;
         };
-        let before = roster.configuration().generation();
-        self.pending_removals.insert(self.my_id.clone());
-        self.apply_pending_removals();
-        if self
-            .roster
-            .as_ref()
-            .is_none_or(|roster| roster.configuration().generation() == before)
-        {
-            return;
-        }
         for peer in self.connected.clone() {
             // Unasked, and sent after the grant is withdrawn: no heartbeat
             // token to vouch for.
-            self.send_ack(peer, None);
+            let content = departure.ack_for(&peer);
+            self.send_ack_with(peer, content, None);
         }
     }
 
     /// Accepts a departing worker's SELF_REMOVE (README §12.3, ADR-0001
     /// decision 10), to take it out of this leader's roster with every
     /// other one accepted since the last change, in one next generation and
-    /// with no commit round (see [`Self::apply_pending_removals`]).
+    /// with no commit round (see [`LeaderOffice::take_removal`]).
     ///
     /// It accepts only a removal addressed to this leadership: to this
     /// node, as the leader of this term. And the term guard (ADR-0001
@@ -1789,105 +1823,8 @@ where
         {
             return;
         }
-        self.pending_removals.insert(departing.clone());
-    }
-
-    /// Takes every worker whose SELF_REMOVE this leader has accepted since
-    /// its last change out of its roster together (ADR-0001 decision 10:
-    /// every pending SELF_REMOVE in the next generation; see
-    /// [`Roster::remove_all`]): a voter leaves a configuration shrunk at the
-    /// next generation, re-based there with every remaining voter
-    /// re-admitted, this leader included; during a founding or a batch the
-    /// joint configuration is re-announced with shrunk counts. A pending
-    /// joiner, or a member that is no voter, is only forgotten.
-    ///
-    /// It runs before anything the configuration changes or shows: before
-    /// an ack announces it, a commit or a batch changes it, the leader's
-    /// own drain, and before the leader would give up for want of a quorum
-    /// of it. Until then the leader counts the departing workers as it did,
-    /// their last confirmations included, which can hold its lease a little
-    /// longer than the shrunk configuration's would. That is safe: a
-    /// departed worker has stopped, grants no vote to anyone, and its leader
-    /// contact was fresh when it confirmed (the TLA+ model keeps a stopped
-    /// worker's confirmation until the lease runs past it). The same holds
-    /// of a removal the leader simply announces late.
-    fn apply_pending_removals(&mut self) {
-        if self.pending_removals.is_empty() {
-            return;
-        }
-        let departing = std::mem::take(&mut self.pending_removals);
-        let Some(roster) = self.roster.as_mut() else {
-            return;
-        };
-        roster.remove_all(&departing, self.term);
-        self.take_on_roster_configuration();
-    }
-
-    /// Takes on, as this leader's own, the configuration its roster leads
-    /// and its admission generations there.
-    fn take_on_roster_configuration(&mut self) {
-        let Some(roster) = &self.roster else {
-            return;
-        };
-        self.standing.take_on_roster(roster, &self.my_id);
-    }
-
-    /// Starts an admission batch (ADR-0001 decision 9, see
-    /// [`Roster::begin_batch`]) of every worker waiting to join that has
-    /// confirmed one of this leader's acks recently enough to leave it a
-    /// lease worth having (see [`Lease::admissible`]): sent
-    /// within the last two heartbeat intervals, or no earlier than the
-    /// lease's quorum-contact time. A worker that drained after its
-    /// last confirmation, its SELF_REMOVE not yet here, may be taken too: the
-    /// same as one that is admitted and then drains, which the removal
-    /// handles in turn. This leader itself, if its
-    /// configuration does not count it, joins too. Nothing starts while its
-    /// configuration is joint: joiners wait for the commit, which calls
-    /// this again.
-    fn admit_waiting_joiners(&mut self) {
-        if self.state != WorkerState::Leader {
-            return;
-        }
-        self.apply_pending_removals();
-        let Some(roster) = self.roster.as_ref() else {
-            return;
-        };
-        if roster.configuration().is_joint() {
-            return;
-        }
-        // A joiner heartbeats every heartbeat interval, echoing the ack that
-        // answered its previous heartbeat: two intervals cover that ack's
-        // age, and network delays within one.
-        let recent_since = Instant::at(
-            self.clock
-                .now()
-                .as_ticks()
-                .saturating_sub(2 * self.timings.heartbeat_interval.as_ticks()),
-        );
-        let mut waiting: BTreeSet<WorkerId> = self
-            .lease
-            .admissible(
-                roster
-                    .pending()
-                    .iter()
-                    .chain(roster.members().keys())
-                    .filter(|worker| roster.is_admissible(worker)),
-                &self.my_id,
-                roster,
-                &self.timings,
-                recent_since,
-            )
-            .into_iter()
-            .cloned()
-            .collect();
-        if roster.is_admissible(&self.my_id) {
-            waiting.insert(self.my_id.clone());
-        }
-        let Some(roster) = self.roster.as_mut() else {
-            return;
-        };
-        if roster.begin_batch(&waiting, self.term) {
-            self.take_on_roster_configuration();
+        if let Some(office) = self.office.as_mut() {
+            office.take_removal(departing.clone());
         }
     }
 
@@ -1908,7 +1845,7 @@ where
     /// of this node as it is now, and carries out what it decided (see
     /// [`Self::apply`]).
     fn decide(&mut self, decide: impl FnOnce(&mut ElectionRound, &View<'_>) -> Vec<Verdict>) {
-        let admission = self.standing.counted_admission();
+        let admission = self.counted_admission();
         let takes_part = self.takes_part_in_elections();
         let leader_contact_is_fresh = self.current_leader_still_valid();
         let view = View {
@@ -1916,7 +1853,7 @@ where
             shard: &self.shard_id,
             recovery_epoch: self.standing.epoch_number(),
             highest_term_seen: self.standing.highest_term_seen(),
-            configuration: self.standing.configuration(),
+            configuration: led_or_followed(&self.office, &self.standing),
             admission,
             takes_part,
             leader_contact_is_fresh,
@@ -2026,7 +1963,7 @@ where
             // leader that outlasted it, as it once locked this node out.
             highest_term_seen: self.standing.highest_term_seen(),
             leader,
-            configuration: self.standing.configuration().map(Into::into),
+            configuration: self.led_or_followed_configuration().map(Into::into),
         };
         self.send(initiator, election_message::Payload::ElectionReject(reject));
     }
@@ -2131,24 +2068,6 @@ where
         }
     }
 
-    /// Commits the joint configuration this leader leads once a majority of
-    /// each side holds it (see [`Roster::commit_if_confirmed`]): it then
-    /// leads the new side alone, which its acks carry from then on, with
-    /// each member's admission generation there, its own included, and
-    /// holds no prior admission generation any more. Joiners that waited
-    /// out the change are then admitted in the next batch (see
-    /// [`Self::admit_waiting_joiners`]).
-    fn commit_if_confirmed(&mut self) {
-        self.apply_pending_removals();
-        let Some(roster) = self.roster.as_mut() else {
-            return;
-        };
-        if roster.commit_if_confirmed(&self.my_id, self.term) {
-            self.take_on_roster_configuration();
-            self.admit_waiting_joiners();
-        }
-    }
-
     /// Accepts `leader`'s certificate of what its election's winner leads
     /// (ADR-0001 decision 8), sent to every respondent of its winning roll
     /// call: this node adopts that configuration and its admission
@@ -2176,6 +2095,9 @@ where
         let voted_for_it = self.round.granted_in(certificate.term) == Some(leader);
         if certificate.term < self.ack_floor() && !voted_for_it {
             return;
+        }
+        if self.state == WorkerState::Leader && certificate.term > self.term {
+            self.leave_office();
         }
         self.standing.adopt_certificate(
             certificate.term,
@@ -2369,7 +2291,7 @@ where
         self.newest_accepted_ack = None;
         self.round.forget();
         self.recovery = None;
-        self.roster = None;
+        self.office = None;
     }
 
     /// Takes the authority path once this node's roll call for `term` under
@@ -2634,17 +2556,13 @@ where
         // A leader never acks itself, so nothing else raises its own
         // `highest_term_seen` to the term it won.
         self.standing.saw_term(self.term);
-        self.pending_removals.clear();
-        self.standing.take_on_roster(&roster, &self.my_id);
-        self.last_heard = roster
-            .members()
-            .keys()
-            .chain(roster.pending())
-            .filter(|worker| **worker != self.my_id)
-            .map(|worker| (worker.clone(), now))
-            .collect();
-        self.roster = Some(roster);
-        self.commit_if_confirmed();
+        let duties = Duties {
+            me: &self.my_id,
+            lease: &self.lease,
+            timings: &self.timings,
+            now,
+        };
+        self.office = Some(LeaderOffice::take(roster, self.term, &duties));
 
         self.lease.won(now);
         if let Some(lease) = self.authority.as_mut()
@@ -2665,16 +2583,6 @@ where
         }
     }
 
-    /// When the leader next has a worker to report lost: a suspicion timeout
-    /// and a reconnect timeout after it last heard from the one it heard
-    /// from longest ago.
-    fn next_worker_lost_at(&self) -> Option<Instant> {
-        self.last_heard
-            .values()
-            .min()
-            .map(|heard| *heard + self.lost_after())
-    }
-
     /// How long a leader goes without hearing from a worker before it
     /// reports that worker lost: a suspicion timeout and then a reconnect
     /// timeout. The worker's own abort deadline counts from the same span
@@ -2693,14 +2601,10 @@ where
     fn report_lost_workers(&mut self) {
         let now = self.clock.now();
         let lost_after = self.lost_after();
-        let lost: Vec<WorkerId> = self
-            .last_heard
-            .iter()
-            .filter(|(_, heard)| now >= **heard + lost_after)
-            .map(|(worker, _)| worker.clone())
-            .collect();
-        for worker in lost {
-            self.last_heard.remove(&worker);
+        let Some(office) = self.office.as_mut() else {
+            return;
+        };
+        for worker in office.lost_by(now, lost_after) {
             self.outputs.push(Output::WorkerLost(worker));
         }
     }
@@ -2719,6 +2623,19 @@ fn assert_heartbeats_keep_a_lease(timings: &ElectionTimings) {
         timings.heartbeat_interval,
         timings.lease_length(),
     );
+}
+
+/// The configuration a node leads through its `office`, if it holds one, and
+/// otherwise the one its `standing` follows. Takes the two fields, not the
+/// node, so a caller can hold it while borrowing another field of the node.
+fn led_or_followed<'a>(
+    office: &'a Option<LeaderOffice>,
+    standing: &'a ShardStanding,
+) -> Option<&'a Configuration> {
+    match office {
+        Some(office) => Some(office.configuration()),
+        None => standing.configuration(),
+    }
 }
 
 /// The earlier of two optional instants; `None` only when both are.

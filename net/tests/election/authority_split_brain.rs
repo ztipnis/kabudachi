@@ -255,7 +255,7 @@ fn voter(clock: RealClock, id: &WorkerId) -> Node {
                 generation: Generation::genesis(0),
                 base: Generation::genesis(0),
                 voter_count: VOTERS,
-            }),
+            }).expect("valid"),
             admission: Some(Generation::genesis(0)),
         }),
         clock,

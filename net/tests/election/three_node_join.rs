@@ -148,7 +148,7 @@ fn make_active_node<C: Clock>(clock: C, my_id: WorkerId, voter_count: usize) -> 
                 generation: Generation::genesis(0),
                 base: Generation::genesis(0),
                 voter_count,
-            }),
+            }).expect("valid"),
             admission: Some(Generation::genesis(0)),
         }),
         clock,

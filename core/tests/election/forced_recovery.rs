@@ -730,7 +730,7 @@ fn a_roll_call_short_of_its_quorum_recovers_through_a_majority_of_the_live_regis
             generation: founded,
             base: founded,
             voter_count: 2,
-        }))
+        }).expect("valid"))
     );
     assert_eq!(driven.node.admission(), Some(founded));
     assert_eq!(
@@ -811,7 +811,7 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
                     generation: Generation::genesis(5),
                     base: Generation::genesis(5),
                     voter_count: 5,
-                }),
+                }).expect("valid"),
                 admission: Some(Generation::genesis(5)),
             },
             Some(AuthorityTimings {
@@ -928,7 +928,7 @@ fn a_node_ignores_an_ack_from_a_lower_epoch_of_another_lineage() {
             generation: epoch_1,
             base: epoch_1,
             voter_count: 3,
-        }),
+        }).expect("valid"),
         admission: Some(epoch_1),
     };
     let (mut driven, _) = Driven::with(
@@ -975,7 +975,7 @@ fn a_node_that_adopts_a_later_epoch_from_an_ack_resumes_it_after_fencing() {
         generation: Generation::new(1, 2, 1),
         base: Generation::new(1, 2, 1),
         voter_count: 3,
-    });
+    }).expect("valid");
     driven.step(Input::Message {
         from: leader.clone(),
         message: ack_message(LeaderHeartbeatAck {
@@ -1068,7 +1068,7 @@ fn a_pending_joiner_pointed_at_a_stale_epoch_adopts_its_leaders_later_one() {
         generation: Generation::new(1, 2, 1),
         base: Generation::new(1, 2, 1),
         voter_count: 2,
-    });
+    }).expect("valid");
 
     let _ = joiner.step(Input::Message {
         from: leader.clone(),

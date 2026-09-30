@@ -64,7 +64,7 @@ pub fn configuration_of(voter_count: usize) -> Configuration {
         generation: g0(),
         base: g0(),
         voter_count,
-    })
+    }).expect("valid")
 }
 
 /// A voter of `configuration_of(voter_count)`, admitted at [`g0`].
@@ -263,7 +263,7 @@ pub fn founded_from_g0(term: u64, old_voter_count: usize, respondents: usize) ->
         old_generation: g0(),
         old_voter_count,
         new_voter_count: respondents,
-    })
+    }).expect("valid")
 }
 
 /// What `founded_from_g0(term, …)` commits to: its `respondents` alone, at
@@ -275,7 +275,7 @@ pub fn committed_from_g0(term: u64, leader_term: u64, respondents: usize) -> Con
         generation: committed,
         base: committed,
         voter_count: respondents,
-    })
+    }).expect("valid")
 }
 
 pub fn election_certificate_message(certificate: ElectionCertificate) -> ElectionMessage {

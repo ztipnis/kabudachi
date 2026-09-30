@@ -615,7 +615,7 @@ mod tests {
             generation: Generation::genesis(0),
             base: Generation::genesis(0),
             voter_count: 2,
-        })
+        }).expect("valid")
     }
 
     /// `me`'s node, a voter of a configuration of two, suspecting a leader

@@ -234,7 +234,8 @@ impl ForcedRecovery {
                 generation: founded,
                 base: founded,
                 voter_count: counted.len(),
-            }),
+            })
+            .expect("a forced recovery's configuration has a voter, and its base is its generation"),
             members,
             pending,
         ))

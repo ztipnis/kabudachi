@@ -91,7 +91,7 @@ fn make_node(clock: RealClock, my_id: WorkerId) -> WorkerNode<RealClock> {
                 generation: Generation::genesis(0),
                 base: Generation::genesis(0),
                 voter_count: 3,
-            }),
+            }).expect("valid"),
             admission: Some(Generation::genesis(0)),
         }),
         clock,

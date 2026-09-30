@@ -32,6 +32,42 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::protocol::generated;
 use crate::protocol::ids::WorkerId;
 
+/// Why a configuration breaks one of its rules, whether built here or decoded
+/// from a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidConfiguration {
+    #[error("a generation's counter is u64::MAX")]
+    CounterAtMax,
+    #[error("Configuration.generation is required but was absent")]
+    MissingGeneration,
+    #[error("Configuration.base is required but was absent")]
+    MissingBase,
+    #[error("Configuration.electorate is required but was absent")]
+    MissingElectorate,
+    #[error("JointElectorate.batch_generation is required but was absent")]
+    MissingBatchGeneration,
+    #[error("JointElectorate.old_base is required but was absent")]
+    MissingOldBase,
+    #[error("JointElectorate.old_generation is required but was absent")]
+    MissingOldGeneration,
+    #[error("base is later than generation")]
+    BaseAfterGeneration,
+    #[error("a joint electorate's base is later than its batch generation")]
+    BaseAfterBatchGeneration,
+    #[error("a joint electorate's batch generation is later than generation")]
+    BatchGenerationAfterGeneration,
+    #[error("a joint electorate's old base is later than its old generation")]
+    OldBaseAfterOldGeneration,
+    #[error("a joint electorate's old generation is not earlier than its batch generation")]
+    OldGenerationNotBeforeBatchGeneration,
+    #[error("a joint electorate's old base is later than its base")]
+    OldBaseAfterBase,
+    #[error("a voter count is zero")]
+    ZeroVoterCount,
+    #[error("a voter count does not fit in usize")]
+    VoterCountTooLarge,
+}
+
 /// The identity of a configuration: the triple (recovery epoch, term,
 /// counter), compared lexicographically in that order.
 ///
@@ -254,67 +290,61 @@ impl Configuration {
             base: genesis,
             voter_count: 1,
         })
+        .expect("a genesis configuration's base is its generation, with one voter")
     }
 
-    /// A configuration of `voter_count` voters: the workers admitted from
-    /// `base` through `generation`.
+    /// A configuration of `single.voter_count` voters: the workers admitted
+    /// from `single.base` through `single.generation`. Refuses a base later
+    /// than the generation, and no voters.
     ///
-    /// For trusted, locally built configurations only: invariants are only
-    /// `debug_assert!`ed, so a local bug fails loudly in tests rather than
-    /// being checked in production. A configuration decoded from a peer goes
-    /// through the checked `TryFrom<&generated::Configuration>` in
-    /// [`crate::protocol::configuration`] instead, which validates the same
-    /// invariants and returns an error rather than panicking.
-    pub fn single(single: Single) -> Self {
-        debug_assert!(
-            single.base <= single.generation,
-            "base must not be later than generation"
-        );
-        debug_assert!(single.voter_count >= 1, "voter_count must be at least 1");
-        Configuration {
+    /// A configuration decoded from a peer is built through here too (see
+    /// [`crate::protocol::configuration`], which checks only field presence),
+    /// so no configuration exists that breaks these rules.
+    pub fn single(single: Single) -> Result<Self, InvalidConfiguration> {
+        if single.base > single.generation {
+            return Err(InvalidConfiguration::BaseAfterGeneration);
+        }
+        if single.voter_count == 0 {
+            return Err(InvalidConfiguration::ZeroVoterCount);
+        }
+        Ok(Configuration {
             generation: single.generation,
             base: single.base,
             electorate: Electorate::Single {
                 voter_count: single.voter_count,
             },
-        }
+        })
     }
 
     /// A joint configuration (see [`Joint`]), whose quorums need a majority
-    /// of the old side and a majority of the new side.
-    ///
-    /// For trusted, locally built configurations only — see
-    /// [`Configuration::single`].
-    pub fn joint(joint: Joint) -> Self {
-        debug_assert!(
-            joint.old_base <= joint.old_generation,
-            "old_base must not be later than old_generation"
-        );
-        debug_assert!(
-            joint.old_generation < joint.batch_generation,
-            "old_generation must be earlier than batch_generation"
-        );
-        debug_assert!(
-            joint.old_base <= joint.base,
-            "old_base must not be later than base"
-        );
-        debug_assert!(
-            joint.base <= joint.batch_generation,
-            "base must not be later than batch_generation"
-        );
-        debug_assert!(
-            joint.batch_generation <= joint.generation,
-            "batch_generation must not be later than generation"
-        );
-        debug_assert!(
-            joint.old_voter_count >= 1,
-            "old_voter_count must be at least 1"
-        );
-        debug_assert!(
-            joint.new_voter_count >= 1,
-            "new_voter_count must be at least 1"
-        );
-        Configuration {
+    /// of the old side and a majority of the new side. Refuses, in this order:
+    /// `BaseAfterGeneration`, `BaseAfterBatchGeneration`,
+    /// `BatchGenerationAfterGeneration`, `OldBaseAfterOldGeneration`,
+    /// `OldGenerationNotBeforeBatchGeneration`, `OldBaseAfterBase`, and
+    /// `ZeroVoterCount` (old side, then new).
+    pub fn joint(joint: Joint) -> Result<Self, InvalidConfiguration> {
+        if joint.base > joint.generation {
+            return Err(InvalidConfiguration::BaseAfterGeneration);
+        }
+        if joint.base > joint.batch_generation {
+            return Err(InvalidConfiguration::BaseAfterBatchGeneration);
+        }
+        if joint.batch_generation > joint.generation {
+            return Err(InvalidConfiguration::BatchGenerationAfterGeneration);
+        }
+        if joint.old_base > joint.old_generation {
+            return Err(InvalidConfiguration::OldBaseAfterOldGeneration);
+        }
+        if joint.old_generation >= joint.batch_generation {
+            return Err(InvalidConfiguration::OldGenerationNotBeforeBatchGeneration);
+        }
+        if joint.old_base > joint.base {
+            return Err(InvalidConfiguration::OldBaseAfterBase);
+        }
+        if joint.old_voter_count == 0 || joint.new_voter_count == 0 {
+            return Err(InvalidConfiguration::ZeroVoterCount);
+        }
+        Ok(Configuration {
             generation: joint.generation,
             base: joint.base,
             electorate: Electorate::Joint {
@@ -324,7 +354,7 @@ impl Configuration {
                 old_voter_count: joint.old_voter_count,
                 new_voter_count: joint.new_voter_count,
             },
-        }
+        })
     }
 
     pub fn generation(&self) -> Generation {
@@ -416,22 +446,20 @@ impl Configuration {
         else {
             unreachable!("only a joint configuration is re-stamped");
         };
-        debug_assert!(new_voter_count >= 1, "a new side has at least one voter");
         debug_assert!(
             generation > self.generation,
             "a change moves a configuration to a later generation"
         );
-        Configuration {
+        Configuration::joint(Joint {
             generation,
             base: generation,
-            electorate: Electorate::Joint {
-                batch_generation: generation,
-                old_base,
-                old_generation,
-                old_voter_count,
-                new_voter_count,
-            },
-        }
+            batch_generation: generation,
+            old_base,
+            old_generation,
+            old_voter_count,
+            new_voter_count,
+        })
+        .expect("a re-stamped configuration keeps its old side, and its new side has a voter")
     }
 }
 
@@ -701,7 +729,8 @@ impl Roster {
                 old_generation: roll_call_configuration.generation,
                 old_voter_count: voter_count,
                 new_voter_count: respondents.len(),
-            }),
+            })
+            .expect("a roll call's respondents are at least one, and its old side is earlier than the founded generation"),
             respondents
                 .keys()
                 .map(|respondent| (respondent.clone(), founded))
@@ -886,7 +915,8 @@ impl Roster {
             } else {
                 new_voter_count
             },
-        });
+        })
+        .expect("a commit's base is its generation, and it has a voter");
         self.prior_admissions.clear();
         self.held_generations.clear();
         true
@@ -970,7 +1000,8 @@ impl Roster {
             old_generation: self.configuration.generation,
             old_voter_count: voter_count,
             new_voter_count,
-        });
+        })
+        .expect("a batch's old generation is its base's, before the batch, and both sides have a voter");
         true
     }
 
@@ -1071,6 +1102,7 @@ impl Roster {
                     old_voter_count,
                     new_voter_count,
                 })
+                .expect("a removal keeps the old side it had, and both sides have a voter")
             }
             _ => {
                 self.prior_admissions.clear();
@@ -1079,6 +1111,7 @@ impl Roster {
                     base: changed,
                     voter_count: new_voter_count,
                 })
+                .expect("a removal leaves at least one voter")
             }
         };
     }

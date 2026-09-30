@@ -668,7 +668,7 @@ fn j1_re_stamped_in_term_2() -> Configuration {
         old_generation: g0(),
         old_voter_count: 3,
         new_voter_count: 2,
-    })
+    }).expect("valid")
 }
 
 #[test]
@@ -754,7 +754,7 @@ fn a_re_stamped_founding_commits_only_on_echoes_of_its_re_stamped_generation() {
             old_generation: committed,
             old_voter_count: 2,
             new_voter_count: 3,
-        }))
+        }).expect("valid"))
     );
 }
 
