@@ -53,20 +53,16 @@ use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, CallKind, Input, MessageSink, Output, Step,
     WorkerNode, carry_out,
 };
-use kabudachi_core::protocol::ids::{IdGenerator, ShardId, TaskId, WorkerId};
-use kabudachi_core::protocol::messages::ElectionMessage;
-use kabudachi_core::protocol::messages::{
-    Claim, ClaimBatch, ClaimReject, ClaimRejectReason, ClaimResponse, JoinResponse, claim_request,
-    claim_response,
-};
+use kabudachi_core::protocol::ids::{IdGenerator, ShardId, WorkerId};
+use kabudachi_core::protocol::messages::{ElectionMessage, JoinResponse};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::{self, ClaimRejection, Scheduler};
+use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Clock, Instant};
 
 use tokio::sync::mpsc;
 
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, WaitLog};
-use crate::framing::MAX_MESSAGE_BYTES;
+use crate::claim;
 use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, find_leader, pointer_for};
 use crate::messenger::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD, Net};
 
@@ -634,103 +630,11 @@ where
 }
 
 /// Answers every inbound `/kabudachi/claim/1` request queued on `net` with
-/// `scheduler`'s decision (README §8.2): `REQUEST_CLAIM` through
-/// `Scheduler::request_claim`, `CLAIM_OLDEST` through
-/// `Scheduler::claim_oldest`.
-///
-/// Whether this node leads is the scheduler's own call, from the leadership
-/// grant [`carry_out`] last handed it and its clock, so nothing about the
-/// node is read here: a worker holding no grant, or one whose grant's lease
-/// has ended, refuses every claim as `NOT_LEADER`.
+/// `scheduler`'s decision (see `claim::answer`).
 fn respond_to_claim_requests<C: Clock, I: IdGenerator>(scheduler: &mut Scheduler<C, I>, net: &Net) {
     for handle in net.poll_claim_requests() {
-        let claimant = handle.from();
-        let result = match handle.request() {
-            claim_request::Request::TaskId(task_id) => scheduler
-                .request_claim(&claimant, &TaskId::from(task_id.clone()))
-                .map(|claim| claim_response::Result::Accept(wire_claim(claim))),
-            claim_request::Request::Oldest(oldest) => {
-                // A limit past what this platform can count is no limit.
-                let limit = usize::try_from(oldest.limit).unwrap_or(usize::MAX);
-                let mut batch = Batch::default();
-                // Every claim the scheduler makes is one `batch` accepted,
-                // in the same order, so `batch` already holds the answer.
-                scheduler
-                    .claim_oldest_fitting(&claimant, limit, |claim| batch.try_add(claim))
-                    .map(|_| {
-                        claim_response::Result::Batch(ClaimBatch {
-                            claims: batch.claims,
-                        })
-                    })
-            }
-        };
-        let result = result.unwrap_or_else(|rejection| {
-            claim_response::Result::Reject(ClaimReject {
-                reason: claim_reject_reason(rejection) as i32,
-            })
-        });
-        net.respond_claim(
-            handle,
-            ClaimResponse {
-                result: Some(result),
-            },
-        );
-    }
-}
-
-/// A `CLAIM_OLDEST` answer as claims are added to it. A claim the
-/// claimant could not decode would stay claimed by a worker that never
-/// received it, so the leader claims only what fits in one message
-/// (`MAX_MESSAGE_BYTES`); the tasks left over stay pending for the next ask.
-#[derive(Default)]
-struct Batch {
-    claims: Vec<Claim>,
-    /// The encoded length of `ClaimBatch { claims }`.
-    encoded_len: usize,
-}
-
-impl Batch {
-    /// Adds `claim` if the answer holding it still fits in one message, and
-    /// says whether it did.
-    fn try_add(&mut self, claim: &scheduler::Claim) -> bool {
-        use prost::encoding::{encoded_len_varint, key_len, message};
-
-        const CLAIMS_TAG: u32 = 1; // ClaimBatch.claims
-        const BATCH_TAG: u32 = 3; // ClaimResponse.batch
-        let claim = wire_claim(claim.clone());
-        let encoded_len = self.encoded_len + message::encoded_len(CLAIMS_TAG, &claim);
-        let response_len =
-            key_len(BATCH_TAG) + encoded_len_varint(encoded_len as u64) + encoded_len;
-        let fits = response_len <= MAX_MESSAGE_BYTES as usize;
-        if fits {
-            self.claims.push(claim);
-            self.encoded_len = encoded_len;
-        }
-        fits
-    }
-}
-
-fn wire_claim(claim: scheduler::Claim) -> Claim {
-    Claim {
-        task: Some(claim.task),
-        task_run_id: Some(claim.task_run_id.into()),
-        attempt_number: claim.attempt_number,
-        chain: claim.chain,
-    }
-}
-
-/// `core::scheduler::ClaimRejection` -> wire `ClaimRejectReason`, one arm per
-/// variant and no wildcard arm, so a new `ClaimRejection` fails to compile
-/// here instead of going out as the wrong reason.
-fn claim_reject_reason(rejection: ClaimRejection) -> ClaimRejectReason {
-    match rejection {
-        ClaimRejection::NotLeader => ClaimRejectReason::ClaimRejectNotLeader,
-        ClaimRejection::TaskUnknown => ClaimRejectReason::ClaimRejectTaskUnknown,
-        ClaimRejection::NotReady => ClaimRejectReason::ClaimRejectNotReady,
-        ClaimRejection::AlreadySelected => ClaimRejectReason::ClaimRejectAlreadySelected,
-        ClaimRejection::Finished => ClaimRejectReason::ClaimRejectFinished,
-        ClaimRejection::Superseded => ClaimRejectReason::ClaimRejectSuperseded,
-        ClaimRejection::KeyBusy => ClaimRejectReason::ClaimRejectKeyBusy,
+        let response = claim::answer(scheduler, &handle.from(), handle.request());
+        net.respond_claim(handle, response);
     }
 }
 

@@ -5,9 +5,10 @@
 //! on `tokio`, to bridge the native runtime to Python, but not on `libp2p`.
 
 pub mod bootstrap;
-pub mod claim_codec;
+pub mod claim;
 pub mod codec;
 pub mod driver;
+mod exchange;
 mod framing;
 pub mod join;
 pub mod join_codec;

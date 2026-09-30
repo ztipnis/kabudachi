@@ -25,14 +25,58 @@ use std::time::Duration as StdDuration;
 use kabudachi_core::coordination_authority::AuthorityError;
 use kabudachi_core::election::WorkerNode;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
-use kabudachi_core::protocol::messages::JoinResponse;
+use kabudachi_core::protocol::messages::{JoinRequest, JoinResponse};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::time::Clock;
 use libp2p::{Multiaddr, PeerId};
 
 use crate::bootstrap::{WaitLog, WaitReason};
 use crate::driver::SharedAuthority;
+use crate::exchange::Asked;
+use crate::join_codec::JoinCodec;
 use crate::messenger::{DialTarget, Net};
+use crate::peers::worker_id_of;
+
+/// An unanswered inbound `/kabudachi/join/1` request, returned by
+/// [`Net::poll_join_requests`]. Answer it with [`Net::respond_join`];
+/// dropping it unanswered just lets the requester's substream eventually
+/// fail with `OutboundFailure` on their side (nothing here relies on that
+/// happening).
+pub struct JoinRequestHandle(Asked<JoinCodec>);
+
+impl JoinRequestHandle {
+    /// The `WorkerId` of whoever sent this join request.
+    pub fn from(&self) -> WorkerId {
+        worker_id_of(&self.0.from)
+    }
+}
+
+impl Net {
+    /// Drains every inbound `/kabudachi/join/1` request not yet answered.
+    /// Answer each with `Self::respond_join`.
+    pub fn poll_join_requests(&self) -> Vec<JoinRequestHandle> {
+        self.take_asked::<JoinCodec>()
+            .into_iter()
+            .map(JoinRequestHandle)
+            .collect()
+    }
+
+    /// Answers a join request obtained from `Self::poll_join_requests`.
+    /// Fire-and-forget like `send`: if the driver task has already stopped,
+    /// there's nowhere for the answer to go, and that's fine to drop.
+    pub fn respond_join(&self, handle: JoinRequestHandle, response: JoinResponse) {
+        self.answer::<JoinCodec>(handle.0.channel, response);
+    }
+
+    /// Sends a `JOIN_REQUEST` to `to` (which must already be connected, see
+    /// this module's `ask_for_leader`, the only caller) and awaits its
+    /// `JOIN_RESPONSE`. `None` if the driver task is gone, the request fails
+    /// outright (`OutboundFailure`), or the peer disconnects before
+    /// answering.
+    pub(crate) async fn send_join_request(&self, to: PeerId) -> Option<JoinResponse> {
+        self.ask::<JoinCodec>(to, JoinRequest {}).await
+    }
+}
 
 /// How long [`ask_for_leader`] waits, per peer, for a connection and then a
 /// `JOIN_RESPONSE` before moving on to the next peer.
@@ -701,5 +745,36 @@ mod tests {
         assert_eq!(node.state(), WorkerState::LeaderSuspect);
 
         assert_eq!(pointer_for(&node, &net_joiner).await, pointer);
+    }
+
+    #[tokio::test]
+    async fn a_request_the_answering_side_drops_is_no_answer_at_once() {
+        let seed = Arc::new(Net::new(build_swarm(identity::Keypair::generate_ed25519())));
+        let seed_addr = timeout(
+            TEST_TIMEOUT,
+            seed.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+        )
+        .await
+        .expect("the seed produced a listen address within the timeout");
+        let dropping = Arc::clone(&seed);
+        let _dropper = tokio::spawn(async move {
+            loop {
+                drop(dropping.poll_join_requests());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
+
+        // Well under the per-peer timeout: a dropped request settles as a
+        // failure, not a wait.
+        let search = timeout(
+            Duration::from_secs(2),
+            ask_for_leader(&net_c, &[seed_addr], Duration::from_secs(5)),
+        )
+        .await
+        .expect("the dropped request settled at once");
+
+        assert_eq!(search, LeaderSearch::NoAnswer);
+        assert_eq!(seed.diagnostics().await.traffic.join_requests_received, 1);
     }
 }

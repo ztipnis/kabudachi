@@ -1,6 +1,6 @@
 //! The message-size limit and body decoding shared by every length-prefixed
 //! `request_response::Codec` in this crate ([`crate::codec`],
-//! [`crate::join_codec`], [`crate::claim_codec`]) — each frames its
+//! [`crate::join_codec`], [`crate::claim::codec`]) — each frames its
 //! messages the same way (a 4-byte big-endian length prefix followed by a
 //! prost-encoded body). The framing lives here once, so every codec enforces
 //! the same limit and error kinds (`STYLE_GUIDE.md`'s "defaults live in one

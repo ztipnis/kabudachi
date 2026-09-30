@@ -83,6 +83,12 @@
 //!
 //! ## The bootstrap join protocol
 //!
+//! Join and claim are both correlated: `crate::exchange` holds the swarm
+//! task's half of one, and every ask and answer of either reaches the swarm
+//! task as one `Command::Exchange` (see `Net::ask`, `Net::take_asked` and
+//! `Net::answer`). The typed wrappers live with their protocol
+//! (`crate::join`, `crate::claim`).
+//!
 //! `/kabudachi/join/1` (see `crate::join_codec`) is a genuine correlated
 //! request/response, unlike the election protocol above, so it needs its own
 //! machinery: the joining side sends a `JOIN_REQUEST` over a connection a
@@ -96,13 +102,14 @@
 //!
 //! ## The claim arbitration protocol
 //!
-//! `/kabudachi/claim/1` (see `crate::claim_codec`) is the same shape of
+//! `/kabudachi/claim/1` (see `crate::claim`) is the same shape of
 //! genuine correlated request/response as join, so it gets the same
-//! machinery: [`Net::request_claim`] and [`Net::claim_oldest`] (the asking
+//! machinery: `Net::request_claim` and `Net::claim_oldest` (the asking
 //! side, sent to the leader the caller names: the transport keeps no leader
 //! of its own) and [`Net::poll_claim_requests`] / [`Net::respond_claim`]
 //! (the answering side). Whether to grant a claim is
-//! `core::scheduler::Scheduler`'s decision, so the driver answers it too.
+//! `core::scheduler::Scheduler`'s decision (`crate::claim::answer`), so the
+//! driver answers it too.
 //!
 //! ## Reconnect/backoff and where a peer's address comes from
 //!
@@ -134,15 +141,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::Input;
-use kabudachi_core::protocol::ids::{ShardId, TaskId, WorkerId};
-use kabudachi_core::protocol::messages::{
-    ClaimOldest, ClaimRequest, ClaimResponse, ElectionMessage, JoinRequest, JoinResponse,
-    claim_request, election_message,
-};
+use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use libp2p::core::ConnectedPoint;
 use libp2p::core::transport::ListenerId;
 use libp2p::futures::StreamExt;
-use libp2p::request_response::{self, OutboundRequestId, ResponseChannel};
+use libp2p::request_response::{self, ResponseChannel};
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, identify};
@@ -151,8 +155,11 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::claim::codec::ClaimCodec;
 use crate::codec::Ack;
+use crate::exchange::{Asked, Exchange};
 use crate::framing::decode_well_formed;
+use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
 use crate::swarm::{Behaviour, BehaviourEvent};
@@ -217,69 +224,57 @@ enum Command {
         addr: Multiaddr,
         respond_to: oneshot::Sender<Multiaddr>,
     },
-    SendJoinRequest {
-        to: PeerId,
-        respond_to: oneshot::Sender<Option<JoinResponse>>,
-    },
-    RespondJoin {
-        channel: ResponseChannel<JoinResponse>,
-        response: JoinResponse,
-    },
-    SendClaimRequest {
-        to: PeerId,
-        request: ClaimRequest,
-        respond_to: oneshot::Sender<Option<ClaimResponse>>,
-    },
-    RespondClaim {
-        channel: ResponseChannel<ClaimResponse>,
-        response: ClaimResponse,
-    },
+    /// Runs an ask or an answer of one correlated protocol on the swarm
+    /// task, which alone owns the swarm and its [`Exchanges`]; see
+    /// `Net::ask` and `Net::answer`.
+    Exchange(Box<dyn FnOnce(&mut Swarm<Behaviour>, &mut Exchanges) + Send>),
     /// Runs a read or small change of the swarm task's [`Peers`] on that
     /// task, which alone owns them; see `Net::with_peers`.
     WithPeers(Box<dyn FnOnce(&mut Peers) + Send>),
 }
 
-/// An unanswered inbound `/kabudachi/join/1` request, returned by
-/// [`Net::poll_join_requests`]. Answer it with [`Net::respond_join`];
-/// dropping it unanswered just lets the requester's substream eventually
-/// fail with `OutboundFailure` on their side (nothing here relies on that
-/// happening).
-pub struct JoinRequestHandle {
-    from: WorkerId,
-    channel: ResponseChannel<JoinResponse>,
+/// The swarm task's asks in flight, one [`Exchange`] per correlated protocol.
+#[derive(Default)]
+pub(crate) struct Exchanges {
+    join: Exchange<JoinCodec>,
+    claim: Exchange<ClaimCodec>,
 }
 
-impl JoinRequestHandle {
-    /// The `WorkerId` of whoever sent this join request.
-    pub fn from(&self) -> WorkerId {
-        self.from.clone()
+/// A correlated protocol `Net` carries through an [`Exchange`]
+/// (implemented here for `JoinCodec` and `ClaimCodec`).
+pub(crate) trait Correlated:
+    request_response::Codec + Clone + Send + Sized + 'static
+{
+    /// The traffic count an arriving request adds.
+    const ARRIVAL: Carried;
+    fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self>;
+    fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self>;
+    fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>>;
+}
+
+impl Correlated for JoinCodec {
+    const ARRIVAL: Carried = Carried::JoinRequest;
+    fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self> {
+        &mut behaviour.join
+    }
+    fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
+        &mut exchanges.join
+    }
+    fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
+        &inbound.joins
     }
 }
 
-/// An unanswered inbound `/kabudachi/claim/1` request, returned by
-/// [`Net::poll_claim_requests`]. Answer it with [`Net::respond_claim`];
-/// dropping it unanswered just lets the requester's substream eventually fail
-/// with `OutboundFailure` on their side (nothing here relies on that
-/// happening) — same contract as [`JoinRequestHandle`].
-pub struct ClaimRequestHandle {
-    from: WorkerId,
-    request: ClaimRequest,
-    channel: ResponseChannel<ClaimResponse>,
-}
-
-impl ClaimRequestHandle {
-    /// The `WorkerId` of whoever sent this claim request.
-    pub fn from(&self) -> WorkerId {
-        self.from.clone()
+impl Correlated for ClaimCodec {
+    const ARRIVAL: Carried = Carried::ClaimRequest;
+    fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self> {
+        &mut behaviour.claim
     }
-
-    /// What this request asks for: one task, or some of the oldest pending
-    /// ones.
-    pub fn request(&self) -> &claim_request::Request {
-        self.request
-            .request
-            .as_ref()
-            .expect("the claim codec only accepts a request that asks for something")
+    fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
+        &mut exchanges.claim
+    }
+    fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
+        &inbound.claims
     }
 }
 
@@ -294,20 +289,6 @@ impl std::fmt::Display for ListenRejected {
 }
 
 impl std::error::Error for ListenRejected {}
-
-/// Why [`Net::request_claim`] or [`Net::claim_oldest`] got no answer from
-/// a leader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimFailure {
-    /// The leader named is this worker. Its own claims are its own scheduler's to
-    /// decide, not a peer's, so nothing was sent.
-    ThisWorkerLeads,
-    /// No answer came: the request failed outright (such as a leader that
-    /// cannot be dialed), the leader disconnected before answering, or
-    /// nothing could be sent (this `Net` has stopped, or the leader's id
-    /// names no libp2p peer).
-    Unanswered,
-}
 
 /// How many of its node's suspicion timeouts `crate::driver::run_driver`
 /// waits, by default, between re-crawls of peer routing that nothing else
@@ -330,12 +311,12 @@ pub const DEFAULT_INPUT_LIMIT: usize = 1024;
 /// What `drive` hands over for the driver of this `Net`'s node, each queue
 /// in arrival order: the node's inputs, and the join and claim requests the
 /// driver answers. `arrived` is signalled whenever any of them grows.
-struct Inbound {
+pub(crate) struct Inbound {
     inputs: Mutex<VecDeque<Input>>,
     /// See [`Net::with_input_limit`].
     input_limit: AtomicUsize,
-    join_requests: Mutex<VecDeque<JoinRequestHandle>>,
-    claim_requests: Mutex<VecDeque<ClaimRequestHandle>>,
+    joins: Mutex<VecDeque<Asked<JoinCodec>>>,
+    claims: Mutex<VecDeque<Asked<ClaimCodec>>>,
     arrived: Notify,
 }
 
@@ -344,8 +325,8 @@ impl Default for Inbound {
         Self {
             inputs: Mutex::default(),
             input_limit: AtomicUsize::new(DEFAULT_INPUT_LIMIT),
-            join_requests: Mutex::default(),
-            claim_requests: Mutex::default(),
+            joins: Mutex::default(),
+            claims: Mutex::default(),
             arrived: Notify::new(),
         }
     }
@@ -392,13 +373,8 @@ impl Inbound {
         self.arrived.notify_one();
     }
 
-    fn queue_join_request(&self, handle: JoinRequestHandle) {
-        push(&self.join_requests, handle);
-        self.arrived.notify_one();
-    }
-
-    fn queue_claim_request(&self, handle: ClaimRequestHandle) {
-        push(&self.claim_requests, handle);
+    fn queue_asked<T>(&self, queue: &Mutex<VecDeque<T>>, asked: T) {
+        push(queue, asked);
         self.arrived.notify_one();
     }
 }
@@ -684,109 +660,42 @@ impl Net {
             .flatten()
     }
 
-    /// Drains every inbound `/kabudachi/join/1` request not yet answered.
-    /// Answer each with `Self::respond_join`.
-    pub fn poll_join_requests(&self) -> Vec<JoinRequestHandle> {
-        drain(&self.inbound.join_requests)
-    }
-
-    /// Answers a join request obtained from `Self::poll_join_requests`.
-    /// Fire-and-forget like `send`: if the driver task has already stopped,
-    /// there's nowhere for the answer to go, and that's fine to drop.
-    pub fn respond_join(&self, handle: JoinRequestHandle, response: JoinResponse) {
-        let _ = self.commands.send(Command::RespondJoin {
-            channel: handle.channel,
-            response,
-        });
-    }
-
-    /// Sends a `JOIN_REQUEST` to `to` (which must already be connected — see
-    /// `crate::join`, the only caller) and awaits its
-    /// `JOIN_RESPONSE`. `None` if the driver task is gone, the request fails
-    /// outright (`OutboundFailure`), or the peer disconnects before
-    /// answering.
-    pub(crate) async fn send_join_request(&self, to: PeerId) -> Option<JoinResponse> {
+    /// Sends `request` to `to` over protocol `C` and awaits its answer. `None`
+    /// if the swarm task is gone, the request fails outright
+    /// (`OutboundFailure`), or the peer disconnects before answering.
+    pub(crate) async fn ask<C: Correlated>(
+        &self,
+        to: PeerId,
+        request: C::Request,
+    ) -> Option<C::Response> {
         let (respond_to, response) = oneshot::channel();
         self.commands
-            .send(Command::SendJoinRequest { to, respond_to })
+            .send(Command::Exchange(Box::new(move |swarm, exchanges| {
+                C::exchange(exchanges).ask(C::behaviour(swarm.behaviour_mut()), &to, request, respond_to);
+            })))
             .ok()?;
         response.await.ok()?
     }
 
-    /// Drains every inbound `/kabudachi/claim/1` request not yet answered.
-    /// Answer each with `Self::respond_claim`.
-    pub fn poll_claim_requests(&self) -> Vec<ClaimRequestHandle> {
-        drain(&self.inbound.claim_requests)
+    /// Drains every inbound request of protocol `C` not yet answered.
+    pub(crate) fn take_asked<C: Correlated>(&self) -> Vec<Asked<C>> {
+        drain(C::queue(&self.inbound))
     }
 
-    /// Answers a claim request obtained from `Self::poll_claim_requests`.
-    /// Fire-and-forget like `respond_join`: if the driver task has already
-    /// stopped, there's nowhere for the answer to go, and that's fine to
-    /// drop.
-    pub fn respond_claim(&self, handle: ClaimRequestHandle, response: ClaimResponse) {
-        let _ = self.commands.send(Command::RespondClaim {
-            channel: handle.channel,
-            response,
-        });
-    }
-
-    /// Asks `leader` for permission to run `task_id` (`REQUEST_CLAIM`,
-    /// README §8.2), and awaits its answer: an accepted `Claim` or a
-    /// `ClaimReject`. The caller names the leader, as its node knows it
-    /// (`WorkerNode::known_leader`); a leader that has since lost office
-    /// answers `NOT_LEADER`. See [`ClaimFailure`] for why there may be no
-    /// answer.
-    pub async fn request_claim(
+    /// Answers an inbound request of protocol `C`. Fire-and-forget like
+    /// `send`: if the swarm task has already stopped, there is nowhere for the
+    /// answer to go, and that is fine to drop.
+    pub(crate) fn answer<C: Correlated>(
         &self,
-        leader: WorkerId,
-        task_id: TaskId,
-    ) -> Result<ClaimResponse, ClaimFailure> {
-        self.ask_leader(leader, claim_request::Request::TaskId(task_id.into()))
-            .await
+        channel: ResponseChannel<C::Response>,
+        response: C::Response,
+    ) {
+        let _ = self
+            .commands
+            .send(Command::Exchange(Box::new(move |swarm, _| {
+                Exchange::<C>::answer(C::behaviour(swarm.behaviour_mut()), channel, response);
+            })));
     }
-
-    /// Asks `leader` for up to `limit` of the oldest pending tasks
-    /// (`CLAIM_OLDEST`), and awaits its answer: a batch of claims, oldest
-    /// task first, or a `ClaimReject`. The batch may hold fewer than
-    /// `limit`, or none: the leader hands out only as many as fit in one
-    /// message. The caller names the leader, as for
-    /// [`Self::request_claim`]. See [`ClaimFailure`] for why there may be no
-    /// answer.
-    pub async fn claim_oldest(
-        &self,
-        leader: WorkerId,
-        limit: u32,
-    ) -> Result<ClaimResponse, ClaimFailure> {
-        self.ask_leader(leader, claim_request::Request::Oldest(ClaimOldest { limit }))
-            .await
-    }
-
-    async fn ask_leader(
-        &self,
-        leader: WorkerId,
-        request: claim_request::Request,
-    ) -> Result<ClaimResponse, ClaimFailure> {
-        if leader == self.local_worker_id {
-            return Err(ClaimFailure::ThisWorkerLeads);
-        }
-        let to = PeerId::from_str(leader.as_str()).map_err(|_| ClaimFailure::Unanswered)?;
-        let (respond_to, response) = oneshot::channel();
-        self.commands
-            .send(Command::SendClaimRequest {
-                to,
-                request: ClaimRequest {
-                    request: Some(request),
-                },
-                respond_to,
-            })
-            .map_err(|_| ClaimFailure::Unanswered)?;
-        response
-            .await
-            .ok()
-            .flatten()
-            .ok_or(ClaimFailure::Unanswered)
-    }
-
 }
 
 impl Drop for Net {
@@ -984,8 +893,7 @@ fn stamp_own_address(message: &mut ElectionMessage, own: &Multiaddr) {
 #[derive(Default)]
 struct Pending {
     listens: HashMap<ListenerId, oneshot::Sender<Multiaddr>>,
-    join_requests: HashMap<OutboundRequestId, oneshot::Sender<Option<JoinResponse>>>,
-    claim_requests: HashMap<OutboundRequestId, oneshot::Sender<Option<ClaimResponse>>>,
+    exchanges: Exchanges,
     dials: HashMap<ConnectionId, PendingDial>,
 }
 
@@ -1188,27 +1096,7 @@ fn handle_command(
             // `Net::listen_on`'s awaiter observes that as a panic with a
             // message pointing at the cause.
         }
-        Command::SendJoinRequest { to, respond_to } => {
-            let request_id = swarm.behaviour_mut().join.send_request(&to, JoinRequest {});
-            pending.join_requests.insert(request_id, respond_to);
-        }
-        Command::RespondJoin { channel, response } => {
-            // Best-effort, like the election Ack: a channel that already
-            // closed just means the requester stopped waiting.
-            let _ = swarm.behaviour_mut().join.send_response(channel, response);
-        }
-        Command::SendClaimRequest {
-            to,
-            request,
-            respond_to,
-        } => {
-            let request_id = swarm.behaviour_mut().claim.send_request(&to, request);
-            pending.claim_requests.insert(request_id, respond_to);
-        }
-        Command::RespondClaim { channel, response } => {
-            // Best-effort, same reasoning as RespondJoin above.
-            let _ = swarm.behaviour_mut().claim.send_response(channel, response);
-        }
+        Command::Exchange(run) => run(swarm, &mut pending.exchanges),
         Command::WithPeers(read) => read(peers),
     }
 }
@@ -1361,70 +1249,29 @@ fn handle_event(
                 inbound.queue_input(input);
             }
         }
-        SwarmEvent::Behaviour(BehaviourEvent::Join(request_response::Event::Message {
-            peer,
-            message:
-                request_response::Message::Request {
-                    request: JoinRequest {},
-                    channel,
-                    ..
-                },
-            ..
-        })) => {
-            peers.observe(Observation::Carried(Carried::JoinRequest), now);
-            inbound.queue_join_request(JoinRequestHandle {
-                from: worker_id_of(&peer),
-                channel,
-            });
+        SwarmEvent::Behaviour(BehaviourEvent::Join(event)) => {
+            settle::<JoinCodec>(&mut pending.exchanges, event, inbound, peers, now);
         }
-        SwarmEvent::Behaviour(BehaviourEvent::Join(request_response::Event::Message {
-            message: request_response::Message::Response { request_id, response },
-            ..
-        })) => {
-            if let Some(respond_to) = pending.join_requests.remove(&request_id) {
-                let _ = respond_to.send(Some(response));
-            }
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::Join(request_response::Event::OutboundFailure {
-            request_id,
-            ..
-        })) => {
-            if let Some(respond_to) = pending.join_requests.remove(&request_id) {
-                let _ = respond_to.send(None);
-            }
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::Claim(request_response::Event::Message {
-            peer,
-            message:
-                request_response::Message::Request {
-                    request, channel, ..
-                },
-            ..
-        })) => {
-            peers.observe(Observation::Carried(Carried::ClaimRequest), now);
-            inbound.queue_claim_request(ClaimRequestHandle {
-                from: worker_id_of(&peer),
-                request,
-                channel,
-            });
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::Claim(request_response::Event::Message {
-            message: request_response::Message::Response { request_id, response },
-            ..
-        })) => {
-            if let Some(respond_to) = pending.claim_requests.remove(&request_id) {
-                let _ = respond_to.send(Some(response));
-            }
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::Claim(request_response::Event::OutboundFailure {
-            request_id,
-            ..
-        })) => {
-            if let Some(respond_to) = pending.claim_requests.remove(&request_id) {
-                let _ = respond_to.send(None);
-            }
+        SwarmEvent::Behaviour(BehaviourEvent::Claim(event)) => {
+            settle::<ClaimCodec>(&mut pending.exchanges, event, inbound, peers, now);
         }
         _ => {}
+    }
+}
+
+/// Settles what `event` of protocol `C` settles (see `Exchange::on_event`),
+/// and queues an arriving request for the driver, counting it in the peer
+/// book's traffic.
+fn settle<C: Correlated>(
+    exchanges: &mut Exchanges,
+    event: request_response::Event<C::Request, C::Response>,
+    inbound: &Inbound,
+    peers: &mut Peers,
+    now: Instant,
+) {
+    if let Some(asked) = C::exchange(exchanges).on_event(event) {
+        peers.observe(Observation::Carried(C::ARRIVAL), now);
+        inbound.queue_asked(C::queue(inbound), asked);
     }
 }
 

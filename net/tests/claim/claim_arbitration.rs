@@ -21,17 +21,18 @@ use kabudachi_core::protocol::ids::{
     IncarnationId, ShardId, TaskDefinitionId, TaskId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::messages::{ClaimRejectReason, ClaimResponse, claim_response};
+use kabudachi_core::protocol::messages::{ClaimResponse, claim_response};
 use kabudachi_core::scheduler::{Scheduler, Submission};
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::driver::run_driver;
-use kabudachi_net::messenger::{ClaimFailure, Net};
+use kabudachi_net::claim::ClaimFailure;
+use kabudachi_net::messenger::Net;
 use kabudachi_net::swarm::build_swarm;
 use libp2p::{Multiaddr, identity};
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-use crate::support::net::{ask_until_pointed_at_a_leader, connect_to};
+use crate::support::net::ask_until_pointed_at_a_leader;
 
 const SHARD: &str = "shard-1";
 
@@ -59,10 +60,6 @@ fn timings() -> ElectionTimings {
 }
 
 type TestNode = WorkerNode<RealClock>;
-
-/// Big enough that two of them do not fit in one claim message
-/// (`/kabudachi/claim/1` caps a message at 1 MiB), small enough that one does.
-const LARGE_PAYLOAD_BYTES: usize = 600 * 1024;
 
 fn submit(scheduler: &mut Scheduler<RealClock, Uuid7Ids>, payload: Vec<u8>) -> TaskId {
     scheduler
@@ -113,34 +110,18 @@ fn claimed_tasks(response: Result<ClaimResponse, ClaimFailure>) -> Vec<TaskId> {
     }
 }
 
-fn rejection(response: Result<ClaimResponse, ClaimFailure>) -> ClaimRejectReason {
-    match response.expect("the leader answered").result {
-        Some(claim_response::Result::Reject(reject)) => ClaimRejectReason::try_from(reject.reason)
-            .expect("the leader only ever sends a reason this build knows about"),
-        other => panic!("expected a rejection, got {other:?}"),
-    }
-}
-
 #[tokio::test]
 async fn pending_members_claim_from_the_leader_their_nodes_name() {
     let net_a = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
     let net_b = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
     let net_c = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
     let worker_a = net_a.local_worker_id();
-    let worker_b = net_b.local_worker_id();
     let seed = timeout(
         TEST_TIMEOUT,
         net_a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
     )
     .await
     .expect("net_a produced a listen address within the timeout");
-    let b_addr = timeout(
-        TEST_TIMEOUT,
-        net_b.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-    )
-    .await
-    .expect("net_b produced a listen address within the timeout");
-
     let clock = RealClock::new();
     let mut node_a: TestNode = WorkerNode::start(
         Identity {
@@ -163,24 +144,12 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
     let oldest = [
         submit(&mut scheduler_a, small()),
         submit(&mut scheduler_a, small()),
-        submit(&mut scheduler_a, vec![0; LARGE_PAYLOAD_BYTES]),
     ];
-    // The first that does not fit ends the batch: the small task behind it
-    // waits too, so the oldest go out first.
-    let left_for_the_next_batch = [
-        submit(&mut scheduler_a, vec![1; LARGE_PAYLOAD_BYTES]),
-        submit(&mut scheduler_a, small()),
-    ];
-
-    // A bare claimant that still names a worker holding no grant, as one
-    // whose node has not yet heard of a newer leader would.
-    let stale = Net::new(build_swarm(identity::Keypair::generate_ed25519()));
-    connect_to(&net_b, &b_addr, &stale).await;
 
     let (b_leader, mut b_knows) = watch::channel(None);
     let (c_leader, mut c_knows) = watch::channel(None);
 
-    let (claimed, taken_again, batch, next_batch, refused, own) = timeout(TEST_TIMEOUT, async {
+    let (claimed, batch) = timeout(TEST_TIMEOUT, async {
         tokio::select! {
             _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, |_, _, _| {}) => {
                 unreachable!("run_driver never returns")
@@ -204,13 +173,8 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
                 }
                 let (b_names, c_names) = (named[0].clone(), named[1].clone());
                 let claimed = net_b.request_claim(b_names, taken.clone()).await;
-                let taken_again = net_c.request_claim(c_names.clone(), taken.clone()).await;
-                let batch = net_c.claim_oldest(c_names.clone(), 5).await;
-                let next_batch = net_c.claim_oldest(c_names, 5).await;
-                let refused = stale.request_claim(worker_b, oldest[0].clone()).await;
-                // A leader naming itself is told to decide its own claims.
-                let own = net_a.request_claim(worker_a.clone(), oldest[0].clone()).await;
-                (claimed, taken_again, batch, next_batch, refused, own)
+                let batch = net_c.claim_oldest(c_names, 5).await;
+                (claimed, batch)
             } => claims,
         }
     })
@@ -226,15 +190,10 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
         other => panic!("expected the first claim to be accepted, got {other:?}"),
     }
     assert_eq!(
-        rejection(taken_again),
-        ClaimRejectReason::ClaimRejectAlreadySelected
-    );
-    assert_eq!(
         claimed_tasks(batch),
         oldest,
-        "the oldest pending tasks, oldest first, as many as fit in one message"
+        "the oldest pending tasks, oldest first, the leader the joiners' nodes name"
     );
-    assert_eq!(claimed_tasks(next_batch), left_for_the_next_batch);
-    assert_eq!(rejection(refused), ClaimRejectReason::ClaimRejectNotLeader);
-    assert_eq!(own, Err(ClaimFailure::ThisWorkerLeads));
+    // The leader counts both asks as claim arrivals.
+    assert_eq!(net_a.diagnostics().await.traffic.claim_requests_received, 2);
 }

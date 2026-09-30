@@ -6,7 +6,7 @@
 //! `request_response` behaviours: one carrying the election protocol (see
 //! `crate::codec`), one the bootstrap join protocol (see
 //! `crate::join_codec`), and one the claim arbitration protocol (see
-//! `crate::claim_codec`) — each a deliberately separate wire protocol, not a
+//! `crate::claim::codec`) — each a deliberately separate wire protocol, not a
 //! variant folded into `ElectionMessage` (see `crate::join_codec`'s module
 //! doc). `gossipsub` carries the election messages a worker publishes to its
 //! whole shard rather than sends to one peer; every message is signed with
@@ -81,7 +81,7 @@ use libp2p::{
     Multiaddr, Swarm, allow_block_list, gossipsub, identify, identity, kad, noise, tcp, yamux,
 };
 
-use crate::claim_codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
+use crate::claim::codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
 use crate::codec::{ElectionCodec, PROTOCOL};
 use crate::join_codec::{JoinCodec, PROTOCOL as JOIN_PROTOCOL};
 
