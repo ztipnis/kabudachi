@@ -3,7 +3,8 @@
 use std::rc::Rc;
 
 use kabudachi_core::configuration::{Admission, Configuration, Generation, Joint, Single};
-use kabudachi_core::election::{ElectionTimings, KnownConfiguration};
+use kabudachi_core::election::{ElectionTimings, Input, KnownConfiguration};
+use kabudachi_core::protocol::checked::{self, CheckedMessage};
 use kabudachi_core::protocol::ids::IncarnationId;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::{
@@ -78,6 +79,21 @@ pub fn voter_of(voter_count: usize) -> KnownConfiguration {
 pub fn message(payload: election_message::Payload) -> ElectionMessage {
     ElectionMessage {
         payload: Some(payload),
+    }
+}
+
+/// `message`, decoded: what a node accepts. Builders return raw messages, for
+/// tests to compare and to malform on purpose; a test that hands one to a
+/// node decodes it here, which also proves every message a node sends decodes.
+pub fn checked(message: ElectionMessage) -> CheckedMessage {
+    checked::decode(message).expect("a test builder builds well-formed messages")
+}
+
+/// `Input::Message` delivering `message`, decoded, from `from`.
+pub fn message_input(from: &WorkerId, message: ElectionMessage) -> Input {
+    Input::Message {
+        from: from.clone(),
+        message: checked(message),
     }
 }
 

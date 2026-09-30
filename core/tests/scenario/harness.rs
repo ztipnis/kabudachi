@@ -3,7 +3,7 @@
 //! `Cluster::network()` to check message-level delivery and drops directly),
 //! and that it tells each node which peers it is connected to.
 
-use crate::support::builders::{past_any_suspicion, timings, worker};
+use crate::support::builders::{message_input, past_any_suspicion, timings, worker};
 
 use std::collections::BTreeSet;
 
@@ -40,10 +40,7 @@ fn heartbeat_ack(shard_id: &str, leader: &WorkerId) -> ElectionMessage {
 fn follow(cluster: &mut Cluster, follower: &WorkerId, leader: &WorkerId) {
     cluster.step(
         follower,
-        Input::Message {
-            from: leader.clone(),
-            message: heartbeat_ack("shard-1", leader),
-        },
+        message_input(&leader, heartbeat_ack("shard-1", leader)),
     );
 }
 

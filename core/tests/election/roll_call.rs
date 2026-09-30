@@ -7,7 +7,9 @@ use crate::support::builders::{
     ack_message, configuration_of, g0, leader_ack, message, past_any_suspicion, roll_call,
     roll_call_message, roll_call_reply, shard, timings, vote_request, vote_request_message, worker,
 };
+use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
+use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
     TestNode, close_roll_call, deliver, published_roll_calls, recipients_of, rejects_sent_to, sent,
     sent_to, start_roll_call, state_changes, tick, voter_node,
@@ -32,11 +34,11 @@ fn is_vote_request(payload: &election_message::Payload) -> bool {
 }
 
 /// The replies among `outputs` addressed to `initiator`.
-fn replies_to(outputs: &[Output], initiator: &WorkerId) -> Vec<RollCallReply> {
+fn replies_to(outputs: &[Output], initiator: &WorkerId) -> Vec<Checked<RollCallReply>> {
     sent_to(outputs, initiator)
         .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::RollCallReply(reply)) => Some(reply),
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::RollCallReply(reply)) => Some(reply),
             _ => None,
         })
         .collect()
@@ -52,7 +54,7 @@ fn stale_voter(clock: &FakeClock, me: &WorkerId, voter_count: usize) -> TestNode
 
 /// `me`, a voter of `voter_count`, in `RollCall` with its own call just
 /// published. Returns the node and its call.
-fn initiator(clock: &FakeClock, me: &WorkerId, voter_count: usize) -> (TestNode, RollCall) {
+fn initiator(clock: &FakeClock, me: &WorkerId, voter_count: usize) -> (TestNode, Checked<RollCall>) {
     let mut node = voter_node(clock, me, voter_count, SUSPECT);
     let outputs = start_roll_call(&mut node, clock, SUSPECT);
     let calls = published_roll_calls(&outputs);
@@ -62,7 +64,7 @@ fn initiator(clock: &FakeClock, me: &WorkerId, voter_count: usize) -> (TestNode,
 
 fn reply_from(
     node: &mut TestNode,
-    call: &RollCall,
+    call: &Checked<RollCall>,
     responder: &WorkerId,
     admission: Option<Generation>,
 ) -> Vec<Output> {
@@ -88,8 +90,12 @@ fn a_suspecting_voter_publishes_a_roll_call_for_the_next_term_under_its_configur
     let outputs = tick(&mut node);
 
     assert_eq!(state_changes(&outputs), vec![WorkerState::RollCall]);
+    let published: Vec<RollCall> = published_roll_calls(&outputs)
+        .into_iter()
+        .map(|call| (*call).clone())
+        .collect();
     assert_eq!(
-        published_roll_calls(&outputs),
+        published,
         vec![roll_call(&me, 1, &configuration_of(3), 1_700)],
         "term = highest term seen + 1, the node's configuration, its wall clock, itself as \
          initiator and no address"
@@ -549,7 +555,7 @@ fn answering_a_roll_call_does_not_raise_the_highest_term_seen() {
 // ---- Refusals ----
 
 /// The one refusal `node` sends `initiator` for `call`.
-fn refusal_of(node: &mut TestNode, initiator: &WorkerId, call: RollCall) -> ElectionReject {
+fn refusal_of(node: &mut TestNode, initiator: &WorkerId, call: RollCall) -> Checked<ElectionReject> {
     let outputs = deliver(node, initiator, roll_call_message(call));
     let mut rejects = rejects_sent_to(&outputs, initiator);
     assert_eq!(
@@ -686,8 +692,11 @@ fn a_node_with_fresh_leader_contact_refuses_naming_its_leader_and_term() {
     );
 
     assert_eq!(reject.reason(), ElectionRejectReason::LeaderStillValid);
-    let named = reject.leader.expect("the refusal names the leader");
-    assert_eq!((named.leader_id(), named.term), (leader, 0));
+    assert_eq!(
+        reject.named_leader(),
+        Some((leader, 0)),
+        "the refusal names the leader"
+    );
 }
 
 #[test]
@@ -968,9 +977,11 @@ fn a_refusal_naming_a_leader_from_an_older_term_is_heartbeated_but_not_followed(
     assert_eq!(node.known_leader(), None);
 }
 
-/// Decode refuses a term of `u64::MAX` from any peer, so only a peer bug
-/// reaches this: a node whose highest term seen is already `u64::MAX` has no
-/// next term to contest, and panics rather than wrap back to term 0.
+/// Decode refuses a term of `u64::MAX` from any peer, so a node reaches
+/// `u64::MAX` only by contesting it itself: a peer that names `u64::MAX - 1`
+/// makes its next roll call contest `u64::MAX`. A node whose highest term
+/// seen is already `u64::MAX` has no next term to contest, and panics rather
+/// than wrap back to term 0.
 #[test]
 #[should_panic(expected = "term overflowed u64::MAX")]
 fn a_node_that_has_seen_the_highest_representable_term_panics_rather_than_contest_term_zero() {
@@ -985,11 +996,14 @@ fn a_node_that_has_seen_the_highest_representable_term_panics_rather_than_contes
             &roll_call(&me, 1, &configuration_of(3), 0),
             &rejecter,
             ElectionRejectReason::StaleTerm,
-            u64::MAX,
+            u64::MAX - 1,
             None,
         ),
     );
 
+    // The first roll call contests `u64::MAX`; the second has no term left.
+    start_roll_call(&mut node, &clock, SUSPECT);
+    close_roll_call(&mut node, &clock, SUSPECT);
     start_roll_call(&mut node, &clock, SUSPECT);
 }
 

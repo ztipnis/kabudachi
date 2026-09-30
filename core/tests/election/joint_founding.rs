@@ -7,6 +7,8 @@
 //! commit.
 
 
+use crate::support::builders::checked;
+use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use std::collections::{BTreeMap, VecDeque};
 
 use kabudachi_core::configuration::{Configuration, Generation, Joint};
@@ -14,7 +16,7 @@ use kabudachi_core::election::{Entry, Identity, Input, KnownConfiguration, Outpu
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
-    AckEcho, ElectionMessage, LeaderHeartbeatAck, RollCall, election_message,
+    AckEcho, ElectionMessage, LeaderHeartbeatAck, election_message,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
@@ -139,19 +141,19 @@ impl Shard {
     ) -> Vec<Output> {
         let clock = self.clock.clone();
         let started = start_roll_call(self.node(initiator), &clock, SUSPECT);
-        let call: RollCall = published_roll_calls(&started).remove(0);
+        let call = published_roll_calls(&started).remove(0);
         for listener in overhearing {
             deliver(
                 self.node(listener),
                 initiator,
-                roll_call_message(call.clone()),
+                roll_call_message((*call).clone()),
             );
         }
         for respondent in respondents {
             let answered = deliver(
                 self.node(respondent),
                 initiator,
-                roll_call_message(call.clone()),
+                roll_call_message((*call).clone()),
             );
             for message in sent_to(&answered, initiator) {
                 deliver(self.node(initiator), respondent, message);
@@ -516,11 +518,11 @@ fn heartbeat_holding(
 }
 
 /// The configuration of the one ack among `outputs`, to `to`.
-fn acked(outputs: &[Output], to: &WorkerId) -> LeaderHeartbeatAck {
+fn acked(outputs: &[Output], to: &WorkerId) -> Checked<LeaderHeartbeatAck> {
     sent_to(outputs, to)
         .into_iter()
-        .find_map(|message| match message.payload {
-            Some(election_message::Payload::HeartbeatAck(ack)) => Some(ack),
+        .find_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::HeartbeatAck(ack)) => Some(ack),
             _ => None,
         })
         .expect("an ack")
@@ -696,8 +698,8 @@ fn an_election_under_an_uncommitted_founding_re_stamps_it_at_its_own_term() {
     );
     let certificate = sent_to(&won, &fellow)
         .into_iter()
-        .find_map(|message| match message.payload {
-            Some(election_message::Payload::ElectionCertificate(certificate)) => Some(certificate),
+        .find_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::ElectionCertificate(certificate)) => Some(certificate),
             _ => None,
         })
         .expect("a certificate to a respondent");
@@ -779,7 +781,7 @@ fn a_member_that_missed_a_commits_ack_counts_again_once_an_ack_repairs_it() {
         &deliver(&mut leader, &p, heartbeat_holding(&clock, &p, 1, founded)),
         &p,
     );
-    deliver(&mut follower, &worker("a"), ack_message(repaired));
+    deliver(&mut follower, &worker("a"), ack_message((*repaired).clone()));
     assert_eq!(follower.configuration(), Some(&committed));
     assert_eq!(follower.admission(), Some(committed.generation()));
     assert!(committed.is_voter(follower.admission()));

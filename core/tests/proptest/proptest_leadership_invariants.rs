@@ -83,7 +83,6 @@ use kabudachi_core::election::Output;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::election_message::Payload;
-use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
 use proptest::prelude::*;
@@ -372,7 +371,10 @@ impl Ledger {
                     let admission = reply.admission.as_ref().map(wire_rank);
                     let prior = reply.prior_admission.as_ref().map(wire_rank);
                     self.replies
-                        .entry((reply.initiator_id(), reply.term))
+                        .entry((
+                            reply.initiator_id.clone().expect("a reply's initiator").into(),
+                            reply.term,
+                        ))
                         .or_default()
                         .entry(node.clone())
                         .or_insert((admission, prior));
@@ -389,7 +391,10 @@ impl Ledger {
                 }
                 Some(Payload::VoteGrant(grant)) => {
                     self.grants
-                        .entry((grant.candidate_id(), grant.term))
+                        .entry((
+                            grant.candidate_id.clone().expect("a grant's candidate").into(),
+                            grant.term,
+                        ))
                         .or_default()
                         .insert(node.clone());
                 }

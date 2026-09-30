@@ -4,6 +4,7 @@
 //! configuration and admission generation it adopts from an accepted ack.
 
 use crate::support::builders::{
+    message_input,
     configuration_of, g0, past_any_suspicion, shard, timings, vote_request, vote_request_message,
     voter_of, worker,
 };
@@ -13,7 +14,6 @@ use crate::support::node::{deliver, sent, sent_to, state_changes, tick};
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input, Output, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
-use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
     AckEcho, ElectionMessage, JoinResponse, LeaderHeartbeatAck, WorkerHeartbeat, election_message,
 };
@@ -96,7 +96,7 @@ fn heartbeat_interval() -> Duration {
 
 /// Hands `node` `ack` from the leader it names, as that leader would send it.
 fn receive_ack(node: &mut TestNode, ack: LeaderHeartbeatAck) -> Vec<Output> {
-    let leader = ack.leader_id();
+    let leader: WorkerId = ack.leader_id.clone().expect("the ack names its leader").into();
     deliver(
         node,
         &leader,
@@ -260,12 +260,9 @@ fn follower_heartbeating_every_4_ticks(clock: &FakeClock) -> (TestNode, Step) {
         None,
     )
     .0;
-    let acked = node.step(Input::Message {
-        from: worker("leader-1"),
-        message: ElectionMessage {
+    let acked = node.step(message_input(&worker("leader-1"), ElectionMessage {
             payload: Some(election_message::Payload::HeartbeatAck(ack_sent_at(1, 0))),
-        },
-    });
+        }));
     (node, acked)
 }
 

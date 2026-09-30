@@ -5,12 +5,13 @@
 //! grant at once.
 
 
+use crate::support::builders::checked;
+use kabudachi_core::protocol::checked::CheckedPayload;
 use std::collections::BTreeSet;
 
 use kabudachi_core::configuration::{Admission, Configuration, Generation, Tally};
 use kabudachi_core::election::Output;
 use kabudachi_core::protocol::ids::WorkerId;
-use kabudachi_core::protocol::messages::election_message::Payload;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
@@ -105,8 +106,8 @@ fn joint_configurations_acked(steps: &[StepRecord], leader: &WorkerId) -> BTreeS
         .filter(|step| step.node == *leader)
         .flat_map(|step| &step.outputs)
         .filter_map(|output| match output {
-            Output::Send { message, .. } => match &message.payload {
-                Some(Payload::HeartbeatAck(ack)) => Some(ack.configuration()),
+            Output::Send { message, .. } => match checked(message.clone()).into_payload() {
+                Some(CheckedPayload::HeartbeatAck(ack)) => Some(ack.configuration()),
                 _ => None,
             },
             _ => None,

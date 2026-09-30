@@ -12,7 +12,10 @@
 //! election built, each at its admission generation. The last tests run end
 //! to end on the `Cluster` harness.
 
+use crate::support::builders::checked;
+use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::builders::{
+    message_input,
     founded_from_g0, g0, heartbeat, heartbeat_message, roll_call_reply, self_remove,
     self_remove_message, shard, timings, vote_grant, vote_grant_message, voter_of, worker,
 };
@@ -140,10 +143,7 @@ fn lone_node(clock: &FakeClock) -> TestNode {
 
 /// Hands `node` `heartbeat` from `from` and returns the whole step.
 fn receive(node: &mut TestNode, from: &WorkerId, heartbeat: WorkerHeartbeat) -> Step {
-    node.step(Input::Message {
-        from: from.clone(),
-        message: heartbeat_message(heartbeat),
-    })
+    node.step(message_input(&from, heartbeat_message(heartbeat)))
 }
 
 /// A heartbeat from `from` confirming the term-1 ack sent at `send_token`.
@@ -169,9 +169,9 @@ fn advance_to(clock: &FakeClock, instant: Instant) {
     clock.advance(instant - clock.now());
 }
 
-fn expect_heartbeat_ack(msg: ElectionMessage) -> LeaderHeartbeatAck {
-    match msg.payload {
-        Some(election_message::Payload::HeartbeatAck(ack)) => ack,
+fn expect_heartbeat_ack(msg: ElectionMessage) -> Checked<LeaderHeartbeatAck> {
+    match checked(msg).into_payload() {
+        Some(CheckedPayload::HeartbeatAck(ack)) => ack,
         other => panic!("expected a LeaderHeartbeatAck payload, got {other:?}"),
     }
 }
@@ -191,7 +191,7 @@ fn a_leader_acks_each_heartbeat_to_its_sender_only_with_its_send_instant() {
     let mut to_sender = sent_to(&outputs, &sender);
     let ack = expect_heartbeat_ack(to_sender.remove(0));
     assert_eq!(
-        ack,
+        *ack,
         LeaderHeartbeatAck {
             shard_id: Some(shard(SHARD).into()),
             leader_id: Some(won.me.clone().into()),
@@ -298,7 +298,7 @@ fn a_leader_announces_itself_to_its_connected_peers_once_on_winning() {
     let mut won = leader_of(&clock, 3);
 
     for other in &won.others {
-        let acks: Vec<LeaderHeartbeatAck> = sent_to(&won.outputs, other)
+        let acks: Vec<Checked<LeaderHeartbeatAck>> = sent_to(&won.outputs, other)
             .into_iter()
             .filter(|message| {
                 matches!(

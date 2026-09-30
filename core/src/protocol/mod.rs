@@ -1,4 +1,5 @@
 pub use kabudachi_proto::kabudachi as generated;
+pub mod checked;
 pub mod configuration;
 pub mod ids;
 pub mod messages;

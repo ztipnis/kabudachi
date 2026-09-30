@@ -132,9 +132,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use kabudachi_core::election::Input;
+use kabudachi_core::protocol::checked::{CheckedMessage, CheckedPayload};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
+
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::watch;
@@ -583,13 +584,13 @@ impl Peers {
 /// someone other than `from` (a peer relaying, or lying about, another
 /// worker's message must not redirect traffic meant for it), and for a stamp
 /// that is empty, does not parse, or is a wildcard bind.
-fn stamped_address(from: &WorkerId, message: &ElectionMessage) -> Option<Multiaddr> {
-    let (author, stamp) = match message.payload.as_ref()? {
-        election_message::Payload::RollCall(call) => {
-            (call.initiator_id(), call.initiator_address.as_str())
+fn stamped_address(from: &WorkerId, message: &CheckedMessage) -> Option<Multiaddr> {
+    let (author, stamp) = match message.payload()? {
+        CheckedPayload::RollCall(call) => {
+            (call.initiator_id(), call.initiator_address.clone())
         }
-        election_message::Payload::RollCallReply(reply) => {
-            (reply.responder_id(), reply.responder_address.as_str())
+        CheckedPayload::RollCallReply(reply) => {
+            (reply.responder_id(), reply.responder_address.clone())
         }
         _ => return None,
     };
@@ -724,7 +725,10 @@ impl RedialTracker {
 mod tests {
     use kabudachi_core::configuration::Configuration;
     use kabudachi_core::protocol::ids::ShardId;
-    use kabudachi_core::protocol::messages::{RollCall, RollCallReply, election_message};
+    use kabudachi_core::protocol::checked;
+    use kabudachi_core::protocol::messages::{
+        ElectionMessage, RollCall, RollCallReply, election_message,
+    };
 
     use super::*;
 
@@ -785,7 +789,7 @@ mod tests {
     fn roll_call(initiator: &WorkerId, initiator_address: &str) -> Input {
         Input::Message {
             from: initiator.clone(),
-            message: ElectionMessage {
+            message: checked::decode(ElectionMessage {
                 payload: Some(election_message::Payload::RollCall(RollCall {
                     shard_id: Some(ShardId::new("shard-1").into()),
                     term: 1,
@@ -794,7 +798,8 @@ mod tests {
                     initiator_address: initiator_address.into(),
                     ..Default::default()
                 })),
-            },
+            })
+            .expect("a well-formed roll call"),
         }
     }
 
@@ -808,7 +813,7 @@ mod tests {
     ) -> Input {
         Input::Message {
             from: from.clone(),
-            message: ElectionMessage {
+            message: checked::decode(ElectionMessage {
                 payload: Some(election_message::Payload::RollCallReply(RollCallReply {
                     shard_id: Some(ShardId::new("shard-1").into()),
                     term: 1,
@@ -818,7 +823,8 @@ mod tests {
                     admission: None,
                     prior_admission: None,
                 })),
-            },
+            })
+            .expect("a well-formed roll call reply"),
         }
     }
 
@@ -1034,7 +1040,7 @@ mod tests {
         }
     }
 
-    fn message_of(input: &Input) -> ElectionMessage {
+    fn message_of(input: &Input) -> checked::CheckedMessage {
         let Input::Message { message, .. } = input else {
             unreachable!("the builders above make messages");
         };

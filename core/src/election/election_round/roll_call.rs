@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use crate::configuration::{Admission, Configuration, Tally};
+use crate::protocol::checked::Checked;
 use crate::protocol::ids::{ShardId, WorkerId};
 use crate::protocol::messages::RollCall;
 use crate::protocol::messages::prelude::*;
@@ -33,7 +34,7 @@ pub(crate) struct CallRank {
 }
 
 impl CallRank {
-    pub(crate) fn of(call: &RollCall) -> Self {
+    pub(crate) fn of(call: &Checked<RollCall>) -> Self {
         CallRank {
             timestamp_millis: call.timestamp_millis,
             initiator: call.initiator_id(),

@@ -128,6 +128,7 @@ pub use entry::{Entry, Identity};
 use crate::configuration::{Admission, Configuration, Generation, Roster, Tally};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::hashing::{Field, HashFunction};
+use crate::protocol::checked::{Checked, CheckedMessage, CheckedPayload};
 use crate::protocol::ids::{IdGenerator, IncarnationId, ShardId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{
@@ -365,7 +366,7 @@ pub enum Input {
     /// published to its shard.
     Message {
         from: WorkerId,
-        message: ElectionMessage,
+        message: CheckedMessage,
     },
     /// This node now holds a connection to the peer. A leader acks any peer
     /// it newly connects to, so the peer learns who leads. Reporting a peer
@@ -1112,7 +1113,7 @@ where
     /// leaves this node's own as they were. A node that adopts a newer
     /// configuration heartbeats its leader at once, so its echo of it
     /// reaches the leader without waiting out a heartbeat interval.
-    fn on_leader_ack(&mut self, ack: &LeaderHeartbeatAck) {
+    fn on_leader_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>) {
         // A node back in `Bootstrapping` rejoins through JOIN alone: an ack
         // from a leader of the epoch it left would take it back past the
         // floor it rejoins at.
@@ -1328,7 +1329,7 @@ where
     /// and help commit its configuration; safety rests on the exact-
     /// generation rule, not on that worker's vote. The term fence above only
     /// keeps echoes of other leaderships' acks from counting here.
-    fn on_heartbeat(&mut self, from: WorkerId, heartbeat: &WorkerHeartbeat) {
+    fn on_heartbeat(&mut self, from: WorkerId, heartbeat: &Checked<WorkerHeartbeat>) {
         let epoch = order_numbers(self.standing.epoch_number(), heartbeat.recovery_epoch_seen);
         if self.state != WorkerState::Leader
             || heartbeat.shard_id() != self.shard_id
@@ -1636,7 +1637,7 @@ where
     /// voter of a vote grant, the rejecter of a refusal, the departing
     /// worker of a self-remove and the leader of an election certificate.
     /// Anything else is dropped.
-    fn on_message(&mut self, from: WorkerId, msg: ElectionMessage) {
+    fn on_message(&mut self, from: WorkerId, message: CheckedMessage) {
         if matches!(
             self.state,
             WorkerState::Draining | WorkerState::Stopped | WorkerState::Fenced
@@ -1644,34 +1645,35 @@ where
             return;
         }
 
-        use election_message::Payload;
-        match msg.payload {
-            Some(Payload::Heartbeat(heartbeat)) if heartbeat.worker_id() == from => {
+        match message.into_payload() {
+            Some(CheckedPayload::Heartbeat(heartbeat)) if heartbeat.worker_id() == from => {
                 self.on_heartbeat(from, &heartbeat);
             }
-            Some(Payload::HeartbeatAck(ack)) if ack.leader_id() == from => {
+            Some(CheckedPayload::HeartbeatAck(ack)) if ack.leader_id() == from => {
                 self.on_leader_ack(&ack);
             }
-            Some(Payload::RollCall(call)) if call.initiator_id() == from => {
+            Some(CheckedPayload::RollCall(call)) if call.initiator_id() == from => {
                 let now = self.clock.now();
                 self.decide(|round, view| round.on_roll_call(view, from, &call, now));
             }
-            Some(Payload::RollCallReply(reply)) if reply.responder_id() == from => {
+            Some(CheckedPayload::RollCallReply(reply)) if reply.responder_id() == from => {
                 self.decide(|round, view| round.on_roll_call_reply(view, from, &reply));
             }
-            Some(Payload::VoteRequest(req)) if req.candidate_id() == from => {
+            Some(CheckedPayload::VoteRequest(req)) if req.candidate_id() == from => {
                 self.decide(|round, view| round.on_vote_request(view, from, &req));
             }
-            Some(Payload::VoteGrant(grant)) if grant.voter_id() == from => {
+            Some(CheckedPayload::VoteGrant(grant)) if grant.voter_id() == from => {
                 self.decide(|round, view| round.on_vote_grant(view, from, &grant));
             }
-            Some(Payload::ElectionReject(reject)) if reject.rejecter_id() == from => {
+            Some(CheckedPayload::ElectionReject(reject)) if reject.rejecter_id() == from => {
                 self.on_election_reject(&reject);
             }
-            Some(Payload::SelfRemove(msg)) if msg.worker_id() == from => {
+            Some(CheckedPayload::SelfRemove(msg)) if msg.worker_id() == from => {
                 self.on_self_remove(&from, &msg);
             }
-            Some(Payload::ElectionCertificate(certificate)) if certificate.leader_id() == from => {
+            Some(CheckedPayload::ElectionCertificate(certificate))
+                if certificate.leader_id() == from =>
+            {
                 self.on_election_certificate(&from, &certificate);
             }
             _ => {}
@@ -1788,7 +1790,7 @@ where
     ///
     /// Only a `Leader` honours it: every other node ignores it, and a
     /// candidate keeps counting against its roll call's configuration.
-    fn on_self_remove(&mut self, departing: &WorkerId, msg: &SelfRemove) {
+    fn on_self_remove(&mut self, departing: &WorkerId, msg: &Checked<SelfRemove>) {
         if self.state != WorkerState::Leader
             || msg.shard_id() != self.shard_id
             || msg.term_seen > self.term
@@ -1980,7 +1982,7 @@ where
     /// amended 2026-09-29). A refusal names its refuser's epoch only through
     /// the configuration it carries, so one that carries none is read as
     /// this node's own epoch's. The refusal itself is not counted.
-    fn on_election_reject(&mut self, reject: &ElectionReject) {
+    fn on_election_reject(&mut self, reject: &Checked<ElectionReject>) {
         if reject.shard_id() != self.shard_id || reject.initiator_id() != self.my_id {
             return;
         }
@@ -1995,10 +1997,10 @@ where
                 // node's nor outpace its roll call: the named leader's ack
                 // will.
                 if self.state == WorkerState::RollCall
-                    && let Some(leader) = &reject.leader
-                    && leader.leader_id() != self.my_id
+                    && let Some((leader, term)) = reject.named_leader()
+                    && leader != self.my_id
                 {
-                    self.leader = Some((leader.leader_id(), leader.term));
+                    self.leader = Some((leader, term));
                 }
                 return;
             }
@@ -2014,12 +2016,12 @@ where
         // ignored, but the heartbeat tells it of the later term, and it
         // steps down (see `Self::on_heartbeat`).
         if self.state == WorkerState::RollCall
-            && let Some(leader) = &reject.leader
-            && (leader.term >= self.standing.highest_term_seen()
+            && let Some((leader, term)) = reject.named_leader()
+            && (term >= self.standing.highest_term_seen()
                 || reject.reason() == ElectionRejectReason::LeaderStillValid)
-            && leader.leader_id() != self.my_id
+            && leader != self.my_id
         {
-            self.leader = Some((leader.leader_id(), leader.term));
+            self.leader = Some((leader, term));
         }
         if let Some(offered) = offered {
             self.adopt_relayed_commit(offered);
@@ -2057,7 +2059,11 @@ where
     /// never came granted nothing but is admitted too. A certificate for an
     /// earlier term from a leader it did not vote for is ignored, as is one
     /// reaching a node still joining, which answered no roll call.
-    fn on_election_certificate(&mut self, leader: &WorkerId, certificate: &ElectionCertificate) {
+    fn on_election_certificate(
+        &mut self,
+        leader: &WorkerId,
+        certificate: &Checked<ElectionCertificate>,
+    ) {
         if matches!(
             self.state,
             WorkerState::Bootstrapping | WorkerState::Joining

@@ -15,6 +15,7 @@ use crate::support::node::{
 use kabudachi_core::election::{Entry, Identity, Input, WorkerNode};
 use kabudachi_core::hashing::HashFunction;
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
+use kabudachi_core::protocol::checked::Checked;
 use kabudachi_core::protocol::messages::RollCall;
 use kabudachi_core::protocol::messages::election_message::Payload;
 use kabudachi_core::protocol::worker_state::WorkerState;
@@ -175,7 +176,7 @@ fn initiator(
     clock: &FakeClock,
     me: &WorkerId,
     voter_count: usize,
-) -> (TestNode, RollCall, Instant) {
+) -> (TestNode, Checked<RollCall>, Instant) {
     let mut node = voter_node(clock, me, voter_count, SUSPECT_TIMEOUT);
     clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
     let _ = node.step(Input::Tick);

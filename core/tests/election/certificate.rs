@@ -5,6 +5,8 @@
 //! acks repair a lost certificate; and a worker adopts admission generations
 //! only together with the configuration they belong to.
 
+use crate::support::builders::checked;
+use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::builders::{
     ack_message, committed_from_g0, configuration_of, election_certificate,
     election_certificate_message, founded_from_g0, g0, leader_ack, no_leader_yet,
@@ -13,7 +15,7 @@ use crate::support::builders::{
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{TestNode, deliver, sent_to, voter_node};
-use kabudachi_core::configuration::{Admission, Configuration, Generation};
+use kabudachi_core::configuration::{Admission, Configuration, Generation, Single};
 use kabudachi_core::election::{Entry, Identity, KnownConfiguration, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
@@ -136,11 +138,14 @@ fn certify(
 }
 
 /// The one roll-call reply among what `node` sent `initiator`.
-fn reply_to(outputs: &[kabudachi_core::election::Output], initiator: &WorkerId) -> RollCallReply {
+fn reply_to(
+    outputs: &[kabudachi_core::election::Output],
+    initiator: &WorkerId,
+) -> Checked<RollCallReply> {
     sent_to(outputs, initiator)
         .into_iter()
-        .find_map(|message| match message.payload {
-            Some(election_message::Payload::RollCallReply(reply)) => Some(reply),
+        .find_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::RollCallReply(reply)) => Some(reply),
             _ => None,
         })
         .expect("it answers the roll call")
@@ -222,7 +227,19 @@ fn a_certificate_for_another_shard_or_recovery_epoch_is_ignored() {
 
     let mut other_shard = certificate();
     other_shard.shard_id = Some(shard("shard-2").into());
-    let mut other_epoch = certificate();
+    // A certificate of epoch 1 carries a configuration of epoch 1.
+    let founded_in_epoch_1 = Configuration::single(Single {
+        generation: Generation::new(1, 1, 1),
+        base: Generation::new(1, 1, 1),
+        voter_count: 3,
+    })
+    .expect("valid");
+    let mut other_epoch = election_certificate(
+        &winner,
+        1,
+        &founded_in_epoch_1,
+        admitted_at(&founded_in_epoch_1, None),
+    );
     other_epoch.recovery_epoch = 1;
     for certificate in [other_shard, other_epoch] {
         deliver(

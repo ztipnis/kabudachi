@@ -47,7 +47,7 @@ fn messages(inputs: Vec<Input>) -> Vec<(WorkerId, ElectionMessage)> {
     inputs
         .into_iter()
         .filter_map(|input| match input {
-            Input::Message { from, message } => Some((from, message)),
+            Input::Message { from, message } => Some((from, message.into_message())),
             _ => None,
         })
         .collect()

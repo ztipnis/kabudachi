@@ -6,6 +6,7 @@
 //! does to the worker's scheduler.
 
 use crate::support::builders::{
+    message_input,
     ack_message, configuration_of, g0, heartbeat, heartbeat_message, leader_ack, no_leader_yet,
     past_any_suspicion, roll_call, roll_call_message, roll_call_reply, shard, timings, vote_grant,
     voter_of, worker,
@@ -205,10 +206,7 @@ fn an_accepted_ack_moves_an_active_nodes_deadline() {
     // that to (20, 25].
     clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT));
     let acked_at = clock.now();
-    let step = node.step(Input::Message {
-        from: leader.clone(),
-        message: heartbeat_ack_from(&leader, 0),
-    });
+    let step = node.step(message_input(&leader, heartbeat_ack_from(&leader, 0)));
 
     // Ticked only at the deadlines it reports (its heartbeats among them),
     // it suspects at the moved one.
@@ -300,10 +298,7 @@ fn a_node_in_a_roll_call_or_standing_as_candidate_is_due_at_its_deadline() {
 
     // One more reply is a quorum of 2 of 3, so the node stands at its
     // deadline.
-    let _ = node.step(Input::Message {
-        from: other.clone(),
-        message: roll_call_reply(&self_id, 1, &other, Some(g0())),
-    });
+    let _ = node.step(message_input(&other, roll_call_reply(&self_id, 1, &other, Some(g0()))));
     clock.advance(roll_call_deadline);
     let stood = node.step(Input::Tick);
     assert_eq!(node.state(), WorkerState::Candidate);
@@ -519,10 +514,7 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
 
 /// Hands `node` `message` from `from` and returns the deadline it reports.
 fn deliver_step(node: &mut TestNode, from: &WorkerId, message: ElectionMessage) -> Option<Instant> {
-    node.step(Input::Message {
-        from: from.clone(),
-        message,
-    })
+    node.step(message_input(&from, message))
     .next_deadline
 }
 

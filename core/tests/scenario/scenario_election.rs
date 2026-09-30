@@ -2,7 +2,10 @@
 //! `SELF_REMOVE` through the network layer (README §26.2), built on the
 //! `Cluster` harness.
 
+use crate::support::builders::checked;
+use kabudachi_core::protocol::checked::CheckedPayload;
 use crate::support::builders::{
+    message_input,
     configuration_of, heartbeat, heartbeat_message, leader_ack, make_network, message, timings,
     worker,
 };
@@ -221,10 +224,7 @@ fn stale_message_after_replacement_is_rejected() {
     let before = cluster.states()[&probe];
     cluster.step(
         &probe,
-        Input::Message {
-            from: old_leader.clone(),
-            message: heartbeat_ack_message(old_leader.clone(), 0, old_term),
-        },
+        message_input(&old_leader, heartbeat_ack_message(old_leader.clone(), 0, old_term)),
     );
     assert_eq!(
         cluster.states()[&probe],
@@ -360,8 +360,8 @@ fn self_remove_duplicated() {
     );
     for (from, msg) in inbox {
         assert!(matches!(
-            &msg.payload,
-            Some(election_message::Payload::SelfRemove(sr)) if sr.worker_id() == drainer
+            checked(msg.clone()).into_payload(),
+            Some(CheckedPayload::SelfRemove(sr)) if sr.worker_id() == drainer
         ));
         deliver(&mut leader, &from, msg);
     }

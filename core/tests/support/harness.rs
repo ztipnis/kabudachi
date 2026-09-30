@@ -51,7 +51,7 @@ pub use kabudachi_testkit::StepRecord;
 use kabudachi_testkit::FaultingAuthority;
 
 use crate::support::authority::{authority_ttl, epoch, warmed_up_authority};
-use crate::support::builders::{timings, voter_of};
+use crate::support::builders::{message_input, timings, voter_of};
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
 use crate::support::network::FakeNetwork;
@@ -425,7 +425,7 @@ impl Cluster {
                     .remove(&id)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(from, message)| Input::Message { from, message }),
+                    .map(|(from, message)| message_input(&from, message)),
             );
             if self.is_stalled(&id, now) {
                 self.hold(&id, inputs);
@@ -433,7 +433,7 @@ impl Cluster {
             }
             for input in inputs {
                 activity.busy.insert(id.clone());
-                if !matches!(&input, Input::Message { message, .. } if is_liveness_traffic(message))
+                if !matches!(&input, Input::Message { message, .. } if is_liveness_traffic(message.message()))
                 {
                     activity.progressed = true;
                 }

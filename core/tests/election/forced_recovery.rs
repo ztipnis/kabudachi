@@ -8,6 +8,7 @@
 
 
 use crate::support::builders::{
+    message_input,
     ack_message, configuration_of, g0, leader_ack, roll_call_reply, shard, timings, voter_of,
     worker,
 };
@@ -154,10 +155,7 @@ impl Driven {
         let call = published_roll_calls(&started).remove(0);
         for respondent in respondents {
             let reply = roll_call_reply(&self.me, call.term, respondent, Some(g0()));
-            self.step(Input::Message {
-                from: respondent.clone(),
-                message: reply,
-            });
+            self.step(message_input(&respondent, reply));
         }
     }
 }
@@ -292,10 +290,7 @@ fn a_fenced_node_ignores_elections() {
     let mut driven = fenced_voter();
     let peer = worker("w2");
 
-    let outputs = driven.step(Input::Message {
-        from: peer.clone(),
-        message: roll_call_message_for(&peer, 7),
-    });
+    let outputs = driven.step(message_input(&peer, roll_call_message_for(&peer, 7)));
 
     assert!(sent_to(&outputs, &peer).is_empty(), "it answers no roll call");
 }
@@ -587,15 +582,12 @@ fn a_leader_that_steps_down_stops_renewing_its_fence() {
         "setup invariant: it took the fence"
     );
     let won_at = driven.clock.now();
-    let later_leader = || Input::Message {
-        from: worker("leader-2"),
-        message: ack_message(leader_ack(
+    let later_leader = || message_input(&worker("leader-2"), ack_message(leader_ack(
             &worker("leader-2"),
             2,
             &configuration_of(3),
             Some(g0()),
-        )),
-    };
+        )));
     let deposed = driven.step(later_leader());
     assert_eq!(driven.node.state(), WorkerState::Active, "{deposed:?}");
 
@@ -905,14 +897,20 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
         // A survivor still leading its old epoch cannot take it back there:
         // it rejoins through JOIN alone.
         let old_leader = worker("w3");
-        driven.step(Input::Message {
-            from: old_leader.clone(),
-            message: ack_message(LeaderHeartbeatAck {
+        let epoch_5 = Configuration::single(Single {
+            generation: Generation::genesis(5),
+            base: Generation::genesis(5),
+            voter_count: 5,
+        })
+        .expect("valid");
+        driven.step(message_input(
+            &old_leader,
+            ack_message(LeaderHeartbeatAck {
                 recovery_epoch: 5,
                 recovery_epoch_lineage: Some(0),
-                ..leader_ack(&old_leader, 9, &configuration_of(5), Some(g0()))
+                ..leader_ack(&old_leader, 9, &epoch_5, Some(Generation::genesis(5)))
             }),
-        });
+        ));
         assert_eq!(
             (
                 driven.node.state(),
@@ -962,14 +960,11 @@ fn a_node_ignores_an_ack_at_its_epoch_number_from_another_lineage() {
     let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 3);
     let stranger = worker("stranger");
 
-    driven.step(Input::Message {
-        from: stranger.clone(),
-        message: ack_message(LeaderHeartbeatAck {
+    driven.step(message_input(&stranger, ack_message(LeaderHeartbeatAck {
             recovery_epoch: 0,
             recovery_epoch_lineage: Some(7),
             ..leader_ack(&stranger, 4, &configuration_of(3), Some(g0()))
-        }),
-    });
+        })));
 
     assert_eq!(
         driven.node.known_leader(),
@@ -1006,14 +1001,11 @@ fn a_node_ignores_an_ack_from_a_lower_epoch_of_another_lineage() {
     );
     let stranger = worker("stranger");
 
-    driven.step(Input::Message {
-        from: stranger.clone(),
-        message: ack_message(LeaderHeartbeatAck {
+    driven.step(message_input(&stranger, ack_message(LeaderHeartbeatAck {
             recovery_epoch: 0,
             recovery_epoch_lineage: Some(7),
             ..leader_ack(&stranger, 4, &configuration_of(3), Some(g0()))
-        }),
-    });
+        })));
 
     assert_eq!(
         driven.node.known_leader(),
@@ -1040,14 +1032,11 @@ fn a_node_that_adopts_a_later_epoch_from_an_ack_resumes_it_after_fencing() {
         base: Generation::new(1, 2, 1),
         voter_count: 3,
     }).expect("valid");
-    driven.step(Input::Message {
-        from: leader.clone(),
-        message: ack_message(LeaderHeartbeatAck {
+    driven.step(message_input(&leader, ack_message(LeaderHeartbeatAck {
             recovery_epoch: recovered.number,
             recovery_epoch_lineage: Some(recovered.lineage),
             ..leader_ack(&leader, 2, &configuration, None)
-        }),
-    });
+        })));
     assert_eq!(
         (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
         (recovered.number, Some(recovered.lineage)),
@@ -1134,13 +1123,10 @@ fn a_pending_joiner_pointed_at_a_stale_epoch_adopts_its_leaders_later_one() {
         voter_count: 2,
     }).expect("valid");
 
-    let _ = joiner.step(Input::Message {
-        from: leader.clone(),
-        message: ack_message(LeaderHeartbeatAck {
+    let _ = joiner.step(message_input(&leader, ack_message(LeaderHeartbeatAck {
             recovery_epoch: 1,
             ..leader_ack(&leader, 2, &recovered, None)
-        }),
-    });
+        })));
     clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)).heartbeat_interval);
     let outputs = joiner.step(Input::Tick).outputs;
 

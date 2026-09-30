@@ -140,6 +140,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kabudachi_core::election::Input;
+use kabudachi_core::protocol::checked;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use libp2p::core::ConnectedPoint;
@@ -157,7 +158,7 @@ use tokio::time::Instant;
 use crate::claim::codec::ClaimCodec;
 use crate::codec::Ack;
 use crate::exchange::{Asked, Exchange};
-use crate::framing::decode_well_formed;
+use crate::framing::decode_election;
 use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
@@ -826,7 +827,7 @@ fn gossip_input(message: gossipsub::Message) -> Option<Input> {
         tracing::debug!(topic = %message.topic, "dropping a gossip message with no author");
         return None;
     };
-    match decode_well_formed::<ElectionMessage>(&message.data) {
+    match decode_election(&message.data) {
         Ok(election_message) => Some(Input::Message {
             from: worker_id_of(&author),
             message: election_message,
@@ -1194,14 +1195,23 @@ fn handle_event(
                 },
             ..
         })) => {
-            let input = Input::Message {
-                from: worker_id_of(&peer),
-                message: request,
-            };
-            // Recorded before the node is told, so a direct answer the node
-            // sends finds the address on file.
-            peers.observe(Observation::MessageArrived(&input), now);
-            inbound.queue_input(input);
+            // The codec already refused a malformed request, so this decode
+            // does not fail; a message it did refuse would be dropped.
+            match checked::decode(request) {
+                Ok(message) => {
+                    let input = Input::Message {
+                        from: worker_id_of(&peer),
+                        message,
+                    };
+                    // Recorded before the node is told, so a direct answer
+                    // the node sends finds the address on file.
+                    peers.observe(Observation::MessageArrived(&input), now);
+                    inbound.queue_input(input);
+                }
+                Err(error) => {
+                    tracing::debug!(%peer, %error, "dropping a direct message that is not a well-formed election message");
+                }
+            }
             // Best-effort: nothing reads this ack back (see module doc), and
             // a channel that is already closed just means the peer stopped
             // waiting on it.
@@ -1262,6 +1272,15 @@ mod tests {
     use crate::swarm::build_swarm;
     use crate::test_support::{TEST_TIMEOUT, worker_that_never_runs};
 
+    /// The input `message` arriving from `from`, decoded as the edge decodes
+    /// it.
+    fn arrived(from: &WorkerId, message: ElectionMessage) -> Input {
+        Input::Message {
+            from: from.clone(),
+            message: checked::decode(message).expect("a well-formed test message"),
+        }
+    }
+
     fn queued_inputs(inbound: &Inbound) -> Vec<Input> {
         drain(&inbound.inputs)
     }
@@ -1270,10 +1289,7 @@ mod tests {
     fn connection_events_that_change_nothing_are_not_queued() {
         let inbound = Inbound::default();
         let (p, q) = (WorkerId::new("p"), WorkerId::new("q"));
-        let message = Input::Message {
-            from: p.clone(),
-            message: heartbeat_message(&p),
-        };
+        let message = arrived(&p, heartbeat_message(&p));
 
         // Connected and gone again before anything was taken: nothing left
         // to hear about `p` but its message.
@@ -1301,10 +1317,7 @@ mod tests {
         inbound.input_limit.store(2, Ordering::Relaxed);
         let message_from = |worker: &str| {
             let worker = WorkerId::new(worker);
-            Input::Message {
-                from: worker.clone(),
-                message: heartbeat_message(&worker),
-            }
+            arrived(&worker, heartbeat_message(&worker))
         };
         let connected = Input::PeerConnected(WorkerId::new("p"));
 
@@ -1561,10 +1574,7 @@ mod tests {
         net_a.unblock_peer(worker_b.clone());
         // A send can race the unblock across the two Nets, so net_b keeps
         // sending until one arrives.
-        let expected = Input::Message {
-            from: worker_b,
-            message: heartbeat.clone(),
-        };
+        let expected = arrived(&worker_b, heartbeat.clone());
         timeout(TEST_TIMEOUT, async {
             loop {
                 net_b.send(worker_a.clone(), heartbeat.clone());
@@ -1791,10 +1801,7 @@ mod tests {
         net_a.send(worker_b.clone(), heartbeat.clone());
         expect_input(
             &net_b,
-            Input::Message {
-                from: worker_a.clone(),
-                message: heartbeat,
-            },
+            arrived(&worker_a, heartbeat),
             "net_b received net_a's heartbeat unstamped",
         )
         .await;
@@ -1802,10 +1809,7 @@ mod tests {
         net_a.send(worker_b.clone(), roll_call_reply(&worker_b, &worker_a, ""));
         expect_input(
             &net_b,
-            Input::Message {
-                from: worker_a.clone(),
-                message: roll_call_reply(&worker_b, &worker_a, &listen_addr_a),
-            },
+            arrived(&worker_a, roll_call_reply(&worker_b, &worker_a, &listen_addr_a)),
             "net_b received net_a's reply stamped with net_a's listen address",
         )
         .await;
@@ -1813,10 +1817,7 @@ mod tests {
         net_b.send(worker_a.clone(), roll_call_reply(&worker_a, &worker_b, ""));
         expect_input(
             &net_a,
-            Input::Message {
-                from: worker_b.clone(),
-                message: roll_call_reply(&worker_a, &worker_b, ""),
-            },
+            arrived(&worker_b, roll_call_reply(&worker_a, &worker_b, "")),
             "net_a received net_b's reply with no address, as net_b listens on none",
         )
         .await;
@@ -1838,10 +1839,7 @@ mod tests {
         net_b.send(worker_a, reply.clone());
         expect_input(
             &net_a,
-            Input::Message {
-                from: worker_b.clone(),
-                message: reply,
-            },
+            arrived(&worker_b, reply),
             "net_a received net_b's reply",
         )
         .await;
@@ -1879,10 +1877,7 @@ mod tests {
 
         expect_input(
             &net_b,
-            Input::Message {
-                from: worker_a.clone(),
-                message: roll_call(&worker_a, &listen_addr_a),
-            },
+            arrived(&worker_a, roll_call(&worker_a, &listen_addr_a)),
             "net_b received net_a's roll call over gossipsub, stamped with net_a's listen address",
         )
         .await;
@@ -1899,10 +1894,7 @@ mod tests {
         .await
         .expect("net_c produced a listen address within the timeout");
         let (worker_a, worker_c) = (net_a.local_worker_id(), net_c.local_worker_id());
-        let arrival = Input::Message {
-            from: worker_c.clone(),
-            message: roll_call(&worker_c, &listen_addr_c.to_string()),
-        };
+        let arrival = arrived(&worker_c, roll_call(&worker_c, &listen_addr_c.to_string()));
         net_a
             .with_peers(move |peers| {
                 peers.observe(Observation::MessageArrived(&arrival), Instant::now());
@@ -1914,10 +1906,7 @@ mod tests {
 
         expect_input(
             &net_c,
-            Input::Message {
-                from: worker_a,
-                message: heartbeat,
-            },
+            arrived(&worker_a, heartbeat),
             "net_c received the heartbeat net_a sent without a prior connection",
         )
         .await;

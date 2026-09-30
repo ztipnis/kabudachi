@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 
 use crate::configuration::{Admission, Configuration, Roster};
 use crate::election::standing::{EpochOrder, order_numbers};
+use crate::protocol::checked::Checked;
 use crate::protocol::ids::{ShardId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{
@@ -268,7 +269,7 @@ impl ElectionRound {
         &mut self,
         view: &View,
         initiator: WorkerId,
-        call: &RollCall,
+        call: &Checked<RollCall>,
         now: Instant,
     ) -> Vec<Verdict> {
         if call.shard_id() != *view.shard || initiator == *view.me {
@@ -334,7 +335,7 @@ impl ElectionRound {
         &mut self,
         view: &View,
         responder: WorkerId,
-        reply: &RollCallReply,
+        reply: &Checked<RollCallReply>,
     ) -> Vec<Verdict> {
         if reply.shard_id() != *view.shard || reply.initiator_id() != *view.me {
             return Vec::new();
@@ -404,7 +405,7 @@ impl ElectionRound {
         &mut self,
         view: &View,
         candidate: WorkerId,
-        req: &VoteRequest,
+        req: &Checked<VoteRequest>,
     ) -> Vec<Verdict> {
         if req.shard_id() != *view.shard {
             return Vec::new();
@@ -445,7 +446,7 @@ impl ElectionRound {
         &mut self,
         view: &View,
         voter: WorkerId,
-        grant: &VoteGrant,
+        grant: &Checked<VoteGrant>,
     ) -> Vec<Verdict> {
         let Some(vote) = self.vote.as_mut() else {
             return Vec::new();
@@ -485,7 +486,7 @@ impl ElectionRound {
     /// # Panics
     ///
     /// If the latest term is already `u64::MAX`. Decode
-    /// ([`crate::protocol::messages::WellFormed`]) refuses that term from any
+    /// ([`crate::protocol::checked::decode`]) refuses that term from any
     /// peer, so reaching it needs a peer bug that names `u64::MAX - 1`, plus
     /// one roll call of this node's own. Wrapping instead would contest term
     /// 0, below every term already seen, which is worse than a panic.
@@ -574,7 +575,7 @@ impl ElectionRound {
 }
 
 /// The admission generations `reply` answered a roll call with.
-fn answered_admission(reply: &RollCallReply) -> Admission {
+fn answered_admission(reply: &Checked<RollCallReply>) -> Admission {
     Admission {
         current: reply.admission(),
         prior: reply.prior_admission(),

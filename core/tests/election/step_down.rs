@@ -5,6 +5,7 @@
 //! leader again.
 
 use crate::support::builders::{
+    message_input,
     ack_message, committed_from_g0, configuration_of, election_certificate,
     election_certificate_message, election_reject, founded_from_g0, g0, leader_ack,
     past_any_suspicion, roll_call, roll_call_message, timings, vote_request,
@@ -224,10 +225,7 @@ fn a_roll_call_for_a_later_term_deposes_no_leader() {
 fn a_node_that_stepped_down_contests_again_only_after_a_fresh_suspicion_timeout() {
     let clock = FakeClock::new();
     let mut node = leader_of_three(&clock);
-    let step = node.step(Input::Message {
-        from: worker("p1"),
-        message: refusal_naming(3),
-    });
+    let step = node.step(message_input(&worker("p1"), refusal_naming(3)));
     assert_eq!(node.state(), WorkerState::LeaderSuspect, "setup invariant");
 
     let retry_at = step.next_deadline.expect("due to contest again");

@@ -10,7 +10,9 @@ use crate::support::builders::{
     roll_call, roll_call_message, self_remove, self_remove_message, vote_request,
     vote_request_message, worker,
 };
+use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
+use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
     TestNode, commit_founding, connect, deliver, elect, sent, sent_to, state_changes, voter_node,
 };
@@ -19,7 +21,7 @@ use kabudachi_core::election::{Input, Output};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
-    AckEcho, LeaderHeartbeatAck, SelfRemove, WorkerHeartbeat, election_message,
+    AckEcho, LeaderHeartbeatAck, SelfRemove, WorkerHeartbeat,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Clock, Duration};
@@ -61,29 +63,29 @@ fn single_at(generation: Generation, voter_count: usize) -> Configuration {
 }
 
 /// The acks among `outputs` sent to `to`.
-fn acks_to(outputs: &[Output], to: &WorkerId) -> Vec<LeaderHeartbeatAck> {
+fn acks_to(outputs: &[Output], to: &WorkerId) -> Vec<Checked<LeaderHeartbeatAck>> {
     sent_to(outputs, to)
         .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::HeartbeatAck(ack)) => Some(ack),
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::HeartbeatAck(ack)) => Some(ack),
             _ => None,
         })
         .collect()
 }
 
 /// The one ack among `outputs` sent to `to`.
-fn ack_to(outputs: &[Output], to: &WorkerId) -> LeaderHeartbeatAck {
+fn ack_to(outputs: &[Output], to: &WorkerId) -> Checked<LeaderHeartbeatAck> {
     let mut acks = acks_to(outputs, to);
     assert_eq!(acks.len(), 1, "expected one ack to {to:?}");
     acks.remove(0)
 }
 
 /// The self-removes among `outputs`, each with its recipient.
-fn self_removes(outputs: &[Output]) -> Vec<(WorkerId, SelfRemove)> {
+fn self_removes(outputs: &[Output]) -> Vec<(WorkerId, Checked<SelfRemove>)> {
     sent(outputs)
         .into_iter()
-        .filter_map(|(to, message)| match message.payload {
-            Some(election_message::Payload::SelfRemove(msg)) => Some((to, msg)),
+        .filter_map(|(to, message)| match checked(message).into_payload() {
+            Some(CheckedPayload::SelfRemove(msg)) => Some((to, msg)),
             _ => None,
         })
         .collect()
@@ -526,10 +528,10 @@ fn a_follower_heartbeats_at_once_on_adopting_a_newer_configuration() {
         ack_message(leader_ack(&leader, 1, &next, Some(next.generation()))),
     );
 
-    let beats: Vec<WorkerHeartbeat> = sent_to(&outputs, &leader)
+    let beats: Vec<Checked<WorkerHeartbeat>> = sent_to(&outputs, &leader)
         .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::Heartbeat(beat)) => Some(beat),
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::Heartbeat(beat)) => Some(beat),
             _ => None,
         })
         .collect();

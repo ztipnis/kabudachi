@@ -636,7 +636,7 @@ mod tests {
                                     Input::Message { from, message }
                                         if *from == me
                                             && matches!(
-                                                message.payload,
+                                                message.message().payload,
                                                 Some(election_message::Payload::Heartbeat(_))
                                             )
                                 )
@@ -702,7 +702,7 @@ mod tests {
                                 Input::Message { from, message }
                                     if *from == me
                                         && matches!(
-                                            message.payload,
+                                            message.message().payload,
                                             Some(election_message::Payload::Heartbeat(_))
                                         )
                             )
@@ -870,7 +870,7 @@ mod tests {
                             Input::Message { from, message }
                                 if from == joiner
                                     && matches!(
-                                        message.payload,
+                                        message.message().payload,
                                         Some(election_message::Payload::Heartbeat(_))
                                     )
                         )

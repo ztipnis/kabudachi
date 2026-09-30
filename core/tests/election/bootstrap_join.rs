@@ -13,6 +13,8 @@
 //! it knows a configuration, and is admitted by the first election whose
 //! roll call it answers.
 
+use crate::support::builders::checked;
+use kabudachi_core::protocol::checked::CheckedPayload;
 use std::collections::BTreeMap;
 
 use kabudachi_core::configuration::{Configuration, Generation, Single};
@@ -279,8 +281,8 @@ fn a_pending_member_answers_roll_calls_and_grants_votes() {
         vote_request_message(vote_request(candidate.clone(), 0, 5)),
     );
 
-    let Some(election_message::Payload::RollCallReply(reply)) =
-        sent_to(&answered, &candidate)[0].payload.clone()
+    let Some(CheckedPayload::RollCallReply(reply)) =
+        checked(sent_to(&answered, &candidate)[0].clone()).into_payload()
     else {
         panic!("a pending member answers a roll call with a reply");
     };

@@ -21,7 +21,7 @@ use libp2p::StreamProtocol;
 use libp2p::futures::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
 
-use crate::framing::{encode_length_prefixed, read_message};
+use crate::framing::{decode_election, encode_length_prefixed, read_frame};
 
 /// The sole protocol this codec negotiates.
 pub const PROTOCOL: StreamProtocol = StreamProtocol::new("/kabudachi/election/2");
@@ -45,7 +45,7 @@ impl request_response::Codec for ElectionCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_message(io).await
+        Ok(decode_election(&read_frame(io).await?)?.into_message())
     }
 
     async fn read_response<T>(&mut self, _: &Self::Protocol, _io: &mut T) -> io::Result<Ack>

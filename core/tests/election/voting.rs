@@ -11,7 +11,9 @@ use crate::support::builders::{
     past_any_suspicion, roll_call, roll_call_message, roll_call_reply, shard, vote_grant,
     vote_grant_message, vote_request, vote_request_message, worker,
 };
+use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
+use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
     TestNode, close_roll_call, connect, deliver, published_roll_calls, rejects_sent_to, sent_to,
     stand_as_candidate, start_roll_call, voter_node,
@@ -21,7 +23,8 @@ use kabudachi_core::election::Output;
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
-    ElectionRejectReason, LeaderHeartbeatAck, RollCall, VoteGrant, VoteRequest, election_message,
+    ElectionCertificate, ElectionRejectReason, LeaderHeartbeatAck, RollCall, VoteGrant,
+    VoteRequest, election_message,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 
@@ -56,15 +59,19 @@ fn answer(node: &mut TestNode, initiator: &WorkerId, term: u64, timestamp_millis
 }
 
 fn request(node: &mut TestNode, request: VoteRequest) -> Vec<Output> {
-    let candidate = request.candidate_id();
+    let candidate: WorkerId = request
+        .candidate_id
+        .clone()
+        .expect("the request names its candidate")
+        .into();
     deliver(node, &candidate, vote_request_message(request))
 }
 
-fn the_grant(outputs: &[Output], candidate: &WorkerId) -> VoteGrant {
-    let grants: Vec<VoteGrant> = sent_to(outputs, candidate)
+fn the_grant(outputs: &[Output], candidate: &WorkerId) -> Checked<VoteGrant> {
+    let grants: Vec<Checked<VoteGrant>> = sent_to(outputs, candidate)
         .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::VoteGrant(grant)) => Some(grant),
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::VoteGrant(grant)) => Some(grant),
             _ => None,
         })
         .collect();
@@ -311,7 +318,7 @@ fn a_request_for_another_shard_or_not_from_its_candidate_is_ignored() {
 
 /// `w1`, a voter of 5, standing as `Candidate` for term 1 once `p1` and `p2`
 /// answered its roll call; connected to both. Returns the node and its call.
-fn candidate_of_five(clock: &FakeClock) -> (TestNode, RollCall) {
+fn candidate_of_five(clock: &FakeClock) -> (TestNode, Checked<RollCall>) {
     let me = worker("w1");
     let mut node = voter_node(clock, &me, 5, SUSPECT);
     connect(&mut node, &[worker("p1"), worker("p2")]);
@@ -327,14 +334,11 @@ fn grant_from(node: &mut TestNode, voter: &WorkerId, term: u64) -> Vec<Output> {
     )
 }
 
-fn certificates_to(
-    outputs: &[Output],
-    voter: &WorkerId,
-) -> Vec<kabudachi_core::protocol::messages::ElectionCertificate> {
+fn certificates_to(outputs: &[Output], voter: &WorkerId) -> Vec<Checked<ElectionCertificate>> {
     sent_to(outputs, voter)
         .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::ElectionCertificate(certificate)) => Some(certificate),
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::ElectionCertificate(certificate)) => Some(certificate),
             _ => None,
         })
         .collect()
@@ -457,7 +461,7 @@ fn candidate_of_three_with(
     clock: &FakeClock,
     returning: &[WorkerId],
     pending: &[WorkerId],
-) -> (TestNode, RollCall) {
+) -> (TestNode, Checked<RollCall>) {
     let me = worker("w1");
     let mut node = voter_node(clock, &me, 3, SUSPECT);
     let call = published_roll_calls(&start_roll_call(&mut node, clock, SUSPECT)).remove(0);
@@ -549,11 +553,11 @@ fn a_refusal_of_a_vote_request_changes_nothing() {
 
 // ---- The winner's roster ----
 
-fn ack_to(outputs: &[Output], worker: &WorkerId) -> LeaderHeartbeatAck {
-    let acks: Vec<LeaderHeartbeatAck> = sent_to(outputs, worker)
+fn ack_to(outputs: &[Output], worker: &WorkerId) -> Checked<LeaderHeartbeatAck> {
+    let acks: Vec<Checked<LeaderHeartbeatAck>> = sent_to(outputs, worker)
         .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::HeartbeatAck(ack)) => Some(ack),
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::HeartbeatAck(ack)) => Some(ack),
             _ => None,
         })
         .collect();

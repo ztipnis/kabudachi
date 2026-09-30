@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use kabudachi_core::election::{Entry, Identity, Input, Output, WorkerNode};
+use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
@@ -14,7 +15,7 @@ use kabudachi_core::scheduler::LeadershipGrant;
 use kabudachi_core::time::{Clock, Duration};
 
 use crate::support::builders::{
-    g0, heartbeat, heartbeat_message, past_any_suspicion, roll_call_reply, shard, timings,
+    checked, g0, heartbeat, heartbeat_message, message_input, past_any_suspicion, roll_call_reply, shard, timings,
     vote_grant, vote_grant_message, voter_of,
 };
 use crate::support::clock::FakeClock;
@@ -78,22 +79,22 @@ pub fn published(outputs: &[Output]) -> Vec<ElectionMessage> {
 }
 
 /// The roll calls among `outputs` the node published, in order.
-pub fn published_roll_calls(outputs: &[Output]) -> Vec<RollCall> {
+pub fn published_roll_calls(outputs: &[Output]) -> Vec<Checked<RollCall>> {
     published(outputs)
         .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::RollCall(call)) => Some(call),
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::RollCall(call)) => Some(call),
             _ => None,
         })
         .collect()
 }
 
 /// The refusals among `outputs` addressed to `recipient`, in order.
-pub fn rejects_sent_to(outputs: &[Output], recipient: &WorkerId) -> Vec<ElectionReject> {
+pub fn rejects_sent_to(outputs: &[Output], recipient: &WorkerId) -> Vec<Checked<ElectionReject>> {
     sent_to(outputs, recipient)
         .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::ElectionReject(reject)) => Some(reject),
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::ElectionReject(reject)) => Some(reject),
             _ => None,
         })
         .collect()
@@ -155,11 +156,7 @@ pub fn deliver<C>(
 where
     C: Clock,
 {
-    node.step(Input::Message {
-        from: from.clone(),
-        message,
-    })
-    .outputs
+    node.step(message_input(from, message)).outputs
 }
 
 /// Feeds `node` a `Tick` and returns what it asked for.
@@ -207,7 +204,7 @@ pub fn stand_as_candidate(
     clock: &FakeClock,
     suspect_timeout: u64,
     peers: &[WorkerId],
-) -> RollCall {
+) -> Checked<RollCall> {
     let started = start_roll_call(node, clock, suspect_timeout);
     let call = published_roll_calls(&started).remove(0);
     let me = call.initiator_id();
