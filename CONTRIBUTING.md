@@ -39,9 +39,58 @@ The Dockerfile also `COPY`'s the repo into the image at build time (see `.docker
 
 See `CLAUDE.md`'s `Commands` section for the native (non-Docker) build/test commands, including the note that Python tests run through Bazel and not `uv run pytest`, and the lockfile restore after Bazel commands.
 
-## Cross-platform testing notes (for when CI is set up)
+## Continuous integration
 
-CI configuration itself is intentionally not set up yet (see the design spec's explicitly-deferred scope). When it is, keep in mind what the Docker setup above does and doesn't cover:
+`.circleci/config.yml` runs one CircleCI job on every push: `bazel test --config=ci //...`. The job is built to make the Free plan's 30,000 credits a month last.
+
+**Incremental testing is Bazel's own.** Bazel reruns only the actions whose inputs changed, and third-party outputs come from a remote cache. There is no test-selection script.
+
+**What the job does:**
+
+1. It checks out the commit in Bazel's official image (`gcr.io/bazel-public/bazel`), which ships Bazel itself, so the job installs nothing. The image tag is the Bazel version; the job fails if it differs from `.bazelversion`, so bump both together.
+2. It restores Bazel's downloaded archives from a CircleCI cache keyed on the lockfiles.
+3. Inside `with_tool_cache` (CircleCI's build tool cache, in beta), it runs `bazel test --config=ci //...`. The `ci` config sets `--build_tests_only`, so the job builds and runs test targets and their dependencies only; targets no test depends on, such as `//:gazelle`, are not built. The tool cache is Bazel's remote cache for the steps inside it.
+4. When the lockfiles changed, it saves the downloads under the new key.
+
+**The caches.**
+
+- *Build outputs: the build tool cache.* Every first-party Rust target (`core`, `net`, `testkit`, `bindings`) is tagged `no-remote-cache`, so the tool cache stores third-party outputs only. Those are content-addressed and change only with a dependency change, so the stored size stays about one copy of the third-party build instead of growing with every push. First-party code rebuilds in every job, about 30 CPU-seconds. The tag does not affect a local `--disk_cache`. The tool cache is billed as ordinary cache storage; CircleCI does not document its retention or eviction, so check storage on the plan's Usage page after it has run for a while.
+- *Downloads: `save_cache`.* The key is a checksum of `MODULE.bazel`, `MODULE.bazel.lock`, `.bazelversion`, `Cargo.lock`, and `runtime/uv.lock`, and an older cache is restored by prefix when it changes. Only the archives are cached (about 0.5 GB); Bazel extracts them again in about 15 seconds, and the extracted copies (`/tmp/bazel/repository/contents`) take 1.8 GB. Bazel does not refresh the modification time of downloads it reuses, so the cache cannot be pruned by age; bump the `bazel-downloads-v1` key prefix to start a clean one.
+
+**Measurements** (measured on 2026-09-30 in a Linux container with the `medium` resource class's 2 CPUs and 4 GB; the host was arm64, and CircleCI's `medium` is x86; the whole-job rows ran on `cimg/base:2026.09` with the earlier disk-cache setup, before the job moved to Bazel's image and the build tool cache):
+
+| Run | Time | Credits (10 a minute) |
+| --- | --- | --- |
+| Cold build and test, before any tuning | 746 s build, 28 s tests | about 130 |
+| Cold build and test, prebuilt protoc | 391 s | about 65 |
+| Cold build and test, each crate built once | 297 s | about 50 |
+| Cold build and test, build tools unoptimized (current) | 188 s | about 32 |
+| Whole job, new cache key | 228 s test step, 39 s save | about 45 |
+| Whole job, cache hit | 34 s test step, no test runs | about 6 plus the restore |
+
+**Why these choices:**
+
+- *Bazel's caching, not a test-selection tool.* A cache hit already skips every unchanged test, and the cached job's test step takes about 34 seconds, mostly Bazel startup and analysis. A tool such as `bazel-diff` hashes the target graph at two commits, which costs about as much as it could save at this size.
+- *Docker `medium` (2 vCPU, 4 GB, x86).* A cold build is throughput-bound, so a larger class costs the same credits for the same work, and cached runs cannot use more CPUs. Arm Docker costs 13 credits a minute, not 10. `.bazelrc`'s `ci` config sets the job's CPU and memory limits, because a Docker executor reports the host's.
+- *Cold-build settings in `.bazelrc`, used everywhere.*
+  - *Prebuilt protoc.* Compiling protoc from C++ source took about 70% of a cold build's action time.
+  - *One output configuration.* aspect_rules_py's `py_test` sets the Python version and venv for everything under it. Without the same values on the command line, `core`, tokio, and every proc macro under a Python test compiled a second time; `pyo3_extension` also forced `opt` on its subtree.
+  - *Build tools in fastbuild.* Proc macros, build scripts, and rules_rust's helpers compiled at `opt-level=3`, about 60% of the remaining Rust compile time.
+- *No path filtering.* A docs-only push still runs the job; on a cache hit it costs about as much as a dynamic-configuration setup job would.
+- *First-party outputs stay out of the remote cache.* Storage costs 420 credits a GB-month beyond the included 2. Test binaries are tens of MB each, so storing every push's first-party outputs would cost more than the minute of rebuild they save.
+- *No `store_test_results`.* Failures print through `--test_output=errors`, and stored results count toward storage.
+- *No usage reports.* `.bazelrc` sets `DO_NOT_TRACK=1`, which aspect_rules_py's telemetry honors.
+
+**One-time CircleCI project settings** (Project Settings → Advanced). They cannot be set in `config.yml`:
+
+- *Auto-cancel redundant workflows*: on. A new push cancels the running workflow for older commits on the same branch.
+- *Only build pull requests*: on, where the project uses the GitHub OAuth integration. A GitHub App project sets a pipeline trigger on pull-request events instead. `main` is always built.
+
+Put `[skip ci]` in a commit message to skip CI for that push.
+
+## Cross-platform testing notes
+
+CI runs Linux only. Keep in mind what the Docker setup above does and doesn't cover:
 
 - **Linux**: fully covered by the `Dockerfile` above, regardless of which OS the CI runner's host is — this is the easy case.
 - **macOS**: Docker on macOS runs Linux containers under a VM (e.g. Colima, Docker Desktop), so it does **not** exercise macOS-native toolchains. A macOS CI job needs to run natively on a `macos-latest`-style runner, replicating the manual setup this project's history went through: `bazelisk`/`bazel` via Homebrew, a Rust toolchain (rustup or Homebrew), and `uv`. Run the Python tests through their Bazel targets there too: `uv run pytest` cannot import `kabudachi` without the Bazel-built extension, whatever the host.

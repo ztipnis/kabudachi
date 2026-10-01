@@ -1567,6 +1567,7 @@ version = "0.1.0"
 dependencies = [
  "prost 0.13.5",
  "prost-build",
+ "prost-types",
  "protox",
 ]
 

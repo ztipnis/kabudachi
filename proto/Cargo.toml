@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 prost = "0.13"
+# Not used by this crate's code. tools/rust_prost_toolchain:prost_toolchain
+# needs `@crates//:prost-types`, and declaring it here keeps it in Cargo.lock.
+# A crate.spec in MODULE.bazel would add a package cargo then removes from
+# Cargo.lock, so the two tools would rewrite the lockfile back and forth.
+prost-types = "0.13"
 
 [build-dependencies]
 prost-build = "0.13"

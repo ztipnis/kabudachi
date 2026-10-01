@@ -1,0 +1,68 @@
+version: 2.1
+
+# One job runs `bazel test //...`. It is built to spend as few Free-plan
+# credits as it can; CONTRIBUTING.md ("Continuous integration") has the
+# measurements and the cost model behind each choice.
+#
+# CircleCI's build tool cache (with_tool_cache) is Bazel's remote cache for
+# third-party build outputs. First-party code builds and tests in the job, and
+# Bazel skips every action whose inputs are unchanged. A separate cache holds
+# Bazel's downloads, keyed on the lockfiles.
+
+executors:
+  bazel:
+    docker:
+      # Bazel's official image ships Bazel itself, so the job installs
+      # nothing. Its tag is the Bazel version: keep it equal to
+      # .bazelversion (the job checks).
+      - image: gcr.io/bazel-public/bazel:9.2.0
+    # 2 vCPU, 4 GB, 10 credits per minute. .bazelrc's `ci` config matches it.
+    resource_class: medium
+
+jobs:
+  test:
+    executor: bazel
+    steps:
+      - checkout:
+          method: blobless
+      - run:
+          name: Check the image's Bazel matches .bazelversion
+          command: |
+            test "$(bazel --version)" = "bazel $(cat .bazelversion)" || {
+              echo "The image has $(bazel --version); .bazelversion says $(cat .bazelversion)."
+              echo "Update the executor image in .circleci/config.yml."
+              exit 1
+            }
+      - run:
+          name: Compute the download cache key
+          command: |
+            # The lockfiles and module files decide which archives Bazel
+            # downloads.
+            cat MODULE.bazel MODULE.bazel.lock .bazelversion Cargo.lock runtime/uv.lock \
+              > /tmp/download-cache-key
+      - restore_cache:
+          keys:
+            - bazel-downloads-v1-{{ checksum "/tmp/download-cache-key" }}
+            # An older cache still holds most downloads.
+            - bazel-downloads-v1-
+      # CircleCI's build tool cache serves as Bazel's remote cache for the
+      # steps inside it. First-party targets are tagged no-remote-cache, so
+      # it holds third-party outputs only and does not grow with each change.
+      - with_tool_cache:
+          tool: bazel
+          steps:
+            - run:
+                name: Test
+                command: bazel test --config=ci //...
+      - save_cache:
+          key: bazel-downloads-v1-{{ checksum "/tmp/download-cache-key" }}
+          # Downloaded archives only (about 0.5 GB). Bazel extracts them again
+          # in about 15 seconds; the extracted copies (repository/contents)
+          # take 1.8 GB.
+          paths:
+            - /tmp/bazel/repository/content_addressable
+
+workflows:
+  test:
+    jobs:
+      - test

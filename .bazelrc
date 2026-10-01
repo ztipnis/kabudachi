@@ -5,3 +5,37 @@
 # action. Cap it so a shared cache (for example a Docker volume) stays bounded.
 # The flag has no effect unless --disk_cache is set.
 common --experimental_disk_cache_gc_max_size=10G
+
+# Use protobuf's released protoc binary instead of compiling protoc from C++
+# source. Compiling it took about 70% of a cold build's action time.
+common --@protobuf//bazel/toolchains:prefer_prebuilt_protoc
+
+# Build tools (proc macros, build scripts, rules_rust's own helpers) without
+# optimization. At the default, `opt`, compiling them was about 60% of a cold
+# build's Rust compile time; they run for milliseconds per build.
+common --host_compilation_mode=fastbuild
+
+# Start every build with the settings aspect_rules_py's py_test transitions
+# to (MODULE.bazel's interpreter, runtime/BUILD's `dev` venv). Otherwise the
+# Rust code under the Python tests builds in a second output configuration,
+# and core, tokio, and every proc macro compile twice. The venv flag has no
+# public alias.
+common --@aspect_rules_py//py:python_version=3.12
+common --@aspect_rules_py//uv/private/constraints/venv:venv=dev
+
+# Opt out of usage reports. aspect_rules_py's tools_telemetry reads it; it is
+# the convention other tools honor too (https://consoledonottrack.com).
+common --repo_env=DO_NOT_TRACK=1
+
+# CI (.circleci/config.yml). Docker executors report the host's CPUs and RAM,
+# not the job's, so the limits of the `medium` resource class (2 vCPU, 4 GB)
+# are set here. The repository cache lives outside the workspace so CI can
+# save and restore it; build outputs go to CircleCI's build tool cache.
+common:ci --repository_cache=/tmp/bazel/repository
+common:ci --curses=no
+common:ci --show_progress_rate_limit=30
+build:ci --jobs=2
+build:ci --local_resources=cpu=2
+build:ci --local_resources=memory=3072
+test:ci --build_tests_only
+test:ci --test_output=errors

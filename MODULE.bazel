@@ -37,16 +37,6 @@ crate.from_cargo(
     manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml", "//net:Cargo.toml", "//testkit:Cargo.toml"],
 )
 
-# Not a direct Cargo dependency of any workspace member — pulled in only so
-# tools/rust_prost_toolchain:prost_toolchain can hand the prost codegen
-# plugin a `prost_types` from this same crate_universe (the toolchain rule
-# needs a value for it even though this workspace's .proto files don't use
-# google.protobuf's well-known types yet).
-crate.spec(
-    package = "prost-types",
-    version = "0.13",
-)
-
 use_repo(crate, "crates")
 
 # --- PyO3 extension support ---

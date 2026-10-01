@@ -1,11 +1,24 @@
 load("@rules_rust//rust:defs.bzl", "rust_test")
 load("@rules_rust_pyo3//:defs.bzl", "pyo3_extension")
 
+# Every first-party target is tagged no-remote-cache: CI's remote cache
+# (CircleCI's with_tool_cache, billed per GB stored) then holds only
+# third-party outputs, which do not change between runs. The local disk
+# cache still stores these targets.
+
 pyo3_extension(
     name = "_native",
     srcs = glob(["src/**/*.rs"]),
     module_name = "kabudachi._native",
     edition = "2024",
+    tags = ["no-remote-cache"],
+    # The default ("opt") moves the extension and everything it depends on,
+    # tools included, into a second configuration, so `core`, tokio, and
+    # every proc macro compiled twice. Only tests build the extension, so it
+    # takes the build's own mode. A release build passes `-c opt`.
+    compilation_mode = "current",
+    # Type stubs are not shipped from Bazel; skip building the stub tool.
+    stubs = False,
     # Puts this package's own directory (bindings/) on sys.path so the
     # compiled extension resolves as top-level `kabudachi._native` rather
     # than `bindings.kabudachi._native`. runtime/src/kabudachi/__init__.py
@@ -32,4 +45,5 @@ rust_test(
     name = "bindings_test",
     crate = ":_native_shared",
     edition = "2024",
+    tags = ["no-remote-cache"],
 )
