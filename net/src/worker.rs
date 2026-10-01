@@ -83,6 +83,11 @@ impl WorkerConfig {
     /// A worker of `shard_id` listening on `listen_on`, on `election_timings`,
     /// with no seeds and no authority, and the default bootstrap timeouts
     /// ([`DEFAULT_JOIN_PEER_TIMEOUT`], [`DEFAULT_RETRY_INTERVAL`]).
+    ///
+    /// `election_timings` are not validated here: starting the worker panics
+    /// on a roll-call deadline that is not shorter than the suspicion
+    /// timeout (unless the worker is alone a quorum), as it does on an
+    /// invalid heartbeat interval (see `WorkerNode::start`).
     pub fn new(shard_id: ShardId, listen_on: Multiaddr, election_timings: ElectionTimings) -> Self {
         WorkerConfig {
             shard_id,

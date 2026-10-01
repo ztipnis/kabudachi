@@ -111,6 +111,29 @@ async fn wait_for_one_leader_of(workers: &[RunningWorker]) -> usize {
     })
 }
 
+/// Waits until each of `workers` holds a connection to every other. Nothing
+/// here dials: a joiner connects only to its leader, and the driver's settled `kad`
+/// crawl (see `kabudachi_net::routing_refresh`) is what finds the others.
+async fn wait_until_connected_to_each_other(workers: &[RunningWorker]) {
+    timeout(WAIT, async {
+        for worker in workers {
+            loop {
+                let connected = worker.net.diagnostics().await.connected;
+                if workers
+                    .iter()
+                    .filter(|other| other.id != worker.id)
+                    .all(|other| connected.contains(&other.id))
+                {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        }
+    })
+    .await
+    .expect("the new workers connected to one another");
+}
+
 // A rolling deploy over real sockets replaces every worker of a three-voter
 // shard, one at a time, the leader last: each new worker joins and is
 // admitted, then one old worker drains. The old followers' SELF_REMOVEs keep
@@ -119,39 +142,99 @@ async fn wait_for_one_leader_of(workers: &[RunningWorker]) -> usize {
 // workers, left with no leader (whether they learn of it from those acks
 // or by suspecting it), elect one of themselves with no authority.
 // No term ever has two leaders.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rolling_deploy_replaces_every_worker_the_leader_last() {
     let leaders = LeaderLog::default();
     let mut old = grow_from_genesis(3, fast_timings(), &leaders).await;
     let started = StdInstant::now();
-    let seeds: Vec<Multiaddr> = vec![old[0].address.clone()];
+    let mut leader = old.remove(0);
+    let seeds: Vec<Multiaddr> = vec![leader.address.clone()];
     let mut new: Vec<RunningWorker> = Vec::new();
 
-    // Followers first, the leader (old[0]) last.
-    for replaced in [1, 2, 0] {
+    // Followers first, the leader last. A drained worker is dropped once its
+    // departure took effect, as its process exiting would cut it from the
+    // mesh.
+    for mut follower in old {
         new.push(spawn_member(fast_timings(), seeds.clone(), &leaders).await);
-        old[0]
+        leader
             .wait_until(|seen| {
                 seen.configuration
                     .as_ref()
                     .is_some_and(|configuration| is_committed_with(configuration, 4))
             })
             .await;
+        // The replacement is a voter of that configuration before the
+        // worker it replaces leaves.
+        new.last_mut()
+            .expect("a replacement was just spawned")
+            .wait_until(|seen| {
+                seen.configuration.as_ref().is_some_and(|configuration| {
+                    is_committed_with(configuration, 4) && seen.is_voter_of(configuration)
+                })
+            })
+            .await;
 
-        old[replaced].net.request_drain();
-        old[replaced]
+        follower.net.request_drain();
+        follower
             .wait_until(|seen| seen.state == WorkerState::Stopped)
             .await;
-        if replaced != 0 {
-            old[0]
-                .wait_until(|seen| {
-                    seen.configuration
-                        .as_ref()
-                        .is_some_and(|configuration| is_committed_with(configuration, 3))
-                })
-                .await;
-        }
+        // Its SELF_REMOVE is applied once the leader commits the shrunk
+        // configuration; only then is the process free to exit.
+        leader
+            .wait_until(|seen| {
+                seen.configuration
+                    .as_ref()
+                    .is_some_and(|configuration| is_committed_with(configuration, 3))
+            })
+            .await;
+        drop(follower);
     }
+    new.push(spawn_member(fast_timings(), seeds.clone(), &leaders).await);
+    leader
+        .wait_until(|seen| {
+            seen.configuration
+                .as_ref()
+                .is_some_and(|configuration| is_committed_with(configuration, 4))
+        })
+        .await;
+    new.last_mut()
+        .expect("a replacement was just spawned")
+        .wait_until(|seen| {
+            seen.configuration.as_ref().is_some_and(|configuration| {
+                is_committed_with(configuration, 4) && seen.is_voter_of(configuration)
+            })
+        })
+        .await;
+    // The leader has been the new workers' one link so far: the shard must
+    // connect beyond it before it drains.
+    wait_until_connected_to_each_other(&new).await;
+    assert_eq!(
+        leader.last_seen_if_any().map(|seen| seen.state),
+        Some(WorkerState::Leader),
+        "the old leader still leads when it drains"
+    );
+    leader.net.request_drain();
+    leader
+        .wait_until(|seen| seen.state == WorkerState::Stopped)
+        .await;
+    // Its final acks announce the configuration without it. They are the
+    // last thing it sends, so the process exits once the new workers hold
+    // that configuration.
+    let announced = leader
+        .last_seen_if_any()
+        .and_then(|seen| seen.configuration)
+        .expect("the leader held a configuration")
+        .generation();
+    for worker in &mut new {
+        worker
+            .wait_until(|seen| {
+                seen.configuration
+                    .as_ref()
+                    .is_some_and(|configuration| configuration.generation() >= announced)
+            })
+            .await;
+    }
+    drop(leader);
     wait_for_one_leader_of(&new).await;
     let deployed_after = started.elapsed();
 

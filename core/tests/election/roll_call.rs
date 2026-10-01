@@ -5,7 +5,8 @@
 
 use crate::support::builders::{
     ack_message, configuration_of, g0, leader_ack, message, past_any_suspicion, roll_call,
-    roll_call_message, roll_call_reply, shard, timings, vote_request, vote_request_message, worker,
+    roll_call_message, roll_call_reply, shard, timings, vote_grant, vote_grant_message,
+    vote_request, vote_request_message, worker,
 };
 use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
@@ -269,6 +270,162 @@ fn a_genesis_node_wins_its_own_roll_call_at_its_deadline() {
     );
     assert_eq!(node.term(), 1);
     assert_eq!(node.known_leader(), Some((me, 1)));
+}
+
+// ---- Backoff ----
+
+/// Ticks `node` once per tick of `clock` until it publishes a roll call, and
+/// returns that call.
+fn next_roll_call(node: &mut TestNode, clock: &FakeClock) -> Checked<RollCall> {
+    for _ in 0..4 * SUSPECT {
+        clock.advance(Duration::from_ticks(1));
+        if let Some(call) = published_roll_calls(&tick(node)).into_iter().next() {
+            return call;
+        }
+    }
+    panic!("the node published no roll call");
+}
+
+#[test]
+fn replies_that_always_outlast_the_base_deadline_still_elect_the_node_once_its_calls_widen() {
+    let clock = FakeClock::new();
+    let mut node = voter_node(&clock, &worker("w1"), 3, SUSPECT);
+    let peer = worker("p1");
+    // The base deadline is a quarter of SUSPECT, 2 ticks; a reply takes 3.
+    const ROUND_TRIP: u64 = 3;
+
+    for _ in 0..5 {
+        let call = next_roll_call(&mut node, &clock);
+        let me = call.initiator_id();
+        for elapsed in 1..=2 * SUSPECT {
+            clock.advance(Duration::from_ticks(1));
+            tick(&mut node);
+            if elapsed == ROUND_TRIP {
+                deliver(
+                    &mut node,
+                    &peer,
+                    roll_call_reply(&me, call.term, &peer, Some(g0())),
+                );
+            }
+            if node.state() == WorkerState::Candidate {
+                deliver(
+                    &mut node,
+                    &peer,
+                    vote_grant_message(vote_grant(me.clone(), peer.clone(), call.term)),
+                );
+                break;
+            }
+            if node.state() == WorkerState::NoQuorum {
+                break;
+            }
+        }
+        if node.state() == WorkerState::Leader {
+            return;
+        }
+    }
+    panic!("the node never led; it ended {:?}", node.state());
+}
+
+#[test]
+fn each_roll_call_that_finds_no_quorum_doubles_the_next_deadline_up_to_the_suspicion_timeout_and_a_leaders_ack_resets_it() {
+    let clock = FakeClock::new();
+    let mut node = voter_node(&clock, &worker("w1"), 3, SUSPECT);
+    let base = timings(Duration::from_ticks(SUSPECT))
+        .roll_call_deadline
+        .as_ticks();
+
+    for streak in 0..5 {
+        next_roll_call(&mut node, &clock);
+        let deadline = (base << streak).min(SUSPECT);
+        clock.advance(Duration::from_ticks(deadline - 1));
+        tick(&mut node);
+        assert_eq!(
+            node.state(),
+            WorkerState::RollCall,
+            "call {streak} closed early"
+        );
+        clock.advance(Duration::from_ticks(1));
+        tick(&mut node);
+        assert_eq!(
+            node.state(),
+            WorkerState::NoQuorum,
+            "call {streak} ran past {deadline}"
+        );
+    }
+
+    // A leader's ack ends the streak: the next call runs the base deadline.
+    let leader = worker("leader-2");
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, 50, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::Active, "setup invariant");
+    next_roll_call(&mut node, &clock);
+    clock.advance(Duration::from_ticks(base - 1));
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::RollCall, "closed early");
+    clock.advance(Duration::from_ticks(1));
+    tick(&mut node);
+    assert_eq!(
+        node.state(),
+        WorkerState::NoQuorum,
+        "the call after a leader's ack did not run the base deadline"
+    );
+}
+
+#[test]
+fn a_node_that_won_after_widening_calls_again_at_the_base_deadline_once_it_loses_its_quorum() {
+    let clock = FakeClock::new();
+    let mut node = voter_node(&clock, &worker("w1"), 3, SUSPECT);
+    let peer = worker("p1");
+    let base = timings(Duration::from_ticks(SUSPECT))
+        .roll_call_deadline
+        .as_ticks();
+
+    // Two calls find no quorum, widening the third to four times the base.
+    for deadline in [base, 2 * base] {
+        next_roll_call(&mut node, &clock);
+        clock.advance(Duration::from_ticks(deadline));
+        tick(&mut node);
+        assert_eq!(node.state(), WorkerState::NoQuorum, "setup invariant");
+    }
+    let call = next_roll_call(&mut node, &clock);
+    let me = call.initiator_id();
+    deliver(
+        &mut node,
+        &peer,
+        roll_call_reply(&me, call.term, &peer, Some(g0())),
+    );
+    clock.advance(Duration::from_ticks(4 * base));
+    tick(&mut node);
+    deliver(
+        &mut node,
+        &peer,
+        vote_grant_message(vote_grant(me, peer.clone(), call.term)),
+    );
+    assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+
+    // No follower confirms an ack, so its lease runs out.
+    let lease_end = tick_step_deadline(&mut node);
+    clock.advance(lease_end - clock.now());
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::NoQuorum, "setup invariant");
+
+    next_roll_call(&mut node, &clock);
+    clock.advance(Duration::from_ticks(base));
+    tick(&mut node);
+    assert_eq!(
+        node.state(),
+        WorkerState::NoQuorum,
+        "the call after a win did not run the base deadline"
+    );
+}
+
+fn tick_step_deadline(node: &mut TestNode) -> kabudachi_core::time::Instant {
+    node.step(Input::Tick)
+        .next_deadline
+        .expect("a leader has a lease end")
 }
 
 // ---- Suppression ----

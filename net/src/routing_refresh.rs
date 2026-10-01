@@ -66,6 +66,10 @@ pub(crate) struct Refresh {
 /// quarter of a suspicion timeout, and, failing that, every
 /// [`DEFAULT_ROUTING_REFRESH_SUSPICIONS`] suspicion timeouts.
 ///
+/// That leaves a race open: a leader that exits before the settled crawl
+/// completes strands workers that have no other route to one another (see
+/// "Phase 2 work still open" in the README).
+///
 /// Waiting for the view to settle bounds the cost. A crawl's first run
 /// connects the node to every peer it finds, a burst of connection
 /// handshakes; a burst of joiners that each crawled at every change of an

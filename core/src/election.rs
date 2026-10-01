@@ -226,18 +226,28 @@ pub struct ElectionTimings {
     /// How long a roll call runs before its initiator decides on it: it
     /// stands as the candidate if the voters among its respondents are a
     /// quorum by then, and goes `NoQuorum` otherwise (ADR-0001 decisions 13
-    /// and 15). A candidate then has as long again to win its vote. A node
-    /// that answered another worker's roll call starts none of its own until
-    /// twice this long after it answered, the longest that call's census and
-    /// vote can take while messages take less than this to arrive: that
-    /// worker is being elected meanwhile (ADR-0001 decision 5). An initiator
-    /// that keeps failing to find a quorum calls again every roll-call
-    /// deadline and suspicion timeout, so with a suspicion timeout no longer
-    /// than this it can hold one answerer back for as long as it keeps
-    /// calling (others may still call). Keep it well above the time a roll
-    /// call takes to reach the shard and its replies to come back, and below
-    /// `suspect_timeout`. Usually [`Self::DEFAULT_ROLL_CALL_DEADLINE`]. Must
-    /// not be zero (see [`WorkerNode::start`]).
+    /// and 15). A candidate then has as long again to win its vote. This is
+    /// the base: a reply that misses its call's deadline never counts, and
+    /// each retry is a new term, so a deadline shorter than the shard's
+    /// round trip would fail forever. Each of a node's own roll calls in a
+    /// row that closes `NoQuorum` therefore doubles the next one's deadline
+    /// (and its vote's), up to `suspect_timeout`; winning an election,
+    /// accepting a leader's ack or leaving the recovery epoch resets it to
+    /// this base. A node that answered another worker's roll call starts
+    /// none of its own until twice this base after it answered, which bounds
+    /// the census and vote of a call of base width, taking less than this
+    /// to arrive: that worker is being elected meanwhile (ADR-0001
+    /// decision 5). A caller whose calls have widened can outlast that, and
+    /// be contested early, which costs extra calls, never safety. An
+    /// initiator that keeps failing to find a quorum calls again every
+    /// roll-call deadline and suspicion timeout, so with a suspicion timeout
+    /// no longer than this it can hold one answerer back for as long as it
+    /// keeps calling (others may still call). Keep it well above the time a
+    /// roll call takes to reach the shard and its replies to come back, and
+    /// below `suspect_timeout`; backoff only rescues a deadline set too low,
+    /// at the cost of failed calls first.
+    /// Usually [`Self::DEFAULT_ROLL_CALL_DEADLINE`]. Must not be zero (see
+    /// [`WorkerNode::start`]).
     pub roll_call_deadline: Duration,
     /// How far apart the rates of two workers' clocks, or of a worker's
     /// and its coordination authority's, may be, as a divisor: every
@@ -278,9 +288,12 @@ impl ElectionTimings {
     /// replies crossing hosts, a publish relayed through the gossip mesh
     /// rather than sent to a direct peer (not exercised there), and a loaded
     /// host, and adds a quarter of a second to each election. A deadline
-    /// too short costs a `NoQuorum` and a retry, never safety. Deployments
-    /// whose round trips run to tens of milliseconds, or whose shards are
-    /// much larger, should measure their own and raise it.
+    /// too short costs `NoQuorum`s and retries, never safety. It costs
+    /// liveness only if the round trip outgrows the suspicion timeout: each
+    /// `NoQuorum` widens the next roll call's deadline (see
+    /// [`Self::roll_call_deadline`]), up to that timeout, and no further.
+    /// Deployments whose round trips run to tens of milliseconds, or whose
+    /// shards are much larger, should measure their own and raise it.
     pub const DEFAULT_ROLL_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
     /// The default `clock_drift_divisor`: clock rates within a tenth of
@@ -560,9 +573,10 @@ where
     /// Panics if `timings.heartbeat_interval`, `timings.roll_call_deadline`
     /// or `timings.clock_drift_divisor` is zero, or if the node is not alone
     /// a quorum of `known.configuration` and twice `timings.heartbeat_interval`
-    /// is not shorter than `timings.lease_length()`: a caller bug. A lone
-    /// voter never needs a lease, so it may run with any suspicion timeout,
-    /// zero among them.
+    /// is not shorter than `timings.lease_length()`, or `timings.roll_call_deadline`
+    /// is not shorter than `timings.suspect_timeout`: a caller bug. A lone
+    /// voter never needs a lease or a suspicion, so it may run with any
+    /// suspicion timeout, zero among them, and any roll-call deadline.
     fn new(
         my_id: WorkerId,
         incarnation_id: IncarnationId,
@@ -586,6 +600,7 @@ where
         alone.record(node.my_id.clone(), known.admission);
         if !alone.has_quorum() {
             assert_heartbeats_keep_a_lease(&timings);
+            assert_roll_call_deadline_leaves_room_to_widen(&timings);
         }
         node.standing = ShardStanding::known(known, lineage);
         node
@@ -649,8 +664,9 @@ where
     /// Panics if `timings.heartbeat_interval`, `timings.roll_call_deadline`
     /// or `timings.clock_drift_divisor` is zero, or if twice
     /// `timings.heartbeat_interval` is not shorter than
-    /// `timings.lease_length()`: a caller bug. A joining node's electorate is
-    /// never itself alone.
+    /// `timings.lease_length()`, or `timings.roll_call_deadline` is not
+    /// shorter than `timings.suspect_timeout`: a caller bug. A joining node's
+    /// electorate is never itself alone.
     fn bootstrapping(
         my_id: WorkerId,
         incarnation_id: IncarnationId,
@@ -669,6 +685,7 @@ where
             timings,
         );
         assert_heartbeats_keep_a_lease(&timings);
+        assert_roll_call_deadline_leaves_room_to_widen(&timings);
         node
     }
 
@@ -1158,6 +1175,7 @@ where
 
         let now = self.clock.now();
         self.last_leader_contact = now;
+        self.round.end_no_quorum_streak();
         // A token from a later instant than this node's own clock reads was
         // never sent by this node, and proves nothing.
         self.lease.acked(
@@ -1833,6 +1851,7 @@ where
             takes_part,
             leader_contact_is_fresh,
             roll_call_deadline: self.timings.roll_call_deadline,
+            suspect_timeout: self.timings.suspect_timeout,
         };
         let verdicts = decide(&mut self.round, &view);
         self.apply(verdicts);
@@ -2297,6 +2316,21 @@ where
             self.outputs.push(Output::WorkerLost(worker));
         }
     }
+}
+
+/// Panics unless `timings.roll_call_deadline` is shorter than
+/// `timings.suspect_timeout`: roll-call backoff caps a widened deadline at
+/// the suspicion timeout and the docs keep the base below it, so a base at
+/// or above it leaves no room to widen. Called only for a node that is not
+/// alone a quorum, which never suspects anyone.
+fn assert_roll_call_deadline_leaves_room_to_widen(timings: &ElectionTimings) {
+    assert!(
+        timings.roll_call_deadline < timings.suspect_timeout,
+        "ElectionTimings::roll_call_deadline ({:?}) must be shorter than \
+         ElectionTimings::suspect_timeout ({:?})",
+        timings.roll_call_deadline,
+        timings.suspect_timeout,
+    );
 }
 
 /// Panics unless a follower heartbeating every `timings.heartbeat_interval`

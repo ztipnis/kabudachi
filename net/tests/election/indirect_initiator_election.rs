@@ -134,7 +134,7 @@ async fn wait_for_convergence(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_and_leads() {
     let (net_a, net_b, net_c) = (new_net(), new_net(), new_net());
     let addr_b = listen(&net_b).await;

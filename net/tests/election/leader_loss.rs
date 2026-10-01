@@ -79,17 +79,23 @@ async fn wait_until(what: &str, mut until: impl FnMut() -> bool) {
     .unwrap_or_else(|_| panic!("{what} within the timeout"));
 }
 
-/// A founder leading four admitted workers, each a voter of the committed
+/// Five admitted workers led by one of them, each a voter of the committed
 /// configuration of five and seeing every other subscribed to the shard's
-/// gossip: the founder first.
+/// gossip: the founder first, and the index of the leader they settled on.
+///
+/// That leader is usually the founder, but under load a joiner's crawl can
+/// delay the founder's heartbeat chain past its lease, and the shard then
+/// rightly elects another; the setup waits for whoever leads.
 ///
 /// Each joiner is given only the founder's address and reaches the others
 /// through kad's crawl. The leader is cut off only once every worker sees
-/// every other in the shard's gossip, so its roll calls can reach them.
+/// every other in the shard's gossip, so its roll calls can reach them; the
+/// leader returned is the one they follow after that wait, so it is current
+/// at the cut-off.
 /// Until kad crawls again as members are admitted (E10's fix), a joiner
 /// whose one crawl ran before the others joined never sees them, and this
 /// waits out its timeout.
-async fn five_admitted_workers(roll_call_deadline: Duration) -> Vec<RunningWorker> {
+async fn five_admitted_workers(roll_call_deadline: Duration) -> (Vec<RunningWorker>, usize) {
     let founder = spawn_worker(roll_call_deadline, vec![]).await;
     wait_until("the founder leads", || {
         founder
@@ -102,19 +108,6 @@ async fn five_admitted_workers(roll_call_deadline: Duration) -> Vec<RunningWorke
         let seeds = vec![workers[0].address.clone()];
         workers.push(spawn_worker(roll_call_deadline, seeds).await);
     }
-    let founder = workers[0].id.clone();
-    wait_until(
-        "every worker is a voter of one committed configuration under the founder",
-        || {
-            workers.iter().all(|worker| {
-                worker.latest().is_some_and(|step| {
-                    step.settled_member
-                        && step.record.leader.as_ref().map(|(id, _)| id) == Some(&founder)
-                })
-            })
-        },
-    )
-    .await;
     let ids: Vec<WorkerId> = workers.iter().map(|worker| worker.id.clone()).collect();
     timeout(WAIT_TIMEOUT, async {
         for worker in &workers {
@@ -133,7 +126,35 @@ async fn five_admitted_workers(roll_call_deadline: Duration) -> Vec<RunningWorke
     })
     .await
     .expect("every worker sees every other subscribed to the shard within the timeout");
-    workers
+    let mut leader_index = 0;
+    wait_until(
+        "every worker is a voter of one committed configuration under one leader of them",
+        || {
+            let leaders: Vec<_> = workers
+                .iter()
+                .map(|worker| {
+                    worker
+                        .latest()
+                        .filter(|step| step.settled_member)
+                        .and_then(|step| step.record.leader)
+                        .map(|(id, _)| id)
+                })
+                .collect();
+            let Some(Some(leader)) = leaders.first() else {
+                return false;
+            };
+            let Some(index) = workers.iter().position(|worker| worker.id == *leader) else {
+                return false;
+            };
+            leader_index = index;
+            leaders.iter().all(|seen| seen.as_ref() == Some(leader))
+                && workers[index]
+                    .latest()
+                    .is_some_and(|step| step.record.state == WorkerState::Leader)
+        },
+    )
+    .await;
+    (workers, leader_index)
 }
 
 /// How a shard of five settled after its leader was cut off.
@@ -181,12 +202,13 @@ impl LeaderLoss {
 /// Builds a shard of five, cuts its leader off, and waits until every
 /// survivor follows one new leader.
 async fn lose_the_leader(roll_call_deadline: Duration) -> LeaderLoss {
-    let workers = five_admitted_workers(roll_call_deadline).await;
-    let old_leader = workers[0].id.clone();
-    let survivors = &workers[1..];
+    let (mut workers, leader_index) = five_admitted_workers(roll_call_deadline).await;
+    let old = workers.remove(leader_index);
+    let old_leader = old.id.clone();
+    let survivors = &workers[..];
     let cut_off_at = StdInstant::now();
     let cut_off_on_timeline = on_timeline(cut_off_at);
-    isolate(&workers[0], survivors);
+    isolate(&old, survivors);
 
     let mut settled = None;
     wait_until("every survivor follows one new leader", || {
@@ -207,7 +229,11 @@ async fn lose_the_leader(roll_call_deadline: Duration) -> LeaderLoss {
     })
     .await;
     let (new_leader, term) = settled.expect("every survivor follows one leader");
-    let mut records: Vec<StepRecord> = workers.iter().flat_map(|worker| worker.records()).collect();
+    let mut records: Vec<StepRecord> = workers
+        .iter()
+        .chain([&old])
+        .flat_map(|worker| worker.records())
+        .collect();
     records.sort_by_key(|record| record.at);
     LeaderLoss {
         records,

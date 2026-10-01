@@ -128,7 +128,7 @@ async fn wait_for_convergence(
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_its_leader() {
     let net_a = Net::new();
     let net_b = Net::new();
@@ -280,7 +280,7 @@ async fn a_third_node_joins_a_converged_two_member_shard_as_a_pending_member_of_
 /// other voter never answers, so it can never elect one — answers "no
 /// leader known", and the joiner moves on to its next seed rather than
 /// adopting it. `node_x` is the one voter of its shard and elects itself.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joiner_passes_over_a_seed_that_knows_no_leader() {
     let (net_a, listen_addr_a) = listening_net().await;
     let (net_x, listen_addr_x) = listening_net().await;

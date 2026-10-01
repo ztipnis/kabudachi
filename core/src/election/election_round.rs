@@ -59,7 +59,11 @@ pub(crate) struct View<'a> {
     pub(crate) takes_part: bool,
     /// Whether the node heard from its leader within its suspicion timeout.
     pub(crate) leader_contact_is_fresh: bool,
+    /// The configured base roll-call deadline.
     pub(crate) roll_call_deadline: Duration,
+    /// The suspicion timeout, which caps how far backoff widens that
+    /// deadline (see [`ElectionRound::roll_call_span`]).
+    pub(crate) suspect_timeout: Duration,
 }
 
 /// What the node does with what the round decided, in order.
@@ -128,14 +132,19 @@ pub(crate) struct ElectionRound {
     /// The vote this node runs while it stands as the candidate. `Some`
     /// only while the node is `Candidate` through a roll call of its own.
     vote: Option<VoteRound>,
-    /// Until when this node starts no roll call of its own: two roll-call
-    /// deadlines after it last answered another worker's roll call.
+    /// Until when this node starts no roll call of its own: two base
+    /// roll-call deadlines after it last answered another worker's roll
+    /// call.
     suppressed_until: Instant,
     /// The earliest instant at which this node, while `LeaderSuspect` or
     /// `NoQuorum`, may start its next roll call: when it began suspecting
     /// its leader, or, after it gave up a term it held or contested or lost
     /// its quorum, a fresh suspicion timeout later.
     next_roll_call_at: Instant,
+    /// How many roll calls of this node's own in a row closed `NoQuorum`,
+    /// each widening the next one's deadline (see [`Self::roll_call_span`]).
+    /// Ends when the node wins, follows a leader or leaves its epoch.
+    no_quorum_streak: u32,
 }
 
 impl ElectionRound {
@@ -146,7 +155,42 @@ impl ElectionRound {
             vote: None,
             suppressed_until: now,
             next_roll_call_at: now,
+            no_quorum_streak: 0,
         }
+    }
+
+    /// How long this node's next roll call, and the vote that follows it,
+    /// run: the base deadline doubled once per roll call of its own in a row
+    /// that closed `NoQuorum`, up to the suspicion timeout (never below the
+    /// base).
+    ///
+    /// A reply that misses a deadline is dropped with its term, and each
+    /// retry is a new term, so with a fixed deadline shorter than the
+    /// shard's round trip, as on a starved host, no call would ever count a
+    /// reply: a livelock instead of a late election. Widening bounds that:
+    /// once the span passes the round trip the call succeeds. The suspicion
+    /// timeout caps it because a node that waits longer for replies than it
+    /// takes to suspect its leader is no better off, and
+    /// `roll_call_deadline` is documented to stay below it. A node that
+    /// retries after a fresh suspicion timeout loses no safety to a long
+    /// call: the span moves no lease, only how long this node collects
+    /// replies. Answering another's call still holds this node back for two
+    /// base deadlines only, so a widened caller can be contested early,
+    /// which costs extra calls, never safety.
+    fn roll_call_span(&self, view: &View) -> Duration {
+        let base = view.roll_call_deadline.as_ticks();
+        let cap = view.suspect_timeout.as_ticks().max(base);
+        let widened = base
+            .checked_shl(self.no_quorum_streak)
+            .filter(|widened| widened >> self.no_quorum_streak == base)
+            .unwrap_or(u64::MAX);
+        Duration::from_ticks(widened.min(cap))
+    }
+
+    /// The node won, follows a leader or left its recovery epoch: its roll
+    /// calls start again at the base deadline.
+    pub(crate) fn end_no_quorum_streak(&mut self) {
+        self.no_quorum_streak = 0;
     }
 
     /// When a `LeaderSuspect` or `NoQuorum` node may start a roll call, as
@@ -181,6 +225,7 @@ impl ElectionRound {
     /// vote given, as the node leaves its recovery epoch behind.
     pub(crate) fn forget(&mut self) {
         self.stop();
+        self.end_no_quorum_streak();
         self.ballot = Ballot::default();
     }
 
@@ -246,7 +291,7 @@ impl ElectionRound {
             timestamp_millis,
             view.me.clone(),
             view.admission,
-            now + view.roll_call_deadline,
+            now + self.roll_call_span(view),
         );
         self.ballot.record_own_roll_call(term, round.rank().clone());
         let call = round.call(view.shard);
@@ -259,8 +304,10 @@ impl ElectionRound {
     /// generations, refuses it with the reason, or passes over a repeat of
     /// a call it answered. A call for another shard, or its own, is
     /// dropped. A call it answers is electing someone, so the node starts
-    /// no roll call of its own until two roll-call deadlines after `now`: a
-    /// repeat of that call, passed over, does not push that back.
+    /// no roll call of its own until two base roll-call deadlines after
+    /// `now`: a repeat of that call, passed over, does not push that back.
+    /// That bounds a base-width call only; an initiator whose calls have
+    /// widened (see [`Self::roll_call_span`]) can be contested early.
     ///
     /// An initiator that answers a better call for its own term abandons
     /// its own call for it: it stays `RollCall` as that call's respondent,
@@ -284,10 +331,12 @@ impl ElectionRound {
         );
         match verdict {
             RollCallVerdict::Answer => {
-                // The call closes within a roll-call deadline of this
-                // answer, and its candidate's vote within another: a call of
-                // this node's own before then would only contest the next
-                // term against the worker it is helping elect.
+                // A call of base width closes within a roll-call deadline of
+                // this answer, and its candidate's vote within another: a
+                // call of this node's own before then would only contest
+                // the next term against the worker it is helping elect. A
+                // widened call can outlast this, costing the contest a
+                // retry, never safety.
                 let census_and_vote =
                     Duration::from_ticks(view.roll_call_deadline.as_ticks().saturating_mul(2));
                 self.suppressed_until = self.suppressed_until.max(now + census_and_vote);
@@ -379,11 +428,13 @@ impl ElectionRound {
                 return vec![Verdict::SuspectAgain];
             }
             if !round.has_returning_quorum() {
-                return vec![Verdict::NoQuorum {
+                let verdict = Verdict::NoQuorum {
                     term: round.term(),
                     configuration: round.configuration().clone(),
                     respondents: round.respondents().clone(),
-                }];
+                };
+                self.no_quorum_streak = self.no_quorum_streak.saturating_add(1);
+                return vec![verdict];
             }
             return self.stand(view, now);
         }
@@ -504,7 +555,7 @@ impl ElectionRound {
         let Some(round) = self.roll_call.take() else {
             return Vec::new();
         };
-        let vote = VoteRound::stand(round, now + view.roll_call_deadline);
+        let vote = VoteRound::stand(round, now + self.roll_call_span(view));
         let term = vote.term();
         // Its own vote does not raise the highest term seen: a candidacy
         // that lapses unwon leaves no term anyone else voted in, and the
@@ -566,6 +617,7 @@ impl ElectionRound {
                 },
             })
             .collect();
+        self.end_no_quorum_streak();
         verdicts.push(Verdict::Won {
             term: vote.term(),
             roster,

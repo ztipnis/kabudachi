@@ -109,7 +109,7 @@ fn claimed_tasks(response: Result<ClaimResponse, ClaimFailure>) -> Vec<TaskId> {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_members_claim_from_the_leader_their_nodes_name() {
     let net_a = Net::new();
     let net_b = Net::new();

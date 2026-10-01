@@ -644,6 +644,43 @@ fn a_zero_roll_call_deadline_is_rejected_at_construction() {
 }
 
 #[test]
+#[should_panic(expected = "roll_call_deadline")]
+fn a_roll_call_deadline_not_shorter_than_the_suspicion_timeout_is_rejected_at_construction() {
+    let clock = FakeClock::new();
+
+    let _ = WorkerNode::start(
+        Identity {
+            id: worker("w1"),
+            incarnation: IncarnationId::new("incarnation-1"),
+            shard: shard(SHARD),
+            timings: timings(Duration::from_ticks(10))
+                .with_roll_call_deadline(Duration::from_ticks(10)),
+        },
+        Entry::Known(voter_of(3)),
+        clock,
+        None,
+    )
+    .0;
+}
+
+#[test]
+fn a_lone_voter_may_have_a_roll_call_deadline_not_shorter_than_its_suspicion_timeout() {
+    let _ = WorkerNode::start(
+        Identity {
+            id: worker("w1"),
+            incarnation: IncarnationId::new("incarnation-1"),
+            shard: shard(SHARD),
+            timings: timings(Duration::from_ticks(10))
+                .with_roll_call_deadline(Duration::from_ticks(10)),
+        },
+        Entry::Known(voter_of(1)),
+        FakeClock::new(),
+        None,
+    )
+    .0;
+}
+
+#[test]
 #[should_panic(expected = "heartbeat_interval")]
 fn a_zero_heartbeat_interval_is_rejected_at_construction() {
     let clock = FakeClock::new();

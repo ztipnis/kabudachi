@@ -68,7 +68,7 @@ async fn take_messages(net: &Net) -> Vec<(WorkerId, ElectionMessage)> {
     .expect("a message arrived within the timeout")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publish_reaches_each_other_subscriber_of_the_shard_once_as_the_publishers_message() {
     // `nets[3]` is in the mesh but subscribed to another shard: it must
     // receive nothing published on this one.
@@ -104,7 +104,7 @@ async fn a_publish_reaches_each_other_subscriber_of_the_shard_once_as_the_publis
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_publish_relayed_by_another_worker_arrives_as_its_authors_message() {
     // A line, author - relay - far: the far worker is not connected to the
     // author, so the publish can reach it only through the relay.

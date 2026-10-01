@@ -231,6 +231,11 @@ def test_concurrent_shutdowns_both_finish_with_the_worker_stopped():
     assert states == ["Stopped"] * 4
 
 
+def test_a_one_millisecond_suspicion_timeout_constructs():
+    native = new_runtime(suspect_timeout_ms=1)
+    native.shutdown()
+
+
 def test_a_result_for_a_closed_loop_is_dropped_without_a_report():
     native = new_runtime(suspect_timeout_ms=100)
     reports = []

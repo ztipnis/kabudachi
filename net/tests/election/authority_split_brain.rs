@@ -370,7 +370,7 @@ async fn elected_leader(cluster: &Cluster) -> usize {
 // and leads once the old leader's fence has ended. Healed, the two find the
 // epoch moved on and rejoin under the new leader, through the driver, as
 // pending members it then admits.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_majority_without_the_authority_fences_while_the_minority_with_it_recovers_then_rejoins()
 {
     with_elected_cluster(async |cluster: &Cluster, leader: usize| {

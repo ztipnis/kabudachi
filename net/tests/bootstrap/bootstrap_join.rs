@@ -81,7 +81,7 @@ async fn warmed_up_authority() -> InMemoryAuthority<RealClock> {
 // shard. The authority lets exactly one win; each of the others finds the
 // winner registered, asks it, and joins it once it leads, rather than
 // founding a second shard beside it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seedless_workers_starting_together_found_one_shard_and_join_its_founder() {
     let authority = warmed_up_authority().await;
     let mut workers = Vec::new();
@@ -159,7 +159,7 @@ async fn three_workers_joined_through_one_seed(
 // to know the other two joiners, whose addresses it was never given. The
 // leader then admits every worker that joined it in an admission batch
 // (ADR-0001 decision 9): each becomes a voter.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_workers_that_join_through_one_seed_register_and_are_admitted() {
     let authority = warmed_up_authority().await;
     let mut workers = three_workers_joined_through_one_seed(&authority).await;
@@ -222,7 +222,7 @@ fn is_loopback(address: &Multiaddr) -> bool {
 // another host can reach, and a joiner dialing that address reaches it.
 // Skipped, saying so, on a host with no non-loopback interface (a sandbox
 // with networking off), where loopback is all a leader can offer.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_leader_bound_to_every_interface_points_joiners_at_a_non_loopback_address() {
     if !has_a_non_loopback_address() {
         eprintln!("skipped: this host has no non-loopback interface");

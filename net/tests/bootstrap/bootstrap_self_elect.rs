@@ -174,7 +174,7 @@ fn keep_registered(
     })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_with_no_seeds_and_no_authority_self_elects_leader_after_the_normal_timeout() {
     let net = fresh_net();
 
@@ -231,7 +231,7 @@ async fn a_node_with_no_seeds_and_no_authority_self_elects_leader_after_the_norm
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_warming_up_authority_keeps_the_node_bootstrapping_until_warm_up_ends() {
     let net = fresh_net();
     // Taken before the authority exists, so its warm-up ends at least one
@@ -262,7 +262,7 @@ async fn a_warming_up_authority_keeps_the_node_bootstrapping_until_warm_up_ends(
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_whose_own_registration_is_the_only_one_founds_the_shard() {
     let net = fresh_net();
     let my_address = timeout(
@@ -308,7 +308,7 @@ async fn a_node_whose_own_registration_is_the_only_one_founds_the_shard() {
 // arrived, or from when the node was built, a founder that cannot renew would
 // still count itself registered, and able to lead, after another
 // bootstrapper had found the shard with no one registered and re-founded it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_founder_counts_its_registration_from_when_the_cascade_asked_for_it() {
     let authority = warmed_up_authority().await;
     let connection = authority.for_another_worker();
@@ -349,7 +349,7 @@ async fn a_founder_counts_its_registration_from_when_the_cascade_asked_for_it() 
 /// (a live worker renews well before its registration would lapse). A
 /// seedless bootstrapper re-founds the shard one epoch on, rather than
 /// waiting on workers that are never coming back.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bootstrapper_re_founds_a_shard_whose_epoch_exists_with_no_live_registration() {
     let authority = warmed_up_authority().await;
     // Stands in for a shard whose founder's registration has lapsed, or
@@ -393,7 +393,7 @@ async fn a_bootstrapper_re_founds_a_shard_whose_epoch_exists_with_no_live_regist
 /// second shard beside it. (The founder separately republishes its epoch
 /// once a fence attempt finds it missing, README §15.3, but on its own
 /// fence-renewal cadence, which this test does not wait on.)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seedless_bootstrapper_joins_the_shard_a_flush_left_running_instead_of_founding_a_second_one()
  {
     let net_founder = fresh_net();

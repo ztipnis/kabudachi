@@ -70,10 +70,11 @@ impl<C: Clock> WorkerNode<C> {
     ///
     /// Panics if `identity.timings.heartbeat_interval`,
     /// `roll_call_deadline` or `clock_drift_divisor` is zero, or if the node
-    /// is not alone a quorum of its shard and twice its heartbeat interval
-    /// is not shorter than its lease length: a caller bug. A lone voter
-    /// never needs a lease, so it may run with any suspicion timeout, zero
-    /// among them.
+    /// is not alone a quorum of its shard and either twice its heartbeat
+    /// interval is not shorter than its lease length or its roll-call
+    /// deadline is not shorter than its suspicion timeout: a caller bug. A
+    /// lone voter never needs a lease or a suspicion, so it may run with any
+    /// suspicion timeout, zero among them, and any roll-call deadline.
     pub fn start(
         identity: Identity,
         entry: Entry,

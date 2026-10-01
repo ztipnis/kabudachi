@@ -117,7 +117,7 @@ fn less_drift(duration: Duration) -> Duration {
     Duration::from_ticks(ticks - ticks.div_ceil(10))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_follower_that_loses_the_authority_fences_itself_in_time_and_resumes_on_reconnect() {
     let net_a = Net::new();
     let net_b = Net::new();

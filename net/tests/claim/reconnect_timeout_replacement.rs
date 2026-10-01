@@ -111,7 +111,7 @@ fn heartbeat_from(worker: &WorkerId) -> ElectionMessage {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_replacement_task_run_is_claimable_before_the_reconnect_timeout_has_elapsed_under_a_partition()
  {
     let net_a = Net::new();

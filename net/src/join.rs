@@ -569,7 +569,8 @@ mod tests {
             timings: ElectionTimings::new(
                 TickDuration::from_millis(5),
                 TickDuration::from_millis(1),
-            ),
+            )
+            .with_roll_call_deadline(TickDuration::from_millis(2)),
         };
         let (mut node, _) = WorkerNode::start(
             identity,

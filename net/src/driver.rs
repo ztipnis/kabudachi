@@ -549,7 +549,7 @@ mod tests {
             // Twice 40 ms fits inside the lease of the shortest suspicion
             // timeout the tests here use (100 ms, less a tenth).
             timings: ElectionTimings::new(suspect_timeout, TickDuration::from_millis(40))
-                .with_roll_call_deadline(TickDuration::from_millis(100)),
+                .with_roll_call_deadline(TickDuration::from_millis(50)),
         };
         let known = KnownConfiguration {
             configuration: two_voters(),
