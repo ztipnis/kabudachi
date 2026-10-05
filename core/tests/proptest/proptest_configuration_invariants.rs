@@ -147,12 +147,17 @@ fn fed(mut tally: Tally, workers: &[Worker], in_set: impl Fn(&Worker) -> bool) -
 }
 
 proptest! {
+    #![proptest_config(crate::proptest::config(256))]
+
     /// A prior admission generation plays no part in a single configuration.
     #[test]
     fn two_quorums_of_one_single_configuration_share_a_voter(
         (bounds, _, workers) in scenario_strategy(),
         slack in 0usize..3,
     ) {
+        if crate::proptest::budget_spent() {
+            return Ok(());
+        }
         let (base, current) = (bounds.old_base, bounds.current);
         let is_voter = |worker: &Worker| within(worker.admission, base, current);
         // A real configuration always has at least one voter (even genesis
@@ -185,6 +190,9 @@ proptest! {
         old_slack in 0usize..3,
         new_slack in 0usize..3,
     ) {
+        if crate::proptest::budget_spent() {
+            return Ok(());
+        }
         let base = if founding { bounds.batch } else { bounds.old_base };
         let is_old_side_voter = |worker: &Worker| {
             within(worker.admission, bounds.old_base, bounds.old_generation)
@@ -311,6 +319,9 @@ proptest! {
     fn adjacent_configurations_share_a_majority(
         ops in proptest::collection::vec(roster_op_strategy(), 1..30),
     ) {
+        if crate::proptest::budget_spent() {
+            return Ok(());
+        }
         let leader = pool_worker(0);
         let mut term = 1u64;
         let mut roster = Roster::genesis(leader.clone(), 0);

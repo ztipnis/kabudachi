@@ -39,9 +39,9 @@ rust_test(
     crate_root = "tests/core_integration.rs",
     data = glob(["tests/proptest/*.proptest-regressions", "tests/proptest/*.rs"]),
     edition = "2024",
-    # The seeded scenarios read their seeds from this variable, so the cached
-    # result must change with it.
-    env_inherit = ["KABUDACHI_SIM_SEEDS"],
+    # The seeded scenarios and the property tests read their seeds and case
+    # counts from these variables, so the cached result must change with them.
+    env_inherit = ["KABUDACHI_SIM_SEEDS", "PROPTEST_CASES", "PROPTEST_RNG_SEED"],
     size = "medium",
     tags = ["no-remote-cache"],
     deps = [":core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),

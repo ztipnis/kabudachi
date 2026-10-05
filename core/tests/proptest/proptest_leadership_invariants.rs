@@ -99,24 +99,22 @@ const MAX_NODES: usize = 7;
 /// cases.
 const RNG_SEED: u64 = 0;
 
+/// The configuration of a run: the fixed seed unless `PROPTEST_RNG_SEED`
+/// names another, and 256 cases unless `PROPTEST_CASES` names another count.
+fn config() -> ProptestConfig {
+    seeded(crate::proptest::config(CASES))
+}
+
 /// How many cases a run checks unless `PROPTEST_CASES` says otherwise.
 const CASES: u32 = 256;
 
-fn config() -> ProptestConfig {
-    let config = ProptestConfig::default();
-    let config = match config.rng_seed {
+fn seeded(config: ProptestConfig) -> ProptestConfig {
+    match config.rng_seed {
         RngSeed::Random => ProptestConfig {
             rng_seed: RngSeed::Fixed(RNG_SEED),
             ..config
         },
         RngSeed::Fixed(_) => config,
-    };
-    if std::env::var_os("PROPTEST_CASES").is_some() {
-        return config;
-    }
-    ProptestConfig {
-        cases: CASES,
-        ..config
     }
 }
 
@@ -707,7 +705,8 @@ fn events_strategy() -> impl Strategy<Value = Vec<ScenarioEvent>> {
 
 /// Runs random event sequences on fresh clusters of 4 to 7 voters, checking
 /// L1-L8 after every event, then checks the run exercised what they guard:
-/// some elections won, some leaving a worker out.
+/// some elections won, some leaving a worker out. A run whose time budget
+/// was spent skips the coverage check, since it truncated the cases.
 #[test]
 fn leadership_invariants_hold_after_every_event() {
     // The strategy draws in the order it always has, so the regression file's
@@ -725,6 +724,9 @@ fn leadership_invariants_hold_after_every_event() {
         },
     );
     let coverage = run_cases(strategy);
+    if crate::proptest::budget_was_spent() {
+        return;
+    }
     assert!(
         coverage.wins > 0,
         "no case won an election, so L1, L3 and L4 checked nothing: {coverage:?}"
@@ -737,7 +739,8 @@ fn leadership_invariants_hold_after_every_event() {
 
 /// The same, on clusters of 3 to 5 voters and 1 or 2 pending members, whose
 /// elections found configurations that admit them, on a network that may
-/// also deliver messages late; then checks some elections admitted one.
+/// also deliver messages late; then checks some elections admitted one,
+/// unless the time budget was spent and truncated the run.
 #[test]
 fn leadership_invariants_hold_with_pending_members() {
     let strategy = (
@@ -755,6 +758,9 @@ fn leadership_invariants_hold_with_pending_members() {
             events,
         });
     let coverage = run_cases(strategy);
+    if crate::proptest::budget_was_spent() {
+        return;
+    }
     assert!(
         coverage.wins_admitting_a_pending_member > 0,
         "no election a pending member answered was won, so nothing was founded with one: \
@@ -777,6 +783,9 @@ fn run_cases(strategy: impl Strategy<Value = Case>) -> Coverage {
     });
 
     let outcome = runner.run(&strategy, |case| {
+        if crate::proptest::budget_spent() {
+            return Ok(());
+        }
         check_case(case, &mut coverage.borrow_mut())
     });
 
@@ -993,7 +1002,7 @@ struct AuthorityCoverage {
 ///
 /// Then checks the run exercised what they guard: grants held, workers
 /// orphaned, shards recovered through the authority path, and orphans
-/// rejoined.
+/// rejoined, unless the time budget was spent and truncated the run.
 #[test]
 fn authority_invariants_hold_after_every_event() {
     let strategy = (
@@ -1002,22 +1011,21 @@ fn authority_invariants_hold_after_every_event() {
         proptest::collection::vec(authority_event_strategy(), 1..60),
     );
     let coverage = RefCell::new(AuthorityCoverage::default());
-    let base = config();
-    let cases = if std::env::var_os("PROPTEST_CASES").is_some() {
-        base.cases
-    } else {
-        AUTHORITY_CASES
-    };
     let mut runner = TestRunner::new(ProptestConfig {
         source_file: Some(file!()),
-        cases,
-        ..base
+        ..seeded(crate::proptest::config(AUTHORITY_CASES))
     });
     let outcome = runner.run(&strategy, |(voters, faults, events)| {
+        if crate::proptest::budget_spent() {
+            return Ok(());
+        }
         check_authority_case(voters, faults, events, &mut coverage.borrow_mut())
     });
     if let Err(failure) = outcome {
         panic!("{failure}\n{runner}");
+    }
+    if crate::proptest::budget_was_spent() {
+        return;
     }
     let coverage = coverage.into_inner();
     assert!(

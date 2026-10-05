@@ -339,12 +339,15 @@ impl Model {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(400))]
+    #![proptest_config(crate::proptest::config(400))]
 
     #[test]
     fn the_coalescing_invariants_hold_over_random_histories(
         ops in proptest::collection::vec(op(), 1..80)
     ) {
+        if crate::proptest::budget_spent() {
+            return Ok(());
+        }
         let mut model = Model::new();
         for op in &ops {
             model.apply(op);

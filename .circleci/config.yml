@@ -53,7 +53,11 @@ jobs:
           steps:
             - run:
                 name: Test
-                command: bazel test --config=ci //...
+                # A hung test fails the job after 5 minutes instead of
+                # holding the executor until CircleCI's default limit. The
+                # timeout bounds the whole command, whether it keeps printing
+                # or goes silent.
+                command: timeout --signal=TERM 300 bazel test --config=ci //...
       - save_cache:
           key: bazel-downloads-v1-{{ checksum "/tmp/download-cache-key" }}
           # Downloaded archives only (about 0.5 GB). Bazel extracts them again

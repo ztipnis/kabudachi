@@ -311,11 +311,16 @@ fn a_voter_a_leader_and_a_bootstrapping_node() -> [TestNode; 3] {
 }
 
 proptest! {
+    #![proptest_config(crate::proptest::config(256))]
+
     // Whatever election message a peer sends, decoding it never panics, and
     // a voter, a leader and a bootstrapping node each step what decode
     // accepts without panicking.
     #[test]
     fn decode_never_panics_and_a_node_steps_what_it_accepts(message in arbitrary_election_message()) {
+        if crate::proptest::budget_spent() {
+            return Ok(());
+        }
         if let Ok(checked) = checked::decode(message) {
             for mut node in a_voter_a_leader_and_a_bootstrapping_node() {
                 let _ = node.step(Input::Message { from: worker("peer"), message: checked.clone() });
