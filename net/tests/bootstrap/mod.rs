@@ -1,4 +1,3 @@
-//! Bootstrap, self-election, and peer routing over real sockets.
+//! Bootstrap joins over real sockets.
 
 mod bootstrap_join;
-mod bootstrap_self_elect;

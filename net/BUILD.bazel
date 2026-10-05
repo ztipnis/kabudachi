@@ -31,7 +31,7 @@ rust_test(
 # One integration-test binary for net, with a module per area under `tests/`.
 #
 # Medium (300 s default timeout) gives the whole crate's tests, which share one
-# process, headroom on slow CI hosts; they take about 5 s on a laptop.
+# process, headroom on slow CI hosts; they take about 3 s on a laptop.
 # rules_rust cannot shard libtest (every shard would run the full binary), so
 # there is no shard_count.
 rust_test(

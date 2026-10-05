@@ -551,15 +551,20 @@ pub(crate) fn decide_round(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::future::Future;
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
     use kabudachi_core::coordination_authority::{CoordinationAuthority, LiveRegistrations};
-    use kabudachi_core::election::{CallKind, Issuer, ReplyToken};
-    use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+    use kabudachi_core::election::{
+        AuthorityTimings, CallKind, ElectionTimings, Identity, Input, Issuer, ReplyToken,
+        WorkerNode,
+    };
+    use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
+    use kabudachi_core::protocol::worker_state::WorkerState;
+    use kabudachi_core::time::Duration as TickDuration;
     use kabudachi_testkit::FaultingAuthority;
-    
     use tokio::time::timeout;
 
     use super::*;
@@ -690,6 +695,21 @@ mod tests {
 
         assert_eq!(joined_leader(entry), (WorkerId::new("seed"), 1));
         assert_eq!(port.passes().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_with_no_seeds_and_no_authority_founds_unregistered() {
+        let port = Scripted::default();
+        let mut cascade = InProcess::new(&port, None, TokioClock::new(), &[]);
+
+        let entry = cascade.run().await;
+
+        assert!(
+            matches!(&entry, Entry::Founding { registered_at: None, .. }),
+            "expected an unregistered founding, got {entry:?}"
+        );
+        assert!(founded_at_epoch_0(&entry));
+        assert!(port.passes().is_empty(), "there was nobody to ask");
     }
 
     // A seed that answered once, pointing at a leader long gone, must not
@@ -858,6 +878,199 @@ mod tests {
         assert!(founded_at_epoch_0(&entry));
     }
 
+    /// Runs `worker`'s cascade, noting in `founder` that it founded the shard
+    /// the moment it does.
+    async fn run_noting_founder(
+        worker: &mut InProcess,
+        founder: &RefCell<Option<WorkerId>>,
+    ) -> (WorkerId, Entry) {
+        let me = worker.me.clone();
+        let entry = worker.run().await;
+        if matches!(entry, Entry::Founding { .. }) {
+            *founder.borrow_mut() = Some(me.clone());
+        }
+        (me, entry)
+    }
+
+    // Seedless workers that start together over one authority race to found
+    // the shard. The authority lets exactly one win; each of the others finds
+    // the winner registered, asks it, and joins it rather than founding a
+    // second shard beside it.
+    #[tokio::test(start_paused = true)]
+    async fn seedless_workers_starting_together_found_one_shard_and_join_its_founder() {
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        let port = Scripted::default();
+        let mut workers = [(); 3].map(|()| InProcess::new(&port, Some(&authority), clock, &[]));
+        let [first, second, third] = &mut workers;
+        let founder: RefCell<Option<WorkerId>> = RefCell::new(None);
+
+        // A cascade registers at its net's listen address, and these nets
+        // never listen, so the founder's node renews its registration here at
+        // the address it would be driven on, and answers its asks.
+        let driven_founder = async {
+            let (id, at) = loop {
+                if let Some(id) = founder.borrow().clone() {
+                    break (id, address(9));
+                }
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            };
+            register(&authority, id.as_str(), &at.to_string());
+            port.script(&at, [Answer::Pointer(pointer_to(id.as_str(), &at))]);
+        };
+        let (a, b, c, ()) = timeout(TEST_TIMEOUT, async {
+            tokio::join!(
+                run_noting_founder(first, &founder),
+                run_noting_founder(second, &founder),
+                run_noting_founder(third, &founder),
+                driven_founder,
+            )
+        })
+        .await
+        .expect("the three cascades ended within the timeout");
+
+        let founder = founder.into_inner().expect("one worker founded the shard");
+        let entries = [a, b, c];
+        for (id, entry) in entries {
+            if id == founder {
+                assert!(founded_at_epoch_0(&entry), "the founder founded at epoch 0: {entry:?}");
+            } else {
+                assert_eq!(joined_leader(entry), (founder.clone(), 1));
+            }
+        }
+        assert_eq!(epoch_number(&authority), Some(0));
+    }
+
+    // The authority reports an empty listing while it warms up, which proves
+    // nothing about who is registered, so the worker founds nothing until
+    // warm-up ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_warming_up_authority_keeps_the_node_bootstrapping_until_warm_up_ends() {
+        let ttl = StdDuration::from_millis(300);
+        let clock = TokioClock::new();
+        let authority = FaultingAuthority::new(
+            clock,
+            TickDuration::from_ticks(ttl.as_millis() as u64),
+        );
+        let started = tokio::time::Instant::now();
+        let mut cascade = InProcess::new(&Scripted::default(), Some(&authority), clock, &[]);
+
+        let entry = timeout(TEST_TIMEOUT, cascade.run())
+            .await
+            .expect("the node founded the shard once warm-up ended");
+
+        assert!(
+            started.elapsed() >= ttl,
+            "the node founded the shard while the authority was warming up, after {:?}",
+            started.elapsed()
+        );
+        assert!(founded_at_epoch_0(&entry));
+        assert_eq!(epoch_number(&authority), Some(0));
+    }
+
+    // The worker's own registration is listed too, and is not another worker
+    // to ask.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_whose_own_registration_is_the_only_one_founds_the_shard() {
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        let port = Scripted::default();
+        let mut cascade = InProcess::new(&port, Some(&authority), clock, &[]);
+        register(&authority, cascade.me.as_str(), &address(1).to_string());
+
+        let entry = timeout(TEST_TIMEOUT, cascade.run())
+            .await
+            .expect("the node founded the shard though it is listed");
+
+        assert!(founded_at_epoch_0(&entry));
+        assert_eq!(port.passes(), Vec::<Vec<Multiaddr>>::new(), "it asked no one");
+        assert_eq!(epoch_number(&authority), Some(0));
+    }
+
+    // The founder's registration lapses a TTL after the cascade asked for it,
+    // however long the authority took to answer. Counted from when the answer
+    // arrived, or from when the node was built, a founder that cannot renew
+    // would still count itself registered, and able to lead, after another
+    // bootstrapper had found the shard with no one registered and re-founded
+    // it.
+    #[tokio::test(start_paused = true)]
+    async fn a_founder_counts_its_registration_from_when_the_cascade_asked_for_it() {
+        let ttl = StdDuration::from_millis(300);
+        let (authority, clock) = warm_authority(ttl).await;
+        // The registration is slow: the authority holds it for half a TTL.
+        authority.hold_next(CallKind::Register);
+        let mut cascade = InProcess::new(&Scripted::default(), Some(&authority), clock, &[]);
+        let (me, shard_id) = (cascade.me.clone(), cascade.shard_id.clone());
+        let mut running = std::pin::pin!(cascade.run());
+
+        let held_at = tokio::select! {
+            entry = &mut running => panic!("the cascade entered while its registration was held: {entry:?}"),
+            held_at = async {
+                wait_until_held(&authority, CallKind::Register).await;
+                // The cascade has asked to register, so this is no earlier
+                // than the instant the registration is measured against.
+                let held_at = tokio::time::Instant::now();
+                // A held call stops auto-advance: time moves by hand.
+                tokio::time::advance(ttl / 2).await;
+                authority.release(CallKind::Register);
+                held_at
+            } => held_at,
+        };
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the worker founded the shard within the timeout");
+        let identity = Identity {
+            id: me,
+            incarnation: IncarnationId::new("incarnation-0"),
+            shard: shard_id,
+            timings: ElectionTimings::new(
+                TickDuration::from_millis(300),
+                TickDuration::from_millis(10),
+            ),
+        };
+        let (mut node, _) = WorkerNode::start(
+            identity,
+            entry,
+            clock,
+            Some(AuthorityTimings {
+                ttl: TickDuration::from_millis(ttl.as_millis() as u64),
+            }),
+        );
+
+        // Past the registration's TTL less drift, but short of it counted from
+        // when the node was built. The node's own renewal is never answered.
+        tokio::time::sleep_until(held_at + ttl * 19 / 20).await;
+        let _ = node.step(Input::Tick);
+
+        assert_eq!(node.state(), WorkerState::Fenced);
+    }
+
+    // A full-shard restart: the authority is warm and lists no live
+    // registration, but its recovery epoch already exists, so every worker
+    // that ever held it is gone or has fenced itself off from leading it. A
+    // seedless bootstrapper re-founds the shard one epoch on, rather than
+    // waiting on workers that are never coming back.
+    #[tokio::test(start_paused = true)]
+    async fn a_bootstrapper_re_founds_a_shard_whose_epoch_exists_with_no_live_registration() {
+        let (authority, clock) = warm_authority(StdDuration::from_secs(5)).await;
+        authority
+            .compare_and_swap_recovery_epoch(
+                &ShardId::new("shard-1"),
+                None,
+                RecoveryEpoch::founding(3, &mut Uuid7Lineages),
+            )
+            .expect("creating the epoch directly succeeds against a warm, empty authority");
+        let mut cascade = InProcess::new(&Scripted::default(), Some(&authority), clock, &[]);
+
+        let entry = timeout(TEST_TIMEOUT, cascade.run())
+            .await
+            .expect("the bootstrapper re-founded the shard within the timeout");
+
+        assert!(
+            matches!(entry, Entry::Founding { recovery_epoch, .. } if recovery_epoch.number == 4),
+            "the shard is re-founded one epoch past the one that existed: {entry:?}"
+        );
+        assert_eq!(epoch_number(&authority), Some(4));
+    }
+
     fn me() -> WorkerId {
         WorkerId::new("me")
     }
@@ -955,7 +1168,7 @@ mod tests {
                 number: 0,
             },
             sent_at: Instant::at(1),
-            result: Ok(kabudachi_core::time::Duration::from_ticks(30)),
+            result: Ok(TickDuration::from_ticks(30)),
         };
         let create = decide_round(Stage::Registering, registered, &me(), false, &mut lineages);
         assert_eq!(swap_asked(&create), (None, RecoveryEpoch::new(0, 7)));

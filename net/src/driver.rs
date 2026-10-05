@@ -479,6 +479,7 @@ mod tests {
     use std::sync::Arc;
 
     use kabudachi_core::configuration::{Configuration, Generation, Single};
+    use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
     use kabudachi_core::election::{
         AuthorityTimings, ElectionTimings, Entry, Identity, KnownConfiguration,
     };
@@ -888,5 +889,103 @@ mod tests {
         timeout(TEST_TIMEOUT, joined_and_heard)
             .await
             .expect("the joiner's first heartbeat reached its leader within the timeout");
+    }
+
+    // A node fenced from its authority while the shard recovers without it
+    // goes back to `Bootstrapping`; the driver then reads the authority's
+    // live registrations itself and joins the worker listed there that leads.
+    #[tokio::test]
+    async fn a_fenced_node_the_shard_recovered_without_rejoins_the_leader_the_authority_lists() {
+        let shard = ShardId::new("shard-1");
+        let (leader_net, leader_addr) = listening_net().await;
+        let leader_net = Arc::new(leader_net);
+        let leader = leader_net.local_worker_id();
+        let _responder = spawn_join_responder(
+            Arc::clone(&leader_net),
+            JoinResponse {
+                leader_id: Some(leader.clone().into()),
+                leader_multiaddr: leader_addr.to_string(),
+                term: 1,
+                recovery_epoch: 1,
+                recovery_epoch_lineage: 0,
+            },
+        );
+        let node_net = Net::new();
+        let me = node_net.local_worker_id();
+
+        let clock = RealClock::new();
+        let ttl = TickDuration::from_millis(1_000);
+        let authority = FaultingAuthority::new(clock, ttl);
+        authority
+            .compare_and_swap_recovery_epoch(&shard, None, RecoveryEpoch::new(0, 0))
+            .expect("a fresh authority holds no epoch");
+        // Cut off from the start, the node's registration lapses and it
+        // fences itself.
+        let node_handle = authority.for_another_worker();
+        node_handle.set_reachable(false);
+        let (mut node, first) = node_of_two_with(
+            clock,
+            &me,
+            TickDuration::from_millis(300),
+            Some(AuthorityTimings { ttl }),
+        );
+        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let (seen, mut observed) = watch::channel((Vec::<WorkerState>::new(), None));
+        let client = AuthorityClient::new(&node_net, shard.clone(), Arc::new(node_handle.clone()));
+
+        let driven = run_driver(
+            &mut node,
+            first,
+            &node_net,
+            &mut scheduler,
+            clock,
+            Some(client),
+            DriverConfig::default(),
+            |node, _, _| {
+                seen.send_modify(|(states, known)| {
+                    if states.last() != Some(&node.state()) {
+                        states.push(node.state());
+                    }
+                    *known = node.known_leader();
+                });
+            },
+        );
+        let scenario = async {
+            observed
+                .wait_for(|(states, _)| states.contains(&WorkerState::Fenced))
+                .await
+                .expect("the observer is alive");
+            // The other worker leads at epoch 1 and is registered; the
+            // fenced node can reach the authority again.
+            authority
+                .compare_and_swap_recovery_epoch(
+                    &shard,
+                    Some(RecoveryEpoch::new(0, 0)),
+                    RecoveryEpoch::new(1, 0),
+                )
+                .expect("the epoch is still 0");
+            authority
+                .register(&shard, &leader, &leader_addr.to_string())
+                .expect("the authority is reachable");
+            node_handle.set_reachable(true);
+            observed
+                .wait_for(|(states, known)| {
+                    states.contains(&WorkerState::Bootstrapping)
+                        && states.last() == Some(&WorkerState::Active)
+                        && known.is_some()
+                })
+                .await
+                .expect("the observer is alive")
+                .clone()
+        };
+        let (_, known) = timeout(TEST_TIMEOUT, async {
+            tokio::select! {
+                _ = driven => unreachable!("run_driver never returns"),
+                states = scenario => states,
+            }
+        })
+        .await
+        .expect("the fenced node rejoined within the timeout");
+        assert_eq!(known, Some((leader, 1)));
     }
 }

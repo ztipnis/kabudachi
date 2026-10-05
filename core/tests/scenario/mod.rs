@@ -7,3 +7,4 @@ mod scenario_election;
 mod scenario_membership;
 mod scenario_no_quorum;
 mod scenario_partition;
+mod scenario_random;

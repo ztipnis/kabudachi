@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::support::harness::Cluster;
 use crate::support::node::published_roll_calls;
-use kabudachi_core::election::Input;
-use kabudachi_core::protocol::ids::WorkerId;
+use kabudachi_core::election::{ElectionTimings, Input};
+use kabudachi_core::protocol::ids::{TaskDefinitionId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::scheduler::{ClaimRejection, Submission};
 use kabudachi_core::time::Duration;
 
 /// Partitions `leader` from everyone else, checks the isolated leader detects
@@ -254,4 +255,75 @@ fn four_survivors_starting_roll_calls_at_once_elect_exactly_one_leader() {
 
     every_initiator_racing_at_once_elects_the_best_call(&mut cluster, &survivors);
     assert_cut_off_and_retrying(&cluster, &old_leader);
+}
+
+#[test]
+fn no_replacement_run_is_claimable_until_the_reconnect_timeout_has_run_out_under_a_partition() {
+    let suspect_timeout = Duration::from_secs(2);
+    let (mut cluster, leader) =
+        bootstrap_5_and_elect_leader(suspect_timeout, Duration::from_secs(1));
+    let followers: Vec<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != leader)
+        .collect();
+    let (cut_off, other) = (followers[0].clone(), followers[1].clone());
+
+    let scheduler = cluster.scheduler_mut(&leader);
+    let task = scheduler
+        .submit(Submission::new(
+            TaskDefinitionId::new("demo.task"),
+            1,
+            b"payload".to_vec(),
+            "default",
+        ))
+        .expect("the leader's scheduler leads");
+    let first = scheduler
+        .request_claim(&cut_off, &task)
+        .expect("the task is queued");
+    assert_eq!(first.attempt_number, 1);
+    scheduler
+        .report_started(&cut_off, &first.task_run_id)
+        .expect("the claim is fresh");
+
+    let rest: BTreeSet<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != cut_off)
+        .collect();
+    cluster.partition(rest, [cut_off.clone()].into_iter().collect());
+
+    // The cut-off follower was last heard at most a heartbeat interval before
+    // the cut, so the leader loses it no earlier than a suspicion timeout and
+    // a reconnect timeout less that interval after it. Another worker's claim
+    // for the task is refused at the start of that window and again a little
+    // before its end.
+    let window = suspect_timeout.as_ticks() + ElectionTimings::DEFAULT_RECONNECT_TIMEOUT.as_ticks();
+    let heartbeat_interval = suspect_timeout.as_ticks() / 4;
+    let assert_still_selected = |cluster: &mut Cluster| {
+        assert_eq!(
+            cluster.states()[&leader],
+            WorkerState::Leader,
+            "the leader keeps its quorum of the four connected nodes"
+        );
+        assert_eq!(
+            cluster.scheduler_mut(&leader).request_claim(&other, &task),
+            Err(ClaimRejection::AlreadySelected),
+            "before the reconnect timeout runs out, the original claim must still stand"
+        );
+    };
+    assert_still_selected(&mut cluster);
+    cluster.advance(Duration::from_ticks(window - heartbeat_interval - 1));
+    assert_still_selected(&mut cluster);
+
+    // Well past the window, the loss has been replayed and the task is
+    // claimable again, as a second attempt.
+    cluster.advance(Duration::from_ticks(2 * heartbeat_interval + 1));
+    let replacement = cluster
+        .scheduler_mut(&leader)
+        .request_claim(&other, &task)
+        .expect("the lost run's task is claimable once the reconnect timeout has run out");
+    assert_eq!(replacement.attempt_number, 2);
+    assert_ne!(replacement.task_run_id, first.task_run_id);
+    assert_eq!(cluster.first_grant_overlap(), None);
 }

@@ -21,7 +21,7 @@ use kabudachi_core::protocol::ids::{
     IncarnationId, ShardId, TaskDefinitionId, TaskId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::messages::{ClaimResponse, claim_response};
+use kabudachi_core::protocol::messages::{ClaimRejectReason, ClaimResponse, claim_response};
 use kabudachi_core::scheduler::{Scheduler, Submission};
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::driver::{DriverConfig, run_driver};
@@ -148,7 +148,7 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
     let (b_leader, mut b_knows) = watch::channel(None);
     let (c_leader, mut c_knows) = watch::channel(None);
 
-    let (claimed, batch) = timeout(TEST_TIMEOUT, async {
+    let (claimed, refused, batch) = timeout(TEST_TIMEOUT, async {
         tokio::select! {
             _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |_, _, _| {}) => {
                 unreachable!("run_driver never returns")
@@ -172,8 +172,9 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
                 }
                 let (b_names, c_names) = (named[0].clone(), named[1].clone());
                 let claimed = net_b.request_claim(b_names, taken.clone()).await;
+                let refused = net_c.request_claim(c_names.clone(), taken.clone()).await;
                 let batch = net_c.claim_oldest(c_names, 5).await;
-                (claimed, batch)
+                (claimed, refused, batch)
             } => claims,
         }
     })
@@ -188,11 +189,19 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
         }
         other => panic!("expected the first claim to be accepted, got {other:?}"),
     }
+    match refused.expect("the leader answered").result {
+        Some(claim_response::Result::Reject(reject)) => assert_eq!(
+            reject.reason(),
+            ClaimRejectReason::ClaimRejectAlreadySelected,
+            "a second claimant for the taken task is refused"
+        ),
+        other => panic!("expected the second claim to be rejected, got {other:?}"),
+    }
     assert_eq!(
         claimed_tasks(batch),
         oldest,
         "the oldest pending tasks, oldest first, the leader the joiners' nodes name"
     );
-    // The leader counts both asks as claim arrivals.
-    assert_eq!(net_a.diagnostics().await.traffic.claim_requests_received, 2);
+    // The leader counts every ask as a claim arrival.
+    assert_eq!(net_a.diagnostics().await.traffic.claim_requests_received, 3);
 }

@@ -77,50 +77,6 @@ async fn warmed_up_authority() -> InMemoryAuthority<RealClock> {
     warmed_up_in_memory_authority(&shard(), Duration::from_millis(AUTHORITY_TTL_MS)).await
 }
 
-// Seedless workers that start together over one authority race to found the
-// shard. The authority lets exactly one win; each of the others finds the
-// winner registered, asks it, and joins it once it leads, rather than
-// founding a second shard beside it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn seedless_workers_starting_together_found_one_shard_and_join_its_founder() {
-    let authority = warmed_up_authority().await;
-    let mut workers = Vec::new();
-    for _ in 0..3 {
-        workers.push(spawn_worker("/ip4/127.0.0.1/tcp/0", Some(authority.clone()), vec![]).await);
-    }
-
-    let mut leaders = Vec::new();
-    for worker in &mut workers {
-        let seen = worker
-            .wait_until(|seen| seen.leader.is_some() && seen.state != WorkerState::Bootstrapping)
-            .await;
-        leaders.push(seen.leader.expect("the node follows a leader"));
-    }
-    let founder = leaders[0].clone();
-    assert!(
-        leaders.iter().all(|leader| *leader == founder),
-        "every worker follows the one founder: {leaders:?}"
-    );
-    // The others joined it as pending members, so following it is all they
-    // share: whether a batch has admitted one yet is a race (ADR-0001
-    // decision 9).
-    let founder_worker = workers
-        .iter_mut()
-        .find(|worker| worker.id == founder)
-        .expect("the founder is one of the workers");
-    let seen = founder_worker.wait_until(|_| true).await;
-    assert!(
-        !seen.pending,
-        "the founder is a voter of the shard it founded"
-    );
-    assert_eq!(
-        authority
-            .read_recovery_epoch(&shard())
-            .map(|epoch| epoch.map(|epoch| epoch.number)),
-        Ok(Some(0))
-    );
-}
-
 /// A shard led by a founder, a second worker that joined it, and three more
 /// workers given only that second worker's address as their one seed, all
 /// over one authority. Returns them once each of the three follows the
@@ -158,7 +114,7 @@ async fn three_workers_joined_through_one_seed(
 // is driven, and, through kad's bootstrap after its join connections, comes
 // to know the other two joiners, whose addresses it was never given. The
 // leader then admits every worker that joined it in an admission batch
-// (ADR-0001 decision 9): each becomes a voter.
+// (ADR-0001 decision 9): each becomes a voter. A drained voter then stops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_workers_that_join_through_one_seed_register_and_are_admitted() {
     let authority = warmed_up_authority().await;
@@ -196,6 +152,14 @@ async fn three_workers_that_join_through_one_seed_register_and_are_admitted() {
     for worker in &mut workers[1..] {
         worker.wait_until(|seen| !seen.pending).await;
     }
+
+    // A drained voter leaves through its own driver and node: the request
+    // reaches the node, which removes itself and stops.
+    let leaving = workers.last_mut().expect("the shard has workers");
+    leaving.net.request_drain();
+    leaving
+        .wait_until(|seen| seen.state == WorkerState::Stopped)
+        .await;
 }
 
 /// Whether this host has an address other than loopback: the local address

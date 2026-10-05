@@ -3,7 +3,7 @@
 //! once joined.
 //! The wire handshake that produces the leader pointer (dialing seeds,
 //! sending `JOIN_REQUEST`, taking the first `JOIN_RESPONSE` that names a
-//! leader) is `net`'s concern (`net/tests/election/three_node_join.rs` covers
+//! leader) is `net`'s concern (`net/tests/bootstrap/bootstrap_join.rs` covers
 //! that end to end); these tests only exercise the plain state-machine
 //! surface `net` calls once it has one.
 //!

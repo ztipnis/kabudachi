@@ -18,14 +18,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::support::authority::authority_ttl;
 use crate::support::builders::{past_any_suspicion, shard};
-use crate::support::harness::Cluster;
+use crate::support::harness::{Cluster, StepRecord};
 use kabudachi_core::configuration::Admission;
 use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, Uuid7Lineages};
-use kabudachi_core::election::{AuthorityRequest, Input, Output, StopReason};
+use kabudachi_core::election::{AuthorityRequest, ElectionTimings, Input, Output, StopReason};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::election_message::Payload;
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::time::Duration;
+use kabudachi_core::time::{Duration, Instant};
 
 const SUSPECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often `run_for` stops to check the cluster.
@@ -690,4 +690,112 @@ fn a_leader_paused_past_its_quorum_lease_does_not_republish_its_old_epoch() {
         );
     });
     assert_ne!(cluster.states()[&leader], WorkerState::Leader);
+}
+
+/// `duration` less its tenth, rounded up, for clock drift: how much of it a
+/// node counts on (see `Output::AbortDeadline`).
+fn less_drift(duration: Duration) -> Duration {
+    let ticks = duration.as_ticks();
+    Duration::from_ticks(ticks - ticks.div_ceil(10))
+}
+
+/// The abort deadline `worker` last reported among `steps` taken no later
+/// than `at`: `Some(None)` for a withdrawal, `None` if it reported none.
+fn abort_deadline_as_of(
+    steps: &[StepRecord],
+    worker: &WorkerId,
+    at: Instant,
+) -> Option<Option<Instant>> {
+    steps
+        .iter()
+        .filter(|step| step.node == *worker && step.at <= at)
+        .flat_map(|step| &step.outputs)
+        .filter_map(|output| match output {
+            Output::AbortDeadline(deadline) => Some(*deadline),
+            _ => None,
+        })
+        .next_back()
+}
+
+#[test]
+fn a_follower_that_loses_the_authority_fences_itself_in_time_and_resumes_on_reconnect() {
+    let (mut cluster, leader) = elected(3);
+    let orphan = followers(&cluster, &leader)[0].clone();
+    let orphan_alone: BTreeSet<WorkerId> = [orphan.clone()].into_iter().collect();
+    cluster.record_steps();
+
+    // Cut the follower off from the authority alone: its connections to the
+    // leader and the other follower stay up. Run until it fences, checking
+    // that it does so only while the authority still lists it, and that the
+    // leader, which with the other follower is a quorum that still reaches
+    // the authority, keeps leading.
+    set_reachable(&cluster, &orphan_alone, false);
+    let mut fenced_checked = false;
+    run_for(&mut cluster, ttls(2), |cluster| {
+        assert_eq!(
+            cluster.states()[&leader],
+            WorkerState::Leader,
+            "the leader keeps leading while one follower loses the authority"
+        );
+        if !fenced_checked && cluster.states()[&orphan] == WorkerState::Fenced {
+            assert!(
+                live(cluster).contains(&orphan),
+                "the follower must fence itself before its registration lapses at the authority"
+            );
+            fenced_checked = true;
+        }
+    });
+    assert!(fenced_checked, "the follower fences itself");
+
+    // The instant of the step that fenced it, not of the check that noticed.
+    let steps = cluster.take_steps();
+    let fenced_at = steps
+        .iter()
+        .find(|step| step.node == orphan && step.state == WorkerState::Fenced)
+        .expect("the follower's fencing step is recorded")
+        .at;
+
+    let abort_by = abort_deadline_as_of(&steps, &orphan, fenced_at)
+        .flatten()
+        .expect("a fenced follower is told by when to abort its runs");
+    assert!(
+        abort_by <= fenced_at + less_drift(ElectionTimings::DEFAULT_RECONNECT_TIMEOUT),
+        "fenced at {fenced_at:?}, the follower must abort within nine tenths of a reconnect \
+         timeout, not at {abort_by:?}"
+    );
+
+    // Reaching the authority again, it resumes at the same epoch straight
+    // from `Fenced` to `Active`, and hearing its leader withdraws the deadline.
+    set_reachable(&cluster, &orphan_alone, true);
+    // The leader keeps leading throughout. The harness exposes no view of
+    // what the leader has heard from a follower short of a production seam,
+    // so the follower's return to `Active` under the same leader stands in
+    // for the leader hearing it again.
+    run_for(&mut cluster, ttl(), |cluster| {
+        assert_eq!(
+            cluster.states()[&leader],
+            WorkerState::Leader,
+            "the leader keeps leading while the follower resumes"
+        );
+    });
+    assert_eq!(cluster.states()[&orphan], WorkerState::Active);
+    assert_eq!(cluster.node(&orphan).recovery_epoch(), 0);
+    let steps = cluster.take_steps();
+    assert!(
+        steps
+            .iter()
+            .filter(|step| step.node == orphan)
+            .all(|step| step.recovery_epoch == 0
+                && !matches!(
+                    step.state,
+                    WorkerState::Bootstrapping | WorkerState::RollCall | WorkerState::Candidate
+                )),
+        "it went from Fenced back to Active, not through a rejoin or an election"
+    );
+    assert_eq!(
+        abort_deadline_as_of(&steps, &orphan, cluster.now()),
+        Some(None),
+        "a follower its leader hears from again withdraws its abort deadline"
+    );
+    assert_eq!(cluster.leader(), Some(leader));
 }

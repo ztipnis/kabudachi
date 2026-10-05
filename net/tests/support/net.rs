@@ -2,7 +2,7 @@
 //!
 //! A `Net` queues its node's inputs, connection events among them, until its
 //! driver takes them. A helper that waits for a connection event by taking
-//! inputs ([`connect_to`], [`wait_until_disconnected`]) takes them from any
+//! inputs ([`connect_to`]) takes them from any
 //! node too, so it waits only on a bare `Net`, one that no node is driven
 //! on. A setup that builds its nodes after connecting waits without taking
 //! anything ([`wait_until_registered`], [`connect_full_mesh`]), so each node
@@ -10,32 +10,21 @@
 
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-use super::election::due_now;
-use kabudachi_core::election::{Input, Output, Step, WorkerNode};
-use kabudachi_core::protocol::ids::{IdGenerator, WorkerId};
-use kabudachi_core::protocol::messages::{ElectionMessage, JoinResponse, election_message};
-use kabudachi_core::scheduler::Scheduler;
-use kabudachi_core::time::Clock;
-use kabudachi_net::driver::{DriverConfig, run_driver};
+use kabudachi_core::election::Input;
+use kabudachi_core::protocol::ids::WorkerId;
+use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_net::join::{LeaderSearch, ask_for_leader};
 use kabudachi_net::messenger::{Diagnostics, Net};
 use libp2p::Multiaddr;
-use tokio::sync::watch;
 use tokio::time::timeout;
 
 /// How long each helper waits for the connection state it waits for.
 const WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(20);
 
-/// Takes `net`'s queued inputs until one is `expected`, and returns when it
-/// was taken. Everything taken is dropped: `net` must be a bare `Net`.
-pub async fn take_inputs_until(net: &Net, expected: &Input) -> StdInstant {
-    take_inputs_until_all(net, std::slice::from_ref(expected)).await
-}
-
 /// Takes `net`'s queued inputs until every one of `expected` has been taken,
 /// in any order, and returns when the last was. Everything taken is
 /// dropped: `net` must be a bare `Net`.
-pub async fn take_inputs_until_all(net: &Net, expected: &[Input]) -> StdInstant {
+pub async fn take_inputs_until(net: &Net, expected: &[Input]) -> StdInstant {
     let mut missing: Vec<&Input> = expected.iter().collect();
     timeout(WAIT_TIMEOUT, async {
         loop {
@@ -60,14 +49,7 @@ pub async fn take_inputs_until_all(net: &Net, expected: &[Input]) -> StdInstant 
 /// (a `Net::disconnect` is a silent no-op on a side that does not).
 pub async fn connect_to(net_a: &Net, listen_addr: &Multiaddr, net_b: &Net) {
     net_b.dial(listen_addr.clone());
-    take_inputs_until(net_b, &Input::PeerConnected(net_a.local_worker_id())).await;
-}
-
-/// Waits until the bare `worker_net` reports its connection to `peer`
-/// closed, and returns when it did: the real-transport moment the worker
-/// and `peer` became unreachable to each other.
-pub async fn wait_until_disconnected(worker_net: &Net, peer: &WorkerId) -> StdInstant {
-    take_inputs_until(worker_net, &Input::PeerDisconnected(peer.clone())).await
+    take_inputs_until(net_b, &[Input::PeerConnected(net_a.local_worker_id())]).await;
 }
 
 /// Reads `net`'s diagnostics until `condition` holds of them, and returns
@@ -166,60 +148,4 @@ pub async fn connect_full_mesh(nets: &[&Net]) -> Vec<WorkerId> {
     }
 
     ids
-}
-
-/// Sends `heartbeat` from `follower` to the node driven on `leader_net`, and
-/// drives that node until it acks `follower`, so the leader has heard the
-/// heartbeat: `Net::send` only queues the message for its swarm, and a
-/// connection closed before it leaves would lose it. Returns when the
-/// heartbeat was sent, no later than the leader heard it.
-pub async fn heartbeat_until_acked<C: Clock, I: IdGenerator>(
-    node: &mut WorkerNode<C>,
-    leader_net: &Net,
-    scheduler: &mut Scheduler<C, I>,
-    clock: C,
-    follower: &Net,
-    heartbeat: ElectionMessage,
-) -> StdInstant {
-    let follower_id = follower.local_worker_id();
-    let (acked_tx, mut acked_rx) = watch::channel(false);
-    follower.send(leader_net.local_worker_id(), heartbeat);
-    let sent_at = StdInstant::now();
-    let observe = |_: &WorkerNode<C>, _: Option<&Input>, step: &Step| {
-        let outputs = &step.outputs;
-        let acked = outputs.iter().any(|output| {
-            matches!(
-                output,
-                Output::Send { to, message: ElectionMessage {
-                    payload: Some(election_message::Payload::HeartbeatAck(_)),
-                } } if *to == follower_id
-            )
-        });
-        if acked {
-            let _ = acked_tx.send(true);
-        }
-    };
-    timeout(WAIT_TIMEOUT, async {
-        tokio::select! {
-            _ = run_driver(node, due_now(&clock), leader_net, scheduler, clock, None, DriverConfig::default(), observe) => {
-                unreachable!("run_driver never returns")
-            }
-            _ = acked_rx.wait_for(|acked| *acked) => {}
-        }
-    })
-    .await
-    .expect("the leader acked the heartbeat within the timeout");
-    sent_at
-}
-
-/// A `Net` listening on a loopback port, and that address.
-pub async fn listening_net() -> (Net, Multiaddr) {
-    let net = Net::new();
-    let listen_addr = timeout(
-        WAIT_TIMEOUT,
-        net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
-    )
-    .await
-    .expect("the net produced a listen address within the timeout");
-    (net, listen_addr)
 }

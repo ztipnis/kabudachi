@@ -1,0 +1,252 @@
+//! Seeded random scenarios on the `Cluster` harness. Each seed draws a
+//! cluster of 3 to 7 voters, lets it elect a leader, then runs a phase of
+//! random faults (brief and long partitions, stalls, duplicated and reordered
+//! messages) and a quiet phase: every fault is lifted and the cluster runs on
+//! until it is quiescent.
+//!
+//! Throughout, no two nodes hold a valid grant at once and no term has two
+//! leaders. Once the quiet phase is over, the cluster has exactly one leader,
+//! which alone holds a valid grant, and every other node follows it.
+//!
+//! The faults are bounded so the cluster can recover: brief cuts and stalls
+//! of up to a third of the suspicion timeout, and long cuts of 70% to 90% of
+//! it, which leave cut-off nodes close to suspecting their leader.
+//! A node that loses a leader's heartbeats for a whole suspicion timeout,
+//! through a cut that long or through message loss, can end in `NoQuorum` with
+//! no election left to join. That stranding is an open liveness gap in the
+//! election, not something the cluster recovers from; this test steps around
+//! it by keeping every cut under the timeout and not dropping or delaying
+//! messages. The bound is per fault: faults can stack, and stacked faults are
+//! not ruled out as a way to strand a node. That a sweep of seeds 0..800
+//! passes is the evidence they do not in practice. The property tests in
+//! `proptest_leadership_invariants` check safety under those harsher faults.
+//!
+//! A run is reproduced by its seed alone, which a failure prints. By default
+//! the fixed seeds in `SEEDS` run. `KABUDACHI_SIM_SEEDS` replaces them: `N`
+//! runs seeds 0 to N-1, `a,b,c` runs those seeds and `a..b` runs seeds a to
+//! b-1, to search wider before closing a change to the election. A trailing
+//! comma is allowed, so `N,` runs the single seed N, even `u64::MAX`.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
+use crate::support::builders::past_any_suspicion;
+use crate::support::harness::Cluster;
+use kabudachi_core::election::Output;
+use kabudachi_core::protocol::ids::WorkerId;
+use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::time::Duration;
+
+/// The seeds a run checks unless `KABUDACHI_SIM_SEEDS` names others.
+const SEEDS: [u64; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+const SEEDS_VARIABLE: &str = "KABUDACHI_SIM_SEEDS";
+
+/// Every cluster's suspicion timeout, in ticks, and the step the quiet phase
+/// runs in.
+const SUSPECT_TICKS: u64 = 10;
+const TICK_SIZE: Duration = Duration::from_ticks(5);
+
+/// The longest a brief cut or a stall lasts, in ticks.
+const LONGEST_CUT: u64 = SUSPECT_TICKS / 3;
+
+/// The bounds of a long cut, in ticks: just under the suspicion timeout. A cut
+/// that reaches it can leave a node in `NoQuorum` with no election to join
+/// (in an earlier sweep over 0..800 with cuts of `SUSPECT_TICKS..=2 *
+/// SUSPECT_TICKS`, seeds 83, 154 and 250 did so).
+const LONG_CUT_LOW: u64 = SUSPECT_TICKS * 7 / 10;
+const LONG_CUT_HIGH: u64 = SUSPECT_TICKS * 9 / 10;
+
+/// How long the cluster runs after its faults are lifted before it is
+/// checked for quiescence, and the most steps that then takes.
+const QUIET_TICKS: u64 = 10 * SUSPECT_TICKS;
+const QUIESCENCE_STEPS: usize = 400;
+
+/// The seeds to run, from `KABUDACHI_SIM_SEEDS` if it is set.
+fn seeds() -> Vec<u64> {
+    let Ok(spec) = std::env::var(SEEDS_VARIABLE) else {
+        return SEEDS.to_vec();
+    };
+    let number = |text: &str| -> u64 {
+        text.trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{SEEDS_VARIABLE}={spec:?}: {text:?} is not a number"))
+    };
+    let seeds: Vec<u64> = if let Some((from, to)) = spec.split_once("..") {
+        (number(from)..number(to)).collect()
+    } else if spec.contains(',') {
+        let list = spec.trim().strip_suffix(',').unwrap_or(&spec);
+        list.split(',').map(number).collect()
+    } else {
+        (0..number(&spec)).collect()
+    };
+    assert!(
+        !seeds.is_empty(),
+        "{SEEDS_VARIABLE}={spec:?} names no seeds, so nothing would run"
+    );
+    seeds
+}
+
+/// One fault, or a step of time, in a random fault phase.
+#[derive(Debug)]
+enum Event {
+    Advance(Duration),
+    /// Cuts the nodes with `true` off from those with `false` for `hold`,
+    /// then heals the cut.
+    Partition(Vec<bool>, Duration),
+    Stall(usize, Duration),
+    DuplicateRate(f64),
+}
+
+fn draw_event(rng: &mut ChaCha8Rng, nodes: usize) -> Event {
+    let up_to = |rng: &mut ChaCha8Rng, most: u64| Duration::from_ticks(rng.random_range(1..=most));
+    match rng.random_range(0..40) {
+        0..=23 => Event::Advance(up_to(rng, 15)),
+        24..=29 => Event::Partition(
+            (0..nodes).map(|_| rng.random_bool(0.5)).collect(),
+            up_to(rng, LONGEST_CUT),
+        ),
+        // Most of a suspicion timeout: long enough that cut-off nodes come
+        // close to suspecting their leader, short enough that one cut alone
+        // strands none.
+        30..=31 => Event::Partition(
+            (0..nodes).map(|_| rng.random_bool(0.5)).collect(),
+            Duration::from_ticks(rng.random_range(LONG_CUT_LOW..=LONG_CUT_HIGH)),
+        ),
+        32..=37 => Event::Stall(rng.random_range(0..nodes), up_to(rng, LONGEST_CUT)),
+        _ => Event::DuplicateRate([0.0, 0.1][rng.random_range(0..2)]),
+    }
+}
+
+fn apply(cluster: &mut Cluster, ids: &[WorkerId], event: &Event) {
+    match event {
+        Event::Advance(dt) => cluster.advance(*dt),
+        Event::Partition(sides, hold) => {
+            let (first, second): (Vec<_>, Vec<_>) =
+                ids.iter().zip(sides).partition(|(_, first)| **first);
+            cluster.partition(
+                first.into_iter().map(|(id, _)| id.clone()).collect(),
+                second.into_iter().map(|(id, _)| id.clone()).collect(),
+            );
+            cluster.advance(*hold);
+            cluster.heal();
+        }
+        Event::Stall(index, dt) => cluster.stall(&ids[*index], *dt),
+        Event::DuplicateRate(rate) => cluster.network().set_duplicate_rate(*rate),
+    }
+}
+
+/// Panics if the steps taken since the last call, or the grants so far, break
+/// an invariant that holds at every moment: at most one valid grant, and at
+/// most one leader of any (recovery epoch, term).
+fn check_safety(cluster: &mut Cluster, leaders: &mut BTreeMap<(u64, u64), BTreeSet<WorkerId>>) {
+    for record in cluster.take_steps() {
+        if record
+            .outputs
+            .contains(&Output::StateChanged(WorkerState::Leader))
+        {
+            let holders = leaders
+                .entry((record.recovery_epoch, record.term))
+                .or_default();
+            holders.insert(record.node.clone());
+            assert!(
+                holders.len() == 1,
+                "(epoch, term) {:?} has more than one leader: {holders:?}",
+                (record.recovery_epoch, record.term)
+            );
+        }
+    }
+    assert_eq!(
+        cluster.first_grant_overlap(),
+        None,
+        "two nodes held a valid grant at once"
+    );
+}
+
+/// Runs `seed`, and returns whether a different worker took over leadership
+/// at some point: a worker that wins several terms in a row does not count.
+fn run_seed(seed: u64) -> bool {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let voters = rng.random_range(3..=7);
+    let mut cluster = Cluster::bootstrap(voters, Duration::from_ticks(SUSPECT_TICKS));
+    cluster.network().seed(seed);
+    cluster.network().set_reorder(rng.random_bool(0.5));
+    let ids: Vec<WorkerId> = cluster.node_ids().into_iter().collect();
+
+    // Recording starts before the first election so the first leader counts
+    // toward the one-leader-per-(epoch, term) check too.
+    cluster.record_steps();
+    let mut leaders = BTreeMap::new();
+
+    // A freshly built cluster elects its leader before any fault.
+    cluster.advance(past_any_suspicion(SUSPECT_TICKS));
+    cluster.run_until_quiescent(TICK_SIZE, QUIESCENCE_STEPS);
+    assert!(
+        cluster.leader().is_some(),
+        "a fresh cluster must elect a leader"
+    );
+    check_safety(&mut cluster, &mut leaders);
+
+    for _ in 0..rng.random_range(40..=120) {
+        let event = draw_event(&mut rng, voters);
+        apply(&mut cluster, &ids, &event);
+        check_safety(&mut cluster, &mut leaders);
+    }
+
+    cluster.network().set_duplicate_rate(0.0);
+    cluster.network().set_reorder(false);
+    cluster.advance(Duration::from_ticks(QUIET_TICKS));
+    cluster.run_until_quiescent(TICK_SIZE, QUIESCENCE_STEPS);
+    check_safety(&mut cluster, &mut leaders);
+
+    let states = cluster.states();
+    let leader = cluster
+        .leader()
+        .unwrap_or_else(|| panic!("no leader after the faults were lifted: {states:?}"));
+    cluster.assert_at_most_one_in_leader_state();
+    assert_eq!(
+        cluster.valid_grant_holders(),
+        [leader.clone()].into_iter().collect(),
+        "the leader alone must hold a valid grant: {states:?}"
+    );
+    for id in ids.iter().filter(|id| **id != leader) {
+        assert_eq!(states[id], WorkerState::Active, "{id:?} must follow");
+        assert_eq!(
+            cluster.node(id).known_leader().map(|(id, _)| id),
+            Some(leader.clone()),
+            "{id:?} must follow {leader:?}"
+        );
+    }
+    leaders.values().flatten().collect::<BTreeSet<_>>().len() > 1
+}
+
+#[test]
+fn seeded_fault_phases_end_with_one_leader_that_everyone_follows() {
+    let mut seeds_that_changed_leader = 0;
+    let seeds = seeds();
+    for &seed in &seeds {
+        match catch_unwind(AssertUnwindSafe(|| run_seed(seed))) {
+            Ok(changed_leader) => seeds_that_changed_leader += usize::from(changed_leader),
+            Err(failure) => {
+                let reason = failure
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| failure.downcast_ref::<&str>().copied())
+                    .unwrap_or("a panic with no message");
+                panic!(
+                    "seed {seed} failed (rerun it with {SEEDS_VARIABLE}={seed},): {reason}"
+                );
+            }
+        }
+    }
+    // Only the fixed seeds are known to exercise a re-election.
+    if std::env::var(SEEDS_VARIABLE).is_err() {
+        assert!(
+            seeds_that_changed_leader > 0,
+            "no fixed seed's faults ever made a different worker take over as leader"
+        );
+    }
+}
