@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 #
 # Test/dev container for kabudachi. Not a production image — this exists so
-# `bazel test //...` and `cargo test --workspace` work
-# the same way on any host OS (see CONTRIBUTING.md), and so the same image
-# doubles as the .devcontainer/ base for interactive VS Code development.
+# `bazel test //...` and `cargo check --workspace --all-targets` work the same
+# way on any host OS (see CONTRIBUTING.md), and so the same image doubles as
+# the .devcontainer/ base for interactive VS Code development.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -34,8 +34,9 @@ RUN arch="$(dpkg --print-architecture)" \
          "https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-${bazelisk_arch}" \
     && chmod +x /usr/local/bin/bazel
 
-# Rust, via rustup — for `cargo test --workspace` (fast local iteration only;
-# Bazel's own Rust toolchain, via rules_rust, is separate and hermetic).
+# Rust, via rustup — for `cargo check --workspace --all-targets` (fast local
+# iteration only; Bazel's own Rust toolchain, via rules_rust, is separate and
+# hermetic).
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH

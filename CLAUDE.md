@@ -4,11 +4,17 @@
 
 - `README.md` is the architecture and phased-delivery specification. Only Phases 0-2 are implemented; do not implement later-phase design.
 - `STYLE_GUIDE.md` governs every code change and review. Do not rewrite unrelated pre-existing code for style alone; address it only when it is a correctness, security, or architecture-boundary risk.
-- `CONTRIBUTING.md` is the source for Docker/devcontainer and platform-specific test guidance. `runtime/README.md` documents the Python runtime API.
+- `CONTRIBUTING.md` is the source for Docker/devcontainer and platform-specific test guidance. Docker is for CI-parity checks only, and only with user approval (see "Shared build state and agent rules"). `runtime/README.md` documents the Python runtime API.
 
 ## Commands
 
-Bazel is canonical for correctness; `cargo` and `uv` are fast local iteration. A change is not complete until the relevant Bazel target passes, and, for a PR, until CI is green (see "Completion gate").
+Bazel is canonical for correctness. Run tests through Bazel only.
+
+For fast local iteration, run only `cargo check --workspace --all-targets` or `cargo clippy`, both with the shared target dir. Do not run `cargo test` or `cargo build`: they duplicate Bazel's artifacts and fill the disk.
+
+All agents share one `CARGO_TARGET_DIR` (`~/.cache/kabudachi-cargo-target`). Do not give a worktree its own target dir.
+
+A change is not complete until the relevant Bazel target passes, and, for a PR, until CI is green (see "Completion gate").
 
 ```bash
 bazel build //...
@@ -29,9 +35,7 @@ bazel test //bindings:bindings_test
 bazel test //runtime/tests:test_native
 bazel test //runtime/tests:test_local
 
-cargo test --workspace
-cargo test -p kabudachi-core
-cargo test -p kabudachi-bindings
+cargo check --workspace --all-targets
 
 bazel run //:gazelle
 ```
@@ -51,6 +55,18 @@ Python tests run through Bazel only, on the host or in the Linux container (`CON
 - Update `Cargo.lock` after Rust dependency changes. Add Python dependencies to the runtime package metadata and regenerate its lockfile/manifest as required.
 - Keep bindings Rust tests PyO3-free; exercise Python-facing behavior from Python tests.
 - For current macOS/Bazel-native-extension caveats and running the Python tests in the Linux container, use the explicit procedures in `CONTRIBUTING.md` and the Phase 1 plan.
+
+## Shared build state and agent rules
+
+- Bazel uses one shared disk cache, `~/.cache/kabudachi-bazel` (6 GB cap, set in `.bazelrc`), so a new worktree reuses existing actions instead of rebuilding. The `ci` config clears it. Bazel servers exit after 900 idle seconds (`startup --max_idle_secs`).
+- At most 2 agents run Bazel at once. Any further agent reads and edits only.
+- Do not run Docker/Colima builds or use remote hosts without user approval.
+- Do not run TLC beyond Bound A without user approval. Put TLC state dirs under the scratchpad and delete them after the run.
+- A local Claude Code hook (not in the repo) blocks `bazel` and `cargo` when free disk is under 30 GB or the cargo target dir exceeds 3 GB.
+- If the hook blocks a command, stop and report to the user; do not work around it.
+- Name these cleanup options: `bazel clean --expunge` in finished worktrees, `git worktree remove`, `rm -rf ~/.cache/kabudachi-cargo-target`.
+- The hook and `CARGO_TARGET_DIR` live in the main checkout's gitignored `.claude/`. Sessions started from the main checkout load them; copy `.claude/settings.json` and `.claude/hooks/` into a worktree whose session does not.
+- When a slice merges, run `bazel clean --expunge` in its worktree, then remove the worktree.
 
 ## Dependencies over homegrown code
 

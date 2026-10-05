@@ -1,10 +1,16 @@
 # kabudachi Bazel configuration
 # Intentionally minimal — add flags here only when a real need arises (YAGNI).
 
+# Every local Bazel run, in any checkout or worktree, shares one disk cache, so
+# an action built once is never rebuilt on this machine. Bazel expands the `~`.
 # A --disk_cache has no size limit by default and grows with every changed
-# action. Cap it so a shared cache (for example a Docker volume) stays bounded.
-# The flag has no effect unless --disk_cache is set.
-common --experimental_disk_cache_gc_max_size=10G
+# action, so cap it at 6G (it is shared, not per checkout).
+common --disk_cache=~/.cache/kabudachi-bazel
+common --experimental_disk_cache_gc_max_size=6G
+
+# Let an idle Bazel server exit after 15 minutes. Each checkout or worktree
+# starts its own server, and an idle one holds memory for nothing.
+startup --max_idle_secs=900
 
 # Use protobuf's released protoc binary instead of compiling protoc from C++
 # source. Compiling it took about 70% of a cold build's action time.
@@ -31,6 +37,8 @@ common --repo_env=DO_NOT_TRACK=1
 # not the job's, so the limits of the `medium` resource class (2 vCPU, 4 GB)
 # are set here. The repository cache lives outside the workspace so CI can
 # save and restore it; build outputs go to CircleCI's build tool cache.
+# CircleCI's build tool cache is its remote cache; the local disk cache is off.
+common:ci --disk_cache=
 common:ci --repository_cache=/tmp/bazel/repository
 common:ci --curses=no
 common:ci --show_progress_rate_limit=30

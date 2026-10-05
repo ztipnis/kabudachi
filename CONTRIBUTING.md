@@ -2,9 +2,11 @@
 
 `README.md` is the architecture spec; `CLAUDE.md` documents the build/test commands and the non-obvious parts of how this repo's Bazel/Cargo/uv setup fits together. This file covers running that setup in a container, and what's not yet covered by it.
 
-## Testing with Docker (recommended)
+## Testing with Docker (CI parity, needs approval on the maintainer's laptop)
 
-The repo ships a `Dockerfile` (Ubuntu 24.04, with `bazel` via bazelisk, a `rustup`-managed Rust toolchain, and `uv` preinstalled) so tests run the same way regardless of host OS. It's been verified end-to-end on linux/arm64: the Bazel test targets (four at the time; the per-area targets added since have not been re-run in it), and `cargo test --workspace` pass inside it. Python tests run through Bazel there too (`bazel test //runtime/tests/...`), and the container needs no host-specific workaround.
+On the maintainer's laptop, Docker/Colima builds need the user's approval and are not the default; use the native setup in "Testing without Docker" below.
+
+The repo ships a `Dockerfile` (Ubuntu 24.04, with `bazel` via bazelisk, a `rustup`-managed Rust toolchain, and `uv` preinstalled) so tests run the same way regardless of host OS. It's been verified end-to-end on linux/arm64: the Bazel test targets (four at the time; the per-area targets added since have not been re-run in it) passed inside it. Python tests run through Bazel there too (`bazel test //runtime/tests/...`), and the container needs no host-specific workaround.
 
 **Build the image and run the full Bazel suite:**
 
@@ -15,17 +17,16 @@ docker run --rm kabudachi-test bazel test //...
 
 **Run one area:** each area of `core` and `net` is its own Bazel test target, so a change reruns only the areas that depend on it: `bazel test //core:election_test` (also `//core:configuration_test`, `//core:proptest_test`, `//core:scenario_test`, `//core:scheduler_test`, and the in-crate unit tests `//core:core_test`), `bazel test //net:bootstrap_test` (also `//net:claim_test`, `//net:election_test`, and `//net:net_test`), `bazel test //testkit:testkit_test`, `bazel test //bindings:bindings_test`, and `bazel test //runtime/tests:test_native` (and the other Python targets under `//runtime/tests`). Run inside the container as `docker run --rm kabudachi-test bazel test //core:election_test`.
 
-**Keep Bazel's cache between runs:** `--rm` discards the container's cache, so each run rebuilds from scratch. To reuse it, mount one named volume as a disk cache. Share that one volume across all runs and worktrees; a volume per run or per worktree multiplies disk use. `.bazelrc` caps the disk cache at 10 GB, but Bazel only trims the cache while its server is idle, after the command ends. With `--rm`, the container stops as soon as `bazel test` returns, so the command below starts the trim at once and keeps the container up for 30 seconds before it returns the test result.
+**Keep Bazel's cache between runs:** `--rm` discards the container's cache, so each run rebuilds from scratch. To reuse it, mount one named volume as a disk cache. Share that one volume across all runs and worktrees; a volume per run or per worktree multiplies disk use. The repo's `.bazelrc` points native runs at the shared `~/.cache/kabudachi-bazel`, capped at 6 GB. The volume example below passes its own `--disk_cache=/disk-cache`, which overrides that path; the 6 GB cap still applies. Bazel only trims the cache while its server is idle, after the command ends. With `--rm`, the container stops as soon as `bazel test` returns, so the command below starts the trim at once and keeps the container up for 30 seconds before it returns the test result.
 
 ```bash
 docker run --rm -v kabudachi-bazel-cache:/disk-cache kabudachi-test bash -c \
   'bazel test //... --disk_cache=/disk-cache --experimental_disk_cache_gc_idle_delay=0; status=$?; sleep 30; exit $status'
 ```
 
-**Run the other local-iteration commands the same way:**
+**Run the Python tests the same way:**
 
 ```bash
-docker run --rm kabudachi-test cargo test --workspace
 docker run --rm kabudachi-test bazel test //runtime/tests/...
 ```
 
@@ -36,6 +37,8 @@ docker run --rm kabudachi-test bazel test //runtime/tests/...
 The Dockerfile also `COPY`'s the repo into the image at build time (see `.dockerignore` for what's excluded — `.git`, Bazel/Cargo/uv build output, caches), so `docker build` alone produces a fully self-contained, testable snapshot without needing the bind mount — useful for a future CI job that just wants to build-and-test in one shot.
 
 ## Testing without Docker
+
+Native runs share one Bazel disk cache, `~/.cache/kabudachi-bazel`, capped at 6 GB, so a new worktree reuses existing actions. Bazel's server exits after 900 idle seconds (`startup --max_idle_secs` in `.bazelrc`). Tests run only through Bazel; for quick checks use `cargo check --workspace --all-targets` with the single shared `CARGO_TARGET_DIR` (`~/.cache/kabudachi-cargo-target`), not a per-worktree target dir. Agents do not use `cargo test`.
 
 See `CLAUDE.md`'s `Commands` section for the native (non-Docker) build/test commands, including the note that Python tests run through Bazel and not `uv run pytest`, and the lockfile restore after Bazel commands.
 
