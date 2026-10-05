@@ -8,5 +8,14 @@ members = ["core", "bindings", "proto", "net", "testkit"]
 # with one binary per integration test the directory grows without limit.
 # "packed" gathers debug info into one .dSYM per binary (a .dwp on Linux),
 # rewritten on each build, and removes the objects.
+#
+# Debug info is also the largest part of every test binary. Line tables are
+# enough for backtraces and panic locations in the workspace's own crates, and
+# no one steps through third-party crates in a debugger, so those carry none.
+# `package."*"` matches only crates outside the workspace.
 [profile.dev]
+debug = "line-tables-only"
 split-debuginfo = "packed"
+
+[profile.dev.package."*"]
+debug = false

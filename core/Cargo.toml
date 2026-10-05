@@ -11,11 +11,11 @@ digest = { version = "0.10", features = ["alloc"] }
 kabudachi-proto = { path = "../proto" }
 sha2 = "0.10"
 thiserror = "2"
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 
 [dev-dependencies]
 kabudachi-testkit = { path = "../testkit" }
-proptest = "1"
-rand = "0.9"
-rand_chacha = "0.9"
+proptest = { version = "1", default-features = false, features = ["std"] }
+rand = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
 sha3 = "0.10"
