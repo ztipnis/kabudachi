@@ -1,8 +1,4 @@
 //! Multi-node scenarios driven through the simulated network.
-//! Shared helpers come from `../support` (see `support/mod.rs`).
-
-#[path = "../support/mod.rs"]
-mod support;
 
 mod harness;
 mod network;

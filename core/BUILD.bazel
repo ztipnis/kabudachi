@@ -24,29 +24,22 @@ rust_test(
     deps = all_crate_deps(normal_dev = True),
 )
 
-# One integration-test crate per area of core (README §26 testing strategy).
-# Each is one Bazel target, so a change to one source file reruns only the
-# areas that depend on it; `tests/support/**` is shared by every crate.
-[
-    rust_test(
-        name = area + "_test",
-        srcs = glob(["tests/" + area + "/**/*.rs", "tests/support/**/*.rs"]),
-        crate_root = "tests/" + area + "/main.rs",
-        edition = "2024",
-        tags = ["no-remote-cache"],
-        deps = [":core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
-    )
-    for area in ["election", "scenario", "scheduler", "configuration"]
-]
-
-# proptest replays the cases saved beside each test's source, which it finds
-# by `file!()` from the working directory, so both are in the runfiles.
+# One integration-test binary for core, with a module per area under
+# `tests/`. proptest replays the cases saved beside each test's source, which
+# it finds by `file!()` from the working directory, so both are in the
+# runfiles.
+#
+# Medium (300 s default timeout) gives the whole crate's tests, which share one
+# process, headroom on slow CI hosts; they take about 6 s on a laptop.
+# rules_rust cannot shard libtest (every shard would run the full binary), so
+# there is no shard_count.
 rust_test(
-    name = "proptest_test",
-    srcs = glob(["tests/proptest/**/*.rs", "tests/support/**/*.rs"]),
-    crate_root = "tests/proptest/main.rs",
+    name = "core_integration_test",
+    srcs = glob(["tests/**/*.rs"]),
+    crate_root = "tests/core_integration.rs",
     data = glob(["tests/proptest/*.proptest-regressions", "tests/proptest/*.rs"]),
     edition = "2024",
+    size = "medium",
     tags = ["no-remote-cache"],
     deps = [":core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
 )

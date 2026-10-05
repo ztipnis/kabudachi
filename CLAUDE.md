@@ -20,15 +20,13 @@ A change is not complete until the relevant Bazel target passes, and, for a PR, 
 bazel build //...
 bazel test //...
 
-bazel test //core:election_test
-bazel test //core:scenario_test
-bazel test //core:scheduler_test
-bazel test //core:configuration_test
-bazel test //core:proptest_test
+bazel test //core:core_integration_test
+# One area of an integration binary. The filter is a substring match on the full test name,
+# so `election::` also matches `scenario::scenario_election::` (231 tests, not 227). Add
+# `--test_arg=--skip --test_arg=scenario::` to get exactly the 227 of the `election` module:
+bazel test //core:core_integration_test --test_arg=election:: --test_arg=--skip --test_arg=scenario::
 bazel test //core:core_test
-bazel test //net:bootstrap_test
-bazel test //net:claim_test
-bazel test //net:election_test
+bazel test //net:net_integration_test
 bazel test //net:net_test
 bazel test //testkit:testkit_test
 bazel test //bindings:bindings_test

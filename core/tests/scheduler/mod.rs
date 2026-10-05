@@ -1,8 +1,4 @@
 //! Scheduler behaviour: backpressure, cancellation, retry, timing and task records.
-//! Shared helpers come from `../support` (see `support/mod.rs`).
-
-#[path = "../support/mod.rs"]
-mod support;
 
 mod scheduler_backpressure;
 mod scheduler_cancel;

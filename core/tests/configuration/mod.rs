@@ -1,0 +1,3 @@
+//! Configuration behaviour.
+
+mod configuration;

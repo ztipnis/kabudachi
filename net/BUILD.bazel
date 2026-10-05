@@ -28,15 +28,18 @@ rust_test(
 # tested crate's own [dependencies]), a Bazel rust_test is a separate
 # compilation unit that only sees what's explicitly in `deps`. "//core"
 # mirrors the ":net" rust_library target's own `+ ["//core"]` above.
-# One integration-test crate per area of net; `tests/support/**` is shared.
-[
-    rust_test(
-        name = area + "_test",
-        srcs = glob(["tests/" + area + "/**/*.rs", "tests/support/**/*.rs"]),
-        crate_root = "tests/" + area + "/main.rs",
-        edition = "2024",
-        tags = ["no-remote-cache"],
-        deps = [":net", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
-    )
-    for area in ["bootstrap", "election", "claim"]
-]
+# One integration-test binary for net, with a module per area under `tests/`.
+#
+# Medium (300 s default timeout) gives the whole crate's tests, which share one
+# process, headroom on slow CI hosts; they take about 5 s on a laptop.
+# rules_rust cannot shard libtest (every shard would run the full binary), so
+# there is no shard_count.
+rust_test(
+    name = "net_integration_test",
+    srcs = glob(["tests/**/*.rs"]),
+    crate_root = "tests/net_integration.rs",
+    edition = "2024",
+    size = "medium",
+    tags = ["no-remote-cache"],
+    deps = [":net", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
+)
