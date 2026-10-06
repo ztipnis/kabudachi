@@ -23,6 +23,11 @@ executors:
 jobs:
   test:
     executor: bazel
+    # Storage is billed at save time as size times retention, so a cache
+    # kept one day costs a fifteenth of the default. A cache that expires
+    # makes the next run rebuild it once.
+    retention:
+      caches: 1d
     steps:
       - checkout:
           method: blobless
