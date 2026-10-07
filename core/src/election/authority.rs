@@ -13,7 +13,7 @@ use crate::protocol::ids::{ShardId, WorkerId};
 use crate::time::{Duration, Instant};
 
 /// How long a node with a coordination authority expects its registration
-/// and, while it leads, its recovery fence to last (ADR-0001 decision 11).
+/// and, while it leads, its recovery fence to last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorityTimings {
     /// The TTL the node expects the authority to grant. The node renews its
@@ -26,7 +26,7 @@ pub struct AuthorityTimings {
 }
 
 impl AuthorityTimings {
-    /// ADR-0001's default TTL: 30 s, renewed every 10 s.
+    /// The default TTL: 30 s, renewed every 10 s.
     pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
 }
 

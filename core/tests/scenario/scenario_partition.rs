@@ -1,4 +1,4 @@
-//! Scenario tests for partitions and isolation (README §26.2), built on the
+//! Scenario tests for partitions and isolation, built on the
 //! `Cluster` harness, including the regression for the split brain the ring
 //! roll call produced when every survivor of a lost leader raced, and races
 //! of four or more roll calls started at the same instant.
@@ -123,7 +123,7 @@ fn rapid_leader_crash_restart() {
     );
 
     // Heal, then restart the crashed worker: its process comes back under a
-    // fresh WorkerId (ADR-0001, amended 2026-09-27), a pending joiner.
+    // fresh WorkerId, a pending joiner.
     cluster.heal();
     let restarted = cluster.restart_node(&original_leader);
 

@@ -2,7 +2,7 @@
 //! length-prefixed, prost-encoded `ElectionMessage` as the request, and a
 //! trivial zero-byte acknowledgement as the response.
 //!
-//! Version 2 is the gossip roll call's schema (ADR-0001). It gives several
+//! Version 2 is the gossip roll call's schema. It gives several
 //! of version 1's field numbers and payload tags, from the ring roll call,
 //! new meanings, so a version 1 peer must never negotiate a stream with a
 //! version 2 one: it would misread every message, or read one as another

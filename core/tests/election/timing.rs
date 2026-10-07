@@ -1,4 +1,4 @@
-//! The election's timers (ADR-0001 decision 15): the jitter on a node's
+//! The election's timers: the jitter on a node's
 //! suspicion timeout, and the deadlines by which a roll call and a vote
 //! must succeed.
 

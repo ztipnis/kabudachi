@@ -1,5 +1,5 @@
-//! The `/kabudachi/join/1` `request_response` protocol (README §27 Phase 2
-//! bootstrap join): a length-prefixed, prost-encoded `JoinRequest` as the
+//! The `/kabudachi/join/1` `request_response` protocol (bootstrap
+//! join): a length-prefixed, prost-encoded `JoinRequest` as the
 //! request, and a length-prefixed, prost-encoded `JoinResponse` (the
 //! responder's pointer to the shard's leader) as the response.
 //!

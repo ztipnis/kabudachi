@@ -55,7 +55,7 @@ class Task(wrapt.ObjectProxy):
             `TaskTimeoutError` and is retried per `retries`. `None` is no
             limit. Ignored by `.local()`.
         cancel_grace: How long a run has to stop once asked, before it is
-            failed anyway and its body abandoned (README §6.2). Defaults to
+            failed anyway and its body abandoned. Defaults to
             the process's.
         merge: For a coalescing task, a pure reducer `(older, newer) -> merged`
             that combines the payloads of superseded generations, oldest
@@ -163,7 +163,7 @@ class Task(wrapt.ObjectProxy):
         earlier. `expires` (a duration or an aware time) says that if the task
         has not started by then it fails with `TaskExpiredError` instead of
         running late. `key` is a coalescing task's flat key for this
-        submission (README §3.2.1); a `@task` has none. Raises `ValueError` or
+        submission; a `@task` has none. Raises `ValueError` or
         `TypeError` at once if the options are wrong or contradict each other.
         """
         if key is not None and self._self_definition.kind is not TaskKind.COALESCING:
@@ -493,7 +493,7 @@ def coalescing_task(
 ) -> Any:
     """Declares continuously replaced work: a newer pending submission with
     the same key supersedes an older one, but never a running one, and only
-    one generation of a key runs at a time (README §3.2.1).
+    one generation of a key runs at a time.
 
     A superseded submission never runs, and its handle raises
     `TaskSupersededError`. Its payload is folded, oldest first, into the
@@ -505,7 +505,7 @@ def coalescing_task(
 
     `drop_oldest=True` opts in to losing this key's oldest retained payloads,
     oldest first, when a submission would pass the hard memory limit, instead
-    of refusing it with `BackpressureError` (README §3.2.1). It is never the
+    of refusing it with `BackpressureError`. It is never the
     default: a dropped payload is never folded.
 
     Takes the other arguments, and raises the errors, of `task`.

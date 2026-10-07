@@ -1,8 +1,8 @@
-//! Claim arbitration (`/kabudachi/claim/1`, README §8.2) end to end over
+//! Claim arbitration (`/kabudachi/claim/1`) end to end over
 //! real sockets: a genesis leader and two joiners, every one a driven
 //! `WorkerNode` with its own `Net` and `Scheduler`.
 //!
-//! The joiners are pending members (ADR-0001 decision 9.1): they claim work
+//! The joiners are pending members: they claim work
 //! as soon as JOIN completes, before any admission makes them voters. Each
 //! asks the leader its own node names: the test passes on what the node
 //! reports, and never picks a leader for a claimant. The leader decides from the leadership grant its election handed

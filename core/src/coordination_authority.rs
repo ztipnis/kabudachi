@@ -1,4 +1,4 @@
-//! The external coordination service (README §9.1, §14): it holds each
+//! The external coordination service: it holds each
 //! worker's TTL registration, each shard's recovery epoch and each shard's
 //! recovery fence. Workers consult it for bootstrap, forced recovery and
 //! fencing; it is off the hot path.
@@ -56,7 +56,7 @@ pub trait CoordinationAuthority {
 
     /// Acquires the shard's recovery fence for `holder`, or renews it if
     /// `holder` already holds it, and returns the fence TTL. A leader must
-    /// hold the fence to act (README §14.4).
+    /// hold the fence to act.
     ///
     /// `recovery_epoch` must be the shard's current epoch, number and
     /// lineage alike; otherwise this returns [`AuthorityError::EpochConflict`],
@@ -82,7 +82,7 @@ pub trait CoordinationAuthority {
     /// recovery epoch and election term it carries: both only ever increase,
     /// and an ordinary handover raises the term. A claim response carries
     /// neither, so the claims an earlier leader grants are bounded by its
-    /// leader lease instead (ADR-0001 decision 16).
+    /// leader lease instead.
     fn acquire_fence(
         &self,
         shard_id: &ShardId,
@@ -101,7 +101,7 @@ pub trait CoordinationAuthority {
 /// held too. The lineage tells the two apart: whoever founds a shard (creates
 /// its epoch, or re-founds it with no worker left) picks a fresh one
 /// ([`Self::founding`]), every epoch recovered from it keeps it, and a
-/// leader that republishes its epoch after a flush (README §15.3) puts back
+/// leader that republishes its epoch after a flush puts back
 /// the same one. A worker cut off from the authority resumes only if the
 /// epoch it finds there is exactly its own, lineage included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

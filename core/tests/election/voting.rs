@@ -1,4 +1,4 @@
-//! The vote (ADR-0001 decisions 6 to 8), from both sides: a voter grants
+//! The vote, from both sides: a voter grants
 //! at most one vote per term, only to the initiator of the best roll call
 //! it answered, and refuses every other request with the reason; a
 //! candidate wins once its granters are a majority of that call's

@@ -790,13 +790,12 @@ impl Net {
         let _ = self.commands.send(Command::RefreshPeerRouting);
     }
 
-    /// Asks this worker's node to leave its shard gracefully (README §12.3,
-    /// ADR-0001 decision 10): queues `Input::Drain` for it, which the driver
-    /// hands it in its next batch like any other input (see
-    /// `kabudachi_core::election::Input::Drain` for what the node then
-    /// does). This is how a worker being shut down, one replaced in a rolling
-    /// deploy say, leaves without waiting to be suspected. Ask once: the
-    /// node ignores a second request.
+    /// Asks this worker's node to leave its shard gracefully: queues
+    /// `Input::Drain` for it, which the driver hands it in its next batch like
+    /// any other input (see `kabudachi_core::election::Input::Drain` for what
+    /// the node then does). This is how a worker being shut down, one replaced
+    /// in a rolling deploy say, leaves without waiting to be suspected. Ask
+    /// once: the node ignores a second request.
     pub fn request_drain(&self) {
         self.inbound.queue_input(Input::Drain);
     }
@@ -1140,8 +1139,8 @@ fn handle_event(
             info,
             ..
         })) => {
-            // The whole point of having `identify` in the swarm (spec
-            // decision 2): `info.listen_addrs` is the peer's own advertised
+            // The whole point of having `identify` in the swarm:
+            // `info.listen_addrs` is the peer's own advertised
             // listen address, which is what a joining node needs to dial —
             // unlike either endpoint-derived address above. See
             // `crate::peers`'s "Where a peer's address comes from" for the

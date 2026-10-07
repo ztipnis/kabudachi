@@ -1,4 +1,4 @@
-//! The worker-side election state machine (README §10-§14, ADR-0001): leader
+//! The worker-side election state machine: leader
 //! liveness, the roll call and the vote, graceful draining, and the
 //! coordination authority's registration, fence and recovery path.
 //!
@@ -16,7 +16,7 @@
 //! is uncommitted, the one it held before (see [`crate::configuration`]);
 //! only the leader holds a [`Roster`] of the members.
 //!
-//! Liveness comes from heartbeats alone (README §12.1, ADR-0001 decision 16),
+//! Liveness comes from heartbeats alone,
 //! never from the connections the driver reports. Every follower heartbeats
 //! its leader, and the leader answers each heartbeat with an ack, which also
 //! carries the leader's configuration and the follower's admission
@@ -35,7 +35,7 @@
 //! (see the `vote_round` module), and wins once those that grant it are a
 //! majority of its respondents and the voters among them a quorum of the
 //! configuration too. The winning roll call's respondents found the next
-//! configuration (ADR-0001 decision 8): a joint one, whose new side has one
+//! configuration: a joint one, whose new side has one
 //! voter per respondent, every one admitted at its new generation, and
 //! whose old side is the configuration the roll call ran under, where each
 //! respondent still counts by the admission it held before. Every roll
@@ -58,41 +58,39 @@
 //! timeout. A `NoQuorum` node keeps taking part in other nodes' elections,
 //! and an ack from a leader returns it to `Active`.
 //!
-//! A leader also changes its configuration while it lives (ADR-0001
-//! decisions 9 and 10). It admits pending joiners in batches, one change at
-//! a time: a joint configuration at its next generation, whose new side
-//! takes in each joiner that has confirmed one of its acks, committed like a
-//! founding. It applies a departing worker's `SelfRemove`, which a follower
-//! sends to its leader alone, at once and with no commit round, unless the
-//! worker has seen a later term than the leader's (the term guard). A
-//! draining leader announces its own departure on final acks.
+//! A leader also changes its configuration while it lives. It admits pending
+//! joiners in batches, one change at a time: a joint configuration at its next
+//! generation, whose new side takes in each joiner that has confirmed one of
+//! its acks, committed like a founding. It applies a departing worker's
+//! `SelfRemove`, which a follower sends to its leader alone, at once and with
+//! no commit round, unless the worker has seen a later term than the leader's
+//! (the term guard). A draining leader announces its own departure on final
+//! acks.
 //!
-//! A node that holds or contests a term steps down once it sees a later one
-//! (ADR-0001 decision 14): to `Active` under that term's leader when its ack
+//! A node that holds or contests a term steps down once it sees a later one:
+//! to `Active` under that term's leader when its ack
 //! is what told it, and otherwise to `LeaderSuspect`. Only a vote granted, an
 //! accepted ack, a refusal or an accepted election certificate raises the
 //! highest term a node has seen, never a roll call it answers, so a follower
 //! with a flaky link cannot depose a healthy leader by calling a roll.
 //!
-//! A node configured with a coordination authority (ADR-0001 decisions 11
-//! and 12) also keeps its registration there, through calls it asks its
-//! driver to make (see the `authority` module): it fences itself once it
-//! has failed to renew for a TTL less drift, and on reconnecting resumes if
-//! the shard's recovery epoch there is still its own, lineage included (see
-//! `RecoveryEpoch`), and otherwise rejoins. Its leader acts only
-//! while it holds the recovery fence, so its grant ends at the earlier of
-//! the fence and the quorum-contact lease. A roll call of its own that falls
-//! short of its returning quorum takes the authority path (see the
-//! `authority_standing` module): with a majority of the authority's live
-//! registrations among its respondents it swaps the recovery epoch, waits
-//! out the fence, and leads a configuration founded at the new epoch; if
-//! the epoch is missing, the shard is abandoned and the node stops. A node
-//! that hears a leader of a later recovery epoch adopts that epoch, and
-//! that leader's configuration, from its ack. A leader also reports each
-//! worker it has not heard from for a suspicion timeout and a reconnect
-//! timeout as lost (README §8.3).
+//! A node configured with a coordination authority also keeps its registration
+//! there, through calls it asks its driver to make (see the `authority`
+//! module): it fences itself once it has failed to renew for a TTL less drift,
+//! and on reconnecting resumes if the shard's recovery epoch there is still
+//! its own, lineage included (see `RecoveryEpoch`), and otherwise rejoins. Its
+//! leader acts only while it holds the recovery fence, so its grant ends at
+//! the earlier of the fence and the quorum-contact lease. A roll call of its
+//! own that falls short of its returning quorum takes the authority path (see
+//! the `authority_standing` module): with a majority of the authority's live
+//! registrations among its respondents it swaps the recovery epoch, waits out
+//! the fence, and leads a configuration founded at the new epoch; if the epoch
+//! is missing, the shard is abandoned and the node stops. A node that hears a
+//! leader of a later recovery epoch adopts that epoch, and that leader's
+//! configuration, from its ack. A leader also reports each worker it has not
+//! heard from for a suspicion timeout and a reconnect timeout as lost.
 //!
-//! Known gaps (see README §27 for the phase plan):
+//! Known gaps:
 //! - With no authority, no removal reaches a leaderless `NoQuorum` shard:
 //!   only a leader applies a departing worker's `SelfRemove`, so such a
 //!   shard leaves `NoQuorum` only once enough of its peers return. With an
@@ -201,18 +199,16 @@ where
 /// The timers a [`WorkerNode`] runs its election on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElectionTimings {
-    /// The shortest time a node goes without an accepted leader ack before
-    /// it suspects its leader. Each node waits longer, by less than half of
-    /// this, by a share hashed from its `WorkerId` and the latest term it
-    /// knows of, so workers rarely suspect at the same instant (ADR-0001
-    /// decision 15). A leader's lease lasts at most its own
-    /// `suspect_timeout` less the drift margin (see
+    /// The shortest time a node goes without an accepted leader ack before it
+    /// suspects its leader. Each node waits longer, by less than half of this,
+    /// by a share hashed from its `WorkerId` and the latest term it knows of,
+    /// so workers rarely suspect at the same instant. A leader's lease lasts
+    /// at most its own `suspect_timeout` less the drift margin (see
     /// [`Self::clock_drift_divisor`]), which is safe only if no follower
-    /// suspects it sooner: every worker in the shard must use the same
-    /// value, or at least no follower a shorter one than its leader. A node
-    /// also refuses roll calls and votes for exactly this long after it last
-    /// heard from its leader (or, before it has one, after it was built or
-    /// joined).
+    /// suspects it sooner: every worker in the shard must use the same value,
+    /// or at least no follower a shorter one than its leader. A node also
+    /// refuses roll calls and votes for exactly this long after it last heard
+    /// from its leader (or, before it has one, after it was built or joined).
     pub suspect_timeout: Duration,
     /// How often a follower heartbeats its leader, which answers each
     /// heartbeat with an ack. A heartbeat confirms the ack that answered the
@@ -223,30 +219,29 @@ pub struct ElectionTimings {
     /// be zero, and twice it must be shorter than the lease length unless
     /// the node starts alone a quorum (see [`WorkerNode::start`]).
     pub heartbeat_interval: Duration,
-    /// How long a roll call runs before its initiator decides on it: it
-    /// stands as the candidate if the voters among its respondents are a
-    /// quorum by then, and goes `NoQuorum` otherwise (ADR-0001 decisions 13
-    /// and 15). A candidate then has as long again to win its vote. This is
-    /// the base: a reply that misses its call's deadline never counts, and
-    /// each retry is a new term, so a deadline shorter than the shard's
-    /// round trip would fail forever. Each of a node's own roll calls in a
-    /// row that closes `NoQuorum` therefore doubles the next one's deadline
-    /// (and its vote's), up to `suspect_timeout`; winning an election,
-    /// accepting a leader's ack or leaving the recovery epoch resets it to
-    /// this base. A node that answered another worker's roll call starts
-    /// none of its own until twice this base after it answered, which bounds
-    /// the census and vote of a call of base width, taking less than this
-    /// to arrive: that worker is being elected meanwhile (ADR-0001
-    /// decision 5). A caller whose calls have widened can outlast that, and
-    /// be contested early, which costs extra calls, never safety. An
-    /// initiator that keeps failing to find a quorum calls again every
-    /// roll-call deadline and suspicion timeout, so with a suspicion timeout
-    /// no longer than this it can hold one answerer back for as long as it
-    /// keeps calling (others may still call). Keep it well above the time a
-    /// roll call takes to reach the shard and its replies to come back, and
-    /// below `suspect_timeout`; backoff only rescues a deadline set too low,
-    /// at the cost of failed calls first.
-    /// Usually [`Self::DEFAULT_ROLL_CALL_DEADLINE`]. Must not be zero (see
+    /// How long a roll call runs before its initiator decides on it: it stands
+    /// as the candidate if the voters among its respondents are a quorum by
+    /// then, and goes `NoQuorum` otherwise. A candidate then has as long again
+    /// to win its vote. This is the base: a reply that misses its call's
+    /// deadline never counts, and each retry is a new term, so a deadline
+    /// shorter than the shard's round trip would fail forever. Each of a
+    /// node's own roll calls in a row that closes `NoQuorum` therefore doubles
+    /// the next one's deadline (and its vote's), up to `suspect_timeout`;
+    /// winning an election, accepting a leader's ack or leaving the recovery
+    /// epoch resets it to this base. A node that answered another worker's
+    /// roll call starts none of its own until twice this base after it
+    /// answered, which bounds the census and vote of a call of base width,
+    /// taking less than this to arrive: that worker is being elected
+    /// meanwhile. A caller whose calls have widened can outlast that, and be
+    /// contested early, which costs extra calls, never safety. An initiator
+    /// that keeps failing to find a quorum calls again every roll-call
+    /// deadline and suspicion timeout, so with a suspicion timeout no longer
+    /// than this it can hold one answerer back for as long as it keeps calling
+    /// (others may still call). Keep it well above the time a roll call takes
+    /// to reach the shard and its replies to come back, and below
+    /// `suspect_timeout`; backoff only rescues a deadline set too low, at the
+    /// cost of failed calls first. Usually
+    /// [`Self::DEFAULT_ROLL_CALL_DEADLINE`]. Must not be zero (see
     /// [`WorkerNode::start`]).
     pub roll_call_deadline: Duration,
     /// How far apart the rates of two workers' clocks, or of a worker's
@@ -260,10 +255,10 @@ pub struct ElectionTimings {
     /// leader's clock advances at least nine tenths of it, so a leader whose
     /// lease is a suspicion timeout less a tenth (see [`Self::lease_length`])
     /// stops acting before any follower that received its last confirmed
-    /// ack can suspect it (ADR-0001 decision 16). The same share comes off a
+    /// ack can suspect it. The same share comes off a
     /// registration or fence TTL (the node gives up before the authority
     /// does), off the time a worker takes to fence itself and abort its
-    /// runs (ADR-0001 decision 12), and off the time before which no leader
+    /// runs, and off the time before which no leader
     /// can replay a cut-off worker's runs (see [`Output::AbortDeadline`]).
     /// Lower it on hosts whose clock rates can differ more. Every worker in
     /// the shard must use the same value. Must not be zero.
@@ -271,7 +266,7 @@ pub struct ElectionTimings {
     /// How long a leader waits, after it would first suspect a silent
     /// worker, before it reports that worker lost and its TaskRuns are
     /// replayed; and, less drift, how long a worker cut off from its leader
-    /// or fenced has to abort its own (README §8.3, ADR-0001 decision 12).
+    /// or fenced has to abort its own.
     /// Every worker in the shard must use the same value, or a leader could
     /// replay the work of a worker still running it. Usually
     /// [`Self::DEFAULT_RECONNECT_TIMEOUT`].
@@ -280,7 +275,7 @@ pub struct ElectionTimings {
 
 impl ElectionTimings {
     /// The default `roll_call_deadline`, set from the census latency
-    /// measured in Phase 2 (ADR-0001 decision 15): over 30 leader losses in
+    /// measured during the networked-election work: over 30 leader losses in
     /// a fully connected shard of five, all in one process on one loopback
     /// host (a debug build), each of the 90 replies to the winning roll call
     /// reached its initiator within 11 ms of the call (p50 6 ms; the p99 of
@@ -301,7 +296,7 @@ impl ElectionTimings {
     /// timeout.
     pub const DEFAULT_CLOCK_DRIFT_DIVISOR: u64 = 10;
 
-    /// The default `reconnect_timeout` (README §8.3).
+    /// The default `reconnect_timeout`.
     pub const DEFAULT_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// Timings with this suspicion timeout and heartbeat interval, which
@@ -391,8 +386,7 @@ pub enum Input {
     /// The coordination authority answered a call this node asked for (see
     /// [`Output::Authority`]). A node with no authority ignores it.
     Authority(AuthorityReply),
-    /// Leave the shard gracefully (README §12.3, §18, ADR-0001 decision
-    /// 10): send `SelfRemove` to the leader this node follows, if any, or as
+    /// Leave the shard gracefully: send `SelfRemove` to the leader this node follows, if any, or as
     /// the leader announce the configuration without itself on a final ack
     /// to every connected peer, and end `Stopped`. From `Active` or `Leader`
     /// this happens at once; from `Draining` or `Stopped` the request does
@@ -406,7 +400,7 @@ pub enum Input {
     /// never joins. A driver that waits for `Stopped` must not rely on it
     /// there.
     Drain,
-    /// The answer to this node's JOIN (README §27 Phase 2 bootstrap join):
+    /// The answer to this node's JOIN:
     /// the leader it names, with its term and recovery epoch. A node in
     /// `Bootstrapping` records that leader and moves through `Joining` to
     /// `Active` as a pending member. It learns the configuration from its
@@ -456,14 +450,14 @@ pub enum Output {
     /// Only a node with an authority asks.
     Authority(AuthorityCall),
     /// While `Leader`: the worker has not been heard from for a suspicion
-    /// timeout and then a reconnect timeout (README §8.3), so every TaskRun
+    /// timeout and then a reconnect timeout, so every TaskRun
     /// it holds is lost and may be replayed (see [`carry_out`]).
     /// Reported once; a worker heard from again is watched afresh.
     WorkerLost(WorkerId),
     /// By when, on the node's clock, this worker must have aborted every
-    /// TaskRun it is running (README §8.3, §25.1.9): `Some` once it has gone
+    /// TaskRun it is running: `Some` once it has gone
     /// a suspicion timeout, less drift, without evidence that its leader
-    /// still hears it, or once it has fenced itself (ADR-0001 decision 12);
+    /// still hears it, or once it has fenced itself;
     /// `None` while it has nothing to abort. Reported whenever it changes,
     /// like [`Output::Grant`]: a later report replaces an earlier one, so a
     /// worker that its leader hears again before the deadline withdraws it
@@ -486,7 +480,7 @@ pub enum Output {
     /// [`ElectionTimings::reconnect_timeout`]).
     AbortDeadline(Option<Instant>),
     /// An alert: the authority path found the shard's recovery epoch gone,
-    /// so the shard is abandoned (README §15.5) and the node has stopped
+    /// so the shard is abandoned and the node has stopped
     /// (see [`StopReason::Abandoned`]). A restart re-enters the bootstrap
     /// cascade.
     ShardAbandoned,
@@ -497,7 +491,7 @@ pub enum Output {
 pub enum StopReason {
     /// It drained, leaving the shard gracefully.
     Drained,
-    /// Its shard was abandoned (ADR-0001 decision 11.5): neither a quorum of
+    /// Its shard was abandoned: neither a quorum of
     /// its configuration nor the authority's recovery epoch was left to
     /// prove the shard's continuity.
     Abandoned,
@@ -607,8 +601,7 @@ where
     }
 
     /// Constructs the node of the worker that creates a shard at
-    /// `recovery_epoch`, of the lineage the founder drew (ADR-0001
-    /// decision 1): it starts `Active` as the only
+    /// `recovery_epoch`, of the lineage the founder drew: it starts `Active` as the only
     /// voter of the genesis configuration, admitted at the genesis
     /// generation. Like any other node it leads once its suspicion timeout
     /// has passed and its own roll call, of one voter, has elected it at the
@@ -646,13 +639,12 @@ where
         )
     }
 
-    /// Constructs a node in `WorkerState::Bootstrapping` (README §27 Phase 2
-    /// bootstrap join protocol): for a fresh node joining a shard that already
-    /// exists. It knows no configuration and has no admission generation;
-    /// step [`Input::JoinAnswer`] once something outside `core` (`net`'s
-    /// `/kabudachi/join/1` handshake) has learned who leads the shard, to
-    /// drive `Bootstrapping -> Joining -> Active`. It learns the shard's
-    /// configuration from its leader's first ack.
+    /// Constructs a node in `WorkerState::Bootstrapping`: for a fresh node
+    /// joining a shard that already exists. It knows no configuration and has
+    /// no admission generation; step [`Input::JoinAnswer`] once something
+    /// outside `core` (`net`'s `/kabudachi/join/1` handshake) has learned who
+    /// leads the shard, to drive `Bootstrapping -> Joining -> Active`. It
+    /// learns the shard's configuration from its leader's first ack.
     ///
     /// A `Tick` does nothing in `Bootstrapping` or `Joining`, and neither
     /// state has a deadline: nothing here times out a stalled join, by
@@ -799,7 +791,7 @@ where
     /// later term, the leader a JOIN pointed it at, winning an election, and
     /// standing through the authority path. Never by a roll call it
     /// answered, nor by standing as a candidate in an election it has not
-    /// won (ADR-0001 decision 14 as amended 2026-09-28).
+    /// won.
     pub fn highest_term_seen(&self) -> u64 {
         self.standing.highest_term_seen()
     }
@@ -1104,10 +1096,9 @@ where
         });
     }
 
-    /// Processes a leader heartbeat acknowledgement (README §12.2
-    /// `on_leader_ack`). Acks for another shard, an older recovery epoch, or
-    /// a term of this node's own epoch below its floor (see
-    /// [`Self::ack_floor`]) are ignored without touching any state.
+    /// Processes a leader heartbeat acknowledgement. Acks for another shard,
+    /// an older recovery epoch, or a term of this node's own epoch below its
+    /// floor (see [`Self::ack_floor`]) are ignored without touching any state.
     ///
     /// An ack from a later recovery epoch means the shard was recovered
     /// through the authority: the node adopts that epoch (see
@@ -1120,7 +1111,7 @@ where
     /// node in `LeaderSuspect`, `RollCall` or `NoQuorum` to `Active` because
     /// a leader is reachable again, whatever term its roll call contests. A
     /// `Candidate` or `Leader` of a term earlier than the ack's steps down
-    /// to `Active` under the ack's leader (ADR-0001 decision 14); one of the
+    /// to `Active` under the ack's leader; one of the
     /// ack's own term keeps it.
     ///
     /// It also carries the leader's configuration and this node's admission
@@ -1206,7 +1197,7 @@ where
         }
     }
 
-    /// Sends this node's leader a heartbeat (README §12.1) once a heartbeat
+    /// Sends this node's leader a heartbeat once a heartbeat
     /// interval has passed since the last one. A leader this node was not
     /// already heartbeating hears from it at once, so a leader it has just
     /// learned of does not wait a whole interval for its first heartbeat.
@@ -1267,7 +1258,7 @@ where
     /// Checks this node's timers against its clock.
     ///
     /// - `Active`: moves to `LeaderSuspect` once no leader ack has arrived
-    ///   within its jittered suspicion timeout (README §12.2).
+    ///   within its jittered suspicion timeout.
     /// - `LeaderSuspect` and `NoQuorum`: starts a roll call, if it can (see
     ///   [`Self::can_start_roll_call`]). Each transition takes its own
     ///   `Tick`, so a single one never goes from `Active` to `RollCall`.
@@ -1281,7 +1272,7 @@ where
     ///   before the input (see [`Self::step`]).
     ///
     /// Every other state is a no-op — deliberately so for `Bootstrapping` and
-    /// `Joining` (README §27 Phase 2 bootstrap join): nothing times out a
+    /// `Joining`: nothing times out a
     /// stalled join here, since the transition out of those states happens
     /// once via [`Input::JoinAnswer`], driven by something outside `core`
     /// that learns who leads the shard, not by a timer.
@@ -1321,7 +1312,7 @@ where
         }
     }
 
-    /// Answers a follower's heartbeat (README §12.1) with one ack to its
+    /// Answers a follower's heartbeat with one ack to its
     /// sender, and records which of this leader's acks the heartbeat
     /// confirms. Only a `Leader` answers, and only a heartbeat from its own
     /// shard at its own recovery epoch or an earlier one: a worker left on an
@@ -1333,7 +1324,7 @@ where
     /// answering this heartbeat already carries. Every sender gets an ack,
     /// though only members' confirmations count towards the lease, except
     /// one whose heartbeat names a later term of this leader's epoch: this
-    /// leader steps down instead (ADR-0001 decision 14), and neither acks
+    /// leader steps down instead, and neither acks
     /// it nor records it as heard.
     ///
     /// A confirmation counts only for an ack of this leader's own term, sent
@@ -1356,8 +1347,8 @@ where
             return;
         }
         let same_epoch = epoch == EpochOrder::Mine;
-        // Decision 14 on the heartbeat's own term: its sender voted, or
-        // heard of a vote, in a later term. Some roll call of that term found
+        // A heartbeat naming a later term than this leader's: its sender
+        // voted, or heard of a vote, in that term. Some roll call of that term found
         // a returning quorum of stale voters, so this leader is all but
         // deposed, and the sender, whose floor is above this term, can never
         // follow it. A heartbeat from an earlier epoch names a term of
@@ -1514,8 +1505,7 @@ where
     /// The earliest term whose leader's acks this node accepts: the highest
     /// term it has seen, or, while it stands or leads, its own term if
     /// later. A candidate never follows an earlier term's leader while its
-    /// candidacy can still win; once that lapses unwon, it can (ADR-0001
-    /// decision 14 as amended 2026-09-28).
+    /// candidacy can still win; once that lapses unwon, it can.
     fn ack_floor(&self) -> u64 {
         // A leader's own term is already its term seen (see
         // `Self::take_office`); the arm only keeps that from resting on it.
@@ -1538,7 +1528,7 @@ where
         }
     }
 
-    /// Steps down (ADR-0001 decision 14) once this node has seen a term
+    /// Steps down once this node has seen a term
     /// later than the one it holds or contests: another worker is electing,
     /// or has elected, a leader for it. An ack from that term's leader
     /// returns the node to `Active` (see [`Self::on_leader_ack`]); anything
@@ -1563,7 +1553,7 @@ where
         self.transition_to(WorkerState::LeaderSuspect);
     }
 
-    /// Moves to `NoQuorum` (ADR-0001 decision 13): the node's quorum is out
+    /// Moves to `NoQuorum`: the node's quorum is out
     /// of reach, so it waits for its peers to return. Every jittered
     /// suspicion timeout it tries a roll call again; meanwhile it answers
     /// the roll calls and grants the votes of others, and an ack from a
@@ -1710,8 +1700,7 @@ where
         }
     }
 
-    /// Gracefully shuts an `Active` or `Leader` node down (README §12.3,
-    /// §18, ADR-0001 decision 10) and ends in `Stopped`.
+    /// Gracefully shuts an `Active` or `Leader` node down and ends in `Stopped`.
     ///
     /// A follower sends `SelfRemove` to its leader alone, carrying the
     /// highest term it has seen, for that leader's term guard (see
@@ -1720,8 +1709,7 @@ where
     /// announces. A node that knows no leader tells no one: the next
     /// founding leaves it out, or the authority path counts it out.
     ///
-    /// A leader applies its own removal, which no other leader can (ADR-0001
-    /// decision 10, amended 2026-09-27),
+    /// A leader applies its own removal, which no other leader can,
     /// and sends every connected peer a final ack announcing the
     /// configuration without it, together with every removal it has
     /// accepted and not yet applied, so the survivors elect under the
@@ -1787,14 +1775,12 @@ where
         }
     }
 
-    /// Accepts a departing worker's SELF_REMOVE (README §12.3, ADR-0001
-    /// decision 10), to take it out of this leader's roster with every
+    /// Accepts a departing worker's SELF_REMOVE, to take it out of this leader's roster with every
     /// other one accepted since the last change, in one next generation and
     /// with no commit round (see [`LeaderOffice::take_removal`]).
     ///
     /// It accepts only a removal addressed to this leadership: to this
-    /// node, as the leader of this term. And the term guard (ADR-0001
-    /// decision 10, amended 2026-09-27): it accepts the removal only if the
+    /// node, as the leader of this term. And the term guard: it accepts the removal only if the
     /// worker has seen no term later than this leader's. A worker that has may
     /// have voted in an election of that later term, whose quorum was
     /// counted with it; shrinking N here as well could let two quorums of
@@ -1967,7 +1953,7 @@ where
     }
 
     /// How long this node, while `Active`, goes without an accepted leader
-    /// ack before it suspects its leader (ADR-0001 decision 15):
+    /// ack before it suspects its leader:
     /// `suspect_timeout` lengthened by less than a half, by a share hashed
     /// from this node's `WorkerId` and the latest term it knows of. Workers
     /// thus rarely suspect at the same instant, and a worker waits a new
@@ -1987,7 +1973,7 @@ where
     }
 
     /// Learns what a refusal of this node's roll call or vote request tells
-    /// it (ADR-0001 decision 4): a higher term raises its highest term seen,
+    /// it: a higher term raises its highest term seen,
     /// and while `RollCall` a leader named at a term no older than that, or
     /// named as still valid at any term, becomes its leader, which it
     /// heartbeats until that leader's ack returns it to `Active` (or, if
@@ -2001,8 +1987,7 @@ where
     /// leader it names this node's, whose ack then moves it to that epoch, as
     /// does a higher-numbered epoch of another lineage. A refusal from an
     /// earlier epoch, or from another lineage's epoch at or below this
-    /// node's number, is dropped (ADR-0001 decision 4, as amended
-    /// 2026-09-29, and L6). A refusal names its refuser's epoch and lineage
+    /// node's number, is dropped. A refusal names its refuser's epoch and lineage
     /// itself; one that names no epoch (its refuser has joined no shard) is
     /// read as this node's own epoch's. The refusal itself is not counted.
     fn on_election_reject(&mut self, reject: &Checked<ElectionReject>) {
@@ -2029,8 +2014,8 @@ where
                 return;
             }
             // A refuser left on a lower epoch counts that epoch's terms,
-            // which order nothing here, and names a leader of that epoch
-            // (ADR-0001 decision 4, amended 2026-09-29). Another lineage's
+            // which order nothing here, and names a leader of that epoch.
+            // Another lineage's
             // epoch at or below this node's number is another shard's: its
             // terms, leader and configuration mean nothing here, and its
             // configuration must not be relayed.
@@ -2063,8 +2048,7 @@ where
     /// generation, as that ack would have admitted it (see
     /// [`Configuration::admission_after_commit`]). Without this, a survivor
     /// holding the commit and one holding the joint configuration refuse
-    /// each other's roll calls term after term (ADR-0001 decision 4 as
-    /// amended 2026-09-28). Only a node that takes part in elections without
+    /// each other's roll calls term after term. Only a node that takes part in elections without
     /// standing or leading adopts it.
     fn adopt_relayed_commit(&mut self, offered: Configuration) {
         if self.takes_part_in_elections() {
@@ -2072,8 +2056,8 @@ where
         }
     }
 
-    /// Accepts `leader`'s certificate of what its election's winner leads
-    /// (ADR-0001 decision 8), sent to every respondent of its winning roll
+    /// Accepts `leader`'s certificate of what its election's winner leads,
+    /// sent to every respondent of its winning roll
     /// call: this node adopts that configuration and its admission
     /// generations there, as [`ShardStanding::adopt_certificate`] allows, and the
     /// certificate's term raises its highest term seen, which makes a node
@@ -2184,7 +2168,7 @@ where
         }
     }
 
-    /// Fences this node (ADR-0001 decision 12) if its registration has
+    /// Fences this node if its registration has
     /// lapsed, on its own clock, in a state that takes part in elections:
     /// it drops any roll call, vote or recovery it runs and any grant it
     /// holds, and asks its executor to abort its TaskRuns within the
@@ -2229,7 +2213,7 @@ where
     /// Leaves the shard this node held for the one the authority holds at
     /// `epoch`, which it cannot resume or recover into: discards everything
     /// it knew of its own and goes back to `Bootstrapping`, for its driver to
-    /// join it again (ADR-0001 decision 12). The epoch it rejoins is a
+    /// join it again. The epoch it rejoins is a
     /// floor: a JOIN pointer to a leader left on an older one, or on another
     /// lineage, must not take it back there.
     fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
@@ -2243,7 +2227,7 @@ where
     }
 
     /// The authority path found the recovery epoch missing: the shard is
-    /// abandoned (ADR-0001 decision 11.5), and this node stops for good,
+    /// abandoned, and this node stops for good,
     /// raising an alert. A restart re-enters the bootstrap cascade.
     fn abandon_shard(&mut self) {
         self.stop_reason = Some(StopReason::Abandoned);
@@ -2259,7 +2243,7 @@ where
     /// itself to every connected peer (see [`Self::announce_leadership`]),
     /// unless a drain kept from before stops it first. With an authority it
     /// needs a fence to act; one it already holds is kept. Leader
-    /// reconciliation (README §13) needs task data that does not exist yet,
+    /// reconciliation needs task data that does not exist yet,
     /// so `LeaderReconciling` is passed through immediately.
     fn take_office(&mut self, roster: Roster) {
         let now = self.clock.now();
@@ -2305,7 +2289,7 @@ where
     }
 
     /// Reports every worker this leader has not heard from for a suspicion
-    /// timeout and a reconnect timeout as lost (README §8.3), once each.
+    /// timeout and a reconnect timeout as lost, once each.
     fn report_lost_workers(&mut self) {
         let now = self.clock.now();
         let lost_after = self.lost_after();

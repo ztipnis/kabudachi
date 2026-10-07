@@ -15,7 +15,7 @@ use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::ids::WorkerId;
 
 /// How another node's, or the authority's, recovery epoch compares with this
-/// node's own (ADR-0001 decision 1's amendment: an epoch is its number and
+/// node's own (an epoch is its number and
 /// its lineage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EpochOrder {
@@ -27,8 +27,7 @@ pub(crate) enum EpochOrder {
     Stale,
     /// Another lineage's epoch: another shard's, whatever its number. The
     /// number ordering is kept for `on_leader_ack`, which adopts a
-    /// higher-numbered foreign epoch and ignores an equal or lower one
-    /// (E13-U1, E13-R10(c)).
+    /// higher-numbered foreign epoch and ignores an equal or lower one.
     Foreign(Ordering),
 }
 

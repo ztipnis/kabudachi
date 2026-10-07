@@ -1,7 +1,7 @@
 //! A task that returns a continuation (an implicit flow): its run is certified
 //! at once, but the task is not over until its continuation is, so a
 //! coalescing key stays held and its memory stays counted until the client
-//! ends the continuation (README §3.2.1 flow lifetime, §25.4.7).
+//! ends the continuation.
 
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};

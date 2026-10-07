@@ -1,14 +1,13 @@
-//! Property tests for the coalescing invariants of README §25.4 at one node
-//! (Phase 1 acceptance, §27.1): random sequences of submissions, claims,
-//! completions, continuations, failures, cancellations and worker losses over
-//! a few keys, checking after every step that
+//! Property tests for the coalescing invariants at one node: random sequences
+//! of submissions, claims, completions, continuations, failures, cancellations
+//! and worker losses over a few keys, checking after every step that
 //!
-//! - 25.4.1 at most one generation of a key is claimed, running or continuing;
-//! - 25.4.2 a generation that was claimed is never superseded;
-//! - 25.4.3 and 25.4.4 a superseded payload is folded exactly once, into the
+//! - at most one generation of a key is claimed, running or continuing;
+//! - a generation that was claimed is never superseded;
+//! - a superseded payload is folded exactly once, into the
 //!   generation that absorbed it, oldest first;
-//! - 25.4.5 a lost generation is replayed only if it is the newest for its key;
-//! - 25.4.7 a continuation only exists for a certified run, and keeps its key
+//! - a lost generation is replayed only if it is the newest for its key;
+//! - a continuation only exists for a certified run, and keeps its key
 //!   held until it ends;
 //!
 //! and, once everything is drained, that memory accounting returns to zero.
@@ -232,7 +231,7 @@ impl Model {
         }
     }
 
-    /// 25.4.5: a lost coalescing generation is replayed only if no newer one
+    /// A lost coalescing generation is replayed only if no newer one
     /// waits for its key.
     fn lose_worker(&mut self) {
         let waiting_keys: BTreeSet<u8> = self
@@ -258,7 +257,7 @@ impl Model {
         self.claims.clear();
     }
 
-    /// 25.4.3 and 25.4.4: what a claim folds is what its generation absorbed,
+    /// What a claim folds is what its generation absorbed,
     /// oldest first, and no payload is folded twice.
     fn check_fold(&mut self, claim: &Claim) {
         let task = claim.task.task_id();
@@ -318,7 +317,7 @@ impl Model {
             );
         }
         for task in &self.continuing {
-            // 25.4.7: a continuation only exists for a certified run.
+            // A continuation only exists for a certified run.
             assert_eq!(self.state_of(task), TaskRunState::Succeeded);
         }
     }

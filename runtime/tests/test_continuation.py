@@ -1,6 +1,6 @@
 """A task that returns a step (an implicit flow): its run is certified first,
 then the returned flow, group or bound task runs as its continuation, and the
-original handle resolves to that continuation's results (README §3.4)."""
+original handle resolves to that continuation's results."""
 
 import asyncio
 import threading

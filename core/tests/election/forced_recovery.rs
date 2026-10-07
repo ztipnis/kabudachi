@@ -1,10 +1,9 @@
-//! A node's life with a coordination authority (ADR-0001 decisions 11 and
-//! 12), driven by hand at the node's interface: the authority calls it asks
-//! its driver to make, its registration and orphaning, the recovery fence a
-//! leader must hold, and the authority path a roll call short of its
-//! returning quorum takes. Every authority call a step asks for is made on
-//! a `FaultingAuthority` at once and its reply handed straight back, as a
-//! driver does.
+//! A node's life with a coordination authority, driven by hand at the node's
+//! interface: the authority calls it asks its driver to make, its registration
+//! and orphaning, the recovery fence a leader must hold, and the authority
+//! path a roll call short of its returning quorum takes. Every authority call
+//! a step asks for is made on a `FaultingAuthority` at once and its reply
+//! handed straight back, as a driver does.
 
 
 use crate::support::builders::{

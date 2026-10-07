@@ -88,8 +88,7 @@ pub enum LeaderSearch {
     NoAnswer,
 }
 
-/// One pass of the JOIN client (README §27 Phase 2, spec decision 5 step
-/// (a)): asks each of `peers` in order who leads the shard, over `net`, and
+/// One pass of the JOIN client: asks each of `peers` in order who leads the shard, over `net`, and
 /// returns [`LeaderSearch::Found`] with the first `JOIN_RESPONSE` that
 /// points at a leader this node is then connected to; the caller enters the
 /// shard with it (`core::election::Entry::Joining`). A peer that fails to
@@ -426,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_for_leader_falls_through_a_non_responding_seed_to_the_next() {
-        // Proves spec decision 5 step (a)'s cascade: seeds are dialed in
+        // Proves the seed cascade: seeds are dialed in
         // order, and a seed that doesn't answer doesn't stop the join —
         // the next seed in the list still gets a chance.
         let (net_a, listen_addr) = listening_net().await;

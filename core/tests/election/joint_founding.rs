@@ -1,5 +1,4 @@
-//! An election founds a joint configuration (ADR-0001 decision 8 as
-//! amended): the respondents of its roll call on the new side,
+//! An election founds a joint configuration: the respondents of its roll call on the new side,
 //! the configuration the roll call ran under on the old side. Every roll
 //! call, win and lease under it needs a majority of both sides until its
 //! leader commits it, once a majority of each side holds it. These tests
@@ -659,7 +658,7 @@ fn leader_re_leading_a_founding(clock: &FakeClock) -> (TestNode, Vec<Output>, [W
 
 /// J1 re-stamped at the term-2 winner's generation (0, 2, 2), re-based
 /// there: its new side counts the two respondents it re-admitted, b and d,
-/// not J1's three (E4c-R3a).
+/// not J1's three.
 fn j1_re_stamped_in_term_2() -> Configuration {
     let restamped = Generation::new(0, 2, 2);
     Configuration::joint(Joint {
@@ -743,7 +742,7 @@ fn a_re_stamped_founding_commits_only_on_echoes_of_its_re_stamped_generation() {
     }
     // The commit (b and d, at (0, 2, 3)) is followed in the same step by
     // the batch that admits c, a respondent the re-stamp left at its old
-    // admission, which confirmed this leader's ack (ADR-0001 decision 9).
+    // admission, which confirmed this leader's ack.
     let committed = restamped.next_change(2);
     let batch = committed.next_change(2);
     assert_eq!(

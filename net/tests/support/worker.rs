@@ -53,9 +53,8 @@ impl Seen {
 /// swarm-driving task). That closes the worker's real listening socket and
 /// every connection it held: the process is gone. Harder and more real
 /// than `Net::disconnect`, which only hangs up a connection its own side
-/// may redial; a deliberate choice over `Net::block_peer` (E13) too, which
-/// isolates a still-alive leader rather than removing it — see
-/// `docs/superpowers/plans/notes/e8.md`, E8-R1.
+/// may redial. Also deliberately not `Net::block_peer`, which isolates a
+/// still-alive worker rather than removing the process.
 pub struct RunningWorker {
     pub id: WorkerId,
     pub address: Multiaddr,

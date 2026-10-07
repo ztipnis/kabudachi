@@ -1,4 +1,4 @@
-//! Claim arbitration (README §8.2) on the network: everything about
+//! Claim arbitration on the network: everything about
 //! `/kabudachi/claim/1` that is neither the wire codec ([`codec`]) nor the
 //! transport's generic request/response machinery.
 //!
@@ -83,12 +83,11 @@ impl Net {
         self.answer::<ClaimCodec>(handle.0.channel, response);
     }
 
-    /// Asks `leader` for permission to run `task_id` (`REQUEST_CLAIM`,
-    /// README §8.2), and awaits its answer: an accepted `Claim` or a
-    /// `ClaimReject`. The caller names the leader, as its node knows it
-    /// (`WorkerNode::known_leader`); a leader that has since lost office
-    /// answers `NOT_LEADER`. See [`ClaimFailure`] for why there may be no
-    /// answer.
+    /// Asks `leader` for permission to run `task_id` (`REQUEST_CLAIM`), and
+    /// awaits its answer: an accepted `Claim` or a `ClaimReject`. The caller
+    /// names the leader, as its node knows it (`WorkerNode::known_leader`); a
+    /// leader that has since lost office answers `NOT_LEADER`. See
+    /// [`ClaimFailure`] for why there may be no answer.
     pub async fn request_claim(
         &self,
         leader: WorkerId,

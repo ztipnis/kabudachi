@@ -1,4 +1,4 @@
-//! Property tests for the election (README §25.2, ADR-0001): random
+//! Property tests for the election: random
 //! sequences of faults against a `Cluster` of 4 to 7 voters, or of 3 to 5
 //! voters and 1 or 2 pending members, each node with its own scheduler,
 //! checking these invariants after every event:
@@ -25,7 +25,7 @@
 //!   generation, or one of a term that node led, or one that term's leader
 //!   sent it (in a certificate or an ack) as a respondent of its winning
 //!   roll call, or at a batch's generation, or having heard it confirm one
-//!   of its acks of the term (a joiner, ADR-0001 decision 9, which a batch
+//!   of its acks of the term (a joiner, which a batch
 //!   takes only once it has confirmed one). Every generation of a term is minted by
 //!   that term's one leader (L1). A worker an election left out can come
 //!   back only through that: a batch, which admits it on the batch's new
@@ -482,7 +482,7 @@ impl Ledger {
             replies
         );
 
-        // The win rule's other clause (ADR-0001 decision 7): the granters
+        // The win rule's other clause: the granters
         // are a majority of the respondents, the winner included. The
         // winner certifies every respondent but itself, so those are the
         // respondents; a grant counted here was at least sent.
@@ -556,8 +556,7 @@ impl Ledger {
     /// member a later change of the term re-admits joined in one of those
     /// ways, and a joiner whose batch ack was lost learns its admission
     /// from such a change. A node that missed a commit takes up its
-    /// admission from a refusal instead (ADR-0001 decision 4 as amended
-    /// 2026-09-28): that term's leader announced a change at `admission`,
+    /// admission from a refusal instead: that term's leader announced a change at `admission`,
     /// and the node came by the generation just before it, which the change
     /// re-admits it from.
     fn came_by(&self, node: &WorkerId, admission: Rank) -> bool {
@@ -942,7 +941,7 @@ enum AuthorityEvent {
     SetReachable(usize, bool),
     /// Takes the whole authority down, or brings it back.
     SetAvailable(bool),
-    /// The authority loses all its data (README §15.3).
+    /// The authority loses all its data.
     Flush,
 }
 
@@ -994,7 +993,7 @@ struct AuthorityCoverage {
 /// - A3: every node's configuration generation is of its own recovery
 ///   epoch, and its recovery epoch never decreases while it stays a member
 ///   of one shard. It may fall only as the node leaves its shard for the
-///   one the authority holds (E13-U2, E13-R10: a fenced node reconnecting,
+///   one the authority holds (a fenced node reconnecting,
 ///   a `NoQuorum` recovery or a leader's fence finding an epoch lower in
 ///   its lineage, such as one a leader republished after a flush, or of
 ///   another lineage), and so only in an event in which it went back to

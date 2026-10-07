@@ -1,6 +1,5 @@
 //! Retries: a failed run with retries left is replaced by a new run of the
-//! same task, one at a time, and only the newest run can be reported on
-//! (README §25.1.2, §25.1.4).
+//! same task, one at a time, and only the newest run can be reported on.
 
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};

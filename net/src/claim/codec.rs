@@ -1,4 +1,4 @@
-//! The `/kabudachi/claim/1` `request_response` protocol (README §8.2 claim
+//! The `/kabudachi/claim/1` `request_response` protocol (claim
 //! arbitration): a length-prefixed, prost-encoded `ClaimRequest`
 //! (`REQUEST_CLAIM` for one task, or `CLAIM_OLDEST`) as the request, and a
 //! length-prefixed, prost-encoded `ClaimResponse` (the accepted `Claim`, a

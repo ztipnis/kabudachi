@@ -224,10 +224,10 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
         }
     }
 
-    /// Wipes the authority for every handle, like Redis `FLUSHALL` (README
-    /// §15.3): all epochs, registrations and fences are gone, and warm-up
-    /// starts again from the clock's current reading. Each handle's faults,
-    /// and whether the authority is down, are kept.
+    /// Wipes the authority for every handle, like Redis `FLUSHALL`: all epochs,
+    /// registrations and fences are gone, and warm-up starts again from the
+    /// clock's current reading. Each handle's faults, and whether the authority
+    /// is down, are kept.
     pub fn flush(&self) {
         let fresh = InMemoryAuthority::new(self.shared.clock.clone(), self.shared.ttl);
         *lock(&self.shared.current) = fresh;

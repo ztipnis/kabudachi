@@ -1,4 +1,4 @@
-//! A follower's half of leader liveness (README §12.1-§12.2): the
+//! A follower's half of leader liveness: the
 //! `WorkerHeartbeat`s it sends its leader, the leader acks it accepts or
 //! ignores, the suspicion timer an accepted ack resets, and the
 //! configuration and admission generation it adopts from an accepted ack.

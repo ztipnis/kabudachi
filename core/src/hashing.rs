@@ -1,6 +1,5 @@
 //! The hash function behind deterministic values derived from fixed inputs,
-//! such as the suspicion jitter ADR-0001 decision 15 derives from a worker's
-//! ID and term.
+//! such as the suspicion jitter derived from a worker's ID and term.
 //!
 //! The function is chosen at runtime. SHA-256 is the default; any hash from
 //! the RustCrypto `digest` ecosystem (SHA-3, BLAKE2, ...) can be substituted

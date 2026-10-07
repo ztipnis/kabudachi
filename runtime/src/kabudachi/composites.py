@@ -2,8 +2,8 @@
 
 A flow runs its stages one after another, a group runs its members side by
 side, and both are orchestrated here, on the session's event loop, rather than
-by the leader: only the tasks they submit are the leader's business (README
-§3.4). Cancelling either cascades to what it started, which is why the handles
+by the leader: only the tasks they submit are the leader's business.
+Cancelling either cascades to what it started, which is why the handles
 live here too, next to the orchestration that is the only thing allowed to
 know their insides.
 """

@@ -1,11 +1,10 @@
-//! A leader's grant and every worker's abort deadline (ADR-0001 decisions
-//! 12 and 16): how long a leader may act, and by when a worker that may
-//! have lost its leader's ear must have aborted its TaskRuns. [`Lease`]
-//! answers both from the acks a leader's followers confirmed, the leader
-//! contact a follower had, and when a worker fenced itself, and reports
-//! each change of either once, as a [`LeaseChange`] `WorkerNode` turns into
-//! an output. The quorum-contact lease (see the `quorum_contact_lease`
-//! module) is private to it.
+//! A leader's grant and every worker's abort deadline: how long a leader may
+//! act, and by when a worker that may have lost its leader's ear must have
+//! aborted its TaskRuns. [`Lease`] answers both from the acks a leader's
+//! followers confirmed, the leader contact a follower had, and when a worker
+//! fenced itself, and reports each change of either once, as a [`LeaseChange`]
+//! `WorkerNode` turns into an output. The quorum-contact lease (see the
+//! `quorum_contact_lease` module) is private to it.
 //!
 //! What moved and why. The lease owns the fields only these two answers
 //! read: the leader's confirmed acks, the contact floor, the orphan abort
@@ -203,7 +202,7 @@ impl Lease {
 
     /// The grant `office` gives: `None` without one, or while no quorum has
     /// confirmed an ack. It ends at the earlier of the fence and the
-    /// quorum-contact lease (design 4.5). Read afresh for every report,
+    /// quorum-contact lease. Read afresh for every report,
     /// never kept, so it follows every move of either end.
     pub(crate) fn grant(
         &self,

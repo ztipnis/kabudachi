@@ -1,4 +1,4 @@
-//! Step-down (ADR-0001 decision 14): a node that holds or contests a term
+//! Step-down: a node that holds or contests a term
 //! gives it up once it has seen a later one (from a vote it grants, an ack,
 //! a refusal or an election certificate), to follow the leader of that
 //! term if an ack from it is what told it, and otherwise to suspect its

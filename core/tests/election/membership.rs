@@ -1,8 +1,7 @@
-//! Membership changes while a leader lives, at one node (README §12.3,
-//! ADR-0001 decisions 9 and 10): a draining worker tells only its leader,
-//! the leader applies a removal under the term guard (E4c-R1) and announces
+//! Membership changes while a leader lives, at one node: a draining worker tells only its leader,
+//! the leader applies a removal under the term guard and announces
 //! the shrunk configuration on its acks, a draining leader announces its own
-//! departure (E4c-R3c), and a leader admits pending joiners in batches. The
+//! departure, and a leader admits pending joiners in batches. The
 //! multi-node behaviour of the same rules is in `scenario_membership_test`.
 
 use crate::support::builders::{
@@ -126,11 +125,10 @@ fn confirming_heartbeat(
 
 // ---- Draining ----
 
-/// A follower tells only its leader that it leaves (E4c: "SELF_REMOVE to
-/// the leader only"), and the message carries the highest term it has seen
-/// (E4c-R1), which a vote it granted raises. A roll call it only answered
-/// does not: it counts for no quorum, and a dead one would block every
-/// removal until the next election.
+/// A follower tells only its leader that it leaves, and the message carries
+/// the highest term it has seen, which a vote it granted raises. A roll call
+/// it only answered does not: it counts for no quorum, and a dead one would
+/// block every removal until the next election.
 #[test]
 fn a_follower_drains_with_one_self_remove_to_its_leader_carrying_the_highest_term_it_has_seen() {
     let clock = FakeClock::new();
@@ -200,8 +198,8 @@ fn a_node_that_knows_no_leader_drains_without_telling_anyone() {
     );
 }
 
-/// A draining leader applies its own removal, which no other leader can
-/// (E4c-R3c), and announces the configuration without itself on a final
+/// A draining leader applies its own removal, which no other leader can,
+/// and announces the configuration without itself on a final
 /// ack to every peer before it stops.
 #[test]
 fn a_draining_leader_announces_the_configuration_without_itself_on_final_acks() {
@@ -264,11 +262,11 @@ fn a_leader_drops_a_removed_member_and_announces_one_fewer_voter_at_the_next_gen
     );
 }
 
-/// A leader applies a removal only when it is addressed to its own term,
-/// from a worker that has seen no term later than it (ADR-0001 decision
-/// 10's term guard). A worker that has may have voted in a rival election
-/// of that term, where shrinking N here would let two quorums miss each
-/// other; the next founding, or the authority path, drops it instead.
+/// A leader applies a removal only when it is addressed to its own term, from
+/// a worker that has seen no term later than it (the term guard). A worker
+/// that has may have voted in a rival election of that term, where shrinking N
+/// here would let two quorums miss each other; the next founding, or the
+/// authority path, drops it instead.
 #[test]
 fn a_leader_applies_a_self_remove_only_for_its_term_from_a_worker_that_has_seen_no_later_one() {
     let clock = FakeClock::new();
@@ -387,8 +385,8 @@ fn batch_of_one_joiner() -> Configuration {
 }
 
 /// A leader admits a pending joiner once the joiner has confirmed one of its
-/// acks, so the batch's new side never costs the leader its lease (ADR-0001
-/// decision 9): a joiner heard of but not yet confirming waits pending.
+/// acks, so the batch's new side never costs the leader its lease: a joiner
+/// heard of but not yet confirming waits pending.
 #[test]
 fn a_leader_admits_a_pending_joiner_that_confirms_its_ack_in_a_batch() {
     let clock = FakeClock::new();

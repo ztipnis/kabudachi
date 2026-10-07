@@ -1,6 +1,6 @@
 //! Memory pressure at one node: the scheduler counts the serialized bytes of
 //! every task that has not finished, raises `SlowDown` past a soft limit, and
-//! refuses a submission past a hard one (README §3.2.1, §27.1). A coalescing
+//! refuses a submission past a hard one. A coalescing
 //! task may opt in to dropping its own oldest retained payloads instead.
 
 

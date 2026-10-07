@@ -12,7 +12,7 @@ use kabudachi_testkit::FaultingAuthority;
 use crate::support::clock::FakeClock;
 
 /// The TTL of every test authority's registrations, fences and warm-up: 30 s
-/// of simulated time, ADR-0001's default. Nothing in these tests renews a
+/// of simulated time, the default. Nothing in these tests renews a
 /// registration. A test that lets a full TTL pass between registering
 /// workers and attempting a recovery, to wait out warm-up say, registers
 /// them again first; the rest attempt it well within one TTL, so no

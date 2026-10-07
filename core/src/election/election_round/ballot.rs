@@ -1,4 +1,4 @@
-//! The voter's side of an election (ADR-0001 decisions 4 to 6): for each
+//! The voter's side of an election: for each
 //! term, the best roll call this node answered and the candidate it granted
 //! its vote to. It is the one place that decides whether this node answers a
 //! roll call or grants a vote.

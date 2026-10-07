@@ -1,6 +1,6 @@
 # Kabudachi
 
-A distributed task runtime whose workers elect one leader per shard; the leader's scheduler alone decides claims. This glossary names the election's driving concepts; the election's own domain terms follow ADR-0001 (`docs/superpowers/adr/`) and README §10, and architecture terms (module, interface, depth, seam, adapter, leverage, locality) follow the codebase-design vocabulary.
+A distributed task runtime whose workers elect one leader per shard; the leader's scheduler alone decides claims. This glossary names the election's driving concepts; the election's own domain terms are defined below, and architecture terms (module, interface, depth, seam, adapter, leverage, locality) follow the codebase-design vocabulary.
 
 ## Driving a node
 
@@ -43,7 +43,7 @@ Entering a shard as a pending member of the leader a JOIN answer points at.
 ## Deciding an election
 
 **Election round**:
-The roll call, candidacy and win rule of ADR-0001 decisions 3–8, deciding through verdicts that the node turns into outputs.
+The roll call, candidacy and win rule, deciding through verdicts that the node turns into outputs.
 _Avoid_: ballot, vote round, roll call round (each names only a part)
 
 **Verdict**:

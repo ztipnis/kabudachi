@@ -1,4 +1,4 @@
-//! Domain `TaskRunState` and its transition table (README §4.4, §25.1). The
+//! Domain `TaskRunState` and its transition table. The
 //! wire enum's `UNSPECIFIED` sentinel has no domain meaning and is not
 //! represented.
 

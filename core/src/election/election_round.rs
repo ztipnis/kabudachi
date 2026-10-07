@@ -1,4 +1,4 @@
-//! The election a worker takes part in (ADR-0001 decisions 3 to 8): the
+//! The election a worker takes part in: the
 //! roll call it starts once it suspects its leader, the roll calls and vote
 //! requests of other workers it answers or refuses, the candidacy it stands
 //! in once its roll call finds a returning quorum, and the rule by which
@@ -196,7 +196,7 @@ impl ElectionRound {
     /// When a `LeaderSuspect` or `NoQuorum` node may start a roll call, as
     /// of `now`: at the instant its suspicion began or its retry falls due,
     /// unless it answered another worker's roll call less than two
-    /// roll-call deadlines ago (ADR-0001 decision 5): that worker is being
+    /// roll-call deadlines ago: that worker is being
     /// elected, by its census and then its vote, so the node waits until
     /// both could have ended.
     pub(crate) fn roll_call_due(&self, now: Instant) -> Instant {
@@ -269,7 +269,7 @@ impl ElectionRound {
         highest_term_seen.max(self.ballot.highest_roll_call_term().unwrap_or(0))
     }
 
-    /// Starts a roll call (ADR-0001 decisions 4 and 6) for the term after
+    /// Starts a roll call for the term after
     /// the latest this node knows of, under its configuration, stamped with
     /// `timestamp_millis` from its wall clock; the node is its first
     /// respondent. The call collects replies until a roll-call deadline
@@ -411,7 +411,7 @@ impl ElectionRound {
     /// Decides on the roll call or candidacy in progress once its deadline
     /// has come by `now`; before that, or with neither, does nothing.
     ///
-    /// A roll call (ADR-0001 decisions 13 and 15) whose returning voters
+    /// A roll call whose returning voters
     /// are a quorum stands the node as its candidate (see
     /// [`Self::stand`]); one short of that leaves it `NoQuorum`. A call it
     /// abandoned for a better one, whose leader has not acked it by now, or
@@ -448,8 +448,8 @@ impl ElectionRound {
         Vec::new()
     }
 
-    /// Decides on `candidate`'s request for this node's vote (README §12.6
-    /// `on_vote_request`; see the `ballot` module for the rules). A request
+    /// Decides on `candidate`'s request for this node's vote
+    /// (see the `ballot` module for the rules). A request
     /// for another shard is ignored; every refusal is answered with the
     /// reason.
     pub(crate) fn on_vote_request(
@@ -559,8 +559,8 @@ impl ElectionRound {
         let term = vote.term();
         // Its own vote does not raise the highest term seen: a candidacy
         // that lapses unwon leaves no term anyone else voted in, and the
-        // leader that outlasted it must still be one this node can follow
-        // (ADR-0001 decision 14 as amended 2026-09-28). The ballot records
+        // leader that outlasted it must still be one this node can follow.
+        // The ballot records
         // the vote, so this node answers and grants nothing for this term
         // or an earlier one (see `Self::voter`), and a win raises the term
         // seen as the node takes office.
@@ -586,7 +586,7 @@ impl ElectionRound {
     /// re-stamped at a generation of this term and re-based there, each
     /// respondent its new side counted re-admitted at it. It certifies
     /// that configuration, with the respondent's admission generations
-    /// there, to every other respondent (README §12.6), and then wins.
+    /// there, to every other respondent, and then wins.
     fn win_if_quorum(&mut self, view: &View) -> Vec<Verdict> {
         let Some(vote) = self.vote.take_if(|vote| vote.has_won()) else {
             return Vec::new();

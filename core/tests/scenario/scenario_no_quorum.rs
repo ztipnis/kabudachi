@@ -1,7 +1,6 @@
-//! Scenario tests for leaving `NoQuorum` with no coordination authority
-//! (ADR-0001 decision 13), built on the `Cluster` harness: the node waits
-//! for its peers to return, then takes part in the election they hold or
-//! holds one itself.
+//! Scenario tests for leaving `NoQuorum` with no coordination authority, built
+//! on the `Cluster` harness: the node waits for its peers to return, then
+//! takes part in the election they hold or holds one itself.
 
 
 use std::collections::BTreeSet;

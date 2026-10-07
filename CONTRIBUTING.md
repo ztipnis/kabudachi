@@ -142,7 +142,7 @@ Because your bypass mode is "Always," these rules gate anyone else with write ac
 - `@coderabbitai configuration` as a PR comment dumps CodeRabbit's *actual* effective config — useful to check `.coderabbit.yaml` is being read as intended, and to catch schema drift against this file.
 - `@coderabbitai generate docstrings` / `@coderabbitai generate unit tests` as PR comments (finishing-touches features) will push a follow-up commit.
 - `@coderabbitai resolve` resolves all of CodeRabbit's own review threads at once from a comment, instead of clicking through each one.
-- Sequence diagrams in the walkthrough are genuinely useful once anything protocol/state-machine-shaped from the README's design (leader election, `TaskRun` transitions) starts landing.
+- Sequence diagrams in the walkthrough are genuinely useful once anything protocol/state-machine-shaped from the design (leader election, `TaskRun` transitions) starts landing.
 
 ### Gotcha
 

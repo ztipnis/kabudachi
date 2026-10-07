@@ -1,4 +1,4 @@
-//! The initiator's side of a roll call (ADR-0001 decisions 3 to 6): the
+//! The initiator's side of a roll call: the
 //! census a worker that suspects its leader publishes to its shard, and the
 //! replies it collects.
 //!
@@ -22,7 +22,7 @@ use crate::time::Instant;
 
 /// How a roll call ranks against the other calls for its term: the lower
 /// the better. Calls are ordered by the initiator's wall-clock timestamp,
-/// then by the initiator's `WorkerId` (ADR-0001 decision 5). The timestamp
+/// then by the initiator's `WorkerId`. The timestamp
 /// only breaks ties, so clocks that disagree bias who wins a tie but never
 /// let two calls rank equal.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

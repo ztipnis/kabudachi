@@ -1,4 +1,4 @@
-//! A leader's quorum-contact lease (ADR-0001 decision 16): how long it may
+//! A leader's quorum-contact lease: how long it may
 //! go on acting on the strength of the acks a quorum of its configuration
 //! has confirmed receiving.
 //!
@@ -96,7 +96,7 @@ impl QuorumContactLease {
     }
 
     /// Those of `workers` an admission batch may take and still leave
-    /// `leader`, leading `roster`, a lease of its own (ADR-0001 decision 9):
+    /// `leader`, leading `roster`, a lease of its own:
     /// each has confirmed an ack of this leader sent no earlier than the
     /// threshold, `recent_since` or, while the lease is bounded, the
     /// quorum-contact time if that is earlier.

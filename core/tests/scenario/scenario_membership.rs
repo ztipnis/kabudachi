@@ -1,4 +1,4 @@
-//! Membership changes across a cluster (ADR-0001 decisions 9 and 10, E4c):
+//! Membership changes across a cluster:
 //! admission batches, removals with no commit round, and elections that fall
 //! in the middle of either. Every scenario runs real `WorkerNode`s through
 //! the `Cluster` harness and checks that no two nodes ever held a valid
@@ -152,7 +152,7 @@ fn assert_no_grant_overlap(cluster: &Cluster) {
 /// A burst of joiners arriving together is admitted in two batches: the
 /// first takes the joiners that had confirmed the leader's ack when it
 /// started, and every joiner that confirmed by its commit waits for it and
-/// forms the second (ADR-0001 decision 9: one change at a time).
+/// forms the second (one change at a time).
 ///
 /// The joiners arrive over half a heartbeat interval, twenty a tick, on a
 /// network that holds half its deliveries back by up to four ticks, so
@@ -261,14 +261,14 @@ fn second_batch_cut_off() -> (Cluster, WorkerId, BTreeSet<WorkerId>, BTreeSet<Wo
     (cluster, leader, old_side, batch_side)
 }
 
-/// A joint configuration's quorums need a majority of both sides (ADR-0001
-/// decision 9), and generations never alias across a split. Cut off
-/// mid-batch, the leader and the batch's joiners are a majority of its new
-/// side but not of its old; the other side, which has adopted the batch,
-/// is a majority of its old side but not of its new. The batch never
-/// commits, the old leader's lease runs out, and neither side elects:
-/// counting only the new side would let the first elect, only the old side
-/// the second. Healed, one leader leads everyone and admits them all.
+/// A joint configuration's quorums need a majority of both sides, and
+/// generations never alias across a split. Cut off mid-batch, the leader and
+/// the batch's joiners are a majority of its new side but not of its old; the
+/// other side, which has adopted the batch, is a majority of its old side but
+/// not of its new. The batch never commits, the old leader's lease runs out,
+/// and neither side elects: counting only the new side would let the first
+/// elect, only the old side the second. Healed, one leader leads everyone and
+/// admits them all.
 #[test]
 fn a_split_mid_batch_elects_on_neither_side_and_heals_to_one_leader() {
     let (mut cluster, leader, old_side, batch_side) = second_batch_cut_off();
@@ -401,8 +401,8 @@ fn a_rolling_deploy_commits_its_batch_and_never_loses_the_quorum() {
     assert_no_grant_overlap(&cluster);
 }
 
-/// Several workers draining at once shrink N in one generation (ADR-0001
-/// decision 10: every pending SELF_REMOVE in the next generation), with no
+/// Several workers draining at once shrink N in one generation (every
+/// pending SELF_REMOVE lands in the next generation), with no
 /// commit round and no joint configuration, and the leader keeps leading
 /// the smaller configuration.
 #[test]
@@ -455,8 +455,8 @@ fn a_mass_self_remove_shrinks_n_in_one_generation_with_no_commit_round() {
 /// A rolling deploy that replaces every old voter, the leader last: the
 /// old voters' removals shrink the batch's old side to the leader alone,
 /// and the leader's own drain empties it. The batch then collapses to its
-/// new side, its joiners (E4c-R3b), which the leader announces on its final
-/// acks (E4c-R3c); they elect among themselves and admit the joiners that
+/// new side, its joiners, which the leader announces on its final
+/// acks; they elect among themselves and admit the joiners that
 /// waited.
 #[test]
 fn a_rolling_deploy_that_replaces_the_leader_last_collapses_the_batch() {

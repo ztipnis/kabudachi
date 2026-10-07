@@ -1,4 +1,4 @@
-//! Leaving `NoQuorum` with no coordination authority (ADR-0001 decision 13):
+//! Leaving `NoQuorum` with no coordination authority:
 //! the node retries a roll call every jittered suspicion timeout, takes part
 //! in other nodes' elections meanwhile, and follows a leader whose ack
 //! reaches it.

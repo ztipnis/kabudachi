@@ -1,4 +1,4 @@
-//! Property tests for the configuration tally (ADR-0001 decisions 2 and 9):
+//! Property tests for the configuration tally:
 //! two sets of workers that each reach a quorum in the same configuration
 //! share a voter, so two elections, or two commits, counted against one
 //! configuration can never both succeed with disjoint supporters.
@@ -8,7 +8,7 @@
 //! base or generation, the batch generation or the current one. Every
 //! voter count is the number of workers the configuration admits plus a random
 //! slack, never fewer: a worker that still holds a count from before a removal
-//! holds a larger one (ADR-0001 decision 10).
+//! holds a larger one.
 //!
 //! The oracle below classifies workers straight from the generation bounds,
 //! not through the module, so a tally that counted a non-voter would break
@@ -19,7 +19,7 @@
 //! won under the roster's configuration) and checks that each change keeps
 //! adjacent configurations sharing a majority: no quorum of the
 //! configuration after a change is disjoint from a quorum of the one before
-//! it (ADR-0001 decisions 8 to 10), counting only the workers still
+//! it, counting only the workers still
 //! present. A removed worker never votes again: it has stopped, and the
 //! term guard on its SELF_REMOVE covers the votes it cast before (the TLA+
 //! model checks that part). Several removed together could otherwise make
@@ -244,7 +244,7 @@ enum RosterOp {
     /// then the leader tries to commit it.
     Confirm(u8),
     /// The workers chosen by bit drain, and the leader takes them out
-    /// together, in one generation (ADR-0001 decision 10). The leader among
+    /// together, in one generation. The leader among
     /// them (worker 0) ends the history: it announces the configuration
     /// without itself, then stops.
     Remove(u8),

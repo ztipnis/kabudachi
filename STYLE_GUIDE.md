@@ -7,10 +7,10 @@ If something here conflicts with `CLAUDE.md`, `CLAUDE.md` wins — it documents 
 ## Philosophy
 
 - **YAGNI on internal boundaries.** No speculative crate/package splits, no abstraction introduced ahead of a real second caller. The `core`/`bindings`/`runtime` split exists because PyO3-vs-pure-Rust forces it, not as a template for further subdivision.
-- **Don't implement ahead of the current phase.** `README.md` §27 defines the phase order. A PR that adds distributed-systems machinery (DHT, leader election, the `TaskRun` state machine, etc.) before its phase has started is out of scope regardless of code quality.
+- **Don't implement ahead of the current phase.** `README.md` sets the phase order. A PR that adds distributed-systems machinery (DHT, leader election, the `TaskRun` state machine, etc.) before its phase has started is out of scope regardless of code quality.
 - **Small, frequent commits under TDD.** Tests before implementation. A PR that adds implementation with no preceding/accompanying test changes is a red flag, not just a style nit.
-- **Stop and clarify instead of guessing.** Don't invent a schema, widen a type, or add a branch just to make something compile or pass a test. If the right shape genuinely isn't clear from `README.md`/`CLAUDE.md`/the current phase's tests, that's a "ask" moment, not a "pick something reasonable and move on" moment.
-- **Name the lasting job, not the rollout state.** Don't name a module, type, or flag after a migration/rollout phase (`v2`, `_new`, `temporary`, `until_phaseN`) — name what it does once it's done. Phase sequencing lives in `README.md` §27 and PR history, not in identifiers.
+- **Stop and clarify instead of guessing.** Don't invent a schema, widen a type, or add a branch just to make something compile or pass a test. If the right shape genuinely isn't clear from `CLAUDE.md`/the current phase's tests, that's a "ask" moment, not a "pick something reasonable and move on" moment.
+- **Name the lasting job, not the rollout state.** Don't name a module, type, or flag after a migration/rollout phase (`v2`, `_new`, `temporary`, `until_phaseN`) — name what it does once it's done. Phase sequencing lives in `README.md` and PR history, not in identifiers.
 
 ## Configurability
 
@@ -25,8 +25,8 @@ Ship opinionated defaults, but make the implementation choices underneath them c
 
 ## Readability target
 
-- Code should be skimmable by someone without deep distributed-systems background: they should be able to get the general gist — what a piece of code does, what it reads/writes, what it deliberately doesn't handle — without first learning the theory behind DHTs, consensus, or leader election. Depth belongs in `README.md`, tests, and well-named helpers; the top-level flow of a function stays plain regardless of how intricate the domain is.
-- **The literal "what" must be readable line by line with zero domain knowledge — this is mandatory, not aspirational.** Someone with general programming literacy and no idea what a DHT, a leader, or a `TaskRun` is should still be able to trace a function's lines and say what each one mechanically does. The *why* (the domain reasoning) and the *how* (the cleverness of the approach) are allowed to require real domain knowledge — that's exactly what `README.md`, docstrings, and "why" comments are for. But if the literal what isn't clear from the code alone, that's not a style nit to leave for later: a comment there is required.
+- Code should be skimmable by someone without deep distributed-systems background: they should be able to get the general gist — what a piece of code does, what it reads/writes, what it deliberately doesn't handle — without first learning the theory behind DHTs, consensus, or leader election. Depth belongs in tests and well-named helpers; the top-level flow of a function stays plain regardless of how intricate the domain is.
+- **The literal "what" must be readable line by line with zero domain knowledge — this is mandatory, not aspirational.** Someone with general programming literacy and no idea what a DHT, a leader, or a `TaskRun` is should still be able to trace a function's lines and say what each one mechanically does. The *why* (the domain reasoning) and the *how* (the cleverness of the approach) are allowed to require real domain knowledge — that's exactly what docstrings and "why" comments are for. But if the literal what isn't clear from the code alone, that's not a style nit to leave for later: a comment there is required.
   - **The one relaxation:** an inherently opaque boundary — dense vector/numeric algebra, a tight FFI marshalling routine, that kind of thing — where making every line self-evident on its own isn't realistic. There, a comment stands in for the line-by-line clarity the code itself can't provide. That's the exception, not a general excuse to skip naming things well.
 - **The bar is highest at the public API surface** — `bindings/`'s PyO3 wrappers and `runtime`'s public functions. A caller must never need to understand `core`'s internal machinery to use the public surface correctly.
 - Internals inside `core` are allowed to get denser than that — but only when the density is what keeps the public API small and simple, not as an excuse for a muddy public surface. If internal complexity is leaking into how callers have to think, that's a sign the boundary is in the wrong place, not that the caller needs to learn more.
@@ -53,7 +53,7 @@ Ship opinionated defaults, but make the implementation choices underneath them c
 - Code should be `clippy`-clean. There's no `clippy.toml` or CI wiring for it yet (see `CLAUDE.md`'s "no lint/format command configured yet" note) — run it manually (`cargo clippy --workspace`) before opening a PR.
 - Prefer `Result`/`?` propagation over `.unwrap()`/`.expect()` outside of tests and truly-unreachable invariants. If a panic is intentional, a comment should say why the case is unreachable.
 - **Test-only support code (fakes, mocks, fixtures, simulation harnesses) must be physically separate from production `src/`, not just feature-flag-gated.** A `#[cfg(feature = "testkit")]` module living inside `core/src/` still means a developer browsing production source trips over test-only code. Use the crate's `tests/` integration-test directory (e.g. `tests/support/`) for shared test support, or a separate dev-dependency crate only once a real cross-crate need exists.
-- Public API of a crate (anything not `pub(crate)`) is held to a higher documentation bar than internal code — see README's note that the *external* surface is allowed to be more deliberately designed than internal boundaries.
+- Public API of a crate (anything not `pub(crate)`) is held to a higher documentation bar than internal code — the *external* surface is allowed to be more deliberately designed than internal boundaries.
 - No new mutable module-level globals (`static mut`, ad-hoc `once_cell`/`lazy_static` state) — put state on the owning type and pass it explicitly, or thread it through the call chain. True constants are fine.
 - Validate untrusted input at the edge — the `bindings/` FFI seam, or wherever `core` first receives externally-derived data — and trust it afterward. Don't re-validate an already-checked invariant deeper in `core`'s call chain "just in case."
 
@@ -88,8 +88,20 @@ kabudachi's public API is functional (free functions over small data types), and
       """Returns true if i is an even number"""  # adds nothing `is_even` didn't already say — delete it
       return i % 2 == 0
   ```
-- A docstring should stand on its own — readable without knowing where sibling code lives or how the rest of the system is wired. Save cross-component context for `README.md`.
+- A docstring should stand on its own — readable without knowing where sibling code lives or how the rest of the system is wired. Say the reason itself rather than pointing at another document.
 - Plain, concrete wording over jargon in names, comments, and log messages — "the leader's term counter" beats "the epoch observable."
+
+## Code stands alone
+
+- Readability comes first. Add a comment only where the logic is too complicated to read, and state the reason in the comment itself. If every design document were lost, the code would still explain itself; documents add colour, never load-bearing meaning. No "README §x", "ADR-000n", "decision n" or "E9-R10"-style references in code, tests, or shipped docs.
+  ```rust
+  // Bad: the reader must find another document to learn why.
+  // Ignore the reply; see README §13.
+
+  // Better: the reason is right here.
+  // Ignore a reply from an older term: its sender has already been replaced.
+  ```
+- **Workers keep no list of peers.** A follower stores counts, the current leader, and its configuration (seeds, authority). The kad routing table is for routing only and is never read as membership. Only the leader's configuration names members.
 
 ## Review scope
 

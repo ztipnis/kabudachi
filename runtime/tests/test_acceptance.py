@@ -1,8 +1,8 @@
-"""Phase 1 acceptance criteria (README §27.1) that are Python behaviour, as
-properties: 25.4.3 and 25.4.4 (payloads are folded in order, whatever the
-compaction points) and 25.4.8 (the stage after a group runs exactly once). The
-scheduler-side coalescing invariants are `core/tests/proptest_flow_invariants.rs`
-and 25.4.7 is `test_continuation.py` plus that file's continuation checks."""
+"""Python-side properties: payloads are folded in order, whatever the
+compaction points, and the stage after a group runs exactly once. The
+scheduler-side coalescing invariants are in
+`core/tests/proptest/proptest_flow_invariants.rs`, and continuation is
+covered by `test_continuation.py` plus that file's continuation checks."""
 
 import functools
 from types import SimpleNamespace
@@ -51,12 +51,11 @@ texts = st.lists(st.text(alphabet="abcdef", min_size=1, max_size=3), min_size=1,
 
 
 @given(texts)
-def test_25_4_3_the_claiming_worker_folds_every_absorbed_payload_in_order(payloads):
+def test_the_claiming_worker_folds_every_absorbed_payload_in_order(payloads):
     """A superseded payload is folded, never dropped, oldest first.
 
-    Criterion 25.4.4 (the fold does not depend on where a prefix was compacted)
-    follows from this: a left fold gives the same result however its prefix was
-    grouped.
+    The fold does not depend on where a prefix was compacted: a left fold
+    gives the same result however its prefix was grouped.
     """
     definition = coalescing_definition()
 
@@ -66,7 +65,7 @@ def test_25_4_3_the_claiming_worker_folds_every_absorbed_payload_in_order(payloa
     assert folded == expected
 
 
-# --- 25.4.8 -------------------------------------------------------------
+# --- the stage after a group runs exactly once --------------------------
 
 RETRIES = 2
 
@@ -122,7 +121,7 @@ failure_counts = st.lists(st.integers(min_value=0, max_value=RETRIES + 1), min_s
 
 @settings(max_examples=15, deadline=None)
 @given(failure_counts)
-def test_25_4_8_under_collect_all_the_stage_after_a_group_runs_once_with_every_outcome(failures):
+def test_under_collect_all_the_stage_after_a_group_runs_once_with_every_outcome(failures):
     seen, outcome = run_group_then_stage(failures, "collect_all")
 
     assert len(seen) == 1, "the stage after the group must run exactly once"
@@ -138,7 +137,7 @@ def test_25_4_8_under_collect_all_the_stage_after_a_group_runs_once_with_every_o
 
 @settings(max_examples=15, deadline=None)
 @given(failure_counts)
-def test_25_4_8_under_fail_fast_the_stage_runs_once_only_if_every_member_succeeds(failures):
+def test_under_fail_fast_the_stage_runs_once_only_if_every_member_succeeds(failures):
     seen, outcome = run_group_then_stage(failures, "fail_fast")
 
     if all(count <= RETRIES for count in failures):

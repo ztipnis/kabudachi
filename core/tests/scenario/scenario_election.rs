@@ -1,5 +1,5 @@
-//! Scenario tests for election-message timing edge cases (README §26.1) and
-//! `SELF_REMOVE` through the network layer (README §26.2), built on the
+//! Scenario tests for election-message timing edge cases and
+//! `SELF_REMOVE` through the network layer, built on the
 //! `Cluster` harness.
 
 use crate::support::builders::checked;

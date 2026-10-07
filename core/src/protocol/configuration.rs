@@ -1,6 +1,6 @@
 //! Checked decode of the wire [`generated::Generation`]/[`generated::Configuration`]
 //! into the domain [`configuration::Generation`]/[`configuration::Configuration`]
-//! (ADR-0001 decision 1), and their infallible encode back to the wire.
+//! and their infallible encode back to the wire.
 //!
 //! Decode is where untrusted configuration data from a peer is validated
 //! (STYLE_GUIDE "validate untrusted input at the edge"). It checks only what

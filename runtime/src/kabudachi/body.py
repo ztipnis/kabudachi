@@ -2,7 +2,7 @@
 
 A body can be asked to stop but not always made to: an async body may ignore
 cancellation, and a synchronous body in a thread cannot be interrupted at all.
-So a body that does not stop is abandoned, not killed (README §6.2): its run
+So a body that does not stop is abandoned, not killed: its run
 fails, and it is left to finish on its own, its outcome discarded.
 """
 

@@ -1,5 +1,5 @@
 //! Which generation of each coalescing key is waiting, which one holds the
-//! key, and the payloads a waiting generation has absorbed (README §3.2.1).
+//! key, and the payloads a waiting generation has absorbed.
 //!
 //! Only bookkeeping: whether a generation is pending, superseded or finished
 //! is the scheduler's business, and it tells this what happened.

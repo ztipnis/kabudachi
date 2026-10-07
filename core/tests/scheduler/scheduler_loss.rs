@@ -1,8 +1,8 @@
-//! A worker that is lost while it holds runs (README §3.2.1, §3.2.2, §25.4.5):
+//! A worker that is lost while it holds runs:
 //! its runs become `Lost`, and are replayed by a new run of the same task
 //! (at-least-once), except that a coalescing generation is only replayed if it
 //! is the newest for its key. An ephemeral task's lost run is not replayed, and a
-//! non-retriable task's running run is orphaned instead (README §3.2.2).
+//! non-retriable task's running run is orphaned instead.
 
 use crate::support::scheduler::Fixture;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};

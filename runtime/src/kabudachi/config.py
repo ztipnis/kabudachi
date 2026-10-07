@@ -35,7 +35,7 @@ ENVIRONMENT_PREFIX = "KABUDACHI_"
 
 # Bytes of serialized task input the scheduler may hold for tasks that have not
 # finished. Past the soft limit bulk submission (group, map) pauses; past the
-# hard limit a submission raises `BackpressureError` (README §3.2.1). Fixed
+# hard limit a submission raises `BackpressureError`. Fixed
 # numbers, not derived from the memory of the machine, until compaction exists.
 DEFAULT_MEMORY_SOFT_LIMIT = 256 * 1024 * 1024
 DEFAULT_MEMORY_HARD_LIMIT = 512 * 1024 * 1024

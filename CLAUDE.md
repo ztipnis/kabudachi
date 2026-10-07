@@ -76,7 +76,7 @@ Use TDD and small commits. Python tests use pytest; Rust tests use `#[test]` thr
 
 ## Completion gate: CI must be green
 
-Work that lands through a PR is complete only when CircleCI's `test` job is green on the PR's current head commit, in addition to the local Bazel pass and CodeRabbit's approval. Wait for it with the `github-pr-review-wait` skill's check mode. A red or cancelled job blocks completion: read its log, fix the cause, push, and wait for a green run on the new head. A push after a green run needs its own green run. Rerun a red job only after its cause is understood; a flaky test is a cause to fix, or to record before rerunning as open work under its phase in `README.md` §27 (not as a GitHub issue). CI setup and its cost model are in `CONTRIBUTING.md` ("Continuous integration").
+Work that lands through a PR is complete only when CircleCI's `test` job is green on the PR's current head commit, in addition to the local Bazel pass and CodeRabbit's approval. Wait for it with the `github-pr-review-wait` skill's check mode. A red or cancelled job blocks completion: read its log, fix the cause, push, and wait for a green run on the new head. A push after a green run needs its own green run. Rerun a red job only after its cause is understood; a flaky test is a cause to fix, or to record before rerunning as open work under its phase section in `README.md` (not as a GitHub issue). CI setup and its cost model are in `CONTRIBUTING.md` ("Continuous integration").
 
 ## Responding to CodeRabbit review comments
 

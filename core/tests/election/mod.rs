@@ -1,4 +1,4 @@
-//! The election state machine's behaviour, one module per ADR-0001 area.
+//! The election state machine's behaviour, one module per area.
 
 mod bootstrap_join;
 mod carry_out;

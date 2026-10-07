@@ -1,6 +1,6 @@
-//! A node's standing with its coordination authority (ADR-0001 decisions 11
-//! and 12): its registration and fence timers, the forced recovery it runs,
-//! how it reconnects once fenced, and the one reply it awaits.
+//! A node's standing with its coordination authority: its registration and
+//! fence timers, the forced recovery it runs, how it reconnects once fenced,
+//! and the one reply it awaits.
 //!
 //! [`AuthorityStanding`] owns the fields only the authority path reads and
 //! writes: the lease (see the `authority_lease` module), the recovery in
@@ -65,7 +65,7 @@ pub(crate) enum AuthorityVerdict {
     Ask(AuthorityCall),
     /// Fenced, it finds its own epoch: resume `Active`.
     Resume,
-    /// Leave for the shard the authority holds at this epoch (decision 12).
+    /// Leave for the shard the authority holds at this epoch.
     RejoinAt(RecoveryEpoch),
     /// The recovery swapped the epoch: stand as `Candidate` for `term` at
     /// `epoch`, leading `roster` once the fence comes.
@@ -218,7 +218,7 @@ impl AuthorityStanding {
                 };
                 self.lease.registered(sent_at, granted);
                 // A fenced node that can register again reads the epoch to
-                // learn whether it may resume (ADR-0001 decision 12).
+                // learn whether it may resume.
                 if view.state == WorkerState::Fenced {
                     vec![AuthorityVerdict::Ask(
                         self.ask_awaited(AuthorityRequest::ReadRecoveryEpoch, now),
@@ -349,7 +349,7 @@ impl AuthorityStanding {
 
     /// A compare-and-swap of the recovery epoch came back: either this
     /// node's authority path, or a leader republishing its epoch after the
-    /// authority lost it (README §15.3), which then asks for its fence
+    /// authority lost it, which then asks for its fence
     /// again at once.
     fn on_recovery_epoch_swapped(
         &mut self,
@@ -369,7 +369,7 @@ impl AuthorityStanding {
             let next = recovery.on_swapped(expected, new, result.is_ok());
             return self.follow_recovery(next, now);
         }
-        // The leader's republish (README §15.3): once the epoch is back, by
+        // The leader's republish: once the epoch is back, by
         // this swap or another worker's, it asks for its fence at once.
         // Otherwise it asks when the fence is next due, so an authority that
         // keeps failing is not asked again within the same instant.
@@ -419,7 +419,7 @@ impl AuthorityStanding {
     /// The authority path swapped the recovery epoch to `epoch`: the node
     /// adopts it, and the configuration its recovery founds there, stands as
     /// `Candidate` for its roll call's term, and asks for the fence, which
-    /// it must hold before it leads (ADR-0001 decision 11.4).
+    /// it must hold before it leads.
     fn stand_through_authority(&mut self, epoch: RecoveryEpoch, now: Instant) -> Vec<AuthorityVerdict> {
         let Some(recovery) = self.recovery.as_ref() else {
             return Vec::new();
@@ -445,7 +445,7 @@ impl AuthorityStanding {
     ///   asked. A waiting candidate now leads.
     /// - Held by another worker: it asks again once that fence has run out.
     /// - The epoch is missing (the authority lost its data): a leader
-    ///   republishes it (README §15.3) and asks again; a waiting candidate
+    ///   republishes it and asks again; a waiting candidate
     ///   gives up, its swap lost with the data.
     /// - The epoch has moved on: the shard was recovered without it. A
     ///   leader steps down, and a waiting candidate gives up; either

@@ -3,12 +3,12 @@
 //! Both records are the generated wire messages, not a second domain type, so
 //! there is nothing to keep in sync with the schema. This module adds the
 //! parts a message cannot express: minting IDs and timestamps, and refusing
-//! any state change the transition table (README §4.4) does not allow.
+//! any state change the transition table does not allow.
 //!
 //! The message fields are public, so the types do not stop code from writing
 //! `run.state` directly or editing a submitted Task. `transition_to` is the
-//! only sanctioned way to change a run's state, and Task immutability (README
-//! §25.1.1) holds because the owner of the records, the scheduler, hands out
+//! only sanctioned way to change a run's state, and Task immutability
+//! holds because the owner of the records, the scheduler, hands out
 //! only shared references and clones.
 
 use crate::protocol::generated;

@@ -239,7 +239,7 @@ where
         }
 
         // A fenced node that found its shard recovered without it went back
-        // to `Bootstrapping` to join again (ADR-0001 decision 12). Only a
+        // to `Bootstrapping` to join again. Only a
         // node with an authority fences itself, and that authority lists
         // whom to ask.
         match authority.as_mut() {

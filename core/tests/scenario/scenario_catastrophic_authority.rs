@@ -1,5 +1,4 @@
-//! Catastrophic-authority scenarios (README §15, §26.3, ADR-0001 decisions
-//! 11 and 12) on the `Cluster` harness, with every node configured with the
+//! Catastrophic-authority scenarios on the `Cluster` harness, with every node configured with the
 //! shared authority (see `Cluster::bootstrap_with_authority`): workers that
 //! lose the authority orphan themselves, a leaderless remnant that still
 //! reaches it recovers the shard through the authority path, and an
@@ -612,7 +611,7 @@ fn an_orphan_rejoins_as_pending_and_a_straggler_finds_the_recovered_leader_by_re
             .node(&new_leader)
             .configuration()
             .is_some_and(|configuration| configuration.is_voter(orphan_admission)),
-        "then a batch admitted it (ADR-0001 decision 9): {orphan_admission:?}"
+        "then a batch admitted it: {orphan_admission:?}"
     );
     assert_eq!(
         cluster.node(&orphan).known_leader().map(|(id, _)| id),

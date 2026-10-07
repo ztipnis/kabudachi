@@ -1,4 +1,4 @@
-//! Interface tests for `configuration` (ADR-0001 decisions 1, 2 and 7 to 10):
+//! Interface tests for `configuration`:
 //! generation identity, the voter test, the quorum tally and the leader's
 //! roster.
 
@@ -550,9 +550,9 @@ fn removing_a_member_that_is_no_voter_changes_no_count() {
 }
 
 /// During a founding or a batch, a removal re-announces the joint
-/// configuration at the next generation with shrunk counts (ADR-0001
-/// decision 10): the new side counts the members left on it, re-admitted
-/// there, and the old side one fewer when it counted the departing worker.
+/// configuration at the next generation with shrunk counts: the new side
+/// counts the members left on it, re-admitted there, and the old side one
+/// fewer when it counted the departing worker.
 #[test]
 fn removing_a_voter_from_a_joint_configuration_re_announces_it_with_shrunk_counts() {
     let g0 = generation(0, 0, 0);
@@ -588,7 +588,7 @@ fn removing_a_voter_from_a_joint_configuration_re_announces_it_with_shrunk_count
 }
 
 /// A removal that empties the old side of a joint configuration collapses
-/// it to its new side alone (E4c-R3b): an empty side can never supply a
+/// it to its new side alone: an empty side can never supply a
 /// majority, so keeping it would stall every quorum.
 #[test]
 fn a_removal_that_empties_the_old_side_collapses_the_joint_configuration() {
@@ -766,7 +766,7 @@ fn an_election_under_a_single_configuration_founds_a_joint_one_admitting_every_r
 /// winner's term, with the same old side, and re-bases its new side there:
 /// the respondents the new side counted are re-admitted at the new
 /// generation, and the new side counts exactly them, and every respondent
-/// keeps the prior admission it answered with (E4c-R3a: a new-side voter
+/// keeps the prior admission it answered with (a new-side voter
 /// that did not answer is no voter of the re-stamp, so counting it would
 /// leave a phantom voter no one can ever supply).
 #[test]
@@ -933,10 +933,9 @@ fn a_leader_of_a_later_term_commits_at_a_generation_of_its_own_term() {
     assert_eq!(roster.configuration().generation(), generation(0, 3, 2));
 }
 
-/// A commit announces as many voters as it re-admits on the new side
-/// (E4c-R3a, the phantom-N fix), whatever count the joint configuration
-/// carried: a new-side voter the leader holds no member for can never
-/// confirm anything.
+/// A commit announces as many voters as it re-admits on the new side, whatever
+/// count the joint configuration carried: a new-side voter the leader holds no
+/// member for can never confirm anything.
 #[test]
 fn a_commit_counts_the_members_it_re_admits() {
     let (g0, founded) = (generation(0, 0, 0), generation(0, 1, 1));
@@ -969,7 +968,7 @@ fn a_commit_counts_the_members_it_re_admits() {
     );
 }
 
-// ---- Admission batches (ADR-0001 decision 9) ----
+// ---- Admission batches ----
 
 /// A batch admits only workers its configuration does not already count:
 /// pending joiners, and members that hold an admission no longer counted
@@ -1007,7 +1006,7 @@ fn a_batch_admits_only_pending_joiners_and_members_that_are_no_voters() {
 
 /// A worker once taken out is never held as pending again: a heartbeat of
 /// a departed worker still in flight must not bring it back into a batch.
-/// Each process start is a fresh identity (E4c-R2), so a departed one never
+/// Each process start is a fresh identity, so a departed one never
 /// returns under the same `WorkerId`.
 #[test]
 fn a_removed_worker_is_never_held_as_pending_again() {
@@ -1022,8 +1021,8 @@ fn a_removed_worker_is_never_held_as_pending_again() {
     assert!(!roster.is_pending(&worker("joiner")));
 }
 
-// ---- Removals applied together (ADR-0001 decision 10: every pending
-// SELF_REMOVE in the next generation) ----
+// ---- Removals applied together (every pending SELF_REMOVE lands in the
+// next generation) ----
 
 #[test]
 fn removals_applied_together_during_a_founding_shrink_each_side_once() {
@@ -1079,8 +1078,7 @@ fn removals_applied_together_change_the_configuration_if_any_counted() {
 }
 
 /// A worker on a joint configuration's new side that missed its commit is
-/// admitted at the commit's generation (ADR-0001 decision 4 as amended
-/// 2026-09-28); nothing else is taken for a commit.
+/// admitted at the commit's generation; nothing else is taken for a commit.
 #[test]
 fn only_a_joint_configurations_own_commit_admits_a_member_of_its_new_side() {
     let joint = Configuration::joint(Joint {

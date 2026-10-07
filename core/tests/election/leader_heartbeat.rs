@@ -1,9 +1,9 @@
-//! A leader's half of leader liveness (README §12.1, ADR-0001 decision 16):
+//! A leader's half of leader liveness:
 //! the ack it sends in answer to each follower heartbeat, the ack
 //! confirmations those heartbeats echo back, and the quorum-contact lease it
 //! computes from them, which decides when it goes `NoQuorum` and what
 //! leadership grant it reports to its driver; and the workers it reports
-//! lost once they fall silent (README §8.3), whose runs its scheduler
+//! lost once they fall silent, whose runs its scheduler
 //! replays.
 //!
 //! Kept apart from `heartbeat.rs` because these tests need a real
@@ -698,8 +698,8 @@ fn losing_a_majority_confirmation_to_a_removal_withdraws_the_grant() {
         "setup invariant"
     );
 
-    // The removal takes effect with the leader's next announcement (ADR-0001
-    // decision 10: every pending SELF_REMOVE in the next generation), here
+    // The removal takes effect with the leader's next announcement (every
+    // pending SELF_REMOVE lands in the next generation), here
     // the ack answering `staying`'s next heartbeat; until then `leaving`'s
     // confirmation still stands.
     let accepted = deliver(
@@ -1066,7 +1066,7 @@ fn a_follower_silent_past_suspicion_and_reconnect_timeouts_is_lost_and_its_runs_
         "the lost run's task is queued again for its replay"
     );
 
-    // README §8.3: the cut-off worker aborts its runs before the leader
+    // The cut-off worker aborts its runs before the leader
     // replays them, and a worker that keeps hearing its leader is never told
     // to abort.
     let steps = cluster.take_steps();

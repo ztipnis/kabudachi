@@ -1,4 +1,4 @@
-//! The authority path (ADR-0001 decision 11): what a node with a
+//! The authority path: what a node with a
 //! coordination authority does once a roll call of its own has closed
 //! without its returning quorum.
 //!

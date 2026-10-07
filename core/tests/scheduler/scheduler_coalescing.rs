@@ -1,6 +1,6 @@
 //! Coalescing: a newer pending generation of a key supersedes the older one,
 //! a running generation is never touched, and only one generation of a key
-//! runs at a time (README §3.2.1, §25.4.1-3).
+//! runs at a time.
 
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};

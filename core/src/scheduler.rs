@@ -1,5 +1,5 @@
 //! The scheduler: it holds every Task and TaskRun and is the single authority
-//! on who may run what (README §8.2, §8.5).
+//! on who may run what.
 //!
 //! It only reacts to calls and never waits, sleeps or does I/O, so the runtime
 //! drives it and a test can drive it with a fake clock. It accepts claims and
@@ -16,7 +16,7 @@
 //!
 //! Tasks and runs are stored privately and handed out only as shared
 //! references or clones, so nothing outside can edit a submitted Task or move
-//! a run without going through the transition table (README §25.1.1).
+//! a run without going through the transition table.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,7 +65,7 @@ const CLAIM_OVERHEAD_BYTES: u64 = 4 * 1024;
 ///
 /// It does not bound a coalescing task's retained chain, which a claim also
 /// carries: many small superseded payloads can still add up past a frame.
-/// Bounding that is chain compaction, which stays Phase 3 (README §3.2.1); a
+/// Bounding that is chain compaction, which is not implemented yet; a
 /// claim that has outgrown a frame is passed over by the leader's batch
 /// claim until then.
 pub const MAX_SUBMISSION_BYTES: u64 = MAX_CLAIM_FRAME_BYTES - CLAIM_OVERHEAD_BYTES;
@@ -136,7 +136,7 @@ impl Submission {
         }
     }
 
-    /// The task is ephemeral (README §3.2.2): a run lost with its worker
+    /// The task is ephemeral: a run lost with its worker
     /// becomes `Lost` and the task is over.
     pub fn ephemeral(mut self) -> Self {
         self.ephemeral = true;
@@ -191,14 +191,13 @@ pub struct Claim {
     /// Which attempt this run is: 1 for the first, then one more per retry.
     pub attempt_number: u32,
     /// The serialized inputs of the generations this one superseded, oldest
-    /// first, for the worker to fold before running the task (README §3.2.1).
+    /// first, for the worker to fold before running the task.
     /// Empty unless the task is a coalescing one that absorbed others.
     pub chain: Vec<Vec<u8>>,
 }
 
 /// The leader's word that a run's result is the authoritative one. Until a
-/// client holds this, result bytes it received are only provisional (README
-/// §8.5).
+/// client holds this, result bytes it received are only provisional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Certification {
     pub task_id: TaskId,
@@ -302,7 +301,7 @@ pub enum Completion {
     /// The task is over: its coalescing key is freed, its payload stops
     /// counting, and it is forgotten `result_ttl` later.
     Final,
-    /// The result is a continuation (an implicit flow, README §3.4): the run
+    /// The result is a continuation (an implicit flow): the run
     /// is certified, but the task holds its key and its memory until
     /// [`Scheduler::end_continuation`].
     Continues,
@@ -489,7 +488,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Records a new Task and queues its first run. Every call is a new Task
-    /// (submission is not idempotent, README §2.3). Submitting decides
+    /// (submission is not idempotent). Submitting decides
     /// nothing, so it does not require leadership; only claims and reports do.
     pub fn submit(&mut self, submission: Submission) -> Result<TaskId, SubmitRejection> {
         let outcome = self.record_submission(submission);
@@ -953,13 +952,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         Ok(Cancellation::Cancelled { was_running })
     }
 
-    /// `worker` is lost, its reconnect timeout having passed (README §8.3): every
+    /// `worker` is lost, its reconnect timeout having passed: every
     /// run it held, claimed or running, becomes `Lost` and nothing it reports
     /// afterwards counts. Each is replayed by a new queued attempt, which is
     /// at-least-once and does not use up a retry (a loss is not a failure), except a coalescing
     /// generation that a newer one is waiting behind: that one stays lost and
-    /// its payload is not folded into the newer one (README §3.2.1). Two kinds
-    /// are not replayed (README §3.2.2): an ephemeral task's run stays `Lost`,
+    /// its payload is not folded into the newer one. Two kinds
+    /// are not replayed: an ephemeral task's run stays `Lost`,
     /// and the running run of a non-retriable task becomes `Orphaned`, since
     /// its effects may have happened. A non-retriable task's claimed run never
     /// started, so it is replayed. Either way the task is over. Only a leader
@@ -1277,8 +1276,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .ok_or(ReportRejection::UnknownRun)?;
         let owned = run.selected_worker().as_ref() == Some(worker);
         // A run replaced by a retry or a replay is `Failed` or `Lost`, which no
-        // report expects, so ownership and state are enough (README §25.1.4,
-        // §25.1.6).
+        // report expects, so ownership and state are enough.
         if !owned || run.current_state() != expected {
             return Err(ReportRejection::NotAuthoritative);
         }

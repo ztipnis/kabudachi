@@ -825,19 +825,18 @@ impl Cluster {
         self.clock.advance(dt);
     }
 
-    /// Crashes the node under `id` and starts its process again, returning
-    /// the new node's `WorkerId`. A `WorkerId` names one process incarnation
-    /// (ADR-0001, amended 2026-09-27), so the restarted process comes back
-    /// under a fresh one, `id` with a restart count appended, as a pending
-    /// member seeded with the original configuration and no admission. The
-    /// old `id` leaves the cluster: every peer that reached it is told its
-    /// connection closed, and nothing is delivered to it any more (see
-    /// `run_pass`). The new node starts `Active` with a fresh scheduler, is
-    /// wired into the shared clock and network at once, connected to the
-    /// peers the network lets it reach, and, in a cluster whose nodes have
-    /// an authority, to the authority through the old node's handle (so any
-    /// fault set on it still applies). A stall of the old node ends with it,
-    /// dropping what was held. Panics on an unknown ID.
+    /// Crashes the node under `id` and starts its process again, returning the
+    /// new node's `WorkerId`. A `WorkerId` names one process incarnation, so
+    /// the restarted process comes back under a fresh one, `id` with a restart
+    /// count appended, as a pending member seeded with the original
+    /// configuration and no admission. The old `id` leaves the cluster: every
+    /// peer that reached it is told its connection closed, and nothing is
+    /// delivered to it any more (see `run_pass`). The new node starts `Active`
+    /// with a fresh scheduler, is wired into the shared clock and network at
+    /// once, connected to the peers the network lets it reach, and, in a
+    /// cluster whose nodes have an authority, to the authority through the old
+    /// node's handle (so any fault set on it still applies). A stall of the
+    /// old node ends with it, dropping what was held. Panics on an unknown ID.
     pub fn restart_node(&mut self, id: &WorkerId) -> WorkerId {
         if !self.nodes.contains_key(id) {
             unknown_node("restart_node", id);

@@ -1,4 +1,4 @@
-//! The initiator's side of a vote (ADR-0001 decisions 6 and 7): once its
+//! The initiator's side of a vote: once its
 //! roll call stands it as the candidate, the initiator asks the call's
 //! respondents for their votes and counts the grants.
 //!
@@ -79,7 +79,7 @@ impl VoteRound {
         }
     }
 
-    /// Whether the candidate has won (ADR-0001 decision 7): the returning
+    /// Whether the candidate has won: the returning
     /// voters among the granting workers are a quorum of the roll call's
     /// configuration, on both sides of a joint one, and the granting
     /// workers, new voters included, are a majority of every respondent so

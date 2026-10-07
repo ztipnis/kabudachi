@@ -94,7 +94,7 @@ class TaskHandle:
     def callback(self, function: Callable[[Any], Any]) -> "TaskHandle":
         """Calls `function` with the task's result once the leader has
         certified it, and returns this handle. Callbacks are for reactions
-        that may be lost, like metrics or a notification (README §3.7): one
+        that may be lost, like metrics or a notification: one
         runs only for a task that succeeded, is held by the run even if this
         handle is dropped, and is lost if the run ends first. `function` may
         be async; a synchronous one runs off the event loop, so it may block.

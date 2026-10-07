@@ -1,5 +1,5 @@
-//! Bootstraps a fresh `core::election::WorkerNode` into its shard (README
-//! §27 Phase 2): the worker joins the shard that already exists, or founds
+//! Bootstraps a fresh `core::election::WorkerNode` into its shard: the
+//! worker joins the shard that already exists, or founds
 //! it when nothing shows that one exists. [`bootstrap`] runs this cascade
 //! in rounds, `retry_interval` apart, until a round ends it:
 //!
@@ -74,14 +74,13 @@
 //! "no epoch at all": re-found the shard one epoch on, of a new lineage
 //! (`compare_and_swap_recovery_epoch(Some(e), e + 1)`) rather than wait
 //! forever for workers that are never coming back — the authority still lets
-//! only one bootstrapper win, and any worker still holding the fence from
-//! the epoch being replaced (impossible by the argument above, but the
-//! authority does not need to know that) makes the new leader wait it out
-//! before it can act, exactly as an ordinary recovery does (ADR-0001 decision
-//! 11.4). This also resolves the ambiguous create-if-absent whose own reply
-//! was lost: the epoch sits with only the worker's own registration, which
-//! it does not count, and the next warm round re-founds it instead of
-//! waiting on it forever.
+//! only one bootstrapper win, and any worker still holding the fence from the
+//! epoch being replaced (impossible by the argument above, but the authority
+//! does not need to know that) makes the new leader wait it out before it can
+//! act, exactly as an ordinary recovery does. This also resolves the ambiguous
+//! create-if-absent whose own reply was lost: the epoch sits with only the
+//! worker's own registration, which it does not count, and the next warm round
+//! re-founds it instead of waiting on it forever.
 //!
 //! The live registrations are read again after the create-if-absent finds
 //! an epoch, because the first read may predate a worker that registered and

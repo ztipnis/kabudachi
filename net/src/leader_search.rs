@@ -210,8 +210,8 @@ pub(crate) fn others_listed(
         .collect()
 }
 
-/// A node back in `Bootstrapping`, rejoining its shard through the driver
-/// (ADR-0001 decision 12). It never founds: nothing here can register or
+/// A node back in `Bootstrapping`, rejoining its shard through the driver.
+/// It never founds: nothing here can register or
 /// swap an epoch. Each round reads the authority's listing through the
 /// driver's client, under the client's `Issuer::Cascade` mint, bounded by one
 /// retry interval, then asks the listed workers through the port. Rounds are

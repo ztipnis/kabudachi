@@ -1,5 +1,4 @@
-//! A node's standing with its coordination authority (design 3.3, ADR-0001
-//! decisions 11 and 12): when it renews its registration, when it must
+//! A node's standing with its coordination authority: when it renews its registration, when it must
 //! fence itself for having failed to, and, while it leads, when it renews
 //! its recovery fence and until when that fence lets it act.
 //!
@@ -10,7 +9,7 @@
 //! taken off so the node gives up first even if its clock runs a little
 //! slower than the authority's.
 //!
-//! A node with no authority has no lease at all (design 3.2): it never
+//! A node with no authority has no lease at all: it never
 //! registers, never fences itself and never needs a fence to lead.
 
 use crate::coordination_authority::RecoveryEpoch;
@@ -157,7 +156,7 @@ impl AuthorityLease {
 }
 
 /// What a fenced node does once it can reach its authority again and has
-/// read the shard's recovery epoch (ADR-0001 decision 12).
+/// read the shard's recovery epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reconnect {
     /// The epoch is exactly the node's own, lineage included: the outage

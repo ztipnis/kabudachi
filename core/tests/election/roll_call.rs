@@ -1,4 +1,4 @@
-//! The roll call (ADR-0001 decisions 3 to 6), from both sides: the
+//! The roll call, from both sides: the
 //! initiator that publishes it and collects replies until its deadline,
 //! when a returning quorum makes it the candidate, and the workers that
 //! answer it, pass over a repeat of it, or refuse it and say why.
@@ -1029,7 +1029,7 @@ fn voter_at_epoch_1(clock: &FakeClock, me: &WorkerId, voters: usize) -> TestNode
     .0
 }
 
-// ADR-0001 decision 4, amended 2026-09-29: a refusal from a lower recovery
+// A refusal from a lower recovery
 // epoch counts that epoch's terms, which order nothing here.
 #[test]
 fn a_refusal_from_a_lower_recovery_epoch_is_dropped() {
@@ -1108,7 +1108,7 @@ fn refusal_at(
     refusal
 }
 
-// ADR-0001 decision 4, amended 2026-09-29, and L6: a refusal names its
+// A refusal names its
 // refuser's epoch and lineage itself, so one without a configuration is
 // placed too.
 #[test]
@@ -1131,7 +1131,7 @@ fn a_refusal_from_a_lower_epoch_is_dropped_even_without_a_configuration() {
     assert_eq!(node.state(), WorkerState::RollCall);
 }
 
-// L6: another lineage's epoch is another shard's, so its terms and
+// Another lineage's epoch is another shard's, so its terms and
 // configuration mean nothing here even when its number is this node's own.
 #[test]
 fn a_refusal_from_another_lineage_at_this_nodes_epoch_number_is_dropped() {
@@ -1161,7 +1161,7 @@ fn a_refusal_from_another_lineage_at_this_nodes_epoch_number_is_dropped() {
     assert!(sent_to(&outputs, &their_leader).is_empty());
 }
 
-// L6, with E13-U1: a higher-numbered epoch of another lineage is taken on by
+// A higher-numbered epoch of another lineage is taken on by
 // the leader's ack, as `on_leader_ack` does, so a refusal from it only names
 // that leader: no term is raised.
 #[test]
@@ -1195,8 +1195,8 @@ fn a_refusal_from_a_higher_numbered_foreign_epoch_names_its_leader_and_raises_no
     );
 }
 
-// Residual of the 2026-09-29 ruling: a refusal that names no epoch (its
-// rejecter has joined no shard) is still read as this node's own.
+// A refusal that names no epoch (its rejecter has joined no shard) is still
+// read as this node's own.
 #[test]
 fn a_refusal_naming_no_epoch_is_read_as_the_nodes_own() {
     let clock = FakeClock::new();

@@ -2,7 +2,7 @@
 
 Only the sequencing lives here: each stage is an ordinary task submitted when
 its predecessor has finished, so retries, timeouts and queues stay per stage
-and nothing is inherited between stages (README §3.4).
+and nothing is inherited between stages.
 """
 
 from typing import Any
@@ -242,7 +242,7 @@ class Group:
 
 class MapStep:
     """A task run on every item of a list, as a group of independent tasks
-    whose results keep the order of the items (README §3.4). Called with the
+    whose results keep the order of the items. Called with the
     list, or used as a flow stage that takes the prior stage's list."""
 
     is_step = True

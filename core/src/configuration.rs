@@ -1,4 +1,4 @@
-//! A shard's voter configuration (ADR-0001 decisions 1, 2 and 7 to 10): which
+//! A shard's voter configuration: which
 //! workers count toward a quorum, and whether a given set of them reaches one.
 //!
 //! Followers never hold the member list. A follower knows its configuration
@@ -12,20 +12,19 @@
 //! admission batch moves to (the new side), together with the one it moves
 //! from (the old side), each with its own voter count. Every quorum of a
 //! joint configuration needs a majority of both sides, so it shares a
-//! majority with every quorum of either (ADR-0001 decisions 2, 8 and 9). An
+//! majority with every quorum of either. An
 //! election founds a joint configuration (see [`Roster::after_election`]),
 //! and its leader commits it to the new side alone once a majority of each
 //! side holds it (see [`Roster::commit_if_confirmed`]).
 //!
 //! Every change a leader makes (founding a joint configuration, re-stamping
 //! one at its own term, committing it, removing a voter) moves the
-//! configuration to a generation of the leader's term, re-bases it there,
-//! and re-admits there every member it counts on the new side (ADR-0001
-//! decision 8, amended 2026-09-26). So the range from base to generation is
-//! one generation, which only that term's one leader mints, and never takes
-//! in a worker a rival election admitted. The cost: a member that misses
-//! the ack carrying its re-admission is no voter of the change until a
-//! later ack repairs it.
+//! configuration to a generation of the leader's term, re-bases it there, and
+//! re-admits there every member it counts on the new side. So the range from
+//! base to generation is one generation, which only that term's one leader
+//! mints, and never takes in a worker a rival election admitted. The cost: a
+//! member that misses the ack carrying its re-admission is no voter of the
+//! change until a later ack repairs it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -113,7 +112,7 @@ impl Generation {
 
     /// The generation of the next change a leader elected in `leader_term`
     /// announces after this one: the same recovery epoch, the announcing
-    /// leader's term, and the counter one higher (ADR-0001 decision 1: every
+    /// leader's term, and the counter one higher (every
     /// change a leader announces carries the term it was elected in). So two
     /// leaders of different terms that each change the same configuration
     /// announce distinct generations, the later term's ordered after the
@@ -400,8 +399,7 @@ impl Configuration {
     /// one at its next generation (a commit, or a removal that empties the
     /// old side) re-admits there every member its new side counted, except
     /// one that removal takes out, which has stopped. So a new-side member
-    /// that missed that change is admitted at its generation (ADR-0001
-    /// decision 4 as amended 2026-09-28). `None` otherwise: this
+    /// that missed that change is admitted at its generation. `None` otherwise: this
     /// configuration is single, `committed` is not its commit, or the worker
     /// is not on its new side.
     pub fn admission_after_commit(
@@ -638,8 +636,7 @@ impl Counted {
 /// configuration generation each member last said it holds, and the
 /// workers it has taken out.
 ///
-/// A `WorkerId` names one process incarnation (ADR-0001, amended
-/// 2026-09-27): a restarted worker
+/// A `WorkerId` names one process incarnation: a restarted worker
 /// comes back under a new one, as a pending joiner, and the old one only
 /// ever leaves. So a worker once taken out is never held again.
 #[derive(Debug, Clone)]
@@ -673,8 +670,7 @@ impl Roster {
 
     /// The roster of the winner of the election for `term`, at
     /// `recovery_epoch`, whose roll call ran under `roll_call_configuration`
-    /// and drew `respondents`, each with the admission it answered with
-    /// (ADR-0001 decision 8).
+    /// and drew `respondents`, each with the admission it answered with.
     ///
     /// Under a single configuration C0, the respondents found the next one:
     /// a joint configuration whose new side is the respondents, every one
@@ -688,10 +684,9 @@ impl Roster {
     /// Under a joint configuration, which no majority of each side has
     /// committed yet, the election founds nothing new: its winner re-stamps
     /// that configuration at g′, a generation of its own term, with the same
-    /// old side, and re-bases the new side there (ADR-0001 decision 8,
-    /// amended 2026-09-26). Each respondent the new side counted, by the
+    /// old side, and re-bases the new side there. Each respondent the new side counted, by the
     /// admission it answered with, is re-admitted at g′, and the new side
-    /// counts exactly those (ADR-0001 decision 8, amended 2026-09-27): a
+    /// counts exactly those: a
     /// new-side voter that did not answer
     /// holds no admission at g′, so counting it would leave a phantom voter
     /// no quorum could ever include. Every other respondent is a member at
@@ -861,12 +856,11 @@ impl Roster {
 
     /// Commits a joint configuration once `leader` and the members that said
     /// they hold exactly its generation are a quorum of it: a majority of
-    /// each side (ADR-0001 decisions 8 and 9, amended 2026-09-26). The
+    /// each side. The
     /// configuration becomes its new side alone at the next generation
     /// `leader`, elected in `leader_term`, announces, re-based there: every
     /// member the new side counted is re-admitted at it, the committed
-    /// configuration counts exactly those (ADR-0001 decision 8, amended
-    /// 2026-09-27), and prior admissions
+    /// configuration counts exactly those, and prior admissions
     /// are dropped.
     /// Returns whether it committed. A single configuration has nothing to
     /// commit.
@@ -946,7 +940,7 @@ impl Roster {
             })
     }
 
-    /// Starts an admission batch (ADR-0001 decision 9) admitting those of
+    /// Starts an admission batch admitting those of
     /// `joiners` that are admissible (see [`Roster::is_admissible`]), as
     /// the leader elected in `leader_term` announces it. Returns whether it
     /// started one.
@@ -1018,21 +1012,19 @@ impl Roster {
         &self.pending
     }
 
-    /// Takes the departing `workers` out together (ADR-0001 decision 10:
-    /// every pending SELF_REMOVE in the next generation), as the leader
+    /// Takes the departing `workers` out together (every pending
+    /// SELF_REMOVE in the next generation), as the leader
     /// elected in `leader_term` announces it, with no commit round.
     ///
     /// If any of them is a voter here, on either side of a joint
     /// configuration, the configuration moves once, to the next generation
     /// that leader announces (see [`Generation::next_change`]), re-based
     /// there: every member left on the new side is re-admitted at it, and
-    /// the new side counts exactly those (ADR-0001 decision 8, amended
-    /// 2026-09-27). A joint configuration keeps its old side, less the
-    /// departing workers it counted: a batch or founding in flight is
-    /// re-announced with shrunk counts. When that empties the old side, the
-    /// joint configuration collapses to its new side alone (ADR-0001
-    /// decision 10, amended 2026-09-27): an empty side could never supply a
-    /// majority, so every quorum would stall.
+    /// the new side counts exactly those. A joint configuration keeps its
+    /// old side, less the departing workers it counted: a batch or founding
+    /// in flight is re-announced with shrunk counts. When that empties the
+    /// old side, the joint configuration collapses to its new side alone: an
+    /// empty side could never supply a majority, so every quorum would stall.
     ///
     /// A member that is no voter, or a pending joiner, is only forgotten. A
     /// worker the roster does not hold changes nothing, so a repeated
@@ -1041,8 +1033,10 @@ impl Roster {
     /// Whoever is taken out is never held again (see
     /// [`Roster::add_pending`]).
     ///
-    /// Which removals a leader may apply at all is the caller's to judge:
-    /// see ADR-0001 decision 10's term guard (amended 2026-09-27).
+    /// Which removals a leader may apply at all is the caller's to judge: the
+    /// leader refuses a removal from a worker that has seen a later term than
+    /// its own (see `WorkerNode`'s handling of `SelfRemove`), so such a
+    /// worker never reaches here.
     ///
     /// # Panics
     ///

@@ -1,4 +1,4 @@
-//! What a win does, from the respondents' side (ADR-0001 decision 8): a
+//! What a win does, from the respondents' side: a
 //! respondent that accepts the winner's election certificate adopts the
 //! joint configuration its roll call founded, admitted at its generation
 //! with the admission it answered with kept as its prior one; the leader's

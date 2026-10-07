@@ -11,11 +11,10 @@ pub trait Clock {
 
     /// Milliseconds since the Unix epoch, read from the wall clock.
     ///
-    /// This is used only to break ties between competing roll calls
-    /// (ADR-0001 decision 5). Unlike `now()`, it is not monotonic: the
-    /// system clock it reads from can jump backwards or forwards (an NTP
-    /// sync, a manual correction), so it must never be used to measure
-    /// elapsed time or drive a timeout.
+    /// This is used only to break ties between competing roll calls. Unlike
+    /// `now()`, it is not monotonic: the system clock it reads from can jump
+    /// backwards or forwards (an NTP sync, a manual correction), so it must
+    /// never be used to measure elapsed time or drive a timeout.
     fn wall_clock_millis(&self) -> u64;
 }
 

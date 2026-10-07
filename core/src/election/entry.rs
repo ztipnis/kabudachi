@@ -23,13 +23,13 @@ pub struct Identity {
 /// How a node enters its shard. The bootstrap cascade ends by choosing one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
-    /// Found a new shard as its only member, at `recovery_epoch` (ADR-0001
-    /// decision 1): the node starts `Active` as the only voter of the
-    /// genesis configuration, admitted at the genesis generation, and leads
-    /// once its suspicion timeout has passed and its own roll call, of one
-    /// voter, has elected it. The epoch's lineage is the one the founder
-    /// drew (see [`RecoveryEpoch::founding`]), which a node with an
-    /// authority must know to recognise its own epoch there.
+    /// Found a new shard as its only member, at `recovery_epoch`: the node
+    /// starts `Active` as the only voter of the genesis configuration,
+    /// admitted at the genesis generation, and leads once its suspicion
+    /// timeout has passed and its own roll call, of one voter, has elected it.
+    /// The epoch's lineage is the one the founder drew (see
+    /// [`RecoveryEpoch::founding`]), which a node with an authority must know
+    /// to recognise its own epoch there.
     ///
     /// `registered_at` is when the founder asked the authority to register
     /// it, before it took ownership of the shard; `None` with no authority.

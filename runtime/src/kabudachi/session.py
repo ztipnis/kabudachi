@@ -5,7 +5,7 @@ A result travels in two steps. The worker hands the client its bytes, which
 are only provisional, and separately asks the leader to certify them by their
 digest. The handle is settled when the leader's certification arrives and
 matches the bytes the client holds; a result the leader refuses is never
-delivered (README §8.5).
+delivered.
 """
 
 import asyncio
@@ -329,7 +329,7 @@ class Session:
     def _continue(self, claim: Any, run: Run, step: Any) -> None:
         """The task returned `step`: certify the run, by the digest of the step,
         and only then start the step as the task's continuation, so a run the
-        leader does not certify leaves no continuation behind (README §3.4).
+        leader does not certify leaves no continuation behind.
         The task is over, and its handle settled, when the continuation is."""
         if not getattr(step, "is_step", False):
             raise TaskDefinitionError(
@@ -367,7 +367,7 @@ class Session:
     @staticmethod
     def _fold(definition: TaskDefinition, serializer: Any, claim: Any) -> Any:
         """The input of the task: its own payload, folded onto the payloads of
-        the generations it superseded, oldest first (README §3.2.1). Runs
+        the generations it superseded, oldest first. Runs
         here, on the worker, because the leader never runs user code."""
         payloads = [*claim.chain, claim.serialized_input]
         values = [serializer.decode(payload, definition.input_type) for payload in payloads]

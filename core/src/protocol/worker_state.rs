@@ -1,6 +1,6 @@
-//! Domain `WorkerState` and its transition table (README §10.2, plus
-//! ADR-0001's step-down, deadline, `NoQuorum` exit, authority-path and
-//! orphaning edges). No message carries a worker's state.
+//! Domain `WorkerState` and its transition table, including the
+//! step-down, deadline, `NoQuorum` exit, authority-path and orphaning
+//! edges. No message carries a worker's state.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkerState {
@@ -42,21 +42,21 @@ impl WorkerState {
 
     /// Whether `self -> next` is a legal edge.
     ///
-    /// Beyond the README's sketch, `LeaderSuspect -> Active` lets an ack
+    /// `LeaderSuspect -> Active` lets an ack
     /// from the leader end a suspicion before any roll call starts: a
     /// pending member, which starts none, has no other way back. A node that
-    /// holds or contests a term steps down once it sees a later one
-    /// (ADR-0001 decision 14): from `RollCall`, `Candidate` or `Leader`, to
+    /// holds or contests a term steps down once it sees a later one:
+    /// from `RollCall`, `Candidate` or `Leader`, to
     /// `Active` under that term's leader or to `LeaderSuspect` to contest
     /// again. `LeaderReconciling` has no such edge: a winner passes through
     /// it to `Leader` in one step, so no input ever finds a node there. A
     /// roll call or a vote that misses its deadline leaves `RollCall` or
     /// `Candidate` for `LeaderSuspect` too, or, short of a quorum, `RollCall`
-    /// for `NoQuorum` (ADR-0001 decisions 13 and 15). A `NoQuorum` node
+    /// for `NoQuorum`. A `NoQuorum` node
     /// leaves by a roll call of its own (`-> RollCall`) or by an ack from a
     /// leader (`-> Active`).
     ///
-    /// With a coordination authority (ADR-0001 decisions 11 and 12): a
+    /// With a coordination authority: a
     /// `NoQuorum` node whose authority path swaps the recovery epoch stands
     /// (`-> Candidate`) while it waits out the recovery fence, and goes back
     /// (`Candidate -> NoQuorum`) if the fence is refused for good; one that

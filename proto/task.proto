@@ -49,7 +49,7 @@ message Task {
   // generations supersede each other. The default key is the empty string.
   optional string coalescing_key = 10;
   // An ephemeral task's run that is lost with its worker is LOST and never
-  // replayed (README §3.2.2).
+  // replayed.
   bool ephemeral = 11;
   // A non-retriable task's run that was running when its worker was lost is
   // ORPHANED and never replayed, because its effects may have happened.

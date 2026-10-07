@@ -1,7 +1,7 @@
 # Merges the compiled //bindings:_native extension (a separate Bazel
 # package/sys.path root) into this package as `kabudachi._native`.
-# Bazel dev/test-layout glue only — see README §23.15 ("Packaging:
-# maturin") for the real packaging story and why this may not be needed.
+# Bazel dev/test-layout glue only: it exists because Bazel puts the extension
+# in a separate package root, and a normally built wheel may not need it.
 from pkgutil import extend_path
 
 __path__ = extend_path(__path__, __name__)

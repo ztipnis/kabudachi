@@ -38,8 +38,7 @@ macro_rules! id_newtype {
 id_newtype!(
     /// Identifies a worker: one process incarnation participating in the
     /// cluster. A restarted process comes back under a new `WorkerId`, as a
-    /// pending joiner, and the old one only ever leaves (ADR-0001, amended
-    /// 2026-09-27): the
+    /// pending joiner, and the old one only ever leaves: the
     /// election's safety relies on no `WorkerId` voting again in a term it
     /// has already voted in, and a process keeps no record of its votes
     /// across a restart.

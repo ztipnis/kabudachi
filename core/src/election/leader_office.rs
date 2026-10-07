@@ -1,4 +1,4 @@
-//! What a node holds only while it leads (ADR-0001 decisions 8 to 10): the
+//! What a node holds only while it leads: the
 //! roster it leads, the removals it has accepted and not yet applied, and
 //! when it last heard from each worker it has not reported lost.
 //!
@@ -6,7 +6,7 @@
 //! and admissions it leads: the node's own standing takes them back when
 //! leadership ends (see [`LeaderOffice::hand_back`]). Every operation
 //! applies the accepted removals first, so nothing reads or changes the
-//! configuration while a removal waits (ADR-0001 decision 10).
+//! configuration while a removal waits.
 //!
 //! Until a removal is applied the leader counts the departing worker as it
 //! did, its last confirmation included, which can hold its lease a little
@@ -234,8 +234,8 @@ impl LeaderOffice {
     }
 
     /// Takes every worker whose SELF_REMOVE was accepted since the last
-    /// change out of the roster together (ADR-0001 decision 10: every
-    /// pending SELF_REMOVE in the next generation; see [`Roster::remove_all`]):
+    /// change out of the roster together (every pending SELF_REMOVE
+    /// in the next generation; see [`Roster::remove_all`]):
     /// a voter leaves a configuration shrunk at the next generation,
     /// re-based there with every remaining voter re-admitted, the leader
     /// included; during a founding or a batch the joint configuration is
@@ -267,7 +267,7 @@ impl LeaderOffice {
         }
     }
 
-    /// Starts an admission batch (ADR-0001 decision 9, see
+    /// Starts an admission batch (see
     /// [`Roster::begin_batch`]) of every worker waiting to join that has
     /// confirmed one of this leader's acks recently enough to leave it a
     /// lease worth having (see [`Lease::admissible`]): sent within the last

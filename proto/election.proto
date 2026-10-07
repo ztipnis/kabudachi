@@ -159,8 +159,8 @@ message ElectionReject {
   // the reason is LEADER_STILL_VALID and it knows one.
   optional KnownLeader leader = 8;
   // The rejecter's configuration. Absent when it has none. A worker still
-  // on the joint configuration this one directly commits adopts it (ADR-0001
-  // decision 4 as amended 2026-09-28): the commit it missed.
+  // on the joint configuration this one directly commits adopts it: the
+  // commit it missed.
   optional Configuration configuration = 9;
   // The recovery epoch the rejecter stands in and its lineage (see the
   // coordination authority), so the initiator can tell a refusal from a
@@ -205,14 +205,14 @@ message SelfRemove {
   // The highest term the sender has seen (raised by a vote it granted, an
   // ack or certificate it accepted, or a refusal; never by a roll call it
   // answered). A leader applies the removal only when this is no later than
-  // its own term (ADR-0001 decision 10's term guard, amended 2026-09-27).
+  // its own term.
   uint64 term_seen = 5;
   // The term of the leader the sender follows, to which it sends this. A
   // leader applies only a removal addressed to its own term.
   uint64 leader_term = 6;
 }
 
-// The identity of a configuration (ADR-0001 decision 1), compared
+// The identity of a configuration, compared
 // lexicographically in field order.
 message Generation {
   uint64 recovery_epoch = 1;

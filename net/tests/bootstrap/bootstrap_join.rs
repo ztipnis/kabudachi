@@ -113,8 +113,8 @@ async fn three_workers_joined_through_one_seed(
 // leader, registers with the authority at the address it listens on once it
 // is driven, and, through kad's bootstrap after its join connections, comes
 // to know the other two joiners, whose addresses it was never given. The
-// leader then admits every worker that joined it in an admission batch
-// (ADR-0001 decision 9): each becomes a voter. A drained voter then stops.
+// leader then admits every worker that joined it in an admission batch:
+// each becomes a voter. A drained voter then stops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_workers_that_join_through_one_seed_register_and_are_admitted() {
     let authority = warmed_up_authority().await;
