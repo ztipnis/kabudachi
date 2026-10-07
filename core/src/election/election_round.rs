@@ -10,18 +10,19 @@
 //!
 //! What moved and why. The round owns the fields only the election reads
 //! and writes: the ballot, the roll call and vote in progress, when this
-//! node may next start a roll call, and until when answering another's
-//! holds its own back. What it reads of the node, the node hands it as a
-//! [`View`]: its own and its shard's ids, its recovery epoch, the highest
-//! term it has seen, its configuration and its admission generations,
-//! whether its state takes part in elections, whether its leader contact
-//! is fresh, and the roll-call deadline; the time and the wall clock come
-//! as arguments. Every change to the node's own fields becomes a verdict:
-//! its state and term (`Stand`, `SuspectAgain`, `NoQuorum`, `Won`), its
-//! highest term seen (`Grant`), the forced recovery it drops as it calls
-//! (`Publish`) or takes up as its call falls short (`NoQuorum`), and every
-//! message it sends. A refusal names the node's leader, highest term seen
-//! and configuration, which the node attaches as it sends one (`Reject`).
+//! node may next start a roll call, and the roll call of another it answered
+//! that holds its own back until it resolves. What it reads of the node, the
+//! node hands it as a [`View`]: its own and its shard's ids, its recovery
+//! epoch, the highest term it has seen, its configuration and its admission
+//! generations, whether its state takes part in elections, whether its
+//! leader contact is fresh, and the roll-call deadline; the time and the
+//! wall clock come as arguments. Every change to the node's own fields
+//! becomes a verdict: its state and term (`Stand`, `SuspectAgain`,
+//! `NoQuorum`, `Won`), its highest term seen (`Grant`), the forced recovery
+//! it drops as it calls (`Publish`) or takes up as its call falls short
+//! (`NoQuorum`), and every message it sends. A refusal names the node's
+//! leader, highest term seen and configuration, which the node attaches as
+//! it sends one (`Reject`).
 
 mod ballot;
 mod roll_call;
@@ -119,6 +120,29 @@ pub(crate) enum Verdict {
     SuspectAgain,
 }
 
+/// A roll call of another worker that this node answered, and until when it
+/// holds this node's own roll calls back if nothing resolves it first.
+#[derive(Debug, Clone)]
+struct AnsweredCall {
+    /// When the first answer of the hold episode this belongs to was made.
+    episode_start: Instant,
+    release_at: Instant,
+    /// Whether this answer's window reached the episode's end. Once such a
+    /// hold has run out the node is owed a call: see
+    /// [`Self::is_owed_a_call`].
+    capped: bool,
+}
+
+impl AnsweredCall {
+    /// Whether this hold ended at or, by the minimum, just past its episode's
+    /// cap by `now` and the node has not called since: until it does, answers
+    /// no longer hold it, so that callers retrying in step with the episode
+    /// cannot starve it.
+    fn is_owed_a_call(&self, now: Instant) -> bool {
+        self.capped && self.release_at <= now
+    }
+}
+
 /// This node's part in its shard's elections: its history as a voter, the
 /// roll call or candidacy it runs, and when it may start its next roll
 /// call.
@@ -132,10 +156,9 @@ pub(crate) struct ElectionRound {
     /// The vote this node runs while it stands as the candidate. `Some`
     /// only while the node is `Candidate` through a roll call of its own.
     vote: Option<VoteRound>,
-    /// Until when this node starts no roll call of its own: two base
-    /// roll-call deadlines after it last answered another worker's roll
-    /// call.
-    suppressed_until: Instant,
+    /// The latest roll call of another worker this node answered, while
+    /// it holds this node's own roll calls back.
+    answered: Option<AnsweredCall>,
     /// The earliest instant at which this node, while `LeaderSuspect` or
     /// `NoQuorum`, may start its next roll call: when it began suspecting
     /// its leader, or, after it gave up a term it held or contested or lost
@@ -153,7 +176,7 @@ impl ElectionRound {
             ballot: Ballot::default(),
             roll_call: None,
             vote: None,
-            suppressed_until: now,
+            answered: None,
             next_roll_call_at: now,
             no_quorum_streak: 0,
         }
@@ -174,9 +197,11 @@ impl ElectionRound {
     /// `roll_call_deadline` is documented to stay below it. A node that
     /// retries after a fresh suspicion timeout loses no safety to a long
     /// call: the span moves no lease, only how long this node collects
-    /// replies. Answering another's call still holds this node back for two
-    /// base deadlines only, so a widened caller can be contested early,
-    /// which costs extra calls, never safety.
+    /// replies. Answering another's call holds this node back until that
+    /// call resolves, or at most two base deadlines and a suspicion timeout:
+    /// one such window per answer, at most two per episode plus two base
+    /// deadlines. So a widened caller can be contested early, which costs
+    /// extra calls, never safety.
     fn roll_call_span(&self, view: &View) -> Duration {
         let base = view.roll_call_deadline.as_ticks();
         let cap = view.suspect_timeout.as_ticks().max(base);
@@ -195,12 +220,21 @@ impl ElectionRound {
 
     /// When a `LeaderSuspect` or `NoQuorum` node may start a roll call, as
     /// of `now`: at the instant its suspicion began or its retry falls due,
-    /// unless it answered another worker's roll call less than two
-    /// roll-call deadlines ago: that worker is being
-    /// elected, by its census and then its vote, so the node waits until
-    /// both could have ended.
+    /// unless it answered another worker's roll call that has not resolved:
+    /// that worker may be winning its election, so a call of this node's
+    /// would only contest the next term against it. The node waits for the
+    /// leader's ack of that call's term, or, if none comes, until the
+    /// call's census, vote and a suspicion timeout for the caller to go
+    /// quiet could all have ended. Answers made while a hold is live, from
+    /// any caller, do not push it past two such windows from the first,
+    /// except that each answer holds the node for at least two base roll-call
+    /// deadlines, unless it comes after the episode's end.
     pub(crate) fn roll_call_due(&self, now: Instant) -> Instant {
-        self.next_roll_call_at.max(self.suppressed_until).max(now)
+        let released = self
+            .answered
+            .as_ref()
+            .map_or(now, |answered| answered.release_at);
+        self.next_roll_call_at.max(released).max(now)
     }
 
     /// The node began suspecting its leader at `at`: it may call from then.
@@ -226,6 +260,7 @@ impl ElectionRound {
     pub(crate) fn forget(&mut self) {
         self.stop();
         self.end_no_quorum_streak();
+        self.answered = None;
         self.ballot = Ballot::default();
     }
 
@@ -285,6 +320,7 @@ impl ElectionRound {
             return Vec::new();
         };
         let term = self.next_term(view.highest_term_seen);
+        self.answered = None;
         let round = RollCallRound::start(
             term,
             configuration.clone(),
@@ -304,10 +340,10 @@ impl ElectionRound {
     /// generations, refuses it with the reason, or passes over a repeat of
     /// a call it answered. A call for another shard, or its own, is
     /// dropped. A call it answers is electing someone, so the node starts
-    /// no roll call of its own until two base roll-call deadlines after
-    /// `now`: a repeat of that call, passed over, does not push that back.
-    /// That bounds a base-width call only; an initiator whose calls have
-    /// widened (see [`Self::roll_call_span`]) can be contested early.
+    /// no roll call of its own until that call resolves (see
+    /// [`Self::roll_call_due`]): a repeat of it, passed over, changes
+    /// nothing, and answering a better call moves the hold to that answer,
+    /// within the limits given at [`Self::roll_call_due`].
     ///
     /// An initiator that answers a better call for its own term abandons
     /// its own call for it: it stays `RollCall` as that call's respondent,
@@ -332,14 +368,73 @@ impl ElectionRound {
         match verdict {
             RollCallVerdict::Answer => {
                 // A call of base width closes within a roll-call deadline of
-                // this answer, and its candidate's vote within another: a
-                // call of this node's own before then would only contest
-                // the next term against the worker it is helping elect. A
-                // widened call can outlast this, costing the contest a
-                // retry, never safety.
-                let census_and_vote =
+                // this answer, and its candidate's vote within another, but
+                // a slow candidate's vote request and the leader's ack can
+                // arrive later still: a call of this node's own before the
+                // ack would only contest the next term against the worker
+                // it is helping elect. So the hold lasts until that ack
+                // (see [`Self::follow_leader_of`]), or, if the candidate
+                // died, a suspicion timeout past the window it needed.
+                //
+                // Every answer made within the episode holds the node for at
+                // least two base roll-call deadlines (a call's census and
+                // vote), however much of the hold episode (the answers made
+                // while a hold is live) has gone; one made after its end
+                // is held no further than one minimum past it, and once that
+                // hold runs out the next answer finds the node owed a call:
+                // a caller retrying a call this node already answered must
+                // not find it free to contest the retry's election.
+                //
+                // Callers taking turns would chain holds so that this node
+                // never gets a window of its own, so the episode ends two
+                // windows after its first answer. The minimum may carry a
+                // late answer's hold past that end, but never past the end
+                // plus one minimum: each retry of one caller comes later than
+                // a minimum after its last, so a lone caller never chains it,
+                // and the bound stops several from doing so. That gives a
+                // lone slow caller its whole window, and a node a window of
+                // its own to call in, after at most two.
+                //
+                // A hold that ran out short of the cap is no part of an
+                // episode: the next answer starts a fresh one. One that the
+                // cap ended leaves the node owed a call: until it starts one
+                // of its own or follows a leader, further answers hold it
+                // no more, or a caller delivered at the very instant the cap
+                // ends could hold it again before its tick runs, and callers
+                // retrying in step could do so without end. The node still
+                // answers; it is only not held. A caller answered late in
+                // another caller's episode may also be contested early,
+                // which costs extra calls, never safety.
+                let round_span =
                     Duration::from_ticks(view.roll_call_deadline.as_ticks().saturating_mul(2));
-                self.suppressed_until = self.suppressed_until.max(now + census_and_vote);
+                let window = Duration::from_ticks(
+                    round_span
+                        .as_ticks()
+                        .saturating_add(view.suspect_timeout.as_ticks()),
+                );
+                if !self
+                    .answered
+                    .as_ref()
+                    .is_some_and(|held| held.is_owed_a_call(now))
+                {
+                    // The gap after a hold that ran out uncapped relies on
+                    // the node's suspicion jitter: a call answered at the
+                    // exact instant of that expiry, before the node's tick,
+                    // starts a new episode.
+                    let live = self.answered.as_ref().filter(|held| held.release_at > now);
+                    let episode_start = live.map_or(now, |held| held.episode_start);
+                    let episode_end = episode_start
+                        + Duration::from_ticks(window.as_ticks().saturating_mul(2));
+                    let release_at = (now + window)
+                        .min(episode_end)
+                        .max(now + round_span)
+                        .min(episode_end + round_span);
+                    self.answered = Some(AnsweredCall {
+                        episode_start,
+                        release_at,
+                        capped: now + window >= episode_end,
+                    });
+                }
                 if let Some(own) = self.roll_call.as_mut()
                     && own.term() == call.term
                 {
@@ -529,10 +624,24 @@ impl ElectionRound {
         }
     }
 
+    /// The node now follows a leader of `term`: the roll calls it answered or
+    /// made for later terms, short of those it voted in, are forgotten (see
+    /// `Ballot::forget_calls_above`), and the roll call it answered no longer
+    /// holds the node's own roll calls back: one of an earlier term has
+    /// resolved, and one of a later term was disproved by the live leader.
+    /// Following a leader also pays a call the node was owed after an
+    /// episode's cap.
+    pub(crate) fn follow_leader_of(&mut self, term: u64) {
+        self.ballot.forget_calls_above(term);
+        self.answered = None;
+    }
+
     /// The term this node's next roll call contests: the one after the
     /// latest it knows of. A roll call that failed has taken its term, so
     /// the next one contests a later term, where no answer or vote given to
-    /// the failed call stands in its way.
+    /// the failed call stands in its way; a call, or an answer to another's
+    /// call, that a leader's ack outlived has not (see
+    /// [`Self::follow_leader_of`]).
     ///
     /// # Panics
     ///

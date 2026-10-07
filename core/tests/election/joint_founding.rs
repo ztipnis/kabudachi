@@ -15,7 +15,7 @@ use kabudachi_core::election::{Entry, Identity, Input, KnownConfiguration, Outpu
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
-    AckEcho, ElectionMessage, LeaderHeartbeatAck, election_message,
+    AckEcho, ElectionMessage, LeaderHeartbeatAck, RollCall, election_message,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
@@ -29,7 +29,7 @@ use crate::support::builders::{
 use crate::support::clock::FakeClock;
 use crate::support::node::{
     TestNode, close_roll_call, connect, deliver, grants, published_roll_calls, sent, sent_to,
-    start_roll_call, state_changes, voter_node,
+    start_roll_call, state_changes, tick, voter_node,
 };
 
 /// Every node here suspects its leader after this many ticks.
@@ -141,6 +141,59 @@ impl Shard {
         let clock = self.clock.clone();
         let started = start_roll_call(self.node(initiator), &clock, SUSPECT);
         let call = published_roll_calls(&started).remove(0);
+        self.elect_call(initiator, call, respondents, granters, overhearing)
+    }
+
+    /// [`Shard::elect`] for an `initiator` that forgot the call it answered
+    /// when a leader's ack reached it: it calls the term of that call again,
+    /// `refuser`, which saw it won, refuses it as stale, and the initiator's
+    /// next call contests the term after.
+    fn elect_after_refusal(
+        &mut self,
+        initiator: &WorkerId,
+        refuser: &WorkerId,
+        respondents: &[&WorkerId],
+        granters: &[&WorkerId],
+    ) -> Vec<Output> {
+        let clock = self.clock.clone();
+        let refused = published_roll_calls(&start_roll_call(self.node(initiator), &clock, SUSPECT))
+            .remove(0);
+        let refusal = deliver(
+            self.node(refuser),
+            initiator,
+            roll_call_message((*refused).clone()),
+        );
+        for message in sent_to(&refusal, initiator) {
+            deliver(self.node(initiator), refuser, message);
+        }
+        // Only the initiator ticks: its retry waits on its own clock reading,
+        // which a few suspicion windows always outlast.
+        let mut next = None;
+        for _ in 0..4 * SUSPECT {
+            clock.advance(Duration::from_ticks(1));
+            next = published_roll_calls(&tick(self.node(initiator)))
+                .into_iter()
+                .next();
+            if next.is_some() {
+                break;
+            }
+        }
+        let next = next.expect("the initiator calls again");
+        assert_eq!(next.term, refused.term + 1, "setup invariant");
+        self.elect_call(initiator, next, respondents, granters, &[])
+    }
+
+    /// [`Shard::elect_overheard`] for `initiator`'s roll call `call`, already
+    /// published.
+    fn elect_call(
+        &mut self,
+        initiator: &WorkerId,
+        call: Checked<RollCall>,
+        respondents: &[&WorkerId],
+        granters: &[&WorkerId],
+        overhearing: &[&WorkerId],
+    ) -> Vec<Output> {
+        let clock = self.clock.clone();
         for listener in overhearing {
             deliver(
                 self.node(listener),
@@ -797,8 +850,10 @@ fn a_member_that_missed_a_commits_ack_counts_again_once_an_ack_repairs_it() {
 ///   c, q1, q2 and p3, founding J2. Only q1 and q2 hear of it. Then a's
 ///   certificate reaches p3 late, and a, with no ack confirmed, goes
 ///   `NoQuorum`.
-/// - Term 3: p3 wins under J1 with a, c and p1, among a, c, p1 and p2 (c
-///   still holds C0, older than J1), and its certificates reach them all.
+/// - Term 3: p3, which the certificate made forget its answer to b's call,
+///   calls term 2 first and is refused as stale, then wins term 3 under J1
+///   with a, c and p1, among a, c, p1 and p2 (c still holds C0, older than
+///   J1), and its certificates reach them all.
 fn rival_foundings_up_to_term_3() -> Shard {
     let clock = FakeClock::new();
     let ids = ["a", "b", "c", "p1", "p2", "p3", "q1", "q2"].map(worker);
@@ -829,7 +884,12 @@ fn rival_foundings_up_to_term_3() -> Shard {
         "setup invariant"
     );
     shard.in_flight.clear();
-    let won_by_p3 = shard.elect(&p3, &[&a, &c, &p1, &p2], &[&a, &c, &p1]);
+    let won_by_p3 = shard.elect_after_refusal(
+        &p3,
+        &c,
+        &[&a, &c, &p1, &p2],
+        &[&a, &c, &p1],
+    );
     shard.hand_out(&won_by_p3, &p3, &[&a, &c, &p1, &p2]);
     shard
 }
@@ -896,9 +956,10 @@ fn a_rival_foundings_admissions_never_count_as_voters_of_a_later_configuration()
 /// C0 = {a, b, c}; p and q are pending.
 ///
 /// a founds J1 with b's grant, then b founds J2 under C0 with c's, and only
-/// p hears of J1 (and of b's call, though its reply is lost, so it contests
-/// the term after). In term 3 p wins under J1 with a and c, and commits it on
-/// their echoes. Only then does b's term-2 certificate reach c, which
+/// p hears of J1 (and of b's call, though its reply is lost; a's certificate
+/// makes it forget the call, so it contests term 2 first, is refused, and
+/// contests the term after). In term 3 p wins under J1 with a and c, and
+/// commits it on their echoes. Only then does b's term-2 certificate reach c, which
 /// granted b that term and so accepts it, taking on J2, newer than J1. A
 /// partition then cuts {b, c, q} off from {a, p}, and b or c won term 4
 /// under J2 beside p.
@@ -928,7 +989,7 @@ fn a_voter_that_helped_commit_never_elects_a_rival_founding_it_learns_of_later()
         "setup invariant"
     );
     shard.in_flight.clear();
-    let won_by_p = shard.elect(&p, &[&a, &c], &[&a, &c]);
+    let won_by_p = shard.elect_after_refusal(&p, &c, &[&a, &c], &[&a, &c]);
     shard.hand_out(&won_by_p, &p, &[&a, &c]);
     let committed = shard.run(
         |id| [&a, &c, &p].contains(&id),
@@ -951,7 +1012,8 @@ fn a_voter_that_helped_commit_never_elects_a_rival_founding_it_learns_of_later()
 /// The commit's ack reaches p1 but not p2, so p1 holds the committed
 /// configuration and p2 the joint one, each unable to count the other: p1
 /// refuses p2's calls as stale, and p2 answers p1's as a new voter. p1's
-/// refusal carries the commit, which p2 takes up, so the two elect a leader.
+/// refusal carries the commit, which p2 takes up: the shard then elects a
+/// leader on a configuration later than the commit.
 #[test]
 fn survivors_split_by_a_commit_one_missed_elect_a_leader() {
     let clock = FakeClock::new();
@@ -981,5 +1043,15 @@ fn survivors_split_by_a_commit_one_missed_elect_a_leader() {
     );
 
     assert!(elected, "{:?}", shard.nodes.values().map(TestNode::state).collect::<Vec<_>>());
-    assert_eq!(shard.nodes[&p2].admission(), Some(committed.generation()));
+    let leader = shard
+        .nodes
+        .values()
+        .find(|node| node.state() == WorkerState::Leader)
+        .expect("elected");
+    assert!(
+        leader
+            .configuration()
+            .is_some_and(|held| held.generation() > committed.generation()),
+        "the leader leads on a configuration built on the commit, not on the joint one"
+    );
 }

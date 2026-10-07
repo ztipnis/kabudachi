@@ -243,19 +243,27 @@ pub struct ElectionTimings {
     /// the next one's deadline (and its vote's), up to `suspect_timeout`;
     /// winning an election, accepting a leader's ack or leaving the recovery
     /// epoch resets it to this base. A node that answered another worker's
-    /// roll call starts none of its own until twice this base after it
-    /// answered, which bounds the census and vote of a call of base width,
-    /// taking less than this to arrive: that worker is being elected
-    /// meanwhile. A caller whose calls have widened can outlast that, and be
-    /// contested early, which costs extra calls, never safety. An initiator
-    /// that keeps failing to find a quorum calls again every roll-call
-    /// deadline and suspicion timeout, so with a suspicion timeout no longer
-    /// than this it can hold one answerer back for as long as it keeps calling
-    /// (others may still call). Keep it well above the time a roll call takes
-    /// to reach the shard and its replies to come back, and below
-    /// `suspect_timeout`; backoff only rescues a deadline set too low, at the
-    /// cost of failed calls first. Usually
-    /// [`Self::DEFAULT_ROLL_CALL_DEADLINE`]. Must not be zero (see
+    /// roll call starts none of its own until that call resolves: until the
+    /// leader's ack of that term or a later one is accepted, or, if none
+    /// comes, until twice this base plus `suspect_timeout` after it answered
+    /// (the call's census and vote, and the time for its caller to go quiet).
+    /// A caller whose calls have widened can outlast that, and be contested
+    /// early, as can a caller answered late in another caller's episode,
+    /// which costs extra calls, never safety. Further roll calls the
+    /// node answers while that hold lasts, from the same initiator or
+    /// another, do not extend it past twice that span from the first
+    /// answer (the hold episode); a later call of the same initiator does
+    /// not extend it even within that. So one initiator that keeps failing
+    /// to find a quorum costs an answerer at most one span, and several
+    /// taking turns at most two, after which the node may call (calls of
+    /// others still go on). A hold that ran out short of that cap ends the
+    /// episode, and the next call the node answers starts a new one; one the
+    /// cap ended leaves the node owed a call, and until it starts one of its
+    /// own or follows a leader, calls it answers hold it no more. Keep it
+    /// well above the time a roll call takes to reach the shard and its
+    /// replies to come back, and below `suspect_timeout`; backoff only
+    /// rescues a deadline set too low, at the cost of failed calls first.
+    /// Usually [`Self::DEFAULT_ROLL_CALL_DEADLINE`]. Must not be zero (see
     /// [`WorkerNode::start`]).
     pub roll_call_deadline: Duration,
     /// How far apart the rates of two workers' clocks, or of a worker's
@@ -1180,7 +1188,12 @@ where
     /// generation (the leader holds this node as pending, or not at all)
     /// leaves this node's own as they were. A node that adopts a newer
     /// configuration heartbeats its leader at once, so its echo of it
-    /// reaches the leader without waiting out a heartbeat interval.
+    /// reaches the leader without waiting out a heartbeat interval. A node
+    /// that accepts an ack, in whatever state, forgets the roll calls it
+    /// answered or made above the ack's term, short of those it voted in (see
+    /// `ElectionRound::follow_leader_of`): the live leader disproved the
+    /// suspicion they rested on, and that includes a node still `Active` whose
+    /// stale contact no tick had yet acted on.
     fn on_leader_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>) {
         // A node back in `Bootstrapping` rejoins through JOIN alone: an ack
         // from a leader of the epoch it left would take it back past the
@@ -1266,6 +1279,8 @@ where
             self.drop_recovery();
             self.transition_to(WorkerState::Active);
         }
+        // Whatever this node's state: see the forgetting described above.
+        self.round.follow_leader_of(ack.term);
     }
 
     /// Whether this node leads an epoch of a lineage other than `lineage`.

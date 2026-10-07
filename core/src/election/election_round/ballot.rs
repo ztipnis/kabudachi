@@ -7,12 +7,14 @@
 //! one that ranks better (see [`CallRank`]); it refuses a worse one, so its
 //! initiator learns why it is short. It grants at most one vote per
 //! term, only to the initiator of the best call it answered, and never
-//! switches a vote it granted. A node whose leader contact is fresh answers
-//! and grants nothing (leader stickiness), and one that holds a newer
-//! configuration than a call's refuses both the call and its candidate's
-//! request.
+//! switches a vote it granted. Following a leader forgets the calls it
+//! answered above the leader's term in which it granted no vote. A node whose
+//! leader contact is fresh answers and grants nothing (leader stickiness),
+//! and one that holds a newer configuration than a call's refuses both the
+//! call and its candidate's request.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use super::roll_call::CallRank;
 use crate::configuration::Generation;
@@ -22,13 +24,16 @@ use crate::protocol::messages::ElectionRejectReason;
 
 /// This node's history as a voter.
 ///
-/// The per-term history grows for the life of the node, one entry per term
-/// it answered a call or voted in; bounding it is deferred.
+/// The per-term history holds one entry per term it answered a call or voted
+/// in. It grows for the life of the node, bar the entries following a leader
+/// forgets (those above the leader's term that hold no vote); bounding it
+/// further is deferred.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Ballot {
     terms: BTreeMap<u64, TermBallot>,
     /// The highest term of any roll call this node accepted, its own
-    /// included.
+    /// included; following a leader drops those above its term in which it
+    /// granted no vote.
     highest_roll_call_term: Option<u64>,
 }
 
@@ -193,6 +198,35 @@ impl Ballot {
         self.terms.entry(term).or_default().best_answered = Some(rank);
     }
 
+    /// Forgets the roll calls this node answered or made for terms above
+    /// `followed_term`, as it follows a leader of `followed_term`, except in
+    /// terms where it granted a vote. That leader was alive, so those calls
+    /// were made or answered on a suspicion the live leader disproved; kept,
+    /// an answer would outrank, and so make the node refuse, the call that
+    /// elects the leader's successor for the same term. The votes it granted
+    /// stay, with the calls they went to.
+    pub(crate) fn forget_calls_above(&mut self, followed_term: u64) {
+        let above = (Bound::Excluded(followed_term), Bound::Unbounded);
+        // Every ack lands here, and most find nothing above to forget; every
+        // ballot holds an answer or a grant, and the highest roll call term
+        // always names a ballot, so there is nothing to prune or recompute.
+        if self.terms.range(above).next().is_none() {
+            return;
+        }
+        for (_, ballot) in self.terms.range_mut(above) {
+            if ballot.granted.is_none() {
+                ballot.best_answered = None;
+            }
+        }
+        self.terms
+            .retain(|_, ballot| ballot.best_answered.is_some() || ballot.granted.is_some());
+        self.highest_roll_call_term = self
+            .terms
+            .iter()
+            .rev()
+            .find_map(|(term, ballot)| ballot.best_answered.as_ref().map(|_| *term));
+    }
+
     /// The candidate this node granted its vote in `term`, if any.
     pub(crate) fn granted_in(&self, term: u64) -> Option<&WorkerId> {
         self.terms.get(&term)?.granted.as_ref()
@@ -213,8 +247,8 @@ impl Ballot {
     }
 
     /// The highest term of any roll call this node accepted, its own
-    /// included; `None` before it accepts one. Its next roll call contests
-    /// a later term.
+    /// included, short of those a leader's ack outlived; `None` before it
+    /// accepts one. Its next roll call contests a later term.
     pub(crate) fn highest_roll_call_term(&self) -> Option<u64> {
         self.highest_roll_call_term
     }

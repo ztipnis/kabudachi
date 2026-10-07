@@ -271,7 +271,30 @@ fn a_failed_candidate_follows_the_leader_that_outlasted_its_candidacy() {
     let outputs = deliver(&mut node, &leader, term_one_ack());
 
     assert_eq!(state_changes(&outputs), vec![WorkerState::Active]);
-    assert_eq!(node.known_leader(), Some((leader, 1)));
+    assert_eq!(node.known_leader(), Some((leader.clone(), 1)));
+
+    // Its vote for itself in term 2 stands: it grants no other candidate
+    // that term's vote.
+    clock.advance(past_any_suspicion(SUSPECT));
+    let rival = worker("w0");
+    let refused = deliver(
+        &mut node,
+        &rival,
+        vote_request_message(vote_request(rival.clone(), 0, 2)),
+    );
+    assert_eq!(
+        rejects_sent_to(&refused, &rival)[0].reason(),
+        ElectionRejectReason::AlreadyVoted
+    );
+
+    // The term it stood in stays taken: losing contact again, its next roll
+    // call contests the term after it, not term 2 again.
+    clock.advance(past_any_suspicion(SUSPECT));
+    let _ = node.step(Input::Tick);
+    let restarted = node.step(Input::Tick).outputs;
+    let calls = published_roll_calls(&restarted);
+    assert_eq!(calls.len(), 1, "{restarted:?}");
+    assert_eq!(calls[0].term, 3);
 }
 
 #[test]

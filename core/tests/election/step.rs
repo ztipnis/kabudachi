@@ -305,42 +305,6 @@ fn a_node_in_a_roll_call_or_standing_as_candidate_is_due_at_its_deadline() {
     assert_eq!(stood.next_deadline, Some(clock.now() + roll_call_deadline));
 }
 
-#[test]
-fn a_voter_that_accepted_a_roll_call_is_next_due_when_that_calls_vote_could_have_ended() {
-    let clock = FakeClock::new();
-    let (w2, leader) = (worker("w2"), worker("leader-1"));
-    // A call and its vote, one tick each, end before the next heartbeat is
-    // due.
-    let mut node = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: ElectionTimings::new(
-                Duration::from_ticks(SUSPECT_TIMEOUT),
-                Duration::from_ticks(4),
-            )
-            .with_roll_call_deadline(Duration::from_ticks(1)),
-        },
-        Entry::Known(voter_of(3)),
-        clock.clone(),
-        None,
-    )
-    .0;
-    deliver(&mut node, &leader, heartbeat_ack_from(&leader, 0));
-    clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
-    deliver(
-        &mut node,
-        &w2,
-        roll_call_message(roll_call(&w2, 1, &configuration_of(3), 0)),
-    );
-
-    let step = node.step(Input::Tick);
-
-    assert_eq!(node.state(), WorkerState::LeaderSuspect);
-    assert_eq!(step.next_deadline, Some(ticks_after(clock.now(), 2)));
-}
-
 // ---- A Tick at the node's deadline always moves it on ----
 
 /// Steps `node` with a `Tick` at every deadline it reports, until it reports

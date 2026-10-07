@@ -357,6 +357,11 @@ impl Ledger {
             };
             match &message.payload {
                 Some(Payload::RollCall(call)) => {
+                    // A node whose earlier call for this term a leader's ack
+                    // outlived calls it again: the replies and grants so far
+                    // belonged to the earlier call.
+                    self.replies.remove(&(node.clone(), call.term));
+                    self.grants.remove(&(node.clone(), call.term));
                     self.roll_calls.insert(
                         (node.clone(), call.term),
                         (

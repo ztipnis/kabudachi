@@ -8,11 +8,11 @@
 
 use crate::support::builders::{
     message_input,
-    ack_message, configuration_of, g0, heartbeat, heartbeat_message, leader_ack, roll_call_reply, shard, timings, voter_of,
+    ack_message, configuration_of, election_certificate, election_certificate_message, g0, heartbeat, heartbeat_message, leader_ack, roll_call_reply, shard, timings, voter_of,
     worker,
 };
 
-use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::configuration::{Admission, Configuration, Generation, Single};
 use kabudachi_core::coordination_authority::{AuthorityError, CoordinationAuthority, RecoveryEpoch};
 use kabudachi_core::election::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, DropMessages,
@@ -21,7 +21,9 @@ use kabudachi_core::election::{
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::election_message;
-use kabudachi_core::protocol::messages::{JoinResponse, LeaderHeartbeatAck, WorkerHeartbeat};
+use kabudachi_core::protocol::messages::{
+    ElectionCertificate, JoinResponse, LeaderHeartbeatAck, WorkerHeartbeat,
+};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeaseEnd, Scheduler};
 use kabudachi_core::time::{Clock, Duration};
@@ -344,6 +346,94 @@ fn a_fenced_node_rejoins_as_pending_once_the_epoch_has_moved_on() {
     read_epoch(&mut driven.node, 1, epoch(1));
     assert_eq!(driven.node.state(), WorkerState::Active);
     assert_eq!(driven.node.recovery_epoch(), 1);
+}
+
+#[test]
+fn a_node_that_rejoins_after_answering_a_call_is_held_by_none_of_the_old_epochs_answer() {
+    // A suspicion timeout longer than a registration's life, and roll calls
+    // nearly as long, so that the hold answering a call gives is still live
+    // when the node, fenced meanwhile, rejoins another epoch.
+    let suspect = 40_000;
+    let timings = ElectionTimings::new(
+        Duration::from_ticks(suspect),
+        Duration::from_ticks(suspect / 4),
+    )
+    .with_roll_call_deadline(Duration::from_ticks(suspect * 9 / 10));
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, []);
+    let (mut driven, _) = Driven::with(
+        &clock,
+        &authority,
+        "w1",
+        voter_of(3),
+        timings,
+        Some(AuthorityTimings {
+            ttl: authority_ttl(),
+        }),
+    );
+    while driven.node.state() != WorkerState::LeaderSuspect {
+        driven.advance(1_000);
+    }
+    let caller = worker("w2");
+    let answered = driven.step(message_input(&caller, roll_call_message_for(&caller, 1)));
+    assert_eq!(sent_to(&answered, &caller).len(), 1, "setup invariant");
+    // Two roll-call deadlines for the call's census and vote, and a
+    // suspicion timeout for its caller to go quiet.
+    let old_release = clock.now() + Duration::from_ticks(suspect * 9 / 5 + suspect);
+
+    // The authority moves on while the node is cut off. The fenced node
+    // rejoins the epoch it holds through a JOIN pointer and an epoch read,
+    // and learns its configuration from a certificate, hearing no leader's
+    // ack: nothing but the rejoin clears what it answered.
+    driven.authority.set_reachable(false);
+    driven.advance(lasting_ticks());
+    assert_eq!(driven.node.state(), WorkerState::Fenced);
+    driven.authority.set_reachable(true);
+    driven
+        .authority
+        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
+        .expect("a recovery elsewhere moved the epoch on");
+    while driven.node.state() == WorkerState::Fenced {
+        driven.advance(1_000);
+    }
+    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
+    let _ = driven.node.step(Input::JoinAnswer(JoinResponse {
+        leader_id: Some(caller.clone().into()),
+        leader_multiaddr: "w2".to_string(),
+        term: 1,
+        recovery_epoch: 1,
+        recovery_epoch_lineage: 0,
+    }));
+    read_epoch(&mut driven.node, 1, epoch(1));
+    assert_eq!(driven.node.state(), WorkerState::Active);
+    driven.step(message_input(
+        &caller,
+        election_certificate_message(ElectionCertificate {
+            recovery_epoch: 1,
+            ..election_certificate(
+                &caller,
+                1,
+                &configuration_at_epoch(1),
+                Admission::from(Some(Generation::new(1, 0, 0))),
+            )
+        }),
+    ));
+    assert!(driven.node.configuration().is_some(), "setup invariant");
+    assert!(clock.now() < old_release, "setup invariant: the old hold is live");
+
+    let mut called_at = None;
+    while called_at.is_none() && clock.now() <= old_release {
+        let outputs = driven.advance(1_000);
+        if !published_roll_calls(&outputs).is_empty() {
+            called_at = Some(clock.now());
+        }
+    }
+
+    assert!(
+        called_at.is_some_and(|at| at < old_release),
+        "it calls once it suspects its new leader, not when the old epoch's hold would end: {called_at:?}"
+    );
 }
 
 // A driver hands authority replies back whenever they arrive, possibly out
