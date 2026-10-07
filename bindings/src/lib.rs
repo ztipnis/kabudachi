@@ -1,4 +1,6 @@
+use kabudachi_core::protocol::digest::Digest;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 mod bridge;
 mod door;
@@ -19,9 +21,16 @@ fn version() -> String {
     native_version()
 }
 
+/// The digest a run's result is certified by: BLAKE3 of `data`.
+#[pyfunction]
+fn result_digest<'py>(py: Python<'py>, data: &[u8]) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, Digest::blake3(data).value())
+}
+
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(result_digest, m)?)?;
     m.add_class::<runtime::NativeRuntime>()?;
     m.add_class::<work::PyClaim>()?;
     m.add_class::<work::PyCertification>()?;

@@ -19,6 +19,7 @@
 pub(super) mod quorum_contact_lease;
 
 use crate::configuration::Roster;
+use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::ids::WorkerId;
 use crate::scheduler::{LeadershipGrant, LeaseEnd};
 use crate::time::{Duration, Instant};
@@ -31,7 +32,7 @@ pub(crate) struct Office<'a> {
     pub(crate) me: &'a WorkerId,
     pub(crate) roster: &'a Roster,
     pub(crate) term: u64,
-    pub(crate) recovery_epoch: u64,
+    pub(crate) recovery_epoch: RecoveryEpoch,
     /// When the leader's recovery fence ends: `Unbounded` for a node with no
     /// authority, which needs none. A leader that needs a fence and holds
     /// none has no office.

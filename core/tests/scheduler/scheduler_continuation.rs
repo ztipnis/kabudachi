@@ -4,6 +4,7 @@
 //! ends the continuation.
 
 
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
@@ -52,11 +53,11 @@ fn completing_with_a_continuation_certifies_the_run_like_any_other() {
 
     let certification = fixture
         .scheduler
-        .complete(&worker(), &run, b"plan".to_vec(), Completion::Continues)
+        .complete(&worker(), &run, Digest::blake3(b"plan"), Completion::Continues)
         .unwrap();
 
     assert_eq!(certification.task_run_id, run);
-    assert_eq!(certification.result_digest, b"plan".to_vec());
+    assert_eq!(certification.result_digest, Digest::blake3(b"plan"));
     assert_eq!(
         fixture.scheduler.task_run(&run).unwrap().current_state(),
         TaskRunState::Succeeded
@@ -71,11 +72,11 @@ fn a_task_with_a_continuation_still_counts_against_memory_until_it_ends() {
 
     fixture
         .scheduler
-        .complete(&worker(), &run, b"d".to_vec(), Completion::Continues)
+        .complete(&worker(), &run, Digest::blake3(b"d"), Completion::Continues)
         .unwrap();
     assert_eq!(fixture.spy.memory_in_use(), 40);
 
-    assert!(fixture.scheduler.end_continuation(&task));
+    assert_eq!(fixture.scheduler.end_continuation(&task), Ok(true));
     assert_eq!(fixture.spy.memory_in_use(), 0);
 }
 
@@ -89,13 +90,13 @@ fn a_task_with_a_continuation_is_not_forgotten_until_it_ends() {
     let run = running(&mut fixture, &task);
     fixture
         .scheduler
-        .complete(&worker(), &run, b"d".to_vec(), Completion::Continues)
+        .complete(&worker(), &run, Digest::blake3(b"d"), Completion::Continues)
         .unwrap();
 
     fixture.clock.advance(Duration::from_ticks(10_000));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
 
-    fixture.scheduler.end_continuation(&task);
+    fixture.scheduler.end_continuation(&task).unwrap();
     fixture.clock.advance(Duration::from_ticks(100));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
     assert!(fixture.spy.forgotten(&task));
@@ -110,7 +111,7 @@ fn a_coalescing_key_stays_held_for_the_life_of_the_continuation() {
 
     fixture
         .scheduler
-        .complete(&worker(), &run, b"d".to_vec(), Completion::Continues)
+        .complete(&worker(), &run, Digest::blake3(b"d"), Completion::Continues)
         .unwrap();
 
     assert!(
@@ -128,7 +129,7 @@ fn a_coalescing_key_stays_held_for_the_life_of_the_continuation() {
         ClaimRejection::KeyBusy
     );
 
-    fixture.scheduler.end_continuation(&first);
+    fixture.scheduler.end_continuation(&first).unwrap();
 
     let claims = fixture.scheduler.claim_oldest(&worker(), 10).unwrap();
     assert_eq!(claims.len(), 1);
@@ -143,13 +144,13 @@ fn ending_a_continuation_is_once_only_and_ignores_tasks_that_have_none() {
     let run = running(&mut fixture, &task);
     fixture
         .scheduler
-        .complete(&worker(), &run, b"d".to_vec(), Completion::Continues)
+        .complete(&worker(), &run, Digest::blake3(b"d"), Completion::Continues)
         .unwrap();
 
-    assert!(!fixture.scheduler.end_continuation(&other));
-    assert!(!fixture.scheduler.end_continuation(&TaskId::new("unknown")));
-    assert!(fixture.scheduler.end_continuation(&task));
-    assert!(!fixture.scheduler.end_continuation(&task));
+    assert_eq!(fixture.scheduler.end_continuation(&other), Ok(false));
+    assert_eq!(fixture.scheduler.end_continuation(&TaskId::new("unknown")), Ok(false));
+    assert_eq!(fixture.scheduler.end_continuation(&task), Ok(true));
+    assert_eq!(fixture.scheduler.end_continuation(&task), Ok(false));
     // Nothing was double-released.
     assert_eq!(fixture.spy.memory_in_use(), 1);
 }

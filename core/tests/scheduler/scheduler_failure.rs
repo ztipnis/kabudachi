@@ -3,6 +3,7 @@
 //! and forgets finished tasks once `result_ttl` has passed.
 
 
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{Completion, ReportRejection, Submission};
@@ -55,7 +56,7 @@ fn a_running_run_can_fail_and_records_what_kind_of_failure_it_was() {
     assert_eq!(fixture.run_state(&run_id), TaskRunState::Failed);
     let run = fixture.scheduler.task_run(&run_id).unwrap();
     assert_eq!(run.failure_kind, "ValueError");
-    assert!(run.result_digest.is_empty());
+    assert_eq!(run.result_digest, None);
 }
 
 #[test]
@@ -89,7 +90,7 @@ fn a_failed_run_cannot_then_complete_or_fail_again() {
 
     let completed = fixture
         .scheduler
-        .complete(&worker("w1"), &run_id, b"digest".to_vec(), Completion::Final);
+        .complete(&worker("w1"), &run_id, Digest::blake3(b"digest"), Completion::Final);
     let failed_again = fixture.scheduler.fail(&worker("w1"), &run_id, "KeyError");
 
     assert_eq!(completed.unwrap_err(), ReportRejection::NotAuthoritative);
@@ -106,7 +107,7 @@ fn nothing_is_forgotten_until_a_result_ttl_is_set() {
     let (task_id, run_id) = running_task(&mut fixture);
     fixture
         .scheduler
-        .complete(&worker("w1"), &run_id, b"digest".to_vec(), Completion::Final)
+        .complete(&worker("w1"), &run_id, Digest::blake3(b"digest"), Completion::Final)
         .unwrap();
     fixture.clock.advance(Duration::from_ticks(1_000_000));
 
@@ -124,7 +125,7 @@ fn a_finished_task_is_kept_for_the_result_ttl_and_then_forgotten() {
     let (task_id, run_id) = running_task(&mut fixture);
     fixture
         .scheduler
-        .complete(&worker("w1"), &run_id, b"digest".to_vec(), Completion::Final)
+        .complete(&worker("w1"), &run_id, Digest::blake3(b"digest"), Completion::Final)
         .unwrap();
 
     fixture.clock.advance(Duration::from_ticks(TTL - 1));
@@ -164,13 +165,13 @@ fn each_finished_task_is_forgotten_at_its_own_time() {
     let (early, early_run) = running_task(&mut fixture);
     fixture
         .scheduler
-        .complete(&worker("w1"), &early_run, b"a".to_vec(), Completion::Final)
+        .complete(&worker("w1"), &early_run, Digest::blake3(b"a"), Completion::Final)
         .unwrap();
     fixture.clock.advance(Duration::from_ticks(60));
     let (late, late_run) = running_task(&mut fixture);
     fixture
         .scheduler
-        .complete(&worker("w1"), &late_run, b"b".to_vec(), Completion::Final)
+        .complete(&worker("w1"), &late_run, Digest::blake3(b"b"), Completion::Final)
         .unwrap();
 
     fixture.clock.advance(Duration::from_ticks(40));

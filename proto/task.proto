@@ -18,6 +18,26 @@ enum TaskRunState {
   ORPHANED = 11;
 }
 
+// A moment by the wall clock of the worker that stamped it, in milliseconds
+// since the Unix epoch. Workers' clocks disagree, so compare two only as far
+// as their clocks are known to agree, and never measure a timeout with one.
+message WallTime {
+  uint64 unix_millis = 1;
+}
+
+// The hash function a Digest was computed with. A reader that does not know
+// the algorithm cannot check the digest, so it refuses it.
+enum DigestAlgorithm {
+  DIGEST_ALGORITHM_UNSPECIFIED = 0;
+  BLAKE3 = 1;
+}
+
+// A content hash: of a task's input, or of a run's result.
+message Digest {
+  DigestAlgorithm algorithm = 1;
+  bytes value = 2;
+}
+
 message TaskRunIdentity {
   TaskRunId task_run_id = 1;
   TaskId task_id = 2;
@@ -28,23 +48,15 @@ message TaskRunIdentity {
 // An immutable submitted invocation. A retry never changes it; it creates a
 // new TaskRun instead.
 message Task {
+  reserved 6, 8, 9;
   TaskId task_id = 1;
   TaskDefinitionId task_definition_id = 2;
   uint32 source_version = 3;
   bytes serialized_input = 4;
   string queue = 5;
-  // Scheduler clock ticks at submission, not wall-clock time. Comparable only
-  // with ticks from the same clock.
-  uint64 created_at_ticks = 6;
   // How many more attempts a failed run may be replaced by. Zero means the
   // task is not retried.
   uint32 max_retries = 7;
-  // The task is not started before this scheduler tick; unset means it may
-  // start at once.
-  optional uint64 not_before_ticks = 8;
-  // A task still pending at this scheduler tick expires instead of running
-  // late; unset means it never expires.
-  optional uint64 expires_at_ticks = 9;
   // Set only on a coalescing task: the flat key that decides which pending
   // generations supersede each other. The default key is the empty string.
   optional string coalescing_key = 10;
@@ -54,25 +66,33 @@ message Task {
   // A non-retriable task's run that was running when its worker was lost is
   // ORPHANED and never replayed, because its effects may have happened.
   bool non_retriable = 12;
+  // When the client submitted the task, by the submitting worker's wall
+  // clock. Its delay and expiry count from here.
+  WallTime submitted_at = 13;
+  // How long after submission the task may first start; unset means at once.
+  optional uint64 delay_millis = 14;
+  // How long after submission the task may wait to start before it expires
+  // instead; unset means it never expires.
+  optional uint64 expiry_millis = 15;
 }
 
-// One execution attempt of a Task. `identity`, the versions and
-// `created_at_ticks` never change after creation; `state` and
-// `updated_at_ticks` are the mutable part.
+// One execution attempt of a Task. `identity`, the versions and `created_at`
+// never change after creation; `state` and `updated_at` are the mutable part.
 message TaskRun {
+  reserved 4, 6, 8;
   TaskRunIdentity identity = 1;
   uint32 source_version = 2;
   uint32 execution_version = 3;
-  uint64 created_at_ticks = 4;
   TaskRunState state = 5;
-  uint64 updated_at_ticks = 6;
   // The worker that claimed this run; the only one whose results the leader
   // accepts. Unset while the run is still pending.
   WorkerId selected_worker = 7;
-  // Digest of the certified result. Empty until the run succeeds, so a real
-  // digest is never empty.
-  bytes result_digest = 8;
   // The type name of the error that failed the run (for example
   // "ValueError"), never its message. Empty unless the run is FAILED.
   string failure_kind = 9;
+  // When the leader created this run and last changed it, by its wall clock.
+  WallTime created_at = 10;
+  WallTime updated_at = 11;
+  // Digest of the certified result. Unset until the run succeeds.
+  Digest result_digest = 12;
 }

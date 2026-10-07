@@ -2,6 +2,7 @@
 //! order, and with which counts. A missed or misplaced notification would
 //! show up here or in `Fixture::state`'s cross-check.
 
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
@@ -137,7 +138,7 @@ fn one_catch_up_notifies_expiries_then_releases_then_forgetting() {
         .complete(
             &worker(),
             &claim.task_run_id,
-            b"d".to_vec(),
+            Digest::blake3(b"d"),
             Completion::Final,
         )
         .unwrap();

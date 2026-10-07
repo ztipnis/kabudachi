@@ -5,6 +5,7 @@
 //! non-retriable task's running run is orphaned instead.
 
 use crate::support::scheduler::Fixture;
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
@@ -133,7 +134,7 @@ fn a_finished_or_pending_run_is_not_touched() {
     let run = running(&mut fixture, &worker("w1"), &done);
     fixture
         .scheduler
-        .complete(&worker("w1"), &run, b"d".to_vec(), Completion::Final)
+        .complete(&worker("w1"), &run, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
 
     let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
@@ -222,7 +223,7 @@ fn a_task_whose_continuation_is_running_is_not_lost_with_its_worker() {
     let run = running(&mut fixture, &worker("w1"), &task);
     fixture
         .scheduler
-        .complete(&worker("w1"), &run, b"d".to_vec(), Completion::Continues)
+        .complete(&worker("w1"), &run, Digest::blake3(b"d"), Completion::Continues)
         .unwrap();
 
     let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
@@ -240,7 +241,7 @@ fn a_lost_workers_report_on_its_lost_run_is_refused() {
 
     let completed = fixture
         .scheduler
-        .complete(&worker("w1"), &run, b"d".to_vec(), Completion::Final);
+        .complete(&worker("w1"), &run, Digest::blake3(b"d"), Completion::Final);
     let failed = fixture.scheduler.fail(&worker("w1"), &run, "ValueError");
 
     assert_eq!(completed.unwrap_err(), ReportRejection::NotAuthoritative);
@@ -304,7 +305,7 @@ fn a_non_retriable_tasks_running_run_is_orphaned_and_not_replayed() {
     assert_eq!(
         fixture
             .scheduler
-            .complete(&worker("w1"), &run, b"d".to_vec(), Completion::Final)
+            .complete(&worker("w1"), &run, Digest::blake3(b"d"), Completion::Final)
             .unwrap_err(),
         ReportRejection::NotAuthoritative
     );

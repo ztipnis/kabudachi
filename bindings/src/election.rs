@@ -121,6 +121,7 @@ mod tests {
         IncarnationId, ShardId, TaskDefinitionId, Uuid7Ids, WorkerId,
     };
     use kabudachi_core::scheduler::{Scheduler, Submission};
+    use kabudachi_core::task_record::LocalRecords;
     use kabudachi_core::time::Duration as CoreDuration;
     use std::time::Duration;
 
@@ -175,7 +176,7 @@ mod tests {
         );
         let (state_sender, mut state) = watch::channel(node.state());
         let door = Arc::new(SchedulerDoor::new(
-            Scheduler::new(clock, Uuid7Ids),
+            Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::default()),
             WorkerId::new("worker-1"),
         ));
         let publisher = Publisher {
@@ -204,7 +205,7 @@ mod tests {
             Vec::new(),
             "default",
         ))
-        .expect("a submission needs no leadership");
+        .expect("a leader records a submission");
         let claims = tokio::time::timeout(WAIT_LIMIT, Arc::clone(&door).claim_when_available(1))
             .await
             .expect("the leader hands out its work within the limit")

@@ -5,20 +5,32 @@
 //!
 //! Every operation runs whole under the scheduler's lock, checks the closed
 //! flag under that same lock, and wakes whoever the change concerns before
-//! returning. The scheduler here carries no observer (`NoObserver`): the
-//! bindings prove leadership through operations, never through a spy.
+//! returning. The scheduler here carries the one-node record sink
+//! (`LocalRecords`): each revision it publishes is stored in this node's own
+//! store before the call returns. An answer that tells a caller something was
+//! decided is held in an effect gate until the store has settled every write
+//! the call made, and is a retryable `NotLeader` if the store refused one or
+//! the lease had ended. A submission made before the node leads gets its task
+//! id at once and waits in the door; an end of a continuation the scheduler
+//! refused for want of leadership waits there too. Once the node leads, every
+//! change except a claim or a read replays the unended continuations, then records the
+//! queued submissions in the order they were made.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kabudachi_core::election::{DropMessages, NoAuthority, Step, WorkerNode, carry_out};
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
+use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::scheduler::{
-    CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Completion, Event,
-    Failure, ReportRejection, Scheduler, Submission, SubmitRejection,
+    CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Completion,
+    ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission, Submitted,
+    SubmitRejection,
 };
+use kabudachi_core::task_record::{EffectGate, LocalRecords, Settled};
 use kabudachi_core::time::{Clock, Instant};
 use tokio::sync::{Notify, watch};
 
@@ -96,9 +108,120 @@ enum Concerned {
     Nobody,
 }
 
+/// The scheduler the door guards: it keeps its own records.
+pub type DoorScheduler<C> = Scheduler<C, Uuid7Ids, LocalRecords>;
+
 struct Inside<C: Clock> {
-    scheduler: Scheduler<C, Uuid7Ids>,
+    scheduler: DoorScheduler<C>,
     closed: bool,
+    /// Submissions made before this node led, in the order they were made.
+    queued: Vec<Submitted>,
+    /// The input bytes `queued` holds, which each new submission is checked
+    /// against the hard limit with.
+    queued_bytes: u64,
+    /// Continuations whose end the scheduler refused for want of leadership,
+    /// in the order they were refused: the grant ends them.
+    unended: Vec<TaskId>,
+}
+
+/// A rejection that can say "this node is not the leader".
+trait NotLeaderRejection {
+    const NOT_LEADER: Self;
+}
+
+macro_rules! not_leader {
+    ($($rejection:ty),*) => {
+        $(impl NotLeaderRejection for $rejection {
+            const NOT_LEADER: Self = Self::NotLeader;
+        })*
+    };
+}
+
+not_leader!(
+    SubmitRejection,
+    ClaimRejection,
+    ReportRejection,
+    CancelRejection,
+    ContinuationRejection
+);
+
+/// Runs `change`, then holds its outcome in an effect gate until the local
+/// store has settled every write the change made. The store settles them
+/// before `put` returns, so the outcome is decided before this returns: it
+/// stands if every write was kept and the scheduler still leads, and is
+/// `NotLeader` otherwise: the answer is `NotLeader` whenever the scheduler no
+/// longer leads after the call, whether or not its writes were published.
+fn gated<C: Clock, T, R: NotLeaderRejection>(
+    scheduler: &mut DoorScheduler<C>,
+    change: impl FnOnce(&mut DoorScheduler<C>) -> Result<T, R>,
+) -> Result<T, R> {
+    // Writes left by an operation nobody waits on are not this call's.
+    drop(scheduler.observer_mut().take_settled());
+    let outcome = change(scheduler);
+    let settled = scheduler.observer_mut().take_settled();
+    let outcome = outcome?;
+    if !scheduler.is_leader() {
+        return Err(R::NOT_LEADER);
+    }
+    let mut gate = EffectGate::new();
+    let mut ended = gate.hold(outcome, settled.iter().map(|(write, _)| write.clone()));
+    for (write, kept) in settled {
+        let more = if kept {
+            gate.acknowledged(&write, scheduler.is_leader())
+        } else {
+            gate.refused(&write).into_iter().map(Settled::NotLeader).collect()
+        };
+        ended = ended.or(more.into_iter().next());
+    }
+    match ended.expect("the local store settles every write before the call returns") {
+        Settled::Released(outcome) => Ok(outcome),
+        Settled::NotLeader(_) => Err(R::NOT_LEADER),
+    }
+}
+
+/// Records the submissions queued before the grant, in order. One refused
+/// outright (the limits fell since it was queued, or the lease ended) and
+/// everything behind it stay queued, in order, rather than being lost. One the
+/// scheduler recorded but whose write the store refused stays recorded:
+/// recording it again would overwrite the task and its runs.
+fn record_queued<C: Clock>(inside: &mut Inside<C>) {
+    let queued = std::mem::take(&mut inside.queued);
+    let mut waiting = queued.into_iter();
+    while let Some(submitted) = waiting.next() {
+        let kept = submitted.clone();
+        let recorded = gated(&mut inside.scheduler, |scheduler| scheduler.submit_minted(submitted));
+        if recorded.is_err() && inside.scheduler.runs_of(&kept.task_id).is_empty() {
+            inside.queued.push(kept);
+            inside.queued.extend(waiting);
+            break;
+        }
+    }
+    inside.queued_bytes = inside
+        .queued
+        .iter()
+        .map(|submitted| submitted.submission.serialized_input.len() as u64)
+        .sum();
+}
+
+/// Once the scheduler leads, ends the continuations it refused to end earlier
+/// (which frees the memory they held), then records the submissions queued
+/// before the grant, in order. Run after every change that can free capacity
+/// or keys, once the change's own effects have settled, so a refused
+/// submission is not left waiting for the next one.
+fn settle_pending<C: Clock>(inside: &mut Inside<C>) {
+    if !inside.scheduler.is_leader() {
+        return;
+    }
+    let unended = std::mem::take(&mut inside.unended);
+    let mut waiting = unended.into_iter();
+    while let Some(task) = waiting.next() {
+        if gated(&mut inside.scheduler, |scheduler| scheduler.end_continuation(&task)).is_err() {
+            inside.unended.push(task);
+            inside.unended.extend(waiting);
+            break;
+        }
+    }
+    record_queued(inside);
 }
 
 /// The bindings' one way into the shared scheduler.
@@ -109,12 +232,14 @@ pub struct SchedulerDoor<C: Clock> {
 }
 
 impl<C: Clock> SchedulerDoor<C> {
-    /// Takes only an unobserved scheduler (`Scheduler::new`).
-    pub fn new(scheduler: Scheduler<C, Uuid7Ids>, worker: WorkerId) -> Self {
+    pub fn new(scheduler: DoorScheduler<C>, worker: WorkerId) -> Self {
         SchedulerDoor {
             inside: Mutex::new(Inside {
                 scheduler,
                 closed: false,
+                queued: Vec::new(),
+                queued_bytes: 0,
+                unended: Vec::new(),
             }),
             wakeups: Wakeups {
                 claims: Wake::new(),
@@ -125,26 +250,48 @@ impl<C: Clock> SchedulerDoor<C> {
         }
     }
 
+    /// Gives `submission` its task id at once. A leader records it now; before
+    /// the grant, or while earlier submissions are still queued behind a
+    /// refusal, it is checked against the hard limit with everything queued
+    /// before it, queued, and recorded, in order, by the first change that
+    /// finds room once this node leads.
     pub fn submit(&self, submission: Submission) -> Result<TaskId, Refusal<SubmitRejection>> {
-        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            scheduler.submit(submission)
+        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            let submitted = inside.scheduler.mint(submission);
+            if inside.scheduler.is_leader() {
+                // The lone leader is not woken by an election step again, so
+                // capacity freed since a refusal is used by the next submission.
+                record_queued(inside);
+            }
+            if inside.scheduler.is_leader() && inside.queued.is_empty() {
+                return gated(&mut inside.scheduler, |scheduler| scheduler.submit_minted(submitted));
+            }
+            inside
+                .scheduler
+                .check_submission(&submitted.submission, inside.queued_bytes)?;
+            inside.queued_bytes += submitted.submission.serialized_input.len() as u64;
+            let task = submitted.task_id.clone();
+            inside.queued.push(submitted);
+            Ok(task)
         }))
     }
 
     pub fn report_started(&self, run: &TaskRunId) -> Result<(), Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            scheduler.report_started(&self.worker, run)
+            gated(scheduler, |scheduler| scheduler.report_started(&self.worker, run))
         }))
     }
 
     pub fn complete(
         &self,
         run: &TaskRunId,
-        result_digest: Vec<u8>,
+        result_digest: Digest,
         completion: Completion,
     ) -> Result<Certification, Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            scheduler.complete(&self.worker, run, result_digest, completion)
+            gated(scheduler, |scheduler| {
+                scheduler.complete(&self.worker, run, result_digest, completion)
+            })
         }))
     }
 
@@ -159,25 +306,45 @@ impl<C: Clock> SchedulerDoor<C> {
         failure_kind: &str,
     ) -> Result<Failure, Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            if scheduler.task_run(run).map(TaskRunRecord::current_state)
-                == Some(TaskRunState::Claimed)
-            {
-                scheduler.report_started(&self.worker, run)?;
-            }
-            scheduler.fail(&self.worker, run, failure_kind)
+            gated(scheduler, |scheduler| {
+                if scheduler.task_run(run).map(TaskRunRecord::current_state)
+                    == Some(TaskRunState::Claimed)
+                {
+                    scheduler.report_started(&self.worker, run)?;
+                }
+                scheduler.fail(&self.worker, run, failure_kind)
+            })
         }))
     }
 
+    /// Cancels `task`. A submission still queued for the grant is dropped
+    /// from the queue, so it never runs.
     pub fn cancel(&self, task: &TaskId) -> Result<Cancellation, Refusal<CancelRejection>> {
-        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            scheduler.cancel(task)
+        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            if let Some(at) = inside.queued.iter().position(|queued| queued.task_id == *task) {
+                let dropped = inside.queued.remove(at);
+                inside.queued_bytes -= dropped.submission.serialized_input.len() as u64;
+                return Ok(Cancellation::Cancelled { was_running: false });
+            }
+            gated(&mut inside.scheduler, |scheduler| scheduler.cancel(task))
         }))
     }
 
-    pub fn end_continuation(&self, task: &TaskId) -> Result<bool, Closed> {
-        self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            scheduler.end_continuation(task)
-        })
+    /// Ends the continuation of `task`. Refused for want of leadership, it
+    /// is kept and ended by the first change once this node leads, so the task
+    /// is not left continuing for ever; the caller is still told it was
+    /// refused.
+    pub fn end_continuation(
+        &self,
+        task: &TaskId,
+    ) -> Result<bool, Refusal<ContinuationRejection>> {
+        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            let ended = gated(&mut inside.scheduler, |scheduler| scheduler.end_continuation(task));
+            if ended.is_err() && !inside.unended.contains(task) {
+                inside.unended.push(task.clone());
+            }
+            ended
+        }))
     }
 
     pub fn run_state(&self, run: &TaskRunId) -> Result<Option<TaskRunState>, Closed> {
@@ -188,17 +355,37 @@ impl<C: Clock> SchedulerDoor<C> {
         })
     }
 
+    /// The newest record of `task` this node holds.
+    #[allow(dead_code, reason = "no Python call reads a record yet; the door tests do")]
+    pub fn record(&self, task: &TaskId) -> Result<Option<TaskRecord>, Closed> {
+        // `observer_mut` is the scheduler's only way to the store, and
+        // reading it wakes nobody.
+        self.change(Concerned::Nobody, |scheduler| {
+            scheduler.observer_mut().records().get(task).cloned()
+        })
+    }
+
     pub fn run_ids(&self, task: &TaskId) -> Result<Vec<TaskRunId>, Closed> {
         self.read(|scheduler| scheduler.runs_of(task))
     }
 
     /// The timer loop's tick: `catch_up`, wake claims (never the timer loop
-    /// itself), and return `next_deadline`.
+    /// itself), and return `next_deadline`. The deadline is read after what
+    /// the catch-up freed has been recorded, since a queued submission
+    /// recorded then may carry a delay or expiry the loop must wake for; the
+    /// loop is not woken for that, as it learns of it from this result.
     pub fn tick(&self) -> Result<Option<Instant>, Closed> {
-        self.change(Concerned::Claims, |scheduler| {
-            scheduler.catch_up();
-            scheduler.next_deadline()
-        })
+        self.change_then(
+            Concerned::Claims,
+            |inside| {
+                inside.scheduler.catch_up();
+                // Nothing waits on what time made it publish, so a write the
+                // store refuses here is deliberately not retried: no answer
+                // depends on it.
+                drop(inside.scheduler.observer_mut().take_settled());
+            },
+            |inside, ()| inside.scheduler.next_deadline(),
+        )
     }
 
     /// Applies an election step of the lone local node: `election::carry_out`
@@ -209,15 +396,17 @@ impl<C: Clock> SchedulerDoor<C> {
         step: Step,
         mut observe: impl FnMut(&Step),
     ) -> Result<Option<Instant>, Closed> {
-        self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            carry_out(
+        self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            let next = carry_out(
                 node,
                 step,
-                scheduler,
+                &mut inside.scheduler,
                 &mut DropMessages,
                 &mut NoAuthority,
                 |_, _, _, step| observe(step),
-            )
+            );
+            drop(inside.scheduler.observer_mut().take_settled());
+            next
         })
     }
 
@@ -230,18 +419,47 @@ impl<C: Clock> SchedulerDoor<C> {
     /// closed, then wakes whoever `concerned` names, and the wait for events
     /// if the scheduler has something to say. What the scheduler decided is
     /// read under the same lock, so an event produced here cannot be missed
-    /// by the wake-up that follows it.
+    /// by the wake-up that follows it. Any change but a claim or a read is followed,
+    /// under the same lock and once this node leads, by ending the
+    /// continuations refused earlier and recording the submissions queued for
+    /// the grant, as capacity or keys the change freed may let those happen.
     fn change<T>(
         &self,
         concerned: Concerned,
-        change: impl FnOnce(&mut Scheduler<C, Uuid7Ids>) -> T,
+        change: impl FnOnce(&mut DoorScheduler<C>) -> T,
     ) -> Result<T, Closed> {
+        self.change_inside(concerned, |inside| change(&mut inside.scheduler))
+    }
+
+    /// [`Self::change`] for a change that also needs the submissions queued
+    /// before the grant.
+    fn change_inside<T>(
+        &self,
+        concerned: Concerned,
+        change: impl FnOnce(&mut Inside<C>) -> T,
+    ) -> Result<T, Closed> {
+        self.change_then(concerned, change, |_, outcome| outcome)
+    }
+
+    /// [`Self::change_inside`] whose result is also read after what the
+    /// change queued has settled, so it describes the scheduler as the caller
+    /// leaves it.
+    fn change_then<T, U>(
+        &self,
+        concerned: Concerned,
+        change: impl FnOnce(&mut Inside<C>) -> T,
+        then: impl FnOnce(&mut Inside<C>, T) -> U,
+    ) -> Result<U, Closed> {
         let (outcome, has_events) = {
             let mut inside = self.lock();
             if inside.closed {
                 return Err(Closed);
             }
-            let outcome = change(&mut inside.scheduler);
+            let outcome = change(&mut inside);
+            if !matches!(concerned, Concerned::Nobody) {
+                settle_pending(&mut inside);
+            }
+            let outcome = then(&mut inside, outcome);
             (outcome, inside.scheduler.has_events())
         };
         match concerned {
@@ -259,7 +477,7 @@ impl<C: Clock> SchedulerDoor<C> {
     }
 
     /// Reads the scheduler under its lock, unless the door is closed.
-    fn read<T>(&self, read: impl FnOnce(&Scheduler<C, Uuid7Ids>) -> T) -> Result<T, Closed> {
+    fn read<T>(&self, read: impl FnOnce(&DoorScheduler<C>) -> T) -> Result<T, Closed> {
         let inside = self.lock();
         if inside.closed {
             return Err(Closed);
@@ -307,7 +525,7 @@ impl<C: Clock + Send + 'static> SchedulerDoor<C> {
                     return Err(Closed);
                 }
                 let claims = match self.change(Concerned::Nobody, |scheduler| {
-                    scheduler.claim_oldest(&self.worker, limit)
+                    gated(scheduler, |scheduler| scheduler.claim_oldest(&self.worker, limit))
                 })? {
                     Ok(claims) => claims,
                     // Not leading yet is not an error: there is just nothing
@@ -369,13 +587,14 @@ fn refuse<T, R>(outcome: Result<Result<T, R>, Closed>) -> Result<T, Refusal<R>> 
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use kabudachi_core::election::Output;
     use kabudachi_core::protocol::ids::{IncarnationId, ShardId, TaskDefinitionId};
     use kabudachi_core::protocol::messages::prelude::*;
-    use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, MemoryLimits};
+    use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, MemoryLimits, Observer};
+    use kabudachi_core::task_record::LocalRecords;
     use kabudachi_core::time::Duration as CoreDuration;
     use tokio::runtime::Builder;
 
@@ -383,14 +602,20 @@ pub(crate) mod tests {
     use crate::local_node::local_node;
 
     const LIMIT: Duration = Duration::from_secs(5);
-    const DIGEST: &[u8] = b"digest-of-the-result";
+    fn digest() -> Digest {
+        Digest::blake3(b"the-result")
+    }
     /// Lets a scheduler lead for as long as a test runs. Shared with the
     /// other test modules of this crate that need a leading scheduler.
-    pub(crate) const UNBOUNDED_GRANT: LeadershipGrant = LeadershipGrant {
-        term: 1,
-        recovery_epoch: 0,
-        valid_until: LeaseEnd::Unbounded,
-    };
+    pub(crate) const UNBOUNDED_GRANT: LeadershipGrant = grant(1);
+
+    const fn grant(term: u64) -> LeadershipGrant {
+        LeadershipGrant {
+            term,
+            recovery_epoch: kabudachi_core::coordination_authority::RecoveryEpoch::new(0, 0),
+            valid_until: LeaseEnd::Unbounded,
+        }
+    }
 
     /// A clock the test moves by hand. Unlike core's single-threaded
     /// `FakeClock`, it can be shared with the door and the timer loop across
@@ -422,7 +647,7 @@ pub(crate) mod tests {
         clock: ManualClock,
         grant: Option<LeadershipGrant>,
     ) -> Arc<SchedulerDoor<ManualClock>> {
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::default());
         scheduler.set_leadership_grant(grant);
         Arc::new(SchedulerDoor::new(scheduler, worker()))
     }
@@ -442,6 +667,16 @@ pub(crate) mod tests {
     fn lead(door: &SchedulerDoor<ManualClock>, node: &mut WorkerNode<ManualClock>) {
         let step = Step {
             outputs: vec![Output::Grant(Some(UNBOUNDED_GRANT))],
+            next_deadline: None,
+        };
+        door.carry_out(node, step, |_| {})
+            .expect("the door is open");
+    }
+
+    /// Takes the grant away, as an election step that lost leadership does.
+    fn withdraw(door: &SchedulerDoor<ManualClock>, node: &mut WorkerNode<ManualClock>) {
+        let step = Step {
+            outputs: vec![Output::Grant(None)],
             next_deadline: None,
         };
         door.carry_out(node, step, |_| {})
@@ -481,12 +716,12 @@ pub(crate) mod tests {
         assert_eq!(door.submit(submission()), Err(Refusal::Closed));
         assert_eq!(door.report_started(&run), Err(Refusal::Closed));
         assert_eq!(
-            door.complete(&run, DIGEST.to_vec(), Completion::Final),
+            door.complete(&run, digest(), Completion::Final),
             Err(Refusal::Closed)
         );
         assert_eq!(door.report_failure(&run, "ValueError"), Err(Refusal::Closed));
         assert_eq!(door.cancel(&task), Err(Refusal::Closed));
-        assert_eq!(door.end_continuation(&task), Err(Closed));
+        assert_eq!(door.end_continuation(&task), Err(Refusal::Closed));
         assert_eq!(door.run_state(&run), Err(Closed));
         assert_eq!(door.run_ids(&task), Err(Closed));
         assert_eq!(door.tick(), Err(Closed));
@@ -524,13 +759,386 @@ pub(crate) mod tests {
 
         let claims = block_on(async {
             let waiting = tokio::spawn(Arc::clone(&door).claim_when_available(10));
-            // Becoming leader with work already queued, before the waiter has run.
-            door.submit(submission()).unwrap();
+            // Work queued before the waiter has run.
             lead(&door, &mut node);
+            door.submit(submission()).unwrap();
             waiting.await.unwrap().unwrap()
         });
 
         assert_eq!(claims.len(), 1);
+    }
+
+    #[test]
+    fn a_submission_before_the_grant_keeps_its_id_and_is_recorded_first_when_the_grant_arrives() {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), None);
+        let mut node = node(clock);
+
+        let task = door.submit(submission()).unwrap();
+        assert_eq!(door.record(&task).unwrap(), None, "no leader has recorded it yet");
+
+        lead(&door, &mut node);
+
+        let record = door.record(&task).unwrap().expect("recorded when the grant arrived");
+        assert_eq!(
+            record.version.map(|version| (version.leader_term, version.revision)),
+            Some((1, 0))
+        );
+        let claims = block_on(Arc::clone(&door).claim_when_available(1)).unwrap();
+        assert_eq!(
+            claims[0].task.task_id(),
+            task,
+            "the task claimed is the one the client was told of"
+        );
+    }
+
+    #[test]
+    fn a_submission_before_the_grant_is_refused_when_it_would_pass_the_hard_limit_with_those_queued()
+     {
+        let mut scheduler =
+            Scheduler::with_observer(ManualClock::default(), Uuid7Ids, LocalRecords::default());
+        scheduler.set_memory_limits(Some(MemoryLimits { soft: 50, hard: 100 }));
+        let door = SchedulerDoor::new(scheduler, worker());
+        let sized = |bytes: usize| {
+            Submission::new(TaskDefinitionId::new("definition"), 0, vec![0; bytes], "default")
+        };
+
+        door.submit(sized(60)).unwrap();
+
+        assert!(matches!(
+            door.submit(sized(60)),
+            Err(Refusal::Rejected(SubmitRejection::Backpressure { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_queued_submission_the_grant_cannot_record_is_kept_and_recorded_once_it_can() {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), None);
+        let mut node = node(clock);
+        let sized = |bytes: usize| {
+            Submission::new(TaskDefinitionId::new("definition"), 0, vec![0; bytes], "default")
+        };
+        let first = door.submit(sized(60)).unwrap();
+        let second = door.submit(sized(60)).unwrap();
+        let third = door.submit(sized(1)).unwrap();
+        // Limits lowered after the two were queued: only one fits.
+        door.lock()
+            .scheduler
+            .set_memory_limits(Some(MemoryLimits { soft: 50, hard: 100 }));
+
+        lead(&door, &mut node);
+
+        assert!(door.record(&first).unwrap().is_some());
+        assert_eq!(door.record(&second).unwrap(), None, "refused for now, not lost");
+        assert_eq!(door.record(&third).unwrap(), None, "kept behind the refused one");
+
+        door.lock().scheduler.set_memory_limits(None);
+        let step = Step {
+            outputs: Vec::new(),
+            next_deadline: None,
+        };
+        door.carry_out(&mut node, step, |_| {}).unwrap();
+
+        let revision = |task: &TaskId| {
+            door.record(task).unwrap().and_then(|record| record.version).map(|v| v.revision)
+        };
+        assert_eq!(
+            (revision(&first), revision(&second), revision(&third)),
+            (Some(0), Some(1), Some(2))
+        );
+    }
+
+    #[test]
+    fn a_leaders_submission_waits_behind_earlier_ones_still_queued() {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), None);
+        let mut node = node(clock);
+        let sized = |bytes: usize| {
+            Submission::new(TaskDefinitionId::new("definition"), 0, vec![0; bytes], "default")
+        };
+        let first = door.submit(sized(60)).unwrap();
+        let second = door.submit(sized(60)).unwrap();
+        door.lock()
+            .scheduler
+            .set_memory_limits(Some(MemoryLimits { soft: 50, hard: 100 }));
+        lead(&door, &mut node);
+        assert!(door.record(&first).unwrap().is_some());
+        assert_eq!(door.record(&second).unwrap(), None, "refused for now, not lost");
+
+        door.lock()
+            .scheduler
+            .set_memory_limits(Some(MemoryLimits { soft: 50, hard: 130 }));
+        let late = door.submit(sized(1)).unwrap();
+
+        let revision = |task: &TaskId| {
+            door.record(task).unwrap().and_then(|record| record.version).map(|v| v.revision)
+        };
+        assert_eq!(
+            (revision(&second), revision(&late)),
+            (Some(1), Some(2)),
+            "the queued one is recorded first, then the new one, without another election step"
+        );
+    }
+
+    /// A door whose queued second submission the grant refused for want of
+    /// room: returns the door, the first task and the refused second one.
+    fn door_with_a_submission_refused_at_the_grant() -> (
+        Arc<SchedulerDoor<ManualClock>>,
+        TaskId,
+        TaskId,
+    ) {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), None);
+        let mut node = node(clock);
+        let sized = |bytes: usize| {
+            Submission::new(TaskDefinitionId::new("definition"), 0, vec![0; bytes], "default")
+        };
+        let first = door.submit(sized(60)).unwrap();
+        let second = door.submit(sized(60)).unwrap();
+        door.lock()
+            .scheduler
+            .set_memory_limits(Some(MemoryLimits { soft: 50, hard: 100 }));
+        lead(&door, &mut node);
+        assert!(door.record(&first).unwrap().is_some());
+        assert_eq!(door.record(&second).unwrap(), None, "refused at the grant");
+        (door, first, second)
+    }
+
+    #[test]
+    fn a_completion_that_frees_room_records_the_queued_submission_without_another_call() {
+        let (door, first, second) = door_with_a_submission_refused_at_the_grant();
+        let claims = block_on(Arc::clone(&door).claim_when_available(1)).unwrap();
+        let run = claims[0].task_run_id.clone();
+        assert_eq!(claims[0].task.task_id(), first);
+        door.report_started(&run).unwrap();
+
+        door.complete(&run, digest(), Completion::Final).unwrap();
+
+        assert!(door.record(&second).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_end_of_continuation_replayed_at_the_grant_frees_room_for_a_queued_submission() {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), Some(UNBOUNDED_GRANT));
+        let mut node = node(clock);
+        let sized = |bytes: usize| {
+            Submission::new(TaskDefinitionId::new("definition"), 0, vec![0; bytes], "default")
+        };
+        let first = door.submit(sized(60)).unwrap();
+        let claims = block_on(Arc::clone(&door).claim_when_available(1)).unwrap();
+        let run = claims[0].task_run_id.clone();
+        door.report_started(&run).unwrap();
+        door.complete(&run, digest(), Completion::Continues).unwrap();
+        withdraw(&door, &mut node);
+        assert!(door.end_continuation(&first).is_err());
+        let second = door.submit(sized(60)).unwrap();
+        door.lock()
+            .scheduler
+            .set_memory_limits(Some(MemoryLimits { soft: 50, hard: 100 }));
+
+        lead(&door, &mut node);
+
+        assert!(
+            door.record(&second).unwrap().is_some(),
+            "the continuation ended at the grant freed the room the queued submission needed"
+        );
+    }
+
+    #[test]
+    fn the_timer_loop_releases_a_delayed_submission_recorded_after_an_expiry_freed_room() {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), None);
+        let mut node = node(clock.clone());
+        let sized = |bytes: usize| {
+            Submission::new(TaskDefinitionId::new("definition"), 0, vec![0; bytes], "default")
+        };
+        door.submit(sized(60).with_expiry(CoreDuration::from_ticks(10)))
+            .unwrap();
+        let delayed = door
+            .submit(sized(60).with_delay(CoreDuration::from_ticks(15)))
+            .unwrap();
+        door.lock()
+            .scheduler
+            .set_memory_limits(Some(MemoryLimits { soft: 50, hard: 100 }));
+        lead(&door, &mut node);
+        assert_eq!(door.record(&delayed).unwrap(), None, "no room for it yet");
+
+        block_on(async {
+            let timers = tokio::spawn(crate::timers::run_timers(Arc::clone(&door), clock.clone()));
+            tokio::task::yield_now().await;
+            // The first task expires, which makes room for the delayed one.
+            clock.advance(10);
+            while door.record(&delayed).unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let claim = tokio::spawn(Arc::clone(&door).claim_when_available(1));
+            tokio::task::yield_now().await;
+            assert!(!claim.is_finished(), "the delayed task is not due yet");
+            clock.advance(5);
+
+            let claims = claim.await.unwrap().unwrap();
+            assert_eq!(claims[0].task.task_id(), delayed);
+            door.close();
+            timers.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_leaders_answer_comes_back_only_after_its_record_is_stored() {
+        let door = door(ManualClock::default(), Some(UNBOUNDED_GRANT));
+        let task = door.submit(submission()).unwrap();
+
+        let record = door.record(&task).unwrap().expect("stored before submit returned");
+        assert_eq!(record.runs.len(), 1);
+    }
+
+    #[test]
+    fn an_answer_whose_record_the_store_refuses_is_not_leader_and_the_stored_record_stands() {
+        let door = door(ManualClock::default(), Some(grant(2)));
+        let task = door.submit(submission()).unwrap();
+        // The store already holds a newer version of the task, as from a
+        // leader of a later term, so it refuses what this leader writes next.
+        let elsewhere = self::door(ManualClock::default(), Some(grant(5)));
+        let other = elsewhere.submit(submission()).unwrap();
+        let mut newer = elsewhere.record(&other).unwrap().expect("stored at term 5");
+        newer.task.as_mut().expect("a record carries its task").task_id = Some(task.clone().into());
+        door.lock().scheduler.observer_mut().revision(newer.clone());
+
+        assert_eq!(
+            door.cancel(&task),
+            Err(Refusal::Rejected(CancelRejection::NotLeader))
+        );
+        assert_eq!(door.record(&task).unwrap(), Some(newer));
+    }
+
+    /// A clock the test can make end a lease at a defined point: once armed,
+    /// the next wall-clock reading (which a leader takes to stamp the records
+    /// of its call, after it has checked that it leads) moves time on.
+    #[derive(Debug, Clone, Default)]
+    struct LapsingClock {
+        ticks: Arc<AtomicU64>,
+        lapse_at_next_stamp: Arc<AtomicBool>,
+    }
+
+    impl Clock for LapsingClock {
+        fn now(&self) -> Instant {
+            Instant::at(self.ticks.load(Ordering::SeqCst))
+        }
+
+        fn wall_clock_millis(&self) -> u64 {
+            if self.lapse_at_next_stamp.swap(false, Ordering::SeqCst) {
+                self.ticks.fetch_add(100, Ordering::SeqCst);
+            }
+            0
+        }
+    }
+
+    #[test]
+    fn an_answer_is_not_leader_when_the_lease_ends_during_the_call() {
+        let clock = LapsingClock::default();
+        let mut scheduler =
+            Scheduler::with_observer(clock.clone(), Uuid7Ids, LocalRecords::default());
+        let lease = LeadershipGrant {
+            valid_until: LeaseEnd::At(Instant::at(50)),
+            ..grant(1)
+        };
+        scheduler.set_leadership_grant(Some(lease));
+        let door = SchedulerDoor::new(scheduler, worker());
+        let task = door.submit(submission()).unwrap();
+        clock.lapse_at_next_stamp.store(true, Ordering::SeqCst);
+
+        let answer = door.cancel(&task);
+
+        assert_eq!(
+            answer,
+            Err(Refusal::Rejected(CancelRejection::NotLeader)),
+            "the lease ended after the leader check, so the cancellation was not published"
+        );
+        let stored = door.record(&task).unwrap().expect("stored by the submission");
+        assert!(!stored.finished);
+        door.lock().scheduler.set_leadership_grant(Some(UNBOUNDED_GRANT));
+        let published = door.record(&task).unwrap().expect("still stored");
+        assert!(
+            published.finished,
+            "the cancellation was made before the refusal, and is published once the grant is back"
+        );
+    }
+
+    #[test]
+    fn a_queued_submission_the_scheduler_recorded_is_not_recorded_again_when_its_write_was_refused()
+     {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), None);
+        let mut node = node(clock);
+        let older = door.submit(submission().with_coalescing_key("k")).unwrap();
+        let newer = door.submit(submission().with_coalescing_key("k")).unwrap();
+        // The store already holds `older` from a term above the one that is
+        // about to lead, so it refuses what the grant records of it.
+        let elsewhere = self::door(ManualClock::default(), Some(grant(5)));
+        let other = elsewhere.submit(submission()).unwrap();
+        let mut held = elsewhere.record(&other).unwrap().expect("stored at term 5");
+        held.task.as_mut().expect("a record carries its task").task_id = Some(older.clone().into());
+        door.lock().scheduler.observer_mut().revision(held.clone());
+
+        lead(&door, &mut node);
+
+        assert!(
+            door.record(&newer).unwrap().is_some(),
+            "the queue went on past the submission the scheduler had recorded"
+        );
+        assert_eq!(door.record(&older).unwrap(), Some(held), "the stored record stands");
+        let runs = door.run_ids(&older).unwrap();
+        let step = Step {
+            outputs: Vec::new(),
+            next_deadline: None,
+        };
+        door.carry_out(&mut node, step, |_| {}).unwrap();
+        assert_eq!(
+            door.run_ids(&older).unwrap(),
+            runs,
+            "the next step did not record it a second time"
+        );
+    }
+
+    #[test]
+    fn an_end_of_continuation_refused_while_not_leading_is_replayed_when_the_leader_returns() {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), Some(UNBOUNDED_GRANT));
+        let mut node = node(clock);
+        let task = door.submit(submission()).unwrap();
+        let claims = block_on(Arc::clone(&door).claim_when_available(1)).unwrap();
+        let run = claims[0].task_run_id.clone();
+        door.report_started(&run).unwrap();
+        door.complete(&run, digest(), Completion::Continues).unwrap();
+        withdraw(&door, &mut node);
+
+        assert_eq!(
+            door.end_continuation(&task),
+            Err(Refusal::Rejected(ContinuationRejection::NotLeader))
+        );
+        lead(&door, &mut node);
+
+        let record = door.record(&task).unwrap().expect("recorded");
+        assert!(record.finished, "the continuation the follower could not end was ended on the grant");
+    }
+
+    #[test]
+    fn cancelling_a_submission_queued_before_the_grant_means_it_never_runs() {
+        let clock = ManualClock::default();
+        let door = door(clock.clone(), None);
+        let mut node = node(clock);
+        let task = door.submit(submission()).unwrap();
+
+        assert_eq!(
+            door.cancel(&task),
+            Ok(Cancellation::Cancelled { was_running: false })
+        );
+        lead(&door, &mut node);
+
+        assert_eq!(door.record(&task).unwrap(), None, "a cancelled submission is not recorded");
+        assert_eq!(door.run_ids(&task).unwrap(), Vec::new());
     }
 
     // Two claims wait while the worker does not lead, with two tasks queued.
@@ -539,12 +1147,13 @@ pub(crate) mod tests {
     #[test]
     fn one_wake_up_hands_queued_work_to_every_waiting_claim() {
         let clock = ManualClock::default();
-        let door = door(clock.clone(), None);
+        let door = door(clock.clone(), Some(UNBOUNDED_GRANT));
         let mut node = node(clock);
         let queued = [
             door.submit(submission()).unwrap(),
             door.submit(submission()).unwrap(),
         ];
+        withdraw(&door, &mut node);
 
         let (first, second) = block_on(async {
             let first = tokio::spawn(Arc::clone(&door).claim_when_available(1));
@@ -578,7 +1187,8 @@ pub(crate) mod tests {
     /// to see. The setup goes through a bare scheduler because the door has
     /// no synchronous claim.
     fn running_over_the_soft_limit() -> (Arc<SchedulerDoor<ManualClock>>, TaskRunId) {
-        let mut scheduler = Scheduler::new(ManualClock::default(), Uuid7Ids);
+        let mut scheduler =
+            Scheduler::with_observer(ManualClock::default(), Uuid7Ids, LocalRecords::default());
         scheduler.set_memory_limits(Some(MemoryLimits {
             soft: 100,
             hard: 1_000,
@@ -614,7 +1224,7 @@ pub(crate) mod tests {
         events.borrow_and_update();
 
         let certified = door
-            .complete(&run_id, DIGEST.to_vec(), Completion::Final)
+            .complete(&run_id, digest(), Completion::Final)
             .expect("the running run completes");
 
         assert_eq!(certified.task_run_id, run_id);

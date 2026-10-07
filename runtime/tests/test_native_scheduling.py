@@ -10,7 +10,7 @@ from kabudachi import _native
 from kabudachi._native import CancelOutcome, RunState
 
 WAIT_LIMIT_SECONDS = 5
-DIGEST = b"digest-of-the-result"
+DIGEST = _native.result_digest(b"the-result")
 
 
 def new_runtime(**options):
@@ -144,6 +144,15 @@ def started_run(native):
     [claimed] = asyncio.run(claim(native))
     native.report_started(claimed.task_run_id)
     return claimed.task_run_id
+
+
+def test_a_digest_of_the_wrong_length_is_refused(runtime):
+    run_id = started_run(runtime)
+
+    with pytest.raises(ValueError):
+        runtime.complete(run_id, b"short")
+
+    assert runtime.task_run_state(run_id) == RunState.RUNNING
 
 
 def test_cancelling_answers_cancelled_then_already_finished_and_unknown_for_no_such_task(runtime):

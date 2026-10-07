@@ -4,6 +4,7 @@
 //! task may opt in to dropping its own oldest retained payloads instead.
 
 
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::scheduler::{
     Completion, Event, MAX_SUBMISSION_BYTES, MemoryLimits, Submission, SubmitRejection,
@@ -57,7 +58,7 @@ fn finish(fixture: &mut Fixture, task: &TaskId) {
         .unwrap();
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
+        .complete(&worker(), &claim.task_run_id, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
 }
 

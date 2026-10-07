@@ -799,7 +799,7 @@ fn a_leader_with_an_authority_acts_only_while_it_holds_the_fence() {
         grants(&won).last(),
         Some(&Some(kabudachi_core::scheduler::LeadershipGrant {
             term: 1,
-            recovery_epoch: 0,
+            recovery_epoch: epoch(0),
             valid_until: LeaseEnd::At(driven.clock.now() + Duration::from_ticks(lasting_ticks())),
         })),
         "even a lone leader's grant ends with its fence"

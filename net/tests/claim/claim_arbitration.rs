@@ -8,13 +8,13 @@
 //! reports, and never picks a leader for a claimant. The leader decides from the leadership grant its election handed
 //! its scheduler, so a worker holding no grant refuses every claim.
 //!
-//! The tasks are submitted before any node is driven: submission needs no
-//! leadership, and a scheduler that leads later finds them queued.
+//! The genesis leader is driven until it leads, and only then is its scheduler
+//! given its tasks: only a leader records a submission.
 
 
 use std::time::Duration as StdDuration;
 
-use crate::support::election::due_now;
+use crate::support::election::{drive_until_leading, due_now};
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, WorkerNode};
 use kabudachi_core::protocol::ids::{
@@ -138,6 +138,12 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
     )
     .0;
     let mut scheduler_a = Scheduler::new(clock, Uuid7Ids);
+    timeout(
+        TEST_TIMEOUT,
+        drive_until_leading(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock),
+    )
+    .await
+    .expect("the genesis leader led within the timeout");
     let small = || b"payload".to_vec();
     let taken = submit(&mut scheduler_a, small());
     let oldest = [

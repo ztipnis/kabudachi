@@ -15,6 +15,8 @@ WAIT_LIMIT_SECONDS = 5
 # Well under the native runtime's one second shutdown grace, which a shutdown
 # that had to give up on something would run into.
 PROMPT_SECONDS = 0.9
+# Longer than the shutdown grace plus the shutdown timeout.
+GIL_HOLD_SECONDS = 2.5
 
 
 def new_runtime(**options):
@@ -173,6 +175,69 @@ def test_no_wait_is_lost_when_shutdown_races_new_waits():
 
         assert issued
         assert stranded == [], delay_seconds
+
+
+def test_waits_whose_delivery_outlasts_the_shutdown_grace_still_fail():
+    waits = 1000
+    native = new_runtime(suspect_timeout_ms=60_000)
+    issued = []
+    ready = threading.Event()
+    loop_done = threading.Event()
+    hog_done = threading.Event()
+    hold_problems = []
+    outcomes = []
+
+    def keep_waiting():
+        async def main():
+            issued.extend(
+                asyncio.ensure_future(native.wait_until_leader()) for _ in range(waits)
+            )
+            ready.set()
+            # Start the clock only once the GIL hold is over, so a slow host
+            # cannot run the limit out while the hold is still in progress.
+            await asyncio.get_running_loop().run_in_executor(None, hog_done.wait)
+            done, pending = await asyncio.wait(issued, timeout=WAIT_LIMIT_SECONDS)
+            outcomes.extend(future.exception() for future in done)
+            outcomes.extend(None for _ in pending)
+
+        asyncio.run(main())
+        loop_done.set()
+
+    def hold_the_gil():
+        # Once shutdown has begun, keep the GIL for a fixed wall-clock time,
+        # longer than the shutdown grace plus the shutdown timeout, so no
+        # result can be handed to the loop in time whatever the host speed.
+        previous_interval = sys.getswitchinterval()
+        try:
+            stop_by = time.monotonic() + WAIT_LIMIT_SECONDS
+            while native.worker_state() != "Stopped":
+                if time.monotonic() > stop_by:
+                    hold_problems.append("the worker never reached Stopped")
+                    return
+            sys.setswitchinterval(30)
+            deadline = time.monotonic() + GIL_HOLD_SECONDS
+            while time.monotonic() < deadline:
+                pass
+        finally:
+            sys.setswitchinterval(previous_interval)
+            hog_done.set()
+
+    loop_thread = threading.Thread(target=keep_waiting)
+    loop_thread.start()
+    assert ready.wait(WAIT_LIMIT_SECONDS)
+    hog = threading.Thread(target=hold_the_gil)
+    hog.start()
+    native.shutdown()
+    hog.join(WAIT_LIMIT_SECONDS * 2)
+    assert not hog.is_alive()
+    assert hold_problems == []
+    assert loop_done.wait(WAIT_LIMIT_SECONDS * 2)
+    loop_thread.join()
+
+    assert len(outcomes) == waits
+    assert all(isinstance(outcome, RuntimeError) for outcome in outcomes), [
+        outcome for outcome in outcomes if not isinstance(outcome, RuntimeError)
+    ][:3]
 
 
 def test_cancelled_waits_stop_counting():

@@ -168,7 +168,7 @@ mod tests {
     fn grant(valid_until: LeaseEnd) -> Option<LeadershipGrant> {
         Some(LeadershipGrant {
             term: 1,
-            recovery_epoch: 0,
+            recovery_epoch: kabudachi_core::coordination_authority::RecoveryEpoch::new(0, 0),
             valid_until,
         })
     }

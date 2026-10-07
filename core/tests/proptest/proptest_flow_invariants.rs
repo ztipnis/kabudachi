@@ -18,6 +18,7 @@ use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
 use crate::support::spy::Spy;
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
@@ -177,12 +178,12 @@ impl Model {
                         self.scheduler.complete(
                             &self.worker,
                             run,
-                            b"d".to_vec(),
+                            Digest::blake3(b"d"),
                             Completion::Continues,
                         )
                     } else {
                         self.scheduler
-                            .complete(&self.worker, run, b"d".to_vec(), Completion::Final)
+                            .complete(&self.worker, run, Digest::blake3(b"d"), Completion::Final)
                     };
                     if done.is_ok() {
                         let task = claim.task.task_id();
@@ -201,7 +202,7 @@ impl Model {
                         .nth(*pick as usize % self.continuing.len())
                         .unwrap()
                         .clone();
-                    assert!(self.scheduler.end_continuation(&task));
+                    assert_eq!(self.scheduler.end_continuation(&task), Ok(true));
                     self.continuing.remove(&task);
                 }
             }
@@ -325,7 +326,7 @@ impl Model {
     /// Finishes everything still open, so accounting can be checked at rest.
     fn drain(&mut self) {
         for task in self.continuing.clone() {
-            assert!(self.scheduler.end_continuation(&task));
+            assert_eq!(self.scheduler.end_continuation(&task), Ok(true));
         }
         self.continuing.clear();
         for task in self.tasks.keys().cloned().collect::<Vec<_>>() {

@@ -1,0 +1,59 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+import "task.proto";
+
+// Which revision of a Task record this is. Records are compared by recovery
+// epoch first (a newer epoch of the shard wins whatever its terms), then by
+// the term of the leader that wrote them, then by that leader's revision
+// counter. Only the shard's leader writes revisions.
+message RecordVersion {
+  uint64 recovery_epoch = 1;
+  uint64 recovery_lineage = 2;
+  uint64 leader_term = 3;
+  uint64 revision = 4;
+}
+
+// Everything the shard knows about one Task, written whole by its leader on
+// every change: a reader never sees part of a change.
+message TaskRecord {
+  RecordVersion version = 1;
+  // The submission. It never changes after the record's first revision.
+  Task task = 2;
+  // Every attempt, oldest first. Runs are only ever appended or moved on.
+  repeated TaskRun runs = 3;
+  // The payloads of the coalescing generations this task absorbed that it
+  // still keeps, oldest first.
+  repeated ChainEntry retained_chain = 4;
+  Digest input_digest = 5;
+  CoalescingLink link = 6;
+  // The voters this revision was written to.
+  repeated WorkerId placement = 7;
+  // When the leader wrote this revision, by its wall clock.
+  WallTime published_at = 8;
+  // The task is over: no run of it will change again. Holders drop a
+  // finished record once its retention has passed.
+  bool finished = 9;
+}
+
+message ChainEntry {
+  oneof entry {
+    AbsorbedGeneration absorbed = 1;
+  }
+}
+
+// A superseded generation whose payload the newer one folds in.
+message AbsorbedGeneration {
+  TaskId task_id = 1;
+  bytes serialized_input = 2;
+  Digest input_digest = 3;
+}
+
+message CoalescingLink {
+  // The newer generation that superseded this one, if one has.
+  TaskId superseded_by = 1;
+  // Every generation this one absorbed, oldest first, including any whose
+  // payload was later dropped to make room.
+  repeated TaskId absorbed = 2;
+}

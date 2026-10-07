@@ -22,7 +22,7 @@ use crate::support::builders::{heartbeat, heartbeat_message, shard, timings, vot
 use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
-use crate::support::node::{TestNode, commit_founding, connect, deliver, elect};
+use crate::support::node::{TestNode, commit_founding, connect, deliver, elect, grants};
 use crate::support::spy::Spy;
 
 const SHARD: &str = "shard-1";
@@ -98,6 +98,30 @@ fn carry<O: Observer>(
         &mut NoAuthority,
         |_, _, _, _| {},
     );
+}
+
+#[test]
+fn a_grant_names_the_recovery_epoch_and_its_lineage() {
+    let clock = FakeClock::new();
+    let me = worker("w1");
+    let (mut node, _) = WorkerNode::start(
+        identity(&me),
+        Entry::Founding {
+            recovery_epoch: RecoveryEpoch::new(2, 77),
+            registered_at: None,
+        },
+        clock.clone(),
+        None,
+    );
+
+    let won = elect(&mut node, &clock, SUSPECT_TIMEOUT, &[]);
+
+    let grant = grants(&won)
+        .into_iter()
+        .flatten()
+        .next()
+        .expect("the winning step reports a grant");
+    assert_eq!(grant.recovery_epoch, RecoveryEpoch::new(2, 77));
 }
 
 #[test]

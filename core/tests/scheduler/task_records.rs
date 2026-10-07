@@ -5,30 +5,31 @@
 
 use std::collections::VecDeque;
 
-use kabudachi_core::protocol::ids::{IdGenerator, TaskDefinitionId};
+use kabudachi_core::protocol::ids::{IdGenerator as _, TaskDefinitionId};
 use kabudachi_core::protocol::messages::{Task, TaskRun};
 use kabudachi_core::protocol::records::{
     IllegalTransition, NewTask, TaskRunRecord, first_attempt, new_task,
 };
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::time::{Duration, Instant};
+use kabudachi_core::scheduler::{Scheduler, Submission};
+use kabudachi_core::time::WallTime;
+
+use crate::support::clock::FakeClock;
 use crate::support::ids::{OversizedIds, SequentialIds};
 
-fn submit(ids: &SequentialIds, now: Instant) -> Task {
-    submit_with(ids, now)
+fn at(millis: u64) -> WallTime {
+    WallTime::from_unix_millis(millis)
 }
 
-fn submit_with(ids: &impl IdGenerator, now: Instant) -> Task {
-    new_task(
-        ids,
-        now,
-        NewTask::new(
-            TaskDefinitionId::new("billing.charge"),
-            3,
-            b"input-bytes".to_vec(),
-            "default",
-        ),
-    )
+fn submit(ids: &SequentialIds, at: WallTime) -> Task {
+    new_task(NewTask::new(
+        ids.next_task_id(),
+        at,
+        TaskDefinitionId::new("billing.charge"),
+        3,
+        b"input-bytes".to_vec(),
+        "default",
+    ))
 }
 
 /// The shortest chain of legal transitions from `start` to `target`,
@@ -57,9 +58,9 @@ fn run_in_state(ids: &SequentialIds, task: &Task, target: TaskRunState) -> TaskR
     } else {
         TaskRunState::Queued
     };
-    let mut run = first_attempt(task, ids, Instant::at(0), start);
+    let mut run = first_attempt(task, ids, at(0), start);
     for step in &legal_path(start, target)[1..] {
-        run.transition_to(*step, Instant::at(0)).unwrap();
+        run.transition_to(*step, at(0)).unwrap();
     }
     run
 }
@@ -67,8 +68,8 @@ fn run_in_state(ids: &SequentialIds, task: &Task, target: TaskRunState) -> TaskR
 #[test]
 fn transition_to_follows_the_transition_table_for_every_pair() {
     let ids = SequentialIds::new();
-    let task = submit(&ids, Instant::at(0));
-    let later = Instant::at(0) + Duration::from_ticks(1);
+    let task = submit(&ids, at(0));
+    let later = at(1);
 
     for from in TaskRunState::ALL {
         for to in TaskRunState::ALL {
@@ -80,7 +81,7 @@ fn transition_to_follows_the_transition_table_for_every_pair() {
             if from.can_transition_to(to) {
                 assert!(result.is_ok(), "{from:?} -> {to:?} should be allowed");
                 assert_eq!(run.current_state(), to, "{from:?} -> {to:?}");
-                assert_eq!(run.updated_at_ticks, later.as_ticks(), "{from:?} -> {to:?}");
+                assert_eq!(run.updated_at, Some(later.into()), "{from:?} -> {to:?}");
             } else {
                 assert_eq!(
                     result,
@@ -97,8 +98,8 @@ fn transition_to_follows_the_transition_table_for_every_pair() {
 #[should_panic(expected = "required by protocol invariant")]
 fn reading_the_state_of_a_run_with_no_state_panics() {
     let ids = SequentialIds::new();
-    let task = submit(&ids, Instant::at(0));
-    let mut run = first_attempt(&task, &ids, Instant::at(0), TaskRunState::Queued);
+    let task = submit(&ids, at(0));
+    let mut run = first_attempt(&task, &ids, at(0), TaskRunState::Queued);
     run.state = 0;
 
     run.current_state();
@@ -108,8 +109,8 @@ fn reading_the_state_of_a_run_with_no_state_panics() {
 #[should_panic(expected = "required by protocol invariant")]
 fn reading_the_id_of_a_run_with_no_identity_panics() {
     let ids = SequentialIds::new();
-    let task = submit(&ids, Instant::at(0));
-    let mut run = first_attempt(&task, &ids, Instant::at(0), TaskRunState::Queued);
+    let task = submit(&ids, at(0));
+    let mut run = first_attempt(&task, &ids, at(0), TaskRunState::Queued);
     run.identity = None;
 
     run.task_run_id();
@@ -119,20 +120,27 @@ fn reading_the_id_of_a_run_with_no_identity_panics() {
 #[should_panic(expected = "a TaskRun starts Scheduled or Queued")]
 fn a_run_cannot_be_created_in_a_state_it_could_only_reach_by_transition() {
     let ids = SequentialIds::new();
-    let task = submit(&ids, Instant::at(0));
+    let task = submit(&ids, at(0));
 
-    let _ = first_attempt(&task, &ids, Instant::at(0), TaskRunState::Running);
+    let _ = first_attempt(&task, &ids, at(0), TaskRunState::Running);
 }
 
 #[test]
 #[should_panic(expected = "task ID of")]
-fn a_task_cannot_be_created_under_an_oversized_id() {
-    submit_with(&OversizedIds, Instant::at(0));
+fn a_task_cannot_be_submitted_under_an_oversized_id() {
+    let scheduler = Scheduler::new(FakeClock::new(), OversizedIds);
+
+    let _ = scheduler.mint(Submission::new(
+        TaskDefinitionId::new("billing.charge"),
+        3,
+        b"input-bytes".to_vec(),
+        "default",
+    ));
 }
 
 #[test]
 #[should_panic(expected = "task run ID of")]
 fn a_run_cannot_be_created_under_an_oversized_id() {
-    let task = submit(&SequentialIds::new(), Instant::at(0));
-    first_attempt(&task, &OversizedIds, Instant::at(0), TaskRunState::Queued);
+    let task = submit(&SequentialIds::new(), at(0));
+    first_attempt(&task, &OversizedIds, at(0), TaskRunState::Queued);
 }

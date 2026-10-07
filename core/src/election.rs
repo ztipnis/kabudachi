@@ -141,7 +141,8 @@ use election_round::{ElectionRound, Verdict, View};
 use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice};
 use lease::{Lease, LeaseChange, Office};
 pub use standing::JoinFloor;
-use standing::{EpochOrder, HeardEpoch, ShardStanding, order_numbers};
+use standing::{ShardStanding, order_numbers};
+pub(crate) use standing::{EpochOrder, HeardEpoch, order as order_epochs};
 
 pub struct WorkerNode<C>
 where
@@ -1638,7 +1639,7 @@ where
             me: &self.my_id,
             roster: self.office.as_ref()?.roster(),
             term: self.term,
-            recovery_epoch: self.standing.epoch_number(),
+            recovery_epoch: self.standing.epoch()?,
             fence_end,
         })
     }

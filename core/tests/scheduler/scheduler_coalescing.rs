@@ -3,6 +3,7 @@
 //! runs at a time.
 
 
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
@@ -148,7 +149,7 @@ fn a_claimed_generation_is_never_superseded_and_the_newer_one_waits_for_it() {
     // Its result is certified as usual, and then the key is free.
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
+        .complete(&worker(), &claim.task_run_id, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
     assert_eq!(
         fixture.scheduler.claim_oldest(&worker(), 10).unwrap().len(),
@@ -195,7 +196,7 @@ fn the_chain_keeps_growing_across_a_running_generation() {
 fn start_and_complete_later(fixture: &mut Fixture, claim: &kabudachi_core::scheduler::Claim) {
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
+        .complete(&worker(), &claim.task_run_id, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
 }
 
@@ -221,7 +222,7 @@ fn superseded_tasks_are_kept_until_the_generation_that_absorbed_them_finishes() 
 
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
+        .complete(&worker(), &claim.task_run_id, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
     fixture.clock.advance(ticks(100));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 2);

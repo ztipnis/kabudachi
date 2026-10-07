@@ -24,7 +24,8 @@ pub use generated::{
     AckEcho, Claim, ClaimBatch, ClaimOldest, ClaimReject, ClaimRejectReason, ClaimRequest,
     ClaimResponse, ElectionCertificate, ElectionMessage, ElectionReject, ElectionRejectReason,
     JoinRequest, JoinResponse, KnownLeader, LeaderHeartbeatAck, RollCall, RollCallReply,
-    SelfRemove, Task, TaskRun, TaskRunIdentity, VoteGrant, VoteRequest, WorkerHeartbeat,
+    AbsorbedGeneration, ChainEntry, CoalescingLink, SelfRemove, Task, TaskRecord, TaskRun,
+    TaskRunIdentity, VoteGrant, VoteRequest, WorkerHeartbeat, chain_entry,
     claim_request, claim_response, election_message,
 };
 

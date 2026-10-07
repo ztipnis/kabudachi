@@ -13,6 +13,8 @@ pub(super) struct Retention {
     ttl: Option<Duration>,
     /// Finished tasks by when they finished, so only the due ones are visited.
     finished: BTreeSet<(Instant, TaskId)>,
+    /// The same tasks, for asking whether one is over.
+    over: BTreeSet<TaskId>,
 }
 
 impl Retention {
@@ -23,6 +25,12 @@ impl Retention {
     /// `task` is over as of `now`.
     pub(super) fn record(&mut self, task: &TaskId, now: Instant) {
         self.finished.insert((now, task.clone()));
+        self.over.insert(task.clone());
+    }
+
+    /// Whether `task` is over and not yet forgotten.
+    pub(super) fn holds(&self, task: &TaskId) -> bool {
+        self.over.contains(task)
     }
 
     /// Removes and returns every task due to be forgotten by `now`, earliest
@@ -37,6 +45,7 @@ impl Retention {
                 break;
             }
             let (_, task) = self.finished.pop_first().expect("just seen");
+            self.over.remove(&task);
             due.push(task);
         }
         due

@@ -2,6 +2,7 @@
 //! same task, one at a time, and only the newest run can be reported on.
 
 
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
@@ -85,7 +86,7 @@ fn a_retry_does_not_change_the_task() {
         .complete(
             &worker(),
             &claim.task_run_id,
-            b"digest".to_vec(),
+            Digest::blake3(b"digest"),
             Completion::Final,
         )
         .unwrap();
@@ -133,19 +134,15 @@ fn a_retry_that_succeeds_certifies_its_own_result() {
     let second = start_attempt(&mut fixture, &task_id);
     let certification = fixture
         .scheduler
-        .complete(&worker(), &second, b"digest".to_vec(), Completion::Final)
+        .complete(&worker(), &second, Digest::blake3(b"digest"), Completion::Final)
         .unwrap();
 
     assert_eq!(second, retry);
     assert_eq!(certification.task_run_id, retry);
     assert_eq!(fixture.run_state(&retry), TaskRunState::Succeeded);
-    assert!(
-        fixture
-            .scheduler
-            .task_run(&first)
-            .unwrap()
-            .result_digest
-            .is_empty()
+    assert_eq!(
+        fixture.scheduler.task_run(&first).unwrap().result_digest,
+        None
     );
 }
 

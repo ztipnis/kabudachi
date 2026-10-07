@@ -4,17 +4,16 @@
 //! `from_secs` constructor, agrees on that unit.
 
 /// The time sources the state machine reads: a monotonic reading (`now`) for
-/// every timer, plus a wall-clock reading (`wall_clock_millis`) used only to
-/// break ties.
+/// every timer, plus a wall-clock reading (`wall_clock_millis`) for moments
+/// that leave the node.
 pub trait Clock {
     fn now(&self) -> Instant;
 
     /// Milliseconds since the Unix epoch, read from the wall clock.
-    ///
-    /// This is used only to break ties between competing roll calls. Unlike
-    /// `now()`, it is not monotonic: the system clock it reads from can jump
-    /// backwards or forwards (an NTP sync, a manual correction), so it must
-    /// never be used to measure elapsed time or drive a timeout.
+    /// Used to break ties between competing roll calls and to stamp the
+    /// wall-clock times a Task record carries off the node. It is not
+    /// monotonic (an NTP sync or a manual correction moves it either way), so
+    /// it must never measure elapsed time or drive a timeout.
     fn wall_clock_millis(&self) -> u64;
 }
 
@@ -35,6 +34,27 @@ impl Instant {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Duration(u64);
+
+/// A moment by a wall clock, in milliseconds since the Unix epoch. Unlike
+/// [`Instant`] it can be compared across workers, but only as far as their
+/// clocks agree, so it is never used to measure a timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WallTime(u64);
+
+impl WallTime {
+    pub const fn from_unix_millis(millis: u64) -> Self {
+        WallTime(millis)
+    }
+
+    pub fn as_unix_millis(&self) -> u64 {
+        self.0
+    }
+
+    /// `clock`'s wall-clock reading now.
+    pub fn now(clock: &impl Clock) -> Self {
+        WallTime(clock.wall_clock_millis())
+    }
+}
 
 impl Duration {
     pub const fn from_ticks(ticks: u64) -> Self {

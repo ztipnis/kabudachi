@@ -1,7 +1,13 @@
 //! Election helpers shared by the `net/tests/<area>/` crates.
 
-use kabudachi_core::election::Step;
-use kabudachi_core::time::Clock;
+use kabudachi_core::election::{Step, WorkerNode};
+use kabudachi_core::protocol::ids::Uuid7Ids;
+use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::time::{Clock, RealClock};
+use kabudachi_net::driver::{DriverConfig, run_driver};
+use kabudachi_net::messenger::Net;
+use tokio::sync::watch;
 
 /// A step that asks for nothing and is due now: the first step of a node
 /// started as a founder or inside a known configuration, and what a node
@@ -10,6 +16,27 @@ pub fn due_now(clock: &impl Clock) -> Step {
     Step {
         outputs: Vec::new(),
         next_deadline: Some(clock.now()),
+    }
+}
+
+/// Drives `node` until it leads (its grant is then with `scheduler`) and
+/// returns, so a test can give the leader's scheduler work before driving on
+/// with [`due_now`].
+pub async fn drive_until_leading(
+    node: &mut WorkerNode<RealClock>,
+    first: Step,
+    net: &Net,
+    scheduler: &mut Scheduler<RealClock, Uuid7Ids>,
+    clock: RealClock,
+) {
+    let (state_sender, mut state) = watch::channel(node.state());
+    tokio::select! {
+        _ = run_driver(node, first, net, scheduler, clock, None, DriverConfig::default(), |node, _, _| {
+            let _ = state_sender.send(node.state());
+        }) => unreachable!("run_driver never returns"),
+        led = state.wait_for(|state| *state == WorkerState::Leader) => {
+            led.expect("the driver is still running");
+        }
     }
 }
 

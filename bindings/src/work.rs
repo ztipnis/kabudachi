@@ -86,7 +86,7 @@ impl From<Certification> for PyCertification {
         PyCertification {
             task_id: certification.task_id.as_str().to_owned(),
             task_run_id: certification.task_run_id.as_str().to_owned(),
-            result_digest: certification.result_digest,
+            result_digest: certification.result_digest.value().to_vec(),
         }
     }
 }

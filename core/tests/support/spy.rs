@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{Task, TaskRun};
@@ -29,6 +30,7 @@ struct Log {
     runs: BTreeMap<TaskId, TaskRun>,
     forgotten: BTreeSet<TaskId>,
     leading: bool,
+    revisions: Vec<TaskRecord>,
 }
 
 /// One notification as the spy recorded it.
@@ -84,6 +86,10 @@ impl Observer for Spy {
             counts,
         });
     }
+
+    fn revision(&mut self, revision: TaskRecord) {
+        self.0.borrow_mut().revisions.push(revision);
+    }
 }
 
 impl Spy {
@@ -110,6 +116,11 @@ impl Spy {
     /// scheduler does not lead.
     pub fn leading(&self) -> bool {
         self.0.borrow().leading
+    }
+
+    /// Every revision the scheduler published, in order.
+    pub fn revisions(&self) -> Vec<TaskRecord> {
+        self.0.borrow().revisions.clone()
     }
 
     /// `task` as `submit` recorded it. Panics if it was never recorded.

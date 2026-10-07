@@ -1,13 +1,15 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{
     IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
-    Completion, MemoryLimits, ReportRejection, Scheduler, Submission,
+    Completion, MemoryLimits, ReportRejection, Scheduler, Submission, SubmitRejection,
 };
+use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -131,7 +133,7 @@ impl NativeRuntime {
             clock,
             CoreDuration::from_millis(suspect_timeout_ms),
         );
-        let mut new_scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut new_scheduler = Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::default());
         new_scheduler.set_result_ttl(Some(CoreDuration::from_millis(result_ttl_ms)));
         new_scheduler.set_memory_limits(limits);
         let door = Arc::new(SchedulerDoor::new(new_scheduler, worker_id));
@@ -201,7 +203,11 @@ impl NativeRuntime {
     /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree,
     /// `BackpressureError` if the task does not fit under the hard memory
     /// limit or is too large to be claimed (about 1 MiB with its queue and
-    /// key), and `RuntimeError` if the runtime has shut down.
+    /// key), and `RuntimeError` if the runtime has shut down or the leader
+    /// could not record the task now: this worker is not leading, its lease
+    /// ended during the call, or the store refused the write. All of those
+    /// can be retried, but the refused task may already sit in the
+    /// scheduler's memory, so a retry can run it twice.
     #[pyo3(signature = (
         definition_id,
         source_version,
@@ -261,8 +267,13 @@ impl NativeRuntime {
             .door
             .submit(submission)
             .map_err(|refusal| {
-                refused(refusal, |rejection| {
-                    errors::backpressure_error(py, rejection.to_string())
+                refused(refusal, |rejection| match rejection {
+                    SubmitRejection::NotLeader | SubmitRejection::DuplicateId => {
+                        PyRuntimeError::new_err(rejection.to_string())
+                    }
+                    SubmitRejection::TooLarge { .. } | SubmitRejection::Backpressure { .. } => {
+                        errors::backpressure_error(py, rejection.to_string())
+                    }
                 })
             })?;
         Ok(task_id.as_str().to_owned())
@@ -319,7 +330,8 @@ impl NativeRuntime {
     /// Reports that a running run succeeded, with the digest of its result,
     /// and returns the certification of that result.
     ///
-    /// Raises `RuntimeError` if the run is unknown, is not running, or is not
+    /// Raises `ValueError` if `result_digest` is not a BLAKE3 digest's length,
+    /// and `RuntimeError` if the run is unknown, is not running, or is not
     /// this worker's; the result is then not certified. With `continues`, the
     /// result is a continuation: the run is certified, but the task is not
     /// over (its coalescing key stays held) until `end_continuation`.
@@ -330,13 +342,15 @@ impl NativeRuntime {
         result_digest: &[u8],
         continues: bool,
     ) -> PyResult<PyCertification> {
+        let digest = Digest::new(DigestAlgorithm::Blake3, result_digest.to_vec())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let completion = if continues {
             Completion::Continues
         } else {
             Completion::Final
         };
         self.door
-            .complete(&TaskRunId::new(task_run_id), result_digest.to_vec(), completion)
+            .complete(&TaskRunId::new(task_run_id), digest, completion)
             .map(Into::into)
             .map_err(|refusal| refused(refusal, rejected))
     }
@@ -344,7 +358,13 @@ impl NativeRuntime {
     /// The continuation of a task completed with `continues` is over, however
     /// it ended. Returns whether there was one to end.
     fn end_continuation(&self, task_id: &str) -> PyResult<bool> {
-        Ok(self.door.end_continuation(&TaskId::new(task_id))?)
+        self.door
+            .end_continuation(&TaskId::new(task_id))
+            .map_err(|refusal| {
+                refused(refusal, |rejection| {
+                    PyRuntimeError::new_err(rejection.to_string())
+                })
+            })
     }
 
     /// Reports that a claimed run failed with an error of type `failure_kind`
@@ -442,7 +462,8 @@ impl NativeRuntime {
                     let _ = timers.await;
                 }
                 // The election ending fails every waiter; let each one hand
-                // its error to Python before the runtime discards it.
+                // its error to Python before the runtime discards it. Any
+                // still undelivered when the grace ends fail as they are dropped.
                 let _ = tokio::time::timeout(SHUTDOWN_GRACE, self.bridge.drained()).await;
             });
             runtime.shutdown_timeout(SHUTDOWN_GRACE);
@@ -453,7 +474,8 @@ impl NativeRuntime {
 impl Drop for NativeRuntime {
     /// A runtime that was never shut down still must not block its owner's
     /// thread, so its tasks are abandoned rather than waited for. Awaitables
-    /// still pending are then never settled: call `shutdown()` to release them.
+    /// still pending fail as their tasks are dropped; `shutdown()` is what
+    /// lets each hand over its own error first.
     fn drop(&mut self) {
         let runtime = self
             .tokio

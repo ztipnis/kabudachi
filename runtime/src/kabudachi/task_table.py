@@ -15,13 +15,13 @@ callback on a handle may re-enter the table.
 """
 
 import asyncio
-import hashlib
 import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from kabudachi import _native
 from kabudachi._native import CancelOutcome
 from kabudachi.body import RunningBody
 from kabudachi.errors import (
@@ -42,8 +42,8 @@ _logger = logging.getLogger("kabudachi")
 
 
 def result_digest(result: bytes) -> bytes:
-    """The digest a run's result is certified by (sha256)."""
-    return hashlib.sha256(result).digest()
+    """The digest a run's result is certified by (BLAKE3)."""
+    return _native.result_digest(result)
 
 
 class _StartingContinuation:
@@ -286,8 +286,10 @@ class TaskTable:
             handle.cancel()  # cancelled while the first stage was being started
 
     def continuation_over(self, task_id: str, error: BaseException | None, result: Any) -> None:
-        """Ends the continuation for the leader (a refusal is logged), then
-        settles the task with `result` or `error`."""
+        """Ends the continuation for the leader, then settles the task with
+        `result` or `error`. If the runtime refuses the end, the refusal is
+        logged: the end is applied when leadership returns, unless the runtime
+        has shut down."""
         with self._lock:
             record = self._records.get(task_id)
             if record is not None:
@@ -299,8 +301,9 @@ class TaskTable:
         try:
             self._runtime.end_continuation(task_id)
         except Exception as refusal:
-            _logger.warning(
-                "the leader did not end the continuation of task %s: %s",
+            _logger.info(
+                "the runtime refused ending the continuation of task %s (%s); it is applied"
+                " when leadership returns unless the runtime has shut down",
                 task_id,
                 type(refusal).__name__,
             )

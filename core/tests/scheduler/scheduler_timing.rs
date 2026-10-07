@@ -4,6 +4,7 @@
 //! whenever time is advanced or a claim is made.
 
 
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
@@ -40,10 +41,7 @@ fn a_delayed_task_waits_scheduled_and_is_not_pending() {
 
     assert_eq!(fixture.state(&task), TaskRunState::Scheduled);
     assert_eq!(fixture.spy.pending(), 0);
-    assert_eq!(
-        fixture.spy.task(&task).not_before_ticks,
-        Some(100)
-    );
+    assert_eq!(fixture.spy.task(&task).delay_millis, Some(100));
 }
 
 #[test]
@@ -353,7 +351,7 @@ fn finished_task(fixture: &mut Fixture) -> TaskId {
         .unwrap();
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
+        .complete(&worker(), &claim.task_run_id, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
     task
 }
@@ -409,7 +407,7 @@ fn every_mutating_call_forgets_what_has_outlived_its_ttl() {
             let _ = s.complete(
                 &worker(),
                 &TaskRunId::new("unknown"),
-                Vec::new(),
+                Digest::blake3(b""),
                 Completion::Final,
             );
         }),
@@ -417,7 +415,7 @@ fn every_mutating_call_forgets_what_has_outlived_its_ttl() {
             let _ = s.fail(&worker(), &TaskRunId::new("unknown"), "E");
         }),
         ("end_continuation", |s| {
-            s.end_continuation(&TaskId::new("unknown"));
+            let _ = s.end_continuation(&TaskId::new("unknown"));
         }),
         ("cancel", |s| {
             let _ = s.cancel(&TaskId::new("unknown"));
@@ -535,7 +533,7 @@ fn a_finished_tasks_forgetting_time_is_a_deadline_too() {
     fixture.clock.advance(ticks(40));
     fixture
         .scheduler
-        .complete(&worker(), &claim.task_run_id, b"d".to_vec(), Completion::Final)
+        .complete(&worker(), &claim.task_run_id, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
 
     assert_eq!(fixture.scheduler.next_deadline(), Some(Instant::at(540)));

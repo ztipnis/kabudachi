@@ -607,7 +607,7 @@ fn a_leader_alone_in_its_electorate_never_loses_its_quorum_and_has_no_deadline()
 fn term_1_grant(valid_until: LeaseEnd) -> LeadershipGrant {
     LeadershipGrant {
         term: 1,
-        recovery_epoch: 0,
+        recovery_epoch: kabudachi_core::coordination_authority::RecoveryEpoch::new(0, 0),
         valid_until,
     }
 }

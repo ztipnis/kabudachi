@@ -72,7 +72,7 @@ use kabudachi_core::election::{
 use kabudachi_core::protocol::ids::{IdGenerator, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, JoinResponse};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::scheduler::{Observer, Scheduler};
 use kabudachi_core::time::{Clock, Instant};
 use libp2p::Multiaddr;
 
@@ -216,11 +216,11 @@ pub use crate::authority::SharedAuthority;
 /// found its shard recovered without it, and so went back to `Bootstrapping`,
 /// reads to learn whom to rejoin through (see
 /// [`crate::leader_search::Rejoin`]); the driver keeps running meanwhile.
-pub async fn run_driver<C, I>(
+pub async fn run_driver<C, I, R>(
     node: &mut WorkerNode<C>,
     first: Step,
     net: &Net,
-    scheduler: &mut Scheduler<C, I>,
+    scheduler: &mut Scheduler<C, I, R>,
     clock: C,
     mut authority: Option<AuthorityClient>,
     config: DriverConfig,
@@ -229,6 +229,7 @@ pub async fn run_driver<C, I>(
 where
     C: Clock,
     I: IdGenerator,
+    R: Observer,
 {
     let my_id = net.local_worker_id();
     net.subscribe_to_shard(node.shard_id());
@@ -437,9 +438,9 @@ where
 }
 
 /// What one batch of [`run_driver`] steps its node with.
-struct Stepper<'a, C: Clock, I: IdGenerator, O> {
+struct Stepper<'a, C: Clock, I: IdGenerator, R: Observer, O> {
     node: &'a mut WorkerNode<C>,
-    scheduler: &'a mut Scheduler<C, I>,
+    scheduler: &'a mut Scheduler<C, I, R>,
     net: &'a Net,
     /// The client to perform the node's calls with; `None` answers each at
     /// once as `Unavailable`.
@@ -448,10 +449,11 @@ struct Stepper<'a, C: Clock, I: IdGenerator, O> {
     observe: &'a mut O,
 }
 
-impl<C, I, O> Stepper<'_, C, I, O>
+impl<C, I, R, O> Stepper<'_, C, I, R, O>
 where
     C: Clock,
     I: IdGenerator,
+    R: Observer,
     O: FnMut(&WorkerNode<C>, Option<&Input>, &Step),
 {
     /// Steps the node with `input`, carries that step out (see
@@ -614,7 +616,10 @@ where
 
 /// Answers every inbound `/kabudachi/claim/1` request queued on `net` with
 /// `scheduler`'s decision (see `claim::answer`).
-fn respond_to_claim_requests<C: Clock, I: IdGenerator>(scheduler: &mut Scheduler<C, I>, net: &Net) {
+fn respond_to_claim_requests<C: Clock, I: IdGenerator, R: Observer>(
+    scheduler: &mut Scheduler<C, I, R>,
+    net: &Net,
+) {
     for handle in net.poll_claim_requests() {
         let response = claim::answer(scheduler, &handle.from(), handle.request());
         net.respond_claim(handle, response);

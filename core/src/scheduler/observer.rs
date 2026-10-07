@@ -1,7 +1,9 @@
 //! The seam through which whoever watches a scheduler hears about every
-//! change it makes. Production installs nothing ([`NoObserver`]); a test
-//! installs a recording spy.
+//! change it makes. The runtime installs the node's record store; a scheduler
+//! that nobody watches installs [`NoObserver`]; a test installs a recording
+//! spy.
 
+use crate::protocol::generated::TaskRecord;
 use crate::protocol::ids::TaskId;
 use crate::protocol::messages::{Task, TaskRun};
 
@@ -11,10 +13,19 @@ use crate::protocol::messages::{Task, TaskRun};
 /// leadership it noticed, a change of memory in use, or `SlowDown` raised or
 /// cleared. Within one call, notifications come in the order the changes
 /// were made, and a change that `take_events` also reports is notified where
-/// its event is recorded, so the two orders agree. Nothing observes in
-/// production ([`NoObserver`]); a test installs a recording spy.
+/// its event is recorded, so the two orders agree. The runtime's
+/// observer stores the records; [`NoObserver`] ignores everything; a test
+/// installs a recording spy.
 pub trait Observer {
     fn notify(&mut self, change: Change<'_>, counts: Counts);
+
+    /// Takes the whole record of one task as a call left it, stamped with
+    /// the next version of this leader's term. Called at the end of every
+    /// call that changed the task, once per changed task, while the scheduler
+    /// leads, after that call's `notify`s (except a forgetting the call ends
+    /// with). Nothing is published once the lease has ended: a change made
+    /// then is published at the next call that finds the scheduler leading.
+    fn revision(&mut self, revision: TaskRecord);
 }
 
 /// One change the scheduler made.
@@ -57,4 +68,5 @@ pub struct NoObserver;
 
 impl Observer for NoObserver {
     fn notify(&mut self, _: Change<'_>, _: Counts) {}
+    fn revision(&mut self, _: TaskRecord) {}
 }

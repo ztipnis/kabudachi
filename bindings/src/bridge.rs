@@ -11,9 +11,11 @@
 //! waiting for it to drain lets the runtime be destroyed without stranding a
 //! Python future that was about to be resolved.
 //!
-//! Two things are not covered: a future that panics never settles its Python
-//! future, and one still running when the runtime is dropped without a drain
-//! is abandoned. Futures passed in are expected to return an error, not panic.
+//! A future that is dropped before it hands over a result, because the runtime
+//! gave up on it, was aborted, or panicked, fails its Python future with the
+//! closed error as it goes, so nothing awaiting it waits forever. The one
+//! exception is a Python interpreter that is already finalizing: nothing is
+//! left to settle then.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -41,6 +43,41 @@ struct InFlight(Arc<watch::Sender<Gate>>);
 impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.send_modify(|gate| gate.in_flight -= 1);
+    }
+}
+
+/// Owes a Python future its result. Dropped before delivering, it fails the
+/// future with the closed error. It is a separate type from [`InFlight`] so
+/// that counting stays free of Python, and it owns the count so the future is
+/// settled before it stops counting: a drain implies every Python future has
+/// been handed its result.
+struct Owed {
+    event_loop: Py<PyAny>,
+    target: Py<PyAny>,
+    delivered: bool,
+    _counted: InFlight,
+}
+
+impl Owed {
+    fn deliver<T>(&mut self, py: Python<'_>, outcome: PyResult<T>)
+    where
+        T: for<'a> IntoPyObject<'a>,
+    {
+        self.delivered = true;
+        if let Err(error) = hand_to_loop(py, &self.event_loop, &self.target, outcome) {
+            report_undeliverable(py, &self.event_loop, error);
+        }
+    }
+}
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        if !self.delivered {
+            // `None` means the interpreter is finalizing, and nobody awaits.
+            Python::try_attach(|py| {
+                self.deliver::<()>(py, Err(PyRuntimeError::new_err(CLOSED_MESSAGE)));
+            });
+        }
     }
 }
 
@@ -122,14 +159,17 @@ impl Bridge {
         let event_loop = event_loop.unbind();
         let target = awaitable.clone().unbind();
 
+        // Built before spawning, so a task dropped without ever running
+        // still settles the future.
+        let mut owed = Owed {
+            event_loop,
+            target,
+            delivered: false,
+            _counted: counted,
+        };
         let task = self.runtime.spawn(async move {
-            let _counted = counted;
             let outcome = future.await;
-            Python::attach(|py| {
-                if let Err(error) = hand_to_loop(py, &event_loop, &target, outcome) {
-                    report_undeliverable(py, &event_loop, error);
-                }
-            });
+            Python::attach(|py| owed.deliver(py, outcome));
         });
 
         let abort = task.abort_handle();

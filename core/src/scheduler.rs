@@ -7,6 +7,11 @@
 //! by its own clock: a node that has not won an election, has lost
 //! leadership, or has outlived its lease must not decide anything.
 //!
+//! Only the leader accepts a submission, and only while it leads does it
+//! publish records: at the end of every call that changed a task, the
+//! observer is handed that task's whole record, versioned by the leader's
+//! term and a revision counter, so the next leader can rebuild from them.
+//!
 //! It owns what time does to its tasks. [`Scheduler::catch_up`] is the one
 //! time-driven entry: it forgets finished tasks whose result TTL has passed
 //! and, only while the scheduler leads, releases delayed tasks that are due
@@ -21,12 +26,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coalescing::{self, Key, Occupancy};
-use crate::protocol::ids::{IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId};
+use crate::coordination_authority::RecoveryEpoch;
+use crate::protocol::digest::Digest;
+use crate::protocol::generated::{
+    AbsorbedGeneration, ChainEntry, CoalescingLink, TaskRecord, chain_entry,
+};
+use crate::protocol::ids::{
+    IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId, mint_task_id,
+};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task, retry_of};
 use crate::protocol::task::TaskRunState;
-use crate::time::{Clock, Duration, Instant};
+use crate::task_record::{RecordVersion, VersionOrder};
+use crate::time::{Clock, Duration, Instant, WallTime};
 
 mod memory_budget;
 mod observer;
@@ -83,6 +96,23 @@ pub enum SubmitRejection {
         in_use: u64,
         needed: u64,
     },
+    #[error("this node is not the leader")]
+    NotLeader,
+    #[error("a task with this id is already recorded")]
+    DuplicateId,
+}
+
+/// A submission given its task id and its submission time: what its client
+/// holds from the moment it submits, before any leader has recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submitted {
+    pub task_id: TaskId,
+    pub submitted_at: WallTime,
+    pub submission: Submission,
+    /// The monotonic reading when it was minted. Its delay and expiry count
+    /// from here, so a wall clock that jumps never shortens the wait. It means
+    /// something only to the scheduler that minted it.
+    minted_at: Instant,
 }
 
 /// What a task is submitted with. Start from [`Submission::new`] and add the
@@ -202,7 +232,7 @@ pub struct Claim {
 pub struct Certification {
     pub task_id: TaskId,
     pub task_run_id: TaskRunId,
-    pub result_digest: Vec<u8>,
+    pub result_digest: Digest,
 }
 
 /// The leader's record that a run failed, so its client can be told.
@@ -349,8 +379,17 @@ pub enum ReportRejection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeadershipGrant {
     pub term: u64,
-    pub recovery_epoch: u64,
+    /// The recovery epoch the worker leads in, lineage included: what a Task
+    /// record this leader writes is versioned by.
+    pub recovery_epoch: RecoveryEpoch,
     pub valid_until: LeaseEnd,
+}
+
+/// Why ending a continuation was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ContinuationRejection {
+    #[error("this node is not the leader")]
+    NotLeader,
 }
 
 /// When a leader's lease ends, and with it the time it may act as leader.
@@ -398,6 +437,18 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     /// lost run is not a retry, so these attempts do not count against the
     /// task's retries.
     losses: BTreeMap<TaskId, u32>,
+    /// Tasks changed since their last published revision.
+    unpublished: BTreeSet<TaskId>,
+    /// The epoch and term this scheduler last published in, and the revision
+    /// it publishes next there. A grant of a newer epoch or term starts it at
+    /// 0, and one of an older epoch or term publishes nothing; a grant of the
+    /// same term handed back after a lapse continues it, so no version is ever
+    /// published twice with different contents.
+    revisions: Option<(RecoveryEpoch, u64, u64)>,
+    /// Each task's input digest, computed once at submission.
+    input_digests: BTreeMap<TaskId, Digest>,
+    /// Each coalescing generation's links: who superseded it, whom it absorbed.
+    links: BTreeMap<TaskId, CoalescingLink>,
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
@@ -430,6 +481,111 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             budget: MemoryBudget::default(),
             continuing: BTreeSet::new(),
             losses: BTreeMap::new(),
+            unpublished: BTreeSet::new(),
+            revisions: None,
+            input_digests: BTreeMap::new(),
+            links: BTreeMap::new(),
+        }
+    }
+
+    /// What every call ends with: publishes the tasks it changed, then
+    /// forgets what has outlived its TTL (so a task finished and forgotten
+    /// in one call is still published first).
+    fn end_call(&mut self) -> usize {
+        self.publish_changed();
+        self.forget_due()
+    }
+
+    fn publish_changed(&mut self) {
+        let Some(grant) = self.grant.filter(|_| self.is_leader()) else {
+            return;
+        };
+        let published_at = WallTime::now(&self.clock);
+        for task_id in std::mem::take(&mut self.unpublished) {
+            if !self.tasks.contains_key(&task_id) {
+                continue;
+            }
+            let version = self.next_version(&grant);
+            let record = self.record_of(&task_id, version, published_at);
+            self.observer.revision(record);
+        }
+    }
+
+    /// Whether `grant` is not older than the epoch and term already published
+    /// in: under an older one, a count restarted at 0 would publish versions
+    /// that were already published with other contents, so a scheduler holding
+    /// such a grant does not lead.
+    fn may_publish_under(&self, grant: &LeadershipGrant) -> bool {
+        let Some((epoch, term, next)) = self.revisions else {
+            return true;
+        };
+        if epoch == grant.recovery_epoch && term == grant.term {
+            return true;
+        }
+        let published = RecordVersion {
+            recovery_epoch: epoch,
+            leader_term: term,
+            revision: next.saturating_sub(1),
+        };
+        let offered = RecordVersion {
+            recovery_epoch: grant.recovery_epoch,
+            leader_term: grant.term,
+            revision: 0,
+        };
+        published.order(&offered) == VersionOrder::Newer
+    }
+
+    fn next_version(&mut self, grant: &LeadershipGrant) -> RecordVersion {
+        let revision = match &mut self.revisions {
+            Some((epoch, term, next)) if *epoch == grant.recovery_epoch && *term == grant.term => {
+                let revision = *next;
+                *next += 1;
+                revision
+            }
+            slot => {
+                *slot = Some((grant.recovery_epoch, grant.term, 1));
+                0
+            }
+        };
+        RecordVersion {
+            recovery_epoch: grant.recovery_epoch,
+            leader_term: grant.term,
+            revision,
+        }
+    }
+
+    /// The whole record of `task_id` as the scheduler holds it now.
+    fn record_of(
+        &self,
+        task_id: &TaskId,
+        version: RecordVersion,
+        published_at: WallTime,
+    ) -> TaskRecord {
+        let retained_chain = self
+            .occupancy
+            .chain(task_id)
+            .iter()
+            .map(|absorbed| ChainEntry {
+                entry: Some(chain_entry::Entry::Absorbed(AbsorbedGeneration {
+                    task_id: Some(absorbed.clone().into()),
+                    serialized_input: self.tasks[absorbed].serialized_input.clone(),
+                    input_digest: Some(self.input_digests[absorbed].clone().into()),
+                })),
+            })
+            .collect();
+        TaskRecord {
+            version: Some(version.into()),
+            task: Some(self.tasks[task_id].clone()),
+            runs: self.runs_of_task[task_id]
+                .iter()
+                .map(|run| self.runs[run].clone())
+                .collect(),
+            retained_chain,
+            input_digest: Some(self.input_digests[task_id].clone().into()),
+            link: self.links.get(task_id).cloned(),
+            placement: Vec::new(),
+            published_at: Some(published_at.into()),
+            finished: self.retention.holds(task_id),
         }
     }
 
@@ -437,7 +593,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// forever. Takes effect at once.
     pub fn set_result_ttl(&mut self, ttl: Option<Duration>) {
         self.retention.set_ttl(ttl);
-        self.forget_due();
+        self.end_call();
     }
 
     /// Forgets every task that finished at least `result_ttl` ago, with its
@@ -459,6 +615,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 self.runs.remove(&run_id);
             }
             self.tasks.remove(&task_id);
+            self.input_digests.remove(&task_id);
+            self.links.remove(&task_id);
+            self.unpublished.remove(&task_id);
             let counts = self.counts();
             self.observer
                 .notify(Change::TaskForgotten(&task_id), counts);
@@ -475,7 +634,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     pub fn set_memory_limits(&mut self, limits: Option<MemoryLimits>) {
         let event = self.budget.set_limits(limits);
         self.announce(event);
-        self.forget_due();
+        self.end_call();
     }
 
     /// Takes the leadership grant its worker's election reports, or `None`
@@ -484,19 +643,29 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     pub fn set_leadership_grant(&mut self, grant: Option<LeadershipGrant>) {
         self.grant = grant;
         self.check_leader();
-        self.forget_due();
+        self.end_call();
     }
 
-    /// Records a new Task and queues its first run. Every call is a new Task
-    /// (submission is not idempotent). Submitting decides
-    /// nothing, so it does not require leadership; only claims and reports do.
-    pub fn submit(&mut self, submission: Submission) -> Result<TaskId, SubmitRejection> {
-        let outcome = self.record_submission(submission);
-        self.forget_due();
-        outcome
+    /// Gives `submission` a fresh task id and stamps it with the wall-clock
+    /// time now, noting the monotonic time too. Records nothing, so it needs no leadership.
+    pub fn mint(&self, submission: Submission) -> Submitted {
+        Submitted {
+            task_id: mint_task_id(&self.ids),
+            submitted_at: WallTime::now(&self.clock),
+            submission,
+            minted_at: self.clock.now(),
+        }
     }
 
-    fn record_submission(&mut self, submission: Submission) -> Result<TaskId, SubmitRejection> {
+    /// Whether `submission` could be recorded now with `queued_bytes` more
+    /// input already promised to submissions not yet recorded: it is not too
+    /// large to claim, and it fits under the hard limit with them. Records
+    /// nothing, so it needs no leadership.
+    pub fn check_submission(
+        &self,
+        submission: &Submission,
+        queued_bytes: u64,
+    ) -> Result<(), SubmitRejection> {
         let needed = submission.serialized_input.len() as u64;
         let size = needed
             + (submission.queue.len()
@@ -508,35 +677,73 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 limit: MAX_SUBMISSION_BYTES,
             });
         }
-        self.check_room(&submission, needed)?;
+        self.check_room(submission, needed + queued_bytes)
+    }
+
+    /// Records a new Task and queues its first run, under the id and
+    /// submission time `submitted` carries. Its delay and expiry count from
+    /// when it was minted, by the monotonic clock: time passed since then,
+    /// including time spent waiting for a leader, is taken off them, and the
+    /// wall clock never shortens them. Only a leader records a submission.
+    pub fn submit_minted(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
+        let outcome = self.record_submission(submitted);
+        self.end_call();
+        outcome
+    }
+
+    /// [`Self::mint`] then [`Self::submit_minted`]: a submission made where
+    /// the leader is. Every call is a new Task (submission is not idempotent).
+    pub fn submit(&mut self, submission: Submission) -> Result<TaskId, SubmitRejection> {
+        let submitted = self.mint(submission);
+        self.submit_minted(submitted)
+    }
+
+    fn record_submission(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
+        if !self.check_leader() {
+            return Err(SubmitRejection::NotLeader);
+        }
+        if self.tasks.contains_key(&submitted.task_id) {
+            return Err(SubmitRejection::DuplicateId);
+        }
+        self.check_submission(&submitted.submission, 0)?;
+        let Submitted {
+            task_id,
+            submitted_at,
+            submission,
+            minted_at,
+        } = submitted;
+        let needed = submission.serialized_input.len() as u64;
         let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
         let not_before = submission
             .delay
             .filter(|delay| delay.as_ticks() > 0)
-            .map(|delay| now + delay);
-        let expires_at = submission.expiry.map(|expiry| now + expiry);
-        let task = new_task(
-            &self.ids,
-            now,
-            NewTask {
-                definition_id: submission.definition_id,
-                source_version: submission.source_version,
-                serialized_input: submission.serialized_input,
-                queue: submission.queue,
-                max_retries: submission.retries,
-                not_before,
-                expires_at,
-                coalescing_key: submission.coalescing_key,
-                ephemeral: submission.ephemeral,
-                non_retriable: submission.non_retriable,
-            },
-        );
+            .map(|delay| minted_at + delay)
+            .filter(|at| *at > now);
+        let expires_at = submission
+            .expiry
+            .map(|expiry| minted_at + expiry);
+        let input_digest = Digest::blake3(&submission.serialized_input);
+        let task = new_task(NewTask {
+            task_id,
+            submitted_at,
+            definition_id: submission.definition_id,
+            source_version: submission.source_version,
+            serialized_input: submission.serialized_input,
+            queue: submission.queue,
+            max_retries: submission.retries,
+            delay: submission.delay,
+            expiry: submission.expiry,
+            coalescing_key: submission.coalescing_key,
+            ephemeral: submission.ephemeral,
+            non_retriable: submission.non_retriable,
+        });
         let first_state = if not_before.is_some() {
             TaskRunState::Scheduled
         } else {
             TaskRunState::Queued
         };
-        let run = first_attempt(&task, &self.ids, now, first_state);
+        let run = first_attempt(&task, &self.ids, stamped_at, first_state);
 
         let task_id = task.task_id();
         self.current_run.insert(task_id.clone(), run.task_run_id());
@@ -544,6 +751,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .insert(task_id.clone(), vec![run.task_run_id()]);
         self.runs.insert(run.task_run_id(), run);
         self.tasks.insert(task_id.clone(), task);
+        self.input_digests.insert(task_id.clone(), input_digest);
+        self.unpublished.insert(task_id.clone());
         self.waiting.admit(&task_id, not_before, expires_at);
         let counts = self.counts();
         self.observer
@@ -557,7 +766,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .coalescing_key_of(&task_id)
             .and_then(|key| self.occupancy.submit(&key, &task_id));
         if let Some(older) = older {
-            self.supersede(&older, &task_id, now);
+            self.supersede(&older, &task_id);
+            let mut absorbed = self
+                .links
+                .get(&older)
+                .map(|link| link.absorbed.clone())
+                .unwrap_or_default();
+            absorbed.push(older.into());
+            self.links.entry(task_id.clone()).or_default().absorbed = absorbed;
         }
         self.drop_oldest_until_it_fits(&task_id, now);
         self.update_pressure();
@@ -575,7 +791,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         } else {
             CaughtUp::default()
         };
-        caught_up.forgotten = self.forget_due();
+        caught_up.forgotten = self.end_call();
         caught_up
     }
 
@@ -586,6 +802,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     fn release_due(&mut self) -> CaughtUp {
         let mut advanced = CaughtUp::default();
         let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
         for task_id in self.waiting.take_expired(now) {
             self.expire(&task_id, now);
             advanced.expired += 1;
@@ -595,7 +812,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.runs
                 .get_mut(&run_id)
                 .expect("every current run is stored")
-                .transition_to(TaskRunState::Queued, now)
+                .transition_to(TaskRunState::Queued, stamped_at)
                 .expect("a Scheduled run can always be queued");
             self.notify_run(&run_id);
             advanced.queued += 1;
@@ -636,7 +853,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// order it happened.
     pub fn take_events(&mut self) -> Vec<Event> {
         let events = std::mem::take(&mut self.events);
-        self.forget_due();
+        self.end_call();
         events
     }
 
@@ -664,7 +881,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         fits: impl FnMut(&Claim) -> bool,
     ) -> Result<Vec<Claim>, ClaimRejection> {
         let outcome = self.claim_while_fitting(worker, limit, fits);
-        self.forget_due();
+        self.end_call();
         outcome
     }
 
@@ -715,7 +932,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         task_id: &TaskId,
     ) -> Result<Claim, ClaimRejection> {
         let outcome = self.claim_task(worker, task_id);
-        self.forget_due();
+        self.end_call();
         outcome
     }
 
@@ -771,13 +988,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// `Queued`. Starting is what expiry is about, so the task's expiry is
     /// dropped.
     fn mark_claimed(&mut self, worker: &WorkerId, task_id: &TaskId) {
-        let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
         let run_id = self.current_run[task_id].clone();
         let run = self
             .runs
             .get_mut(&run_id)
             .expect("every current run is stored");
-        run.transition_to(TaskRunState::Claimed, now)
+        run.transition_to(TaskRunState::Claimed, stamped_at)
             .expect("a Queued run can always be claimed");
         run.selected_worker = Some(worker.clone().into());
         self.waiting.claimed(task_id);
@@ -794,14 +1011,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run_id: &TaskRunId,
     ) -> Result<(), ReportRejection> {
         let outcome = self.start_run(worker, run_id);
-        self.forget_due();
+        self.end_call();
         outcome
     }
 
     fn start_run(&mut self, worker: &WorkerId, run_id: &TaskRunId) -> Result<(), ReportRejection> {
-        let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
         let run = self.run_owned_by(worker, run_id, TaskRunState::Claimed)?;
-        run.transition_to(TaskRunState::Running, now)
+        run.transition_to(TaskRunState::Running, stamped_at)
             .expect("a Claimed run can always start");
         self.notify_run(run_id);
         Ok(())
@@ -815,11 +1032,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         &mut self,
         worker: &WorkerId,
         run_id: &TaskRunId,
-        result_digest: Vec<u8>,
+        result_digest: Digest,
         completion: Completion,
     ) -> Result<Certification, ReportRejection> {
         let outcome = self.certify(worker, run_id, result_digest, completion);
-        self.forget_due();
+        self.end_call();
         outcome
     }
 
@@ -828,14 +1045,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         &mut self,
         worker: &WorkerId,
         run_id: &TaskRunId,
-        result_digest: Vec<u8>,
+        result_digest: Digest,
         completion: Completion,
     ) -> Result<Certification, ReportRejection> {
         let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
         let run = self.run_owned_by(worker, run_id, TaskRunState::Running)?;
-        run.transition_to(TaskRunState::Succeeded, now)
+        run.transition_to(TaskRunState::Succeeded, stamped_at)
             .expect("a Running run can always succeed");
-        run.result_digest = result_digest.clone();
+        run.result_digest = Some(result_digest.clone().into());
         let task_id = run.task_id();
         self.notify_run(run_id);
         match completion {
@@ -854,10 +1072,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// The continuation of `task_id` is over, however it ended: the task is
     /// finished after all. Says whether it had a continuation to end, so
     /// ending twice, or a task with none, changes nothing.
-    pub fn end_continuation(&mut self, task_id: &TaskId) -> bool {
+    pub fn end_continuation(&mut self, task_id: &TaskId) -> Result<bool, ContinuationRejection> {
+        if !self.check_leader() {
+            return Err(ContinuationRejection::NotLeader);
+        }
         let had_one = self.finish_continuation(task_id);
-        self.forget_due();
-        had_one
+        self.end_call();
+        Ok(had_one)
     }
 
     fn finish_continuation(&mut self, task_id: &TaskId) -> bool {
@@ -879,7 +1100,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         failure_kind: impl Into<String>,
     ) -> Result<Failure, ReportRejection> {
         let outcome = self.fail_run(worker, run_id, failure_kind.into());
-        self.forget_due();
+        self.end_call();
         outcome
     }
 
@@ -890,14 +1111,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         failure_kind: String,
     ) -> Result<Failure, ReportRejection> {
         let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
         let run = self.run_owned_by(worker, run_id, TaskRunState::Running)?;
-        run.transition_to(TaskRunState::Failed, now)
+        run.transition_to(TaskRunState::Failed, stamped_at)
             .expect("a Running run can always fail");
         run.failure_kind = failure_kind;
         let task_id = run.task_id();
         let attempt = run.attempt_number();
         self.notify_run(run_id);
-        let retry = self.replace_failed_run(&task_id, run_id, attempt, now);
+        let retry = self.replace_failed_run(&task_id, run_id, attempt);
         if retry.is_none() {
             self.record_finished(&task_id, now);
         }
@@ -918,7 +1140,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// A cancelled task is not retried, and does not expire.
     pub fn cancel(&mut self, task_id: &TaskId) -> Result<Cancellation, CancelRejection> {
         let outcome = self.cancel_task(task_id);
-        self.forget_due();
+        self.end_call();
         outcome
     }
 
@@ -930,6 +1152,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return Ok(Cancellation::UnknownTask);
         };
         let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
         let run = self
             .runs
             .get_mut(&run_id)
@@ -939,7 +1162,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             TaskRunState::Claimed | TaskRunState::Running => true,
             _ => return Ok(Cancellation::AlreadyFinished),
         };
-        run.transition_to(TaskRunState::Cancelled, now)
+        run.transition_to(TaskRunState::Cancelled, stamped_at)
             .expect("an unfinished run can always be cancelled");
         self.waiting.leave(task_id);
         self.record_finished(task_id, now);
@@ -965,7 +1188,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// decides.
     pub fn lose_worker(&mut self, worker: &WorkerId) -> Result<Vec<LostRun>, LoseRejection> {
         let outcome = self.lose_runs_of(worker);
-        self.forget_due();
+        self.end_call();
         outcome
     }
 
@@ -974,6 +1197,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return Err(LoseRejection::NotLeader);
         }
         let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
         let held: Vec<TaskId> = self
             .current_run
             .iter()
@@ -1000,7 +1224,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.runs
                 .get_mut(&run_id)
                 .expect("every current run is stored")
-                .transition_to(state, now)
+                .transition_to(state, stamped_at)
                 .expect("a claimed run can be lost, and a running one lost or orphaned");
             self.notify_run(&run_id);
             let newer_waits = self
@@ -1011,7 +1235,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 None
             } else {
                 *self.losses.entry(task_id.clone()).or_default() += 1;
-                Some(self.queue_next_attempt(&task_id, &run_id, now))
+                Some(self.queue_next_attempt(&task_id, &run_id))
             };
             lost.push(LostRun {
                 task_id,
@@ -1036,7 +1260,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         task_id: &TaskId,
         failed: &TaskRunId,
         attempt: u32,
-        now: Instant,
     ) -> Option<TaskRunId> {
         let retries = self.tasks.get(task_id)?.max_retries;
         // Attempt 1 is the first try, so retries left = retries - (attempt - 1),
@@ -1045,7 +1268,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if attempt - lost > retries {
             return None;
         }
-        Some(self.queue_next_attempt(task_id, failed, now))
+        Some(self.queue_next_attempt(task_id, failed))
     }
 
     /// Queues the attempt that follows `previous`, a terminal run of
@@ -1054,9 +1277,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         &mut self,
         task_id: &TaskId,
         previous: &TaskRunId,
-        now: Instant,
     ) -> TaskRunId {
-        let next = retry_of(&self.runs[previous], &self.ids, now);
+        let stamped_at = WallTime::now(&self.clock);
+        let next = retry_of(&self.runs[previous], &self.ids, stamped_at);
         let next_id = next.task_run_id();
         self.current_run.insert(task_id.clone(), next_id.clone());
         self.runs_of_task
@@ -1072,6 +1295,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Expires `task_id`, which `take_expired` found still waiting, so its
     /// current run is pending.
     fn expire(&mut self, task_id: &TaskId, now: Instant) {
+        let stamped_at = WallTime::now(&self.clock);
         let run_id = self.current_run[task_id].clone();
         let run = self
             .runs
@@ -1088,7 +1312,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             ),
             "a waiting task's run is pending"
         );
-        run.transition_to(TaskRunState::Expired, now)
+        run.transition_to(TaskRunState::Expired, stamped_at)
             .expect("a pending run can always expire");
         self.record_finished(task_id, now);
         self.notify_run(&run_id);
@@ -1117,6 +1341,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let payload = self.payload_len(task_id);
         self.budget.give_back(payload);
         self.retention.record(task_id, now);
+        self.unpublished.insert(task_id.clone());
         if payload > 0 {
             self.notify_memory();
         }
@@ -1178,14 +1403,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// `older`, a pending generation, is replaced by `newer`, which has
     /// absorbed its payload: it is over, but not forgotten until `newer` is.
-    fn supersede(&mut self, older: &TaskId, newer: &TaskId, now: Instant) {
+    fn supersede(&mut self, older: &TaskId, newer: &TaskId) {
+        let stamped_at = WallTime::now(&self.clock);
         let run_id = self.current_run[older].clone();
         self.runs
             .get_mut(&run_id)
             .expect("every current run is stored")
-            .transition_to(TaskRunState::Superseded, now)
+            .transition_to(TaskRunState::Superseded, stamped_at)
             .expect("a pending run can always be superseded");
         self.waiting.leave(older);
+        self.links.entry(older.clone()).or_default().superseded_by = Some(newer.clone().into());
         self.notify_run(&run_id);
         self.events.push(Event::Superseded {
             task_id: older.clone(),
@@ -1209,14 +1436,24 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .is_some_and(|key| self.occupancy.is_blocked(&key, task_id))
     }
 
-    /// Whether this worker leads, the only one that decides anything: it
-    /// holds a grant whose lease has not ended by this scheduler's clock.
-    fn is_leader(&self) -> bool {
-        match self.grant.map(|grant| grant.valid_until) {
-            None => false,
-            Some(LeaseEnd::Unbounded) => true,
-            Some(LeaseEnd::At(end)) => self.clock.now() < end,
-        }
+    /// Whether this scheduler leads, the only one that decides anything: it
+    /// holds a grant whose lease has not ended by its own clock and that is
+    /// not older than the epoch and term it already published in. Reading it
+    /// tells the observer nothing.
+    pub fn is_leader(&self) -> bool {
+        let Some(grant) = self.grant else {
+            return false;
+        };
+        let leased = match grant.valid_until {
+            LeaseEnd::Unbounded => true,
+            LeaseEnd::At(end) => self.clock.now() < end,
+        };
+        leased && self.may_publish_under(&grant)
+    }
+
+    /// Its observer, for a driver that takes what the scheduler published.
+    pub fn observer_mut(&mut self) -> &mut O {
+        &mut self.observer
     }
 
     /// Like `is_leader`, and tells the observer if the answer differs from
@@ -1240,6 +1477,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     fn notify_run(&mut self, run_id: &TaskRunId) {
+        self.unpublished.insert(self.runs[run_id].task_id());
         let counts = self.counts();
         self.observer.notify(Change::Run(&self.runs[run_id]), counts);
     }

@@ -6,6 +6,7 @@ pub mod hashing;
 pub mod in_memory_authority;
 pub mod protocol;
 pub mod scheduler;
+pub mod task_record;
 pub mod time;
 
 pub fn version() -> &'static str {

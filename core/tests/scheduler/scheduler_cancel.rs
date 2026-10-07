@@ -3,6 +3,7 @@
 //! reports about it can count, and the worker is told to stop the body.
 
 use crate::support::scheduler::{ticks, Fixture};
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
@@ -119,7 +120,7 @@ fn a_running_task_is_cancelled_and_nothing_it_reports_afterwards_counts() {
     let completed = fixture.scheduler.complete(
         &worker(),
         &claim.task_run_id,
-        b"late".to_vec(),
+        Digest::blake3(b"late"),
         Completion::Final,
     );
     let failed = fixture
@@ -132,12 +133,14 @@ fn a_running_task_is_cancelled_and_nothing_it_reports_afterwards_counts() {
         fixture.spy.since(mark).is_empty(),
         "refused reports change nothing"
     );
-    assert!(fixture
-        .scheduler
-        .task_run(&claim.task_run_id)
-        .unwrap()
-        .result_digest
-        .is_empty());
+    assert_eq!(
+        fixture
+            .scheduler
+            .task_run(&claim.task_run_id)
+            .unwrap()
+            .result_digest,
+        None
+    );
     // A cancelled task is not retried.
     assert!(fixture.spy.pending() == 0);
     assert_eq!(fixture.scheduler.runs_of(&task).len(), 1);
@@ -177,7 +180,7 @@ fn a_finished_task_cannot_be_cancelled() {
         .complete(
             &worker(),
             &claim.task_run_id,
-            b"d".to_vec(),
+            Digest::blake3(b"d"),
             Completion::Final,
         )
         .unwrap();

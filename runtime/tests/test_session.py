@@ -4,7 +4,6 @@ provoked on."""
 
 import asyncio
 import gc
-import hashlib
 import logging
 import threading
 import time
@@ -12,7 +11,7 @@ from datetime import timedelta
 
 import pytest
 
-from kabudachi._native import EventKind, RunState
+from kabudachi._native import EventKind, RunState, result_digest
 from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration
 from kabudachi.errors import (
@@ -112,7 +111,7 @@ def test_a_result_the_leader_refuses_to_certify_is_never_delivered():
 
 def test_a_certification_for_a_different_result_is_never_delivered():
     world = World(echo)
-    world.runtime.altered_digest = hashlib.sha256(b"something else").digest()
+    world.runtime.altered_digest = result_digest(b"something else")
 
     async def body():
         return await world.call("echo", Greeting(text="x"))

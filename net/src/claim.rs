@@ -15,7 +15,7 @@ use kabudachi_core::protocol::messages::{
     Claim, ClaimBatch, ClaimOldest, ClaimReject, ClaimRejectReason, ClaimRequest, ClaimResponse,
     claim_request, claim_response,
 };
-use kabudachi_core::scheduler::{self, ClaimRejection, Scheduler};
+use kabudachi_core::scheduler::{self, ClaimRejection, Observer, Scheduler};
 use kabudachi_core::time::Clock;
 use libp2p::PeerId;
 
@@ -141,8 +141,8 @@ impl Net {
 /// Whether this node leads is the scheduler's own call, from the leadership
 /// grant `carry_out` last handed it and its clock, so nothing about the node
 /// is read here.
-pub(crate) fn answer<C: Clock, I: IdGenerator>(
-    scheduler: &mut Scheduler<C, I>,
+pub(crate) fn answer<C: Clock, I: IdGenerator, R: Observer>(
+    scheduler: &mut Scheduler<C, I, R>,
     claimant: &WorkerId,
     request: &claim_request::Request,
 ) -> ClaimResponse {
@@ -245,8 +245,9 @@ mod tests {
     
     use prost::Message as _;
 
-    /// A clock that never moves, so every task's `created_at_ticks` is 0 and
-    /// encodes to nothing: a claim's length depends on its payload alone.
+    /// A clock that never moves, so every wall-clock time a task or run
+    /// carries is the same constant: a claim's length stays a constant size
+    /// and depends on its payload alone.
     #[derive(Debug, Clone, Copy)]
     struct Frozen;
     impl Clock for Frozen {
@@ -263,7 +264,7 @@ mod tests {
     fn grant() -> LeadershipGrant {
         LeadershipGrant {
             term: 1,
-            recovery_epoch: 0,
+            recovery_epoch: kabudachi_core::coordination_authority::RecoveryEpoch::new(0, 0),
             valid_until: LeaseEnd::Unbounded,
         }
     }
@@ -424,8 +425,9 @@ mod tests {
 
     #[test]
     fn a_worker_without_a_grant_refuses_both_asks_as_not_leader_and_claims_nothing() {
-        let mut scheduler: Leader = Scheduler::new(Frozen, Uuid7Ids);
+        let mut scheduler = leading();
         let task = submit(&mut scheduler, 16);
+        scheduler.set_leadership_grant(None);
         assert_eq!(
             reason(&answer(&mut scheduler, &claimant(), &by_id(&task))),
             ClaimRejectReason::ClaimRejectNotLeader
