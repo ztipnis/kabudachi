@@ -4,7 +4,7 @@
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::task_record::{Put, PutRefusal, RecordVersion, VersionedRecords};
+use kabudachi_core::task_record::{Origin, Put, PutRefusal, RecordVersion, VersionedRecords};
 use kabudachi_core::time::{Duration, Instant};
 
 const NOW: Instant = Instant::at(0);
@@ -132,4 +132,55 @@ fn a_republished_finished_record_keeps_its_first_retention_deadline() {
     store.put(finished, Instant::at(90)).unwrap();
 
     assert_eq!(store.next_due(), Some(Instant::at(110)));
+}
+
+/// `record` placed on `holders`.
+fn placed(mut record: TaskRecord, holders: &[&str]) -> TaskRecord {
+    record.placement = holders.iter().map(|id| WorkerId::new(*id).into()).collect();
+    record
+}
+
+#[test]
+fn a_holder_drops_its_copy_when_the_leader_moves_the_record_away() {
+    let task = TaskId::new("t");
+    let mut store = VersionedRecords::default().held_by(WorkerId::new("me"));
+    store.put(placed(record("t", version(0, 0, 1, 0), "q"), &["me", "a"]), NOW).unwrap();
+
+    let moved = placed(record("t", version(0, 0, 1, 1), "q"), &["a", "b"]);
+    assert_eq!(store.put(moved, NOW), Ok(Put::Retired));
+    assert!(store.get(&task).is_none(), "a copy nothing will update again would never go away");
+
+    // The same revision placed anew without this holder retires it too.
+    store.put(placed(record("t", version(0, 0, 1, 2), "q"), &["me"]), NOW).unwrap();
+    let re_placed = placed(record("t", version(0, 0, 1, 2), "q"), &["a", "b"]);
+    assert_eq!(store.put(re_placed, NOW), Ok(Put::Retired));
+    assert!(store.get(&task).is_none());
+
+    // A revision that is not newer than what is held is refused as ever, and a
+    // record whose placement is not yet known names no one to leave out.
+    store.put(placed(record("t", version(0, 0, 1, 5), "q"), &["me"]), NOW).unwrap();
+    let older_and_away = placed(record("t", version(0, 0, 1, 4), "q"), &["a", "b"]);
+    assert_eq!(store.put(older_and_away, NOW), Err(PutRefusal::Older));
+    assert!(store.get(&task).is_some());
+    let unplaced = record("t", version(0, 0, 1, 6), "q");
+    assert_eq!(store.put(unplaced, NOW), Ok(Put::Stored));
+}
+
+#[test]
+fn a_handed_off_copy_is_kept_whatever_its_placement_names_and_yields_to_a_newer_one() {
+    let task = TaskId::new("t");
+    let mut store = VersionedRecords::default().held_by(WorkerId::new("me"));
+    let handed = placed(record("t", version(0, 0, 1, 1), "q"), &["drainer"]);
+
+    assert_eq!(store.put_from(handed.clone(), Origin::HandOff, NOW), Ok(Put::Stored));
+    assert_eq!(store.get(&task), Some(&handed), "kept until the leader places it");
+
+    // A copy of the same revision from another drainer changes nothing.
+    let same = placed(record("t", version(0, 0, 1, 1), "q"), &["other"]);
+    assert_eq!(store.put_from(same, Origin::HandOff, NOW), Ok(Put::Unchanged));
+    assert_eq!(store.get(&task), Some(&handed));
+
+    // A copy older than the leader's is refused.
+    store.put(placed(record("t", version(0, 0, 1, 9), "q"), &["me"]), NOW).unwrap();
+    assert_eq!(store.put_from(handed, Origin::HandOff, NOW), Err(PutRefusal::Older));
 }

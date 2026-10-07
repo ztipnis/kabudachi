@@ -2565,6 +2565,35 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .is_some_and(|key| self.occupancy.is_blocked(&key, task_id))
     }
 
+    /// Publishes a new revision of each of `tasks` it holds, unchanged but for
+    /// its version, so its driver can write it where it now belongs. Tasks it
+    /// does not hold, or holds uncertain, are skipped. Only a leader
+    /// publishes: any other returns 0. Returns how many it published.
+    pub fn republish(&mut self, tasks: &[TaskId]) -> usize {
+        if !self.is_leader() {
+            return 0;
+        }
+        let eligible: BTreeSet<&TaskId> = tasks
+            .iter()
+            .filter(|task| self.tasks.contains_key(*task) && !self.uncertain.contains_key(*task))
+            .collect();
+        self.unpublished.extend(eligible.iter().map(|task| (*task).clone()));
+        self.end_call();
+        eligible.len()
+    }
+
+    /// Whether `task`'s newest record is not yet known to it: held back until
+    /// a holder answers or leaves.
+    pub fn is_uncertain(&self, task: &TaskId) -> bool {
+        self.uncertain.contains_key(task)
+    }
+
+    /// Whether it holds `task`: it decides the task, and a driver that kept
+    /// where it wrote its record can forget the task once this is false.
+    pub fn holds(&self, task: &TaskId) -> bool {
+        self.tasks.contains_key(task)
+    }
+
     /// Whether this scheduler leads, the only one that decides anything: it
     /// holds a grant whose lease has not ended by its own clock and that is
     /// not older than the epoch and term it already published in.

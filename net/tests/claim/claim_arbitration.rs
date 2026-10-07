@@ -192,13 +192,13 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
         let (claimed, refused, batch, huge_batches) = timeout(TEST_TIMEOUT, async {
             tokio::select! {
                 _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |_, _, _| {}) => {
-                    unreachable!("run_driver never returns")
+                    unreachable!("this test never drains a node, so its driver never returns")
                 }
                 () = join_and_drive(&net_b, &seed, clock, &b_leader) => {
-                    unreachable!("run_driver never returns")
+                    unreachable!("this test never drains a node, so its driver never returns")
                 }
                 () = join_and_drive(&net_c, &seed, clock, &c_leader) => {
-                    unreachable!("run_driver never returns")
+                    unreachable!("this test never drains a node, so its driver never returns")
                 }
                 claims = async {
                     let mut named = Vec::new();

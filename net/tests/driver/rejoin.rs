@@ -195,7 +195,7 @@ async fn a_stranded_node_reaches_a_leader_despite(listing: Listing) {
     };
     let state_when_it_reached_out = timeout(TEST_TIMEOUT, async {
         tokio::select! {
-            _ = driven => unreachable!("run_driver never returns"),
+            _ = driven => unreachable!("this test never drains a node, so its driver never returns"),
             () = keep_registered(&authority, &listed) => unreachable!("registers for ever"),
             state = reached_out => state,
         }
@@ -362,7 +362,7 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
             .await;
         };
         tokio::select! {
-            _ = driven => unreachable!("run_driver never returns"),
+            _ = driven => unreachable!("this test never drains a node, so its driver never returns"),
             () = register_leaders => unreachable!("registering never ends"),
             () = scenario => {}
         }

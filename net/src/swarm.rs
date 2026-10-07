@@ -96,7 +96,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use kabudachi_core::protocol::ids::ShardId;
+use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use libp2p::core::transport::{
     DialOpts, ListenerId, PortUse, Transport, TransportError, TransportEvent,
 };
@@ -264,6 +264,7 @@ fn records_behaviour(
         .set_periodic_bootstrap_interval(None)
         .set_max_packet_size(MAX_RECORD_PACKET_BYTES)
         .set_query_timeout(RECORD_WRITE_TIMEOUT);
+    held.held_by(WorkerId::new(local.to_string()));
     let mut records = kad::Behaviour::with_config(local, TaskRecordStore::new(held), config);
     records.set_mode(Some(kad::Mode::Server));
     records

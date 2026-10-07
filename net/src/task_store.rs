@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kabudachi_core::protocol::generated::TaskRecord;
-use kabudachi_core::protocol::ids::TaskId;
+use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::reconcile::HeldKey;
 use kabudachi_core::reconcile::wire::held_key;
-use kabudachi_core::task_record::{MAX_RECORD_BYTES, VersionedRecords, identify, looks_claimable};
+use kabudachi_core::task_record::{MAX_RECORD_BYTES, Origin, VersionedRecords, identify, looks_claimable};
 use kabudachi_core::time::{Clock, RealClock, WallTime};
 use libp2p::PeerId;
 use libp2p::kad;
@@ -56,6 +56,13 @@ impl HeldRecords {
             records: Arc::new(Mutex::new(VersionedRecords::with_retention(retention))),
             clock: Arc::new(RealClock::new()),
         }
+    }
+
+    /// Names this worker as the holder of the records: a revision the leader
+    /// writes that leaves it out of the record's holders then drops its copy.
+    pub(crate) fn held_by(&self, holder: WorkerId) {
+        let mut records = self.lock();
+        *records = std::mem::take(&mut *records).held_by(holder);
     }
 
     /// The newest revision of `task`'s record this worker holds.
@@ -123,7 +130,9 @@ pub fn record_key(task: &TaskId) -> kad::RecordKey {
 
 /// kad's view of [`HeldRecords`]: a put decodes the record and is refused
 /// (an `Err`, so kad resets the stream instead of acknowledging it) unless
-/// it is newer than what is held or an identical republish. kad's error type
+/// it is newer than what is held or an identical republish. A record that
+/// names a publisher was handed over by a draining worker, and is kept
+/// whatever holders it names; the leader's own writes name none. kad's error type
 /// has no variant for an older record; any `Err` has the effect that
 /// matters, and the real reason is logged here.
 pub struct TaskRecordStore {
@@ -170,7 +179,12 @@ impl kad::store::RecordStore for TaskRecordStore {
                 return Err(kad::store::Error::ValueTooLarge);
             }
         };
-        match self.held.lock().put(decoded, self.held.clock.now()) {
+        let origin = if record.publisher.is_some() {
+            Origin::HandOff
+        } else {
+            Origin::Leader
+        };
+        match self.held.lock().put_from(decoded, origin, self.held.clock.now()) {
             Ok(_) => Ok(()),
             Err(refusal) => {
                 tracing::debug!(task = task.as_str(), %refusal, "refusing a record");

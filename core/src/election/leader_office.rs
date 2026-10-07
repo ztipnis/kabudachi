@@ -97,6 +97,9 @@ pub(crate) struct LeaderOffice {
     /// heartbeats kept arriving, to take out one at a time (see
     /// [`Self::remove_one_unconfirming`]).
     unconfirming: BTreeSet<WorkerId>,
+    /// The workers reported lost and not heard since: one that confirmed no
+    /// ack stays here until it confirms one, its heartbeats notwithstanding.
+    lost: BTreeSet<WorkerId>,
     /// The voters taken out for confirming no ack, each with the generation
     /// it last echoed before (see [`Self::may_remove_one_unconfirming`]).
     removed: Vec<(WorkerId, Option<Generation>)>,
@@ -133,6 +136,7 @@ impl LeaderOffice {
             last_heard,
             confirmed_at: BTreeMap::new(),
             unconfirming: BTreeSet::new(),
+            lost: BTreeSet::new(),
             removed: Vec::new(),
             voters_at: BTreeMap::new(),
             pending_removals: BTreeSet::new(),
@@ -194,6 +198,9 @@ impl LeaderOffice {
                 self.confirmed_at.insert(from.clone(), duties.now);
                 self.unconfirming.remove(&from);
             }
+        }
+        if !self.unconfirming.contains(&from) {
+            self.lost.remove(&from);
         }
         match admission.filter(|_| routing_crawled) {
             Some(admission) if Some(admission) == self.roster.admission_of(&from) => {
@@ -258,6 +265,16 @@ impl LeaderOffice {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .cloned()
+            .collect()
+    }
+
+    /// The voters of the committed configuration records may be placed on:
+    /// those of [`Self::voter_ids`] that this office has not reported lost
+    /// since it last heard them (`me` is never lost).
+    pub(crate) fn placeable_voter_ids(&self, me: &WorkerId) -> Vec<WorkerId> {
+        self.voter_ids(me)
+            .into_iter()
+            .filter(|voter| voter == me || !self.lost.contains(voter))
             .collect()
     }
 
@@ -434,6 +451,7 @@ impl LeaderOffice {
         for worker in &lost {
             self.last_heard.remove(worker);
             self.confirmed_at.remove(worker);
+            self.lost.insert(worker.clone());
         }
         // A voter already reported for confirming no ack is reported again
         // only after it confirmed one in between, which unqueues it.
@@ -574,6 +592,7 @@ impl LeaderOffice {
         let members = self.roster.members();
         self.confirmed_at.retain(|worker, _| members.contains_key(worker));
         self.unconfirming.retain(|worker| members.contains_key(worker));
+        self.lost.retain(|worker| members.contains_key(worker));
     }
 
     /// Leadership ended: `standing` takes on the configuration the roster

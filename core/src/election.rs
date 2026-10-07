@@ -65,7 +65,10 @@
 //! `SelfRemove`, which a follower sends to its leader alone, at once and with
 //! no commit round, unless the worker has seen a later term than the leader's
 //! (the term guard). A draining leader announces its own departure on final
-//! acks.
+//! acks. A draining node also reports who is to choose where the Task records
+//! it holds go (see [`Output::HandOff`]), and a leader reads, from its roster
+//! alone, the voters it places records on: those it has not reported lost
+//! and not heard since (see [`WorkerNode::placeable_voters`]).
 //!
 //! A winner holds office from its win, in `LeaderReconciling`, and performs
 //! every election duty of a leader there: it announces itself, acks
@@ -629,6 +632,24 @@ pub enum Output {
     /// (see [`StopReason::Abandoned`]). A restart re-enters the bootstrap
     /// cascade.
     ShardAbandoned,
+    /// The node is leaving the shard: its driver hands every Task record the
+    /// worker holds to where [`HandOffTo`] says, and waits for them to be
+    /// stored (no longer than the drain wait limit) before it lets the worker
+    /// exit. Reported once, as the node drains, before it reports `Stopped`.
+    HandOff(HandOffTo),
+}
+
+/// To whom a draining node hands the Task records it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandOffTo {
+    /// The leader this follower followed: it chooses where each record goes,
+    /// for a follower knows no voters.
+    Leader(WorkerId),
+    /// This node led: these are the voters it could still place records on,
+    /// itself left out, as its configuration named them when it left office.
+    Voters(Vec<WorkerId>),
+    /// It knows no leader: no one can choose where its records go.
+    Nobody,
 }
 
 /// Why a node is `Stopped`.
@@ -691,6 +712,7 @@ pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator, O: Observer>(
             | Output::Authority(_)
             | Output::AbortDeadline(_)
             | Output::RunsHeard { .. }
+            | Output::HandOff(_)
             | Output::ShardAbandoned => {}
         }
     }
@@ -942,6 +964,17 @@ where
     pub fn voters(&self) -> Vec<WorkerId> {
         match (&self.office, self.holds_office()) {
             (Some(office), true) => office.voter_ids(&self.my_id),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The voters this leader places Task records on: those of its
+    /// configuration, minus every one it has reported lost and not heard
+    /// from since (one reported for confirming no ack, until it confirms
+    /// one). Empty unless it holds office. Read from its roster alone.
+    pub fn placeable_voters(&self) -> Vec<WorkerId> {
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => office.placeable_voter_ids(&self.my_id),
             _ => Vec::new(),
         }
     }
@@ -2259,6 +2292,19 @@ where
         // Leaving `Leader` withdraws the grant first, so no departure
         // message goes out while this node still holds one.
         let was_leader = self.holds_office();
+        let hand_off = if was_leader {
+            HandOffTo::Voters(
+                self.placeable_voters()
+                    .into_iter()
+                    .filter(|voter| *voter != self.my_id)
+                    .collect(),
+            )
+        } else {
+            match &self.leader {
+                Some((leader, _)) if *leader != self.my_id => HandOffTo::Leader(leader.clone()),
+                _ => HandOffTo::Nobody,
+            }
+        };
         let departure = self
             .office
             .take()
@@ -2269,6 +2315,7 @@ where
         } else {
             self.tell_leader_of_departure();
         }
+        self.outputs.push(Output::HandOff(hand_off));
 
         // There is no outstanding work to wait for yet, so draining finishes
         // immediately. The transition table has no direct `Active -> Stopped`

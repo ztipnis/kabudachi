@@ -27,8 +27,9 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelTask, ReportCompleted, ReportFailed, ReportStarted, StartAccepted, SubmitAccepted,
-    TaskReject, TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
+    CancelTask, PlaceRecords, PlacedKey, RecordPlacements, ReportCompleted, ReportFailed,
+    ReportStarted, StartAccepted, SubmitAccepted, TaskReject, TaskRejectReason, TaskRequest,
+    TaskResponse, task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
@@ -41,9 +42,15 @@ use crate::messenger::Net;
 use crate::peers::worker_id_of;
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_exchange::wire::Malformed;
+use crate::task_store::placement::{Placement, ReplicationFactor, placement};
 
 pub mod codec;
 mod wire;
+
+/// The most task ids one placement request carries (see
+/// [`Net::place_records`]): a worker with more asks in pages, so that an
+/// answer, which names every holder, stays far below a message's size limit.
+pub(crate) const MAX_PLACE_IDS: usize = 256;
 
 /// Why a task-exchange call got no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +188,22 @@ impl Net {
         self.ask_task(leader, request).await
     }
 
+    /// Asks `leader` where it would place each of `tasks` now, this worker
+    /// left out: a draining worker, which knows no voters, asks before it
+    /// hands its copies over. No more than [`MAX_PLACE_IDS`] ids at once;
+    /// the answer names the holders and the quorum of each task the leader
+    /// could place.
+    pub(crate) async fn place_records(
+        &self,
+        leader: WorkerId,
+        tasks: Vec<TaskId>,
+    ) -> Result<TaskResponse, TaskFailure> {
+        let request = task_request::Request::Place(PlaceRecords {
+            task_ids: tasks.into_iter().map(Into::into).collect(),
+        });
+        self.ask_task(leader, request).await
+    }
+
     /// Drains every inbound `/kabudachi/task/1` request not yet answered.
     /// Answer each with [`Self::respond_task`].
     pub fn poll_task_requests(&self) -> Vec<TaskRequestHandle> {
@@ -303,6 +326,8 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
                 .map_err(wire::cancel_reject),
             None => Err(TaskRejectReason::TaskRejectMalformed),
         },
+        // Where records go is the driver's to say: it alone knows the voters.
+        Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
     };
     match result {
         Ok(result) => TaskResponse {
@@ -317,6 +342,40 @@ fn run_id(run: Option<&generated::TaskRunId>) -> Result<TaskRunId, TaskRejectRea
     run.cloned()
         .map(TaskRunId::from)
         .ok_or(TaskRejectReason::TaskRejectMalformed)
+}
+
+/// The leader's answer to `request`: where each task it names would be placed
+/// among `voters`, the voters it can place records on other than the asker,
+/// `factor` of them for each. A task that could not be placed (no voter, or a
+/// voter that is no peer) is left out. Not gated on the writes of any
+/// decision: it decides nothing. A request that names too many tasks, or one
+/// without its id, is malformed.
+pub(crate) fn placements(
+    request: &PlaceRecords,
+    voters: &[WorkerId],
+    factor: ReplicationFactor,
+) -> TaskResponse {
+    if request.task_ids.len() > MAX_PLACE_IDS {
+        return wire::reject(TaskRejectReason::TaskRejectMalformed);
+    }
+    let placed = request
+        .task_ids
+        .iter()
+        .filter_map(|task| {
+            let task = TaskId::from(task.clone());
+            let Placement { holders, quorum } = placement(&task, voters, factor)?;
+            Some(PlacedKey {
+                task_id: Some(task.into()),
+                holders: holders.into_iter().map(Into::into).collect(),
+                quorum: u32::try_from(quorum).unwrap_or(u32::MAX),
+            })
+        })
+        .collect();
+    TaskResponse {
+        result: Some(task_response::Result::Placements(RecordPlacements {
+            placements: placed,
+        })),
+    }
 }
 
 /// The answer to a request from a worker the leader's roster holds neither as

@@ -3,4 +3,5 @@
 mod candidate;
 mod local_records;
 mod record_store;
+mod repair;
 mod write_ledger;

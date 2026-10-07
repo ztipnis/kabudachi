@@ -13,6 +13,7 @@ pub mod discovery;
 pub mod driver;
 mod exchange;
 mod framing;
+pub mod handoff;
 pub mod join;
 pub mod join_codec;
 mod leader_search;

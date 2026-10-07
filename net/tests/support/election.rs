@@ -36,7 +36,7 @@ pub async fn drive_until_leading(
     tokio::select! {
         _ = run_driver(node, first, net, scheduler, clock, None, DriverConfig::default(), |node, _, _| {
             let _ = state_sender.send(node.state());
-        }) => unreachable!("run_driver never returns"),
+        }) => unreachable!("this test never drains a node, so its driver never returns"),
         led = state.wait_for(|state| *state == WorkerState::Leader) => {
             led.expect("the driver is still running");
         }

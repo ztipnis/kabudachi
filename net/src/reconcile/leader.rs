@@ -342,14 +342,14 @@ impl<'n> LeaderReconciliation<'n> {
                 self.led = true;
                 return Progress::Republished(self.round.term());
             }
-            let mut voters = node.voters();
+            let mut voters = node.placeable_voters();
             voters.sort();
             if !republish.is_done() && voters != self.republish_voters {
                 self.republish_voters = voters;
                 return Progress::RePlace;
             }
         }
-        if let Some(stuck) = self.stuck.take_if_due(&node.voters(), now) {
+        if let Some(stuck) = self.stuck.take_if_due(&node.placeable_voters(), now) {
             return match stuck {
                 Stuck::Rebuild(rebuild) => Progress::Rebuild(rebuild),
                 Stuck::Place(records) => Progress::Place(records),

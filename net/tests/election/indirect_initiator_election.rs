@@ -197,7 +197,7 @@ async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_an
                     DriverConfig::default(),
                     |node, _, _| { let _ = tx_a.send(seen(node)); },
                 ) => {
-                    unreachable!("run_driver never returns")
+                    unreachable!("this test never drains a node, so its driver never returns")
                 }
                 _ = run_driver(
                     &mut node_c,
@@ -209,7 +209,7 @@ async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_an
                     DriverConfig::default(),
                     |node, _, _| { let _ = tx_c.send(seen(node)); },
                 ) => {
-                    unreachable!("run_driver never returns")
+                    unreachable!("this test never drains a node, so its driver never returns")
                 }
                 states = wait_for_convergence(rx_a, rx_c) => states,
             }

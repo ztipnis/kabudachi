@@ -1,7 +1,6 @@
 //! A shard of driven voters over real loopback sockets, for tests of what a
 //! leader does with its records.
 
-use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,6 +22,7 @@ use kabudachi_core::scheduler::{Scheduler, Submission, Submitted, mint};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::{Duration, RealClock, WallTime};
 use kabudachi_net::driver::{DriverConfig, run_driver};
+use kabudachi_net::handoff::HandedOff;
 use kabudachi_net::messenger::Net;
 use kabudachi_net::task_store::placement::ReplicationFactor;
 use libp2p::futures::future::select_all;
@@ -72,6 +72,40 @@ pub struct Voters {
     states: Vec<watch::Receiver<WorkerState>>,
     senders: Vec<watch::Sender<WorkerState>>,
     killed: Vec<bool>,
+    /// What each voter's driver returned once it had drained and handed its
+    /// records over; such a voter is driven no more.
+    handed_off: HandedOffBy,
+}
+
+/// What the drivers of drained voters returned, readable while the shard is
+/// driven.
+#[derive(Clone)]
+pub struct HandedOffBy(Arc<watch::Sender<Vec<Option<HandedOff>>>>);
+
+impl HandedOffBy {
+    fn new(voters: usize) -> Self {
+        HandedOffBy(Arc::new(watch::channel(vec![None; voters]).0))
+    }
+
+    fn of(&self, voter: usize) -> Option<HandedOff> {
+        self.0.borrow()[voter].clone()
+    }
+
+    fn record(&self, voter: usize, handed_off: HandedOff) {
+        self.0.send_modify(|returned| returned[voter] = Some(handed_off));
+    }
+
+    /// Resolves once `voter`'s driver has returned (it does once the voter
+    /// drained and handed its records over), with what it returned. Callers
+    /// bound the wait.
+    pub async fn returned(&self, voter: usize) -> HandedOff {
+        let mut returned = self.0.subscribe();
+        let returned = returned
+            .wait_for(|returned| returned[voter].is_some())
+            .await
+            .expect("the sender lives as long as the shard");
+        returned[voter].clone().expect("waited for it")
+    }
 }
 
 /// A shard of three voters.
@@ -145,6 +179,7 @@ impl Voters {
         let senders = channels.iter().map(|(sender, _)| sender.clone()).collect();
         let states = channels.into_iter().map(|(_, receiver)| receiver).collect();
         let killed = vec![false; nodes.len()];
+        let handed_off = HandedOffBy::new(nodes.len());
         Voters {
             nets,
             nodes,
@@ -156,6 +191,7 @@ impl Voters {
             states,
             senders,
             killed,
+            handed_off,
         }
     }
 
@@ -238,43 +274,69 @@ impl Voters {
         leader
     }
 
-    /// Drives every voter not killed until `until` completes, and returns what
-    /// it returned; panics if that takes past the backstop.
+    /// Drives every voter not killed, and not one that has handed its
+    /// records over, until `until` completes, and returns what it returned;
+    /// panics if that takes past the backstop. A voter whose driver returns
+    /// meanwhile is driven no more (see [`Self::handed_off`]).
     pub async fn drive_until<T>(&mut self, until: impl Future<Output = T>) -> T {
         let clock = self.clock;
         let (nets, senders, killed) = (&self.nets, &self.senders, &self.killed);
+        let handed_off = self.handed_off.clone();
         let config = DriverConfig {
             replication_factor: self.replication_factor,
             ..DriverConfig::default()
         };
-        let drivers: Vec<Pin<Box<dyn Future<Output = Infallible> + '_>>> = self
+        let drivers: Vec<Pin<Box<dyn Future<Output = (usize, HandedOff)> + '_>>> = self
             .nodes
             .iter_mut()
             .zip(self.schedulers.iter_mut())
             .enumerate()
-            .filter(|(voter, _)| !killed[*voter])
+            .filter(|(voter, _)| !killed[*voter] && handed_off.of(*voter).is_none())
             .map(|(voter, (node, scheduler))| {
                 let observe = publish(senders[voter].clone());
-                Box::pin(run_driver(
-                    node,
-                    due_now(&clock),
-                    &*nets[voter],
-                    scheduler,
-                    clock,
-                    None,
-                    config.clone(),
-                    observe,
-                )) as Pin<Box<dyn Future<Output = Infallible> + '_>>
+                let config = config.clone();
+                Box::pin(async move {
+                    let returned = run_driver(
+                        node,
+                        due_now(&clock),
+                        &*nets[voter],
+                        scheduler,
+                        clock,
+                        None,
+                        config,
+                        observe,
+                    )
+                    .await;
+                    (voter, returned)
+                }) as Pin<Box<dyn Future<Output = (usize, HandedOff)> + '_>>
             })
             .collect();
-        timeout(TEST_TIMEOUT, async {
-            tokio::select! {
-                _ = select_all(drivers) => unreachable!("run_driver never returns"),
-                output = until => output,
+        let output = timeout(TEST_TIMEOUT, async {
+            let mut running = drivers;
+            let mut until = std::pin::pin!(until);
+            loop {
+                if running.is_empty() {
+                    return until.await;
+                }
+                tokio::select! {
+                    ((voter, done), _, rest) = select_all(running) => {
+                        handed_off.record(voter, done);
+                        running = rest;
+                    }
+                    output = &mut until => return output,
+                }
             }
         })
         .await
-        .expect("the awaited event happened within the timeout")
+        .expect("the awaited event happened within the timeout");
+        output
+    }
+
+    /// What the drivers of drained voters returned, to wait on inside
+    /// [`Self::drive_until`]: the shard's drivers keep what they know of their
+    /// leader's writes only for as long as one call drives them.
+    pub fn handed_off(&self) -> HandedOffBy {
+        self.handed_off.clone()
     }
 }
 

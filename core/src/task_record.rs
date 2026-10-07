@@ -8,6 +8,7 @@ mod ledger;
 mod local;
 mod order;
 mod outbox;
+mod repair;
 mod store;
 mod version;
 
@@ -17,7 +18,8 @@ pub use ledger::{Waits, WriteLedger};
 pub use local::LocalRecords;
 pub use order::{Settlement, WriteOrder};
 pub use outbox::RecordOutbox;
-pub use store::{Put, PutRefusal, VersionedRecords, identify};
+pub use repair::{Repair, Retirement};
+pub use store::{Origin, Put, PutRefusal, VersionedRecords, identify};
 pub use version::{RecordVersion, VersionOrder};
 
 use crate::scheduler::MAX_CLAIM_FRAME_BYTES;

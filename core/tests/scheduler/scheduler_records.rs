@@ -12,7 +12,9 @@ use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
     Completion, Event, LeadershipGrant, LeaseEnd, MAX_SUBMISSION_BYTES, Submission, SubmitRejection,
 };
-use kabudachi_core::task_record::{HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion};
+use kabudachi_core::task_record::{
+    HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion, VersionOrder,
+};
 use kabudachi_core::time::Instant;
 use prost::Message;
 
@@ -348,4 +350,35 @@ fn a_failure_kind_too_long_for_the_record_is_cut_so_the_record_stays_within_the_
     assert!(last.encoded_len() as u64 <= MAX_RECORD_BYTES);
     let stored = &last.runs.last().unwrap().failure_kind;
     assert!(!stored.is_empty() && kind.starts_with(stored.as_str()), "the kind is cut, not replaced");
+}
+
+#[test]
+fn a_republished_task_gets_a_newer_revision_with_the_same_contents() {
+    let mut fixture = Fixture::leading();
+    let task = fixture.scheduler.submit(plain(b"a")).unwrap();
+    let before = fixture.spy.newest_revision_of(&task).unwrap();
+
+    let republished = fixture.scheduler.republish(&[task.clone(), TaskId::new("unknown")]);
+
+    assert_eq!(republished, 1, "a task it does not hold is skipped");
+    let after = fixture.spy.newest_revision_of(&task).unwrap();
+    assert_eq!(version_of(&before).order(&version_of(&after)), VersionOrder::Newer);
+    assert_eq!(
+        TaskRecord { version: None, published_at: None, ..after },
+        TaskRecord { version: None, published_at: None, ..before },
+    );
+}
+
+#[test]
+fn a_scheduler_that_does_not_lead_republishes_nothing() {
+    let mut fixture = Fixture::leading();
+    let task = fixture.scheduler.submit(plain(b"a")).unwrap();
+    fixture.scheduler.set_leadership_grant(None);
+    let mark = fixture.spy.mark();
+
+    assert_eq!(fixture.scheduler.republish(&[task]), 0);
+
+    assert!(fixture.spy.revised_since(mark).is_empty());
+    fixture.scheduler.set_leadership_grant(Some(unbounded_grant()));
+    assert!(fixture.spy.revised_since(mark).is_empty(), "nothing is left to publish when it leads again");
 }

@@ -41,10 +41,13 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use crate::support::builders::past_any_suspicion;
-use crate::support::harness::Cluster;
+use crate::support::harness::{Answer, Cluster, Ticket};
 use kabudachi_core::election::{Output, StopReason};
+use kabudachi_core::task_record::{VersionOrder, identify};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::protocol::ids::TaskDefinitionId;
+use kabudachi_core::scheduler::Submission;
 use kabudachi_core::time::Duration;
 
 /// The seeds a run checks unless `KABUDACHI_SIM_SEEDS` names others.
@@ -55,6 +58,10 @@ const SEEDS_VARIABLE: &str = "KABUDACHI_SIM_SEEDS";
 /// Every cluster's suspicion timeout, in ticks, and the step the quiet phase
 /// runs in.
 const SUSPECT_TICKS: u64 = 10;
+
+/// How long past a suspicion timeout a silent worker is reported lost, in
+/// ticks: short, so that a loss and its repair fit a run.
+const RECONNECT_TICKS: u64 = 3 * SUSPECT_TICKS;
 
 /// The authority's TTL for registrations and fences, in ticks. The tests'
 /// default of 30 s is 30000 ticks, which would dwarf this simulation's
@@ -124,6 +131,12 @@ enum Event {
     AuthorityOutage,
     AuthorityCut(usize),
     AuthorityRestored,
+    /// Submits a task to whichever node leads, if one does.
+    Submit,
+    /// Takes the node at the index down for good, as a host that died: it is
+    /// stepped no more, and no other node, record store or authority hears
+    /// from it again. At most one per run.
+    Down(usize),
 }
 
 fn draw_event(rng: &mut ChaCha8Rng, nodes: usize, voters: usize) -> Event {
@@ -132,7 +145,7 @@ fn draw_event(rng: &mut ChaCha8Rng, nodes: usize, voters: usize) -> Event {
         Duration::from_ticks(rng.random_range(LONG_CUT_LOW..=LONG_CUT_HIGH))
     };
     let sides = |rng: &mut ChaCha8Rng| (0..nodes).map(|_| rng.random_bool(0.5)).collect();
-    match rng.random_range(0..56) {
+    match rng.random_range(0..64) {
         0..=23 => Event::Advance(up_to(rng, 15)),
         24..=28 => Event::Partition(sides(rng), up_to(rng, LONGEST_CUT)),
         29..=31 => Event::Partition(sides(rng), long(rng)),
@@ -144,11 +157,19 @@ fn draw_event(rng: &mut ChaCha8Rng, nodes: usize, voters: usize) -> Event {
         46..=47 => Event::Drain(rng.random_range(0..voters)),
         48..=49 => Event::AuthorityOutage,
         50..=52 => Event::AuthorityCut(rng.random_range(0..nodes)),
-        _ => Event::AuthorityRestored,
+        53..=55 => Event::AuthorityRestored,
+        56..=61 => Event::Submit,
+        _ => Event::Down(rng.random_range(0..nodes)),
     }
 }
 
-fn apply(cluster: &mut Cluster, ids: &[WorkerId], voters: &[WorkerId], event: &Event) {
+fn apply(
+    cluster: &mut Cluster,
+    ids: &[WorkerId],
+    voters: &[WorkerId],
+    submissions: &mut Vec<Ticket>,
+    event: &Event,
+) {
     let set_reachable = |cluster: &Cluster, id: &WorkerId, reachable| {
         cluster.node_authority(id).set_reachable(reachable);
     };
@@ -171,7 +192,17 @@ fn apply(cluster: &mut Cluster, ids: &[WorkerId], voters: &[WorkerId], event: &E
         Event::Drain(index) => cluster.drain(&voters[*index]),
         Event::AuthorityOutage => ids.iter().for_each(|id| set_reachable(cluster, id, false)),
         Event::AuthorityCut(index) => set_reachable(cluster, &ids[*index], false),
-        Event::AuthorityRestored => ids.iter().for_each(|id| set_reachable(cluster, id, true)),
+        Event::AuthorityRestored => ids
+            .iter()
+            .filter(|id| !cluster.is_down(id))
+            .for_each(|id| set_reachable(cluster, id, true)),
+        Event::Down(index) => cluster.set_down(&ids[*index]),
+        Event::Submit => {
+            if let Some(leader) = cluster.leader() {
+                let task = Submission::new(TaskDefinitionId::new("random.task"), 0, b"in".to_vec(), "default");
+                submissions.push(cluster.submit(&leader, task));
+            }
+        }
     }
 }
 
@@ -208,11 +239,12 @@ fn run_seed(seed: u64) -> bool {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let voter_count = rng.random_range(3..=7);
     let pending = rng.random_range(0..=2);
-    let mut cluster = Cluster::bootstrap_with_authority_ttl(
+    let mut cluster = Cluster::bootstrap_with_authority_ttl_and_reconnect_timeout(
         voter_count,
         pending,
         Duration::from_ticks(SUSPECT_TICKS),
         Duration::from_ticks(AUTHORITY_TTL_TICKS),
+        Duration::from_ticks(RECONNECT_TICKS),
     );
     cluster.network().seed(seed);
     cluster.network().set_reorder(rng.random_bool(0.5));
@@ -223,6 +255,8 @@ fn run_seed(seed: u64) -> bool {
         .cloned()
         .collect();
     let mut drained = BTreeSet::new();
+    let mut submissions = Vec::new();
+    let mut down: Option<WorkerId> = None;
 
     // Recording starts before the first election so the first leader counts
     // toward the one-leader-per-(epoch, term) check too.
@@ -242,11 +276,20 @@ fn run_seed(seed: u64) -> bool {
         let event = draw_event(&mut rng, ids.len(), voters.len());
         if let Event::Drain(index) = event {
             // Below half the voters, so the rest can still elect.
-            if drained.len() >= (voters.len() - 1) / 2 || !drained.insert(voters[index].clone()) {
+            let gone = drained.len() + usize::from(down.is_some());
+            if gone >= (voters.len() - 1) / 2 || !drained.insert(voters[index].clone()) {
                 continue;
             }
         }
-        apply(&mut cluster, &ids, &voters, &event);
+        if let Event::Down(index) = &event {
+            // One loss, counted with the drains against the voters that must
+            // stay to elect.
+            if down.is_some() || drained.len() + 1 > (voters.len() - 1) / 2 {
+                continue;
+            }
+            down = Some(ids[*index].clone());
+        }
+        apply(&mut cluster, &ids, &voters, &mut submissions, &event);
         check_safety(&mut cluster, &mut leaders);
     }
 
@@ -254,11 +297,12 @@ fn run_seed(seed: u64) -> bool {
     cluster.network().set_reorder(false);
     cluster.network().set_drop_rate(0.0);
     cluster.network().set_delay(Duration::from_ticks(0));
-    for id in &ids {
+    for id in ids.iter().filter(|id| !cluster.is_down(id)) {
         cluster.node_authority(id).set_reachable(true);
     }
     cluster.advance(Duration::from_ticks(QUIET_TICKS));
-    cluster.run_until_quiescent(TICK_SIZE, QUIESCENCE_STEPS);
+    let steps = cluster.run_until_quiescent(TICK_SIZE, QUIESCENCE_STEPS);
+    assert!(steps < QUIESCENCE_STEPS, "the cluster never went quiet after the faults were lifted");
     check_safety(&mut cluster, &mut leaders);
 
     let states = cluster.states();
@@ -275,6 +319,9 @@ fn run_seed(seed: u64) -> bool {
         if drained.contains(id) && cluster.node(id).stop_reason() == Some(StopReason::Drained) {
             continue;
         }
+        if cluster.is_down(id) {
+            continue;
+        }
         assert_eq!(states[id], WorkerState::Active, "{id:?} must follow");
         assert_eq!(
             cluster.node(id).known_leader().map(|(id, _)| id),
@@ -282,7 +329,74 @@ fn run_seed(seed: u64) -> bool {
             "{id:?} must follow {leader:?}"
         );
     }
+    // Every write has been acknowledged and no refused one waits to be
+    // published again before the records are looked at.
+    for _ in 0..QUIESCENCE_STEPS {
+        if cluster.records().next_due().is_none() && !cluster.has_repair_due() {
+            break;
+        }
+        cluster.advance(TICK_SIZE);
+    }
+    assert!(
+        cluster.records().next_due().is_none() && !cluster.has_repair_due(),
+        "writes were still outstanding after the cluster went quiet"
+    );
+    check_records_are_held(&mut cluster, &leader, &submissions);
     leaders.values().flatten().collect::<BTreeSet<_>>().len() > 1
+}
+
+/// Panics unless every task submitted is held by the leader or uncertain to it,
+/// and every one the leader holds has its newest record
+/// stored by more than half of its placement that is up.
+fn check_records_are_held(cluster: &mut Cluster, leader: &WorkerId, submissions: &[Ticket]) {
+    let submitted: Vec<_> = submissions
+        .iter()
+        .filter_map(|ticket| match cluster.answer(*ticket) {
+            Some(Answer::Submitted(task)) => Some(task.clone()),
+            _ => None,
+        })
+        .collect();
+    // Nothing in a run claims, finishes or cancels a task, so none may be lost:
+    // the leader holds it, or it is still uncertain to it, because holders it
+    // cannot hear may hide a newer revision.
+    let mut held = Vec::new();
+    for task in submitted {
+        if cluster.scheduler_mut(leader).holds(&task) {
+            held.push(task);
+        } else {
+            assert!(
+                cluster.scheduler_mut(leader).is_uncertain(&task),
+                "{task:?} was submitted and the leader neither holds it nor is waiting on its holders"
+            );
+        }
+    }
+    for task in held {
+        let newest = cluster
+            .node_ids()
+            .iter()
+            .filter_map(|holder| cluster.records().held_by(holder, &task))
+            .reduce(|newest, record| {
+                let (_, held) = identify(&newest).expect("a held record is identified");
+                let (_, other) = identify(&record).expect("a held record is identified");
+                if held.order(&other) == VersionOrder::Newer { record } else { newest }
+            });
+        let newest = newest.unwrap_or_else(|| panic!("{task:?} is held by no node"));
+        let (_, version) = identify(&newest).expect("a held record is identified");
+        let placement: Vec<WorkerId> = newest.placement.iter().cloned().map(WorkerId::from).collect();
+        let holding = placement
+            .iter()
+            .filter(|holder| !cluster.is_down(holder))
+            .filter(|holder| {
+                cluster.records().held_by(holder, &task).is_some_and(|record| {
+                    identify(&record).is_ok_and(|(_, held)| held == version)
+                })
+            })
+            .count();
+        assert!(
+            holding > placement.len() / 2,
+            "{task:?}: its newest record, placed on {placement:?}, is stored by {holding} of them"
+        );
+    }
 }
 
 #[test]

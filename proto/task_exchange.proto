@@ -51,6 +51,13 @@ message CancelTask {
   TaskId task_id = 1;
 }
 
+// Where the leader would place each of these records now, the asker left out:
+// a draining worker, which knows no voters, asks before it hands its copies
+// over. Decides nothing, so a leader answers it without gating.
+message PlaceRecords {
+  repeated TaskId task_ids = 1;
+}
+
 message TaskRequest {
   oneof request {
     SubmitTask submit = 1;
@@ -58,6 +65,7 @@ message TaskRequest {
     ReportCompleted completed = 3;
     ReportFailed failed = 4;
     CancelTask cancel = 5;
+    PlaceRecords place = 6;
   }
 }
 
@@ -123,6 +131,17 @@ message CancelAnswer {
   bool was_running = 2;
 }
 
+message PlacedKey {
+  TaskId task_id = 1;
+  repeated WorkerId holders = 2;
+  // How many of them must store a copy.
+  uint32 quorum = 3;
+}
+
+message RecordPlacements {
+  repeated PlacedKey placements = 1;
+}
+
 message TaskResponse {
   oneof result {
     SubmitAccepted submitted = 1;
@@ -131,5 +150,6 @@ message TaskResponse {
     RunFailed failed = 4;
     CancelAnswer cancelled = 5;
     TaskReject reject = 6;
+    RecordPlacements placements = 7;
   }
 }

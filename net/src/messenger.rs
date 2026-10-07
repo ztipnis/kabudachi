@@ -281,6 +281,28 @@ enum Command {
     WithPeers(Box<dyn FnOnce(&mut Peers) + Send>),
     /// See `Net::write_records`.
     WriteRecords(Vec<PlacedWrite>),
+    /// See `Net::hand_off`.
+    HandOff {
+        write: HandOffWrite,
+        respond_to: oneshot::Sender<bool>,
+    },
+    /// See `Net::retire_copies`.
+    RetireCopies {
+        record: TaskRecord,
+        former: Vec<WorkerId>,
+    },
+}
+
+/// A copy a draining worker hands to the holders a placement named (see
+/// `Net::hand_off`).
+#[derive(Debug, Clone)]
+pub(crate) struct HandOffWrite {
+    /// The record exactly as the worker holds it.
+    pub record: TaskRecord,
+    /// The voters to send it to, this worker not among them.
+    pub holders: Vec<WorkerId>,
+    /// How many of them must store it for the hand-off to count.
+    pub quorum: usize,
 }
 
 /// The swarm task's asks in flight, one [`Exchange`] per correlated protocol.
@@ -895,6 +917,27 @@ impl Net {
         }
     }
 
+    /// Hands `write.record`, a copy this worker holds, to `write.holders`
+    /// over the shard's records protocol, naming this worker as its
+    /// publisher, so a holder keeps the copy whatever holders the record
+    /// names. Resolves once `write.quorum` of them stored it (`true`) or it
+    /// could not be stored there (`false`): a holder that holds a newer
+    /// revision refuses it. A `Net` that stores no shard's records
+    /// ([`Self::new`]) resolves `false` at once.
+    pub(crate) fn hand_off(&self, write: HandOffWrite) -> impl Future<Output = bool> + use<> {
+        let (respond_to, stored) = oneshot::channel();
+        let _ = self.commands.send(Command::HandOff { write, respond_to });
+        async move { stored.await.unwrap_or(false) }
+    }
+
+    /// Sends `record`, a revision the leader placed elsewhere, to `former`,
+    /// holders it left, each of which then drops the copy it holds. Nothing
+    /// waits for them: a holder that is gone or does not answer keeps a copy
+    /// nothing will read.
+    pub fn retire_copies(&self, record: TaskRecord, former: Vec<WorkerId>) {
+        let _ = self.commands.send(Command::RetireCopies { record, former });
+    }
+
     /// The newest revision of `task`'s record that this worker or any shard
     /// peer kad reaches holds: every answer of the lookup, this worker's own
     /// copy included, is compared by version and the newest kept; an
@@ -1090,6 +1133,9 @@ struct Pending {
     dials: HashMap<ConnectionId, PendingDial>,
     /// Record writes in flight to other workers, by their `kad` query.
     writes: HashMap<kad::QueryId, Write>,
+    /// Hand-offs in flight to other workers, by their `kad` query, each to
+    /// say whether it reached its quorum.
+    hand_offs: HashMap<kad::QueryId, oneshot::Sender<bool>>,
     /// Record lookups in flight, by their `kad` query.
     reads: HashMap<kad::QueryId, Read>,
     /// Bootstrap queries that have had a failed step, until their last step.
@@ -1324,6 +1370,8 @@ fn handle_command(
                 write_record(swarm, placed, pending, inbound);
             }
         }
+        Command::HandOff { write, respond_to } => hand_off_record(swarm, write, respond_to, pending),
+        Command::RetireCopies { record, former } => retire_copies(swarm, &record, &former),
         Command::GetRecord { task, respond_to } => {
             match swarm.behaviour_mut().records.as_mut() {
                 Some(records) => {
@@ -1399,6 +1447,66 @@ fn write_record(
             quorum,
         );
         pending.writes.insert(query, write);
+    }
+}
+
+/// Starts one hand-off (see [`Net::hand_off`]): the copy goes to each holder
+/// but this worker, under this worker's name as its publisher, at the quorum
+/// the hand-off asks.
+fn hand_off_record(
+    swarm: &mut Swarm<Behaviour>,
+    write: HandOffWrite,
+    respond_to: oneshot::Sender<bool>,
+    pending: &mut Pending,
+) {
+    let local = *swarm.local_peer_id();
+    let Some(records) = swarm.behaviour_mut().records.as_mut() else {
+        let _ = respond_to.send(false);
+        return;
+    };
+    let Ok((task, _)) = identify(&write.record) else {
+        let _ = respond_to.send(false);
+        return;
+    };
+    let remote: Vec<PeerId> = write
+        .holders
+        .iter()
+        .filter_map(|holder| PeerId::from_str(holder.as_str()).ok())
+        .filter(|peer| *peer != local)
+        .collect();
+    let Some(needed) = NonZeroUsize::new(write.quorum.max(1)).filter(|needed| needed.get() <= remote.len()) else {
+        let _ = respond_to.send(false);
+        return;
+    };
+    let mut record = kad::Record::new(record_key(&task), write.record.encode_to_vec());
+    record.publisher = Some(local);
+    let query = records.put_record_to(record, remote.into_iter(), kad::Quorum::N(needed));
+    pending.hand_offs.insert(query, respond_to);
+}
+
+/// Sends `record` to `former`, so each drops the copy it holds (see
+/// [`Net::retire_copies`]). A former holder that is this worker drops its own
+/// copy through its own store. The query's outcome is not tracked.
+fn retire_copies(swarm: &mut Swarm<Behaviour>, record: &TaskRecord, former: &[WorkerId]) {
+    let local = *swarm.local_peer_id();
+    let Some(records) = swarm.behaviour_mut().records.as_mut() else {
+        return;
+    };
+    let Ok((task, _)) = identify(record) else {
+        return;
+    };
+    let key = record_key(&task);
+    let value = record.encode_to_vec();
+    let mut remote = Vec::new();
+    for peer in former.iter().filter_map(|holder| PeerId::from_str(holder.as_str()).ok()) {
+        if peer == local {
+            let _ = records.store_mut().put(kad::Record::new(key.clone(), value.clone()));
+        } else {
+            remote.push(peer);
+        }
+    }
+    if !remote.is_empty() {
+        records.put_record_to(kad::Record::new(key, value), remote.into_iter(), kad::Quorum::One);
     }
 }
 
@@ -1630,6 +1738,11 @@ fn handle_event(
                     write,
                     stored: result.is_ok(),
                 });
+            } else if let Some(respond_to) = pending.hand_offs.remove(&id) {
+                if let Err(error) = &result {
+                    tracing::debug!(%error, "a record hand-off did not reach its quorum");
+                }
+                let _ = respond_to.send(result.is_ok());
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Records(kad::Event::OutboundQueryProgressed {

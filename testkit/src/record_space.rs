@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
-use kabudachi_core::task_record::{VersionOrder, Write, identify};
+use kabudachi_core::task_record::{Origin, VersionedRecords, Write};
 use kabudachi_core::time::{Duration, Instant};
 
 /// The shard's Task records as the simulator's nodes hold them: each node
@@ -29,7 +29,7 @@ pub struct SpaceWrite {
 #[derive(Default)]
 struct Space {
     ack_delay: Option<Duration>,
-    stores: BTreeMap<WorkerId, BTreeMap<TaskId, TaskRecord>>,
+    stores: BTreeMap<WorkerId, VersionedRecords>,
     down: BTreeSet<WorkerId>,
     cut: Option<(BTreeSet<WorkerId>, BTreeSet<WorkerId>)>,
     acknowledgements: Vec<(Instant, SpaceWrite)>,
@@ -61,28 +61,11 @@ impl Space {
             if !reached {
                 continue;
             }
-            let (task, version) =
-                identify(&record).expect("the scheduler builds every record with its task and version");
-            let held = self.stores.entry(holder).or_default();
-            // The real store refuses an older version and a different record
-            // at the same version, unless only its placement differs; a
-            // refused put is no acknowledgement.
-            let accepted = held.get(&task).is_none_or(|have| {
-                let (_, have_version) =
-                    identify(have).expect("a stored record names its task and version");
-                match have_version.order(&version) {
-                    VersionOrder::Newer => true,
-                    VersionOrder::Same => {
-                        let mut moved = record.clone();
-                        moved.placement.clone_from(&have.placement);
-                        moved == *have
-                    }
-                    VersionOrder::Older => false,
-                }
-            });
-            if accepted {
+            // The holders' own store decides: it refuses an older version and a
+            // different record at the same version, and a refused put is no
+            // acknowledgement.
+            if self.store_of(&holder).put(record.clone(), now).is_ok() {
                 stored += 1;
-                held.insert(task, record.clone());
             }
         }
         let due = now + self.ack_delay.unwrap_or(Duration::from_ticks(0));
@@ -94,6 +77,13 @@ impl Space {
                 stored: stored >= quorum,
             },
         ));
+    }
+
+    /// `holder`'s store, which names `holder` as its holder.
+    fn store_of(&mut self, holder: &WorkerId) -> &mut VersionedRecords {
+        self.stores
+            .entry(holder.clone())
+            .or_insert_with(|| VersionedRecords::default().held_by(holder.clone()))
     }
 
     fn reaches(&self, from: &WorkerId, to: &WorkerId) -> bool {
@@ -169,6 +159,44 @@ impl RecordSpace {
         }
     }
 
+    /// `from` hands `record`, a copy it held, to each of `holders` it can
+    /// reach, which keep it as a drained worker's copy; says whether at least
+    /// `quorum` of them stored it. Nothing is held back and no acknowledgement
+    /// is delayed: the drain waits for the outcome.
+    pub fn hand_off(
+        &self,
+        from: &WorkerId,
+        record: &TaskRecord,
+        holders: &[WorkerId],
+        quorum: usize,
+        now: Instant,
+    ) -> bool {
+        let mut space = self.0.borrow_mut();
+        let mut stored = 0;
+        for holder in holders {
+            if space.reaches(from, holder)
+                && space
+                    .store_of(holder)
+                    .put_from(record.clone(), Origin::HandOff, now)
+                    .is_ok()
+            {
+                stored += 1;
+            }
+        }
+        stored >= quorum
+    }
+
+    /// `writer`, the leader, sends `record`, a revision placed elsewhere, to
+    /// each of `former` it can reach, which drop their stale copies.
+    pub fn retire(&self, writer: &WorkerId, record: &TaskRecord, former: &[WorkerId], now: Instant) {
+        let mut space = self.0.borrow_mut();
+        for holder in former {
+            if space.reaches(writer, holder) {
+                let _ = space.store_of(holder).put(record.clone(), now);
+            }
+        }
+    }
+
     /// The acknowledgements due by `now`, in the order their writes were made.
     pub fn take_due(&self, now: Instant) -> Vec<SpaceWrite> {
         let mut space = self.0.borrow_mut();
@@ -225,7 +253,7 @@ impl RecordSpace {
             .borrow()
             .stores
             .get(holder)
-            .map(|store| store.values().cloned().collect())
+            .map(|store| store.iter().cloned().collect())
             .unwrap_or_default()
     }
 

@@ -18,7 +18,7 @@ use crate::support::node::{
     published_roll_calls, sent, sent_to, voter_node, voter_node_reconnecting,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::election::{Input, Output};
+use kabudachi_core::election::{HandOffTo, Input, Output};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
@@ -218,6 +218,121 @@ fn a_follower_drains_with_one_self_remove_to_its_leader_carrying_the_highest_ter
         "the vote it granted counts; the roll call it answered not"
     );
     assert_eq!(msg.leader_term, 2, "addressed to its leader's term");
+}
+
+/// A follower holds no list of voters, so it cannot choose where its records
+/// go: it names the leader it followed for its driver to ask. A node that has
+/// followed no one names nobody.
+#[test]
+fn a_draining_follower_names_the_leader_it_followed_to_place_its_records() {
+    let clock = FakeClock::new();
+    let (leader, me) = (worker("leader"), worker("w1"));
+    let mut followed = voter_node(&clock, &me, 3, SUSPECT);
+    connect(&mut followed, &[leader.clone()]);
+    deliver(
+        &mut followed,
+        &leader,
+        ack_message(leader_ack(&leader, 2, &configuration_of(3), Some(g0()))),
+    );
+    let mut stranger = voter_node(&clock, &worker("w2"), 3, SUSPECT);
+
+    let drained = followed.step(Input::Drain).outputs;
+    let alone = stranger.step(Input::Drain).outputs;
+
+    assert!(drained.contains(&Output::HandOff(HandOffTo::Leader(leader))), "{drained:?}");
+    assert!(alone.contains(&Output::HandOff(HandOffTo::Nobody)), "{alone:?}");
+}
+
+/// A leader that drains hands its records to its other voters, read from its
+/// own configuration before it leaves office.
+#[test]
+fn a_draining_leader_names_its_other_voters_to_place_its_records() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let _ = leader.step(Input::Drain);
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+
+    let drained = crawled(&clock, &mut leader, &worker("p2"));
+
+    assert_eq!(leader.state(), WorkerState::Stopped, "setup invariant");
+    assert!(
+        drained.contains(&Output::HandOff(HandOffTo::Voters(vec![worker("p1"), worker("p2")]))),
+        "{drained:?}"
+    );
+}
+
+/// What `leader_of_three_losing_quickly` does while `p1` sends `beats` and `p2`
+/// keeps the lease without echoing a generation, for `ticks`.
+fn run_leader_of_three_with_p1_beating(
+    clock: &FakeClock,
+    leader: &mut TestNode,
+    p1_beats: Option<bool>,
+    ticks: u64,
+) -> Vec<Output> {
+    let heartbeat_interval = crate::support::builders::timings(Duration::from_ticks(SUSPECT))
+        .heartbeat_interval
+        .as_ticks();
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let committed = three_voters_founded_in_term_1().generation();
+    let mut outputs = Vec::new();
+    for _ in 0..ticks / heartbeat_interval {
+        clock.advance(Duration::from_ticks(heartbeat_interval));
+        let beat = confirming_heartbeat(clock, leader, &p2, None);
+        deliver(leader, &p2, heartbeat_message(beat));
+        if let Some(confirming) = p1_beats {
+            let mut beat = if confirming {
+                confirming_heartbeat(clock, leader, &p1, Some(committed))
+            } else {
+                heartbeat(&p1, None)
+            };
+            beat.configuration_generation = Some(committed.into());
+            deliver(leader, &p1, heartbeat_message(beat));
+        }
+        outputs.extend(leader.step(Input::Tick).outputs);
+    }
+    outputs
+}
+
+/// A silent voter is reported lost but stays a voter while the shard keeps its
+/// quorum, so records are not placed on it from then on, until it is heard
+/// again.
+#[test]
+fn a_silent_voter_reported_lost_is_not_placeable_until_it_is_heard_again() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three_losing_quickly(&clock);
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let mut all = vec![worker("w1"), p1.clone(), p2.clone()];
+    all.sort();
+    assert_eq!(leader.placeable_voters(), all, "every voter is placeable at first");
+
+    let lost = run_leader_of_three_with_p1_beating(&clock, &mut leader, None, 2 * loss_timeout());
+
+    assert!(lost.contains(&Output::WorkerLost(p1.clone())), "setup invariant");
+    assert!(leader.voters().contains(&p1), "nothing removed it");
+    assert!(!leader.placeable_voters().contains(&p1));
+    assert!(leader.placeable_voters().contains(&p2));
+
+    deliver(&mut leader, &p1, heartbeat_message(heartbeat(&p1, None)));
+    assert!(leader.placeable_voters().contains(&p1));
+}
+
+/// A voter whose heartbeats arrive but which confirms no ack is reported lost
+/// once; its heartbeats do not make it placeable again, only confirming an ack
+/// does.
+#[test]
+fn a_voter_that_confirms_no_ack_is_not_placeable_until_it_confirms_one() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three_losing_quickly(&clock);
+    let p1 = worker("p1");
+
+    let lost = run_leader_of_three_with_p1_beating(&clock, &mut leader, Some(false), 2 * loss_timeout());
+
+    assert!(lost.contains(&Output::WorkerLost(p1.clone())), "setup invariant");
+    assert!(leader.voters().contains(&p1), "setup invariant: its removal is blocked");
+    assert!(!leader.placeable_voters().contains(&p1), "it still beats, and confirms nothing");
+
+    run_leader_of_three_with_p1_beating(&clock, &mut leader, Some(true), 2 * SUSPECT);
+    assert!(leader.placeable_voters().contains(&p1));
 }
 
 // A heartbeat delayed from before a voter's re-admission can still say it

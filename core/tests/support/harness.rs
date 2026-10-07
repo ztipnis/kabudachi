@@ -49,8 +49,8 @@ use std::rc::Rc;
 
 use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, CallKind, Entry, Identity,
-    Input, Issuer, KnownConfiguration, MessageSink, Output, ReplyToken, Step, WorkerNode, carry_out,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, CallKind, Entry, HandOffTo,
+    Identity, Input, Issuer, KnownConfiguration, MessageSink, Output, ReplyToken, Step, WorkerNode, carry_out,
 };
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, TaskId, WorkerId};
@@ -66,7 +66,8 @@ use kabudachi_core::scheduler::{
     Certification, Claim, Completion, Scheduler, Submission,
 };
 use kabudachi_core::task_record::{
-    EffectGate, PlacedWrite, Settled, Settlement, Waits, Write, WriteLedger, WriteOrder, WriteOutcome,
+    EffectGate, PlacedWrite, Repair, Settled, Settlement, Waits, Write, WriteLedger, WriteOrder,
+    WriteOutcome,
 };
 use kabudachi_core::time::{Clock, Duration, Instant};
 use kabudachi_testkit::FaultingAuthority;
@@ -82,7 +83,8 @@ use crate::support::spy::Spy;
 
 const SHARD_ID: &str = "shard-1";
 
-/// How many of its voters a leader places each record on.
+/// How many of its voters a leader places each record on, unless a scenario
+/// sets another (see `Cluster::set_replication_factor`).
 const REPLICATION_FACTOR: usize = 3;
 
 /// How many ticks in a row a node may be given at one instant before it must
@@ -125,26 +127,42 @@ pub enum Answer {
     NotLeader,
 }
 
-/// A leader's held answers and the writes still bearing on what it may tell.
-#[derive(Default)]
+/// A leader's held answers and the writes still bearing on what it may tell,
+/// and its repair of where its records are held.
 struct Gating {
     gate: EffectGate<Ticket>,
     unsettled: WriteLedger,
     order: WriteOrder,
+    repair: Repair,
+}
+
+impl Gating {
+    /// A refused write is published again after `retry_after`.
+    fn new(retry_after: Duration) -> Self {
+        Gating {
+            gate: EffectGate::new(),
+            unsettled: WriteLedger::default(),
+            order: WriteOrder::default(),
+            repair: Repair::new(retry_after),
+        }
+    }
 }
 
 /// Places `record` on `voters` and writes it to the shared record space as
 /// `writer`.
 fn store_revision(
     space: &RecordSpace,
+    repair: &mut Repair,
     writer: &WorkerId,
     voters: &[WorkerId],
+    factor: usize,
     mut record: TaskRecord,
     now: Instant,
 ) {
     let write = Write::of(&record);
-    let (holders, quorum) = RecordSpace::placement(&write.task_id, voters, REPLICATION_FACTOR);
+    let (holders, quorum) = RecordSpace::placement(&write.task_id, voters, factor);
     record.placement = holders.into_iter().map(Into::into).collect();
+    repair.written(&record);
     space.write(writer, record, quorum, now);
 }
 
@@ -155,9 +173,9 @@ fn sorted(mut voters: Vec<WorkerId>) -> Vec<WorkerId> {
 }
 
 /// `record` placed on `voters`, with the quorum that must store it.
-fn place(mut record: TaskRecord, voters: &[WorkerId]) -> PlacedWrite {
+fn place(mut record: TaskRecord, voters: &[WorkerId], factor: usize) -> PlacedWrite {
     let (holders, quorum) =
-        RecordSpace::placement(&Write::of(&record).task_id, voters, REPLICATION_FACTOR);
+        RecordSpace::placement(&Write::of(&record).task_id, voters, factor);
     record.placement = holders.into_iter().map(Into::into).collect();
     PlacedWrite { record, quorum }
 }
@@ -230,6 +248,15 @@ pub struct Cluster {
     routing_crawls_held: bool,
     /// The shard's Task records, written by each node's leader.
     records: RecordSpace,
+    /// How many voters each record is placed on.
+    replication_factor: usize,
+    /// The nodes taken down, and those that drained and handed their records
+    /// over: they hold and store no record.
+    down: BTreeSet<WorkerId>,
+    /// The nodes whose host died (see `set_down`): never stepped again, no
+    /// message reaches them, and neither the network nor the authority hears
+    /// from them.
+    dead: BTreeSet<WorkerId>,
     /// Each node's held answers.
     gating: BTreeMap<WorkerId, Gating>,
     /// What a held call will answer once released.
@@ -325,6 +352,24 @@ impl Cluster {
         )
     }
 
+    /// `bootstrap_with_authority_ttl` with every node reporting a worker lost
+    /// `reconnect_timeout` past its suspicion timeout rather than the default.
+    pub fn bootstrap_with_authority_ttl_and_reconnect_timeout(
+        voters: usize,
+        pending: usize,
+        suspect_timeout: Duration,
+        ttl: Duration,
+        reconnect_timeout: Duration,
+    ) -> Self {
+        Cluster::build(
+            voters,
+            pending,
+            suspect_timeout,
+            Some(AuthorityTimings { ttl }),
+            Some(reconnect_timeout),
+        )
+    }
+
     fn build(
         voters: usize,
         pending: usize,
@@ -373,6 +418,9 @@ impl Cluster {
             recorded_steps: None,
             routing_crawls_held: false,
             records: RecordSpace::default(),
+            replication_factor: REPLICATION_FACTOR,
+            down: BTreeSet::new(),
+            dead: BTreeSet::new(),
             gating: BTreeMap::new(),
             drafts: BTreeMap::new(),
             answers: BTreeMap::new(),
@@ -431,7 +479,10 @@ impl Cluster {
             Scheduler::with_observer((*self.clock).clone(), self.ids.clone(), spy.clone()),
         );
         self.spies.insert(id.clone(), spy);
-        self.gating.insert(id.clone(), Gating::default());
+        self.gating.insert(
+            id.clone(),
+            Gating::new(timings(self.suspect_timeout).heartbeat_interval),
+        );
         self.deadlines.insert(id.clone(), None);
         // A node reports its deadline only when stepped. A `Tick` changes
         // nothing on a node this fresh, but a node no connection event ever
@@ -455,8 +506,8 @@ impl Cluster {
     /// Every ordered pair of distinct nodes the network currently lets talk.
     fn connections(&self) -> BTreeSet<(WorkerId, WorkerId)> {
         let mut pairs = BTreeSet::new();
-        for me in self.nodes.keys() {
-            for peer in self.nodes.keys() {
+        for me in self.nodes.keys().filter(|id| !self.dead.contains(*id)) {
+            for peer in self.nodes.keys().filter(|id| !self.dead.contains(*id)) {
                 if me != peer && !self.network.is_partitioned(me, peer) {
                     pairs.insert((me.clone(), peer.clone()));
                 }
@@ -503,6 +554,7 @@ impl Cluster {
             // acknowledgement due at the instant a lease ends is judged by
             // the lease check at that instant.
             self.deliver_acknowledgements();
+            self.repair_placements();
             self.reconcile_due();
             activity.progressed |= self.run_passes(true).progressed;
             self.reconcile_due();
@@ -523,20 +575,35 @@ impl Cluster {
         let next_deadline = self
             .deadlines
             .iter()
-            .filter(|(id, _)| !self.is_stalled(id, now))
+            .filter(|(id, _)| !self.is_stalled(id, now) && !self.dead.contains(*id))
             .filter_map(|(_, deadline)| *deadline)
             .min();
         let next_scheduler_deadline = self
             .schedulers
-            .values()
-            .filter_map(|scheduler| scheduler.next_deadline())
+            .iter()
+            .filter(|(id, _)| !self.dead.contains(*id))
+            .filter_map(|(_, scheduler)| scheduler.next_deadline())
             .map(|deadline| deadline.max(now))
             .min();
         let next_acknowledgement = self.records.next_due().map(|due| due.max(now));
-        let next_stall_end = self.stalls.values().map(|stall| stall.until.max(now)).min();
+        let next_stall_end = self
+            .stalls
+            .iter()
+            .filter(|(id, _)| !self.dead.contains(*id))
+            .map(|(_, stall)| stall.until.max(now))
+            .min();
+        let next_repair = self
+            .gating
+            .iter()
+            .filter(|(id, _)| !self.dead.contains(*id))
+            .filter_map(|(_, gating)| gating.repair.wake_at())
+            .map(|at| at.max(now))
+            .min();
         let next_reconciliation = self
             .reconciling
-            .values()
+            .iter()
+            .filter(|(id, _)| !self.dead.contains(*id))
+            .map(|(_, reconciliation)| reconciliation)
             .filter_map(|reconciliation| match &reconciliation.republish {
                 None => Some(reconciliation.round.grace_ends_at()).filter(|at| *at > now),
                 Some(republish) => republish.wake_at().map(|at| at.max(now)),
@@ -548,6 +615,7 @@ impl Cluster {
             .chain(next_deadline)
             .chain(next_scheduler_deadline)
             .chain(next_acknowledgement)
+            .chain(next_repair)
             .chain(next_stall_end)
             .min()
     }
@@ -561,6 +629,9 @@ impl Cluster {
         let now = self.clock.now();
         let mut caught_up = Vec::new();
         for (id, scheduler) in &mut self.schedulers {
+            if self.dead.contains(id) {
+                continue;
+            }
             if scheduler
                 .next_deadline()
                 .is_some_and(|deadline| deadline <= now)
@@ -589,12 +660,20 @@ impl Cluster {
         ) else {
             return Vec::new();
         };
-        let voters = node.voters();
+        let voters = node.placeable_voters();
         let now = self.clock.now();
         let revisions = spy.take_revisions();
         let writes: Vec<Write> = revisions.iter().map(Write::of).collect();
         for record in gating.order.admit(revisions) {
-            store_revision(&self.records, id, &voters, record, now);
+            store_revision(
+                &self.records,
+                &mut gating.repair,
+                id,
+                &voters,
+                self.replication_factor,
+                record,
+                now,
+            );
         }
         gating.unsettled.made(&writes);
         writes
@@ -610,6 +689,17 @@ impl Cluster {
             ) else {
                 continue;
             };
+            let now = self.clock.now();
+            // A record moved away from holders has their copies retired once
+            // the write that moved it is stored.
+            let settled = WriteOutcome {
+                write: outcome.write.clone(),
+                stored: outcome.stored,
+            };
+            if let Some(retirement) = gating.repair.settled(&settled, now) {
+                self.records
+                    .retire(&outcome.writer, &retirement.record, &retirement.former, now);
+            }
             // The republish of a leader that is still reconciling settles its
             // own writes; no held answer waits on them.
             if let Some(republish) = self
@@ -617,11 +707,7 @@ impl Cluster {
                 .get_mut(&outcome.writer)
                 .and_then(|reconciliation| reconciliation.republish.as_mut())
             {
-                let settled = WriteOutcome {
-                    write: outcome.write.clone(),
-                    stored: outcome.stored,
-                };
-                if republish.settled(&settled, self.clock.now()) {
+                if republish.settled(&settled, now) {
                     continue;
                 }
             }
@@ -645,10 +731,17 @@ impl Cluster {
             match released {
                 Settlement::Release(records) => {
                     if let Some(node) = self.nodes.get(&outcome.writer) {
-                        let voters = node.voters();
-                        let now = self.clock.now();
+                        let voters = node.placeable_voters();
                         for record in records {
-                            store_revision(&self.records, &outcome.writer, &voters, record, now);
+                            store_revision(
+                                &self.records,
+                                &mut gating.repair,
+                                &outcome.writer,
+                                &voters,
+                                self.replication_factor,
+                                record,
+                                now,
+                            );
                         }
                     }
                 }
@@ -669,6 +762,38 @@ impl Cluster {
             self.resolve(settled);
         }
         self.answer_held_calls_of_nodes_not_leading();
+    }
+
+    /// Has every leader publish again the records its voters' changes, or
+    /// writes refused, call for, and writes them where they belong now.
+    fn repair_placements(&mut self) {
+        let ids: Vec<WorkerId> = self.gating.keys().filter(|id| !self.dead.contains(*id)).cloned().collect();
+        for id in ids {
+            let (Some(node), Some(scheduler), Some(gating)) = (
+                self.nodes.get(&id),
+                self.schedulers.get_mut(&id),
+                self.gating.get_mut(&id),
+            ) else {
+                continue;
+            };
+            let in_office = node.office_term().is_some();
+            let placeable = if in_office { node.placeable_voters() } else { Vec::new() };
+            let factor = self.replication_factor;
+            let tasks = gating.repair.check(
+                in_office,
+                scheduler.is_leader(),
+                &placeable,
+                |task| scheduler.holds(task),
+                |task| {
+                    let (holders, _) = RecordSpace::placement(task, &placeable, factor);
+                    (!holders.is_empty()).then_some(holders)
+                },
+                self.clock.now(),
+            );
+            if !tasks.is_empty() && scheduler.republish(&tasks) > 0 {
+                self.write_revisions(&id);
+            }
+        }
     }
 
     /// A node whose scheduler no longer leads answers every call it holds
@@ -898,6 +1023,39 @@ impl Cluster {
         &self.records
     }
 
+    /// From now on a leader places each record on `factor` of its voters.
+    pub fn set_replication_factor(&mut self, factor: usize) {
+        self.replication_factor = factor;
+    }
+
+    /// Takes `id` down as a host that died would be: it is stepped no more,
+    /// hears no one and no one hears it (its peers are told the connection
+    /// closed), it stores no record, and it reaches no authority, so its
+    /// registration lapses.
+    pub fn set_down(&mut self, id: &WorkerId) {
+        let before = self.connections();
+        self.down.insert(id.clone());
+        self.dead.insert(id.clone());
+        self.records.set_up(id, false);
+        if let Some(authority) = self.node_authorities.get(id) {
+            authority.set_reachable(false);
+        }
+        self.report_connection_changes(before);
+    }
+
+    /// Whether any leader still has a refused write to publish again.
+    pub fn has_repair_due(&self) -> bool {
+        self.gating
+            .iter()
+            .any(|(id, gating)| !self.dead.contains(id) && gating.repair.wake_at().is_some())
+    }
+
+    /// Whether `id` was taken down, by `set_down` or because it drained and
+    /// handed its records over.
+    pub fn is_down(&self, id: &WorkerId) -> bool {
+        self.down.contains(id)
+    }
+
     /// Runs passes at the current instant until nothing more is due at it.
     /// In each pass every node, in sorted `WorkerId` order for determinism,
     /// handles the messages that were due when the pass began, then (with
@@ -942,7 +1100,8 @@ impl Cluster {
                 .push((due.from, due.message));
         }
 
-        let ids: Vec<WorkerId> = self.nodes.keys().cloned().collect();
+        let ids: Vec<WorkerId> =
+            self.nodes.keys().filter(|id| !self.dead.contains(*id)).cloned().collect();
         for id in ids {
             let mut inputs = self.end_stall_if_over(&id, now);
             inputs.extend(
@@ -1101,7 +1260,10 @@ impl Cluster {
                         ),
                         _ => !is_liveness_traffic(message),
                     })
-                    || self.stalls.values().any(|stall| !stall.held.is_empty());
+                    || self
+                        .stalls
+                        .iter()
+                        .any(|(id, stall)| !self.dead.contains(id) && !stall.held.is_empty());
 
             let electing = states
                 .values()
@@ -1264,14 +1426,42 @@ impl Cluster {
         self.nodes.insert(id.clone(), node);
         self.schedulers.insert(id.clone(), scheduler);
         self.write_revisions(id);
+        self.repair_placements();
         self.answer_held_calls_of_nodes_not_leading();
         for output in &all {
-            if let Output::Reconcile(term) = output {
-                self.begin_reconciliation(id, *term);
+            match output {
+                Output::Reconcile(term) => self.begin_reconciliation(id, *term),
+                Output::HandOff(to) => self.hand_off(id, to),
+                _ => {}
             }
         }
         self.reconcile_due();
         all
+    }
+
+    /// A drained node hands each record it holds to the holders its leader
+    /// would place it on now, this node left out (a leader's own voters, for
+    /// a leader), and goes down. One attempt, as the hand-off of a node that
+    /// is not asked to wait.
+    fn hand_off(&mut self, drainer: &WorkerId, to: &HandOffTo) {
+        let now = self.clock.now();
+        let voters = match to {
+            HandOffTo::Leader(leader) if self.records.can_reach(drainer, leader) => self
+                .nodes
+                .get(leader)
+                .map(ClusterNode::placeable_voters)
+                .unwrap_or_default(),
+            HandOffTo::Voters(voters) => voters.clone(),
+            HandOffTo::Leader(_) | HandOffTo::Nobody => Vec::new(),
+        };
+        let voters: Vec<WorkerId> = voters.into_iter().filter(|voter| voter != drainer).collect();
+        for record in self.records.held_records(drainer) {
+            let (holders, quorum) =
+                RecordSpace::placement(&Write::of(&record).task_id, &voters, self.replication_factor);
+            self.records.hand_off(drainer, &record, &holders, quorum, now);
+        }
+        self.down.insert(drainer.clone());
+        self.records.set_up(drainer, false);
     }
 
     fn begin_reconciliation(&mut self, id: &WorkerId, term: ReconcileTerm) {
@@ -1289,11 +1479,13 @@ impl Cluster {
 
     /// Takes every reconciliation as far as it can go now.
     fn reconcile_due(&mut self) {
-        let ids: Vec<WorkerId> = self.reconciling.keys().cloned().collect();
+        let ids: Vec<WorkerId> =
+            self.reconciling.keys().filter(|id| !self.dead.contains(*id)).cloned().collect();
         for id in ids {
             self.reconcile(&id);
         }
-        let ids: Vec<WorkerId> = self.adopting.keys().cloned().collect();
+        let ids: Vec<WorkerId> =
+            self.adopting.keys().filter(|id| !self.dead.contains(*id)).cloned().collect();
         for id in ids {
             self.adopt_late(&id);
         }
@@ -1321,10 +1513,14 @@ impl Cluster {
         if !leading {
             return;
         }
+        // Workers admitted since are asked too, for as long as the office
+        // lasts, as the leader's own driver does.
+        for worker in self.nodes[id].reconcilees() {
+            round.ask_also(worker);
+        }
         self.collect_answers(id, &mut round, now);
         let node = &self.nodes[id];
         let learnt = round.take_settled(|worker| node.is_member(worker));
-        let complete = round.is_complete(|worker| node.is_member(worker));
         let adopted = match self.scheduler_mut(id).adopt(learnt) {
             Ok(adopted) => adopted,
             // Holding office is not leading: no quorum has confirmed the
@@ -1340,9 +1536,7 @@ impl Cluster {
         if !adopted.silent_holders.is_empty() {
             self.step(id, Input::WatchWorkers(adopted.silent_holders));
         }
-        if !complete {
-            self.adopting.insert(id.clone(), round);
-        }
+        self.adopting.insert(id.clone(), round);
     }
 
     /// One reconciliation's next steps: ask, rebuild when its round allows,
@@ -1383,14 +1577,14 @@ impl Cluster {
                 Ok(rebuilt) => rebuilt,
                 Err(error) => panic!("the scheduler of {id:?} refused its reconciliation: {error:?}"),
             };
-            let voters = sorted(self.nodes[id].voters());
+            let voters = sorted(self.nodes[id].placeable_voters());
             let placed = self
                 .spies
                 .get(id)
                 .map(Spy::take_revisions)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|record| place(record, &voters))
+                .map(|record| place(record, &voters, self.replication_factor))
                 .collect();
             let retry_after = timings(self.suspect_timeout).heartbeat_interval;
             reconciliation.republish = Some(Republish::new(placed, retry_after));
@@ -1400,12 +1594,26 @@ impl Cluster {
             }
         }
         if let Some(republish) = reconciliation.republish.as_mut() {
-            let voters = sorted(self.nodes[id].voters());
+            let voters = sorted(self.nodes[id].placeable_voters());
             if !republish.is_done() && voters != reconciliation.placed_on {
-                republish.re_place(|write| *write = place(write.record.clone(), &voters), now);
+                let factor = self.replication_factor;
+                let repair = self.gating.get_mut(id).map(|gating| &mut gating.repair);
+                let mut repair = repair;
+                republish.re_place(
+                    |write| {
+                        *write = place(write.record.clone(), &voters, factor);
+                        if let Some(repair) = repair.as_deref_mut() {
+                            repair.written(&write.record);
+                        }
+                    },
+                    now,
+                );
                 reconciliation.placed_on = voters;
             }
             for write in republish.due(now) {
+                if let Some(gating) = self.gating.get_mut(id) {
+                    gating.repair.written(&write.record);
+                }
                 self.records.write(id, write.record, write.quorum, now);
             }
         }
@@ -1479,7 +1687,9 @@ impl Cluster {
             .nodes
             .iter()
             .filter(|(id, node)| {
-                node.state() == WorkerState::Bootstrapping && !self.is_stalled(id, now)
+                node.state() == WorkerState::Bootstrapping
+                    && !self.is_stalled(id, now)
+                    && !self.dead.contains(*id)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1566,7 +1776,7 @@ impl Cluster {
     pub fn valid_grant_holders(&self) -> BTreeSet<WorkerId> {
         self.schedulers
             .iter()
-            .filter(|(_, scheduler)| scheduler.is_leader())
+            .filter(|(id, scheduler)| scheduler.is_leader() && !self.dead.contains(*id))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -1679,13 +1889,16 @@ impl Cluster {
     pub fn leader(&self) -> Option<WorkerId> {
         self.nodes
             .iter()
+            .filter(|(id, _)| !self.dead.contains(*id))
             .find(|(_, node)| node.state() == WorkerState::Leader)
             .map(|(id, _)| id.clone())
     }
 
+    /// The state of every node but those whose host died (see `set_down`).
     pub fn states(&self) -> BTreeMap<WorkerId, WorkerState> {
         self.nodes
             .iter()
+            .filter(|(id, _)| !self.dead.contains(*id))
             .map(|(id, node)| (id.clone(), node.state()))
             .collect()
     }
@@ -1697,7 +1910,7 @@ impl Cluster {
         let leaders: Vec<&WorkerId> = self
             .nodes
             .iter()
-            .filter(|(_, node)| node.state() == WorkerState::Leader)
+            .filter(|(id, node)| node.state() == WorkerState::Leader && !self.dead.contains(*id))
             .map(|(id, _)| id)
             .collect();
 

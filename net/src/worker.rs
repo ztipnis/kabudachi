@@ -24,7 +24,6 @@
 //! registration and fence for the shorter of the two, so a mismatch costs
 //! renewals, not safety.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -38,6 +37,7 @@ use libp2p::Multiaddr;
 use crate::authority::{AuthorityClient, SharedAuthority};
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, DEFAULT_SEED_ROUNDS, bootstrap};
 use crate::driver::{DriverConfig, run_driver};
+use crate::handoff::HandedOff;
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::{ListenRejected, Net};
 use crate::task_store::placement::ReplicationFactor;
@@ -225,6 +225,14 @@ impl Worker {
     /// `run_driver`). Stop the worker by dropping the returned future; a
     /// worker stopped this way is gone, and a new one must be started.
     ///
+    /// A worker asked to drain (see `Net::request_drain`) leaves its shard,
+    /// hands the records it holds to the voters its leader chooses, and then
+    /// returns, saying what became of them: the process may exit. It
+    /// returns only once every record was stored or passed on, or once the
+    /// node's drain wait limit has passed. A leader that drains may spend
+    /// that limit twice, once waiting for its voters to crawl and once handing
+    /// its records over.
+    ///
     /// A node that fences itself and then finds its shard recovered without
     /// it goes back to `Bootstrapping`; the driver rejoins it through the
     /// workers the authority lists (see `run_driver`), without founding
@@ -232,7 +240,7 @@ impl Worker {
     pub async fn run(
         self,
         observe: impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
-    ) -> Infallible {
+    ) -> HandedOff {
         let Worker { net, config } = self;
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
