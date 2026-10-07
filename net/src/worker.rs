@@ -245,7 +245,12 @@ impl Worker {
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
         let mut authority = config.authority.as_ref().map(|authority| {
-            AuthorityClient::new(&net, config.shard_id.clone(), Arc::clone(&authority.authority))
+            AuthorityClient::new(
+                &net,
+                config.shard_id.clone(),
+                Arc::clone(&authority.authority),
+                authority.timings,
+            )
         });
         let entry = bootstrap(
             &net,

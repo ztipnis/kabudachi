@@ -9,7 +9,7 @@ use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, CallKind, Issuer,
+    AuthorityCall, AuthorityTimings, AuthorityPerformer, AuthorityReply, AuthorityRequest, CallKind, Issuer,
     ReplyToken, ReplyTokens,
 };
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
@@ -30,6 +30,11 @@ pub type SharedAuthority = Arc<dyn CoordinationAuthority + Send + Sync>;
 /// moves it into the driver, whose rejoin uses it too. It holds no `Net`: it
 /// reads the worker's id once and watches its own address.
 ///
+/// A call unanswered after the TTL of the worker's [`AuthorityTimings`], the
+/// time the node counts a lost call by, is answered as `Unavailable`, which
+/// frees its kind. The blocking thread it was on may still be running; if it
+/// ever returns, its result is discarded, so a call is answered once.
+///
 /// A slow authority holds at most one blocking thread per kind, rather than
 /// one more at every renewal. A dropped call is asked again on its asker's
 /// own schedule: the node's renewals come round, and a fenced node reads the
@@ -45,16 +50,24 @@ pub struct AuthorityClient {
     replies: mpsc::UnboundedReceiver<AuthorityReply>,
     /// The token of the call of each kind performed and not yet answered.
     in_flight: BTreeMap<CallKind, ReplyToken>,
+    /// How long a call may go unanswered before it is answered as lost.
+    call_timeout: StdDuration,
     /// Mints the token of every call net asks for itself. Its issuer is
     /// [`Issuer::Cascade`], so no token of it equals a node's.
     tokens: ReplyTokens,
 }
 
 impl AuthorityClient {
-    pub fn new(net: &Net, shard_id: ShardId, authority: SharedAuthority) -> Self {
+    pub fn new(
+        net: &Net,
+        shard_id: ShardId,
+        authority: SharedAuthority,
+        timings: AuthorityTimings,
+    ) -> Self {
         Self::from_parts(
             authority,
             shard_id,
+            timings,
             net.local_worker_id(),
             net.own_address_watch(),
         )
@@ -63,6 +76,7 @@ impl AuthorityClient {
     fn from_parts(
         authority: SharedAuthority,
         shard_id: ShardId,
+        timings: AuthorityTimings,
         my_id: WorkerId,
         own_address: watch::Receiver<Option<Multiaddr>>,
     ) -> Self {
@@ -75,6 +89,7 @@ impl AuthorityClient {
             sender,
             replies,
             in_flight: BTreeMap::new(),
+            call_timeout: StdDuration::from_millis(timings.ttl.as_ticks()),
             tokens: ReplyTokens::new(Issuer::Cascade),
         }
     }
@@ -132,17 +147,32 @@ impl AuthorityClient {
             .map(ToString::to_string)
             .unwrap_or_default();
         let replies = self.sender.clone();
-        tokio::task::spawn_blocking(move || {
-            let performed = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                call.perform(&*authority, &shard_id, &my_id, &address)
-            }));
-            let reply = performed.unwrap_or_else(|_| {
-                tracing::error!(
-                    request = ?call.request,
-                    "a coordination authority call panicked; answering it as unavailable"
-                );
-                call.unavailable()
+        let call_timeout = self.call_timeout;
+        tokio::spawn(async move {
+            let performing = tokio::task::spawn_blocking(move || {
+                std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    call.perform(&*authority, &shard_id, &my_id, &address)
+                }))
             });
+            // On a timeout `performing` is dropped, not aborted: a running
+            // blocking task cannot be stopped, and its result goes nowhere.
+            let reply = match tokio::time::timeout(call_timeout, performing).await {
+                Ok(Ok(Ok(reply))) => reply,
+                Ok(_) => {
+                    tracing::error!(
+                        request = ?call.request,
+                        "a coordination authority call panicked; answering it as unavailable"
+                    );
+                    call.unavailable()
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        request = ?call.request,
+                        "a coordination authority call went unanswered; answering it as unavailable"
+                    );
+                    call.unavailable()
+                }
+            };
             // Whoever asked has stopped: no one is left to hand it to.
             let _ = replies.send(reply);
         });

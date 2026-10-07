@@ -51,15 +51,30 @@ struct Worker {
 }
 
 impl Worker {
+    /// A worker whose authority calls are never given up on.
     fn new(
         authority: Option<&FaultingAuthority<TokioClock>>,
         clock: TokioClock,
         seeds: &[Multiaddr],
     ) -> Self {
+        Self::giving_up_calls_after(authority, clock, seeds, Duration::from_secs(3600))
+    }
+
+    /// A worker that counts an authority call lost after `call_timeout`.
+    fn giving_up_calls_after(
+        authority: Option<&FaultingAuthority<TokioClock>>,
+        clock: TokioClock,
+        seeds: &[Multiaddr],
+        call_timeout: Duration,
+    ) -> Self {
         let net = Net::new();
         let shard = ShardId::new("shard-1");
-        let client = authority
-            .map(|authority| AuthorityClient::new(&net, shard.clone(), Arc::new(authority.clone())));
+        let timings = AuthorityTimings {
+            ttl: TickDuration::from_ticks(call_timeout.as_millis() as u64),
+        };
+        let client = authority.map(|authority| {
+            AuthorityClient::new(&net, shard.clone(), Arc::new(authority.clone()), timings)
+        });
         Worker {
             me: net.local_worker_id(),
             net,
@@ -260,6 +275,41 @@ async fn a_listing_read_that_hangs_is_not_asked_again_while_it_hangs() {
         let entry = timeout(TEST_TIMEOUT, running)
             .await
             .expect("the worker founded the shard within the timeout");
+        assert!(founded_at(&entry, 0));
+    })
+    .await
+}
+
+// A call the authority never answers is given up after the call timeout, so
+// the node proceeds: a later read of the same kind is made, and answered. The
+// first read stays held for the whole test, so the worker founding the shard
+// shows the second one was asked and answered, not the held one.
+#[tokio::test(start_paused = true)]
+async fn a_listing_read_that_never_returns_is_given_up_and_asked_again() {
+    within_deadline(async {
+        let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
+        authority.hold_next(CallKind::ReadLiveRegistrations);
+        let call_timeout = Duration::from_secs(5);
+        let mut worker = Worker::giving_up_calls_after(Some(&authority), clock, &[], call_timeout);
+        let mut running = std::pin::pin!(worker.bootstrap());
+
+        let entry = tokio::select! {
+            entry = &mut running => entry,
+            () = async {
+                wait_until_held(&authority, CallKind::ReadLiveRegistrations).await;
+                // Time moves by hand: a held call stops auto-advance.
+                loop {
+                    tokio::time::advance(RETRY_INTERVAL).await;
+                    for _ in 0..5 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            } => unreachable!("the clock is advanced for ever"),
+        };
+        assert!(
+            authority.is_holding(CallKind::ReadLiveRegistrations),
+            "the hung read was answered, so the test proves nothing about giving it up"
+        );
         assert!(founded_at(&entry, 0));
     })
     .await

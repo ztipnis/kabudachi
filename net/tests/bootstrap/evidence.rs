@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kabudachi_core::coordination_authority::CoordinationAuthority;
-use kabudachi_core::election::Entry;
+use kabudachi_core::election::{AuthorityTimings, Entry};
 use kabudachi_core::in_memory_authority::InMemoryAuthority;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
@@ -97,7 +97,11 @@ async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lap
         let net = Net::new();
         let me = net.local_worker_id();
         let (clock, shard_id) = (RealClock::new(), shard());
-        let mut client = AuthorityClient::new(&net, shard_id.clone(), Arc::new(authority.clone()));
+        let timings = AuthorityTimings {
+            ttl: TickDuration::from_millis(TTL.as_millis() as u64),
+        };
+        let mut client =
+            AuthorityClient::new(&net, shard_id.clone(), Arc::new(authority.clone()), timings);
         let mut running = pin!(bootstrap(
             &net,
             &clock,

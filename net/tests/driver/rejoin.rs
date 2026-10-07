@@ -172,7 +172,9 @@ async fn a_stranded_node_reaches_a_leader_despite(listing: Listing) {
             seed_net
         }
     };
-    let client = AuthorityClient::new(&node_net, shard(), Arc::new(node_handle.clone()));
+    // Long enough that the held listing read of `HeldWithASeed` is not given up.
+    let timings = AuthorityTimings { ttl: TickDuration::from_secs(60) };
+    let client = AuthorityClient::new(&node_net, shard(), Arc::new(node_handle.clone()), timings);
     let (mut node, first) = node_of_two(clock, &me, TickDuration::from_millis(100), None);
     let mut scheduler = driven_scheduler(clock);
     let (seen, observed) = watch::channel(node.state());
@@ -290,7 +292,12 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
             &net,
             &mut scheduler,
             clock,
-            Some(AuthorityClient::new(&net, shard(), Arc::new(mine.clone()))),
+            Some(AuthorityClient::new(
+                &net,
+                shard(),
+                Arc::new(mine.clone()),
+                AuthorityTimings { ttl },
+            )),
             DriverConfig::default(),
             |node, _, _| {
                 seen_tx.send_replace((node.state(), node.recovery_lineage()));
