@@ -55,7 +55,7 @@ The read-only snapshot of a node that the election round decides against.
 ## Testing against the authority
 
 **Faulting authority**:
-The one test stand-in for the coordination authority that injects faults: unreachability, unavailability, a lost race, a flush, and held calls that model slow, hung and rival-during-call authorities without sleeping.
+The one test stand-in for the coordination authority that injects faults: unreachability, unavailability, a lost race, a flush, and held calls that model slow, hung and rival-during-call authorities without sleeping. It only injects: what the authority does after a flush or an outage, warm-up included, is the in-memory authority's own behaviour.
 _Avoid_: slow authority, fake authority
 
 **Authority contract**:
