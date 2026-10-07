@@ -255,8 +255,16 @@ impl Voters {
     }
 
     /// Drives the voters until one leads with a lease its scheduler holds
-    /// (so it accepts submissions), and returns its index; panics if that
-    /// takes past the backstop.
+    /// (so it accepts submissions), and every voter holds the committed
+    /// configuration it leads, which counts them all; returns its index, and
+    /// panics if that takes past the backstop.
+    ///
+    /// An election founds its configuration on the voters whose roll-call
+    /// replies came in by the deadline. On a loaded host one can come in
+    /// late, and the leader then admits it through a joint change of its
+    /// own. Until that change commits, the shard has a voter fewer than a
+    /// test built it with, and a test that kills a minority of the voters
+    /// it built may leave no quorum to elect a successor.
     pub async fn drive_until_a_leader(&mut self) -> usize {
         timeout(TEST_TIMEOUT, self.drive_to_a_leader())
             .await
@@ -264,23 +272,43 @@ impl Voters {
     }
 
     async fn drive_to_a_leader(&mut self) -> usize {
-        let states = self.states.clone();
-        let leader = self
-            .drive_until(async move {
-                wait_until(|| states.iter().any(|state| *state.borrow() == WorkerState::Leader))
-                    .await;
-                states
-                    .iter()
-                    .position(|state| *state.borrow() == WorkerState::Leader)
-                    .expect("one of the voters leads")
-            })
-            .await;
-        // The lease starts once the followers' acknowledgements arrive.
-        while !self.schedulers[leader].is_leader() {
-            self.drive_until(tokio::time::sleep(StdDuration::from_millis(10)))
+        loop {
+            let states = self.states.clone();
+            let leader = self
+                .drive_until(async move {
+                    wait_until(|| states.iter().any(|state| *state.borrow() == WorkerState::Leader))
+                        .await;
+                    states
+                        .iter()
+                        .position(|state| *state.borrow() == WorkerState::Leader)
+                        .expect("one of the voters leads")
+                })
                 .await;
+            // The lease starts once the followers' acknowledgements arrive,
+            // and a late voter's admission commits a round of acks later. A
+            // loaded host can cost the leader its office meanwhile: then wait
+            // for the next one.
+            while *self.states[leader].borrow() == WorkerState::Leader {
+                if self.schedulers[leader].is_leader() && self.all_hold_the_full_configuration_of(leader) {
+                    return leader;
+                }
+                self.drive_until(tokio::time::sleep(StdDuration::from_millis(10)))
+                    .await;
+            }
         }
-        leader
+    }
+
+    /// Whether `leader`'s configuration is committed with every voter of the
+    /// shard in it, and every voter holds it as one of its voters.
+    fn all_hold_the_full_configuration_of(&self, leader: usize) -> bool {
+        let Some(led) = self.nodes[leader].configuration() else {
+            return false;
+        };
+        led.voter_count() == Some(self.nodes.len())
+            && self.nodes.iter().all(|node| {
+                node.configuration().map(Configuration::generation) == Some(led.generation())
+                    && led.is_voter(node.admission())
+            })
     }
 
     /// Drives every voter not killed, and not one that has handed its

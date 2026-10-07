@@ -115,9 +115,12 @@ impl RunningWorker {
         wait_for_seen(&mut self.seen, until).await
     }
 
-    /// Waits until this worker's node follows `leader`.
-    pub async fn wait_to_follow(&mut self, leader: &WorkerId) -> Seen {
-        self.wait_until(|seen| seen.leader.as_ref() == Some(leader))
+    /// Waits until this worker's node is `Active` under a leader, whichever
+    /// worker leads by then. Not a particular one: on a loaded host a leader
+    /// can lose its office to a later election while a test waits, and a
+    /// wait for that worker would then wait for good.
+    pub async fn wait_to_follow_a_leader(&mut self) -> Seen {
+        self.wait_until(|seen| seen.state == WorkerState::Active && seen.leader.is_some())
             .await
     }
 }

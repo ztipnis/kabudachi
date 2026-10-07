@@ -32,17 +32,36 @@ const SHARD: &str = "shard-1";
 const GRACE: StdDuration = StdDuration::from_secs(5);
 
 /// The authority's registration TTL, which is also how long it warms up.
-/// Long enough that a driven worker on a loaded host always renews in time
-/// (every third of it).
-const AUTHORITY_TTL_MS: u64 = 1_000;
+/// A worker renews every third of it, one call at a time, and a loaded host
+/// can leave a renewal's reply waiting most of a second on the blocking pool
+/// and the driver's next wake; at a TTL of one second such a worker lapses
+/// and fences itself, a leader included, with its authority still reachable.
+const AUTHORITY_TTL_MS: u64 = 3_000;
+
+/// Long enough that a follower whose acks a loaded host holds back keeps its
+/// leader, and its leader the lease of a shard of several voters.
+const SUSPECT_TIMEOUT_MS: u64 = 2_000;
+
+/// How often a worker heartbeats its leader. A leader admits a joiner only
+/// once it echoes an ack sent within the last two intervals, so the interval
+/// bounds the round trip admission tolerates: at 50 ms, the acks and echoes
+/// of five workers on a host running several test binaries at once fall
+/// behind by more than that, and a joiner is admitted only in a lull.
+const HEARTBEAT_INTERVAL_MS: u64 = 100;
+
+/// How long a roll call runs: well above a loopback round trip.
+const ROLL_CALL_DEADLINE_MS: u64 = 100;
 
 fn shard() -> ShardId {
     ShardId::new(SHARD)
 }
 
 fn timings() -> ElectionTimings {
-    ElectionTimings::new(Duration::from_millis(300), Duration::from_millis(50))
-        .with_roll_call_deadline(Duration::from_millis(100))
+    ElectionTimings::new(
+        Duration::from_millis(SUSPECT_TIMEOUT_MS),
+        Duration::from_millis(HEARTBEAT_INTERVAL_MS),
+    )
+    .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS))
 }
 
 /// Starts a worker listening on `bind` that bootstraps through `seeds`, with
@@ -70,8 +89,8 @@ async fn warmed_up_authority() -> InMemoryAuthority<RealClock> {
 
 /// A shard led by a founder, a second worker that joined it, and three more
 /// workers given only that second worker's address as their one seed, all
-/// over one authority. Returns them once each of the three follows the
-/// founder: the founder first, the seed second.
+/// over one authority. Returns them once each of the three follows a
+/// leader: the founder first, the seed second.
 async fn three_workers_joined_through_one_seed(
     authority: &InMemoryAuthority<RealClock>,
 ) -> Vec<RunningWorker> {
@@ -79,7 +98,6 @@ async fn three_workers_joined_through_one_seed(
     founder
         .wait_until(|seen| seen.state == WorkerState::Leader)
         .await;
-    let leader = founder.id.clone();
 
     let mut seed = spawn_worker(
         "/ip4/127.0.0.1/tcp/0",
@@ -87,7 +105,7 @@ async fn three_workers_joined_through_one_seed(
         vec![founder.address.clone()],
     )
     .await;
-    seed.wait_to_follow(&leader).await;
+    seed.wait_to_follow_a_leader().await;
 
     let mut workers = vec![founder, seed];
     for _ in 0..3 {
@@ -95,7 +113,7 @@ async fn three_workers_joined_through_one_seed(
         workers.push(spawn_worker("/ip4/127.0.0.1/tcp/0", Some(authority.clone()), seeds).await);
     }
     for joiner in &mut workers[2..] {
-        joiner.wait_to_follow(&leader).await;
+        joiner.wait_to_follow_a_leader().await;
     }
     workers
 }
