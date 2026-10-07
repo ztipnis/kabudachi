@@ -30,7 +30,7 @@ The system consists of two major layers:
 
 2. **Compiled native core**
    - peer networking and DHT;
-   - shard membership and ring awareness;
+   - shard peer awareness (a gossipsub roll call, a peer book and routing refreshes);
    - worker-to-leader heartbeats;
    - leader election and reconciliation;
    - reliable lifecycle/control messaging;
@@ -1048,11 +1048,11 @@ The bootstrap cascade asks the configured seeds, then the workers the authority 
 
 #### `JOINING`
 
-The worker has identified a shard and is being incorporated into the live peer/ring view.
+The worker has identified a shard and is being incorporated into the shard's peer view (§11), which the DHT routing crawl and the shard's gossip topic build.
 
 It may:
 
-- exchange DHT/ring metadata;
+- exchange routing metadata with its peers over the DHT;
 - learn the current leader (a join asks a full pass of its peers and takes the newest pointer, by the epoch order of §12);
 - prepare execution slots.
 
@@ -1141,93 +1141,64 @@ LEADER_SUSPECT                        DRAINING
       |                                  |
       v                                  v
   ROLL_CALL                           STOPPED
-    /   \
-   /     \
-leader    quorum exists
-returns       |
-  |           v
-ACTIVE    CANDIDATE
-               |
-               | wins
-               v
-      LEADER_RECONCILING
-               |
-               v
-            LEADER
-             /  \
-     peer loss   SIGTERM
-        |          |
-        v          v
-   NO_QUORUM    DRAINING
-        |
-        +--> ordinary quorum restored --> ROLL_CALL
-        |
-        +--> forced recovery -----------> ROLL_CALL
-        |
-        +--> authority continuity lost -> shard ABANDONED
+      |
+      +--> the leader's ack arrives -----------------> ACTIVE
+      |
+      +--> returning voters are a quorum ------------> CANDIDATE
+      |                                                   |
+      |                                                   | wins
+      |                                                   v
+      |                                          LEADER_RECONCILING
+      |                                                   |
+      |                                                   v
+      |                                                LEADER
+      |                                                   |
+      +--> short of a quorum                              | quorum-contact
+      |                                                   | lease ends
+      v                                                   v
+  NO_QUORUM <---------------------------------------------+
+      |
+      +--> a leader's ack ---------------------------> ACTIVE
+      |
+      +--> peers return: its own roll call ----------> ROLL_CALL
+      |
+      +--> authority path: respondents are a majority
+      |    of the live registrations; swaps the epoch
+      |    ------------------------------------------> CANDIDATE (while it waits
+      |                                                out the fence), then
+      |                                                LEADER_RECONCILING
+      |
+      +--> authority holds an epoch it cannot recover
+      |    from ------------------------------------> BOOTSTRAPPING (rejoins)
+      |
+      +--> authority holds no recovery epoch --------> STOPPED (shard ABANDONED)
 ```
 
-A leader may also become `FENCED` if its low-frequency external recovery lease expires.
+A candidate that loses its vote, or a roll call that misses its deadline, returns to `LEADER_SUSPECT` and tries again at a later term after a fresh jittered suspicion timeout. A `CANDIDATE` waiting out the fence that the authority refuses for good goes back to `NO_QUORUM`. A leader asked to drain goes to `DRAINING`. With an authority configured, a `LEADER_SUSPECT` member first reads the authority's recovery epoch and starts its roll call only if the read names its own epoch (or the authority holds none); otherwise it rejoins at the epoch the read names. A worker that takes part in elections becomes `FENCED` if it fails to renew its authority registration, leader included. A leader's grant to schedule ends at the earlier of its recovery fence and its quorum-contact lease.
 
 ---
 
-## 11. Ring-based peer awareness
+## 11. Shard peer awareness
 
-At shard scale, every worker does not need to maintain heavyweight all-to-all failure-detection sessions.
+A shard needs three things from its peers' connections, and none of them is all-to-all failure detection. A worker keeps one heartbeat relationship, with its leader (§12.1). It must be able to reach the other workers when the leader is lost, which is what a roll call does. And the leader must be able to tell how many workers answer (§12.4). No worker keeps a member list: a follower knows its shard's configuration only as a generation and a voter count, and only the leader holds the list of members (§12.1). The overlay that carries these three things is libp2p's, not a structure of this system's own.
 
-Workers form a logical ring. Each node tracks several predecessors and successors—an initial default around three in each direction is reasonable.
+### 11.1 Roles of the overlay
 
-Example:
+- **Gossipsub carries the roll call.** Each shard has one topic, `/kabudachi/<shard>/election/2`. A worker that suspects its leader publishes its roll call there, so one publish reaches the workers in the topic's mesh, whatever the shard's size. Delivery is best effort, like every election message: a call a worker misses is a worker the election does not count. Every message is signed with its author's key, and a message with no valid signature is dropped. A reply goes straight back to the initiator over a request-response connection, never over the topic.
+- **Request-response carries everything addressed to one peer:** roll-call replies and refusals, vote requests and grants, worker heartbeats and leader acks, claims, JOIN, and the reconciliation and task exchanges.
+- **Kademlia is for peer routing only.** It runs in server mode and `identify` feeds it each peer's listen addresses. A crawl asks the known peers for those closest to the node and connects to those it finds, and gossipsub then meshes with the connected peers that serve the same shard. The routing table is never read as membership: a node's table holds a fraction of the shard, and a count of live workers comes only from a roll call or from the authority's registrations (§12.4, §14.3). A second Kademlia behaviour stores Task records (§8.6).
 
-```text
-        A
-    H       B
-  G           C
-    F       D
-        E
-```
+### 11.2 The peer book
 
-Worker `D` may track:
+Each worker's swarm task keeps a peer book: which peers are connected, the address of record for each, its own address, which peers share its shard's gossip topic and mesh, and the traffic it has carried. A peer's address is taken, in order of preference, from its `identify` listen addresses, the address this worker successfully dialed, the address the peer stamped on a roll call or reply it sent (accepted only when the stamp names the peer that gossip or the connection vouches for), and, as a last resort, the source address of an inbound connection, which is never handed to a joiner or dialed by a send.
 
-```text
-predecessors = [C, B, A]
-successors   = [E, F, G]
-```
+### 11.3 Redial schedule
 
-The ring provides:
+A dropped connection is redialed only when the peer was in the node's gossip mesh for its shard, because a peer cut off from the mesh never hears a roll call and gossipsub never dials. Any other connection reopens on its own when the next send dials it, or was not needed. The default schedule tries again after one second, backs off exponentially to 30 seconds over eight fast attempts, then retries once a minute for as long as the peer stays away. A blocked peer stays eligible and keeps failing and backing off. The first retry lands well within a suspicion timeout so that a follower whose mesh link dropped is back before the next election needs it.
 
-- cheap local liveness awareness;
-- roll-call propagation;
-- membership gossip;
-- a deterministic route around failed neighbors.
+### 11.4 Routing refresh
 
-It is not the source of election safety. Quorum/term/recovery semantics remain authoritative.
-
-A neighbor heartbeat can include:
-
-```text
-worker_id
-incarnation_id
-shard_id
-recovery_epoch
-membership_generation
-state
-highest_term_seen
-leader_id_seen
-membership_digest
-```
-
-When a successor disappears:
-
-```text
-try successor[0]
-if unavailable:
-    try successor[1]
-if unavailable:
-    try successor[2]
-```
-
-If ring knowledge becomes badly fragmented, DHT and `CoordinationAuthority` discovery can repair it.
+A worker's JOIN connects it to its seed and its leader only, so a burst of joiners would form a star that no roll call crosses once the leader is gone. The driver therefore crawls again once a worker's view of its shard (its leader, the configuration it holds, and whether it is admitted) has held still for a quarter of a suspicion timeout, and otherwise every ten suspicion timeouts (never more often than once a second). A completed crawl is reported to the node. A draining leader waits for every other voter to report a crawl since its admission, up to `drain_wait_limit`, before it leaves, and a node in `ROLL_CALL` or `NO_QUORUM` that has reached no shard peer for a suspicion timeout searches for a leader again, through the authority's registrations and then the seeds (§12.3).
 
 ---
 
@@ -1237,16 +1208,27 @@ If ring knowledge becomes badly fragmented, DHT and `CoordinationAuthority` disc
 
 Every active worker maintains a logical heartbeat/control relationship with the leader.
 
-Representative heartbeat:
+A follower does not hold the member list. It knows its shard's current configuration only as a **generation** and a voter count (two counts, old and new, while a change is in flight), plus its own **admission generation**: the generation at which it became a voter. Only the leader holds the members, with each one's admission generation, and the workers waiting to be admitted. These are the terms (§4.5):
+
+- A **`Generation`** is the triple (recovery epoch, term, counter), compared in that order. The term is that of the election or leader that announced the configuration, and the counter rises by one with every configuration change (each phase of an admission batch, each removal batch, each election).
+- A **`Configuration`** is a generation, a base generation (the generation of the election that founded it) and either a single voter count or, for a joint configuration, the old and new counts. A worker is a voter of a configuration when its admission generation lies between the base and the generation, inclusive. A worker with no admission generation, such as a joiner, is a pending member: it claims work and heartbeats, but it is no voter.
+
+Representative heartbeat (the fields that matter here):
 
 ```text
 WORKER_HEARTBEAT {
     worker_id
     incarnation_id
+    shard_id
     recovery_epoch_seen
     term_seen
     available_capacity
     active_task_runs_digest
+    newest_accepted_ack        // term and send token of the newest leader ack it accepted
+    configuration_generation   // the configuration it holds, if any
+    admission_generation       // its own, if any
+    send_token                 // its monotonic clock reading, echoed back by the ack
+    routing_crawled            // whether it has finished a routing crawl since admission
 }
 ```
 
@@ -1257,10 +1239,16 @@ LEADER_HEARTBEAT_ACK {
     shard_id
     leader_id
     recovery_epoch
+    recovery_epoch_lineage
     term
-    membership_generation
+    configuration              // the leader's current configuration
+    recipient_admission        // the recipient's admission generation in the leader's roster
+    send_token
+    heartbeat_token            // the send token of the heartbeat this ack answers
 }
 ```
+
+The ack is how a configuration change reaches a follower, and the heartbeat that echoes the newest ack is how the leader learns that a follower holds it: a leader counts a configuration change as committed once a majority of each of its sides has echoed exactly it. The same echoes keep the leader's **quorum-contact lease**: the leader may act only until the earlier of its recovery fence (§14.4) and the send time of the newest acks a majority of its configuration has confirmed, plus a suspicion timeout less a share for clock drift. A follower whose contact with its leader is fresh (it heard from its leader within a suspicion timeout) refuses to answer a roll call or grant a vote, so one worker with a flaky link cannot depose a healthy leader, and no majority can grant a vote while the old leader's lease runs.
 
 Use monotonic time for local timeout decisions. Distributed wall-clock synchronization should not be required for ordinary elections.
 
@@ -1302,15 +1290,17 @@ SELF_REMOVE {
     worker_id
     incarnation_id
     shard_id
-    membership_generation
+    configuration_generation
+    term_seen
+    leader_term
 }
 ```
 
-`SELF_REMOVE` is irrevocable for that worker incarnation. It means:
+`SELF_REMOVE` is sent to the draining worker's own leader alone. It is irrevocable for that worker incarnation. It means:
 
 > This incarnation permanently withdraws from election participation.
 
-Peers can reduce the effective electorate accordingly.
+Only the leader applies it, and only if it is addressed to the leader's own term and the sender has seen no later term than the leader's (a worker that has may have voted in a later election whose quorum counted it, and shrinking the electorate as well could let two quorums of one term miss each other). The leader applies every removal that has passed this check and arrived since its last announcement together, in the one next generation it announces, with no commit round; until it does, the departing workers still count, which is conservative for quorums. A removal that fails the check leaves the worker in the roster until the next election founds a configuration without it, or the authority path counts it out. A draining leader announces its own departure on its final acks.
 
 This is particularly important during scale-down:
 
@@ -1330,49 +1320,41 @@ A draining leader keeps leading until every other voter has reported a routing c
 
 A node in `ROLL_CALL` or `NO_QUORUM` that has reached no shard peer for one suspicion timeout searches for a leader again: it reads the authority's registrations and then asks the seeds, so a node stranded without a leader reconnects to whoever leads.
 
-### 12.4 Cooperative ring roll call
+### 12.4 Roll call
 
-When the leader is suspected:
+When a follower's leader falls silent for a suspicion timeout, jittered per worker and per term so that workers do not all call at once, it starts a roll call: a census of its shard that the election then votes on. The **initiator** publishes the call on the shard's gossip topic (§11.1) and every worker that takes part answers it directly:
 
 ```text
 ROLL_CALL {
-    roll_call_id
     shard_id
-    recovery_epoch
-    membership_generation
-    membership_digest
-    highest_term_seen
+    term                    // the term the initiator contests
+    configuration           // the initiator's configuration
+    timestamp_millis        // its wall clock, to break ties only
     initiator_id
+    initiator_address
+}
+
+ROLL_CALL_REPLY {
+    shard_id
+    term
+    initiator_id
+    responder_id
+    responder_address
+    admission               // the responder's admission generation; absent for a pending member
+    prior_admission         // the one it held before an election that founded a joint configuration admitted it
+    configuration_generation
 }
 ```
 
-Each active worker:
+The initiator counts itself as a respondent. A respondent whose admission generations make it a voter of the call's configuration, on both sides of a joint one, is a **returning voter**; every other respondent, a pending member among them, is a **new voter**. The call collects replies until its deadline, which is configurable (and widens, up to a suspicion timeout, over consecutive calls that fell short of a quorum). At the deadline:
 
-1. validates shard and recovery epoch;
-2. drops duplicate roll-call IDs;
-3. appends its observation;
-4. records whether it still sees a live leader;
-5. forwards to its next reachable ring neighbor.
+- if the returning voters among the respondents are a quorum of the call's configuration (of both sides, for a joint one), the initiator stands as the candidate (§12.5, §12.6);
+- if they are not, the initiator goes to `NO_QUORUM` and tries again at a later term after a fresh jittered suspicion timeout. With an authority configured it also takes the authority path, counting the call's respondents (§14.3). The same happens when the authority holds a later recovery epoch of the initiator's own lineage: the call is then only a census and never stands the initiator as a candidate;
+- an initiator that abandoned its call for a better one, or that finds the term it contested already holds a vote or a leader, returns to `LEADER_SUSPECT` instead.
 
-Pseudocode:
+A worker answers a call only from a state that takes part in elections (`ACTIVE`, `LEADER_SUSPECT`, `ROLL_CALL` or `NO_QUORUM`). Otherwise it refuses, naming why, in an `ELECTION_REJECT` that carries its highest term seen, its configuration, the leader it follows if it holds one, and its recovery epoch and lineage. The reasons are: a stale term, a stale generation (the call ran under an older configuration, or an older recovery epoch than the worker's), a leader still valid (the worker heard from its leader within a suspicion timeout), a worse call than one already answered, a wrong recovery epoch, and a state that takes no part. The refusal is how an initiator learns that a leader is alive, or that it is behind.
 
-```text
-handle_roll_call(call):
-    if seen(call.roll_call_id):
-        return
-
-    mark_seen(call.roll_call_id)
-
-    call.responses.add({
-        worker_id,
-        state,
-        highest_term_seen,
-        current_leader_seen,
-        leader_contact_age
-    })
-
-    forward_to_next_reachable_ring_neighbor(call)
-```
+**Competing calls.** A worker answers the first call it accepts for a term, and any later call for that term that ranks better; it refuses a worse one. Calls rank by the initiator's wall-clock timestamp, then by its `WorkerId`, lowest first, so a tie always has a winner. The timestamp only breaks ties: clocks that disagree bias who wins a tie but cannot break safety, so ordinary elections need no clock synchronization. A worker that has answered another's call does not start its own until that call resolves (the leader's ack for the answered term or a later one arrives), or, if the caller died, for a bounded wait.
 
 If the existing leader becomes verifiably reachable before the election begins, workers return to `ACTIVE`. A node that accepts a leader's ack forgets the roll calls it made or answered for terms above the term it now follows (except where it granted a vote): those were made on a suspicion the live leader disproved, and kept they would make the node refuse the call that elects the leader's successor.
 
@@ -1382,28 +1364,12 @@ A roll call is answered only from sound state. A reply carries the configuration
 
 **Admission.** A joiner is admitted in two phases and at a pace. The leader first promises each joiner that has confirmed a recent ack its admission at a generation of the leader's term; once every one holds its promise, it starts a batch that admits exactly those workers. Nothing starts until every member of the just-committed configuration has echoed it, so a member left a generation behind cannot be needed for a quorum nobody can reach. A member whose heartbeats arrive but which confirms none of the leader's acks blocks admission only until a suspicion timeout and a reconnect timeout have passed since it last confirmed one. The leader then removes it, one voter per configuration change and only when the voters that hold the current configuration, the leader among them, are a majority of the oldest configuration any removed or queued voter may still hold. That bound keeps two successive removals from letting the removed voters, a majority of the old configuration, elect a second leader. A removed worker may rejoin as a pending member. A silent member is reported lost but not removed.
 
-### 12.5 Choosing a candidate
-
-When roll call demonstrates a quorum of the effective electorate, candidate selection should be deterministic so the same observation set naturally converges on the same preferred worker.
-
-Example:
-
-```text
-next_term =
-    max(term observed during roll call) + 1
-
-candidate_priority =
-    hash(shard_id, recovery_epoch, next_term, worker_id)
-
-candidate =
-    eligible active worker with highest candidate_priority
-```
-
-The hash function is a design detail. The important properties are deterministic selection and avoidance of a fixed preferred host.
+### 12.5 The initiator is the candidate
+There is no separate candidate selection. The initiator whose roll call stands is the candidate for the term it contests, and the ranking above decides between initiators that call for the same term. This replaces any scheme in which the respondents agree on a preferred worker: the call's rank is deterministic, and it needs no hash and no extra round.
 
 ### 12.6 Voting
 
-The candidate broadcasts:
+The candidate asks its respondents for their votes over the connections their replies opened:
 
 ```text
 VOTE_REQUEST {
@@ -1411,53 +1377,36 @@ VOTE_REQUEST {
     recovery_epoch
     term
     candidate_id
-    membership_generation
-    membership_digest
-    roll_call_digest
+    roll_call_generation    // the generation of the configuration the call ran under
 }
 ```
 
-A worker grants at most one vote per term.
+A voter grants at most one vote per term, only to the initiator of the best call it answered for that term, and never switches a vote it has granted. It refuses with a reason (the refusal shapes of §12.4) when the term is stale, the recovery epoch is not its own, it holds a newer configuration than the call's, the call is not the best it answered, it already voted in the term, or its leader contact is fresh. The candidate counts itself as a respondent and grants itself the first vote. A candidate that is asked for a later term, or that sees a later one in any message, steps down.
 
-Pseudocode:
+The candidate **wins** when both of these hold:
 
-```text
-on_vote_request(req):
-    if state != ACTIVE:
-        reject("not voter")
-        return
+- the voters that granted it, new voters included, are a majority of all respondents so far, itself included;
+- the returning voters among those that granted it are a quorum of the call's configuration, on both sides of a joint one.
 
-    if req.recovery_epoch != local.recovery_epoch:
-        reject("wrong recovery epoch")
-        return
+A respondent that replies after the candidate stood joins the census, is asked for its vote, and raises the number of respondents a win needs a majority of.
 
-    if req.term <= highest_term_seen:
-        reject("stale term")
-        return
-
-    if voted_for(req.term) exists:
-        reject("already voted")
-        return
-
-    if current_leader_still_valid():
-        reject("leader still valid")
-        return
-
-    highest_term_seen = req.term
-    voted_for[req.term] = req.candidate_id
-
-    grant_vote(req)
-```
-
-The candidate wins when:
+**What a win does.** The respondents of the winning call found the next configuration. It is a joint configuration, so that a partitioned election under the old configuration cannot win beside it: its old side is the configuration the call ran under, where each respondent still counts by the admission it held before, and its new side has one voter per respondent, every one admitted at the new generation (the current recovery epoch, the election's term, the call configuration's counter plus one). The winner moves to `LEADER_RECONCILING`, leads the joint configuration, certifies it to every respondent:
 
 ```text
-votes >= floor(effective_electorate / 2) + 1
+ELECTION_CERTIFICATE {
+    shard_id
+    recovery_epoch
+    term
+    leader_id
+    configuration
+    recipient_admission
+    recipient_prior_admission
+}
 ```
 
-It publishes an election certificate and enters `LEADER_RECONCILING`.
+and commits the new side alone once a majority of each side has echoed exactly the joint generation in a heartbeat confirming one of its acks. A worker that missed the call is no voter of the new side until the next election it answers. An election won under a joint configuration that is not yet committed founds nothing new: its winner re-stamps that configuration at a generation of its own term and commits it. A candidacy that is not won within as long again as the roll call's deadline returns to `LEADER_SUSPECT` and calls again at a later term.
 
-Ordinary election does not need Redis if peer quorum exists.
+Ordinary election does not need Redis if a quorum of returning voters exists.
 
 ---
 
@@ -1539,13 +1488,15 @@ A peer-only protocol cannot safely allow an arbitrary surviving minority to rede
 
 Therefore `NO_QUORUM` is recoverable through multiple paths, but it cannot simply invent a smaller electorate.
 
-While `NO_QUORUM`, workers continuously:
+While `NO_QUORUM`, a worker:
 
-- probe ring peers;
-- query DHT membership;
-- apply valid `SELF_REMOVE` records;
-- query the `CoordinationAuthority`;
-- alert/emit metrics.
+- keeps answering other workers' roll calls and granting their votes, and starts a roll call of its own every jittered suspicion timeout;
+- returns to `ACTIVE` as soon as a leader's ack reaches it;
+- searches for a leader again, through the authority's registrations and then the seeds, once it has reached no shard peer for a suspicion timeout (§12.3);
+- with an authority configured, runs the authority path after each roll call that falls short (§14.3);
+- alerts/emits metrics.
+
+A `NO_QUORUM` worker never reads the DHT's routing table as membership (§11.1) and applies no `SELF_REMOVE`: only a leader does (§14.2).
 
 ### 14.1 Exit path A: peers return
 
@@ -1556,74 +1507,72 @@ NO_QUORUM
     -> ordinary election
 ```
 
-### 14.2 Exit path B: graceful self-removals shrink electorate
+### 14.2 Exit path B: graceful self-removals shrink the electorate
 
 ```text
-NO_QUORUM
-    -> enough SELF_REMOVE records observed
-    -> effective quorum shrinks
-    -> ROLL_CALL
-    -> ordinary election
+leader applies SELF_REMOVE
+    -> the next generation it announces has a smaller voter count
+    -> a later election is counted against the smaller electorate
 ```
+
+Only a leader applies a `SELF_REMOVE` (§12.3), so this path protects a shard that still has a leader: when most of its workers are scaled down, the removals shrink the electorate before the leader is lost. It does not rescue a leaderless `NO_QUORUM` shard. No worker in `NO_QUORUM` applies a removal, so with no authority such a shard leaves `NO_QUORUM` only once enough of its peers return (a product limit). With an authority, the departed workers' registrations lapse and the authority path (§14.3) counts them out.
 
 ### 14.3 Exit path C: forced reconfiguration through CoordinationAuthority
 
-Redis or another configured authority stores a per-shard `recovery_epoch`.
+Redis or another configured authority stores a per-shard `recovery_epoch`, which is a number and a lineage. The lineage is drawn fresh whoever founds a shard, kept by every epoch recovered from it, and put back unchanged when a leader republishes its epoch after the authority lost its data; it tells two epochs that share a number apart. The authority also holds each worker's TTL registration and the leader's recovery fence (§14.4).
 
-Every authoritative message carries:
+Every election message that is authoritative carries the recovery epoch and the term (leader acks, vote requests and grants, certificates, refusals). `ClaimResponse` deliberately carries neither: the claims an earlier leader grants are bounded by that leader's lease (§12.1), so a late claim response needs no epoch to reject it.
 
-```text
-shard_id
-recovery_epoch
-term
-```
-
-Forced recovery atomically advances the recovery epoch and establishes a replacement live membership.
-
-Pseudocode:
+Forced recovery runs on a node in `NO_QUORUM` whose roll call has just fallen short, and it advances the recovery epoch on the strength of the roll call's respondents:
 
 ```text
-attempt_forced_recovery():
+attempt_forced_recovery(respondents):
     if state != NO_QUORUM:
         return
 
-    authority_view =
-        authority.live_registrations(shard_id)
+    live = authority.live_registrations(shard_id)
 
-    reachable =
-        intersect(
-            authority_view,
-            locally_reachable_workers()
-        )
+    # The authority gives no authoritative count until one full TTL has
+    # passed since it started or last lost its data: a few registrations
+    # could pass for the whole shard.
+    if live.authoritative_count() is None:
+        give_up()
+    # A node the authority does not list as live has no standing.
+    if self not in live:
+        give_up()
 
-    if reachable is empty:
-        fail_recovery()
+    counted = respondents intersect live
+    if len(counted) < floor(live.authoritative_count() / 2) + 1:
+        give_up()                    # other registered workers were not heard from
+
+    held = authority.read_recovery_epoch(shard_id)
+
+    if held is missing:
+        abandon_shard()              # state = STOPPED
+        return
+    if held is of another lineage, or lower in own lineage,
+       or own lineage is unknown:
+        rejoin_at(held)              # swapping from it could reuse a number
         return
 
-    old_epoch =
-        authority.read_recovery_epoch(shard_id)
+    swapped = authority.compare_and_swap_recovery_epoch(
+        shard_id, expected=held, new=held.next())
 
-    new_epoch = old_epoch.next()
-
-    swapped =
-        authority.compare_and_swap_recovery_epoch(
-            shard_id=shard_id,
-            expected=old_epoch,
-            new=new_epoch
-        )
-
-    if not swapped:
-        reload_authority_state()
+    if lost the race to another swap:
+        rejoin_at(the epoch that won)
         return
 
-    local.recovery_epoch = new_epoch
-    establish_new_effective_electorate(reachable)
-
-    state = ROLL_CALL
-    elect_leader_normally()
+    state = CANDIDATE                # while it waits out the fence
+    acquire_fence(held.next())       # FenceHeld: ask again after what remains
+    on fence granted:
+        lead a configuration founded at the new epoch
 ```
 
-A single surviving worker may recover if the forced reconfiguration makes it the only member.
+Respondents must be a majority of the live registrations, so a minority that can reach the authority cannot take over a live majority: the workers it did not hear from are still registered and still counted. Roll-call respondents are counted only if they are also live in the authority's view, and the node itself must be among them. A warm-up is never trusted. The shard's recovery epoch swap is what lets only one worker recover it from a given epoch, and the fence is what keeps a leader of the old epoch and the new leader from acting at the same time.
+
+The configuration the recovery founds is a single configuration, at the generation (the new epoch, the roll call's term, the roll call configuration's counter plus one), with one voter per counted respondent, each admitted at that generation; every other respondent is a pending member. It needs no joint configuration, because every generation of the new epoch outranks every generation of the old one, so no worker of the new epoch counts a quorum of the old. If the fence is refused for good (the epoch moved on), the candidate goes back to `NO_QUORUM`, or rejoins when the epoch it finds is one it cannot recover from.
+
+A single surviving worker may recover if it is a majority of the live registrations, which happens once the registrations of the others have lapsed.
 
 ### 14.4 Low-frequency recovery fencing
 
