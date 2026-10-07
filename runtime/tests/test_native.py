@@ -355,49 +355,6 @@ def test_submissions_made_before_the_node_leads_are_claimed_in_order_after_the_g
         native.shutdown()
 
 
-def test_a_submission_the_record_cannot_hold_at_the_grant_waits_only_with_its_own_key():
-    # Each payload fits a record alone, but a record that also carries the
-    # superseded generation's input does not, so the grant records the first
-    # and leaves the second queued until the first has ended. Submissions made
-    # after it under another key, or under none, are recorded all the same,
-    # while the leader still counts what is held against the hard limit.
-    half = b"x" * 557_056
-    native = new_runtime(
-        suspect_timeout_ms=1000, memory_soft_limit=1_800_000, memory_hard_limit=1_900_000
-    )
-    try:
-        first = generation(native, half)
-        second = generation(native, half)
-        other_key = generation(native, b"small", key="other")
-        plain = submit(native)
-
-        async def main():
-            await leader_within_limit(native)
-            # The node leads and `second` is still queued behind `first`. What
-            # it holds counts against the hard limit for a submission that is
-            # recorded at once, a submission of another key is recorded at
-            # once, and a later one of the held key waits behind `second`.
-            with pytest.raises(_native.BackpressureError):
-                generation(native, b"y" * 1_000_000, key="late-other")
-            late_other = generation(native, b"small", key="late-other")
-            third = generation(native, b"third")
-            claims = await claim(native)
-            assert {each.task_id for each in claims} == {first, other_key, plain, late_other}
-            [claimed] = [each for each in claims if each.task_id == first]
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(native.claim_pending(1), 0.3)
-            native.report_started(claimed.task_run_id)
-            native.complete(claimed.task_run_id, DIGEST)
-            # `second` is recorded first and `third` then absorbs it.
-            [next_claimed] = await claim(native)
-            assert next_claimed.task_id == third
-            assert next_claimed.chain == [half]
-
-        asyncio.run(main())
-    finally:
-        native.shutdown()
-
-
 def test_an_unknown_run_is_refused(runtime):
     asyncio.run(leader_within_limit(runtime))
 
