@@ -650,13 +650,6 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     input_digests: BTreeMap<TaskId, Digest>,
     /// Each coalescing generation's links: who superseded it, whom it absorbed.
     links: BTreeMap<TaskId, CoalescingLink>,
-    /// While its node reconciles: the office, whether `reconcile` has run,
-    /// and the workers reported lost meanwhile.
-    reconciling: Option<Reconciling>,
-    /// The workers whose answer the last rebuild used, kept after the
-    /// reconciliation ends: a late record that names one of them as holding a
-    /// run does not make it a silent holder.
-    rebuild_answered: BTreeSet<WorkerId>,
     /// What a rebuild left it: see [`Reconciliation`].
     reconciliation: Reconciliation,
     /// When this scheduler last changed each run. A worker asked what it
@@ -696,14 +689,6 @@ enum Supersession {
     Broken,
 }
 
-struct Reconciling {
-    term: ReconcileTerm,
-    rebuilt: bool,
-    lost: BTreeSet<WorkerId>,
-    /// The workers whose answer the rebuild used: they are alive.
-    answered: BTreeSet<WorkerId>,
-}
-
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
     /// A scheduler that refuses every claim and report until it is given a
     /// leadership grant ([`Self::set_leadership_grant`]). `clock` must be the
@@ -738,8 +723,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             revisions: None,
             input_digests: BTreeMap::new(),
             links: BTreeMap::new(),
-            reconciling: None,
-            rebuild_answered: BTreeSet::new(),
             reconciliation: Reconciliation::default(),
             run_decided_at: BTreeMap::new(),
             compaction_runners: BTreeSet::new(),
@@ -1017,32 +1000,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// node watches it again once it leads, so it is reported lost once more
     /// if it is dead.
     pub fn set_leadership_grant(&mut self, grant: Option<LeadershipGrant>) {
-        let mut lost = BTreeSet::new();
-        self.grant = match (grant, self.reconciling.as_ref()) {
-            (None, _) => {
-                self.reconciling = None;
-                None
-            }
-            (Some(grant), Some(reconciling))
-                if !(reconciling.rebuilt
-                    && reconciling.term.recovery_epoch == grant.recovery_epoch
-                    && reconciling.term.term == grant.term) =>
-            {
-                None
-            }
-            (Some(grant), Some(_)) => {
-                let reconciling = self.reconciling.take().expect("just seen");
-                lost = reconciling
-                    .lost
-                    .difference(&reconciling.answered)
-                    .cloned()
-                    .collect();
-                Some(grant)
-            }
-            (Some(grant), None) => Some(grant),
-        };
+        let lost = self.reconciliation.takes_grant(grant.as_ref());
+        self.grant = grant.filter(|_| lost.is_some());
         self.check_leader();
-        for worker in lost {
+        for worker in lost.unwrap_or_default() {
             let _ = self.lose_runs_of(&worker);
         }
         self.compact_every_due_key();
@@ -1058,18 +1019,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     pub fn begin_reconcile(&mut self, term: ReconcileTerm) {
         self.grant = None;
         self.check_leader();
-        self.rebuild_answered.clear();
-        self.reconciling = Some(Reconciling {
-            term,
-            rebuilt: false,
-            lost: BTreeSet::new(),
-            answered: BTreeSet::new(),
-        });
+        self.reconciliation.begin(term);
     }
 
     /// The office it reconciles for, until that office's grant arrives.
     pub fn reconciling(&self) -> Option<ReconcileTerm> {
-        self.reconciling.as_ref().map(|reconciling| reconciling.term)
+        self.reconciliation.office()
     }
 
     /// Replaces everything this scheduler holds with what `rebuild` says,
@@ -1085,38 +1040,33 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// still installed but nothing is republished and `republished` is 0:
     /// there is no live term left to fence a late write at.
     pub fn reconcile(&mut self, rebuild: Rebuild) -> Result<Reconciled, ReconcileRefused> {
-        let rejection = match self.reconciling.as_ref() {
-            None => Some(ReconcileRejection::NotReconciling),
-            Some(reconciling) if reconciling.rebuilt => Some(ReconcileRejection::AlreadyRebuilt),
-            Some(_) => None,
-        };
-        if let Some(rejection) = rejection {
+        if let Some(rejection) = self.reconciliation.refusal() {
             return Err(ReconcileRefused { rejection, rebuild });
         }
-        let reconciling = self.reconciling.as_mut().expect("just seen");
-        reconciling.rebuilt = true;
-        reconciling.answered = rebuild.reports.keys().cloned().collect();
-        let office = reconciling.term;
-
+        let Rebuild {
+            records,
+            uncertain,
+            uncertain_keys,
+            reports,
+        } = rebuild;
         self.clear_tasks();
-        self.rebuild_answered = rebuild.reports.keys().cloned().collect();
-        self.reconciliation
-            .replace_uncertain(rebuild.uncertain, rebuild.uncertain_keys);
-        self.install_settled(rebuild.records, false);
+        let office =
+            self.reconciliation
+                .rebuilt(reports.keys().cloned().collect(), uncertain, uncertain_keys);
+        self.install_settled(records, false);
         // What applying the reports did (runs lost, certified or failed) is
         // not reported back: the caller learns of it from the revisions the
         // scheduler publishes and from the events it queues.
         let mut applied = Adopted::default();
-        self.apply_reports(rebuild.reports, &mut applied);
+        self.apply_reports(reports, &mut applied);
         let republished = if self.may_publish_under(office.recovery_epoch, office.term) {
             self.publish_unpublished(office.recovery_epoch, office.term)
         } else {
             0
         };
-        let answered = &self.reconciling.as_ref().expect("still reconciling").answered;
         let silent_holders = self
             .holders_of(self.current_run.keys())
-            .difference(answered)
+            .difference(self.reconciliation.answered())
             .cloned()
             .collect();
         Ok(Reconciled {
@@ -1155,7 +1105,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let installed = self.install_settled(candidates, true);
         adopted.installed = installed.len();
         let mut answered: BTreeSet<WorkerId> = reports.keys().cloned().collect();
-        answered.extend(self.rebuild_answered.iter().cloned());
+        answered.extend(self.reconciliation.answered().iter().cloned());
         for task_id in &installed {
             for (worker, run) in self.reconciliation.take_reports_for(task_id) {
                 answered.insert(worker.clone());
@@ -1549,7 +1499,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.links.clear();
         self.unpublished.clear();
         self.events.clear();
-        self.rebuild_answered.clear();
         self.run_decided_at.clear();
         self.failed_compactions.clear();
     }
@@ -2354,8 +2303,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// While its node reconciles, a lost worker is kept and applied once the
     /// grant arrives; the call returns no runs then.
     pub fn lose_worker(&mut self, worker: &WorkerId) -> Result<Vec<LostRun>, LoseRejection> {
-        if let Some(reconciling) = self.reconciling.as_mut() {
-            reconciling.lost.insert(worker.clone());
+        if self.reconciliation.keeps_lost(worker) {
             return Ok(Vec::new());
         }
         let outcome = self.lose_runs_of(worker);

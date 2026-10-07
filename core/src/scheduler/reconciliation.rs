@@ -14,12 +14,13 @@ use crate::protocol::records::TaskRunRecord;
 use crate::reconcile::{CoalescingKey, ReconcileTerm, ReportedRun, ReportedState};
 use crate::task_record::{VersionOrder, identify};
 
+use super::{LeadershipGrant, ReconcileRejection};
+
 /// What a rebuild left the scheduler, kept consistent in one place. A task
 /// is uncertain until its record is installed; a record held back with its
 /// key is uncertain too; a worker's report is held only for an uncertain
 /// task, and handed back when that task's record is installed.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub(super) struct Reconciliation {
     /// While its node reconciles: the office, whether the rebuild ran, and
     /// the workers reported lost meanwhile.
@@ -44,7 +45,6 @@ pub(super) struct Reconciliation {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 struct Office {
     term: ReconcileTerm,
     rebuilt: bool,
@@ -197,15 +197,95 @@ impl Reconciliation {
             .map(|(_, run)| run.claim.task_run_id.clone())
     }
 
-    /// A rebuild ran: replaces what earlier ones left.
-    pub(super) fn replace_uncertain(
+    /// Its node took office for `term`: the rebuild is awaited, and no one
+    /// has answered yet.
+    pub(super) fn begin(&mut self, term: ReconcileTerm) {
+        self.answered.clear();
+        self.office = Some(Office {
+            term,
+            rebuilt: false,
+            lost: BTreeSet::new(),
+        });
+    }
+
+    /// The office it reconciles for, until that office's grant arrives.
+    pub(super) fn office(&self) -> Option<ReconcileTerm> {
+        self.office.as_ref().map(|office| office.term)
+    }
+
+    /// Keeps `worker` as lost while reconciling, to apply once the grant
+    /// arrives; whether it did.
+    pub(super) fn keeps_lost(&mut self, worker: &WorkerId) -> bool {
+        match self.office.as_mut() {
+            Some(office) => {
+                office.lost.insert(worker.clone());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `grant` takes effect, with the workers to lose then: those
+    /// reported lost while reconciling that the rebuild did not hear from.
+    /// `None` when it does not: while reconciling, only the grant of the
+    /// office rebuilt for is taken; any other is not held. A grant of `None`
+    /// ends the reconciliation (the node left office).
+    pub(super) fn takes_grant(
         &mut self,
+        grant: Option<&LeadershipGrant>,
+    ) -> Option<BTreeSet<WorkerId>> {
+        let Some(grant) = grant else {
+            self.office = None;
+            return None;
+        };
+        let Some(office) = self.office.as_ref() else {
+            return Some(BTreeSet::new());
+        };
+        if !(office.rebuilt
+            && office.term.recovery_epoch == grant.recovery_epoch
+            && office.term.term == grant.term)
+        {
+            return None;
+        }
+        let office = self.office.take().expect("just seen");
+        Some(office.lost.difference(&self.answered).cloned().collect())
+    }
+
+    /// Why a rebuild would be refused now, if it would.
+    pub(super) fn refusal(&self) -> Option<ReconcileRejection> {
+        match self.office.as_ref() {
+            None => Some(ReconcileRejection::NotReconciling),
+            Some(office) if office.rebuilt => Some(ReconcileRejection::AlreadyRebuilt),
+            Some(_) => None,
+        }
+    }
+
+    /// The rebuild ran for the office: `answered` are the workers whose
+    /// answer it used, and `uncertain` the tasks it could not settle.
+    /// Replaces everything earlier rebuilds or adoptions left. Returns the
+    /// office. Panics unless [`Self::refusal`] is `None`.
+    pub(super) fn rebuilt(
+        &mut self,
+        answered: BTreeSet<WorkerId>,
         uncertain: BTreeMap<TaskId, BTreeSet<TaskRunId>>,
         uncertain_keys: BTreeMap<TaskId, CoalescingKey>,
-    ) {
+    ) -> ReconcileTerm {
+        let office = self
+            .office
+            .as_mut()
+            .expect("a rebuild runs only while one is awaited");
+        office.rebuilt = true;
+        let term = office.term;
+        self.answered = answered;
         self.uncertain = uncertain;
         self.uncertain_keys = key_map(uncertain_keys);
         self.deferred.clear();
         self.held_reports.clear();
+        term
+    }
+
+    /// The workers whose answer the last rebuild used.
+    pub(super) fn answered(&self) -> &BTreeSet<WorkerId> {
+        &self.answered
     }
 }
