@@ -17,13 +17,13 @@ pub(super) struct MemoryBudget {
 }
 
 impl MemoryBudget {
-    /// Sets the limits, or removes them with `None`, and returns the
-    /// `SlowDown` change the new limits make at the current usage, if any.
+    /// Sets the limits, or removes them with `None`. They are set before
+    /// anything is recorded, so there is no usage to re-check them against.
     ///
     /// # Panics
     ///
     /// If the soft limit is above the hard one.
-    pub(super) fn set_limits(&mut self, limits: Option<MemoryLimits>) -> Option<Event> {
+    pub(super) fn set_limits(&mut self, limits: Option<MemoryLimits>) {
         if let Some(limits) = limits {
             assert!(
                 limits.soft <= limits.hard,
@@ -31,7 +31,6 @@ impl MemoryBudget {
             );
         }
         self.limits = limits;
-        self.update_pressure()
     }
 
     /// Refuses `needed` more bytes past the hard limit, unless dropping what

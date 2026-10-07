@@ -7,15 +7,17 @@
 //! flag under that same lock, and wakes whoever the change concerns before
 //! returning. The scheduler here carries the one-node record sink
 //! (`LocalRecords`): each revision it publishes is stored in this node's own
-//! store before the call returns. An answer that tells a caller something was
-//! decided is held in an effect gate until the store has settled every write
-//! the call made, and is a retryable `NotLeader` if the store refused one or
-//! the lease had ended. A submission made before the node leads gets its task
-//! id at once and waits in the door; an end of a continuation the scheduler
-//! refused for want of leadership waits there too. Once the node leads, every
-//! change except a claim or a read replays the unended continuations, then records the
-//! queued submissions in the order they were made.
+//! store before the call returns, and keeps every write, so an answer stands
+//! once the scheduler has given it. A submission made before the node leads
+//! gets its task id at once and waits in the door; an end of a continuation
+//! the scheduler refused for want of leadership waits there too. Once the node
+//! leads, every change except a claim or a read replays the unended
+//! continuations, then records the queued submissions in the order they were
+//! made. A submission whose record would not yet fit (it carries the input of
+//! the generation it supersedes) and everything behind it stay queued until a
+//! change frees room.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -25,13 +27,13 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::reconcile::{ReconcileTerm, reconcile_alone};
+use kabudachi_core::reconcile::{Rebuild, ReconcileTerm};
 use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Completion,
     ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission, Submitted,
     SubmitRejection,
 };
-use kabudachi_core::task_record::{EffectGate, LocalRecords, Settled};
+use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Clock, Instant};
 use tokio::sync::{Notify, watch};
 
@@ -125,34 +127,12 @@ struct Inside<C: Clock> {
     unended: Vec<TaskId>,
 }
 
-/// A rejection that can say "this node is not the leader".
-trait NotLeaderRejection {
-    const NOT_LEADER: Self;
-}
-
-macro_rules! not_leader {
-    ($($rejection:ty),*) => {
-        $(impl NotLeaderRejection for $rejection {
-            const NOT_LEADER: Self = Self::NotLeader;
-        })*
-    };
-}
-
-not_leader!(
-    SubmitRejection,
-    ClaimRejection,
-    ReportRejection,
-    CancelRejection,
-    ContinuationRejection
-);
-
-/// Runs `change`, then holds its outcome in an effect gate until the local
-/// store has settled every write the change made. The store settles them
-/// before `put` returns, so the outcome is decided before this returns: it
-/// stands if every write was kept and the scheduler still leads, and is
-/// `NotLeader` otherwise: the answer is `NotLeader` whenever the scheduler no
-/// longer leads after the call, whether or not its writes were published.
-fn gated<C: Clock, T, R: NotLeaderRejection>(
+/// Runs `change` and returns its outcome. The local store settles every write
+/// the change made before `put` returns, and keeps all of them: it holds only
+/// what this one node wrote, each a newer version of the last. So the
+/// scheduler's own answer stands, including a `NotLeader` it gave for want of
+/// leadership.
+fn settled_change<C: Clock, T, R>(
     scheduler: &mut DoorScheduler<C>,
     change: impl FnOnce(&mut DoorScheduler<C>) -> Result<T, R>,
 ) -> Result<T, R> {
@@ -160,38 +140,26 @@ fn gated<C: Clock, T, R: NotLeaderRejection>(
     drop(scheduler.observer_mut().take_settled());
     let outcome = change(scheduler);
     let settled = scheduler.observer_mut().take_settled();
-    let outcome = outcome?;
-    if !scheduler.is_leader() {
-        return Err(R::NOT_LEADER);
-    }
-    let mut gate = EffectGate::new();
-    let mut ended = gate.hold(outcome, settled.iter().map(|(write, _)| write.clone()));
-    for (write, kept) in settled {
-        let more = if kept {
-            gate.acknowledged(&write, scheduler.is_leader())
-        } else {
-            gate.refused(&write).into_iter().map(Settled::NotLeader).collect()
-        };
-        ended = ended.or(more.into_iter().next());
-    }
-    match ended.expect("the local store settles every write before the call returns") {
-        Settled::Released(outcome) => Ok(outcome),
-        Settled::NotLeader(_) => Err(R::NOT_LEADER),
-    }
+    debug_assert!(
+        settled.iter().all(|(_, kept)| *kept),
+        "the lone node's own store keeps every record it is given"
+    );
+    outcome
 }
 
-/// Records the submissions queued before the grant, in order. One refused
-/// outright (the limits fell since it was queued, or the lease ended) and
-/// everything behind it stay queued, in order, rather than being lost. One the
-/// scheduler recorded but whose write the store refused stays recorded:
-/// it is already recorded.
+/// Records the submissions queued before the grant, in order. One the
+/// scheduler refuses (its record would pass the size limit while it carries
+/// the input of the generation it supersedes) and everything behind it stay
+/// queued, in order, rather than being lost, and the next change tries again.
 fn record_queued<C: Clock>(inside: &mut Inside<C>) {
     let queued = std::mem::take(&mut inside.queued);
     let mut waiting = queued.into_iter();
     while let Some(submitted) = waiting.next() {
         let kept = submitted.clone();
-        let recorded = gated(&mut inside.scheduler, |scheduler| scheduler.submit_minted(submitted));
-        if recorded.is_err() && inside.scheduler.runs_of(&kept.task_id).is_empty() {
+        let recorded = settled_change(&mut inside.scheduler, |scheduler| {
+            scheduler.submit_minted(submitted)
+        });
+        if recorded.is_err() {
             inside.queued.push(kept);
             inside.queued.extend(waiting);
             break;
@@ -207,20 +175,17 @@ fn record_queued<C: Clock>(inside: &mut Inside<C>) {
 /// Once the scheduler leads, ends the continuations it refused to end earlier
 /// (which frees the memory they held), then records the submissions queued
 /// before the grant, in order. Run after every change that can free capacity
-/// or keys, once the change's own effects have settled, so a refused
-/// submission is not left waiting for the next one.
+/// or keys, so a queued submission is not left waiting for the next one.
 fn settle_pending<C: Clock>(inside: &mut Inside<C>) {
     if !inside.scheduler.is_leader() {
         return;
     }
-    let unended = std::mem::take(&mut inside.unended);
-    let mut waiting = unended.into_iter();
-    while let Some(task) = waiting.next() {
-        if gated(&mut inside.scheduler, |scheduler| scheduler.end_continuation(&task)).is_err() {
-            inside.unended.push(task);
-            inside.unended.extend(waiting);
-            break;
-        }
+    for task in std::mem::take(&mut inside.unended) {
+        // `Ok(false)` is a task that finished or was cancelled meanwhile and has
+        // nothing to end; the node leads (checked above), so `NotLeader` cannot occur.
+        let _ = settled_change(&mut inside.scheduler, |scheduler| {
+            scheduler.end_continuation(&task)
+        });
     }
     record_queued(inside);
 }
@@ -272,11 +237,13 @@ impl<C: Clock> SchedulerDoor<C> {
             let submitted = inside.scheduler.mint(submission);
             if inside.scheduler.is_leader() {
                 // The lone leader is not woken by an election step again, so
-                // capacity freed since a refusal is used by the next submission.
+                // room freed since a refusal is used by the next submission.
                 record_queued(inside);
             }
             if inside.scheduler.is_leader() && inside.queued.is_empty() {
-                return gated(&mut inside.scheduler, |scheduler| scheduler.submit_minted(submitted));
+                return settled_change(&mut inside.scheduler, |scheduler| {
+                    scheduler.submit_minted(submitted)
+                });
             }
             inside
                 .scheduler
@@ -290,7 +257,9 @@ impl<C: Clock> SchedulerDoor<C> {
 
     pub fn report_started(&self, run: &TaskRunId) -> Result<(), Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            gated(scheduler, |scheduler| scheduler.report_started(&self.worker, run))
+            settled_change(scheduler, |scheduler| {
+                scheduler.report_started(&self.worker, run)
+            })
         }))
     }
 
@@ -301,7 +270,7 @@ impl<C: Clock> SchedulerDoor<C> {
         completion: Completion,
     ) -> Result<Certification, Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            gated(scheduler, |scheduler| {
+            settled_change(scheduler, |scheduler| {
                 scheduler.complete(&self.worker, run, result_digest, completion)
             })
         }))
@@ -318,7 +287,7 @@ impl<C: Clock> SchedulerDoor<C> {
         failure_kind: &str,
     ) -> Result<Failure, Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            gated(scheduler, |scheduler| {
+            settled_change(scheduler, |scheduler| {
                 if scheduler.task_run(run).map(TaskRunRecord::current_state)
                     == Some(TaskRunState::Claimed)
                 {
@@ -338,7 +307,7 @@ impl<C: Clock> SchedulerDoor<C> {
                 inside.queued_bytes -= dropped.submission.serialized_input.len() as u64;
                 return Ok(Cancellation::Cancelled { was_running: false });
             }
-            gated(&mut inside.scheduler, |scheduler| scheduler.cancel(task))
+            settled_change(&mut inside.scheduler, |scheduler| scheduler.cancel(task))
         }))
     }
 
@@ -351,7 +320,9 @@ impl<C: Clock> SchedulerDoor<C> {
         task: &TaskId,
     ) -> Result<bool, Refusal<ContinuationRejection>> {
         refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
-            let ended = gated(&mut inside.scheduler, |scheduler| scheduler.end_continuation(task));
+            let ended = settled_change(&mut inside.scheduler, |scheduler| {
+                scheduler.end_continuation(task)
+            });
             if ended.is_err() && !inside.unended.contains(task) {
                 inside.unended.push(task.clone());
             }
@@ -416,12 +387,17 @@ impl<C: Clock> SchedulerDoor<C> {
             );
             drop(inside.scheduler.observer_mut().take_settled());
             if let Some(office) = reconciling_office(node, &inside.scheduler) {
-                let silent = reconcile_alone(&mut inside.scheduler, &self.worker, node.now(), office)
+                // A lone node has nothing stored to rebuild from: a record is
+                // only ever written once the node leads, and it is the one
+                // that wrote it.
+                inside
+                    .scheduler
                     // Cannot fail: the caller found the scheduler reconciling this office
                     // (`reconciling_office`), and the rebuild runs once, before the node
                     // is told it has reconciled, which is what ends the reconciliation.
+                    .reconcile(Rebuild::default())
                     .expect("a lone node reconciles the office its scheduler waits for");
-                let watching = node.step(Input::WatchWorkers(silent));
+                let watching = node.step(Input::WatchWorkers(BTreeSet::new()));
                 carry_out(
                     node,
                     watching,
@@ -560,7 +536,9 @@ impl<C: Clock + Send + 'static> SchedulerDoor<C> {
                     return Err(Closed);
                 }
                 let claims = match self.change(Concerned::Nobody, |scheduler| {
-                    gated(scheduler, |scheduler| scheduler.claim_oldest(&self.worker, limit))
+                    settled_change(scheduler, |scheduler| {
+                        scheduler.claim_oldest(&self.worker, limit)
+                    })
                 })? {
                     Ok(claims) => claims,
                     // Not leading yet is not an error: there is just nothing

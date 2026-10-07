@@ -326,6 +326,61 @@ def test_a_submitted_task_can_be_claimed(runtime):
     assert only.attempt_number == 1
 
 
+def test_submissions_made_before_the_node_leads_are_claimed_in_order_after_the_grant():
+    # Leadership is 1 s away, so everything up to `wait_until_leader` is made
+    # while the node does not lead.
+    native = new_runtime(suspect_timeout_ms=1000, memory_soft_limit=50, memory_hard_limit=100)
+    try:
+        dropped = submit(native, payload=b"a" * 60)
+        assert native.cancel(dropped) == CancelOutcome.CANCELLED
+        first = submit(native, payload=b"b" * 30)
+        second = submit(native, payload=b"c" * 30)
+        with pytest.raises(_native.BackpressureError):
+            submit(native, payload=b"d" * 50)
+        with pytest.raises(RuntimeError, match="not the leader"):
+            native.end_continuation("x")
+        assert native.worker_state() != "Leader"
+
+        async def claim_once_leading():
+            await leader_within_limit(native)
+            return await claim(native)
+
+        claims = asyncio.run(claim_once_leading())
+        assert [claimed.task_id for claimed in claims] == [first, second]
+
+        later = submit(native, payload=b"e" * 40)
+        [after] = asyncio.run(claim(native))
+        assert after.task_id == later
+    finally:
+        native.shutdown()
+
+
+def test_a_submission_the_record_cannot_hold_at_the_grant_waits_for_the_one_before_it():
+    # Each payload fits a record alone, but a record that also carries the
+    # superseded generation's input does not, so the grant records the first
+    # and leaves the second queued until the first has ended.
+    half = b"x" * 557_056
+    native = new_runtime(suspect_timeout_ms=1000)
+    try:
+        first = generation(native, half)
+        second = generation(native, half)
+
+        async def main():
+            await leader_within_limit(native)
+            [claimed] = await claim(native)
+            assert claimed.task_id == first
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(native.claim_pending(1), 0.3)
+            native.report_started(claimed.task_run_id)
+            native.complete(claimed.task_run_id, DIGEST)
+            [next_claimed] = await claim(native)
+            assert next_claimed.task_id == second
+
+        asyncio.run(main())
+    finally:
+        native.shutdown()
+
+
 def test_an_unknown_run_is_refused(runtime):
     asyncio.run(leader_within_limit(runtime))
 

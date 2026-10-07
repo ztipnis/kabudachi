@@ -207,11 +207,11 @@ impl NativeRuntime {
     /// limit, is too large to be claimed (about 1 MiB with its queue and
     /// key), or, transiently, its coalescing key's newest generation is not
     /// yet known to the scheduler (submit again shortly), and
-    /// `RuntimeError` if the runtime has shut down or the leader
-    /// could not record the task now: this worker is not leading, its lease
-    /// ended during the call, or the store refused the write. All of those
-    /// can be retried, but the refused task may already sit in the
-    /// scheduler's memory, so a retry can run it twice.
+    /// `RuntimeError` if the runtime has shut down. Before this worker leads
+    /// the task is queued and its id returned at once; it is recorded, in
+    /// order, when the worker comes to lead. A task whose record cannot yet
+    /// fit stays queued, with everything behind it, until the generation it
+    /// supersedes ends, and no error is raised for it.
     #[pyo3(signature = (
         definition_id,
         source_version,

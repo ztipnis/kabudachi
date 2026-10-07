@@ -912,15 +912,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         forgotten
     }
 
-    /// Sets the memory limits, or removes them with `None`.
+    /// Sets the memory limits, or removes them with `None`. Set them before
+    /// anything is recorded: they are not checked against what is already in
+    /// use, and no `SlowDown` change is announced for them.
     ///
     /// # Panics
     ///
     /// If the soft limit is above the hard one.
     pub fn set_memory_limits(&mut self, limits: Option<MemoryLimits>) {
-        let event = self.budget.set_limits(limits);
-        self.announce(event);
-        self.end_call();
+        self.budget.set_limits(limits);
     }
 
     /// Takes the leadership grant its worker's election reports, or `None`
