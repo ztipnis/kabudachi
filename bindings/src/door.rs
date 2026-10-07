@@ -12,10 +12,12 @@
 //! gets its task id at once and waits in the door; an end of a continuation
 //! the scheduler refused for want of leadership waits there too. Once the node
 //! leads, every change except a claim or a read replays the unended
-//! continuations, then records the queued submissions in the order they were
-//! made. A submission whose record would not yet fit (it carries the input of
-//! the generation it supersedes) and everything behind it stay queued until a
-//! change frees room.
+//! continuations, then records the queued submissions, in the order they were
+//! made within a coalescing key. A submission whose record would not yet fit
+//! (it carries the input of the generation it supersedes) stays queued until a
+//! change frees room, and so do the later submissions of its coalescing key,
+//! which must not be recorded ahead of it. Every other queued submission is
+//! recorded regardless.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -117,7 +119,9 @@ pub type DoorScheduler<C> = Scheduler<C, Uuid7Ids, LocalRecords<C>>;
 struct Inside<C: Clock> {
     scheduler: DoorScheduler<C>,
     closed: bool,
-    /// Submissions made before this node led, in the order they were made.
+    /// The submissions not yet recorded: those made before the grant, and
+    /// those made since then behind a refused submission of their coalescing
+    /// key, in the order they were made.
     queued: Vec<Submitted>,
     /// The input bytes `queued` holds, which each new submission is checked
     /// against the hard limit with.
@@ -147,22 +151,39 @@ fn settled_change<C: Clock, T, R>(
     outcome
 }
 
-/// Records the submissions queued before the grant, in order. One the
+/// The coalescing key a submission competes under: its task definition and
+/// its flat key, the same pair the scheduler keys generations by. `None` for a
+/// submission that does not coalesce.
+fn coalescing_key_of(submission: &Submission) -> Option<(&str, &str)> {
+    let key = submission.coalescing_key.as_deref()?;
+    Some((submission.definition_id.as_str(), key))
+}
+
+/// Records the submissions not yet recorded: those queued before the grant,
+/// and those held behind a refused submission of their key. One the
 /// scheduler refuses (its record would pass the size limit while it carries
-/// the input of the generation it supersedes) and everything behind it stay
-/// queued, in order, rather than being lost, and the next change tries again.
+/// the input of the generation it supersedes) stays queued rather than being
+/// lost, and the next change tries again. So do the later submissions of its
+/// coalescing key, in order, because recording one ahead of it would reverse
+/// the generations; submissions of other keys, and those that do not coalesce,
+/// are recorded without waiting for it. A refused submission without a key
+/// holds nothing back.
 fn record_queued<C: Clock>(inside: &mut Inside<C>) {
-    let queued = std::mem::take(&mut inside.queued);
-    let mut waiting = queued.into_iter();
-    while let Some(submitted) = waiting.next() {
+    let mut held: BTreeSet<(String, String)> = BTreeSet::new();
+    for submitted in std::mem::take(&mut inside.queued) {
+        let key = coalescing_key_of(&submitted.submission)
+            .map(|(definition, key)| (definition.to_owned(), key.to_owned()));
+        if key.as_ref().is_some_and(|key| held.contains(key)) {
+            inside.queued.push(submitted);
+            continue;
+        }
         let kept = submitted.clone();
         let recorded = settled_change(&mut inside.scheduler, |scheduler| {
             scheduler.submit_minted(submitted)
         });
         if recorded.is_err() {
+            held.extend(key);
             inside.queued.push(kept);
-            inside.queued.extend(waiting);
-            break;
         }
     }
     inside.queued_bytes = inside
@@ -173,8 +194,8 @@ fn record_queued<C: Clock>(inside: &mut Inside<C>) {
 }
 
 /// Once the scheduler leads, ends the continuations it refused to end earlier
-/// (which frees the memory they held), then records the submissions queued
-/// before the grant, in order. Run after every change that can free capacity
+/// (which frees the memory they held), then records the queued submissions
+/// (see [`record_queued`]). Run after every change that can free capacity
 /// or keys, so a queued submission is not left waiting for the next one.
 fn settle_pending<C: Clock>(inside: &mut Inside<C>) {
     if !inside.scheduler.is_leader() {
@@ -227,11 +248,12 @@ impl<C: Clock> SchedulerDoor<C> {
         }
     }
 
-    /// Gives `submission` its task id at once. A leader records it now; before
-    /// the grant, or while earlier submissions are still queued behind a
-    /// refusal, it is checked against the hard limit with everything queued
-    /// before it, queued, and recorded, in order, by the first change that
-    /// finds room once this node leads.
+    /// Gives `submission` its task id at once. A leader records it now, unless
+    /// an earlier submission of its coalescing key is still queued behind a
+    /// refusal. Every submission is checked against the hard limit together
+    /// with everything queued before it. Before the grant, or behind a refused
+    /// submission of its key, it is then queued, and recorded, in order, by
+    /// the first change that finds room once this node leads.
     pub fn submit(&self, submission: Submission) -> Result<TaskId, Refusal<SubmitRejection>> {
         refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
             let submitted = inside.scheduler.mint(submission);
@@ -239,11 +261,23 @@ impl<C: Clock> SchedulerDoor<C> {
                 // The lone leader is not woken by an election step again, so
                 // room freed since a refusal is used by the next submission.
                 record_queued(inside);
-            }
-            if inside.scheduler.is_leader() && inside.queued.is_empty() {
-                return settled_change(&mut inside.scheduler, |scheduler| {
-                    scheduler.submit_minted(submitted)
+                let key = coalescing_key_of(&submitted.submission);
+                let behind_queued = key.is_some_and(|key| {
+                    inside
+                        .queued
+                        .iter()
+                        .any(|queued| coalescing_key_of(&queued.submission) == Some(key))
                 });
+                if !behind_queued {
+                    // What is held counts against the hard limit here as it
+                    // does for a queued submission.
+                    inside
+                        .scheduler
+                        .check_submission(&submitted.submission, inside.queued_bytes)?;
+                    return settled_change(&mut inside.scheduler, |scheduler| {
+                        scheduler.submit_minted(submitted)
+                    });
+                }
             }
             inside
                 .scheduler
