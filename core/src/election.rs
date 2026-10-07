@@ -1247,15 +1247,6 @@ where
         }
     }
 
-    /// The workers that have answered the roll call this node is running,
-    /// itself included: none unless it is `RollCall` with a call it has not
-    /// given up for a better one. For observing how long a census takes to
-    /// come back (the roll-call deadline must outlast it: see
-    /// [`ElectionTimings::roll_call_deadline`]).
-    pub fn roll_call_respondents(&self) -> impl Iterator<Item = &WorkerId> {
-        self.round.respondents()
-    }
-
     /// The leader this node would point a joining worker at, with the term
     /// that leader was elected in: itself while `Leader`, and while `Active`
     /// the leader whose heartbeat ack it last accepted, or that a JOIN
