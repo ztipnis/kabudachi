@@ -15,12 +15,16 @@
 //! the shared-voter property.
 //!
 //! A third property runs a leader's roster through random histories from
-//! genesis (joiners, admission batches, commits, removals, and elections
-//! won under the roster's configuration) and checks that each change keeps
+//! genesis (joiners, promises of admission and their confirmations, admission
+//! batches, commits, removals, and elections won under the roster's
+//! configuration) and checks that each change keeps
 //! adjacent configurations sharing a majority: no quorum of the
 //! configuration after a change is disjoint from a quorum of the one before
 //! it, counting only the workers still
-//! present. A removed worker never votes again: it has stopped, and the
+//! present. A joiner holds the admission promised it as soon as it confirms
+//! it, before any batch exists, and answers elections with it: it counts
+//! wherever that generation is a configuration's, so the roster must
+//! announce nothing else there. A removed worker never votes again: it has stopped, and the
 //! term guard on its SELF_REMOVE covers the votes it cast before (the TLA+
 //! model checks that part). Several removed together could otherwise make
 //! up a quorum of the configuration before, as a single one never can.
@@ -238,8 +242,14 @@ const POOL: usize = 5;
 enum RosterOp {
     /// A worker heartbeats the leader and is held pending.
     Join(usize),
-    /// A batch of the workers chosen by bit, among those waiting.
-    Batch(u8),
+    /// The leader promises the workers chosen by bit, among those waiting,
+    /// admission in a coming batch.
+    Promise(u8),
+    /// The workers chosen by bit say they hold the admission promised them.
+    Hold(u8),
+    /// A batch of the workers promised, once all hold their promise, and the
+    /// leader too if it asks.
+    Batch(bool),
     /// The workers chosen by bit say they hold the leader's configuration,
     /// then the leader tries to commit it.
     Confirm(u8),
@@ -256,7 +266,9 @@ enum RosterOp {
 fn roster_op_strategy() -> impl Strategy<Value = RosterOp> {
     prop_oneof![
         3 => (0..POOL).prop_map(RosterOp::Join),
-        3 => any::<u8>().prop_map(RosterOp::Batch),
+        2 => any::<u8>().prop_map(RosterOp::Promise),
+        3 => any::<u8>().prop_map(RosterOp::Hold),
+        3 => any::<bool>().prop_map(RosterOp::Batch),
         4 => any::<u8>().prop_map(RosterOp::Confirm),
         2 => any::<u8>().prop_map(RosterOp::Remove),
         1 => any::<u8>().prop_map(RosterOp::Elect),
@@ -274,12 +286,23 @@ fn chosen(bits: u8) -> BTreeSet<WorkerId> {
         .collect()
 }
 
-/// Every worker's counted admission in `roster`.
-fn admissions(roster: &Roster) -> BTreeMap<WorkerId, Admission> {
+/// Every worker's counted admission in `roster`: what the roster admitted it
+/// at, or the admission it holds from a promise (`held`) when the roster has
+/// admitted it at no later generation (a worker takes the roster's admission
+/// as soon as it is later than its promise).
+fn admissions(
+    roster: &Roster,
+    held: &BTreeMap<WorkerId, Generation>,
+) -> BTreeMap<WorkerId, Admission> {
     (0..POOL)
         .map(pool_worker)
         .map(|worker| {
-            let admission = roster.counted_admission_of(&worker);
+            let mut admission = roster.counted_admission_of(&worker);
+            if let Some(promised) = held.get(&worker)
+                && admission.current.is_none_or(|current| current < *promised)
+            {
+                admission.current = Some(*promised);
+            }
             (worker, admission)
         })
         .collect()
@@ -326,13 +349,29 @@ proptest! {
         let mut term = 1u64;
         let mut roster = Roster::genesis(leader.clone(), 0);
         let mut present: BTreeSet<WorkerId> = (0..POOL).map(pool_worker).collect();
+        // The promises workers hold, which no election or change forgets.
+        let mut held: BTreeMap<WorkerId, Generation> = BTreeMap::new();
+        // Every promise ever held, across elections.
+        let mut ever_held: BTreeSet<(WorkerId, Generation)> = BTreeSet::new();
         for op in ops {
             let before_configuration = roster.configuration().clone();
-            let before = admissions(&roster);
+            let before = admissions(&roster, &held);
             match &op {
                 RosterOp::Join(index) => roster.add_pending(pool_worker(*index)),
-                RosterOp::Batch(bits) => {
-                    roster.begin_batch(&chosen(*bits), term);
+                RosterOp::Promise(bits) => {
+                    roster.promise_admission(&chosen(*bits), term);
+                }
+                RosterOp::Hold(bits) => {
+                    for worker in chosen(*bits) {
+                        if let Some(promised) = roster.promised_admission_of(&worker) {
+                            held.insert(worker.clone(), promised);
+                            ever_held.insert((worker.clone(), promised));
+                            roster.record_held_admission(&worker, promised);
+                        }
+                    }
+                }
+                RosterOp::Batch(with_leader) => {
+                    roster.begin_batch(with_leader.then_some(&leader), term);
                 }
                 RosterOp::Confirm(bits) => {
                     let held = roster.configuration().generation();
@@ -358,7 +397,7 @@ proptest! {
                     }
                 }
             }
-            let after = admissions(&roster);
+            let after = admissions(&roster, &held);
             let missed = quorums_miss(
                 (&before_configuration, &before),
                 (roster.configuration(), &after),
@@ -375,6 +414,23 @@ proptest! {
                 roster.configuration(),
                 missed
             );
+            // A quorum counts a worker at the promise it holds, so the
+            // configuration that exists at that generation must admit the
+            // worker there: a batch that left it out, or took it at
+            // another generation, would be counted as it is not.
+            // A roster whose leader was removed is abandoned, not honoured.
+            for (worker, promised) in &ever_held {
+                if !leader_left && roster.configuration().generation() == *promised {
+                    prop_assert_eq!(
+                        roster.admission_of(worker),
+                        Some(*promised),
+                        "{:?} holds a promise of {:?}, which {:?} does not honour",
+                        worker,
+                        promised,
+                        roster.configuration()
+                    );
+                }
+            }
             if leader_left {
                 break;
             }

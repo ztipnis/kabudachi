@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 
 use super::roll_call::RollCallRound;
-use crate::configuration::{Admission, Tally};
+use crate::configuration::{Admission, Generation, Tally};
 use crate::protocol::ids::{ShardId, WorkerId};
 use crate::protocol::messages::VoteRequest;
 use crate::time::Instant;
@@ -67,8 +67,13 @@ impl VoteRound {
     /// Records a reply to the roll call that arrived after the candidate
     /// stood. Returns whether `respondent` is new, and so is to be asked for
     /// its vote.
-    pub(crate) fn record_respondent(&mut self, respondent: WorkerId, admission: Admission) -> bool {
-        self.census.record(respondent, admission)
+    pub(crate) fn record_respondent(
+        &mut self,
+        respondent: WorkerId,
+        admission: Admission,
+        held: Option<Generation>,
+    ) -> bool {
+        self.census.record(respondent, admission, held)
     }
 
     /// Records `voter`'s grant. A worker that did not answer the roll call

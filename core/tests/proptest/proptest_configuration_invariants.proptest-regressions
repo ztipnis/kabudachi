@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc 7ec80679fec054a499e5bb9c03fcf6914f19afa9a9cd2b77376031db30241588 # shrinks to ([base, batch, current], workers) = ([Generation { recovery_epoch: 0, term: 0, counter: 0 }, Generation { recovery_epoch: 0, term: 0, counter: 0 }, Generation { recovery_epoch: 0, term: 0, counter: 0 }], [Worker { admission: None, in_first_set: false, in_second_set: false }]), old_slack = 0, new_slack = 0
 cc 2f0d73cf0d660dca25607e0fb5fd12d903d7b26d0ae310ea620d17b36f024210 # shrinks to ([base, _, current], workers) = ([Generation { recovery_epoch: 0, term: 0, counter: 0 }, Generation { recovery_epoch: 0, term: 0, counter: 0 }, Generation { recovery_epoch: 0, term: 0, counter: 0 }], [Worker { admission: None, in_first_set: false, in_second_set: false }]), slack = 0
+cc 6e7eee36518bd81c17990f0ad7ba70b2b26da32860c9338975619ffd3df9eb26 # shrinks to ops = [Join(2), Promise(4), Hold(20), Batch(false), Remove(133)]
+cc 9f31cc21a455de8056e98ee3ea013eecfb88ccb3232855a9d521130e07c3cb84 # shrinks to ops = [Elect(32), Elect(10), Confirm(0), Promise(46), Hold(10), Remove(150), Batch(false)]

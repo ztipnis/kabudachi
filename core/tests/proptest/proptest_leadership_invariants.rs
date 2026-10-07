@@ -329,6 +329,10 @@ struct Ledger {
     /// Every configuration generation a node announced on an ack or a
     /// certificate, and whether that configuration is joint.
     announced_joint: BTreeMap<Rank, bool>,
+    /// The base generation of each configuration generation a node announced.
+    announced_base: BTreeMap<Rank, Rank>,
+    /// The nodes that announced each configuration generation.
+    announcers: BTreeMap<Rank, BTreeSet<WorkerId>>,
     /// The (worker, leader, term) triples where the worker heartbeated that
     /// leader confirming one of its acks of that term: what a batch needs
     /// of a joiner.
@@ -408,7 +412,7 @@ impl Ledger {
                         .insert(node.clone());
                 }
                 Some(Payload::HeartbeatAck(ack)) => {
-                    self.note_announced(ack.configuration.as_ref());
+                    self.note_announced(&node, ack.configuration.as_ref());
                     let batch = ack.configuration.as_ref().and_then(batch_generation);
                     if let Some((batch, moved_from)) = batch {
                         self.batches.insert(batch, moved_from);
@@ -424,7 +428,7 @@ impl Ledger {
                     }
                 }
                 Some(Payload::ElectionCertificate(certificate)) => {
-                    self.note_announced(certificate.configuration.as_ref());
+                    self.note_announced(&node, certificate.configuration.as_ref());
                     if let Output::Send { to, .. } = output {
                         certified.insert(to.clone());
                         self.note_given(
@@ -563,18 +567,24 @@ impl Ledger {
     /// Whether `node` came by `admission` as L4 allows: that term's leader
     /// gave it to a respondent of its winning roll call, or at a batch's
     /// generation (a joiner), or to a node that had confirmed one of its
-    /// acks of the term, which a batch requires of every joiner. Every
+    /// acks of the term, which a promise of admission requires of every
+    /// joiner (the promise itself is such a give, ahead of the batch). Every
     /// member a later change of the term re-admits joined in one of those
     /// ways, and a joiner whose batch ack was lost learns its admission
-    /// from such a change. A node that missed a commit takes up its
-    /// admission from a refusal instead: that term's leader announced a change at `admission`,
-    /// and the node came by the generation just before it, which the change
-    /// re-admits it from.
+    /// from such a change. A node that missed a change takes up its
+    /// admission from a refusal instead (see [`Self::relayed`]), and may
+    /// then have missed the change before it too, so the relays chain: each
+    /// step needs the generation just before it, or a lower one for a batch
+    /// start, so the counter strictly decreases and the recursion ends.
     fn came_by(&self, node: &WorkerId, admission: Rank) -> bool {
         self.given_directly(node, admission) || self.relayed(node, admission)
     }
 
-    fn note_announced(&mut self, configuration: Option<&generated::Configuration>) {
+    fn note_announced(
+        &mut self,
+        sender: &WorkerId,
+        configuration: Option<&generated::Configuration>,
+    ) {
         if let Some(configuration) = configuration
             && let Some(generation) = configuration.generation.as_ref()
         {
@@ -582,28 +592,58 @@ impl Ledger {
                 configuration.electorate,
                 Some(generated::configuration::Electorate::Joint(_))
             );
-            self.announced_joint.insert(wire_rank(generation), joint);
+            let generation = wire_rank(generation);
+            self.announced_joint.insert(generation, joint);
+            if let Some(base) = configuration.base.as_ref() {
+                self.announced_base.insert(generation, wire_rank(base));
+            }
+            self.announcers.entry(generation).or_default().insert(sender.clone());
         }
     }
 
-    /// Whether `admission` is the commit of a joint configuration at the
-    /// generation just before it, which `node` came by, and that term's
-    /// leader announced it to some node.
+    /// Whether `admission` was announced by that term's leader as the commit
+    /// of the joint configuration at the generation just before it, which
+    /// `node` came by (possibly itself by relay), or as a batch started on
+    /// the single configuration it moved from, of which `node` was a voter:
+    /// a node that missed it may take it from a refusal before the leader has
+    /// acked any member at it. A voter of that single configuration may hold
+    /// any admission within its base through its generation, so for a batch
+    /// `node` need only have been given one of those directly.
     fn relayed(&self, node: &WorkerId, admission: Rank) -> bool {
         let (epoch, term, counter) = admission;
         let Some(previous) = counter.checked_sub(1) else {
             return false;
         };
-        let commits_a_joint = self.announced_joint.get(&(epoch, term, previous)) == Some(&true)
-            && self.announced_joint.get(&admission) == Some(&false);
         let leaders = self.leaders_by_term.get(&term);
-        let announced = self.given.iter().any(|((_, given), gives)| {
-            *given == admission
-                && gives
-                    .iter()
-                    .any(|give| leaders.is_some_and(|leaders| leaders.contains(&give.sender)))
+        let by_leader = self.announcers.get(&admission).is_some_and(|announcers| {
+            leaders.is_some_and(|leaders| announcers.iter().any(|a| leaders.contains(a)))
         });
-        commits_a_joint && announced && self.given_directly(node, (epoch, term, previous))
+        let previous = (epoch, term, previous);
+        let commits_a_joint = self.announced_joint.get(&previous) == Some(&true)
+            && self.announced_joint.get(&admission) == Some(&false);
+        // A batch sits on the single configuration it moved from, which is
+        // not the generation just before it when the leader promised the
+        // joiners their admission first.
+        let moved_from = self.batches.get(&admission).copied().filter(|moved_from| {
+            self.announced_joint.get(moved_from) == Some(&false)
+                && self.announced_joint.get(&admission) == Some(&true)
+        });
+        by_leader
+            && ((commits_a_joint && self.came_by(node, previous))
+                || moved_from.is_some_and(|moved_from| self.given_within_base_of(node, moved_from)))
+    }
+
+    /// Whether `node` was directly given an admission from the base of the
+    /// configuration announced at `generation` through `generation`.
+    fn given_within_base_of(&self, node: &WorkerId, generation: Rank) -> bool {
+        let Some(&base) = self.announced_base.get(&generation) else {
+            return false;
+        };
+        base.0 == generation.0
+            && self
+                .given
+                .range((node.clone(), base)..=(node.clone(), generation))
+                .any(|((_, earlier), _)| self.given_directly(node, *earlier))
     }
 
     fn given_directly(&self, node: &WorkerId, admission: Rank) -> bool {

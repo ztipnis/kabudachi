@@ -33,6 +33,8 @@ struct Inner {
     late_by_at_most: Duration,
     rng: ChaCha8Rng,
     partition: Option<(BTreeSet<WorkerId>, BTreeSet<WorkerId>)>,
+    /// Directed links that drop everything sent along them, `(from, to)`.
+    blocked: BTreeSet<(WorkerId, WorkerId)>,
 }
 
 impl Inner {
@@ -46,6 +48,9 @@ impl Inner {
     }
 
     fn is_partitioned(&self, from: &WorkerId, to: &WorkerId) -> bool {
+        if self.blocked.contains(&(from.clone(), to.clone())) {
+            return true;
+        }
         match &self.partition {
             Some((group_a, group_b)) => {
                 (group_a.contains(from) && group_b.contains(to))
@@ -135,6 +140,7 @@ impl FakeNetwork {
                 late_by_at_most: Duration::from_ticks(0),
                 rng: ChaCha8Rng::seed_from_u64(0),
                 partition: None,
+                blocked: BTreeSet::new(),
             })),
         }
     }
@@ -188,8 +194,32 @@ impl FakeNetwork {
         self.inner.borrow_mut().partition = Some((group_a, group_b));
     }
 
+    /// Drops every message already on its way across the current partition,
+    /// as a cable cut at that moment would; [`FakeNetwork::partition`] alone
+    /// lets those arrive.
+    pub fn drop_in_flight_across_partition(&self) {
+        let mut inner = self.inner.borrow_mut();
+        let scheduled = std::mem::take(&mut inner.scheduled);
+        inner.scheduled = scheduled
+            .into_iter()
+            .filter(|message| !inner.is_partitioned(&message.from, &message.to))
+            .collect();
+    }
+
     pub fn heal_partition(&self) {
         self.inner.borrow_mut().partition = None;
+    }
+
+    /// Ends every one-way block, leaving the partition as it is.
+    pub fn unblock_all(&self) {
+        self.inner.borrow_mut().blocked.clear();
+    }
+
+    /// Drops everything `from` sends `to` from now on while `to` still
+    /// reaches `from`: a one-way link failure. Ended by
+    /// [`FakeNetwork::unblock_all`].
+    pub fn block_one_way(&self, from: WorkerId, to: WorkerId) {
+        self.inner.borrow_mut().blocked.insert((from, to));
     }
 
     /// Puts `new` wherever the current partition has `old`: a process

@@ -130,6 +130,7 @@ pub fn roll_call_reply(
         responder_address: String::new(),
         admission: admission.map(Into::into),
         prior_admission: None,
+        configuration_generation: None,
     }))
 }
 
@@ -150,7 +151,7 @@ pub fn heartbeat(sender: &WorkerId, newest_accepted_ack: Option<AckEcho>) -> Wor
         configuration_generation: None,
         send_token: 0,
         routing_crawled: false,
-        crawl_admission: None,
+        admission_generation: None,
     }
 }
 

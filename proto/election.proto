@@ -27,12 +27,13 @@ message WorkerHeartbeat {
   // are connected to one another and not only to it. False while the
   // sender is a pending member.
   bool routing_crawled = 11;
-  // The admission generation the sender held when it completed the crawl
-  // routing_crawled reports. A leader counts the crawl only when this is the
-  // sender's current admission in its roster, so a delayed heartbeat from
-  // before a re-admission does not count. Absent while routing_crawled is
-  // false.
-  optional Generation crawl_admission = 12;
+  // The admission generation the sender holds, including one its leader
+  // promised before the batch admitting it exists; the leader reads that as
+  // confirmation of the promise. A leader counts a crawl routing_crawled
+  // reports only when this is the sender's current admission in its roster,
+  // so a delayed heartbeat from before a re-admission does not count.
+  // Absent while it holds none.
+  optional Generation admission_generation = 12;
 }
 
 // Names one leader ack a heartbeat confirms receiving.
@@ -50,7 +51,10 @@ message LeaderHeartbeatAck {
   // than its own.
   Configuration configuration = 5;
   // The recipient's admission generation in the leader's roster. Absent for
-  // a pending joiner, or a worker the roster does not hold.
+  // a pending joiner, or a worker the roster does not hold. For a joiner the
+  // leader means to admit in a coming batch it is that batch's generation,
+  // later than the configuration this ack carries: a promise the joiner
+  // holds until the batch exists, and confirms in its next heartbeat.
   optional Generation recipient_admission = 6;
   // The leader's monotonic clock reading when it sent this ack, in ticks.
   // Followers never interpret it; they only echo it back. 0 is a real
@@ -104,6 +108,10 @@ message RollCallReply {
   // The admission generation the responder held before the election that
   // founded its joint configuration admitted it. Absent otherwise.
   optional Generation prior_admission = 7;
+  // The generation of the configuration the responder holds, which a leader
+  // that wins the election seeds its record of what that responder has
+  // echoed with. Absent while it holds none.
+  optional Generation configuration_generation = 8;
 }
 
 message VoteRequest {

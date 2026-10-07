@@ -745,11 +745,18 @@ fn a_batch_admits_only_pending_joiners_and_members_that_are_no_voters() {
     );
     let before = roster.configuration().clone();
 
-    assert!(!roster.begin_batch(&BTreeSet::from([worker("a"), worker("stranger")]), 1));
-    assert!(!roster.begin_batch(&BTreeSet::new(), 1));
+    assert!(!roster.promise_admission(&BTreeSet::from([worker("a"), worker("stranger")]), 1));
+    assert!(!roster.promise_admission(&BTreeSet::new(), 1));
+    assert!(!roster.begin_batch(None, 1));
     assert_eq!(roster.configuration(), &before);
 
-    assert!(roster.begin_batch(&BTreeSet::from([worker("left-out")]), 1));
+    assert!(roster.promise_admission(&BTreeSet::from([worker("left-out")]), 1));
+    assert!(
+        !roster.begin_batch(None, 1),
+        "no batch before the joiner says it holds its promise"
+    );
+    roster.record_held_admission(&worker("left-out"), generation(0, 1, 2));
+    assert!(roster.begin_batch(None, 1));
     let batch = generation(0, 1, 2);
     assert_eq!(
         roster.counted_admission_of(&worker("left-out")),
@@ -760,6 +767,70 @@ fn a_batch_admits_only_pending_joiners_and_members_that_are_no_voters() {
         tally.record(worker(member), roster.counted_admission_of(&worker(member)));
     }
     assert!(tally.has_quorum(), "old side a and b; new side all three");
+}
+
+/// A joiner promised an admission holds it before any batch exists, so the
+/// leader announces nothing else at that generation: a removal made while the
+/// promise stands moves past it, and a later promise past that. Otherwise a
+/// configuration announced at the promised generation would count a joiner it
+/// never admitted.
+#[test]
+fn a_change_made_while_a_joiner_holds_a_promise_moves_past_the_promised_generation() {
+    let mut roster = Roster::new(
+        three_voters_at(1),
+        BTreeMap::from([
+            (worker("a"), generation(0, 1, 1)),
+            (worker("b"), generation(0, 1, 1)),
+            (worker("c"), generation(0, 1, 1)),
+        ]),
+        BTreeSet::from([worker("joiner")]),
+    );
+
+    assert!(roster.promise_admission(&BTreeSet::from([worker("joiner")]), 1));
+    let promised = generation(0, 1, 2);
+    assert_eq!(roster.promised_admission_of(&worker("joiner")), Some(promised));
+    roster.remove_all(&BTreeSet::from([worker("c")]), 1);
+
+    let removed = roster.configuration().generation();
+    assert!(removed > promised, "{removed:?} is not past {promised:?}");
+    assert_eq!(
+        roster.promised_admission_of(&worker("joiner")),
+        None,
+        "a promise a change moved past is void"
+    );
+    assert!(roster.promise_admission(&BTreeSet::from([worker("joiner")]), 1));
+    assert!(roster.promised_admission_of(&worker("joiner")) > Some(removed));
+}
+
+/// A joiner promised admission and then taken out voids the round it was
+/// promised in: a batch at that generation without it would leave it holding a
+/// promise that the configuration at that generation does not honour. The
+/// joiners still waiting are promised again, past it.
+#[test]
+fn removing_a_promised_joiner_voids_the_round_so_no_batch_leaves_it_out_at_its_generation() {
+    let mut roster = roster_of_three_and_a_joiner();
+    roster.add_pending(worker("other"));
+    assert!(roster.promise_admission(&BTreeSet::from([worker("joiner"), worker("other")]), 1));
+    let promised = generation(0, 1, 2);
+    for label in ["joiner", "other"] {
+        roster.record_held_admission(&worker(label), promised);
+    }
+
+    remove(&mut roster, "joiner", 1);
+
+    assert_eq!(
+        roster.promised_admission_of(&worker("other")),
+        None,
+        "the round the removed joiner was in is void"
+    );
+    assert!(!roster.begin_batch(None, 1), "no batch honours a void round");
+    assert!(roster.promise_admission(&BTreeSet::from([worker("other")]), 1));
+    let again = roster.promised_admission_of(&worker("other")).expect("promised again");
+    assert!(again > promised);
+    roster.record_held_admission(&worker("other"), again);
+    assert!(roster.begin_batch(None, 1));
+    assert_eq!(roster.configuration().generation(), again);
+    assert_eq!(roster.admission_of(&worker("other")), Some(again));
 }
 
 /// A worker once taken out is never held as pending again: a heartbeat of

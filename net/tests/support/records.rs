@@ -262,7 +262,7 @@ fn heartbeat_from(worker: &WorkerId) -> ElectionMessage {
             configuration_generation: None,
             send_token: 0,
             routing_crawled: false,
-            crawl_admission: None,
+            admission_generation: None,
         })),
     }
 }

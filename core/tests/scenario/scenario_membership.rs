@@ -21,6 +21,14 @@ use crate::support::harness::{Cluster, StepRecord};
 const SUSPECT: Duration = Duration::from_ticks(10);
 const TICK: Duration = Duration::from_ticks(1);
 
+/// How long past a suspicion timeout a leader waits before it reports a
+/// worker lost, in scenarios about losses.
+const RECONNECT: Duration = Duration::from_ticks(100);
+
+/// A suspicion timeout and a reconnect timeout, in ticks: `SUSPECT` plus
+/// `RECONNECT`.
+const LOSS_TICKS: u64 = 10 + 100;
+
 /// How long a scenario waits for something that should happen within a few
 /// heartbeats or elections.
 const PATIENCE_TICKS: u64 = 60 * 10;
@@ -76,7 +84,35 @@ fn leaders_among(cluster: &Cluster, group: &BTreeSet<WorkerId>) -> BTreeSet<Work
 /// cut off while the voters elect a leader and commit what they founded.
 /// The joiners stay cut off. Returns the cluster and its leader.
 fn elected_with_joiners_away(voters: usize, joiners: usize) -> (Cluster, WorkerId) {
-    let mut cluster = Cluster::bootstrap_with_pending(voters, joiners, SUSPECT);
+    elected_with_joiners_away_suspecting_after(voters, joiners, SUSPECT)
+}
+
+/// `elected_with_joiners_away` for nodes that suspect a silent leader only
+/// after `suspect_timeout`.
+fn elected_with_joiners_away_suspecting_after(
+    voters: usize,
+    joiners: usize,
+    suspect_timeout: Duration,
+) -> (Cluster, WorkerId) {
+    let mut cluster = Cluster::bootstrap_with_pending(voters, joiners, suspect_timeout);
+    cluster.partition(ids(0..voters), ids(voters..voters + joiners));
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.leader().is_some_and(
+            |leader| !configuration_of(cluster, &leader).is_joint()
+        )),
+        "the voters elect a leader and commit its founding"
+    );
+    let leader = cluster.leader().expect("a leader");
+    (cluster, leader)
+}
+
+/// `elected_with_joiners_away` with a reconnect timeout of `RECONNECT`, so a
+/// scenario about reporting workers lost need not simulate the default 30 s.
+fn elected_with_joiners_away_reconnecting_quickly(
+    voters: usize,
+    joiners: usize,
+) -> (Cluster, WorkerId) {
+    let mut cluster = Cluster::bootstrap_with_reconnect_timeout(voters, joiners, SUSPECT, RECONNECT);
     cluster.partition(ids(0..voters), ids(voters..voters + joiners));
     assert!(
         run_until(&mut cluster, |cluster| cluster.leader().is_some_and(
@@ -139,6 +175,49 @@ fn assert_no_grant_overlap(cluster: &Cluster) {
     );
 }
 
+/// A joiner that holds its promise but then falls silent for a while, its
+/// last confirmation of the leader's ack older than the batch's freshness
+/// bound yet within a suspicion timeout, is waited for: the leader keeps the
+/// round and starts the batch at the generation it promised once the joiner
+/// confirms again, rather than discarding the round and promising a later
+/// generation that every joiner must confirm afresh.
+#[test]
+fn a_joiner_that_goes_briefly_silent_after_its_promise_is_still_admitted_at_the_promised_generation() {
+    let suspect_timeout = Duration::from_ticks(40);
+    let (mut cluster, leader) = elected_with_joiners_away_suspecting_after(3, 1, suspect_timeout);
+    let joiner = worker("worker-3");
+    cluster.network().set_delay(TICK);
+    cluster.heal();
+    assert!(
+        run_until(&mut cluster, |cluster| cluster
+            .node(&joiner)
+            .admission()
+            .is_some()),
+        "setup: the joiner holds a promise"
+    );
+    let promised = cluster.node(&joiner).admission().expect("a promise");
+    cluster.partition(
+        BTreeSet::from([joiner.clone()]),
+        ids(0..3),
+    );
+    cluster.network().drop_in_flight_across_partition();
+    for _ in 0..26 {
+        cluster.advance(TICK);
+    }
+    cluster.heal();
+
+    let started = run_until(&mut cluster, |cluster| {
+        configuration_of(cluster, &leader).is_joint()
+    });
+
+    assert!(started, "the batch starts");
+    assert_eq!(
+        configuration_of(&cluster, &leader).generation(),
+        promised,
+        "the batch is at the promised generation"
+    );
+}
+
 /// Three voters elect a leader; four joiners then arrive. The first batch
 /// takes the joiner that confirmed first; the other three wait and form the
 /// second. Just as the leader starts the second batch, a partition cuts the
@@ -149,25 +228,40 @@ fn assert_no_grant_overlap(cluster: &Cluster) {
 fn second_batch_cut_off() -> (Cluster, WorkerId, BTreeSet<WorkerId>, BTreeSet<WorkerId>) {
     let (mut cluster, leader) = elected_with_joiners_away(3, 4);
     let joiners = ids(3..7);
-    // A delay of a few ticks keeps each batch joint for several ticks, so a
-    // scenario stepping a tick at a time sees the second one start.
-    cluster.network().set_delay(Duration::from_ticks(2));
+    // A delay keeps each batch joint for a few ticks, so a scenario stepping a
+    // tick at a time sees the second one start; a longer one leaves the
+    // joiners that wait too stale to join it.
+    cluster.network().set_delay(Duration::from_ticks(1));
     cluster.heal();
     let mut batches: Vec<Generation> = Vec::new();
+    // The joiners promised their admission by the time the first batch
+    // starts: no second round of promises starts before it commits.
+    let mut first = BTreeSet::new();
     for _ in 0..PATIENCE_TICKS {
         let configuration = configuration_of(&cluster, &leader);
         if configuration.is_joint() && !batches.contains(&configuration.generation()) {
             batches.push(configuration.generation());
+            if first.is_empty() {
+                first = joiners
+                    .iter()
+                    .filter(|joiner| cluster.node(joiner).admission().is_some())
+                    .cloned()
+                    .collect();
+            }
+            cluster.heal();
         }
         if batches.len() == 2 {
+            // Acks of the second batch now take longer than a heartbeat
+            // interval, which the old side's phases differ by at most, so
+            // every member of the old side holds the batch before the first
+            // echo of it reaches the leader.
+            cluster.network().set_delay(Duration::from_ticks(6));
             break;
         }
         cluster.advance(TICK);
     }
     assert_eq!(batches.len(), 2, "two batches start");
-    let (first, second): (BTreeSet<WorkerId>, BTreeSet<WorkerId>) = joiners
-        .into_iter()
-        .partition(|joiner| cluster.node(joiner).admission().is_some());
+    let second: BTreeSet<WorkerId> = joiners.difference(&first).cloned().collect();
     assert_eq!(
         (first.len(), second.len()),
         (1, 3),
@@ -181,7 +275,19 @@ fn second_batch_cut_off() -> (Cluster, WorkerId, BTreeSet<WorkerId>, BTreeSet<Wo
         .collect();
     let mut batch_side = second;
     batch_side.insert(leader.clone());
+    // The second batch starts after the last joiner of it confirms, on the
+    // heartbeat that catches the last member up with the commit and so starts
+    // the promise round, and the old side has yet to hear of it: cut once it
+    // has, before the echoes that would commit the batch reach the leader.
+    let second_batch = configuration_of(&cluster, &leader).generation();
+    assert!(
+        run_until(&mut cluster, |cluster| old_side
+            .iter()
+            .all(|id| configuration_of(cluster, id).generation() == second_batch)),
+        "setup: the old side has adopted the second batch"
+    );
     cluster.partition(old_side.clone(), batch_side.clone());
+    cluster.network().drop_in_flight_across_partition();
     // No delay from here: under it, a roll call's replies could never beat
     // the tests' roll-call deadline (a quarter of the suspicion timeout),
     // and no side could elect whatever the rules.
@@ -240,17 +346,31 @@ fn a_stale_initiator_several_generations_behind_cannot_win() {
     let stale = followers[0].clone();
     let before = configuration_of(&cluster, &stale).generation();
     cluster.record_steps();
+    // The leader admits no one before every voter has echoed its
+    // configuration, the worker about to be cut off included.
+    for _ in 0..3 * SUSPECT.as_ticks() {
+        cluster.advance(TICK);
+    }
 
     let mut rest = ids(0..6);
     rest.remove(&stale);
     cluster.partition(BTreeSet::from([stale.clone()]), rest);
-    cluster.drain(&followers[1]);
-    cluster.drain(&followers[2]);
-    let changed = run_until(&mut cluster, |cluster| {
+    let admitted = run_until(&mut cluster, |cluster| {
         let configuration = configuration_of(cluster, &leader);
         !configuration.is_joint() && is_voter_of(cluster, &worker("worker-5"), &configuration)
     });
-    assert!(changed, "two removals and a batch");
+    assert!(admitted, "a batch");
+    cluster.drain(&followers[1]);
+    cluster.drain(&followers[2]);
+    let changed = run_until(&mut cluster, |cluster| {
+        configuration_of(cluster, &leader).generation()
+            >= before
+                .next_change(before.term())
+                .next_change(before.term())
+                .next_change(before.term())
+                .next_change(before.term())
+    });
+    assert!(changed, "two removals");
     let behind = configuration_of(&cluster, &leader).generation();
     assert!(behind > before.next_change(behind.term()).next_change(behind.term()));
     for _ in 0..3 * SUSPECT.as_ticks() {
@@ -546,5 +666,472 @@ fn a_rolling_deploy_that_replaces_the_leader_last_collapses_the_batch() {
         }),
         "the joiners elect among themselves and admit those that waited"
     );
+    assert_no_grant_overlap(&cluster);
+}
+
+/// Five voters elect a leader while a sixth worker waits to join, cut off
+/// from the election. Two followers lose contact with the leader once the
+/// election has founded its configuration, before they hear that it
+/// committed, and the leader admits the waiting worker without them: they
+/// are then behind the rest, which refuse their calls as stale. With the
+/// leader lost, the two that kept up and the new voter are not a majority of
+/// the six, so a new leader needs the two laggards: the leader must not
+/// start the batch before everyone the commit counted has caught up.
+#[test]
+fn a_leader_lost_after_admitting_without_two_laggards_is_replaced() {
+    let mut cluster = Cluster::bootstrap_with_pending(5, 1, SUSPECT);
+    cluster.network().set_delay(Duration::from_ticks(2));
+    cluster.partition(ids(0..5), ids(5..6));
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.leader().is_some_and(
+            |leader| configuration_of(cluster, &leader).is_joint()
+        )),
+        "the voters elect a leader that founds a joint configuration"
+    );
+    let leader = cluster.leader().expect("a leader");
+    let laggards: BTreeSet<WorkerId> = ids(0..5)
+        .into_iter()
+        .filter(|id| *id != leader)
+        .take(2)
+        .collect();
+    let keeping_up: BTreeSet<WorkerId> = ids(0..6)
+        .into_iter()
+        .filter(|id| !laggards.contains(id))
+        .collect();
+    cluster.partition(keeping_up, laggards);
+    // The leader admits no one while two members it counts have yet to
+    // echo the commit: the waiting worker stays pending and no batch starts.
+    for _ in 0..3 * SUSPECT.as_ticks() {
+        cluster.advance(TICK);
+    }
+    assert!(
+        !configuration_of(&cluster, &leader).is_joint(),
+        "no batch while the laggards are behind"
+    );
+    assert_eq!(cluster.node(&worker("worker-5")).admission(), None);
+
+    let rest: BTreeSet<WorkerId> = ids(0..6).into_iter().filter(|id| *id != leader).collect();
+    cluster.partition(BTreeSet::from([leader.clone()]), rest.clone());
+    let replaced = run_until(&mut cluster, |cluster| {
+        !leaders_among(cluster, &rest).is_empty()
+    });
+
+    assert!(replaced, "no new leader: {:?}", cluster.states());
+    assert_no_grant_overlap(&cluster);
+}
+
+/// Three voters elect a leader and commit what it founded; a joiner waits
+/// cut off. The link from the leader to one voter then fails one way: its
+/// heartbeats still reach the leader, but it never hears an ack, so it
+/// confirms none. The leader reports that voter lost after the loss timeout,
+/// although it keeps hearing it, and removes it like a voter that left;
+/// the other voter, which acks, stays counted. Admissions, which wait for
+/// every counted member to hold the configuration, then go ahead.
+#[test]
+fn a_voter_that_hears_no_ack_is_removed_though_its_heartbeats_arrive_and_admissions_go_ahead() {
+    let (mut cluster, leader) = elected_with_joiners_away_reconnecting_quickly(3, 1);
+    let joiner = worker("worker-3");
+    let voters: Vec<WorkerId> = ids(0..3).into_iter().filter(|id| *id != leader).collect();
+    let (mute, other) = (voters[0].clone(), voters[1].clone());
+    cluster.network().block_one_way(leader.clone(), mute.clone());
+
+    // Past the suspicion and reconnect timeouts.
+    for _ in 0..LOSS_TICKS + 100 {
+        cluster.advance(TICK);
+    }
+    assert_eq!(
+        configuration_of(&cluster, &leader).voter_count(),
+        Some(2),
+        "the voter that confirmed no ack is removed, the one that acked is not"
+    );
+    assert_eq!(cluster.leader(), Some(leader.clone()), "the leader keeps its office");
+    assert!(
+        is_voter_of(&cluster, &other, &configuration_of(&cluster, &leader)),
+        "the acking voter stays counted"
+    );
+
+    // The link is still one-way while the waiting worker is admitted.
+    cluster.heal();
+    assert!(
+        run_until(&mut cluster, |cluster| {
+            let configuration = configuration_of(cluster, &leader);
+            !configuration.is_joint() && is_voter_of(cluster, &joiner, &configuration)
+        }),
+        "the waiting worker is admitted"
+    );
+
+    // Once its link heals the removed voter rejoins as a pending member and
+    // is admitted again.
+    cluster.network().unblock_all();
+    assert!(
+        run_until(&mut cluster, |cluster| {
+            let configuration = configuration_of(cluster, &leader);
+            !configuration.is_joint() && is_voter_of(cluster, &mute, &configuration)
+        }),
+        "the removed voter is admitted again once its link heals"
+    );
+    assert_no_grant_overlap(&cluster);
+}
+
+/// Five voters; the links from the leader to two of them, D and E, fail one
+/// way, so both confirm no ack. The leader removes one, and a third voter, C,
+/// is then cut off from the leader and the fourth, B, while D and E, still
+/// holding the five-voter configuration, can reach C. A second removal that
+/// took E out while C, D and E, a majority of the five, could still elect
+/// under the old generation would leave two leaders beside each other. The
+/// leader removes the second only while a majority of the five holds the
+/// generation the removal moves from, so no two nodes ever hold a valid
+/// grant at once.
+#[test]
+fn a_second_removal_waits_until_a_majority_of_the_voters_it_leaves_behind_holds_the_change() {
+    let (mut cluster, leader) = elected_with_joiners_away_reconnecting_quickly(5, 0);
+    cluster.network().set_delay(Duration::from_ticks(1));
+    let followers: Vec<WorkerId> = ids(0..5).into_iter().filter(|id| *id != leader).collect();
+    let (b, c, d, e) = (
+        followers[0].clone(),
+        followers[1].clone(),
+        followers[2].clone(),
+        followers[3].clone(),
+    );
+    cluster.network().block_one_way(leader.clone(), d.clone());
+    cluster.network().block_one_way(leader.clone(), e.clone());
+    assert!(
+        run_until(&mut cluster, |cluster| configuration_of(cluster, &leader)
+            .voter_count()
+            .is_some_and(|voters| voters <= 4)),
+        "the first of the two is removed"
+    );
+    cluster.partition(
+        BTreeSet::from([leader.clone(), b.clone()]),
+        BTreeSet::from([c.clone()]),
+    );
+    cluster.network().drop_in_flight_across_partition();
+
+    for _ in 0..2 * LOSS_TICKS {
+        cluster.advance(TICK);
+        assert_no_grant_overlap(&cluster);
+    }
+}
+
+/// Three voters admit a joiner in a batch, and the link from the leader to
+/// one of the three fails one way the moment the batch commits, before that
+/// voter echoes the committed generation. It must still be removed, once it
+/// has confirmed no ack for a loss timeout, or no later admission could ever
+/// go ahead: a second waiting worker is then admitted, and no two nodes
+/// ever hold a valid grant at once.
+#[test]
+fn a_voter_muted_as_a_batch_commits_is_removed_and_a_waiting_worker_is_admitted() {
+    let mut cluster = Cluster::bootstrap_with_reconnect_timeout(3, 2, SUSPECT, RECONNECT);
+    let (joiner, waiting) = (worker("worker-3"), worker("worker-4"));
+    cluster.partition(ids(0..3), ids(3..5));
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.leader().is_some_and(
+            |leader| !configuration_of(cluster, &leader).is_joint()
+        )),
+        "the voters elect a leader and commit its founding"
+    );
+    let leader = cluster.leader().expect("a leader");
+    let muted = ids(0..3).into_iter().find(|id| *id != leader).expect("a follower");
+    cluster.network().set_delay(TICK);
+    // The first joiner is reachable, the second waits for later.
+    cluster.partition(ids(0..4), BTreeSet::from([waiting.clone()]));
+    assert!(
+        run_until(&mut cluster, |cluster| configuration_of(cluster, &leader).is_joint()),
+        "a batch starts"
+    );
+    assert!(
+        run_until(&mut cluster, |cluster| {
+            let configuration = configuration_of(cluster, &leader);
+            !configuration.is_joint() && is_voter_of(cluster, &joiner, &configuration)
+        }),
+        "the batch commits"
+    );
+    cluster.network().block_one_way(leader.clone(), muted.clone());
+    cluster.network().drop_in_flight_across_partition();
+
+    for _ in 0..4 * LOSS_TICKS {
+        cluster.advance(TICK);
+    }
+    assert_eq!(
+        configuration_of(&cluster, &leader).voter_count(),
+        Some(3),
+        "the muted voter is removed from the four"
+    );
+    cluster.heal();
+    assert!(
+        run_until(&mut cluster, |cluster| {
+            let configuration = configuration_of(cluster, &leader);
+            !configuration.is_joint() && is_voter_of(cluster, &waiting, &configuration)
+        }),
+        "the waiting worker is admitted"
+    );
+    assert_no_grant_overlap(&cluster);
+}
+
+/// A voter whose link from a newly elected leader fails one way before it
+/// echoes anything in that office is still removed after a loss timeout: its
+/// answer to the roll call said which configuration it holds, which anchors
+/// the removal.
+#[test]
+fn a_voter_muted_just_after_an_election_is_removed() {
+    let mut cluster = Cluster::bootstrap_with_reconnect_timeout(3, 0, SUSPECT, RECONNECT);
+    cluster.network().set_delay(TICK);
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.leader().is_some()),
+        "the voters elect a leader"
+    );
+    let leader = cluster.leader().expect("a leader");
+    let muted = ids(0..3).into_iter().find(|id| *id != leader).expect("a follower");
+    cluster.network().block_one_way(leader.clone(), muted.clone());
+    cluster.network().drop_in_flight_across_partition();
+
+    for _ in 0..4 * LOSS_TICKS {
+        cluster.advance(TICK);
+    }
+
+    assert_eq!(configuration_of(&cluster, &leader).voter_count(), Some(2));
+    assert_eq!(cluster.leader(), Some(leader));
+    assert_no_grant_overlap(&cluster);
+}
+
+/// A voter that dies outright is reported lost for task replay but stays in
+/// the configuration: only one whose heartbeats still arrive is removed.
+#[test]
+fn a_voter_that_goes_silent_stays_counted() {
+    let (mut cluster, leader) = elected_with_joiners_away_reconnecting_quickly(3, 0);
+    let dead = ids(0..3).into_iter().find(|id| *id != leader).expect("a follower");
+    cluster.stall(&dead, Duration::from_secs(1_000_000));
+    cluster.record_steps();
+
+    for _ in 0..LOSS_TICKS + 100 {
+        cluster.advance(TICK);
+    }
+
+    let steps = cluster.take_steps();
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.node == leader && step.outputs.contains(&Output::WorkerLost(dead.clone()))),
+        "the dead voter is reported lost, for task replay"
+    );
+    assert_eq!(configuration_of(&cluster, &leader).voter_count(), Some(3));
+    assert_eq!(cluster.leader(), Some(leader));
+}
+
+/// Three voters elect a leader and commit what it founded, and every voter
+/// echoes the commit. A joiner then arrives and the leader starts a batch,
+/// but one voter, cut off from the leader at that moment, never hears the
+/// batch start: it still holds the commit, which the other voter and the
+/// joiner, now holding the batch, refuse as stale, while it refuses their
+/// calls as not the best. The leader is then lost, and a new leader needs the
+/// cut-off voter on the old side and counts it on the new side only once it
+/// has taken up the batch from a refusal.
+#[test]
+fn a_leader_lost_after_starting_a_batch_a_voter_missed_is_replaced() {
+    let (mut cluster, leader) = elected_with_joiners_away(3, 1);
+    let joiner = worker("worker-3");
+    let voters: Vec<WorkerId> = ids(0..3).into_iter().filter(|id| *id != leader).collect();
+    let (missed, other) = (voters[0].clone(), voters[1].clone());
+    cluster.network().set_delay(Duration::from_ticks(1));
+    // The leader admits no one before every voter has echoed the commit.
+    for _ in 0..3 * SUSPECT.as_ticks() {
+        cluster.advance(TICK);
+    }
+    let committed = configuration_of(&cluster, &missed).generation();
+
+    cluster.heal();
+    assert!(
+        run_until(&mut cluster, |cluster| configuration_of(cluster, &leader)
+            .is_joint()),
+        "a batch starts"
+    );
+    cluster.partition(BTreeSet::from([missed.clone()]), BTreeSet::from([leader.clone()]));
+    cluster.network().drop_in_flight_across_partition();
+    assert!(
+        run_until(&mut cluster, |cluster| {
+            [&other, &joiner]
+                .iter()
+                .all(|id| configuration_of(cluster, id).is_joint())
+        }),
+        "setup: the other voter and the joiner hold the batch"
+    );
+    assert_eq!(
+        configuration_of(&cluster, &missed).generation(),
+        committed,
+        "setup: the cut-off voter missed the batch start"
+    );
+
+    let rest: BTreeSet<WorkerId> = ids(0..4).into_iter().filter(|id| *id != leader).collect();
+    cluster.partition(BTreeSet::from([leader.clone()]), rest.clone());
+    cluster.network().drop_in_flight_across_partition();
+    let replaced = run_until(&mut cluster, |cluster| {
+        !leaders_among(cluster, &rest).is_empty()
+    });
+
+    assert!(replaced, "no new leader: {:?}", cluster.states());
+    assert_no_grant_overlap(&cluster);
+}
+
+/// `voters` voters elect a leader and commit what they founded, with `joiners`
+/// workers waiting to join, out of reach. `draining` of the voters drain,
+/// which moves the leader's configuration on, and the leader admits no one
+/// before every voter left has echoed it: the voter left in the leader's
+/// charge stalls while the joiners come within reach, so once it catches up
+/// the leader takes every joiner in one batch. The instant its configuration
+/// turns joint the joiners are cut off from the voters, every message on its
+/// way to them lost: no joiner is told of the batch by an ack. Then the
+/// leader's lease, which needs a majority of the batch's new side, runs out.
+/// Returns the cluster, once the joiners are back in reach, and the old
+/// leader.
+fn batch_the_joiners_never_hear_of_with_its_leader_lapsed(
+    voters: usize,
+    draining: usize,
+    joiners: usize,
+) -> (Cluster, WorkerId) {
+    let (mut cluster, leader) =
+        elected_with_joiners_away_suspecting_after(voters, joiners, Duration::from_ticks(40));
+    cluster.network().set_delay(TICK);
+    let followers: Vec<WorkerId> = ids(0..voters).into_iter().filter(|id| *id != leader).collect();
+    let (leaving, staying) = followers.split_at(draining);
+    for voter in staying {
+        cluster.stall(voter, Duration::from_ticks(15));
+    }
+    for voter in leaving {
+        cluster.drain(voter);
+    }
+    for _ in 0..3 {
+        cluster.advance(TICK);
+    }
+    cluster.heal();
+    assert!(
+        run_until(&mut cluster, |cluster| configuration_of(cluster, &leader)
+            .is_joint()),
+        "a batch starts"
+    );
+    let staying: BTreeSet<WorkerId> = staying.iter().cloned().chain([leader.clone()]).collect();
+    cluster.partition(staying.clone(), ids(voters..voters + joiners));
+    cluster.network().drop_in_flight_across_partition();
+    assert!(
+        run_until(&mut cluster, |cluster| staying
+            .iter()
+            .all(|id| configuration_of(cluster, id).is_joint())),
+        "setup: every voter left holds the batch"
+    );
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.states()[&leader]
+            != WorkerState::Leader),
+        "setup: the leader's lease runs out for want of the joiners"
+    );
+    cluster.heal();
+    (cluster, leader)
+}
+
+/// Two voters elect a leader, which starts a batch of two joiners. No joiner
+/// hears of it from an ack, and the leader loses its lease: its old side is
+/// both voters and its new side needs a majority of four, which the two
+/// voters are not. Every joiner must have learned its admission before the
+/// batch began, or the survivors can never count it.
+#[test]
+fn a_leader_lost_after_starting_a_batch_no_joiner_heard_of_is_replaced() {
+    let (mut cluster, _leader) = batch_the_joiners_never_hear_of_with_its_leader_lapsed(3, 1, 2);
+
+    let replaced = run_until(&mut cluster, |cluster| cluster.leader().is_some());
+
+    assert!(replaced, "no new leader: {:?}", cluster.states());
+    assert_no_grant_overlap(&cluster);
+}
+
+/// The same for a shard's first batch: its one voter leads, and its new side
+/// is itself and the joiner, so its lease needs the joiner too.
+#[test]
+fn a_sole_voter_lost_after_starting_the_first_batch_its_joiner_never_heard_of_is_replaced() {
+    let (mut cluster, _leader) = batch_the_joiners_never_hear_of_with_its_leader_lapsed(1, 0, 1);
+
+    let replaced = run_until(&mut cluster, |cluster| cluster.leader().is_some());
+
+    assert!(replaced, "no new leader: {:?}", cluster.states());
+    assert_no_grant_overlap(&cluster);
+}
+
+/// Three voters elect a leader and two joiners, X and Y, arrive. X is told
+/// it will be admitted, then cut off before the leader hears it agree, and
+/// the leader admits Y alone in a batch, which a split leaves uncommitted:
+/// the leader and Y on one side, the two other voters and X on the other.
+/// X's promise names no generation of that batch, so it is no voter of it,
+/// and the batch's new side (the three voters and Y, needing three of four)
+/// is out of the other side's reach: nobody there wins. Healed, the shard
+/// elects and admits X after all.
+#[test]
+fn a_joiner_told_of_an_admission_the_leader_never_heard_it_take_is_no_voter_of_a_later_batch() {
+    let (mut cluster, leader) = elected_with_joiners_away(3, 2);
+    let (x, y) = (worker("worker-3"), worker("worker-4"));
+    let others: BTreeSet<WorkerId> = ids(0..3).into_iter().filter(|id| *id != leader).collect();
+    cluster.network().set_delay(TICK);
+    cluster.heal();
+    assert!(
+        run_until(&mut cluster, |cluster| cluster
+            .node(&x)
+            .admission()
+            .is_some()),
+        "setup: X learns of its admission"
+    );
+    assert!(
+        !configuration_of(&cluster, &leader).is_joint(),
+        "setup: before any batch exists"
+    );
+    cluster.partition(
+        BTreeSet::from([x.clone()]),
+        ids(0..5).into_iter().filter(|id| *id != x).collect(),
+    );
+    cluster.network().drop_in_flight_across_partition();
+
+    assert!(
+        run_until(&mut cluster, |cluster| configuration_of(cluster, &leader)
+            .is_joint()),
+        "a batch of Y alone starts"
+    );
+    let batch = configuration_of(&cluster, &leader);
+    assert!(
+        run_until(&mut cluster, |cluster| others
+            .iter()
+            .all(|id| configuration_of(cluster, id) == batch)),
+        "setup: the other voters hold the batch"
+    );
+    assert!(cluster.node(&x).admission().is_some());
+    assert!(
+        !is_voter_of(&cluster, &x, &batch),
+        "X's admission names no generation of the batch"
+    );
+    let side_with_x: BTreeSet<WorkerId> = others.iter().cloned().chain([x.clone()]).collect();
+    cluster.partition(
+        side_with_x.clone(),
+        BTreeSet::from([leader.clone(), y.clone()]),
+    );
+    cluster.network().drop_in_flight_across_partition();
+    cluster.record_steps();
+    for _ in 0..PATIENCE_TICKS {
+        cluster.advance(TICK);
+    }
+    let steps = cluster.take_steps();
+    for id in &side_with_x {
+        assert!(
+            !ever_moved_to(&steps, id, WorkerState::Leader),
+            "{id:?} won counting X as a voter of a batch that left it out"
+        );
+    }
+
+    cluster.heal();
+    let everyone = ids(0..5);
+    let admitted_after_all = run_until(&mut cluster, |cluster| {
+        let leaders = leaders_among(cluster, &everyone);
+        leaders.len() == 1 && {
+            let configuration = configuration_of(cluster, leaders.first().unwrap());
+            !configuration.is_joint()
+                && everyone
+                    .iter()
+                    .all(|id| is_voter_of(cluster, id, &configuration))
+        }
+    });
+    assert!(admitted_after_all, "{:?}", cluster.states());
     assert_no_grant_overlap(&cluster);
 }

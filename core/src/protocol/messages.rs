@@ -255,7 +255,7 @@ macro_rules! configuration_accessors {
 configuration_accessors!(WorkerHeartbeatConfigurations for Checked<WorkerHeartbeat>, of WorkerHeartbeat {
     configuration: [],
     generation: [],
-    optional_generation: [configuration_generation, crawl_admission],
+    optional_generation: [configuration_generation, admission_generation],
 });
 configuration_accessors!(LeaderHeartbeatAckConfigurations for Checked<LeaderHeartbeatAck>, of LeaderHeartbeatAck {
     configuration: [configuration],
@@ -270,7 +270,7 @@ configuration_accessors!(RollCallConfigurations for Checked<RollCall>, of RollCa
 configuration_accessors!(RollCallReplyConfigurations for Checked<RollCallReply>, of RollCallReply {
     configuration: [],
     generation: [],
-    optional_generation: [admission, prior_admission],
+    optional_generation: [admission, prior_admission, configuration_generation],
 });
 configuration_accessors!(VoteRequestConfigurations for Checked<VoteRequest>, of VoteRequest {
     configuration: [],

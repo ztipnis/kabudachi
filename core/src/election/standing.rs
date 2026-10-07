@@ -202,6 +202,10 @@ pub(crate) struct AckChange {
     /// The configuration generation the standing holds differs from the one
     /// it held before the ack's configuration was offered.
     pub(crate) generation_changed: bool,
+    /// The admission generation the standing holds differs from the one it
+    /// held before the ack: it took up a promise, which its leader waits to
+    /// hear it hold.
+    pub(crate) admission_changed: bool,
 }
 
 impl ShardStanding {
@@ -259,6 +263,12 @@ impl ShardStanding {
         self.configuration.as_ref()
     }
 
+    /// The admission generation the node holds, a promise ahead of its
+    /// configuration included.
+    pub(crate) fn admission(&self) -> Option<Generation> {
+        self.admission
+    }
+
     /// Both admission generations a quorum counts this node by.
     pub(crate) fn counted_admission(&self) -> Admission {
         Admission {
@@ -308,10 +318,12 @@ impl ShardStanding {
         }
         self.saw_term(term);
         let held = self.configuration.as_ref().map(Configuration::generation);
+        let admitted = self.admission;
         self.adopt(offered, admission, prior);
         AckChange {
             epoch_moved,
             generation_changed: self.configuration.as_ref().map(Configuration::generation) != held,
+            admission_changed: self.admission != admitted,
         }
     }
 
@@ -332,19 +344,38 @@ impl ShardStanding {
     /// the joint configuration this node holds and this node is on that
     /// one's new side: it is admitted at the commit's generation, as the
     /// commit's own ack would have admitted it (see
-    /// [`Configuration::admission_after_commit`]). Returns whether it did.
-    pub(crate) fn adopt_relayed_commit(&mut self, offered: Configuration) -> bool {
-        let Some(admission) = self
-            .configuration
-            .as_ref()
-            .and_then(|own| own.admission_after_commit(&offered, self.admission))
-        else {
+    /// [`Configuration::admission_after_commit`]). Or when it is the batch
+    /// the leader of the single configuration this node holds started on it,
+    /// whose start this node missed: it is admitted at the batch's
+    /// generation, its old admission the prior (see
+    /// [`Configuration::admission_after_batch_start`]). Or when it is the
+    /// batch this node was promised admission in, the joint configuration at
+    /// exactly the promised generation: this node already holds that
+    /// admission (see [`Self::adopt`]), and takes up the configuration it
+    /// counts in, with no prior admission (see
+    /// [`Configuration::is_the_batch_promised`]). Returns whether it adopted.
+    pub(crate) fn adopt_relayed_configuration(&mut self, offered: Configuration) -> bool {
+        let Some(own) = self.configuration.as_ref() else {
             return false;
         };
-        self.configuration = Some(offered);
-        self.admission = Some(admission);
-        self.prior_admission = None;
-        true
+        if let Some(admission) = own.admission_after_commit(&offered, self.admission) {
+            self.configuration = Some(offered);
+            self.admission = Some(admission);
+            self.prior_admission = None;
+            return true;
+        }
+        if let Some(admission) = own.admission_after_batch_start(&offered, self.admission) {
+            self.configuration = Some(offered);
+            self.prior_admission = self.admission;
+            self.admission = Some(admission);
+            return true;
+        }
+        if own.is_the_batch_promised(&offered, self.admission) {
+            self.configuration = Some(offered);
+            self.prior_admission = None;
+            return true;
+        }
+        false
     }
 
     /// Takes on, as the leader `me`'s own, the configuration `roster` leads
@@ -391,6 +422,12 @@ impl ShardStanding {
     /// generations offered with an older configuration than its own are
     /// ignored: they belong to a configuration the node has moved past,
     /// where they would make it no voter of its own.
+    ///
+    /// An admission later than `offered`'s generation is a promise: the
+    /// leader will admit the node at that generation in a batch it has yet
+    /// to start. The node holds it, and so counts at that generation, only if
+    /// it raises the admission it holds and the node is no voter of the
+    /// configuration it ends up holding; its prior admission stays.
     fn adopt(
         &mut self,
         offered: Configuration,
@@ -404,9 +441,19 @@ impl ShardStanding {
         if !is_newer && self.configuration.as_ref() != Some(&offered) {
             return;
         }
-        if let Some(admission) = admission {
-            self.admission = Some(admission);
-            self.prior_admission = prior;
+        match admission {
+            Some(promised) if promised > offered.generation() => {
+                if self.admission.is_none_or(|held| held < promised)
+                    && !offered.is_voter(self.counted_admission())
+                {
+                    self.admission = Some(promised);
+                }
+            }
+            Some(admission) => {
+                self.admission = Some(admission);
+                self.prior_admission = prior;
+            }
+            None => {}
         }
         self.configuration = Some(offered);
     }

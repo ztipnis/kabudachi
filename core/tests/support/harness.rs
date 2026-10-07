@@ -209,6 +209,8 @@ pub struct Cluster {
     rejoin_reads: u64,
     /// The suspicion timeout every node was built with, reused by `restart_node`.
     suspect_timeout: Duration,
+    /// The reconnect timeout every node was built with, if not the default.
+    reconnect_timeout: Option<Duration>,
     /// The authority timings every node was built with, reused by
     /// `restart_node`; `None` for a cluster whose nodes have no authority.
     authority_timings: Option<AuthorityTimings>,
@@ -276,7 +278,20 @@ impl Cluster {
         pending: usize,
         suspect_timeout: Duration,
     ) -> Self {
-        Cluster::build(voters, pending, suspect_timeout, None)
+        Cluster::build(voters, pending, suspect_timeout, None, None)
+    }
+
+    /// `bootstrap_with_pending(voters, pending, ..)` with every node
+    /// reporting a worker lost after `reconnect_timeout` past its suspicion
+    /// timeout rather than the default 30 s, for a scenario about losses
+    /// that should not simulate that long.
+    pub fn bootstrap_with_reconnect_timeout(
+        voters: usize,
+        pending: usize,
+        suspect_timeout: Duration,
+        reconnect_timeout: Duration,
+    ) -> Self {
+        Cluster::build(voters, pending, suspect_timeout, None, Some(reconnect_timeout))
     }
 
     /// `bootstrap_with_pending(voters, pending, ..)`, with every node
@@ -306,6 +321,7 @@ impl Cluster {
             pending,
             suspect_timeout,
             Some(AuthorityTimings { ttl }),
+            None,
         )
     }
 
@@ -314,6 +330,7 @@ impl Cluster {
         pending: usize,
         suspect_timeout: Duration,
         authority_timings: Option<AuthorityTimings>,
+        reconnect_timeout: Option<Duration>,
     ) -> Self {
         let clock = Rc::new(FakeClock::new());
         let network = FakeNetwork::new(Rc::clone(&clock));
@@ -347,6 +364,7 @@ impl Cluster {
             restarts: 0,
             rejoin_reads: 0,
             suspect_timeout,
+            reconnect_timeout,
             authority_timings,
             schedulers: BTreeMap::new(),
             spies: BTreeMap::new(),
@@ -397,7 +415,10 @@ impl Cluster {
                 id: id.clone(),
                 incarnation: incarnation_id,
                 shard: self.shard_id.clone(),
-                timings: timings(self.suspect_timeout),
+                timings: match self.reconnect_timeout {
+                    Some(reconnect) => timings(self.suspect_timeout).with_reconnect_timeout(reconnect),
+                    None => timings(self.suspect_timeout),
+                },
             },
             Entry::Known(known_configuration),
             (*self.clock).clone(),

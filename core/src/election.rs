@@ -589,8 +589,11 @@ pub enum Output {
     Authority(AuthorityCall),
     /// While the node holds office: the worker has not been heard from for
     /// a suspicion timeout and then a reconnect timeout, so every TaskRun it
-    /// holds is lost and may be replayed (see [`carry_out`]). Reported once;
-    /// a worker heard from again is watched afresh.
+    /// holds is lost and may be replayed (see [`carry_out`]). A counted
+    /// member whose heartbeats keep arriving but which confirms none of the
+    /// leader's acks for that long is lost too, and the leader also removes
+    /// it from its configuration, one at a time; a silent worker is only
+    /// reported. Reported once; a worker heard from again is watched afresh.
     WorkerLost(WorkerId),
     /// While in office: a heartbeat from `worker` said the runs it holds have
     /// this digest, empty if it sent none. For the driver to compare with
@@ -1079,8 +1082,10 @@ where
         self.admission().is_some() && self.crawled_at_admission == self.admission()
     }
 
-    /// The generation at which this node became a voter; `None` for a
-    /// pending member.
+    /// The generation at which this node was admitted or promised admission
+    /// as a voter; `None` for a pending member. A promise outruns the
+    /// configuration that will count it, so this alone does not make the
+    /// node a voter of the configuration it holds.
     pub fn admission(&self) -> Option<Generation> {
         self.counted_admission().current
     }
@@ -1094,7 +1099,7 @@ where
 
     /// Whether this node has no admission generation: it joined through a
     /// JOIN and neither a leader's ack nor an election certificate has
-    /// admitted it since. It claims work, and it answers roll calls and
+    /// admitted or promised it admission since. It claims work, and it answers roll calls and
     /// grants votes as a new voter, but no quorum counts it.
     pub fn is_pending_member(&self) -> bool {
         self.counted_admission().current.is_none()
@@ -1300,7 +1305,13 @@ where
                     }),
                     self.office
                         .as_ref()
-                        .and_then(|office| office.next_lost_at(self.lost_after())),
+                        .and_then(|office| {
+                            office.next_lost_at(
+                                self.clock.now(),
+                                self.lost_after(),
+                                self.timings.suspect_timeout,
+                            )
+                        }),
                 ),
                 self.drain_wait_until,
             ),
@@ -1484,9 +1495,11 @@ where
             term: ack.term,
             send_token: ack.send_token,
         });
-        if change.generation_changed {
+        if change.generation_changed || change.admission_changed {
             // Heartbeat at once: the echo of the new generation is what
-            // commits it (see `Roster::commit_if_confirmed`).
+            // commits it (see `Roster::commit_if_confirmed`), and the
+            // admission held is what confirms a promise (see
+            // `Roster::promise_admission`).
             self.next_heartbeat = None;
         }
 
@@ -1555,10 +1568,7 @@ where
                 .map(|configuration| configuration.generation().into()),
             send_token: now.as_ticks(),
             routing_crawled: self.routing_crawled(),
-            crawl_admission: self
-                .routing_crawled()
-                .then(|| self.admission().map(Into::into))
-                .flatten(),
+            admission_generation: self.standing.admission().map(Into::into),
         };
         self.send(
             leader.clone(),
@@ -1653,9 +1663,10 @@ where
     /// earlier epoch adopts this leader's from the ack, but what it echoes
     /// confirms nothing here. Any heartbeat also tells the leader its sender
     /// is alive (see [`Self::report_lost_workers`]). A sender its roster does not hold is
-    /// added as a pending joiner, so its acks name it pending, until a batch
-    /// admits it (see [`LeaderOffice::take_heartbeat`]), which the ack
-    /// answering this heartbeat already carries. Every sender gets an ack,
+    /// added as a pending joiner, so its acks name it pending, until the
+    /// leader promises it admission and then a batch admits it (see
+    /// [`LeaderOffice::take_heartbeat`]); the ack answering this heartbeat
+    /// already carries either. Every sender gets an ack,
     /// though only members' confirmations count towards the lease, except
     /// one whose heartbeat names a later term of this leader's epoch: this
     /// leader steps down instead, and neither acks
@@ -1703,6 +1714,7 @@ where
             self.lease
                 .confirm(from.clone(), Instant::at(echo.send_token));
             heard = Heard::Confirmed {
+                sent_at: Instant::at(echo.send_token),
                 held: heartbeat.configuration_generation(),
             };
         }
@@ -1713,11 +1725,13 @@ where
                 timings: &self.timings,
                 now,
             };
-            let crawl_admission = heartbeat
-                .routing_crawled
-                .then(|| heartbeat.crawl_admission())
-                .flatten();
-            office.take_heartbeat(from.clone(), heard, crawl_admission, &duties);
+            office.take_heartbeat(
+                from.clone(),
+                heard,
+                heartbeat.routing_crawled,
+                heartbeat.admission_generation(),
+                &duties,
+            );
         }
         self.drain_once_free();
         if !self.holds_office() {
@@ -2459,9 +2473,11 @@ where
     /// heartbeats until that leader's ack returns it to `Active` (or, if
     /// that leader's term is below its own term seen, until the heartbeat
     /// makes that leader step down). A refusal carrying the commit of the
-    /// joint configuration this node holds hands it that commit (see
-    /// [`Self::adopt_relayed_commit`]). A term later than the one it holds
-    /// or contests makes it step down (see [`Self::step_down_if_outpaced`]).
+    /// joint configuration this node holds, or a batch started on its single
+    /// one, hands it that configuration (see
+    /// [`Self::adopt_relayed_configuration`]). A term later than the one it
+    /// holds or contests makes it step down (see
+    /// [`Self::step_down_if_outpaced`]).
     /// A refusal from a newer epoch raises nothing (the two epochs' terms do
     /// not compare) but, while `RollCall`, makes the leader it names this
     /// node's, whose ack then moves it to that epoch. A refusal from an older
@@ -2509,23 +2525,24 @@ where
             self.leader = Some((leader, term));
         }
         if let Some(offered) = offered {
-            self.adopt_relayed_commit(offered);
+            self.adopt_relayed_configuration(offered);
         }
         self.step_down_if_outpaced();
     }
 
     /// Adopts `offered`, a refuser's configuration, when it is the commit of
-    /// the joint configuration this node holds and this node is on that
-    /// one's new side: the commit's ack never reached it, say because its
-    /// leader stopped just after committing. It is admitted at the commit's
-    /// generation, as that ack would have admitted it (see
-    /// [`Configuration::admission_after_commit`]). Without this, a survivor
-    /// holding the commit and one holding the joint configuration refuse
-    /// each other's roll calls term after term. Only a node that takes part in elections without
-    /// standing or leading adopts it.
-    fn adopt_relayed_commit(&mut self, offered: Configuration) {
+    /// the joint configuration this node holds, or the batch its leader
+    /// started on the single one it holds, and this node is a voter there, or
+    /// the batch it was promised admission in, which it is no voter of in what
+    /// it holds, only in the batch itself: the ack that carried it never reached this node, say because its
+    /// leader stopped soon after (see
+    /// [`ShardStanding::adopt_relayed_configuration`]). Without this, a
+    /// survivor holding the older configuration and one holding the newer
+    /// refuse each other's roll calls term after term. Only a node that takes
+    /// part in elections without standing or leading adopts it.
+    fn adopt_relayed_configuration(&mut self, offered: Configuration) {
         if self.takes_part_in_elections() {
-            self.standing.adopt_relayed_commit(offered);
+            self.standing.adopt_relayed_configuration(offered);
         }
     }
 
@@ -2778,10 +2795,15 @@ where
     fn report_lost_workers(&mut self) {
         let now = self.clock.now();
         let lost_after = self.lost_after();
+        let suspect_timeout = self.timings.suspect_timeout;
         let Some(office) = self.office.as_mut() else {
             return;
         };
-        for worker in office.lost_by(now, lost_after) {
+        for worker in office.lost_by(
+            now,
+            lost_after,
+            suspect_timeout,
+        ) {
             if self.state == WorkerState::LeaderReconciling {
                 self.lost_while_reconciling.insert(worker.clone());
             }

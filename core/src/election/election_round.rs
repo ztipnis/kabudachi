@@ -455,6 +455,9 @@ impl ElectionRound {
                     responder_address: String::new(),
                     admission: view.admission.current.map(Into::into),
                     prior_admission: view.admission.prior.map(Into::into),
+                    configuration_generation: view
+                        .configuration
+                        .map(|configuration| configuration.generation().into()),
                 };
                 vec![Verdict::Answer { initiator, reply }]
             }
@@ -494,13 +497,13 @@ impl ElectionRound {
         let admission = answered_admission(reply);
         if let Some(round) = self.roll_call.as_mut() {
             if round.term() == reply.term {
-                round.record(responder, admission);
+                round.record(responder, admission, reply.configuration_generation());
             }
             return Vec::new();
         }
         if let Some(vote) = self.vote.as_mut()
             && vote.term() == reply.term
-            && vote.record_respondent(responder.clone(), admission)
+            && vote.record_respondent(responder.clone(), admission, reply.configuration_generation())
         {
             return vec![Verdict::AskVotes {
                 voters: vec![responder],
@@ -708,12 +711,13 @@ impl ElectionRound {
             return Vec::new();
         };
         let census = vote.census();
-        let roster = Roster::after_election(
+        let mut roster = Roster::after_election(
             view.recovery_epoch,
             vote.term(),
             census.configuration(),
             census.respondents(),
         );
+        roster.seed_held_generations(census.held_generations());
         let mut verdicts: Vec<Verdict> = census
             .respondents()
             .keys()

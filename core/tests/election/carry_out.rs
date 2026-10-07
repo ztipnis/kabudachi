@@ -82,7 +82,7 @@ fn grant_is_applied_before_any_message_leaves() {
     for peer in &peers {
         let mut beat = heartbeat(peer, None);
         beat.routing_crawled = true;
-        beat.crawl_admission = node
+        beat.admission_generation = node
             .configuration()
             .map(|configuration| configuration.generation().into());
         let _ = deliver(&mut node, peer, heartbeat_message(beat));

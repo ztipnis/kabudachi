@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::configuration::{Admission, Configuration, Tally};
+use crate::configuration::{Admission, Configuration, Generation, Tally};
 use crate::protocol::checked::Checked;
 use crate::protocol::ids::{ShardId, WorkerId};
 use crate::protocol::messages::RollCall;
@@ -54,6 +54,9 @@ pub(crate) struct RollCallRound {
     configuration: Configuration,
     rank: CallRank,
     respondents: BTreeMap<WorkerId, Admission>,
+    /// The configuration generation each respondent said it holds, if it
+    /// said.
+    held: BTreeMap<WorkerId, Generation>,
     abandoned: bool,
     deadline: Instant,
 }
@@ -75,6 +78,7 @@ impl RollCallRound {
             term,
             configuration,
             respondents: BTreeMap::from([(initiator.clone(), admission)]),
+            held: BTreeMap::new(),
             rank: CallRank {
                 timestamp_millis,
                 initiator,
@@ -117,12 +121,25 @@ impl RollCallRound {
     /// whether it is a new respondent: a worker that answers twice counts
     /// once, with the admission it first gave, and an abandoned call records
     /// no one.
-    pub(crate) fn record(&mut self, respondent: WorkerId, admission: Admission) -> bool {
+    pub(crate) fn record(
+        &mut self,
+        respondent: WorkerId,
+        admission: Admission,
+        held: Option<Generation>,
+    ) -> bool {
         if self.abandoned || self.respondents.contains_key(&respondent) {
             return false;
         }
+        if let Some(held) = held {
+            self.held.insert(respondent.clone(), held);
+        }
         self.respondents.insert(respondent, admission);
         true
+    }
+
+    /// The configuration generation each respondent that said so holds.
+    pub(crate) fn held_generations(&self) -> &BTreeMap<WorkerId, Generation> {
+        &self.held
     }
 
     /// Gives this call up for a better one for the same term: it collects no

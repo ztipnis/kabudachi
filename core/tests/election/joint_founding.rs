@@ -10,26 +10,27 @@ use crate::support::builders::checked;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use std::collections::{BTreeMap, VecDeque};
 
-use kabudachi_core::configuration::{Configuration, Generation, Joint};
+use kabudachi_core::configuration::{Configuration, Generation, Joint, Single};
 use kabudachi_core::election::{Entry, Identity, Input, KnownConfiguration, Output, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::protocol::messages::ElectionRejectReason;
 use kabudachi_core::protocol::messages::{
-    AckEcho, ElectionMessage, LeaderHeartbeatAck, RollCall, election_message,
+    AckEcho, ElectionMessage, LeaderHeartbeatAck, RollCall, WorkerHeartbeat, election_message,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
 use kabudachi_core::time::{Clock, Duration, Instant};
 use crate::support::builders::{
     ack_message, committed_from_g0, configuration_of, founded_from_g0, g0, heartbeat,
-    heartbeat_message, leader_ack, past_any_suspicion, roll_call, roll_call_message,
+    election_reject, heartbeat_message, leader_ack, past_any_suspicion, roll_call, roll_call_message,
     roll_call_reply, shard, timings, vote_grant, vote_grant_message, vote_request,
     vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
     TestNode, close_roll_call, connect, deliver, finish_reconciling, grants, published_roll_calls, sent, sent_to,
-    start_roll_call, state_changes, tick, voter_node,
+    start_roll_call, state_changes, tick, voter_node, voter_node_reconnecting,
 };
 
 /// Every node here suspects its leader after this many ticks.
@@ -456,15 +457,30 @@ fn call_with_replies(
     initiator: &mut TestNode,
     replies: &[(&WorkerId, Option<Generation>, Option<Generation>)],
 ) -> u64 {
+    let replies: Vec<_> = replies
+        .iter()
+        .map(|(responder, admission, prior)| (*responder, *admission, *prior, None))
+        .collect();
+    call_with_replies_holding(clock, initiator, &replies)
+}
+
+/// `call_with_replies`, each reply also saying which configuration
+/// generation its responder holds.
+fn call_with_replies_holding(
+    clock: &FakeClock,
+    initiator: &mut TestNode,
+    replies: &[(&WorkerId, Option<Generation>, Option<Generation>, Option<Generation>)],
+) -> u64 {
     clock.advance(past_any_suspicion(SUSPECT));
     // Active to LeaderSuspect; the next tick starts the call.
     let _ = initiator.step(Input::Tick);
     let call = published_roll_calls(&initiator.step(Input::Tick).outputs).remove(0);
     let me = call.initiator_id();
-    for (responder, admission, prior) in replies {
+    for (responder, admission, prior, held) in replies {
         let mut reply = roll_call_reply(&me, call.term, responder, *admission);
         if let Some(election_message::Payload::RollCallReply(inner)) = &mut reply.payload {
             inner.prior_admission = prior.map(Into::into);
+            inner.configuration_generation = held.map(Into::into);
         }
         deliver(initiator, responder, reply);
     }
@@ -581,6 +597,14 @@ fn heartbeat_holding(
         inner.configuration_generation = Some(held.into());
     }
     message
+}
+
+/// `heartbeat`, as sent by a worker that holds the admission `admission`.
+fn holding_admission(mut heartbeat: ElectionMessage, admission: Generation) -> ElectionMessage {
+    if let Some(election_message::Payload::Heartbeat(inner)) = &mut heartbeat.payload {
+        inner.admission_generation = Some(admission.into());
+    }
+    heartbeat
 }
 
 /// The configuration of the one ack among `outputs`, to `to`.
@@ -745,11 +769,41 @@ fn a_re_stamped_founding_commits_only_on_echoes_of_its_re_stamped_generation() {
             heartbeat_holding(&clock, member, 2, restamped),
         );
     }
-    // The commit (b and d, at (0, 2, 3)) is followed in the same step by
-    // the batch that admits c, a respondent the re-stamp left at its old
-    // admission, which confirmed this leader's ack.
     let committed = restamped.next_change(2);
+    assert_eq!(
+        leader.configuration(),
+        Some(&Configuration::single(Single {
+            generation: committed,
+            base: committed,
+            voter_count: 2,
+        }).expect("valid")),
+        "the commit (b and d) admits no one before d holds it"
+    );
+
+    // Then c, a respondent the re-stamp left at its old admission, which
+    // confirmed this leader's ack, is promised admission, and admitted in a
+    // batch once it holds the promise.
+    deliver(
+        &mut leader,
+        &fellow,
+        heartbeat_holding(&clock, &fellow, 2, committed),
+    );
     let batch = committed.next_change(2);
+    let promised = deliver(
+        &mut leader,
+        &left_out,
+        heartbeat_holding(&clock, &left_out, 2, committed),
+    );
+    assert_eq!(acked(&promised, &left_out).recipient_admission(), Some(batch));
+    assert!(
+        leader.configuration().is_some_and(|configuration| !configuration.is_joint()),
+        "a promise starts no batch"
+    );
+    deliver(
+        &mut leader,
+        &left_out,
+        holding_admission(heartbeat_holding(&clock, &left_out, 2, committed), batch),
+    );
     assert_eq!(
         leader.configuration(),
         Some(&Configuration::joint(Joint {
@@ -1006,4 +1060,306 @@ fn survivors_split_by_a_commit_one_missed_elect_a_leader() {
             .is_some_and(|held| held.generation() > committed.generation()),
         "the leader leads on a configuration built on the commit, not on the joint one"
     );
+}
+
+/// A joint configuration moving from the commit of the term-1 founding to
+/// two voters, minted at `term` at the commit's next generation, which
+/// claims `old_voter_count` voters on the old side.
+fn batch_started_on_the_commit(term: u64, old_voter_count: usize) -> Configuration {
+    let committed = committed_from_g0(1, 1, 3).generation();
+    batch_started_on_the_commit_at(committed.next_change(term), old_voter_count)
+}
+
+/// `batch_started_on_the_commit`, minted at `batch`.
+fn batch_started_on_the_commit_at(batch: Generation, old_voter_count: usize) -> Configuration {
+    let committed = committed_from_g0(1, 1, 3).generation();
+    Configuration::joint(Joint {
+        generation: batch,
+        base: batch,
+        batch_generation: batch,
+        old_base: committed,
+        old_generation: committed,
+        old_voter_count,
+        new_voter_count: 2,
+    })
+    .expect("valid")
+}
+
+/// Runs, for a while, p1 holding `batch` from the ack of the leader `w0`
+/// that started it (admitted at it, and at the commit before) and p2 holding
+/// the commit it never heard the batch start of. Returns whether either
+/// became leader, and p2's admission.
+fn survivors_of_a_batch_start_one_missed(batch: Configuration) -> (bool, Option<Generation>) {
+    let clock = FakeClock::new();
+    let committed = committed_from_g0(1, 1, 3);
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let mut p1_node = node_holding(&clock, &p1, committed.clone(), Some(committed.generation()));
+    let w0 = worker("w0");
+    let mut ack = leader_ack(&w0, batch.generation().term(), &batch, Some(batch.generation()));
+    ack.recipient_prior_admission = Some(committed.generation().into());
+    deliver(&mut p1_node, &w0, ack_message(ack));
+    assert_eq!(p1_node.prior_admission(), Some(committed.generation()), "setup");
+    let mut shard = Shard::of(
+        &clock,
+        vec![
+            (p1.clone(), p1_node),
+            (
+                p2.clone(),
+                node_holding(&clock, &p2, committed.clone(), Some(committed.generation())),
+            ),
+        ],
+    );
+    let elected = shard.run(
+        |id| *id != w0,
+        SUSPECT * 20,
+        |shard| {
+            shard
+                .nodes
+                .values()
+                .any(|node| node.state() == WorkerState::Leader)
+        },
+    );
+    (elected, shard.nodes[&p2].admission())
+}
+
+/// The leader of the commit starts a batch and stops. The batch's start
+/// reaches p1 but not p2, which echoed the commit: p1 refuses p2's calls as
+/// stale and p2 refuses p1's as not the best. p1's refusal carries the batch,
+/// which p2 takes up, so the two elect a leader.
+#[test]
+fn survivors_split_by_a_batch_start_one_missed_elect_a_leader() {
+    let batch = batch_started_on_the_commit(1, 3);
+
+    let (elected, p2_admission) = survivors_of_a_batch_start_one_missed(batch.clone());
+
+    assert!(elected, "no leader");
+    assert_eq!(p2_admission, Some(batch.generation()));
+}
+
+/// A joint configuration of the same shape founded by a later term's
+/// election is no batch of the commit's leader: its voters may have left p2
+/// out, so p2 stays out of it, and neither elects.
+#[test]
+fn a_founding_of_a_later_term_on_the_commit_is_not_taken_up_as_a_batch_start() {
+    let (elected, p2_admission) =
+        survivors_of_a_batch_start_one_missed(batch_started_on_the_commit(2, 3));
+
+    assert!(!elected, "a leader");
+    assert_eq!(p2_admission, Some(committed_from_g0(1, 1, 3).generation()));
+}
+
+/// A joint configuration of the right shape that claims a different voter
+/// count for the commit it moves from is not that commit's batch: p2 does
+/// not take it up, and neither elects.
+#[test]
+fn a_batch_claiming_another_old_voter_count_is_not_taken_up_as_a_batch_start() {
+    let (elected, p2_admission) =
+        survivors_of_a_batch_start_one_missed(batch_started_on_the_commit(1, 2));
+
+    assert!(!elected, "a leader");
+    assert_eq!(p2_admission, Some(committed_from_g0(1, 1, 3).generation()));
+}
+
+/// A leader promises the joiners of its batch their admission before it
+/// starts it, and its own changes skip the promised generation, so the batch
+/// sits on the commit at a later generation than the next. A voter that
+/// missed its start still takes it up from a refusal.
+#[test]
+fn survivors_split_by_a_batch_start_at_a_promised_generation_elect_a_leader() {
+    let committed = committed_from_g0(1, 1, 3).generation();
+    let promised = committed.next_change(1).next_change(1);
+    let batch = batch_started_on_the_commit_at(promised, 3);
+
+    let (elected, p2_admission) = survivors_of_a_batch_start_one_missed(batch);
+
+    assert!(elected, "no leader");
+    assert_eq!(p2_admission, Some(promised));
+}
+
+/// The heartbeats a node sent to `leader` among `outputs`.
+fn heartbeats_sent_to(outputs: &[Output], leader: &WorkerId) -> Vec<Checked<WorkerHeartbeat>> {
+    sent_to(outputs, leader)
+        .into_iter()
+        .filter_map(|message| match checked(message).into_payload() {
+            Some(CheckedPayload::Heartbeat(beat)) => Some(beat),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A joiner told it will be admitted at a generation beyond its leader's
+/// configuration holds that admission and tells its leader at once, which is
+/// how the leader learns it may start the batch. It keeps the latest
+/// promise, whatever order its acks arrive in, and a voter takes none.
+#[test]
+fn a_joiner_holds_the_latest_admission_promised_it_and_a_voter_takes_none() {
+    let clock = FakeClock::new();
+    let committed = committed_from_g0(1, 1, 3);
+    let w0 = worker("w0");
+    let (joiner, voter) = (worker("joiner"), worker("voter"));
+    let mut joiner_node = node_holding(&clock, &joiner, committed.clone(), None);
+    let mut voter_node = node_holding(&clock, &voter, committed.clone(), Some(committed.generation()));
+    let first = committed.generation().next_change(1);
+    let second = first.next_change(1);
+    let promise = |to: Generation| ack_message(leader_ack(&w0, 1, &committed, Some(to)));
+
+    // A plain ack sends the joiner's first heartbeat; the promise then moves
+    // the next one forward rather than waiting out the interval.
+    let plain = deliver(
+        &mut joiner_node,
+        &w0,
+        ack_message(leader_ack(&w0, 1, &committed, None)),
+    );
+    assert_eq!(heartbeats_sent_to(&plain, &w0).len(), 1, "setup: its first heartbeat");
+
+    let outputs = deliver(&mut joiner_node, &w0, promise(second));
+    assert_eq!(joiner_node.admission(), Some(second));
+    assert!(!committed.is_voter(joiner_node.admission()), "a promise is no admission yet");
+    let beats = heartbeats_sent_to(&outputs, &w0);
+    assert_eq!(beats.len(), 1, "a heartbeat in the same step");
+    assert_eq!(beats[0].admission_generation(), Some(second));
+
+    deliver(&mut joiner_node, &w0, promise(first));
+    assert_eq!(joiner_node.admission(), Some(second), "an older promise arriving late");
+
+    deliver(&mut voter_node, &w0, promise(second));
+    assert_eq!(voter_node.admission(), Some(committed.generation()));
+}
+
+/// A joiner promised admission at a batch's generation that never heard the
+/// batch start holds that admission already, which the batch's new side
+/// counts. Its roll call under the commit is refused by those holding the
+/// batch, and the refusal hands it the batch: it takes it up as it is, and
+/// can answer a call of the survivors that elect. A refusal carrying the
+/// joint configuration of any other generation hands it nothing.
+#[test]
+fn a_joiner_promised_a_batch_it_never_heard_start_takes_it_up_from_a_refusal() {
+    let clock = FakeClock::new();
+    let committed = committed_from_g0(1, 1, 3);
+    let promised = committed.generation().next_change(1).next_change(1);
+    let (w0, joiner, p1) = (worker("w0"), worker("joiner"), worker("p1"));
+    let mut node = node_holding(&clock, &joiner, committed.clone(), None);
+    deliver(
+        &mut node,
+        &w0,
+        ack_message(leader_ack(&w0, 1, &committed, Some(promised))),
+    );
+    assert_eq!(node.admission(), Some(promised), "setup: promised");
+    let call = &published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT))[0];
+    let refusal = |batch: &Configuration| {
+        let mut refusal = election_reject(
+            &joiner,
+            call.term,
+            &p1,
+            ElectionRejectReason::StaleGeneration,
+            1,
+            None,
+        );
+        if let Some(election_message::Payload::ElectionReject(inner)) = &mut refusal.payload {
+            inner.configuration = Some(batch.into());
+        }
+        refusal
+    };
+
+    let another = batch_started_on_the_commit_at(promised.next_change(1), 3);
+    deliver(&mut node, &p1, refusal(&another));
+    assert_eq!(node.configuration(), Some(&committed), "not the promised batch");
+
+    let batch = batch_started_on_the_commit_at(promised, 3);
+    deliver(&mut node, &p1, refusal(&batch));
+    assert_eq!(node.configuration(), Some(&batch));
+    assert_eq!(node.admission(), Some(promised));
+    assert_eq!(node.prior_admission(), None);
+    assert!(batch.is_voter(node.admission()), "the batch counts it");
+}
+
+/// `b` of five voters, admitted to a founding J1 by a lost leader, wins term 2
+/// under J1, a joint configuration, with `c` and `d`; `e` answered its call,
+/// saying it holds `e_reports`, but is muted before it echoes anything in the
+/// new office. The re-stamped founding commits on `c` and `d`. Returns the
+/// committed configuration and the one the leader leads after a loss timeout.
+fn joint_election_then_e_goes_quiet(e_reports: Option<Generation>) -> (Configuration, Configuration) {
+    let clock = FakeClock::new();
+    let reconnect = 100;
+    let (j1, admitted) = (founded_from_g0(1, 5, 5), founded_from_g0(1, 5, 5).generation());
+    let me = worker("b");
+    let mut node = voter_node_reconnecting(&clock, &me, 5, SUSPECT, Some(reconnect));
+    let old_leader = worker("a");
+    let mut admitting = leader_ack(&old_leader, 1, &j1, Some(admitted));
+    admitting.recipient_prior_admission = Some(g0().into());
+    deliver(&mut node, &old_leader, ack_message(admitting));
+    let (c, d, e) = (worker("c"), worker("d"), worker("e"));
+    connect(&mut node, &[c.clone(), d.clone(), e.clone()]);
+    let term = call_with_replies_holding(
+        &clock,
+        &mut node,
+        &[
+            (&c, Some(admitted), Some(g0()), Some(admitted)),
+            (&d, Some(admitted), Some(g0()), Some(admitted)),
+            (&e, Some(admitted), Some(g0()), e_reports),
+        ],
+    );
+    close_roll_call(&mut node, &clock, SUSPECT);
+    for voter in [&c, &d] {
+        deliver(
+            &mut node,
+            voter,
+            vote_grant_message(vote_grant(me.clone(), voter.clone(), term)),
+        );
+    }
+    finish_reconciling(&mut node);
+    assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+    let restamped = node.configuration().expect("a configuration").generation();
+    for voter in [&c, &d] {
+        deliver(&mut node, voter, heartbeat_holding(&clock, voter, 2, restamped));
+    }
+    let committed = node.configuration().expect("a configuration").clone();
+    assert!(!committed.is_joint(), "setup invariant: the founding commits on c and d");
+
+    let heartbeat_interval = timings(Duration::from_ticks(SUSPECT)).heartbeat_interval.as_ticks();
+    for _ in 0..(SUSPECT + reconnect + 100) / heartbeat_interval {
+        clock.advance(Duration::from_ticks(heartbeat_interval));
+        let held = node.configuration().expect("a configuration").generation();
+        for voter in [&c, &d] {
+            deliver(&mut node, voter, heartbeat_holding(&clock, voter, 2, held));
+        }
+        deliver(&mut node, &e, heartbeat_message(heartbeat(&e, None)));
+        let _ = node.step(Input::Tick);
+    }
+    (committed, node.configuration().expect("a configuration").clone())
+}
+
+/// A voter muted after an election under a joint configuration is removed once
+/// the change commits: its answer to the roll call said it holds J1, which
+/// anchors the removal, and every voter of J1 the leader knows holds the
+/// commit.
+#[test]
+fn a_voter_muted_after_an_election_under_a_joint_configuration_is_removed_once_it_commits() {
+    let j1 = founded_from_g0(1, 5, 5).generation();
+
+    let (committed, after) = joint_election_then_e_goes_quiet(Some(j1));
+
+    assert_eq!(
+        after.voter_count(),
+        Some(committed.voter_count().expect("single") - 1),
+        "e is removed"
+    );
+}
+
+/// A respondent that omits the generation it holds, or reports one older than
+/// the election's call, is anchored to no configuration the leader knows the
+/// voters of, so it is not removed however long it confirms no ack: seeding it
+/// with the call's generation would claim a majority covers a configuration it
+/// may still hold.
+#[test]
+fn a_voter_muted_after_an_election_that_does_not_say_what_it_holds_is_not_removed() {
+    for reported in [None, Some(g0())] {
+        let (committed, after) = joint_election_then_e_goes_quiet(reported);
+
+        assert_eq!(
+            after.voter_count(),
+            committed.voter_count(),
+            "e reporting {reported:?} stays counted"
+        );
+    }
 }

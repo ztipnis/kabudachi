@@ -63,6 +63,10 @@ pub fn with_in_memory_authority(
 pub struct Seen {
     pub state: WorkerState,
     pub pending: bool,
+    /// Whether the configuration the node holds counts it as a voter. A
+    /// promise of admission already clears `pending`, before any
+    /// configuration counts the joiner.
+    pub voter: bool,
     pub leader: Option<WorkerId>,
 }
 
@@ -71,6 +75,9 @@ impl Seen {
         Seen {
             state: node.state(),
             pending: node.is_pending_member(),
+            voter: node
+                .configuration()
+                .is_some_and(|configuration| configuration.is_voter(node.admission())),
             leader: node.known_leader().map(|(leader, _)| leader),
         }
     }

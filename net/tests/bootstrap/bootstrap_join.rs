@@ -142,7 +142,7 @@ async fn three_workers_that_join_through_one_seed_register_and_are_admitted() {
             }
         }
         for worker in &mut workers[1..] {
-            worker.wait_until(|seen| !seen.pending).await;
+            worker.wait_until(|seen| seen.voter).await;
         }
 
         // A drained voter leaves through its own driver and node: the request

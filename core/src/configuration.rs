@@ -428,6 +428,71 @@ impl Configuration {
         .then_some(next)
     }
 
+    /// The admission generation that a worker admitted at `admission` in this
+    /// single configuration takes up in `batch`, when `batch` is the joint
+    /// configuration its own leader started directly on it: at a later
+    /// generation of the same recovery epoch and term (the leader promised
+    /// the joiners that generation, which its own changes then skip past),
+    /// based and batched there, moving from this configuration's voters (its
+    /// old side has as many). `batch`'s own start
+    /// admits the voters here that echoed this configuration at its generation
+    /// (see [`Self::admission_after_commit`]), so a voter that missed the
+    /// start is admitted there. `None` otherwise: this configuration is
+    /// joint, `batch` is not such a batch, or the worker is not a voter here.
+    ///
+    /// Only the same term qualifies. An election's founding is shaped like
+    /// a batch but in a later term, and its respondents are not every voter
+    /// of the configuration it moves from, so a voter it left out must not
+    /// count as admitted there.
+    pub(crate) fn admission_after_batch_start(
+        &self,
+        batch: &Configuration,
+        admission: Option<Generation>,
+    ) -> Option<Generation> {
+        let Electorate::Joint {
+            batch_generation,
+            old_base,
+            old_generation,
+            old_voter_count,
+            ..
+        } = batch.electorate
+        else {
+            return None;
+        };
+        let Electorate::Single { voter_count } = self.electorate else {
+            return None;
+        };
+        (old_voter_count == voter_count
+            && old_base == self.base
+            && old_generation == self.generation
+            && batch.generation > self.generation
+            && batch.generation.recovery_epoch == self.generation.recovery_epoch
+            && batch.generation.term == self.generation.term
+            && batch.base == batch.generation
+            && batch_generation == batch.generation
+            && self.voters().counts(admission.into()))
+        .then_some(batch.generation)
+    }
+
+    /// Whether a worker holding this configuration, and the promise of
+    /// admission at `promised` (a generation later than this one that it
+    /// does not count in), holds the configuration `batch` the promise is
+    /// for: a joint configuration at exactly `promised`, the only one that
+    /// admits the workers promised it. The worker is then admitted there, as
+    /// its promise says. (A promise lies beyond this configuration's range,
+    /// so the worker is no voter of it.)
+    pub(crate) fn is_the_batch_promised(
+        &self,
+        batch: &Configuration,
+        promised: Option<Generation>,
+    ) -> bool {
+        promised.is_some_and(|promised| {
+            batch.is_joint()
+                && batch.generation == promised
+                && promised > self.generation
+        })
+    }
+
     /// The voters of a single configuration, or of a joint one's new side.
     fn voters(&self) -> Counted {
         Counted::AdmittedWithin(self.base, self.generation)
@@ -662,12 +727,41 @@ impl Counted {
 /// ever leaves. So a worker once taken out is never held again.
 #[derive(Debug, Clone)]
 pub struct Roster {
+    /// The configuration an election this roster's leader won was called
+    /// under, with its voters (see [`Roster::sides`]); `None` for a roster
+    /// no election made.
+    called_under: Option<(Generation, Vec<Side>)>,
     configuration: Configuration,
     members: BTreeMap<WorkerId, Generation>,
     prior_admissions: BTreeMap<WorkerId, Generation>,
     pending: BTreeSet<WorkerId>,
     held_generations: BTreeMap<WorkerId, Generation>,
+    /// The generation each member's latest echo named, whatever came before:
+    /// a joint configuration commits on those that name exactly its own.
+    latest_echoes: BTreeMap<WorkerId, Generation>,
     departed: BTreeSet<WorkerId>,
+    promises: Promises,
+}
+
+/// One side of a configuration's electorate: the voters known by id and how
+/// many there are in all. A side an election was called under counts voters
+/// that never answered, whom nobody knows by id.
+pub(crate) type Side = (BTreeSet<WorkerId>, usize);
+
+/// The admissions a leader has promised joiners, ahead of the batch that
+/// admits them: a joiner told it will be admitted at a generation holds that
+/// as its admission before the batch exists, so a quorum counts it there
+/// whether or not the leader lives to start the batch.
+#[derive(Debug, Clone, Default)]
+struct Promises {
+    /// The latest generation promised: every change the leader announces
+    /// moves past it, so no joiner holding a promise is ever counted at a
+    /// generation it was not admitted in.
+    latest: Option<Generation>,
+    /// The workers promised `latest`, each with whether it has said it holds
+    /// the promise. Earlier rounds are forgotten: a worker left out of the
+    /// latest holds a promise no batch honours.
+    round: BTreeMap<WorkerId, bool>,
 }
 
 impl Roster {
@@ -680,12 +774,15 @@ impl Roster {
     ) -> Self {
         pending.retain(|worker| !members.contains_key(worker));
         Roster {
+            called_under: None,
             configuration,
             members,
             prior_admissions: BTreeMap::new(),
             pending,
             held_generations: BTreeMap::new(),
+            latest_echoes: BTreeMap::new(),
             departed: BTreeSet::new(),
+            promises: Promises::default(),
         }
     }
 
@@ -736,6 +833,10 @@ impl Roster {
         let Electorate::Single { voter_count } = roll_call_configuration.electorate else {
             return Roster::re_stamped(roll_call_configuration, founded, respondents);
         };
+        let called_under = (
+            roll_call_configuration.generation,
+            Roster::sides_called_under(roll_call_configuration, respondents),
+        );
         let mut roster = Roster::new(
             Configuration::joint(Joint {
                 generation: founded,
@@ -761,7 +862,113 @@ impl Roster {
                     .map(|current| (respondent.clone(), current))
             })
             .collect();
+        roster.called_under = Some(called_under);
         roster
+    }
+
+    /// Seeds what each of `held`'s members last echoed with the generation
+    /// it said it holds, in answering the roll call this roster's leader won
+    /// on. A voter refuses a call older than its own configuration, so the
+    /// generation a respondent reports is a lower bound on the generation of
+    /// any call it grants from then on: the leader can anchor the removal of
+    /// one that then echoes nothing in this office to it, and a respondent
+    /// that reported nothing, or an older generation than the call's, is
+    /// anchored to no configuration the leader knows the voters of. Never
+    /// lowers what a member has already echoed.
+    pub(crate) fn seed_held_generations(&mut self, held: &BTreeMap<WorkerId, Generation>) {
+        for (member, generation) in held {
+            if self.members.contains_key(member) {
+                let newest = self.held_generations.entry(member.clone()).or_insert(*generation);
+                *newest = (*newest).max(*generation);
+            }
+        }
+    }
+
+    /// The sides of `call`, as far as its `respondents` show them: each
+    /// respondent the side counts, by the admission it answered with, and
+    /// the side's voter count.
+    fn sides_called_under(
+        call: &Configuration,
+        respondents: &BTreeMap<WorkerId, Admission>,
+    ) -> Vec<Side> {
+        let known = |counted: Counted| -> BTreeSet<WorkerId> {
+            respondents
+                .iter()
+                .filter(|(_, admission)| counted.counts(**admission))
+                .map(|(respondent, _)| respondent.clone())
+                .collect()
+        };
+        match call.electorate {
+            Electorate::Single { voter_count } => vec![(known(call.voters()), voter_count)],
+            Electorate::Joint {
+                old_base,
+                old_generation,
+                old_voter_count,
+                new_voter_count,
+                ..
+            } => vec![
+                (known(call.voters()), new_voter_count),
+                (
+                    known(Counted::OnceAdmittedWithin(old_base, old_generation)),
+                    old_voter_count,
+                ),
+            ],
+        }
+    }
+
+    /// The configuration an election this roster's leader won was called
+    /// under, and its sides, as the respondents showed them.
+    pub(crate) fn called_under(&self) -> Option<(Generation, Vec<Side>)> {
+        self.called_under.clone()
+    }
+
+    /// The sides of the current configuration: of a single one, its counted
+    /// voters; of a joint one, its new side and its old side.
+    pub(crate) fn sides(&self) -> Vec<Side> {
+        let counted = self.counted_voters();
+        match self.configuration.electorate {
+            Electorate::Single { voter_count } => vec![(counted, voter_count)],
+            Electorate::Joint {
+                old_voter_count,
+                new_voter_count,
+                ..
+            } => {
+                let mut sides = vec![(counted, new_voter_count)];
+                if let Some((_, known, _)) = self.old_side() {
+                    sides.push((known, old_voter_count));
+                }
+                sides
+            }
+        }
+    }
+
+    /// While the configuration is joint: the generation of the configuration
+    /// it moves from, the members its old side counts (by the admissions
+    /// they held then, those the roster knows), and how many voters that old
+    /// side has in all.
+    pub(crate) fn old_side(&self) -> Option<(Generation, BTreeSet<WorkerId>, usize)> {
+        let Electorate::Joint {
+            old_base,
+            old_generation,
+            old_voter_count,
+            ..
+        } = self.configuration.electorate
+        else {
+            return None;
+        };
+        let old_side = Counted::OnceAdmittedWithin(old_base, old_generation);
+        let counted = self
+            .members
+            .iter()
+            .filter(|(member, current)| {
+                old_side.counts(Admission {
+                    current: Some(**current),
+                    prior: self.prior_admissions.get(*member).copied(),
+                })
+            })
+            .map(|(member, _)| member.clone())
+            .collect();
+        Some((old_generation, counted, old_voter_count))
     }
 
     /// The roster of a win under `joint`, a joint configuration not yet
@@ -797,6 +1004,10 @@ impl Roster {
             .collect();
         let re_admitted = roster.re_admit_new_side_at(restamped);
         roster.configuration = joint.re_stamped_at(restamped, re_admitted);
+        roster.called_under = Some((
+            joint.generation,
+            Roster::sides_called_under(joint, respondents),
+        ));
         roster
     }
 
@@ -832,12 +1043,15 @@ impl Roster {
     /// genesis generation.
     pub fn genesis(creator: WorkerId, recovery_epoch: u64) -> Self {
         Roster {
+            called_under: None,
             configuration: Configuration::genesis(recovery_epoch),
             members: BTreeMap::from([(creator, Generation::genesis(recovery_epoch))]),
             prior_admissions: BTreeMap::new(),
             pending: BTreeSet::new(),
             held_generations: BTreeMap::new(),
+            latest_echoes: BTreeMap::new(),
             departed: BTreeSet::new(),
+            promises: Promises::default(),
         }
     }
 
@@ -867,12 +1081,49 @@ impl Roster {
     }
 
     /// Records that `member` holds a configuration at `held`, as its
-    /// heartbeat said. Only the latest said counts; a worker that is no
-    /// member is ignored.
+    /// heartbeat said. Only the highest said counts, so a heartbeat that
+    /// arrives late never takes back a newer one; a worker that is no member
+    /// is ignored.
     pub fn record_held_generation(&mut self, member: &WorkerId, held: Generation) {
         if self.members.contains_key(member) {
-            self.held_generations.insert(member.clone(), held);
+            let newest = self.held_generations.entry(member.clone()).or_insert(held);
+            *newest = (*newest).max(held);
+            self.latest_echoes.insert(member.clone(), held);
         }
+    }
+
+    /// Whether every member the configuration counts, `leader` aside, has
+    /// said it holds the configuration's generation since it took it.
+    pub(crate) fn is_held_by_every_voter(&self, leader: &WorkerId) -> bool {
+        let voters = self.configuration.voters();
+        self.members
+            .iter()
+            .filter(|(member, admission)| {
+                *member != leader && voters.counts(Admission::from(Some(**admission)))
+            })
+            .all(|(member, _)| {
+                self.held_generations
+                    .get(member)
+                    .is_some_and(|held| *held >= self.configuration.generation())
+            })
+    }
+
+    /// The highest generation `member` has said it holds, in this office or
+    /// as a respondent of the roll call that made its leader; `None` until it
+    /// says so.
+    pub(crate) fn held_generation_of(&self, member: &WorkerId) -> Option<Generation> {
+        self.held_generations.get(member).copied()
+    }
+
+    /// The members the configuration counts as voters now, the leader
+    /// included.
+    pub(crate) fn counted_voters(&self) -> BTreeSet<WorkerId> {
+        let voters = self.configuration.voters();
+        self.members
+            .iter()
+            .filter(|(_, admission)| voters.counts(Admission::from(Some(**admission))))
+            .map(|(member, _)| member.clone())
+            .collect()
     }
 
     /// Commits a joint configuration once `leader` and the members that said
@@ -908,7 +1159,7 @@ impl Roster {
         let generation = self.configuration.generation;
         let mut tally = Tally::against(&self.configuration);
         tally.record(leader.clone(), self.counted_admission_of(leader));
-        for (member, held) in &self.held_generations {
+        for (member, held) in &self.latest_echoes {
             if *held == generation {
                 tally.record(member.clone(), self.counted_admission_of(member));
             }
@@ -933,7 +1184,6 @@ impl Roster {
         })
         .expect("a commit's base is its generation, and it has a voter");
         self.prior_admissions.clear();
-        self.held_generations.clear();
         true
     }
 
@@ -961,37 +1211,135 @@ impl Roster {
             })
     }
 
-    /// Starts an admission batch admitting those of
-    /// `joiners` that are admissible (see [`Roster::is_admissible`]), as
-    /// the leader elected in `leader_term` announces it. Returns whether it
-    /// started one.
-    ///
-    /// Only a single configuration takes a batch: one change at a time, so
-    /// a joint configuration admits no one until it commits, and joiners
-    /// arriving meanwhile wait for the next batch. The batch is a joint
-    /// configuration at the next generation this leader announces, j, re-based
-    /// there: its old side is the single configuration (its base, generation
-    /// and voter count), and its new side the voters re-admitted at j, each
-    /// keeping its old admission as the prior one by which the old side
-    /// counts it, plus the joiners, admitted at j with no prior one. It
-    /// commits like a founding (see [`Roster::commit_if_confirmed`]).
+    /// The generation of the next change `leader_term`'s leader announces:
+    /// the next past the configuration's, or past the latest admission it
+    /// promised, if that is later. A promise names a generation only the
+    /// batch admitting the joiners promised it may announce; any other change
+    /// announced there would count a joiner that holds the promise as a voter
+    /// it never admitted.
     ///
     /// # Panics
     ///
     /// See [`Generation::next_change`].
-    pub fn begin_batch(&mut self, joiners: &BTreeSet<WorkerId>, leader_term: u64) -> bool {
+    fn next_generation(&self, leader_term: u64) -> Generation {
+        let current = self.configuration.generation;
+        self.promises
+            .latest
+            .filter(|latest| *latest > current)
+            .unwrap_or(current)
+            .next_change(leader_term)
+    }
+
+    /// The latest promise round, while a batch has yet to honour it: nothing
+    /// announced since reached its generation, and it names someone.
+    fn standing_promises(&self) -> Option<(Generation, &BTreeMap<WorkerId, bool>)> {
+        let latest = self.promises.latest?;
+        (latest > self.configuration.generation && !self.promises.round.is_empty())
+            .then_some((latest, &self.promises.round))
+    }
+
+    /// The generation `worker` is promised admission at, while a batch has
+    /// yet to honour the promise.
+    pub fn promised_admission_of(&self, worker: &WorkerId) -> Option<Generation> {
+        let (latest, round) = self.standing_promises()?;
+        round.contains_key(worker).then_some(latest)
+    }
+
+    /// The workers promised admission in the round a batch has yet to
+    /// honour, each with whether it has said it holds the promise.
+    pub(crate) fn promised_workers(&self) -> impl Iterator<Item = (&WorkerId, bool)> {
+        self.standing_promises()
+            .into_iter()
+            .flat_map(|(_, round)| round.iter().map(|(worker, held)| (worker, *held)))
+    }
+
+    /// Whether a round of promises stands and every worker it names has said
+    /// it holds its promise.
+    pub(crate) fn is_every_promise_held(&self) -> bool {
+        self.standing_promises()
+            .is_some_and(|(_, round)| round.values().all(|held| *held))
+    }
+
+    /// Records that `worker` holds an admission at `held`, as its heartbeat
+    /// said: confirms its promise if that is the generation promised it.
+    pub fn record_held_admission(&mut self, worker: &WorkerId, held: Generation) {
+        if self.promises.latest == Some(held)
+            && let Some(confirmed) = self.promises.round.get_mut(worker)
+        {
+            *confirmed = true;
+        }
+    }
+
+    /// Promises the admissible `joiners` (see [`Roster::is_admissible`]) an
+    /// admission at a generation of the leader's term, in a new round that
+    /// replaces any earlier one: each is admitted there by the batch that
+    /// follows once every one has confirmed, so each already holds that
+    /// admission when the batch exists, and a quorum counts it even if the
+    /// leader is lost before the batch reaches it. The generation is past
+    /// every change announced and every earlier promise. Only a single
+    /// configuration takes promises. Returns whether a round stands.
+    ///
+    /// # Panics
+    ///
+    /// See [`Generation::next_change`].
+    pub fn promise_admission(&mut self, joiners: &BTreeSet<WorkerId>, leader_term: u64) -> bool {
+        self.promises.round.clear();
+        if self.configuration.is_joint() {
+            return false;
+        }
+        let promised: BTreeMap<WorkerId, bool> = joiners
+            .iter()
+            .filter(|joiner| self.is_admissible(joiner))
+            .map(|joiner| (joiner.clone(), false))
+            .collect();
+        if promised.is_empty() {
+            return false;
+        }
+        self.promises.latest = Some(self.next_generation(leader_term));
+        self.promises.round = promised;
+        true
+    }
+
+    /// Starts an admission batch (see [`Roster::promise_admission`]) of the
+    /// workers promised admission, once every one has confirmed its promise,
+    /// and `leader`, if it is admissible and given: the leader needs no
+    /// promise, for it holds the batch itself. Without a round of promises
+    /// the leader alone is admitted. Returns whether it started one.
+    ///
+    /// Only a single configuration takes a batch: one change at a time, so
+    /// a joint configuration admits no one until it commits, and joiners
+    /// arriving meanwhile wait for the next batch. The batch is a joint
+    /// configuration at the generation promised, j, re-based there: its old
+    /// side is the single configuration (its base, generation and voter
+    /// count), and its new side the voters re-admitted at j, each keeping its
+    /// old admission as the prior one by which the old side counts it, plus
+    /// the joiners, admitted at j with no prior one. It commits like a
+    /// founding (see [`Roster::commit_if_confirmed`]).
+    ///
+    /// # Panics
+    ///
+    /// See [`Generation::next_change`].
+    pub fn begin_batch(&mut self, leader: Option<&WorkerId>, leader_term: u64) -> bool {
         let Electorate::Single { voter_count } = self.configuration.electorate else {
             return false;
         };
-        let admitted: Vec<WorkerId> = joiners
-            .iter()
+        let (batch, promised) = match self.standing_promises() {
+            Some((latest, round)) => {
+                if !round.values().all(|held| *held) {
+                    return false;
+                }
+                (latest, round.keys().cloned().collect::<BTreeSet<_>>())
+            }
+            None => (self.next_generation(leader_term), BTreeSet::new()),
+        };
+        let admitted: BTreeSet<WorkerId> = promised
+            .into_iter()
+            .chain(leader.cloned())
             .filter(|joiner| self.is_admissible(joiner))
-            .cloned()
             .collect();
         if admitted.is_empty() {
             return false;
         }
-        let batch = self.configuration.generation.next_change(leader_term);
         let new_side = self.configuration.voters();
         let mut new_voter_count = 0;
         for (member, admission) in self.members.iter_mut() {
@@ -1007,6 +1355,7 @@ impl Roster {
             self.members.insert(joiner, batch);
             new_voter_count += 1;
         }
+        self.promises.round.clear();
         self.configuration = Configuration::joint(Joint {
             generation: batch,
             base: batch,
@@ -1064,6 +1413,20 @@ impl Roster {
     /// If `leader_term` is below the term of the configuration's generation
     /// (see [`Generation::next_change`]).
     pub fn remove_all(&mut self, workers: &BTreeSet<WorkerId>, leader_term: u64) {
+        self.take_out(workers, leader_term, true);
+    }
+
+    /// Takes `worker` out as [`Self::remove_all`] does, as a leader does
+    /// one that confirms none of its acks, but without keeping it from
+    /// returning: it is not recorded as departed, so its next heartbeat
+    /// holds it as a pending joiner again. Only one worker, so a single
+    /// change shrinks the electorate by one and every quorum of the
+    /// configuration before it shares a voter with every quorum after it.
+    pub(crate) fn remove_lost(&mut self, worker: &WorkerId, leader_term: u64) {
+        self.take_out(&BTreeSet::from([worker.clone()]), leader_term, false);
+    }
+
+    fn take_out(&mut self, workers: &BTreeSet<WorkerId>, leader_term: u64, depart: bool) {
         let old_side = match self.configuration.electorate {
             Electorate::Single { .. } => None,
             Electorate::Joint {
@@ -1076,9 +1439,19 @@ impl Roster {
         let new_side = self.configuration.voters();
         let (mut counted_anywhere, mut counted_on_old_side) = (false, 0);
         for worker in workers {
-            self.departed.insert(worker.clone());
+            if depart {
+                self.departed.insert(worker.clone());
+            }
             self.pending.remove(worker);
+            // A round a taken-out worker was promised in is void: a batch at
+            // its generation without it would leave it holding a promise the
+            // configuration there does not honour. The joiners still waiting
+            // are promised again, past it.
+            if self.promises.round.contains_key(worker) {
+                self.promises.round.clear();
+            }
             self.held_generations.remove(worker);
+            self.latest_echoes.remove(worker);
             let prior = self.prior_admissions.remove(worker);
             let Some(current) = self.members.remove(worker) else {
                 continue;
@@ -1097,7 +1470,7 @@ impl Roster {
             return;
         }
 
-        let changed = self.configuration.generation.next_change(leader_term);
+        let changed = self.next_generation(leader_term);
         let new_voter_count = self.re_admit_new_side_at(changed);
         let old_side_left = old_side.map(|(old_base, old_generation, old_voter_count)| {
             (

@@ -30,12 +30,30 @@ pub fn voter_node(
     voter_count: usize,
     suspect_timeout: u64,
 ) -> TestNode {
+    voter_node_reconnecting(clock, my_id, voter_count, suspect_timeout, None)
+}
+
+/// `voter_node`, reporting a worker lost a reconnect timeout of
+/// `reconnect_timeout` ticks past the suspicion timeout rather than the
+/// default, for a test about losses that should not run that long.
+pub fn voter_node_reconnecting(
+    clock: &FakeClock,
+    my_id: &WorkerId,
+    voter_count: usize,
+    suspect_timeout: u64,
+    reconnect_timeout: Option<u64>,
+) -> TestNode {
+    let timings = timings(Duration::from_ticks(suspect_timeout));
+    let timings = match reconnect_timeout {
+        Some(ticks) => timings.with_reconnect_timeout(Duration::from_ticks(ticks)),
+        None => timings,
+    };
     WorkerNode::start(
         Identity {
             id: my_id.clone(),
             incarnation: IncarnationId::new("incarnation-1"),
             shard: shard("shard-1"),
-            timings: timings(Duration::from_ticks(suspect_timeout)),
+            timings,
         },
         Entry::Known(voter_of(voter_count)),
         clock.clone(),
