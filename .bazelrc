@@ -41,6 +41,11 @@ common --repo_env=DO_NOT_TRACK=1
 # CircleCI's build tool cache is its remote cache; the local disk cache is off.
 common:ci --disk_cache=
 common:ci --repo_contents_cache=/tmp/bazel/repo-contents
+# The download cache is saved and restored with the repository contents cache.
+# Without it, every run re-downloads the Bazel Central Registry module files
+# and the gazelle and protoc archives (about 250 files); with it, Bazel's
+# initialization measured 0.5 s instead of 4.4 s.
+common:ci --repository_cache=/tmp/bazel/repo-downloads
 common:ci --curses=no
 common:ci --show_progress_rate_limit=30
 # Most actions are remote cache hits that wait on the network, so allow many at

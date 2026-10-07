@@ -2,10 +2,11 @@ load("@aspect_rules_py//py:defs.bzl", "py_library")
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_rust//rust:defs.bzl", "rust_shared_library")
 
-# Every first-party target is tagged no-remote-cache: CI's remote cache
-# (CircleCI's with_tool_cache, billed per GB stored) then holds only
-# third-party outputs, which do not change between runs. The local disk
-# cache still stores these targets.
+# The shared library in this package goes to CI's remote cache (CircleCI's
+# with_tool_cache, billed per GB stored), so a change that leaves it alone
+# does not rebuild it. The extension copy (_native_so) and its py_library
+# wrapper (_native) are tagged no-remote-cache because they are a second copy
+# of the shared library.
 
 # The PyO3 extension, built as a plain shared library against Python's stable
 # ABI (see bindings/Cargo.toml and MODULE.bazel). The crate name is the
@@ -30,7 +31,6 @@ rust_shared_library(
         ],
         "//conditions:default": [],
     }),
-    tags = ["no-remote-cache"],
     visibility = ["//visibility:private"],
     deps = [
         "//core:core",

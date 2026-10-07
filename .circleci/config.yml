@@ -5,9 +5,10 @@ version: 2.1
 # measurements and the cost model behind each choice.
 #
 # CircleCI's build tool cache (with_tool_cache) is Bazel's remote cache for
-# third-party build outputs. First-party code builds and tests in the job, and
-# Bazel skips every action whose inputs are unchanged. A separate cache holds
-# the unpacked external repositories, keyed on the lockfiles.
+# third-party build outputs and the first-party libraries. Test binaries build
+# and the tests run in every job, and Bazel skips every other action whose
+# inputs are unchanged. A separate cache holds the unpacked external
+# repositories, keyed on the lockfiles.
 
 executors:
   bazel:
@@ -47,12 +48,13 @@ jobs:
               > /tmp/repo-cache-key
       - restore_cache:
           keys:
-            - bazel-repos-v1-{{ checksum "/tmp/repo-cache-key" }}
+            - bazel-repos-v3-{{ checksum "/tmp/repo-cache-key" }}
             # An older cache still holds most repositories.
-            - bazel-repos-v1-
+            - bazel-repos-v3-
       # CircleCI's build tool cache serves as Bazel's remote cache for the
-      # steps inside it. First-party targets are tagged no-remote-cache, so
-      # it holds third-party outputs only and does not grow with each change.
+      # steps inside it. It holds third-party outputs and the first-party
+      # libraries; test binaries are tagged no-remote-cache and stay out.
+      # It grows by about one copy of the changed libraries per push.
       - with_tool_cache:
           tool: bazel
           steps:
@@ -64,11 +66,14 @@ jobs:
                 # or goes silent.
                 command: timeout --signal=TERM 300 bazel test --config=ci //...
       - save_cache:
-          key: bazel-repos-v1-{{ checksum "/tmp/repo-cache-key" }}
+          key: bazel-repos-v3-{{ checksum "/tmp/repo-cache-key" }}
           # Unpacking the repositories inside Bazel took about 50 seconds per
           # run on the 2 vCPU quota. The cache is about 590 MiB compressed.
+          # The download cache holds the archives and module files Bazel
+          # fetched, so a run does not fetch them again.
           paths:
             - /tmp/bazel/repo-contents
+            - /tmp/bazel/repo-downloads
 
 workflows:
   test:

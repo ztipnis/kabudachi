@@ -1,17 +1,16 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 
-# Every first-party target is tagged no-remote-cache: CI's remote cache
-# (CircleCI's with_tool_cache, billed per GB stored) then holds only
-# third-party outputs, which do not change between runs. The local disk
-# cache still stores these targets.
+# The libraries in this package go to CI's remote cache (CircleCI's
+# with_tool_cache, billed per GB stored), so a change that leaves them alone
+# does not rebuild them. Test binaries are tagged no-remote-cache: they are
+# large and every job reruns the tests anyway.
 
 rust_library(
     name = "net",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "kabudachi_net",
     edition = "2024",
-    tags = ["no-remote-cache"],
     deps = all_crate_deps(normal = True) + ["//core"],
 )
 
