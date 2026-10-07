@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 load("@crates//:defs.bzl", "all_crate_deps")
 
 # The library in this package goes to CI's remote cache (CircleCI's
@@ -14,4 +14,14 @@ rust_library(
     testonly = True,
     deps = all_crate_deps(normal = True) + ["//core"],
     visibility = ["//core:__pkg__", "//net:__pkg__"],
+)
+
+rust_test(
+    name = "testkit_integration_test",
+    srcs = glob(["tests/**/*.rs"]),
+    crate_root = "tests/faulting_authority.rs",
+    edition = "2024",
+    size = "small",
+    tags = ["no-remote-cache"],
+    deps = [":testkit", "//core"],
 )

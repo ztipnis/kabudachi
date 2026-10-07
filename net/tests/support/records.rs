@@ -38,7 +38,14 @@ const SHARD: &str = "shard-1";
 /// share), and short enough that a lease that does end ends well before
 /// [`kabudachi_net::task_store::RECORD_WRITE_TIMEOUT`].
 pub const SUSPECT_TIMEOUT_MS: u64 = 2000;
-const HEARTBEAT_INTERVAL_MS: u64 = 10;
+/// A twentieth of the suspicion timeout: a leader's newest confirmation is
+/// at most two intervals and a round trip old, well inside its lease. Not
+/// shorter: every heartbeat and every ack is a stream of its own, and at
+/// 10 ms a five-voter leader carries hundreds a second, which an
+/// unoptimised build on a host running several test binaries at once
+/// cannot keep up with. Its acks and the confirmations of them then fall
+/// seconds behind, and the leader loses its lease with every follower alive.
+const HEARTBEAT_INTERVAL_MS: u64 = 100;
 /// Short, so that a worker reported lost a suspicion timeout and a reconnect
 /// timeout after it was last heard fits a test.
 pub const RECONNECT_TIMEOUT_MS: u64 = 1000;

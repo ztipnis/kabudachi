@@ -3,6 +3,7 @@
 //! panic.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use kabudachi_core::coordination_authority::{
@@ -26,6 +27,8 @@ pub struct FaultingAuthority<C> {
     shared: Arc<SharedAuthority<C>>,
     faults: Arc<Mutex<Faults>>,
     gate: Arc<Gate>,
+    /// Tells this handle apart from its clones at the gate.
+    handle: u64,
 }
 
 /// One connection's held calls. Kept apart from [`Faults`] and taken before
@@ -33,8 +36,43 @@ pub struct FaultingAuthority<C> {
 /// so it must not stop any other call, on this handle or another.
 #[derive(Default)]
 struct Gate {
-    slots: Mutex<BTreeMap<CallKind, Slot>>,
+    state: Mutex<GateState>,
     released: Condvar,
+}
+
+/// The holds on one connection, and the handles that could release them.
+#[derive(Default)]
+struct GateState {
+    slots: BTreeMap<CallKind, Slot>,
+    /// The connection's handles alive: the one it was made with and every
+    /// clone of it.
+    handles: usize,
+    /// The handles that have a call held, each with how many.
+    holding_handles: BTreeMap<u64, u32>,
+}
+
+impl GateState {
+    /// Whether some handle has no call held, and so could still release one.
+    /// A node's client calls through one handle, and its held call blocks a
+    /// thread its runtime waits for when it shuts down: once the test has
+    /// dropped every handle of its own, nothing can release that call, and
+    /// the test would never end.
+    fn may_be_released(&self) -> bool {
+        self.handles > self.holding_handles.len()
+    }
+}
+
+/// A fresh id for each handle.
+fn next_handle() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A gate with one handle.
+fn new_gate() -> Arc<Gate> {
+    let gate = Gate::default();
+    lock(&gate.state).handles = 1;
+    Arc::new(gate)
 }
 
 /// The hold on one kind of call.
@@ -84,11 +122,22 @@ struct Faults {
 
 impl<C> Clone for FaultingAuthority<C> {
     fn clone(&self) -> Self {
+        lock(&self.gate.state).handles += 1;
         Self {
             shared: Arc::clone(&self.shared),
             faults: Arc::clone(&self.faults),
             gate: Arc::clone(&self.gate),
+            handle: next_handle(),
         }
+    }
+}
+
+/// Dropping the last handle that could release a held call lets every held
+/// call on the connection go (see [`FaultingAuthority::hold_next`]).
+impl<C> Drop for FaultingAuthority<C> {
+    fn drop(&mut self) {
+        lock(&self.gate.state).handles -= 1;
+        self.gate.released.notify_all();
     }
 }
 
@@ -106,7 +155,8 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
                 availability: Mutex::new(Availability::default()),
             }),
             faults: Arc::new(Mutex::new(Faults::default())),
-            gate: Arc::new(Gate::default()),
+            gate: new_gate(),
+            handle: next_handle(),
         }
     }
 
@@ -116,7 +166,8 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
         Self {
             shared: Arc::clone(&self.shared),
             faults: Arc::new(Mutex::new(Faults::default())),
-            gate: Arc::new(Gate::default()),
+            gate: new_gate(),
+            handle: next_handle(),
         }
     }
 
@@ -166,15 +217,20 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// [`Self::release`], and the call then proceeds against the authority as
     /// it is at release time. Holding never affects other handles, nor other
     /// kinds of call on this one.
+    ///
+    /// A held call also proceeds once every handle of this connection that
+    /// is left has a call of its own held: none is left that could release
+    /// it. So a test that ends, or panics, before releasing a call its node
+    /// made does not leave that call's thread blocked for ever.
     pub fn hold_next(&self, kind: CallKind) {
-        lock(&self.gate.slots).entry(kind).or_default().armed = true;
+        lock(&self.gate.state).slots.entry(kind).or_default().armed = true;
     }
 
     /// Releases every call held by [`Self::hold_next`] for `kind` on this
     /// handle. A hold that no call has reached yet is cancelled.
     pub fn release(&self, kind: CallKind) {
-        let mut slots = lock(&self.gate.slots);
-        let slot = slots.entry(kind).or_default();
+        let mut state = lock(&self.gate.state);
+        let slot = state.slots.entry(kind).or_default();
         slot.armed = false;
         slot.holding = 0;
         slot.releases += 1;
@@ -185,13 +241,14 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// before it reaches the authority. No lock is held while it panics, so
     /// nothing another handle waits on is poisoned.
     pub fn panic_next(&self, kind: CallKind) {
-        lock(&self.gate.slots).entry(kind).or_default().panics = true;
+        lock(&self.gate.state).slots.entry(kind).or_default().panics = true;
     }
 
     /// True while a call of `kind` is held on this handle, so a test can wait
     /// for this before acting "during" the call.
     pub fn is_holding(&self, kind: CallKind) -> bool {
-        lock(&self.gate.slots)
+        lock(&self.gate.state)
+            .slots
             .get(&kind)
             .is_some_and(|slot| slot.holding > 0)
     }
@@ -199,26 +256,45 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// Blocks while a hold on `kind` catches this call, then panics if
     /// [`Self::panic_next`] asked, all before the call reaches the authority.
     fn pass_gate(&self, kind: CallKind) {
-        let mut slots = lock(&self.gate.slots);
-        let slot = slots.entry(kind).or_default();
+        let mut state = lock(&self.gate.state);
+        let slot = state.slots.entry(kind).or_default();
         if std::mem::take(&mut slot.armed) {
             slot.holding += 1;
             let releases = slot.releases;
-            while slots[&kind].releases == releases {
-                slots = self
+            *state.holding_handles.entry(self.handle).or_default() += 1;
+            // Another held call may have just lost the last handle that could
+            // release it.
+            self.gate.released.notify_all();
+            while state.slots[&kind].releases == releases && state.may_be_released() {
+                state = self
                     .gate
                     .released
-                    .wait(slots)
+                    .wait(state)
                     .unwrap_or_else(PoisonError::into_inner);
+            }
+            if state.slots[&kind].releases == releases {
+                // Let go for want of a handle to release it: no release
+                // cleared its count.
+                let slot = state.slots.get_mut(&kind).expect("the slot was made above");
+                slot.holding -= 1;
+            }
+            let held = state
+                .holding_handles
+                .get_mut(&self.handle)
+                .expect("counted above");
+            *held -= 1;
+            if *held == 0 {
+                state.holding_handles.remove(&self.handle);
             }
         }
         let panics = std::mem::take(
-            &mut slots
+            &mut state
+                .slots
                 .get_mut(&kind)
                 .expect("the slot was made above")
                 .panics,
         );
-        drop(slots);
+        drop(state);
         if panics {
             panic!("a {kind:?} call panics, as FaultingAuthority::panic_next asked");
         }

@@ -330,7 +330,19 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
             // The node's next read of the epoch lags, and the shard is refounded
             // under lineage 2 at the same number. Both leaders are listed only
             // now: the old one's pointer is the only one the node's floor accepts.
+            // The shard is refounded only once the next read is held: a read
+            // already past the hold could otherwise reach the authority after
+            // the refounding, and the node would learn the new lineage early.
+            // The client keeps one read in flight, so every read before the
+            // held one has been answered by then.
             mine.hold_next(CallKind::ReadRecoveryEpoch);
+            timeout(TEST_TIMEOUT, async {
+                while !mine.is_holding(CallKind::ReadRecoveryEpoch) {
+                    tokio::time::sleep(StdDuration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the node's next read of the epoch was held within the timeout");
             elsewhere
                 .compare_and_swap_recovery_epoch(
                     &shard(),
