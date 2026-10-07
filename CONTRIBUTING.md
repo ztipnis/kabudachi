@@ -55,15 +55,11 @@ PROPTEST_CASES=5000 PROPTEST_RNG_SEED=7 bazel test //core:core_integration_test 
 
 ## Continuous integration
 
-`.circleci/config.yml` runs one CircleCI job on every push. On a pull request it runs only the tests the pull request affects; on `main`, and on a branch without an open pull request, it runs `bazel test --config=ci //...`. The job is built to make the Free plan's 30,000 credits a month last.
+`.circleci/config.yml` runs one CircleCI job on every push: `bazel test --config=ci //...`. The job is built to make the Free plan's 30,000 credits a month last.
 
 **Time guard.** The test step stops after 5 minutes (`timeout 300` around the Bazel command), so a hung test fails the job quickly instead of spending credits until CircleCI's own limit. A healthy run takes well under that. Each property test has its own budget, so on a starved host the budgets of the tests sharing the binary can add up.
 
-**Test selection.** `.circleci/select-tests.sh` writes the list of test targets to run, and the Test step runs exactly that list. For a pull request it hashes the Bazel target graph at the pull request head and at its merge base with [bazel-diff](https://github.com/Tinder/bazel-diff) (pinned release v49.1.0, a static binary downloaded and checked against a pinned sha256), takes the impacted targets, and keeps the test targets among them. bazel-diff already counts a target as impacted when any of its dependencies changed, so the script needs no further dependent lookup. If no test is impacted, such as for a documentation-only change, the Test step prints that and passes without running Bazel. Bazel's own caching still applies on top: it reruns only the actions whose inputs changed, and third-party outputs come from a remote cache.
-
-The script finds the merge base without a GitHub token, because the repository is private and the API needs one. It fetches `refs/pull/<N>/merge`, GitHub's test merge of the pull request head into its base branch, requires its second parent to be the commit under test, and takes the merge base of its first parent (the base branch tip) and the head. That works for stacked pull requests, whose base is another pull request's branch rather than `main`, which a diff against `main` would get wrong. GitHub computes the ref asynchronously and not at all when the pull request has conflicts, so the script retries for about 25 seconds before giving up. When a branch has several open pull requests, `CIRCLE_PULL_REQUEST` names only one of them, so the base the script finds can differ from the base of the pull request you are looking at.
-
-The script never skips tests silently. It runs `//...` and logs a line `select-tests: running //... because <reason>` when any of these holds: the branch is `main`; there is no open pull request; the merge ref is missing or stale; a needed tool (`curl`, `sha256sum`, `git`, `bazel`) is absent; the download or its checksum fails; bazel-diff or the final `bazel query` fails; or the diff touches a file that can change every target and that bazel-diff cannot see: `.bazelrc` or any `*.bazelrc`, `MODULE.bazel`, `MODULE.bazel.lock`, `.bazelversion`, `.bazelignore`, any `WORKSPACE*` file, `Cargo.lock`, `Cargo.toml` at any level, `runtime/uv.lock`, `runtime/pyproject.toml`, `rust-toolchain*`, anything under `.cargo/`, `.bazeliskrc`, any `*.bzl` or `*.patch` file, or anything under `.circleci/`. The log names the file that triggered it. A failure to select means a full run, not a failed job: the output file holds `//...` until the script finishes, so even a script killed by its 240 s `timeout` leaves a full run. The Select step reports a non-zero exit from the script (including `timeout`'s 124) and carries on, and the Test step runs `//...` if the output file is missing. The script restores the checkout with `git checkout --force --detach`, also on TERM or INT, and exits non-zero when it cannot; the Test step fails if `HEAD` is not `$CIRCLE_SHA1`.
+**Incremental testing is Bazel's own.** Bazel reruns only the actions whose inputs changed, and third-party outputs come from a remote cache. There is no test-selection script.
 
 **What the job does:**
 
@@ -88,25 +84,15 @@ The script never skips tests silently. It runs `//...` and logs a line `select-t
 | Whole job, new cache key | 228 s test step, 39 s save | about 45 |
 | Whole job, cache hit | 34 s test step, no test runs | about 6 plus the restore |
 
-**Affected-only testing** (measured on CircleCI on 2026-10-04 with the `medium` class, Bazel's image, and the build tool cache). Each row is one pull request run, split into the Select step, which hashes the target graph, and the Test step:
-
-| Change | Select | Test | Whole job |
-| --- | --- | --- | --- |
-| Full `//...` run (a change under `.circleci`) | 0.4 s | 150.7 s | 177.8 s |
-| Test-only change (one integration test file) | 24.9 s | 85.5 s | 120.9 s |
-| Docs-only change | 22.6 s | 0 s | 30.6 s |
-
-The test-only change selected one target, `//core:core_integration_test`, and its 85.5 s went mostly to analysis and compiling the test binary. The docs-only change printed that no test targets are impacted. Selection costs about 23 to 25 s (two hashing passes), so it pays off on small changes, and a change to any fallback file runs everything at the old cost.
-
 **Why these choices:**
 
-- *Test selection with bazel-diff on pull requests only.* A cache hit already skips every unchanged test, but the cached run still pays Bazel's startup and analysis, and a change to one crate reruns every test that depends on it. Selecting by impacted target skips the rest outright, and a documentation-only change runs no Bazel test at all. Selection costs two target-graph hashes, so it only runs for pull requests; `main` and PR-less branches run everything, which keeps a full run on every merge as the safety net.
+- *Bazel's caching, not a test-selection tool.* A cache hit already skips every unchanged test, and the cached job's test step takes about 34 seconds, mostly Bazel startup and analysis. A tool such as `bazel-diff` hashes the target graph at two commits, which costs about as much as it could save at this size.
 - *Docker `medium` (2 vCPU, 4 GB, x86).* A cold build is throughput-bound, so a larger class costs the same credits for the same work, and cached runs cannot use more CPUs. Arm Docker costs 13 credits a minute, not 10. `.bazelrc`'s `ci` config sets the job's CPU and memory limits, because a Docker executor reports the host's.
 - *Cold-build settings in `.bazelrc`, used everywhere.*
   - *Prebuilt protoc.* Compiling protoc from C++ source took about 70% of a cold build's action time.
   - *One output configuration.* aspect_rules_py's `py_test` sets the Python version and venv for everything under it. Without the same values on the command line, `core`, tokio, and every proc macro under a Python test compiled a second time; `pyo3_extension` also forced `opt` on its subtree.
   - *Build tools in fastbuild.* Proc macros, build scripts, and rules_rust's helpers compiled at `opt-level=3`, about 60% of the remaining Rust compile time.
-- *No path filtering.* Selection works on the target graph, not on paths, so a change to a file no target reads selects nothing, while a change to a file every target can read (the files listed under test selection) selects everything.
+- *No path filtering.* A docs-only push still runs the job; on a cache hit it costs about as much as a dynamic-configuration setup job would.
 - *First-party outputs stay out of the remote cache.* Storage costs 420 credits a GB-month beyond the included 2. Test binaries are tens of MB each, so storing every push's first-party outputs would cost more than the minute of rebuild they save.
 - *No `store_test_results`.* Failures print through `--test_output=errors`, and stored results count toward storage.
 - *No usage reports.* `.bazelrc` sets `DO_NOT_TRACK=1`, which aspect_rules_py's telemetry honors.

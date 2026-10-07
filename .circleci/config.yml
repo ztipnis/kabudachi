@@ -1,7 +1,6 @@
 version: 2.1
 
-# One job runs `bazel test`: on a pull request only the impacted tests, else
-# `//...`. It is built to spend as few Free-plan
+# One job runs `bazel test //...`. It is built to spend as few Free-plan
 # credits as it can; CONTRIBUTING.md ("Continuous integration") has the
 # measurements and the cost model behind each choice.
 #
@@ -58,41 +57,12 @@ jobs:
           tool: bazel
           steps:
             - run:
-                name: Select the tests
-                # A pull request tests only the targets bazel-diff finds
-                # impacted; main and branches without a pull request test
-                # everything. The script falls back to //... whenever it
-                # cannot judge, and says why. It runs inside the tool cache
-                # because it builds the target graph at two commits. The
-                # output file holds //... until the script finishes, so a
-                # timeout kill means a full run, and the script restores
-                # HEAD on TERM. timeout exits 124 when it fires, and any
-                # other non-zero exit is reported but does not fail this
-                # step; the Test step then runs whatever the output file
-                # holds, and fails if HEAD is not the commit under test.
-                command: |
-                  SELECT_TESTS_BAZEL_OPTIONS=--config=ci \
-                    timeout --signal=TERM --kill-after=10 240 .circleci/select-tests.sh /tmp/test-targets \
-                    || echo "select-tests exited with status $?; the Test step runs whatever /tmp/test-targets holds (//... unless selection finished)"
-            - run:
                 name: Test
                 # A hung test fails the job after 5 minutes instead of
                 # holding the executor until CircleCI's default limit. The
                 # timeout bounds the whole command, whether it keeps printing
                 # or goes silent.
-                command: |
-                  if [ "$(git rev-parse HEAD)" != "$CIRCLE_SHA1" ]; then
-                    echo "HEAD is $(git rev-parse HEAD), not $CIRCLE_SHA1; the select step left the wrong commit checked out."
-                    exit 1
-                  fi
-                  if [ ! -e /tmp/test-targets ]; then
-                    echo "/tmp/test-targets does not exist; running //..."
-                    echo '//...' > /tmp/test-targets
-                  elif [ ! -s /tmp/test-targets ]; then
-                    echo "No test targets are impacted by this pull request; nothing to run."
-                    exit 0
-                  fi
-                  timeout --signal=TERM 300 bazel test --config=ci $(cat /tmp/test-targets)
+                command: timeout --signal=TERM 300 bazel test --config=ci //...
       - save_cache:
           key: bazel-downloads-v1-{{ checksum "/tmp/download-cache-key" }}
           # Downloaded archives only (about 0.5 GB). Bazel extracts them again
