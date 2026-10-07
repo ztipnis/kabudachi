@@ -75,6 +75,10 @@ What the lease reads of a node that leads: its id, roster, term, recovery epoch 
 What a node holds only while it leads: the roster it leads, the removals it accepted and has not applied, and when it last heard from each worker it has not reported lost. It applies removals before anything reads or changes the configuration it leads. When leadership ends it hands its configuration back to the node's shard standing; a draining leader's departure hands back the announcement of its own removal too.
 _Avoid_: leader state
 
+**Drain request**:
+A node's request to leave its shard gracefully, from when it is asked until the node drains: kept while the node cannot drain yet, and, while it leads, held until every other voter has reported a routing crawl or its drain wait limit passes. It decides only when the node drains; the node carries the departure out, and the leader office supplies a draining leader's announcement.
+_Avoid_: drain state, pending drain
+
 **Lease change**:
 A grant or abort-deadline change the lease reports, which the node turns into its grant output or its abort-deadline output.
 
