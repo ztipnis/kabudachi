@@ -35,14 +35,19 @@ common --repo_env=DO_NOT_TRACK=1
 
 # CI (.circleci/config.yml). Docker executors report the host's CPUs and RAM,
 # not the job's, so the limits of the `medium` resource class (2 vCPU, 4 GB)
-# are set here. The repository cache lives outside the workspace so CI can
-# save and restore it; build outputs go to CircleCI's build tool cache.
+# are set here. The repository contents cache (the unpacked external
+# repositories) lives outside the workspace so CI can save and restore it;
+# build outputs go to CircleCI's build tool cache.
 # CircleCI's build tool cache is its remote cache; the local disk cache is off.
 common:ci --disk_cache=
-common:ci --repository_cache=/tmp/bazel/repository
+common:ci --repo_contents_cache=/tmp/bazel/repo-contents
 common:ci --curses=no
 common:ci --show_progress_rate_limit=30
-build:ci --jobs=2
+# Most actions are remote cache hits that wait on the network, so allow many at
+# once; --local_resources and --local_test_jobs keep compiles and tests at the
+# quota's 2 CPUs.
+build:ci --jobs=16
+build:ci --local_test_jobs=2
 build:ci --local_resources=cpu=2
 build:ci --local_resources=memory=3072
 test:ci --build_tests_only

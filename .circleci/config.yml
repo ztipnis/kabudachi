@@ -7,7 +7,7 @@ version: 2.1
 # CircleCI's build tool cache (with_tool_cache) is Bazel's remote cache for
 # third-party build outputs. First-party code builds and tests in the job, and
 # Bazel skips every action whose inputs are unchanged. A separate cache holds
-# Bazel's downloads, keyed on the lockfiles.
+# the unpacked external repositories, keyed on the lockfiles.
 
 executors:
   bazel:
@@ -39,17 +39,17 @@ jobs:
               exit 1
             }
       - run:
-          name: Compute the download cache key
+          name: Compute the repository cache key
           command: |
-            # The lockfiles and module files decide which archives Bazel
-            # downloads.
+            # The lockfiles and module files decide which repositories Bazel
+            # unpacks.
             cat MODULE.bazel MODULE.bazel.lock .bazelversion Cargo.lock runtime/uv.lock \
-              > /tmp/download-cache-key
+              > /tmp/repo-cache-key
       - restore_cache:
           keys:
-            - bazel-downloads-v1-{{ checksum "/tmp/download-cache-key" }}
-            # An older cache still holds most downloads.
-            - bazel-downloads-v1-
+            - bazel-repos-v1-{{ checksum "/tmp/repo-cache-key" }}
+            # An older cache still holds most repositories.
+            - bazel-repos-v1-
       # CircleCI's build tool cache serves as Bazel's remote cache for the
       # steps inside it. First-party targets are tagged no-remote-cache, so
       # it holds third-party outputs only and does not grow with each change.
@@ -64,12 +64,11 @@ jobs:
                 # or goes silent.
                 command: timeout --signal=TERM 300 bazel test --config=ci //...
       - save_cache:
-          key: bazel-downloads-v1-{{ checksum "/tmp/download-cache-key" }}
-          # Downloaded archives only (about 0.5 GB). Bazel extracts them again
-          # in about 15 seconds; the extracted copies (repository/contents)
-          # take 1.8 GB.
+          key: bazel-repos-v1-{{ checksum "/tmp/repo-cache-key" }}
+          # Unpacking the repositories inside Bazel took about 50 seconds per
+          # run on the 2 vCPU quota. The cache is about 590 MiB compressed.
           paths:
-            - /tmp/bazel/repository/content_addressable
+            - /tmp/bazel/repo-contents
 
 workflows:
   test:
