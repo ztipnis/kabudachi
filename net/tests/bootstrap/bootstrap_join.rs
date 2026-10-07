@@ -5,11 +5,10 @@
 //! `InMemoryAuthority`.
 
 
-use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::CoordinationAuthority;
-use kabudachi_core::election::{AuthorityTimings, ElectionTimings};
+use kabudachi_core::election::ElectionTimings;
 use kabudachi_core::in_memory_authority::InMemoryAuthority;
 use kabudachi_core::protocol::ids::ShardId;
 use kabudachi_core::protocol::messages::prelude::*;
@@ -17,23 +16,16 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::join::{LeaderSearch, ask_for_leader};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::worker::{AuthorityConfig, WorkerConfig};
 use libp2p::Multiaddr;
 use libp2p::multiaddr::Protocol;
 use tokio::time::timeout;
 
-use crate::support::worker::{RunningWorker, poll_until, warmed_up_in_memory_authority};
+use crate::support::worker::{
+    PER_PEER_TIMEOUT, RunningWorker, TEST_TIMEOUT, poll_until, warmed_up_in_memory_authority,
+    with_in_memory_authority, worker_config,
+};
 
 const SHARD: &str = "shard-1";
-
-/// Generous whole-test backstop for everything that is expected to happen.
-const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
-
-/// Short, so a waiting worker goes round the cascade many times per test.
-const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(50);
-
-/// How long each ask of one seed or registered peer may take.
-const PER_PEER_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 
 /// The authority's registration TTL, which is also how long it warms up.
 /// Long enough that a driven worker on a loaded host always renews in time
@@ -57,18 +49,13 @@ async fn spawn_worker(
     authority: Option<InMemoryAuthority<RealClock>>,
     seeds: Vec<Multiaddr>,
 ) -> RunningWorker {
-    let mut config = WorkerConfig::new(shard(), bind.parse().unwrap(), timings())
-        .with_seeds(seeds)
-        .with_join_peer_timeout(PER_PEER_TIMEOUT)
-        .with_retry_interval(RETRY_INTERVAL);
-    if let Some(authority) = authority {
-        config = config.with_authority(AuthorityConfig {
-            authority: Arc::new(authority),
-            timings: AuthorityTimings {
-                ttl: Duration::from_millis(AUTHORITY_TTL_MS),
-            },
-        });
-    }
+    let config = worker_config(shard(), bind, timings(), seeds);
+    let config = match authority {
+        Some(authority) => {
+            with_in_memory_authority(config, authority, Duration::from_millis(AUTHORITY_TTL_MS))
+        }
+        None => config,
+    };
     crate::support::worker::spawn_worker(config).await
 }
 

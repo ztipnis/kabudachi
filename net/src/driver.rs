@@ -693,6 +693,12 @@ mod tests {
                     |_, _, _| {},
                 ) => unreachable!("run_driver never returns"),
                 () = async {
+                    // The registration must be held before the ack arrives:
+                    // only then does a heartbeat show that the held call
+                    // stops nothing else.
+                    while !authority.is_holding(CallKind::Register) {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
                     net_leader.send(me.clone(), ack_from(&leader));
                     loop {
                         let heartbeat_arrived = net_leader.take_inputs().iter().any(|input| {

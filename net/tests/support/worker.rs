@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::CoordinationAuthority;
-use kabudachi_core::election::WorkerNode;
-use kabudachi_core::protocol::ids::WorkerId;
+use kabudachi_core::election::{AuthorityTimings, ElectionTimings, WorkerNode};
+use kabudachi_core::in_memory_authority::InMemoryAuthority;
+use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::worker::{Worker, WorkerConfig};
+use kabudachi_net::worker::{AuthorityConfig, Worker, WorkerConfig};
 use libp2p::Multiaddr;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -22,7 +23,40 @@ use tokio::time::timeout;
 /// Generous whole-test backstop for everything a spawned worker is expected
 /// to do. Not a tuning knob: individual tests bound their own timing
 /// expectations more tightly with their own waits and windows.
-const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+pub const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+/// How long bootstrap waits on each seed or registered peer it asks.
+pub const PER_PEER_TIMEOUT: StdDuration = StdDuration::from_secs(1);
+
+/// Short, so a waiting worker goes round its cascade many times per test.
+pub const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(50);
+
+/// A worker of `shard` bound to `bind`, bootstrapping through `seeds` on
+/// `timings`, with the test-scale join timeout and retry interval above
+/// and no authority.
+pub fn worker_config(
+    shard: ShardId,
+    bind: &str,
+    timings: ElectionTimings,
+    seeds: Vec<Multiaddr>,
+) -> WorkerConfig {
+    WorkerConfig::new(shard, bind.parse().expect("a valid multiaddr"), timings)
+        .with_seeds(seeds)
+        .with_join_peer_timeout(PER_PEER_TIMEOUT)
+        .with_retry_interval(RETRY_INTERVAL)
+}
+
+/// `config` with `authority` as its coordination authority, granting `ttl`.
+pub fn with_in_memory_authority(
+    config: WorkerConfig,
+    authority: InMemoryAuthority<RealClock>,
+    ttl: Duration,
+) -> WorkerConfig {
+    config.with_authority(AuthorityConfig {
+        authority: Arc::new(authority),
+        timings: AuthorityTimings { ttl },
+    })
+}
 
 /// What a worker's driver last showed of its node.
 #[derive(Clone, Debug, PartialEq)]
@@ -152,12 +186,13 @@ pub async fn warmed_up_in_memory_authority(
     authority
 }
 
-/// Waits until `until` holds, polling: for state a test observes some other
-/// way than a worker's own `Seen` (an authority's bookkeeping, a `Net`'s).
-pub async fn poll_until(what: &str, until: impl Fn() -> bool) {
+/// Waits until `until` holds, polling every 5 ms: for state a test observes
+/// some other way than a worker's own `Seen` (an authority's bookkeeping, a
+/// `Net`'s).
+pub async fn poll_until(what: &str, mut until: impl FnMut() -> bool) {
     timeout(TEST_TIMEOUT, async {
         while !until() {
-            tokio::time::sleep(StdDuration::from_millis(10)).await;
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
         }
     })
     .await

@@ -533,23 +533,43 @@ pub(crate) mod tests {
         assert_eq!(claims.len(), 1);
     }
 
+    // Two claims wait while the worker does not lead, with two tasks queued.
+    // The grant reaches both in one wake-up, and each must claim one: a
+    // second waiter left asleep with work queued would never be woken again.
     #[test]
-    fn a_claim_waits_until_the_worker_leads() {
+    fn one_wake_up_hands_queued_work_to_every_waiting_claim() {
         let clock = ManualClock::default();
         let door = door(clock.clone(), None);
         let mut node = node(clock);
-        door.submit(submission()).unwrap();
+        let queued = [
+            door.submit(submission()).unwrap(),
+            door.submit(submission()).unwrap(),
+        ];
 
-        let claims = block_on(async {
-            let waiting = tokio::spawn(Arc::clone(&door).claim_when_available(10));
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(!waiting.is_finished(), "claimed work without leading");
-            // An election step that hands over the grant must wake the waiter.
+        let (first, second) = block_on(async {
+            let first = tokio::spawn(Arc::clone(&door).claim_when_available(1));
+            let second = tokio::spawn(Arc::clone(&door).claim_when_available(1));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !first.is_finished() && !second.is_finished(),
+                "a claim took work before the worker led"
+            );
             lead(&door, &mut node);
-            waiting.await.unwrap().unwrap()
+            (
+                first.await.unwrap().unwrap(),
+                second.await.unwrap().unwrap(),
+            )
         });
 
-        assert_eq!(claims.len(), 1);
+        let mut claimed: Vec<TaskId> = first
+            .iter()
+            .chain(&second)
+            .map(|claim| claim.task.task_id())
+            .collect();
+        claimed.sort();
+        let mut queued = queued.to_vec();
+        queued.sort();
+        assert_eq!(claimed, queued, "each waiting claim took one queued task");
     }
 
     /// A door over a scheduler that leads and holds one running task whose
