@@ -58,6 +58,10 @@ The read-only snapshot of a node that the election round decides against.
 The one test stand-in for the coordination authority that injects faults: unreachability, unavailability, a lost race, a flush, and held calls that model slow, hung and rival-during-call authorities without sleeping.
 _Avoid_: slow authority, fake authority
 
+**Authority contract**:
+What every coordination authority adapter must do, as one suite in testkit (`check_authority_contract`): registration TTLs, create-if-absent and exact-epoch swaps, fences that need the current epoch and are waited out across epochs, no fence for one TTL after the authority starts or loses its data, and no authoritative count for one TTL after it starts, loses its data or comes back from an outage. An adapter runs it with its own way to pass time: the in-memory authority on the simulated clock, a real service in real time.
+_Avoid_: authority tests, conformance tests
+
 **Step record**:
 One node's step as a harness saw it: the input, the outputs, and the node's state, term, epoch, admission and leader afterwards. Both harnesses record one per step (the core simulator from `carry_out`'s observer, the net tests from `run_driver`'s, which hands on the same) and assert the same invariants over the records: `assert_at_most_one_leader` and `first_grant_overlap`. A grant holds from the record that reports it until the earlier of its lease end and that node's next grant report, so a node that stalls or stops holds it no longer than its scheduler would; records must share one timeline, lease ends included.
 _Avoid_: batch (for the record), timeline entry

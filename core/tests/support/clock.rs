@@ -62,3 +62,10 @@ impl Clock for FakeClock {
         self.wall_clock_millis.get()
     }
 }
+
+/// The contract suite passes time on the simulated clock by advancing it.
+impl kabudachi_testkit::PassTime for FakeClock {
+    fn pass(&self, duration: Duration) {
+        self.advance(duration);
+    }
+}
