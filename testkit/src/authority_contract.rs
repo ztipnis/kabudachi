@@ -5,7 +5,9 @@
 //! clauses run on a simulated clock in an instant, or against a real
 //! service with real waits. Every check sits at least a quarter of a TTL
 //! away from the instant its outcome changes, so a real-time run passes
-//! as long as each call completes well within a quarter TTL.
+//! as long as the calls between a timed check and the event it counts
+//! from, `go_down` and `come_back` included, together take well within a
+//! quarter TTL.
 
 use std::collections::BTreeMap;
 
@@ -86,6 +88,13 @@ fn quarters(adapter: &impl AuthorityAdapter, quarters: u64) -> Duration {
         .checked_mul(quarters)
         .expect("a TTL times a few quarters fits in ticks");
     Duration::from_ticks(ticks / 4)
+}
+
+/// What remains of the adapter's TTL once `quarters` quarters of it have
+/// passed.
+fn left_after(adapter: &impl AuthorityAdapter, quarters: u64) -> Duration {
+    let passed = self::quarters(adapter, quarters).as_ticks();
+    Duration::from_ticks(adapter.ttl().as_ticks() - passed)
 }
 
 /// A fresh authority past its warm-up: five quarters of a TTL have passed.
@@ -321,7 +330,7 @@ fn a_fence_needs_the_current_epoch(adapter: &impl AuthorityAdapter, time: &impl 
     time.pass(quarters(adapter, 3));
     fence_held(
         authority.acquire_fence(&shard(), &worker_b(), FOUNDED),
-        quarters(adapter, 1),
+        left_after(adapter, 3),
         clause,
     );
 }
@@ -341,7 +350,7 @@ fn a_fence_held_by_another_is_waited_out_across_epochs(
     time.pass(quarters(adapter, 1));
     fence_held(
         authority.acquire_fence(&shard(), &worker_b(), FOUNDED),
-        quarters(adapter, 3),
+        left_after(adapter, 1),
         clause,
     );
     let next = FOUNDED.next().expect("0 has a successor");
@@ -352,7 +361,7 @@ fn a_fence_held_by_another_is_waited_out_across_epochs(
     );
     fence_held(
         authority.acquire_fence(&shard(), &worker_b(), next),
-        quarters(adapter, 3),
+        left_after(adapter, 1),
         clause,
     );
     assert_eq!(
@@ -365,7 +374,7 @@ fn a_fence_held_by_another_is_waited_out_across_epochs(
     time.pass(quarters(adapter, 2));
     fence_held(
         authority.acquire_fence(&shard(), &worker_b(), next),
-        quarters(adapter, 1),
+        left_after(adapter, 3),
         clause,
     );
     time.pass(quarters(adapter, 2));
@@ -383,13 +392,13 @@ fn no_fence_for_one_ttl_after_start(adapter: &impl AuthorityAdapter, time: &impl
     time.pass(quarters(adapter, 1));
     fence_held(
         authority.acquire_fence(&shard(), &worker_a(), FOUNDED),
-        quarters(adapter, 3),
+        left_after(adapter, 1),
         clause,
     );
     time.pass(quarters(adapter, 2));
     fence_held(
         authority.acquire_fence(&shard(), &worker_a(), FOUNDED),
-        quarters(adapter, 1),
+        left_after(adapter, 3),
         clause,
     );
     time.pass(quarters(adapter, 2));
@@ -429,12 +438,12 @@ fn a_flush_loses_everything_and_restarts_both_waits(
     time.pass(quarters(adapter, 1));
     fence_held(
         authority.acquire_fence(&shard(), &worker_a(), RIVAL),
-        quarters(adapter, 3),
+        left_after(adapter, 1),
         clause,
     );
     fence_held(
         authority.acquire_fence(&shard(), &worker_b(), RIVAL),
-        quarters(adapter, 3),
+        left_after(adapter, 1),
         clause,
     );
     register(&authority, adapter, &worker_b(), "address-b", clause);
@@ -447,7 +456,7 @@ fn a_flush_loses_everything_and_restarts_both_waits(
     time.pass(quarters(adapter, 2));
     fence_held(
         authority.acquire_fence(&shard(), &worker_b(), RIVAL),
-        quarters(adapter, 1),
+        left_after(adapter, 3),
         clause,
     );
     assert_eq!(
@@ -500,7 +509,7 @@ fn an_outage_keeps_the_data_and_withholds_only_the_count(
     );
     fence_held(
         authority.acquire_fence(&shard(), &worker_b(), FOUNDED),
-        quarters(adapter, 3),
+        left_after(adapter, 1),
         clause,
     );
     assert_eq!(
