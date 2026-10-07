@@ -113,7 +113,6 @@ mod leader_office;
 mod lease;
 mod standing;
 
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 pub use authority::{
@@ -141,6 +140,7 @@ use authority_standing::{AuthorityStanding, AuthorityVerdict, AuthorityView};
 use election_round::{ElectionRound, Verdict, View};
 use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice};
 use lease::{Lease, LeaseChange, Office};
+pub use standing::JoinFloor;
 use standing::{EpochOrder, HeardEpoch, ShardStanding, order_numbers};
 
 pub struct WorkerNode<C>
@@ -192,8 +192,22 @@ where
     lease: Lease,
     /// A drain was asked for in a state that cannot drain yet.
     drain_requested: bool,
+    /// What a node bootstrapping again holds while it checks a JOIN pointer
+    /// against the authority.
+    rejoin: RejoinCheck,
     /// What the step in progress has produced so far.
     outputs: Vec<Output>,
+}
+
+/// The state a rejoining node keeps beside its floor: the authority read it
+/// awaits, and the pointer it holds until a read validates it.
+#[derive(Debug, Default)]
+struct RejoinCheck {
+    /// The latest read of the authority's epoch the driver told this node it
+    /// asked, and has not been answered; an answer to any other is dropped.
+    awaited_read: Option<ReplyToken>,
+    /// The JOIN pointer taken, held while the node is `Joining`.
+    held: Option<JoinResponse>,
 }
 
 /// The timers a [`WorkerNode`] runs its election on.
@@ -405,16 +419,45 @@ pub enum Input {
     /// `Bootstrapping` records that leader and moves through `Joining` to
     /// `Active` as a pending member. It learns the configuration from its
     /// leader's first ack. It stays `Bootstrapping`, so its driver can ask
-    /// again, for an answer that names no leader, and for one that names a
-    /// leader of an epoch older than its own or of another lineage. Every
-    /// other state ignores it.
+    /// again, for an answer that names no leader, and for one the node's
+    /// floor does not accept (see [`JoinFloor::accepts`]). Every other state
+    /// ignores it.
+    ///
+    /// A node that rejoins, one with a floor, does not become a member on the
+    /// pointer alone: it holds the pointer's epoch in `Joining`, ignoring
+    /// acks as a bootstrapping node does, until a read of the authority
+    /// answers (see [`Self::AuthorityEpochRead`]). A node with no floor, a
+    /// first join, becomes a member at once.
     ///
     /// The wire handshake that produces the answer, dialing seed addresses,
-    /// sending `JOIN_REQUEST`, taking the first `JOIN_RESPONSE` that names a
-    /// leader, is entirely `net`'s concern (a separate `/kabudachi/join/1`
-    /// request_response protocol, not an `ElectionMessage`); this input only
+    /// sending `JOIN_REQUEST`, taking the newest leader pointer among the
+    /// `JOIN_RESPONSE`s of one pass, is entirely `net`'s concern (a separate
+    /// `/kabudachi/join/1` request_response protocol, not an
+    /// `ElectionMessage`); this input only
     /// performs the resulting state transition. Joining publishes nothing.
     JoinAnswer(JoinResponse),
+    /// The driver asked the coordination authority for the recovery epoch it
+    /// holds for this node's shard, as a read named by `token`, for a node
+    /// rejoining (`Bootstrapping`, or `Joining` while it checks a JOIN
+    /// pointer). The node keeps the latest such token: only the answer to that
+    /// read is applied (see [`Self::AuthorityEpochRead`]), so an older read
+    /// answered late is dropped. Every other state ignores it.
+    AuthorityEpochAsked(ReplyToken),
+    /// The answer to the read named by `token`: the recovery epoch `held` the
+    /// coordination authority held when it answered. It is applied only when
+    /// `token` is the latest read the node was told of, and once.
+    ///
+    /// In `Bootstrapping`, a held epoch of another lineage than the floor's
+    /// becomes the floor, so that a leader of that epoch is one the node can
+    /// join even at or below the old floor's number; one of the floor's own
+    /// lineage changes nothing. In `Joining`, where the node holds the epoch
+    /// of a JOIN pointer it took (see [`Self::JoinAnswer`]), a held epoch
+    /// equal to that one, number and lineage, makes the node a member, and any
+    /// other drops the pointer: the node is `Bootstrapping` again with the held
+    /// epoch as its floor. Every other state ignores it. An authority that
+    /// holds no epoch answers nothing here, and a node validating a pointer
+    /// waits.
+    AuthorityEpochRead { token: ReplyToken, held: RecoveryEpoch },
 }
 
 /// Something a [`WorkerNode`] asks its driver to do.
@@ -731,6 +774,7 @@ where
             connected: BTreeSet::new(),
             lease: Lease::new(now),
             drain_requested: false,
+            rejoin: RejoinCheck::default(),
             outputs: Vec::new(),
         }
     }
@@ -802,6 +846,14 @@ where
     /// its own, and adopted from the ack of a leader of a later epoch.
     pub fn recovery_epoch(&self) -> u64 {
         self.standing.epoch_number()
+    }
+
+    /// The floor this node takes JOIN pointers against: its recovery epoch,
+    /// or none before it has joined a shard. A driver searching for a leader
+    /// for it takes the node's current floor for each pass, as the node's
+    /// floor moves with the epoch reads it is told of.
+    pub fn join_floor(&self) -> JoinFloor {
+        self.standing.join_floor()
     }
 
     /// The lineage of this node's recovery epoch (see [`RecoveryEpoch`]),
@@ -944,6 +996,8 @@ where
             }
             Input::Authority(reply) => self.on_authority_reply(reply),
             Input::JoinAnswer(pointer) => self.join(&pointer),
+            Input::AuthorityEpochAsked(token) => self.note_epoch_read_asked(token),
+            Input::AuthorityEpochRead { token, held } => self.on_epoch_read(token, held),
             Input::Drain => self.request_drain(),
         }
         self.finish_step()
@@ -1059,6 +1113,10 @@ where
         if let Some(authority) = self.authority.as_mut() {
             authority.state_changed(next);
         }
+        // Only a rejoining node keeps a read it awaits or a pointer it holds.
+        if !matches!(next, WorkerState::Bootstrapping | WorkerState::Joining) {
+            self.rejoin = RejoinCheck::default();
+        }
         self.state = next;
         self.outputs.push(Output::StateChanged(next));
 
@@ -1105,14 +1163,16 @@ where
     /// [`ShardStanding::accept_ack`]) and steps down from any term it holds
     /// or contests, whatever the terms, which two epochs do not order. A
     /// pending joiner that a stale JOIN pointer left on the old epoch finds
-    /// its way the same way. An accepted ack
-    /// refreshes leader contact, records its leader as [`Self::known_leader`]
-    /// and the ack itself for this node's heartbeats to echo, and returns a
-    /// node in `LeaderSuspect`, `RollCall` or `NoQuorum` to `Active` because
-    /// a leader is reachable again, whatever term its roll call contests. A
-    /// `Candidate` or `Leader` of a term earlier than the ack's steps down
-    /// to `Active` under the ack's leader; one of the
-    /// ack's own term keeps it.
+    /// its way the same way. A leader of the authority's epoch (see
+    /// [`Self::leads_its_office_epoch`]) ignores an ack of another
+    /// lineage's epoch whatever its number, even after its fence lapsed. An
+    /// accepted ack refreshes leader contact, records its leader as
+    /// [`Self::known_leader`] and the ack itself for this node's heartbeats
+    /// to echo, and returns a node in `LeaderSuspect`, `RollCall` or
+    /// `NoQuorum` to `Active` because a leader is reachable again, whatever
+    /// term its roll call contests. A `Candidate` or `Leader` of a term
+    /// earlier than the ack's steps down to `Active` under the ack's leader;
+    /// one of the ack's own term keeps it.
     ///
     /// It also carries the leader's configuration and this node's admission
     /// generations in the leader's roster, which this node adopts as
@@ -1124,8 +1184,13 @@ where
     fn on_leader_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>) {
         // A node back in `Bootstrapping` rejoins through JOIN alone: an ack
         // from a leader of the epoch it left would take it back past the
-        // floor it rejoins at.
-        if self.state == WorkerState::Bootstrapping || ack.shard_id() != self.shard_id {
+        // floor it rejoins at, and one validating the pointer it took is no
+        // member yet.
+        if matches!(
+            self.state,
+            WorkerState::Bootstrapping | WorkerState::Joining
+        ) || ack.shard_id() != self.shard_id
+        {
             return;
         }
         let heard = HeardEpoch {
@@ -1137,13 +1202,19 @@ where
             return;
         };
         let later_epoch = match order {
-            // An earlier epoch, or another lineage's epoch at or below this
-            // node's number: its own epoch number in another lineage is
-            // another shard's.
-            EpochOrder::Stale | EpochOrder::Foreign(Ordering::Less | Ordering::Equal) => return,
-            EpochOrder::Later | EpochOrder::Foreign(Ordering::Greater) => true,
+            EpochOrder::Stale => return,
+            EpochOrder::Later => true,
             EpochOrder::Mine => false,
         };
+        // A leader with an authority leads the epoch it took office at, which
+        // no other lineage's number outranks.
+        if later_epoch
+            && heard
+                .lineage
+                .is_some_and(|lineage| self.leads_its_office_epoch(lineage))
+        {
+            return;
+        }
         if !later_epoch && ack.term < self.ack_floor() {
             return;
         }
@@ -1195,6 +1266,23 @@ where
             self.drop_recovery();
             self.transition_to(WorkerState::Active);
         }
+    }
+
+    /// Whether this node leads an epoch of a lineage other than `lineage`.
+    /// It leads the epoch it took office at from the moment it took office,
+    /// before any grant. Once the authority grants the fence, that epoch is the
+    /// one the authority holds (it grants only at the epoch it holds). The node
+    /// keeps that standing after the fence lapses, by time or by a flush of the
+    /// authority, until it leaves leadership. An ack of a later epoch of its
+    /// own lineage ends it too, by taking the node out of office. A node with
+    /// no authority has none.
+    fn leads_its_office_epoch(&self, lineage: u64) -> bool {
+        self.state == WorkerState::Leader
+            && self
+                .authority
+                .as_ref()
+                .and_then(AuthorityStanding::office_epoch)
+                .is_some_and(|led| led.lineage != lineage)
     }
 
     /// Sends this node's leader a heartbeat once a heartbeat
@@ -1599,7 +1687,7 @@ where
         self.round.latest_term(self.standing.highest_term_seen())
     }
 
-    /// Records the leader `pointer` names and drives `Bootstrapping ->
+    /// Takes the leader `pointer` names and drives `Bootstrapping ->
     /// Joining -> Active` (see [`Input::JoinAnswer`]).
     fn join(&mut self, pointer: &JoinResponse) {
         if !self.state.can_transition_to(WorkerState::Joining) {
@@ -1608,19 +1696,33 @@ where
         let Some(leader_id) = pointer.leader_id() else {
             return;
         };
-        // A first join takes any pointer. After that, a leader of an epoch
-        // older than this node's own (one it rejoins after a recovery
-        // without it), or of another lineage whatever its number (one the
-        // authority lost), no longer leads the shard.
-        let named = RecoveryEpoch::new(pointer.recovery_epoch, pointer.recovery_epoch_lineage);
-        match self.standing.order(named.into()) {
-            None | Some(EpochOrder::Mine | EpochOrder::Later) => {}
-            Some(EpochOrder::Stale | EpochOrder::Foreign(_)) => return,
+        // A first join takes any pointer. After that, a pointer the floor the
+        // node rejoins at does not accept leads nothing the node can return
+        // to.
+        let floor = self.standing.join_floor();
+        if !floor.accepts(pointer) {
+            return;
         }
+        let named = RecoveryEpoch::new(pointer.recovery_epoch, pointer.recovery_epoch_lineage);
 
         self.transition_to(WorkerState::Joining);
-        self.standing.joined(named, pointer.term);
-        self.leader = Some((leader_id, pointer.term));
+        // A node with a floor is rejoining, and the pointer was taken from a
+        // search that may lag the authority: it holds the pointer until a
+        // read of the authority names its epoch. A read asked before this
+        // says nothing of it.
+        self.rejoin.awaited_read = None;
+        if floor.epoch().is_some() {
+            self.rejoin.held = Some(pointer.clone());
+            return;
+        }
+        self.become_member_of(leader_id, pointer.term, named);
+    }
+
+    /// Becomes the pending member of `leader`, elected in `term` at
+    /// `epoch`, that a validated JOIN pointer named: `Joining -> Active`.
+    fn become_member_of(&mut self, leader: WorkerId, term: u64, epoch: RecoveryEpoch) {
+        self.standing.joined(epoch, term);
+        self.leader = Some((leader, term));
         // A freshly joined node hasn't heard from its leader yet; start the
         // suspicion clock now so it isn't judged suspect the instant it
         // ticks — the same reasoning `Self::new`'s doc gives for a freshly
@@ -1633,6 +1735,55 @@ where
             authority.restart_at(now);
         }
         self.transition_to(WorkerState::Active);
+    }
+
+    /// Records `token` as the read of the authority's epoch that the next
+    /// answer must name (see [`Input::AuthorityEpochAsked`]).
+    fn note_epoch_read_asked(&mut self, token: ReplyToken) {
+        if matches!(
+            self.state,
+            WorkerState::Bootstrapping | WorkerState::Joining
+        ) {
+            self.rejoin.awaited_read = Some(token);
+        }
+    }
+
+    /// Applies the answer `held` to the read `token` when it is the latest
+    /// asked (see [`Input::AuthorityEpochRead`]): a bootstrapping node
+    /// refreshes its floor, and one validating a pointer becomes a member or
+    /// drops the pointer.
+    fn on_epoch_read(&mut self, token: ReplyToken, held: RecoveryEpoch) {
+        if self.rejoin.awaited_read != Some(token) {
+            return;
+        }
+        self.rejoin.awaited_read = None;
+        match self.state {
+            WorkerState::Bootstrapping => {
+                let mut floor = self.standing.join_floor();
+                let before = floor;
+                floor.refresh(held);
+                if floor != before {
+                    self.standing.rejoin_at(held);
+                }
+            }
+            WorkerState::Joining => {
+                let Some(pointer) = self.rejoin.held.take() else {
+                    return;
+                };
+                let named =
+                    RecoveryEpoch::new(pointer.recovery_epoch, pointer.recovery_epoch_lineage);
+                match pointer.leader_id() {
+                    Some(leader) if named == held => {
+                        self.become_member_of(leader, pointer.term, named);
+                    }
+                    _ => {
+                        self.standing.rejoin_at(held);
+                        self.transition_to(WorkerState::Bootstrapping);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Dispatches an inbound message from `from` to its handler.
@@ -1982,14 +2133,13 @@ where
     /// joint configuration this node holds hands it that commit (see
     /// [`Self::adopt_relayed_commit`]). A term later than the one it holds
     /// or contests makes it step down (see [`Self::step_down_if_outpaced`]).
-    /// A refusal from a node at a later recovery epoch raises nothing (the
-    /// two epochs' terms do not compare) but, while `RollCall`, makes the
-    /// leader it names this node's, whose ack then moves it to that epoch, as
-    /// does a higher-numbered epoch of another lineage. A refusal from an
-    /// earlier epoch, or from another lineage's epoch at or below this
-    /// node's number, is dropped. A refusal names its refuser's epoch and lineage
-    /// itself; one that names no epoch (its refuser has joined no shard) is
-    /// read as this node's own epoch's. The refusal itself is not counted.
+    /// A refusal from a newer epoch raises nothing (the two epochs' terms do
+    /// not compare) but, while `RollCall`, makes the leader it names this
+    /// node's, whose ack then moves it to that epoch. A refusal from an older
+    /// epoch is dropped (see [`EpochOrder`]). A refusal names its refuser's
+    /// epoch and lineage itself; one that names no epoch (its refuser has
+    /// joined no shard) is read as this node's own epoch's. The refusal
+    /// itself is not counted.
     fn on_election_reject(&mut self, reject: &Checked<ElectionReject>) {
         if reject.shard_id() != self.shard_id || reject.initiator_id() != self.my_id {
             return;
@@ -2000,11 +2150,9 @@ where
             lineage: reject.recovery_epoch_lineage,
         });
         match refuser_epoch.and_then(|heard| self.standing.order(heard)) {
-            // A later epoch of this lineage, or a higher-numbered foreign one
-            // (as `on_leader_ack` takes it): its terms are not this epoch's,
-            // so they neither raise this node's nor outpace its roll call:
-            // the named leader's ack will.
-            Some(EpochOrder::Later | EpochOrder::Foreign(Ordering::Greater)) => {
+            // A newer epoch's terms are not this epoch's, so they raise
+            // nothing here; the named leader's ack moves this node.
+            Some(EpochOrder::Later) => {
                 if self.state == WorkerState::RollCall
                     && let Some((leader, term)) = reject.named_leader()
                     && leader != self.my_id
@@ -2013,13 +2161,9 @@ where
                 }
                 return;
             }
-            // A refuser left on a lower epoch counts that epoch's terms,
-            // which order nothing here, and names a leader of that epoch.
-            // Another lineage's
-            // epoch at or below this node's number is another shard's: its
-            // terms, leader and configuration mean nothing here, and its
-            // configuration must not be relayed.
-            Some(EpochOrder::Stale | EpochOrder::Foreign(_)) => return,
+            // An older epoch's terms, leader and configuration mean nothing
+            // here, and its configuration must not be relayed.
+            Some(EpochOrder::Stale) => return,
             Some(EpochOrder::Mine) | None => {}
         }
         self.standing.saw_term(reject.highest_term_seen);
@@ -2214,8 +2358,8 @@ where
     /// `epoch`, which it cannot resume or recover into: discards everything
     /// it knew of its own and goes back to `Bootstrapping`, for its driver to
     /// join it again. The epoch it rejoins is a
-    /// floor: a JOIN pointer to a leader left on an older one, or on another
-    /// lineage, must not take it back there.
+    /// floor: a JOIN pointer to a leader left on an older one (see
+    /// [`EpochOrder::Stale`]) must not take it back there.
     fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
         self.forget_election_state();
         self.standing.rejoin_at(epoch);
@@ -2260,7 +2404,7 @@ where
 
         self.lease.won(now);
         if let Some(authority) = self.authority.as_mut() {
-            authority.took_office(now);
+            authority.took_office(self.standing.epoch(), now);
         }
         // The leader it followed before is replaced. Should this node lose
         // its quorum and go back to electing, it must not heartbeat that

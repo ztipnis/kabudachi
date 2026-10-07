@@ -5,6 +5,7 @@ mod carry_out;
 mod certificate;
 mod forced_recovery;
 mod heartbeat;
+mod join_floor;
 mod joint_founding;
 mod leader_heartbeat;
 mod membership;

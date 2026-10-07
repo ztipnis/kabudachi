@@ -157,6 +157,12 @@ impl AuthorityStanding {
         self.lease.fence_valid_until()
     }
 
+    /// The recovery epoch of the office this node took, fence granted or not,
+    /// for as long as it leads.
+    pub(crate) fn office_epoch(&self) -> Option<RecoveryEpoch> {
+        self.lease.office_epoch()
+    }
+
     /// The node moved to `next`: outside `Candidate`, `LeaderReconciling`
     /// and `Leader` it gives up any fence.
     pub(crate) fn state_changed(&mut self, next: WorkerState) {
@@ -168,11 +174,10 @@ impl AuthorityStanding {
         }
     }
 
-    /// The node took office at `now`: it needs a fence unless it holds one.
-    pub(crate) fn took_office(&mut self, now: Instant) {
-        if self.lease.fence_valid_until().is_none() {
-            self.lease.need_fence(now);
-        }
+    /// The node took office at `now`, leading `epoch`: it needs a fence unless
+    /// it holds one, and leads `epoch` from now on.
+    pub(crate) fn took_office(&mut self, epoch: Option<RecoveryEpoch>, now: Instant) {
+        self.lease.took_office(epoch, now);
     }
 
     /// A roll call of `term` under `configuration` fell short with these
@@ -473,7 +478,7 @@ impl AuthorityStanding {
         }
         match result {
             Ok(granted) => {
-                self.lease.fence_acquired(sent_at, granted);
+                self.lease.fence_acquired(epoch, sent_at, granted);
                 if view.state == WorkerState::Candidate {
                     self.lead_recovered()
                 } else {

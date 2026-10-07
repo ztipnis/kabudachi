@@ -10,7 +10,7 @@
 
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-use kabudachi_core::election::Input;
+use kabudachi_core::election::{Input, JoinFloor};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_net::join::{LeaderSearch, ask_for_leader};
@@ -20,6 +20,8 @@ use tokio::time::timeout;
 
 /// How long each helper waits for the connection state it waits for.
 const WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(20);
+/// How long a pass of `ask_for_leader` keeps listening once a pointer arrived.
+const GRACE: StdDuration = StdDuration::from_secs(5);
 
 /// Takes `net`'s queued inputs until every one of `expected` has been taken,
 /// in any order, and returns when the last was. Everything taken is
@@ -96,7 +98,8 @@ pub async fn ask_until_pointed_at_a_leader(
 ) -> JoinResponse {
     timeout(WAIT_TIMEOUT, async {
         loop {
-            if let LeaderSearch::Found(pointer) = ask_for_leader(net, seeds, per_seed_timeout).await
+            if let LeaderSearch::Found(pointer) =
+                ask_for_leader(net, seeds, JoinFloor::none(), per_seed_timeout, GRACE).await
             {
                 return pointer;
             }

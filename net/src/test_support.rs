@@ -10,7 +10,7 @@ use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::time::Duration as TickDuration;
-use kabudachi_core::election::CallKind;
+use kabudachi_core::election::{CallKind, JoinFloor};
 use kabudachi_testkit::FaultingAuthority;
 use libp2p::{Multiaddr, identity};
 
@@ -93,27 +93,30 @@ impl Scripted {
 }
 
 impl AskWhoLeads for Scripted {
-    /// Walks the pass as `join::ask_for_leader` walks its peers. A pass over
-    /// no address asks no one, and is not recorded.
-    fn ask(&mut self, addresses: &[Multiaddr]) -> impl Future<Output = LeaderSearch> + Send {
+    /// Asks every address as `join::ask_for_leader` asks its peers: returns
+    /// the newest pointer the floor accepts, the one asked first among
+    /// equally new. A pass over no address asks no one, and is not
+    /// recorded.
+    fn ask(
+        &mut self,
+        addresses: &[Multiaddr],
+        floor: JoinFloor,
+    ) -> impl Future<Output = LeaderSearch> + Send {
         if !addresses.is_empty() {
             self.passes.lock().unwrap().push(addresses.to_vec());
         }
         let mut answered = false;
-        let mut found = None;
+        let mut pointers = Vec::new();
         for address in addresses {
             match self.answer(address) {
                 Answer::Silent => {}
                 Answer::NoLeader => answered = true,
-                Answer::Pointer(pointer) => {
-                    found = Some(pointer);
-                    break;
-                }
+                Answer::Pointer(pointer) => pointers.push(pointer),
             }
         }
-        let search = match found {
-            Some(pointer) => LeaderSearch::Found(pointer),
-            None if answered => LeaderSearch::NoReachableLeader,
+        let search = match floor.newest(&pointers) {
+            Some(pointer) => LeaderSearch::Found(pointer.clone()),
+            None if answered || !pointers.is_empty() => LeaderSearch::NoReachableLeader,
             None => LeaderSearch::NoAnswer,
         };
         std::future::ready(search)

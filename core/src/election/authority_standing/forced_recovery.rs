@@ -78,13 +78,15 @@ pub(crate) enum Next {
 /// afresh), or lower in its own (lost data, or put back by a republish),
 /// so a recovery from it would swap an epoch number its shard may already
 /// have used. A node that never learned its lineage cannot tell.
-pub(crate) fn cannot_recover_from(own_epoch: Option<RecoveryEpoch>, held: RecoveryEpoch) -> bool {
+pub(crate) fn cannot_recover_from(
+    own_epoch: Option<RecoveryEpoch>,
+    held: RecoveryEpoch,
+) -> bool {
     match own_epoch {
         None => true,
-        Some(own) => match order(&own, held.into()) {
-            EpochOrder::Stale | EpochOrder::Foreign(_) => true,
-            EpochOrder::Mine | EpochOrder::Later => false,
-        },
+        Some(own) => {
+            own.lineage != held.lineage || order(&own, held.into()) == EpochOrder::Stale
+        }
     }
 }
 

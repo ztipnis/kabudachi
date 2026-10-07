@@ -33,6 +33,13 @@ pub(crate) struct AuthorityLease {
 struct Fence {
     /// Until when the fence lets the node act; `None` until first acquired.
     valid_until: Option<Instant>,
+    /// The recovery epoch of the leader's office: the epoch the node led from
+    /// the moment it took office, before any fence was granted, and the epoch
+    /// of any grant since (the authority grants a fence only at the epoch it
+    /// holds). It outlasts the grant's validity: a lapsed fence keeps it.
+    /// Cleared by `need_fence`, which starts a fresh fence, and by
+    /// `drop_fence`; `took_office` sets it again after either.
+    office_epoch: Option<RecoveryEpoch>,
     next_attempt_at: Instant,
 }
 
@@ -96,8 +103,20 @@ impl AuthorityLease {
     pub(crate) fn need_fence(&mut self, now: Instant) {
         self.fence = Some(Fence {
             valid_until: None,
+            office_epoch: None,
             next_attempt_at: now,
         });
+    }
+
+    /// The node took office leading `epoch`: it needs a fence unless it holds
+    /// a live one, and it leads `epoch` from now on, with or without a grant.
+    pub(crate) fn took_office(&mut self, epoch: Option<RecoveryEpoch>, now: Instant) {
+        if self.fence_valid_until().is_none() {
+            self.need_fence(now);
+        }
+        if let Some(fence) = self.fence.as_mut() {
+            fence.office_epoch = epoch;
+        }
     }
 
     /// The node no longer leads or stands: it gives up its fence.
@@ -118,10 +137,16 @@ impl AuthorityLease {
         }
     }
 
-    /// A fence asked for at `sent_at` was granted for `granted`.
-    pub(crate) fn fence_acquired(&mut self, sent_at: Instant, granted: Duration) {
+    /// A fence at `epoch`, asked for at `sent_at`, was granted for `granted`.
+    pub(crate) fn fence_acquired(
+        &mut self,
+        epoch: RecoveryEpoch,
+        sent_at: Instant,
+        granted: Duration,
+    ) {
         let until = self.lasts_until(sent_at, granted);
         if let Some(fence) = self.fence.as_mut() {
+            fence.office_epoch = Some(epoch);
             fence.valid_until = Some(fence.valid_until.map_or(until, |valid| valid.max(until)));
         }
     }
@@ -138,6 +163,13 @@ impl AuthorityLease {
     /// Until when the node's fence lets it act; `None` while it holds none.
     pub(crate) fn fence_valid_until(&self) -> Option<Instant> {
         self.fence.and_then(|fence| fence.valid_until)
+    }
+
+    /// The recovery epoch of the office the node took, held with or without a
+    /// fence grant, valid or lapsed; `None` once it gave the fence up or
+    /// before it took office.
+    pub(crate) fn office_epoch(&self) -> Option<RecoveryEpoch> {
+        self.fence.and_then(|fence| fence.office_epoch)
     }
 
     /// The earliest instant at which this lease wants something done: a

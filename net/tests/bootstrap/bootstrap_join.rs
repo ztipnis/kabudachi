@@ -8,7 +8,7 @@
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::CoordinationAuthority;
-use kabudachi_core::election::ElectionTimings;
+use kabudachi_core::election::{ElectionTimings, JoinFloor};
 use kabudachi_core::in_memory_authority::InMemoryAuthority;
 use kabudachi_core::protocol::ids::ShardId;
 use kabudachi_core::protocol::messages::prelude::*;
@@ -26,6 +26,9 @@ use crate::support::worker::{
 };
 
 const SHARD: &str = "shard-1";
+
+/// How long a pass of `ask_for_leader` keeps listening once a pointer arrived.
+const GRACE: StdDuration = StdDuration::from_secs(5);
 
 /// The authority's registration TTL, which is also how long it warms up.
 /// Long enough that a driven worker on a loaded host always renews in time
@@ -187,7 +190,13 @@ async fn a_leader_bound_to_every_interface_points_joiners_at_a_non_loopback_addr
     let joining_net = Net::new();
     let search = timeout(
         TEST_TIMEOUT,
-        ask_for_leader(&joining_net, std::slice::from_ref(&leader.address), PER_PEER_TIMEOUT),
+        ask_for_leader(
+            &joining_net,
+            std::slice::from_ref(&leader.address),
+            JoinFloor::none(),
+            PER_PEER_TIMEOUT,
+            GRACE,
+        ),
     )
     .await
     .expect("the leader answered within the timeout");
@@ -206,7 +215,7 @@ async fn a_leader_bound_to_every_interface_points_joiners_at_a_non_loopback_addr
     let remote_net = Net::new();
     let search = timeout(
         TEST_TIMEOUT,
-        ask_for_leader(&remote_net, &[pointed], PER_PEER_TIMEOUT),
+        ask_for_leader(&remote_net, &[pointed], JoinFloor::none(), PER_PEER_TIMEOUT, GRACE),
     )
     .await
     .expect("the leader answered within the timeout");

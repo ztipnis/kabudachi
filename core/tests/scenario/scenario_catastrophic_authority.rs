@@ -598,9 +598,10 @@ fn an_orphan_rejoins_as_pending_and_a_straggler_finds_the_recovered_leader_by_re
         steps.iter().any(|step| step.node == orphan
             && step.recovery_epoch == 1
             && step.admission.is_none()
-            && matches!(step.input, Some(Input::JoinAnswer(_)))
+            && matches!(step.input, Some(Input::AuthorityEpochRead { .. }))
             && step.state == WorkerState::Active),
-        "the orphan rejoined at the new epoch as a pending member, on a JOIN answer"
+        "the orphan rejoined at the new epoch as a pending member, once the authority confirmed \
+         the epoch of the JOIN answer it took"
     );
     let orphan_admission = Admission {
         current: cluster.node(&orphan).admission(),

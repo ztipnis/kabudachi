@@ -340,6 +340,8 @@ fn a_fenced_node_rejoins_as_pending_once_the_epoch_has_moved_on() {
         recovery_epoch: 1,
         recovery_epoch_lineage: 0,
     }));
+    assert_eq!(driven.node.state(), WorkerState::Joining);
+    read_epoch(&mut driven.node, 1, epoch(1));
     assert_eq!(driven.node.state(), WorkerState::Active);
     assert_eq!(driven.node.recovery_epoch(), 1);
 }
@@ -387,19 +389,19 @@ fn a_fenced_node_ignores_an_epoch_read_it_asked_for_before_reconnecting() {
 }
 
 // A shard founded afresh after a flush may reuse the old shard's epoch
-// number. A node that rejoins it must not be taken back to the old shard by
-// a pointer to one of its leaders at that same number.
+// number. A node rejoining it refuses a pointer to a leader of another
+// lineage at or below its floor's number, which may be the old shard's at
+// the same number, and takes one numbered above it, which is newer.
 #[test]
-fn a_node_rejoining_a_shard_founded_afresh_ignores_a_pointer_into_its_old_lineage() {
+fn a_node_rejoining_a_shard_founded_afresh_takes_another_lineages_pointer_only_above_its_floor() {
     let mut driven = fenced_voter();
     driven.authority.flush();
     driven.authority.set_reachable(true);
-    let refounded = RecoveryEpoch::new(0, 9);
+    let refounded = RecoveryEpoch::new(1, 9);
     driven
         .authority
         .compare_and_swap_recovery_epoch(&shard(SHARD), None, refounded)
         .expect("a bootstrapper founds the shard afresh");
-
     while driven.node.state() == WorkerState::Fenced {
         driven.advance(1_000);
     }
@@ -412,17 +414,242 @@ fn a_node_rejoining_a_shard_founded_afresh_ignores_a_pointer_into_its_old_lineag
         recovery_epoch: number,
         recovery_epoch_lineage: lineage,
     };
-    for number in [0, 5] {
+    for number in [0, 1] {
         let _ = driven.node.step(Input::JoinAnswer(pointer(number, 0)));
         assert_eq!(
             driven.node.state(),
             WorkerState::Bootstrapping,
-            "a leader of the lost shard leads nothing, at epoch {number} or any other"
+            "another lineage's epoch {number} is at or below the floor"
         );
     }
-    let _ = driven.node.step(Input::JoinAnswer(pointer(0, refounded.lineage)));
+    let _ = driven.node.step(Input::JoinAnswer(pointer(2, 0)));
+    assert_eq!(
+        driven.node.state(),
+        WorkerState::Joining,
+        "the floor takes the pointer, which the authority has yet to confirm"
+    );
+    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(2, 0));
     assert_eq!(driven.node.state(), WorkerState::Active);
-    assert_eq!(driven.node.recovery_lineage(), Some(refounded.lineage));
+    assert_eq!(
+        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+        (2, Some(0))
+    );
+}
+
+/// A node back in `Bootstrapping` at a floor of epoch 2 of lineage 1.
+fn rejoining_at_floor_two_of_lineage_one() -> Driven {
+    let mut driven = fenced_voter();
+    driven.authority.set_reachable(true);
+    driven
+        .authority
+        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), RecoveryEpoch::new(2, 1))
+        .expect("a recovery elsewhere moved the epoch on");
+    while driven.node.state() == WorkerState::Fenced {
+        driven.advance(1_000);
+    }
+    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
+    driven
+}
+
+/// A JOIN answer naming a leader of epoch 2 of `lineage`.
+fn pointer_at_epoch_two_of(lineage: u64) -> Input {
+    Input::JoinAnswer(JoinResponse {
+        leader_id: Some(worker("w2").into()),
+        leader_multiaddr: "w2".to_string(),
+        term: 1,
+        recovery_epoch: 2,
+        recovery_epoch_lineage: lineage,
+    })
+}
+
+/// A read of the authority's epoch asked for with a token of its own number,
+/// as a driver does, and answered at once with `held`.
+fn read_epoch(node: &mut TestNode, number: u64, held: RecoveryEpoch) {
+    let _ = node.step(Input::AuthorityEpochAsked(read_token(number)));
+    let _ = node.step(Input::AuthorityEpochRead {
+        token: read_token(number),
+        held,
+    });
+}
+
+fn read_token(number: u64) -> ReplyToken {
+    ReplyToken {
+        issuer: Issuer::Cascade,
+        kind: CallKind::ReadRecoveryEpoch,
+        number,
+    }
+}
+
+// A shard flushed and founded afresh may land on a number at or below the
+// floor of a node still rejoining the old one. The authority's epoch, read
+// while it rejoins, becomes its floor when it is another lineage's, so the
+// new shard's leader at that number is taken, not refused for ever.
+#[test]
+fn a_rejoining_node_takes_the_authoritys_epoch_of_another_lineage_as_its_floor() {
+    let mut driven = rejoining_at_floor_two_of_lineage_one();
+
+    let _ = driven.node.step(pointer_at_epoch_two_of(2));
+    assert_eq!(
+        driven.node.state(),
+        WorkerState::Bootstrapping,
+        "before the read, epoch 2 of another lineage is not above the floor"
+    );
+
+    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(2, 2));
+    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
+    assert_eq!(
+        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+        (2, Some(2))
+    );
+
+    let _ = driven.node.step(pointer_at_epoch_two_of(2));
+    read_epoch(&mut driven.node, 2, RecoveryEpoch::new(2, 2));
+    assert_eq!(driven.node.state(), WorkerState::Active);
+}
+
+// The floor moves only to an epoch of another lineage, and only for a node
+// rejoining.
+#[test]
+fn an_authority_epoch_of_the_floors_own_lineage_or_read_by_a_node_not_rejoining_changes_nothing() {
+    let mut driven = rejoining_at_floor_two_of_lineage_one();
+    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(3, 1));
+    assert_eq!(
+        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+        (2, Some(1))
+    );
+
+    let mut fenced = fenced_voter();
+    read_epoch(&mut fenced.node, 1, RecoveryEpoch::new(5, 9));
+    assert_eq!(fenced.node.state(), WorkerState::Fenced);
+    assert_eq!(fenced.node.recovery_epoch(), 0);
+}
+
+// A pointer taken from a delayed or lagging search is not the shard's say:
+// the node holds it, still rejoining and settled nowhere, until a read of the
+// authority names the pointer's epoch, lineage included.
+#[test]
+fn a_node_that_took_a_pointer_becomes_a_member_only_when_a_read_names_its_epoch() {
+    let mut driven = rejoining_at_floor_two_of_lineage_one();
+
+    let _ = driven.node.step(pointer_at_epoch_two_of(1));
+    assert_eq!(driven.node.state(), WorkerState::Joining);
+    assert_eq!(driven.node.known_leader(), None);
+
+    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(2, 1));
+    assert_eq!(driven.node.state(), WorkerState::Active);
+    assert_eq!(driven.node.known_leader(), Some((worker("w2"), 1)));
+    assert_eq!(
+        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+        (2, Some(1))
+    );
+}
+
+// An ack from the leader the node holds is no confirmation: a bootstrapper
+// ignores acks, and a node validating a pointer is one.
+#[test]
+fn a_node_validating_a_pointer_ignores_acks() {
+    let mut driven = rejoining_at_floor_two_of_lineage_one();
+    let _ = driven.node.step(pointer_at_epoch_two_of(1));
+    assert_eq!(driven.node.state(), WorkerState::Joining);
+
+    let _ = driven.node.step(message_input(
+        &worker("w2"),
+        ack_message(leader_ack(&worker("w2"), 1, &configuration_of(3), None)),
+    ));
+
+    assert_eq!(driven.node.state(), WorkerState::Joining);
+    assert_eq!(driven.node.configuration(), None);
+}
+
+// A read that names another epoch than the pointer's drops the pointer. The
+// node bootstraps again with the read's epoch as its floor, below the
+// pointer's number or not.
+#[test]
+fn a_read_naming_another_epoch_than_the_held_pointers_sends_the_node_back_to_bootstrap() {
+    let mut driven = rejoining_at_floor_two_of_lineage_one();
+    let _ = driven.node.step(pointer_at_epoch_two_of(1));
+    assert_eq!(driven.node.state(), WorkerState::Joining);
+
+    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(1, 2));
+
+    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
+    assert_eq!(driven.node.known_leader(), None);
+    assert_eq!(
+        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+        (1, Some(2))
+    );
+}
+
+// Only the answer to the latest read counts: one asked earlier, however late
+// it arrives, names an epoch the authority may have left since.
+#[test]
+fn an_answer_to_an_older_read_than_the_latest_is_dropped() {
+    let mut driven = rejoining_at_floor_two_of_lineage_one();
+    let _ = driven.node.step(pointer_at_epoch_two_of(1));
+    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(1)));
+    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(2)));
+
+    let _ = driven.node.step(Input::AuthorityEpochRead {
+        token: read_token(1),
+        held: RecoveryEpoch::new(7, 9),
+    });
+    assert_eq!(driven.node.state(), WorkerState::Joining);
+
+    let _ = driven.node.step(Input::AuthorityEpochRead {
+        token: read_token(2),
+        held: RecoveryEpoch::new(2, 1),
+    });
+    assert_eq!(driven.node.state(), WorkerState::Active);
+
+    // An answer is applied once.
+    let _ = driven.node.step(Input::AuthorityEpochRead {
+        token: read_token(2),
+        held: RecoveryEpoch::new(7, 9),
+    });
+    assert_eq!(driven.node.state(), WorkerState::Active);
+}
+
+// A read asked before the node took its pointer says nothing of that pointer.
+#[test]
+fn a_read_asked_before_the_pointer_was_taken_does_not_validate_it() {
+    let mut driven = rejoining_at_floor_two_of_lineage_one();
+    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(1)));
+    let _ = driven.node.step(pointer_at_epoch_two_of(1));
+
+    let _ = driven.node.step(Input::AuthorityEpochRead {
+        token: read_token(1),
+        held: RecoveryEpoch::new(2, 1),
+    });
+
+    assert_eq!(driven.node.state(), WorkerState::Joining);
+}
+
+// The authority refounds under lineage 2 at a lower number while a read of
+// the old lineage is still on its way. The late read must not put the floor
+// back on lineage 1 and let a lineage-1 leader's pointer make the node a
+// member.
+#[test]
+fn a_delayed_read_of_a_refounded_lineage_cannot_make_the_node_a_member_of_the_old_one() {
+    let mut driven = rejoining_at_floor_two_of_lineage_one();
+    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(1)));
+    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(2)));
+    let _ = driven.node.step(Input::AuthorityEpochRead {
+        token: read_token(2),
+        held: RecoveryEpoch::new(1, 2),
+    });
+    let _ = driven.node.step(Input::AuthorityEpochRead {
+        token: read_token(1),
+        held: RecoveryEpoch::new(2, 1),
+    });
+    assert_eq!(
+        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+        (1, Some(2)),
+        "the delayed read of lineage 1 left the floor on lineage 2"
+    );
+
+    // Lineage 1's old leader is still reachable and numbered above the floor.
+    let _ = driven.node.step(pointer_at_epoch_two_of(1));
+    assert_ne!(driven.node.state(), WorkerState::Active);
 }
 
 #[test]
@@ -441,6 +668,15 @@ fn a_fenced_node_stays_fenced_while_the_epoch_is_missing() {
 /// `w1`, the only voter of its configuration, with the authority at epoch 0,
 /// once its own roll call has closed; returns what that step produced.
 fn lone_winner(authority_timings: Option<AuthorityTimings>) -> (Driven, Vec<Output>) {
+    lone_winner_reaching(authority_timings, true)
+}
+
+/// As [`lone_winner`], with the authority unreachable from the start when
+/// `reachable` is false, so the winner takes office with no fence granted.
+fn lone_winner_reaching(
+    authority_timings: Option<AuthorityTimings>,
+    reachable: bool,
+) -> (Driven, Vec<Output>) {
     let clock = FakeClock::new();
     let authority = warmed_up_authority(&clock);
     seed_shard(&authority, &shard(SHARD), 0, []);
@@ -452,6 +688,7 @@ fn lone_winner(authority_timings: Option<AuthorityTimings>) -> (Driven, Vec<Outp
         default_timings(),
         authority_timings,
     );
+    driven.authority.set_reachable(reachable);
     driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
     driven.tick();
     let won = driven.advance(SUSPECT_TIMEOUT_TICKS);
@@ -1040,6 +1277,126 @@ fn a_node_ignores_an_ack_from_a_lower_epoch_of_another_lineage() {
         "a lower epoch of another lineage is no leader of this one"
     );
     assert_eq!(driven.node.recovery_epoch(), 1);
+}
+
+/// A configuration of three voters founded at recovery epoch `number`.
+fn configuration_at_epoch(number: u64) -> Configuration {
+    let generation = Generation::new(number, 0, 0);
+    Configuration::single(Single {
+        generation,
+        base: generation,
+        voter_count: 3,
+    })
+    .expect("valid")
+}
+
+/// An ack from `leader` of recovery epoch `number` of `lineage`, term 9.
+fn ack_of_epoch(leader: &WorkerId, number: u64, lineage: u64) -> Input {
+    message_input(leader, ack_message(LeaderHeartbeatAck {
+        recovery_epoch: number,
+        recovery_epoch_lineage: Some(lineage),
+        ..leader_ack(leader, 9, &configuration_at_epoch(number), Some(Generation::new(number, 0, 0)))
+    }))
+}
+
+/// Moves a leader's clock to the instant its fence lapses while its
+/// registration, renewed on the way, still stands: its fence renewals
+/// failed, its registrations did not.
+fn lapse_the_fence(driven: &mut Driven) {
+    let half = lasting_ticks() / 2;
+    driven.clock.advance(Duration::from_ticks(half));
+    let _ = driven.node.step(Input::Authority(AuthorityReply::Registered {
+        token: ReplyToken {
+            issuer: Issuer::Node,
+            kind: CallKind::Register,
+            number: 0,
+        },
+        sent_at: driven.clock.now(),
+        result: Ok(authority_ttl()),
+    }));
+    driven.clock.advance(Duration::from_ticks(lasting_ticks() - half));
+}
+
+/// Flushes the authority's records, then runs the leader's clock to the end
+/// of its fence. The flushed authority is warming up and refuses the leader's
+/// renewals, so the fence lapses, though the node never learned of the flush
+/// by any message.
+fn flush_the_fence(driven: &mut Driven) {
+    driven.authority.flush();
+    for _ in 0..3 {
+        driven.advance(lasting_ticks() / 3);
+    }
+}
+
+// The leader leads the epoch it took office at from the moment it takes
+// office, whether its fence is not yet granted, live, flushed away, or lapsed
+// by time. Another lineage's leader numbered above it is no newer for that: it
+// must not take the shard from the leader of its office epoch, who would then
+// leave every worker with no leader and no way to found one while the epoch
+// stands.
+#[test]
+fn a_leader_that_took_office_at_the_authoritys_epoch_ignores_an_ack_of_another_lineage_however_the_fence_stands() {
+    type Disturb = fn(&mut Driven);
+    let cases: [(&str, bool, Disturb); 4] = [
+        ("no fence granted yet", false, |_| {}),
+        ("a live fence", true, |_| {}),
+        ("a flushed fence", true, flush_the_fence),
+        ("a fence lapsed by time", true, lapse_the_fence),
+    ];
+    for (stands, granted, disturb) in cases {
+        let (mut driven, won) = lone_winner_reaching(
+            Some(AuthorityTimings {
+                ttl: authority_ttl(),
+            }),
+            granted,
+        );
+        assert_eq!(
+            grants(&won).iter().any(Option::is_some),
+            granted,
+            "{stands}: it acts only once it holds the fence"
+        );
+        disturb(&mut driven);
+
+        driven.step(ack_of_epoch(&worker("stranger"), 5, 7));
+
+        assert_eq!(driven.node.state(), WorkerState::Leader, "{stands}");
+        assert_eq!(
+            (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+            (0, Some(0)),
+            "{stands}"
+        );
+    }
+}
+
+// The standing ends with the leadership: a later epoch of its own lineage
+// takes the leader's office, and the node then follows the plain order, in
+// which another lineage's higher number is newer.
+#[test]
+fn a_leader_adopts_a_later_epoch_of_its_lineage_and_then_follows_the_plain_order() {
+    for (stands, granted) in [("no fence granted yet", false), ("a lapsed fence", true)] {
+        let (mut driven, _) = lone_winner_reaching(
+            Some(AuthorityTimings {
+                ttl: authority_ttl(),
+            }),
+            granted,
+        );
+        let own_leader = worker("own-leader");
+        let stranger = worker("stranger");
+        if granted {
+            lapse_the_fence(&mut driven);
+        }
+
+        driven.step(ack_of_epoch(&own_leader, 1, 0));
+        assert_eq!(driven.node.state(), WorkerState::Active, "{stands}");
+        assert_eq!(driven.node.recovery_epoch(), 1, "{stands}");
+
+        driven.step(ack_of_epoch(&stranger, 5, 7));
+        assert_eq!(
+            (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+            (5, Some(7)),
+            "{stands}"
+        );
+    }
 }
 
 #[test]

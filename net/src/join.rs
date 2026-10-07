@@ -2,9 +2,9 @@
 //! `crate::join_codec`), one for the bootstrap cascade and the driver's
 //! rejoin alike:
 //!
-//! - the client: [`ask_for_leader`] asks peers in order who leads the shard
-//!   and connects to the first leader one points at (the leader search,
-//!   `crate::leader_search`, decides whom to ask and when);
+//! - the client: [`ask_for_leader`] asks peers who lead the shard, all at
+//!   once, and connects to the newest leader they point at (the leader
+//!   search, `crate::leader_search`, decides whom to ask and when);
 //! - the responder's answer: [`pointer_for`], the pointer a node hands a
 //!   joiner. A pointer names the shard's leader, which only
 //!   `core::election::WorkerNode` knows, and its address, which only `Net`
@@ -16,15 +16,20 @@
 //! rather than by diffing the connected-peer set, so a late connection from
 //! an abandoned ask is never mistaken for a later one's.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::election::WorkerNode;
+use kabudachi_core::election::{JoinFloor, WorkerNode};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::{JoinRequest, JoinResponse};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::time::Clock;
+use libp2p::futures::StreamExt;
+use libp2p::futures::stream::FuturesUnordered;
 use libp2p::{Multiaddr, PeerId};
+use tokio::time::Instant;
 
 use crate::exchange::Asked;
 use crate::join_codec::JoinCodec;
@@ -73,13 +78,14 @@ impl Net {
 }
 
 /// How long [`ask_for_leader`] waits, per peer, for a connection and then a
-/// `JOIN_RESPONSE` before moving on to the next peer.
+/// `JOIN_RESPONSE` before giving up on that peer.
 pub const DEFAULT_JOIN_PEER_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 /// What one pass of [`ask_for_leader`] over its peers found.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LeaderSearch {
-    /// A peer pointed at a leader, and this node is now connected to it.
+    /// A peer pointed at a leader, the newest of the pass this node could
+    /// reach, and it is now connected to it.
     Found(JoinResponse),
     /// Some peer answered, but none pointed at a leader this node could
     /// reach: the shard exists, and its leader may not be elected yet.
@@ -88,13 +94,32 @@ pub enum LeaderSearch {
     NoAnswer,
 }
 
-/// One pass of the JOIN client: asks each of `peers` in order who leads the shard, over `net`, and
-/// returns [`LeaderSearch::Found`] with the first `JOIN_RESPONSE` that
-/// points at a leader this node is then connected to; the caller enters the
-/// shard with it (`core::election::Entry::Joining`). A peer that fails to
-/// connect or answer within `per_peer_timeout`, answers "no leader known",
-/// or points at a leader this node cannot reach (see [`connect_to_leader`]),
-/// is passed over for the next one.
+/// One pass of the JOIN client: asks every one of `peers` who leads the
+/// shard, over `net`, all at once: every seed is dialed at the same time, so a
+/// pass may leave a connection to each live seed. A peer that fails to connect or answer
+/// within `per_peer_timeout`, answers "no leader known", or points at an
+/// address that does not parse, contributes no pointer.
+///
+/// `floor` is the recovery epoch the caller rejoins at, [`JoinFloor::none`]
+/// for a first join. It alone judges the pointers: one it does not accept is
+/// treated as no pointer, and it never starts the grace window below.
+///
+/// The pass ends when every peer has answered or timed out, or `grace` after
+/// the first answer that points at an acceptable leader arrived, whichever
+/// comes first: a live seed's answer is not held up by a dead seed's full
+/// timeout, and a seed that answers within `grace` of the first still has its
+/// say. Callers pass the shard's suspicion timeout, the time after which a
+/// silent leader is no longer waited on.
+///
+/// It then takes the acceptable pointers newest first, as
+/// [`JoinFloor::newest_first`] ranks them (equally new ones in `peers`
+/// order), and returns
+/// [`LeaderSearch::Found`] with the first whose leader this node is then
+/// connected to (see [`connect_to_leader`]); the caller enters the shard
+/// with it (`core::election::Entry::Joining`). A pointer to a leader that
+/// cannot be reached is passed over for the next newest. These connections
+/// are made one at a time after the gathering ends, each bounded by
+/// `per_peer_timeout` on its own.
 ///
 /// Otherwise the pass says whether anyone answered at all:
 /// [`LeaderSearch::NoReachableLeader`] when some peer did (even "no leader
@@ -106,19 +131,33 @@ pub enum LeaderSearch {
 pub async fn ask_for_leader(
     net: &Net,
     peers: &[Multiaddr],
+    floor: JoinFloor,
     per_peer_timeout: StdDuration,
+    grace: StdDuration,
 ) -> LeaderSearch {
-    let mut a_peer_answered = false;
-    for peer in peers {
-        let Some(response) = ask_peer_for_leader(net, peer, per_peer_timeout).await else {
-            continue;
-        };
-        a_peer_answered = true;
-        let Some((leader, leader_addr)) = pointed_leader(&response) else {
-            continue;
-        };
+    let asks = peers
+        .iter()
+        .map(|peer| {
+            Box::pin(ask_peer_for_leader(net, peer, per_peer_timeout)) as PeerAsk<'_>
+        })
+        .collect();
+    let answers = gather_answers(asks, grace, |pointer| {
+        floor.accepts(pointer) && pointed_leader(pointer).is_some()
+    })
+    .await;
+    let a_peer_answered = answers.iter().any(Option::is_some);
+    let answers: Vec<_> = answers.into_iter().flatten().collect();
+    let pointers: Vec<_> = floor
+        .newest_first(&answers)
+        .into_iter()
+        .filter_map(|response| {
+            let (leader, leader_addr) = pointed_leader(response)?;
+            Some((response, leader, leader_addr))
+        })
+        .collect();
+    for (response, leader, leader_addr) in pointers {
         if connect_to_leader(net, &leader, leader_addr, per_peer_timeout).await {
-            return LeaderSearch::Found(response);
+            return LeaderSearch::Found(response.clone());
         }
     }
     if a_peer_answered {
@@ -126,6 +165,43 @@ pub async fn ask_for_leader(
     } else {
         LeaderSearch::NoAnswer
     }
+}
+
+/// One peer's ask of a pass, in flight.
+type PeerAsk<'a> = Pin<Box<dyn Future<Output = Option<JoinResponse>> + Send + 'a>>;
+
+/// Drives every ask at once and returns what each answered, in the order
+/// the asks were given (`None` for one that did not answer). It stops early
+/// when `grace` has passed since the first answer `starts_grace` holds of
+/// arrived, dropping the asks still in flight: their dials and requests are
+/// abandoned exactly as a per-peer timeout abandons them.
+async fn gather_answers(
+    asks: Vec<PeerAsk<'_>>,
+    grace: StdDuration,
+    starts_grace: impl Fn(&JoinResponse) -> bool,
+) -> Vec<Option<JoinResponse>> {
+    let mut answers = vec![None; asks.len()];
+    let mut in_flight: FuturesUnordered<_> = asks
+        .into_iter()
+        .enumerate()
+        .map(|(index, ask)| async move { (index, ask.await) })
+        .collect();
+    let mut grace_ends = None;
+    loop {
+        let next = match grace_ends {
+            Some(end) => match tokio::time::timeout_at(end, in_flight.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+            None => in_flight.next().await,
+        };
+        let Some((index, answer)) = next else { break };
+        if grace_ends.is_none() && answer.as_ref().is_some_and(&starts_grace) {
+            grace_ends = Some(Instant::now() + grace);
+        }
+        answers[index] = answer;
+    }
+    answers
 }
 
 /// The `JOIN_RESPONSE` `node`, running over `net`, gives a joiner right
@@ -266,6 +342,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use kabudachi_core::coordination_authority::RecoveryEpoch;
     use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input};
     use kabudachi_core::protocol::ids::{IncarnationId, ShardId};
     use kabudachi_core::protocol::worker_state::WorkerState;
@@ -290,6 +367,12 @@ mod tests {
         .unwrap_or_else(|_| panic!("{what} within the timeout"));
     }
 
+    /// How long past the first pointer a pass keeps listening for others.
+    const GRACE: Duration = Duration::from_secs(1);
+    /// Grace for tests over real sockets: far longer than a loopback answer
+    /// takes, so a slow host never cuts a pass short.
+    const REAL_SOCKET_GRACE: Duration = Duration::from_secs(5);
+
     fn pointer_to(leader: &WorkerId, leader_addr: &Multiaddr) -> JoinResponse {
         JoinResponse {
             leader_id: Some(leader.clone().into()),
@@ -298,6 +381,180 @@ mod tests {
             recovery_epoch: 0,
             recovery_epoch_lineage: 0,
         }
+    }
+
+    fn pointer_at(
+        leader: &WorkerId,
+        leader_addr: &Multiaddr,
+        recovery_epoch: u64,
+        term: u64,
+    ) -> JoinResponse {
+        JoinResponse {
+            recovery_epoch,
+            term,
+            ..pointer_to(leader, leader_addr)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_for_leader_asks_every_peer_and_takes_the_newest_pointer() {
+        // Each pair: what the first seed points at, what the second points at.
+        // The second is newer each time: a later epoch whatever the term, or a
+        // later term at the same epoch.
+        for ((first_epoch, first_term), (second_epoch, second_term)) in
+            [((0, 5), (1, 1)), ((2, 2), (2, 3))]
+        {
+            let (net_a, addr_a) = listening_net().await;
+            let (net_b, addr_b) = listening_net().await;
+            let net_c = Net::new();
+            let (worker_a, worker_b) = (net_a.local_worker_id(), net_b.local_worker_id());
+            let older = pointer_at(&worker_a, &addr_a, first_epoch, first_term);
+            let newer = pointer_at(&worker_b, &addr_b, second_epoch, second_term);
+            let _responder_a = spawn_join_responder(Arc::new(net_a), older);
+            let _responder_b = spawn_join_responder(Arc::new(net_b), newer.clone());
+
+            let search = timeout(
+                TEST_TIMEOUT,
+                ask_for_leader(
+                    &net_c,
+                    &[addr_a, addr_b],
+                    JoinFloor::none(),
+                    Duration::from_secs(5),
+                    REAL_SOCKET_GRACE,
+                ),
+            )
+            .await
+            .expect("ask_for_leader completed within the test timeout");
+
+            assert_eq!(search, LeaderSearch::Found(newer));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_for_leader_takes_the_pointer_the_floor_accepts_over_a_higher_term_of_another_lineage() {
+        // The floor is epoch 5 of lineage 1. Seed A, listed first, points at
+        // epoch 5 of lineage 2 at a much later term: a leader the floor
+        // refuses. Seed B points at the floor's own lineage.
+        let (net_a, addr_a) = listening_net().await;
+        let (net_b, addr_b) = listening_net().await;
+        let net_c = Net::new();
+        let (worker_a, worker_b) = (net_a.local_worker_id(), net_b.local_worker_id());
+        let other_lineage = JoinResponse {
+            recovery_epoch_lineage: 2,
+            ..pointer_at(&worker_a, &addr_a, 5, 10)
+        };
+        let own_lineage = JoinResponse {
+            recovery_epoch_lineage: 1,
+            ..pointer_at(&worker_b, &addr_b, 5, 1)
+        };
+        let _responder_a = spawn_join_responder(Arc::new(net_a), other_lineage);
+        let _responder_b = spawn_join_responder(Arc::new(net_b), own_lineage.clone());
+
+        let search = timeout(
+            TEST_TIMEOUT,
+            ask_for_leader(
+                &net_c,
+                &[addr_a, addr_b],
+                JoinFloor::at(RecoveryEpoch::new(5, 1)),
+                Duration::from_secs(5),
+                REAL_SOCKET_GRACE,
+            ),
+        )
+        .await
+        .expect("ask_for_leader completed within the test timeout");
+
+        assert_eq!(search, LeaderSearch::Found(own_lineage));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pointer_the_floor_refuses_does_not_start_the_grace_window() {
+        // Seed A answers at once with a pointer the floor (epoch 5) refuses.
+        // Seed B answers 200 ms later with an acceptable one. With no grace,
+        // a pass that counted A's answer would end before B's.
+        let (net_a, addr_a) = listening_net().await;
+        let (net_b, addr_b) = listening_net().await;
+        let net_c = Net::new();
+        let (worker_a, worker_b) = (net_a.local_worker_id(), net_b.local_worker_id());
+        let refused = pointer_at(&worker_a, &addr_a, 4, 9);
+        let accepted = pointer_at(&worker_b, &addr_b, 5, 1);
+        let _responder_a = spawn_join_responder(Arc::new(net_a), refused);
+        let late_b = {
+            let accepted = accepted.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                spawn_join_responder(Arc::new(net_b), accepted).await
+            })
+        };
+
+        let search = timeout(
+            TEST_TIMEOUT,
+            ask_for_leader(
+                &net_c,
+                &[addr_a, addr_b],
+                JoinFloor::at(RecoveryEpoch::new(5, 0)),
+                Duration::from_secs(5),
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("ask_for_leader completed within the test timeout");
+        late_b.abort();
+
+        assert_eq!(search, LeaderSearch::Found(accepted));
+    }
+
+    fn answers_after(delay: Duration, answer: Option<JoinResponse>) -> PeerAsk<'static> {
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            answer
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_with_no_pointer_runs_until_every_peer_answered_or_timed_out() {
+        // "No leader known" is an answer but not a pointer: it starts no grace,
+        // so the pass waits for the slow peer, and for the silent one's full
+        // timeout.
+        let asks = vec![
+            answers_after(Duration::from_secs(1), Some(JoinResponse::default())),
+            answers_after(Duration::from_secs(4), Some(JoinResponse::default())),
+            answers_after(Duration::from_secs(10), None),
+        ];
+        let started = Instant::now();
+
+        let answers = gather_answers(asks, GRACE, |pointer| pointed_leader(pointer).is_some()).await;
+
+        assert_eq!(
+            answers,
+            vec![Some(JoinResponse::default()), Some(JoinResponse::default()), None]
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_ends_one_grace_after_the_first_pointer_keeping_answers_in_peer_order() {
+        let leader = WorkerId::new("leader-1");
+        let leader_addr: Multiaddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
+        let pointer = pointer_to(&leader, &leader_addr);
+        let asks = vec![
+            // Silent and listed first: its timeout must not hold up the pass.
+            answers_after(Duration::from_secs(10), None),
+            // Starts the grace at one second.
+            answers_after(Duration::from_secs(1), Some(pointer.clone())),
+            // Listed after the first pointer but arrives within the grace.
+            answers_after(Duration::from_millis(1500), Some(pointer.clone())),
+            // Arrives after the grace has ended.
+            answers_after(Duration::from_millis(2100), Some(pointer.clone())),
+        ];
+        let started = Instant::now();
+
+        let answers = gather_answers(asks, GRACE, |pointer| pointed_leader(pointer).is_some()).await;
+
+        assert_eq!(
+            answers,
+            vec![None, Some(pointer.clone()), Some(pointer), None]
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(1) + GRACE);
     }
 
     #[test]
@@ -334,7 +591,7 @@ mod tests {
 
         let pointer = timeout(
             TEST_TIMEOUT,
-            ask_for_leader(&net_c, &[addr_a, addr_b], Duration::from_secs(5)),
+            ask_for_leader(&net_c, &[addr_a, addr_b], JoinFloor::none(), Duration::from_secs(5), REAL_SOCKET_GRACE),
         )
         .await
         .expect("ask_for_leader completed within the test timeout");
@@ -373,7 +630,7 @@ mod tests {
 
         let search = timeout(
             TEST_TIMEOUT,
-            ask_for_leader(&net_c, &[addr_a], Duration::from_secs(1)),
+            ask_for_leader(&net_c, &[addr_a], JoinFloor::none(), Duration::from_secs(1), REAL_SOCKET_GRACE),
         )
         .await
         .expect("ask_for_leader completed within the test timeout");
@@ -394,7 +651,7 @@ mod tests {
 
         timeout(
             TEST_TIMEOUT,
-            ask_for_leader(&net_c, &[seed_addr], Duration::from_secs(5)),
+            ask_for_leader(&net_c, &[seed_addr], JoinFloor::none(), Duration::from_secs(5), REAL_SOCKET_GRACE),
         )
         .await
         .expect("ask_for_leader completed within the test timeout");
@@ -415,7 +672,7 @@ mod tests {
 
         let pointer = timeout(
             TEST_TIMEOUT,
-            ask_for_leader(&net_c, &[unreachable_seed], Duration::from_secs(2)),
+            ask_for_leader(&net_c, &[unreachable_seed], JoinFloor::none(), Duration::from_secs(2), REAL_SOCKET_GRACE),
         )
         .await
         .expect("ask_for_leader completed within the test timeout");
@@ -425,9 +682,8 @@ mod tests {
 
     #[tokio::test]
     async fn ask_for_leader_falls_through_a_non_responding_seed_to_the_next() {
-        // Proves the seed cascade: seeds are dialed in
-        // order, and a seed that doesn't answer doesn't stop the join —
-        // the next seed in the list still gets a chance.
+        // A seed that never answers does not stop the join: the live seed
+        // listed after it still gets its answer heard.
         let (net_a, listen_addr) = listening_net().await;
         let net_c = Net::new();
 
@@ -441,7 +697,7 @@ mod tests {
 
         let pointer = timeout(
             TEST_TIMEOUT,
-            ask_for_leader(&net_c, &seeds, Duration::from_secs(5)),
+            ask_for_leader(&net_c, &seeds, JoinFloor::none(), Duration::from_secs(5), REAL_SOCKET_GRACE),
         )
         .await
         .expect("ask_for_leader completed within the test timeout");
@@ -509,7 +765,7 @@ mod tests {
         // leak into seed B's result.
         let pointer = timeout(
             TEST_TIMEOUT,
-            ask_for_leader(&net_c, &[addr_b], Duration::from_secs(5)),
+            ask_for_leader(&net_c, &[addr_b], JoinFloor::none(), Duration::from_secs(5), REAL_SOCKET_GRACE),
         )
         .await
         .expect("ask_for_leader completed within the test timeout");
@@ -605,7 +861,7 @@ mod tests {
         // failure, not a wait.
         let search = timeout(
             Duration::from_secs(2),
-            ask_for_leader(&net_c, &[seed_addr], Duration::from_secs(5)),
+            ask_for_leader(&net_c, &[seed_addr], JoinFloor::none(), Duration::from_secs(5), REAL_SOCKET_GRACE),
         )
         .await
         .expect("the dropped request settled at once");

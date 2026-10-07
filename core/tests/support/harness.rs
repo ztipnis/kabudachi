@@ -39,8 +39,8 @@ use std::rc::Rc;
 
 use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, Entry, Identity, Input,
-    KnownConfiguration, MessageSink, Output, Step, WorkerNode, carry_out,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, CallKind, Entry, Identity,
+    Input, Issuer, KnownConfiguration, MessageSink, Output, ReplyToken, Step, WorkerNode, carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
@@ -97,6 +97,9 @@ pub struct Cluster {
     pending_members: BTreeSet<WorkerId>,
     /// How many nodes `restart_node` has restarted, to name each afresh.
     restarts: usize,
+    /// How many reads of the authority's epoch rejoining nodes have asked, to
+    /// number each afresh.
+    rejoin_reads: u64,
     /// The suspicion timeout every node was built with, reused by `restart_node`.
     suspect_timeout: Duration,
     /// The authority timings every node was built with, reused by
@@ -197,6 +200,7 @@ impl Cluster {
             voter_count: voters,
             pending_members: worker_ids[voters..].iter().cloned().collect(),
             restarts: 0,
+            rejoin_reads: 0,
             suspect_timeout,
             authority_timings,
             schedulers: BTreeMap::new(),
@@ -702,10 +706,11 @@ impl Cluster {
 
     /// Answers JOIN for every node back in `Bootstrapping` to rejoin its
     /// shard (a fenced node that found the recovery epoch moved on), as a
-    /// seed would: with the leader the network lets it reach, of its epoch
-    /// or a later one (the latest epoch and term, if several lead), that is
-    /// not stalled. A node no such leader leads for stays `Bootstrapping`
-    /// until one does. Returns the nodes it joined.
+    /// seed would: with the newest leader its floor accepts that the network
+    /// lets it reach and that is not stalled. A node no such leader leads for
+    /// stays `Bootstrapping` until one does. Every node `Joining` on a pointer
+    /// it took then reads the authority's epoch, as a driver does, and is told
+    /// the answer. Returns the nodes it joined.
     fn join_rejoining_nodes(&mut self) -> BTreeSet<WorkerId> {
         let now = self.clock.now();
         let rejoining: Vec<WorkerId> = self
@@ -718,32 +723,61 @@ impl Cluster {
             .collect();
         let mut joined = BTreeSet::new();
         for id in rejoining {
-            let own_epoch = self.nodes[&id].recovery_epoch();
+            let floor = self.nodes[&id].join_floor();
             // A leader names itself (see `WorkerNode::known_leader`), and
             // the harness addresses each node by its id.
-            let pointer = self
+            let pointers: Vec<_> = self
                 .nodes
                 .iter()
                 .filter(|(leader, node)| {
                     node.state() == WorkerState::Leader
-                        && node.recovery_epoch() >= own_epoch
                         && !self.network.is_partitioned(&id, leader)
                         && !self.is_stalled(leader, now)
                 })
-                .filter_map(|(leader, node)| {
-                    let pointer = node.join_response(leader.as_str().to_string())?;
-                    Some(((pointer.recovery_epoch, pointer.term), pointer))
-                })
-                .max_by_key(|(latest, _)| *latest)
-                .map(|(_, pointer)| pointer);
-            if let Some(pointer) = pointer {
+                .filter_map(|(leader, node)| node.join_response(leader.as_str().to_string()))
+                .collect();
+            if let Some(pointer) = floor.newest(&pointers).cloned() {
                 let input = Input::JoinAnswer(pointer);
                 let step = self.node_mut(&id, "join").step(input.clone());
                 self.drive(&id, Some(input), step);
                 joined.insert(id);
             }
         }
+        self.validate_held_pointers();
         joined
+    }
+
+    /// Reads the authority's epoch for every node `Joining` on a pointer it
+    /// took and not stalled, and tells the node the answer, as a driver does.
+    fn validate_held_pointers(&mut self) {
+        let now = self.clock.now();
+        let validating: Vec<WorkerId> = self
+            .nodes
+            .iter()
+            .filter(|(id, node)| {
+                node.state() == WorkerState::Joining && !self.is_stalled(id, now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in validating {
+            let Ok(Some(held)) = self.node_authorities[&id].read_recovery_epoch(&self.shard_id)
+            else {
+                continue;
+            };
+            let token = ReplyToken {
+                issuer: Issuer::Cascade,
+                kind: CallKind::ReadRecoveryEpoch,
+                number: self.rejoin_reads,
+            };
+            self.rejoin_reads += 1;
+            for input in [
+                Input::AuthorityEpochAsked(token),
+                Input::AuthorityEpochRead { token, held },
+            ] {
+                let step = self.node_mut(&id, "validate").step(input.clone());
+                self.drive(&id, Some(input), step);
+            }
+        }
     }
 
     /// Whether the named node's scheduler leads now, as its spy last heard.

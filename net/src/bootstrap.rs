@@ -141,7 +141,7 @@ use std::time::Duration as StdDuration;
 use kabudachi_core::coordination_authority::{
     AuthorityError, LineageSource, RecoveryEpoch, Uuid7Lineages,
 };
-use kabudachi_core::election::{AuthorityReply, AuthorityRequest, Entry};
+use kabudachi_core::election::{AuthorityReply, AuthorityRequest, Entry, JoinFloor};
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::time::{Clock, Instant};
@@ -182,8 +182,12 @@ pub const DEFAULT_RETRY_INTERVAL: StdDuration = StdDuration::from_millis(500);
 /// node will read.
 ///
 /// `per_peer_timeout` bounds each attempt to connect to, and hear from, one
-/// seed or registered peer. `retry_interval` is the wait between rounds of
-/// the cascade. See `crate::join::DEFAULT_JOIN_PEER_TIMEOUT` and
+/// seed or registered peer. `grace` bounds how long a round keeps listening
+/// for more pointers once the first arrived (see
+/// [`crate::join::ask_for_leader`]; the shard's suspicion timeout is the
+/// natural value); it is internal to a round, not added to
+/// `per_peer_timeout`. `retry_interval` is the wait between rounds of the
+/// cascade. See `crate::join::DEFAULT_JOIN_PEER_TIMEOUT` and
 /// [`DEFAULT_RETRY_INTERVAL`] for defaults.
 ///
 /// A worker that joins is a pending member (see `Entry::Joining`). One that
@@ -202,6 +206,7 @@ pub async fn bootstrap<C: Clock>(
     my_id: &WorkerId,
     seeds: &[Multiaddr],
     per_peer_timeout: StdDuration,
+    grace: StdDuration,
     retry_interval: StdDuration,
 ) -> Entry {
     cascade(
@@ -209,6 +214,7 @@ pub async fn bootstrap<C: Clock>(
         &mut JoinOverNet {
             net,
             per_peer_timeout,
+            grace,
         },
         &mut Uuid7Lineages,
         clock,
@@ -241,7 +247,7 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
         refuse_requests(net);
 
         // With no seeds this finds no answer at once.
-        let found = port.ask(search.seeds()).await;
+        let found = port.ask(search.seeds(), JoinFloor::none()).await;
         if let Some(pointer) = search.heard_from_seeds(found) {
             return Entry::Joining(pointer);
         }
@@ -349,7 +355,7 @@ async fn consult_authority<C: Clock, P: AskWhoLeads>(
             }
             Decision::AskPeers(peers) => {
                 let addresses = search.to_ask(&peers);
-                let found = port.ask(&addresses).await;
+                let found = port.ask(&addresses, JoinFloor::none()).await;
                 return match search.heard_from_listed(found) {
                     Some(pointer) => AuthorityRound::Joined(pointer),
                     None => AuthorityRound::Wait,

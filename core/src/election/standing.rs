@@ -13,22 +13,23 @@ use std::cmp::Ordering;
 use crate::configuration::{Admission, Configuration, Generation, Roster};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::ids::WorkerId;
+use crate::protocol::messages::JoinResponse;
 
 /// How another node's, or the authority's, recovery epoch compares with this
-/// node's own (an epoch is its number and
-/// its lineage).
+/// node's own. An epoch is a number and a lineage; numbers order epochs of
+/// one lineage, and also order another lineage's against this one, except
+/// at an equal number: two foundings can both start there, and nothing says
+/// which came later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EpochOrder {
     /// The same epoch: same number, and the same lineage or none named.
     Mine,
-    /// A later epoch of the same lineage, or of an unnamed one.
+    /// A newer epoch: a later one of this lineage (or of an unnamed one), or
+    /// another lineage's numbered above this one.
     Later,
-    /// An earlier epoch of the same lineage, or of an unnamed one.
+    /// An older epoch: an earlier one of this lineage (or of an unnamed
+    /// one), or another lineage's at or below this one's number.
     Stale,
-    /// Another lineage's epoch: another shard's, whatever its number. The
-    /// number ordering is kept for `on_leader_ack`, which adopts a
-    /// higher-numbered foreign epoch and ignores an equal or lower one.
-    Foreign(Ordering),
 }
 
 /// A recovery epoch as a message or the authority names it: its number, and
@@ -54,20 +55,123 @@ impl From<RecoveryEpoch> for HeardEpoch {
 /// are compared (see [`order_numbers`]).
 pub(crate) fn order(own: &RecoveryEpoch, other: HeardEpoch) -> EpochOrder {
     match other.lineage {
-        Some(lineage) if lineage != own.lineage => {
-            EpochOrder::Foreign(other.number.cmp(&own.number))
+        Some(lineage) if lineage != own.lineage && other.number <= own.number => {
+            EpochOrder::Stale
         }
         _ => order_numbers(own.number, other.number),
     }
 }
 
 /// [`order`] where neither lineage is in play: `Mine`, `Later` or `Stale` by
-/// number, never `Foreign`.
+/// number.
 pub(crate) fn order_numbers(own: u64, other: u64) -> EpochOrder {
     match other.cmp(&own) {
         Ordering::Equal => EpochOrder::Mine,
         Ordering::Greater => EpochOrder::Later,
         Ordering::Less => EpochOrder::Stale,
+    }
+}
+
+/// The recovery epoch a node rejoins at, and the one place JOIN pointers are
+/// judged against it: which a node takes, and which of those is newest. It is
+/// a value: `net` takes the node's current floor for each pass of its search
+/// for a leader, and asks it instead of comparing epochs itself.
+///
+/// A pointer is accepted when its epoch is the floor's own or later (see
+/// [`EpochOrder`]): another lineage's epoch is accepted only when numbered
+/// above the floor. A floor of `None`, a node that never joined, accepts every
+/// pointer. Among accepted pointers a higher number is newer, and a later term
+/// is newer only within one lineage; pointers of different lineages at one
+/// number are equally new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinFloor {
+    epoch: Option<RecoveryEpoch>,
+}
+
+impl JoinFloor {
+    /// The floor of a node that has joined no shard: it accepts every pointer.
+    pub fn none() -> Self {
+        JoinFloor { epoch: None }
+    }
+
+    /// The floor at `epoch`.
+    pub fn at(epoch: RecoveryEpoch) -> Self {
+        JoinFloor { epoch: Some(epoch) }
+    }
+
+    /// The epoch the floor stands at, `None` for a node that never joined.
+    pub fn epoch(&self) -> Option<RecoveryEpoch> {
+        self.epoch
+    }
+
+    /// Whether the floor takes a pointer to a leader of `pointer`'s epoch.
+    pub fn accepts(&self, pointer: &JoinResponse) -> bool {
+        self.accepts_epoch(pointer_epoch(pointer))
+    }
+
+    fn accepts_epoch(&self, named: RecoveryEpoch) -> bool {
+        self.epoch
+            .is_none_or(|floor| order(&floor, named.into()) != EpochOrder::Stale)
+    }
+
+    /// The newest of the pointers this floor accepts; of equally new ones,
+    /// the first. `None` when it accepts none.
+    pub fn newest<'a>(
+        &self,
+        pointers: impl IntoIterator<Item = &'a JoinResponse>,
+    ) -> Option<&'a JoinResponse> {
+        self.newest_first(pointers).into_iter().next()
+    }
+
+    /// The pointers this floor accepts, newest first; equally new ones keep
+    /// the order they were given in.
+    pub fn newest_first<'a>(
+        &self,
+        pointers: impl IntoIterator<Item = &'a JoinResponse>,
+    ) -> Vec<&'a JoinResponse> {
+        let mut remaining: Vec<_> = pointers
+            .into_iter()
+            .filter(|pointer| self.accepts(pointer))
+            .collect();
+        let mut ranked = Vec::with_capacity(remaining.len());
+        // Not a sort: equal newness across lineages is not transitive with
+        // the terms inside one, so it picks the newest still remaining.
+        while !remaining.is_empty() {
+            let mut best = 0;
+            for (index, pointer) in remaining.iter().enumerate().skip(1) {
+                if newer_than(pointer, remaining[best]) {
+                    best = index;
+                }
+            }
+            ranked.push(remaining.remove(best));
+        }
+        ranked
+    }
+
+    /// Takes `held`, the epoch the coordination authority holds, as the floor
+    /// when it is of another lineage than the floor's. The floor may move
+    /// down: the held epoch's number can be below it. A floor of the same
+    /// lineage stays, and so does one that is `None`.
+    pub fn refresh(&mut self, held: RecoveryEpoch) {
+        if self.epoch.is_some_and(|floor| floor.lineage != held.lineage) {
+            self.epoch = Some(held);
+        }
+    }
+}
+
+fn pointer_epoch(pointer: &JoinResponse) -> RecoveryEpoch {
+    RecoveryEpoch::new(pointer.recovery_epoch, pointer.recovery_epoch_lineage)
+}
+
+/// Whether `a` names a newer leader than `b`: a higher epoch number, or at one
+/// number of one lineage a later term.
+fn newer_than(a: &JoinResponse, b: &JoinResponse) -> bool {
+    match a.recovery_epoch.cmp(&b.recovery_epoch) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => {
+            a.recovery_epoch_lineage == b.recovery_epoch_lineage && a.term > b.term
+        }
     }
 }
 
@@ -131,6 +235,11 @@ impl ShardStanding {
         self.epoch
     }
 
+    /// The floor this standing's epoch is, for a node rejoining.
+    pub(crate) fn join_floor(&self) -> JoinFloor {
+        JoinFloor { epoch: self.epoch }
+    }
+
     /// The recovery epoch number; 0 before the first join.
     pub(crate) fn epoch_number(&self) -> u64 {
         self.epoch.map_or(0, |epoch| epoch.number)
@@ -171,7 +280,7 @@ impl ShardStanding {
     }
 
     /// Accepts `term` and what an ack of `heard`'s epoch carries. An ack of a
-    /// later epoch (or a higher foreign one) first moves this standing to
+    /// newer epoch (see [`EpochOrder::Later`]) first moves this standing to
     /// that epoch, forgetting the old one's configuration: the epochs' terms
     /// are not comparable, so `term` becomes the highest seen. The epoch
     /// takes `heard`'s lineage when the ack names one: a recovery usually
@@ -187,10 +296,7 @@ impl ShardStanding {
         admission: Option<Generation>,
         prior: Option<Generation>,
     ) -> AckChange {
-        let epoch_moved = matches!(
-            self.order(heard),
-            Some(EpochOrder::Later | EpochOrder::Foreign(Ordering::Greater))
-        );
+        let epoch_moved = self.order(heard) == Some(EpochOrder::Later);
         if epoch_moved {
             self.forget();
             let lineage = heard
@@ -268,7 +374,8 @@ impl ShardStanding {
         }
     }
 
-    /// Leaves the shard for `epoch`, the floor the node rejoins at: forgets
+    /// Leaves the shard for `epoch`, the floor the node rejoins at: a JOIN
+    /// pointer older than it (see [`EpochOrder::Stale`]) is refused. Forgets
     /// the configuration and admissions, and the terms seen.
     pub(crate) fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
         self.forget();
@@ -330,17 +437,8 @@ mod tests {
         assert_eq!(order(&own, heard(4, None)), EpochOrder::Later);
         assert_eq!(order(&own, heard(2, None)), EpochOrder::Stale);
 
-        assert_eq!(
-            order(&own, heard(2, Some(6))),
-            EpochOrder::Foreign(Ordering::Less)
-        );
-        assert_eq!(
-            order(&own, heard(3, Some(6))),
-            EpochOrder::Foreign(Ordering::Equal)
-        );
-        assert_eq!(
-            order(&own, heard(4, Some(6))),
-            EpochOrder::Foreign(Ordering::Greater)
-        );
+        assert_eq!(order(&own, heard(2, Some(6))), EpochOrder::Stale);
+        assert_eq!(order(&own, heard(3, Some(6))), EpochOrder::Stale);
+        assert_eq!(order(&own, heard(4, Some(6))), EpochOrder::Later);
     }
 }

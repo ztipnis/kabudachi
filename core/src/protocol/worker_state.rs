@@ -66,12 +66,16 @@ impl WorkerState {
     /// resumes (`Fenced -> Active`) or, if the epoch is no longer its own,
     /// rejoins (`Fenced -> Bootstrapping`); a `NoQuorum` node whose
     /// authority path finds an epoch it cannot recover from rejoins it the
-    /// same way (`NoQuorum -> Bootstrapping`).
+    /// same way (`NoQuorum -> Bootstrapping`). A rejoining node that took a
+    /// JOIN pointer waits in `Joining` for the authority to confirm it
+    /// (`-> Active`), and goes back (`Joining -> Bootstrapping`) when the
+    /// authority holds another epoch.
     pub fn can_transition_to(self, next: WorkerState) -> bool {
         matches!(
             (self, next),
             (WorkerState::Bootstrapping, WorkerState::Joining)
                 | (WorkerState::Joining, WorkerState::Active)
+                | (WorkerState::Joining, WorkerState::Bootstrapping)
                 | (WorkerState::Active, WorkerState::LeaderSuspect)
                 | (WorkerState::Active, WorkerState::Draining)
                 | (WorkerState::Active, WorkerState::Fenced)

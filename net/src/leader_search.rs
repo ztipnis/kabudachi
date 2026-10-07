@@ -16,8 +16,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::coordination_authority::LiveRegistrations;
-use kabudachi_core::election::{AuthorityReply, AuthorityRequest, ReplyToken};
+use kabudachi_core::coordination_authority::{LiveRegistrations, RecoveryEpoch};
+use kabudachi_core::election::{
+    AuthorityReply, AuthorityRequest, CallKind, JoinFloor, ReplyToken,
+};
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use libp2p::Multiaddr;
@@ -31,10 +33,15 @@ use crate::wait_log::{WaitLog, WaitReason};
 /// Asks addresses who leads the shard: the leader search's one socket
 /// dependency.
 pub(crate) trait AskWhoLeads {
-    /// One pass over `addresses` in order: `Found` with the first pointer to a
-    /// leader this worker then reaches, else `NoReachableLeader` if any
-    /// answered, else `NoAnswer`.
-    fn ask(&mut self, addresses: &[Multiaddr]) -> impl Future<Output = LeaderSearch> + Send;
+    /// One pass over `addresses`: `Found` with the newest pointer `floor`
+    /// accepts (see [`JoinFloor::newest_first`]) to a leader this worker then
+    /// reaches (the one asked first among equally new), else
+    /// `NoReachableLeader` if any answered, else `NoAnswer`.
+    fn ask(
+        &mut self,
+        addresses: &[Multiaddr],
+        floor: JoinFloor,
+    ) -> impl Future<Output = LeaderSearch> + Send;
 }
 
 /// The JOIN client over a real `Net` ([`ask_for_leader`]).
@@ -42,11 +49,18 @@ pub(crate) trait AskWhoLeads {
 pub(crate) struct JoinOverNet<'a> {
     pub(crate) net: &'a Net,
     pub(crate) per_peer_timeout: StdDuration,
+    /// How long past the first pointer a pass keeps listening for others (see
+    /// [`ask_for_leader`]).
+    pub(crate) grace: StdDuration,
 }
 
 impl AskWhoLeads for JoinOverNet<'_> {
-    fn ask(&mut self, addresses: &[Multiaddr]) -> impl Future<Output = LeaderSearch> + Send {
-        ask_for_leader(self.net, addresses, self.per_peer_timeout)
+    fn ask(
+        &mut self,
+        addresses: &[Multiaddr],
+        floor: JoinFloor,
+    ) -> impl Future<Output = LeaderSearch> + Send {
+        ask_for_leader(self.net, addresses, floor, self.per_peer_timeout, self.grace)
     }
 }
 
@@ -214,9 +228,13 @@ pub(crate) fn others_listed(
 /// It never founds: nothing here can register or
 /// swap an epoch. Each round reads the authority's listing through the
 /// driver's client, under the client's `Issuer::Cascade` mint, bounded by one
-/// retry interval, then asks the listed workers through the port. Rounds are
+/// retry interval, then asks the listed workers through the port. It also
+/// reads the authority's recovery epoch beside the listing and hands it to
+/// its caller, whose node may take it as its floor; each round asks the port
+/// with the floor its caller gives with the listing's answer. Rounds are
 /// one retry interval apart, so a round after a refused pointer waits one
-/// first.
+/// first. A node `Joining` on a pointer it took keeps this rejoin alive:
+/// it reads the epoch, at most once a retry interval, until the node is told.
 pub(crate) struct Rejoin<'a, P> {
     search: SearchRounds,
     port: P,
@@ -225,8 +243,32 @@ pub(crate) struct Rejoin<'a, P> {
     next_round_at: Option<Instant>,
     /// The listing this rejoin asked for and has not been answered.
     read: Option<PendingRead>,
+    /// The authority's recovery epoch this rejoin asked for and has not been
+    /// answered. Best effort: a round neither waits on it nor ends for it. A
+    /// read past its bound is given up on (see [`Self::ask_epoch`]).
+    epoch_read: Option<PendingEpochRead>,
+    /// The earliest an epoch read is asked again: a retry interval after the
+    /// last was asked (or after a busy kind was found), so an authority that
+    /// holds no epoch, or lags, is never asked in a loop, and a reply that
+    /// arrives late never delays the next read past the next round.
+    epoch_ask_due: Instant,
+    /// The node is `Joining` on a pointer it took, so this rejoin runs no
+    /// round: it only reads the epoch until the node is told of it.
+    validating: bool,
+    /// An epoch read asked and not yet reported to the node, which keeps the
+    /// latest read it was told of (see [`Self::take_asked_epoch_read`]).
+    asked_epoch_read: Option<ReplyToken>,
     /// The round's ask of the listed workers, while it runs.
     asking: Option<Pin<Box<dyn Future<Output = LeaderSearch> + Send + 'a>>>,
+}
+
+/// A read of the authority's epoch, asked and not yet answered or given up
+/// on.
+#[derive(Clone, Copy)]
+struct PendingEpochRead {
+    token: ReplyToken,
+    /// When the read is given up on.
+    bound: Instant,
 }
 
 /// A read of the listing, asked and not yet answered.
@@ -252,13 +294,24 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
             retry_interval,
             next_round_at: Some(now),
             read: None,
+            epoch_read: None,
+            epoch_ask_due: now,
+            validating: false,
+            asked_epoch_read: None,
             asking: None,
         }
     }
 
     /// When the driver must next wake for this rejoin: a round due, or a
-    /// read's bound.
+    /// read's bound; while validating, the epoch read's bound, or when the
+    /// next is due.
     pub(crate) fn wake_at(&self) -> Option<Instant> {
+        if self.validating {
+            return Some(match self.epoch_read {
+                Some(read) => read.bound,
+                None => self.epoch_ask_due,
+            });
+        }
         if self.asking.is_some() {
             return None;
         }
@@ -268,8 +321,9 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         }
     }
 
-    /// At `now`, a due round asks `client` for the listing, stamping the call
-    /// `sent_at` on the node's clock. A round whose read is past its bound
+    /// At `now`, a due round asks `client` for the listing, and for the
+    /// authority's recovery epoch unless that read is still out, stamping the
+    /// calls `sent_at` on the node's clock. A round whose read is past its bound
     /// ends (`AuthorityNotAnswering`), and the read stays pending for a later
     /// round. A due round that finds the kind busy with a call it did not ask
     /// (a read the cascade left in flight) asks nothing and ends the same
@@ -281,6 +335,7 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         sent_at: kabudachi_core::time::Instant,
         now: Instant,
     ) {
+        self.validating = false;
         if self.asking.is_some() {
             return;
         }
@@ -308,23 +363,108 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                     bound: Some(now + self.retry_interval),
                 });
                 self.next_round_at = None;
+                // Left unasked when the kind is busy: a later round asks again.
+                self.ask_epoch(client, sent_at, now);
             }
             // Busy with a call this rejoin did not ask.
             None => self.end_round_unanswered(now),
         }
     }
 
-    /// Takes `reply` if it answers this rejoin's pending read, and starts the
-    /// round's ask. Drops any other reply: the driver offers only
-    /// Cascade-issued ones, and one that is not this read's was left in flight
-    /// by the cascade or an earlier rejoin.
-    pub(crate) fn offer(&mut self, reply: AuthorityReply, now: Instant) {
-        if self.read.as_ref().map(|read| read.token) != Some(reply.token()) {
+    /// For a node `Joining` on a pointer it took: asks `client` for the
+    /// authority's recovery epoch, unless that read is still out or was asked a
+    /// retry interval ago or less, for the node to check the pointer against.
+    /// A read asked before the node took the pointer says nothing of it, so the
+    /// first call drops it and asks afresh.
+    pub(crate) fn validate(
+        &mut self,
+        client: &mut AuthorityClient,
+        sent_at: kabudachi_core::time::Instant,
+        now: Instant,
+    ) {
+        if !self.validating {
+            self.validating = true;
+            self.epoch_read = None;
+            self.epoch_ask_due = now;
+        }
+        self.ask_epoch(client, sent_at, now);
+    }
+
+    /// Asks for the authority's recovery epoch when none is out and the last
+    /// is a retry interval past. A read still out past its bound is given up
+    /// on: its late reply is dropped (see [`Self::offer`]), never applied, and
+    /// the next read is asked once that reply has freed the client's call of
+    /// that kind (a client keeps one in flight per kind, so a slow authority
+    /// holds one blocking thread, not one more at every retry).
+    fn ask_epoch(
+        &mut self,
+        client: &mut AuthorityClient,
+        sent_at: kabudachi_core::time::Instant,
+        now: Instant,
+    ) {
+        if self.epoch_read.is_some_and(|read| now >= read.bound) {
+            self.epoch_read = None;
+            self.epoch_ask_due = now;
+        }
+        if self.epoch_read.is_some() || now < self.epoch_ask_due {
             return;
+        }
+        match client.ask(AuthorityRequest::ReadRecoveryEpoch, sent_at) {
+            Some(token) => {
+                self.epoch_read = Some(PendingEpochRead {
+                    token,
+                    bound: now + self.retry_interval,
+                });
+                self.asked_epoch_read = Some(token);
+            }
+            // Busy with a read this rejoin did not ask, or gave up on.
+            None => self.epoch_ask_due = now + self.retry_interval,
+        }
+    }
+
+    /// The epoch read asked since this was last called, if any, for the
+    /// caller to tell the node of before it offers the read's answer.
+    pub(crate) fn take_asked_epoch_read(&mut self) -> Option<ReplyToken> {
+        self.asked_epoch_read.take()
+    }
+
+    /// Takes `reply` if it answers this rejoin's pending listing, and starts
+    /// the round's ask; or, if it answers the pending epoch read, returns that
+    /// read's token with the recovery epoch the authority holds, for the node
+    /// to read. Drops any
+    /// other reply: the driver offers only Cascade-issued ones, and one that
+    /// is not this rejoin's was left in flight by the cascade or an earlier
+    /// rejoin.
+    pub(crate) fn offer(
+        &mut self,
+        reply: AuthorityReply,
+        now: Instant,
+        floor: JoinFloor,
+    ) -> Option<(ReplyToken, RecoveryEpoch)> {
+        if let Some(read) = self.epoch_read
+            && read.token == reply.token()
+        {
+            self.epoch_read = None;
+            self.epoch_ask_due = read.bound;
+            return match reply {
+                AuthorityReply::RecoveryEpoch { token, result: Ok(Some(held)), .. } => {
+                    Some((token, held))
+                }
+                _ => None,
+            };
+        }
+        if reply.token().kind == CallKind::ReadRecoveryEpoch {
+            // A read this rejoin gave up on, or the cascade's: it frees its
+            // kind, so the next read may be asked at once.
+            self.epoch_ask_due = now;
+            return None;
+        }
+        if self.read.as_ref().map(|read| read.token) != Some(reply.token()) {
+            return None;
         }
         self.read = None;
         let AuthorityReply::LiveRegistrations { result, .. } = reply else {
-            return;
+            return None;
         };
         let was_in_round = self.next_round_at.is_none();
         match result {
@@ -340,12 +480,13 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                 let addresses = self.search.to_ask(&peers);
                 if addresses.is_empty() {
                     self.end_round(now);
-                    return;
+                    return None;
                 }
                 let mut port = self.port.clone();
-                self.asking = Some(Box::pin(async move { port.ask(&addresses).await }));
+                self.asking = Some(Box::pin(async move { port.ask(&addresses, floor).await }));
             }
         }
+        None
     }
 
     /// Waits for the round's ask, for ever while none runs. Cancel-safe.
@@ -457,7 +598,7 @@ mod tests {
             }
             tokio::select! {
                 Some(reply) = fixture.client.next_reply(None) => {
-                    rejoin.offer(reply, Instant::now());
+                    rejoin.offer(reply, Instant::now(), JoinFloor::none());
                 }
                 result = rejoin.ask_done() => {
                     if let Some(pointer) = rejoin.asked(result, Instant::now()) {
@@ -501,6 +642,178 @@ mod tests {
             found[1].1 - found[0].1 >= RETRY,
             "the second round started sooner than a retry interval after the first ended"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_asks_the_pass_with_the_floor_it_is_given() {
+        let mut fixture = fixture().await;
+        let (a1, a2) = (address(1), address(2));
+        register(&fixture.authority, "w1", &a1.to_string());
+        register(&fixture.authority, "w2", &a2.to_string());
+        // The floor is epoch 5 of lineage 1. Listed first, w1 leads epoch 5 of
+        // lineage 2 at a far later term, which the floor refuses.
+        let in_lineage = |leader: &str, at: &Multiaddr, lineage: u64, term: u64| JoinResponse {
+            recovery_epoch: 5,
+            recovery_epoch_lineage: lineage,
+            term,
+            ..pointer_to(leader, at)
+        };
+        let refused = in_lineage("w1", &a1, 2, 10);
+        let accepted = in_lineage("w2", &a2, 1, 1);
+        fixture.port.script(&a1, [Answer::Pointer(refused)]);
+        fixture.port.script(&a2, [Answer::Pointer(accepted.clone())]);
+        let mut rejoin = rejoin_of(&fixture);
+        let floor = JoinFloor::at(RecoveryEpoch::new(5, 1));
+
+        rejoin.tick(&mut fixture.client, stamp(fixture.clock), Instant::now());
+        for _ in 0..2 {
+            let reply = fixture
+                .client
+                .next_reply(Some(TEST_TIMEOUT))
+                .await
+                .expect("each read is answered");
+            rejoin.offer(reply, Instant::now(), floor);
+        }
+        let result = rejoin.ask_done().await;
+
+        assert_eq!(rejoin.asked(result, Instant::now()), Some(accepted));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_epoch_read_that_fails_or_finds_no_epoch_is_asked_again_next_round() {
+        for reachable in [false, true] {
+            // Unreachable, the read is an error; reachable, a fresh authority
+            // holds no epoch.
+            let mut fixture = fixture().await;
+            fixture.authority.set_reachable(reachable);
+            let mut rejoin = rejoin_of(&fixture);
+
+            for round in 0..2 {
+                tokio::time::advance(RETRY).await;
+                rejoin.tick(&mut fixture.client, stamp(fixture.clock), Instant::now());
+                let mut epoch_reads = 0;
+                for _ in 0..2 {
+                    let reply = fixture
+                        .client
+                        .next_reply(Some(TEST_TIMEOUT))
+                        .await
+                        .expect("the listing and the epoch are each answered");
+                    if matches!(reply, AuthorityReply::RecoveryEpoch { .. }) {
+                        epoch_reads += 1;
+                        assert_eq!(
+                            rejoin.offer(reply, Instant::now(), JoinFloor::none()),
+                            None,
+                            "reachable: {reachable}, round {round}: no epoch to hand over"
+                        );
+                    } else {
+                        rejoin.offer(reply, Instant::now(), JoinFloor::none());
+                    }
+                }
+                assert_eq!(
+                    epoch_reads, 1,
+                    "reachable: {reachable}, round {round}: the epoch is asked again"
+                );
+            }
+        }
+    }
+
+    /// Founds epoch 3 in the fixture's authority, from another worker's handle.
+    fn found_epoch_3(fixture: &Fixture) -> RecoveryEpoch {
+        let epoch = RecoveryEpoch::founding(3, &mut Uuid7Lineages);
+        fixture
+            .authority
+            .for_another_worker()
+            .compare_and_swap_recovery_epoch(&ShardId::new("shard-1"), None, epoch)
+            .unwrap();
+        epoch
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_round_reads_the_epoch_again_when_the_last_answer_came_late_in_its_interval() {
+        let mut fixture = fixture().await;
+        let held = found_epoch_3(&fixture);
+        let mut rejoin = rejoin_of(&fixture);
+        let sent_at = stamp(fixture.clock);
+
+        // Nobody is listed, so the listing's answer ends the round at once; the
+        // epoch's answer follows part of an interval later.
+        rejoin.tick(&mut fixture.client, sent_at, Instant::now());
+        let asked = rejoin.take_asked_epoch_read().expect("the first round asks for the epoch");
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            replies.push(fixture.client.next_reply(Some(TEST_TIMEOUT)).await.unwrap());
+        }
+        replies.sort_by_key(|reply| reply.token() == asked);
+        let round_ended = Instant::now();
+        rejoin.offer(replies.remove(0), round_ended, JoinFloor::none());
+        tokio::time::advance(RETRY / 2).await;
+        assert_eq!(
+            rejoin.offer(replies.remove(0), Instant::now(), JoinFloor::none()),
+            Some((asked, held))
+        );
+
+        tokio::time::advance(RETRY / 2).await;
+        assert_eq!(Instant::now(), round_ended + RETRY);
+        rejoin.tick(&mut fixture.client, sent_at, Instant::now());
+        assert!(
+            rejoin.take_asked_epoch_read().is_some(),
+            "the next round reads the epoch too"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_validating_a_pointer_reads_the_epoch_again_once_a_lagging_read_is_answered() {
+        let mut fixture = fixture().await;
+        let held = found_epoch_3(&fixture);
+        fixture.authority.hold_next(CallKind::ReadRecoveryEpoch);
+        let mut rejoin = rejoin_of(&fixture);
+        let sent_at = stamp(fixture.clock);
+        let t0 = Instant::now();
+
+        rejoin.validate(&mut fixture.client, sent_at, t0);
+        let lagging = rejoin.take_asked_epoch_read().expect("validation asks for the epoch");
+        wait_until_held(&fixture.authority, CallKind::ReadRecoveryEpoch).await;
+        assert_eq!(rejoin.wake_at(), Some(t0 + RETRY), "the read is bounded");
+
+        tokio::time::advance(RETRY).await;
+        rejoin.validate(&mut fixture.client, sent_at, Instant::now());
+        assert_eq!(rejoin.take_asked_epoch_read(), None, "the kind is busy with the lagging read");
+        fixture.authority.release(CallKind::ReadRecoveryEpoch);
+        let late = fixture.client.next_reply(Some(TEST_TIMEOUT)).await.unwrap();
+        assert_eq!(late.token(), lagging);
+        assert_eq!(rejoin.offer(late, Instant::now(), JoinFloor::none()), None);
+
+        rejoin.validate(&mut fixture.client, sent_at, Instant::now());
+        let fresh = rejoin.take_asked_epoch_read().expect("the freed kind is asked again at once");
+        let reply = fixture.client.next_reply(Some(TEST_TIMEOUT)).await.unwrap();
+        assert_eq!(
+            rejoin.offer(reply, Instant::now(), JoinFloor::none()),
+            Some((fresh, held))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_node_validating_a_pointer_does_not_spin_on_an_authority_with_no_epoch() {
+        // A fresh authority holds no epoch, so each read answers nothing.
+        let mut fixture = fixture().await;
+        let mut rejoin = rejoin_of(&fixture);
+        let sent_at = stamp(fixture.clock);
+
+        for round in 0..3 {
+            let now = Instant::now();
+            rejoin.validate(&mut fixture.client, sent_at, now);
+            assert!(
+                rejoin.take_asked_epoch_read().is_some(),
+                "round {round}: a read is asked once the interval has passed"
+            );
+            let reply = fixture.client.next_reply(Some(TEST_TIMEOUT)).await.unwrap();
+            assert_eq!(rejoin.offer(reply, now, JoinFloor::none()), None);
+
+            rejoin.validate(&mut fixture.client, sent_at, now);
+            assert_eq!(rejoin.take_asked_epoch_read(), None, "round {round}: no read inside the interval");
+            assert_eq!(rejoin.wake_at(), Some(now + RETRY));
+            tokio::time::advance(RETRY).await;
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -577,12 +890,15 @@ mod tests {
         tokio::time::advance(RETRY).await;
         rejoin.tick(&mut fixture.client, sent_at, Instant::now());
         fixture.authority.release(CallKind::ReadLiveRegistrations);
-        let late = fixture
-            .client
-            .next_reply(Some(TEST_TIMEOUT))
-            .await
-            .expect("the held read is answered once released");
-        rejoin.offer(late, Instant::now());
+        // The epoch read the first round asked beside it was answered at once.
+        for _ in 0..2 {
+            let reply = fixture
+                .client
+                .next_reply(Some(TEST_TIMEOUT))
+                .await
+                .expect("each read is answered once the held one is released");
+            rejoin.offer(reply, Instant::now(), JoinFloor::none());
+        }
         let result = rejoin.ask_done().await;
 
         let pointer = rejoin.asked(result, Instant::now());
@@ -625,7 +941,7 @@ mod tests {
             .next_reply(Some(TEST_TIMEOUT))
             .await
             .expect("the cascade's read is answered once released");
-        rejoin.offer(cascade_reply, Instant::now());
+        rejoin.offer(cascade_reply, Instant::now(), JoinFloor::none());
         tokio::select! {
             biased;
             _ = rejoin.ask_done() => panic!("the rejoin asked on a reply that was not its own"),
@@ -641,7 +957,7 @@ mod tests {
             .next_reply(Some(TEST_TIMEOUT))
             .await
             .expect("the rejoin's own read is answered");
-        rejoin.offer(own, Instant::now());
+        rejoin.offer(own, Instant::now(), JoinFloor::none());
         let result = rejoin.ask_done().await;
         assert!(rejoin.asked(result, Instant::now()).is_some());
         assert_eq!(fixture.port.passes(), [vec![a1]]);

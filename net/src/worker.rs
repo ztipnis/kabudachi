@@ -206,6 +206,7 @@ impl Worker {
             &my_id,
             &config.seeds,
             config.join_peer_timeout,
+            StdDuration::from_millis(config.election_timings.suspect_timeout.as_ticks()),
             config.retry_interval,
         )
         .await;
