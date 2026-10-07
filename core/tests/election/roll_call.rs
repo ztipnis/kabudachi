@@ -4,15 +4,15 @@
 //! with a refusal from another recovery epoch or lineage.
 
 use crate::support::builders::{
-    configuration_of, g0, message, past_any_suspicion, roll_call,
+    ack_message, leader_ack, configuration_of, g0, message, past_any_suspicion, roll_call,
     roll_call_message, roll_call_reply, shard, timings, worker,
 };
 use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, close_roll_call, deliver, published_roll_calls,
-    sent_to, start_roll_call, state_changes, tick, voter_node,
+    TestNode, close_roll_call, connect, deliver, elect, published_roll_calls,
+    rejects_sent_to, sent_to, start_roll_call, state_changes, tick, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{Entry, Identity, Input, KnownConfiguration, Output, WorkerNode};
@@ -398,6 +398,57 @@ fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
         assert_eq!(node.highest_term_seen(), term_seen, "{name}");
         assert_eq!(node.state(), state, "{name}");
         assert_eq!(!sent_to(&outputs, &their_leader).is_empty(), heartbeats, "{name}");
+    }
+}
+
+/// A node cut off from its leader's acks while a new one is elected keeps
+/// heartbeating the old leader and rolling calls under a configuration older
+/// than everyone's. The followers refuse it for its stale generation and the
+/// leader for being no voter, so each refusal must name the leader, or the
+/// stranded node never learns who to follow.
+#[test]
+fn a_refusal_names_the_leader_whatever_its_reason() {
+    let clock = FakeClock::new();
+    let stranded = worker("stranded");
+    let call = roll_call(&stranded, 5, &configuration_of(3), 0);
+
+    let leader = worker("leader");
+    let (peers, mut leading) = (
+        [worker("p1"), worker("p2")],
+        voter_node(&clock, &leader, 3, SUSPECT),
+    );
+    connect(&mut leading, &peers);
+    elect(&mut leading, &clock, SUSPECT, &peers);
+    assert_eq!(leading.state(), WorkerState::Leader, "setup invariant");
+
+    let follower = worker("follower");
+    let mut following = voter_node(&clock, &follower, 3, SUSPECT);
+    let newer = Configuration::single(Single {
+        generation: Generation::new(0, 0, 1),
+        base: g0(),
+        voter_count: 3,
+    })
+    .expect("valid");
+    deliver(
+        &mut following,
+        &leader,
+        ack_message(leader_ack(&leader, 0, &newer, Some(g0()))),
+    );
+
+    for (name, mut node, reason) in [
+        ("a follower", following, ElectionRejectReason::StaleGeneration),
+        ("the leader", leading, ElectionRejectReason::NotEligible),
+    ] {
+        let outputs = deliver(&mut node, &stranded, roll_call_message(call.clone()));
+
+        let refusals = rejects_sent_to(&outputs, &stranded);
+        assert_eq!(refusals.len(), 1, "{name}");
+        assert_eq!(refusals[0].reason(), reason, "{name}");
+        assert_eq!(
+            refusals[0].named_leader().map(|(id, _)| id),
+            Some(leader.clone()),
+            "{name}"
+        );
     }
 }
 

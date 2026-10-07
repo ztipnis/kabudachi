@@ -73,7 +73,7 @@ use kabudachi_testkit::FaultingAuthority;
 use kabudachi_testkit::RecordSpace;
 pub use kabudachi_testkit::StepRecord;
 
-use crate::support::authority::{authority_ttl, epoch, warmed_up_authority};
+use crate::support::authority::{authority_ttl, epoch};
 use crate::support::builders::{message_input, timings, voter_of};
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
@@ -285,13 +285,23 @@ impl Cluster {
         pending: usize,
         suspect_timeout: Duration,
     ) -> Self {
+        Cluster::bootstrap_with_authority_ttl(voters, pending, suspect_timeout, authority_ttl())
+    }
+
+    /// `bootstrap_with_authority(voters, pending, ..)` with the authority's
+    /// registrations, fences and warm-up lasting `ttl` instead of the tests'
+    /// default, for a simulation whose timescale is far shorter than 30 s.
+    pub fn bootstrap_with_authority_ttl(
+        voters: usize,
+        pending: usize,
+        suspect_timeout: Duration,
+        ttl: Duration,
+    ) -> Self {
         Cluster::build(
             voters,
             pending,
             suspect_timeout,
-            Some(AuthorityTimings {
-                ttl: authority_ttl(),
-            }),
+            Some(AuthorityTimings { ttl }),
         )
     }
 
@@ -303,7 +313,9 @@ impl Cluster {
     ) -> Self {
         let clock = Rc::new(FakeClock::new());
         let network = FakeNetwork::new(Rc::clone(&clock));
-        let authority = warmed_up_authority(&clock);
+        let ttl = authority_timings.map_or_else(authority_ttl, |timings| timings.ttl);
+        let authority = FaultingAuthority::new(clock.as_ref().clone(), ttl);
+        clock.advance(ttl);
         let shard_id = ShardId::new(SHARD_ID);
         if authority_timings.is_some() {
             authority
@@ -1317,6 +1329,11 @@ impl Cluster {
             return;
         }
         if reconciliation.republish.is_none() {
+            // Workers that joined the roster since the round began are asked
+            // too, as the leader's own driver does.
+            for worker in self.nodes[id].reconcilees() {
+                reconciliation.round.ask_also(worker);
+            }
             self.collect_answers(id, &mut reconciliation.round, now);
             let node = &self.nodes[id];
             let answered = node.voters_answered(&reconciliation.round.answered());

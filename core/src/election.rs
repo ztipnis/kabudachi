@@ -2355,8 +2355,12 @@ where
     }
 
     /// Refuses `initiator`'s roll call or vote request for `term`, naming
-    /// this node's highest term seen, its configuration, and,
-    /// with `name_leader`, the leader it follows, if any.
+    /// this node's highest term seen, its configuration, and the leader it
+    /// follows, if any, when `name_leader` asks for it, when this node leads,
+    /// or when its contact with that leader is fresh: a node refused a roll
+    /// call for any reason learns who leads, or one cut off from its leader's
+    /// acks while another is elected never finds it again. A candidate refused
+    /// a vote ignores the name.
     fn send_reject(
         &mut self,
         initiator: WorkerId,
@@ -2367,7 +2371,9 @@ where
         let leader = self
             .leader
             .as_ref()
-            .filter(|_| name_leader)
+            .filter(|_| {
+                name_leader || self.holds_office() || self.current_leader_still_valid()
+            })
             .map(|(leader, term)| KnownLeader {
                 leader_id: Some(leader.clone().into()),
                 term: *term,
