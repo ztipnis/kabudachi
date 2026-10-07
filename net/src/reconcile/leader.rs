@@ -1,7 +1,6 @@
-//! A new leader's reconciliation as the driver runs it: asking its shard what
-//! it holds, fetching the records it lacks, deciding when to stop waiting,
-//! writing the rebuilt records again at its term, and, once it leads, taking
-//! the answers that come late.
+//! A new leader's asking as the driver runs it: the questions to its shard
+//! about what each worker holds, and the lookups of the records it lacks.
+//! What the answers decide is core's `OfficeReconciliation`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,15 +9,14 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{ElectionCertificate, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::messages::ReconcileRequest;
-use kabudachi_core::reconcile::{
-    Cursor, DriftWatch, Rebuild, ReconcileRound, ReconcileTerm, Republish, ReportPage, wire,
-};
+use kabudachi_core::reconcile::{Cursor, DriftWatch, ReconcileTerm, ReportPage, wire};
+use kabudachi_core::task_record::OfficeReconciliation;
 use kabudachi_core::time::{Clock, Duration, Instant};
 use libp2p::futures::StreamExt;
 use libp2p::futures::future::BoxFuture;
 use libp2p::futures::stream::FuturesUnordered;
 
-use crate::messenger::{Net, PlacedWrite, WriteOutcome};
+use crate::messenger::Net;
 use crate::reconcile::report::page_of;
 use crate::reconcile::request_after;
 
@@ -29,80 +27,11 @@ const FETCHES_IN_FLIGHT: usize = 32;
 /// looked up again if the lookup did not find it.
 const FETCH_COOLDOWN: Duration = Duration::from_millis(250);
 
-/// What the driver is to do next for a reconciliation.
-pub(crate) enum Progress {
-    /// Nothing yet.
-    Waiting,
-    /// The round may stop: rebuild the scheduler from this.
-    Rebuild(Rebuild),
-    /// The rebuilt scheduler's records are to be placed on the voters and
-    /// written again: an earlier attempt could not place them all.
-    Place(Vec<TaskRecord>),
-    /// The voters changed while records are still to be stored: place them
-    /// on the new voters (see [`LeaderReconciliation::re_place`]).
-    RePlace,
-    /// Every republished record is stored: the node may lead.
-    Republished(ReconcileTerm),
-    /// What was learnt since, for the leading scheduler to adopt.
-    Learnt(Rebuild),
-}
-
-/// What a reconciliation could not finish, to be done again.
-pub(crate) enum Stuck {
-    /// The scheduler did not take the rebuild.
-    Rebuild(Rebuild),
-    /// These records could not all be placed on the voters.
-    Place(Vec<TaskRecord>),
-}
-
-/// Work that failed and is tried again when the voters change and, failing
-/// that, once per `every`.
-struct Retry<T> {
-    work: Option<T>,
-    voters: Vec<WorkerId>,
-    at: Instant,
-    every: Duration,
-}
-
-impl<T> Retry<T> {
-    fn new(every: Duration) -> Self {
-        Retry {
-            work: None,
-            voters: Vec::new(),
-            at: Instant::at(0),
-            every,
-        }
-    }
-
-    /// Keeps `work` to try again, given the voters it failed with.
-    fn hold(&mut self, work: T, mut voters: Vec<WorkerId>, now: Instant) {
-        voters.sort();
-        self.work = Some(work);
-        self.voters = voters;
-        self.at = now + self.every;
-    }
-
-    /// The work to try again, if the voters changed or the time has come.
-    fn take_if_due(&mut self, voters: &[WorkerId], now: Instant) -> Option<T> {
-        let mut voters = voters.to_vec();
-        voters.sort();
-        if self.work.is_some() && (voters != self.voters || now >= self.at) {
-            self.work.take()
-        } else {
-            None
-        }
-    }
-
-    fn wake_at(&self) -> Option<Instant> {
-        self.work.as_ref().map(|_| self.at)
-    }
-}
-
-/// One office's reconciliation: the round, the questions and lookups in
-/// flight, the republish, and, once the node leads, the answers still
-/// awaited.
+/// One office's reconciliation as the driver runs it: what it decides, and
+/// the questions and lookups in flight.
 pub(crate) struct LeaderReconciliation<'n> {
-    round: ReconcileRound,
+    /// What this office's reconciliation decides.
+    pub(crate) reconciling: OfficeReconciliation,
     net: &'n Net,
     /// The certificate of this office, which every worker asked checks.
     proof: ElectionCertificate,
@@ -128,17 +57,6 @@ pub(crate) struct LeaderReconciliation<'n> {
     scan_again_at: Option<Instant>,
     /// Missing records not yet looked up once.
     unlooked: usize,
-    republish: Option<Republish>,
-    /// The voters, sorted, the republish was last placed on.
-    republish_voters: Vec<WorkerId>,
-    rebuilt: bool,
-    /// The rebuild or placement that failed, tried again.
-    stuck: Retry<Stuck>,
-    /// When `progress` last ran: what falls due after it is woken for.
-    progressed_at: Instant,
-    led: bool,
-    /// Whether something arrived that the round has not yet handed over.
-    news: bool,
     /// Which answered workers' heartbeats keep disagreeing with this leader.
     drift: DriftWatch,
 }
@@ -159,7 +77,7 @@ impl<'n> LeaderReconciliation<'n> {
         let mut roster = reconcilees.clone();
         roster.sort();
         let mut reconciliation = LeaderReconciliation {
-            round: ReconcileRound::new(office, reconcilees.iter().cloned(), now, grace),
+            reconciling: OfficeReconciliation::new(office, reconcilees.iter().cloned(), now, grace),
             net,
             proof,
             me: net.local_worker_id(),
@@ -175,13 +93,6 @@ impl<'n> LeaderReconciliation<'n> {
             scan: true,
             scan_again_at: None,
             unlooked: 0,
-            republish: None,
-            republish_voters: Vec::new(),
-            rebuilt: false,
-            stuck: Retry::new(grace),
-            progressed_at: now,
-            led: false,
-            news: false,
             drift: DriftWatch::new(heartbeat_interval, grace),
         };
         for worker in reconcilees {
@@ -191,7 +102,7 @@ impl<'n> LeaderReconciliation<'n> {
     }
 
     pub(crate) fn office(&self) -> ReconcileTerm {
-        self.round.term()
+        self.reconciling.office()
     }
 
     /// Asks `worker` for its first page; this worker reads its own.
@@ -210,7 +121,7 @@ impl<'n> LeaderReconciliation<'n> {
         after: Option<Cursor>,
         runs_only: bool,
     ) {
-        let (net, office, proof) = (self.net, self.round.term(), self.proof.clone());
+        let (net, office, proof) = (self.net, self.office(), self.proof.clone());
         self.asking.insert(worker.clone());
         self.asks.push(Box::pin(async move {
             let page = net
@@ -232,11 +143,11 @@ impl<'n> LeaderReconciliation<'n> {
         believed: &Digest,
         now: Instant,
     ) {
-        if *worker == self.me || !self.led {
+        if *worker == self.me || !self.reconciling.leads() {
             return;
         }
         if self.drift.heard(worker, heard, believed, now)
-            && self.round.answered().contains(worker)
+            && self.reconciling.round().answered().contains(worker)
             && !self.asking.contains(worker)
         {
             self.drift.asked(worker, now);
@@ -265,9 +176,9 @@ impl<'n> LeaderReconciliation<'n> {
                     return;
                 }
             };
-            self.news = true;
+            self.reconciling.heard();
             self.scan = true;
-            match self.round.page(&self.me, page, now) {
+            match self.reconciling.round_mut().page(&self.me, page, now) {
                 Some(cursor) => after = Some(cursor),
                 None => return,
             }
@@ -287,9 +198,9 @@ impl<'n> LeaderReconciliation<'n> {
             Some((task, record)) = self.fetches.next() => {
                 self.fetching.remove(&task);
                 if let Some(record) = record {
-                    self.round.fetched(record);
+                    self.reconciling.round_mut().fetched(record);
                 }
-                self.news = true;
+                self.reconciling.heard();
                 self.scan = true;
             }
         }
@@ -303,83 +214,26 @@ impl<'n> LeaderReconciliation<'n> {
         page: Option<ReportPage>,
     ) {
         self.asking.remove(&worker);
-        self.news = true;
+        self.reconciling.heard();
         self.scan = true;
         if let Some(page) = page
-            && let Some(cursor) = self.round.page(&worker, page, asked_at)
+            && let Some(cursor) = self.reconciling.round_mut().page(&worker, page, asked_at)
         {
             self.send_ask(worker, asked_at, Some(cursor), runs_only);
         }
     }
 
-    /// What the driver should do now, given its node and whether its
-    /// scheduler leads. What late answers teach is handed over only while it
-    /// does, and is kept until then.
-    pub(crate) fn progress<C: Clock>(
-        &mut self,
-        node: &WorkerNode<C>,
-        leading: bool,
-        now: Instant,
-    ) -> Progress {
-        self.progressed_at = now;
+    /// Asks a worker that joined the roster since, every member that has not
+    /// answered once per suspicion timeout, and looks up the records the round
+    /// lacks.
+    pub(crate) fn ask_and_fetch<C: Clock>(&mut self, node: &WorkerNode<C>, now: Instant) {
         self.ask_who_is_due(node, now);
         self.fetch_what_is_missing(node, now);
-
-        // A republish that cannot reach a quorum is not given up: this leader
-        // keeps office, writes each record again, and places the writes anew
-        // whenever the voters change. That is accepted because a node holds
-        // office only while its lease holds, and holding the lease means a
-        // quorum of voters has been heard from lately. When the lease ends the
-        // node leaves office (`NoQuorum`), the driver drops this
-        // reconciliation. Writes that fell due before the node stepped may
-        // still go out; a holder refuses them against a newer term.
-        if let Some(republish) = self.republish.as_mut() {
-            let due = republish.due(now);
-            if !due.is_empty() {
-                self.net.write_records(due);
-            }
-            if republish.is_done() && !self.led {
-                self.led = true;
-                return Progress::Republished(self.round.term());
-            }
-            let mut voters = node.placeable_voters();
-            voters.sort();
-            if !republish.is_done() && voters != self.republish_voters {
-                self.republish_voters = voters;
-                return Progress::RePlace;
-            }
-        }
-        if let Some(stuck) = self.stuck.take_if_due(&node.placeable_voters(), now) {
-            return match stuck {
-                Stuck::Rebuild(rebuild) => Progress::Rebuild(rebuild),
-                Stuck::Place(records) => Progress::Place(records),
-            };
-        }
-        if !self.rebuilt {
-            let answered = node.voters_answered(&self.round.answered());
-            if self.round.may_finish(answered, now) && self.fetching.is_empty() && self.unlooked == 0
-            {
-                self.rebuilt = true;
-                self.news = false;
-                return Progress::Rebuild(self.round.take_settled(|worker| node.is_member(worker)));
-            }
-            return Progress::Waiting;
-        }
-        if self.led && self.news && leading {
-            self.news = false;
-            let learnt = self.round.take_settled(|worker| node.is_member(worker));
-            if !learnt.records.is_empty() || !learnt.reports.is_empty() {
-                return Progress::Learnt(learnt);
-            }
-        }
-        Progress::Waiting
     }
 
-    /// Takes back what the scheduler could not adopt because it did not lead:
-    /// it is offered again, with what is learnt meanwhile, once it does.
-    pub(crate) fn give_back(&mut self, learnt: Rebuild) {
-        self.round.give_back(learnt);
-        self.news = true;
+    /// Whether no lookup is in flight and none is owed.
+    pub(crate) fn lookups_done(&self) -> bool {
+        self.fetching.is_empty() && self.unlooked == 0
     }
 
     /// Asks a worker that joined the roster since, and, once per suspicion
@@ -390,7 +244,7 @@ impl<'n> LeaderReconciliation<'n> {
         if roster != self.roster {
             for worker in &roster {
                 if self.known.insert(worker.clone()) {
-                    self.round.ask_also(worker.clone());
+                    self.reconciling.round_mut().ask_also(worker.clone());
                     self.ask(worker.clone(), now);
                 }
             }
@@ -399,11 +253,11 @@ impl<'n> LeaderReconciliation<'n> {
             }
             self.roster = roster;
             // A holder that left may have made a record certain.
-            self.news = true;
+            self.reconciling.heard();
         }
         if now >= self.asked_again_at {
             self.asked_again_at = now + self.grace;
-            for worker in self.round.unanswered() {
+            for worker in self.reconciling.round().unanswered() {
                 if node.is_member(&worker) {
                     self.ask(worker, now);
                 }
@@ -422,12 +276,12 @@ impl<'n> LeaderReconciliation<'n> {
         self.scan_again_at = None;
         self.unlooked = 0;
         let held = self.net.held_records();
-        for task in self.round.missing_records(|worker| node.is_member(worker)) {
+        for task in self.reconciling.round().missing_records(|worker| node.is_member(worker)) {
             if let Some(record) = held.get(&task) {
-                self.round.fetched(record);
+                self.reconciling.round_mut().fetched(record);
             }
         }
-        for task in self.round.missing_records(|worker| node.is_member(worker)) {
+        for task in self.reconciling.round().missing_records(|worker| node.is_member(worker)) {
             if self.fetching.contains(&task) {
                 continue;
             }
@@ -464,59 +318,22 @@ impl<'n> LeaderReconciliation<'n> {
         Duration::from_ticks(ticks).min(self.grace.max(FETCH_COOLDOWN))
     }
 
-    /// Keeps what could not be finished, to be done again when the voters
-    /// change or after a suspicion timeout.
-    pub(crate) fn stuck(&mut self, work: Stuck, voters: Vec<WorkerId>, now: Instant) {
-        self.stuck.hold(work, voters, now);
-    }
-
-    /// The rebuild ran: write these republished records, each again after
-    /// `retry_after` if it was not stored.
-    pub(crate) fn republishing(
-        &mut self,
-        writes: Vec<PlacedWrite>,
-        retry_after: Duration,
-        mut voters: Vec<WorkerId>,
-    ) {
-        voters.sort();
-        self.republish_voters = voters;
-        self.republish = Some(Republish::new(writes, retry_after));
-    }
-
-    /// The voters changed: places every republished write not yet stored on
-    /// them, and writes each refused one again now.
-    pub(crate) fn re_place(&mut self, replace: impl FnMut(&mut PlacedWrite), now: Instant) {
-        if let Some(republish) = self.republish.as_mut() {
-            republish.re_place(replace, now);
-        }
-    }
-
-    /// Takes a write outcome that belongs to the republish; whether it did.
-    pub(crate) fn settle(&mut self, outcome: &WriteOutcome, now: Instant) -> bool {
-        self.republish
-            .as_mut()
-            .is_some_and(|republish| republish.settled(outcome, now))
-    }
-
-    /// When the driver must wake for this reconciliation: the end of the
-    /// grace, the next time to ask again, a record to look up again, a write
-    /// or a stuck step to try again. What fell due since `progress` last ran
-    /// is due now, so no wake is lost to the time `progress` took; `progress`
-    /// moves its own time on, so this does not spin.
+    /// When the driver must wake for this reconciliation: what core's
+    /// `OfficeReconciliation` falls due at, the next time to ask again, or a
+    /// record to look up again. What fell due since `progress` last ran is due
+    /// now, so no wake is lost to the time `progress` took; `progress` moves
+    /// its own time on, so this does not spin.
     pub(crate) fn wake_at<C: Clock>(&self, node: &WorkerNode<C>) -> Option<Instant> {
-        let grace = (!self.rebuilt).then(|| self.round.grace_ends_at());
-        let ask_again = (!self.round.is_complete(|worker| node.is_member(worker)))
+        let after = self.reconciling.progressed_at();
+        let ask_again = (!self.reconciling.round().is_complete(|worker| node.is_member(worker)))
             .then_some(self.asked_again_at);
         [
-            grace,
-            ask_again,
-            self.scan_again_at,
-            self.republish.as_ref().and_then(Republish::wake_at),
-            self.stuck.wake_at(),
+            self.reconciling.wake_at(),
+            ask_again.filter(|at| *at > after),
+            self.scan_again_at.filter(|at| *at > after),
         ]
         .into_iter()
         .flatten()
-        .filter(|at| *at > self.progressed_at)
         .min()
     }
 }

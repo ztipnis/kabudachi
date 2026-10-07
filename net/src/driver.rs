@@ -148,7 +148,8 @@ use kabudachi_core::reconcile::active_runs_digest;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{Reconciled, ReconcileRefused, Scheduler};
 use kabudachi_core::task_record::{
-    EffectGate, RecordOutbox, Repair, Settled, Settlement, Waits, Write, WriteLedger, WriteOrder,
+    EffectGate, OfficeReconciliation, Progress, RecordOutbox, RecordPorts, Repair, Settled,
+    Settlement, Stuck, Waits, Write, WriteLedger, WriteOrder,
 };
 use kabudachi_core::time::{Clock, Instant, WallTime};
 use libp2p::Multiaddr;
@@ -162,7 +163,7 @@ use crate::handoff::{HandedOff, hand_off_held_records};
 use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, pointer_for};
 use crate::leader_search::{DrivenSearch, JoinOverNet};
 use crate::messenger::{Net, PlacedWrite, WriteOutcome};
-use crate::reconcile::leader::{LeaderReconciliation, Progress, Stuck};
+use crate::reconcile::leader::LeaderReconciliation;
 use crate::reconcile::report::page_of;
 use crate::steal::candidates_for_steal;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
@@ -581,7 +582,7 @@ fn settle_republish(
     now: Instant,
 ) -> Vec<WriteOutcome> {
     if let Some(current) = reconciliation.as_mut() {
-        outcomes.retain(|outcome| !current.settle(outcome, now));
+        outcomes.retain(|outcome| !current.reconciling.settle(outcome, now));
     }
     outcomes
 }
@@ -645,7 +646,16 @@ where
     let current = reconciliation.as_mut()?;
     let mut next_deadline = None;
     loop {
-        match current.progress(node, scheduler.is_leader(), clock.now()) {
+        current.ask_and_fetch(node, clock.now());
+        let lookups_done = current.lookups_done();
+        let mut ports = NetRecords { net, factor };
+        match current.reconciling.progress(
+            node,
+            scheduler.is_leader(),
+            lookups_done,
+            clock.now(),
+            &mut ports,
+        ) {
             Progress::Waiting => return next_deadline,
             Progress::Rebuild(rebuild) => match reconcile_noting_holders(scheduler, &mut unsettled.repair, rebuild) {
                 Ok(rebuilt) => {
@@ -655,7 +665,7 @@ where
                         "a new leader rebuilt its scheduler from its shard"
                     );
                     let revisions = scheduler.observer_mut().take();
-                    place_republish(current, node, factor, &mut unsettled.repair, revisions);
+                    place_republish(&mut current.reconciling, node, factor, &mut unsettled.repair, revisions);
                     if !rebuilt.silent_holders.is_empty() {
                         let due = Stepper {
                             node: &mut *node,
@@ -678,16 +688,16 @@ where
                     // Nothing was installed, so the same rebuild is offered
                     // again; leading without it would serve an empty shard.
                     tracing::error!(%rejection, "the scheduler did not take the rebuild: not leading");
-                    current.stuck(Stuck::Rebuild(rebuild), node.placeable_voters(), clock.now());
+                    current.reconciling.stuck(Stuck::Rebuild(rebuild), node.placeable_voters(), clock.now());
                 }
             },
             Progress::Place(records) => {
-                place_republish(current, node, factor, &mut unsettled.repair, records);
+                place_republish(&mut current.reconciling, node, factor, &mut unsettled.repair, records);
             }
             Progress::RePlace => {
                 let voters = node.placeable_voters();
                 let repair = &mut unsettled.repair;
-                current.re_place(
+                current.reconciling.re_place(
                     |write| match placement(&Write::of(&write.record).task_id, &voters, factor) {
                         Some(Placement { holders, quorum }) => {
                             write.record.placement = holders.into_iter().map(Into::into).collect();
@@ -758,7 +768,7 @@ where
                     // leads.
                     Err(learnt) => {
                         tracing::debug!("late reconciliation answers were not adopted: not leading");
-                        current.give_back(learnt);
+                        current.reconciling.give_back(learnt);
                         return next_deadline;
                     }
                 }
@@ -802,7 +812,7 @@ fn reconcile_noting_holders<C: Clock, I: IdGenerator>(
 /// when the voters change or after a suspicion timeout: leading without every
 /// record written again would leave a late write of the last leader unfenced.
 fn place_republish<C: Clock>(
-    current: &mut LeaderReconciliation<'_>,
+    current: &mut OfficeReconciliation,
     node: &WorkerNode<C>,
     factor: ReplicationFactor,
     repair: &mut Repair,
@@ -1074,6 +1084,27 @@ impl RecordWrites {
         self.ledger.clear();
         self.order.clear();
         self.repair = Repair::new(self.retry_after);
+    }
+}
+
+/// A leader's record path over the network: kad's placement among the
+/// voters, and `Net`'s writes.
+struct NetRecords<'a> {
+    net: &'a Net,
+    factor: ReplicationFactor,
+}
+
+impl RecordPorts for NetRecords<'_> {
+    fn place(&self, task: &TaskId, voters: &[WorkerId]) -> Option<Placement> {
+        placement(task, voters, self.factor)
+    }
+
+    fn write(&mut self, writes: Vec<PlacedWrite>) {
+        self.net.write_records(writes);
+    }
+
+    fn refuse(&mut self, write: Write) {
+        self.net.refuse_write(write);
     }
 }
 

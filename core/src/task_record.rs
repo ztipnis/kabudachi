@@ -15,7 +15,7 @@ mod version;
 
 pub use candidate::looks_claimable;
 pub use gate::{EffectGate, PlacedWrite, PriorPlacement, Settled, Write, WriteOutcome};
-pub use leader_records::Placement;
+pub use leader_records::{OfficeReconciliation, Placement, Progress, RecordPorts, Stuck};
 pub use ledger::{Waits, WriteLedger};
 pub use local::LocalRecords;
 pub use order::{Settlement, WriteOrder};
