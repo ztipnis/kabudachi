@@ -165,7 +165,7 @@ impl EpochConfirmation {
             }
             Ok(None) => {
                 // Recovering an emptied authority after a lost swap needs a
-                // catastrophic-reset procedure that is not implemented yet:
+                // catastrophic-reset procedure that does not exist:
                 // an empty answer says nothing of an epoch such a swap may
                 // have made, so the plain rule stands this node at its own.
                 self.confirmed = Some(Confirmed::Empty);
