@@ -143,7 +143,7 @@ pub use entry::{Entry, Identity};
 use crate::configuration::{Admission, Configuration, Generation, Roster, Tally};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::hashing::{Field, HashFunction};
-use crate::protocol::checked::{Checked, CheckedMessage, CheckedPayload};
+use crate::protocol::checked::{Checked, CheckedMessage, CheckedPayload, decode};
 use crate::protocol::digest::Digest;
 use crate::protocol::ids::{IdGenerator, IncarnationId, ShardId, WorkerId};
 use crate::protocol::messages::prelude::*;
@@ -967,6 +967,72 @@ where
             recovery_epoch: self.standing.epoch()?,
             term: self.term,
         })
+    }
+
+    /// The certificate this leader presents to a worker it asks what it holds
+    /// (see [`Self::may_answer_reconcile`]): for the term and recovery epoch
+    /// it took office in, the configuration it leads. `None` unless it holds
+    /// office.
+    pub fn reconcile_proof(&self) -> Option<ElectionCertificate> {
+        let office = self.office.as_ref().filter(|_| self.holds_office())?;
+        Some(ElectionCertificate {
+            shard_id: Some(self.shard_id.clone().into()),
+            recovery_epoch: self.standing.epoch_number(),
+            term: self.term,
+            leader_id: Some(self.my_id.clone().into()),
+            configuration: Some(office.configuration().into()),
+            recipient_admission: None,
+            recipient_prior_admission: None,
+        })
+    }
+
+    /// Whether this worker may answer `from`, which asks it what it holds
+    /// before it schedules, presenting `proof`. It answers the leader it
+    /// follows, and a requester that proves an office: a certificate it
+    /// names itself as the leader of, for this node's shard, no earlier in
+    /// term than the highest this node has seen and not stamped before the
+    /// configuration this node holds (a later recovery epoch's terms do not
+    /// compare with this node's, so one is accepted as a newer office). A
+    /// requester that is neither, such as a deposed leader, is refused, so
+    /// what a worker holds is told only to the office that may act on it.
+    /// The certificate is checked as one received over the wire is.
+    pub fn may_answer_reconcile(
+        &self,
+        from: &WorkerId,
+        proof: Option<&ElectionCertificate>,
+    ) -> bool {
+        if self
+            .known_leader()
+            .is_some_and(|(leader, _)| &leader == from)
+        {
+            return true;
+        }
+        let Some(proof) = proof else {
+            return false;
+        };
+        let wrapped = ElectionMessage {
+            payload: Some(election_message::Payload::ElectionCertificate(
+                proof.clone(),
+            )),
+        };
+        let Some(CheckedPayload::ElectionCertificate(certificate)) =
+            decode(wrapped).ok().and_then(CheckedMessage::into_payload)
+        else {
+            return false;
+        };
+        if certificate.leader_id() != *from || certificate.shard_id() != self.shard_id {
+            return false;
+        }
+        match order_numbers(self.standing.epoch_number(), certificate.recovery_epoch) {
+            EpochOrder::Later => true,
+            EpochOrder::Stale => false,
+            EpochOrder::Mine => {
+                certificate.term >= self.standing.highest_term_seen()
+                    && self
+                        .led_or_followed_configuration()
+                        .is_none_or(|held| held.generation().term() <= certificate.term)
+            }
+        }
     }
 
     /// Whom its reconciliation asks: the voters of the configuration it leads

@@ -5,13 +5,14 @@ import "ids.proto";
 import "task.proto";
 import "claim.proto";
 import "task_record.proto";
+import "election.proto";
 
 // A new leader asks each worker of its shard what it holds before it
 // schedules anything. A worker answers in pages, each within one message:
 // first the runs it holds, then the Task records it holds.
 message ReconcileRequest {
-  // The office asking: a worker answers any leader that asks; these let it
-  // say whom it answered in its logs.
+  // The office asking, for the worker's logs. What a worker answers on is
+  // `proof`.
   uint64 recovery_epoch = 1;
   uint64 recovery_lineage = 2;
   uint64 term = 3;
@@ -23,6 +24,11 @@ message ReconcileRequest {
   // Only the runs, no records: the leader asks this when the runs it
   // believes a worker holds differ from what the worker's heartbeats say.
   bool runs_only = 6;
+  // The asker's election certificate for the office it holds. A worker
+  // answers the leader it follows, or an asker whose certificate names it
+  // leader of the worker's shard in a term no earlier than the highest the
+  // worker has seen; it gives no answer to any other.
+  ElectionCertificate proof = 7;
 }
 
 // One record a worker holds, summarised.

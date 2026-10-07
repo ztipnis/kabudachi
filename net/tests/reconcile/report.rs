@@ -10,7 +10,7 @@ use kabudachi_core::reconcile::wire::held_key;
 use kabudachi_core::reconcile::{Cursor, ReconcileTerm, ReportedState};
 
 use crate::support::deadline::within_deadline;
-use crate::support::records::{ThreeVoters, plain_with, wait_until_held};
+use crate::support::records::{ThreeVoters, plain_with, proof_of_office, wait_until_held};
 
 const RESULT: &[u8] = b"result";
 
@@ -86,15 +86,17 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
             .drive_until(wait_until_held(worker_net.clone(), tasks.clone()))
             .await;
 
-        // Any office: a worker answers whoever asks, and the term only labels its logs.
+        // The leader the worker follows asks, presenting the certificate of its
+        // office.
         let term = ReconcileTerm {
             recovery_epoch: RecoveryEpoch::new(0, 0),
             term: 99,
         };
+        let proof = proof_of_office(&leader_id, 99);
         let (mut runs, mut keys, mut cursor, mut pages) = (Vec::new(), Vec::new(), None, 0);
         loop {
             let page = shard
-                .drive_until(leader_net.ask_reconcile(worker_id.clone(), term, cursor.clone(), false))
+                .drive_until(leader_net.ask_reconcile(worker_id.clone(), term, proof.clone(), cursor.clone(), false))
                 .await
                 .expect("the worker answered");
             pages += 1;

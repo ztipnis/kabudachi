@@ -11,6 +11,7 @@ use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{
     ElectionTimings, Entry, Identity, Input, KnownConfiguration, Step, WorkerNode,
 };
+use kabudachi_core::protocol::generated::ElectionCertificate;
 use kabudachi_core::protocol::ids::{
     IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
@@ -400,4 +401,25 @@ pub async fn claimed_and_started(worker: &Net, leader: &WorkerId, task: &TaskId)
         "expected the start acknowledged, got {started:?}"
     );
     run
+}
+
+/// A certificate that `leader` leads `term` of the voters' shard, over the
+/// configuration the voters start in.
+pub fn proof_of_office(leader: &WorkerId, term: u64) -> ElectionCertificate {
+    let genesis = Generation::genesis(0);
+    let configuration = Configuration::single(Single {
+        generation: genesis,
+        base: genesis,
+        voter_count: 3,
+    })
+    .expect("valid");
+    ElectionCertificate {
+        shard_id: Some(ShardId::new(SHARD).into()),
+        recovery_epoch: 0,
+        term,
+        leader_id: Some(leader.clone().into()),
+        configuration: Some((&configuration).into()),
+        recipient_admission: None,
+        recipient_prior_admission: None,
+    }
 }

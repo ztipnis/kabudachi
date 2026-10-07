@@ -2,4 +2,5 @@
 
 mod drift;
 mod leader_loss;
+mod proof;
 mod report;

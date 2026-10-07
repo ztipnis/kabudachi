@@ -17,8 +17,9 @@ const LAST_BYTES: usize = 2;
 
 /// One page of this worker's answer to `request`: its runs (from `runs`)
 /// after the cursor, then the records it holds (from `held`) after it, as
-/// many as fit in one message. A worker answers whichever leader asks: it
-/// keeps no view of who leads, and its answer decides nothing by itself.
+/// many as fit in one message. Whether `request` may be answered is not decided
+/// here (see `WorkerNode::may_answer_reconcile`); the answer decides nothing
+/// by itself.
 pub(crate) fn page_of(
     request: &ReconcileRequest,
     runs: &ClaimedRuns,

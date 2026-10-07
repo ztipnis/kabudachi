@@ -435,7 +435,7 @@ where
             stepper.unsettled,
             config.replication_factor,
         );
-        respond_to_reconcile_requests(net);
+        respond_to_reconcile_requests(stepper.node, net);
         stepper.write_revisions();
         // A step can report a deadline that has already come: a voter that
         // begins suspecting its leader starts a roll call at its next
@@ -670,11 +670,13 @@ where
     }
     if reconciliation.is_none()
         && let Some(office) = office
+        && let Some(proof) = node.reconcile_proof()
         && scheduler.reconciling() == Some(office)
     {
         *reconciliation = Some(LeaderReconciliation::start(
             net,
             office,
+            proof,
             node.reconcilees(),
             clock.now(),
             node.timings().suspect_timeout,
@@ -1242,11 +1244,25 @@ fn respond_to_task_requests<C: Clock, I: IdGenerator>(
 }
 
 /// Answers every inbound `/kabudachi/reconcile/1` request queued on `net`
-/// with a page of what this worker holds. A worker keeps no view of who
-/// leads, so it answers whoever asks, from its own runs and records alone.
-fn respond_to_reconcile_requests(net: &Net) {
+/// that `node` may answer (see `WorkerNode::may_answer_reconcile`) with a
+/// page of what this worker holds, from its own runs and records alone. A
+/// request that proves neither that its sender is the leader this worker
+/// follows nor an office no earlier than the highest term it has seen is
+/// logged and left unanswered, which the asker reads as no answer.
+fn respond_to_reconcile_requests<C: Clock>(node: &WorkerNode<C>, net: &Net) {
     for handle in net.poll_reconcile_requests() {
         let request = handle.request();
+        if !node.may_answer_reconcile(&handle.from(), request.proof.as_ref()) {
+            tracing::warn!(
+                from = handle.from().as_str(),
+                recovery_epoch = request.recovery_epoch,
+                term = request.term,
+                highest_term_seen = node.highest_term_seen(),
+                "refusing a reconciliation request: its sender is not the leader this worker \
+                 follows and proves no office for a term this worker could still honour"
+            );
+            continue;
+        }
         tracing::debug!(
             from = handle.from().as_str(),
             recovery_epoch = request.recovery_epoch,

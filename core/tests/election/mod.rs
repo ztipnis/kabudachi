@@ -9,6 +9,7 @@ mod joint_founding;
 mod leader_heartbeat;
 mod member_standing;
 mod membership;
+mod reconcile_proof;
 mod reconciling;
 mod roll_call;
 mod step_down;

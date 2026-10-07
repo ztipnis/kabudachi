@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::election::WorkerNode;
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::TaskRecord;
+use kabudachi_core::protocol::generated::{ElectionCertificate, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::messages::ReconcileRequest;
 use kabudachi_core::reconcile::{
@@ -104,6 +104,8 @@ impl<T> Retry<T> {
 pub(crate) struct LeaderReconciliation<'n> {
     round: ReconcileRound,
     net: &'n Net,
+    /// The certificate of this office, which every worker asked checks.
+    proof: ElectionCertificate,
     me: WorkerId,
     grace: Duration,
     /// Each question or page in flight, as the worker asked, when its first
@@ -148,6 +150,7 @@ impl<'n> LeaderReconciliation<'n> {
     pub(crate) fn start(
         net: &'n Net,
         office: ReconcileTerm,
+        proof: ElectionCertificate,
         reconcilees: Vec<WorkerId>,
         now: Instant,
         grace: Duration,
@@ -158,6 +161,7 @@ impl<'n> LeaderReconciliation<'n> {
         let mut reconciliation = LeaderReconciliation {
             round: ReconcileRound::new(office, reconcilees.iter().cloned(), now, grace),
             net,
+            proof,
             me: net.local_worker_id(),
             grace,
             asks: FuturesUnordered::new(),
@@ -206,11 +210,11 @@ impl<'n> LeaderReconciliation<'n> {
         after: Option<Cursor>,
         runs_only: bool,
     ) {
-        let (net, office) = (self.net, self.round.term());
+        let (net, office, proof) = (self.net, self.round.term(), self.proof.clone());
         self.asking.insert(worker.clone());
         self.asks.push(Box::pin(async move {
             let page = net
-                .ask_reconcile(worker.clone(), office, after, runs_only)
+                .ask_reconcile(worker.clone(), office, proof, after, runs_only)
                 .await;
             (worker, asked_at, runs_only, page)
         }));

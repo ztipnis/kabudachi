@@ -1424,11 +1424,15 @@ impl Cluster {
     /// Asks every reconcilee `id` can reach that has not answered, and
     /// fetches the full records its answers name from those that did.
     fn collect_answers(&self, id: &WorkerId, round: &mut ReconcileRound, now: Instant) {
+        let proof = self.nodes[id].reconcile_proof();
         for worker in round.unanswered() {
+            // A worker answers only the leader it follows, or one whose
+            // certificate proves its office, as the driver decides.
             let answers = worker == *id
                 || (self.nodes.contains_key(&worker)
                     && !self.is_stalled(&worker, now)
-                    && self.records.can_reach(id, &worker));
+                    && self.records.can_reach(id, &worker)
+                    && self.nodes[&worker].may_answer_reconcile(id, proof.as_ref()));
             if answers {
                 let _ = round.page(&worker, self.report_of(&worker), now);
             }

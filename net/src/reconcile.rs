@@ -1,11 +1,15 @@
 //! The reconcile exchange: how a new leader asks a worker what it holds, and
-//! how every worker answers.
+//! how a worker answers it.
 //!
 //! [`codec`] frames the `/kabudachi/reconcile/1` messages. The asking side is
 //! [`Net::ask_reconcile`], one page per call, to the worker the caller names.
-//! The answering side is [`report::page_of`], which the driver applies to
-//! every inbound request: a worker keeps no view of who leads, answers
-//! whichever leader asks, and its answer decides nothing by itself.
+//! The answering side is [`report::page_of`], which the driver applies to the
+//! inbound requests its worker may answer: those of the leader it follows,
+//! and of a requester whose election certificate proves an office no earlier
+//! than the highest term the worker has seen (see
+//! `WorkerNode::may_answer_reconcile`). A request that proves neither gets no
+//! answer, and the refusal is logged. What a worker answers decides nothing
+//! by itself.
 //!
 //! An answer is paged: a worker's runs first, in run id order, then a summary
 //! of each record it holds, in task id order, each page within the message
@@ -18,6 +22,7 @@
 
 use std::str::FromStr;
 
+use kabudachi_core::protocol::generated::ElectionCertificate;
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::{ReconcileReport, ReconcileRequest, reconcile_request};
 use kabudachi_core::reconcile::{Cursor, ReconcileTerm, ReportPage, wire};
@@ -60,16 +65,18 @@ impl ReconcileRequestHandle {
 }
 
 impl Net {
-    /// Asks `worker` for one page of what it holds, for the office `term`,
-    /// starting after `cursor` (the first page for `None`). With
+    /// Asks `worker` for one page of what it holds, for the office `term` that
+    /// `proof`, the asker's election certificate, proves, starting after `cursor` (the first page for `None`). With
     /// `runs_only`, the page holds runs and no records. `None` if no usable
     /// answer came: the worker could not be reached, did not answer, or sent
-    /// a page that could not be read. Also `None` for the local worker: the
+    /// a page that could not be read. A worker that does not accept `proof`
+    /// gives no answer, so that is `None` too. Also `None` for the local worker: the
     /// leader reads its own store directly instead of asking itself.
     pub async fn ask_reconcile(
         &self,
         worker: WorkerId,
         term: ReconcileTerm,
+        proof: ElectionCertificate,
         cursor: Option<Cursor>,
         runs_only: bool,
     ) -> Option<ReportPage> {
@@ -84,6 +91,7 @@ impl Net {
             term: term.term,
             after,
             runs_only,
+            proof: Some(proof),
         };
         let report = self.ask::<ReconcileCodec>(to, request).await?;
         match wire::page(&report) {
