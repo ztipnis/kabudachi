@@ -80,6 +80,7 @@ pub(crate) fn submit_reject(rejection: SubmitRejection) -> TaskRejectReason {
         SubmitRejection::Backpressure { .. } => TaskRejectReason::TaskRejectBackpressure,
         SubmitRejection::NotLeader => TaskRejectReason::TaskRejectNotLeader,
         SubmitRejection::RecordTooLarge { .. } => TaskRejectReason::TaskRejectRecordTooLarge,
+        SubmitRejection::KeyNotReady => TaskRejectReason::TaskRejectNotReady,
     }
 }
 
@@ -88,12 +89,14 @@ pub(crate) fn report_reject(rejection: ReportRejection) -> TaskRejectReason {
         ReportRejection::NotLeader => TaskRejectReason::TaskRejectNotLeader,
         ReportRejection::UnknownRun => TaskRejectReason::TaskRejectUnknownRun,
         ReportRejection::NotAuthoritative => TaskRejectReason::TaskRejectNotAuthoritative,
+        ReportRejection::NotReady => TaskRejectReason::TaskRejectNotReady,
     }
 }
 
 pub(crate) fn cancel_reject(rejection: CancelRejection) -> TaskRejectReason {
     match rejection {
         CancelRejection::NotLeader => TaskRejectReason::TaskRejectNotLeader,
+        CancelRejection::NotReady => TaskRejectReason::TaskRejectNotReady,
     }
 }
 

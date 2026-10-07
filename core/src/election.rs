@@ -67,6 +67,19 @@
 //! (the term guard). A draining leader announces its own departure on final
 //! acks.
 //!
+//! A winner holds office from its win, in `LeaderReconciling`, and performs
+//! every election duty of a leader there: it announces itself, acks
+//! heartbeats, keeps its lease and watches the workers it leads. Only its
+//! scheduler's grant waits: the node asks its driver to reconcile (see
+//! [`Output::Reconcile`]) and moves to `Leader`, and reports a grant, once
+//! handed [`Input::Reconciled`] for the same office; one for any other office
+//! changes nothing. The roster says whom it asks ([`WorkerNode::reconcilees`]:
+//! its voters and pending members) and how much an answer counts
+//! ([`WorkerNode::voters_answered`]: only voters, and a worker the roster does
+//! not hold counts for nothing). A worker it reports lost while it reconciles
+//! is reported like any other, for the scheduler to keep until it leads. It
+//! leaves office from either state by the same edges, and then reports no grant.
+//!
 //! A node that holds or contests a term steps down once it sees a later one:
 //! to `Active` under that term's leader when its ack
 //! is what told it, and otherwise to `LeaderSuspect`. Only a vote granted, an
@@ -126,6 +139,7 @@ use crate::configuration::{Admission, Configuration, Generation, Roster, Tally};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::hashing::{Field, HashFunction};
 use crate::protocol::checked::{Checked, CheckedMessage, CheckedPayload};
+use crate::protocol::digest::Digest;
 use crate::protocol::ids::{IdGenerator, IncarnationId, ShardId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{
@@ -133,6 +147,7 @@ use crate::protocol::messages::{
     JoinResponse, KnownLeader, LeaderHeartbeatAck, SelfRemove, WorkerHeartbeat, election_message,
 };
 use crate::protocol::worker_state::WorkerState;
+use crate::reconcile::{Answered, ReconcileTerm};
 use crate::scheduler::{LeadershipGrant, LeaseEnd, Observer, Scheduler};
 use crate::time::{Clock, Duration, Instant};
 
@@ -176,6 +191,10 @@ where
     /// While it is held it, not `standing`, holds the configuration and
     /// admissions this node leads (see [`Self::led_or_followed_configuration`]).
     office: Option<LeaderOffice>,
+    /// The workers reported lost while this node reconciled, which its
+    /// scheduler keeps rather than applies. Watched again once the node leads
+    /// (see [`Self::on_reconciled`]).
+    lost_while_reconciling: BTreeSet<WorkerId>,
     /// The leader whose heartbeat ack this node last accepted, or that a JOIN
     /// pointed it at, or that a roll-call refusal named, or this node itself
     /// once it wins, with the term that leader was elected in.
@@ -196,6 +215,9 @@ where
     /// The admission generation this node held when its last routing crawl
     /// completed.
     crawled_at_admission: Option<Generation>,
+    /// What this node's heartbeats say of the runs it holds (see
+    /// [`Self::set_active_runs_digest`]); empty until set.
+    active_runs_digest: Vec<u8>,
     /// When a leader asked to drain stops waiting for its voters' routing
     /// crawls and leaves regardless (see [`Self::drain_once_free`]).
     drain_wait_until: Option<Instant>,
@@ -447,13 +469,13 @@ pub enum Input {
     /// (see [`ElectionTimings::drain_wait_limit`]), and then leaves; a leader
     /// with no other voter leaves at once. From `Draining` or `Stopped` the request does
     /// nothing; from any other state, `Fenced` among them, the node keeps it and
-    /// drains as soon as it reaches `Active` or `Leader`, in the same step. A
-    /// leader that loses office while it waits keeps the request, and the
-    /// drain wait, its limit included, starts over when it regains
-    /// leadership. A driver asks once.
+    /// drains as soon as it reaches `Active`, `LeaderReconciling` or `Leader`,
+    /// in the same step. A leader that loses office while it waits keeps the
+    /// request, and the drain wait, its limit included, starts over when it
+    /// regains leadership. A driver asks once.
     ///
-    /// A drain kept in a state the node never leaves for `Active` or
-    /// `Leader` waits for good: a node whose peers never return, which keeps
+    /// A drain kept in a state the node never leaves for `Active`,
+    /// `LeaderReconciling` or `Leader` waits for good: a node whose peers never return, which keeps
     /// retrying roll calls from `NoQuorum`, or a `Bootstrapping` node that
     /// never joins. A driver that waits for `Stopped` must not rely on it
     /// there.
@@ -507,6 +529,18 @@ pub enum Input {
     /// The node's heartbeats then say so until its admission generation
     /// next changes (see [`WorkerNode::routing_crawled`]).
     RoutingCrawled,
+    /// The node's scheduler has rebuilt the shard's tasks for this office and
+    /// every record it republished is stored: a node still reconciling for
+    /// that office moves to `Leader`, and its grant follows. Ignored for any
+    /// other office, or in any other state.
+    Reconciled(ReconcileTerm),
+    /// The node's scheduler found these workers holding runs it rebuilt or
+    /// adopted, and none of them answered: they may have died with the old
+    /// leader, and never be heard from. A node holding an office reports each
+    /// not yet heard from lost a suspicion timeout and a reconnect timeout
+    /// after this input (see [`Output::WorkerLost`]); a worker it already
+    /// tracks keeps the time it was last heard. Ignored without an office.
+    WatchWorkers(BTreeSet<WorkerId>),
 }
 
 /// Something a [`WorkerNode`] asks its driver to do.
@@ -527,25 +561,36 @@ pub enum Output {
     /// reports each move, in order.
     StateChanged(WorkerState),
     /// The node's leadership grant, reported whenever it changes and whenever
-    /// the node leaves `Leader`, for its driver to hand to the node's
+    /// the node leaves office, for its driver to hand to the node's
     /// scheduler (see [`carry_out`]): `Some` while the node is
-    /// `Leader` with a lease, ending where the lease does; `None` otherwise.
+    /// `Leader` with a lease, ending where the lease does; `None` otherwise,
+    /// and so while it is still `LeaderReconciling`.
     ///
     /// A leader that is not alone a quorum first holds a lease once a quorum
     /// has confirmed one of its acks, and its lease end moves as more
-    /// confirmations arrive. A node that leaves `Leader` reports `None` just
+    /// confirmations arrive. A node that leaves office reports `None` just
     /// before that state change, so nothing it asks for after leaving can
     /// let another leader act while its own grant stands.
     Grant(Option<LeadershipGrant>),
+    /// The node took office as this term's leader and reconciles before it
+    /// leads: its scheduler starts rebuilding (see
+    /// `Scheduler::begin_reconcile`), and the node moves to `Leader`, and
+    /// reports a grant, only once handed `Input::Reconciled` for the same
+    /// office.
+    Reconcile(ReconcileTerm),
     /// Make this call on the node's coordination authority, and hand the
     /// node the reply as [`Input::Authority`] (see [`AuthorityCall::perform`]).
     /// Only a node with an authority asks.
     Authority(AuthorityCall),
-    /// While `Leader`: the worker has not been heard from for a suspicion
-    /// timeout and then a reconnect timeout, so every TaskRun
-    /// it holds is lost and may be replayed (see [`carry_out`]).
-    /// Reported once; a worker heard from again is watched afresh.
+    /// While the node holds office: the worker has not been heard from for
+    /// a suspicion timeout and then a reconnect timeout, so every TaskRun it
+    /// holds is lost and may be replayed (see [`carry_out`]). Reported once;
+    /// a worker heard from again is watched afresh.
     WorkerLost(WorkerId),
+    /// While in office: a heartbeat from `worker` said the runs it holds have
+    /// this digest, empty if it sent none. For the driver to compare with
+    /// what the scheduler believes.
+    RunsHeard { worker: WorkerId, digest: Vec<u8> },
     /// By when, on the node's clock, this worker must have aborted every
     /// TaskRun it is running: `Some` once it has gone
     /// a suspicion timeout, less drift, without evidence that its leader
@@ -626,6 +671,7 @@ pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator, O: Observer>(
     for output in outputs {
         match output {
             Output::Grant(grant) => scheduler.set_leadership_grant(*grant),
+            Output::Reconcile(term) => scheduler.begin_reconcile(*term),
             Output::WorkerLost(worker) => {
                 // Refused only when this scheduler no longer leads, and then
                 // the next leader decides what the worker held.
@@ -636,6 +682,7 @@ pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator, O: Observer>(
             | Output::StateChanged(_)
             | Output::Authority(_)
             | Output::AbortDeadline(_)
+            | Output::RunsHeard { .. }
             | Output::ShardAbandoned => {}
         }
     }
@@ -824,6 +871,8 @@ where
             lease: Lease::new(now),
             drain_requested: false,
             crawled_at_admission: None,
+            lost_while_reconciling: BTreeSet::new(),
+            active_runs_digest: Vec::new(),
             drain_wait_until: None,
             rejoin: RejoinCheck::default(),
             outputs: Vec::new(),
@@ -878,25 +927,90 @@ where
     }
 
     /// The voters of the configuration this node leads, by id, itself
-    /// included; empty unless it is the leader. Count-based configurations
-    /// may hold fewer ids than voters (a voter the roster does not know is
-    /// not named); only the leader's own roster is read, never the routing
-    /// table.
+    /// included; empty unless it holds office, reconciling or leading.
+    /// Count-based configurations may hold fewer ids than voters (a voter the
+    /// roster does not know is not named); only the leader's own roster is
+    /// read, never the routing table.
     pub fn voters(&self) -> Vec<WorkerId> {
-        match (&self.office, self.state) {
-            (Some(office), WorkerState::Leader) => office.voter_ids(&self.my_id),
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => office.voter_ids(&self.my_id),
             _ => Vec::new(),
         }
     }
 
-    /// Whether this node leads and its roster holds `worker` as a voter of the
-    /// configuration it leads or as a pending member. `false` for every
-    /// worker while this node does not lead. Only the leader's own roster is
-    /// read, never the routing table.
+    /// Whether this node holds office and its roster holds `worker` as a
+    /// voter of the configuration it leads or as a pending member. `false`
+    /// for every worker while this node holds none. Only the leader's own
+    /// roster is read, never the routing table.
     pub fn is_voter_or_pending(&self, worker: &WorkerId) -> bool {
-        match (&self.office, self.state) {
-            (Some(office), WorkerState::Leader) => office.is_voter_or_pending(worker),
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => office.is_voter_or_pending(worker),
             _ => false,
+        }
+    }
+
+    /// The office this node holds, reconciling or leading: its recovery epoch
+    /// and term. `None` while it holds none.
+    pub fn office_term(&self) -> Option<ReconcileTerm> {
+        if !self.holds_office() {
+            return None;
+        }
+        Some(ReconcileTerm {
+            recovery_epoch: self.standing.epoch()?,
+            term: self.term,
+        })
+    }
+
+    /// Whom its reconciliation asks: the voters of the configuration it leads
+    /// and its pending members, by id, itself included. Empty unless it holds
+    /// office. Read from its roster alone, never the routing table.
+    pub fn reconcilees(&self) -> Vec<WorkerId> {
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => office.reconcilees(&self.my_id),
+            _ => Vec::new(),
+        }
+    }
+
+    /// What `answered`, the workers that answered its reconciliation, amount
+    /// to among its voters (both sides of a joint configuration): all, a
+    /// quorum, or short of one. Pending members count for nothing. `Short`
+    /// unless it holds office.
+    pub fn voters_answered(&self, answered: &BTreeSet<WorkerId>) -> Answered {
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => office.voters_answered(&self.my_id, answered),
+            _ => Answered::Short,
+        }
+    }
+
+    /// Whether its roster holds `worker`, admitted or pending. `false`
+    /// unless it holds office.
+    pub fn is_member(&self, worker: &WorkerId) -> bool {
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => office.is_member(worker),
+            _ => false,
+        }
+    }
+
+    /// Whether it holds office: reconciling or leading.
+    fn holds_office(&self) -> bool {
+        matches!(
+            self.state,
+            WorkerState::LeaderReconciling | WorkerState::Leader
+        )
+    }
+
+    /// Its scheduler reconciled for `office`: the node leads. A worker lost
+    /// while it reconciled may have answered the reconciliation first and died
+    /// after, which the scheduler cannot tell from one that is alive; watching
+    /// each again from now loses a dead one once more, this time applied.
+    fn on_reconciled(&mut self, office: ReconcileTerm) {
+        if self.state == WorkerState::LeaderReconciling && self.office_term() == Some(office) {
+            let now = self.clock.now();
+            let lost = std::mem::take(&mut self.lost_while_reconciling);
+            if let Some(held) = self.office.as_mut() {
+                held.watch(lost, &self.my_id, now);
+            }
+            self.transition_to(WorkerState::Leader);
         }
     }
 
@@ -946,6 +1060,12 @@ where
     /// `None` for a joiner that has accepted neither yet.
     pub fn configuration(&self) -> Option<&Configuration> {
         self.led_or_followed_configuration()
+    }
+
+    /// The digest of the runs this worker holds, which every heartbeat it
+    /// sends from now on carries (see `reconcile::active_runs_digest`).
+    pub fn set_active_runs_digest(&mut self, digest: Digest) {
+        self.active_runs_digest = digest.value().to_vec();
     }
 
     /// Whether this node has completed a routing crawl since it was admitted
@@ -1022,7 +1142,9 @@ where
     /// a vote in it, say): a newer leader may lead by then.
     pub fn known_leader(&self) -> Option<(WorkerId, u64)> {
         let named = match self.state {
-            WorkerState::Leader => Some((self.my_id.clone(), self.term)),
+            WorkerState::LeaderReconciling | WorkerState::Leader => {
+                Some((self.my_id.clone(), self.term))
+            }
             WorkerState::Active => self.leader.clone(),
             WorkerState::LeaderSuspect if self.led_or_followed_configuration().is_none() => {
                 self.leader.clone()
@@ -1080,6 +1202,13 @@ where
             Input::AuthorityEpochRead { token, held } => self.on_epoch_read(token, held),
             Input::Drain => self.request_drain(),
             Input::RoutingCrawled => self.crawled_at_admission = self.admission(),
+            Input::Reconciled(office) => self.on_reconciled(office),
+            Input::WatchWorkers(workers) => {
+                let now = self.clock.now();
+                if let Some(office) = self.office.as_mut() {
+                    office.watch(workers, &self.my_id, now);
+                }
+            }
         }
         self.finish_step()
     }
@@ -1120,9 +1249,10 @@ where
     /// - `RollCall`: its roll call's deadline, or its next heartbeat to its
     ///   leader if that comes first.
     /// - `Candidate`: its vote's deadline.
-    /// - `Leader`: when it goes `NoQuorum` unless more confirmations arrive
-    ///   (never, for a leader that alone is a quorum), or when it next has a
-    ///   worker to report lost, whichever comes first.
+    /// - `LeaderReconciling` and `Leader`: when it goes `NoQuorum` unless
+    ///   more confirmations arrive (never, for a leader that alone is a
+    ///   quorum), or when it next has a worker to report lost, whichever
+    ///   comes first.
     /// - Every other state: `None`.
     ///
     /// With an authority, also the lease's next registration or fence
@@ -1157,7 +1287,7 @@ where
             }
             WorkerState::RollCall => earliest(next_heartbeat, self.round.next_deadline()),
             WorkerState::Candidate => self.round.next_deadline(),
-            WorkerState::Leader => earliest(
+            WorkerState::LeaderReconciling | WorkerState::Leader => earliest(
                 earliest(
                     self.office.as_ref().and_then(|office| {
                         self.lease
@@ -1176,9 +1306,8 @@ where
     /// Moves to `next` and reports the move. Leaving `Leader` first reports
     /// that the node holds no grant (see [`Output::Grant`]), and leaving the
     /// states that lead or stand to lead gives up any fence. Reaching
-    /// `Active` or `Leader` applies a drain kept from an earlier request at
-    /// once (see [`Input::Drain`]), so the node can come out of this
-    /// `Stopped`.
+    /// `Active`, `LeaderReconciling` or `Leader` applies a drain kept from an
+    /// earlier request at once (see [`Input::Drain`]).
     fn transition_to(&mut self, next: WorkerState) {
         // Every caller moves along an edge of the transition table, checked
         // by the state it guards on first; no input can reach an illegal
@@ -1188,10 +1317,11 @@ where
             "illegal election state transition {:?} -> {next:?}",
             self.state
         );
-        // No edge leads from `Leader` back to itself.
-        if self.state == WorkerState::Leader {
+        // Reconciling to leading keeps the office; every other edge out of
+        // either state gives it up.
+        if self.holds_office() && next != WorkerState::Leader {
             // Losing office mid-wait keeps the request: the node drains
-            // when it next reaches `Active` or `Leader`.
+            // when it next reaches `Active`, `LeaderReconciling` or `Leader`.
             if self.drain_wait_until.take().is_some() {
                 self.drain_requested = true;
             }
@@ -1209,7 +1339,12 @@ where
         self.state = next;
         self.outputs.push(Output::StateChanged(next));
 
-        if self.drain_requested && matches!(next, WorkerState::Active | WorkerState::Leader) {
+        if self.drain_requested
+            && matches!(
+                next,
+                WorkerState::Active | WorkerState::LeaderReconciling | WorkerState::Leader
+            )
+        {
             self.drain_requested = false;
             self.request_drain();
         }
@@ -1373,7 +1508,7 @@ where
     /// own lineage ends it too, by taking the node out of office. A node with
     /// no authority has none.
     fn leads_its_office_epoch(&self, lineage: u64) -> bool {
-        self.state == WorkerState::Leader
+        self.holds_office()
             && self
                 .authority
                 .as_ref()
@@ -1404,9 +1539,9 @@ where
             incarnation_id: Some(self.incarnation_id.clone().into()),
             recovery_epoch_seen: self.standing.epoch_number(),
             term_seen: self.standing.highest_term_seen(),
-            // Nothing reports this node's capacity or running work yet.
+            // Nothing reports this node's capacity yet.
             available_capacity: 0,
-            active_task_runs_digest: Vec::new(),
+            active_task_runs_digest: self.active_runs_digest.clone(),
             shard_id: Some(self.shard_id.clone().into()),
             newest_accepted_ack: self.newest_accepted_ack,
             configuration_generation: self
@@ -1484,9 +1619,9 @@ where
                 let now = self.clock.now();
                 self.decide(|round, view| round.on_deadline(view, now));
             }
-            WorkerState::Leader => {
+            WorkerState::LeaderReconciling | WorkerState::Leader => {
                 self.drain_once_free();
-                if self.state == WorkerState::Leader {
+                if self.holds_office() {
                     self.report_lost_workers();
                 }
             }
@@ -1501,7 +1636,7 @@ where
     /// a new `WorkerId`), would otherwise never learn whom to heartbeat.
     fn on_peer_connected(&mut self, peer: WorkerId) {
         let newly_connected = self.connected.insert(peer.clone());
-        if newly_connected && self.state == WorkerState::Leader {
+        if newly_connected && self.holds_office() {
             self.send_ack(peer, None);
         }
     }
@@ -1534,7 +1669,7 @@ where
     /// keeps echoes of other leaderships' acks from counting here.
     fn on_heartbeat(&mut self, from: WorkerId, heartbeat: &Checked<WorkerHeartbeat>) {
         let epoch = order_numbers(self.standing.epoch_number(), heartbeat.recovery_epoch_seen);
-        if self.state != WorkerState::Leader
+        if !self.holds_office()
             || heartbeat.shard_id() != self.shard_id
             || epoch == EpochOrder::Later
         {
@@ -1580,9 +1715,13 @@ where
             office.take_heartbeat(from.clone(), heard, crawl_admission, &duties);
         }
         self.drain_once_free();
-        if self.state != WorkerState::Leader {
+        if !self.holds_office() {
             return;
         }
+        self.outputs.push(Output::RunsHeard {
+            worker: from.clone(),
+            digest: heartbeat.active_task_runs_digest.clone(),
+        });
         // Only a leader that holds a grant vouches for when it heard the
         // sender: no rival can win until that grant ends (see
         // `Output::AbortDeadline`). The office applied removals pending, as
@@ -1651,7 +1790,7 @@ where
     /// is `Leader`, and, with an authority, holds the recovery fence (design
     /// 4.5), whose end also ends its grant.
     fn office(&self) -> Option<Office<'_>> {
-        if self.state != WorkerState::Leader {
+        if !self.holds_office() {
             return None;
         }
         let fence_end = match &self.authority {
@@ -1670,9 +1809,12 @@ where
     /// Reports this node's grant and abort deadline where they differ from
     /// the ones last reported.
     fn report_lease_changes(&mut self) {
+        // The lease runs from the win, exactly as a leader's, but the
+        // scheduler is handed a grant only once the node leads.
         let grant = self.lease.grant(self.office().as_ref(), &self.timings);
         let changes = self.lease.report(
             grant,
+            self.state == WorkerState::Leader,
             &self.timings,
             self.lost_after(),
             self.clock.now(),
@@ -1712,7 +1854,7 @@ where
         // A leader's own term is already its term seen (see
         // `Self::take_office`); the arm only keeps that from resting on it.
         match self.state {
-            WorkerState::Candidate | WorkerState::Leader => {
+            WorkerState::Candidate | WorkerState::LeaderReconciling | WorkerState::Leader => {
                 self.standing.highest_term_seen().max(self.term)
             }
             _ => self.standing.highest_term_seen(),
@@ -1725,7 +1867,9 @@ where
     fn term_in_play(&self) -> Option<u64> {
         match self.state {
             WorkerState::RollCall => self.round.roll_call_term(),
-            WorkerState::Candidate | WorkerState::Leader => Some(self.term),
+            WorkerState::Candidate | WorkerState::LeaderReconciling | WorkerState::Leader => {
+                Some(self.term)
+            }
             _ => None,
         }
     }
@@ -1764,7 +1908,7 @@ where
     /// A leader that has not heard from a quorum within its quorum-contact
     /// lease gives up leading, to `NoQuorum`.
     fn lose_quorum_if_its_lease_ended(&mut self) {
-        if self.state != WorkerState::Leader {
+        if !self.holds_office() {
             return;
         }
         let now = self.clock.now();
@@ -1953,18 +2097,24 @@ where
         }
     }
 
-    /// Drains at once from `Active` or `Leader`. From a state that will
-    /// reach one of them later it keeps the request for
+    /// Drains at once from `Active`, and from `LeaderReconciling` or `Leader`
+    /// once every other voter has crawled or the wait limit has passed. From a
+    /// state that will reach one of them later it keeps the request for
     /// [`Self::transition_to`] to apply; a node already draining, or one
     /// that can never drain again, ignores it.
     fn request_drain(&mut self) {
         match self.state {
             WorkerState::Active => self.drain(),
-            WorkerState::Leader if self.drain_wait_until.is_none() => {
+            WorkerState::LeaderReconciling | WorkerState::Leader
+                if self.drain_wait_until.is_none() =>
+            {
                 self.drain_wait_until = Some(self.clock.now() + self.timings.drain_wait_limit);
                 self.drain_once_free();
             }
-            WorkerState::Leader | WorkerState::Draining | WorkerState::Stopped => {}
+            WorkerState::LeaderReconciling
+            | WorkerState::Leader
+            | WorkerState::Draining
+            | WorkerState::Stopped => {}
             _ => self.drain_requested = true,
         }
     }
@@ -2005,7 +2155,7 @@ where
     fn drain(&mut self) {
         // Leaving `Leader` withdraws the grant first, so no departure
         // message goes out while this node still holds one.
-        let was_leader = self.state == WorkerState::Leader;
+        let was_leader = self.holds_office();
         let departure = self
             .office
             .take()
@@ -2082,7 +2232,7 @@ where
     /// Only a `Leader` honours it: every other node ignores it, and a
     /// candidate keeps counting against its roll call's configuration.
     fn on_self_remove(&mut self, departing: &WorkerId, msg: &Checked<SelfRemove>) {
-        if self.state != WorkerState::Leader
+        if !self.holds_office()
             || msg.shard_id() != self.shard_id
             || msg.term_seen > self.term
             || msg.leader_term != self.term
@@ -2369,7 +2519,7 @@ where
         if certificate.term < self.ack_floor() && !voted_for_it {
             return;
         }
-        if self.state == WorkerState::Leader && certificate.term > self.term {
+        if self.holds_office() && certificate.term > self.term {
             self.leave_office();
         }
         self.standing.adopt_certificate(
@@ -2467,6 +2617,7 @@ where
                 | WorkerState::LeaderSuspect
                 | WorkerState::RollCall
                 | WorkerState::Candidate
+                | WorkerState::LeaderReconciling
                 | WorkerState::Leader
                 | WorkerState::NoQuorum
         );
@@ -2516,16 +2667,17 @@ where
         self.outputs.push(Output::ShardAbandoned);
     }
 
-    /// Becomes `Leader` of `roster` in this node's current term: holds its
-    /// configuration and its own admission generations there, commits it
-    /// at once if it alone is a majority of each side, starts its quorum-
-    /// contact lease and its watch over the workers it leads, records itself
-    /// as its own leader in place of any it followed before, and announces
-    /// itself to every connected peer (see [`Self::announce_leadership`]),
-    /// unless a drain kept from before stops it first. With an authority it
-    /// needs a fence to act; one it already holds is kept. Leader
-    /// reconciliation needs task data that does not exist yet,
-    /// so `LeaderReconciling` is passed through immediately.
+    /// Takes office as leader of `roster` in this node's current term, in
+    /// `LeaderReconciling`: holds its configuration and its own admission
+    /// generations there, commits it at once if it alone is a majority of
+    /// each side, starts its quorum-contact lease and its watch over the
+    /// workers it leads, records itself as its own leader in place of any it
+    /// followed before, asks its driver to reconcile (see
+    /// [`Output::Reconcile`]), and announces itself to every connected peer
+    /// (see [`Self::announce_leadership`]), unless a drain kept from before
+    /// stops it first. With an authority it needs a fence to act; one it
+    /// already holds is kept. Every election duty runs from here; only the
+    /// scheduler's grant waits for [`Input::Reconciled`].
     fn take_office(&mut self, roster: Roster) {
         let now = self.clock.now();
         // A leader never acks itself, so nothing else raises its own
@@ -2538,6 +2690,7 @@ where
             now,
         };
         self.office = Some(LeaderOffice::take(roster, self.term, &duties));
+        self.lost_while_reconciling.clear();
 
         self.lease.won(now);
         if let Some(authority) = self.authority.as_mut() {
@@ -2550,8 +2703,11 @@ where
         self.newest_accepted_ack = None;
         self.next_heartbeat = None;
         self.transition_to(WorkerState::LeaderReconciling);
-        self.transition_to(WorkerState::Leader);
-        if self.state == WorkerState::Leader {
+        // A drain kept from before may have drained the node already.
+        if self.state == WorkerState::LeaderReconciling {
+            if let Some(office) = self.office_term() {
+                self.outputs.push(Output::Reconcile(office));
+            }
             self.announce_leadership();
         }
     }
@@ -2578,6 +2734,9 @@ where
             return;
         };
         for worker in office.lost_by(now, lost_after) {
+            if self.state == WorkerState::LeaderReconciling {
+                self.lost_while_reconciling.insert(worker.clone());
+            }
             self.outputs.push(Output::WorkerLost(worker));
         }
     }

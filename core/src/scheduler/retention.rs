@@ -22,6 +22,12 @@ impl Retention {
         self.ttl = ttl;
     }
 
+    /// Forgets every task it holds, keeping the TTL.
+    pub(super) fn clear(&mut self) {
+        self.finished.clear();
+        self.over.clear();
+    }
+
     /// `task` is over as of `now`.
     pub(super) fn record(&mut self, task: &TaskId, now: Instant) {
         self.finished.insert((now, task.clone()));

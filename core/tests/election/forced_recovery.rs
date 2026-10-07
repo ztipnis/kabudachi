@@ -25,6 +25,7 @@ use kabudachi_core::protocol::messages::{
     ElectionCertificate, JoinResponse, LeaderHeartbeatAck, WorkerHeartbeat,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{LeaseEnd, Scheduler};
 use kabudachi_core::time::{Clock, Duration};
 use kabudachi_testkit::FaultingAuthority;
@@ -132,6 +133,21 @@ impl Driven {
         self.step(Input::Tick)
     }
 
+    /// Hands the node, which has just won, the end of its reconciliation, as
+    /// its driver does once its scheduler has rebuilt and republished (a
+    /// shard with no tasks has nothing to rebuild); returns what that
+    /// produced.
+    fn finish_reconciling(&mut self) -> Vec<Output> {
+        let office = self
+            .node
+            .office_term()
+            .expect("finish_reconciling: the node holds office");
+        self.scheduler
+            .reconcile(Rebuild::default())
+            .expect("the scheduler reconciles for the office it was told of");
+        self.step(Input::Reconciled(office))
+    }
+
     fn advance(&mut self, ticks: u64) -> Vec<Output> {
         self.clock.advance(Duration::from_ticks(ticks));
         self.tick()
@@ -212,6 +228,28 @@ fn a_node_registers_at_once_and_renews_every_third_of_its_ttl() {
 }
 
 #[test]
+fn a_winner_that_cannot_renew_fences_itself_while_it_reconciles() {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, []);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 1);
+    driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
+    driven.tick();
+    driven.advance(SUSPECT_TIMEOUT_TICKS);
+    assert_eq!(driven.node.state(), WorkerState::LeaderReconciling);
+    driven.authority.set_reachable(false);
+
+    let mut outputs = Vec::new();
+    while driven.node.state() == WorkerState::LeaderReconciling {
+        outputs.extend(driven.advance(100));
+    }
+
+    assert_eq!(driven.node.state(), WorkerState::Fenced);
+    assert_eq!(grants(&outputs).last(), Some(&None), "leaving office reports no grant");
+    assert_eq!(driven.node.office_term(), None);
+}
+
+#[test]
 fn a_node_that_cannot_renew_fences_itself_before_its_registration_lapses() {
     let clock = FakeClock::new();
     let authority = warmed_up_authority(&clock);
@@ -231,6 +269,7 @@ fn a_node_that_cannot_renew_fences_itself_before_its_registration_lapses() {
     driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
     driven.tick();
     driven.advance(SUSPECT_TIMEOUT_TICKS);
+    driven.finish_reconciling();
     assert_eq!(driven.node.state(), WorkerState::Leader);
     let registered_at = clock.now();
     let configuration = driven.node.configuration().cloned();
@@ -781,7 +820,9 @@ fn lone_winner_reaching(
     driven.authority.set_reachable(reachable);
     driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
     driven.tick();
-    let won = driven.advance(SUSPECT_TIMEOUT_TICKS);
+    let mut won = driven.advance(SUSPECT_TIMEOUT_TICKS);
+    assert_eq!(driven.node.state(), WorkerState::LeaderReconciling);
+    won.extend(driven.finish_reconciling());
     assert_eq!(driven.node.state(), WorkerState::Leader);
     (driven, won)
 }
@@ -818,7 +859,9 @@ fn a_new_leader_waits_out_the_fence_another_worker_holds() {
     let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 1);
     driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
     driven.tick();
-    let won = driven.advance(SUSPECT_TIMEOUT_TICKS);
+    let mut won = driven.advance(SUSPECT_TIMEOUT_TICKS);
+    assert_eq!(driven.node.state(), WorkerState::LeaderReconciling);
+    won.extend(driven.finish_reconciling());
     assert_eq!(driven.node.state(), WorkerState::Leader);
     assert_eq!(grants(&won), Vec::new(), "no grant while another holds the fence");
 
@@ -1098,7 +1141,6 @@ fn a_roll_call_short_of_its_quorum_recovers_through_a_majority_of_the_live_regis
             WorkerState::NoQuorum,
             WorkerState::Candidate,
             WorkerState::LeaderReconciling,
-            WorkerState::Leader,
         ]
     );
     let term = driven.node.term();
@@ -1137,6 +1179,7 @@ fn a_roll_call_short_of_its_quorum_recovers_through_a_majority_of_the_live_regis
 #[test]
 fn a_leader_of_a_recovered_epoch_steps_down_only_for_a_later_term_at_its_own_epoch() {
     let (mut driven, _) = short_roll_call(&["w1", "w2"], Some(0), true);
+    driven.finish_reconciling();
     assert_eq!(driven.node.recovery_epoch(), 1, "setup invariant");
     assert_eq!(driven.node.state(), WorkerState::Leader, "setup invariant");
     let w2 = worker("w2");
@@ -1551,7 +1594,7 @@ fn a_lost_swap_race_leaves_the_node_no_quorum_at_its_epoch() {
 fn the_authority_path_recovers_a_shard_left_at_a_swapped_epoch_with_no_leader() {
     // A swap to epoch 1 was applied but its caller never heard (its reply
     // was lost), so no leader leads epoch 1.
-    let (driven, _) = {
+    let (mut driven, _) = {
         let clock = FakeClock::new();
         let authority = warmed_up_authority(&clock);
         seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
@@ -1563,8 +1606,10 @@ fn the_authority_path_recovers_a_shard_left_at_a_swapped_epoch_with_no_leader() 
         (driven, closed)
     };
 
-    assert_eq!(driven.node.state(), WorkerState::Leader);
+    assert_eq!(driven.node.state(), WorkerState::LeaderReconciling);
     assert_eq!(driven.node.recovery_epoch(), 2);
+    driven.finish_reconciling();
+    assert_eq!(driven.node.state(), WorkerState::Leader);
 }
 
 #[test]

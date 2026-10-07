@@ -3,12 +3,13 @@
 //! handshake over TCP+noise+yamux.
 //!
 //! `Behaviour` holds `identify`, `gossipsub`, two `kad` behaviours (one that
-//! routes, one that stores the shard's Task records) and four
+//! routes, one that stores the shard's Task records) and five
 //! `request_response` behaviours: one carrying the election protocol (see
 //! `crate::codec`), one the bootstrap join protocol (see
 //! `crate::join_codec`), one the claim arbitration protocol (see
 //! `crate::claim::codec`), and one the task exchange (see
-//! `crate::task_exchange::codec`) — each a deliberately separate wire protocol, not a
+//! `crate::task_exchange::codec`), and one the reconciliation of a new leader
+//! (see `crate::reconcile::codec`) — each a deliberately separate wire protocol, not a
 //! variant folded into `ElectionMessage` (see `crate::join_codec`'s module
 //! doc). `gossipsub` carries the election messages a worker publishes to its
 //! whole shard rather than sends to one peer; every message is signed with
@@ -106,6 +107,7 @@ use libp2p::{
 use crate::claim::codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
 use crate::codec::{ElectionCodec, PROTOCOL};
 use crate::join_codec::{JoinCodec, PROTOCOL as JOIN_PROTOCOL};
+use crate::reconcile::codec::{PROTOCOL as RECONCILE_PROTOCOL, ReconcileCodec};
 use crate::task_exchange::codec::{PROTOCOL as TASK_PROTOCOL, TaskCodec};
 use crate::task_store::{
     HeldRecords, MAX_RECORD_PACKET_BYTES, RECORD_WRITE_TIMEOUT, TaskRecordStore,
@@ -164,6 +166,7 @@ pub struct Behaviour {
     pub join: request_response::Behaviour<JoinCodec>,
     pub claim: request_response::Behaviour<ClaimCodec>,
     pub task: request_response::Behaviour<TaskCodec>,
+    pub reconcile: request_response::Behaviour<ReconcileCodec>,
 }
 
 /// libp2p's TCP transport, except that every dial it makes leaves from a
@@ -348,6 +351,14 @@ pub(crate) fn build_swarm(shard: Option<&ShardId>, held: HeldRecords) -> Swarm<B
             // whichever holds leadership answers.
             task: request_response::Behaviour::new(
                 [(TASK_PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default(),
+            ),
+            // ProtocolSupport::Full on every node: a worker keeps no view of
+            // who leads, so any worker may ask (a new leader) or answer (every
+            // worker it asks) — see net/src/driver.rs's
+            // respond_to_reconcile_requests for the answering side.
+            reconcile: request_response::Behaviour::new(
+                [(RECONCILE_PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default(),
             ),
             blocked: allow_block_list::Behaviour::default(),

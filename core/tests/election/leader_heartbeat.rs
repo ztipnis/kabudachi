@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use crate::support::clock::FakeClock;
 use crate::support::harness::{Cluster, ClusterScheduler, StepRecord};
 use crate::support::node::{
-    close_roll_call, connect, deliver, grants, published_roll_calls, sent, sent_to,
+    close_roll_call, connect, deliver, finish_reconciling, grants, published_roll_calls, sent, sent_to,
     stand_as_candidate, start_roll_call, state_changes, tick,
 };
 use crate::support::scenarios::bootstrap_5_and_elect_leader;
@@ -113,6 +113,7 @@ fn leader_with_timings(clock: &FakeClock, size: usize, timings: ElectionTimings)
             vote_grant_message(vote_grant(me.clone(), voter.clone(), 1)),
         );
     }
+    outputs.extend(finish_reconciling(&mut node));
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
 
     Won {
@@ -589,8 +590,12 @@ fn a_leader_alone_in_its_electorate_never_loses_its_quorum_and_has_no_deadline()
     let mut node = lone_node(&clock);
     start_roll_call(&mut node, &clock, SUSPECT_TIMEOUT_TICKS);
     clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)).roll_call_deadline);
-    let won = node.step(Input::Tick);
+    let mut won = node.step(Input::Tick);
+    assert_eq!(node.state(), WorkerState::LeaderReconciling, "setup invariant");
+    assert_eq!(won.next_deadline, None);
+    finish_reconciling(&mut node);
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+    won = node.step(Input::Tick);
     assert_eq!(won.next_deadline, None);
 
     clock.advance(Duration::from_ticks(100 * SUSPECT_TIMEOUT_TICKS));
@@ -618,7 +623,9 @@ fn a_lone_leader_is_granted_unbounded_leadership_on_winning() {
     let mut node = lone_node(&clock);
     start_roll_call(&mut node, &clock, SUSPECT_TIMEOUT_TICKS);
 
-    let won = close_roll_call(&mut node, &clock, SUSPECT_TIMEOUT_TICKS);
+    let mut won = close_roll_call(&mut node, &clock, SUSPECT_TIMEOUT_TICKS);
+    assert!(grants(&won).is_empty(), "no grant while it reconciles");
+    won.extend(finish_reconciling(&mut node));
 
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
     assert_eq!(grants(&won), vec![Some(term_1_grant(LeaseEnd::Unbounded))]);
@@ -958,6 +965,7 @@ fn a_respondent_that_was_no_voter_of_the_roll_call_counts_toward_the_lease_on_th
         &voter,
         vote_grant_message(vote_grant(me.clone(), voter.clone(), call.term)),
     );
+    finish_reconciling(&mut node);
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
     let w = clock.now();
     clock.advance(Duration::from_ticks(3));
@@ -1010,6 +1018,50 @@ fn a_reconnect_timeout_in_the_timings_times_lost_workers() {
         lost,
         vec![lost_at],
         "lost a suspicion timeout and the configured reconnect timeout after it was last heard"
+    );
+}
+
+#[test]
+fn a_worker_the_scheduler_asks_to_watch_is_lost_after_the_same_span_unless_it_is_heard_first() {
+    const RECONNECT_TICKS: u64 = 7;
+    const WATCHED_AFTER: u64 = 4;
+    let clock = FakeClock::new();
+    let timings = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS))
+        .with_reconnect_timeout(Duration::from_ticks(RECONNECT_TICKS));
+    let mut won = leader_with_timings(&clock, 3, timings);
+    let heard = won.others[0].clone();
+    let (silent, chatty) = (worker("died-with-the-old-leader"), worker("alive-but-slow"));
+    let heartbeat_ticks = timings.heartbeat_interval.as_ticks();
+    clock.advance(Duration::from_ticks(WATCHED_AFTER));
+    let watched_at = clock.now();
+    let lost_at = ticks_after(watched_at, SUSPECT_TIMEOUT_TICKS + RECONNECT_TICKS);
+
+    let _ = won.node
+        .step(Input::WatchWorkers(BTreeSet::from([silent.clone(), chatty.clone()])));
+    let mut last_ack = won.won_at;
+    let mut lost = Vec::new();
+    while clock.now() < lost_at {
+        clock.advance(Duration::from_ticks(1));
+        let outputs = if (clock.now() - won.won_at).as_ticks() % heartbeat_ticks == 0 {
+            let step = confirm(&mut won.node, &heard, last_ack);
+            last_ack = clock.now();
+            step.outputs
+        } else if clock.now() == ticks_after(watched_at, 1) {
+            receive(&mut won.node, &chatty, heartbeat(&chatty, None)).outputs
+        } else {
+            tick(&mut won.node)
+        };
+        for lost_worker in [&silent, &chatty] {
+            if outputs.contains(&Output::WorkerLost(lost_worker.clone())) {
+                lost.push((lost_worker.clone(), clock.now()));
+            }
+        }
+    }
+
+    assert_eq!(
+        lost,
+        vec![(silent, lost_at)],
+        "exactly a suspicion timeout and a reconnect timeout after it was named; one heard first is not"
     );
 }
 

@@ -13,7 +13,8 @@ use crate::support::builders::{
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    connect, deliver, sent, sent_to, stand_as_candidate, start_roll_call, state_changes, tick,
+    connect, deliver, finish_reconciling, sent, sent_to, stand_as_candidate, start_roll_call,
+    state_changes, tick,
 };
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input, Output, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
@@ -122,7 +123,8 @@ fn candidate_of_three(clock: &FakeClock) -> (TestNode, WorkerId, WorkerId, Worke
 /// those of the step that won.
 fn leader_of_three(clock: &FakeClock) -> (TestNode, WorkerId, WorkerId, WorkerId, Vec<Output>) {
     let (mut node, self_id, peer_a, peer_b) = candidate_of_three(clock);
-    let outputs = deliver(&mut node, &peer_a, vote_grant_message(&self_id, &peer_a, 1));
+    let mut outputs = deliver(&mut node, &peer_a, vote_grant_message(&self_id, &peer_a, 1));
+    outputs.extend(finish_reconciling(&mut node));
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
     (node, self_id, peer_a, peer_b, outputs)
 }
@@ -473,7 +475,10 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
             WorkerState::RollCall
         ]
     );
-    assert_eq!(lone.state(), WorkerState::Leader);
+    assert_eq!(lone.state(), WorkerState::LeaderReconciling);
+    let led = finish_reconciling(&mut lone);
+    assert_eq!(state_changes(&led), vec![WorkerState::Leader]);
+    assert_eq!(lone.step(Input::Tick).next_deadline, None);
 }
 
 /// Hands `node` `message` from `from` and returns the deadline it reports.
@@ -508,7 +513,6 @@ fn a_drain_while_suspecting_the_leader_waits_until_the_node_can_drain() {
         vec![
             WorkerState::Candidate,
             WorkerState::LeaderReconciling,
-            WorkerState::Leader,
             WorkerState::Draining,
             WorkerState::Stopped,
         ]

@@ -59,6 +59,11 @@ impl WaitingRoom {
         self.places.insert(task.clone(), Place { spot, expires_at });
     }
 
+    /// Every task stops waiting.
+    pub(super) fn clear(&mut self) {
+        *self = WaitingRoom::default();
+    }
+
     /// The next attempt of a task that was claimed (a retry or a replay)
     /// waits again at the back of the queue, never with an expiry: expiry is
     /// only about starting.

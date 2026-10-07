@@ -19,7 +19,8 @@ create_exception!(
 
 const BACKPRESSURE_DOC: &str = "A task was not submitted because the scheduler holds as much \
 pending work as its hard memory limit allows. Nothing was queued; submit again once running \
-tasks have finished.";
+tasks have finished. Also raised, transiently, while a coalescing key's newest generation is \
+not yet known to the scheduler; submit again shortly.";
 
 static BACKPRESSURE_ERROR: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 

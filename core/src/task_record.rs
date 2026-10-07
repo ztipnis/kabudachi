@@ -5,6 +5,7 @@
 mod gate;
 mod ledger;
 mod local;
+mod order;
 mod outbox;
 mod store;
 mod version;
@@ -12,6 +13,7 @@ mod version;
 pub use gate::{EffectGate, Settled, Write};
 pub use ledger::{Waits, WriteLedger};
 pub use local::LocalRecords;
+pub use order::{Settlement, WriteOrder};
 pub use outbox::RecordOutbox;
 pub use store::{Put, PutRefusal, VersionedRecords, identify};
 pub use version::{RecordVersion, VersionOrder};

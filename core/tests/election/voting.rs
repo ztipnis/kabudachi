@@ -15,7 +15,7 @@ use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, close_roll_call, connect, deliver, published_roll_calls, rejects_sent_to, sent_to,
+    TestNode, close_roll_call, connect, deliver, finish_reconciling, published_roll_calls, rejects_sent_to, sent_to,
     stand_as_candidate, start_roll_call, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Single};
@@ -357,7 +357,7 @@ fn a_candidate_wins_once_its_returning_granters_are_a_quorum() {
     );
     grant_from(&mut node, &worker("p2"), call.term);
 
-    assert_eq!(node.state(), WorkerState::Leader);
+    assert_eq!(node.state(), WorkerState::LeaderReconciling);
     assert_eq!(node.term(), 1);
 }
 
@@ -383,7 +383,7 @@ fn the_winner_certifies_what_its_respondents_founded_to_each_of_them() {
 
     let won = grant_from(&mut node, &pending, call.term);
 
-    assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+    assert_eq!(node.state(), WorkerState::LeaderReconciling, "setup invariant");
     for respondent in [&granting, &silent, &pending] {
         let certificates = certificates_to(&won, respondent);
         assert_eq!(certificates.len(), 1, "one certificate to {respondent:?}");
@@ -501,7 +501,7 @@ fn a_win_needs_a_majority_of_the_respondents_even_once_the_returning_voters_are_
     assert_eq!(node.state(), WorkerState::Candidate, "three of six");
     grant_from(&mut node, &pending[1], call.term);
 
-    assert_eq!(node.state(), WorkerState::Leader);
+    assert_eq!(node.state(), WorkerState::LeaderReconciling);
 }
 
 #[test]
@@ -522,7 +522,7 @@ fn a_win_needs_a_returning_quorum_even_once_a_majority_of_the_respondents_grante
     );
     grant_from(&mut node, &returning, call.term);
 
-    assert_eq!(node.state(), WorkerState::Leader);
+    assert_eq!(node.state(), WorkerState::LeaderReconciling);
 }
 
 #[test]
@@ -589,7 +589,7 @@ fn the_winner_leads_the_joint_configuration_its_respondents_found_each_admitted_
     close_roll_call(&mut node, &clock, SUSPECT);
 
     let won = grant_from(&mut node, &returning, call.term);
-    assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
+    assert_eq!(node.state(), WorkerState::LeaderReconciling, "setup invariant");
 
     let founded = founded_in_term_1(3, 3);
     assert_eq!(node.configuration(), Some(&founded));
@@ -617,6 +617,7 @@ fn a_worker_that_heartbeats_the_leader_without_being_in_its_roster_is_acked_with
     let (mut node, call) = candidate_of_five(&clock);
     grant_from(&mut node, &worker("p1"), call.term);
     grant_from(&mut node, &worker("p2"), call.term);
+    finish_reconciling(&mut node);
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
     let missed = worker("missed-the-call");
 

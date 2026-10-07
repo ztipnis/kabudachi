@@ -47,6 +47,8 @@
 //!   gets there, so a node counts as drained from the first time it is seen
 //!   `Stopped`, whichever event got it there.
 //! - L8: a `Heal` alone changes no node's `term()` or `recovery_epoch()`.
+//! - L9: no step that leaves a node reconciling as the new leader reports a
+//!   grant: the scheduler is handed one only once the node leads.
 //!
 //! L3 and L4 are checked by an oracle of their own over the wire messages,
 //! comparing generations as (recovery epoch, term, counter) tuples, so a
@@ -308,7 +310,8 @@ struct Ledger {
     grants: BTreeMap<(WorkerId, u64), BTreeSet<WorkerId>>,
     /// Per term, the respondents of the roll call that won it.
     respondents_by_term: BTreeMap<u64, BTreeSet<WorkerId>>,
-    /// Every node that became `Leader`, by the term it leads.
+    /// Every node that took office as leader (won an election), by the term
+    /// it holds.
     leaders_by_term: BTreeMap<u64, BTreeSet<WorkerId>>,
     /// Replies that named an admission generation, to check against
     /// `given` once every step of the event is in.
@@ -348,7 +351,7 @@ impl Ledger {
         let won = record
             .outputs
             .iter()
-            .any(|output| matches!(output, Output::StateChanged(WorkerState::Leader)));
+            .any(|output| matches!(output, Output::StateChanged(WorkerState::LeaderReconciling)));
         let mut certified = BTreeSet::new();
         for output in &record.outputs {
             let message = match output {
@@ -1070,9 +1073,19 @@ fn check_authority_case(
         }
 
         for record in cluster.take_steps() {
+            prop_assert!(
+                record.state != WorkerState::LeaderReconciling
+                    || !record
+                        .outputs
+                        .iter()
+                        .any(|output| matches!(output, Output::Grant(Some(_)))),
+                "L9 violated: {:?} reported a grant while still reconciling: {:?}",
+                record.node,
+                record.outputs
+            );
             for output in &record.outputs {
                 match output {
-                    Output::StateChanged(WorkerState::Leader) => {
+                    Output::StateChanged(WorkerState::LeaderReconciling) => {
                         let holders = leaders
                             .entry((record.recovery_epoch, record.term))
                             .or_default();

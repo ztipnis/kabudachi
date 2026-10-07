@@ -13,6 +13,7 @@ kabudachi-proto = { path = "../proto" }
 prost = "0.13"
 sha2 = "0.10"
 thiserror = "2"
+tracing = "0.1"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }
 
 [dev-dependencies]

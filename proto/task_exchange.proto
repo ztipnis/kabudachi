@@ -79,6 +79,12 @@ enum TaskRejectReason {
   // The asker is neither a voter nor a pending member of the leader's shard:
   // it must join the shard first. Nothing of the request took effect.
   TASK_REJECT_NOT_MEMBER = 9;
+  // The task's newest record is not known to this leader yet, as it is still
+  // collecting what its shard holds: ask again. Also the answer to a
+  // submission whose coalescing key has a generation not yet known, until
+  // that generation is found. Nothing of the request took effect, and the
+  // asker keeps what it holds for the run.
+  TASK_REJECT_NOT_READY = 10;
 }
 
 message TaskReject {

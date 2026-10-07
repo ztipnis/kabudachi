@@ -48,10 +48,14 @@ impl WorkerState {
     /// holds or contests a term steps down once it sees a later one:
     /// from `RollCall`, `Candidate` or `Leader`, to
     /// `Active` under that term's leader or to `LeaderSuspect` to contest
-    /// again. `LeaderReconciling` has no such edge: a winner passes through
-    /// it to `Leader` in one step, so no input ever finds a node there. A
-    /// roll call or a vote that misses its deadline leaves `RollCall` or
-    /// `Candidate` for `LeaderSuspect` too, or, short of a quorum, `RollCall`
+    /// again. A winner holds office from its win but leads only once it has
+    /// reconciled: `LeaderReconciling` does every election duty of a leader
+    /// and leaves office by the same edges as `Leader` (to `Active` or
+    /// `LeaderSuspect` on a later term, to `NoQuorum` when its lease runs
+    /// out, to `Fenced`, to `Draining`), or moves to `Leader` once
+    /// reconciled. A roll call or a vote that misses its deadline leaves
+    /// `RollCall` or `Candidate` for `LeaderSuspect` too, or, short of a
+    /// quorum, `RollCall`
     /// for `NoQuorum`. A `NoQuorum` node
     /// leaves by a roll call of its own (`-> RollCall`) or by an ack from a
     /// leader (`-> Active`).
@@ -93,6 +97,11 @@ impl WorkerState {
                 | (WorkerState::Candidate, WorkerState::NoQuorum)
                 | (WorkerState::Candidate, WorkerState::Fenced)
                 | (WorkerState::LeaderReconciling, WorkerState::Leader)
+                | (WorkerState::LeaderReconciling, WorkerState::Active)
+                | (WorkerState::LeaderReconciling, WorkerState::LeaderSuspect)
+                | (WorkerState::LeaderReconciling, WorkerState::NoQuorum)
+                | (WorkerState::LeaderReconciling, WorkerState::Fenced)
+                | (WorkerState::LeaderReconciling, WorkerState::Draining)
                 | (WorkerState::Leader, WorkerState::Active)
                 | (WorkerState::Leader, WorkerState::LeaderSuspect)
                 | (WorkerState::Leader, WorkerState::NoQuorum)

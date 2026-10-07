@@ -42,6 +42,32 @@ impl Occupancy {
         Some(older)
     }
 
+    /// Sets what `key` holds, as a leader rebuilding from records found it:
+    /// its waiting generation, the generation holding it, and each one's
+    /// chain, oldest first.
+    pub fn restore(
+        &mut self,
+        key: &Key,
+        waiting: Option<TaskId>,
+        holder: Option<TaskId>,
+        chains: BTreeMap<TaskId, Vec<TaskId>>,
+    ) {
+        match waiting {
+            Some(task) => self.waiting.insert(key.clone(), task),
+            None => self.waiting.remove(key),
+        };
+        match holder {
+            Some(task) => self.holders.insert(key.clone(), task),
+            None => self.holders.remove(key),
+        };
+        self.chains.extend(chains);
+    }
+
+    /// Forgets every key, holder and chain.
+    pub fn clear(&mut self) {
+        *self = Occupancy::default();
+    }
+
     /// The payloads `key` retains, oldest first: what the waiting generation
     /// absorbed, then the waiting generation itself, which a submission of the
     /// same key would supersede next.

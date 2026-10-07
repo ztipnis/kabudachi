@@ -28,7 +28,7 @@ use crate::support::builders::{
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    TestNode, close_roll_call, connect, deliver, grants, published_roll_calls, sent, sent_to,
+    TestNode, close_roll_call, connect, deliver, finish_reconciling, grants, published_roll_calls, sent, sent_to,
     start_roll_call, state_changes, tick, voter_node,
 };
 
@@ -227,10 +227,11 @@ impl Shard {
         }
         assert_eq!(
             self.nodes[initiator].state(),
-            WorkerState::Leader,
+            WorkerState::LeaderReconciling,
             "setup invariant: {initiator:?} wins"
         );
-        self.record_grants(initiator, &won);
+        let won = self.after_step(initiator, won);
+        assert_eq!(self.nodes[initiator].state(), WorkerState::Leader);
         won
     }
 
@@ -267,7 +268,7 @@ impl Shard {
                     continue;
                 }
                 let outputs = deliver(self.node(&to), &from, message);
-                self.record_grants(&to, &outputs);
+                let outputs = self.after_step(&to, outputs);
                 queue(&mut self.in_flight, &to, &outputs, &everyone);
                 if stop(self) {
                     return true;
@@ -288,7 +289,7 @@ impl Shard {
             self.clock.advance(Duration::from_ticks(1));
             for id in &everyone {
                 let outputs = self.node(id).step(Input::Tick).outputs;
-                self.record_grants(id, &outputs);
+                let outputs = self.after_step(id, outputs);
                 queue(&mut self.in_flight, id, &outputs, &everyone);
             }
             if stop(self) {
@@ -305,7 +306,7 @@ impl Shard {
         for (recipient, message) in sent(outputs) {
             if to.contains(&&recipient) {
                 let answered = deliver(self.node(&recipient), from, message);
-                self.record_grants(&recipient, &answered);
+                self.after_step(&recipient, answered);
             }
         }
     }
@@ -314,8 +315,19 @@ impl Shard {
     fn tick(&mut self, id: &WorkerId) {
         let everyone: Vec<WorkerId> = self.nodes.keys().cloned().collect();
         let outputs = self.node(id).step(Input::Tick).outputs;
-        self.record_grants(id, &outputs);
+        let outputs = self.after_step(id, outputs);
         queue(&mut self.in_flight, id, &outputs, &everyone);
+    }
+
+    /// What a step of `id` produced, with what finishing its reconciliation
+    /// produced too if it took office, and its grants noted. A node tested
+    /// for its election alone has no tasks to reconcile.
+    fn after_step(&mut self, id: &WorkerId, mut outputs: Vec<Output>) -> Vec<Output> {
+        if self.nodes[id].state() == WorkerState::LeaderReconciling {
+            outputs.extend(finish_reconciling(self.node(id)));
+        }
+        self.record_grants(id, &outputs);
+        outputs
     }
 
     fn holds_joint(&self, id: &WorkerId) -> bool {
@@ -539,6 +551,8 @@ fn leader_of_a_founding(clock: &FakeClock) -> (TestNode, WorkerId, WorkerId) {
         &b,
         vote_grant_message(vote_grant(a.clone(), b.clone(), call.term)),
     );
+    assert_eq!(node.state(), WorkerState::LeaderReconciling, "setup invariant");
+    finish_reconciling(&mut node);
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
     assert_eq!(
         node.configuration(),
@@ -705,6 +719,8 @@ fn leader_re_leading_a_founding(clock: &FakeClock) -> (TestNode, Vec<Output>, [W
             vote_grant_message(vote_grant(me.clone(), voter.clone(), term)),
         );
     }
+    assert_eq!(node.state(), WorkerState::LeaderReconciling, "setup invariant");
+    won.extend(finish_reconciling(&mut node));
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
     (node, won, [fellow, left_out, joiner])
 }

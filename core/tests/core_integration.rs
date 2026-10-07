@@ -4,6 +4,7 @@
 mod configuration;
 mod election;
 mod proptest;
+mod reconcile;
 mod records;
 mod scenario;
 mod scheduler;

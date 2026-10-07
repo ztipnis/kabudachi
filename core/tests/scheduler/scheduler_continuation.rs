@@ -9,9 +9,10 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerI
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
+use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{Completion, ClaimRejection, Submission};
 use kabudachi_core::time::Duration;
-use crate::support::scheduler::Fixture;
+use crate::support::scheduler::{Fixture, OFFICE, grant_of, newest_records, reconciling_after};
 
 fn worker() -> WorkerId {
     WorkerId::new("w1")
@@ -153,4 +154,37 @@ fn ending_a_continuation_is_once_only_and_ignores_tasks_that_have_none() {
     assert_eq!(fixture.scheduler.end_continuation(&task), Ok(false));
     // Nothing was double-released.
     assert_eq!(fixture.spy.memory_in_use(), 1);
+}
+
+/// A certified run whose task is not finished is the record of a continuation,
+/// so a new leader rebuilds the flow's lifetime from the records alone.
+#[test]
+fn an_implicit_flows_lifetime_survives_a_leader_change() {
+    let mut old = Fixture::leading();
+    let task = old.scheduler.submit(generation()).unwrap();
+    let run = running(&mut old, &task);
+    old.scheduler
+        .complete(&worker(), &run, Digest::blake3(b"step"), Completion::Continues)
+        .unwrap();
+    let waiting = old.scheduler.submit(generation()).unwrap();
+    let mut new = reconciling_after(&old);
+
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&old),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+
+    assert_eq!(
+        new.scheduler.request_claim(&worker(), &waiting),
+        Err(ClaimRejection::KeyBusy),
+        "the flow still holds its key"
+    );
+    assert_eq!(
+        new.scheduler.end_continuation(&task),
+        Ok(true),
+        "and its continuation can still end"
+    );
 }

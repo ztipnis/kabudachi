@@ -136,6 +136,14 @@
 //! names, and [`Net::poll_task_requests`] / [`Net::respond_task`] serve the
 //! answering side. The calls about a run also keep [`Net::claimed_runs`].
 //!
+//! ## The reconcile protocol
+//!
+//! `/kabudachi/reconcile/1` (see `crate::reconcile`) is a fourth correlated
+//! protocol of the same shape: [`Net::ask_reconcile`] asks a worker for one
+//! page of what it holds, and [`Net::poll_reconcile_requests`] /
+//! [`Net::respond_reconcile`] serve the answering side, which every worker
+//! does for whichever leader asks.
+//!
 //! ## Reconnect/backoff and where a peer's address comes from
 //!
 //! What a `Net` knows about its peers, and the fast-then-slow redial of a dropped
@@ -192,6 +200,7 @@ use crate::framing::decode_election;
 use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
+use crate::reconcile::codec::ReconcileCodec;
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm};
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_store::{HeldRecords, record_key};
@@ -294,10 +303,12 @@ pub(crate) struct Exchanges {
     join: Exchange<JoinCodec>,
     claim: Exchange<ClaimCodec>,
     task: Exchange<TaskCodec>,
+    reconcile: Exchange<ReconcileCodec>,
 }
 
 /// A correlated protocol `Net` carries through an [`Exchange`]
-/// (implemented here for `JoinCodec`, `ClaimCodec` and `TaskCodec`).
+/// (implemented here for `JoinCodec`, `ClaimCodec`, `TaskCodec` and
+/// `ReconcileCodec`).
 pub(crate) trait Correlated:
     request_response::Codec + Clone + Send + Sized + 'static
 {
@@ -347,6 +358,19 @@ impl Correlated for TaskCodec {
     }
 }
 
+impl Correlated for ReconcileCodec {
+    const ARRIVAL: Carried = Carried::ReconcileRequest;
+    fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self> {
+        &mut behaviour.reconcile
+    }
+    fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
+        &mut exchanges.reconcile
+    }
+    fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
+        &inbound.reconciles
+    }
+}
+
 /// [`Net::try_listen_on`] could not listen on this address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenRejected(pub Multiaddr);
@@ -364,7 +388,7 @@ impl std::error::Error for ListenRejected {}
 pub const DEFAULT_INPUT_LIMIT: usize = 1024;
 
 /// What `drive` hands over for the driver of this `Net`'s node, each queue
-/// in arrival order: the node's inputs, the join, claim and task requests the
+/// in arrival order: the node's inputs, the join, claim, task and reconcile requests the
 /// driver answers, and the outcomes of the record writes it asked for.
 /// `arrived` is signalled whenever any of them grows.
 pub(crate) struct Inbound {
@@ -374,6 +398,7 @@ pub(crate) struct Inbound {
     joins: Mutex<VecDeque<Asked<JoinCodec>>>,
     claims: Mutex<VecDeque<Asked<ClaimCodec>>>,
     tasks: Mutex<VecDeque<Asked<TaskCodec>>>,
+    reconciles: Mutex<VecDeque<Asked<ReconcileCodec>>>,
     writes: Mutex<VecDeque<WriteOutcome>>,
     arrived: Notify,
 }
@@ -386,6 +411,7 @@ impl Default for Inbound {
             joins: Mutex::default(),
             claims: Mutex::default(),
             tasks: Mutex::default(),
+            reconciles: Mutex::default(),
             writes: Mutex::default(),
             arrived: Notify::new(),
         }
@@ -1623,6 +1649,9 @@ fn handle_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Task(event)) => {
             settle::<TaskCodec>(&mut pending.exchanges, event, inbound, peers, now);
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Reconcile(event)) => {
+            settle::<ReconcileCodec>(&mut pending.exchanges, event, inbound, peers, now);
         }
         _ => {}
     }

@@ -1,0 +1,71 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+import "task.proto";
+import "claim.proto";
+import "task_record.proto";
+
+// A new leader asks each worker of its shard what it holds before it
+// schedules anything. A worker answers in pages, each within one message:
+// first the runs it holds, then the Task records it holds.
+message ReconcileRequest {
+  // The office asking: a worker answers any leader that asks; these let it
+  // say whom it answered in its logs.
+  uint64 recovery_epoch = 1;
+  uint64 recovery_lineage = 2;
+  uint64 term = 3;
+  // Where the previous page ended. Unset for the first page.
+  oneof after {
+    TaskRunId after_run = 4;
+    TaskId after_key = 5;
+  }
+  // Only the runs, no records: the leader asks this when the runs it
+  // believes a worker holds differ from what the worker's heartbeats say.
+  bool runs_only = 6;
+}
+
+// One record a worker holds, summarised.
+message HeldKey {
+  TaskId task_id = 1;
+  RecordVersion version = 2;
+  Digest input_digest = 3;
+  // The record's latest run.
+  TaskRunId latest_run = 4;
+  // The voters that revision was written to.
+  repeated WorkerId placement = 5;
+  bool finished = 6;
+  // Set only when the task is a coalescing one: the definition and flat key
+  // that name the key its generations share (see Task in task.proto), so a
+  // leader that cannot read this record can still tell which key it belongs to.
+  TaskDefinitionId task_definition_id = 7;
+  optional string coalescing_key = 8;
+}
+
+enum ReportedRunState {
+  REPORTED_RUN_STATE_UNSPECIFIED = 0;
+  REPORTED_RUN_CLAIMED = 1;
+  REPORTED_RUN_RUNNING = 2;
+  // Succeeded, and no leader has certified it.
+  REPORTED_RUN_SUCCEEDED = 3;
+  // Failed, and no leader has recorded the failure.
+  REPORTED_RUN_FAILED = 4;
+}
+
+// A run the worker holds, with the claim it was granted under, so a leader
+// that knows no record of its task can still rebuild it. The claim's chain
+// is left out: a claim alone can fill a message, and the generations the
+// chain held have records of their own.
+message ReportedRun {
+  Claim claim = 1;
+  ReportedRunState state = 2;
+  Digest result_digest = 3;
+  string failure_kind = 4;
+}
+
+message ReconcileReport {
+  repeated ReportedRun runs = 1;
+  repeated HeldKey keys = 2;
+  // Nothing follows this page.
+  bool last = 3;
+}

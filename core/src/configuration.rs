@@ -604,6 +604,19 @@ impl Tally {
             .all(|majority| majority.is_reached_by(self.fed.values().copied()))
     }
 
+    /// Whether every voter of every majority it needs has been fed: all of a
+    /// configuration's voters, of both sides for a joint one.
+    pub fn is_unanimous(&self) -> bool {
+        self.majorities.iter().all(|majority| {
+            let counted = self
+                .fed
+                .values()
+                .filter(|admission| majority.counted.counts(**admission))
+                .count();
+            counted >= majority.voter_count
+        })
+    }
+
     fn needing(majorities: Vec<Majority>) -> Self {
         Tally {
             majorities,

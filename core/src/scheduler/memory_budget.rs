@@ -55,6 +55,11 @@ impl MemoryBudget {
         })
     }
 
+    /// Forgets the bytes in use, keeping the limits.
+    pub(super) fn reset_usage(&mut self) {
+        self.in_use = 0;
+    }
+
     pub(super) fn take(&mut self, bytes: u64) {
         self.in_use += bytes;
     }

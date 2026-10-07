@@ -33,9 +33,64 @@ struct Space {
     down: BTreeSet<WorkerId>,
     cut: Option<(BTreeSet<WorkerId>, BTreeSet<WorkerId>)>,
     acknowledgements: Vec<(Instant, SpaceWrite)>,
+    /// Writers whose writes stay in flight, and the writes held so far.
+    holding: BTreeSet<WorkerId>,
+    in_flight: Vec<(WorkerId, TaskRecord, usize)>,
 }
 
 impl Space {
+    /// Lands `record` on every placement holder that is up (and, unless the
+    /// write was already on its way, that `writer` can reach), and queues the
+    /// writer's acknowledgement.
+    fn deliver(
+        &mut self,
+        writer: &WorkerId,
+        record: TaskRecord,
+        quorum: usize,
+        now: Instant,
+        on_its_way: bool,
+    ) {
+        let write = Write::of(&record);
+        let mut stored = 0;
+        for holder in record.placement.iter().cloned().map(WorkerId::from) {
+            let reached = if on_its_way {
+                !self.down.contains(&holder)
+            } else {
+                self.reaches(writer, &holder)
+            };
+            if !reached {
+                continue;
+            }
+            let (task, version) =
+                identify(&record).expect("the scheduler builds every record with its task and version");
+            let held = self.stores.entry(holder).or_default();
+            // The real store refuses an older version and a different record
+            // at the same version; a refused put is no acknowledgement.
+            let accepted = held.get(&task).is_none_or(|have| {
+                let (_, have_version) =
+                    identify(have).expect("a stored record names its task and version");
+                match have_version.order(&version) {
+                    VersionOrder::Newer => true,
+                    VersionOrder::Same => *have == record,
+                    VersionOrder::Older => false,
+                }
+            });
+            if accepted {
+                stored += 1;
+                held.insert(task, record.clone());
+            }
+        }
+        let due = now + self.ack_delay.unwrap_or(Duration::from_ticks(0));
+        self.acknowledgements.push((
+            due,
+            SpaceWrite {
+                writer: writer.clone(),
+                write,
+                stored: stored >= quorum,
+            },
+        ));
+    }
+
     fn reaches(&self, from: &WorkerId, to: &WorkerId) -> bool {
         if self.down.contains(to) {
             return false;
@@ -72,46 +127,41 @@ impl RecordSpace {
         (holders, quorum)
     }
 
-    /// Writes `record` (its `placement` filled) for `writer` at `now`.
+    /// Writes `record` (its `placement` filled) for `writer` at `now`. A
+    /// writer whose writes are held (see `hold_writes_from`) lands nothing and
+    /// is acknowledged by no one.
     ///
     /// # Panics
     /// If `record` lacks its version, its task or its task id.
     pub fn write(&self, writer: &WorkerId, record: TaskRecord, quorum: usize, now: Instant) {
-        let write = Write::of(&record);
         let mut space = self.0.borrow_mut();
-        let mut stored = 0;
-        for holder in record.placement.iter().cloned().map(WorkerId::from) {
-            if !space.reaches(writer, &holder) {
-                continue;
-            }
-            let (task, version) =
-                identify(&record).expect("the scheduler builds every record with its task and version");
-            let held = space.stores.entry(holder).or_default();
-            // The real store refuses an older version and a different record
-            // at the same version; a refused put is no acknowledgement.
-            let accepted = held.get(&task).is_none_or(|have| {
-                let (_, have_version) =
-                    identify(have).expect("a stored record names its task and version");
-                match have_version.order(&version) {
-                    VersionOrder::Newer => true,
-                    VersionOrder::Same => *have == record,
-                    VersionOrder::Older => false,
-                }
-            });
-            if accepted {
-                stored += 1;
-                held.insert(task, record.clone());
-            }
+        if space.holding.contains(writer) {
+            space.in_flight.push((writer.clone(), record, quorum));
+            return;
         }
-        let due = now + space.ack_delay.unwrap_or(Duration::from_ticks(0));
-        space.acknowledgements.push((
-            due,
-            SpaceWrite {
-                writer: writer.clone(),
-                write,
-                stored: stored >= quorum,
-            },
-        ));
+        space.deliver(writer, record, quorum, now, false);
+    }
+
+    /// From now on `writer`'s writes stay in flight: they land on no holder
+    /// and are acknowledged by none until released.
+    pub fn hold_writes_from(&self, writer: &WorkerId) {
+        self.0.borrow_mut().holding.insert(writer.clone());
+    }
+
+    /// Delivers every write held from `writer`, now, to each holder that is
+    /// up, as if it had been delayed on the way (a cut made since does not
+    /// stop it); holders store or refuse it by version, as always. Later
+    /// writes of `writer` are no longer held.
+    pub fn release_writes_from(&self, writer: &WorkerId, now: Instant) {
+        let mut space = self.0.borrow_mut();
+        space.holding.remove(writer);
+        let (released, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut space.in_flight)
+            .into_iter()
+            .partition(|(from, _, _)| from == writer);
+        space.in_flight = kept;
+        for (writer, record, quorum) in released {
+            space.deliver(&writer, record, quorum, now, true);
+        }
     }
 
     /// The acknowledgements due by `now`, in the order their writes were made.
@@ -157,6 +207,21 @@ impl RecordSpace {
 
     pub fn heal(&self) {
         self.0.borrow_mut().cut = None;
+    }
+
+    /// Whether `from` can reach `holder`: it is up and no cut separates them.
+    pub fn can_reach(&self, from: &WorkerId, holder: &WorkerId) -> bool {
+        self.0.borrow().reaches(from, holder)
+    }
+
+    /// Every record `holder` holds, the newest revision of each task.
+    pub fn held_records(&self, holder: &WorkerId) -> Vec<TaskRecord> {
+        self.0
+            .borrow()
+            .stores
+            .get(holder)
+            .map(|store| store.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// What `holder` holds of `task`.
@@ -256,5 +321,29 @@ mod tests {
             .collect();
         assert_eq!(outcomes, [(1, false), (3, true), (2, false)]);
         assert!(space.take_due(now).is_empty(), "each outcome is taken once");
+    }
+
+    #[test]
+    fn held_writes_land_late_through_a_cut_and_lose_to_a_newer_revision_stored_meanwhile() {
+        let [a, b, c] = ["a", "b", "c"].map(WorkerId::new);
+        let holders = [a.clone(), b.clone(), c.clone()];
+        let task = TaskId::new("task-1");
+        let space = RecordSpace::default();
+        let now = Instant::at(0);
+
+        space.hold_writes_from(&a);
+        space.write(&a, revision(&task, 1, &holders), 2, now);
+        space.write(&a, revision(&task, 2, &holders), 2, now);
+        assert_eq!(held_revision(&space, &b, &task), None);
+        assert!(space.take_due(now).is_empty(), "nothing is acknowledged while held");
+
+        space.partition(&BTreeSet::from([a.clone()]), &BTreeSet::from([b.clone(), c.clone()]));
+        space.set_up(&c, false);
+        space.write(&b, revision(&task, 3, &[b.clone(), c.clone()]), 1, now);
+        space.release_writes_from(&a, now);
+
+        assert_eq!(held_revision(&space, &a, &task), Some(2), "the late write passed the cut");
+        assert_eq!(held_revision(&space, &b, &task), Some(3), "and lost to the newer revision");
+        assert_eq!(held_revision(&space, &c, &task), None, "a holder that is down stores nothing");
     }
 }

@@ -33,6 +33,9 @@ pub use generated::{
     RunCertified, RunFailed, StartAccepted, SubmitAccepted, SubmitTask, TaskReject,
     TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
 };
+pub use generated::{
+    HeldKey, ReconcileReport, ReconcileRequest, ReportedRun, ReportedRunState, reconcile_request,
+};
 
 /// Whether every required ID field of a raw message is present. Nested
 /// messages are not checked; [`checked::decode`] covers them.

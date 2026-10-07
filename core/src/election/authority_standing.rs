@@ -58,6 +58,16 @@ pub(crate) struct AuthorityView<'a> {
     pub(crate) own_epoch: Option<RecoveryEpoch>,
 }
 
+impl AuthorityView<'_> {
+    /// Whether the node holds office, reconciling or leading.
+    fn in_office(&self) -> bool {
+        matches!(
+            self.state,
+            WorkerState::LeaderReconciling | WorkerState::Leader
+        )
+    }
+}
+
 /// What the node does with a reply, in order.
 #[derive(Debug)]
 pub(crate) enum AuthorityVerdict {
@@ -385,7 +395,7 @@ impl AuthorityStanding {
             }
             Err(_) => false,
         };
-        if view.state == WorkerState::Leader
+        if view.in_office()
             && expected.is_none()
             && view.own_epoch.map(|own| order(&own, new.into())) == Some(EpochOrder::Mine)
             && republished
@@ -465,7 +475,7 @@ impl AuthorityStanding {
         now: Instant,
     ) -> Vec<AuthorityVerdict> {
         let seeking = match view.state {
-            WorkerState::Leader => true,
+            WorkerState::LeaderReconciling | WorkerState::Leader => true,
             WorkerState::Candidate => self
                 .recovery
                 .as_ref()
@@ -490,8 +500,7 @@ impl AuthorityStanding {
                     .retry_fence_at(now + remaining + Duration::from_ticks(1));
                 Vec::new()
             }
-            Err(AuthorityError::EpochConflict { current: None })
-                if view.state == WorkerState::Leader =>
+            Err(AuthorityError::EpochConflict { current: None }) if view.in_office() =>
             {
                 vec![AuthorityVerdict::Ask(self.ask(
                     AuthorityRequest::SwapRecoveryEpoch {
@@ -510,7 +519,7 @@ impl AuthorityStanding {
                 vec![AuthorityVerdict::LoseQuorum, AuthorityVerdict::RejoinAt(held)]
             }
             Err(AuthorityError::EpochConflict { .. }) => {
-                if view.state == WorkerState::Leader {
+                if view.in_office() {
                     vec![AuthorityVerdict::SuspectAgain]
                 } else {
                     vec![AuthorityVerdict::LoseQuorum]

@@ -17,6 +17,7 @@ pub mod join_codec;
 mod leader_search;
 pub mod messenger;
 mod peers;
+pub mod reconcile;
 mod routing_refresh;
 pub mod swarm;
 pub mod task_exchange;

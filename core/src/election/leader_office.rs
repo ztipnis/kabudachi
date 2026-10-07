@@ -18,8 +18,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::configuration::{Configuration, Generation, Roster};
+use crate::configuration::{Configuration, Generation, Roster, Tally};
 use crate::protocol::ids::WorkerId;
+use crate::reconcile::Answered;
 use crate::time::{Duration, Instant};
 
 use super::ElectionTimings;
@@ -218,6 +219,53 @@ impl LeaderOffice {
                 .is_voter(self.roster.counted_admission_of(worker))
     }
 
+    /// Whom a reconciliation asks: the voters of the committed configuration
+    /// (either side of a joint one), `me` among them, then the pending
+    /// members. Read from the roster alone.
+    pub(crate) fn reconcilees(&self, me: &WorkerId) -> Vec<WorkerId> {
+        let mut asked = self.voter_ids(me);
+        asked.extend(
+            self.roster
+                .pending()
+                .iter()
+                .filter(|worker| !asked.contains(*worker))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        asked
+    }
+
+    /// What `answered` amounts to among the voters: all of them (of both
+    /// sides of a joint configuration), a quorum, or short of one. Pending
+    /// members and workers the roster does not hold count for nothing; `me`
+    /// counts as the lease counts it, whether or not the roster lists it.
+    pub(crate) fn voters_answered(
+        &self,
+        me: &WorkerId,
+        answered: &BTreeSet<WorkerId>,
+    ) -> Answered {
+        let mut tally = Tally::against(self.roster.configuration());
+        for worker in answered
+            .iter()
+            .filter(|worker| *worker == me || self.roster.members().contains_key(*worker))
+        {
+            tally.record(worker.clone(), self.roster.counted_admission_of(worker));
+        }
+        if tally.is_unanimous() {
+            Answered::All
+        } else if tally.has_quorum() {
+            Answered::Quorum
+        } else {
+            Answered::Short
+        }
+    }
+
+    /// Whether the roster holds `worker`, admitted or pending. Removals
+    /// pending are not applied first, as for [`Self::is_voter_or_pending`].
+    pub(crate) fn is_member(&self, worker: &WorkerId) -> bool {
+        self.roster.members().contains_key(worker) || self.roster.pending().contains(worker)
+    }
+
     /// A SELF_REMOVE the node accepted (its term guard stays with the
     /// node): `departing` is taken out with every other one accepted, in
     /// the next operation.
@@ -257,6 +305,15 @@ impl LeaderOffice {
             .lease
             .no_quorum_at(duties.me, &self.roster, duties.timings)
             .is_some_and(|at| duties.now >= at)
+    }
+
+    /// Starts counting from `now` toward reporting each of `workers` but `me`
+    /// lost, unless it already counts one: a worker heard from keeps its own
+    /// time.
+    pub(crate) fn watch(&mut self, workers: BTreeSet<WorkerId>, me: &WorkerId, now: Instant) {
+        for worker in workers.into_iter().filter(|worker| worker != me) {
+            self.last_heard.entry(worker).or_insert(now);
+        }
     }
 
     /// When the office next has a worker to report lost: `lost_after` after

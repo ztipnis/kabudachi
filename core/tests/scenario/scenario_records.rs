@@ -13,10 +13,10 @@ use kabudachi_core::time::Duration;
 
 use crate::support::harness::{Answer, Cluster};
 
-const SUSPECT: Duration = Duration::from_millis(1_000);
-const STEP: Duration = Duration::from_millis(50);
+pub(crate) const SUSPECT: Duration = Duration::from_millis(1_000);
+pub(crate) const STEP: Duration = Duration::from_millis(50);
 
-fn plain() -> Submission {
+pub(crate) fn plain() -> Submission {
     Submission::new(
         TaskDefinitionId::new("billing.charge"),
         0,
@@ -26,19 +26,31 @@ fn plain() -> Submission {
 }
 
 fn elected() -> (Cluster, WorkerId) {
-    let mut cluster = Cluster::bootstrap(3, SUSPECT);
+    elected_among(3)
+}
+
+pub(crate) fn elected_among(voters: usize) -> (Cluster, WorkerId) {
+    let mut cluster = Cluster::bootstrap(voters, SUSPECT);
     // A fresh cluster is a fixed point until its first election starts,
     // which it does once its voters suspect there is no leader.
     for _ in 0..(SUSPECT.as_ticks() * 2 / STEP.as_ticks()) {
         cluster.advance(STEP);
     }
     cluster.run_until_quiescent(STEP, 200);
-    let leader = cluster.leader().expect("three voters elect a leader");
+    let leader = cluster.leader().expect("the voters elect a leader");
     (cluster, leader)
 }
 
-fn submitted(cluster: &mut Cluster, leader: &WorkerId) -> TaskId {
-    let ticket = cluster.submit(leader, plain());
+pub(crate) fn submitted(cluster: &mut Cluster, leader: &WorkerId) -> TaskId {
+    submitted_with(cluster, leader, plain())
+}
+
+pub(crate) fn submitted_with_key(cluster: &mut Cluster, leader: &WorkerId, key: &str) -> TaskId {
+    submitted_with(cluster, leader, plain().with_coalescing_key(key))
+}
+
+pub(crate) fn submitted_with(cluster: &mut Cluster, leader: &WorkerId, submission: Submission) -> TaskId {
+    let ticket = cluster.submit(leader, submission);
     cluster.advance(STEP);
     match cluster.answer(ticket) {
         Some(Answer::Submitted(task)) => task.clone(),
@@ -48,7 +60,7 @@ fn submitted(cluster: &mut Cluster, leader: &WorkerId) -> TaskId {
 
 /// Claims and starts `task` on `claimant` with acknowledgements flowing at
 /// once, and returns the run.
-fn running(
+pub(crate) fn running(
     cluster: &mut Cluster,
     leader: &WorkerId,
     claimant: &WorkerId,
@@ -188,4 +200,29 @@ fn a_certification_whose_acknowledgement_arrives_after_the_lease_ended_is_answer
     run_past_the_lease(&mut cluster);
 
     assert_eq!(cluster.answer(ticket), Some(&Answer::NotLeader));
+}
+
+#[test]
+fn a_supersession_stores_the_newer_generation_before_marking_the_older_superseded() {
+    let (mut cluster, leader) = elected();
+    let older = submitted_with_key(&mut cluster, &leader, "k");
+    cluster.records().set_ack_delay(STEP);
+
+    let ticket = cluster.submit(&leader, plain().with_coalescing_key("k"));
+    let holders: Vec<WorkerId> = cluster.node_ids().into_iter().collect();
+    let superseded_anywhere = |cluster: &Cluster| {
+        holders.iter().any(|holder| {
+            cluster.records().held_by(holder, &older).is_some_and(|record| {
+                record.runs.last().map(TaskRunRecord::current_state)
+                    == Some(TaskRunState::Superseded)
+            })
+        })
+    };
+    assert!(!superseded_anywhere(&cluster), "the older generation waits for its successor's write");
+
+    cluster.advance(STEP);
+    assert!(superseded_anywhere(&cluster));
+    assert_eq!(cluster.answer(ticket), None, "the client hears only once both are stored");
+    cluster.advance(STEP);
+    assert!(matches!(cluster.answer(ticket), Some(Answer::Submitted(_))));
 }

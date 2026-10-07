@@ -61,8 +61,12 @@ pub(crate) struct Lease {
     /// its TaskRuns. Cleared once it resumes, or once a leader acks it
     /// after it rejoined.
     orphan_abort_by: Option<Instant>,
-    /// The grant this node last reported, so it reports each change once.
+    /// The grant this node last held, whether or not it handed it over: the
+    /// end its contact floor counts, and from which it reports changes.
     reported_grant: Option<LeadershipGrant>,
+    /// The grant this node last handed over, so it hands over each change
+    /// once.
+    handed_over_grant: Option<LeadershipGrant>,
     /// The abort deadline this node last reported, so it reports each
     /// change once.
     reported_abort_deadline: Option<Instant>,
@@ -76,6 +80,7 @@ impl Lease {
             contact_floor: None,
             orphan_abort_by: None,
             reported_grant: None,
+            handed_over_grant: None,
             reported_abort_deadline: None,
         }
     }
@@ -117,6 +122,7 @@ impl Lease {
     pub(crate) fn withdraw_grant(&mut self, now: Instant) {
         self.raise_contact_floor_to_grant(now);
         self.reported_grant = None;
+        self.handed_over_grant = None;
     }
 
     /// Whether the node leads `office` with a grant that has not ended at
@@ -136,7 +142,9 @@ impl Lease {
 
     /// What changed since the node last reported, now that it holds `grant`
     /// (see [`Self::grant`]): its grant, then its abort deadline, which a
-    /// changed grant can move. `lost_after` is how long a leader goes
+    /// changed grant can move. The grant counts toward the contact floor
+    /// as soon as it is held, but is handed over only when `hand_over` is
+    /// set, and then once. `lost_after` is how long a leader goes
     /// without hearing from a worker before it reports that worker lost and
     /// replays its TaskRuns; the node hands over the same span its own
     /// leader side counts, so the abort deadline, drift taken off it, always
@@ -144,6 +152,7 @@ impl Lease {
     pub(crate) fn report(
         &mut self,
         grant: Option<LeadershipGrant>,
+        hand_over: bool,
         timings: &ElectionTimings,
         lost_after: Duration,
         now: Instant,
@@ -152,6 +161,9 @@ impl Lease {
         if grant != self.reported_grant {
             self.raise_contact_floor_to_grant(now);
             self.reported_grant = grant;
+        }
+        if hand_over && grant != self.handed_over_grant {
+            self.handed_over_grant = grant;
             changes.push(LeaseChange::Grant(grant));
         }
         let deadline = self.abort_deadline(timings, lost_after, now);

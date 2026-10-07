@@ -1,25 +1,33 @@
-//! A shard of three driven voters over real loopback sockets, for tests of
-//! what a leader does with its records.
+//! A shard of driven voters over real loopback sockets, for tests of what a
+//! leader does with its records.
 
-use std::sync::Arc;
+use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{
     ElectionTimings, Entry, Identity, Input, KnownConfiguration, Step, WorkerNode,
 };
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
-use kabudachi_core::protocol::messages::{ElectionMessage, WorkerHeartbeat, election_message};
+use kabudachi_core::protocol::ids::{
+    IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
+};
+use kabudachi_core::protocol::messages::{
+    ElectionMessage, WorkerHeartbeat, claim_response, election_message, task_response,
+};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::scheduler::{Scheduler, Submission, Submitted, mint};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::{Duration, RealClock};
+use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
+use libp2p::futures::future::select_all;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-use super::election::{built_on_one_tick, drive_three_until, wait_until};
+use super::election::{built_on_one_tick, due_now, wait_until};
 use super::net::{connect_full_mesh, driven_scheduler};
 
 const SHARD: &str = "shard-1";
@@ -27,50 +35,86 @@ const SHARD: &str = "shard-1";
 /// moment keeps its lease (it lasts a suspicion timeout less its drift
 /// share), and short enough that a lease that does end ends well before
 /// [`kabudachi_net::task_store::RECORD_WRITE_TIMEOUT`].
-const SUSPECT_TIMEOUT_MS: u64 = 2000;
+pub const SUSPECT_TIMEOUT_MS: u64 = 2000;
 const HEARTBEAT_INTERVAL_MS: u64 = 10;
+/// Short, so that a worker reported lost a suspicion timeout and a reconnect
+/// timeout after it was last heard fits a test.
+pub const RECONNECT_TIMEOUT_MS: u64 = 1000;
 const ROLL_CALL_DEADLINE_MS: u64 = 100;
 /// A "something is actually broken" backstop for every wait of the fixture.
 const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 type Scheduled = Scheduler<RealClock, Uuid7Ids, RecordOutbox>;
 
-/// Three voters of one known configuration, fully meshed, each with its own
+/// Voters of one known configuration, fully meshed, each with its own
 /// `Net::for_shard`, node and scheduler. Nothing runs until a `drive_*` call;
-/// each call drives all three drivers and leaves the nodes where they stood.
-pub struct ThreeVoters {
-    /// Shared, so a test can ask through a voter's net while driving the three.
-    pub nets: [Arc<Net>; 3],
-    pub nodes: [WorkerNode<RealClock>; 3],
-    pub schedulers: [Scheduled; 3],
+/// each call drives every voter not killed and leaves the nodes where they
+/// stood.
+pub struct Voters {
+    /// Shared, so a test can ask through a voter's net while driving the shard.
+    pub nets: Vec<Arc<Net>>,
+    pub nodes: Vec<WorkerNode<RealClock>>,
+    pub schedulers: Vec<Scheduled>,
     pub clock: RealClock,
-    ids: [WorkerId; 3],
-    hosts: [Hosting; 3],
-    states: [watch::Receiver<WorkerState>; 3],
-    senders: [watch::Sender<WorkerState>; 3],
+    ids: Vec<WorkerId>,
+    hosts: Vec<Hosting>,
+    states: Vec<watch::Receiver<WorkerState>>,
+    senders: Vec<watch::Sender<WorkerState>>,
+    killed: Vec<bool>,
 }
 
+/// A shard of three voters.
+pub struct ThreeVoters;
+
 impl ThreeVoters {
-    /// The voters, and a fourth connected `Net` for the shard that has no
+    pub async fn start() -> (Voters, Net) {
+        Voters::start(3).await
+    }
+}
+
+/// What a test can read of the voters' states while the shard is driven.
+pub struct Watch {
+    states: Vec<watch::Receiver<WorkerState>>,
+    killed: Vec<bool>,
+}
+
+impl Watch {
+    pub fn state(&self, voter: usize) -> WorkerState {
+        *self.states[voter].borrow()
+    }
+
+    /// The voter that leads, among those not killed when this was taken.
+    pub fn leader(&self) -> Option<usize> {
+        (0..self.states.len())
+            .find(|voter| !self.killed[*voter] && self.state(*voter) == WorkerState::Leader)
+    }
+}
+
+impl Voters {
+    /// `count` voters, and a further connected `Net` for the shard that has no
     /// node: a client the leader's roster does not hold until
     /// [`Self::join_as_pending`] makes it a pending member.
-    pub async fn start() -> (ThreeVoters, Net) {
+    pub async fn start(count: usize) -> (Voters, Net) {
         let shard = ShardId::new(SHARD);
-        let hosted = [0, 1, 2].map(|_| host(shard.clone()));
-        let [(net_a, host_a), (net_b, host_b), (net_c, host_c)] = hosted;
-        let nets = [net_a, net_b, net_c].map(Arc::new);
-        let hosts = [host_a, host_b, host_c];
+        let hosted: Vec<_> = (0..count).map(|_| host(shard.clone())).collect();
+        let (nets, hosts): (Vec<_>, Vec<_>) = hosted.into_iter().unzip();
+        let nets: Vec<Arc<Net>> = nets.into_iter().map(Arc::new).collect();
         let claimant = Net::for_shard(shard, None);
-        let ids = connect_full_mesh(&[&*nets[0], &*nets[1], &*nets[2], &claimant]).await;
-        let ids = [ids[0].clone(), ids[1].clone(), ids[2].clone()];
+        let mut everyone: Vec<&Net> = nets.iter().map(|net| &**net).collect();
+        everyone.push(&claimant);
+        let mut ids = connect_full_mesh(&everyone).await;
+        ids.truncate(nets.len());
         let clock = RealClock::new();
-        let nodes = built_on_one_tick(&clock, || ids.clone().map(|id| voter(clock, id)));
-        let schedulers = [0, 1, 2].map(|_| driven_scheduler(clock));
-        let channels = [0, 1, 2].map(|i| watch::channel(nodes[i].state()));
-        let senders = channels.each_ref().map(|(sender, _)| sender.clone());
-        let states = channels.map(|(_, receiver)| receiver);
+        let nodes = built_on_one_tick(&clock, || {
+            ids.iter().map(|id| voter(clock, id.clone(), count)).collect::<Vec<_>>()
+        });
+        let schedulers = nodes.iter().map(|_| driven_scheduler(clock)).collect();
+        let channels: Vec<_> = nodes.iter().map(|node| watch::channel(node.state())).collect();
+        let senders = channels.iter().map(|(sender, _)| sender.clone()).collect();
+        let states = channels.into_iter().map(|(_, receiver)| receiver).collect();
+        let killed = vec![false; nodes.len()];
         (
-            ThreeVoters {
+            Voters {
                 nets,
                 nodes,
                 schedulers,
@@ -79,9 +123,29 @@ impl ThreeVoters {
                 hosts,
                 states,
                 senders,
+                killed,
             },
             claimant,
         )
+    }
+
+    /// A reading of every voter's state that stays current while the shard is
+    /// driven, for a condition to wait on.
+    pub fn watch(&self) -> Watch {
+        Watch {
+            states: self.states.clone(),
+            killed: self.killed.clone(),
+        }
+    }
+
+    /// Stops driving `voter` and cuts it off from every other voter, as a
+    /// host that died would be: its connections close and none reopens.
+    pub fn kill(&mut self, voter: usize) {
+        self.killed[voter] = true;
+        for other in (0..self.nets.len()).filter(|other| *other != voter) {
+            self.nets[other].block_peer(self.ids[voter].clone());
+            self.nets[voter].block_peer(self.ids[other].clone());
+        }
     }
 
     pub fn id(&self, voter: usize) -> WorkerId {
@@ -89,7 +153,7 @@ impl ThreeVoters {
     }
 
     pub fn others(&self, voter: usize) -> Vec<usize> {
-        (0..3).filter(|other| *other != voter).collect()
+        (0..self.nets.len()).filter(|other| *other != voter).collect()
     }
 
     /// Makes `client` a pending member of the shard, as a worker that has
@@ -131,13 +195,13 @@ impl ThreeVoters {
         }
     }
 
-    /// Drives the three until one leads with a lease its scheduler holds
+    /// Drives the voters until one leads with a lease its scheduler holds
     /// (so it accepts submissions), and returns its index; panics if that
     /// takes past the backstop.
     pub async fn drive_until_a_leader(&mut self) -> usize {
         timeout(TEST_TIMEOUT, self.drive_to_a_leader())
             .await
-            .expect("one of the three led within the timeout")
+            .expect("one of the voters led within the timeout")
     }
 
     async fn drive_to_a_leader(&mut self) -> usize {
@@ -149,7 +213,7 @@ impl ThreeVoters {
                 states
                     .iter()
                     .position(|state| *state.borrow() == WorkerState::Leader)
-                    .expect("one of the three leads")
+                    .expect("one of the voters leads")
             })
             .await;
         // The lease starts once the followers' acknowledgements arrive.
@@ -160,23 +224,37 @@ impl ThreeVoters {
         leader
     }
 
-    /// Drives the three until `until` completes, and returns what it
-    /// returned; panics if that takes past the backstop.
+    /// Drives every voter not killed until `until` completes, and returns what
+    /// it returned; panics if that takes past the backstop.
     pub async fn drive_until<T>(&mut self, until: impl Future<Output = T>) -> T {
-        let [net_a, net_b, net_c] = self.nets.each_ref().map(|net| &**net);
-        let [tx_a, tx_b, tx_c] = self.senders.clone();
-        timeout(
-            TEST_TIMEOUT,
-            drive_three_until(
-                &mut self.nodes,
-                [net_a, net_b, net_c],
-                &mut self.schedulers,
-                self.clock,
-                [None, None, None],
-                [publish(tx_a), publish(tx_b), publish(tx_c)],
-                until,
-            ),
-        )
+        let clock = self.clock;
+        let (nets, senders, killed) = (&self.nets, &self.senders, &self.killed);
+        let drivers: Vec<Pin<Box<dyn Future<Output = Infallible> + '_>>> = self
+            .nodes
+            .iter_mut()
+            .zip(self.schedulers.iter_mut())
+            .enumerate()
+            .filter(|(voter, _)| !killed[*voter])
+            .map(|(voter, (node, scheduler))| {
+                let observe = publish(senders[voter].clone());
+                Box::pin(run_driver(
+                    node,
+                    due_now(&clock),
+                    &*nets[voter],
+                    scheduler,
+                    clock,
+                    None,
+                    DriverConfig::default(),
+                    observe,
+                )) as Pin<Box<dyn Future<Output = Infallible> + '_>>
+            })
+            .collect();
+        timeout(TEST_TIMEOUT, async {
+            tokio::select! {
+                _ = select_all(drivers) => unreachable!("run_driver never returns"),
+                output = until => output,
+            }
+        })
         .await
         .expect("the awaited event happened within the timeout")
     }
@@ -262,7 +340,7 @@ fn publish(
     }
 }
 
-fn voter(clock: RealClock, id: WorkerId) -> WorkerNode<RealClock> {
+fn voter(clock: RealClock, id: WorkerId, count: usize) -> WorkerNode<RealClock> {
     WorkerNode::start(
         Identity {
             incarnation: IncarnationId::new(format!("{}-incarnation-0", id.as_str())),
@@ -272,13 +350,14 @@ fn voter(clock: RealClock, id: WorkerId) -> WorkerNode<RealClock> {
                 Duration::from_millis(SUSPECT_TIMEOUT_MS),
                 Duration::from_millis(HEARTBEAT_INTERVAL_MS),
             )
-            .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS)),
+            .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS))
+            .with_reconnect_timeout(Duration::from_millis(RECONNECT_TIMEOUT_MS)),
         },
         Entry::Known(KnownConfiguration {
             configuration: Configuration::single(Single {
                 generation: Generation::genesis(0),
                 base: Generation::genesis(0),
-                voter_count: 3,
+                voter_count: count,
             })
             .expect("valid"),
             admission: Some(Generation::genesis(0)),
@@ -287,4 +366,62 @@ fn voter(clock: RealClock, id: WorkerId) -> WorkerNode<RealClock> {
         None,
     )
     .0
+}
+
+/// A plain submission whose input is `input`.
+pub fn plain_with(input: &[u8]) -> Submission {
+    Submission::new(
+        TaskDefinitionId::new("demo.task"),
+        1,
+        input.to_vec(),
+        "default",
+    )
+}
+
+/// Resolves once `net` holds a record of every task in `tasks`.
+pub async fn wait_until_held(net: Arc<Net>, tasks: Vec<TaskId>) {
+    wait_until(|| {
+        let held = net.held_records();
+        tasks.iter().all(|task| held.get(task).is_some())
+    })
+    .await;
+}
+
+/// Has `worker` submit `submission` to `leader` as a client would, asking
+/// again until the leader's lease is ready, and returns the task's id.
+pub async fn submitted_through(worker: &Net, leader: &WorkerId, submission: Submission) -> TaskId {
+    submitted_as(worker, leader, mint(submission, &Uuid7Ids, &RealClock::new())).await
+}
+
+/// Like [`submitted_through`], for a submission already minted.
+async fn submitted_as(worker: &Net, leader: &WorkerId, submitted: Submitted) -> TaskId {
+    loop {
+        let answer = worker.submit(leader.clone(), submitted.clone()).await;
+        if matches!(answer.map(|answer| answer.result), Ok(Some(task_response::Result::Submitted(_)))) {
+            return submitted.task_id;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+}
+
+/// Has `worker` claim `task` from `leader` and report the run started, and
+/// returns the run.
+pub async fn claimed_and_started(worker: &Net, leader: &WorkerId, task: &TaskId) -> TaskRunId {
+    let claimed = worker
+        .request_claim(leader.clone(), task.clone())
+        .await
+        .expect("the leader answered");
+    let Some(claim_response::Result::Accept(claim)) = claimed.result else {
+        panic!("expected an accepted claim, got {claimed:?}");
+    };
+    let run: TaskRunId = claim.task_run_id.expect("a claim names its run").into();
+    let started = worker
+        .report_started(leader.clone(), run.clone())
+        .await
+        .expect("the leader answered");
+    assert!(
+        matches!(started.result, Some(task_response::Result::Started(_))),
+        "expected the start acknowledged, got {started:?}"
+    );
+    run
 }

@@ -54,6 +54,15 @@ impl WallTime {
     pub fn now(clock: &impl Clock) -> Self {
         WallTime(clock.wall_clock_millis())
     }
+
+    /// The instant on the monotonic clock, which reads `now` while the wall
+    /// clock reads `wall_now`, at which `delay` counted from this moment
+    /// ends. Time already gone by the wall clock is taken off the delay; a
+    /// wall clock that reads before this moment has taken none off.
+    pub fn deadline(self, delay: Duration, now: Instant, wall_now: WallTime) -> Instant {
+        let elapsed = Duration(wall_now.0.saturating_sub(self.0));
+        now + Duration(delay.0.saturating_sub(elapsed.0))
+    }
 }
 
 impl Duration {

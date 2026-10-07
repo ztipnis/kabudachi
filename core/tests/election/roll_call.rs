@@ -12,7 +12,7 @@ use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, close_roll_call, deliver, published_roll_calls, recipients_of, rejects_sent_to, sent,
+    TestNode, close_roll_call, deliver, finish_reconciling, published_roll_calls, recipients_of, rejects_sent_to, sent,
     sent_to, start_roll_call, state_changes, tick, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Single};
@@ -262,14 +262,14 @@ fn a_genesis_node_wins_its_own_roll_call_at_its_deadline() {
 
     assert_eq!(
         state_changes(&outputs),
-        vec![
-            WorkerState::Candidate,
-            WorkerState::LeaderReconciling,
-            WorkerState::Leader,
-        ]
+        vec![WorkerState::Candidate, WorkerState::LeaderReconciling]
     );
     assert_eq!(node.term(), 1);
     assert_eq!(node.known_leader(), Some((me, 1)));
+    assert_eq!(
+        state_changes(&finish_reconciling(&mut node)),
+        vec![WorkerState::Leader]
+    );
 }
 
 // ---- Backoff ----
@@ -319,7 +319,9 @@ fn replies_that_always_outlast_the_base_deadline_still_elect_the_node_once_its_c
                 break;
             }
         }
-        if node.state() == WorkerState::Leader {
+        if node.state() == WorkerState::LeaderReconciling {
+            finish_reconciling(&mut node);
+            assert_eq!(node.state(), WorkerState::Leader);
             return;
         }
     }
@@ -404,6 +406,7 @@ fn a_node_that_won_after_widening_calls_again_at_the_base_deadline_once_it_loses
         &peer,
         vote_grant_message(vote_grant(me, peer.clone(), call.term)),
     );
+    finish_reconciling(&mut node);
     assert_eq!(node.state(), WorkerState::Leader, "setup invariant");
 
     // No follower confirms an ack, so its lease runs out.

@@ -14,8 +14,8 @@ use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, close_roll_call, commit_founding, connect, deliver, elect, published_roll_calls, sent,
-    sent_to, state_changes, voter_node,
+    TestNode, close_roll_call, commit_founding, connect, deliver, elect, finish_reconciling,
+    published_roll_calls, sent, sent_to, state_changes, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Joint, Single};
 use kabudachi_core::election::{Input, Output};
@@ -427,6 +427,7 @@ fn a_leader_that_regains_office_after_a_kept_drain_request_waits_again() {
             vote_grant_message(vote_grant(me.clone(), peer.clone(), call.term)),
         );
     }
+    let _ = finish_reconciling(&mut leader);
     assert_eq!(
         leader.state(),
         WorkerState::Leader,

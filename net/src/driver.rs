@@ -19,7 +19,9 @@
 //! leader grants a claim only to a voter or a pending member of its shard,
 //! and answers any other worker `NOT_MEMBER` without asking the scheduler;
 //! and a task-exchange request (a submission, a report on a run, a cancel)
-//! with the scheduler's decision, gated like a claim. And it tells `Net` which leader the node
+//! with the scheduler's decision, gated like a claim. Every worker, leader or
+//! not, also answers a reconcile request with a page of the runs and records it
+//! holds, whoever asks. And it tells `Net` which leader the node
 //! names, so the worker's own claims go to that leader. Between batches it
 //! re-crawls the worker's peer routing once the node's view of its shard
 //! has changed and settled, and periodically (see `crate::routing_refresh`), so
@@ -37,6 +39,31 @@
 //! arrives. A write that misses its quorum while the leader still leads
 //! may or may not have landed, so the driver answers `NotLeader` to every
 //! later question about that task until a newer revision of it is stored.
+//!
+//! A node that takes office reconciles before it leads (see
+//! `crate::reconcile::leader`). The driver asks every worker of the office's
+//! roster what it holds, this worker's own page read locally and the rest
+//! over the reconcile exchange, page by page, and looks up the full records it
+//! lacks. It stops waiting when every voter answered, or a quorum did and a
+//! suspicion timeout has passed, rebuilds the scheduler from the answers, and
+//! writes every record the rebuild published again at the office's term, at
+//! most 64 at a time, writing again after one heartbeat interval any that was
+//! not stored. Only when all are stored does it step the node
+//! [`Input::Reconciled`], which makes the node lead and hands the scheduler
+//! its grant; until then the scheduler answers every claim and report
+//! `NotLeader`. Once the node leads, it keeps asking the workers that have not
+//! answered, once per suspicion timeout, and hands the scheduler what their
+//! late answers teach: a record that became certain, a run a slow worker
+//! held, a worker that was thought silent.
+//!
+//! Every worker's heartbeats carry a digest of the runs its ledger holds, and
+//! the leader compares each with the runs its scheduler believes that worker
+//! holds. A difference that lasts two heartbeat intervals (an answer still on
+//! its way does not last that long) brings one re-report of that worker's
+//! runs, at most one per suspicion timeout per worker, which is adopted like
+//! a late answer. Reconciliation work that could not proceed, such as records
+//! that could not be placed or writes that were refused, is tried again when
+//! the voters change or the time comes, and the driver wakes for it.
 //!
 //! Time acts on the scheduler here too: each batch lets it catch up once its
 //! deadline has come (a delayed task is released, a pending task past its
@@ -86,6 +113,7 @@
 //! listing and the seeds, and never reads the routing table, the connection
 //! count or the gossip mesh as membership.
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::time::Duration;
 
@@ -93,13 +121,17 @@ use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, Input, Issuer, MessageSink, Output, Step,
     WorkerNode, carry_out,
 };
+use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     ClaimResponse, ElectionMessage, JoinResponse, TaskResponse, claim_request, task_request,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::Scheduler;
-use kabudachi_core::task_record::{EffectGate, RecordOutbox, Settled, Waits, Write, WriteLedger};
+use kabudachi_core::reconcile::active_runs_digest;
+use kabudachi_core::scheduler::{ReconcileRefused, Scheduler};
+use kabudachi_core::task_record::{
+    EffectGate, RecordOutbox, Settled, Settlement, Waits, Write, WriteLedger, WriteOrder,
+};
 use kabudachi_core::time::{Clock, Instant};
 use libp2p::Multiaddr;
 
@@ -110,7 +142,9 @@ use crate::bootstrap::DEFAULT_RETRY_INTERVAL;
 use crate::claim::{self, ClaimRequestHandle};
 use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, pointer_for};
 use crate::leader_search::{JoinOverNet, Rejoin, StrandedWatch};
-use crate::messenger::{Net, PlacedWrite};
+use crate::messenger::{Net, PlacedWrite, WriteOutcome};
+use crate::reconcile::leader::{LeaderReconciliation, Progress, Stuck};
+use crate::reconcile::report::page_of;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
 use crate::routing_refresh::{RoutingRefresh, ShardView};
 use crate::task_exchange::{self, TaskRequestHandle};
@@ -289,7 +323,10 @@ where
     // its decision made.
     let mut held_answers = EffectGate::new();
     // Every write made and not yet settled, whichever call made it.
-    let mut unsettled = WriteLedger::default();
+    let mut unsettled = RecordWrites::default();
+    // While the node holds an office whose scheduler has not been rebuilt, or
+    // has been but still awaits late answers: the office's reconciliation.
+    let mut reconciliation: Option<LeaderReconciliation<'_>> = None;
     let mut routing = RoutingRefresh::new(
         node.timings().suspect_timeout,
         config.routing_refresh_period,
@@ -303,6 +340,9 @@ where
         if let Some(client) = authority.as_mut() {
             arrived_replies.extend(std::iter::from_fn(|| client.try_reply()));
         }
+        // Every heartbeat this batch sends carries the runs held now.
+        node.set_active_runs_digest(active_runs_digest(&net.claimed_runs().active_ids()));
+        let mut runs_heard = Vec::new();
         let mut stepper = Stepper {
             node: &mut *node,
             scheduler: &mut *scheduler,
@@ -311,6 +351,7 @@ where
             unsettled: &mut unsettled,
             calls: authority.as_mut(),
             observe: &mut observe,
+            runs_heard: &mut runs_heard,
         };
         if let Some(first) = first.take() {
             next_deadline = stepper.carry(first, None);
@@ -365,7 +406,17 @@ where
                 }
             }
         }
-        settle_answers(stepper.scheduler, net, &mut held_answers, stepper.unsettled);
+        // The republish's own writes first; every other outcome is the gate's.
+        let outcomes = settle_republish(&mut reconciliation, net.take_write_outcomes(), clock.now());
+        settle_answers(
+            stepper.node,
+            stepper.scheduler,
+            net,
+            config.replication_factor,
+            &mut held_answers,
+            stepper.unsettled,
+            outcomes,
+        );
         respond_to_join_requests(stepper.node, net).await;
         respond_to_claim_requests(
             stepper.node,
@@ -384,6 +435,7 @@ where
             stepper.unsettled,
             config.replication_factor,
         );
+        respond_to_reconcile_requests(net);
         stepper.write_revisions();
         // A step can report a deadline that has already come: a voter that
         // begins suspecting its leader starts a roll call at its next
@@ -392,6 +444,20 @@ where
         while next_deadline.is_some_and(|deadline| deadline <= clock.now()) {
             next_deadline = stepper.step(Input::Tick);
         }
+        if let Some(deadline) = reconcile_office(
+            &mut reconciliation,
+            node,
+            scheduler,
+            net,
+            &clock,
+            config.replication_factor,
+            &mut unsettled,
+            authority.as_mut(),
+            &mut observe,
+        ) {
+            next_deadline = Some(deadline);
+        }
+        compare_run_digests(&mut reconciliation, scheduler, &clock, runs_heard);
         let scheduler_deadline = catch_up_if_due(
             node,
             scheduler,
@@ -487,6 +553,9 @@ where
         };
         let search_wake = search.as_ref().and_then(|(_, search)| search.wake_at());
         let stranded_wake = stranded.wake_at(clock.now());
+        let reconcile_wake = reconciliation
+            .as_ref()
+            .and_then(|current| current.wake_at(node));
 
         // A due routing crawl is made between batches, with no batch of its
         // own: the node is stepped only when something arrives or its
@@ -505,6 +574,8 @@ where
                 () = sleep_until(&clock, stranded_wake) => break,
                 () = sleep_until(&clock, lease_wake) => break,
                 () = sleep_until(&clock, scheduler_deadline) => break,
+                () = sleep_until(&clock, reconcile_wake) => break,
+                () = next_reconciliation(&mut reconciliation) => break,
                 result = ask_done(&mut search) => {
                     if let Some((purpose, search)) = search.as_mut() {
                         found = search
@@ -522,6 +593,229 @@ where
     }
 }
 
+/// Compares each run digest a heartbeat reported with the runs `scheduler`
+/// believes that worker holds, and asks a worker whose heartbeats keep
+/// disagreeing for its runs again (see [`LeaderReconciliation::runs_heard`]).
+/// Only a leading scheduler has a belief to compare.
+fn compare_run_digests<C: Clock, I: IdGenerator>(
+    reconciliation: &mut Option<LeaderReconciliation<'_>>,
+    scheduler: &Scheduler<C, I, RecordOutbox>,
+    clock: &C,
+    heard: Vec<(WorkerId, Vec<u8>)>,
+) {
+    let Some(current) = reconciliation.as_mut() else {
+        return;
+    };
+    if !scheduler.is_leader() {
+        return;
+    }
+    for (worker, digest) in heard {
+        let believed = active_runs_digest(&scheduler.active_runs_of(&worker));
+        current.runs_heard(&worker, &digest, &believed, clock.now());
+    }
+}
+
+/// Hands the reconciliation the outcomes of its republished writes and
+/// returns the rest.
+fn settle_republish(
+    reconciliation: &mut Option<LeaderReconciliation<'_>>,
+    mut outcomes: Vec<WriteOutcome>,
+    now: Instant,
+) -> Vec<WriteOutcome> {
+    if let Some(current) = reconciliation.as_mut() {
+        outcomes.retain(|outcome| !current.settle(outcome, now));
+    }
+    outcomes
+}
+
+/// The reconciliation's next answer or lookup, taken in; for ever without one.
+/// Cancel-safe.
+async fn next_reconciliation(reconciliation: &mut Option<LeaderReconciliation<'_>>) {
+    match reconciliation {
+        Some(reconciliation) => reconciliation.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Runs the reconciliation of the office `node` holds: starts it when the
+/// scheduler awaits a rebuild for that office, drops it when the node holds
+/// another office or none, rebuilds the scheduler when the round may stop,
+/// writes its records again at the office's term, steps the node
+/// [`Input::Reconciled`] once all are stored, and, once it leads, hands the
+/// scheduler what late answers teach. Returns the node's next deadline when
+/// it stepped the node.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_office<'n, C, I, O>(
+    reconciliation: &mut Option<LeaderReconciliation<'n>>,
+    node: &mut WorkerNode<C>,
+    scheduler: &mut Scheduler<C, I, RecordOutbox>,
+    net: &'n Net,
+    clock: &C,
+    factor: ReplicationFactor,
+    unsettled: &mut RecordWrites,
+    mut calls: Option<&mut AuthorityClient>,
+    observe: &mut O,
+) -> Option<Instant>
+where
+    C: Clock,
+    I: IdGenerator,
+    O: FnMut(&WorkerNode<C>, Option<&Input>, &Step),
+{
+    let office = node.office_term();
+    if reconciliation
+        .as_ref()
+        .is_some_and(|current| Some(current.office()) != office)
+    {
+        *reconciliation = None;
+    }
+    if reconciliation.is_none()
+        && let Some(office) = office
+        && scheduler.reconciling() == Some(office)
+    {
+        *reconciliation = Some(LeaderReconciliation::start(
+            net,
+            office,
+            node.reconcilees(),
+            clock.now(),
+            node.timings().suspect_timeout,
+            node.timings().heartbeat_interval,
+        ));
+    }
+    let current = reconciliation.as_mut()?;
+    let mut next_deadline = None;
+    loop {
+        match current.progress(node, clock.now()) {
+            Progress::Waiting => return next_deadline,
+            Progress::Rebuild(rebuild) => match scheduler.reconcile(rebuild) {
+                Ok(rebuilt) => {
+                    tracing::info!(
+                        republished = rebuilt.republished,
+                        uncertain = rebuilt.uncertain,
+                        "a new leader rebuilt its scheduler from its shard"
+                    );
+                    let revisions = scheduler.observer_mut().take();
+                    place_republish(current, node, factor, revisions);
+                    if !rebuilt.silent_holders.is_empty() {
+                        let due = Stepper {
+                            node: &mut *node,
+                            scheduler: &mut *scheduler,
+                            net,
+                            replication_factor: factor,
+                            unsettled: &mut *unsettled,
+                            calls: calls.as_deref_mut(),
+                            observe: &mut *observe,
+                            runs_heard: &mut Vec::new(),
+                        }
+                        .step(Input::WatchWorkers(rebuilt.silent_holders));
+                        next_deadline = match (next_deadline, due) {
+                            (Some(held), Some(due)) => Some(held.min(due)),
+                            (held, due) => held.or(due),
+                        };
+                    }
+                }
+                Err(ReconcileRefused { rejection, rebuild }) => {
+                    // Nothing was installed, so the same rebuild is offered
+                    // again; leading without it would serve an empty shard.
+                    tracing::error!(%rejection, "the scheduler did not take the rebuild: not leading");
+                    current.stuck(Stuck::Rebuild(rebuild), node.voters(), clock.now());
+                }
+            },
+            Progress::Place(records) => place_republish(current, node, factor, records),
+            Progress::RePlace => {
+                let voters = node.voters();
+                current.re_place(
+                    |write| match placement(&Write::of(&write.record).task_id, &voters, factor) {
+                        Some(Placement { holders, quorum }) => {
+                            write.record.placement = holders.into_iter().map(Into::into).collect();
+                            write.quorum = quorum;
+                        }
+                        None => tracing::error!(
+                            task = Write::of(&write.record).task_id.as_str(),
+                            "a republished record could not be placed on the new voters"
+                        ),
+                    },
+                    clock.now(),
+                );
+            }
+            Progress::Republished(office) => {
+                let mut stepper = Stepper {
+                    node: &mut *node,
+                    scheduler: &mut *scheduler,
+                    net,
+                    replication_factor: factor,
+                    unsettled: &mut *unsettled,
+                    calls: calls.as_deref_mut(),
+                    observe: &mut *observe,
+                    runs_heard: &mut Vec::new(),
+                };
+                // The node leads now: answers that came while it was
+                // republishing are taken on the next turn of this loop.
+                next_deadline = stepper.step(Input::Reconciled(office));
+                // The grant applied what was lost while reconciling.
+                write_revisions(node, scheduler, net, factor, unsettled);
+            }
+            Progress::Learnt(mut queue) => {
+                let mut silent_holders = BTreeSet::new();
+                while let Some(learnt) = queue.pop_front() {
+                    match scheduler.adopt(learnt) {
+                        Ok(adopted) => silent_holders.extend(adopted.silent_holders),
+                        Err(learnt) => {
+                            // Not leading yet, or no more: the round has
+                            // given this knowledge up, so it is offered
+                            // again, in order.
+                            tracing::debug!("late reconciliation answers were not adopted: not leading");
+                            queue.push_front(learnt);
+                            current.stuck(Stuck::Adopt(queue), node.voters(), clock.now());
+                            break;
+                        }
+                    }
+                }
+                if !silent_holders.is_empty() {
+                    let due = Stepper {
+                        node: &mut *node,
+                        scheduler: &mut *scheduler,
+                        net,
+                        replication_factor: factor,
+                        unsettled: &mut *unsettled,
+                        calls: calls.as_deref_mut(),
+                        observe: &mut *observe,
+                        runs_heard: &mut Vec::new(),
+                    }
+                    .step(Input::WatchWorkers(silent_holders));
+                    next_deadline = match (next_deadline, due) {
+                        (Some(held), Some(due)) => Some(held.min(due)),
+                        (held, due) => held.or(due),
+                    };
+                }
+                write_revisions(node, scheduler, net, factor, unsettled);
+            }
+        }
+    }
+}
+
+/// Places the republished `records` on the voters and starts writing them. If
+/// any cannot be placed none is written, and all are kept to be placed again
+/// when the voters change or after a suspicion timeout: leading without every
+/// record written again would leave a late write of the last leader unfenced.
+fn place_republish<C: Clock>(
+    current: &mut LeaderReconciliation<'_>,
+    node: &WorkerNode<C>,
+    factor: ReplicationFactor,
+    records: Vec<TaskRecord>,
+) {
+    let (writes, unplaced) = place(node, factor, records);
+    if unplaced.is_empty() {
+        current.republishing(writes, node.timings().heartbeat_interval, node.voters());
+    } else {
+        tracing::error!(
+            unplaced = unplaced.len(),
+            "records could not be placed on the voters: not leading"
+        );
+        let all = writes.into_iter().map(|write| write.record).chain(unplaced).collect();
+        current.stuck(Stuck::Place(all), node.voters(), node.now());
+    }
+}
+
 /// Lets time act on `scheduler` if its deadline has come (delays released,
 /// pending tasks expired, finished tasks forgotten), writes what that
 /// changed, and returns its next deadline. Nothing waits on those writes: no
@@ -531,7 +825,7 @@ fn catch_up_if_due<C: Clock, I: IdGenerator>(
     scheduler: &mut Scheduler<C, I, RecordOutbox>,
     net: &Net,
     factor: ReplicationFactor,
-    unsettled: &mut WriteLedger,
+    unsettled: &mut RecordWrites,
     now: Instant,
 ) -> Option<Instant> {
     if scheduler.next_deadline().is_some_and(|due| due <= now) {
@@ -550,7 +844,7 @@ fn drain_events<C: Clock, I: IdGenerator>(
     scheduler: &mut Scheduler<C, I, RecordOutbox>,
     net: &Net,
     factor: ReplicationFactor,
-    unsettled: &mut WriteLedger,
+    unsettled: &mut RecordWrites,
 ) {
     for event in scheduler.take_events() {
         tracing::debug!(?event, "scheduler event with no client to tell");
@@ -565,12 +859,16 @@ struct Stepper<'a, C: Clock, I: IdGenerator, O> {
     net: &'a Net,
     replication_factor: ReplicationFactor,
     /// [`run_driver`]'s `unsettled`.
-    unsettled: &'a mut WriteLedger,
+    unsettled: &'a mut RecordWrites,
     /// The client to perform the node's calls with; `None` answers each at
     /// once as `Unavailable`.
     calls: Option<&'a mut AuthorityClient>,
     /// [`run_driver`]'s `observe`.
     observe: &'a mut O,
+    /// The run digests that heartbeats heard in office reported, with the
+    /// workers that sent them, for the batch to compare (see
+    /// [`LeaderReconciliation::runs_heard`]).
+    runs_heard: &'a mut Vec<(WorkerId, Vec<u8>)>,
 }
 
 impl<C, I, O> Stepper<'_, C, I, O>
@@ -604,6 +902,7 @@ where
     fn carry(&mut self, stepped: Step, input: Option<&Input>) -> Option<Instant> {
         let mut performer = Calls(self.calls.as_deref_mut());
         let observe = &mut *self.observe;
+        let runs_heard = &mut *self.runs_heard;
         let next_deadline = carry_out(
             &mut *self.node,
             stepped,
@@ -612,6 +911,10 @@ where
             &mut performer,
             |node, _, reply, step| {
                 log_alerts(node, &step.outputs);
+                runs_heard.extend(step.outputs.iter().filter_map(|output| match output {
+                    Output::RunsHeard { worker, digest } => Some((worker.clone(), digest.clone())),
+                    _ => None,
+                }));
                 // Only the first step has no reply for its input.
                 observe(node, reply.or(input), step);
             },
@@ -641,29 +944,62 @@ fn write_revisions<C: Clock, I: IdGenerator>(
     scheduler: &mut Scheduler<C, I, RecordOutbox>,
     net: &Net,
     factor: ReplicationFactor,
-    unsettled: &mut WriteLedger,
+    unsettled: &mut RecordWrites,
 ) -> Vec<Write> {
+    let revisions = scheduler.observer_mut().take();
+    let writes: Vec<Write> = revisions.iter().map(Write::of).collect();
+    let admitted = unsettled.order.admit(revisions);
+    place_and_write(node, net, factor, admitted);
+    unsettled.ledger.made(&writes);
+    writes
+}
+
+/// Places `records` on the node's voters and writes them; each write's
+/// outcome arrives at `net`.
+fn place_and_write<C: Clock>(
+    node: &WorkerNode<C>,
+    net: &Net,
+    factor: ReplicationFactor,
+    records: Vec<TaskRecord>,
+) {
+    let (placed, unplaced) = place(node, factor, records);
+    // No placement means either the leader has just stopped leading (a
+    // scheduler publishes only while it leads, so its own roster no longer
+    // holds it), or a voter id is not a peer id, so it cannot be placed:
+    // either way the write counts as refused.
+    for record in unplaced {
+        net.refuse_write(Write::of(&record));
+    }
+    net.write_records(placed);
+}
+
+/// `records` placed on the node's voters, and those that could not be.
+fn place<C: Clock>(
+    node: &WorkerNode<C>,
+    factor: ReplicationFactor,
+    records: Vec<TaskRecord>,
+) -> (Vec<PlacedWrite>, Vec<TaskRecord>) {
     let voters = node.voters();
-    let mut writes = Vec::new();
-    let mut placed = Vec::new();
-    for mut record in scheduler.observer_mut().take() {
-        let write = Write::of(&record);
-        match placement(&write.task_id, &voters, factor) {
+    let (mut placed, mut unplaced) = (Vec::new(), Vec::new());
+    for mut record in records {
+        match placement(&Write::of(&record).task_id, &voters, factor) {
             Some(Placement { holders, quorum }) => {
                 record.placement = holders.into_iter().map(Into::into).collect();
                 placed.push(PlacedWrite { record, quorum });
             }
-            // No placement means either the leader has just stopped leading
-            // (a scheduler publishes only while it leads, so its own roster
-            // no longer holds it), or a voter id is not a peer id, so it
-            // cannot be placed: either way the write counts as refused.
-            None => net.refuse_write(write.clone()),
+            None => unplaced.push(record),
         }
-        writes.push(write);
     }
-    net.write_records(placed);
-    unsettled.made(&writes);
-    writes
+    (placed, unplaced)
+}
+
+/// What the driver has written and not yet seen settled: the ledger of the
+/// writes bearing on what the leader may tell, and the order that holds a
+/// superseded generation's revision behind its successor's.
+#[derive(Default)]
+struct RecordWrites {
+    ledger: WriteLedger,
+    order: WriteOrder,
 }
 
 /// Performs the node's authority calls through its client, or, with none,
@@ -717,7 +1053,9 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
             | Output::Publish { .. }
             | Output::StateChanged(_)
             | Output::Grant(_)
+            | Output::Reconcile(_)
             | Output::Authority(_)
+            | Output::RunsHeard { .. }
             | Output::WorkerLost(_) => {}
         }
     }
@@ -811,7 +1149,7 @@ fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
     scheduler: &mut Scheduler<C, I, RecordOutbox>,
     net: &Net,
     held: &mut EffectGate<HeldAnswer>,
-    unsettled: &mut WriteLedger,
+    unsettled: &mut RecordWrites,
     factor: ReplicationFactor,
 ) {
     for handle in net.poll_claim_requests() {
@@ -824,7 +1162,7 @@ fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
         if let (true, claim_request::Request::TaskId(named)) = (writes.is_empty(), handle.request())
         {
             let task = TaskId::from(named.clone());
-            match unsettled.waits_on(&task) {
+            match unsettled.ledger.waits_on(&task) {
                 Waits::Refused => {
                     send_answer(net, Settled::NotLeader(HeldAnswer::Claim { handle, response }));
                     continue;
@@ -854,7 +1192,7 @@ fn respond_to_task_requests<C: Clock, I: IdGenerator>(
     net: &Net,
     clock: &C,
     held: &mut EffectGate<HeldAnswer>,
-    unsettled: &mut WriteLedger,
+    unsettled: &mut RecordWrites,
     factor: ReplicationFactor,
 ) {
     for handle in net.poll_task_requests() {
@@ -866,7 +1204,7 @@ fn respond_to_task_requests<C: Clock, I: IdGenerator>(
         let response = task_exchange::answer(scheduler, &handle.from(), handle.request(), clock);
         let mut writes = write_revisions(node, scheduler, net, factor, unsettled);
         if let (true, Some(task)) = (writes.is_empty(), named) {
-            match unsettled.waits_on(&task) {
+            match unsettled.ledger.waits_on(&task) {
                 Waits::Refused => {
                     send_answer(net, Settled::NotLeader(HeldAnswer::Task { handle, response }));
                     continue;
@@ -877,6 +1215,27 @@ fn respond_to_task_requests<C: Clock, I: IdGenerator>(
         if let Some(settled) = held.hold(HeldAnswer::Task { handle, response }, writes) {
             send_answer(net, settled);
         }
+    }
+}
+
+/// Answers every inbound `/kabudachi/reconcile/1` request queued on `net`
+/// with a page of what this worker holds. A worker keeps no view of who
+/// leads, so it answers whoever asks, from its own runs and records alone.
+fn respond_to_reconcile_requests(net: &Net) {
+    for handle in net.poll_reconcile_requests() {
+        let request = handle.request();
+        tracing::debug!(
+            from = handle.from().as_str(),
+            recovery_epoch = request.recovery_epoch,
+            term = request.term,
+            "answering a reconciliation request"
+        );
+        let page = page_of(
+            handle.request(),
+            &net.claimed_runs(),
+            &net.held_records(),
+        );
+        net.respond_reconcile(handle, page);
     }
 }
 
@@ -902,13 +1261,17 @@ fn task_named<C: Clock, I: IdGenerator>(
     }
 }
 
-/// Settles the held claim answers on the write outcomes that arrived, and
-/// answers every held one `NotLeader` once the scheduler no longer leads.
+/// Settles the held claim answers on `outcomes`, the write outcomes that
+/// arrived (those of a republish are settled by it first), and answers every
+/// held one `NotLeader` once the scheduler no longer leads.
 fn settle_answers<C: Clock, I: IdGenerator>(
+    node: &WorkerNode<C>,
     scheduler: &Scheduler<C, I, RecordOutbox>,
     net: &Net,
+    factor: ReplicationFactor,
     held: &mut EffectGate<HeldAnswer>,
-    unsettled: &mut WriteLedger,
+    unsettled: &mut RecordWrites,
+    outcomes: Vec<WriteOutcome>,
 ) {
     // Read once per call. A loss and regain of leadership inside one driver
     // iteration would keep the old term's refused entries, but the scheduler
@@ -916,8 +1279,22 @@ fn settle_answers<C: Clock, I: IdGenerator>(
     // with every renewal), and the leftover only errs safe: it answers
     // `NotLeader` for a task until a newer revision of it is stored.
     let leading = scheduler.is_leader();
-    for outcome in net.take_write_outcomes() {
-        unsettled.settled(&outcome.write, outcome.stored, leading);
+    for outcome in outcomes {
+        unsettled.ledger.settled(&outcome.write, outcome.stored, leading);
+        // A superseded generation's revision is written only once its
+        // successor's is stored while the leader still leads.
+        let mut refused = Vec::new();
+        match unsettled.order.settled(&outcome.write, outcome.stored && leading) {
+            Settlement::Release(records) => {
+                place_and_write(node, net, factor, records);
+            }
+            Settlement::Refuse(writes) => {
+                for write in writes {
+                    unsettled.ledger.settled(&write, false, leading);
+                    refused.push(write);
+                }
+            }
+        }
         if outcome.stored {
             for settled in held.acknowledged(&outcome.write, leading) {
                 send_answer(net, settled);
@@ -927,7 +1304,10 @@ fn settle_answers<C: Clock, I: IdGenerator>(
                 task = outcome.write.task_id.as_str(),
                 "a record revision was not stored at its quorum"
             );
-            for answer in held.refused(&outcome.write) {
+            refused.push(outcome.write);
+        }
+        for write in refused {
+            for answer in held.refused(&write) {
                 send_answer(net, Settled::NotLeader(answer));
             }
         }
@@ -936,7 +1316,8 @@ fn settle_answers<C: Clock, I: IdGenerator>(
         for answer in held.lease_ended() {
             send_answer(net, Settled::NotLeader(answer));
         }
-        unsettled.clear();
+        unsettled.ledger.clear();
+        unsettled.order.clear();
     }
 }
 
@@ -956,6 +1337,9 @@ fn send_answer(net: &Net, settled: Settled<HeldAnswer>) {
         }
     }
 }
+
+#[cfg(test)]
+mod reconcile_tests;
 
 #[cfg(test)]
 mod tests {

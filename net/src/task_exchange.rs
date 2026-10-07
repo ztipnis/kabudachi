@@ -334,10 +334,12 @@ pub(crate) fn not_leader() -> TaskResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use kabudachi_core::coordination_authority::RecoveryEpoch;
-    use kabudachi_core::protocol::ids::Uuid7Ids;
-    use kabudachi_core::protocol::ids::TaskDefinitionId;
+    use kabudachi_core::protocol::ids::{TaskDefinitionId, Uuid7Ids};
     use kabudachi_core::protocol::messages::{CancelOutcome, CancelTask, ReportCompleted, SubmitTask};
+    use kabudachi_core::reconcile::{Rebuild, ReconcileTerm};
     use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, Scheduler, Submission};
     use kabudachi_core::time::RealClock;
 
@@ -468,5 +470,48 @@ mod tests {
         };
         assert_eq!(cancelled.outcome, CancelOutcome::Cancelled as i32);
         assert!(cancelled.was_running, "the retry was claimed");
+    }
+
+    /// A report or cancel about a task the new leader has not been able to
+    /// pin down is answered retryably, so its claimant keeps the run in its
+    /// ledger.
+    #[test]
+    fn a_task_the_leader_cannot_know_yet_is_answered_not_ready() {
+        let mut scheduler = Scheduler::new(RealClock::new(), Uuid7Ids);
+        let office = ReconcileTerm {
+            recovery_epoch: RecoveryEpoch::new(0, 0),
+            term: 2,
+        };
+        let task = TaskId::new("task-1");
+        let run = TaskRunId::new("run-1");
+        scheduler.begin_reconcile(office);
+        scheduler
+            .reconcile(Rebuild {
+                uncertain: BTreeMap::from([(task.clone(), BTreeSet::from([run.clone()]))]),
+                ..Rebuild::default()
+            })
+            .unwrap();
+        scheduler.set_leadership_grant(Some(LeadershipGrant {
+            term: office.term,
+            recovery_epoch: office.recovery_epoch,
+            valid_until: LeaseEnd::Unbounded,
+        }));
+        let someone = WorkerId::new("w1");
+
+        let started = task_request::Request::Started(ReportStarted {
+            task_run_id: Some(run.into()),
+        });
+        let cancel = task_request::Request::Cancel(CancelTask {
+            task_id: Some(task.into()),
+        });
+
+        for request in [started, cancel] {
+            let response = answer(&mut scheduler, &someone, &request, &RealClock::new());
+            assert_eq!(
+                reason(&response),
+                Some(TaskRejectReason::TaskRejectNotReady),
+                "{request:?}"
+            );
+        }
     }
 }

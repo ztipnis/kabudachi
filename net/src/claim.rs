@@ -176,7 +176,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, R: Observer>(
     let result = match request {
         claim_request::Request::TaskId(task_id) => scheduler
             .request_claim(claimant, &TaskId::from(task_id.clone()))
-            .map(|claim| claim_response::Result::Accept(wire_claim(claim))),
+            .map(|claim| claim_response::Result::Accept(Claim::from(claim))),
         claim_request::Request::Oldest(oldest) => {
             // A limit past what this platform can count is no limit.
             let limit = usize::try_from(oldest.limit).unwrap_or(usize::MAX);
@@ -242,7 +242,7 @@ impl Batch {
 
         const CLAIMS_TAG: u32 = 1; // ClaimBatch.claims
         const BATCH_TAG: u32 = 3; // ClaimResponse.batch
-        let claim = wire_claim(claim.clone());
+        let claim = Claim::from(claim.clone());
         let encoded_len = self.encoded_len + message::encoded_len(CLAIMS_TAG, &claim);
         let response_len =
             key_len(BATCH_TAG) + encoded_len_varint(encoded_len as u64) + encoded_len;
@@ -252,15 +252,6 @@ impl Batch {
             self.encoded_len = encoded_len;
         }
         fits
-    }
-}
-
-fn wire_claim(claim: scheduler::Claim) -> Claim {
-    Claim {
-        task: Some(claim.task),
-        task_run_id: Some(claim.task_run_id.into()),
-        attempt_number: claim.attempt_number,
-        chain: claim.chain,
     }
 }
 

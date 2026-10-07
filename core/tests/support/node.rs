@@ -224,12 +224,28 @@ pub fn stand_as_candidate(
     call
 }
 
+/// Hands `node`, which has just won, `Input::Reconciled` for its office, as
+/// its driver does once its scheduler has rebuilt and republished; returns
+/// what that step asked for. A node tested for its election alone has no
+/// tasks to reconcile.
+pub fn finish_reconciling(node: &mut TestNode) -> Vec<Output> {
+    let office = node
+        .office_term()
+        .expect("finish_reconciling: the node holds office");
+    assert_eq!(
+        node.state(),
+        WorkerState::LeaderReconciling,
+        "finish_reconciling: the node must be reconciling"
+    );
+    node.step(Input::Reconciled(office)).outputs
+}
+
 /// Elects `node`, an `Active` voter, over a real roll call for the term
 /// after the latest it knows of: stands it as the candidate (see
 /// [`stand_as_candidate`]), so each of `peers` is in the roster it wins,
-/// then hands it a grant from each of them until it wins. With no `peers`
-/// its own roll call elects it at its deadline. Returns what the step that
-/// won asked for.
+/// then hands it a grant from each of them until it wins, and finishes its
+/// reconciling. With no `peers` its own roll call elects it at its
+/// deadline. Returns what the steps that won and reconciled asked for.
 pub fn elect(
     node: &mut TestNode,
     clock: &FakeClock,
@@ -238,7 +254,8 @@ pub fn elect(
 ) -> Vec<Output> {
     if peers.is_empty() {
         start_roll_call(node, clock, suspect_timeout);
-        let won = close_roll_call(node, clock, suspect_timeout);
+        let mut won = close_roll_call(node, clock, suspect_timeout);
+        won.extend(finish_reconciling(node));
         assert_eq!(
             node.state(),
             WorkerState::Leader,
@@ -258,6 +275,7 @@ pub fn elect(
             );
         }
     }
+    won.extend(finish_reconciling(node));
     assert_eq!(
         node.state(),
         WorkerState::Leader,

@@ -19,12 +19,14 @@
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use kabudachi_core::election::{DropMessages, NoAuthority, Step, WorkerNode, carry_out};
+use kabudachi_core::election::{DropMessages, Input, NoAuthority, Step, WorkerNode, carry_out};
+use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::protocol::generated::TaskRecord;
+use kabudachi_core::reconcile::{ReconcileTerm, reconcile_alone};
 use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Completion,
     ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission, Submitted,
@@ -224,6 +226,17 @@ fn settle_pending<C: Clock>(inside: &mut Inside<C>) {
     record_queued(inside);
 }
 
+/// The office the node holds while it waits to be told it has reconciled,
+/// if its scheduler is waiting for the same one.
+fn reconciling_office<C: Clock>(
+    node: &WorkerNode<C>,
+    scheduler: &DoorScheduler<C>,
+) -> Option<ReconcileTerm> {
+    let office = node.office_term()?;
+    (node.state() == WorkerState::LeaderReconciling && scheduler.reconciling() == Some(office))
+        .then_some(office)
+}
+
 /// The bindings' one way into the shared scheduler.
 pub struct SchedulerDoor<C: Clock> {
     inside: Mutex<Inside<C>>,
@@ -404,7 +417,7 @@ impl<C: Clock> SchedulerDoor<C> {
         mut observe: impl FnMut(&Step),
     ) -> Result<Option<Instant>, Closed> {
         self.change_inside(Concerned::ClaimsAndTimers, |inside| {
-            let next = carry_out(
+            let mut next = carry_out(
                 node,
                 step,
                 &mut inside.scheduler,
@@ -413,6 +426,32 @@ impl<C: Clock> SchedulerDoor<C> {
                 |_, _, _, step| observe(step),
             );
             drop(inside.scheduler.observer_mut().take_settled());
+            if let Some(office) = reconciling_office(node, &inside.scheduler) {
+                let silent = reconcile_alone(&mut inside.scheduler, &self.worker, node.now(), office)
+                    // Cannot fail: the caller found the scheduler reconciling this office
+                    // (`reconciling_office`), and the rebuild runs once, before the node
+                    // is told it has reconciled, which is what ends the reconciliation.
+                    .expect("a lone node reconciles the office its scheduler waits for");
+                let watching = node.step(Input::WatchWorkers(silent));
+                carry_out(
+                    node,
+                    watching,
+                    &mut inside.scheduler,
+                    &mut DropMessages,
+                    &mut NoAuthority,
+                    |_, _, _, step| observe(step),
+                );
+                let reconciled = node.step(Input::Reconciled(office));
+                next = carry_out(
+                    node,
+                    reconciled,
+                    &mut inside.scheduler,
+                    &mut DropMessages,
+                    &mut NoAuthority,
+                    |_, _, _, step| observe(step),
+                );
+                drop(inside.scheduler.observer_mut().take_settled());
+            }
             next
         })
     }
@@ -797,6 +836,41 @@ pub(crate) mod tests {
             task,
             "the task claimed is the one the client was told of"
         );
+    }
+
+    #[test]
+    fn a_node_that_takes_office_rebuilds_from_its_own_store_and_keeps_its_runs() {
+        let clock = ManualClock::default();
+        // An earlier leader, at term 0, left a task running in the store.
+        let door = door(clock.clone(), Some(grant(0)));
+        let task = door.submit(submission()).unwrap();
+        let claims = block_on(Arc::clone(&door).claim_when_available(1)).unwrap();
+        let run = claims[0].task_run_id.clone();
+        door.report_started(&run).unwrap();
+
+        let (mut node, first) = local_node(
+            worker(),
+            IncarnationId::new("incarnation-1"),
+            ShardId::new("local"),
+            clock.clone(),
+            CoreDuration::from_millis(0),
+        );
+        door.carry_out(&mut node, first, |_| {}).unwrap();
+        for _ in 0..4 {
+            clock.advance(10);
+            let step = node.step(Input::Tick);
+            door.carry_out(&mut node, step, |_| {}).unwrap();
+        }
+
+        assert_eq!(node.state(), WorkerState::Leader, "it leads in the same call that reconciled");
+        let record = door.record(&task).unwrap().unwrap();
+        assert_eq!(
+            record.version.map(|version| version.leader_term),
+            Some(node.term()),
+            "republished at the new term"
+        );
+        assert_eq!(door.run_state(&run).unwrap(), Some(TaskRunState::Running));
+        assert!(door.complete(&run, digest(), Completion::Final).is_ok(), "the run is still its own");
     }
 
     #[test]

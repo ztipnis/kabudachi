@@ -33,7 +33,8 @@ use crate::support::builders::{
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    TestNode, connect, deliver, deliver_all, published_roll_calls, sent, sent_to, tick, voter_node,
+    TestNode, connect, deliver, deliver_all, finish_reconciling, published_roll_calls, sent, sent_to,
+    tick, voter_node,
 };
 
 const SHARD: &str = "shard-1";
@@ -320,10 +321,12 @@ fn an_election_admits_a_pending_joiner_that_answered_its_roll_call() {
         let ticked: Vec<(WorkerId, Vec<Output>)> = ids
             .iter()
             .map(|id| {
-                (
-                    id.clone(),
-                    nodes.get_mut(id).unwrap().step(Input::Tick).outputs,
-                )
+                let node = nodes.get_mut(id).unwrap();
+                let mut outputs = node.step(Input::Tick).outputs;
+                if node.state() == WorkerState::LeaderReconciling {
+                    outputs.extend(finish_reconciling(node));
+                }
+                (id.clone(), outputs)
             })
             .collect();
         for (id, outputs) in ticked {

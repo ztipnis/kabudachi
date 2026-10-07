@@ -5,15 +5,18 @@
 
 use crate::support::builders::{
     message_input,
-    configuration_of, g0, past_any_suspicion, shard, timings, vote_request, vote_request_message,
-    voter_of, worker,
+    configuration_of, g0, heartbeat_message, past_any_suspicion, shard, timings, vote_request,
+    vote_request_message, voter_of, worker,
 };
 
 use crate::support::clock::FakeClock;
-use crate::support::node::{deliver, sent, sent_to, state_changes, tick};
+use crate::support::node::{
+    deliver, elect, finish_reconciling, sent, sent_to, state_changes, tick, voter_node,
+};
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input, Output, Step, WorkerNode};
-use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
+use kabudachi_core::protocol::ids::{IncarnationId, TaskRunId, WorkerId};
+use kabudachi_core::reconcile::active_runs_digest;
 use kabudachi_core::protocol::messages::{
     AckEcho, ElectionMessage, JoinResponse, LeaderHeartbeatAck, WorkerHeartbeat, election_message,
 };
@@ -471,6 +474,9 @@ fn a_leader_knows_itself_as_leader_in_its_own_term() {
     clock.advance(timings(Duration::from_ticks(10)).roll_call_deadline);
     tick(&mut node);
 
+    assert_eq!(node.state(), WorkerState::LeaderReconciling);
+    assert_eq!(node.known_leader(), Some((worker("w1"), node.term())));
+    finish_reconciling(&mut node);
     assert_eq!(node.state(), WorkerState::Leader);
     assert_eq!(node.known_leader(), Some((worker("w1"), node.term())));
 }
@@ -570,4 +576,26 @@ fn an_ack_from_someone_other_than_the_leader_it_names_is_ignored() {
     clock.advance(Duration::from_ticks(7));
     tick(&mut node);
     assert_eq!(node.state(), WorkerState::LeaderSuspect);
+}
+
+#[test]
+fn a_heartbeat_carries_the_digest_of_the_runs_the_worker_holds_and_its_leader_reports_it() {
+    let clock = FakeClock::new();
+    let mut follower = make_node(&clock, worker("w1"), Duration::from_ticks(SUSPECT_TIMEOUT));
+    let digest = active_runs_digest([&TaskRunId::new("r1")]);
+    follower.set_active_runs_digest(digest.clone());
+    clock.advance(Duration::from_ticks(2));
+    let outputs = receive_ack(&mut follower, ack_sent_at(1, 7));
+    let beat = heartbeats_to(&outputs, "leader-1").remove(0);
+    assert_eq!(beat.active_task_runs_digest, digest.value().to_vec());
+
+    let leader_id = worker("leader-1");
+    let mut leader = voter_node(&clock, &leader_id, 3, SUSPECT_TIMEOUT);
+    elect(&mut leader, &clock, SUSPECT_TIMEOUT, &[worker("w1"), worker("w2")]);
+    let heard = deliver(&mut leader, &worker("w1"), heartbeat_message(beat));
+
+    assert!(heard.contains(&Output::RunsHeard {
+        worker: worker("w1"),
+        digest: digest.value().to_vec(),
+    }));
 }

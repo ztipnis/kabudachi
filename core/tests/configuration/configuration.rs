@@ -1235,3 +1235,26 @@ fn a_configuration_that_breaks_a_rule_is_refused_by_its_constructor() {
         assert_eq!(Configuration::joint(joint), Err(rule), "{rule}");
     }
 }
+
+#[test]
+fn a_tally_is_unanimous_only_when_every_voter_of_every_side_was_fed() {
+    let base = generation(1, 2, 0);
+    let configuration = Configuration::single(Single {
+        generation: base,
+        base,
+        voter_count: 3,
+    })
+    .expect("valid");
+
+    let mut tally = fed(
+        Tally::against(&configuration),
+        &[("a", Some(base)), ("b", Some(base)), ("pending", None)],
+    );
+    assert!(tally.has_quorum());
+    assert!(
+        !tally.is_unanimous(),
+        "a quorum is not all, and a pending member is not a voter"
+    );
+    tally.record(worker("c"), Some(base));
+    assert!(tally.is_unanimous());
+}

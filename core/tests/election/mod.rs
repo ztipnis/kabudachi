@@ -10,6 +10,7 @@ mod joint_founding;
 mod leader_heartbeat;
 mod membership;
 mod no_quorum;
+mod reconciling;
 mod roll_call;
 mod step_down;
 mod step;

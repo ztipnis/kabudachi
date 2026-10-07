@@ -18,7 +18,7 @@ use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::claimed_runs::HeldRun;
 use kabudachi_net::messenger::Net;
 
-use crate::support::records::ThreeVoters;
+use crate::support::records::{ThreeVoters, Voters};
 
 const RESULT: &[u8] = b"the-result";
 
@@ -35,7 +35,7 @@ fn reject_reason(response: &TaskResponse) -> Option<TaskRejectReason> {
 
 /// How many of the shard's workers hold, as the newest run of `task`, one in
 /// `state`.
-fn holders_at(shard: &ThreeVoters, task: &TaskId, state: TaskRunState) -> usize {
+fn holders_at(shard: &Voters, task: &TaskId, state: TaskRunState) -> usize {
     shard
         .nets
         .iter()
@@ -48,7 +48,7 @@ fn holders_at(shard: &ThreeVoters, task: &TaskId, state: TaskRunState) -> usize 
 const QUORUM: usize = 2;
 
 /// Claims `task` for `client` through `leader`, returning the run.
-async fn claim(shard: &mut ThreeVoters, client: &Net, leader: usize, task: &TaskId) -> TaskRunId {
+async fn claim(shard: &mut Voters, client: &Net, leader: usize, task: &TaskId) -> TaskRunId {
     let claimed = shard
         .drive_until(client.request_claim(shard.id(leader), task.clone()))
         .await

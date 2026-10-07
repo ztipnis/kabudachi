@@ -204,8 +204,10 @@ impl NativeRuntime {
     ///
     /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree,
     /// `BackpressureError` if the task does not fit under the hard memory
-    /// limit or is too large to be claimed (about 1 MiB with its queue and
-    /// key), and `RuntimeError` if the runtime has shut down or the leader
+    /// limit, is too large to be claimed (about 1 MiB with its queue and
+    /// key), or, transiently, its coalescing key's newest generation is not
+    /// yet known to the scheduler (submit again shortly), and
+    /// `RuntimeError` if the runtime has shut down or the leader
     /// could not record the task now: this worker is not leading, its lease
     /// ended during the call, or the store refused the write. All of those
     /// can be retried, but the refused task may already sit in the
@@ -275,7 +277,8 @@ impl NativeRuntime {
                     }
                     SubmitRejection::TooLarge { .. }
                     | SubmitRejection::RecordTooLarge { .. }
-                    | SubmitRejection::Backpressure { .. } => {
+                    | SubmitRejection::Backpressure { .. }
+                    | SubmitRejection::KeyNotReady => {
                         errors::backpressure_error(py, rejection.to_string())
                     }
                 })

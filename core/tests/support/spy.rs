@@ -139,6 +139,14 @@ impl Spy {
         self.0.borrow().revisions.clone()
     }
 
+    /// Every revision the scheduler published of `task`, in order.
+    pub fn revisions_of(&self, task: &TaskId) -> Vec<TaskRecord> {
+        self.revisions()
+            .into_iter()
+            .filter(|record| record.task.as_ref().map(|task| task.task_id()).as_ref() == Some(task))
+            .collect()
+    }
+
     /// Every revision published since the last call, oldest first. A
     /// `Cluster` drains this after each step to write the revisions, so a
     /// cluster node's spy has an empty `revisions()` once a step has run.

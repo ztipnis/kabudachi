@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::TaskId;
+use kabudachi_core::reconcile::HeldKey;
+use kabudachi_core::reconcile::wire::held_key;
 use kabudachi_core::task_record::{MAX_RECORD_BYTES, VersionedRecords, identify};
 use kabudachi_core::time::{Clock, RealClock};
 use libp2p::PeerId;
@@ -67,6 +69,26 @@ impl HeldRecords {
             .iter()
             .filter_map(|record| identify(record).ok().map(|(task, _)| task))
             .collect()
+    }
+
+    /// Feeds `take` a summary of each record held after `after` (every one
+    /// for `None`), in task id order, until it refuses one. Says whether it
+    /// took every record: `false` means the refused one, and all after it,
+    /// remain.
+    pub fn keys_after(&self, after: Option<&TaskId>, mut take: impl FnMut(HeldKey) -> bool) -> bool {
+        self.lock()
+            .iter()
+            .filter_map(|record| {
+                let key = match held_key(record) {
+                    Ok(key) => key,
+                    Err(malformed) => {
+                        tracing::warn!(%malformed, "a held record does not summarise; left out of the report");
+                        return None;
+                    }
+                };
+                after.is_none_or(|after| key.task_id > *after).then_some(key)
+            })
+            .all(|key| take(key))
     }
 
     /// The records, after dropping every finished one whose retention has

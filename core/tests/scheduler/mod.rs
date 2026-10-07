@@ -8,6 +8,7 @@ mod scheduler_failure;
 mod scheduler_lifecycle;
 mod scheduler_loss;
 mod scheduler_observer;
+mod scheduler_reconcile;
 mod scheduler_records;
 mod scheduler_retry;
 mod scheduler_timing;
