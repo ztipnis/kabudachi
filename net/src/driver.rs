@@ -588,7 +588,8 @@ where
     let current = reconciliation.as_mut()?;
     let mut next_deadline = None;
     loop {
-        current.ask_and_fetch(stepper.node, clock.now());
+        let now = clock.now();
+        current.ask_and_fetch(stepper.node, now);
         let lookups_done = current.lookups_done();
         let mut ports = stepper.ports();
         let turn = stepper.records.reconcile(
@@ -596,7 +597,7 @@ where
             stepper.node,
             stepper.scheduler,
             lookups_done,
-            clock.now(),
+            now,
             &mut ports,
         );
         match turn {

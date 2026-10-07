@@ -560,7 +560,7 @@ impl Cluster {
         let next_reconciliation = self
             .reconciling
             .iter()
-            .filter(|(id, _)| !self.dead.contains(*id))
+            .filter(|(id, _)| !self.is_stalled(id, now) && !self.dead.contains(*id))
             .filter_map(|(_, reconciliation)| reconciliation.wake_at())
             .map(|at| at.max(now))
             .min();
