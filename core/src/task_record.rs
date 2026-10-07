@@ -2,6 +2,7 @@
 //! wrote it, the order between two revisions of one, and the store a worker
 //! keeps them in.
 
+mod candidate;
 mod gate;
 mod ledger;
 mod local;
@@ -10,6 +11,7 @@ mod outbox;
 mod store;
 mod version;
 
+pub use candidate::looks_claimable;
 pub use gate::{EffectGate, PlacedWrite, Settled, Write, WriteOutcome};
 pub use ledger::{Waits, WriteLedger};
 pub use local::LocalRecords;

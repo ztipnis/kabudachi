@@ -21,9 +21,10 @@ use kabudachi_core::protocol::messages::{
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{Scheduler, Submission, Submitted, mint};
 use kabudachi_core::task_record::RecordOutbox;
-use kabudachi_core::time::{Duration, RealClock};
+use kabudachi_core::time::{Duration, RealClock, WallTime};
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
+use kabudachi_net::task_store::placement::ReplicationFactor;
 use libp2p::futures::future::select_all;
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -58,6 +59,7 @@ pub struct Voters {
     pub schedulers: Vec<Scheduled>,
     pub clock: RealClock,
     ids: Vec<WorkerId>,
+    replication_factor: ReplicationFactor,
     /// Keeps each net's hosting thread running for as long as the voters live.
     _hosts: Vec<Hosting>,
     states: Vec<watch::Receiver<WorkerState>>,
@@ -97,13 +99,34 @@ impl Voters {
     /// node: a client the leader's roster does not hold until
     /// [`Self::join_as_pending`] makes it a pending member.
     pub async fn start(count: usize) -> (Voters, Net) {
+        Self::start_with(count, ReplicationFactor::DEFAULT).await
+    }
+
+    /// Like [`Self::start`], with each record written to `replication_factor`
+    /// voters, so that with fewer than `count` of them, voters differ in what
+    /// they hold.
+    pub async fn start_with(count: usize, replication_factor: ReplicationFactor) -> (Voters, Net) {
+        let claimant = Net::for_shard(ShardId::new(SHARD), None);
+        let shard = Self::meshed(count, replication_factor, Some(&claimant)).await;
+        (shard, claimant)
+    }
+
+    /// Like [`Self::start_with`], with no client: the client speaks the
+    /// shard's records protocol, so it would sit in each voter's records
+    /// routing table, and with it a voter's steal targets would not be the
+    /// other voters alone.
+    pub async fn start_without_client(count: usize, replication_factor: ReplicationFactor) -> Voters {
+        Self::meshed(count, replication_factor, None).await
+    }
+
+    /// `count` hosted voters, fully meshed with each other and with `client`.
+    async fn meshed(count: usize, replication_factor: ReplicationFactor, client: Option<&Net>) -> Voters {
         let shard = ShardId::new(SHARD);
         let hosted: Vec<_> = (0..count).map(|_| host(shard.clone())).collect();
         let (nets, hosts): (Vec<_>, Vec<_>) = hosted.into_iter().unzip();
         let nets: Vec<Arc<Net>> = nets.into_iter().map(Arc::new).collect();
-        let claimant = Net::for_shard(shard, None);
         let mut everyone: Vec<&Net> = nets.iter().map(|net| &**net).collect();
-        everyone.push(&claimant);
+        everyone.extend(client);
         let mut ids = connect_full_mesh(&everyone).await;
         ids.truncate(nets.len());
         let clock = RealClock::new();
@@ -115,20 +138,18 @@ impl Voters {
         let senders = channels.iter().map(|(sender, _)| sender.clone()).collect();
         let states = channels.into_iter().map(|(_, receiver)| receiver).collect();
         let killed = vec![false; nodes.len()];
-        (
-            Voters {
-                nets,
-                nodes,
-                schedulers,
-                clock,
-                ids,
-                _hosts: hosts,
-                states,
-                senders,
-                killed,
-            },
-            claimant,
-        )
+        Voters {
+            nets,
+            nodes,
+            schedulers,
+            clock,
+            ids,
+            replication_factor,
+            _hosts: hosts,
+            states,
+            senders,
+            killed,
+        }
     }
 
     /// A reading of every voter's state that stays current while the shard is
@@ -215,6 +236,10 @@ impl Voters {
     pub async fn drive_until<T>(&mut self, until: impl Future<Output = T>) -> T {
         let clock = self.clock;
         let (nets, senders, killed) = (&self.nets, &self.senders, &self.killed);
+        let config = DriverConfig {
+            replication_factor: self.replication_factor,
+            ..DriverConfig::default()
+        };
         let drivers: Vec<Pin<Box<dyn Future<Output = Infallible> + '_>>> = self
             .nodes
             .iter_mut()
@@ -230,7 +255,7 @@ impl Voters {
                     scheduler,
                     clock,
                     None,
-                    DriverConfig::default(),
+                    config.clone(),
                     observe,
                 )) as Pin<Box<dyn Future<Output = Infallible> + '_>>
             })
@@ -363,6 +388,19 @@ pub async fn wait_until_held(net: Arc<Net>, tasks: Vec<TaskId>) {
 /// again until the leader's lease is ready, and returns the task's id.
 pub async fn submitted_through(worker: &Net, leader: &WorkerId, submission: Submission) -> TaskId {
     submitted_as(worker, leader, mint(submission, &Uuid7Ids, &RealClock::new())).await
+}
+
+/// Has `worker` submit `submission` to `leader` under the given task id and
+/// submission time, so a test can set the order of ids apart from the order of
+/// submission, and returns the task's id.
+pub async fn submitted_with(
+    worker: &Net,
+    leader: &WorkerId,
+    (task, at): (&str, WallTime),
+    submission: Submission,
+) -> TaskId {
+    let submitted = Submitted::received(TaskId::new(task), at, submission, &RealClock::new());
+    submitted_as(worker, leader, submitted).await
 }
 
 /// Like [`submitted_through`], for a submission already minted.

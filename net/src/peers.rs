@@ -242,11 +242,13 @@ pub struct Traffic {
     pub task_requests_received: u64,
     /// `/kabudachi/reconcile/1` requests received.
     pub reconcile_requests_received: u64,
+    /// `/kabudachi/steal/1` requests received.
+    pub steal_requests_received: u64,
 }
 
 impl Traffic {
     /// Everything this worker received or sent: election messages in and
-    /// out, and join, claim, task and reconcile requests in (each answered once).
+    /// out, and join, claim, task, reconcile and steal requests in (each answered once).
     pub fn total(&self) -> u64 {
         self.messages_received
             + self.messages_sent
@@ -255,6 +257,7 @@ impl Traffic {
             + self.claim_requests_received
             + self.task_requests_received
             + self.reconcile_requests_received
+            + self.steal_requests_received
     }
 }
 
@@ -284,6 +287,9 @@ impl std::ops::Sub for Traffic {
             reconcile_requests_received: self
                 .reconcile_requests_received
                 .saturating_sub(earlier.reconcile_requests_received),
+            steal_requests_received: self
+                .steal_requests_received
+                .saturating_sub(earlier.steal_requests_received),
         }
     }
 }
@@ -334,6 +340,7 @@ pub(crate) enum Carried {
     ClaimRequest,
     TaskRequest,
     ReconcileRequest,
+    StealRequest,
 }
 
 /// What the swarm task saw happen, for the peer book. Every observation comes
@@ -483,6 +490,7 @@ impl Peers {
                 Carried::ClaimRequest => self.traffic.claim_requests_received += 1,
                 Carried::TaskRequest => self.traffic.task_requests_received += 1,
                 Carried::ReconcileRequest => self.traffic.reconcile_requests_received += 1,
+                Carried::StealRequest => self.traffic.steal_requests_received += 1,
             },
         }
     }

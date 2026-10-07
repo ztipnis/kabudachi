@@ -50,6 +50,11 @@ impl WallTime {
         self.0
     }
 
+    /// This moment `millis` later, saturating at the largest time.
+    pub(crate) fn plus_millis(self, millis: u64) -> Self {
+        WallTime(self.0.saturating_add(millis))
+    }
+
     /// `clock`'s wall-clock reading now.
     pub fn now(clock: &impl Clock) -> Self {
         WallTime(clock.wall_clock_millis())

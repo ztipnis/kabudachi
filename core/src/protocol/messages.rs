@@ -36,6 +36,7 @@ pub use generated::{
 pub use generated::{
     HeldKey, ReconcileReport, ReconcileRequest, ReportedRun, ReportedRunState, reconcile_request,
 };
+pub use generated::{StealRequest, StealResponse};
 
 /// Whether every required ID field of a raw message is present. Nested
 /// messages are not checked; [`checked::decode`] covers them.

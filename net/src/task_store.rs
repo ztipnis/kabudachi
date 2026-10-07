@@ -17,8 +17,8 @@ use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::TaskId;
 use kabudachi_core::reconcile::HeldKey;
 use kabudachi_core::reconcile::wire::held_key;
-use kabudachi_core::task_record::{MAX_RECORD_BYTES, VersionedRecords, identify};
-use kabudachi_core::time::{Clock, RealClock};
+use kabudachi_core::task_record::{MAX_RECORD_BYTES, VersionedRecords, identify, looks_claimable};
+use kabudachi_core::time::{Clock, RealClock, WallTime};
 use libp2p::PeerId;
 use libp2p::kad;
 use prost::Message as _;
@@ -68,6 +68,21 @@ impl HeldRecords {
         self.lock()
             .iter()
             .filter_map(|record| identify(record).ok().map(|(task, _)| task))
+            .collect()
+    }
+
+    /// Each task whose record, as this worker holds it, looks claimable at
+    /// `now` (see `looks_claimable`), with when it was submitted, in task id
+    /// order.
+    pub(crate) fn claimable(&self, now: WallTime) -> Vec<(WallTime, TaskId)> {
+        self.lock()
+            .iter()
+            .filter(|record| looks_claimable(record, now))
+            .filter_map(|record| {
+                let (task, _) = identify(record).ok()?;
+                let submitted_at = record.task.as_ref()?.submitted_at?;
+                Some((WallTime::from(submitted_at), task))
+            })
             .collect()
     }
 

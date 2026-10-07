@@ -3,6 +3,7 @@
 
 mod bootstrap;
 mod claim;
+mod discovery;
 mod driver;
 mod election;
 mod join;

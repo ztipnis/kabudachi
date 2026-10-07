@@ -21,7 +21,8 @@
 //! and a task-exchange request (a submission, a report on a run, a cancel)
 //! with the scheduler's decision, gated like a claim. Every worker, leader or
 //! not, also answers a reconcile request with a page of the runs and records it
-//! holds, whoever asks. And it tells `Net` which leader the node
+//! holds, whoever asks, and a steal request with the tasks whose records it
+//! holds that look claimable (see `crate::steal`). And it tells `Net` which leader the node
 //! names, so the worker's own claims go to that leader. Between batches it
 //! re-crawls the worker's peer routing once the node's view of its shard
 //! has changed and settled, and periodically (see `crate::routing_refresh`), so
@@ -132,7 +133,7 @@ use kabudachi_core::scheduler::{ReconcileRefused, Scheduler};
 use kabudachi_core::task_record::{
     EffectGate, RecordOutbox, Settled, Settlement, Waits, Write, WriteLedger, WriteOrder,
 };
-use kabudachi_core::time::{Clock, Instant};
+use kabudachi_core::time::{Clock, Instant, WallTime};
 use libp2p::Multiaddr;
 
 use tokio::time::Instant as TokioInstant;
@@ -145,6 +146,7 @@ use crate::leader_search::{JoinOverNet, Rejoin, StrandedWatch};
 use crate::messenger::{Net, PlacedWrite, WriteOutcome};
 use crate::reconcile::leader::{LeaderReconciliation, Progress, Stuck};
 use crate::reconcile::report::page_of;
+use crate::steal::candidates_for_steal;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
 use crate::routing_refresh::{RoutingRefresh, ShardView};
 use crate::task_exchange::{self, TaskRequestHandle};
@@ -436,6 +438,7 @@ where
             config.replication_factor,
         );
         respond_to_reconcile_requests(stepper.node, net);
+        respond_to_steal_requests(net, &clock);
         stepper.write_revisions();
         // A step can report a deadline that has already come: a voter that
         // begins suspecting its leader starts a roll call at its next
@@ -1275,6 +1278,18 @@ fn respond_to_reconcile_requests<C: Clock>(node: &WorkerNode<C>, net: &Net) {
             &net.held_records(),
         );
         net.respond_reconcile(handle, page);
+    }
+}
+
+/// Answers every inbound `/kabudachi/steal/1` request queued on `net` with
+/// the tasks this worker holds records of that look claimable. Every worker
+/// answers: it needs no leadership and decides nothing, since a task it names
+/// must still be claimed from the leader.
+fn respond_to_steal_requests<C: Clock>(net: &Net, clock: &C) {
+    let now = WallTime::now(clock);
+    for handle in net.poll_steal_requests() {
+        let task_ids = candidates_for_steal(&net.held_records(), now, handle.limit());
+        net.respond_steal(handle, task_ids);
     }
 }
 

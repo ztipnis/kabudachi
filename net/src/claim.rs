@@ -113,7 +113,8 @@ impl Net {
     /// `limit`, or none: the leader hands out only as many as fit in one
     /// message. The caller names the leader, as for
     /// [`Self::request_claim`]. See [`ClaimFailure`] for why there may be no
-    /// answer.
+    /// answer. It is the last stage of [`Self::discover`], after the tasks
+    /// this worker's own records and its peers' show.
     pub async fn claim_oldest(
         &self,
         leader: WorkerId,

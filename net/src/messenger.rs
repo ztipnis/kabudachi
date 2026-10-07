@@ -144,6 +144,15 @@
 //! [`Net::respond_reconcile`] serve the answering side, which every worker
 //! does for whichever leader asks.
 //!
+//! ## The steal protocol
+//!
+//! `/kabudachi/steal/1` (see `crate::steal`) is a fifth correlated protocol of
+//! the same shape: [`Net::steal`] asks a shard peer which tasks it holds
+//! records of that look claimable, and [`Net::poll_steal_requests`] /
+//! [`Net::respond_steal`] serve the answering side, which every worker does.
+//! [`Net::steal_targets`] reads the records `kad` routing table, afresh on
+//! every call, to say which peers to ask; nothing keeps that list.
+//!
 //! ## Reconnect/backoff and where a peer's address comes from
 //!
 //! What a `Net` knows about its peers, and the fast-then-slow redial of a dropped
@@ -202,6 +211,7 @@ use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
 use crate::reconcile::codec::ReconcileCodec;
+use crate::steal::codec::StealCodec;
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm};
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_store::{HeldRecords, record_key};
@@ -280,6 +290,7 @@ pub(crate) struct Exchanges {
     claim: Exchange<ClaimCodec>,
     task: Exchange<TaskCodec>,
     reconcile: Exchange<ReconcileCodec>,
+    steal: Exchange<StealCodec>,
 }
 
 /// A correlated protocol `Net` carries through an [`Exchange`]
@@ -347,6 +358,19 @@ impl Correlated for ReconcileCodec {
     }
 }
 
+impl Correlated for StealCodec {
+    const ARRIVAL: Carried = Carried::StealRequest;
+    fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self> {
+        &mut behaviour.steal
+    }
+    fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
+        &mut exchanges.steal
+    }
+    fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
+        &inbound.steals
+    }
+}
+
 /// [`Net::try_listen_on`] could not listen on this address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenRejected(pub Multiaddr);
@@ -364,7 +388,7 @@ impl std::error::Error for ListenRejected {}
 pub const DEFAULT_INPUT_LIMIT: usize = 1024;
 
 /// What `drive` hands over for the driver of this `Net`'s node, each queue
-/// in arrival order: the node's inputs, the join, claim, task and reconcile requests the
+/// in arrival order: the node's inputs, the join, claim, task, reconcile and steal requests the
 /// driver answers, and the outcomes of the record writes it asked for.
 /// `arrived` is signalled whenever any of them grows.
 pub(crate) struct Inbound {
@@ -375,6 +399,7 @@ pub(crate) struct Inbound {
     claims: Mutex<VecDeque<Asked<ClaimCodec>>>,
     tasks: Mutex<VecDeque<Asked<TaskCodec>>>,
     reconciles: Mutex<VecDeque<Asked<ReconcileCodec>>>,
+    steals: Mutex<VecDeque<Asked<StealCodec>>>,
     writes: Mutex<VecDeque<WriteOutcome>>,
     arrived: Notify,
 }
@@ -388,6 +413,7 @@ impl Default for Inbound {
             claims: Mutex::default(),
             tasks: Mutex::default(),
             reconciles: Mutex::default(),
+            steals: Mutex::default(),
             writes: Mutex::default(),
             arrived: Notify::new(),
         }
@@ -904,6 +930,38 @@ impl Net {
                 None => Vec::new(),
             };
             let _ = respond_to.send(peers);
+        })));
+        if sent.is_err() {
+            return Vec::new();
+        }
+        answer.await.unwrap_or_default()
+    }
+
+    /// The shard peers this worker's records `kad` routing table knows,
+    /// grouped by distance class from this worker's key, nearest class
+    /// first: the order a steal asks in. `kad` keeps a peer in the bucket
+    /// that holds peers at its XOR distance, and the buckets run from near
+    /// to far, so a class is one bucket. Read afresh on every call and kept
+    /// by no one: it routes asks and says nothing about who is a member of
+    /// the shard. Empty for a `Net` built with [`Self::new`], or if the swarm
+    /// task has stopped.
+    pub async fn steal_targets(&self) -> Vec<Vec<WorkerId>> {
+        let (respond_to, answer) = oneshot::channel();
+        let sent = self.commands.send(Command::Exchange(Box::new(move |swarm, _| {
+            let classes = match swarm.behaviour_mut().records.as_mut() {
+                Some(records) => records
+                    .kbuckets()
+                    .map(|bucket| {
+                        bucket
+                            .iter()
+                            .map(|entry| worker_id_of(entry.node.key.preimage()))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|class| !class.is_empty())
+                    .collect(),
+                None => Vec::new(),
+            };
+            let _ = respond_to.send(classes);
         })));
         if sent.is_err() {
             return Vec::new();
@@ -1603,6 +1661,9 @@ fn handle_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Reconcile(event)) => {
             settle::<ReconcileCodec>(&mut pending.exchanges, event, inbound, peers, now);
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Steal(event)) => {
+            settle::<StealCodec>(&mut pending.exchanges, event, inbound, peers, now);
         }
         _ => {}
     }

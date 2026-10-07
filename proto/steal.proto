@@ -1,0 +1,17 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+
+// A worker with nothing to run asks a shard peer which tasks that peer holds
+// records of that look claimable. The answer decides nothing: every task in
+// it must still be claimed from the leader, who may refuse.
+message StealRequest {
+  // The most task ids to return.
+  uint32 limit = 1;
+}
+
+// Task ids, oldest submission first.
+message StealResponse {
+  repeated TaskId task_ids = 1;
+}

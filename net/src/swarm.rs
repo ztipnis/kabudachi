@@ -3,13 +3,15 @@
 //! handshake over TCP+noise+yamux.
 //!
 //! `Behaviour` holds `identify`, `gossipsub`, two `kad` behaviours (one that
-//! routes, one that stores the shard's Task records) and five
+//! routes, one that stores the shard's Task records) and six
 //! `request_response` behaviours: one carrying the election protocol (see
 //! `crate::codec`), one the bootstrap join protocol (see
 //! `crate::join_codec`), one the claim arbitration protocol (see
-//! `crate::claim::codec`), and one the task exchange (see
-//! `crate::task_exchange::codec`), and one the reconciliation of a new leader
-//! (see `crate::reconcile::codec`) — each a deliberately separate wire protocol, not a
+//! `crate::claim::codec`), one the task exchange (see
+//! `crate::task_exchange::codec`), one the reconciliation of a new leader
+//! (see `crate::reconcile::codec`) and one the steal exchange, by which a
+//! worker asks a shard peer for the tasks it holds records of that look
+//! claimable (see `crate::steal::codec`) — each a deliberately separate wire protocol, not a
 //! variant folded into `ElectionMessage` (see `crate::join_codec`'s module
 //! doc). `gossipsub` carries the election messages a worker publishes to its
 //! whole shard rather than sends to one peer; every message is signed with
@@ -85,8 +87,11 @@
 //! record to the holders it names (`put_record_to`), and a worker's records
 //! behaviour only answers those puts and gets. Where a record goes is the
 //! leader's configuration alone; this behaviour's routing table is never read
-//! as membership either. A `Net` that serves no shard (`Net::new`) has it
-//! disabled.
+//! as membership either. Its routing table holds only peers that speak the
+//! shard's records protocol, which is why a worker looking for work reads it,
+//! afresh on each call and keeping nothing of it, to choose the shard peers to
+//! ask (`crate::messenger::Net::steal_targets`). A `Net` that serves no shard
+//! (`Net::new`) has it disabled, and so has no peers to ask.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -108,6 +113,7 @@ use crate::claim::codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
 use crate::codec::{ElectionCodec, PROTOCOL};
 use crate::join_codec::{JoinCodec, PROTOCOL as JOIN_PROTOCOL};
 use crate::reconcile::codec::{PROTOCOL as RECONCILE_PROTOCOL, ReconcileCodec};
+use crate::steal::codec::{PROTOCOL as STEAL_PROTOCOL, StealCodec};
 use crate::task_exchange::codec::{PROTOCOL as TASK_PROTOCOL, TaskCodec};
 use crate::task_store::{
     HeldRecords, MAX_RECORD_PACKET_BYTES, RECORD_WRITE_TIMEOUT, TaskRecordStore,
@@ -167,6 +173,7 @@ pub struct Behaviour {
     pub claim: request_response::Behaviour<ClaimCodec>,
     pub task: request_response::Behaviour<TaskCodec>,
     pub reconcile: request_response::Behaviour<ReconcileCodec>,
+    pub steal: request_response::Behaviour<StealCodec>,
 }
 
 /// libp2p's TCP transport, except that every dial it makes leaves from a
@@ -359,6 +366,15 @@ pub(crate) fn build_swarm(shard: Option<&ShardId>, held: HeldRecords) -> Swarm<B
             // respond_to_reconcile_requests for the answering side.
             reconcile: request_response::Behaviour::new(
                 [(RECONCILE_PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default(),
+            ),
+            // ProtocolSupport::Full on every node: any worker may ask a shard
+            // peer for work or answer such a question — see
+            // net/src/driver.rs's respond_to_steal_requests for the answering
+            // side. Only a shard's workers are ever asked (see
+            // `crate::messenger::Net::steal_targets`).
+            steal: request_response::Behaviour::new(
+                [(STEAL_PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default(),
             ),
             blocked: allow_block_list::Behaviour::default(),
