@@ -1050,9 +1050,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             reports,
         } = rebuild;
         self.clear_tasks();
-        let office =
-            self.reconciliation
-                .rebuilt(reports.keys().cloned().collect(), uncertain, uncertain_keys);
+        let office = self.reconciliation.rebuilt(
+            reports.keys().cloned().collect(),
+            uncertain,
+            uncertain_keys,
+        );
         self.install_settled(records, false);
         // What applying the reports did (runs lost, certified or failed) is
         // not reported back: the caller learns of it from the revisions the
@@ -1100,7 +1102,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let tasks = &self.tasks;
         let candidates = self
             .reconciliation
-            .learn(records, uncertain, uncertain_keys, |task| tasks.contains_key(task));
+            .learn(records, uncertain, uncertain_keys, |task| {
+                tasks.contains_key(task)
+            });
         let mut adopted = Adopted::default();
         let installed = self.install_settled(candidates, true);
         adopted.installed = installed.len();
@@ -2647,7 +2651,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let eligible: BTreeSet<&TaskId> = tasks
             .iter()
-            .filter(|task| self.tasks.contains_key(*task) && !self.reconciliation.is_uncertain(task))
+            .filter(|task| {
+                self.tasks.contains_key(*task) && !self.reconciliation.is_uncertain(task)
+            })
             .collect();
         self.unpublished.extend(eligible.iter().map(|task| (*task).clone()));
         self.end_call();

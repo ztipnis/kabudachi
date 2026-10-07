@@ -59,6 +59,7 @@ fn key_map(keys: BTreeMap<TaskId, CoalescingKey>) -> BTreeMap<TaskId, Key> {
 }
 
 impl Reconciliation {
+    /// Whether `task`'s newest record cannot be known yet.
     pub(super) fn is_uncertain(&self, task: &TaskId) -> bool {
         self.uncertain.contains_key(task)
     }
@@ -68,6 +69,7 @@ impl Reconciliation {
         self.uncertain.values().any(|runs| runs.contains(run))
     }
 
+    /// How many tasks still wait for a record this leader can rely on.
     pub(super) fn uncertain_count(&self) -> usize {
         self.uncertain.len()
     }
@@ -106,7 +108,10 @@ impl Reconciliation {
             return;
         };
         let runs = record.runs.iter().map(TaskRunRecord::task_run_id);
-        self.uncertain.entry(task_id.clone()).or_default().extend(runs);
+        self.uncertain
+            .entry(task_id.clone())
+            .or_default()
+            .extend(runs);
         self.deferred.insert(task_id, record);
     }
 
@@ -172,7 +177,9 @@ impl Reconciliation {
     /// earlier and left out now is no longer held.
     pub(super) fn drop_unreported(&mut self, worker: &WorkerId, reported: &BTreeSet<TaskRunId>) {
         for held in self.held_reports.values_mut() {
-            held.retain(|(holder, run)| holder != worker || reported.contains(&run.claim.task_run_id));
+            held.retain(|(holder, run)| {
+                holder != worker || reported.contains(&run.claim.task_run_id)
+            });
         }
         self.held_reports.retain(|_, held| !held.is_empty());
     }
