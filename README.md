@@ -40,7 +40,7 @@ The system consists of two major layers:
 
 Rust is the leading implementation candidate for the native layer, but the architecture is deliberately language-agnostic at the protocol boundary. The specification requires an FFI-capable compiled implementation, not Rust specifically.
 
-The DHT is used for peer registration/discovery inside the live cluster, immutable Task dissemination, TaskRun snapshots, and non-authoritative status reads. It is not the scheduler's source of truth. One worker per shard is elected leader and acts as the current scheduling and lifecycle authority. Workers discover pending work and request claims; the leader accepts or rejects those claims. This keeps task data decentralized while still serializing the small set of operations that genuinely require ordering.
+The DHT is used for peer registration/discovery inside the live cluster, versioned Task records (each holding a Task and its TaskRuns), and non-authoritative status reads. It is not the scheduler's source of truth. One worker per shard is elected leader and acts as the current scheduling and lifecycle authority. Workers discover pending work and request claims; the leader accepts or rejects those claims. This keeps task data decentralized while still serializing the small set of operations that genuinely require ordering.
 
 An external `CoordinationAuthority` exists, with Redis as the default provider. This is intentionally not a broker. It serves as a cold-start directory, leader/shard discovery accelerator, task-to-shard cache, and catastrophic quorum-loss fencing authority. A healthy shard continues claiming, running, completing, and certifying work without Redis on the hot path. If Redis is briefly saturated, cleared, or unavailable, live shards continue. An extended authority outage eventually forces conservative self-fencing because safe automatic recovery from a network partition mathematically requires an external witness.
 
@@ -213,9 +213,9 @@ refresh_index.options(key=tenant)(ids)     # per-submission key (illustrative sp
 
 Until the claiming worker folds them, superseded payloads are retained as an ordered chain (§8.2). A left-fold of a prefix equals the plain left-fold of the whole chain, so compaction needs no associativity from the reducer, only that it is deterministic and side-effect free.
 
-**Bounded retention.** The retained chain is bounded by a memory budget derived from available memory, or from a configured target memory limit. Past a soft threshold the leader schedules an internal compaction run on an eligible worker that folds the oldest payloads into one. Past a hard threshold submission is backpressured. A task may opt in to lossy `drop_oldest` behavior instead; it is never the default.
+**Bounded retention.** The retained chain is bounded by a memory budget derived from available memory, or from a configured target memory limit. Past a soft threshold (per key, or memory-wide) the leader schedules an internal compaction run on a worker that runs compaction, which folds the oldest payloads that fit one claim into one (§8.2). Past a hard threshold submission is backpressured. A task may opt in to lossy `drop_oldest` behavior instead; it is never the default.
 
-**One-node subset (Phase 1).** Before compaction exists, the two thresholds are absolute byte limits set with `configure(memory_soft_limit=..., memory_hard_limit=...)` and count the serialized bytes of every non-terminal Task payload, including retained chains. Past the soft limit the scheduler raises a `SlowDown` signal, cleared once usage falls a hysteresis margin below the limit; bulk submitters (`group`, `.map`) pause while it is raised, and a plain `task(x)` call proceeds. Past the hard limit `submit` raises `BackpressureError`, or, for a coalescing task that opted in to `drop_oldest`, drops that key's retained payloads oldest first until the new payload fits. If it still does not fit (the payload alone exceeds the limit, or the key has nothing left to drop), `submit` raises `BackpressureError` anyway, so `drop_oldest` never lets usage exceed the hard limit. Nothing is compacted, so a coalescing key that is never claimed can reach the hard limit from its own superseded payloads. `SlowDown` is a core-level event, so a later phase can carry it over the leader-to-client channel unchanged.
+**One-node subset.** The two thresholds are absolute byte limits set with `configure(memory_soft_limit=..., memory_hard_limit=...)` and count the serialized bytes of every non-terminal Task payload, including retained chains. Past the soft limit the scheduler raises a `SlowDown` signal, cleared once usage falls a hysteresis margin below the limit; bulk submitters (`group`, `.map`) pause while it is raised, and a plain `task(x)` call proceeds. Past the hard limit `submit` raises `BackpressureError`, or, for a coalescing task that opted in to `drop_oldest`, drops that key's retained payloads oldest first until the new payload fits. If it still does not fit (the payload alone exceeds the limit, or the key has nothing left to drop), `submit` raises `BackpressureError` anyway, so `drop_oldest` never lets usage exceed the hard limit. Past the soft limit the one-node runtime compacts the key's chain on a free worker place, so a merge that shrinks its inputs keeps the key below the hard limit (a concatenating merge gets no such promise). `drop_oldest` does not relax the frame bound: a key whose claim would pass one message is refused with backpressure even with `drop_oldest`. `SlowDown` is a core-level event, so a later phase can carry it over the leader-to-client channel unchanged.
 
 **Running generation and worker loss.** A running generation is never cancelled by a newer submission. If the worker running it is lost, the generation is replayed when it was the newest for its key (at-least-once for the latest state). If a newer pending generation already exists, that generation runs and the lost one stays `LOST` and is not replayed (`SUPERSEDED` is reserved for pending generations). A timeout is different: it is an ordinary task failure and is not requeued, so work does not grow through repeated requeue and timeout; the next submission creates the newest generation.
 
@@ -520,6 +520,8 @@ Tasks are disseminated through the DHT and, for durable tasks, copied to the dis
 
 A Task survives retries. Retry history belongs to TaskRuns.
 
+A Task and all its TaskRuns travel as one Task record (§8.6): the submission is immutable after the record's first revision, and the runs are the part of the record the leader changes.
+
 A Task superseded by a newer coalescing generation stays immutable. Its serialized input is retained until the claiming worker folds it into the generation that superseded it (§3.2.1, §8.2).
 
 ### 4.3 TaskRun
@@ -551,6 +553,8 @@ result metadata
 ```
 
 Both worker and leader may mutate legitimate state fields. The implementation must not use naive whole-record "last writer wins" semantics. Mutations should be state-machine constrained, event/field scoped, and reconciliation must be deterministic.
+
+A TaskRun is not stored on its own: it is one of the runs inside its Task's record (§8.6), so a Task and its runs share one key, one placement and one version. Only the leader writes the record, and each write carries a version ordered by recovery epoch, leader term and a per-term revision, so a stale or conflicting write is refused by the store rather than overwriting a newer one.
 
 Retries never move a failed TaskRun back to queued. A retry creates a new child TaskRun.
 
@@ -738,7 +742,7 @@ Mixed code versions during a rolling deployment are handled by this same migrati
 
 ### 8.1 Submission
 
-The client creates the immutable Task, chooses a shard if sharding is enabled, writes/disseminates the Task into the shard's DHT, and optionally writes the durable Task to the disaster-recovery backend.
+A worker mints the task id and the submission time and sends SUBMIT to the shard's leader (a client reaches it through a worker). The leader writes the Task's record at revision 0 (§8.6) and answers once the write is stored. If the answer is a retryable `NOT_LEADER`, the worker sends the same minted task to the new leader, and a task already recorded is never recorded twice. In the one-node runtime a submission made before the worker is granted leadership is queued and recorded when the grant arrives. Choosing a shard when sharding is enabled and writing the durable Task to the disaster-recovery backend are later phases.
 
 The client receives a TaskHandle containing at least:
 
@@ -749,15 +753,17 @@ shard_id
 
 plus local callback and result-delivery state.
 
-Submission is not idempotent (§2.3): each submission creates a new Task.
+Submission is not idempotent (§2.3): each new mint is a new Task. Resubmitting a minted task after `NOT_LEADER` is a retry of that submission, not a second one.
 
 A handle can report how durably its Task is held, and callers may await a stronger level before treating the submission as accepted:
 
 ```text
 in_memory            held by the receiving peer
-replicated           replicated to k DHT peers
-dr_store_written     written to the disaster-recovery store (§9.2)
+replicated           stored at a majority of the record's placement (§8.6)
+dr_store_written     written to the disaster-recovery store (§9.2); not yet implemented (Phase 4 and later)
 ```
+
+Submission is acknowledged only once its record is `replicated` in this sense.
 
 Kabudachi is not a transactional inbox/outbox. An application that must enqueue atomically with a database commit records the intent in its own store and submits after commit, handling repeat submission itself.
 
@@ -773,6 +779,14 @@ worker sees pending Task T
     -> leader examines authoritative state
 ```
 
+A worker with room to run more finds work in stages, moving to the next until it has claimed as many tasks as it has room for (stopping early only when the leader refuses or does not answer):
+
+1. the records it holds itself, nearest key first;
+2. `STEAL` requests to shard peers, by distance class from the worker's own key, nearest first, widening one class at a time; a peer answers with the waiting tasks it holds, oldest first, up to a limit;
+3. `CLAIM_OLDEST` at the leader, which hands back its oldest pending tasks.
+
+A worker that finds nothing at every stage waits longer before it looks again, and finding work resets the wait. Every task found is claimed through `REQUEST_CLAIM`. A worker's view of a record can be stale, so the leader may refuse a claim for a task the worker saw waiting, and a refusal only moves discovery on. The leader answers a claim only for a worker that is a voter or a pending member of its shard.
+
 Leader response may include:
 
 ```text
@@ -784,6 +798,8 @@ REJECT_SUPERSEDED
 REJECT_NOT_LEADER
 REJECT_FINISHED
 REJECT_KEY_BUSY
+REJECT_NOT_MEMBER
+REJECT_CANNOT_RUN
 ```
 
 Two workers racing for one Task are serialized at the leader:
@@ -803,7 +819,9 @@ The DHT handles data dissemination and discovery. The leader handles ownership s
 
 For coalescing tasks (§3.2.1), the leader also serializes supersession. A newer submission with the same key marks the older pending generation `SUPERSEDED` (a claim for it is answered `REJECT_SUPERSEDED`); a generation that is already `CLAIMED` cannot be superseded.
 
-The leader never executes the reducer. It keeps the superseded Tasks' payloads linked in order; the worker that claims the newest generation folds the chain oldest to newest with the task's reducer before running the task body. If the retained chain exceeds its memory budget, the leader schedules an internal compaction run that a worker executes to fold the oldest payloads into one; past the hard threshold, new submissions are backpressured (or dropped-oldest if the task opted in).
+The leader never executes the reducer. It keeps the superseded Tasks' payloads linked in order, in the retained chain of the newest generation's record; the worker that claims the newest generation folds the chain oldest to newest with the task's reducer before running the task body.
+
+Compaction keeps that chain short. When a waiting generation's chain holds more payload than the per-key soft threshold (half of what one claim may carry), or memory is past its soft limit, and some worker has said it runs compaction, the leader creates an internal compaction run naming the oldest entries that fit in one claim. The worker folds exactly those entries with the task's reducer, and the leader swaps them for one folded entry only while the chain still starts with them. Only a claimed compaction holds the newest generation back, and with no worker that runs compaction the newest generation folds its whole chain itself. No claim ever outgrows one message: a submission that would make its key's waiting claim too large is refused (backpressure), and a fold that grows past one message fails the newest generation with `CoalescedPayloadTooLarge`. Past the hard memory threshold, new submissions are backpressured (or dropped-oldest if the task opted in).
 
 After leader change, reconciliation (§13) rebuilds per-key occupancy, including the lifetime of any implicit flow, so a second running generation for the same key is never admitted.
 
@@ -894,6 +912,39 @@ This solves stale-worker result races at the scheduler level. If an old retriabl
 For a non-retriable TaskRun that survived leader replacement, the new leader may adopt the same TaskRun during reconciliation and certify its already-delivered result.
 
 When a task returns a task-like value (§3.4), the leader commits the continuation atomically with certification of the returning TaskRun. A TaskRun that is not certified therefore leaves no continuation behind.
+
+### 8.6 Task records and placement
+
+The shard's DHT holds one record per Task, written whole by the leader on every change. A record holds:
+
+```text
+version             recovery epoch (with its lineage), leader term, per-term revision
+task                the submission, immutable after the first revision
+runs                every TaskRun of the Task
+retained chain      a coalescing generation's absorbed or folded payloads (§8.2)
+input digest        BLAKE3 of the serialized input, the algorithm named
+coalescing link     the generation that superseded it, and the ones it absorbed
+placement           the voters that hold the record
+publication time
+finished            set once the Task is terminal
+prior placements    where earlier revisions of a moved record were held (below)
+```
+
+A certified result carries its content digest the same way, so a reader can check a payload it receives. A Task and its runs share one key (the task id), one placement and one version.
+
+**Version order.** Records compare by recovery epoch first, under the cross-lineage rule of §12: another lineage's higher-numbered epoch is newer and a lower or equal one is older, whatever its term. Within one epoch the leader term decides, then the revision. The store refuses an older revision, and refuses a revision of the same version that is not identical, with two exceptions. A revision of the same version that differs only in its placement or prior placements (a leader re-place) is accepted and replaces a stub. A leader write that leaves the holder out of its placement is acknowledged by that holder as a stub. So an acknowledgement means the record was stored, or kept as a stub where the record moved away, and a writer that counts acknowledgements counts holders.
+
+**Placement.** A record is written to the `r` placeable voters nearest its key by XOR distance (`r` defaults to 3 and is capped at the voters known), and a write counts once a majority of them has stored it. Any later read of `r - w + 1` of them then meets a holder of the newest revision. Records travel on a per-shard records protocol that only the shard's workers speak, so a record never lands in another shard.
+
+**Retention.** A finished record is dropped after the result TTL; an unfinished one never expires.
+
+**Effects wait for storage.** Every answer that releases an effect (a submission acknowledgement, a claim, a certification, a failure answer, a cancel answer) is held until the writes that record it are stored and the leader's lease is still valid. If the writes miss their quorum, or the lease ended first, the answer is a retryable `NOT_LEADER`. A leader never acts on state that a successor could not find.
+
+**Moving a record.** When the placeable voters change (a worker is admitted, leaves or is lost), the leader writes the records whose placement moves, a bounded number at a time, to their new holders. A write that moves a record is a joint write: it counts only once a quorum of the new placement and of each earlier placement the record may still be known by (counting only holders still in the configuration) has stored it. A reader that hears most of an earlier placement therefore meets the new revision. A holder a record moved away from keeps a key-only stub (task, version, new placement), which reconciliation reports (§13), and a later plain write that names no earlier placement clears the carried placements. A write the store refused is kept by repair and published again after a delay until it is stored; while the scheduler is not leading nothing is published, the refusal is kept, and it is published once the scheduler leads (it is forgotten when the leader leaves office). Only the reconciling leader's republish of a rebuild retries before the grant. Repair places writes that are waiting on the voters that remain when a holder leaves.
+
+**One-node runtime.** The one-node runtime keeps its records in its own store with `r = 1`; the same writes happen, and each is stored at once.
+
+**Trust.** The record store trusts the peers of its shard: it checks a record's key, size and version, not who sent it, and it does not cap how many unfinished records a holder keeps. Stopping a forged or flooding writer needs peer authentication, which is part of the production-readiness gate (§27.2, §28.10).
 
 
 ---
@@ -993,6 +1044,8 @@ Actions:
 - connect to known peers;
 - if no shard exists, compete for atomic bootstrap ownership.
 
+The bootstrap cascade asks the configured seeds, then the workers the authority lists as registered, and then, with an authority, founds the shard only by winning a compare-and-swap of its recovery epoch. A worker with seeds and no authority founds its own shard only after the seeds have stayed silent for a configured number of rounds, which bounds the split such a founding can cause until the shards converge (§17).
+
 #### `JOINING`
 
 The worker has identified a shard and is being incorporated into the live peer/ring view.
@@ -1000,7 +1053,7 @@ The worker has identified a shard and is being incorporated into the live peer/r
 It may:
 
 - exchange DHT/ring metadata;
-- learn the current leader;
+- learn the current leader (a join asks a full pass of its peers and takes the newest pointer, by the epoch order of §12);
 - prepare execution slots.
 
 It should not become an election candidate until the cluster recognizes it as active.
@@ -1038,7 +1091,7 @@ The worker is requesting votes for a new leader term.
 
 #### `LEADER_RECONCILING`
 
-The worker has won an election but cannot schedule new work yet. It reconstructs authoritative TaskRun state from live workers and DHT snapshots.
+The worker has won an election but cannot schedule new work yet. It keeps every election duty of a leader (heartbeats, acks, its lease) but is granted no claims, and it reconstructs authoritative TaskRun state from live workers and Task records (§13). It leaves for `LEADER` when reconciliation finishes, and for `ACTIVE`, `LEADER_SUSPECT`, `NO_QUORUM`, `FENCED` or `DRAINING` when it loses office or is asked to drain.
 
 #### `LEADER`
 
@@ -1061,7 +1114,7 @@ It:
 - no longer casts ordinary votes;
 - emits irreversible `SELF_REMOVE`;
 - may finish existing work;
-- hands off sole DHT replicas.
+- hands off the Task records it holds (§18.1).
 
 #### `FENCED`
 
@@ -1273,6 +1326,10 @@ The remaining cluster does not depend on 51 soon-to-die pods.
 
 A restarted pod has a new incarnation ID and joins from scratch.
 
+A draining leader keeps leading until every other voter has reported a routing crawl since its admission, bounded by `drain_wait_limit` (ten suspicion timeouts by default), and then leaves. Leaving earlier would strand a worker that knows no one but this leader: workers find one another only through their routing crawl. A voter that never reports cannot hold the shutdown up beyond the limit.
+
+A node in `ROLL_CALL` or `NO_QUORUM` that has reached no shard peer for one suspicion timeout searches for a leader again: it reads the authority's registrations and then asks the seeds, so a node stranded without a leader reconnects to whoever leads.
+
 ### 12.4 Cooperative ring roll call
 
 When the leader is suspected:
@@ -1317,7 +1374,13 @@ handle_roll_call(call):
     forward_to_next_reachable_ring_neighbor(call)
 ```
 
-If the existing leader becomes verifiably reachable before the election begins, workers return to `ACTIVE`.
+If the existing leader becomes verifiably reachable before the election begins, workers return to `ACTIVE`. A node that accepts a leader's ack forgets the roll calls it made or answered for terms above the term it now follows (except where it granted a vote): those were made on a suspicion the live leader disproved, and kept they would make the node refuse the call that elects the leader's successor.
+
+A roll call is answered only from sound state. A reply carries the configuration generation its sender holds, and a node refuses a call built on an older configuration, so a seed taken from a stale census is never counted. A promise of admission a worker holds, and any promise round for a configuration that has since removed a worker, are void once the removal commits.
+
+**Epoch order across lineages.** A recovery epoch is a number within a lineage. Whenever a worker compares an epoch it hears of with its own (in election messages, join pointers and Task records alike), a later epoch of its own lineage is newer; another lineage's epoch numbered above its own is newer; another lineage's epoch numbered at or below its own is older, whatever the terms. A worker whose own lineage has a later epoch than the one it followed rejoins it, and a refusal of an election message names the leader, so a node that missed a certificate learns who leads.
+
+**Admission.** A joiner is admitted in two phases and at a pace. The leader first promises each joiner that has confirmed a recent ack its admission at a generation of the leader's term; once every one holds its promise, it starts a batch that admits exactly those workers. Nothing starts until every member of the just-committed configuration has echoed it, so a member left a generation behind cannot be needed for a quorum nobody can reach. A member whose heartbeats arrive but which confirms none of the leader's acks blocks admission only until a suspicion timeout and a reconnect timeout have passed since it last confirmed one. The leader then removes it, one voter per configuration change and only when the voters that hold the current configuration, the leader among them, are a majority of the oldest configuration any removed or queued voter may still hold. That bound keeps two successive removals from letting the removed voters, a majority of the old configuration, elect a second leader. A removed worker may rejoin as a pending member. A silent member is reported lost but not removed.
 
 ### 12.5 Choosing a candidate
 
@@ -1402,16 +1465,15 @@ Ordinary election does not need Redis if peer quorum exists.
 
 A newly elected leader must not immediately assign work.
 
-It requests reconciliation reports from live workers:
+It asks its voters and pending members for reconciliation reports. A worker answers a requester only if it is the leader the worker follows, or presents an election certificate for a term at least the worker's; only the exit rule below counts voters. A report is paged and holds:
 
 ```text
 RECONCILE_REPORT {
-    worker_id
-    active_runs[]
-    locally_completed_uncertified_runs[]
-    locally_failed_runs[]
-    last_leader_term_seen
-    local_dht_generation
+    runs[]      every run the worker holds, each with the claim it was granted under
+                and its state (claimed, running, succeeded, failed), result digest, failure kind
+    keys[]      a summary per Task record held: version, input digest, latest run,
+                placement, finished, task definition, coalescing key
+    last        whether this is the final page
 }
 ```
 
@@ -1421,29 +1483,45 @@ It combines:
 live worker reports
 +
 DHT Task records
-+
-DHT TaskRun snapshots
 ```
 
 to rebuild authoritative state.
 
+**Per-key certainty.** The leader knows a task's newest record once `r - w + 1` of the holders of its latest reported placement have answered, so that a silent holder cannot hide a newer revision, or once every placement member still in the configuration has. A key short of that is uncertain: it is not scheduled, cancelled or republished, and requests for it are answered `NOT_READY`. A holder that rejoins keeps its store, and its stale copy counts only as the revision it holds. A stub left by a joint write (§8.6) names the placement the record moved to, so a revision on a placement the first reports did not name is still found.
+
+**Exit rule.** The leader stops collecting once every voter has answered, or a quorum has and a suspicion timeout has passed since the first ask. Answers that come later are adopted after the leader leads, by the same rules, and workers reported lost meanwhile are applied as ordinary losses at the grant, except one that answered.
+
 Representative decisions:
 
 ```text
-DHT says Run 42 RUNNING on A
+Record says Run 42 RUNNING on A
 A says Run 42 RUNNING
 => adopt same assignment
 
-DHT says Run 42 RUNNING on A
+Record says Run 42 RUNNING on A
 A alive but reports no Run 42
 => retriable: mark LOST and create child run
-=> non-retriable: reconcile carefully; if execution uncertainty exists, ORPHANED
+=> non-retriable: the run is ORPHANED; an ephemeral one is LOST with no replay
 
-DHT says Run 42 RUNNING
+
+Record says Run 42 RUNNING
 A reports SUCCEEDED but uncertified
 => validate run still authoritative
 => accept completion and certify if valid
+
+A reports a run whose record the leader lacks
+=> rebuild the run from the claim the worker holds
+
+A holder never answers
+=> an ordinary worker loss: the newest lost generation of a coalescing key is replayed,
+   a superseded one is not
 ```
+
+**Supersession.** A supersession writes the newer generation's record before it marks the older superseded. A leader lost between the two writes leaves a pair that the new leader finishes, writing the older generation last.
+
+**Republish before the grant.** Before it is granted, the new leader writes every record of the rebuild again at its own term. Those revisions are newer than anything the old leader could still write, which fences the old leader's late writes, and any write a holder refused is repeated until it is stored.
+
+**After the grant.** A worker's heartbeats carry a digest of the runs it holds. When the leader's view of a worker has disagreed with that digest for long enough, it asks the worker for its runs again.
 
 Only after reconciliation:
 
@@ -1778,9 +1856,11 @@ DRAINING
     -> stop new claim requests
     -> emit SELF_REMOVE
     -> finish/cancel running TaskRuns according to semantics
-    -> hand off sole DHT replicas
+    -> hand off the Task records it holds
 STOPPED
 ```
+
+The drained worker asks the leader it followed where each of its records goes now, writes each copy to the holders it names (as the record is held, naming the worker as its publisher, so the holder keeps it whatever holders the record names), waits for the acknowledgements, and writes again what was refused, until the drain wait limit. A copy a holder refuses because it holds a newer revision needs no handing over.
 
 Termination is soft and then hard, similar to a warm/cold shutdown in Celery. A soft terminate starts the drain above and lets running TaskRuns finish within a configured grace period; when the grace period elapses, running task subprocesses are cancelled cooperatively and then killed, and their TaskRuns follow the worker-loss semantics of §3.2.2.
 
@@ -1797,15 +1877,17 @@ LEADER
     -> remain reachable during reconciliation
     -> successor becomes authoritative
     -> self-remove
-    -> hand off DHT responsibility
+    -> hand off its Task records
 STOPPED
 ```
+
+A draining leader waits for the other voters' routing crawls before it leaves (§12.3), and places its records among its other placeable voters.
 
 ### 18.3 SIGKILL
 
 No graceful guarantees apply.
 
-Surviving peers recover through election/reconciliation. Complete live-cluster loss falls back to DR and/or catastrophic recovery semantics.
+Surviving peers recover through election/reconciliation: the leader reports the holder lost and repairs the records it held, writing them to a full placement without it. Complete live-cluster loss falls back to DR and/or catastrophic recovery semantics.
 
 ---
 
@@ -2381,7 +2463,7 @@ The project should prototype both:
 
 libp2p is capable, but its abstractions may be heavier than necessary if our network protocol is tightly controlled.
 
-**Phase 2 design note:** Phase 2 chose between the two prototype paths above — libp2p as transport (TCP/Noise/Yamux, `identify`), but narrow: three `request_response` behaviours, for election, bootstrap join, and claim arbitration, plus `gossipsub` for the election roll call and `kad` for peer routing only (`net/src/swarm.rs`'s `Behaviour`; ADR-0001 decision 17), with no DHT record storage. The `net` crate implements this. This is an implementation decision, not a change to this section's candidate status.
+**Phase 2 design note:** Phase 2 chose between the two prototype paths above — libp2p as transport (TCP/Noise/Yamux, `identify`), but narrow: three `request_response` behaviours, for election, bootstrap join, and claim arbitration, plus `gossipsub` for the election roll call and `kad` for peer routing. Phase 3 added a second `kad` behaviour, apart from the routing one and on a protocol only the shard's workers speak, that stores Task records (§8.6; `net/src/swarm.rs`'s `Behaviour`). The `net` crate implements this. This is an implementation decision, not a change to this section's candidate status.
 
 ### 23.5 Protocol Buffers: prost
 
@@ -2892,35 +2974,30 @@ Still avoid sharding.
 
 Phase 1 left `NoPeers` and `NoAuthority` (`core/src/single_node.rs`) and the election tick loop in place as single-node placeholders, each with one adapter until this phase. Phase 2 gave peer messaging and the coordination authority their second real adapter and resolved that question, as follows.
 
-`core/src/single_node.rs` is gone. Its message-sink placeholder became `core::election::DropMessages`, which drops every message for a node with no peers, and the single-process Python runtime's wiring lives in `bindings/src/local_node.rs`. That runtime's instant (zero suspicion timeout) self-election is a deliberate product choice for it, not the generic behaviour of a one-member electorate. The Phase 1 `NoAuthority` coordination authority was removed rather than moved: the single-process runtime starts its node with no authority timings, so the node never asks for an authority call. The name now belongs to `core::election::NoAuthority`, the authority performer that runtime hands `core::election::carry_out`, which answers any call at once as unavailable. The generic multi-node case is `net/src/bootstrap.rs`'s `bootstrap` cascade (seeds, then the coordination authority's registered peers, then ownership of the shard, or, with no authority, founding it alone), where a lone node still waits out whatever suspicion timeout it was configured with.
+`core/src/single_node.rs` is gone. Its message-sink placeholder became `core::election::DropMessages`, which drops every message for a node with no peers, and the single-process Python runtime's wiring lives in `bindings/src/local_node.rs`. That runtime's instant (zero suspicion timeout) self-election is a deliberate product choice for it, not the generic behaviour of a one-member electorate. The Phase 1 `NoAuthority` coordination authority was removed rather than moved: the single-process runtime starts its node with no authority timings, so the node never asks for an authority call. The name now belongs to `core::election::NoAuthority`, the authority performer that runtime hands `core::election::carry_out`, which answers any call at once as unavailable. The generic multi-node case is `net/src/bootstrap.rs`'s `bootstrap` cascade (seeds, then the coordination authority's registered peers, then ownership of the shard, or, with no authority, founding it alone once the seeds have stayed silent for `seed_rounds` rounds), where a lone node still waits out whatever suspicion timeout it was configured with. A worker with seeds that all stay silent can therefore found its own shard; the split that causes is bounded by `seed_rounds` and ends when the shards converge (§17).
 
 Both runtimes drive the node through `core::election::carry_out`: `bindings/src/election.rs`'s `run_election` on the single-process node, and `net/src/driver.rs`'s `run_driver` on a real-transport node, each on its own tick.
 
 `kabudachi_net::worker::Worker` wires these together: its `run` calls `bootstrap`, starts the node with `WorkerNode::start` and hands it to `run_driver`.
 
-The bootstrap join changes no one's configuration by itself. `bootstrap` only returns an `Entry`: for a join, `Entry::Joining` with the leader a seed or registered peer pointed at, found through the net `join` module (`net/src/join.rs`: `ask_for_leader` asks peers who leads, and `pointer_for` builds the pointer a node hands a joiner; the leader search in `net/src/leader_search.rs` decides whom to ask: bootstrap queries the configured seeds and then the workers the authority lists, while a rejoining node, which has no seeds, reads the live authority registrations first and then asks those workers). `WorkerNode::start` then makes the worker a pending member of that leader's shard, which no quorum counts; the members that answered it keep their configuration until an election admits the joiner (ADR-0001).
+The bootstrap join changes no one's configuration by itself. `bootstrap` only returns an `Entry`: for a join, `Entry::Joining` with the leader a seed or registered peer pointed at, found through the net `join` module (`net/src/join.rs`: `ask_for_leader` asks peers who leads, and `pointer_for` builds the pointer a node hands a joiner; the leader search in `net/src/leader_search.rs` decides whom to ask: bootstrap queries the configured seeds and then the workers the authority lists, while a rejoining node, which has no seeds, reads the live authority registrations first and then asks those workers). `WorkerNode::start` then makes the worker a pending member of that leader's shard, which no quorum counts; the members that answered it keep their configuration until the leader admits the joiner (§12.4). A join asks a full pass of its candidates and takes the newest pointer by the epoch order of §12.4, not the first reachable one.
 
 The authority step of the bootstrap cascade reads `CoordinationAuthority::live_registrations`, which returns each registered worker's address, so a node asks the registered peers the way it asks seeds. A worker that finds no other worker registered registers itself and founds the shard only by winning a compare-and-swap of the shard's recovery epoch (created at 0, or one epoch on when re-founding), so two workers never found the same shard. Until a real remote `CoordinationAuthority` exists (Phase 4), the only production implementation is the in-memory one (tests also use `kabudachi_testkit::FaultingAuthority`), and nodes in tests join through seeds or a shared in-memory authority.
 
-The one-node window between startup and the worker becoming leader is still not testable, and is still recorded as such in `docs/superpowers/follow-ups.md` ("Test for a signal arriving during startup, before leadership" — the one-node election takes about 20 ms, too short to hit without a flaky test; picked up when startup is slow enough to test, i.e. DHT election). Phase 2's real transport did not change that: it makes multi-node startup slower, but the *one-node* window is exactly the case that has no network to wait on.
-
-Phase 2 work still open:
-
-- **A refused roll call outlives the leader it suspected.** A node that falsely suspects a live leader (heartbeats late past its suspicion timeout) publishes a roll call for term `t + 1` that every worker refuses. When it then accepts the leader's ack and goes back to `Active`, its ballot keeps that call: `record_own_roll_call` (`core/src/election/election_round/ballot.rs`) has set `highest_roll_call_term` and the call's rank as `best_answered` for `t + 1`, and accepting the ack clears neither. When the leader is later lost, the real initiator calls the same term `t + 1`. The stale call ranks earlier, so the node refuses the real call as `NotBestRollCall`, takes no answer suppression (only an answer sets it), and calls `t + 2` itself. Safety holds, because grants and not answers decide a term, and the real initiator still wins `t + 1`. The cost is one or more extra roll calls, a slower failover. ADR-0001's amendment E12-R5 only stops a later call by a worker that *answered* the winning call, so this does not break the ADR as written. But `net/tests/election/leader_loss.rs`'s `the_survivors_of_a_lost_leader_settle_on_one_initiator_that_leads` asserts that no survivor calls a later term, and fails in about 2% of runs on a CPU-starved 2-vCPU host (the same rate before and after roll-call backoff). The proposed fix is that accepting an ack drops the node's own refused calls above the term it now follows (`highest_roll_call_term` and own-call `best_answered` entries). It changes ADR-0001's answer rules, so it needs an ADR amendment first.
-- **The same test has a rarer, undiagnosed failure.** Its single-candidate assertion failed in 2 of 120 runs on the same starved host. The cause has not been found yet.
-- **A shard whose every member is `Bootstrapping` at a leaderless epoch can fail to recover while registrations are live.** After a swap whose reply was lost, members that rejoined the authority's later epoch can all wait there with no leader, and the core election has no way for a `Bootstrapping` node to recover an epoch. Net bootstrap (`net/src/bootstrap.rs`) re-founds a shard that has an epoch but no live registration, one epoch on, so the gap there is limited to a leaderless epoch where live registrations still exist and bootstrap therefore keeps asking the registered workers; it closes once those registrations lapse. The core simulation has no net bootstrap, so there it is not closed at all. The random scenario finds no such run in seeds 0 to 3999.
-- **A leader that drains before new workers have crawled strands them.** A joiner dials only the leader it was pointed at, and workers find one another only through the driver's settled kad routing crawl (`net/src/routing_refresh.rs`), which runs once the node's view has held still for a quarter of a suspicion timeout. If the leader exits before any new worker's crawl completes, the new workers are connected to no one. Redial targets only the dead leader, and nodes in `RollCall` or `NoQuorum` do not read the authority's registrations, so the shard never elects. A crawl at once on a node's first admission or first leader was tried and dropped: it raised `leader_loss` post-setup failures on a starved 2-CPU host from about 1% to about 11% (100 runs each, p about 0.01), because the handshake burst of a joiner's crawl can delay a live leader's heartbeat, ack and echo chain past its lease, and the shard then re-elects. That cost applies to the settled crawl too, at a lower rate, which is why `net/tests/election/leader_loss.rs` setup accepts whichever worker leads. The race stays as it is. Two candidate fixes need a design ruling: a draining leader does not report itself free to exit until the remaining voters are connected to each other, or nodes with no quorum fall back to dialling the addresses in `CoordinationAuthority::live_registrations`.
+The one-node window between startup and the worker becoming leader is tested by running the runtime with a non-zero suspicion timeout, which widens the window before leadership so a signal can arrive inside it.
 
 ### Phase 3: DHT task dissemination
 
 Implement:
 
 - leader reconciliation (§13), moved here from Phase 2 because it rebuilds state from DHT task records;
-- immutable Task records;
-- TaskRun snapshots;
-- content hashes;
-- replica/handoff behavior;
-- worker discovery of pending Tasks.
+- versioned Task records: one record per Task, written whole by the leader on every change, holding the submission (immutable after the first revision) and every TaskRun of the Task; TaskRuns are not stored on their own, so a Task and its runs share one key, one placement and one version (§8.6);
+- content hashes (BLAKE3, with the algorithm named) of inputs and certified results;
+- placement and replication on the shard's kad record store, handoff of a draining worker's records, and repair when the placeable voters change;
+- worker discovery of pending Tasks: own records, then shard peers outward by distance, then the leader's oldest pending tasks;
+- compaction of retained coalescing chains.
+
+The leader does not execute compaction, and a networked worker does not yet run a claimed compaction by itself: that needs the worker-side executor of Phase 5. The one-node runtime executes compaction on a free worker place.
 
 ### Phase 4: Redis CoordinationAuthority
 
@@ -2943,7 +3020,8 @@ Implement:
 - sync bodies via the §6.2 `asgiref` mechanism, now inside the task subprocess;
 - cooperative cancellation and soft-to-hard timeout escalation;
 - execution lifecycle hooks in the task subprocess;
-- SIGTERM/SIGKILL behavior.
+- SIGTERM/SIGKILL behavior;
+- networked workers run the tasks they claim, compaction runs included.
 
 ### Phase 6: flow/group/map/reduce
 
@@ -2998,7 +3076,7 @@ The coalescing, flow, and failure-detection invariants (§25.1 item 9 and §25.4
 
 No real workload should adopt kabudachi until the following are closed:
 
-- peer and client authentication, and encrypted transport (§28.10);
+- peer and client authentication, and encrypted transport (§28.10). Authenticating peers also closes the trust the Task record store places in its shard (§8.6): it accepts a record write from any peer that passes its key, size and version checks, with no check of the writer's authority and no cap on how many unfinished records a holder keeps;
 - a minimal orchestrator requirements document. The implementation should minimize what it demands of the deployment environment (no mandatory Kubernetes, §2.3) and then define the small set that remains: how peers discover each other, behavior under address churn, reachability between peers, graceful-termination signals, and health endpoints;
 - measured submit-to-start latency (§28.11).
 
@@ -3014,7 +3092,7 @@ Does libp2p simplify the product enough to justify its abstraction cost, or woul
 
 ### 28.2 DHT semantics
 
-What exact DHT replication factor, expiration policy, provider-record behavior, and content manifest structure provide adequate durability without excessive chatter?
+Phase 3 settled the Task-record part of this question: three replicas by default, a majority write, no expiry for unfinished records, retention of finished ones for the result TTL, and no provider records (§8.6). What remains open is the content manifest structure for large payloads and whether three replicas give adequate durability without excessive chatter at scale.
 
 The DHT should not quietly become a database.
 
@@ -3046,12 +3124,11 @@ The worker/client/leader certification protocol should be enumerated as a full f
 
 ### 28.6 DHT last-holder shutdown
 
-The graceful "last holder does not exit until replica acknowledged" requirement needs an explicit scope:
+A draining worker hands its Task records to the holders its leader names and waits for their acknowledgements, bounded by the drain wait limit (§18.1). Every record the worker holds counts, an acknowledgement is a holder's stored-record answer to the write, and a record a holder refuses as older needs no handing over. What remains open:
 
-- which records count as live;
-- how acknowledgements are proven;
-- maximum drain behavior;
-- operator override.
+- an operator override of the bound;
+- handing off records that are not Task records, if any are ever kept;
+- draining the sole voter of a shard, a product limit today: a draining leader hands its records only to its other voters, and with none there is no holder to hand them to (a pending member is not a target), so the records leave with it. Whether such a drain should refuse, wait for a voter, or hand records to pending members is an open design question.
 
 ### 28.7 Map cardinality and backpressure
 
@@ -3086,6 +3163,8 @@ Before production use, the protocol needs:
 - replay protection for signed/identified control messages;
 - safe serializer policies;
 - encrypted transport.
+
+The Task record store checks a record's key, size and version, and trusts every peer of its shard to write it. It does not verify that a writer is the shard's leader or a member, and it does not cap how many unfinished records a holder keeps (the leader's memory budget bounds what an honest leader writes). A forged or flooding peer is stopped only by authenticated peers, so this is part of the gate in §27.2.
 
 Do not use Python pickle as a production network serializer.
 

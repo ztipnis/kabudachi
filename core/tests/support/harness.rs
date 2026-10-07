@@ -131,6 +131,9 @@ pub enum Answer {
 /// A leader's held answers and the writes still bearing on what it may tell,
 /// and its repair of where its records are held.
 struct Gating {
+    /// The office its node held when last looked at, to tell one office
+    /// from the next.
+    office: Option<ReconcileTerm>,
     gate: EffectGate<Ticket>,
     unsettled: WriteLedger,
     order: WriteOrder,
@@ -141,6 +144,7 @@ impl Gating {
     /// A refused write is published again after `retry_after`.
     fn new(retry_after: Duration) -> Self {
         Gating {
+            office: None,
             gate: EffectGate::new(),
             unsettled: WriteLedger::default(),
             order: WriteOrder::default(),
@@ -750,7 +754,8 @@ impl Cluster {
                 }
             }
             for write in &refused {
-                for ticket in gating.gate.refused(write) {
+                let newer = gating.unsettled.pending_newer_than(write);
+                for ticket in gating.gate.refused(write, &newer) {
                     resolved.push(Settled::NotLeader(ticket));
                 }
             }
@@ -793,13 +798,18 @@ impl Cluster {
         }
     }
 
-    /// A node whose scheduler no longer leads answers every call it holds
-    /// `NotLeader` and forgets the writes of the term that ended.
+    /// A node whose scheduler no longer leads, or whose office changed
+    /// (reconciling or not), answers every call it holds `NotLeader` and
+    /// forgets the writes of the term that ended, as the driver does.
     fn answer_held_calls_of_nodes_not_leading(&mut self) {
         let mut ended: Vec<Ticket> = Vec::new();
         for (id, gating) in &mut self.gating {
-            if self.schedulers.get(id).is_some_and(|s| !s.is_leader())
-                && !self.reconciling.contains_key(id)
+            let office = self.nodes.get(id).and_then(ClusterNode::office_term);
+            let office_changed = office != gating.office;
+            gating.office = office;
+            if office_changed
+                || (self.schedulers.get(id).is_some_and(|s| !s.is_leader())
+                    && !self.reconciling.contains_key(id))
             {
                 ended.extend(gating.gate.lease_ended());
                 gating.unsettled.clear();

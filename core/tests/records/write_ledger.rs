@@ -2,7 +2,7 @@
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::ids::TaskId;
-use kabudachi_core::task_record::{RecordVersion, Waits, Write, WriteLedger};
+use kabudachi_core::task_record::{EffectGate, RecordVersion, Waits, Write, WriteLedger};
 
 fn write(task: &str, revision: u64) -> Write {
     Write {
@@ -90,4 +90,29 @@ fn clearing_forgets_pending_and_refused_writes() {
 
     assert_eq!(waits_on(&ledger, "a"), Waits::Writes(vec![]));
     assert_eq!(waits_on(&ledger, "b"), Waits::Writes(vec![]));
+}
+
+/// The scenarios in `scenario_records` cover a later revision of the same
+/// office settling an answer; across offices the gate alone decides, since
+/// a node that loses its office and wins the next between two driver
+/// batches never shows the simulator a step without one.
+#[test]
+fn an_answer_held_in_one_office_is_never_settled_by_a_revision_of_a_later_one() {
+    let later_office = |task: &str, recovery_epoch: RecoveryEpoch, leader_term: u64| Write {
+        task_id: TaskId::new(task),
+        version: RecordVersion { recovery_epoch, leader_term, revision: 0 },
+    };
+    let mut ledger = WriteLedger::default();
+    let mut gate = EffectGate::new();
+    assert!(gate.hold("claim", [write("a", 16)]).is_none());
+
+    let next_term = later_office("a", RecoveryEpoch::new(0, 0), 2);
+    let next_epoch = later_office("a", RecoveryEpoch::new(1, 0), 1);
+    assert!(gate.acknowledged(&next_term, true).is_empty());
+    assert!(gate.acknowledged(&next_epoch, true).is_empty());
+
+    ledger.made(&[write("a", 16), next_term.clone()]);
+    ledger.settled(&write("a", 16), false, true);
+    let newer = ledger.pending_newer_than(&write("a", 16));
+    assert_eq!(gate.refused(&write("a", 16), &newer), vec!["claim"]);
 }

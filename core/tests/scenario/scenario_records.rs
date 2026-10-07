@@ -11,7 +11,7 @@ use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::Submission;
 use kabudachi_core::time::Duration;
 
-use crate::support::harness::{Answer, Cluster};
+use crate::support::harness::{Answer, Cluster, Ticket};
 
 pub(crate) const SUSPECT: Duration = Duration::from_millis(1_000);
 pub(crate) const STEP: Duration = Duration::from_millis(50);
@@ -243,4 +243,90 @@ fn a_supersession_stores_the_newer_generation_before_marking_the_older_supersede
 
     assert_eq!(cluster.answer(refused), Some(&Answer::NotLeader));
     assert!(!superseded_anywhere(&cluster, &newer));
+}
+
+/// Claims `task` on `claimant` while every other holder is down, so the
+/// claim's revision misses its quorum, its outcome due after `claim_ack`;
+/// then, the holders up again, starts the run, whose later revision of the
+/// same office is stored, its outcome due after `start_ack`. Returns the
+/// claim's ticket and the start's.
+fn claim_then_start_with_the_claim_unstored(
+    cluster: &mut Cluster,
+    leader: &WorkerId,
+    claimant: &WorkerId,
+    task: &TaskId,
+    claim_ack: Duration,
+    start_ack: Duration,
+) -> (Ticket, Ticket) {
+    let others: Vec<WorkerId> = cluster.node_ids().into_iter().filter(|id| id != leader).collect();
+    for holder in &others {
+        cluster.records().set_up(holder, false);
+    }
+    cluster.records().set_ack_delay(claim_ack);
+    let claim = cluster.claim(leader, claimant, task);
+    for holder in &others {
+        cluster.records().set_up(holder, true);
+    }
+    let run = cluster
+        .records()
+        .held_by(leader, task)
+        .and_then(|record| record.runs.last().map(TaskRunRecord::task_run_id))
+        .expect("the leader's own copy holds the claimed run");
+    cluster.records().set_ack_delay(start_ack);
+    let started = cluster.start(leader, claimant, &run);
+    (claim, started)
+}
+
+#[test]
+fn a_claim_whose_own_revision_missed_its_quorum_is_answered_once_a_later_one_of_its_office_is_stored() {
+    let (mut cluster, leader) = elected();
+    let task = submitted(&mut cluster, &leader);
+    let claimant = cluster.node_ids().into_iter().find(|id| *id != leader).unwrap();
+    // The later revision is acknowledged first, as when a holder took a
+    // re-placed revision before the claim's own and refused that as older.
+    let (claim, started) = claim_then_start_with_the_claim_unstored(
+        &mut cluster,
+        &leader,
+        &claimant,
+        &task,
+        steps(6),
+        STEP,
+    );
+
+    cluster.advance(STEP);
+    assert!(matches!(cluster.answer(claim), Some(Answer::Claimed(_))));
+    assert_eq!(cluster.answer(started), Some(&Answer::Started));
+    run_until_settled(&mut cluster);
+    assert!(matches!(cluster.answer(claim), Some(Answer::Claimed(_))));
+}
+
+#[test]
+fn a_claim_whose_own_revision_is_refused_waits_for_a_later_one_of_its_office_in_flight() {
+    let (mut cluster, leader) = elected();
+    let task = submitted(&mut cluster, &leader);
+    let claimant = cluster.node_ids().into_iter().find(|id| *id != leader).unwrap();
+    let (claim, started) = claim_then_start_with_the_claim_unstored(
+        &mut cluster,
+        &leader,
+        &claimant,
+        &task,
+        STEP,
+        steps(3),
+    );
+
+    cluster.advance(STEP);
+    assert_eq!(cluster.answer(claim), None, "the refusal leaves the claim waiting on the start");
+    cluster.advance(steps(2));
+    assert!(matches!(cluster.answer(claim), Some(Answer::Claimed(_))));
+    assert_eq!(cluster.answer(started), Some(&Answer::Started));
+}
+
+fn steps(count: u64) -> Duration {
+    Duration::from_ticks(STEP.as_ticks() * count)
+}
+
+fn run_until_settled(cluster: &mut Cluster) {
+    while cluster.records().next_due().is_some() {
+        cluster.advance(STEP);
+    }
 }

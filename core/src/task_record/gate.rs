@@ -11,6 +11,21 @@ pub struct Write {
 }
 
 impl Write {
+    /// Whether storing `self` stores what `earlier` wrote: a revision of
+    /// the same task by the same office (recovery epoch and leader term), at
+    /// `earlier`'s revision or later. Within one office the leader's
+    /// revisions carry the whole record as that leader holds it, so a later
+    /// one stored where it must be stands for every decision an earlier one
+    /// wrote. A later office rebuilt the record from what its holders had
+    /// stored, which need not include a write that never reached its quorum,
+    /// so its revisions stand for nothing an earlier office wrote.
+    fn covers(&self, earlier: &Write) -> bool {
+        self.task_id == earlier.task_id
+            && self.version.recovery_epoch == earlier.version.recovery_epoch
+            && self.version.leader_term == earlier.version.leader_term
+            && self.version.revision >= earlier.version.revision
+    }
+
     /// The write of `record`, which the scheduler built, so it names its task
     /// and version.
     ///
@@ -113,10 +128,15 @@ pub enum Settled<E> {
 }
 
 /// Holds each effect a leader's call produced (an answer that tells a client
-/// or worker something was decided) until every revision the call wrote is
-/// acknowledged as stored where it must be, and the lease is still valid
-/// when the last acknowledgement arrives. An answer released earlier could
-/// tell someone of a decision that a leader elected next never sees.
+/// or worker something was decided) until every revision the call wrote, or
+/// a later revision of the same task by the same office, is acknowledged as stored where it
+/// must be, and the lease is still valid when the last acknowledgement
+/// arrives. An answer released earlier could tell someone of a decision that
+/// a leader elected next never sees.
+///
+/// Two revisions of one task can be in flight to the same holder at once,
+/// and the newer can arrive first; the holder then refuses the older. That
+/// refusal decides nothing for an effect a newer revision stands for.
 pub struct EffectGate<E> {
     held: Vec<Held<E>>,
 }
@@ -153,22 +173,23 @@ impl<E> EffectGate<E> {
     }
 
     /// `write` was acknowledged; `leading` says whether the lease was still
-    /// valid when the acknowledgement arrived. Effects settle in the order
-    /// they were held.
+    /// valid when the acknowledgement arrived. It stands for every awaited
+    /// revision of its task its office wrote at or below its revision. Effects settle in the
+    /// order they were held.
     #[must_use]
     pub fn acknowledged(&mut self, write: &Write, leading: bool) -> Vec<Settled<E>> {
         let mut settled = Vec::new();
         let mut still_held = Vec::with_capacity(self.held.len());
         for mut held in self.held.drain(..) {
-            let Some(position) = held.awaiting.iter().position(|w| w == write) else {
+            if !held.awaiting.iter().any(|awaited| write.covers(awaited)) {
                 still_held.push(held);
                 continue;
-            };
+            }
             if !leading {
                 settled.push(Settled::NotLeader(held.effect));
                 continue;
             }
-            held.awaiting.remove(position);
+            held.awaiting.retain(|awaited| !write.covers(awaited));
             if held.awaiting.is_empty() {
                 settled.push(Settled::Released(held.effect));
             } else {
@@ -179,14 +200,34 @@ impl<E> EffectGate<E> {
         settled
     }
 
-    /// `write` was refused or timed out: every effect waiting for it is
-    /// answered `NotLeader`.
+    /// `write` was refused or timed out. `newer` are the revisions of its
+    /// task still in flight that are newer than it: an effect waiting for
+    /// `write` waits for those of them its own office wrote instead, since
+    /// any of them stored stands for it. With none, every effect waiting for
+    /// `write` is answered `NotLeader`.
     #[must_use]
-    pub fn refused(&mut self, write: &Write) -> Vec<E> {
-        let (refused, still_held): (Vec<_>, Vec<_>) =
+    pub fn refused(&mut self, write: &Write, newer: &[Write]) -> Vec<E> {
+        let newer: Vec<&Write> = newer
+            .iter()
+            .filter(|successor| *successor != write && successor.covers(write))
+            .collect();
+        let (refused, mut still_held): (Vec<_>, Vec<_>) =
             self.held.drain(..).partition(|held| held.awaiting.contains(write));
+        if newer.is_empty() {
+            self.held = still_held;
+            return refused.into_iter().map(|held| held.effect).collect();
+        }
+        for mut held in refused {
+            held.awaiting.retain(|awaited| awaited != write);
+            for successor in &newer {
+                if !held.awaiting.contains(*successor) {
+                    held.awaiting.push((*successor).clone());
+                }
+            }
+            still_held.push(held);
+        }
         self.held = still_held;
-        refused.into_iter().map(|held| held.effect).collect()
+        Vec::new()
     }
 
     /// The lease ended: every held effect is answered `NotLeader`.

@@ -87,6 +87,18 @@ impl WriteLedger {
         self.stored.clear();
     }
 
+    /// The writes of `write`'s task still pending that are newer than it.
+    pub fn pending_newer_than(&self, write: &Write) -> Vec<Write> {
+        self.pending
+            .iter()
+            .filter(|pending| {
+                pending.task_id == write.task_id
+                    && matches!(write.version.order(&pending.version), VersionOrder::Newer)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// What an answer about `task` that made no write of its own waits on.
     pub fn waits_on(&self, task: &TaskId) -> Waits {
         if self.refused.iter().any(|write| write.task_id == *task) {

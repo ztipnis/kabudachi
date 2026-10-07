@@ -285,7 +285,7 @@ fn a_move_that_was_refused_before_the_leader_was_lost_is_still_reached_by_the_ne
 /// record again.
 #[test]
 fn a_stored_move_is_followed_by_a_plain_write_that_names_no_earlier_placement() {
-    let (mut cluster, old, moving) = moved_while_down(&|_| Vec::new());
+    let (cluster, old, moving) = moved_while_down(&|_| Vec::new());
 
     let held = |holder: &WorkerId| cluster.records().held_by(holder, &moving.task).expect("a new holder has the record");
     let version = |holder: &WorkerId| held(holder).version;

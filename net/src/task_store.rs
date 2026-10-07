@@ -145,6 +145,15 @@ pub fn record_key(task: &TaskId) -> kad::RecordKey {
 /// whatever holders it names; the leader's own writes name none. kad's error type
 /// has no variant for an older record; any `Err` has the effect that
 /// matters, and the real reason is logged here.
+///
+/// This store trusts the peers of its shard. It does not check that a writer
+/// is the shard's leader or even a member, and it bounds the size of each
+/// record but not how many unfinished records a holder keeps. The version
+/// order stops a stale write from replacing a newer record, and the leader's
+/// own memory budget bounds what an honest leader writes, but a forged or
+/// flooding writer is stopped only by authenticating peers. That
+/// authentication, with encrypted transport, is a gate before any real
+/// workload adopts the system, not something this store can supply.
 pub struct TaskRecordStore {
     held: HeldRecords,
 }

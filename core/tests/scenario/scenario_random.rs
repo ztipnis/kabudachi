@@ -23,7 +23,7 @@
 //! A known gap remains: when every member of a shard is `Bootstrapping`
 //! at a leaderless epoch, which nodes that rejoined the authority's epoch
 //! after its leader drained or stopped can all be, no node can recover it.
-//! The default seeds and seeds 0 to 3999 avoid it; a wider sweep through
+//! The default seeds avoid it; a wider sweep through
 //! `KABUDACHI_SIM_SEEDS` can still find it. So this test can fail on a
 //! liveness gap in the election as well as on a broken invariant. A failure
 //! names its seed.
@@ -31,7 +31,9 @@
 //! A run is reproduced by its seed alone, which a failure prints. By default
 //! the fixed seeds in `SEEDS` run. `KABUDACHI_SIM_SEEDS` replaces them: `N`
 //! runs seeds 0 to N-1, `a,b,c` runs those seeds and `a..b` runs seeds a to
-//! b-1, to search wider before closing a change to the election. A trailing
+//! b-1, to search wider. A wider sweep is optional exploration: the default
+//! seeds are the gate, and what a sweep finds is triaged, not a reason to
+//! hold a change. A trailing
 //! comma is allowed, so `N,` runs the single seed N, even `u64::MAX`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +44,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::support::builders::past_any_suspicion;
 use crate::support::harness::{Answer, Cluster, Ticket};
+use kabudachi_core::configuration::Admission;
 use kabudachi_core::election::{Output, StopReason};
 use kabudachi_core::task_record::{VersionOrder, identify};
 use kabudachi_core::protocol::ids::WorkerId;
@@ -206,6 +209,24 @@ fn apply(
     }
 }
 
+/// Whether `id` is the only voter of the configuration it knows. The voters
+/// counted against above are the ones the cluster was built with, but the
+/// authority path can found a configuration of fewer: of only the node whose
+/// registration was still live. A product limit: the sole voter has no other
+/// voter to hand its records to, and pending members are not targets, so
+/// draining or losing it takes every record it alone held with it. Runs do
+/// not exercise that limit.
+fn is_sole_voter(cluster: &Cluster, id: &WorkerId) -> bool {
+    let node = cluster.node(id);
+    node.configuration().is_some_and(|configuration| {
+        configuration.voter_count() == Some(1)
+            && configuration.is_voter(Admission {
+                current: node.admission(),
+                prior: node.prior_admission(),
+            })
+    })
+}
+
 /// Panics if the steps taken since the last call, or the grants so far, break
 /// an invariant that holds at every moment: at most one valid grant, and at
 /// most one leader of any (recovery epoch, term).
@@ -277,14 +298,20 @@ fn run_seed(seed: u64) -> bool {
         if let Event::Drain(index) = event {
             // Below half the voters, so the rest can still elect.
             let gone = drained.len() + usize::from(down.is_some());
-            if gone >= (voters.len() - 1) / 2 || !drained.insert(voters[index].clone()) {
+            if gone >= (voters.len() - 1) / 2
+                || is_sole_voter(&cluster, &voters[index])
+                || !drained.insert(voters[index].clone())
+            {
                 continue;
             }
         }
         if let Event::Down(index) = &event {
             // One loss, counted with the drains against the voters that must
             // stay to elect.
-            if down.is_some() || drained.len() + 1 > (voters.len() - 1) / 2 {
+            if down.is_some()
+                || drained.len() + 1 > (voters.len() - 1) / 2
+                || is_sole_voter(&cluster, &ids[*index])
+            {
                 continue;
             }
             down = Some(ids[*index].clone());

@@ -2,7 +2,7 @@
 
 ## Source of truth
 
-- `README.md` is the architecture and phased-delivery specification. Only Phases 0-2 are implemented; do not implement later-phase design.
+- `README.md` is the architecture and phased-delivery specification. Only Phases 0-3 are implemented; do not implement later-phase design.
 - `STYLE_GUIDE.md` governs every code change and review. Do not rewrite unrelated pre-existing code for style alone; address it only when it is a correctness, security, or architecture-boundary risk.
 - `CONTRIBUTING.md` is the source for Docker/devcontainer and platform-specific test guidance. Docker is for CI-parity checks only, and only with user approval (see "Shared build state and agent rules"). `runtime/README.md` documents the Python runtime API.
 
@@ -25,7 +25,10 @@ bazel test //core:core_integration_test
 # so `election::` also matches `scenario::scenario_election::`. Add
 # `--test_arg=--skip --test_arg=scenario::` to get exactly the `election` module:
 bazel test //core:core_integration_test --test_arg=election:: --test_arg=--skip --test_arg=scenario::
-bazel test //net:net_integration_test
+# The same filter selects one area of net: bootstrap, claim, discovery, driver, election, join,
+# lifecycle, reconcile, records, transport.
+bazel test //net:net_integration_test --test_arg=records::
+bazel test //testkit:testkit_integration_test
 bazel test //runtime/tests:test_native
 bazel test //runtime/tests:test_declaration
 bazel test //runtime/tests:test_serialization

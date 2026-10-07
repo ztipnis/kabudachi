@@ -8,7 +8,6 @@ use kabudachi_core::protocol::messages::{ClaimRejectReason, claim_response, task
 use kabudachi_core::scheduler::MemoryLimits;
 
 use crate::support::deadline::within_deadline;
-use crate::support::election::wait_until;
 use crate::support::records::{
     ThreeVoters, claimed_and_started, plain_with, submitted_through,
 };
@@ -107,54 +106,6 @@ async fn a_leader_compacts_a_chain_for_a_worker_that_runs_compaction_and_applies
             })
             .count();
         assert!(folded_on >= 2, "a majority holds the record with the fold");
-    })
-    .await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "blocked: no networked worker runs task claims by itself yet, so a worker that advertises compaction never folds one; this needs the worker-side subprocess executor"]
-async fn a_worker_that_runs_compaction_folds_a_long_chain_before_its_newest_generation_runs() {
-    within_deadline(async {
-        let (mut shard, client) = ThreeVoters::start().await;
-        for voter in 0..3 {
-            shard.set_runs_compaction(voter, true);
-            shard.schedulers[voter].set_memory_limits(Some(MemoryLimits {
-                soft: 300,
-                hard: 1_000_000,
-            }));
-        }
-        let leader = shard.drive_until_a_leader().await;
-        let leader_id = shard.id(leader);
-        shard.join_as_pending(&client, leader).await;
-        let runner = shard.others(leader)[0];
-        let runner_net = shard.nets[runner].clone();
-        let nets = shard.nets.clone();
-        let keyed = |payload: &[u8]| plain_with(payload).with_coalescing_key("k");
-
-        shard
-            .drive_until(async {
-                let holder = submitted_through(&client, &leader_id, keyed(b"h")).await;
-                claimed_and_started(&runner_net, &leader_id, &holder).await;
-                let mut newest = None;
-                for letter in b'a'..b'g' {
-                    newest = Some(submitted_through(&client, &leader_id, keyed(&[letter; 80])).await);
-                }
-                let newest = newest.expect("generations were submitted");
-                // Nothing here claims the compaction run: only a worker's own
-                // executor would, and the record never carries a fold.
-                wait_until(|| {
-                    nets.iter().any(|net| {
-                        net.held_records().get(&newest).is_some_and(|record| {
-                            matches!(
-                                record.retained_chain.first().and_then(|entry| entry.entry.as_ref()),
-                                Some(chain_entry::Entry::Folded(_))
-                            )
-                        })
-                    })
-                })
-                .await;
-            })
-            .await;
     })
     .await
 }

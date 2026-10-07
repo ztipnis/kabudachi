@@ -437,10 +437,11 @@ where
             }
         }
         // A new office (even one won as soon as the last was lost) starts
-        // with no memory of the last one's writes.
+        // with no memory of the last one's writes, and tells nothing the last
+        // one decided.
         if stepper.node.office_term() != office {
             office = stepper.node.office_term();
-            stepper.unsettled.forget_office();
+            stepper.unsettled.forget_office(&mut held_answers, net);
         }
         let outcomes = net.take_write_outcomes();
         for outcome in &outcomes {
@@ -1190,8 +1191,14 @@ impl RecordWrites {
 
     /// Forgets everything about the writes of an office that ended: a
     /// refusal of that office's must not answer questions of the next,
-    /// which republishes every record itself.
-    fn forget_office(&mut self) {
+    /// which republishes every record itself. Every answer still `held` for
+    /// that office goes out `NotLeader`: the next office rebuilt its records
+    /// from what was stored, which need not hold the decision, so none of
+    /// its writes may release the answer.
+    fn forget_office(&mut self, held: &mut EffectGate<HeldAnswer>, net: &Net) {
+        for answer in held.lease_ended() {
+            send_answer(net, Settled::NotLeader(answer));
+        }
         self.ledger.clear();
         self.order.clear();
         self.repair = Repair::new(self.retry_after);
@@ -1555,7 +1562,8 @@ fn settle_answers<C: Clock, I: IdGenerator>(
             refused.push(outcome.write);
         }
         for write in refused {
-            for answer in held.refused(&write) {
+            let newer = unsettled.ledger.pending_newer_than(&write);
+            for answer in held.refused(&write, &newer) {
                 send_answer(net, Settled::NotLeader(answer));
             }
         }

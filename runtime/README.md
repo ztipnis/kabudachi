@@ -108,7 +108,16 @@ handle raises `TaskSupersededError`. A running generation is never cancelled, an
 of a key runs at a time.
 
 The scheduler counts the bytes of task input that has not finished. Past `memory_soft_limit`, `group`
-and `map` pause; past `memory_hard_limit`, submitting raises `BackpressureError`. A `@coalescing_task` declared with `drop_oldest=True` instead drops the key's oldest retained payloads until the submission fits, but still raises `BackpressureError` when dropping every retained payload for the key would not free enough bytes (for example an oversized payload). Independent of the limits, a task whose input, queue and key together exceed about 1 MiB (the size of one message to a worker) also raises `BackpressureError`, because no worker could ever be sent it.
+and `map` pause; past `memory_hard_limit`, submitting raises `BackpressureError`. A `@coalescing_task` declared with `drop_oldest=True` instead drops the key's oldest retained payloads until the submission fits, but still raises `BackpressureError` when dropping every retained payload for the key would not free enough bytes (for example an oversized payload). Independent of the limits, a task whose input, queue and key together exceed about 1 MiB (the size of one message to a worker) also raises `BackpressureError`, because no worker could ever be sent it. `drop_oldest` does not relax this bound: a key whose claim would pass one message raises `BackpressureError` even with `drop_oldest`.
+
+A coalescing key's superseded payloads are kept as a chain until the newest generation runs. When a
+key's chain holds more than about half of one message to a worker (or memory is past
+`memory_soft_limit`), the scheduler creates a compaction run. It runs on a free worker place with the
+task's `merge` function, which folds the oldest payloads that fit one claim into one. The newest
+generation still sees every payload folded in order, so `merge` must be deterministic and free of side
+effects but need not be associative. While a key's chain is as large as one message to a worker,
+submitting to that key raises `BackpressureError`. If a fold grows past one message, the newest
+generation fails with `CoalescedPayloadTooLargeError`.
 
 ## Errors and native types
 
@@ -119,10 +128,11 @@ re-exports them, so catch them as `kabudachi.errors.*` like the rest. Some nativ
 errors, which `except KabudachiError` does not catch.
 
 The native module reports what happened as typed values rather than strings, all in
-`kabudachi._native`: `EventKind` (`EXPIRED`, `SUPERSEDED`, `SLOW_DOWN`, `CANCELLED`, `RECORD_FULL`) for scheduler
+`kabudachi._native`: `EventKind` (`EXPIRED`, `SUPERSEDED`, `SLOW_DOWN`, `CANCELLED`, `RECORD_FULL`, `COALESCED_PAYLOAD_TOO_LARGE`) for scheduler
 events, `CancelOutcome` (`CANCELLED`, `ALREADY_FINISHED`, `UNKNOWN_TASK`) for how a cancel ended, and
 `RunState` (`SCHEDULED` through `ORPHANED`) for where a run is. The runtime turns these into the
 handle behaviour described above; you meet them only if you call the native module directly.
+`COALESCED_PAYLOAD_TOO_LARGE` surfaces as `CoalescedPayloadTooLargeError` on the handle.
 
 ## Configuration
 
