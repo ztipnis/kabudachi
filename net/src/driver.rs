@@ -160,7 +160,7 @@ use crate::bootstrap::DEFAULT_RETRY_INTERVAL;
 use crate::claim::{self, ClaimRequestHandle};
 use crate::handoff::{HandedOff, hand_off_held_records};
 use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, pointer_for};
-use crate::leader_search::{JoinOverNet, Rejoin, StrandedWatch};
+use crate::leader_search::{JoinOverNet, Rejoin, SearchFor, StrandedWatch, search_purpose};
 use crate::messenger::{Net, PlacedWrite, WriteOutcome};
 use crate::reconcile::leader::{LeaderReconciliation, Progress, Stuck};
 use crate::reconcile::report::page_of;
@@ -204,36 +204,6 @@ impl Default for DriverConfig {
             runs_compaction: false,
         }
     }
-}
-
-/// The search the driver runs for a node in `state`, if any. A rejoin needs
-/// an authority to confirm a pointer against. A stranded node's leader
-/// search needs someone to ask, an authority's listing or a seed: with
-/// neither it would run empty rounds every retry interval.
-fn search_purpose(
-    state: WorkerState,
-    authority_present: bool,
-    seeds_present: bool,
-    stranded_search: bool,
-) -> Option<SearchFor> {
-    match state {
-        WorkerState::Bootstrapping | WorkerState::Joining if authority_present => {
-            Some(SearchFor::Rejoin)
-        }
-        _ if stranded_search && (authority_present || seeds_present) => Some(SearchFor::Leader),
-        _ => None,
-    }
-}
-
-/// Why the driver runs a leader search.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SearchFor {
-    /// The node fenced itself and is back in `Bootstrapping` (or `Joining` on
-    /// a pointer it took): a pointer is joined through `Input::JoinAnswer`.
-    Rejoin,
-    /// The node is stranded: the search's own dials reconnect it, and a leader
-    /// it reaches acks it as a newly connected peer.
-    Leader,
 }
 
 pub use crate::authority::SharedAuthority;

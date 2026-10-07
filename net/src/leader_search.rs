@@ -633,3 +633,33 @@ impl StrandedWatch {
         self.since.map(|since| since + self.window).filter(|due| *due > now)
     }
 }
+
+/// The search the driver runs for a node in `state`, if any. A rejoin needs
+/// an authority to confirm a pointer against. A stranded node's leader
+/// search needs someone to ask, an authority's listing or a seed: with
+/// neither it would run empty rounds every retry interval.
+pub(crate) fn search_purpose(
+    state: WorkerState,
+    authority_present: bool,
+    seeds_present: bool,
+    stranded_search: bool,
+) -> Option<SearchFor> {
+    match state {
+        WorkerState::Bootstrapping | WorkerState::Joining if authority_present => {
+            Some(SearchFor::Rejoin)
+        }
+        _ if stranded_search && (authority_present || seeds_present) => Some(SearchFor::Leader),
+        _ => None,
+    }
+}
+
+/// Why the driver runs a leader search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchFor {
+    /// The node fenced itself and is back in `Bootstrapping` (or `Joining` on
+    /// a pointer it took): a pointer is joined through `Input::JoinAnswer`.
+    Rejoin,
+    /// The node is stranded: the search's own dials reconnect it, and a leader
+    /// it reaches acks it as a newly connected peer.
+    Leader,
+}
