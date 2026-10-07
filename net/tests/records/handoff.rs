@@ -45,7 +45,7 @@ async fn a_drained_voter_hands_its_records_over_before_its_driver_returns_and_th
         let (leader_id, drainer_id) = (shard.id(leader), shard.id(drainer));
 
         let handed_off = shard.handed_off();
-        // One call drives the shard throughout: its drivers keep where they
+        // No `with` call interrupts the drivers here: they keep where they
         // wrote each record only while they run.
         shard
             .drive_until(async {

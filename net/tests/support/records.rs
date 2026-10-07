@@ -112,6 +112,10 @@ impl HandedOffBy {
         self.0.send_modify(|returned| returned[voter] = Some(handed_off));
     }
 
+    fn has_returned(&self, voter: usize) -> bool {
+        self.0.borrow()[voter].is_some()
+    }
+
     /// Resolves once `voter`'s driver has returned (it does once the voter
     /// drained and handed its records over), with what it returned. Callers
     /// bound the wait.
@@ -238,24 +242,49 @@ impl Voters {
         voter: usize,
         act: impl FnOnce(&mut WorkerNode<RealClock>, &mut Scheduled) -> R + Send + 'static,
     ) -> R {
+        self.check_drivers().await;
         let gone = || panic!("voter {voter} is no longer driven");
         match &mut self.voters[voter] {
             Voter::Idle(driven) => act(&mut driven.node, &mut driven.scheduler),
             Voter::Running { commands, .. } => {
                 let (reply, answer) = tokio::sync::oneshot::channel();
+                // A panic in `act` goes back to the caller, so the test fails
+                // with its own message and the driver keeps running.
                 let command: Command = Box::new(move |node, scheduler| {
-                    let _ = reply.send(act(node, scheduler));
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        act(node, scheduler)
+                    }));
+                    let _ = reply.send(outcome);
                 });
                 if commands.send(command).is_err() {
                     gone();
                 }
                 match timeout(TEST_TIMEOUT, answer).await {
-                    Ok(Ok(answer)) => answer,
+                    Ok(Ok(Ok(answer))) => answer,
+                    Ok(Ok(Err(panic))) => std::panic::resume_unwind(panic),
                     Ok(Err(_)) => gone(),
                     Err(_) => panic!("voter {voter} ran the command within the timeout"),
                 }
             }
             Voter::Gone => gone(),
+        }
+    }
+
+    /// Fails the test if a voter's driver ended without handing off: a driver
+    /// runs on a task nobody awaits, so its panic would otherwise go unseen.
+    async fn check_drivers(&mut self) {
+        for voter in 0..self.voters.len() {
+            let Voter::Running { task, .. } = &mut self.voters[voter] else {
+                continue;
+            };
+            if !task.is_finished() || self.handed_off.has_returned(voter) {
+                continue;
+            }
+            // The task has finished, so this resolves at once.
+            match timeout(StdDuration::ZERO, task).await {
+                Ok(Err(error)) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                _ => panic!("voter {voter}'s driver stopped without handing off"),
+            }
         }
     }
 
@@ -396,7 +425,8 @@ impl Voters {
     }
 
     /// Whether `led`, a leader's configuration, is committed with every voter
-    /// of the shard in it, and every voter holds it as one of its voters.
+    /// of the shard in it, and every voter still driven holds it as one of
+    /// its voters.
     async fn all_hold(&mut self, led: Option<Configuration>) -> bool {
         let Some(led) = led else {
             return false;
@@ -405,6 +435,9 @@ impl Voters {
             return false;
         }
         for voter in 0..self.voters.len() {
+            if matches!(self.voters[voter], Voter::Gone) {
+                continue;
+            }
             let led = led.clone();
             let holds = self
                 .with(voter, move |node, _| {
@@ -425,9 +458,11 @@ impl Voters {
     /// (see [`Self::handed_off`]).
     pub async fn drive_until<T>(&mut self, until: impl Future<Output = T>) -> T {
         self.start_idle();
-        timeout(TEST_TIMEOUT, until)
+        let awaited = timeout(TEST_TIMEOUT, until)
             .await
-            .expect("the awaited event happened within the timeout")
+            .expect("the awaited event happened within the timeout");
+        self.check_drivers().await;
+        awaited
     }
 
     /// What the drivers of drained voters returned, to wait on inside
