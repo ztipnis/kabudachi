@@ -480,6 +480,29 @@ fn a_leader_names_its_voters_and_a_follower_names_none() {
 }
 
 #[test]
+fn a_leader_knows_its_voters_and_pending_members_and_no_one_else() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let follower = voter_node(&clock, &worker("p1"), 3, SUSPECT);
+    let joiner = worker("joiner");
+    connect(&mut leader, std::slice::from_ref(&joiner));
+    deliver(
+        &mut leader,
+        &joiner,
+        heartbeat_message(heartbeat(&joiner, None)),
+    );
+
+    for voter in ["w1", "p1", "p2", "joiner"] {
+        assert!(leader.is_voter_or_pending(&worker(voter)), "{voter}");
+    }
+    assert!(!leader.is_voter_or_pending(&worker("stranger")));
+    assert!(
+        !follower.is_voter_or_pending(&worker("p2")),
+        "only a leader's roster names members"
+    );
+}
+
+#[test]
 fn a_leader_drops_a_removed_member_and_announces_one_fewer_voter_at_the_next_generation() {
     let clock = FakeClock::new();
     let mut leader = leader_of_three(&clock);

@@ -206,6 +206,18 @@ impl LeaderOffice {
             .collect()
     }
 
+    /// Whether the roster holds `worker` as a voter of the committed
+    /// configuration or as a pending member. Removals pending are not applied
+    /// first: a worker that has just asked to leave may be counted once more,
+    /// and nothing its claim decides outlives its removal.
+    pub(crate) fn is_voter_or_pending(&self, worker: &WorkerId) -> bool {
+        self.roster.pending().contains(worker)
+            || self
+                .roster
+                .configuration()
+                .is_voter(self.roster.counted_admission_of(worker))
+    }
+
     /// A SELF_REMOVE the node accepted (its term guard stays with the
     /// node): `departing` is taken out with every other one accepted, in
     /// the next operation.

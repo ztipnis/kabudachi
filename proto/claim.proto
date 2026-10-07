@@ -39,10 +39,12 @@ message Claim {
   repeated bytes chain = 4;
 }
 
-// Mirrors `core::scheduler::ClaimRejection`'s seven variants, one enum value
-// each — the same enum-plus-reason shape `VoteRejectReason` (election.proto)
-// already uses in this codebase for "why was this request refused", rather
-// than seven separate empty message types.
+// The reasons a leader refuses a claim: one enum value for each variant of
+// `core::scheduler::ClaimRejection`, and `CLAIM_REJECT_NOT_MEMBER` for a
+// claimant that is neither a voter nor a pending member of the shard, which
+// must join it first. This is the same enum-plus-reason shape
+// `VoteRejectReason` (election.proto) uses for "why was this request
+// refused", rather than a separate empty message type for each reason.
 enum ClaimRejectReason {
   CLAIM_REJECT_REASON_UNSPECIFIED = 0;
   CLAIM_REJECT_NOT_LEADER = 1;
@@ -52,6 +54,7 @@ enum ClaimRejectReason {
   CLAIM_REJECT_FINISHED = 5;
   CLAIM_REJECT_SUPERSEDED = 6;
   CLAIM_REJECT_KEY_BUSY = 7;
+  CLAIM_REJECT_NOT_MEMBER = 8;
 }
 
 message ClaimReject {

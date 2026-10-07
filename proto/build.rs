@@ -1,9 +1,10 @@
-const PROTO_FILES: [&str; 6] = [
+const PROTO_FILES: [&str; 7] = [
     "claim.proto",
     "election.proto",
     "ids.proto",
     "join.proto",
     "task.proto",
+    "task_exchange.proto",
     "task_record.proto",
 ];
 

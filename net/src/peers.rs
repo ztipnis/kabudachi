@@ -252,17 +252,20 @@ pub struct Traffic {
     pub join_requests_received: u64,
     /// `/kabudachi/claim/1` requests received.
     pub claim_requests_received: u64,
+    /// `/kabudachi/task/1` requests received.
+    pub task_requests_received: u64,
 }
 
 impl Traffic {
     /// Everything this worker received or sent: election messages in and
-    /// out, and join and claim requests in (each answered once).
+    /// out, and join, claim and task requests in (each answered once).
     pub fn total(&self) -> u64 {
         self.messages_received
             + self.messages_sent
             + self.messages_published
             + self.join_requests_received
             + self.claim_requests_received
+            + self.task_requests_received
     }
 }
 
@@ -286,6 +289,9 @@ impl std::ops::Sub for Traffic {
             claim_requests_received: self
                 .claim_requests_received
                 .saturating_sub(earlier.claim_requests_received),
+            task_requests_received: self
+                .task_requests_received
+                .saturating_sub(earlier.task_requests_received),
         }
     }
 }
@@ -334,6 +340,7 @@ pub(crate) enum Carried {
     Published,
     JoinRequest,
     ClaimRequest,
+    TaskRequest,
 }
 
 /// What the swarm task saw happen, for the peer book. Every observation comes
@@ -484,6 +491,7 @@ impl Peers {
                 Carried::Published => self.traffic.messages_published += 1,
                 Carried::JoinRequest => self.traffic.join_requests_received += 1,
                 Carried::ClaimRequest => self.traffic.claim_requests_received += 1,
+                Carried::TaskRequest => self.traffic.task_requests_received += 1,
             },
         }
     }
@@ -1120,7 +1128,13 @@ mod tests {
         let arrival = roll_call(&worker_id_of(&PeerId::random()), "");
 
         book.observe(Observation::MessageArrived(&arrival), t);
-        for carried in [Carried::Sent, Carried::Published, Carried::JoinRequest, Carried::ClaimRequest] {
+        for carried in [
+            Carried::Sent,
+            Carried::Published,
+            Carried::JoinRequest,
+            Carried::ClaimRequest,
+            Carried::TaskRequest,
+        ] {
             book.observe(Observation::Carried(carried), t);
         }
 
@@ -1132,10 +1146,11 @@ mod tests {
                 traffic.messages_published,
                 traffic.join_requests_received,
                 traffic.claim_requests_received,
+                traffic.task_requests_received,
             ),
-            (1, 1, 1, 1, 1)
+            (1, 1, 1, 1, 1, 1)
         );
-        assert_eq!(traffic.total(), 5);
+        assert_eq!(traffic.total(), 6);
     }
 
     #[test]

@@ -28,6 +28,11 @@ pub use generated::{
     TaskRunIdentity, VoteGrant, VoteRequest, WorkerHeartbeat, chain_entry,
     claim_request, claim_response, election_message,
 };
+pub use generated::{
+    CancelAnswer, CancelOutcome, CancelTask, ReportCompleted, ReportFailed, ReportStarted,
+    RunCertified, RunFailed, StartAccepted, SubmitAccepted, SubmitTask, TaskReject,
+    TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
+};
 
 /// Whether every required ID field of a raw message is present. Nested
 /// messages are not checked; [`checked::decode`] covers them.
@@ -319,6 +324,21 @@ impl WellFormed for ClaimResponse {
 
 fn claim_is_well_formed(claim: &Claim) -> bool {
     claim.has_required_ids() && claim.task.as_ref().is_none_or(|t| t.has_required_ids())
+}
+
+impl WellFormed for TaskRequest {
+    /// An id or digest missing inside a request is for the leader to refuse
+    /// as `TASK_REJECT_MALFORMED`; only a request that asks for nothing stops
+    /// at the codec.
+    fn is_well_formed(&self) -> bool {
+        self.request.is_some()
+    }
+}
+
+impl WellFormed for TaskResponse {
+    fn is_well_formed(&self) -> bool {
+        self.result.is_some()
+    }
 }
 
 impl WellFormed for JoinRequest {

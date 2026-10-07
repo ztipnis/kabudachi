@@ -270,7 +270,7 @@ impl NativeRuntime {
             .submit(submission)
             .map_err(|refusal| {
                 refused(refusal, |rejection| match rejection {
-                    SubmitRejection::NotLeader | SubmitRejection::DuplicateId => {
+                    SubmitRejection::NotLeader => {
                         PyRuntimeError::new_err(rejection.to_string())
                     }
                     SubmitRejection::TooLarge { .. }

@@ -183,7 +183,7 @@ fn gated<C: Clock, T, R: NotLeaderRejection>(
 /// outright (the limits fell since it was queued, or the lease ended) and
 /// everything behind it stay queued, in order, rather than being lost. One the
 /// scheduler recorded but whose write the store refused stays recorded:
-/// recording it again would overwrite the task and its runs.
+/// it is already recorded.
 fn record_queued<C: Clock>(inside: &mut Inside<C>) {
     let queued = std::mem::take(&mut inside.queued);
     let mut waiting = queued.into_iter();

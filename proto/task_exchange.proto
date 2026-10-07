@@ -1,0 +1,129 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+import "task.proto";
+
+// A worker asks its shard's leader to record a task, or tells it what
+// became of a run it claimed. Only the leader decides; a worker that is not
+// the leader answers TASK_REJECT_NOT_LEADER, and so does a leader that could
+// not make its decision last before it lost its lease. As with claims, the
+// leader answers only workers its roster holds as voters or pending members,
+// and refuses any other with TASK_REJECT_NOT_MEMBER.
+
+// A submission as its client minted it: the task id and submission time
+// are fixed before any leader sees it, so resubmitting after a refusal
+// names the same task.
+message SubmitTask {
+  TaskId task_id = 1;
+  WallTime submitted_at = 2;
+  TaskDefinitionId task_definition_id = 3;
+  uint32 source_version = 4;
+  bytes serialized_input = 5;
+  string queue = 6;
+  uint32 max_retries = 7;
+  optional uint64 delay_millis = 8;
+  optional uint64 expiry_millis = 9;
+  optional string coalescing_key = 10;
+  bool drop_oldest = 11;
+  bool ephemeral = 12;
+  bool non_retriable = 13;
+}
+
+message ReportStarted {
+  TaskRunId task_run_id = 1;
+}
+
+// The run succeeded. Only the digest of its result travels: the result
+// itself stays with the worker that produced it.
+message ReportCompleted {
+  TaskRunId task_run_id = 1;
+  Digest result_digest = 2;
+}
+
+message ReportFailed {
+  TaskRunId task_run_id = 1;
+  // The error's type name, never its message.
+  string failure_kind = 2;
+}
+
+message CancelTask {
+  TaskId task_id = 1;
+}
+
+message TaskRequest {
+  oneof request {
+    SubmitTask submit = 1;
+    ReportStarted started = 2;
+    ReportCompleted completed = 3;
+    ReportFailed failed = 4;
+    CancelTask cancel = 5;
+  }
+}
+
+enum TaskRejectReason {
+  TASK_REJECT_REASON_UNSPECIFIED = 0;
+  // Ask the leader your node names again later: this worker does not lead,
+  // or lost its lease before its decision was stored where it must be.
+  TASK_REJECT_NOT_LEADER = 1;
+  TASK_REJECT_TOO_LARGE = 2;
+  TASK_REJECT_BACKPRESSURE = 3;
+  TASK_REJECT_RECORD_TOO_LARGE = 4;
+  TASK_REJECT_UNKNOWN_RUN = 5;
+  TASK_REJECT_NOT_AUTHORITATIVE = 6;
+  // The request could not be read: a missing id, an undecodable digest.
+  TASK_REJECT_MALFORMED = 7;
+  // A submission under an id the leader holds is answered with that id, so
+  // no reason names it.
+  reserved 8;
+  // The asker is neither a voter nor a pending member of the leader's shard:
+  // it must join the shard first. Nothing of the request took effect.
+  TASK_REJECT_NOT_MEMBER = 9;
+}
+
+message TaskReject {
+  TaskRejectReason reason = 1;
+}
+
+message SubmitAccepted {
+  TaskId task_id = 1;
+}
+
+message StartAccepted {}
+
+message RunCertified {
+  TaskId task_id = 1;
+  TaskRunId task_run_id = 2;
+  Digest result_digest = 3;
+}
+
+message RunFailed {
+  TaskId task_id = 1;
+  TaskRunId task_run_id = 2;
+  // The attempt queued in its place, if the task had retries left.
+  TaskRunId retry = 3;
+}
+
+enum CancelOutcome {
+  CANCEL_OUTCOME_UNSPECIFIED = 0;
+  CANCEL_OUTCOME_CANCELLED = 1;
+  CANCEL_OUTCOME_ALREADY_FINISHED = 2;
+  CANCEL_OUTCOME_UNKNOWN_TASK = 3;
+}
+
+message CancelAnswer {
+  CancelOutcome outcome = 1;
+  // With CANCEL_OUTCOME_CANCELLED: a worker had claimed the task.
+  bool was_running = 2;
+}
+
+message TaskResponse {
+  oneof result {
+    SubmitAccepted submitted = 1;
+    StartAccepted started = 2;
+    RunCertified certified = 3;
+    RunFailed failed = 4;
+    CancelAnswer cancelled = 5;
+    TaskReject reject = 6;
+  }
+}

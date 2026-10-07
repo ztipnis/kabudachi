@@ -38,10 +38,11 @@
 //! each step and each scheduler catch-up, the revisions a node's scheduler
 //! published are placed on `replication_factor` of the voters that node
 //! leads, nearest by a fixed hash, and written to the shared `RecordSpace`.
-//! `submit` and `claim` call a node's scheduler and hold its answer, as the
-//! net driver does, until every write the call made is acknowledged within
-//! the lease (see `answer`): a write the space could not store at a quorum,
-//! or a lease that ended first, answers `NotLeader`.
+//! `submit`, `claim`, `start`, `complete`, `fail` and `cancel` call a node's
+//! scheduler and hold its answer, as the net driver does, until every write
+//! the call made is acknowledged within the lease (see `answer`): a write the
+//! space could not store at a quorum, or a lease that ended first, answers
+//! `NotLeader`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -54,7 +55,12 @@ use kabudachi_core::election::{
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::{Claim, Scheduler, Submission};
+use kabudachi_core::protocol::digest::Digest;
+use kabudachi_core::protocol::ids::TaskRunId;
+use kabudachi_core::protocol::records::TaskRunRecord;
+use kabudachi_core::scheduler::{
+    Certification, Claim, Completion, Scheduler, Submission,
+};
 use kabudachi_core::task_record::{EffectGate, Settled, Waits, Write, WriteLedger};
 use kabudachi_core::time::{Clock, Duration, Instant};
 use kabudachi_testkit::FaultingAuthority;
@@ -90,7 +96,7 @@ struct Stall {
     held: Vec<Input>,
 }
 
-/// What `submit` or `claim` asked of a node, to read its answer with
+/// What a call on the cluster asked of a node, to read its answer with
 /// `answer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Ticket(u64);
@@ -101,6 +107,8 @@ pub struct Ticket(u64);
 pub enum Answer {
     Submitted(TaskId),
     Claimed(Claim),
+    Started,
+    Certified(Certification),
     /// The rejection's `Display`, for a call the scheduler refused outright.
     Refused(String),
     /// A write was refused or the lease ended first.
@@ -570,11 +578,58 @@ impl Cluster {
     /// unsettled, or is answered `NotLeader` at once if one was refused.
     /// Panics on an unknown ID.
     pub fn claim(&mut self, at: &WorkerId, claimant: &WorkerId, task: &TaskId) -> Ticket {
-        let ticket = self.next_ticket();
         let answer = match self.scheduler_mut(at).request_claim(claimant, task) {
             Ok(claim) => Answer::Claimed(claim),
             Err(rejection) => Answer::Refused(rejection.to_string()),
         };
+        self.hold_call_on(at, task, answer)
+    }
+
+    /// `claimant` reports to the named node's scheduler that it started
+    /// `run`, and the answer is held as `claim`'s is.
+    pub fn start(&mut self, at: &WorkerId, claimant: &WorkerId, run: &TaskRunId) -> Ticket {
+        let task = self.task_of(at, run);
+        let answer = match self.scheduler_mut(at).report_started(claimant, run) {
+            Ok(()) => Answer::Started,
+            Err(rejection) => Answer::Refused(rejection.to_string()),
+        };
+        self.hold_call_on(at, &task, answer)
+    }
+
+    /// `claimant` reports that it completed `run` with a result of `digest`,
+    /// ending the task; the answer is held as `claim`'s is.
+    pub fn complete(
+        &mut self,
+        at: &WorkerId,
+        claimant: &WorkerId,
+        run: &TaskRunId,
+        digest: Digest,
+    ) -> Ticket {
+        let task = self.task_of(at, run);
+        let answer = match self
+            .scheduler_mut(at)
+            .complete(claimant, run, digest, Completion::Final)
+        {
+            Ok(certification) => Answer::Certified(certification),
+            Err(rejection) => Answer::Refused(rejection.to_string()),
+        };
+        self.hold_call_on(at, &task, answer)
+    }
+
+    /// The task that `run` belongs to, as the named node's scheduler knows it.
+    fn task_of(&mut self, at: &WorkerId, run: &TaskRunId) -> TaskId {
+        self.scheduler_mut(at)
+            .task_run(run)
+            .map(|record| record.task_id())
+            .expect("the node's scheduler knows the run")
+    }
+
+    /// Holds `answer` to a call about `task` until the writes the call made
+    /// are acknowledged within the lease. A call that wrote nothing, because
+    /// the task was already decided, waits for that task's writes still
+    /// unsettled, or is answered `NotLeader` at once if one was refused.
+    fn hold_call_on(&mut self, at: &WorkerId, task: &TaskId, answer: Answer) -> Ticket {
+        let ticket = self.next_ticket();
         let mut writes = self.write_revisions(at);
         if writes.is_empty() {
             match self.gating[at].unsettled.waits_on(task) {

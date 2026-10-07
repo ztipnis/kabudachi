@@ -10,6 +10,7 @@ use kabudachi_core::election::{
     ElectionTimings, Entry, Identity, Input, KnownConfiguration, Step, WorkerNode,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::messages::{ElectionMessage, WorkerHeartbeat, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::task_record::RecordOutbox;
@@ -38,7 +39,8 @@ type Scheduled = Scheduler<RealClock, Uuid7Ids, RecordOutbox>;
 /// `Net::for_shard`, node and scheduler. Nothing runs until a `drive_*` call;
 /// each call drives all three drivers and leaves the nodes where they stood.
 pub struct ThreeVoters {
-    pub nets: [Net; 3],
+    /// Shared, so a test can ask through a voter's net while driving the three.
+    pub nets: [Arc<Net>; 3],
     pub nodes: [WorkerNode<RealClock>; 3],
     pub schedulers: [Scheduled; 3],
     pub clock: RealClock,
@@ -50,15 +52,16 @@ pub struct ThreeVoters {
 
 impl ThreeVoters {
     /// The voters, and a fourth connected `Net` for the shard that has no
-    /// node: the client that asks the leader for claims.
+    /// node: a client the leader's roster does not hold until
+    /// [`Self::join_as_pending`] makes it a pending member.
     pub async fn start() -> (ThreeVoters, Net) {
         let shard = ShardId::new(SHARD);
         let hosted = [0, 1, 2].map(|_| host(shard.clone()));
         let [(net_a, host_a), (net_b, host_b), (net_c, host_c)] = hosted;
-        let nets = [net_a, net_b, net_c];
+        let nets = [net_a, net_b, net_c].map(Arc::new);
         let hosts = [host_a, host_b, host_c];
         let claimant = Net::for_shard(shard, None);
-        let ids = connect_full_mesh(&[&nets[0], &nets[1], &nets[2], &claimant]).await;
+        let ids = connect_full_mesh(&[&*nets[0], &*nets[1], &*nets[2], &claimant]).await;
         let ids = [ids[0].clone(), ids[1].clone(), ids[2].clone()];
         let clock = RealClock::new();
         let nodes = built_on_one_tick(&clock, || ids.clone().map(|id| voter(clock, id)));
@@ -87,6 +90,29 @@ impl ThreeVoters {
 
     pub fn others(&self, voter: usize) -> Vec<usize> {
         (0..3).filter(|other| *other != voter).collect()
+    }
+
+    /// Makes `client` a pending member of the shard, as a worker that has
+    /// just started heartbeating to `leader` is: one heartbeat that confirms
+    /// no ack, so the leader records it and admits it no further. Drives the
+    /// three until the leader's roster holds it.
+    pub async fn join_as_pending(&mut self, client: &Net, leader: usize) {
+        let joiner = client.local_worker_id();
+        let leader_id = self.id(leader);
+        timeout(TEST_TIMEOUT, async {
+            client.send(leader_id.clone(), heartbeat_from(&joiner));
+            while !self.nodes[leader].is_voter_or_pending(&joiner) {
+                self.drive_until(tokio::time::sleep(StdDuration::from_millis(10)))
+                    .await;
+                // A heartbeat sent before the leader's lease or the
+                // connection was ready is dropped, so send another.
+                if !self.nodes[leader].is_voter_or_pending(&joiner) {
+                    client.send(leader_id.clone(), heartbeat_from(&joiner));
+                }
+            }
+        })
+        .await
+        .expect("the leader's roster held the joiner within the timeout");
     }
 
     /// Freezes `voter`'s network: its connections stay open, but it answers
@@ -137,7 +163,7 @@ impl ThreeVoters {
     /// Drives the three until `until` completes, and returns what it
     /// returned; panics if that takes past the backstop.
     pub async fn drive_until<T>(&mut self, until: impl Future<Output = T>) -> T {
-        let [net_a, net_b, net_c] = &self.nets;
+        let [net_a, net_b, net_c] = self.nets.each_ref().map(|net| &**net);
         let [tx_a, tx_b, tx_c] = self.senders.clone();
         timeout(
             TEST_TIMEOUT,
@@ -153,6 +179,28 @@ impl ThreeVoters {
         )
         .await
         .expect("the awaited event happened within the timeout")
+    }
+}
+
+/// A first heartbeat from `worker`, which confirms no ack.
+fn heartbeat_from(worker: &WorkerId) -> ElectionMessage {
+    ElectionMessage {
+        payload: Some(election_message::Payload::Heartbeat(WorkerHeartbeat {
+            worker_id: Some(worker.clone().into()),
+            incarnation_id: Some(
+                IncarnationId::new(format!("{}-incarnation-0", worker.as_str())).into(),
+            ),
+            recovery_epoch_seen: 0,
+            term_seen: 0,
+            available_capacity: 0,
+            active_task_runs_digest: Vec::new(),
+            shard_id: Some(ShardId::new(SHARD).into()),
+            newest_accepted_ack: None,
+            configuration_generation: None,
+            send_token: 0,
+            routing_crawled: false,
+            crawl_admission: None,
+        })),
     }
 }
 

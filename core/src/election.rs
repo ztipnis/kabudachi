@@ -889,6 +889,17 @@ where
         }
     }
 
+    /// Whether this node leads and its roster holds `worker` as a voter of the
+    /// configuration it leads or as a pending member. `false` for every
+    /// worker while this node does not lead. Only the leader's own roster is
+    /// read, never the routing table.
+    pub fn is_voter_or_pending(&self, worker: &WorkerId) -> bool {
+        match (&self.office, self.state) {
+            (Some(office), WorkerState::Leader) => office.is_voter_or_pending(worker),
+            _ => false,
+        }
+    }
+
     pub fn shard_id(&self) -> &ShardId {
         &self.shard_id
     }

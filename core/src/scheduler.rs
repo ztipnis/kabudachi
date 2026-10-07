@@ -120,8 +120,6 @@ pub enum SubmitRejection {
     },
     #[error("this node is not the leader")]
     NotLeader,
-    #[error("a task with this id is already recorded")]
-    DuplicateId,
     #[error("the task's record would be {size} bytes, past the {limit} a record may have")]
     RecordTooLarge { size: u64, limit: u64 },
 }
@@ -137,6 +135,38 @@ pub struct Submitted {
     /// from here, so a wall clock that jumps never shortens the wait. It means
     /// something only to the scheduler that minted it.
     minted_at: Instant,
+}
+
+impl Submitted {
+    /// A submission whose id and submission time were fixed elsewhere, as
+    /// it arrives here: its delay and expiry count from `clock`'s monotonic
+    /// reading now, because the client's reading means nothing on this node.
+    pub fn received(
+        task_id: TaskId,
+        submitted_at: WallTime,
+        submission: Submission,
+        clock: &impl Clock,
+    ) -> Self {
+        Submitted {
+            task_id,
+            submitted_at,
+            submission,
+            minted_at: clock.now(),
+        }
+    }
+}
+
+/// Gives `submission` a fresh task id from `ids` and stamps it with
+/// `clock`'s wall-clock time now. Records nothing anywhere, so a client
+/// mints its submission before it knows who leads, and asking again after a
+/// refusal resubmits the same task.
+pub fn mint(submission: Submission, ids: &impl IdGenerator, clock: &impl Clock) -> Submitted {
+    Submitted {
+        task_id: mint_task_id(ids),
+        submitted_at: WallTime::now(clock),
+        submission,
+        minted_at: clock.now(),
+    }
 }
 
 /// What a task is submitted with. Start from [`Submission::new`] and add the
@@ -725,12 +755,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Gives `submission` a fresh task id and stamps it with the wall-clock
     /// time now, noting the monotonic time too. Records nothing, so it needs no leadership.
     pub fn mint(&self, submission: Submission) -> Submitted {
-        Submitted {
-            task_id: mint_task_id(&self.ids),
-            submitted_at: WallTime::now(&self.clock),
-            submission,
-            minted_at: self.clock.now(),
-        }
+        mint(submission, &self.ids, &self.clock)
     }
 
     /// Whether `submission` could be recorded now with `queued_bytes` more
@@ -761,6 +786,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// when it was minted, by the monotonic clock: time passed since then,
     /// including time spent waiting for a leader, is taken off them, and the
     /// wall clock never shortens them. Only a leader records a submission.
+    ///
+    /// A task id it already holds is a client asking again after a refusal:
+    /// it records nothing and answers the id, so a retry never makes a second
+    /// task. A task it has forgotten (past its result's time to live) that is
+    /// submitted again is recorded afresh.
     pub fn submit_minted(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
         let outcome = self.record_submission(submitted);
         self.end_call();
@@ -779,7 +809,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return Err(SubmitRejection::NotLeader);
         }
         if self.tasks.contains_key(&submitted.task_id) {
-            return Err(SubmitRejection::DuplicateId);
+            return Ok(submitted.task_id);
         }
         self.check_submission(&submitted.submission, 0)?;
         let Submitted {

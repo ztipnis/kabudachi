@@ -37,8 +37,10 @@ use crate::support::net::{ask_until_pointed_at_a_leader, driven_scheduler};
 const SHARD: &str = "shard-1";
 
 /// How long a node goes without leader contact before it suspects its
-/// leader; the genesis leader waits this out before its lone roll call.
-const SUSPECT_TIMEOUT_MS: u64 = 300;
+/// leader; the genesis leader waits this out before its lone roll call. Long
+/// enough that a leader whose threads a loaded host starves for a moment
+/// keeps its lease, which lasts a suspicion timeout less its drift share.
+const SUSPECT_TIMEOUT_MS: u64 = 2000;
 
 /// How often a follower heartbeats its leader: well inside the suspicion
 /// timeout.
@@ -97,6 +99,29 @@ async fn join_and_drive(
         let _ = known_leader.send(node.known_leader().map(|(leader, _)| leader));
     })
     .await;
+}
+
+/// Asks until the leader's roster holds the asker. A joiner learns its leader
+/// from the join answer, before the leader has heard its first heartbeat, so
+/// a claim made at once can be refused as `NOT_MEMBER` for a moment. That
+/// refusal changes nothing on the leader, so asking again is safe.
+async fn until_a_member<F, Fut>(mut ask: F) -> Result<ClaimResponse, ClaimFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ClaimResponse, ClaimFailure>>,
+{
+    loop {
+        let response = ask().await;
+        let not_member = matches!(
+            &response,
+            Ok(ClaimResponse { result: Some(claim_response::Result::Reject(reject)) })
+                if reject.reason == ClaimRejectReason::ClaimRejectNotMember as i32
+        );
+        if !not_member {
+            return response;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 fn claimed_tasks(response: Result<ClaimResponse, ClaimFailure>) -> Vec<TaskId> {
@@ -178,9 +203,9 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
                     named.push(leader);
                 }
                 let (b_names, c_names) = (named[0].clone(), named[1].clone());
-                let claimed = net_b.request_claim(b_names, taken.clone()).await;
-                let refused = net_c.request_claim(c_names.clone(), taken.clone()).await;
-                let batch = net_c.claim_oldest(c_names, 5).await;
+                let claimed = until_a_member(|| net_b.request_claim(b_names.clone(), taken.clone())).await;
+                let refused = until_a_member(|| net_c.request_claim(c_names.clone(), taken.clone())).await;
+                let batch = until_a_member(|| net_c.claim_oldest(c_names.clone(), 5)).await;
                 (claimed, refused, batch)
             } => claims,
         }
@@ -209,6 +234,6 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
         oldest,
         "the oldest pending tasks, oldest first, the leader the joiners' nodes name"
     );
-    // The leader counts every ask as a claim arrival.
-    assert_eq!(net_a.diagnostics().await.traffic.claim_requests_received, 3);
+    // The leader counts each ask as a claim arrival, a refused one too.
+    assert!(net_a.diagnostics().await.traffic.claim_requests_received >= 3);
 }

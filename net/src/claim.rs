@@ -8,7 +8,12 @@
 //! request: whether to grant a claim is `core::scheduler::Scheduler`'s decision
 //! alone. The decision is made at once, but the driver sends the answer only
 //! once the revisions it wrote are acknowledged and the leader still leads;
-//! otherwise the claimant is answered [`not_leader`].
+//! otherwise the claimant is answered [`not_leader`]. Before the scheduler is
+//! asked, the driver checks the claimant against the leader's roster: a
+//! worker that is neither a voter nor a pending member of the shard is
+//! answered [`not_member`] and must join the shard first. Each claim a leader
+//! grants is also entered in the claimant's
+//! [`ClaimedRuns`](crate::claimed_runs::ClaimedRuns).
 
 use std::str::FromStr;
 
@@ -95,8 +100,11 @@ impl Net {
         leader: WorkerId,
         task_id: TaskId,
     ) -> Result<ClaimResponse, ClaimFailure> {
-        self.ask_leader(leader, claim_request::Request::TaskId(task_id.into()))
-            .await
+        let response = self
+            .ask_leader(leader, claim_request::Request::TaskId(task_id.into()))
+            .await?;
+        self.keep_granted(&response);
+        Ok(response)
     }
 
     /// Asks `leader` for up to `limit` of the oldest pending tasks
@@ -111,8 +119,25 @@ impl Net {
         leader: WorkerId,
         limit: u32,
     ) -> Result<ClaimResponse, ClaimFailure> {
-        self.ask_leader(leader, claim_request::Request::Oldest(ClaimOldest { limit }))
-            .await
+        let response = self
+            .ask_leader(leader, claim_request::Request::Oldest(ClaimOldest { limit }))
+            .await?;
+        self.keep_granted(&response);
+        Ok(response)
+    }
+
+    /// Enters every claim `response` grants in this worker's ledger of the
+    /// runs it holds.
+    fn keep_granted(&self, response: &ClaimResponse) {
+        match &response.result {
+            Some(claim_response::Result::Accept(claim)) => self.claimed.claimed(claim.clone()),
+            Some(claim_response::Result::Batch(batch)) => {
+                for claim in &batch.claims {
+                    self.claimed.claimed(claim.clone());
+                }
+            }
+            Some(claim_response::Result::Reject(_)) | None => {}
+        }
     }
 
     async fn ask_leader(
@@ -184,6 +209,16 @@ pub(crate) fn not_leader() -> ClaimResponse {
     ClaimResponse {
         result: Some(claim_response::Result::Reject(ClaimReject {
             reason: ClaimRejectReason::ClaimRejectNotLeader as i32,
+        })),
+    }
+}
+
+/// The answer to a claim from a worker the leader's roster holds neither as a
+/// voter nor as a pending member: it must join the shard first.
+pub(crate) fn not_member() -> ClaimResponse {
+    ClaimResponse {
+        result: Some(claim_response::Result::Reject(ClaimReject {
+            reason: ClaimRejectReason::ClaimRejectNotMember as i32,
         })),
     }
 }

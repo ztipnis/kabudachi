@@ -12,10 +12,14 @@
 //! something arrives, whichever is first; it never steps the node on a fixed
 //! timer.
 //!
-//! It also answers the two request/response protocols whose answers only
+//! It also answers the three request/response protocols whose answers only
 //! this side of the worker holds. A join request is answered with the
 //! leader the node knows, at the address `Net` knows for it; a claim request
-//! with the scheduler's decision. And it tells `Net` which leader the node
+//! with the scheduler's decision, once the node's roster has been checked: a
+//! leader grants a claim only to a voter or a pending member of its shard,
+//! and answers any other worker `NOT_MEMBER` without asking the scheduler;
+//! and a task-exchange request (a submission, a report on a run, a cancel)
+//! with the scheduler's decision, gated like a claim. And it tells `Net` which leader the node
 //! names, so the worker's own claims go to that leader. Between batches it
 //! re-crawls the worker's peer routing once the node's view of its shard
 //! has changed and settled, and periodically (see `crate::routing_refresh`), so
@@ -25,13 +29,22 @@
 //! A leader's scheduler records each decision as a new revision of its
 //! task's Task record. The driver writes every revision to the voters
 //! the record's placement names (the replication factor nearest the key),
-//! and holds the answer a decision produced, a claim's included, until a
+//! and holds the answer a decision produced, a claim's or a task-exchange
+//! request's included, until a
 //! quorum of those voters has stored it and the scheduler still leads. The
 //! held answer is released `NotLeader` when the lease ends, and the driver
 //! wakes just past the lease end so that happens even if nothing else
 //! arrives. A write that misses its quorum while the leader still leads
 //! may or may not have landed, so the driver answers `NotLeader` to every
 //! later question about that task until a newer revision of it is stored.
+//!
+//! Time acts on the scheduler here too: each batch lets it catch up once its
+//! deadline has come (a delayed task is released, a pending task past its
+//! expiry expires, a finished task is forgotten) and writes what that
+//! changed, and the driver sleeps no later than that deadline. The events the
+//! scheduler raises are drained each batch: they are logged and dropped, as
+//! no client lives on a networked worker to hear them, and the revisions
+//! published when that ends the scheduler's call are written too.
 //!
 //! With a coordination authority configured, it is also the sole caller of
 //! [`kabudachi_core::election::AuthorityCall::perform`]. Each step's
@@ -80,9 +93,9 @@ use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, Input, Issuer, MessageSink, Output, Step,
     WorkerNode, carry_out,
 };
-use kabudachi_core::protocol::ids::{IdGenerator, TaskId, WorkerId};
+use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    ClaimResponse, ElectionMessage, JoinResponse, claim_request,
+    ClaimResponse, ElectionMessage, JoinResponse, TaskResponse, claim_request, task_request,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
@@ -100,6 +113,7 @@ use crate::leader_search::{JoinOverNet, Rejoin, StrandedWatch};
 use crate::messenger::{Net, PlacedWrite};
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
 use crate::routing_refresh::{RoutingRefresh, ShardView};
+use crate::task_exchange::{self, TaskRequestHandle};
 use crate::task_store::placement::{Placement, ReplicationFactor, placement};
 
 /// How [`run_driver`] runs, beyond the node, transport and scheduler it drives.
@@ -361,6 +375,15 @@ where
             stepper.unsettled,
             config.replication_factor,
         );
+        respond_to_task_requests(
+            stepper.node,
+            stepper.scheduler,
+            net,
+            &clock,
+            &mut held_answers,
+            stepper.unsettled,
+            config.replication_factor,
+        );
         stepper.write_revisions();
         // A step can report a deadline that has already come: a voter that
         // begins suspecting its leader starts a roll call at its next
@@ -369,6 +392,15 @@ where
         while next_deadline.is_some_and(|deadline| deadline <= clock.now()) {
             next_deadline = stepper.step(Input::Tick);
         }
+        let scheduler_deadline = catch_up_if_due(
+            node,
+            scheduler,
+            net,
+            config.replication_factor,
+            &mut unsettled,
+            clock.now(),
+        );
+        drain_events(node, scheduler, net, config.replication_factor, &mut unsettled);
         // What the node showed after this batch: the timer arm below decides
         // on this same view, since the node is not stepped between batches.
         let view = ShardView::of(node);
@@ -472,6 +504,7 @@ where
                 () = wake_at(search_wake) => break,
                 () = sleep_until(&clock, stranded_wake) => break,
                 () = sleep_until(&clock, lease_wake) => break,
+                () = sleep_until(&clock, scheduler_deadline) => break,
                 result = ask_done(&mut search) => {
                     if let Some((purpose, search)) = search.as_mut() {
                         found = search
@@ -487,6 +520,42 @@ where
             }
         }
     }
+}
+
+/// Lets time act on `scheduler` if its deadline has come (delays released,
+/// pending tasks expired, finished tasks forgotten), writes what that
+/// changed, and returns its next deadline. Nothing waits on those writes: no
+/// one asked for them.
+fn catch_up_if_due<C: Clock, I: IdGenerator>(
+    node: &WorkerNode<C>,
+    scheduler: &mut Scheduler<C, I, RecordOutbox>,
+    net: &Net,
+    factor: ReplicationFactor,
+    unsettled: &mut WriteLedger,
+    now: Instant,
+) -> Option<Instant> {
+    if scheduler.next_deadline().is_some_and(|due| due <= now) {
+        scheduler.catch_up();
+        write_revisions(node, scheduler, net, factor, unsettled);
+    }
+    scheduler.next_deadline()
+}
+
+/// No client lives on a worker of a networked shard yet, so the events the
+/// scheduler raises for one are logged and dropped rather than kept for ever.
+/// Taking them ends the scheduler's call, which can publish the revisions
+/// the call made, so they are written too; nothing waits on those writes.
+fn drain_events<C: Clock, I: IdGenerator>(
+    node: &WorkerNode<C>,
+    scheduler: &mut Scheduler<C, I, RecordOutbox>,
+    net: &Net,
+    factor: ReplicationFactor,
+    unsettled: &mut WriteLedger,
+) {
+    for event in scheduler.take_events() {
+        tracing::debug!(?event, "scheduler event with no client to tell");
+    }
+    write_revisions(node, scheduler, net, factor, unsettled);
 }
 
 /// What one batch of [`run_driver`] steps its node with.
@@ -715,11 +784,17 @@ where
     }
 }
 
-/// A claim answer the leader has decided and holds until the writes its
-/// decision made settle.
-struct HeldAnswer {
-    handle: ClaimRequestHandle,
-    response: ClaimResponse,
+/// An answer the leader has decided and holds until the writes its decision
+/// made settle.
+enum HeldAnswer {
+    Claim {
+        handle: ClaimRequestHandle,
+        response: ClaimResponse,
+    },
+    Task {
+        handle: TaskRequestHandle,
+        response: TaskResponse,
+    },
 }
 
 /// Decides every inbound `/kabudachi/claim/1` request queued on `net` with
@@ -740,6 +815,10 @@ fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
     factor: ReplicationFactor,
 ) {
     for handle in net.poll_claim_requests() {
+        if scheduler.is_leader() && !node.is_voter_or_pending(&handle.from()) {
+            net.respond_claim(handle, claim::not_member());
+            continue;
+        }
         let response = claim::answer(scheduler, &handle.from(), handle.request());
         let mut writes = write_revisions(node, scheduler, net, factor, unsettled);
         if let (true, claim_request::Request::TaskId(named)) = (writes.is_empty(), handle.request())
@@ -747,15 +826,79 @@ fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
             let task = TaskId::from(named.clone());
             match unsettled.waits_on(&task) {
                 Waits::Refused => {
-                    send_answer(net, Settled::NotLeader(HeldAnswer { handle, response }));
+                    send_answer(net, Settled::NotLeader(HeldAnswer::Claim { handle, response }));
                     continue;
                 }
                 Waits::Writes(pending) => writes.extend(pending),
             }
         }
-        if let Some(settled) = held.hold(HeldAnswer { handle, response }, writes) {
+        if let Some(settled) = held.hold(HeldAnswer::Claim { handle, response }, writes) {
             send_answer(net, settled);
         }
+    }
+}
+
+/// Decides every inbound `/kabudachi/task/1` request queued on `net` with
+/// `scheduler`'s decision (see `task_exchange::answer`) and writes the
+/// revisions that decision made, then holds the answer as
+/// [`respond_to_claim_requests`] does. As claims are, task requests are
+/// answered only for the voters and pending members of the shard the leader
+/// leads: any other worker is answered `NotMember` at once, and its request
+/// never reaches the scheduler. A submission, a cancel or a report
+/// that made no write of its own (its task was already decided, or the report
+/// repeats one) waits for that task's writes still unsettled, for the same
+/// reason.
+fn respond_to_task_requests<C: Clock, I: IdGenerator>(
+    node: &WorkerNode<C>,
+    scheduler: &mut Scheduler<C, I, RecordOutbox>,
+    net: &Net,
+    clock: &C,
+    held: &mut EffectGate<HeldAnswer>,
+    unsettled: &mut WriteLedger,
+    factor: ReplicationFactor,
+) {
+    for handle in net.poll_task_requests() {
+        if scheduler.is_leader() && !node.is_voter_or_pending(&handle.from()) {
+            net.respond_task(handle, task_exchange::not_member());
+            continue;
+        }
+        let named = task_named(scheduler, handle.request());
+        let response = task_exchange::answer(scheduler, &handle.from(), handle.request(), clock);
+        let mut writes = write_revisions(node, scheduler, net, factor, unsettled);
+        if let (true, Some(task)) = (writes.is_empty(), named) {
+            match unsettled.waits_on(&task) {
+                Waits::Refused => {
+                    send_answer(net, Settled::NotLeader(HeldAnswer::Task { handle, response }));
+                    continue;
+                }
+                Waits::Writes(pending) => writes.extend(pending),
+            }
+        }
+        if let Some(settled) = held.hold(HeldAnswer::Task { handle, response }, writes) {
+            send_answer(net, settled);
+        }
+    }
+}
+
+/// The task a request names, for the requests that name one, or whose run
+/// `scheduler` holds (a report names its run).
+fn task_named<C: Clock, I: IdGenerator>(
+    scheduler: &Scheduler<C, I, RecordOutbox>,
+    request: &task_request::Request,
+) -> Option<TaskId> {
+    let of_run = |run: &Option<_>| {
+        let run = TaskRunId::from(Clone::clone(run.as_ref()?));
+        scheduler
+            .task_run(&run)
+            .and_then(|held| held.identity.as_ref()?.task_id.clone())
+            .map(TaskId::from)
+    };
+    match request {
+        task_request::Request::Submit(task) => task.task_id.clone().map(TaskId::from),
+        task_request::Request::Cancel(cancel) => cancel.task_id.clone().map(TaskId::from),
+        task_request::Request::Started(report) => of_run(&report.task_run_id),
+        task_request::Request::Completed(report) => of_run(&report.task_run_id),
+        task_request::Request::Failed(report) => of_run(&report.task_run_id),
     }
 }
 
@@ -799,8 +942,18 @@ fn settle_answers<C: Clock, I: IdGenerator>(
 
 fn send_answer(net: &Net, settled: Settled<HeldAnswer>) {
     match settled {
-        Settled::Released(held) => net.respond_claim(held.handle, held.response),
-        Settled::NotLeader(held) => net.respond_claim(held.handle, claim::not_leader()),
+        Settled::Released(HeldAnswer::Claim { handle, response }) => {
+            net.respond_claim(handle, response);
+        }
+        Settled::NotLeader(HeldAnswer::Claim { handle, .. }) => {
+            net.respond_claim(handle, claim::not_leader());
+        }
+        Settled::Released(HeldAnswer::Task { handle, response }) => {
+            net.respond_task(handle, response);
+        }
+        Settled::NotLeader(HeldAnswer::Task { handle, .. }) => {
+            net.respond_task(handle, task_exchange::not_leader());
+        }
     }
 }
 

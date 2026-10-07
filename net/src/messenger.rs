@@ -3,8 +3,11 @@
 //! the node asks to send, publishes the ones it asks to publish to its whole
 //! shard (see "Gossip" below), and queues the node's inputs as they happen:
 //! every election message received, and every connection to a peer opening
-//! or closing. It also carries the join and claim protocols, whose requests
-//! only the driver can answer (see `crate::driver::run_driver`). A completed
+//! or closing. It also carries the join, claim and task-exchange protocols,
+//! whose requests only the driver can answer (see
+//! `crate::driver::run_driver`), and keeps this worker's ledger of the runs
+//! it claimed (`crate::claimed_runs::ClaimedRuns`), which the claim and task
+//! exchange calls update from the leader's answers. A completed
 //! routing crawl is reported to the node as `Input::RoutingCrawled`.
 //!
 //! ## `WorkerId` <-> `PeerId` mapping
@@ -125,6 +128,14 @@
 //! `core::scheduler::Scheduler`'s decision (`crate::claim::answer`), so the
 //! driver answers it too.
 //!
+//! ## The task exchange protocol
+//!
+//! `/kabudachi/task/1` (see `crate::task_exchange`) is a third correlated
+//! protocol of the same shape: `Net::submit`, `Net::report_started`,
+//! `Net::complete`, `Net::fail` and `Net::cancel` ask the leader the caller
+//! names, and [`Net::poll_task_requests`] / [`Net::respond_task`] serve the
+//! answering side. The calls about a run also keep [`Net::claimed_runs`].
+//!
 //! ## Reconnect/backoff and where a peer's address comes from
 //!
 //! What a `Net` knows about its peers, and the fast-then-slow redial of a dropped
@@ -174,6 +185,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::claim::codec::ClaimCodec;
+use crate::claimed_runs::ClaimedRuns;
 use crate::codec::Ack;
 use crate::exchange::{Asked, Exchange};
 use crate::framing::decode_election;
@@ -181,6 +193,7 @@ use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm};
+use crate::task_exchange::codec::TaskCodec;
 use crate::task_store::{HeldRecords, record_key};
 
 /// What [`Net::dial_for_connection`] dials.
@@ -280,10 +293,11 @@ pub struct WriteOutcome {
 pub(crate) struct Exchanges {
     join: Exchange<JoinCodec>,
     claim: Exchange<ClaimCodec>,
+    task: Exchange<TaskCodec>,
 }
 
 /// A correlated protocol `Net` carries through an [`Exchange`]
-/// (implemented here for `JoinCodec` and `ClaimCodec`).
+/// (implemented here for `JoinCodec`, `ClaimCodec` and `TaskCodec`).
 pub(crate) trait Correlated:
     request_response::Codec + Clone + Send + Sized + 'static
 {
@@ -320,6 +334,19 @@ impl Correlated for ClaimCodec {
     }
 }
 
+impl Correlated for TaskCodec {
+    const ARRIVAL: Carried = Carried::TaskRequest;
+    fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self> {
+        &mut behaviour.task
+    }
+    fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
+        &mut exchanges.task
+    }
+    fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
+        &inbound.tasks
+    }
+}
+
 /// [`Net::try_listen_on`] could not listen on this address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenRejected(pub Multiaddr);
@@ -337,7 +364,7 @@ impl std::error::Error for ListenRejected {}
 pub const DEFAULT_INPUT_LIMIT: usize = 1024;
 
 /// What `drive` hands over for the driver of this `Net`'s node, each queue
-/// in arrival order: the node's inputs, the join and claim requests the
+/// in arrival order: the node's inputs, the join, claim and task requests the
 /// driver answers, and the outcomes of the record writes it asked for.
 /// `arrived` is signalled whenever any of them grows.
 pub(crate) struct Inbound {
@@ -346,6 +373,7 @@ pub(crate) struct Inbound {
     input_limit: AtomicUsize,
     joins: Mutex<VecDeque<Asked<JoinCodec>>>,
     claims: Mutex<VecDeque<Asked<ClaimCodec>>>,
+    tasks: Mutex<VecDeque<Asked<TaskCodec>>>,
     writes: Mutex<VecDeque<WriteOutcome>>,
     arrived: Notify,
 }
@@ -357,6 +385,7 @@ impl Default for Inbound {
             input_limit: AtomicUsize::new(DEFAULT_INPUT_LIMIT),
             joins: Mutex::default(),
             claims: Mutex::default(),
+            tasks: Mutex::default(),
             writes: Mutex::default(),
             arrived: Notify::new(),
         }
@@ -461,6 +490,8 @@ pub struct Net {
     records_shard: Option<ShardId>,
     /// The Task records this `Net` holds (see [`Self::held_records`]).
     held: HeldRecords,
+    /// The runs this worker claimed (see [`Self::claimed_runs`]).
+    pub(crate) claimed: ClaimedRuns,
     driver: JoinHandle<()>,
 }
 
@@ -524,6 +555,7 @@ impl Net {
             shard: Mutex::new(None),
             records_shard,
             held,
+            claimed: ClaimedRuns::default(),
             driver,
         }
     }
@@ -1588,6 +1620,9 @@ fn handle_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Claim(event)) => {
             settle::<ClaimCodec>(&mut pending.exchanges, event, inbound, peers, now);
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Task(event)) => {
+            settle::<TaskCodec>(&mut pending.exchanges, event, inbound, peers, now);
         }
         _ => {}
     }

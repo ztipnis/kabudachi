@@ -169,7 +169,7 @@ fn a_grant_of_an_older_term_than_one_published_in_does_not_let_the_scheduler_act
 }
 
 #[test]
-fn a_submission_under_an_id_already_recorded_is_refused_and_changes_nothing() {
+fn a_task_id_asked_for_again_answers_the_id_and_records_nothing_more() {
     let mut fixture = Fixture::leading();
     let minted = fixture.scheduler.mint(plain(b"a"));
     fixture.scheduler.submit_minted(minted.clone()).unwrap();
@@ -178,9 +178,9 @@ fn a_submission_under_an_id_already_recorded_is_refused_and_changes_nothing() {
     let mut again = fixture.scheduler.mint(plain(b"other"));
     again.task_id = minted.task_id.clone();
 
-    assert_eq!(fixture.scheduler.submit_minted(again), Err(SubmitRejection::DuplicateId));
+    assert_eq!(fixture.scheduler.submit_minted(again), Ok(minted.task_id.clone()));
     assert_eq!(fixture.scheduler.runs_of(&minted.task_id).len(), 1, "the first recording stands untouched");
-    assert_eq!(fixture.spy.revisions().len(), revisions);
+    assert_eq!(fixture.spy.revisions().len(), revisions, "nothing changed, nothing published");
 }
 
 #[test]

@@ -7,6 +7,7 @@
 pub mod authority;
 pub mod bootstrap;
 pub mod claim;
+pub mod claimed_runs;
 pub mod codec;
 pub mod driver;
 mod exchange;
@@ -18,6 +19,7 @@ pub mod messenger;
 mod peers;
 mod routing_refresh;
 pub mod swarm;
+pub mod task_exchange;
 pub mod task_store;
 #[cfg(test)]
 mod test_support;

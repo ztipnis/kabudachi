@@ -4,7 +4,8 @@
 
 use std::collections::BTreeSet;
 
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::digest::Digest;
+use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::Submission;
@@ -42,6 +43,45 @@ fn submitted(cluster: &mut Cluster, leader: &WorkerId) -> TaskId {
     match cluster.answer(ticket) {
         Some(Answer::Submitted(task)) => task.clone(),
         other => panic!("expected the submission to be acknowledged, got {other:?}"),
+    }
+}
+
+/// Claims and starts `task` on `claimant` with acknowledgements flowing at
+/// once, and returns the run.
+fn running(
+    cluster: &mut Cluster,
+    leader: &WorkerId,
+    claimant: &WorkerId,
+    task: &TaskId,
+) -> TaskRunId {
+    let claim = cluster.claim(leader, claimant, task);
+    cluster.advance(STEP);
+    let Some(Answer::Claimed(claim)) = cluster.answer(claim).cloned() else {
+        panic!("the claim was not answered");
+    };
+    let started = cluster.start(leader, claimant, &claim.task_run_id);
+    cluster.advance(STEP);
+    assert_eq!(cluster.answer(started), Some(&Answer::Started));
+    claim.task_run_id
+}
+
+/// Cuts `leader` off from the rest and holds every acknowledgement of a write
+/// made from now on back longer than its lease can last.
+fn depose_before_the_ack(cluster: &mut Cluster, leader: &WorkerId) {
+    cluster
+        .records()
+        .set_ack_delay(Duration::from_ticks(SUSPECT.as_ticks() * 4));
+    let rest: BTreeSet<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| id != leader)
+        .collect();
+    cluster.partition(BTreeSet::from([leader.clone()]), rest);
+}
+
+fn run_past_the_lease(cluster: &mut Cluster) {
+    for _ in 0..(SUSPECT.as_ticks() * 5 / STEP.as_ticks()) {
+        cluster.advance(STEP);
     }
 }
 
@@ -130,4 +170,22 @@ fn a_submission_whose_write_missed_its_quorum_is_answered_not_leader_while_the_l
 
     assert_eq!(cluster.answer(ticket), Some(&Answer::NotLeader));
     assert!(cluster.holds_valid_grant(&leader), "the lease did not end");
+}
+
+#[test]
+fn a_certification_whose_acknowledgement_arrives_after_the_lease_ended_is_answered_not_leader() {
+    let (mut cluster, leader) = elected();
+    let task = submitted(&mut cluster, &leader);
+    let claimant = cluster
+        .node_ids()
+        .into_iter()
+        .find(|id| *id != leader)
+        .unwrap();
+    let run = running(&mut cluster, &leader, &claimant, &task);
+
+    depose_before_the_ack(&mut cluster, &leader);
+    let ticket = cluster.complete(&leader, &claimant, &run, Digest::blake3(b"result"));
+    run_past_the_lease(&mut cluster);
+
+    assert_eq!(cluster.answer(ticket), Some(&Answer::NotLeader));
 }

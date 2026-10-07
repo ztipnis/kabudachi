@@ -3,11 +3,12 @@
 //! handshake over TCP+noise+yamux.
 //!
 //! `Behaviour` holds `identify`, `gossipsub`, two `kad` behaviours (one that
-//! routes, one that stores the shard's Task records) and three
+//! routes, one that stores the shard's Task records) and four
 //! `request_response` behaviours: one carrying the election protocol (see
 //! `crate::codec`), one the bootstrap join protocol (see
-//! `crate::join_codec`), and one the claim arbitration protocol (see
-//! `crate::claim::codec`) — each a deliberately separate wire protocol, not a
+//! `crate::join_codec`), one the claim arbitration protocol (see
+//! `crate::claim::codec`), and one the task exchange (see
+//! `crate::task_exchange::codec`) — each a deliberately separate wire protocol, not a
 //! variant folded into `ElectionMessage` (see `crate::join_codec`'s module
 //! doc). `gossipsub` carries the election messages a worker publishes to its
 //! whole shard rather than sends to one peer; every message is signed with
@@ -105,6 +106,7 @@ use libp2p::{
 use crate::claim::codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
 use crate::codec::{ElectionCodec, PROTOCOL};
 use crate::join_codec::{JoinCodec, PROTOCOL as JOIN_PROTOCOL};
+use crate::task_exchange::codec::{PROTOCOL as TASK_PROTOCOL, TaskCodec};
 use crate::task_store::{
     HeldRecords, MAX_RECORD_PACKET_BYTES, RECORD_WRITE_TIMEOUT, TaskRecordStore,
 };
@@ -161,6 +163,7 @@ pub struct Behaviour {
     pub request_response: request_response::Behaviour<ElectionCodec>,
     pub join: request_response::Behaviour<JoinCodec>,
     pub claim: request_response::Behaviour<ClaimCodec>,
+    pub task: request_response::Behaviour<TaskCodec>,
 }
 
 /// libp2p's TCP transport, except that every dial it makes leaves from a
@@ -338,6 +341,13 @@ pub(crate) fn build_swarm(shard: Option<&ShardId>, held: HeldRecords) -> Swarm<B
             // respond_to_claim_requests for the answering side.
             claim: request_response::Behaviour::new(
                 [(CLAIM_PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default(),
+            ),
+            // ProtocolSupport::Full on every node, same reasoning as `claim`
+            // above: any node may ask the leader about a task or a run, and
+            // whichever holds leadership answers.
+            task: request_response::Behaviour::new(
+                [(TASK_PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default(),
             ),
             blocked: allow_block_list::Behaviour::default(),
