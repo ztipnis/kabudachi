@@ -84,7 +84,9 @@ fn a_submission_its_record_cannot_hold_yet_waits_with_only_its_own_key() {
         backlog.submit(&mut fixture.scheduler, generation(&vec![b'y'; 1_000_000], "late-other")),
         Err(SubmitRejection::Backpressure { .. })
     ));
-    let late_other = backlog.submit(&mut fixture.scheduler, generation(b"small", "late-other")).unwrap();
+    let late_other = backlog
+        .submit(&mut fixture.scheduler, generation(b"small", "late-other"))
+        .unwrap();
     let third = backlog.submit(&mut fixture.scheduler, generation(b"third", "k")).unwrap();
     backlog.hand_over(&mut fixture.scheduler);
     assert!(

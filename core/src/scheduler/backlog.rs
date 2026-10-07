@@ -42,8 +42,11 @@ impl Backlog {
     /// Gives `submission` its task id at once. A scheduler that leads
     /// records it now, after recording what waits here, unless an earlier
     /// submission of its coalescing key still waits; otherwise it waits
-    /// here. Refused only when it is too large to claim or would pass the
-    /// hard limit with everything waiting here.
+    /// here. Refused when it is too large to claim or would pass the hard
+    /// limit with everything waiting here; while the scheduler leads and no
+    /// submission of its key waits, the scheduler's own refusal
+    /// (`RecordTooLarge`, `KeyNotReady`, `KeyBackpressure`) is returned
+    /// instead.
     pub fn submit<C: Clock, I: IdGenerator, O: Observer>(
         &mut self,
         scheduler: &mut Scheduler<C, I, O>,

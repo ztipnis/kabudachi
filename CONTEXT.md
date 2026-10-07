@@ -149,7 +149,7 @@ The one module for the claim protocol on the network (`net/src/claim.rs`): askin
 ## The scheduler
 
 **Scheduler door**:
-The bindings' one way into the shared scheduler (`bindings/src/door.rs`): the lock around it, the wake-ups after every change to claims, timers and events, and the closed flag. It holds the scheduler's backlog and hands it over after every change. Once the runtime is closed it refuses everything.
+The bindings' one way into the shared scheduler (`bindings/src/door.rs`): the lock around it, the wake-ups after every change to claims, timers and events, and the closed flag. It holds the scheduler's backlog and hands it over after every change but a claim. Once the runtime is closed it refuses everything.
 
 **Catch up**:
 The scheduler's one time-driven call (`Scheduler::catch_up`), made when its next deadline comes: it forgets every finished task past its retention, and, only while this scheduler leads, makes due delayed tasks pending and expires pending tasks past their expiry.

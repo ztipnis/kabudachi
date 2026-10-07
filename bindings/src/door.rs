@@ -25,8 +25,9 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{
-    Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted, Completion,
-    ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission, SubmitRejection,
+    Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
+    Completion, ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission,
+    SubmitRejection,
 };
 use kabudachi_core::task_record::{LocalRecords, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};
