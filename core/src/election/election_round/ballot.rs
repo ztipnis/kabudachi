@@ -35,6 +35,12 @@ pub(crate) struct Ballot {
     /// included; following a leader drops those above its term in which it
     /// granted no vote.
     highest_roll_call_term: Option<u64>,
+    /// The highest term of a roll call this node refused only because it was
+    /// counted against an older configuration than its own, taking no part
+    /// in the term. Its own next roll call goes past it, so the caller's
+    /// term is not contested again by a node that never learns of it;
+    /// following a leader drops it if it is above the leader's term.
+    stale_call_term: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -117,6 +123,7 @@ impl Ballot {
             .configuration_generation
             .is_some_and(|own| configuration_generation < own)
         {
+            self.stale_call_term = self.stale_call_term.max(Some(term));
             return RollCallVerdict::Reject(ElectionRejectReason::StaleGeneration);
         }
         if voter.leader_contact_is_fresh {
@@ -205,7 +212,10 @@ impl Ballot {
     /// an answer would outrank, and so make the node refuse, the call that
     /// elects the leader's successor for the same term. The votes it granted
     /// stay, with the calls they went to.
+    /// The term of a call refused for an older configuration goes too, if it
+    /// is above the leader's.
     pub(crate) fn forget_calls_above(&mut self, followed_term: u64) {
+        self.stale_call_term = self.stale_call_term.filter(|term| *term <= followed_term);
         let above = (Bound::Excluded(followed_term), Bound::Unbounded);
         // Every ack lands here, and most find nothing above to forget; every
         // ballot holds an answer or a grant, and the highest roll call term
@@ -251,6 +261,13 @@ impl Ballot {
     /// accepts one. Its next roll call contests a later term.
     pub(crate) fn highest_roll_call_term(&self) -> Option<u64> {
         self.highest_roll_call_term
+    }
+
+    /// The highest term this node has refused a roll call in for want of a
+    /// current configuration, or `None`; its next roll call contests a later
+    /// term.
+    pub(crate) fn stale_call_term(&self) -> Option<u64> {
+        self.stale_call_term
     }
 
     fn accept_roll_call_term(&mut self, term: u64) {

@@ -85,6 +85,10 @@ const SHARD_ID: &str = "shard-1";
 /// How many of its voters a leader places each record on.
 const REPLICATION_FACTOR: usize = 3;
 
+/// How many ticks in a row a node may be given at one instant before it must
+/// have moved on or reported a later deadline.
+const TICKS_AT_ONE_INSTANT: usize = 3;
+
 /// More passes than any real exchange needs at one instant: each pass
 /// carries a message one hop further, and roll calls, votes and acks all
 /// end within a few hops.
@@ -944,13 +948,23 @@ impl Cluster {
             if with_ticks && self.is_due(&id, now) {
                 activity.busy.insert(id.clone());
                 let state_before = self.nodes[&id].state();
-                let outputs = self.step(&id, Input::Tick);
-                activity.progressed |= changes_state(&outputs);
-                assert!(
-                    !self.is_due(&id, now) || self.nodes[&id].state() != state_before,
-                    "Cluster: node {id:?} is still due at {now:?} after a Tick that left it in \
-                     {state_before:?}, so its timers would never let the clock move on"
-                );
+                // A tick can ask the authority a call whose reply, handed
+                // back in the same step, makes the next tick due (a member
+                // may stand once its read of the authority's epoch is
+                // answered), so a node may be due again at once. It must not
+                // stay due: a few ticks at one instant are enough to tell.
+                for tick in 1..=TICKS_AT_ONE_INSTANT {
+                    let outputs = self.step(&id, Input::Tick);
+                    activity.progressed |= changes_state(&outputs);
+                    if !self.is_due(&id, now) || self.nodes[&id].state() != state_before {
+                        break;
+                    }
+                    assert!(
+                        tick < TICKS_AT_ONE_INSTANT,
+                        "Cluster: node {id:?} is still due at {now:?} after {tick} ticks that left \
+                         it in {state_before:?}, so its timers would never let the clock move on"
+                    );
+                }
             }
         }
         activity

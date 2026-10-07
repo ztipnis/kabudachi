@@ -20,10 +20,10 @@
 //! like the rest; the drains are capped below half the voters, so the
 //! rest can still elect.
 //!
-//! A known gap remains: a forced recovery that is dropped after the
-//! authority's epoch swap can leave nodes split across epochs with no leader,
-//! and the simulation's drain and authority-cut combinations can reach it. The
-//! default seeds avoid known failures; a wider sweep through
+//! A known gap remains: when every member of a shard is `Bootstrapping`
+//! at a leaderless epoch, which nodes that rejoined the authority's epoch
+//! after its leader drained or stopped can all be, no node can recover it.
+//! The default seeds and seeds 0 to 3999 avoid it; a wider sweep through
 //! `KABUDACHI_SIM_SEEDS` can still find it. So this test can fail on a
 //! liveness gap in the election as well as on a broken invariant. A failure
 //! names its seed.

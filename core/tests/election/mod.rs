@@ -7,6 +7,7 @@ mod heartbeat;
 mod join_floor;
 mod joint_founding;
 mod leader_heartbeat;
+mod member_standing;
 mod membership;
 mod reconciling;
 mod roll_call;

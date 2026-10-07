@@ -70,7 +70,10 @@ impl WorkerState {
     /// resumes (`Fenced -> Active`) or, if the epoch is no longer its own,
     /// rejoins (`Fenced -> Bootstrapping`); a `NoQuorum` node whose
     /// authority path finds an epoch it cannot recover from rejoins it the
-    /// same way (`NoQuorum -> Bootstrapping`). A rejoining node that took a
+    /// same way (`NoQuorum -> Bootstrapping`), and so does a `LeaderSuspect` or
+    /// `NoQuorum` member whose read of the authority's epoch names another
+    /// epoch than its own, rather than stand for election at it
+    /// (`LeaderSuspect -> Bootstrapping`). A rejoining node that took a
     /// JOIN pointer waits in `Joining` for the authority to confirm it
     /// (`-> Active`), and goes back (`Joining -> Bootstrapping`) when the
     /// authority holds another epoch.
@@ -85,6 +88,8 @@ impl WorkerState {
                 | (WorkerState::Active, WorkerState::Fenced)
                 | (WorkerState::LeaderSuspect, WorkerState::Active)
                 | (WorkerState::LeaderSuspect, WorkerState::RollCall)
+                | (WorkerState::LeaderSuspect, WorkerState::NoQuorum)
+                | (WorkerState::LeaderSuspect, WorkerState::Bootstrapping)
                 | (WorkerState::LeaderSuspect, WorkerState::Fenced)
                 | (WorkerState::RollCall, WorkerState::Active)
                 | (WorkerState::RollCall, WorkerState::LeaderSuspect)

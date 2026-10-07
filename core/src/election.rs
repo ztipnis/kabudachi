@@ -100,8 +100,13 @@
 //! the fence, and leads a configuration founded at the new epoch; if the epoch
 //! is missing, the shard is abandoned and the node stops. A node that hears a
 //! leader of a later recovery epoch adopts that epoch, and that leader's
-//! configuration, from its ack. A leader also reports each worker it has not
-//! heard from for a suspicion timeout and a reconnect timeout as lost.
+//! configuration, from its ack. A member with an authority stands for
+//! election only at the epoch the authority holds: once it suspects its
+//! leader it reads the authority's epoch, stands while that read names its own
+//! (or the authority holds none), and otherwise rejoins at the epoch the read
+//! names (see the `authority_standing` module). A leader also reports each
+//! worker it has not heard from for a suspicion timeout and a reconnect
+//! timeout as lost.
 //!
 //! Known gaps:
 //! - With no authority, no removal reaches a leaderless `NoQuorum` shard:
@@ -1840,10 +1845,28 @@ where
     /// `None` for a node with no configuration: it has nothing to count a
     /// quorum against. It stays `LeaderSuspect`, still heartbeating its
     /// leader, until an ack from a leader returns it to `Active`.
+    ///
+    /// `None` too for a member that may not stand yet: with an authority, it
+    /// stands only once its latest read of the authority's epoch confirms its
+    /// own (see [`Self::may_stand`]). Its deadline is then its next read, so
+    /// a `Tick` is never due that moves nothing.
     fn next_roll_call_due(&self) -> Option<Instant> {
         self.standing
             .configuration()
+            .filter(|_| self.may_stand())
             .map(|_| self.round.roll_call_due(self.clock.now()))
+    }
+
+    /// Whether this node may stand for election. With no authority, always.
+    /// With one, only while its latest read of the authority's recovery epoch
+    /// confirms this node's own epoch, or found the authority holding none:
+    /// a node at an epoch the authority does not hold must rejoin, not elect
+    /// a leader there that would pull the others off the authority's epoch.
+    fn may_stand(&self) -> bool {
+        match (self.authority.as_ref(), self.standing.epoch()) {
+            (Some(authority), Some(own)) => authority.permits_standing(own),
+            _ => true,
+        }
     }
 
     /// The earliest term whose leader's acks this node accepts: the highest
@@ -2273,6 +2296,10 @@ where
             configuration: led_or_followed(&self.office, &self.standing),
             admission,
             takes_part,
+            roll_call_is_census: self
+                .authority
+                .as_ref()
+                .is_some_and(AuthorityStanding::roll_call_is_census),
             leader_contact_is_fresh,
             roll_call_deadline: self.timings.roll_call_deadline,
             suspect_timeout: self.timings.suspect_timeout,
@@ -2333,8 +2360,17 @@ where
                 } => {
                     self.lose_quorum();
                     let now = self.clock.now();
+                    // The authority path ends where the roll call's retry
+                    // would have come.
+                    let retry_at = self.round.roll_call_due(now);
                     if let Some(authority) = self.authority.as_mut() {
-                        let call = authority.begin_recovery(term, configuration, respondents, now);
+                        let call = authority.begin_recovery(
+                            term,
+                            configuration,
+                            respondents,
+                            now,
+                            retry_at,
+                        );
                         self.outputs.push(Output::Authority(call));
                     }
                 }
@@ -2585,6 +2621,9 @@ where
                     roster,
                 } => {
                     self.newest_accepted_ack = None;
+                    if let Some(authority) = self.authority.as_mut() {
+                        authority.epoch_left();
+                    }
                     self.standing
                         .recovered_to(epoch, term, Some(&roster), &self.my_id);
                     self.term = term;
@@ -2642,6 +2681,9 @@ where
     /// the transition that moves it (see [`ShardStanding::accept_ack`] and
     /// [`ShardStanding::rejoin_at`]).
     fn forget_election_state(&mut self) {
+        if let Some(authority) = self.authority.as_mut() {
+            authority.epoch_left();
+        }
         self.newest_accepted_ack = None;
         self.round.forget();
         self.drop_recovery();

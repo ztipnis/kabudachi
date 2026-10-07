@@ -13,6 +13,7 @@
 //! must, every call it asks, so the node never builds an authority call.
 
 mod authority_lease;
+mod epoch_confirmation;
 mod forced_recovery;
 
 use std::collections::BTreeMap;
@@ -29,6 +30,7 @@ use crate::protocol::worker_state::WorkerState;
 use crate::time::{Duration, Instant};
 
 use authority_lease::{AuthorityLease, Reconnect};
+use epoch_confirmation::{Answer, EpochConfirmation};
 use forced_recovery::{ForcedRecovery, Next, cannot_recover_from};
 
 /// A node's standing with its coordination authority.
@@ -38,12 +40,20 @@ pub(crate) struct AuthorityStanding {
     /// call that fell short, while `NoQuorum` or, waiting out the fence,
     /// `Candidate`.
     recovery: Option<ForcedRecovery>,
+    /// When the node gives up `recovery` if it is still running, so a call of
+    /// it the authority never answers does not park the node `NoQuorum`.
+    recovery_gives_up_at: Option<Instant>,
+    /// When the swap of `recovery` was asked, while it waits on its reply.
+    swap_asked_at: Option<Instant>,
     /// The token of the one authority read or swap this node now waits on:
     /// its forced recovery's current step, or, while `Fenced`, its read of
     /// the recovery epoch. Replies arrive whenever the driver gets them,
     /// possibly out of order, so a reply to any earlier call is stale and
     /// ignored.
     awaited: Option<ReplyToken>,
+    /// What this node's latest read of the authority's epoch confirmed, while
+    /// it suspects its leader: whether it may stand for election.
+    confirmation: EpochConfirmation,
     /// `ReplyTokens::new(Issuer::Node)`, made once in `starting_at`. The
     /// standing is never rebuilt (`join` and `registered_at` call
     /// `restart_at`), so the node never repeats a number.
@@ -103,7 +113,10 @@ impl AuthorityStanding {
         AuthorityStanding {
             lease: AuthorityLease::starting_at(timings, drift_divisor, now),
             recovery: None,
+            recovery_gives_up_at: None,
+            swap_asked_at: None,
             awaited: None,
+            confirmation: EpochConfirmation::default(),
             tokens: ReplyTokens::new(Issuer::Node),
         }
     }
@@ -130,6 +143,10 @@ impl AuthorityStanding {
     /// for at `now`, for a node in `view.state`: a registration, from every
     /// state that keeps one, and, while it needs one, its recovery fence.
     pub(crate) fn calls_due(&mut self, view: &AuthorityView, now: Instant) -> Vec<AuthorityCall> {
+        if self.recovery_overdue(view.state, now) {
+            self.recovery = None;
+            self.awaited = None;
+        }
         let register = Self::registers_in(view.state) && self.lease.registration_due(now);
         if register {
             self.lease.registration_asked(now);
@@ -147,7 +164,76 @@ impl AuthorityStanding {
         if let Some(recovery_epoch) = fence {
             calls.push(self.ask(AuthorityRequest::AcquireFence { recovery_epoch }, now));
         }
+        if view.own_epoch.is_some()
+            && self.may_ask_for_confirmation(view.state)
+            && self.confirmation.read_due(now)
+        {
+            let call = self.ask(AuthorityRequest::ReadRecoveryEpoch, now);
+            self.confirmation
+                .read_asked(call.token, now, self.lease.call_timeout());
+            calls.push(call);
+        }
         calls
+    }
+
+    /// When the authority path of a node in `state` is given up, if it is
+    /// running. Once its swap is asked, the path outlives the usual give-up
+    /// instant: the swap may have landed, and only its reply says whether this
+    /// node holds the new epoch or lost the race for it. A reply that has not
+    /// come a call timeout after the swap was asked is counted lost, for it may
+    /// never come; the epoch the swap may have made is then found by the
+    /// node's next read, which leaves it standing beside that epoch (see
+    /// [`EpochConfirmation`]) to recover it.
+    fn recovery_gives_up_in(&self, state: WorkerState) -> Option<Instant> {
+        if state != WorkerState::NoQuorum {
+            return None;
+        }
+        match self.recovery.as_ref() {
+            None => None,
+            Some(recovery) if recovery.is_swapping() => self
+                .swap_asked_at
+                .map(|asked| asked + self.lease.call_timeout()),
+            Some(_) => self.recovery_gives_up_at,
+        }
+    }
+
+    /// Whether the authority path of a node in `state` has run past the
+    /// instant it is given up at.
+    fn recovery_overdue(&self, state: WorkerState, now: Instant) -> bool {
+        self.recovery_gives_up_in(state).is_some_and(|at| now >= at)
+    }
+
+    /// Whether a node in `state` has no leader it follows and may stand for
+    /// election, so it must know the authority's epoch first.
+    fn suspects_its_leader(state: WorkerState) -> bool {
+        matches!(state, WorkerState::LeaderSuspect | WorkerState::NoQuorum)
+    }
+
+    /// Whether a node in `state` asks for a read to confirm its epoch: it
+    /// suspects its leader, and runs no authority path. That path reads the
+    /// epoch itself and rejoins or swaps by what it finds, and a read of the
+    /// node's own beside it would send the node off before the path could.
+    fn may_ask_for_confirmation(&self, state: WorkerState) -> bool {
+        Self::suspects_its_leader(state) && self.recovery.is_none()
+    }
+
+    /// Whether a member at `own` may stand for election: its latest read of
+    /// the authority's epoch confirmed `own`, or found the authority empty.
+    pub(crate) fn permits_standing(&self, own: RecoveryEpoch) -> bool {
+        self.confirmation.permits(own)
+    }
+
+    /// Whether the node's roll call in flight is a census of respondents for
+    /// the authority path, not an election: the node called it standing beside
+    /// a later epoch of its own lineage.
+    pub(crate) fn roll_call_is_census(&self) -> bool {
+        self.confirmation.is_census()
+    }
+
+    /// The node left the epoch it was confirmed at: its confirmation, and any
+    /// read it waits on, are void.
+    pub(crate) fn epoch_left(&mut self) {
+        self.confirmation.clear();
     }
 
     /// The earliest instant at which the lease wants something done for a
@@ -155,7 +241,17 @@ impl AuthorityStanding {
     /// `Fenced`, fencing itself. `None` in a state that keeps no
     /// registration.
     pub(crate) fn next_deadline(&self, state: WorkerState) -> Option<Instant> {
-        Self::registers_in(state).then(|| self.lease.next_deadline(state == WorkerState::Fenced))
+        let lease = Self::registers_in(state)
+            .then(|| self.lease.next_deadline(state == WorkerState::Fenced))?;
+        // A node that suspects its leader also asks again for the read that
+        // has not confirmed its epoch, and gives up an authority path that
+        // does not finish.
+        let read = self
+            .may_ask_for_confirmation(state)
+            .then(|| self.confirmation.next_read_at())
+            .flatten();
+        let give_up = self.recovery_gives_up_in(state);
+        Some([read, give_up].into_iter().flatten().fold(lease, Instant::min))
     }
 
     pub(crate) fn is_registered(&self, now: Instant) -> bool {
@@ -175,12 +271,25 @@ impl AuthorityStanding {
 
     /// The node moved to `next`: outside `Candidate`, `LeaderReconciling`
     /// and `Leader` it gives up any fence.
+    ///
+    /// Only a node that is a member of its shard keeps what its latest read
+    /// of the authority's epoch confirmed. A node that suspects its leader
+    /// keeps it, and so does a candidate or a follower, which no longer waits
+    /// on a read: a follower that suspects again may stand on it until its
+    /// epoch changes. A roll call spends it, so an attempt that fails and
+    /// calls again needs a read of its own.
     pub(crate) fn state_changed(&mut self, next: WorkerState) {
         if !matches!(
             next,
             WorkerState::Candidate | WorkerState::LeaderReconciling | WorkerState::Leader
         ) {
             self.lease.drop_fence();
+        }
+        match next {
+            WorkerState::LeaderSuspect | WorkerState::NoQuorum => self.confirmation.end_census(),
+            WorkerState::RollCall => self.confirmation.spend_on_roll_call(),
+            WorkerState::Candidate | WorkerState::Active => self.confirmation.stop_reading(),
+            _ => self.confirmation.clear(),
         }
     }
 
@@ -191,16 +300,19 @@ impl AuthorityStanding {
     }
 
     /// A roll call of `term` under `configuration` fell short with these
-    /// `respondents`: starts the authority path and returns its first call,
-    /// the read of the shard's live registrations.
+    /// `respondents`: starts the authority path, which it gives up at
+    /// `give_up_at` if it has not finished, and returns its first call, the
+    /// read of the shard's live registrations.
     pub(crate) fn begin_recovery(
         &mut self,
         term: u64,
         configuration: Configuration,
         respondents: BTreeMap<WorkerId, Admission>,
         now: Instant,
+        give_up_at: Instant,
     ) -> AuthorityCall {
         self.recovery = Some(ForcedRecovery::start(term, configuration, respondents));
+        self.recovery_gives_up_at = Some(give_up_at);
         self.ask_awaited(AuthorityRequest::ReadLiveRegistrations, now)
     }
 
@@ -250,7 +362,9 @@ impl AuthorityStanding {
                 }
             }
             AuthorityReply::RecoveryEpoch { token, result, .. } => {
-                if !self.take_awaited(token) {
+                if self.confirmation.is_awaiting(token) {
+                    self.on_member_read(token, result, view, now)
+                } else if !self.take_awaited(token) {
                     Vec::new()
                 } else if view.state == WorkerState::Fenced {
                     match result {
@@ -298,6 +412,27 @@ impl AuthorityStanding {
     /// number never empties the slot.
     fn take_awaited(&mut self, token: ReplyToken) -> bool {
         self.awaited.take_if(|awaited| *awaited == token).is_some()
+    }
+
+    /// The answer to a read of the authority's epoch that a member asked for
+    /// before it may stand (see [`EpochConfirmation`]). A node that no longer
+    /// suspects its leader drops it.
+    fn on_member_read(
+        &mut self,
+        token: ReplyToken,
+        result: Result<Option<RecoveryEpoch>, AuthorityError>,
+        view: &AuthorityView,
+        now: Instant,
+    ) -> Vec<AuthorityVerdict> {
+        let (true, Some(own)) = (Self::suspects_its_leader(view.state), view.own_epoch) else {
+            self.confirmation.stop_reading();
+            return Vec::new();
+        };
+        let interval = self.lease.renewal_interval();
+        match self.confirmation.answered(token, result, own, now, interval) {
+            Answer::RejoinAt(epoch) => vec![AuthorityVerdict::RejoinAt(epoch)],
+            Answer::Confirmed | Answer::Ignored => Vec::new(),
+        }
     }
 
     /// A fenced node that can reach its authority again, which reports the
@@ -381,7 +516,7 @@ impl AuthorityStanding {
             if !awaited {
                 return Vec::new();
             }
-            let next = recovery.on_swapped(expected, new, result.is_ok());
+            let next = recovery.on_swapped(expected, new, &result);
             return self.follow_recovery(next, now);
         }
         // The leader's republish: once the epoch is back, by
@@ -411,13 +546,16 @@ impl AuthorityStanding {
             Next::ReadEpoch => vec![AuthorityVerdict::Ask(
                 self.ask_awaited(AuthorityRequest::ReadRecoveryEpoch, now),
             )],
-            Next::Swap { from, to } => vec![AuthorityVerdict::Ask(self.ask_awaited(
-                AuthorityRequest::SwapRecoveryEpoch {
-                    expected: Some(from),
-                    new: to,
-                },
-                now,
-            ))],
+            Next::Swap { from, to } => {
+                self.swap_asked_at = Some(now);
+                vec![AuthorityVerdict::Ask(self.ask_awaited(
+                    AuthorityRequest::SwapRecoveryEpoch {
+                        expected: Some(from),
+                        new: to,
+                    },
+                    now,
+                ))]
+            }
             Next::AwaitFence { epoch } => self.stand_through_authority(epoch, now),
             Next::Abandon => {
                 self.recovery = None;
@@ -426,6 +564,11 @@ impl AuthorityStanding {
             Next::Rejoin(epoch) => vec![AuthorityVerdict::RejoinAt(epoch)],
             Next::GiveUp => {
                 self.recovery = None;
+                Vec::new()
+            }
+            Next::Outvoted => {
+                self.recovery = None;
+                self.confirmation.outvoted();
                 Vec::new()
             }
         }

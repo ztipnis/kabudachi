@@ -452,6 +452,44 @@ fn a_refusal_names_the_leader_whatever_its_reason() {
     }
 }
 
+/// A node refuses a roll call counted against an older configuration than its
+/// own, and takes no part in its term. Its own next roll call must still pass
+/// that term: otherwise two nodes that refuse each other's calls, one for an
+/// older configuration and one for ranking below its own, step their terms by
+/// one each round and never meet.
+#[test]
+fn a_node_that_refused_a_stale_roll_call_calls_for_a_later_term_than_it() {
+    let clock = FakeClock::new();
+    let stranded = worker("stranded");
+    let leader = worker("leader");
+    let mut following = voter_node(&clock, &worker("follower"), 3, SUSPECT);
+    let newer = Configuration::single(Single {
+        generation: Generation::new(0, 0, 1),
+        base: g0(),
+        voter_count: 3,
+    })
+    .expect("valid");
+    deliver(
+        &mut following,
+        &leader,
+        ack_message(leader_ack(&leader, 0, &newer, Some(g0()))),
+    );
+    clock.advance(past_any_suspicion(SUSPECT));
+    let stale = roll_call(&stranded, 5, &configuration_of(3), 0);
+    let refused = deliver(&mut following, &stranded, roll_call_message(stale));
+    assert_eq!(
+        rejects_sent_to(&refused, &stranded)[0].reason(),
+        ElectionRejectReason::StaleGeneration,
+        "setup invariant"
+    );
+
+    let outputs = start_roll_call(&mut following, &clock, SUSPECT);
+
+    let calls = published_roll_calls(&outputs);
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].term > 5, "called for term {}", calls[0].term);
+}
+
 /// Decode refuses a term of `u64::MAX` from any peer, so a node reaches
 /// `u64::MAX` only by contesting it itself: a peer that names `u64::MAX - 1`
 /// makes its next roll call contest `u64::MAX`. A node whose highest term

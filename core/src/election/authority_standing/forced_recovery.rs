@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use crate::configuration::{Admission, Configuration, Generation, Roster, Single, Tally};
-use crate::coordination_authority::{LiveRegistrations, RecoveryEpoch};
+use crate::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
 use crate::election::standing::{EpochOrder, order};
 use crate::protocol::ids::WorkerId;
 
@@ -70,6 +70,10 @@ pub(crate) enum Next {
     /// This attempt is over; the node stays `NoQuorum` and tries again at
     /// its next roll call.
     GiveUp,
+    /// This attempt is over because the respondents are not a majority of the
+    /// shard's live registrations: other workers are registered that the node
+    /// has not heard from.
+    Outvoted,
 }
 
 /// Whether a node at `own_epoch` (`None` if it never learned its lineage)
@@ -111,6 +115,11 @@ impl ForcedRecovery {
         self.term
     }
 
+    /// Whether the swap has been asked and not answered.
+    pub(crate) fn is_swapping(&self) -> bool {
+        matches!(self.phase, Phase::Swapping { .. })
+    }
+
     pub(crate) fn is_awaiting_fence(&self) -> bool {
         matches!(self.phase, Phase::AwaitingFence { .. })
     }
@@ -135,7 +144,7 @@ impl ForcedRecovery {
             tally.record(respondent.clone(), None);
         }
         if !tally.has_quorum() {
-            return Next::GiveUp;
+            return Next::Outvoted;
         }
         self.phase = Phase::ReadingEpoch { counted };
         Next::ReadEpoch
@@ -180,12 +189,19 @@ impl ForcedRecovery {
         Next::Swap { from, to }
     }
 
-    /// The swap from `expected` to `new` came back.
+    /// The swap from `expected` to `new` came back with `result`. Another
+    /// worker's swap from the same epoch landed first when it names the
+    /// epoch the authority now holds: the node rejoins there. That differs
+    /// from a fenced node that finds a later epoch of its own lineage, which
+    /// resumes and lets a census decide: a lost race proves a live rival
+    /// swapped from the same epoch a moment ago and is recovering the shard,
+    /// so joining it at once is the shortest way to a leader, where a later
+    /// epoch found by a read alone may have no leader at all.
     pub(crate) fn on_swapped(
         &mut self,
         expected: Option<RecoveryEpoch>,
         new: RecoveryEpoch,
-        succeeded: bool,
+        result: &Result<(), AuthorityError>,
     ) -> Next {
         let Phase::Swapping { counted, from, to } = &self.phase else {
             return Next::GiveUp;
@@ -193,8 +209,15 @@ impl ForcedRecovery {
         let asked_for_this_swap = expected
             .is_some_and(|expected| order(from, expected.into()) == EpochOrder::Mine)
             && order(to, new.into()) == EpochOrder::Mine;
-        if !asked_for_this_swap || !succeeded {
+        if !asked_for_this_swap {
             return Next::GiveUp;
+        }
+        match result {
+            Ok(()) => {}
+            Err(AuthorityError::EpochConflict {
+                current: Some(winner),
+            }) => return Next::Rejoin(*winner),
+            Err(_) => return Next::GiveUp,
         }
         let epoch = *to;
         self.phase = Phase::AwaitingFence {

@@ -22,7 +22,6 @@ use kabudachi_core::configuration::Admission;
 use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, Uuid7Lineages};
 use kabudachi_core::election::{AuthorityRequest, ElectionTimings, Input, Output, StopReason};
 use kabudachi_core::protocol::ids::WorkerId;
-use kabudachi_core::protocol::messages::election_message::Payload;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Duration, Instant};
 
@@ -515,7 +514,7 @@ fn departed_workers_stop_blocking_a_leaderless_shard_once_their_registrations_la
 }
 
 #[test]
-fn an_orphan_rejoins_as_pending_and_a_straggler_finds_the_recovered_leader_by_refusal() {
+fn an_orphan_and_a_straggler_that_read_the_recovered_epoch_both_rejoin_as_pending() {
     let (mut cluster, leader) = elected(5);
     let others = followers(&cluster, &leader);
     crash(&mut cluster, &leader);
@@ -526,6 +525,7 @@ fn an_orphan_rejoins_as_pending_and_a_straggler_finds_the_recovered_leader_by_re
         .into_iter()
         .collect();
     cluster.node_authority(&orphan).set_reachable(false);
+    cluster.node_authority(&straggler).set_reachable(false);
     cluster.partition(away, recovering.clone());
 
     run_for(&mut cluster, ttls(2), |_| {});
@@ -533,18 +533,16 @@ fn an_orphan_rejoins_as_pending_and_a_straggler_finds_the_recovered_leader_by_re
         .pop_first()
         .expect("the two that reach each other are a majority of the three live");
     assert_eq!(cluster.states()[&orphan], WorkerState::Fenced);
-    assert_ne!(
-        cluster.states()[&straggler],
-        WorkerState::Fenced,
-        "the straggler reaches the authority"
-    );
-    assert_eq!(cluster.node(&straggler).recovery_epoch(), 0);
+    assert_eq!(cluster.states()[&straggler], WorkerState::Fenced);
 
-    // The connection acks the recovered leader sends as the partition heals
-    // are lost, so the straggler learns of it only from a refusal.
-    cluster.network().set_drop_rate(1.0);
+    // The straggler reaches the authority again, which now holds the epoch
+    // the others recovered, while the partition still hides their leader.
+    cluster.node_authority(&straggler).set_reachable(true);
+    run_for(&mut cluster, ttl(), |_| {});
+    assert_eq!(cluster.states()[&straggler], WorkerState::Bootstrapping);
+    assert_eq!(cluster.node(&straggler).recovery_epoch(), 1);
+
     cluster.heal();
-    cluster.network().set_drop_rate(0.0);
     cluster.node_authority(&orphan).set_reachable(true);
 
     cluster.record_steps();
@@ -557,31 +555,16 @@ fn an_orphan_rejoins_as_pending_and_a_straggler_finds_the_recovered_leader_by_re
         cluster.node(&straggler).known_leader().map(|(id, _)| id),
         Some(new_leader.clone())
     );
-    let refused_naming_leader = steps.iter().any(|step| {
-        step.outputs.iter().any(|output| match output {
-            Output::Send { to, message } if *to == straggler => matches!(
-                &message.payload,
-                Some(Payload::ElectionReject(reject))
-                    if reject.leader.as_ref().is_some_and(|named| named.leader_id == Some(new_leader.clone().into()))
-            ),
-            _ => false,
-        })
-    });
-    assert!(
-        refused_naming_leader,
-        "a refusal named the recovered leader"
-    );
-
     assert_eq!(cluster.states()[&orphan], WorkerState::Active);
     assert_eq!(cluster.node(&orphan).recovery_epoch(), 1);
     assert!(
         steps.iter().any(|step| step.node == orphan
             && step.recovery_epoch == 1
             && step.admission.is_none()
-            && matches!(step.input, Some(Input::AuthorityEpochRead { .. }))
+            && matches!(step.input, Some(Input::Message { .. }))
             && step.state == WorkerState::Active),
-        "the orphan rejoined at the new epoch as a pending member, once the authority confirmed \
-         the epoch of the JOIN answer it took"
+        "the orphan, which resumed beside the later epoch of its lineage, joined the new epoch \
+         as a pending member on its leader's ack"
     );
     let orphan_admission = Admission {
         current: cluster.node(&orphan).admission(),
@@ -778,4 +761,66 @@ fn a_follower_that_loses_the_authority_fences_itself_in_time_and_resumes_on_reco
         "a follower its leader hears from again withdraws its abort deadline"
     );
     assert_eq!(cluster.leader(), Some(leader));
+}
+
+// The authority was flushed and the shard founded afresh while the old leader
+// died, and the members, which still hold the old epoch, have no leader. A
+// member that confirmed that epoch before the flush may elect there once, but
+// the authority refuses that leader's fence, and it steps down. Electing at
+// the dead epoch must not repeat for ever, pulling the others off the epoch
+// the authority holds: with its confirmation spent, each member reads the
+// authority's epoch, and rejoins at it. The test pins that rejoin, and no more:
+// the refounded epoch here has no worker to lead it, so the shard has no
+// leader afterwards, and getting one is not something this test shows.
+#[test]
+fn members_stranded_at_a_dead_epoch_rejoin_the_authoritys_instead_of_electing_there_for_ever() {
+    let (mut cluster, leader) = elected(3);
+    let stranded: BTreeSet<WorkerId> = followers(&cluster, &leader).into_iter().collect();
+    crash(&mut cluster, &leader);
+    cluster.authority().flush();
+    let refounded = RecoveryEpoch::founding(0, &mut Uuid7Lineages);
+    cluster
+        .authority()
+        .compare_and_swap_recovery_epoch(&shard("shard-1"), None, refounded)
+        .expect("the flushed authority holds no epoch, so create-if-absent succeeds");
+
+    run_for(&mut cluster, ttls(1), |_| {});
+
+    assert_rejoining(&cluster, &stranded, refounded);
+}
+
+// A swap that landed at the authority whose caller never heard of it, because
+// that caller died or its reply was lost, leaves the authority at a later
+// epoch of the shard's lineage with no leader. The live workers still hold the
+// old epoch: none may lead at it, none may swap before the dead leader's
+// registration has lapsed, and all of them must not drift to the empty epoch
+// and wait there. The shard recovers at an epoch past the one the lost swap
+// made, under exactly one leader.
+#[test]
+fn a_shard_left_at_an_epoch_a_lost_swap_made_recovers_under_one_leader() {
+    let (mut cluster, leader) = elected(5);
+    let survivors: BTreeSet<WorkerId> = followers(&cluster, &leader).into_iter().collect();
+    crash(&mut cluster, &leader);
+    cluster.partition(BTreeSet::from([leader.clone()]), survivors.clone());
+    let held = cluster
+        .authority()
+        .read_recovery_epoch(&shard("shard-1"))
+        .expect("the seeding handle reaches the authority")
+        .expect("the elected shard has an epoch");
+    let lost_swap = held.next().expect("the epoch can be swapped");
+    cluster
+        .authority()
+        .compare_and_swap_recovery_epoch(&shard("shard-1"), Some(held), lost_swap)
+        .expect("the swap whose reply was lost");
+
+    run_for(&mut cluster, ttls(4), |cluster| {
+        assert!(leaders_among(cluster, &survivors).len() <= 1, "two survivors lead");
+    });
+
+    let new_leader = leaders_among(&cluster, &survivors)
+        .pop_first()
+        .expect("the survivors recover the shard past the epoch the lost swap made");
+    assert!(cluster.holds_valid_grant(&new_leader));
+    assert!(cluster.node(&new_leader).recovery_epoch() > lost_swap.number);
+    assert_eq!(authority_epoch(&cluster), Some(cluster.node(&new_leader).recovery_epoch()));
 }

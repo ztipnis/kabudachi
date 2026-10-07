@@ -167,6 +167,13 @@ impl Driven {
     fn answer_roll_call(&mut self, respondents: &[WorkerId]) {
         self.advance(SUSPECT_TIMEOUT_TICKS * 2);
         assert_eq!(self.node.state(), WorkerState::LeaderSuspect);
+        self.start_roll_call(respondents);
+    }
+
+    /// Starts the roll call a node already suspecting its leader, and so
+    /// confirmed by its read of the authority's epoch, may start, answered by
+    /// each of `respondents` admitted at `g0`.
+    fn start_roll_call(&mut self, respondents: &[WorkerId]) {
         let started = self.tick();
         let call = published_roll_calls(&started).remove(0);
         for respondent in respondents {
@@ -247,8 +254,27 @@ fn a_fenced_node_ignores_an_epoch_read_it_asked_for_before_reconnecting() {
     let _ = driven.node.step(answer(first, epoch(0)));
     assert_eq!(driven.node.state(), WorkerState::Fenced, "a stale read is ignored");
 
-    let _ = driven.node.step(answer(second, epoch(1)));
+    let _ = driven.node.step(answer(second, RecoveryEpoch::new(1, 1)));
     assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
+}
+
+// A swap whose reply was lost leaves the authority at a later epoch of the
+// fenced node's own lineage, possibly with no leader there. The node cannot
+// tell, so it resumes and suspects its leader as any follower does, and its
+// own roll calls decide whether to recover that epoch or to rejoin it.
+#[test]
+fn a_fenced_node_reconnecting_to_a_later_epoch_of_its_lineage_resumes_instead_of_rejoining() {
+    let mut driven = fenced_voter();
+    driven.authority.set_reachable(true);
+    driven
+        .authority
+        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
+        .expect("the swap lands");
+
+    driven.advance(lasting_ticks());
+
+    assert_ne!(driven.node.state(), WorkerState::Fenced);
+    assert_ne!(driven.node.state(), WorkerState::Bootstrapping);
 }
 
 /// A node back in `Bootstrapping` at a floor of epoch 2 of lineage 1.
@@ -422,8 +448,10 @@ fn lone_winner_reaching(
         default_timings(),
         authority_timings,
     );
-    driven.authority.set_reachable(reachable);
+    // It suspects its leader first, so that its read of the authority's epoch
+    // confirms its own, and only then loses the authority.
     driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
+    driven.authority.set_reachable(reachable);
     driven.tick();
     let mut won = driven.advance(SUSPECT_TIMEOUT_TICKS);
     assert_eq!(driven.node.state(), WorkerState::LeaderReconciling);
@@ -604,9 +632,14 @@ fn the_authority_path_needs_a_majority_of_the_live_registrations() {
     // w3 and w4 are still registered: 2 of 4 live is no majority.
     let (driven, closed) = short_roll_call(&["w1", "w2", "w3", "w4"], Some(0), true);
 
+    // The attempt gave up after its one read; the node then reads the
+    // authority's epoch before it may stand again.
     assert_eq!(
         authority_calls(&closed),
-        vec![AuthorityRequest::ReadLiveRegistrations]
+        vec![
+            AuthorityRequest::ReadLiveRegistrations,
+            AuthorityRequest::ReadRecoveryEpoch
+        ]
     );
     assert_eq!(driven.node.state(), WorkerState::NoQuorum);
     assert_eq!(
@@ -624,15 +657,14 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
     // number this node's shard may already have used, so it swaps nothing;
     // and, as a fenced node reconnecting does, it follows the authority:
     // it rejoins at that epoch rather than stay NoQuorum beside it.
+    //
+    // The node's read of the authority at its suspicion confirmed its own
+    // epoch; the authority moves before its roll call closes short.
     for (held, lineage) in [(2, 0), (9, 7)] {
         let clock = FakeClock::new();
         let authority = warmed_up_authority(&clock);
         authority
-            .compare_and_swap_recovery_epoch(
-                &shard(SHARD),
-                None,
-                RecoveryEpoch::new(held, lineage),
-            )
+            .compare_and_swap_recovery_epoch(&shard(SHARD), None, RecoveryEpoch::new(5, 0))
             .expect("the shard has no epoch yet");
         register_all(&authority, &shard(SHARD), &[worker("w2")]);
         let (mut driven, _) = Driven::with(
@@ -653,7 +685,16 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
             }),
         );
 
-        let closed = driven.run_roll_call(&[worker("w2")]);
+        driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
+        authority
+            .compare_and_swap_recovery_epoch(
+                &shard(SHARD),
+                Some(RecoveryEpoch::new(5, 0)),
+                RecoveryEpoch::new(held, lineage),
+            )
+            .expect("the epoch moves on after the node's read");
+        driven.start_roll_call(&[worker("w2")]);
+        let closed = driven.advance(default_timings().roll_call_deadline.as_ticks());
 
         assert!(
             !authority_calls(&closed)
@@ -891,7 +932,7 @@ fn a_leader_adopts_a_later_epoch_of_its_lineage_and_then_follows_the_plain_order
 }
 
 #[test]
-fn a_lost_swap_race_leaves_the_node_no_quorum_at_its_epoch() {
+fn a_lost_swap_race_sends_the_node_to_rejoin_the_epoch_that_won() {
     let clock = FakeClock::new();
     let authority = warmed_up_authority(&clock);
     seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
@@ -900,26 +941,75 @@ fn a_lost_swap_race_leaves_the_node_no_quorum_at_its_epoch() {
 
     let _ = driven.run_roll_call(&[worker("w2")]);
 
-    assert_eq!(driven.node.state(), WorkerState::NoQuorum);
-    assert_eq!(driven.node.recovery_epoch(), 0);
-    assert_eq!(driven.node.configuration(), Some(&configuration_of(5)));
+    // The rival's swap made epoch 1 the authority's: the node's next read of
+    // it, before it may stand again, finds its own epoch dead.
+    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
+    assert_eq!(driven.node.join_floor().epoch(), Some(epoch(1)));
+    assert_eq!(driven.node.configuration(), None);
 }
 
+// A swap that went out may have landed whatever the node saw: the authority
+// holds the new epoch, and the old leader's fence is already being waited out.
+// A reply that comes after the roll call's retry is due, but within the time
+// any call to the authority is given, is still the answer to a swap that
+// happened, so the node stands at the epoch it swapped to, rather than leave
+// it empty-handed to rejoin an epoch with no leader. (A reply later than that
+// call timeout finds the attempt given up, and changes nothing.)
 #[test]
-fn the_authority_path_recovers_a_shard_left_at_a_swapped_epoch_with_no_leader() {
-    // A swap to epoch 1 was applied but its caller never heard (its reply
-    // was lost), so no leader leads epoch 1.
-    let (mut driven, _) = {
-        let clock = FakeClock::new();
-        let authority = warmed_up_authority(&clock);
-        seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
-        authority
-            .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
-            .expect("the ambiguous swap");
-        let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
-        let closed = driven.run_roll_call(&[worker("w2")]);
-        (driven, closed)
+fn a_swap_reply_after_the_rolls_retry_within_the_call_timeout_still_makes_the_node_stand_at_the_new_epoch() {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
+    driven.answer_roll_call(&[worker("w2")]);
+    driven.clock.advance(default_timings().roll_call_deadline);
+    let closed = driven.node.step(Input::Tick);
+
+    let perform = |driven: &Driven, call: AuthorityCall| {
+        Input::Authority(call.perform(&driven.authority, &shard(SHARD), &worker("w1"), "w1"))
     };
+    let live = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
+    let read = driven.node.step(perform(&driven, live));
+    let epoch_read = asked(&read.outputs, AuthorityRequest::ReadRecoveryEpoch);
+    let read = driven.node.step(perform(&driven, epoch_read));
+    let swap = asked(
+        &read.outputs,
+        AuthorityRequest::SwapRecoveryEpoch {
+            expected: Some(epoch(0)),
+            new: epoch(1),
+        },
+    );
+    // The swap lands, and its reply is held past the next roll call's due time.
+    let reply = perform(&driven, swap);
+    driven.clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS * 10));
+    let _ = driven.node.step(Input::Tick);
+
+    let step = driven.node.step(reply);
+    let _ = driven.carry(step);
+
+    assert_eq!(driven.node.recovery_epoch(), 1);
+    assert_ne!(
+        driven.node.state(),
+        WorkerState::Bootstrapping,
+        "the node stands at the epoch it swapped to"
+    );
+}
+
+// A roll call that returns a quorum of the node's own, dead epoch does not
+// stand the node there: beside a later epoch of its lineage, no leader of its
+// own epoch can hold the fence, so the node takes the respondents to the
+// authority path, and leads the epoch after the one the lost swap made.
+#[test]
+fn a_roll_call_that_returns_a_quorum_beside_a_later_epoch_is_a_census_not_an_election() {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2"), &worker("w3")]);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 3);
+    authority
+        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
+        .expect("the ambiguous swap");
+
+    let _ = driven.run_roll_call(&[worker("w2")]);
 
     assert_eq!(driven.node.state(), WorkerState::LeaderReconciling);
     assert_eq!(driven.node.recovery_epoch(), 2);

@@ -58,9 +58,16 @@ impl AuthorityLease {
         }
     }
 
+    /// How long a call to the authority may go unanswered before the node
+    /// counts it lost: the TTL it expects a registration to last, the time
+    /// after which the node would have fenced itself had it stopped renewing.
+    pub(crate) fn call_timeout(&self) -> Duration {
+        self.ttl
+    }
+
     /// How often the node renews its registration and its fence: a third of
     /// the TTL, so two renewals can fail before either lapses.
-    fn renewal_interval(&self) -> Duration {
+    pub(crate) fn renewal_interval(&self) -> Duration {
         Duration::from_ticks((self.ttl.as_ticks() / 3).max(1))
     }
 
@@ -191,12 +198,17 @@ impl AuthorityLease {
 /// read the shard's recovery epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reconnect {
-    /// The epoch is exactly the node's own, lineage included: the outage
-    /// hit it alone, or every worker alike, and nothing replaced it. It
-    /// carries on as it was.
+    /// The epoch is the node's own, lineage included, or a later one of the
+    /// node's own lineage: the outage hit it alone, or every worker alike,
+    /// and nothing replaced it; a recovery that kept the lineage and raised
+    /// the number; or a swap whose reply was lost moved the authority on,
+    /// with or without a live leader at the later epoch. It carries on as it
+    /// was, and its next read of the epoch decides whether it stands beside a
+    /// later one: beside one with a live leader, an ack or a refused census
+    /// then moves the node.
     Resume,
-    /// The epoch is another: the shard was recovered without the node; or,
-    /// if the lineage differs, founded afresh after the authority lost the
+    /// The epoch is another, and not a later one of the node's lineage: it
+    /// differs in lineage, founded afresh after the authority lost the
     /// node's own (whatever the numbers, which a flush resets); or, lower in
     /// the same lineage, put back by a leader that republished it after a
     /// flush while the node had moved past it, which it can no longer
@@ -222,6 +234,7 @@ impl Reconnect {
             (None, Some(epoch)) => Reconnect::Rejoin(epoch),
             (Some(own), Some(epoch)) => match order(&own, epoch.into()) {
                 EpochOrder::Mine => Reconnect::Resume,
+                EpochOrder::Later if own.lineage == epoch.lineage => Reconnect::Resume,
                 _ => Reconnect::Rejoin(epoch),
             },
         }

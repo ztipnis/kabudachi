@@ -58,6 +58,10 @@ pub(crate) struct View<'a> {
     pub(crate) admission: Admission,
     /// Whether the node's state takes part in elections at all.
     pub(crate) takes_part: bool,
+    /// Whether the node's roll call is a census only: the authority holds a
+    /// later epoch of the node's lineage than its own, so the roll call,
+    /// whatever it returns, never stands the node as a candidate.
+    pub(crate) roll_call_is_census: bool,
     /// Whether the node heard from its leader within its suspicion timeout.
     pub(crate) leader_contact_is_fresh: bool,
     /// The configured base roll-call deadline.
@@ -299,9 +303,12 @@ impl ElectionRound {
     }
 
     /// The latest term this node knows of: `highest_term_seen`, or that of
-    /// the latest roll call it accepted, its own included, if later.
+    /// the latest roll call it accepted, its own included, or refused as
+    /// counted against an older configuration than its own, if later.
     pub(crate) fn latest_term(&self, highest_term_seen: u64) -> u64 {
-        highest_term_seen.max(self.ballot.highest_roll_call_term().unwrap_or(0))
+        highest_term_seen
+            .max(self.ballot.highest_roll_call_term().unwrap_or(0))
+            .max(self.ballot.stale_call_term().unwrap_or(0))
     }
 
     /// Starts a roll call for the term after
@@ -522,7 +529,7 @@ impl ElectionRound {
             if round.is_abandoned() || round.term() <= view.highest_term_seen {
                 return vec![Verdict::SuspectAgain];
             }
-            if !round.has_returning_quorum() {
+            if view.roll_call_is_census || !round.has_returning_quorum() {
                 let verdict = Verdict::NoQuorum {
                     term: round.term(),
                     configuration: round.configuration().clone(),
