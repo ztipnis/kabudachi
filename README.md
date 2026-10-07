@@ -1079,7 +1079,7 @@ It:
 
 - stops requesting new claims;
 - preserves currently running work during the short suspicion window;
-- starts cooperative roll call.
+- starts a roll call (§12.4) once its jittered suspicion timeout ends, unless a roll call of another worker it answered has not yet resolved.
 
 #### `ROLL_CALL`
 
@@ -1174,7 +1174,7 @@ LEADER_SUSPECT                        DRAINING
       +--> authority holds no recovery epoch --------> STOPPED (shard ABANDONED)
 ```
 
-A candidate that loses its vote, or a roll call that misses its deadline, returns to `LEADER_SUSPECT` and tries again at a later term after a fresh jittered suspicion timeout. A `CANDIDATE` waiting out the fence that the authority refuses for good goes back to `NO_QUORUM`. A leader asked to drain goes to `DRAINING`. With an authority configured, a `LEADER_SUSPECT` member first reads the authority's recovery epoch and starts its roll call only if the read names its own epoch (or the authority holds none); otherwise it rejoins at the epoch the read names. A worker that takes part in elections becomes `FENCED` if it fails to renew its authority registration, leader included. A leader's grant to schedule ends at the earlier of its recovery fence and its quorum-contact lease.
+A candidate that loses its vote, or an initiator that abandoned its call for a better one or finds its term already holds a vote or a leader, returns to `LEADER_SUSPECT` and tries again at a later term after a fresh jittered suspicion timeout; a call short of quorum at its deadline goes to `NO_QUORUM`. A `CANDIDATE` waiting out the fence that the authority refuses for good goes back to `NO_QUORUM`. A leader asked to drain goes to `DRAINING`. With an authority configured, a `LEADER_SUSPECT` member first reads the authority's recovery epoch and starts its roll call only if the read names its own epoch (or the authority holds none); otherwise it rejoins at the epoch the read names. A worker in any state from `ACTIVE` through `LEADER`, `NO_QUORUM` included, becomes `FENCED` if it fails to renew its authority registration. A leader's grant to schedule ends at the earlier of its recovery fence and its quorum-contact lease.
 
 ---
 
@@ -1198,7 +1198,7 @@ A dropped connection is redialed only when the peer was in the node's gossip mes
 
 ### 11.4 Routing refresh
 
-A worker's JOIN connects it to its seed and its leader only, so a burst of joiners would form a star that no roll call crosses once the leader is gone. The driver therefore crawls again once a worker's view of its shard (its leader, the configuration it holds, and whether it is admitted) has held still for a quarter of a suspicion timeout, and otherwise every ten suspicion timeouts (never more often than once a second). A completed crawl is reported to the node. A draining leader waits for every other voter to report a crawl since its admission, up to `drain_wait_limit`, before it leaves, and a node in `ROLL_CALL` or `NO_QUORUM` that has reached no shard peer for a suspicion timeout searches for a leader again, through the authority's registrations and then the seeds (§12.3).
+A worker's JOIN connects it to its seed and its leader only, so a burst of joiners would form a star that no roll call crosses once the leader is gone. The driver therefore crawls again once a change to a worker's view of its shard (its leader, the configuration it holds, and whether it is admitted) has held still for a quarter of a suspicion timeout, or a period after that change if the view never settles, and otherwise once a period; the period defaults to ten suspicion timeouts and is never under one second. A completed crawl is reported to the node. A draining leader waits for every other voter to report a crawl since its admission, up to `drain_wait_limit`, before it leaves, and a node in `ROLL_CALL` or `NO_QUORUM` that has reached no shard peer for a suspicion timeout searches for a leader again, through the authority's registrations and then the seeds (§12.3).
 
 ---
 
@@ -1211,7 +1211,7 @@ Every active worker maintains a logical heartbeat/control relationship with the 
 A follower does not hold the member list. It knows its shard's current configuration only as a **generation** and a voter count (two counts, old and new, while a change is in flight), plus its own **admission generation**: the generation at which it became a voter. Only the leader holds the members, with each one's admission generation, and the workers waiting to be admitted. These are the terms (§4.5):
 
 - A **`Generation`** is the triple (recovery epoch, term, counter), compared in that order. The term is that of the election or leader that announced the configuration, and the counter rises by one with every configuration change (each phase of an admission batch, each removal batch, each election).
-- A **`Configuration`** is a generation, a base generation (the generation of the election that founded it) and either a single voter count or, for a joint configuration, the old and new counts. A worker is a voter of a configuration when its admission generation lies between the base and the generation, inclusive. A worker with no admission generation, such as a joiner, is a pending member: it claims work and heartbeats, but it is no voter.
+- A **`Configuration`** is a generation, a base generation and either a single voter count or, for a joint configuration, the counts of its new and old sides (with the old side's base and generation, and the generation joiners are admitted at). Every change a leader makes re-bases the configuration at its new generation and re-admits there the members it counts, so the base is the generation of the latest change. A worker is a voter of a single configuration when its admission generation lies between the base and the generation, inclusive; on a joint one's old side it counts by the admission it held before (its prior admission). A worker with no admission generation, such as a joiner, is a pending member: it claims work and heartbeats, but it is no voter.
 
 Representative heartbeat (the fields that matter here):
 
@@ -1352,7 +1352,7 @@ The initiator counts itself as a respondent. A respondent whose admission genera
 - if they are not, the initiator goes to `NO_QUORUM` and tries again at a later term after a fresh jittered suspicion timeout. With an authority configured it also takes the authority path, counting the call's respondents (§14.3). The same happens when the authority holds a later recovery epoch of the initiator's own lineage: the call is then only a census and never stands the initiator as a candidate;
 - an initiator that abandoned its call for a better one, or that finds the term it contested already holds a vote or a leader, returns to `LEADER_SUSPECT` instead.
 
-A worker answers a call only from a state that takes part in elections (`ACTIVE`, `LEADER_SUSPECT`, `ROLL_CALL` or `NO_QUORUM`). Otherwise it refuses, naming why, in an `ELECTION_REJECT` that carries its highest term seen, its configuration, the leader it follows if it holds one, and its recovery epoch and lineage. The reasons are: a stale term, a stale generation (the call ran under an older configuration, or an older recovery epoch than the worker's), a leader still valid (the worker heard from its leader within a suspicion timeout), a worse call than one already answered, a wrong recovery epoch, and a state that takes no part. The refusal is how an initiator learns that a leader is alive, or that it is behind.
+A worker answers a call only from a state that takes part in elections (`ACTIVE`, `LEADER_SUSPECT`, `ROLL_CALL` or `NO_QUORUM`). Otherwise it refuses, naming why, in an `ELECTION_REJECT` that carries its highest term seen, its configuration, the leader it follows if it holds one, and its recovery epoch and lineage. The reasons are: a stale term, a stale generation (the call ran under an older configuration, or an older recovery epoch than the worker's), a leader still valid (the worker heard from its leader within a suspicion timeout), a worse call than one already answered, and a state that takes no part. A call from a later recovery epoch than the worker's own is ignored, not refused. The refusal is how an initiator learns that a leader is alive, or that it is behind.
 
 **Competing calls.** A worker answers the first call it accepts for a term, and any later call for that term that ranks better; it refuses a worse one. Calls rank by the initiator's wall-clock timestamp, then by its `WorkerId`, lowest first, so a tie always has a winner. The timestamp only breaks ties: clocks that disagree bias who wins a tie but cannot break safety, so ordinary elections need no clock synchronization. A worker that has answered another's call does not start its own until that call resolves (the leader's ack for the answered term or a later one arrives), or, if the caller died, for a bounded wait.
 
@@ -1362,10 +1362,11 @@ A roll call is answered only from sound state. A reply carries the configuration
 
 **Epoch order across lineages.** A recovery epoch is a number within a lineage. Whenever a worker compares an epoch it hears of with its own (in election messages, join pointers and Task records alike), a later epoch of its own lineage is newer; another lineage's epoch numbered above its own is newer; another lineage's epoch numbered at or below its own is older, whatever the terms. A worker whose own lineage has a later epoch than the one it followed rejoins it, and a refusal of an election message names the leader, so a node that missed a certificate learns who leads.
 
-**Admission.** A joiner is admitted in two phases and at a pace. The leader first promises each joiner that has confirmed a recent ack its admission at a generation of the leader's term; once every one holds its promise, it starts a batch that admits exactly those workers. Nothing starts until every member of the just-committed configuration has echoed it, so a member left a generation behind cannot be needed for a quorum nobody can reach. A member whose heartbeats arrive but which confirms none of the leader's acks blocks admission only until a suspicion timeout and a reconnect timeout have passed since it last confirmed one. The leader then removes it, one voter per configuration change and only when the voters that hold the current configuration, the leader among them, are a majority of the oldest configuration any removed or queued voter may still hold. That bound keeps two successive removals from letting the removed voters, a majority of the old configuration, elect a second leader. A removed worker may rejoin as a pending member. A silent member is reported lost but not removed.
+**Admission.** A joiner is admitted in two phases and at a pace. The leader first promises each joiner that has confirmed a recent ack its admission at a generation of the leader's term; once every one holds its promise, it starts a batch that admits exactly those workers. Nothing starts until every member of the just-committed configuration has echoed it, so a member left a generation behind cannot be needed for a quorum nobody can reach. A member whose heartbeats arrive but which confirms none of the leader's acks blocks admission only until a suspicion timeout and a reconnect timeout have passed since it last confirmed one. The leader then removes it, one voter per configuration change and only when the voters that hold the current configuration, the leader among them, are a majority of the voters of every configuration a muted or removed voter may still stand at. That bound keeps two successive removals from letting the removed voters, a majority of the old configuration, elect a second leader. A removed worker may rejoin as a pending member. A silent member is reported lost but not removed.
 
 ### 12.5 The initiator is the candidate
-There is no separate candidate selection. The initiator whose roll call stands is the candidate for the term it contests, and the ranking above decides between initiators that call for the same term. This replaces any scheme in which the respondents agree on a preferred worker: the call's rank is deterministic, and it needs no hash and no extra round.
+
+There is no separate candidate selection. The initiator whose roll call stands is the candidate for the term it contests, and the ranking above decides between initiators that call for the same term. The call's rank is deterministic, so choosing the candidate needs no hash and no extra round.
 
 ### 12.6 Voting
 
@@ -2505,8 +2506,7 @@ It is a reasonable candidate for:
 
 - immutable DHT blob IDs;
 - serialized payload digests;
-- result certification digests;
-- membership/roll-call digests.
+- result certification digests.
 
 The protocol should version its digest algorithm instead of assuming BLAKE3 can never change.
 
@@ -2763,7 +2763,7 @@ Peer review should focus heavily on invariants. If an implementation violates on
 
 This system should not be validated primarily through happy-path integration tests.
 
-The tests are organised as one Bazel `rust_test` target per crate (`//core:core_integration_test`, `//net:net_integration_test`, `//testkit:testkit_integration_test`), each an integration binary whose areas are modules, and a name filter runs one area. `core` has the areas `configuration`, `election`, `proptest`, `reconcile`, `records`, `scenario` and `scheduler` (`core/tests/<area>/`), and `net` has `bootstrap`, `claim`, `discovery`, `driver`, `election`, `join`, `lifecycle`, `reconcile`, `records` and `transport` (`net/tests/<area>/`), with no in-crate unit tests. The `testkit` crate is the shared test seam: the faulting authority (`FaultingAuthority`) and the step record with the invariants asserted over it, which the core simulator and the real-socket net tests both use.
+The tests are organised as one Bazel `rust_test` target per crate (`//core:core_integration_test`, `//net:net_integration_test`, `//testkit:testkit_integration_test`), each an integration binary whose areas are modules, and a name filter runs one area. `core` has the areas `configuration`, `election`, `proptest`, `reconcile`, `records`, `scenario` and `scheduler` (`core/tests/<area>/`), and `net` has `bootstrap`, `claim`, `discovery`, `driver`, `election`, `join`, `lifecycle`, `reconcile`, `records` and `transport` (`net/tests/<area>/`), with no in-crate unit tests. The `testkit` crate is the shared test seam: the faulting authority (`FaultingAuthority`) and the step record with the invariants asserted over it, which the core simulator and the real-socket net tests both use. It also holds the simulated Task record store (`RecordSpace`) the core simulator writes to.
 
 ### 26.1 Deterministic state-machine tests
 
@@ -2977,7 +2977,7 @@ Implement:
 - execution lifecycle hooks in the task subprocess;
 - SIGTERM/SIGKILL behavior;
 - networked workers run the tasks they claim, compaction runs included;
-- a TaskRun executor that honors `Output::AbortDeadline` and starts a TaskRun only once the node has contact with its leader (the reconnect-timeout floor, §8.3);
+- a TaskRun executor that honors `Output::AbortDeadline` and starts a TaskRun only once the node has a contact floor (a leader has heard from it), so its abort deadline is defined;
 - a leader's own claims (today the leader's own node answers a claim as `ThisWorkerLeads`);
 - a multi-process SIGKILL harness;
 - a test for a sync body raising `BaseException`, under subprocess isolation;
