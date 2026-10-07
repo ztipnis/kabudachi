@@ -210,7 +210,7 @@ pub struct Cluster {
     authority_timings: Option<AuthorityTimings>,
     /// Each node's scheduler, handed every grant its node reports.
     schedulers: BTreeMap<WorkerId, ClusterScheduler>,
-    /// The spy on each node's scheduler, which hears what it decides.
+    /// The spy on each node's scheduler, which keeps the revisions it publishes.
     spies: BTreeMap<WorkerId, Spy>,
     /// Every step that reported a grant or its withdrawal, in order, for
     /// `first_grant_overlap`.
@@ -1486,21 +1486,15 @@ impl Cluster {
         }
     }
 
-    /// Whether the named node's scheduler leads now, as its spy last heard.
-    /// The harness catches every scheduler up at its deadlines, a bounded
-    /// lease's end among them, so after any `advance` or `run_until_quiescent`
-    /// the spy has heard every lapse up to the shared clock's now. After
-    /// `advance_clock_only`, which moves the clock alone, it may not have
-    /// yet. Panics on an unknown ID.
+    /// Whether the named node's scheduler leads now: it holds a grant whose
+    /// lease has not ended by the shared clock's now, whether or not the
+    /// scheduler has been called since the lease ended. Panics on an unknown
+    /// ID.
     pub fn holds_valid_grant(&self, id: &WorkerId) -> bool {
-        self.scheduler_spy(id).leading()
-    }
-
-    /// The spy on the named node's scheduler. Panics on an unknown ID.
-    pub fn scheduler_spy(&self, id: &WorkerId) -> &Spy {
-        self.spies
+        self.schedulers
             .get(id)
-            .unwrap_or_else(|| unknown_node("scheduler_spy", id))
+            .unwrap_or_else(|| unknown_node("holds_valid_grant", id))
+            .is_leader()
     }
 
     /// The named node's scheduler, which the harness hands every grant and
@@ -1512,11 +1506,11 @@ impl Cluster {
             .unwrap_or_else(|| unknown_node("scheduler_mut", id))
     }
 
-    /// Every node whose scheduler leads now, as its spy last heard.
+    /// Every node whose scheduler leads now.
     pub fn valid_grant_holders(&self) -> BTreeSet<WorkerId> {
-        self.spies
+        self.schedulers
             .iter()
-            .filter(|(_, spy)| spy.leading())
+            .filter(|(_, scheduler)| scheduler.is_leader())
             .map(|(id, _)| id.clone())
             .collect()
     }

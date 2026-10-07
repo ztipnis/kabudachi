@@ -46,7 +46,7 @@ fn a_delay_queues_the_task_exactly_when_due() {
         let what = format!("delay {delay}, waited {wait}");
         let state = fixture.state(&task);
         assert_eq!(caught_up.queued, usize::from(queued && delay > 0), "{what}");
-        assert_eq!(fixture.spy.pending(), usize::from(queued), "{what}");
+        assert_eq!(fixture.scheduler.pending_len(), usize::from(queued), "{what}");
         let claim = fixture.scheduler.request_claim(&worker(), &task);
         if queued {
             assert_eq!(state, TaskRunState::Queued, "{what}");
@@ -112,7 +112,7 @@ fn expiry_is_only_about_starting() {
     fixture.clock.advance(ticks(1));
     assert_eq!(fixture.scheduler.catch_up().expired, 1);
     assert_eq!(fixture.state(&task), TaskRunState::Expired);
-    assert_eq!(fixture.spy.pending(), 0);
+    assert_eq!(fixture.scheduler.pending_len(), 0);
 
     // It is never handed out, even if nobody advanced time.
     let mut fixture = Fixture::leading();
@@ -140,7 +140,7 @@ fn expiry_is_only_about_starting() {
     let outcome = fixture.scheduler.catch_up();
     assert_eq!((outcome.expired, outcome.queued), (1, 0));
     assert_eq!(fixture.state(&task), TaskRunState::Expired);
-    assert_eq!(fixture.spy.pending(), 0);
+    assert_eq!(fixture.scheduler.pending_len(), 0);
 
     // A retry has already started once, so it never expires.
     let mut fixture = Fixture::leading();

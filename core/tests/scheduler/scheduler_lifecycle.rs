@@ -4,7 +4,6 @@
 
 use crate::support::grant::unbounded_grant;
 use crate::support::scheduler::{Fixture, TestScheduler};
-use crate::support::spy::Noted;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
@@ -76,7 +75,7 @@ fn a_grant_lets_claims_through_until_the_schedulers_clock_reaches_its_end() {
 
     assert!(just_before_the_end.is_ok(), "{just_before_the_end:?}");
     assert_eq!(at_the_end.unwrap_err(), ClaimRejection::NotLeader);
-    assert_eq!(fixture.spy.pending(), 1);
+    assert_eq!(fixture.scheduler.pending_len(), 1);
     assert_eq!(fixture.state(&at), TaskRunState::Queued);
 }
 
@@ -84,7 +83,7 @@ fn a_grant_lets_claims_through_until_the_schedulers_clock_reaches_its_end() {
 fn every_decision_needs_a_live_grant_and_changes_nothing_without_one() {
     let mut fixture = Fixture::leading();
     let queued = submit(&mut fixture.scheduler);
-    let (_, running) = running_task(&mut fixture);
+    let (running_task, running) = running_task(&mut fixture);
     let claimed_task = submit(&mut fixture.scheduler);
     let claimed = fixture
         .scheduler
@@ -92,7 +91,7 @@ fn every_decision_needs_a_live_grant_and_changes_nothing_without_one() {
         .unwrap()
         .task_run_id;
     fixture.scheduler.set_leadership_grant(None);
-    let mark = fixture.spy.mark();
+    let memory = fixture.scheduler.memory_in_use();
 
     let s = &mut fixture.scheduler;
     let not_leader = Some(ReportRejection::NotLeader);
@@ -141,10 +140,19 @@ fn every_decision_needs_a_live_grant_and_changes_nothing_without_one() {
     assert_eq!(fixture.run_state(&running), TaskRunState::Running);
     assert_eq!(fixture.run_state(&claimed), TaskRunState::Claimed);
     assert_eq!(fixture.state(&queued), TaskRunState::Queued);
-    assert_eq!(fixture.spy.pending(), 1);
+    assert_eq!(fixture.scheduler.pending_len(), 1);
+    assert_eq!(fixture.scheduler.memory_in_use(), memory);
+    for task in [&queued, &claimed_task] {
+        assert_eq!(
+            fixture.scheduler.runs_of(task).len(),
+            1,
+            "a refused decision made no new attempt"
+        );
+    }
+    assert_eq!(fixture.scheduler.runs_of(&running_task).len(), 1);
     assert!(
-        fixture.spy.since(mark).is_empty(),
-        "a refused decision changes nothing"
+        fixture.scheduler.take_events().is_empty(),
+        "a refused decision raised no event"
     );
 }
 
@@ -262,21 +270,14 @@ fn the_queue_hands_out_in_order_and_up_to_the_limit() {
         .request_claim(&worker("w1"), &ids[2])
         .unwrap();
     assert_eq!(claim.task, fixture.spy.task(&ids[2]));
-    let changed: Vec<Noted> = fixture
-        .spy
-        .since(mark)
-        .into_iter()
-        .map(|note| note.change)
-        .collect();
     assert_eq!(
-        changed,
-        vec![Noted::Run {
-            task: ids[2].clone(),
-            run: claim.task_run_id.clone(),
-            state: TaskRunState::Claimed,
-        }],
-        "nothing but the claimed run moved"
+        fixture.spy.revised_since(mark),
+        vec![ids[2].clone()],
+        "nothing but the claimed task moved"
     );
+    assert_eq!(fixture.scheduler.runs_of(&ids[2]).len(), 1);
+    assert_eq!(fixture.state(&ids[2]), TaskRunState::Claimed);
+    assert_eq!(fixture.scheduler.pending_len(), 5);
 
     let mark = fixture.spy.mark();
     assert!(
@@ -286,12 +287,13 @@ fn the_queue_hands_out_in_order_and_up_to_the_limit() {
             .unwrap()
             .is_empty()
     );
-    assert!(fixture.spy.since(mark).is_empty());
+    assert!(fixture.spy.revised_since(mark).is_empty());
+    assert_eq!(fixture.scheduler.pending_len(), 5);
 
     let claims = fixture.scheduler.claim_oldest(&worker("w2"), 2).unwrap();
     let claimed: Vec<TaskId> = claims.iter().map(|claim| claim.task.task_id()).collect();
     assert_eq!(claimed, vec![ids[0].clone(), ids[1].clone()]);
-    assert_eq!(fixture.spy.pending(), 3);
+    assert_eq!(fixture.scheduler.pending_len(), 3);
     for claim in claims {
         let run = fixture.scheduler.task_run(&claim.task_run_id).unwrap();
         assert_eq!(run.current_state(), TaskRunState::Claimed);
@@ -305,7 +307,7 @@ fn the_queue_hands_out_in_order_and_up_to_the_limit() {
         ids[3..].to_vec(),
         "the rest come out in submission order, the middle one skipped"
     );
-    assert_eq!(fixture.spy.pending(), 0);
+    assert_eq!(fixture.scheduler.pending_len(), 0);
     assert!(
         fixture
             .scheduler

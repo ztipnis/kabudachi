@@ -110,7 +110,7 @@ fn a_task_is_cancelled_in_whatever_state_its_run_is_in() {
     assert_eq!(fixture.scheduler.catch_up().queued, 0);
     // A cancelled task is never handed out, and a cancelled running task is
     // not retried.
-    assert_eq!(fixture.spy.pending(), 0);
+    assert_eq!(fixture.scheduler.pending_len(), 0);
     assert_eq!(
         fixture
             .scheduler
@@ -129,6 +129,7 @@ fn a_task_is_cancelled_in_whatever_state_its_run_is_in() {
     // The worker can no longer start the claimed run, and nothing it reports
     // about the running one afterwards counts.
     let mark = fixture.spy.mark();
+    let memory = fixture.scheduler.memory_in_use();
     assert_eq!(
         fixture
             .scheduler
@@ -148,9 +149,10 @@ fn a_task_is_cancelled_in_whatever_state_its_run_is_in() {
     assert_eq!(completed.unwrap_err(), ReportRejection::NotAuthoritative);
     assert_eq!(failed.unwrap_err(), ReportRejection::NotAuthoritative);
     assert!(
-        fixture.spy.since(mark).is_empty(),
+        fixture.spy.revised_since(mark).is_empty(),
         "refused reports change nothing"
     );
+    assert_eq!(fixture.scheduler.memory_in_use(), memory);
     assert_eq!(
         fixture.scheduler.task_run(&running_run).unwrap().result_digest,
         None

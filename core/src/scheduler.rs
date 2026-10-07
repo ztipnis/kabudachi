@@ -85,7 +85,7 @@ mod observer;
 mod retention;
 mod waiting_room;
 
-pub use observer::{Change, Counts, NoObserver, Observer};
+pub use observer::{NoObserver, Observer};
 use memory_budget::MemoryBudget;
 use retention::Retention;
 use waiting_room::WaitingRoom;
@@ -554,10 +554,10 @@ pub enum LeaseEnd {
 pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     clock: C,
     ids: I,
-    /// Told about every change the scheduler makes.
+    /// Handed every revision the scheduler publishes.
     observer: O,
-    /// What the scheduler last told its observer about leadership: it tells
-    /// changes, not checks, and `next_deadline` reads it for the lease end.
+    /// Whether the scheduler led at the last call that checked, which
+    /// `next_deadline` reads for the lease end.
     noticed_leading: bool,
     /// The leadership grant its worker's election last gave it, if any.
     grant: Option<LeadershipGrant>,
@@ -672,7 +672,7 @@ impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
 }
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
-    /// Like [`Self::new`], telling `observer` about every change.
+    /// Like [`Self::new`], handing `observer` every revision published.
     pub fn with_observer(clock: C, ids: I, observer: O) -> Self {
         Scheduler {
             clock,
@@ -904,9 +904,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.input_digests.remove(&task_id);
             self.links.remove(&task_id);
             self.unpublished.remove(&task_id);
-            let counts = self.counts();
-            self.observer
-                .notify(Change::TaskForgotten(&task_id), counts);
             forgotten += 1;
         }
         forgotten
@@ -914,7 +911,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// Sets the memory limits, or removes them with `None`. Set them before
     /// anything is recorded: they are not checked against what is already in
-    /// use, and no `SlowDown` change is announced for them.
+    /// use, and no `SlowDown` event is raised for them.
     ///
     /// # Panics
     ///
@@ -1176,7 +1173,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         });
         self.restore_keys(&kept_payloads, touched.as_ref());
         self.update_pressure();
-        self.notify_memory();
         installed
     }
 
@@ -1465,14 +1461,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .insert(task_id.clone(), vec![claim.task_run_id.clone()]);
         self.runs.insert(claim.task_run_id.clone(), run);
         self.tasks.insert(task_id.clone(), task);
-        let counts = self.counts();
-        self.observer
-            .notify(Change::TaskRecorded(&self.tasks[&task_id]), counts);
-        self.notify_current_run(&task_id);
+        self.mark_current_decided(&task_id);
         self.budget.take(needed);
-        if needed > 0 {
-            self.notify_memory();
-        }
         if let Some(key) = key {
             self.occupancy.start(&key, &task_id);
         }
@@ -1483,7 +1473,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Forgets every task, run and what hangs on them, keeping the result
     /// TTL and the memory limits.
     fn clear_tasks(&mut self) {
-        let forgotten = std::mem::take(&mut self.tasks);
+        self.tasks.clear();
         self.runs.clear();
         self.current_run.clear();
         self.runs_of_task.clear();
@@ -1503,10 +1493,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.deferred.clear();
         self.held_reports.clear();
         self.run_decided_at.clear();
-        for task_id in forgotten.keys() {
-            let counts = self.counts();
-            self.observer.notify(Change::TaskForgotten(task_id), counts);
-        }
     }
 
     /// Holds the task `record` describes, as its newest revision says.
@@ -1581,10 +1567,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         self.current_run.insert(task_id.clone(), current);
         self.tasks.insert(task_id.clone(), task);
-        let counts = self.counts();
-        self.observer
-            .notify(Change::TaskRecorded(&self.tasks[&task_id]), counts);
-        self.notify_current_run(&task_id);
+        self.mark_current_decided(&task_id);
         // Installing a record decides nothing: this leader did not make it.
         for run_id in self.runs_of_task[&task_id].clone() {
             self.run_decided_at.remove(&run_id);
@@ -1797,14 +1780,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.input_digests.insert(task_id.clone(), input_digest);
         self.unpublished.insert(task_id.clone());
         self.waiting.admit(&task_id, not_before, expires_at);
-        let counts = self.counts();
-        self.observer
-            .notify(Change::TaskRecorded(&self.tasks[&task_id]), counts);
-        self.notify_current_run(&task_id);
+        self.mark_current_decided(&task_id);
         self.budget.take(needed);
-        if needed > 0 {
-            self.notify_memory();
-        }
         let older = self
             .coalescing_key_of(&task_id)
             .and_then(|key| self.occupancy.submit(&key, &task_id));
@@ -1857,7 +1834,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .expect("every current run is stored")
                 .transition_to(TaskRunState::Queued, stamped_at)
                 .expect("a Scheduled run can always be queued");
-            self.notify_run(&run_id);
+            self.mark_decided(&run_id);
             advanced.queued += 1;
         }
         advanced
@@ -2046,7 +2023,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if let Some(key) = self.coalescing_key_of(task_id) {
             self.occupancy.start(&key, task_id);
         }
-        self.notify_run(&run_id);
+        self.mark_decided(&run_id);
     }
 
     /// The worker that claimed `run_id` reports that it began executing.
@@ -2070,7 +2047,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let run = self.owned_run(worker, run_id, TaskRunState::Claimed)?;
         run.transition_to(TaskRunState::Running, stamped_at)
             .expect("a Claimed run can always start");
-        self.notify_run(run_id);
+        self.mark_decided(run_id);
         Ok(())
     }
 
@@ -2116,7 +2093,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("a Running run can always succeed");
         run.result_digest = Some(result_digest.clone().into());
         let task_id = run.task_id();
-        self.notify_run(run_id);
+        self.mark_decided(run_id);
         match completion {
             Completion::Continues => {
                 self.continuing.insert(task_id.clone());
@@ -2190,7 +2167,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run.failure_kind = cut_to_fit(failure_kind, MAX_FAILURE_KIND_BYTES);
         let task_id = run.task_id();
         let attempt = run.attempt_number();
-        self.notify_run(run_id);
+        self.mark_decided(run_id);
         let retry = self.replace_failed_run(&task_id, run_id, attempt);
         if retry.is_none() {
             self.record_finished(&task_id, now);
@@ -2241,7 +2218,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("an unfinished run can always be cancelled");
         self.waiting.leave(task_id);
         self.record_finished(task_id, now);
-        self.notify_run(&run_id);
+        self.mark_decided(&run_id);
         self.events.push(Event::Cancelled {
             task_id: task_id.clone(),
             task_run_id: run_id,
@@ -2338,7 +2315,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("every current run is stored")
             .transition_to(state, stamped_at)
             .expect("a claimed run can be lost, and a running one lost or orphaned");
-        self.notify_run(&run_id);
+        self.mark_decided(&run_id);
         let newer_waits = self
             .coalescing_key_of(task_id)
             .is_some_and(|key| self.occupancy.has_waiting(&key));
@@ -2409,7 +2386,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .expect("a previous run is stored");
             if run.failure_kind.is_empty() {
                 run.failure_kind = HISTORY_TOO_LARGE_FAILURE_KIND.to_owned();
-                self.notify_run(previous);
+                self.mark_decided(previous);
             }
             self.events.push(Event::RecordFull {
                 task_id: task_id.clone(),
@@ -2424,7 +2401,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .push(next_id.clone());
         self.runs.insert(next_id.clone(), next);
         self.waiting.requeue(task_id);
-        self.notify_run(&next_id);
+        self.mark_decided(&next_id);
         Some(next_id)
     }
 
@@ -2451,7 +2428,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run.transition_to(TaskRunState::Expired, stamped_at)
             .expect("a pending run can always expire");
         self.record_finished(task_id, now);
-        self.notify_run(&run_id);
+        self.mark_decided(&run_id);
         self.events.push(Event::Expired {
             task_id: task_id.clone(),
             task_run_id: run_id,
@@ -2478,9 +2455,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.budget.give_back(payload);
         self.retention.record(task_id, now);
         self.unpublished.insert(task_id.clone());
-        if payload > 0 {
-            self.notify_memory();
-        }
     }
 
     /// The serialized bytes of the task's input, which is what memory use counts.
@@ -2525,15 +2499,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.announce(event);
     }
 
-    /// Tells the observer, then records for the caller, the `SlowDown` change
-    /// the budget returned, if any.
+    /// Records for the caller the event the budget returned, if
+    /// any.
     fn announce(&mut self, event: Option<Event>) {
         let Some(event) = event else {
             return;
         };
-        if let Event::SlowDown { active } = event {
-            self.notify_slow_down(active);
-        }
         self.events.push(event);
     }
 
@@ -2549,7 +2520,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("a pending run can always be superseded");
         self.waiting.leave(older);
         self.links.entry(older.clone()).or_default().superseded_by = Some(newer.clone().into());
-        self.notify_run(&run_id);
+        self.mark_decided(&run_id);
         self.events.push(Event::Superseded {
             task_id: older.clone(),
             task_run_id: run_id,
@@ -2596,8 +2567,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// Whether this scheduler leads, the only one that decides anything: it
     /// holds a grant whose lease has not ended by its own clock and that is
-    /// not older than the epoch and term it already published in. Reading it
-    /// tells the observer nothing.
+    /// not older than the epoch and term it already published in.
     pub fn is_leader(&self) -> bool {
         let Some(grant) = self.grant else {
             return false;
@@ -2607,6 +2577,18 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             LeaseEnd::At(end) => self.clock.now() < end,
         };
         leased && self.may_publish_under(grant.recovery_epoch, grant.term)
+    }
+
+    /// How many tasks are queued to be claimed, including generations their
+    /// coalescing key holds back. A delayed task counts once it is due.
+    pub fn pending_len(&self) -> usize {
+        self.waiting.queued_len()
+    }
+
+    /// Serialized bytes of every task that has not finished, and of every
+    /// superseded one still needed by the generation that absorbed it.
+    pub fn memory_in_use(&self) -> u64 {
+        self.budget.in_use()
     }
 
     /// The instant the lease of the grant this scheduler holds ends, or
@@ -2624,47 +2606,24 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         &mut self.observer
     }
 
-    /// Like `is_leader`, and tells the observer if the answer differs from
-    /// what it was last told, so the observer hears changes, not checks.
+    /// Like `is_leader`, and remembers the answer as the one last noticed.
     fn check_leader(&mut self) -> bool {
         let leading = self.is_leader();
-        if leading != self.noticed_leading {
-            self.noticed_leading = leading;
-            let counts = self.counts();
-            self.observer.notify(Change::Leadership(leading), counts);
-        }
+        self.noticed_leading = leading;
         leading
     }
 
-    /// The counts every notification carries, read after the change.
-    fn counts(&self) -> Counts {
-        Counts {
-            pending: self.waiting.queued_len(),
-            memory_in_use: self.budget.in_use(),
-        }
-    }
-
-    fn notify_run(&mut self, run_id: &TaskRunId) {
+    /// Records that `run_id` was decided now, and that its task has a change
+    /// to publish.
+    fn mark_decided(&mut self, run_id: &TaskRunId) {
         self.run_decided_at
             .insert(run_id.clone(), self.clock.now());
         self.unpublished.insert(self.runs[run_id].task_id());
-        let counts = self.counts();
-        self.observer.notify(Change::Run(&self.runs[run_id]), counts);
     }
 
-    fn notify_current_run(&mut self, task_id: &TaskId) {
+    fn mark_current_decided(&mut self, task_id: &TaskId) {
         let run_id = self.current_run[task_id].clone();
-        self.notify_run(&run_id);
-    }
-
-    fn notify_memory(&mut self) {
-        let counts = self.counts();
-        self.observer.notify(Change::Memory, counts);
-    }
-
-    fn notify_slow_down(&mut self, active: bool) {
-        let counts = self.counts();
-        self.observer.notify(Change::SlowDown(active), counts);
+        self.mark_decided(&run_id);
     }
 
     fn require_leader(&mut self) -> Result<(), ReportRejection> {

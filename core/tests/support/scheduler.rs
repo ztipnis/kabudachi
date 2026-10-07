@@ -5,13 +5,13 @@ use std::collections::BTreeMap;
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::TaskRecord;
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId};
+use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::ReconcileTerm;
-use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, MemoryLimits, Scheduler};
-use kabudachi_core::time::Duration;
+use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, MemoryLimits, Observer, Scheduler};
+use kabudachi_core::time::{Clock, Duration};
 
 use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
@@ -66,11 +66,17 @@ impl Fixture {
         fixture
     }
 
-    /// The state of `task`'s current run, from what the spy was told, after
-    /// checking it against the scheduler's own public reads. Panics on an
-    /// unknown task.
+    /// The state of `task`'s current run. Panics on an unknown or forgotten
+    /// task.
     pub fn state(&self, task: &TaskId) -> TaskRunState {
-        self.spy.checked_state_of(&self.scheduler, task)
+        state_of(&self.scheduler, &self.spy, task)
+    }
+
+    /// Whether the scheduler has forgotten `task` and every run of it, as it
+    /// does a finished task that outlived its retention or was superseded.
+    /// A task it never knew counts as forgotten too.
+    pub fn forgotten(&self, task: &TaskId) -> bool {
+        self.scheduler.runs_of(task).is_empty()
     }
 
     /// The state of `run`. Panics on an unknown run.
@@ -80,6 +86,45 @@ impl Fixture {
             .unwrap_or_else(|| panic!("no run {run:?}"))
             .current_state()
     }
+}
+
+/// The state of `task`'s current run, its newest. Panics on an unknown or
+/// forgotten task.
+///
+/// While the scheduler leads, it also checks that what the scheduler
+/// published says the same: the newest revision `spy` holds of `task` ends in
+/// a run with the id and state of the scheduler's newest run. A change the
+/// scheduler made after its lease ended is published only by the next call
+/// that finds it leading, so nothing is asserted while it does not lead. A
+/// task `spy` holds no revision of is skipped, as a driver may have drained
+/// the spy.
+pub fn state_of<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &Scheduler<C, I, O>,
+    spy: &Spy,
+    task: &TaskId,
+) -> TaskRunState {
+    let newest = scheduler
+        .runs_of(task)
+        .pop()
+        .unwrap_or_else(|| panic!("the scheduler has no run of {task:?}"));
+    let state = scheduler
+        .task_run(&newest)
+        .unwrap_or_else(|| panic!("the scheduler has no run {newest:?}"))
+        .current_state();
+    if scheduler.is_leader()
+        && let Some(record) = spy.newest_revision_of(task)
+    {
+        let published = record
+            .runs
+            .last()
+            .unwrap_or_else(|| panic!("the newest revision of {task:?} has no run"));
+        assert_eq!(
+            (published.task_run_id(), published.current_state()),
+            (newest, state),
+            "the newest revision of {task:?} does not carry its current run as it stands"
+        );
+    }
+    state
 }
 
 pub fn ticks(n: u64) -> Duration {

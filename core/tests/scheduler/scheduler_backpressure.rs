@@ -74,7 +74,7 @@ fn finish(fixture: &mut Fixture, task: &TaskId) {
 #[test]
 fn memory_counts_exactly_the_unfinished_tasks() {
     let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
-    assert_eq!(fixture.spy.memory_in_use(), 0);
+    assert_eq!(fixture.scheduler.memory_in_use(), 0);
 
     // A queued and a delayed task both count.
     let first = fixture.scheduler.submit(payload(30)).unwrap();
@@ -82,10 +82,10 @@ fn memory_counts_exactly_the_unfinished_tasks() {
         .scheduler
         .submit(payload(20).with_delay(Duration::from_ticks(50)))
         .unwrap();
-    assert_eq!(fixture.spy.memory_in_use(), 50);
+    assert_eq!(fixture.scheduler.memory_in_use(), 50);
 
     finish(&mut fixture, &first);
-    assert_eq!(fixture.spy.memory_in_use(), 20, "a completed task stops counting");
+    assert_eq!(fixture.scheduler.memory_in_use(), 20, "a completed task stops counting");
 
     let failing = fixture.scheduler.submit(payload(10)).unwrap();
     let claim = start(&mut fixture, &failing);
@@ -93,20 +93,20 @@ fn memory_counts_exactly_the_unfinished_tasks() {
         .scheduler
         .fail(&worker(), &claim, "ValueError")
         .unwrap();
-    assert_eq!(fixture.spy.memory_in_use(), 20, "a failed task stops counting");
+    assert_eq!(fixture.scheduler.memory_in_use(), 20, "a failed task stops counting");
 
     let cancelled = fixture.scheduler.submit(payload(10)).unwrap();
     fixture.scheduler.cancel(&cancelled).unwrap();
-    assert_eq!(fixture.spy.memory_in_use(), 20, "a cancelled task stops counting");
+    assert_eq!(fixture.scheduler.memory_in_use(), 20, "a cancelled task stops counting");
 
     fixture
         .scheduler
         .submit(payload(10).with_expiry(Duration::from_ticks(5)))
         .unwrap();
-    assert_eq!(fixture.spy.memory_in_use(), 30);
+    assert_eq!(fixture.scheduler.memory_in_use(), 30);
     fixture.clock.advance(Duration::from_ticks(5));
     fixture.scheduler.catch_up();
-    assert_eq!(fixture.spy.memory_in_use(), 20, "an expired task stops counting");
+    assert_eq!(fixture.scheduler.memory_in_use(), 20, "an expired task stops counting");
 
     let retrying = fixture
         .scheduler
@@ -118,7 +118,7 @@ fn memory_counts_exactly_the_unfinished_tasks() {
         .fail(&worker(), &claim, "ValueError")
         .unwrap();
     assert_eq!(
-        fixture.spy.memory_in_use(),
+        fixture.scheduler.memory_in_use(),
         60,
         "a task waiting for its retry still counts"
     );
@@ -130,12 +130,12 @@ fn memory_counts_exactly_the_unfinished_tasks() {
         .complete(&worker(), &claim, Digest::blake3(b"d"), Completion::Continues)
         .unwrap();
     assert_eq!(
-        fixture.spy.memory_in_use(),
+        fixture.scheduler.memory_in_use(),
         100,
         "a task with a continuation counts until it ends"
     );
     assert_eq!(fixture.scheduler.end_continuation(&continuing), Ok(true));
-    assert_eq!(fixture.spy.memory_in_use(), 60);
+    assert_eq!(fixture.scheduler.memory_in_use(), 60);
 }
 
 #[test]
@@ -177,6 +177,7 @@ fn slow_down_can_be_raised_again_after_it_cleared() {
 fn a_submission_is_refused_past_the_hard_limit_and_accepted_when_it_exactly_fills_it() {
     let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     fixture.scheduler.submit(payload(150)).unwrap();
+    let _ = fixture.scheduler.take_events();
 
     let mark = fixture.spy.mark();
     let rejected = fixture.scheduler.submit(payload(51));
@@ -190,14 +191,15 @@ fn a_submission_is_refused_past_the_hard_limit_and_accepted_when_it_exactly_fill
         }
     );
     assert!(
-        fixture.spy.since(mark).is_empty(),
+        fixture.spy.revised_since(mark).is_empty(),
         "a refused submission changes nothing"
     );
-    assert_eq!(fixture.spy.memory_in_use(), 150);
-    assert_eq!(fixture.spy.pending(), 1);
+    assert!(fixture.scheduler.take_events().is_empty());
+    assert_eq!(fixture.scheduler.memory_in_use(), 150);
+    assert_eq!(fixture.scheduler.pending_len(), 1);
 
     assert!(fixture.scheduler.submit(payload(50)).is_ok());
-    assert_eq!(fixture.spy.memory_in_use(), HARD);
+    assert_eq!(fixture.scheduler.memory_in_use(), HARD);
 }
 
 #[test]
@@ -275,7 +277,7 @@ fn drop_oldest_outcomes() {
         let outcome = fixture.scheduler.submit(row.submission);
 
         assert_eq!(outcome.is_ok(), row.accepted, "{}", row.what);
-        assert_eq!(fixture.spy.memory_in_use(), row.memory, "{}", row.what);
+        assert_eq!(fixture.scheduler.memory_in_use(), row.memory, "{}", row.what);
         if let Some(folded) = row.folded {
             let claim = fixture
                 .scheduler
@@ -306,8 +308,8 @@ fn a_task_too_large_for_a_claim_frame_is_refused_with_no_limits_set_and_leaves_n
         }
     );
     // Only the accepted one is held.
-    assert_eq!(fixture.spy.memory_in_use(), largest_input as u64);
-    assert_eq!(fixture.spy.pending(), 1);
+    assert_eq!(fixture.scheduler.memory_in_use(), largest_input as u64);
+    assert_eq!(fixture.scheduler.pending_len(), 1);
 }
 
 #[test]

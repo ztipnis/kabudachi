@@ -18,7 +18,6 @@ use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
 use crate::support::node::{TestNode, commit_founding, connect, deliver, elect};
-use crate::support::spy::Spy;
 
 const SHARD: &str = "shard-1";
 const SUSPECT_TIMEOUT: u64 = 10;
@@ -75,9 +74,7 @@ fn grant_is_applied_before_any_message_leaves() {
         clock.clone(),
         None,
     );
-    let spy = Spy::default();
-    let mut scheduler =
-        Scheduler::with_observer(clock.clone(), SequentialIds::new(), spy.clone());
+    let mut scheduler = Scheduler::new(clock.clone(), SequentialIds::new());
     carry(&mut node, first, &mut scheduler);
     connect(&mut node, &peers);
     let _ = elect(&mut node, &clock, SUSPECT_TIMEOUT, &peers);
@@ -107,9 +104,9 @@ fn grant_is_applied_before_any_message_leaves() {
         &mut scheduler,
         &mut LoggingSink { log: &log },
         &mut NoAuthority,
-        |_, _, _, _| {
+        |_, scheduler, _, _| {
             log.borrow_mut()
-                .push(format!("scheduler leading: {}", spy.leading()));
+                .push(format!("scheduler leading: {}", scheduler.is_leader()));
         },
     );
 

@@ -92,7 +92,7 @@ impl MemoryBudget {
         }
     }
 
-    /// For the notifications' `Counts::memory_in_use`.
+    /// The bytes counted in use, which `Scheduler::memory_in_use` reports.
     pub(super) fn in_use(&self) -> u64 {
         self.in_use
     }

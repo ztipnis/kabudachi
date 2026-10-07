@@ -159,7 +159,7 @@ impl WaitingRoom {
         [delay, expiry].into_iter().flatten().min()
     }
 
-    /// How many tasks are queued, for the notifications' `Counts::pending`.
+    /// How many tasks are queued, which `Scheduler::pending_len` reports.
     pub(super) fn queued_len(&self) -> usize {
         self.queue.len()
     }

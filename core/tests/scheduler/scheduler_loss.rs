@@ -128,7 +128,7 @@ fn what_a_lost_worker_leaves_behind() {
         .complete(&worker("w1"), &done_run, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
     let waiting = fixture.scheduler.submit(plain("e")).unwrap();
-    assert_eq!(fixture.spy.memory_in_use(), 8);
+    assert_eq!(fixture.scheduler.memory_in_use(), 8);
 
     let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
 
@@ -161,7 +161,7 @@ fn what_a_lost_worker_leaves_behind() {
     }
     // Memory counts the three replays, the other worker's run and the waiting
     // task; an orphaned or ephemeral run's task is over.
-    assert_eq!(fixture.spy.memory_in_use(), 5);
+    assert_eq!(fixture.scheduler.memory_in_use(), 5);
     assert_eq!(fixture.run_state(&their_run), TaskRunState::Running);
     assert_eq!(fixture.run_state(&done_run), TaskRunState::Succeeded);
     assert_eq!(fixture.state(&done), TaskRunState::Succeeded);

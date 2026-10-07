@@ -1,6 +1,6 @@
 use crate::protocol::generated::TaskRecord;
 use crate::protocol::ids::WorkerId;
-use crate::scheduler::{Change, Counts, Observer};
+use crate::scheduler::Observer;
 use crate::task_record::gate::Write;
 use crate::task_record::store::VersionedRecords;
 use crate::time::{Clock, Duration};
@@ -51,8 +51,6 @@ impl<C: Clock> LocalRecords<C> {
 }
 
 impl<C: Clock> Observer for LocalRecords<C> {
-    fn notify(&mut self, _: Change<'_>, _: Counts) {}
-
     fn revision(&mut self, mut revision: TaskRecord) {
         revision.placement = vec![self.worker.clone().into()];
         let write = Write::of(&revision);

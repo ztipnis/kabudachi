@@ -48,7 +48,7 @@ fn the_same_key_of_a_different_task_does_not_supersede() {
         .submit(generation("cache.warm", "a", "3"))
         .unwrap();
 
-    assert_eq!(fixture.spy.pending(), 2);
+    assert_eq!(fixture.scheduler.pending_len(), 2);
     for task in [&refresh, &warm] {
         assert_eq!(fixture.state(task), TaskRunState::Queued);
     }
@@ -71,7 +71,7 @@ fn a_delayed_pending_generation_is_superseded_too() {
     fixture.clock.advance(ticks(500));
     let advanced = fixture.scheduler.catch_up();
     assert_eq!(advanced.queued, 0);
-    assert_eq!(fixture.spy.pending(), 1);
+    assert_eq!(fixture.scheduler.pending_len(), 1);
     assert_eq!(fixture.state(&newer), TaskRunState::Queued);
     assert_eq!(fixture.scheduler.next_deadline(), None);
 }
@@ -120,7 +120,7 @@ fn superseded_tasks_are_kept_until_the_generation_that_absorbed_them_finishes() 
         .unwrap();
     fixture.clock.advance(ticks(10_000));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
-    assert!(!fixture.spy.forgotten(&older));
+    assert!(!fixture.forgotten(&older));
 
     fixture
         .scheduler
@@ -128,8 +128,8 @@ fn superseded_tasks_are_kept_until_the_generation_that_absorbed_them_finishes() 
         .unwrap();
     fixture.clock.advance(ticks(100));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 2);
-    assert!(fixture.spy.forgotten(&older));
-    assert!(fixture.spy.forgotten(&newest));
+    assert!(fixture.forgotten(&older));
+    assert!(fixture.forgotten(&newest));
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn a_dead_newest_generation_releases_its_chain() {
         fixture.clock.advance(ticks(100));
 
         assert_eq!(fixture.scheduler.catch_up().forgotten, 2, "{how}");
-        assert!(fixture.spy.forgotten(&older), "{how}");
+        assert!(fixture.forgotten(&older), "{how}");
         // A later submission starts a fresh generation with nothing chained.
         fixture.scheduler.submit(refresh("c")).unwrap();
         assert!(claim_one(&mut fixture).chain.is_empty(), "{how}");

@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
+use crate::support::scheduler::state_of;
 use crate::support::spy::Spy;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
@@ -126,7 +127,7 @@ impl Model {
     }
 
     fn state_of(&self, task: &TaskId) -> TaskRunState {
-        self.spy.checked_state_of(&self.scheduler, task)
+        state_of(&self.scheduler, &self.spy, task)
     }
 
     fn apply(&mut self, op: &Op) {
@@ -334,8 +335,8 @@ impl Model {
             let _ = self.scheduler.cancel(&task);
         }
         // What was claimed and is running was just cancelled with the rest.
-        assert_eq!(self.spy.pending(), 0);
-        assert_eq!(self.spy.memory_in_use(), 0, "memory accounting drifted");
+        assert_eq!(self.scheduler.pending_len(), 0);
+        assert_eq!(self.scheduler.memory_in_use(), 0, "memory accounting drifted");
     }
 }
 

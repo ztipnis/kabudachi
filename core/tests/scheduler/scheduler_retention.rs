@@ -63,7 +63,7 @@ fn nothing_is_forgotten_until_a_result_ttl_is_set() {
 
     assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
 
-    assert!(!fixture.spy.forgotten(&task_id));
+    assert!(!fixture.forgotten(&task_id));
 }
 
 #[test]
@@ -78,8 +78,8 @@ fn tasks_that_have_not_finished_are_never_forgotten() {
     fixture.clock.advance(Duration::from_ticks(TTL * 10));
 
     assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
-    assert!(!fixture.spy.forgotten(&queued));
-    assert!(!fixture.spy.forgotten(&running));
+    assert!(!fixture.forgotten(&queued));
+    assert!(!fixture.forgotten(&running));
 }
 
 #[test]
@@ -96,12 +96,12 @@ fn each_finished_task_is_forgotten_at_its_own_time() {
 
     fixture.clock.advance(Duration::from_ticks(40));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
-    assert!(fixture.spy.forgotten(&early));
-    assert!(!fixture.spy.forgotten(&late));
+    assert!(fixture.forgotten(&early));
+    assert!(!fixture.forgotten(&late));
 
     fixture.clock.advance(Duration::from_ticks(60));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
-    assert!(fixture.spy.forgotten(&late));
+    assert!(fixture.forgotten(&late));
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn a_finished_task_is_forgotten_with_every_run_counted_from_its_last() {
     assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
     assert!(fixture.scheduler.task_run(&first).is_none());
     assert!(fixture.scheduler.task_run(&second).is_none());
-    assert!(fixture.spy.forgotten(&task_id));
+    assert!(fixture.forgotten(&task_id));
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn a_task_that_is_waiting_for_its_retry_is_not_forgotten() {
     fixture.clock.advance(Duration::from_ticks(1_000));
 
     assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
-    assert!(!fixture.spy.forgotten(&task_id));
+    assert!(!fixture.forgotten(&task_id));
 }
 
 #[test]
@@ -168,5 +168,5 @@ fn a_task_with_a_continuation_is_not_forgotten_until_it_ends() {
     fixture.scheduler.end_continuation(&task).unwrap();
     fixture.clock.advance(Duration::from_ticks(100));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
-    assert!(fixture.spy.forgotten(&task));
+    assert!(fixture.forgotten(&task));
 }

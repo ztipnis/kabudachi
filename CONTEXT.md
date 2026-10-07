@@ -147,7 +147,7 @@ The bindings' one way into the shared scheduler (`bindings/src/door.rs`): the lo
 The scheduler's one time-driven call (`Scheduler::catch_up`), made when its next deadline comes: it forgets every finished task past its retention, and, only while this scheduler leads, makes due delayed tasks pending and expires pending tasks past their expiry.
 
 **Scheduler observer**:
-Whoever the scheduler tells about each task, run, leadership, memory and slow-down change, with the counts just after it (the `Observer` trait). Nobody in production (`NoObserver`); a recording spy in tests.
+Whoever the scheduler hands each published task record to (the `Observer` trait). The runtime's record store in production, `NoObserver` where nobody watches, a recording spy in tests.
 
 **Waiting room**, **Memory budget**, **Retention**:
 The scheduler's private parts for pending tasks, the payload memory of unfinished tasks, and how long finished tasks are kept.

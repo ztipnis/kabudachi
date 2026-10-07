@@ -1,5 +1,5 @@
 use crate::protocol::generated::TaskRecord;
-use crate::scheduler::{Change, Counts, Observer};
+use crate::scheduler::Observer;
 
 /// A record sink that keeps each revision until its driver takes it, to
 /// write it where it belongs.
@@ -16,8 +16,6 @@ impl RecordOutbox {
 }
 
 impl Observer for RecordOutbox {
-    fn notify(&mut self, _: Change<'_>, _: Counts) {}
-
     fn revision(&mut self, revision: TaskRecord) {
         self.revisions.push(revision);
     }
