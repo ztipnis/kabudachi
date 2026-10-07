@@ -8,17 +8,11 @@
 //! returning. The scheduler here carries the one-node record sink
 //! (`LocalRecords`): each revision it publishes is stored in this node's own
 //! store before the call returns, and keeps every write, so an answer stands
-//! once the scheduler has given it. A submission made before the node leads
-//! gets its task id at once and waits in the door; an end of a continuation
-//! the scheduler refused for want of leadership waits there too. Once the node
-//! leads, every change except a claim or a read replays the unended
-//! continuations, then records the queued submissions, in the order they were
-//! made within a coalescing key. A submission whose record would not yet fit
-//! (it carries the input of the generation it supersedes) stays queued until a
-//! change frees room, and so do the later submissions of its coalescing key,
-//! which must not be recorded ahead of it. Every other queued submission is
-//! recorded regardless. The one worker this door serves runs compaction, so
-//! it claims the compaction runs of its own scheduler like any other claim.
+//! once the scheduler has given it. What the scheduler cannot take yet waits
+//! in its backlog (`Backlog`), which every change except a claim or a read
+//! hands over once the node leads. The one worker this door serves runs
+//! compaction, so it claims the compaction runs of its own scheduler like any
+//! other claim.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -31,9 +25,8 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{
-    CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted, Completion,
-    ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission, Submitted,
-    SubmitRejection,
+    Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted, Completion,
+    ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission, SubmitRejection,
 };
 use kabudachi_core::task_record::{LocalRecords, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};
@@ -119,16 +112,9 @@ pub type DoorScheduler<C> = Scheduler<C, Uuid7Ids, LocalRecords<C>>;
 struct Inside<C: Clock> {
     scheduler: DoorScheduler<C>,
     closed: bool,
-    /// The submissions not yet recorded: those made before the grant, and
-    /// those made since then behind a refused submission of their coalescing
-    /// key, in the order they were made.
-    queued: Vec<Submitted>,
-    /// The input bytes `queued` holds, which each new submission is checked
-    /// against the hard limit with.
-    queued_bytes: u64,
-    /// Continuations whose end the scheduler refused for want of leadership,
-    /// in the order they were refused: the grant ends them.
-    unended: Vec<TaskId>,
+    /// What the scheduler cannot take yet; handed over after every change
+    /// but a claim or a read.
+    backlog: Backlog,
 }
 
 /// Runs `change` and returns its outcome. The local store settles every write
@@ -151,64 +137,24 @@ fn settled_change<C: Clock, T, R>(
     outcome
 }
 
-/// The coalescing key a submission competes under: its task definition and
-/// its flat key, the same pair the scheduler keys generations by. `None` for a
-/// submission that does not coalesce.
-fn coalescing_key_of(submission: &Submission) -> Option<(&str, &str)> {
-    let key = submission.coalescing_key.as_deref()?;
-    Some((submission.definition_id.as_str(), key))
+/// [`settled_change`] for a change that goes through the backlog.
+fn settled_backlog<C: Clock, T, R>(
+    inside: &mut Inside<C>,
+    change: impl FnOnce(&mut Backlog, &mut DoorScheduler<C>) -> Result<T, R>,
+) -> Result<T, R> {
+    let Inside { scheduler, backlog, .. } = inside;
+    settled_change(scheduler, |scheduler| change(backlog, scheduler))
 }
 
-/// Records the submissions not yet recorded: those queued before the grant,
-/// and those held behind a refused submission of their key. One the
-/// scheduler refuses (its record would pass the size limit while it carries
-/// the input of the generation it supersedes) stays queued rather than being
-/// lost, and the next change tries again. So do the later submissions of its
-/// coalescing key, in order, because recording one ahead of it would reverse
-/// the generations; submissions of other keys, and those that do not coalesce,
-/// are recorded without waiting for it. A refused submission without a key
-/// holds nothing back.
-fn record_queued<C: Clock>(inside: &mut Inside<C>) {
-    let mut held: BTreeSet<(String, String)> = BTreeSet::new();
-    for submitted in std::mem::take(&mut inside.queued) {
-        let key = coalescing_key_of(&submitted.submission)
-            .map(|(definition, key)| (definition.to_owned(), key.to_owned()));
-        if key.as_ref().is_some_and(|key| held.contains(key)) {
-            inside.queued.push(submitted);
-            continue;
-        }
-        let kept = submitted.clone();
-        let recorded = settled_change(&mut inside.scheduler, |scheduler| {
-            scheduler.submit_minted(submitted)
-        });
-        if recorded.is_err() {
-            held.extend(key);
-            inside.queued.push(kept);
-        }
-    }
-    inside.queued_bytes = inside
-        .queued
-        .iter()
-        .map(|submitted| submitted.submission.serialized_input.len() as u64)
-        .sum();
-}
-
-/// Once the scheduler leads, ends the continuations it refused to end earlier
-/// (which frees the memory they held), then records the queued submissions
-/// (see [`record_queued`]). Run after every change that can free capacity
-/// or keys, so a queued submission is not left waiting for the next one.
+/// Hands the backlog over once the scheduler leads. Run after every change
+/// that can free capacity or keys, so a queued submission is not left waiting
+/// for the next one.
 fn settle_pending<C: Clock>(inside: &mut Inside<C>) {
-    if !inside.scheduler.is_leader() {
-        return;
-    }
-    for task in std::mem::take(&mut inside.unended) {
-        // `Ok(false)` is a task that finished or was cancelled meanwhile and has
-        // nothing to end; the node leads (checked above), so `NotLeader` cannot occur.
-        let _ = settled_change(&mut inside.scheduler, |scheduler| {
-            scheduler.end_continuation(&task)
-        });
-    }
-    record_queued(inside);
+    let handed_over = settled_backlog(inside, |backlog, scheduler| {
+        backlog.hand_over(scheduler);
+        Ok::<(), std::convert::Infallible>(())
+    });
+    let Ok(()) = handed_over;
 }
 
 /// The bindings' one way into the shared scheduler.
@@ -227,9 +173,7 @@ impl<C: Clock> SchedulerDoor<C> {
             inside: Mutex::new(Inside {
                 scheduler,
                 closed: false,
-                queued: Vec::new(),
-                queued_bytes: 0,
-                unended: Vec::new(),
+                backlog: Backlog::default(),
             }),
             wakeups: Wakeups {
                 claims: Wake::new(),
@@ -240,44 +184,13 @@ impl<C: Clock> SchedulerDoor<C> {
         }
     }
 
-    /// Gives `submission` its task id at once. A leader records it now, unless
-    /// an earlier submission of its coalescing key is still queued behind a
-    /// refusal. Every submission is checked against the hard limit together
-    /// with everything queued before it. Before the grant, or behind a refused
-    /// submission of its key, it is then queued, and recorded, in order, by
-    /// the first change that finds room once this node leads.
+    /// Gives `submission` its task id at once; the backlog records it now or
+    /// holds it until the node leads. Wakes claims and timers.
     pub fn submit(&self, submission: Submission) -> Result<TaskId, Refusal<SubmitRejection>> {
         refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
-            let submitted = inside.scheduler.mint(submission);
-            if inside.scheduler.is_leader() {
-                // The lone leader is not woken by an election step again, so
-                // room freed since a refusal is used by the next submission.
-                record_queued(inside);
-                let key = coalescing_key_of(&submitted.submission);
-                let behind_queued = key.is_some_and(|key| {
-                    inside
-                        .queued
-                        .iter()
-                        .any(|queued| coalescing_key_of(&queued.submission) == Some(key))
-                });
-                if !behind_queued {
-                    // What is held counts against the hard limit here as it
-                    // does for a queued submission.
-                    inside
-                        .scheduler
-                        .check_submission(&submitted.submission, inside.queued_bytes)?;
-                    return settled_change(&mut inside.scheduler, |scheduler| {
-                        scheduler.submit_minted(submitted)
-                    });
-                }
-            }
-            inside
-                .scheduler
-                .check_submission(&submitted.submission, inside.queued_bytes)?;
-            inside.queued_bytes += submitted.submission.serialized_input.len() as u64;
-            let task = submitted.task_id.clone();
-            inside.queued.push(submitted);
-            Ok(task)
+            settled_backlog(inside, |backlog, scheduler| {
+                backlog.submit(scheduler, submission)
+            })
         }))
     }
 
@@ -339,35 +252,25 @@ impl<C: Clock> SchedulerDoor<C> {
         }))
     }
 
-    /// Cancels `task`. A submission still queued for the grant is dropped
-    /// from the queue, so it never runs.
+    /// Cancels `task`. A submission still waiting in the backlog is dropped,
+    /// so it never runs.
     pub fn cancel(&self, task: &TaskId) -> Result<Cancellation, Refusal<CancelRejection>> {
         refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
-            if let Some(at) = inside.queued.iter().position(|queued| queued.task_id == *task) {
-                let dropped = inside.queued.remove(at);
-                inside.queued_bytes -= dropped.submission.serialized_input.len() as u64;
-                return Ok(Cancellation::Cancelled { was_running: false });
-            }
-            settled_change(&mut inside.scheduler, |scheduler| scheduler.cancel(task))
+            settled_backlog(inside, |backlog, scheduler| backlog.cancel(scheduler, task))
         }))
     }
 
     /// Ends the continuation of `task`. Refused for want of leadership, it
-    /// is kept and ended by the first change once this node leads, so the task
-    /// is not left continuing for ever; the caller is still told it was
-    /// refused.
+    /// is kept by the backlog and ended once this node leads; the caller is
+    /// still told it was refused.
     pub fn end_continuation(
         &self,
         task: &TaskId,
     ) -> Result<bool, Refusal<ContinuationRejection>> {
         refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
-            let ended = settled_change(&mut inside.scheduler, |scheduler| {
-                scheduler.end_continuation(task)
-            });
-            if ended.is_err() && !inside.unended.contains(task) {
-                inside.unended.push(task.clone());
-            }
-            ended
+            settled_backlog(inside, |backlog, scheduler| {
+                backlog.end_continuation(scheduler, task)
+            })
         }))
     }
 
@@ -472,9 +375,8 @@ impl<C: Clock> SchedulerDoor<C> {
     /// if the scheduler has something to say. What the scheduler decided is
     /// read under the same lock, so an event produced here cannot be missed
     /// by the wake-up that follows it. Any change but a claim or a read is followed,
-    /// under the same lock and once this node leads, by ending the
-    /// continuations refused earlier and recording the submissions queued for
-    /// the grant, as capacity or keys the change freed may let those happen.
+    /// under the same lock and once this node leads, by handing over the
+    /// backlog, as capacity or keys the change freed may let it advance.
     fn change<T>(
         &self,
         concerned: Concerned,
@@ -483,8 +385,7 @@ impl<C: Clock> SchedulerDoor<C> {
         self.change_inside(concerned, |inside| change(&mut inside.scheduler))
     }
 
-    /// [`Self::change`] for a change that also needs the submissions queued
-    /// before the grant.
+    /// [`Self::change`] for a change that also needs the backlog.
     fn change_inside<T>(
         &self,
         concerned: Concerned,
@@ -493,8 +394,8 @@ impl<C: Clock> SchedulerDoor<C> {
         self.change_then(concerned, change, |_, outcome| outcome)
     }
 
-    /// [`Self::change_inside`] whose result is also read after what the
-    /// change queued has settled, so it describes the scheduler as the caller
+    /// [`Self::change_inside`] whose result is also read after the
+    /// backlog has been handed over, so it describes the scheduler as the caller
     /// leaves it.
     fn change_then<T, U>(
         &self,
