@@ -167,7 +167,7 @@
 //! membership"). So a peer this node never itself connected to can still be
 //! reached, once some other peer's Identify has given `kad` a route to it.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1034,6 +1034,8 @@ struct Pending {
     writes: HashMap<kad::QueryId, Write>,
     /// Record lookups in flight, by their `kad` query.
     reads: HashMap<kad::QueryId, Read>,
+    /// Bootstrap queries that have had a failed step, until their last step.
+    crawls: CrawlTracker,
 }
 
 /// A record lookup collecting the answers of its `kad` query.
@@ -1342,10 +1344,36 @@ fn write_record(
     }
 }
 
-/// What a finished Kademlia bootstrap tells the node: a crawl that failed
-/// reached nothing it can vouch for, so it reports none.
-fn crawl_report(result: &kad::BootstrapResult) -> Option<Input> {
-    result.is_ok().then_some(Input::RoutingCrawled)
+/// The bootstrap queries that have had a failed step so far.
+///
+/// A bootstrap is several steps (the lookup of the node's own key, then
+/// bucket refreshes), and a step may time out while a later one succeeds. The
+/// last step's result alone would then vouch for a crawl that missed part of
+/// the routing table, so a failed earlier step voids the query's report.
+#[derive(Default)]
+struct CrawlTracker {
+    failed: HashSet<kad::QueryId>,
+}
+
+impl CrawlTracker {
+    /// Notes one step of bootstrap query `id`; on its last step, what the
+    /// finished crawl tells the node: a crawl that failed anywhere reached
+    /// nothing it can vouch for, so it reports none.
+    fn step(
+        &mut self,
+        id: kad::QueryId,
+        result: &kad::BootstrapResult,
+        step: &kad::ProgressStep,
+    ) -> Option<Input> {
+        if !step.last {
+            if result.is_err() {
+                self.failed.insert(id);
+            }
+            return None;
+        }
+        let failed = self.failed.remove(&id);
+        (result.is_ok() && !failed).then_some(Input::RoutingCrawled)
+    }
 }
 
 fn handle_event(
@@ -1371,10 +1399,11 @@ fn handle_event(
         }
         SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
             result: kad::QueryResult::Bootstrap(result),
+            id,
             step,
             ..
-        })) if step.last => {
-            if let Some(input) = crawl_report(&result) {
+        })) => {
+            if let Some(input) = pending.crawls.step(id, &result, &step) {
                 inbound.queue_input(input);
             }
         }
