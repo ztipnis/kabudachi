@@ -10,7 +10,7 @@ use crate::time::{Clock, Duration, Instant};
 use super::RecordPorts;
 
 /// What the driver is to do next for a reconciliation.
-pub enum Progress {
+pub(crate) enum Progress {
     /// Nothing yet.
     Waiting,
     /// The round may stop: rebuild the scheduler from this.
@@ -28,7 +28,7 @@ pub enum Progress {
 }
 
 /// What a reconciliation could not finish, to be done again.
-pub enum Stuck {
+pub(crate) enum Stuck {
     /// The scheduler did not take the rebuild.
     Rebuild(Rebuild),
     /// These records could not all be placed on the voters.
@@ -97,6 +97,9 @@ pub struct OfficeReconciliation {
     led: bool,
     /// Whether something arrived that the round has not yet handed over.
     news: bool,
+    /// Late answers taken from the round, held while the node is stepped with
+    /// a `Tick` that checks its lease first.
+    learnt: Option<Rebuild>,
 }
 
 impl OfficeReconciliation {
@@ -118,6 +121,7 @@ impl OfficeReconciliation {
             progressed_at: now,
             led: false,
             news: false,
+            learnt: None,
         }
     }
 
@@ -157,7 +161,7 @@ impl OfficeReconciliation {
     /// the republished records that fell due through `ports`. What late
     /// answers teach is handed over only while the scheduler leads, and is
     /// kept until then.
-    pub fn progress<C: Clock>(
+    pub(crate) fn progress<C: Clock>(
         &mut self,
         node: &WorkerNode<C>,
         leading: bool,
@@ -218,20 +222,30 @@ impl OfficeReconciliation {
 
     /// Takes back what the scheduler could not adopt because it did not lead:
     /// it is offered again, with what is learnt meanwhile, once it does.
-    pub fn give_back(&mut self, learnt: Rebuild) {
+    pub(crate) fn give_back(&mut self, learnt: Rebuild) {
         self.round.give_back(learnt);
         self.news = true;
     }
 
+    /// Holds late answers taken from the round while the node is stepped.
+    pub(crate) fn hold_learnt(&mut self, learnt: Rebuild) {
+        self.learnt = Some(learnt);
+    }
+
+    /// The late answers held while the node was stepped, if any.
+    pub(crate) fn take_learnt(&mut self) -> Option<Rebuild> {
+        self.learnt.take()
+    }
+
     /// Keeps what could not be finished, to be done again when the voters
     /// change or after a suspicion timeout.
-    pub fn stuck(&mut self, work: Stuck, voters: Vec<WorkerId>, now: Instant) {
+    pub(crate) fn stuck(&mut self, work: Stuck, voters: Vec<WorkerId>, now: Instant) {
         self.stuck.hold(work, voters, now);
     }
 
     /// The rebuild ran: write these republished records, each again after
     /// `retry_after` if it was not stored.
-    pub fn republishing(
+    pub(crate) fn republishing(
         &mut self,
         writes: Vec<PlacedWrite>,
         retry_after: Duration,
@@ -244,7 +258,7 @@ impl OfficeReconciliation {
 
     /// The voters changed: places every republished write not yet stored on
     /// them, and writes each refused one again now.
-    pub fn re_place(&mut self, replace: impl FnMut(&mut PlacedWrite), now: Instant) {
+    pub(crate) fn re_place(&mut self, replace: impl FnMut(&mut PlacedWrite), now: Instant) {
         if let Some(republish) = self.republish.as_mut() {
             republish.re_place(replace, now);
         }
