@@ -90,7 +90,7 @@ PROPTEST_CASES=5000 PROPTEST_RNG_SEED=7 bazel test //core:core_integration_test 
 - *Docker `medium` (2 vCPU, 4 GB, x86).* A cold build is throughput-bound, so a larger class costs the same credits for the same work, and cached runs cannot use more CPUs. Arm Docker costs 13 credits a minute, not 10. `.bazelrc`'s `ci` config sets the job's CPU and memory limits, because a Docker executor reports the host's.
 - *Cold-build settings in `.bazelrc`, used everywhere.*
   - *Prebuilt protoc.* Compiling protoc from C++ source took about 70% of a cold build's action time.
-  - *One output configuration.* aspect_rules_py's `py_test` sets the Python version and venv for everything under it. Without the same values on the command line, `core`, tokio, and every proc macro under a Python test compiled a second time; `pyo3_extension` also forced `opt` on its subtree.
+  - *One output configuration.* aspect_rules_py's `py_test` sets the Python version and venv for everything under it. Without the same values on the command line, `core`, tokio, and every proc macro under a Python test compiled a second time.
   - *Build tools in fastbuild.* Proc macros, build scripts, and rules_rust's helpers compiled at `opt-level=3`, about 60% of the remaining Rust compile time.
 - *No path filtering.* A docs-only push still runs the job; on a cache hit it costs about as much as a dynamic-configuration setup job would.
 - *First-party outputs stay out of the remote cache.* Storage costs 420 credits a GB-month beyond the included 2. Test binaries are tens of MB each, so storing every push's first-party outputs would cost more than the minute of rebuild they save.

@@ -37,19 +37,25 @@ crate.from_cargo(
     manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml", "//net:Cargo.toml", "//testkit:Cargo.toml"],
 )
 
+# PyO3 builds the extension against Python's stable ABI (the `abi3-py312`
+# feature in bindings/Cargo.toml), so it needs no interpreter or libpython at
+# build time. These two build scripts only have to be told not to look for one.
+# https://pyo3.rs/main/building-and-distribution#py_limited_apiabi3
+crate.annotation(
+    build_script_env = {"PYO3_BUILD_EXTENSION_MODULE": "1", "PYO3_NO_PYTHON": "1"},
+    crate = "pyo3-build-config",
+)
+crate.annotation(
+    build_script_env = {"PYO3_BUILD_EXTENSION_MODULE": "1", "PYO3_NO_PYTHON": "1"},
+    crate = "pyo3-ffi",
+)
+
 use_repo(crate, "crates")
 
-# --- PyO3 extension support ---
-# `platforms` is required here (not just transitively via rules_rust)
-# because pyo3_extension's internal select() on @platforms//os:macos
-# needs it directly.
+# `platforms` selects the macOS link flags for the PyO3 extension
+# (bindings/BUILD.bazel); `bazel_skylib` renames its library to a Python module.
 bazel_dep(name = "platforms", version = "1.1.0")
-bazel_dep(name = "rules_rust_pyo3", version = "0.74.0")
-
-register_toolchains(
-    "@rules_rust_pyo3//toolchains:toolchain",
-    "@rules_rust_pyo3//toolchains:rust_toolchain",
-)
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
 
 # --- Python toolchain + uv-managed deps for runtime/ ---
 # The interpreter Bazel runs Python on. rules_python defaults to 3.11, but

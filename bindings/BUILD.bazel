@@ -1,32 +1,62 @@
-load("@rules_rust_pyo3//:defs.bzl", "pyo3_extension")
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library")
 
 # Every first-party target is tagged no-remote-cache: CI's remote cache
 # (CircleCI's with_tool_cache, billed per GB stored) then holds only
 # third-party outputs, which do not change between runs. The local disk
 # cache still stores these targets.
 
-pyo3_extension(
-    name = "_native",
+# The PyO3 extension, built as a plain shared library against Python's stable
+# ABI (see bindings/Cargo.toml and MODULE.bazel). The crate name is the
+# module's own name: Python looks for `PyInit__native` in the file.
+rust_shared_library(
+    name = "_native_shared",
     srcs = glob(["src/**/*.rs"]),
-    module_name = "kabudachi._native",
+    crate_name = "_native",
     edition = "2024",
+    rustc_flags = select({
+        # A macOS extension leaves the Python symbols to the interpreter that
+        # loads it, and needs the pre-chained-fixups Mach-O format
+        # (https://pyo3.rs/main/building-and-distribution#macos,
+        # https://github.com/PyO3/pyo3/issues/5035).
+        "@platforms//os:macos": [
+            "-C",
+            "link-arg=-undefined",
+            "-C",
+            "link-arg=dynamic_lookup",
+            "-C",
+            "link-arg=-Wl,-no_fixup_chains",
+        ],
+        "//conditions:default": [],
+    }),
     tags = ["no-remote-cache"],
-    # The default ("opt") moves the extension and everything it depends on,
-    # tools included, into a second configuration, so `core`, tokio, and
-    # every proc macro compiled twice. Only tests build the extension, so it
-    # takes the build's own mode. A release build passes `-c opt`.
-    compilation_mode = "current",
-    # Type stubs are not shipped from Bazel; skip building the stub tool.
-    stubs = False,
+    visibility = ["//visibility:private"],
+    deps = [
+        "//core:core",
+        "@crates//:pyo3",
+        "@crates//:tokio",
+    ],
+)
+
+# Python imports an extension from a file named `<module>.so` on macOS and
+# Linux alike, though macOS names a shared library `.dylib`.
+copy_file(
+    name = "_native_so",
+    src = ":_native_shared",
+    out = "kabudachi/_native.so",
+    tags = ["no-remote-cache"],
+)
+
+py_library(
+    name = "_native",
+    data = [":_native_so"],
     # Puts this package's own directory (bindings/) on sys.path so the
     # compiled extension resolves as top-level `kabudachi._native` rather
     # than `bindings.kabudachi._native`. runtime/src/kabudachi/__init__.py
     # extends its own __path__ (pkgutil-style) so this merges into the
     # same `kabudachi` package as the pure-Python sources.
     imports = ["."],
-    deps = [
-        "//core:core",
-        "@crates//:tokio",
-    ],
+    tags = ["no-remote-cache"],
     visibility = ["//runtime:__subpackages__"],
 )
