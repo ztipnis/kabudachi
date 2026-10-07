@@ -286,11 +286,6 @@ enum Command {
         write: HandOffWrite,
         respond_to: oneshot::Sender<bool>,
     },
-    /// See `Net::retire_copies`.
-    RetireCopies {
-        record: TaskRecord,
-        former: Vec<WorkerId>,
-    },
 }
 
 /// A copy a draining worker hands to the holders a placement named (see
@@ -930,14 +925,6 @@ impl Net {
         async move { stored.await.unwrap_or(false) }
     }
 
-    /// Sends `record`, a revision the leader placed elsewhere, to `former`,
-    /// holders it left, each of which then drops the copy it holds. Nothing
-    /// waits for them: a holder that is gone or does not answer keeps a copy
-    /// nothing will read.
-    pub fn retire_copies(&self, record: TaskRecord, former: Vec<WorkerId>) {
-        let _ = self.commands.send(Command::RetireCopies { record, former });
-    }
-
     /// The newest revision of `task`'s record that this worker or any shard
     /// peer kad reaches holds: every answer of the lookup, this worker's own
     /// copy included, is compared by version and the newest kept; an
@@ -1131,8 +1118,14 @@ struct Pending {
     listens: HashMap<ListenerId, oneshot::Sender<Multiaddr>>,
     exchanges: Exchanges,
     dials: HashMap<ConnectionId, PendingDial>,
-    /// Record writes in flight to other workers, by their `kad` query.
-    writes: HashMap<kad::QueryId, Write>,
+    /// The `kad` queries of record writes in flight to other workers, each
+    /// to the write it is part of.
+    writes: HashMap<kad::QueryId, u64>,
+    /// The record writes with a query still in flight, by the number each is
+    /// known by here.
+    unfinished: HashMap<u64, UnfinishedWrite>,
+    /// The number the next record write is known by.
+    next_write: u64,
     /// Hand-offs in flight to other workers, by their `kad` query, each to
     /// say whether it reached its quorum.
     hand_offs: HashMap<kad::QueryId, oneshot::Sender<bool>>,
@@ -1371,7 +1364,6 @@ fn handle_command(
             }
         }
         Command::HandOff { write, respond_to } => hand_off_record(swarm, write, respond_to, pending),
-        Command::RetireCopies { record, former } => retire_copies(swarm, &record, &former),
         Command::GetRecord { task, respond_to } => {
             match swarm.behaviour_mut().records.as_mut() {
                 Some(records) => {
@@ -1394,7 +1386,10 @@ fn handle_command(
 
 /// Starts one record write (see [`Net::write_records`]): puts the copy of a
 /// holder that is this worker into its own store, and writes the others'
-/// over the records protocol at the quorum still missing.
+/// over the records protocol, to each placement the write must reach at the
+/// quorum of it still missing. A holder of two placements is written twice,
+/// once for each quorum that counts it. The write is stored once every
+/// placement's quorum has stored it, and refused as soon as one cannot.
 fn write_record(
     swarm: &mut Swarm<Behaviour>,
     placed: PlacedWrite,
@@ -1412,41 +1407,70 @@ fn write_record(
     };
     let value = placed.record.encode_to_vec();
     let key = record_key(&write.task_id);
-    let mut acked = 0;
-    let mut remote = Vec::new();
-    for holder in &placed.record.placement {
-        let Ok(peer) = PeerId::from_str(WorkerId::from(holder.clone()).as_str()) else {
-            continue;
-        };
-        if peer == local {
-            let stored = records
-                .store_mut()
-                .put(kad::Record::new(key.clone(), value.clone()))
-                .is_ok();
-            acked += usize::from(stored);
-        } else {
-            remote.push(peer);
+    // Every holder the write goes to: this worker's own copy first, so its
+    // acknowledgement counts for each placement it belongs to.
+    let goes_here = placed
+        .recipients()
+        .iter()
+        .any(|holder| PeerId::from_str(holder.as_str()).is_ok_and(|peer| peer == local));
+    let stored_here = goes_here
+        && records
+            .store_mut()
+            .put(kad::Record::new(key.clone(), value.clone()))
+            .is_ok();
+    let mut queries = Vec::new();
+    let placements = std::iter::once((placed.holders(), placed.quorum))
+        .chain(placed.prior.iter().map(|prior| (prior.holders.clone(), prior.quorum)));
+    for (holders, quorum) in placements {
+        let mut acked = 0;
+        let mut remote = Vec::new();
+        for holder in holders {
+            let Ok(peer) = PeerId::from_str(holder.as_str()) else {
+                continue;
+            };
+            if peer == local {
+                acked += usize::from(stored_here);
+            } else {
+                remote.push(peer);
+            }
         }
+        let needed = quorum.saturating_sub(acked);
+        if needed == 0 {
+            continue;
+        }
+        if remote.len() < needed {
+            inbound.queue_write(WriteOutcome {
+                write,
+                stored: false,
+            });
+            return;
+        }
+        queries.push((remote, needed));
     }
-    let needed = placed.quorum.saturating_sub(acked);
-    if needed == 0 {
+    if queries.is_empty() {
         inbound.queue_write(WriteOutcome {
             write,
             stored: true,
         });
-    } else if remote.len() < needed {
-        inbound.queue_write(WriteOutcome {
+        return;
+    }
+    let number = pending.next_write;
+    pending.next_write += 1;
+    pending.unfinished.insert(
+        number,
+        UnfinishedWrite {
             write,
-            stored: false,
-        });
-    } else {
+            outstanding: queries.len(),
+        },
+    );
+    for (remote, needed) in queries {
         let quorum = kad::Quorum::N(NonZeroUsize::new(needed).expect("needed is not zero here"));
         let query = records.put_record_to(
-            kad::Record::new(key, value),
+            kad::Record::new(key.clone(), value.clone()),
             remote.into_iter(),
             quorum,
         );
-        pending.writes.insert(query, write);
+        pending.writes.insert(query, number);
     }
 }
 
@@ -1484,30 +1508,12 @@ fn hand_off_record(
     pending.hand_offs.insert(query, respond_to);
 }
 
-/// Sends `record` to `former`, so each drops the copy it holds (see
-/// [`Net::retire_copies`]). A former holder that is this worker drops its own
-/// copy through its own store. The query's outcome is not tracked.
-fn retire_copies(swarm: &mut Swarm<Behaviour>, record: &TaskRecord, former: &[WorkerId]) {
-    let local = *swarm.local_peer_id();
-    let Some(records) = swarm.behaviour_mut().records.as_mut() else {
-        return;
-    };
-    let Ok((task, _)) = identify(record) else {
-        return;
-    };
-    let key = record_key(&task);
-    let value = record.encode_to_vec();
-    let mut remote = Vec::new();
-    for peer in former.iter().filter_map(|holder| PeerId::from_str(holder.as_str()).ok()) {
-        if peer == local {
-            let _ = records.store_mut().put(kad::Record::new(key.clone(), value.clone()));
-        } else {
-            remote.push(peer);
-        }
-    }
-    if !remote.is_empty() {
-        records.put_record_to(kad::Record::new(key, value), remote.into_iter(), kad::Quorum::One);
-    }
+/// A record write that waits for the queries it started: one for each
+/// placement it must reach, each to a quorum of that placement.
+struct UnfinishedWrite {
+    write: Write,
+    /// The queries not answered yet.
+    outstanding: usize,
 }
 
 /// The bootstrap queries that have had a failed step so far.
@@ -1730,14 +1736,34 @@ fn handle_event(
             result: kad::QueryResult::PutRecord(result),
             ..
         })) => {
-            if let Some(write) = pending.writes.remove(&id) {
-                if let Err(error) = &result {
-                    tracing::debug!(task = write.task_id.as_str(), %error, "a record write did not reach its quorum");
+            if let Some(number) = pending.writes.remove(&id) {
+                // A write already refused has no entry left: its other queries
+                // end unheard.
+                if let Some(mut unfinished) = pending.unfinished.remove(&number) {
+                    unfinished.outstanding -= 1;
+                    match &result {
+                        Err(error) => {
+                            tracing::debug!(
+                                task = unfinished.write.task_id.as_str(),
+                                %error,
+                                "a record write did not reach its quorum"
+                            );
+                            inbound.queue_write(WriteOutcome {
+                                write: unfinished.write,
+                                stored: false,
+                            });
+                        }
+                        Ok(_) if unfinished.outstanding == 0 => {
+                            inbound.queue_write(WriteOutcome {
+                                write: unfinished.write,
+                                stored: true,
+                            });
+                        }
+                        Ok(_) => {
+                            pending.unfinished.insert(number, unfinished);
+                        }
+                    }
                 }
-                inbound.queue_write(WriteOutcome {
-                    write,
-                    stored: result.is_ok(),
-                });
             } else if let Some(respond_to) = pending.hand_offs.remove(&id) {
                 if let Err(error) = &result {
                     tracing::debug!(%error, "a record hand-off did not reach its quorum");

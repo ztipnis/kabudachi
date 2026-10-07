@@ -184,3 +184,38 @@ fn a_handed_off_copy_is_kept_whatever_its_placement_names_and_yields_to_a_newer_
     store.put(placed(record("t", version(0, 0, 1, 9), "q"), &["me"]), NOW).unwrap();
     assert_eq!(store.put_from(handed, Origin::HandOff, NOW), Err(PutRefusal::Older));
 }
+
+#[test]
+fn a_holder_that_a_record_moved_away_from_reports_where_it_went_until_the_task_finishes() {
+    let task = TaskId::new("t");
+    let retention = Duration::from_ticks(100);
+    let mut store = VersionedRecords::with_retention(Some(retention)).held_by(WorkerId::new("me"));
+    store.put(placed(record("t", version(0, 0, 1, 0), "q"), &["me", "a"]), NOW).unwrap();
+
+    let moved = placed(record("t", version(0, 0, 1, 1), "q"), &["a", "b"]);
+    assert_eq!(store.put(moved, NOW), Ok(Put::Retired));
+
+    // Nothing is served, handed off or claimed from the stub, but a reader
+    // that asks this holder learns the revision and its holders.
+    assert!(store.get(&task).is_none());
+    assert_eq!(store.iter().count(), 0);
+    let reported: Vec<&TaskRecord> = store.reported().collect();
+    assert_eq!(reported.len(), 1);
+    assert_eq!(reported[0].version.as_ref().map(RecordVersion::from), Some(version(0, 0, 1, 1)));
+    assert_eq!(reported[0].placement, placed(TaskRecord::default(), &["a", "b"]).placement);
+
+    // A write that is not newer than the stub is refused, and one that names
+    // this holder again replaces it with the record.
+    assert_eq!(store.put(placed(record("t", version(0, 0, 1, 0), "q"), &["me"]), NOW), Err(PutRefusal::Older));
+    let back = placed(record("t", version(0, 0, 1, 2), "q"), &["me", "b"]);
+    assert_eq!(store.put(back.clone(), NOW), Ok(Put::Stored));
+    assert_eq!(store.get(&task), Some(&back));
+
+    // The stub of a finished task goes with its retention.
+    let mut finished = placed(record("t", version(0, 0, 1, 3), "q"), &["a", "b"]);
+    finished.finished = true;
+    assert_eq!(store.put(finished, NOW), Ok(Put::Retired));
+    assert_eq!(store.reported().count(), 1);
+    store.sweep(NOW + retention);
+    assert_eq!(store.reported().count(), 0, "the stub does not outlive the finished task");
+}

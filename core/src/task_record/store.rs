@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::protocol::generated::TaskRecord;
+use crate::protocol::generated::{self, TaskRecord};
 use crate::protocol::ids::{TaskId, WorkerId};
 use crate::task_record::version::{RecordVersion, VersionOrder};
 use crate::time::{Duration, Instant};
@@ -12,8 +12,9 @@ pub enum Put {
     Stored,
     /// It was exactly the record already held: a republish.
     Unchanged,
-    /// The leader wrote a revision, newer than the copy held, whose holders do
-    /// not include this one: the copy is dropped and nothing is stored.
+    /// The leader wrote a revision whose holders do not include this one, and
+    /// that is not older than what is held: the copy is replaced by a stub,
+    /// which names the revision and its holders but holds none of the record.
     Retired,
 }
 
@@ -41,13 +42,17 @@ pub enum PutRefusal {
 /// The newest revision of each Task record a worker holds. A put never
 /// replaces a record with an older one, nor with a different one of the same
 /// version, unless it differs only in the voters it is placed on. A store
-/// that knows its holder drops a copy the leader moves to other holders, so a
-/// copy no later revision would reach does not outlive its placement.
+/// that knows its holder keeps only a stub of a revision the leader moves to
+/// other holders: the task, the version and the holders, no record. The stub
+/// is not a copy anyone reads (it is not served, handed off or claimed from),
+/// but it is reported (see [`Self::reported`]), so a reader that asks this
+/// holder learns that a newer revision exists and where it went.
 ///
-/// A finished record is dropped once its retention has passed, counted on
-/// this node's own clock from when it first held a finished revision of it.
-/// Unfinished records are never dropped, and a put is never refused for lack
-/// of room: the leader's memory budget bounds how much there is.
+/// A finished record, or the stub of one, is dropped once its retention has
+/// passed, counted on this node's own clock from when it first held a
+/// finished revision of it. Unfinished records are never dropped, and a put
+/// is never refused for lack of room: the leader's memory budget bounds how
+/// much there is.
 #[derive(Debug, Clone, Default)]
 pub struct VersionedRecords {
     records: BTreeMap<TaskId, Held>,
@@ -59,13 +64,16 @@ pub struct VersionedRecords {
 struct Held {
     record: TaskRecord,
     finished_since: Option<Instant>,
+    /// Whether `record` is only the key of a revision held elsewhere.
+    stub: bool,
 }
 
-/// Whether `record` is `held` placed on other holders, and nothing else
-/// differs.
+/// Whether `record` is `held` placed on other holders (and so written to other
+/// prior placements), and nothing else differs.
 fn only_placed_elsewhere(held: &TaskRecord, record: &TaskRecord) -> bool {
     let mut replaced = record.clone();
     replaced.placement.clone_from(&held.placement);
+    replaced.prior_placements.clone_from(&held.prior_placements);
     replaced == *held
 }
 
@@ -81,7 +89,8 @@ impl VersionedRecords {
     }
 
     /// The store of `holder`: a leader's revision whose holders leave `holder`
-    /// out retires its copy instead of being stored (see [`Put::Retired`]).
+    /// out leaves it a stub of the revision instead of a copy (see
+    /// [`Put::Retired`]).
     #[must_use]
     pub fn held_by(mut self, holder: WorkerId) -> Self {
         self.holder = Some(holder);
@@ -95,9 +104,9 @@ impl VersionedRecords {
     }
 
     /// Like [`Self::put`], for a revision sent by `origin`. A leader's
-    /// revision, newer than what is held, whose placement names holders but
-    /// not this store's own, drops the held copy and is not stored
-    /// ([`Put::Retired`]); one that is not newer is refused as by `put`. A
+    /// revision, not older than what is held, whose placement names holders
+    /// but not this store's own, replaces the held copy with a stub of it
+    /// ([`Put::Retired`]); an older one is refused as by `put`. A
     /// handed-off copy is stored by version alone, whatever its placement
     /// names, and a copy of the revision already held changes nothing.
     pub fn put_from(
@@ -114,23 +123,16 @@ impl VersionedRecords {
                     && !record.placement.iter().any(|holder| WorkerId::from(holder.clone()) == *me)
             });
         let Some(held) = self.records.get(&task) else {
-            if leaves_me_out {
-                return Ok(Put::Retired);
-            }
-            self.records.insert(task, Held::new(record, None, now));
-            return Ok(Put::Stored);
+            return Ok(self.keep(task, record, leaves_me_out, None, now));
         };
         let (_, held_version) = identify(&held.record)?;
+        let since = held.finished_since;
         match held_version.order(&version) {
-            VersionOrder::Newer if leaves_me_out => {
-                self.records.remove(&task);
-                Ok(Put::Retired)
-            }
-            VersionOrder::Newer => {
-                let since = held.finished_since;
-                self.records.insert(task, Held::new(record, since, now));
-                Ok(Put::Stored)
-            }
+            VersionOrder::Newer => Ok(self.keep(task, record, leaves_me_out, since, now)),
+            // Only the key of this revision is held: a record that names this
+            // holder now is the revision itself, and one that does not is the
+            // same stub, perhaps placed elsewhere again.
+            VersionOrder::Same if held.stub => Ok(self.keep(task, record, leaves_me_out, since, now)),
             VersionOrder::Same if held.record == record => Ok(Put::Unchanged),
             VersionOrder::Same if only_placed_elsewhere(&held.record, &record) => {
                 if origin == Origin::HandOff {
@@ -138,20 +140,32 @@ impl VersionedRecords {
                     // to learn, and its placement is stale where this is not.
                     return Ok(Put::Unchanged);
                 }
-                if leaves_me_out {
-                    self.records.remove(&task);
-                    return Ok(Put::Retired);
-                }
                 // A leader that placed the record anew after its voters
                 // changed writes it again to a holder that kept the first
-                // write: the holder takes the new placement.
-                if let Some(held) = self.records.get_mut(&task) {
-                    held.record.placement = record.placement;
-                }
-                Ok(Put::Stored)
+                // write: the holder takes the new placement, or keeps only a
+                // stub of it if the new placement leaves it out.
+                Ok(self.keep(task, record, leaves_me_out, since, now))
             }
             VersionOrder::Same => Err(PutRefusal::Conflicting),
             VersionOrder::Older => Err(PutRefusal::Older),
+        }
+    }
+
+    /// Holds `record`, or only its stub if it leaves this holder out.
+    fn keep(
+        &mut self,
+        task: TaskId,
+        record: TaskRecord,
+        leaves_me_out: bool,
+        finished_since: Option<Instant>,
+        now: Instant,
+    ) -> Put {
+        if leaves_me_out {
+            self.records.insert(task, Held::stub_of(&record, finished_since, now));
+            Put::Retired
+        } else {
+            self.records.insert(task, Held::new(record, finished_since, now));
+            Put::Stored
         }
     }
 
@@ -179,18 +193,33 @@ impl VersionedRecords {
             .map(|since| since + retention)
     }
 
+    /// The record held of `task`, if this store holds one and not only a
+    /// stub of it.
     pub fn get(&self, task: &TaskId) -> Option<&TaskRecord> {
-        self.records.get(task).map(|held| &held.record)
+        self.records.get(task).filter(|held| !held.stub).map(|held| &held.record)
     }
 
+    /// Removes the record held of `task`; a stub stays, for it is no copy to
+    /// remove and a reader still learns from it.
     pub fn remove(&mut self, task: &TaskId) -> Option<TaskRecord> {
+        if self.records.get(task).is_some_and(|held| held.stub) {
+            return None;
+        }
         self.records.remove(task).map(|held| held.record)
     }
 
+    /// The records held, the newest revision of each task: no stub.
     pub fn iter(&self) -> impl Iterator<Item = &TaskRecord> {
+        self.records.values().filter(|held| !held.stub).map(|held| &held.record)
+    }
+
+    /// What a holder reports of its tasks: each record, and the stub of each
+    /// revision held elsewhere, the newest revision of each task.
+    pub fn reported(&self) -> impl Iterator<Item = &TaskRecord> {
         self.records.values().map(|held| &held.record)
     }
 
+    /// The tasks held, as records or as stubs.
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -208,6 +237,29 @@ impl Held {
         Held {
             record,
             finished_since,
+            stub: false,
+        }
+    }
+
+    /// The stub of `record`: its task (named by its id, its definition and its
+    /// coalescing key), version, holders and whether it is finished, and
+    /// nothing else.
+    fn stub_of(record: &TaskRecord, finished_since: Option<Instant>, now: Instant) -> Self {
+        let key = TaskRecord {
+            task: record.task.as_ref().map(|task| generated::Task {
+                task_id: task.task_id.clone(),
+                task_definition_id: task.task_definition_id.clone(),
+                coalescing_key: task.coalescing_key.clone(),
+                ..Default::default()
+            }),
+            version: record.version,
+            placement: record.placement.clone(),
+            finished: record.finished,
+            ..Default::default()
+        };
+        Held {
+            stub: true,
+            ..Held::new(key, finished_since, now)
         }
     }
 }

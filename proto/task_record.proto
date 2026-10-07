@@ -35,6 +35,16 @@ message TaskRecord {
   // The task is over: no run of it will change again. Holders drop a
   // finished record once its retention has passed.
   bool finished = 9;
+  // Placements an earlier revision was written to that this one, written
+  // jointly, had to reach as well. A leader that takes over from the one that
+  // wrote this carries them into its own writes, so no placement the record
+  // may still be known by is left behind by a change of leader.
+  repeated PlacementHolders prior_placements = 10;
+}
+
+// The holders of one placement.
+message PlacementHolders {
+  repeated WorkerId holders = 1;
 }
 
 message ChainEntry {

@@ -2,47 +2,39 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::protocol::generated::TaskRecord;
+use crate::protocol::generated::{self, TaskRecord};
 use crate::protocol::ids::{TaskId, WorkerId};
-use crate::task_record::gate::{Write, WriteOutcome};
-use crate::task_record::version::RecordVersion;
+use crate::task_record::gate::{PlacedWrite, PriorPlacement, Write, WriteOutcome};
+use crate::task_record::version::{RecordVersion, VersionOrder};
 use crate::time::{Duration, Instant};
 
 /// The most writes a repair (and the writes already under way) keep in
 /// flight.
 const IN_FLIGHT: usize = 64;
 
-/// A revision stored where it now belongs, and the holders that no longer
-/// hold the record: each is sent `record` so it drops its stale copy.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Retirement {
-    pub record: TaskRecord,
-    pub former: Vec<WorkerId>,
-}
-
 /// What a leader keeps to repair the placement of its records. Every
 /// revision it writes is noted ([`Self::written`]), so it knows where each
-/// record went. When the voters it can place records on change, or a write is
-/// refused, it asks for the records concerned to be published again
+/// record went and which placements the next revision must reach as well
+/// (see [`PlacedWrite`]). When the voters it can place records on change, or a
+/// write is refused, it asks for the records concerned to be published again
 /// ([`Self::check`]), a bounded number at a time, so they are written where
-/// they belong now; and once such a write is stored, it names the holders
-/// the record left ([`Self::settled`]), which hold a copy nothing else would
-/// ever update. It keeps nothing past an office: a leader that stops
-/// leading forgets it all, and the next one learns where records went from
-/// the writes it makes.
+/// they belong now. It keeps nothing past an office: a leader that stops
+/// leading forgets it all, and the next one learns where records were held
+/// from what it finds ([`Self::found`]) and from the writes it makes.
 #[derive(Debug)]
 pub struct Repair {
     retry_after: Duration,
     /// Where each record's newest write went, and in which version.
     written: BTreeMap<TaskId, Written>,
-    /// The copies to retire once the write that moved the record is stored.
-    leaving: Vec<(Write, Retirement)>,
     /// Writes issued whose outcome has not arrived.
     in_flight: Vec<Write>,
     /// The voters records could be placed on at the last check.
     seen: Option<Vec<WorkerId>>,
     /// Records whose placement changed, not yet published again.
     pending: BTreeSet<TaskId>,
+    /// Records whose joint write was stored, to be published once more on
+    /// their placement alone. Kept while the scheduler does not lead.
+    ending_move: BTreeSet<TaskId>,
     /// Records whose newest write was refused, to publish again at the
     /// instant.
     retries: BTreeMap<TaskId, Instant>,
@@ -55,9 +47,25 @@ pub struct Repair {
 struct Written {
     version: RecordVersion,
     holders: BTreeSet<WorkerId>,
-    /// Holders the record left whose copy has not been retired yet: a
-    /// write that was refused retired nothing, and its successor still owes it.
-    owed: BTreeSet<WorkerId>,
+    /// Whether the newest revision was written jointly with earlier placements
+    /// and has not been stored yet: once it is, the record is written once
+    /// more on its placement alone, which ends the move.
+    moving: bool,
+    /// The placements some revision of the record may still be known by, each
+    /// with the newest version written to it: every one an earlier revision
+    /// was written to, until a revision stored at all of them is stored at
+    /// the next.
+    chain: Vec<(RecordVersion, BTreeSet<WorkerId>)>,
+}
+
+impl Written {
+    /// Notes `holders` as a placement `version` was written to.
+    fn reach(&mut self, version: RecordVersion, holders: &BTreeSet<WorkerId>) {
+        match self.chain.iter_mut().find(|(_, placement)| placement == holders) {
+            Some((newest, _)) => *newest = version,
+            None => self.chain.push((version, holders.clone())),
+        }
+    }
 }
 
 impl Repair {
@@ -67,73 +75,123 @@ impl Repair {
         Repair {
             retry_after,
             written: BTreeMap::new(),
-            leaving: Vec::new(),
             in_flight: Vec::new(),
             seen: None,
             pending: BTreeSet::new(),
+            ending_move: BTreeSet::new(),
             retries: BTreeMap::new(),
             can_wake: false,
         }
     }
 
-    /// `record`, placed on the holders it names, is being written now.
+    /// `records`, which a rebuild or a late answer gave this leader, were held
+    /// as their placements say. A record this leader has written since keeps
+    /// its own entry.
+    pub fn found(&mut self, records: &[TaskRecord]) {
+        for record in records {
+            let Ok((task, version)) = crate::task_record::store::identify(record) else {
+                continue;
+            };
+            let holders: BTreeSet<WorkerId> =
+                record.placement.iter().cloned().map(WorkerId::from).collect();
+            if holders.is_empty() {
+                continue;
+            }
+            // The placements the revision was written to jointly are still
+            // ones the record may be known by.
+            let carried: Vec<BTreeSet<WorkerId>> = record
+                .prior_placements
+                .iter()
+                .map(|prior| prior.holders.iter().cloned().map(WorkerId::from).collect())
+                .collect();
+            let known = self
+                .written
+                .get(&task)
+                .is_some_and(|written| written.version.order(&version) != VersionOrder::Newer);
+            if !known {
+                self.written.insert(
+                    task,
+                    Written {
+                        version,
+                        holders: holders.clone(),
+                        moving: false,
+                        chain: std::iter::once(holders)
+                            .chain(carried)
+                            .map(|placement| (version, placement))
+                            .collect(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// `write`, its record placed on the holders it names, is being written
+    /// now: it learns the other placements it must reach (see
+    /// [`PlacedWrite::prior`]), those earlier revisions of the record were
+    /// written to that it does not name. `is_member` says whether a holder is
+    /// still in the configuration: a placement that has lost holders is
+    /// reached at all of those that remain, if they are fewer than a majority.
     ///
     /// # Panics
-    /// If `record` lacks its version, its task or its task id.
-    pub fn written(&mut self, record: &TaskRecord) {
-        let write = Write::of(record);
-        let holders: BTreeSet<WorkerId> =
-            record.placement.iter().cloned().map(WorkerId::from).collect();
+    /// If the record lacks its version, its task or its task id.
+    pub fn written(&mut self, write: &mut PlacedWrite, is_member: impl Fn(&WorkerId) -> bool) {
+        let issued = Write::of(&write.record);
+        let holders: BTreeSet<WorkerId> = write.holders().into_iter().collect();
         if holders.is_empty() {
             return;
         }
-        if let Some(before) = self.written.get_mut(&write.task_id)
-            && before.version == write.version
+        let before = self.written.get(&issued.task_id);
+        write.prior = before
+            .map(|written| {
+                written
+                    .chain
+                    .iter()
+                    .filter(|(_, placement)| *placement != holders)
+                    .map(|(_, placement)| {
+                        PriorPlacement::new(placement.iter().cloned().collect(), &is_member)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        write.record.prior_placements = write
+            .prior
+            .iter()
+            .map(|prior| generated::PlacementHolders {
+                holders: prior.holders.iter().cloned().map(Into::into).collect(),
+            })
+            .collect();
+        if let Some(before) = self.written.get_mut(&issued.task_id)
+            && before.version == issued.version
         {
             // The same revision placed anew while its write is under way:
             // nothing writes it to the new holders, so the old ones keep
             // theirs until a revision written after this stores.
-            before.holders.extend(holders);
+            before.holders.extend(holders.iter().cloned());
+            before.moving |= !write.prior.is_empty();
+            before.reach(issued.version, &holders);
             return;
         }
-        let owed: BTreeSet<WorkerId> = self
-            .written
-            .get(&write.task_id)
-            .map(|before| {
-                before
-                    .owed
-                    .union(&before.holders)
-                    .filter(|holder| !holders.contains(*holder))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !owed.is_empty() {
-            self.leaving.push((
-                write.clone(),
-                Retirement {
-                    record: record.clone(),
-                    former: owed.iter().cloned().collect(),
-                },
-            ));
-        }
-        self.in_flight.push(write.clone());
-        self.written.insert(
-            write.task_id,
-            Written {
-                version: write.version,
-                holders,
-                owed,
-            },
-        );
+        let mut written = self.written.remove(&issued.task_id).unwrap_or(Written {
+            version: issued.version,
+            holders: BTreeSet::new(),
+            moving: false,
+            chain: Vec::new(),
+        });
+        written.version = issued.version;
+        written.moving = !write.prior.is_empty();
+        written.holders = holders.clone();
+        written.reach(issued.version, &holders);
+        self.in_flight.push(issued.clone());
+        self.written.insert(issued.task_id, written);
     }
 
-    /// `outcome` of a write arrived at `now`. A stored write that moved its
-    /// record away from holders returns the copies to retire. A refused one
-    /// is, if it is its record's newest, published again after the retry
+    /// `outcome` of a write arrived at `now`. A stored write was stored at a
+    /// majority of every placement its revision had to reach, so the
+    /// placements of earlier revisions no longer need reaching. A refused
+    /// one is, if it is its record's newest, published again after the retry
     /// delay: a record some revision of which was not stored is not certain
     /// to be held anywhere.
-    pub fn settled(&mut self, outcome: &WriteOutcome, now: Instant) -> Option<Retirement> {
+    pub fn settled(&mut self, outcome: &WriteOutcome, now: Instant) {
         let newest = self
             .written
             .get(&outcome.write.task_id)
@@ -141,27 +199,25 @@ impl Repair {
         if let Some(at) = self.in_flight.iter().position(|write| *write == outcome.write) {
             self.in_flight.remove(at);
         }
-        let retirement = self
-            .leaving
-            .iter()
-            .position(|(write, _)| *write == outcome.write)
-            .map(|at| self.leaving.remove(at).1);
         if outcome.stored {
             if newest {
                 self.retries.remove(&outcome.write.task_id);
             }
-            if let (Some(retirement), Some(written)) =
-                (&retirement, self.written.get_mut(&outcome.write.task_id))
-            {
-                written.owed.retain(|holder| !retirement.former.contains(holder));
+            if let Some(written) = self.written.get_mut(&outcome.write.task_id) {
+                let stored = outcome.write.version;
+                written
+                    .chain
+                    .retain(|(version, _)| version.order(&stored) != VersionOrder::Newer);
+                if newest && std::mem::take(&mut written.moving) {
+                    self.ending_move.insert(outcome.write.task_id.clone());
+                }
             }
-            return retirement;
+            return;
         }
         if newest {
             self.retries
                 .insert(outcome.write.task_id.clone(), now + self.retry_after);
         }
-        None
     }
 
     /// The records to publish again now. `in_office` says whether the node
@@ -199,6 +255,7 @@ impl Repair {
             return Vec::new();
         }
         self.written.retain(|task, _| holds(task));
+        self.pending.extend(std::mem::take(&mut self.ending_move));
         self.pending.retain(|task| holds(task));
         self.retries.retain(|task, _| holds(task));
         let mut voters = placeable.to_vec();

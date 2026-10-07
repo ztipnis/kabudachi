@@ -59,7 +59,8 @@ impl HeldRecords {
     }
 
     /// Names this worker as the holder of the records: a revision the leader
-    /// writes that leaves it out of the record's holders then drops its copy.
+    /// writes that leaves it out of the record's holders then leaves it a stub of the
+    /// revision, not a copy.
     pub(crate) fn held_by(&self, holder: WorkerId) {
         let mut records = self.lock();
         *records = std::mem::take(&mut *records).held_by(holder);
@@ -94,12 +95,13 @@ impl HeldRecords {
     }
 
     /// Feeds `take` a summary of each record held after `after` (every one
-    /// for `None`), in task id order, until it refuses one. Says whether it
+    /// for `None`), and of each stub of a revision held elsewhere (see
+    /// [`VersionedRecords::reported`]), in task id order, until it refuses one. Says whether it
     /// took every record: `false` means the refused one, and all after it,
     /// remain.
     pub fn keys_after(&self, after: Option<&TaskId>, mut take: impl FnMut(HeldKey) -> bool) -> bool {
         self.lock()
-            .iter()
+            .reported()
             .filter_map(|record| {
                 let key = match held_key(record) {
                     Ok(key) => key,

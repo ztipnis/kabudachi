@@ -274,7 +274,7 @@ async fn a_claim_the_workers_stale_record_suggested_is_refused_and_discovery_mov
                 claimed(&nets[rival], &ids[leader], &task).await;
                 let mut lagging = waiting;
                 lagging.placement = vec![ids[worker].clone().into()];
-                client.write_records(vec![PlacedWrite { record: lagging, quorum: 1 }]);
+                client.write_records(vec![PlacedWrite::new(lagging, 1)]);
                 wait_until_held(nets[worker].clone(), vec![task]).await;
 
                 nets[worker].discover(ids[leader].clone(), 1, now()).await

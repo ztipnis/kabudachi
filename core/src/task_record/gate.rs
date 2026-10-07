@@ -1,5 +1,5 @@
 use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::TaskId;
+use crate::protocol::ids::{TaskId, WorkerId};
 use crate::task_record::store::identify;
 use crate::task_record::version::RecordVersion;
 
@@ -25,10 +25,70 @@ impl Write {
 
 /// A revision to write: `record.placement` names the holders, and `quorum`
 /// of them must store it for the write to count.
+///
+/// A revision whose placement differs from where the task's earlier revisions
+/// were placed is a joint write: it also goes to each placement in `prior`,
+/// and counts only once the quorum of every one of them has stored it too. A
+/// reader that hears most of an earlier placement then meets a holder of the
+/// revision, and cannot take the task for older than it is.
 #[derive(Debug, Clone)]
 pub struct PlacedWrite {
     pub record: TaskRecord,
     pub quorum: usize,
+    /// The other placements the revision must reach, each a placement some
+    /// earlier revision of the task may still be known by.
+    pub prior: Vec<PriorPlacement>,
+}
+
+/// A placement an earlier revision was written to, as far as it can still
+/// know the record: its holders still in the configuration, and how many of
+/// them must store the revision that moves the record from it, a majority of
+/// the placement, or all of them if fewer remain. A holder that left the
+/// configuration is not asked, and its acknowledgement counts for nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorPlacement {
+    pub holders: Vec<WorkerId>,
+    pub quorum: usize,
+}
+
+impl PriorPlacement {
+    /// The placement `holders`, of which only those `is_member` says are still
+    /// in the configuration are kept.
+    pub fn new(holders: Vec<WorkerId>, is_member: impl Fn(&WorkerId) -> bool) -> Self {
+        let majority = holders.len() / 2 + 1;
+        let members: Vec<WorkerId> = holders.into_iter().filter(|holder| is_member(holder)).collect();
+        let quorum = majority.min(members.len());
+        PriorPlacement { holders: members, quorum }
+    }
+}
+
+impl PlacedWrite {
+    /// `record`, already placed, written with no placement before it.
+    pub fn new(record: TaskRecord, quorum: usize) -> Self {
+        PlacedWrite {
+            record,
+            quorum,
+            prior: Vec::new(),
+        }
+    }
+
+    /// The holders of the record's placement.
+    pub fn holders(&self) -> Vec<WorkerId> {
+        self.record.placement.iter().cloned().map(WorkerId::from).collect()
+    }
+
+    /// Every holder the revision goes to: its placement, then each prior
+    /// placement's holders not named before, so a holder in two is written
+    /// once.
+    pub fn recipients(&self) -> Vec<WorkerId> {
+        let mut recipients = self.holders();
+        for holder in self.prior.iter().flat_map(|prior| &prior.holders) {
+            if !recipients.contains(holder) {
+                recipients.push(holder.clone());
+            }
+        }
+        recipients
+    }
 }
 
 /// How a write ended: `stored` once `quorum` holders acknowledged it; not

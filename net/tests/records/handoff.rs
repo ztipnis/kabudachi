@@ -10,6 +10,7 @@ use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::task_record::RecordVersion;
 use kabudachi_net::messenger::{Net, PlacedWrite};
+use kabudachi_core::task_record::PriorPlacement;
 use kabudachi_net::task_store::placement::ReplicationFactor;
 
 use crate::support::deadline::within_deadline;
@@ -104,20 +105,29 @@ fn placed(task: &TaskId, revision: u64, holders: &[WorkerId]) -> TaskRecord {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_revision_placed_elsewhere_makes_a_holder_it_left_drop_its_copy() {
+async fn a_stub_arrives_over_the_wire_at_a_holder_a_joint_write_moved_the_record_from() {
     within_deadline(async {
         let (shard, writer) = ThreeVoters::start().await;
         let (former, other) = (shard.id(0), shard.id(1));
         let task = TaskId::new("task-1");
-        writer.write_records(vec![PlacedWrite {
-            record: placed(&task, 0, std::slice::from_ref(&former)),
-            quorum: 1,
-        }]);
+        writer.write_records(vec![PlacedWrite::new(placed(&task, 0, std::slice::from_ref(&former)), 1)]);
         wait_until_held(shard.nets[0].clone(), vec![task.clone()]).await;
 
-        writer.retire_copies(placed(&task, 1, &[other]), vec![former]);
+        let mut moved = PlacedWrite::new(placed(&task, 1, std::slice::from_ref(&other)), 1);
+        moved.prior = vec![PriorPlacement { holders: vec![former], quorum: 1 }];
+        writer.write_records(vec![moved]);
 
-        wait_until(|| shard.nets[0].held_records().get(&task).is_none()).await;
+        wait_until(|| {
+            let mut reported = Vec::new();
+            shard.nets[0].held_records().keys_after(None, |key| {
+                reported.push(key);
+                true
+            });
+            shard.nets[0].held_records().get(&task).is_none()
+                && reported.len() == 1
+                && reported[0].placement == [other.clone()]
+        })
+        .await;
     })
     .await;
 }

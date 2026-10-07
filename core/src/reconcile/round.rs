@@ -344,6 +344,15 @@ impl ReconcileRound {
     /// no newer revision can be hiding among the silent ones. Failing that, a
     /// task is also known once every holder still in the configuration has
     /// answered: then a newer revision could only be on holders that have left.
+    ///
+    /// That holds because holders only move forward. A revision is stored at a
+    /// majority of the placement `p_j` of the revision before it, as well as of
+    /// its own (it is written jointly when the placement moves), and a holder
+    /// that a later revision leaves out keeps a stub of it, which it reports
+    /// like a record. So whichever revision `p_j` belongs to, a reader that
+    /// hears more than `p_j - w` of its holders meets one that holds, or holds
+    /// the stub of, any later revision, and reports it as newer.
+    ///
     /// Losing every holder of one write (more than `p - w` of them: one, with
     /// the default replication factor of three) can lose that revision. That is
     /// the tolerance of a majority write, accepted here.

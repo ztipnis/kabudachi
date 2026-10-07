@@ -156,14 +156,13 @@ fn store_revision(
     writer: &WorkerId,
     voters: &[WorkerId],
     factor: usize,
-    mut record: TaskRecord,
+    is_member: impl Fn(&WorkerId) -> bool,
+    record: TaskRecord,
     now: Instant,
 ) {
-    let write = Write::of(&record);
-    let (holders, quorum) = RecordSpace::placement(&write.task_id, voters, factor);
-    record.placement = holders.into_iter().map(Into::into).collect();
-    repair.written(&record);
-    space.write(writer, record, quorum, now);
+    let mut placed = place(record, voters, factor);
+    repair.written(&mut placed, is_member);
+    space.write(writer, placed, now);
 }
 
 /// `voters`, in a fixed order.
@@ -177,7 +176,7 @@ fn place(mut record: TaskRecord, voters: &[WorkerId], factor: usize) -> PlacedWr
     let (holders, quorum) =
         RecordSpace::placement(&Write::of(&record).task_id, voters, factor);
     record.placement = holders.into_iter().map(Into::into).collect();
-    PlacedWrite { record, quorum }
+    PlacedWrite::new(record, quorum)
 }
 
 /// A leader's reconciliation as the harness drives it: it asks every
@@ -671,6 +670,7 @@ impl Cluster {
                 id,
                 &voters,
                 self.replication_factor,
+                |holder| node.is_member(holder),
                 record,
                 now,
             );
@@ -690,16 +690,11 @@ impl Cluster {
                 continue;
             };
             let now = self.clock.now();
-            // A record moved away from holders has their copies retired once
-            // the write that moved it is stored.
             let settled = WriteOutcome {
                 write: outcome.write.clone(),
                 stored: outcome.stored,
             };
-            if let Some(retirement) = gating.repair.settled(&settled, now) {
-                self.records
-                    .retire(&outcome.writer, &retirement.record, &retirement.former, now);
-            }
+            gating.repair.settled(&settled, now);
             // The republish of a leader that is still reconciling settles its
             // own writes; no held answer waits on them.
             if let Some(republish) = self
@@ -739,6 +734,7 @@ impl Cluster {
                                 &outcome.writer,
                                 &voters,
                                 self.replication_factor,
+                                |holder| node.is_member(holder),
                                 record,
                                 now,
                             );
@@ -1521,6 +1517,7 @@ impl Cluster {
         self.collect_answers(id, &mut round, now);
         let node = &self.nodes[id];
         let learnt = round.take_settled(|worker| node.is_member(worker));
+        let found = learnt.records.clone();
         let adopted = match self.scheduler_mut(id).adopt(learnt) {
             Ok(adopted) => adopted,
             // Holding office is not leading: no quorum has confirmed the
@@ -1532,6 +1529,9 @@ impl Cluster {
                 return;
             }
         };
+        if let Some(gating) = self.gating.get_mut(id) {
+            gating.repair.found(&found);
+        }
         self.write_revisions(id);
         if !adopted.silent_holders.is_empty() {
             self.step(id, Input::WatchWorkers(adopted.silent_holders));
@@ -1573,12 +1573,16 @@ impl Cluster {
             let rebuild = reconciliation
                 .round
                 .take_settled(|worker| node.is_member(worker));
+            let found = rebuild.records.clone();
             let rebuilt = match self.scheduler_mut(id).reconcile(rebuild) {
                 Ok(rebuilt) => rebuilt,
                 Err(error) => panic!("the scheduler of {id:?} refused its reconciliation: {error:?}"),
             };
+            if let Some(gating) = self.gating.get_mut(id) {
+                gating.repair.found(&found);
+            }
             let voters = sorted(self.nodes[id].placeable_voters());
-            let placed = self
+            let mut placed: Vec<PlacedWrite> = self
                 .spies
                 .get(id)
                 .map(Spy::take_revisions)
@@ -1586,6 +1590,11 @@ impl Cluster {
                 .into_iter()
                 .map(|record| place(record, &voters, self.replication_factor))
                 .collect();
+            if let Some(gating) = self.gating.get_mut(id) {
+                for write in &mut placed {
+                    gating.repair.written(write, |holder| self.nodes[id].is_member(holder));
+                }
+            }
             let retry_after = timings(self.suspect_timeout).heartbeat_interval;
             reconciliation.republish = Some(Republish::new(placed, retry_after));
             reconciliation.placed_on = voters;
@@ -1597,13 +1606,13 @@ impl Cluster {
             let voters = sorted(self.nodes[id].placeable_voters());
             if !republish.is_done() && voters != reconciliation.placed_on {
                 let factor = self.replication_factor;
-                let repair = self.gating.get_mut(id).map(|gating| &mut gating.repair);
-                let mut repair = repair;
+                let node = &self.nodes[id];
+                let mut repair = self.gating.get_mut(id).map(|gating| &mut gating.repair);
                 republish.re_place(
                     |write| {
                         *write = place(write.record.clone(), &voters, factor);
                         if let Some(repair) = repair.as_deref_mut() {
-                            repair.written(&write.record);
+                            repair.written(write, |holder| node.is_member(holder));
                         }
                     },
                     now,
@@ -1611,10 +1620,7 @@ impl Cluster {
                 reconciliation.placed_on = voters;
             }
             for write in republish.due(now) {
-                if let Some(gating) = self.gating.get_mut(id) {
-                    gating.repair.written(&write.record);
-                }
-                self.records.write(id, write.record, write.quorum, now);
+                self.records.write(id, write, now);
             }
         }
         let stored = reconciliation
@@ -1666,7 +1672,7 @@ impl Cluster {
                 .unwrap_or_default(),
             keys: self
                 .records
-                .held_records(worker)
+                .reported_records(worker)
                 .iter()
                 .filter_map(|record| wire::held_key(record).ok())
                 .collect(),

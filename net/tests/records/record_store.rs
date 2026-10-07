@@ -8,6 +8,7 @@ use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::task_record::{MAX_RECORD_BYTES, RecordVersion, Write};
+use kabudachi_core::task_record::PriorPlacement;
 use kabudachi_net::messenger::{Net, PlacedWrite};
 use kabudachi_net::task_store::{HeldRecords, TaskRecordStore, record_key};
 use libp2p::kad::store::RecordStore;
@@ -87,13 +88,18 @@ async fn write_all(
         .into_iter()
         .map(|record| placed_at(record, holders))
         .collect();
-    let writes: Vec<Write> = records.iter().map(Write::of).collect();
-    writer.write_records(
-        records
-            .into_iter()
-            .map(|record| PlacedWrite { record, quorum })
-            .collect(),
-    );
+    write_placed(
+        writer,
+        records.into_iter().map(|record| PlacedWrite::new(record, quorum)).collect(),
+    )
+    .await
+}
+
+/// Writes `placed` at once from `writer`, and says, in order, whether each
+/// write was stored.
+async fn write_placed(writer: &Net, placed: Vec<PlacedWrite>) -> Vec<bool> {
+    let writes: Vec<Write> = placed.iter().map(|placed| Write::of(&placed.record)).collect();
+    writer.write_records(placed);
     let mut outcomes: Vec<Option<bool>> = vec![None; writes.len()];
     timeout(TEST_TIMEOUT, async {
         loop {
@@ -286,4 +292,27 @@ fn the_store_keeps_only_what_is_a_well_formed_record_of_its_own_key() {
     assert_eq!(held.task_ids(), vec![task.clone()]);
     let served = store.get(&record_key(&task)).expect("the record is served");
     assert_eq!(TaskRecord::decode(&served.value[..]).unwrap(), stored);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_that_moves_a_record_is_stored_only_once_the_placement_it_left_has_stored_it_too() {
+    within_deadline(async {
+        let (writer, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;
+        let holder_id = holder.local_worker_id();
+        // No peer answers to this id, so no quorum of a placement naming only
+        // it can be had.
+        let gone = WorkerId::new("not-a-peer");
+
+        let moved = placed_at(record("task-1", version(0, 0, 1, 1), "q"), &[&holder_id]);
+        let joint = |from: &WorkerId| {
+            let mut write = PlacedWrite::new(moved.clone(), 1);
+            write.prior = vec![PriorPlacement { holders: vec![from.clone()], quorum: 1 }];
+            write
+        };
+
+        assert_eq!(write_placed(&writer, vec![joint(&gone)]).await, [false], "the old placement has no quorum");
+        assert!(holder.held_records().get(&TaskId::new("task-1")).is_none(), "nothing was written");
+        assert_eq!(write_placed(&writer, vec![joint(&holder_id)]).await, [true]);
+    })
+    .await;
 }

@@ -145,7 +145,8 @@ use kabudachi_core::protocol::messages::{
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::reconcile::active_runs_digest;
-use kabudachi_core::scheduler::{ReconcileRefused, Scheduler};
+use kabudachi_core::reconcile::Rebuild;
+use kabudachi_core::scheduler::{Reconciled, ReconcileRefused, Scheduler};
 use kabudachi_core::task_record::{
     EffectGate, RecordOutbox, Repair, Settled, Settlement, Waits, Write, WriteLedger, WriteOrder,
 };
@@ -434,13 +435,9 @@ where
             office = stepper.node.office_term();
             stepper.unsettled.forget_office();
         }
-        // A write that moved a record away from holders has them drop their
-        // copies once it is stored.
         let outcomes = net.take_write_outcomes();
         for outcome in &outcomes {
-            if let Some(retirement) = stepper.unsettled.repair.settled(outcome, clock.now()) {
-                net.retire_copies(retirement.record, retirement.former);
-            }
+            stepper.unsettled.repair.settled(outcome, clock.now());
         }
         // The republish's own writes first; every other outcome is the gate's.
         let outcomes = settle_republish(&mut reconciliation, outcomes, clock.now());
@@ -757,7 +754,7 @@ where
     loop {
         match current.progress(node, scheduler.is_leader(), clock.now()) {
             Progress::Waiting => return next_deadline,
-            Progress::Rebuild(rebuild) => match scheduler.reconcile(rebuild) {
+            Progress::Rebuild(rebuild) => match reconcile_noting_holders(scheduler, &mut unsettled.repair, rebuild) {
                 Ok(rebuilt) => {
                     tracing::info!(
                         republished = rebuilt.republished,
@@ -802,7 +799,7 @@ where
                         Some(Placement { holders, quorum }) => {
                             write.record.placement = holders.into_iter().map(Into::into).collect();
                             write.quorum = quorum;
-                            repair.written(&write.record);
+                            repair.written(write, |holder| node.is_member(holder));
                         }
                         None => tracing::error!(
                             task = Write::of(&write.record).task_id.as_str(),
@@ -854,8 +851,12 @@ where
                     return next_deadline;
                 }
                 let mut silent_holders = BTreeSet::new();
+                let found = learnt.records.clone();
                 match scheduler.adopt(learnt) {
-                    Ok(adopted) => silent_holders.extend(adopted.silent_holders),
+                    Ok(adopted) => {
+                        unsettled.repair.found(&found);
+                        silent_holders.extend(adopted.silent_holders);
+                    }
                     // Holding office does not mean leading: the grant also
                     // ends with the recovery fence, which the node can renew,
                     // and has not arrived before a quorum confirms the
@@ -891,6 +892,18 @@ where
     }
 }
 
+/// Hands `rebuild` to the scheduler, after noting where its records were held
+/// (see [`Repair::found`]), so a revision that moves one is written to the
+/// holders it left too.
+fn reconcile_noting_holders<C: Clock, I: IdGenerator>(
+    scheduler: &mut Scheduler<C, I, RecordOutbox>,
+    repair: &mut Repair,
+    rebuild: Rebuild,
+) -> Result<Reconciled, ReconcileRefused> {
+    repair.found(&rebuild.records);
+    scheduler.reconcile(rebuild)
+}
+
 /// Places the republished `records` on the voters and starts writing them. If
 /// any cannot be placed none is written, and all are kept to be placed again
 /// when the voters change or after a suspicion timeout: leading without every
@@ -902,10 +915,10 @@ fn place_republish<C: Clock>(
     repair: &mut Repair,
     records: Vec<TaskRecord>,
 ) {
-    let (writes, unplaced) = place(node, factor, records);
+    let (mut writes, unplaced) = place(node, factor, records);
     if unplaced.is_empty() {
-        for write in &writes {
-            repair.written(&write.record);
+        for write in &mut writes {
+            repair.written(write, |holder| node.is_member(holder));
         }
         current.republishing(writes, node.timings().heartbeat_interval, node.placeable_voters());
     } else {
@@ -1106,9 +1119,9 @@ fn place_and_write<C: Clock>(
     repair: &mut Repair,
     records: Vec<TaskRecord>,
 ) {
-    let (placed, unplaced) = place(node, factor, records);
-    for write in &placed {
-        repair.written(&write.record);
+    let (mut placed, unplaced) = place(node, factor, records);
+    for write in &mut placed {
+        repair.written(write, |holder| node.is_member(holder));
     }
     // No placement means either the leader has just stopped leading (a
     // scheduler publishes only while it leads, so its own roster no longer
@@ -1132,7 +1145,7 @@ fn place<C: Clock>(
         match placement(&Write::of(&record).task_id, &voters, factor) {
             Some(Placement { holders, quorum }) => {
                 record.placement = holders.into_iter().map(Into::into).collect();
-                placed.push(PlacedWrite { record, quorum });
+                placed.push(PlacedWrite::new(record, quorum));
             }
             None => unplaced.push(record),
         }

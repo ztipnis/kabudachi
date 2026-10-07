@@ -815,6 +815,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             input_digest: Some(self.input_digests[task_id].clone().into()),
             link: self.links.get(task_id).cloned(),
             placement: Vec::new(),
+            prior_placements: Vec::new(),
             published_at: Some(published_at.into()),
             finished: self.retention.holds(task_id),
         }
@@ -868,6 +869,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             input_digest: Some(digest.clone().into()),
             link,
             placement: Vec::new(),
+            prior_placements: Vec::new(),
             published_at: None,
             finished: false,
         };

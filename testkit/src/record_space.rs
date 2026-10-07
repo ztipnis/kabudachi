@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
-use kabudachi_core::task_record::{Origin, VersionedRecords, Write};
+use kabudachi_core::task_record::{Origin, PlacedWrite, VersionedRecords, Write};
 use kabudachi_core::time::{Duration, Instant};
 
 /// The shard's Task records as the simulator's nodes hold them: each node
@@ -22,7 +22,7 @@ pub struct RecordSpace(Rc<RefCell<Space>>);
 pub struct SpaceWrite {
     pub writer: WorkerId,
     pub write: Write,
-    /// Whether a quorum of the placement stored it.
+    /// Whether a quorum of every placement it had to reach stored it.
     pub stored: bool,
 }
 
@@ -35,24 +35,18 @@ struct Space {
     acknowledgements: Vec<(Instant, SpaceWrite)>,
     /// Writers whose writes stay in flight, and the writes held so far.
     holding: BTreeSet<WorkerId>,
-    in_flight: Vec<(WorkerId, TaskRecord, usize)>,
+    in_flight: Vec<(WorkerId, PlacedWrite)>,
 }
 
 impl Space {
-    /// Lands `record` on every placement holder that is up (and, unless the
+    /// Lands `placed` on every holder it goes to that is up (and, unless the
     /// write was already on its way, that `writer` can reach), and queues the
-    /// writer's acknowledgement.
-    fn deliver(
-        &mut self,
-        writer: &WorkerId,
-        record: TaskRecord,
-        quorum: usize,
-        now: Instant,
-        on_its_way: bool,
-    ) {
-        let write = Write::of(&record);
-        let mut stored = 0;
-        for holder in record.placement.iter().cloned().map(WorkerId::from) {
+    /// writer's acknowledgement, which says whether a quorum of each of the
+    /// placements the write must reach stored it.
+    fn deliver(&mut self, writer: &WorkerId, placed: &PlacedWrite, now: Instant, on_its_way: bool) {
+        let write = Write::of(&placed.record);
+        let mut stored = BTreeSet::new();
+        for holder in placed.recipients() {
             let reached = if on_its_way {
                 !self.down.contains(&holder)
             } else {
@@ -64,8 +58,8 @@ impl Space {
             // The holders' own store decides: it refuses an older version and a
             // different record at the same version, and a refused put is no
             // acknowledgement.
-            if self.store_of(&holder).put(record.clone(), now).is_ok() {
-                stored += 1;
+            if self.store_of(&holder).put(placed.record.clone(), now).is_ok() {
+                stored.insert(holder);
             }
         }
         let due = now + self.ack_delay.unwrap_or(Duration::from_ticks(0));
@@ -74,7 +68,7 @@ impl Space {
             SpaceWrite {
                 writer: writer.clone(),
                 write,
-                stored: stored >= quorum,
+                stored: is_stored(placed, &stored),
             },
         ));
     }
@@ -122,19 +116,19 @@ impl RecordSpace {
         (holders, quorum)
     }
 
-    /// Writes `record` (its `placement` filled) for `writer` at `now`. A
-    /// writer whose writes are held (see `hold_writes_from`) lands nothing and
-    /// is acknowledged by no one.
+    /// Writes `placed` (its record's `placement` filled) for `writer` at
+    /// `now`. A writer whose writes are held (see `hold_writes_from`) lands
+    /// nothing and is acknowledged by no one.
     ///
     /// # Panics
-    /// If `record` lacks its version, its task or its task id.
-    pub fn write(&self, writer: &WorkerId, record: TaskRecord, quorum: usize, now: Instant) {
+    /// If the record lacks its version, its task or its task id.
+    pub fn write(&self, writer: &WorkerId, placed: PlacedWrite, now: Instant) {
         let mut space = self.0.borrow_mut();
         if space.holding.contains(writer) {
-            space.in_flight.push((writer.clone(), record, quorum));
+            space.in_flight.push((writer.clone(), placed));
             return;
         }
-        space.deliver(writer, record, quorum, now, false);
+        space.deliver(writer, &placed, now, false);
     }
 
     /// From now on `writer`'s writes stay in flight: they land on no holder
@@ -152,10 +146,10 @@ impl RecordSpace {
         space.holding.remove(writer);
         let (released, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut space.in_flight)
             .into_iter()
-            .partition(|(from, _, _)| from == writer);
+            .partition(|(from, _)| from == writer);
         space.in_flight = kept;
-        for (writer, record, quorum) in released {
-            space.deliver(&writer, record, quorum, now, true);
+        for (writer, placed) in released {
+            space.deliver(&writer, &placed, now, true);
         }
     }
 
@@ -184,17 +178,6 @@ impl RecordSpace {
             }
         }
         stored >= quorum
-    }
-
-    /// `writer`, the leader, sends `record`, a revision placed elsewhere, to
-    /// each of `former` it can reach, which drop their stale copies.
-    pub fn retire(&self, writer: &WorkerId, record: &TaskRecord, former: &[WorkerId], now: Instant) {
-        let mut space = self.0.borrow_mut();
-        for holder in former {
-            if space.reaches(writer, holder) {
-                let _ = space.store_of(holder).put(record.clone(), now);
-            }
-        }
     }
 
     /// The acknowledgements due by `now`, in the order their writes were made.
@@ -257,6 +240,17 @@ impl RecordSpace {
             .unwrap_or_default()
     }
 
+    /// What `holder` reports of its tasks: every record it holds, and the stub
+    /// of each revision held elsewhere.
+    pub fn reported_records(&self, holder: &WorkerId) -> Vec<TaskRecord> {
+        self.0
+            .borrow()
+            .stores
+            .get(holder)
+            .map(|store| store.reported().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// What `holder` holds of `task`.
     pub fn held_by(&self, holder: &WorkerId, task: &TaskId) -> Option<TaskRecord> {
         self.0
@@ -266,6 +260,14 @@ impl RecordSpace {
             .and_then(|store| store.get(task))
             .cloned()
     }
+}
+
+/// Whether `placed` counts as stored when exactly `stored` stored it: the
+/// quorum of its own placement and of every prior one has.
+fn is_stored(placed: &PlacedWrite, stored: &BTreeSet<WorkerId>) -> bool {
+    let reached = |holders: &[WorkerId]| holders.iter().filter(|holder| stored.contains(*holder)).count();
+    reached(&placed.holders()) >= placed.quorum
+        && placed.prior.iter().all(|prior| reached(&prior.holders) >= prior.quorum)
 }
 
 /// FNV-1a over the voter's id, a separator and the task's id, finalized: fixed

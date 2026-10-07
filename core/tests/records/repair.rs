@@ -1,11 +1,12 @@
 //! What a leader keeps to put its records where they belong: it publishes a
 //! moved record or a refused write again, a bounded number at a time, and
-//! names the holders a record left once the write that moved it is stored.
+//! reaches, for a write that moves a record, only the holders of earlier
+//! placements that are still in the configuration.
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::task_record::{RecordVersion, Repair, Write, WriteOutcome};
+use kabudachi_core::task_record::{PlacedWrite, PriorPlacement, RecordVersion, Repair, Write, WriteOutcome};
 use kabudachi_core::time::{Duration, Instant};
 
 const RETRY_AFTER: Duration = Duration::from_ticks(100);
@@ -34,6 +35,19 @@ fn record(task: &str, revision: u64, holders: &[&str]) -> TaskRecord {
     }
 }
 
+/// Notes `record` as written and returns the placements the write must reach
+/// besides its own.
+fn written(repair: &mut Repair, record: &TaskRecord) -> Vec<PriorPlacement> {
+    let mut placed = PlacedWrite::new(record.clone(), record.placement.len() / 2 + 1);
+    repair.written(&mut placed, |_| true);
+    placed.prior
+}
+
+
+fn holders(ids: &[&str]) -> Vec<WorkerId> {
+    ids.iter().map(|id| worker(id)).collect()
+}
+
 fn outcome(record: &TaskRecord, stored: bool) -> WriteOutcome {
     WriteOutcome { write: Write::of(record), stored }
 }
@@ -47,33 +61,11 @@ fn check(repair: &mut Repair, placeable: &[&str], holders: &[&str], at: u64) -> 
 }
 
 #[test]
-fn a_record_placed_anew_at_the_version_being_written_retires_nothing_when_that_write_is_stored() {
-    let mut repair = Repair::new(RETRY_AFTER);
-    let first = record("t", 0, &["a"]);
-    repair.written(&first);
-    // The same revision, placed on other voters while its write is in flight:
-    // nothing writes it there, so the holder it left holds the only copy.
-    repair.written(&record("t", 0, &["b"]));
-
-    assert_eq!(repair.settled(&outcome(&first, true), Instant::at(1)), None);
-
-    // The record is still held by both until a later revision is written to
-    // the new holders alone: it is published again, and that write retires.
-    let placeable = [worker("b")];
-    let republish = repair.check(true, true, &placeable, |_| true, |_| Some(vec![worker("b")]), Instant::at(2));
-    assert_eq!(republish, [TaskId::new("t")]);
-    let next = record("t", 1, &["b"]);
-    repair.written(&next);
-    let retirement = repair.settled(&outcome(&next, true), Instant::at(3)).expect("it left a holder");
-    assert_eq!(retirement.former, [worker("a")]);
-}
-
-#[test]
 fn a_refused_write_is_published_again_after_the_delay_even_while_the_scheduler_does_not_lead() {
     let mut repair = Repair::new(RETRY_AFTER);
     let first = record("t", 0, &["a", "b"]);
-    repair.written(&first);
-    assert_eq!(repair.settled(&outcome(&first, false), Instant::at(10)), None);
+    written(&mut repair, &first);
+    repair.settled(&outcome(&first, false), Instant::at(10));
     assert_eq!(repair.wake_at(), None, "not before a check has found it leads");
     assert!(check(&mut repair, &["a", "b"], &["a", "b"], 11).is_empty());
     assert_eq!(repair.wake_at(), Some(Instant::at(110)));
@@ -92,7 +84,7 @@ fn with_no_room_under_the_writes_in_flight_nothing_is_due_and_the_driver_is_not_
     let mut repair = Repair::new(RETRY_AFTER);
     let records: Vec<TaskRecord> = (0..65).map(|n| record(&format!("t{n:03}"), 0, &["a"])).collect();
     for record in &records {
-        repair.written(record);
+        written(&mut repair, record);
     }
     repair.settled(&outcome(&records[64], false), Instant::at(0));
 
@@ -103,31 +95,11 @@ fn with_no_room_under_the_writes_in_flight_nothing_is_due_and_the_driver_is_not_
 }
 
 #[test]
-fn a_write_that_moved_a_record_names_the_holders_it_left_once_stored_and_a_refusal_hands_the_debt_on() {
-    let mut repair = Repair::new(RETRY_AFTER);
-    repair.written(&record("t", 0, &["a", "b", "c"]));
-
-    let moved = record("t", 1, &["a", "b", "d"]);
-    repair.written(&moved);
-    assert_eq!(repair.settled(&outcome(&moved, false), Instant::at(0)), None, "nothing is retired by a refused write");
-
-    let moved_again = record("t", 2, &["a", "d", "e"]);
-    repair.written(&moved_again);
-    let retirement = repair.settled(&outcome(&moved_again, true), Instant::at(1)).expect("it left holders");
-    assert_eq!(retirement.record, moved_again);
-    assert_eq!(retirement.former, [worker("b"), worker("c")], "c left before the refused write, b since");
-
-    let same_holders = record("t", 3, &["a", "d", "e"]);
-    repair.written(&same_holders);
-    assert_eq!(repair.settled(&outcome(&same_holders, true), Instant::at(2)), None, "no one is owed");
-}
-
-#[test]
 fn a_change_of_voters_republishes_moved_records_a_bounded_number_at_a_time_and_only_while_leading() {
     let mut repair = Repair::new(RETRY_AFTER);
     let records: Vec<TaskRecord> = (0..100).map(|n| record(&format!("t{n:03}"), 0, &["a", "b"])).collect();
     for record in &records {
-        repair.written(record);
+        written(&mut repair, record);
     }
     for record in &records {
         repair.settled(&outcome(record, true), Instant::at(0));
@@ -139,15 +111,32 @@ fn a_change_of_voters_republishes_moved_records_a_bounded_number_at_a_time_and_o
     let republished: Vec<TaskRecord> =
         batch.iter().map(|task| record(task.as_str(), 1, &["a", "c"])).collect();
     for again in &republished {
-        repair.written(again);
+        written(&mut repair, again);
     }
     assert!(check(&mut repair, &["a", "c"], &["a", "c"], 2).is_empty(), "the batch is still in flight");
     for again in &republished {
         repair.settled(&outcome(again, true), Instant::at(3));
     }
-    assert_eq!(check(&mut repair, &["a", "c"], &["a", "c"], 4).len(), 36, "the rest follow");
+    assert_eq!(
+        check(&mut repair, &["a", "c"], &["a", "c"], 4).len(),
+        64,
+        "the rest follow with the ends of the moves just stored, again no more than fit"
+    );
 
     let placeable = [worker("a")];
     let held_nothing = repair.check(true, false, &placeable, |_| true, |_| None, Instant::at(5));
     assert!(held_nothing.is_empty(), "a scheduler that does not lead publishes nothing");
+}
+
+#[test]
+fn a_placement_a_record_moves_from_is_reached_only_at_the_holders_still_in_the_configuration() {
+    let mut repair = Repair::new(RETRY_AFTER);
+    written(&mut repair, &record("t", 0, &["a", "b", "c"]));
+
+    // `b` and `c` left the configuration but still answer: they are not asked,
+    // and so cannot stand in for `a`, the one holder that can know the record.
+    let mut moved = PlacedWrite::new(record("t", 1, &["a", "d", "e"]), 2);
+    repair.written(&mut moved, |holder| *holder != worker("b") && *holder != worker("c"));
+
+    assert_eq!(moved.prior, [PriorPlacement { holders: holders(&["a"]), quorum: 1 }]);
 }

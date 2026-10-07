@@ -13,12 +13,12 @@ mod store;
 mod version;
 
 pub use candidate::looks_claimable;
-pub use gate::{EffectGate, PlacedWrite, Settled, Write, WriteOutcome};
+pub use gate::{EffectGate, PlacedWrite, PriorPlacement, Settled, Write, WriteOutcome};
 pub use ledger::{Waits, WriteLedger};
 pub use local::LocalRecords;
 pub use order::{Settlement, WriteOrder};
 pub use outbox::RecordOutbox;
-pub use repair::{Repair, Retirement};
+pub use repair::Repair;
 pub use store::{Origin, Put, PutRefusal, VersionedRecords, identify};
 pub use version::{RecordVersion, VersionOrder};
 

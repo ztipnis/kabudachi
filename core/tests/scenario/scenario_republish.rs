@@ -200,14 +200,18 @@ fn writes_waiting_for_a_quorum_are_placed_again_on_the_voters_left_when_a_holder
     assert!(!stuck.is_stored_by(&replacement));
 
     // A holder leaves the voters, and the record is placed on the voters left.
-    // Only then does another holder return: the old placement's holders could
-    // not make a quorum of it, the new placement's can.
+    // Only then do the other holders return: the record moved, so its write
+    // counts once a quorum of the new placement and of the old one, without
+    // the holder that left, has stored it.
     let known = stuck.cluster.node(&stuck.leader).voters().len();
     stuck.cluster.drain(stuck.leaving.as_ref().expect("a holder leaves"));
     let leader = stuck.leader.clone();
     advance_until(&mut stuck.cluster, |cluster| cluster.node(&leader).voters().len() < known);
     assert_eq!(stuck.cluster.states()[&leader], WorkerState::LeaderReconciling, "still no quorum");
-    stuck.cluster.records().set_up(stuck.returning.as_ref().expect("a holder returns"), true);
+    assert!(stuck.returning.is_some(), "a holder returns");
+    for holder in stuck.held.iter().filter(|holder| Some(*holder) != stuck.leaving.as_ref()) {
+        stuck.cluster.records().set_up(holder, true);
+    }
     advance_until(&mut stuck.cluster, |cluster| cluster.states()[&leader] == WorkerState::Leader);
 
     assert!(stuck.is_stored_by(&replacement));
@@ -227,11 +231,15 @@ fn a_holder_that_stored_the_record_under_the_old_placement_counts_towards_the_qu
     assert!(!stuck.is_stored_by(&replacement));
 
     // A holder leaves the voters and the record is placed on the voters left:
-    // the holder that stayed and the replacement make its quorum.
+    // the holder that stayed and the replacement make its quorum, and the
+    // holder that stayed and another of the old placement make the old one's.
     let known = stuck.cluster.node(&stuck.leader).voters().len();
     stuck.cluster.drain(stuck.leaving.as_ref().expect("a holder leaves"));
     let leader = stuck.leader.clone();
     advance_until(&mut stuck.cluster, |cluster| cluster.node(&leader).voters().len() < known);
+    for holder in stuck.held.iter().filter(|holder| Some(*holder) != stuck.leaving.as_ref()) {
+        stuck.cluster.records().set_up(holder, true);
+    }
     advance_until(&mut stuck.cluster, |cluster| cluster.states()[&leader] == WorkerState::Leader);
 
     assert!(stuck.is_stored_by(&replacement));
