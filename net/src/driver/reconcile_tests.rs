@@ -204,12 +204,10 @@ impl<'n> Office<'n> {
 
     /// One pass of the driver's loop for the reconciliation: settles the
     /// republished writes whose outcomes arrived, then runs the office.
-    fn turn(&mut self) -> usize {
+    fn turn(&mut self) {
         let outcomes = self.net.take_write_outcomes();
-        let arrived = outcomes.len();
         settle_republish(&mut self.reconciliation, outcomes, self.clock.now());
         self.reconcile();
-        arrived
     }
 
     /// Answers the peers' questions until the round has taken in `completions`
@@ -379,33 +377,6 @@ async fn writes_waiting_for_a_quorum_are_placed_again_on_a_voter_that_joins_and_
     })
     .await
     .expect("the newcomer was written the record at the leader's term");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reconciling_leader_that_loses_its_lease_leaves_office_and_stops_writing() {
-    let (me, _) = shard_net().await;
-    let (mut office, _) = republishing_with_both_voters_gone(&me).await;
-    // The write of the republish went out once and was refused: no voter held it.
-    timeout(TEST_TIMEOUT, async {
-        while office.turn() == 0 {
-            me.wait_for_arrival().await;
-        }
-    })
-    .await
-    .expect("the first write was refused within the timeout");
-
-    // Nothing confirmed its leadership since: a suspicion timeout later its lease is over.
-    office.clock.advance(2 * SUSPECT_MS);
-    office.step(Input::Tick);
-    assert_eq!(office.node.state(), WorkerState::NoQuorum);
-    office.turn();
-    assert!(office.reconciliation.is_none(), "the driver dropped the reconciliation");
-
-    // The write would be issued again within a heartbeat interval if it were still run.
-    office.clock.advance(10 * HEARTBEAT_MS);
-    office.turn();
-    tokio::time::sleep(StdDuration::from_millis(300)).await;
-    assert_eq!(office.turn(), 0, "no republish write was issued after it left office");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -21,4 +21,3 @@ kabudachi-testkit = { path = "../testkit" }
 proptest = { version = "1", default-features = false, features = ["std"] }
 rand = { version = "0.9", default-features = false }
 rand_chacha = { version = "0.9", default-features = false }
-sha3 = "0.10"

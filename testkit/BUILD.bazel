@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 load("@crates//:defs.bzl", "all_crate_deps")
 
 # Every first-party target is tagged no-remote-cache: CI's remote cache
@@ -16,12 +16,4 @@ rust_library(
     testonly = True,
     deps = all_crate_deps(normal = True) + ["//core"],
     visibility = ["//core:__pkg__", "//net:__pkg__"],
-)
-
-rust_test(
-    name = "testkit_test",
-    crate = ":testkit",
-    edition = "2024",
-    tags = ["no-remote-cache"],
-    deps = all_crate_deps(normal_dev = True),
 )

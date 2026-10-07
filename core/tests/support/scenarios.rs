@@ -2,13 +2,13 @@
 //! leader among chosen nodes with one roll call it picks the initiator of,
 //! and let a leader that has been cut off run out its lease.
 
-use kabudachi_core::election::Input;
+use kabudachi_core::election::{Input, Output};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::time::Duration;
+use kabudachi_core::time::{Duration, Instant};
 
 use crate::support::builders::{past_any_suspicion, timings};
-use crate::support::harness::Cluster;
+use crate::support::harness::{Cluster, StepRecord};
 
 /// Lets the clock run past every node's suspicion timeout, whatever its
 /// jitter, without delivering or ticking anything, then moves each of
@@ -131,4 +131,48 @@ pub fn run_out_cut_off_leaders_lease(cluster: &mut Cluster) {
     let timings = timings(cluster.suspect_timeout());
     let lease_run_out = timings.suspect_timeout.as_ticks() - timings.heartbeat_interval.as_ticks();
     cluster.advance(Duration::from_ticks(lease_run_out));
+}
+
+/// When `leader` first reported `worker` lost among `steps`.
+pub fn reported_lost_at(steps: &[StepRecord], leader: &WorkerId, worker: &WorkerId) -> Instant {
+    steps
+        .iter()
+        .find(|step| {
+            step.node == *leader
+                && step
+                    .outputs
+                    .iter()
+                    .any(|output| *output == Output::WorkerLost(worker.clone()))
+        })
+        .map(|step| step.at)
+        .unwrap_or_else(|| panic!("{leader:?} reported {worker:?} lost"))
+}
+
+/// The abort deadline `worker` last reported among `steps` taken no later
+/// than `at`, `Some(None)` for a withdrawal; `None` if it reported none.
+pub fn abort_deadline_at(
+    steps: &[StepRecord],
+    worker: &WorkerId,
+    at: Instant,
+) -> Option<Option<Instant>> {
+    steps
+        .iter()
+        .filter(|step| step.node == *worker && step.at <= at)
+        .flat_map(|step| &step.outputs)
+        .filter_map(|output| match output {
+            Output::AbortDeadline(deadline) => Some(*deadline),
+            _ => None,
+        })
+        .next_back()
+}
+
+/// Asserts that by `replayed_at`, when a leader replays `worker`'s runs,
+/// `worker` has been told to abort them no later than that.
+pub fn assert_aborts_by(steps: &[StepRecord], worker: &WorkerId, replayed_at: Instant) {
+    let deadline = abort_deadline_at(steps, worker, replayed_at).flatten();
+    assert!(
+        deadline.is_some_and(|by| by < replayed_at),
+        "{worker:?} must abort before its runs are replayed at {replayed_at:?}, but its \
+         deadline was {deadline:?}"
+    );
 }

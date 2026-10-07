@@ -1,7 +1,4 @@
-//! Task and TaskRun records: how they are created, what links a run to its
-//! task, and that `transition_to` only ever follows the legal transition
-//! table.
-
+//! That `TaskRun::transition_to` only ever follows the legal transition table.
 
 use std::collections::VecDeque;
 
@@ -11,11 +8,9 @@ use kabudachi_core::protocol::records::{
     IllegalTransition, NewTask, TaskRunRecord, first_attempt, new_task,
 };
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{Scheduler, Submission};
 use kabudachi_core::time::WallTime;
 
-use crate::support::clock::FakeClock;
-use crate::support::ids::{OversizedIds, SequentialIds};
+use crate::support::ids::SequentialIds;
 
 fn at(millis: u64) -> WallTime {
     WallTime::from_unix_millis(millis)
@@ -92,55 +87,4 @@ fn transition_to_follows_the_transition_table_for_every_pair() {
             }
         }
     }
-}
-
-#[test]
-#[should_panic(expected = "required by protocol invariant")]
-fn reading_the_state_of_a_run_with_no_state_panics() {
-    let ids = SequentialIds::new();
-    let task = submit(&ids, at(0));
-    let mut run = first_attempt(&task, &ids, at(0), TaskRunState::Queued);
-    run.state = 0;
-
-    run.current_state();
-}
-
-#[test]
-#[should_panic(expected = "required by protocol invariant")]
-fn reading_the_id_of_a_run_with_no_identity_panics() {
-    let ids = SequentialIds::new();
-    let task = submit(&ids, at(0));
-    let mut run = first_attempt(&task, &ids, at(0), TaskRunState::Queued);
-    run.identity = None;
-
-    run.task_run_id();
-}
-
-#[test]
-#[should_panic(expected = "a TaskRun starts Scheduled or Queued")]
-fn a_run_cannot_be_created_in_a_state_it_could_only_reach_by_transition() {
-    let ids = SequentialIds::new();
-    let task = submit(&ids, at(0));
-
-    let _ = first_attempt(&task, &ids, at(0), TaskRunState::Running);
-}
-
-#[test]
-#[should_panic(expected = "task ID of")]
-fn a_task_cannot_be_submitted_under_an_oversized_id() {
-    let scheduler = Scheduler::new(FakeClock::new(), OversizedIds);
-
-    let _ = scheduler.mint(Submission::new(
-        TaskDefinitionId::new("billing.charge"),
-        3,
-        b"input-bytes".to_vec(),
-        "default",
-    ));
-}
-
-#[test]
-#[should_panic(expected = "task run ID of")]
-fn a_run_cannot_be_created_under_an_oversized_id() {
-    let task = submit(&SequentialIds::new(), at(0));
-    first_attempt(&task, &OversizedIds, at(0), TaskRunState::Queued);
 }

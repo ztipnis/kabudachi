@@ -3,8 +3,11 @@
 
 mod bootstrap;
 mod claim;
+mod driver;
 mod election;
+mod join;
 mod lifecycle;
 mod reconcile;
 mod records;
 mod support;
+mod transport;

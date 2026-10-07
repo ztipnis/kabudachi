@@ -5,7 +5,7 @@
 //! task's placement stored the decision, and only the result's digest reaches
 //! the leader. The cases of the exchange (retries, cancels, repeated
 //! submissions, answers withheld without a quorum) are the scheduler's and
-//! the simulator's; the ledger is a unit test of `kabudachi-net`.
+//! the simulator's.
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRunState;
@@ -22,8 +22,16 @@ use crate::support::records::{ThreeVoters, Voters};
 
 const RESULT: &[u8] = b"the-result";
 
+/// A submission that sets every field a client chooses, so that each is seen
+/// to reach the records the voters hold.
 fn plain() -> Submission {
-    Submission::new(TaskDefinitionId::new("billing.charge"), 0, b"in".to_vec(), "default")
+    Submission::new(TaskDefinitionId::new("billing.charge"), 7, b"in".to_vec(), "billing")
+        .with_retries(3)
+        .with_delay(Duration::from_secs(2))
+        .with_expiry(Duration::from_secs(600))
+        .with_coalescing_key("charge-1")
+        .ephemeral()
+        .non_retriable()
 }
 
 fn reject_reason(response: &TaskResponse) -> Option<TaskRejectReason> {
@@ -69,7 +77,7 @@ async fn a_worker_submits_claims_starts_and_completes_a_task_through_the_leader(
     // nothing of the request takes effect. The delay is long enough for the
     // quorum write, the answer and the checks below to finish while the task
     // is still held back, even if the runtime stalls for a while.
-    let submitted = mint(plain().with_delay(Duration::from_secs(2)), &Uuid7Ids, &RealClock::new());
+    let submitted = mint(plain(), &Uuid7Ids, &RealClock::new());
     let refused = shard
         .drive_until(client.submit(leader_id.clone(), submitted.clone()))
         .await
@@ -94,6 +102,24 @@ async fn a_worker_submits_claims_starts_and_completes_a_task_through_the_leader(
         panic!("expected the submission accepted, got {answer:?}");
     };
     assert_eq!(accepted.task_id.map(TaskId::from), Some(submitted.task_id.clone()));
+    let held = shard
+        .nets
+        .iter()
+        .find_map(|net| net.held_records().get(&submitted.task_id))
+        .expect("a majority stored the record before the leader answered");
+    let task = held.task.expect("the record holds the task");
+    let wanted = &submitted.submission;
+    assert_eq!(task.task_definition_id.map(TaskDefinitionId::from), Some(wanted.definition_id.clone()));
+    assert_eq!(task.source_version, wanted.source_version);
+    assert_eq!(task.serialized_input, wanted.serialized_input);
+    assert_eq!(task.queue, wanted.queue);
+    assert_eq!(task.max_retries, wanted.retries);
+    assert_eq!(task.coalescing_key, wanted.coalescing_key);
+    assert_eq!(task.ephemeral, wanted.ephemeral);
+    assert_eq!(task.non_retriable, wanted.non_retriable);
+    assert_eq!(task.delay_millis, wanted.delay.map(|delay| delay.as_ticks()));
+    assert_eq!(task.expiry_millis, wanted.expiry.map(|expiry| expiry.as_ticks()));
+    assert_eq!(task.submitted_at, Some(submitted.submitted_at.into()));
     assert_eq!(
         holders_at(&shard, &submitted.task_id, TaskRunState::Queued),
         0,

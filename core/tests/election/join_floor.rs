@@ -62,16 +62,12 @@ fn a_floor_ranks_accepted_pointers_by_number_then_by_term_within_one_lineage() {
         "the epoch of another lineage numbered above the floor outranks lower numbers, and the \
          pointer below the floor is left out"
     );
-}
 
-#[test]
-fn equal_numbered_epochs_of_two_foreign_lineages_keep_the_order_they_were_heard_in() {
-    let floor = floor_at(5, A);
+    // Terms are not compared across lineages: a high term in a third lineage
+    // does not outrank the pointer heard first at the same number.
     let first = pointer(7, B, 1);
     let second = pointer(7, 3, 50);
-
-    assert_eq!(floor.newest_first([&first, &second]), vec![&first, &second]);
-    assert_eq!(floor.newest_first([&second, &first]), vec![&second, &first]);
+    assert_eq!(floor.newest([&first, &second]), Some(&first));
 }
 
 #[test]

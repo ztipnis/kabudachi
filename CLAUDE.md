@@ -22,16 +22,19 @@ bazel test //...
 
 bazel test //core:core_integration_test
 # One area of an integration binary. The filter is a substring match on the full test name,
-# so `election::` also matches `scenario::scenario_election::` (231 tests, not 227). Add
-# `--test_arg=--skip --test_arg=scenario::` to get exactly the 227 of the `election` module:
+# so `election::` also matches `scenario::scenario_election::`. Add
+# `--test_arg=--skip --test_arg=scenario::` to get exactly the `election` module:
 bazel test //core:core_integration_test --test_arg=election:: --test_arg=--skip --test_arg=scenario::
-bazel test //core:core_test
 bazel test //net:net_integration_test
 bazel test //net:net_test
-bazel test //testkit:testkit_test
-bazel test //bindings:bindings_test
 bazel test //runtime/tests:test_native
-bazel test //runtime/tests:test_local
+bazel test //runtime/tests:test_declaration
+bazel test //runtime/tests:test_serialization
+bazel test //runtime/tests:test_composition
+bazel test //runtime/tests:test_session
+bazel test //runtime/tests:test_run
+bazel test //runtime/tests:test_runner
+bazel test //runtime/tests:test_signals
 
 cargo check --workspace --all-targets
 
@@ -51,7 +54,7 @@ Python tests run through Bazel only, on the host or in the Linux container (`CON
 - Keep internal code YAGNI-driven; design public APIs deliberately.
 - Do not hand-edit Gazelle-generated runtime BUILD files. Run `bazel run //:gazelle` after Python-file changes; preserve manual BUILD dependencies with `# keep`.
 - Update `Cargo.lock` after Rust dependency changes. Add Python dependencies to the runtime package metadata and regenerate its lockfile/manifest as required.
-- Keep bindings Rust tests PyO3-free; exercise Python-facing behavior from Python tests.
+- `bindings` has no Rust tests; exercise Python-facing behavior from Python tests.
 - For current macOS/Bazel-native-extension caveats and running the Python tests in the Linux container, use the explicit procedures in `CONTRIBUTING.md` and the Phase 1 plan.
 
 ## Shared build state and agent rules

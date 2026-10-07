@@ -31,7 +31,6 @@ struct Log {
     forgotten: BTreeSet<TaskId>,
     leading: bool,
     revisions: Vec<TaskRecord>,
-    only_latest_revision: bool,
 }
 
 /// One notification as the spy recorded it.
@@ -90,19 +89,12 @@ impl Observer for Spy {
 
     fn revision(&mut self, revision: TaskRecord) {
         let mut log = self.0.borrow_mut();
-        if log.only_latest_revision
-            && let Some(last) = log.revisions.last_mut()
-            && last.task == revision.task
-        {
-            *last = revision;
-            return;
-        }
         log.revisions.push(revision);
     }
 }
 
 impl Spy {
-    /// How many notes so far: a mark for `since` and `queued_since`.
+    /// How many notes so far: a mark for `since`.
     pub fn mark(&self) -> usize {
         self.0.borrow().notes.len()
     }
@@ -125,13 +117,6 @@ impl Spy {
     /// scheduler does not lead.
     pub fn leading(&self) -> bool {
         self.0.borrow().leading
-    }
-
-    /// From now on keeps only the latest revision while the same task keeps
-    /// being revised, so a test that drives one task through many large
-    /// revisions does not hold every one of them in memory.
-    pub fn keep_only_the_latest_revision_of_a_busy_task(&self) {
-        self.0.borrow_mut().only_latest_revision = true;
     }
 
     /// Every revision the scheduler published, in order.
@@ -175,27 +160,8 @@ impl Spy {
             .clone()
     }
 
-    pub fn state_of(&self, task: &TaskId) -> TaskRunState {
-        self.run_of(task).current_state()
-    }
-
     pub fn forgotten(&self, task: &TaskId) -> bool {
         self.0.borrow().forgotten.contains(task)
-    }
-
-    /// The tasks whose runs were notified entering `Queued` after `mark`, in order.
-    pub fn queued_since(&self, mark: usize) -> Vec<TaskId> {
-        self.since(mark)
-            .into_iter()
-            .filter_map(|note| match note.change {
-                Noted::Run {
-                    task,
-                    state: TaskRunState::Queued,
-                    ..
-                } => Some(task),
-                _ => None,
-            })
-            .collect()
     }
 
     /// `state_of(task)`, after checking the notes against the scheduler's

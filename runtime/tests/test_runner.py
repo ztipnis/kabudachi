@@ -1,15 +1,19 @@
-"""`run()`'s lifecycle over a real native runtime: the native runtime is
-shut down and the session ended however the run ends, and a worker that dies
-is reported instead of waited on."""
+"""`run()`'s lifecycle over a real native runtime: the native runtime is shut
+down and the session ended however the run ends, a worker that dies is
+reported instead of waited on, and the example in runtime/README.md runs and
+does what its comment says."""
 
 import asyncio
 import os
+import re
 import signal
 import socket
 import sys
 import threading
 import time
 import traceback
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +27,7 @@ from kabudachi import session as session_module
 from kabudachi.config import Configuration
 from kabudachi.errors import RunStoppedError
 from kabudachi.registry import TaskRegistry
-from proto_messages import Greeting
+from proto_messages import Greeting, make_message_class
 
 
 @pytest.fixture(autouse=True)
@@ -64,22 +68,12 @@ def test_a_run_that_completes_refuses_late_submissions_to_its_session():
         session.submit(echo.definition, Greeting())
 
 
-def test_a_main_that_raises_still_shuts_down_and_ends_the_session():
+@pytest.mark.parametrize("error", [KeyError("main failed"), asyncio.CancelledError()], ids=["raises", "cancelled"])
+def test_a_main_that_raises_or_is_cancelled_still_shuts_down_and_ends_the_session(error):
     async def main():
-        raise KeyError("main failed")
+        raise error
 
-    with pytest.raises(KeyError, match="main failed"):
-        kabudachi.run(main)
-
-    assert only_native().shutdowns == 1
-    assert session_module.active_session() is None
-
-
-def test_a_main_that_is_cancelled_still_shuts_down_and_ends_the_session():
-    async def main():
-        raise asyncio.CancelledError()
-
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(type(error)):
         kabudachi.run(main)
 
     assert only_native().shutdowns == 1
@@ -273,7 +267,7 @@ def test_a_slow_unwind_is_not_interrupted_again_while_it_has_not_been_discarded(
         # A raise that is still unwinding in a slow `finally` has not been
         # discarded, and a second raise would cut the cleanup short.
         try:
-            time.sleep(0.5)
+            time.sleep(0.25)
         except KeyboardInterrupt:
             pytest.fail("the interrupt was raised again without a discard")
 
@@ -531,3 +525,29 @@ def test_every_restore_step_runs_even_if_one_fails(main_thread_loop, monkeypatch
     finally:
         monkeypatch.undo()
         original(signal.SIGTERM, original_term)
+
+
+# --- the README example ----------------------------------------------------
+
+README = Path(__file__).resolve().parents[1] / "README.md"
+
+
+def example_source():
+    text = README.read_text()
+    match = re.search(r"<!-- example -->\n```python\n(.*?)```", text, re.S)
+    assert match, "README.md has no example block"
+    return match.group(1)
+
+
+def test_the_readme_example_runs_and_prints_what_it_says(monkeypatch, capsys):
+    messages = types.ModuleType("myapp_pb2")
+    messages.Order = make_message_class(
+        "ExampleOrder", [("item", "string"), ("quantity", "int64"), ("cents", "int64")]
+    )
+    messages.Receipt = make_message_class("ExampleReceipt", [("ok", "bool"), ("total", "int64")])
+    monkeypatch.setitem(sys.modules, "myapp_pb2", messages)
+    source = example_source()
+
+    exec(compile(source, str(README), "exec"), {"__name__": "readme_example"})
+
+    assert capsys.readouterr().out.strip() == "(500, [100, 250])"

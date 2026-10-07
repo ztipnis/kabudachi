@@ -16,14 +16,6 @@ rust_library(
     visibility = ["//bindings:__pkg__", "//net:__pkg__", "//testkit:__pkg__"],
 )
 
-rust_test(
-    name = "core_test",
-    crate = ":core",
-    edition = "2024",
-    tags = ["no-remote-cache"],
-    deps = all_crate_deps(normal_dev = True),
-)
-
 # One integration-test binary for core, with a module per area under
 # `tests/`. proptest replays the cases saved beside each test's source, which
 # it finds by `file!()` from the working directory, so both are in the

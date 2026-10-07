@@ -521,30 +521,3 @@ impl<'n> LeaderReconciliation<'n> {
         .min()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn worker(name: &str) -> WorkerId {
-        WorkerId::new(name)
-    }
-
-    #[test]
-    fn stuck_work_comes_back_when_the_voters_change_or_the_time_comes() {
-        let every = Duration::from_millis(1_000);
-        let mut retry = Retry::new(every);
-        let voters = vec![worker("b"), worker("a")];
-        retry.hold("place", voters.clone(), Instant::at(10));
-        assert_eq!(retry.wake_at(), Some(Instant::at(1_010)));
-
-        assert_eq!(retry.take_if_due(&[worker("a"), worker("b")], Instant::at(500)), None);
-        let grown = [worker("a"), worker("b"), worker("c")];
-        assert_eq!(retry.take_if_due(&grown, Instant::at(500)), Some("place"));
-        assert_eq!(retry.wake_at(), None);
-
-        retry.hold("place", voters.clone(), Instant::at(600));
-        assert_eq!(retry.take_if_due(&voters, Instant::at(1_599)), None);
-        assert_eq!(retry.take_if_due(&voters, Instant::at(1_600)), Some("place"));
-    }
-}

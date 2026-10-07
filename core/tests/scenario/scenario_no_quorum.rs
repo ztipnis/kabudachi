@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use kabudachi_core::election::Output;
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
@@ -103,4 +104,34 @@ fn a_shard_whose_every_node_lost_its_quorum_elects_a_leader_once_its_peers_retur
     cluster.run_until_quiescent(tick_size(), 60);
 
     assert_settled(&cluster);
+}
+
+/// A shard whose replies take longer to come back than the base roll call
+/// deadline, though a lease is still longer than a round trip: each roll call
+/// closes before its replies arrive, so only calls that widen with each
+/// failure ever elect, and the election must never put two grants at once.
+#[test]
+fn a_shard_whose_replies_outlast_the_base_roll_call_deadline_still_elects_without_overlapping_grants() {
+    // A round trip of 12 ticks exceeds the base roll call deadline of 10; the
+    // lease, of two such trips and two deadlines, is 32 of the 36 ticks a
+    // suspicion timeout leaves it.
+    let suspect_timeout = Duration::from_ticks(40);
+    let mut cluster = Cluster::bootstrap(3, suspect_timeout);
+    cluster.network().set_delay(Duration::from_ticks(6));
+    cluster.record_steps();
+    let patience = 4 * suspect_timeout.as_ticks();
+
+    for _ in 0..patience / 2 {
+        cluster.advance(Duration::from_ticks(2));
+    }
+
+    let steps = cluster.take_steps();
+    assert!(
+        steps
+            .iter()
+            .any(|step| step.outputs.contains(&Output::StateChanged(WorkerState::Leader))),
+        "no node led within four suspicion timeouts: {:?}",
+        cluster.states()
+    );
+    assert_eq!(cluster.first_grant_overlap(), None);
 }

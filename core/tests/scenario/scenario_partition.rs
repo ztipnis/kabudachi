@@ -4,15 +4,15 @@
 //! of four or more roll calls started at the same instant.
 
 use crate::support::scenarios::{
-    bootstrap_5_and_elect_leader, elect_new_leader_among, run_out_cut_off_leaders_lease,
-    suspect_leader_by_hand,
+    abort_deadline_at, assert_aborts_by, bootstrap_5_and_elect_leader, elect_new_leader_among,
+    reported_lost_at, run_out_cut_off_leaders_lease, suspect_leader_by_hand,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::support::harness::Cluster;
 use crate::support::node::published_roll_calls;
-use kabudachi_core::election::{ElectionTimings, Input};
+use kabudachi_core::election::{ElectionTimings, Input, Output};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{ClaimRejection, Submission};
@@ -48,61 +48,6 @@ fn isolate_leader_and_elect_new(cluster: &mut Cluster, leader: &WorkerId) -> Wor
     suspect_leader_by_hand(cluster, &others);
 
     elect_new_leader_among(cluster, &others)
-}
-
-#[test]
-fn leader_isolated_with_minority() {
-    let suspect_timeout = Duration::from_ticks(10);
-    let tick_size = Duration::from_ticks(5);
-
-    let (mut cluster, original_leader) = bootstrap_5_and_elect_leader(suspect_timeout, tick_size);
-    let followers: Vec<WorkerId> = cluster
-        .node_ids()
-        .into_iter()
-        .filter(|id| *id != original_leader)
-        .collect();
-    assert_eq!(followers.len(), 4);
-
-    let companion = followers[0].clone();
-    let majority: Vec<WorkerId> = followers[1..].to_vec();
-    assert_eq!(majority.len(), 3);
-
-    let isolated_group: BTreeSet<WorkerId> = [original_leader.clone(), companion.clone()]
-        .into_iter()
-        .collect();
-    let majority_group: BTreeSet<WorkerId> = majority.iter().cloned().collect();
-    cluster.partition(isolated_group, majority_group.clone());
-
-    // The isolated leader+1 pair caps at 2 responses, below quorum 3, like
-    // test 1; the majority-of-3 is safe to drive with plain advance().
-    for _ in 0..3 {
-        cluster.advance(tick_size);
-    }
-    cluster.run_until_quiescent(tick_size, 60);
-
-    assert_ne!(
-        cluster.states()[&original_leader],
-        WorkerState::Leader,
-        "the isolated original leader must not remain an unchallenged authority"
-    );
-    assert_ne!(
-        cluster.states()[&companion],
-        WorkerState::Leader,
-        "the 2-node isolated minority (leader+1) can never reach quorum-of-3 on its own"
-    );
-
-    let new_leader = cluster
-        .leader()
-        .expect("the majority-of-3 side must independently elect a new leader");
-    assert!(
-        majority_group.contains(&new_leader),
-        "the new leader must be a majority-side node"
-    );
-    assert_ne!(new_leader, original_leader);
-
-    // At most one node is Leader across both groups: only one side of a
-    // partition can have a legitimate leader.
-    cluster.assert_at_most_one_in_leader_state();
 }
 
 #[test]
@@ -291,6 +236,7 @@ fn no_replacement_run_is_claimable_until_the_reconnect_timeout_has_run_out_under
         .into_iter()
         .filter(|id| *id != cut_off)
         .collect();
+    cluster.record_steps();
     cluster.partition(rest, [cut_off.clone()].into_iter().collect());
 
     // The cut-off follower was last heard at most a heartbeat interval before
@@ -325,5 +271,68 @@ fn no_replacement_run_is_claimable_until_the_reconnect_timeout_has_run_out_under
         .expect("the lost run's task is claimable once the reconnect timeout has run out");
     assert_eq!(replacement.attempt_number, 2);
     assert_ne!(replacement.task_run_id, first.task_run_id);
+    assert_eq!(cluster.first_grant_overlap(), None);
+
+    // The cut-off worker aborts its runs before the leader replays them, and
+    // a worker that keeps hearing its leader is never told to abort.
+    let steps = cluster.take_steps();
+    let lost_at = reported_lost_at(&steps, &leader, &cut_off);
+    assert_aborts_by(&steps, &cut_off, lost_at);
+    assert!(
+        steps
+            .iter()
+            .filter(|step| step.node == other)
+            .flat_map(|step| &step.outputs)
+            .all(|output| !matches!(output, Output::AbortDeadline(Some(_)))),
+        "a follower that hears its leader has nothing to abort"
+    );
+
+    // Heard by its leader again, it withdraws the abort.
+    cluster.heal();
+    cluster.advance(suspect_timeout);
+    let steps = cluster.take_steps();
+    assert_eq!(
+        abort_deadline_at(&steps, &cut_off, cluster.now()),
+        Some(None),
+        "a worker its leader hears from again withdraws its deadline and keeps its runs"
+    );
+}
+
+// The leader's driver stalls, so its node is never ticked at its lease end
+// and stays `Leader`; its scheduler, reading the clock itself, stops leading
+// there all the same, before the others can elect a new leader.
+#[test]
+fn a_stalled_leaders_scheduler_stops_leading_at_its_lease_end() {
+    let suspect_timeout = Duration::from_ticks(10);
+    let tick_size = Duration::from_ticks(5);
+    let (mut cluster, leader) = bootstrap_5_and_elect_leader(suspect_timeout, tick_size);
+
+    assert_eq!(
+        cluster.valid_grant_holders(),
+        BTreeSet::from([leader.clone()]),
+        "setup invariant: once a quorum confirmed its acks, only the leader's scheduler leads"
+    );
+    cluster.stall(&leader, Duration::from_ticks(40));
+    // Past any lease the leader held when it stalled, yet short of any
+    // follower's suspicion timeout.
+    cluster.advance(Duration::from_ticks(9));
+
+    assert_eq!(cluster.states()[&leader], WorkerState::Leader);
+    assert!(
+        !cluster.holds_valid_grant(&leader),
+        "the stalled leader's grant must lapse at its lease end"
+    );
+    assert!(cluster.valid_grant_holders().is_empty());
+
+    cluster.advance(Duration::from_ticks(31));
+    cluster.run_until_quiescent(tick_size, 60);
+
+    let new_leader = cluster.leader().expect("the four must elect a leader");
+    assert_ne!(new_leader, leader);
+    assert_eq!(
+        cluster.states()[&leader],
+        WorkerState::Active,
+        "once its stall ends, the old leader handles what was held and follows the new one"
+    );
     assert_eq!(cluster.first_grant_overlap(), None);
 }

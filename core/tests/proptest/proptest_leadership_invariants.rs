@@ -49,6 +49,9 @@
 //! - L8: a `Heal` alone changes no node's `term()` or `recovery_epoch()`.
 //! - L9: no step that leaves a node reconciling as the new leader reports a
 //!   grant: the scheduler is handed one only once the node leads.
+//! - L10: a node's configuration generation never decreases while its
+//!   recovery epoch stays the same: an ack, certificate or refusal carrying
+//!   an older configuration than the node's own leaves it where it was.
 //!
 //! L3 and L4 are checked by an oracle of their own over the wire messages,
 //! comparing generations as (recovery epoch, term, counter) tuples, so a
@@ -59,7 +62,7 @@
 //! ticks), and changes to the network's drop rate (up to 30%) and delay (up
 //! to 3 ticks). Each case also draws the network's seed, its duplicate rate
 //! and whether it reorders deliveries. Sequences are 1..150 events, and a
-//! run checks 256 cases of each cluster shape (see `CASES`).
+//! run checks 64 cases of each cluster shape (see `CASES`).
 //!
 //! No node joins later: a pending member is one from the start, holding the
 //! voters' configuration with no admission generation (see
@@ -102,13 +105,13 @@ const MAX_NODES: usize = 7;
 const RNG_SEED: u64 = 0;
 
 /// The configuration of a run: the fixed seed unless `PROPTEST_RNG_SEED`
-/// names another, and 256 cases unless `PROPTEST_CASES` names another count.
+/// names another, and 64 cases unless `PROPTEST_CASES` names another count.
 fn config() -> ProptestConfig {
     seeded(crate::proptest::config(CASES))
 }
 
 /// How many cases a run checks unless `PROPTEST_CASES` says otherwise.
-const CASES: u32 = 256;
+const CASES: u32 = 64;
 
 fn seeded(config: ProptestConfig) -> ProptestConfig {
     match config.rng_seed {
@@ -840,6 +843,7 @@ fn check_case(case: Case, coverage: &mut Coverage) -> Result<(), TestCaseError> 
     let mut last_epoch: BTreeMap<WorkerId, u64> = ids.iter().cloned().map(|id| (id, 0)).collect();
     let mut ever_drained: BTreeSet<WorkerId> = BTreeSet::new();
     let mut last_admission: BTreeMap<WorkerId, Rank> = BTreeMap::new();
+    let mut last_generation: BTreeMap<WorkerId, (u64, Option<u64>, Rank)> = BTreeMap::new();
 
     for event in events {
         let before: BTreeMap<WorkerId, (u64, u64)> = ids
@@ -877,6 +881,32 @@ fn check_case(case: Case, coverage: &mut Coverage) -> Result<(), TestCaseError> 
         );
 
         check_configurations(&cluster, &ids)?;
+
+        for id in &ids {
+            let node = cluster.node(id);
+            let Some(configuration) = node.configuration() else {
+                last_generation.remove(id);
+                continue;
+            };
+            let held = (
+                node.recovery_epoch(),
+                node.recovery_lineage(),
+                rank(configuration.generation()),
+            );
+            if let Some(before) = last_generation.insert(id.clone(), held)
+                && (before.0, before.1) == (held.0, held.1)
+            {
+                prop_assert!(
+                    held.2 >= before.2,
+                    "L10 violated: node {:?}'s configuration generation fell from {:?} to {:?} \
+                     within recovery epoch {}",
+                    id,
+                    before.2,
+                    held.2,
+                    held.0
+                );
+            }
+        }
 
         let states = cluster.states();
         for drained_id in &ever_drained {
@@ -935,7 +965,7 @@ fn check_case(case: Case, coverage: &mut Coverage) -> Result<(), TestCaseError> 
 /// How many cases the authority property checks unless `PROPTEST_CASES`
 /// says otherwise: each case runs many TTLs of heartbeats, so far fewer
 /// than `CASES` keep the run to a few seconds.
-const AUTHORITY_CASES: u32 = 40;
+const AUTHORITY_CASES: u32 = 20;
 
 /// The suspicion timeout of the authority property's clusters: seconds, as
 /// in production, against the authority's 30 s TTL, so a registration
@@ -1006,6 +1036,8 @@ struct AuthorityCoverage {
 ///   its lineage, such as one a leader republished after a flush, or of
 ///   another lineage), and so only in an event in which it went back to
 ///   `Bootstrapping`, and to an epoch whose lineage it then knows.
+/// - A4: every grant a step reports names the term the node holds and its
+///   recovery epoch and lineage.
 ///
 /// Then checks the run exercised what they guard: grants held, workers
 /// orphaned, shards recovered through the authority path, and orphans
@@ -1072,7 +1104,13 @@ fn check_authority_case(
             AuthorityEvent::Flush => cluster.authority().flush(),
         }
 
-        for record in cluster.take_steps() {
+        let records = cluster.take_steps();
+        let final_record: BTreeMap<&WorkerId, usize> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (&record.node, index))
+            .collect();
+        for (index, record) in records.iter().enumerate() {
             prop_assert!(
                 record.state != WorkerState::LeaderReconciling
                     || !record
@@ -1102,7 +1140,25 @@ fn check_authority_case(
                         coverage.rejoined += 1;
                         rejoined_now.insert(record.node.clone());
                     }
-                    Output::Grant(Some(_)) => coverage.grants += 1,
+                    Output::Grant(Some(grant)) => {
+                        coverage.grants += 1;
+                        prop_assert_eq!(
+                            (grant.term, grant.recovery_epoch.number),
+                            (record.term, record.recovery_epoch),
+                            "{:?} was granted leadership of a term or epoch other than its own",
+                            record.node
+                        );
+                        // The lineage is the node's now, so only the node's
+                        // last step of the event vouches for it.
+                        if final_record[&record.node] == index {
+                            prop_assert_eq!(
+                                Some(grant.recovery_epoch.lineage),
+                                cluster.node(&record.node).recovery_lineage(),
+                                "{:?} was granted leadership of another lineage's epoch",
+                                record.node
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }

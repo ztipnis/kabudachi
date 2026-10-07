@@ -1,19 +1,18 @@
-//! `WorkerNode::step` as a driver sees it: the connected peers it keeps from
-//! connection events, the next deadline it reports in each state and that a
-//! `Tick` at that deadline always moves it on, a new leader's announcement
-//! to its connected roster, a drain requested in any state, the order in
-//! which it reports its state changes, and what applying a step's outputs
-//! does to the worker's scheduler.
+//! `WorkerNode::step` as a driver sees it: a `Tick` at the deadline a node
+//! reports always moves it on, a drain requested while a roll call is open is
+//! kept until the leader is heard, and a node refuses timings it could not run
+//! an election on.
 
 use crate::support::builders::{
     message_input,
     ack_message, configuration_of, g0, heartbeat, heartbeat_message, leader_ack, no_leader_yet,
-    past_any_suspicion, roll_call, roll_call_message, roll_call_reply, shard, timings, vote_grant,
+    past_any_suspicion, roll_call, roll_call_message, shard, timings, vote_grant,
+    vote_request, vote_request_message,
     voter_of, worker,
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    connect, deliver, finish_reconciling, sent, sent_to, stand_as_candidate, start_roll_call,
+    connect, deliver, finish_reconciling, stand_as_candidate, start_roll_call,
     state_changes, tick,
 };
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input, Output, WorkerNode};
@@ -63,10 +62,6 @@ fn bootstrapping_node(clock: &FakeClock, my_id: &WorkerId) -> TestNode {
     .0
 }
 
-fn ticks_after(start: Instant, ticks: u64) -> Instant {
-    start + Duration::from_ticks(ticks)
-}
-
 fn heartbeat_ack_from(leader: &WorkerId, term: u64) -> ElectionMessage {
     ack_message(leader_ack(leader, term, &configuration_of(2), Some(g0())))
 }
@@ -79,22 +74,6 @@ fn vote_grant_message(candidate: &WorkerId, voter: &WorkerId, term: u64) -> Elec
             term,
         ))),
     }
-}
-
-fn is_heartbeat_ack(message: &ElectionMessage) -> bool {
-    matches!(
-        message.payload,
-        Some(election_message::Payload::HeartbeatAck(_))
-    )
-}
-
-/// The recipients of the heartbeat acks among `outputs`, in order.
-fn acked(outputs: &[Output]) -> Vec<WorkerId> {
-    sent(outputs)
-        .into_iter()
-        .filter(|(_, message)| is_heartbeat_ack(message))
-        .map(|(to, _)| to)
-        .collect()
 }
 
 /// A voter of 3, connected to both peers, standing as `Candidate` for term
@@ -129,184 +108,6 @@ fn leader_of_three(clock: &FakeClock) -> (TestNode, WorkerId, WorkerId, WorkerId
     (node, self_id, peer_a, peer_b, outputs)
 }
 
-// ---- Connection events ----
-
-#[test]
-fn connection_events_decide_whom_a_new_leader_announces_itself_to() {
-    let clock = FakeClock::new();
-    let (mut node, self_id, peer_a, peer_b) = candidate_of_three(&clock);
-
-    let _ = node.step(Input::PeerDisconnected(peer_b.clone()));
-    // Reporting the same connection twice changes nothing.
-    let _ = node.step(Input::PeerConnected(peer_a.clone()));
-    let _ = node.step(Input::PeerConnected(peer_a.clone()));
-    let won = deliver(&mut node, &peer_a, vote_grant_message(&self_id, &peer_a, 1));
-
-    assert_eq!(acked(&won), vec![peer_a]);
-}
-
-// ---- A new leader's announcement ----
-
-#[test]
-fn a_new_leader_also_acks_a_connected_peer_that_missed_its_roll_call() {
-    let clock = FakeClock::new();
-    let (mut node, self_id, peer_a, _peer_b) = candidate_of_three(&clock);
-    let outsider = worker("missed-the-roll-call");
-    connect(&mut node, std::slice::from_ref(&outsider));
-
-    let won = deliver(&mut node, &peer_a, vote_grant_message(&self_id, &peer_a, 1));
-
-    let to_outsider = sent_to(&won, &outsider);
-    assert_eq!(to_outsider.len(), 1, "{won:?}");
-    match &to_outsider[0].payload {
-        Some(election_message::Payload::HeartbeatAck(ack)) => assert_eq!(
-            ack.recipient_admission, None,
-            "it is not in the roster, so its ack names no admission and it keeps its own"
-        ),
-        other => panic!("expected an ack, got {other:?}"),
-    }
-}
-
-// ---- The next deadline in each state ----
-
-#[test]
-fn an_active_node_is_next_due_just_past_its_jittered_suspicion_timeout() {
-    let clock = FakeClock::new();
-    let started = clock.now();
-    let mut node = node(&clock, &worker("w1"), &[worker("w1"), worker("w2")]);
-
-    let suspicion_due = node
-        .step(Input::PeerConnected(worker("w2")))
-        .next_deadline
-        .expect("an active node is due to suspect its leader");
-    assert!(
-        suspicion_due > ticks_after(started, SUSPECT_TIMEOUT)
-            && suspicion_due <= started + past_any_suspicion(SUSPECT_TIMEOUT),
-        "{suspicion_due:?}"
-    );
-
-    // Just before its deadline the node is not yet suspicious.
-    clock.advance(Duration::from_ticks(
-        (suspicion_due - clock.now()).as_ticks() - 1,
-    ));
-    let step = node.step(Input::Tick);
-    assert_eq!(node.state(), WorkerState::Active);
-    assert_eq!(step.next_deadline, Some(suspicion_due));
-
-    clock.advance(Duration::from_ticks(1));
-    let _ = node.step(Input::Tick);
-    assert_eq!(node.state(), WorkerState::LeaderSuspect);
-}
-
-#[test]
-fn an_accepted_ack_moves_an_active_nodes_deadline() {
-    let clock = FakeClock::new();
-    let leader = worker("leader-1");
-    let mut node = node(&clock, &worker("w1"), &[worker("w1"), worker("w2")]);
-
-    // Built at 0, the node would suspect in (10, 15]; the ack at 10 moves
-    // that to (20, 25].
-    clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT));
-    let acked_at = clock.now();
-    let step = node.step(message_input(&leader, heartbeat_ack_from(&leader, 0)));
-
-    // Ticked only at the deadlines it reports (its heartbeats among them),
-    // it suspects at the moved one.
-    let mut due = step
-        .next_deadline
-        .expect("a follower always has a deadline");
-    while node.state() != WorkerState::LeaderSuspect {
-        clock.advance(due - clock.now());
-        due = node
-            .step(Input::Tick)
-            .next_deadline
-            .expect("a follower always has a deadline");
-    }
-    assert!(
-        clock.now() > ticks_after(acked_at, SUSPECT_TIMEOUT)
-            && clock.now() <= acked_at + past_any_suspicion(SUSPECT_TIMEOUT),
-        "{:?}",
-        clock.now()
-    );
-}
-
-#[test]
-fn a_voter_suspecting_its_leader_is_due_at_once() {
-    let clock = FakeClock::new();
-    let mut node = node(&clock, &worker("w1"), &[worker("w1"), worker("w2")]);
-
-    clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
-    let step = node.step(Input::Tick);
-
-    assert_eq!(node.state(), WorkerState::LeaderSuspect);
-    assert_eq!(step.next_deadline, Some(clock.now()));
-}
-
-#[test]
-fn a_pending_member_suspecting_its_leader_is_next_due_at_its_next_heartbeat() {
-    let clock = FakeClock::new();
-    let mut node = bootstrapping_node(&clock, &worker("joiner"));
-    let _ = node.step(Input::JoinAnswer(JoinResponse {
-        leader_id: Some(worker("leader-1").into()),
-        leader_multiaddr: "/ip4/127.0.0.1/tcp/4001".into(),
-        term: 1,
-        recovery_epoch: 0,
-        recovery_epoch_lineage: 0,
-    }));
-
-    clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
-    let step = node.step(Input::Tick);
-
-    // It starts no roll call, so only its heartbeat timer is left; this
-    // `Tick` sent the heartbeat that was overdue.
-    assert_eq!(node.state(), WorkerState::LeaderSuspect);
-    assert_eq!(
-        step.next_deadline,
-        Some(clock.now() + timings(Duration::from_ticks(SUSPECT_TIMEOUT)).heartbeat_interval)
-    );
-}
-
-#[test]
-fn a_bootstrapping_node_has_no_deadline() {
-    let clock = FakeClock::new();
-    let mut node = bootstrapping_node(&clock, &worker("joiner"));
-
-    clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT * 5));
-    let step = node.step(Input::Tick);
-
-    assert_eq!(node.state(), WorkerState::Bootstrapping);
-    assert_eq!(step.next_deadline, None);
-}
-
-#[test]
-fn a_node_in_a_roll_call_or_standing_as_candidate_is_due_at_its_deadline() {
-    let clock = FakeClock::new();
-    let (self_id, other) = (worker("w1"), worker("w2"));
-    let mut node = node(
-        &clock,
-        &self_id,
-        &[self_id.clone(), other.clone(), worker("w3")],
-    );
-    let roll_call_deadline = timings(Duration::from_ticks(SUSPECT_TIMEOUT)).roll_call_deadline;
-
-    clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
-    tick(&mut node);
-    let roll_call_started = node.step(Input::Tick);
-    assert_eq!(node.state(), WorkerState::RollCall);
-    assert_eq!(
-        roll_call_started.next_deadline,
-        Some(clock.now() + roll_call_deadline)
-    );
-
-    // One more reply is a quorum of 2 of 3, so the node stands at its
-    // deadline.
-    let _ = node.step(message_input(&other, roll_call_reply(&self_id, 1, &other, Some(g0()))));
-    clock.advance(roll_call_deadline);
-    let stood = node.step(Input::Tick);
-    assert_eq!(node.state(), WorkerState::Candidate);
-    assert_eq!(stood.next_deadline, Some(clock.now() + roll_call_deadline));
-}
-
 // ---- A Tick at the node's deadline always moves it on ----
 
 /// Steps `node` with a `Tick` at every deadline it reports, until it reports
@@ -333,6 +134,22 @@ fn tick_at_every_deadline(
             node.state() != before || next.is_none_or(|next| next > due),
             "a Tick at its deadline {due:?} left a {before:?} node due again at {next:?}"
         );
+        // Every state but these reports a deadline: a node never waits for a
+        // Tick it has not asked for. Only the lone voter below ends in
+        // `LeaderReconciling` with none; the peered leaders end in `NoQuorum`
+        // (their `ticked_in` assertions), so a peered leader never lands here.
+        assert!(
+            next.is_some()
+                || matches!(
+                    node.state(),
+                    WorkerState::Bootstrapping
+                        | WorkerState::Stopped
+                        | WorkerState::LeaderReconciling
+                        | WorkerState::Leader
+                ),
+            "a {:?} node reports no deadline",
+            node.state()
+        );
         ticked_in.push(before);
         deadline = next;
     }
@@ -347,6 +164,41 @@ fn assert_ticked_in(ticked_in: &[WorkerState], states: &[WorkerState]) {
             "{state:?} missing: {ticked_in:?}"
         );
     }
+}
+
+#[test]
+fn a_node_names_its_leader_to_joiners_only_while_it_can_follow_it() {
+    let clock = FakeClock::new();
+    let (w1, w2) = (worker("w1"), worker("w2"));
+
+    // A voter that suspects its leader names none to joiners.
+    let mut suspecting = node(&clock, &w1, &[w1.clone(), w2.clone()]);
+    let _ = deliver_step(&mut suspecting, &w2, heartbeat_ack_from(&w2, 1));
+    assert_eq!(suspecting.known_leader(), Some((w2.clone(), 1)));
+    clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
+    let _ = suspecting.step(Input::Tick);
+    assert_eq!(suspecting.state(), WorkerState::LeaderSuspect);
+    assert_eq!(suspecting.known_leader(), None);
+
+    // A follower that has granted a vote in a term later than its leader's
+    // names no leader: a newer one may lead by now.
+    let mut outvoted = node(&clock, &w1, &[w1.clone(), w2.clone(), worker("w3")]);
+    let _ = deliver_step(&mut outvoted, &w2, heartbeat_ack_from(&w2, 3));
+    assert_eq!(outvoted.known_leader(), Some((w2.clone(), 3)));
+    clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
+    let candidate = worker("w3");
+    let _ = deliver_step(
+        &mut outvoted,
+        &candidate,
+        roll_call_message(roll_call(&candidate, 4, &configuration_of(3), 0)),
+    );
+    let _ = deliver_step(
+        &mut outvoted,
+        &candidate,
+        vote_request_message(vote_request(candidate.clone(), 0, 4)),
+    );
+    assert_eq!(outvoted.state(), WorkerState::Active);
+    assert_eq!(outvoted.known_leader(), None);
 }
 
 #[test]
@@ -372,6 +224,7 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
     // keeps heartbeating it through its roll calls.
     let mut follower = node(&clock, &w1, &[w1.clone(), w2.clone()]);
     let first = deliver_step(&mut follower, &w2, heartbeat_ack_from(&w2, 1));
+    assert_eq!(follower.known_leader(), Some((w2.clone(), 1)));
     assert_ticked_in(
         &tick_at_every_deadline(&mut follower, &clock, first, 50),
         &[
@@ -381,7 +234,6 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
             WorkerState::NoQuorum,
         ],
     );
-
     // A follower that has accepted another's roll call: suspects its
     // leader, keeps heartbeating it, and starts a roll call of its own once
     // that call's deadline has passed.
@@ -404,6 +256,12 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
     // A joiner with no configuration whose leader stops acking: suspects it
     // and keeps heartbeating it.
     let mut joiner = bootstrapping_node(&clock, &worker("joiner"));
+    clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT * 5));
+    assert_eq!(
+        joiner.step(Input::Tick).next_deadline,
+        None,
+        "a joining node waits for its answer with no deadline"
+    );
     let first = joiner.step(Input::JoinAnswer(JoinResponse {
             leader_id: Some(w2.clone().into()),
             leader_multiaddr: "/ip4/127.0.0.1/tcp/4001".into(),
@@ -412,9 +270,17 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
             recovery_epoch_lineage: 0,
         }))
         .next_deadline;
-    assert_ticked_in(
-        &tick_at_every_deadline(&mut joiner, &clock, first, 50),
-        &[WorkerState::Active, WorkerState::LeaderSuspect],
+    let ticked_in = tick_at_every_deadline(&mut joiner, &clock, first, 50);
+    assert_ticked_in(&ticked_in, &[WorkerState::Active, WorkerState::LeaderSuspect]);
+    assert!(
+        !ticked_in.contains(&WorkerState::RollCall),
+        "a joiner with no configuration never calls a roll call: {ticked_in:?}"
+    );
+    assert_eq!(joiner.state(), WorkerState::LeaderSuspect);
+    assert_eq!(
+        joiner.known_leader(),
+        Some((w2.clone(), 1)),
+        "a joiner that suspects its leader still names it to joiners"
     );
 
     // A candidate no one grants: gives up at its vote's deadline and
@@ -490,37 +356,6 @@ fn deliver_step(node: &mut TestNode, from: &WorkerId, message: ElectionMessage) 
 // ---- A drain in any state ----
 
 #[test]
-fn a_drain_while_suspecting_the_leader_waits_until_the_node_can_drain() {
-    let clock = FakeClock::new();
-    let solo = worker("solo");
-    let mut node = node(&clock, &solo, std::slice::from_ref(&solo));
-    clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
-    tick(&mut node);
-    assert_eq!(node.state(), WorkerState::LeaderSuspect);
-
-    let asked = node.step(Input::Drain);
-    assert!(asked.outputs.is_empty(), "{asked:?}");
-    assert_eq!(node.state(), WorkerState::LeaderSuspect);
-
-    // Its roll call elects it at the call's deadline, and the kept drain
-    // applies in the same step.
-    let started = node.step(Input::Tick);
-    assert_eq!(state_changes(&started.outputs), vec![WorkerState::RollCall]);
-    clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT)).roll_call_deadline);
-    let elected = node.step(Input::Tick);
-    assert_eq!(
-        state_changes(&elected.outputs),
-        vec![
-            WorkerState::Candidate,
-            WorkerState::LeaderReconciling,
-            WorkerState::Draining,
-            WorkerState::Stopped,
-        ]
-    );
-    assert_eq!(elected.next_deadline, None);
-}
-
-#[test]
 fn a_drain_during_a_roll_call_applies_once_the_leader_is_heard_again() {
     let clock = FakeClock::new();
     let (w1, leader) = (worker("w1"), worker("leader-1"));
@@ -544,214 +379,105 @@ fn a_drain_during_a_roll_call_applies_once_the_leader_is_heard_again() {
     );
 }
 
-#[test]
-fn a_drain_while_bootstrapping_applies_once_the_node_has_joined() {
-    let clock = FakeClock::new();
-    let mut node = bootstrapping_node(&clock, &worker("joiner"));
-
-    assert!(node.step(Input::Drain).outputs.is_empty());
-    assert_eq!(node.state(), WorkerState::Bootstrapping);
-
-    let joined = node.step(Input::JoinAnswer(JoinResponse {
-        leader_id: Some(worker("leader-1").into()),
-        leader_multiaddr: "/ip4/127.0.0.1/tcp/4001".into(),
-        term: 1,
-        recovery_epoch: 0,
-        recovery_epoch_lineage: 0,
-    }));
-    assert_eq!(
-        state_changes(&joined.outputs),
-        vec![
-            WorkerState::Joining,
-            WorkerState::Active,
-            WorkerState::Draining,
-            WorkerState::Stopped,
-        ]
-    );
-}
-
-#[test]
-fn a_second_drain_changes_nothing() {
-    let clock = FakeClock::new();
-    let (w1, w2) = (worker("w1"), worker("w2"));
-    let mut node = node(&clock, &w1, &[w1.clone(), w2.clone()]);
-    connect(&mut node, &[w2]);
-    let _ = node.step(Input::Drain);
-    assert_eq!(node.state(), WorkerState::Stopped);
-
-    let again = node.step(Input::Drain);
-
-    assert!(again.outputs.is_empty(), "{again:?}");
-    assert_eq!(node.state(), WorkerState::Stopped);
-}
-
-// ---- The order of reported state changes ----
-
 // ---- Construction ----
 
+// A node refuses timings that could never keep a lease or elect a leader,
+// except where it is a lone voter and needs neither.
 #[test]
-#[should_panic(expected = "roll_call_deadline")]
-fn a_zero_roll_call_deadline_is_rejected_at_construction() {
-    let clock = FakeClock::new();
-
-    let _ = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: ElectionTimings {
-                roll_call_deadline: Duration::from_ticks(0),
-                ..timings(Duration::from_ticks(10))
+fn a_node_refuses_timings_it_could_not_run_an_election_on() {
+    let ticks = Duration::from_ticks;
+    let rows = [
+        (
+            "a zero roll call deadline",
+            ElectionTimings {
+                roll_call_deadline: ticks(0),
+                ..timings(ticks(10))
             },
-        },
-        Entry::Known(voter_of(1)),
-        clock,
-        None,
-    )
-    .0;
-}
-
-#[test]
-#[should_panic(expected = "roll_call_deadline")]
-fn a_roll_call_deadline_not_shorter_than_the_suspicion_timeout_is_rejected_at_construction() {
-    let clock = FakeClock::new();
-
-    let _ = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: timings(Duration::from_ticks(10))
-                .with_roll_call_deadline(Duration::from_ticks(10)),
-        },
-        Entry::Known(voter_of(3)),
-        clock,
-        None,
-    )
-    .0;
-}
-
-#[test]
-fn a_lone_voter_may_have_a_roll_call_deadline_not_shorter_than_its_suspicion_timeout() {
-    let _ = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: timings(Duration::from_ticks(10))
-                .with_roll_call_deadline(Duration::from_ticks(10)),
-        },
-        Entry::Known(voter_of(1)),
-        FakeClock::new(),
-        None,
-    )
-    .0;
-}
-
-#[test]
-#[should_panic(expected = "heartbeat_interval")]
-fn a_zero_heartbeat_interval_is_rejected_at_construction() {
-    let clock = FakeClock::new();
-
-    let _ = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: ElectionTimings::new(Duration::from_ticks(10), Duration::from_ticks(0))
-                .with_roll_call_deadline(Duration::from_ticks(1)),
-        },
-        Entry::Known(voter_of(1)),
-        clock,
-        None,
-    )
-    .0;
-}
-
-#[test]
-#[should_panic(expected = "clock_drift_divisor")]
-fn a_zero_clock_drift_divisor_is_rejected_at_construction() {
-    let clock = FakeClock::new();
-
-    let _ = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: ElectionTimings {
+            Entry::Known(voter_of(1)),
+            Some("roll_call_deadline"),
+        ),
+        (
+            "a roll call deadline not shorter than the suspicion timeout",
+            timings(ticks(10)).with_roll_call_deadline(ticks(10)),
+            Entry::Known(voter_of(3)),
+            Some("roll_call_deadline"),
+        ),
+        (
+            "a zero heartbeat interval",
+            ElectionTimings::new(ticks(10), ticks(0)).with_roll_call_deadline(ticks(1)),
+            Entry::Known(voter_of(1)),
+            Some("heartbeat_interval"),
+        ),
+        (
+            "a zero clock drift divisor",
+            ElectionTimings {
                 clock_drift_divisor: 0,
-                ..timings(Duration::from_ticks(10))
+                ..timings(ticks(10))
             },
-        },
-        Entry::Known(voter_of(1)),
-        clock,
-        None,
-    )
-    .0;
-}
-
-#[test]
-fn a_lone_voter_may_run_heartbeats_that_could_keep_no_lease() {
-    // With no suspicion timeout there is no lease at all, but a node that
-    // is alone a quorum never needs one.
-    let node = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: timings(Duration::from_ticks(0)),
-        },
-        Entry::Known(voter_of(1)),
-        FakeClock::new(),
-        None,
-    )
-    .0;
-
-    assert_eq!(node.state(), WorkerState::Active);
-}
-
-#[test]
-#[should_panic(expected = "must be shorter than the lease length")]
-fn a_voter_of_several_whose_heartbeats_cannot_keep_a_lease_is_rejected_at_construction() {
-    let clock = FakeClock::new();
-
-    // A lease of 10 ticks less a fifth is 8 ticks: two heartbeat intervals
-    // of 4 do not fit strictly inside it.
-    let _ = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: ElectionTimings {
-                heartbeat_interval: Duration::from_ticks(4),
+            Entry::Known(voter_of(1)),
+            Some("clock_drift_divisor"),
+        ),
+        (
+            // A lease of 10 ticks less a fifth is 8 ticks: two heartbeat
+            // intervals of 4 do not fit strictly inside it.
+            "heartbeats that cannot keep a voter of several's lease",
+            ElectionTimings {
+                heartbeat_interval: ticks(4),
                 clock_drift_divisor: 5,
-                ..timings(Duration::from_ticks(10))
+                ..timings(ticks(10))
             },
-        },
-        Entry::Known(voter_of(3)),
-        clock,
-        None,
-    )
-    .0;
-}
+            Entry::Known(voter_of(3)),
+            Some("must be shorter than the lease length"),
+        ),
+        (
+            // A joiner's shard already has a leader, whose lease its
+            // heartbeats must keep.
+            "heartbeats that cannot keep a joiner's lease",
+            timings(ticks(0)),
+            Entry::Joining(no_leader_yet()),
+            Some("must be shorter than the lease length"),
+        ),
+        (
+            "a lone voter's roll call deadline as long as its suspicion timeout",
+            timings(ticks(10)).with_roll_call_deadline(ticks(10)),
+            Entry::Known(voter_of(1)),
+            None,
+        ),
+        (
+            "a lone voter with no suspicion timeout, so no lease",
+            timings(ticks(0)),
+            Entry::Known(voter_of(1)),
+            None,
+        ),
+    ];
 
-#[test]
-#[should_panic(expected = "must be shorter than the lease length")]
-fn a_joining_node_whose_heartbeats_cannot_keep_a_lease_is_rejected_at_construction() {
-    let clock = FakeClock::new();
+    for (name, timings, entry, refused) in rows {
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            WorkerNode::start(
+                Identity {
+                    id: worker("w1"),
+                    incarnation: IncarnationId::new("incarnation-1"),
+                    shard: shard(SHARD),
+                    timings,
+                },
+                entry,
+                FakeClock::new(),
+                None,
+            )
+        }));
 
-    // A joiner's shard already has a leader, whose lease its heartbeats
-    // must keep: here a suspicion timeout of 0 leaves no lease at all.
-    let _ = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: timings(Duration::from_ticks(0)),
-        },
-        Entry::Joining(no_leader_yet()),
-        clock,
-        None,
-    )
-    .0;
+        match (started, refused) {
+            (Ok(_), None) => {}
+            (Err(panic), Some(expected)) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or_default();
+                assert!(message.contains(expected), "{name}: {message}");
+            }
+            (Ok(_), Some(_)) => panic!("{name} was accepted"),
+            (Err(_), None) => panic!("{name} was refused"),
+        }
+    }
 }

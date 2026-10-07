@@ -34,14 +34,6 @@ impl FakeClock {
         }
     }
 
-    pub fn at(instant: Instant) -> Self {
-        Self {
-            now: Rc::new(Cell::new(instant)),
-            wall_clock_millis: Rc::new(Cell::new(0)),
-            step_on_read: Rc::new(Cell::new(Duration::from_ticks(0))),
-        }
-    }
-
     pub fn advance(&self, duration: Duration) {
         let current = self.now.get();
         self.now.set(current + duration);

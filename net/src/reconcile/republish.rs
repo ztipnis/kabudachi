@@ -153,7 +153,7 @@ impl Republish {
 #[cfg(test)]
 mod tests {
     use kabudachi_core::coordination_authority::RecoveryEpoch;
-    use kabudachi_core::protocol::generated::{CoalescingLink, Task};
+    use kabudachi_core::protocol::generated::{Task, TaskRecord};
     use kabudachi_core::protocol::ids::TaskId;
     use kabudachi_core::task_record::RecordVersion;
 
@@ -163,7 +163,7 @@ mod tests {
         Instant::at(ticks)
     }
 
-    fn record(task: &str, superseded_by: Option<&str>) -> TaskRecord {
+    fn record(task: &str) -> TaskRecord {
         TaskRecord {
             version: Some(
                 RecordVersion {
@@ -177,17 +177,13 @@ mod tests {
                 task_id: Some(TaskId::new(task).into()),
                 ..Task::default()
             }),
-            link: superseded_by.map(|newer| CoalescingLink {
-                superseded_by: Some(TaskId::new(newer).into()),
-                absorbed: Vec::new(),
-            }),
             ..TaskRecord::default()
         }
     }
 
     fn placed(task: &str) -> PlacedWrite {
         PlacedWrite {
-            record: record(task, None),
+            record: record(task),
             quorum: 2,
         }
     }
@@ -207,32 +203,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_cap_is_in_flight_and_the_rest_follow_as_writes_are_stored() {
-        let total = REPUBLISH_IN_FLIGHT + 3;
-        let writes: Vec<PlacedWrite> = (0..total).map(|n| placed(&format!("task-{n:03}"))).collect();
-        let mut republish = Republish::new(writes, Duration::from_millis(10));
-
-        let first = republish.due(at(0));
-        assert_eq!(first.len(), REPUBLISH_IN_FLIGHT);
-        assert!(republish.due(at(0)).is_empty(), "nothing more is issued at the cap");
-
-        for issued in &first[..2] {
-            assert!(republish.settled(&outcome(issued, true), at(1)));
-        }
-        let second = republish.due(at(1));
-        assert_eq!(named(&second), ["task-064", "task-065"]);
-        assert!(!republish.is_done());
-
-        for issued in first[2..].iter().chain(&second) {
-            republish.settled(&outcome(issued, true), at(2));
-        }
-        let last = republish.due(at(2));
-        assert_eq!(named(&last), ["task-066"]);
-        republish.settled(&outcome(&last[0], true), at(3));
-        assert!(republish.is_done());
-    }
-
-    #[test]
     fn a_refused_write_is_written_again_after_the_delay_until_it_is_stored() {
         let mut republish = Republish::new(vec![placed("task-a")], Duration::from_millis(10));
         let issued = republish.due(at(0));
@@ -248,53 +218,5 @@ mod tests {
         republish.settled(&outcome(&again[0], true), at(16));
         assert!(republish.is_done());
         assert_eq!(republish.wake_at(), None);
-    }
-
-    #[test]
-    fn writes_not_yet_stored_are_placed_again_and_written_at_once() {
-        let mut republish = Republish::new(
-            vec![placed("task-a"), placed("task-b"), placed("task-c")],
-            Duration::from_millis(1_000),
-        );
-        let issued = republish.due(at(0));
-        republish.settled(&outcome(&issued[0], true), at(1));
-        republish.settled(&outcome(&issued[1], false), at(1));
-
-        republish.re_place(|write| write.quorum = 7, at(2));
-
-        let again = republish.due(at(2));
-        assert_eq!(named(&again), ["task-b"], "the refused write does not wait out its delay");
-        assert_eq!(again[0].quorum, 7);
-        republish.settled(&outcome(&again[0], true), at(3));
-        let last = republish.settled(&outcome(&issued[2], false), at(3));
-        assert!(last);
-        let retried = republish.due(at(1_003));
-        assert_eq!(named(&retried), ["task-c"]);
-        assert_eq!(retried[0].quorum, 7, "a write still in flight is placed again too");
-    }
-
-    #[test]
-    fn a_generation_naming_its_successor_is_written_only_once_the_successor_is_stored() {
-        let newer = placed("task-new");
-        let older = PlacedWrite {
-            record: record("task-old", Some("task-new")),
-            quorum: 2,
-        };
-        let mut republish = Republish::new(vec![newer, older], Duration::from_millis(10));
-
-        let first = republish.due(at(0));
-        assert_eq!(named(&first), ["task-new"], "the older generation waits");
-        // The successor is refused and written again; the older one still waits.
-        republish.settled(&outcome(&first[0], false), at(1));
-        let second = republish.due(at(11));
-        assert_eq!(named(&second), ["task-new"]);
-        assert!(republish.due(at(11)).is_empty());
-
-        republish.settled(&outcome(&second[0], true), at(12));
-
-        let last = republish.due(at(12));
-        assert_eq!(named(&last), ["task-old"]);
-        republish.settled(&outcome(&last[0], true), at(13));
-        assert!(republish.is_done());
     }
 }

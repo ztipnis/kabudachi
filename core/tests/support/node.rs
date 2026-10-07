@@ -1,14 +1,12 @@
 //! Helpers for driving `WorkerNode`s by hand and reading back what they
 //! asked their driver to do.
 
-use std::collections::{BTreeMap, VecDeque};
-
 use kabudachi_core::election::{Entry, Identity, Input, Output, WorkerNode};
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
-    AckEcho, ElectionMessage, ElectionReject, RollCall, election_message,
+    AckEcho, ElectionMessage, ElectionReject, RollCall,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::LeadershipGrant;
@@ -97,18 +95,6 @@ pub fn rejects_sent_to(outputs: &[Output], recipient: &WorkerId) -> Vec<Checked<
             Some(CheckedPayload::ElectionReject(reject)) => Some(reject),
             _ => None,
         })
-        .collect()
-}
-
-/// The workers among `outputs` sent a message `is_kind` picks, in order.
-pub fn recipients_of(
-    outputs: &[Output],
-    is_kind: impl Fn(&election_message::Payload) -> bool,
-) -> Vec<WorkerId> {
-    sent(outputs)
-        .into_iter()
-        .filter(|(_, message)| message.payload.as_ref().is_some_and(&is_kind))
-        .map(|(to, _)| to)
         .collect()
 }
 
@@ -314,51 +300,4 @@ pub fn commit_founding(
             .is_some_and(|configuration| !configuration.is_joint()),
         "commit_founding: the leader must have committed"
     );
-}
-
-/// Hands each message among `outputs`, which `from` produced, to its
-/// addressee among `nodes`, then does the same for every message those
-/// deliveries produce, until none is left. A published message goes to
-/// every node among `nodes` but its publisher. A message to a worker not in
-/// `nodes` is dropped.
-pub fn deliver_all<C>(
-    nodes: &mut BTreeMap<WorkerId, WorkerNode<C>>,
-    from: &WorkerId,
-    outputs: Vec<Output>,
-) where
-    C: Clock,
-{
-    let mut in_flight: VecDeque<(WorkerId, WorkerId, ElectionMessage)> = VecDeque::new();
-    let queue = |in_flight: &mut VecDeque<_>,
-                 sender: &WorkerId,
-                 outputs: &[Output],
-                 everyone: Vec<WorkerId>| {
-        for output in outputs {
-            match output {
-                Output::Send { to, message } => {
-                    in_flight.push_back((sender.clone(), to.clone(), message.clone()));
-                }
-                Output::Publish { message } => {
-                    for to in everyone.iter().filter(|to| *to != sender) {
-                        in_flight.push_back((sender.clone(), to.clone(), message.clone()));
-                    }
-                }
-                _ => {}
-            }
-        }
-    };
-    queue(
-        &mut in_flight,
-        from,
-        &outputs,
-        nodes.keys().cloned().collect(),
-    );
-    while let Some((sender, to, message)) = in_flight.pop_front() {
-        let everyone: Vec<WorkerId> = nodes.keys().cloned().collect();
-        let Some(node) = nodes.get_mut(&to) else {
-            continue;
-        };
-        let replies = deliver(node, &sender, message);
-        queue(&mut in_flight, &to, &replies, everyone);
-    }
 }

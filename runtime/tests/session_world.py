@@ -71,6 +71,15 @@ class World:
             await asyncio.gather(worker, return_exceptions=True)
 
 
+async def until(condition, what="the condition", limit=WAIT):
+    """Waits for `condition()` to be true, polling, and fails once `limit` has passed."""
+    deadline = asyncio.get_running_loop().time() + limit
+    while not condition():
+        if asyncio.get_running_loop().time() > deadline:
+            raise TimeoutError(f"{what} never became true")
+        await asyncio.sleep(0.001)
+
+
 def run(coroutine):
     return asyncio.run(coroutine)
 

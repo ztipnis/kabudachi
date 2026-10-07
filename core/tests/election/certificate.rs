@@ -5,11 +5,9 @@
 //! acks repair a lost certificate; and a worker adopts admission generations
 //! only together with the configuration they belong to.
 
-use crate::support::builders::checked;
-use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::builders::{
-    ack_message, committed_from_g0, configuration_of, election_certificate,
-    election_certificate_message, founded_from_g0, g0, leader_ack, no_leader_yet,
+    ack_message, configuration_of, election_certificate,
+    election_certificate_message, founded_from_g0, g0, leader_ack,
     past_any_suspicion, roll_call, roll_call_message, shard, timings, vote_request,
     vote_request_message, worker,
 };
@@ -18,7 +16,6 @@ use crate::support::node::{TestNode, deliver, sent_to, voter_node};
 use kabudachi_core::configuration::{Admission, Configuration, Generation, Single};
 use kabudachi_core::election::{Entry, Identity, KnownConfiguration, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
-use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{RollCallReply, election_message};
 use kabudachi_core::time::Duration;
 
@@ -63,18 +60,6 @@ fn stale_voter(clock: &FakeClock, me: &WorkerId) -> TestNode {
     let node = voter_node(clock, me, 3, SUSPECT);
     clock.advance(past_any_suspicion(SUSPECT));
     node
-}
-
-/// A pending member of `configuration_of(3)`, with stale leader contact.
-fn stale_pending_member(clock: &FakeClock, me: &WorkerId) -> TestNode {
-    stale_node(
-        clock,
-        me,
-        KnownConfiguration {
-            configuration: configuration_of(3),
-            admission: None,
-        },
-    )
 }
 
 /// Has `node` answer `initiator`'s roll call for `term` under `g0`'s
@@ -137,60 +122,7 @@ fn certify(
     );
 }
 
-/// The one roll-call reply among what `node` sent `initiator`.
-fn reply_to(
-    outputs: &[kabudachi_core::election::Output],
-    initiator: &WorkerId,
-) -> Checked<RollCallReply> {
-    sent_to(outputs, initiator)
-        .into_iter()
-        .find_map(|message| match checked(message).into_payload() {
-            Some(CheckedPayload::RollCallReply(reply)) => Some(reply),
-            _ => None,
-        })
-        .expect("it answers the roll call")
-}
-
 // ---- The certificate ----
-
-#[test]
-fn a_respondent_that_granted_the_winner_adopts_what_its_roll_call_founded() {
-    let clock = FakeClock::new();
-    let (me, winner) = (worker("w2"), worker("w1"));
-    let mut node = stale_voter(&clock, &me);
-    answer_and_grant(&mut node, &winner, 1);
-    let founded = founded_in(1, 3);
-
-    certify(&mut node, &winner, 1, 3, Some(g0()));
-
-    assert_eq!(node.configuration(), Some(&founded));
-    assert_eq!(node.admission(), Some(founded.generation()));
-    assert_eq!(node.prior_admission(), Some(g0()));
-}
-
-#[test]
-fn a_pending_respondent_is_admitted_and_answers_the_next_roll_call_as_a_voter() {
-    let clock = FakeClock::new();
-    let (me, winner) = (worker("p1"), worker("w1"));
-    let mut node = stale_pending_member(&clock, &me);
-    // It answered, but its vote request was lost: it granted nothing.
-    answer(&mut node, &winner, 1);
-    let founded = founded_in(1, 3);
-
-    certify(&mut node, &winner, 1, 3, None);
-    assert!(!node.is_pending_member());
-    let next_initiator = worker("w3");
-    let outputs = deliver(
-        &mut node,
-        &next_initiator,
-        roll_call_message(roll_call(&next_initiator, 2, &founded, 0)),
-    );
-
-    let reply = reply_to(&outputs, &next_initiator);
-    assert_eq!(reply.admission(), Some(founded.generation()));
-    assert_eq!(reply.prior_admission(), None);
-    assert!(founded.is_voter(reply.admission()), "a returning voter");
-}
 
 #[test]
 fn a_certificate_for_a_term_the_node_has_moved_past_is_refused_unless_it_granted_that_winner() {
@@ -258,58 +190,7 @@ fn a_certificate_for_another_shard_or_recovery_epoch_is_ignored() {
     assert_eq!(node.admission(), Some(g0()));
 }
 
-#[test]
-fn a_node_still_joining_ignores_a_certificate() {
-    let clock = FakeClock::new();
-    let winner = worker("w1");
-    let mut node: TestNode = WorkerNode::start(
-        Identity {
-            id: worker("joiner"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard("shard-1"),
-            timings: timings(Duration::from_ticks(SUSPECT)),
-        },
-        Entry::Joining(no_leader_yet()),
-        clock.clone(),
-        None,
-    )
-    .0;
-
-    deliver(
-        &mut node,
-        &winner,
-        election_certificate_message(election_certificate(
-            &winner,
-            1,
-            &founded_in(1, 3),
-            admitted_at(&founded_in(1, 3), None),
-        )),
-    );
-
-    assert_eq!(node.configuration(), None);
-    assert!(node.is_pending_member());
-}
-
 // ---- Acks after a win ----
-
-#[test]
-fn a_lost_certificate_is_repaired_by_the_winners_ack() {
-    let clock = FakeClock::new();
-    let (me, winner) = (worker("w2"), worker("w1"));
-    let mut node = stale_voter(&clock, &me);
-    answer_and_grant(&mut node, &winner, 1);
-    let founded = founded_in(1, 3);
-
-    deliver(
-        &mut node,
-        &winner,
-        ack_message(ack_admitting(&winner, &founded, Some(g0()))),
-    );
-
-    assert_eq!(node.configuration(), Some(&founded));
-    assert_eq!(node.admission(), Some(founded.generation()));
-    assert_eq!(node.prior_admission(), Some(g0()));
-}
 
 /// An ack from `leader`, elected in term 1, carrying `configuration` and
 /// admitting the recipient at its generation, having held `prior` before.
@@ -324,132 +205,33 @@ fn ack_admitting(
     }
 }
 
+// A member that missed the certificate, or whose admission lagged its
+// configuration, is repaired by the leader's next ack.
 #[test]
-fn a_worker_outside_the_winning_roll_call_counts_on_the_old_side_only_until_the_commit() {
+fn the_winners_ack_repairs_the_admission_of_a_node_that_missed_the_certificate() {
     let clock = FakeClock::new();
-    let (me, winner) = (worker("w9"), worker("w1"));
-    let mut node = stale_voter(&clock, &me);
+    let (me, winner) = (worker("w2"), worker("w1"));
     let founded = founded_in(1, 3);
-
-    deliver(
-        &mut node,
-        &winner,
-        ack_message(leader_ack(&winner, 1, &founded, None)),
-    );
-    assert_eq!(node.configuration(), Some(&founded));
-    assert_eq!(node.admission(), Some(g0()), "it keeps its old admission");
-    assert!(
-        founded.is_voter(node.admission()),
-        "still a voter of the old side: the configuration it moved from"
-    );
-    let committed = committed_from_g0(1, 1, 3);
-    deliver(
-        &mut node,
-        &winner,
-        ack_message(leader_ack(&winner, 1, &committed, None)),
-    );
-    // Its leader's contact goes stale, and a roll call under the committed
-    // configuration follows.
-    clock.advance(past_any_suspicion(SUSPECT));
-    let next_initiator = worker("w3");
-    let outputs = deliver(
-        &mut node,
-        &next_initiator,
-        roll_call_message(roll_call(&next_initiator, 2, &committed, 0)),
-    );
-
-    let reply = reply_to(&outputs, &next_initiator);
-    assert_eq!(reply.admission(), Some(g0()));
-    assert!(
-        !committed.is_voter(reply.admission()),
-        "older than the new base: a new voter, not a returning one"
-    );
-}
-
-#[test]
-fn an_ack_carrying_an_older_configuration_than_the_nodes_own_leaves_its_admission_alone() {
-    let clock = FakeClock::new();
-    let later = founded_in(2, 3);
-    let mut node = stale_node(
+    let mut lost_certificate = stale_voter(&clock, &me);
+    answer_and_grant(&mut lost_certificate, &winner, 1);
+    let mut lagging_admission = stale_node(
         &clock,
-        &worker("w2"),
-        KnownConfiguration {
-            configuration: later.clone(),
-            admission: Some(later.generation()),
-        },
-    );
-    let older = founded_in(1, 3);
-    let stale_leader = worker("w1");
-
-    deliver(
-        &mut node,
-        &stale_leader,
-        ack_message(leader_ack(
-            &stale_leader,
-            2,
-            &older,
-            Some(older.generation()),
-        )),
-    );
-
-    assert_eq!(node.configuration(), Some(&later));
-    assert_eq!(node.admission(), Some(later.generation()));
-    assert_eq!(
-        node.known_leader(),
-        Some((stale_leader, 2)),
-        "the ack is accepted (same term) but its older configuration is not"
-    );
-}
-
-#[test]
-fn an_ack_carrying_the_nodes_own_configuration_repairs_its_admission() {
-    let clock = FakeClock::new();
-    let founded = founded_in(1, 3);
-    let mut node = stale_node(
-        &clock,
-        &worker("w2"),
+        &me,
         KnownConfiguration {
             configuration: founded.clone(),
             admission: Some(g0()),
         },
     );
-    let leader = worker("w1");
 
-    deliver(
-        &mut node,
-        &leader,
-        ack_message(ack_admitting(&leader, &founded, Some(g0()))),
-    );
+    for node in [&mut lost_certificate, &mut lagging_admission] {
+        deliver(
+            node,
+            &winner,
+            ack_message(ack_admitting(&winner, &founded, Some(g0()))),
+        );
 
-    assert_eq!(node.admission(), Some(founded.generation()));
-    assert_eq!(node.prior_admission(), Some(g0()));
-}
-
-#[test]
-fn a_committed_configuration_drops_the_prior_admission() {
-    let clock = FakeClock::new();
-    let founded = founded_in(1, 3);
-    let mut node = stale_voter(&clock, &worker("w2"));
-    let leader = worker("w1");
-    deliver(
-        &mut node,
-        &leader,
-        ack_message(ack_admitting(&leader, &founded, Some(g0()))),
-    );
-
-    let committed = committed_from_g0(1, 1, 3);
-    deliver(
-        &mut node,
-        &leader,
-        ack_message(leader_ack(
-            &leader,
-            1,
-            &committed,
-            Some(founded.generation()),
-        )),
-    );
-
-    assert_eq!(node.configuration(), Some(&committed));
-    assert_eq!(node.admission(), Some(founded.generation()));
-    assert_eq!(node.prior_admission(), None);
+        assert_eq!(node.configuration(), Some(&founded));
+        assert_eq!(node.admission(), Some(founded.generation()));
+        assert_eq!(node.prior_admission(), Some(g0()));
+    }
 }

@@ -1,13 +1,18 @@
 //! A worker's record store over the network: what a peer acknowledges it
-//! has stored, and it refuses older, conflicting and other shards' records.
+//! has stored, and it refuses older, conflicting, malformed and other shards'
+//! records.
 
 use std::time::Duration;
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::task_record::{RecordVersion, Write};
+use kabudachi_core::task_record::{MAX_RECORD_BYTES, RecordVersion, Write};
 use kabudachi_net::messenger::{Net, PlacedWrite};
+use kabudachi_net::task_store::{HeldRecords, TaskRecordStore, record_key};
+use libp2p::kad::store::RecordStore;
+use libp2p::kad::{Record, RecordKey};
+use prost::Message as _;
 use tokio::time::timeout;
 
 use crate::support::net::connect_to;
@@ -137,24 +142,21 @@ async fn a_holder_acknowledges_only_records_it_stored() {
     assert_eq!(holder.held_records().get(&TaskId::new("task-1")), Some(held));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_record_never_lands_in_another_shard() {
-    let (writer, stranger) = two_connected(shard("shard-1"), shard("shard-2")).await;
+/// What `reader` finds when it looks `task` up among its peers and itself.
+async fn lookup(reader: &Net, task: &str) -> Option<TaskRecord> {
+    timeout(TEST_TIMEOUT, reader.get_record(TaskId::new(task)))
+        .await
+        .expect("the lookup ended within the timeout")
+}
 
-    let stored = write_one(
-        &writer,
-        record("task-1", version(0, 0, 1, 0), "q"),
-        &[&stranger.local_worker_id()],
-        1,
-    )
-    .await;
-
-    assert!(!stored);
-    assert_eq!(stranger.held_records().get(&TaskId::new("task-1")), None);
+fn queue_of(found: Option<TaskRecord>) -> Option<String> {
+    found.and_then(|record| record.task).map(|task| task.queue)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lookup_returns_the_newest_revision_any_holder_has() {
+async fn a_lookup_finds_the_newest_revision_among_the_peers_and_the_reader_itself() {
+    // The newest revision any peer holds, though one holds only an old one,
+    // and nothing at all for a task no one holds.
     let [reader, stale, fresh] = three_connected(shard("shard-1")).await;
     let (stale_id, fresh_id) = (stale.local_worker_id(), fresh.local_worker_id());
     assert!(
@@ -162,42 +164,23 @@ async fn a_lookup_returns_the_newest_revision_any_holder_has() {
             .await
     );
     assert!(write_one(&reader, record("task-1", version(0, 0, 2, 0), "new"), &[&fresh_id], 1).await);
+    assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("new"));
+    assert_eq!(lookup(&reader, "task-2").await, None, "no one holds task-2");
 
-    let found = timeout(TEST_TIMEOUT, reader.get_record(TaskId::new("task-1")))
-        .await
-        .expect("the lookup ended within the timeout")
-        .expect("two peers hold it");
-
-    assert_eq!(found.task.unwrap().queue, "new");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lookup_counts_the_readers_own_copy() {
+    // The reader's own copy counts: a newer revision only it holds.
     let (reader, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;
     let holders = [&reader.local_worker_id(), &holder.local_worker_id()];
     assert!(write_one(&reader, record("task-1", version(0, 0, 1, 0), "mine"), &holders, 2).await);
-    // A newer revision only the reader holds: no peer has it.
     assert!(
-        write_one(&reader, record("task-1", version(0, 0, 1, 1), "newer"), &[&holders[0]], 1).await
+        write_one(&reader, record("task-1", version(0, 0, 1, 1), "newer"), &[holders[0]], 1).await
     );
+    assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("newer"));
 
-    let found = timeout(TEST_TIMEOUT, reader.get_record(TaskId::new("task-1")))
-        .await
-        .expect("the lookup ended within the timeout")
-        .expect("the reader holds it");
-
-    assert_eq!(found.task.unwrap().queue, "newer");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lookup_of_a_record_no_one_holds_finds_nothing() {
-    let [reader, _, _] = three_connected(shard("shard-1")).await;
-
-    let found = timeout(TEST_TIMEOUT, reader.get_record(TaskId::new("task-1")))
-        .await
-        .expect("the lookup ended within the timeout");
-
-    assert_eq!(found, None);
+    // Holders that dialed the reader are found too, though it never dialed them.
+    let [reader, writer, first, second] = reader_dialed_by_holders(shard("shard-1")).await;
+    let holders = [&first.local_worker_id(), &second.local_worker_id()];
+    assert!(write_one(&writer, record("task-1", version(0, 0, 1, 0), "held"), &holders, 2).await);
+    assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("held"));
 }
 
 /// A reader of `shard` that only its two holders dialed (it never dialed
@@ -217,20 +200,6 @@ async fn reader_dialed_by_holders(shard: ShardId) -> [Net; 4] {
     [reader, writer, first, second]
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lookup_finds_records_of_holders_that_dialed_the_reader() {
-    let [reader, writer, first, second] = reader_dialed_by_holders(shard("shard-1")).await;
-    let holders = [&first.local_worker_id(), &second.local_worker_id()];
-    assert!(write_one(&writer, record("task-1", version(0, 0, 1, 0), "held"), &holders, 2).await);
-
-    let found = timeout(TEST_TIMEOUT, reader.get_record(TaskId::new("task-1")))
-        .await
-        .expect("the lookup ended within the timeout")
-        .expect("both holders hold it");
-
-    assert_eq!(found.task.unwrap().queue, "held");
-}
-
 /// Polls `condition` until it holds, panicking at the timeout.
 async fn eventually(what: &str, mut condition: impl AsyncFnMut() -> bool) {
     timeout(TEST_TIMEOUT, async {
@@ -243,7 +212,7 @@ async fn eventually(what: &str, mut condition: impl AsyncFnMut() -> bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_peer_of_another_shard_is_never_added_to_the_records_kad() {
+async fn a_record_never_lands_in_another_shard_and_its_peer_is_never_a_routing_candidate() {
     let host = Net::for_shard(shard("shard-1"), None);
     let same_shard = Net::for_shard(shard("shard-1"), None);
     let other_shard = Net::for_shard(shard("shard-2"), None);
@@ -254,6 +223,11 @@ async fn a_peer_of_another_shard_is_never_added_to_the_records_kad() {
         connect_to(&host, &address, dialer).await;
     }
     let (same_id, other_id) = (same_shard.local_worker_id(), other_shard.local_worker_id());
+
+    let stored = write_one(&host, record("task-1", version(0, 0, 1, 0), "q"), &[&other_id], 1).await;
+
+    assert!(!stored);
+    assert_eq!(other_shard.held_records().get(&TaskId::new("task-1")), None);
 
     // Both were identified by the host, which only an Identify gives it an
     // address for: the dialers connected inbound.
@@ -266,4 +240,40 @@ async fn a_peer_of_another_shard_is_never_added_to_the_records_kad() {
     let routed = host.records_routing_peers().await;
     assert!(routed.contains(&same_id), "a peer of the same shard is a routing candidate");
     assert!(!routed.contains(&other_id), "a peer of another shard is not");
+}
+
+// A store is what kad hands every record it is asked to keep, whatever a
+// peer sent: it keeps only a decodable record, of the key it is stored
+// under, with a version, no larger than the largest record.
+#[test]
+fn the_store_keeps_only_what_is_a_well_formed_record_of_its_own_key() {
+    let held = HeldRecords::new(None);
+    let mut store = TaskRecordStore::new(held.clone());
+    let task = TaskId::new("task-1");
+    let put = |store: &mut TaskRecordStore, key: RecordKey, value: Vec<u8>| {
+        store.put(Record::new(key, value)).is_ok()
+    };
+    let stored = record("task-1", version(0, 0, 1, 1), "q");
+
+    assert!(!put(&mut store, record_key(&task), b"not a record".to_vec()), "undecodable");
+    assert!(
+        !put(&mut store, RecordKey::new(&"other"), stored.encode_to_vec()),
+        "a record stored under another task's key"
+    );
+    assert!(
+        !put(&mut store, record_key(&task), vec![0; MAX_RECORD_BYTES as usize + 1]),
+        "a value past the largest record"
+    );
+    let mut unversioned = stored.clone();
+    unversioned.version = None;
+    assert!(
+        !put(&mut store, record_key(&task), unversioned.encode_to_vec()),
+        "a record with no version"
+    );
+    assert!(held.task_ids().is_empty());
+
+    assert!(put(&mut store, record_key(&task), stored.encode_to_vec()));
+    assert_eq!(held.task_ids(), vec![task.clone()]);
+    let served = store.get(&record_key(&task)).expect("the record is served");
+    assert_eq!(TaskRecord::decode(&served.value[..]).unwrap(), stored);
 }

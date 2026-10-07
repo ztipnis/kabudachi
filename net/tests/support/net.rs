@@ -8,6 +8,8 @@
 //! anything ([`wait_until_registered`], [`connect_full_mesh`]), so each node
 //! is still told of its connections.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use kabudachi_core::election::{Input, JoinFloor};
@@ -19,6 +21,7 @@ use kabudachi_core::time::Clock;
 use kabudachi_net::join::{LeaderSearch, ask_for_leader};
 use kabudachi_net::messenger::{Diagnostics, Net};
 use libp2p::Multiaddr;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 /// How long each helper waits for the connection state it waits for.
@@ -50,8 +53,7 @@ pub async fn take_inputs_until(net: &Net, expected: &[Input]) -> StdInstant {
 /// waits until `net_b` reports the connection. `net_a`'s own
 /// `PeerConnected` stays queued for its node. `net_a` reports the connection
 /// no later than it receives anything `net_b` sends over it, so once a
-/// request from `net_b` has been answered, `net_a` holds the connection too
-/// (a `Net::disconnect` is a silent no-op on a side that does not).
+/// request from `net_b` has been answered, `net_a` holds the connection too.
 pub async fn connect_to(net_a: &Net, listen_addr: &Multiaddr, net_b: &Net) {
     net_b.dial(listen_addr.clone());
     take_inputs_until(net_b, &[Input::PeerConnected(net_a.local_worker_id())]).await;
@@ -160,4 +162,75 @@ pub async fn connect_full_mesh(nets: &[&Net]) -> Vec<WorkerId> {
 /// driver writes (see `run_driver`).
 pub fn driven_scheduler<C: Clock>(clock: C) -> Scheduler<C, Uuid7Ids, RecordOutbox> {
     Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default())
+}
+
+/// A `Net` listening on a loopback port, and that address.
+pub async fn listening_net() -> (Net, Multiaddr) {
+    let net = Net::new();
+    let address = timeout(
+        WAIT_TIMEOUT,
+        net.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()),
+    )
+    .await
+    .expect("the net produced a listen address within the timeout");
+    (net, address)
+}
+
+/// Answers every join request a `Net` receives with what a test last set,
+/// as `run_driver`'s join responder does in production, but without a node
+/// behind it: `None` leaves the request unanswered, which the asker hears at
+/// once as no answer. Stops when dropped.
+pub struct JoinResponder {
+    answer: Arc<Mutex<Option<JoinResponse>>>,
+    answered: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl JoinResponder {
+    pub fn start(net: Arc<Net>, answer: Option<JoinResponse>) -> Self {
+        let answer = Arc::new(Mutex::new(answer));
+        let current = Arc::clone(&answer);
+        let answered = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&answered);
+        let task = tokio::spawn(async move {
+            loop {
+                for handle in net.poll_join_requests() {
+                    let answer = current.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                    if let Some(answer) = answer {
+                        net.respond_join(handle, answer);
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        });
+        JoinResponder { answer, answered, task }
+    }
+
+    /// How many requests it has answered.
+    pub fn answered(&self) -> usize {
+        self.answered.load(Ordering::SeqCst)
+    }
+
+    /// What the responder answers from now on.
+    pub fn set(&self, answer: Option<JoinResponse>) {
+        *self.answer.lock().unwrap_or_else(PoisonError::into_inner) = answer;
+    }
+}
+
+impl Drop for JoinResponder {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A pointer at `leader`, reachable at `at`, of epoch 0 and term 1.
+pub fn pointer_to(leader: &WorkerId, at: &Multiaddr) -> JoinResponse {
+    JoinResponse {
+        leader_id: Some(leader.clone().into()),
+        leader_multiaddr: at.to_string(),
+        term: 1,
+        recovery_epoch: 0,
+        recovery_epoch_lineage: 0,
+    }
 }

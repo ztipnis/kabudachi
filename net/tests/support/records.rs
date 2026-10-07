@@ -57,7 +57,8 @@ pub struct Voters {
     pub schedulers: Vec<Scheduled>,
     pub clock: RealClock,
     ids: Vec<WorkerId>,
-    hosts: Vec<Hosting>,
+    /// Keeps each net's hosting thread running for as long as the voters live.
+    _hosts: Vec<Hosting>,
     states: Vec<watch::Receiver<WorkerState>>,
     senders: Vec<watch::Sender<WorkerState>>,
     killed: Vec<bool>,
@@ -120,7 +121,7 @@ impl Voters {
                 schedulers,
                 clock,
                 ids,
-                hosts,
+                _hosts: hosts,
                 states,
                 senders,
                 killed,
@@ -177,22 +178,6 @@ impl Voters {
         })
         .await
         .expect("the leader's roster held the joiner within the timeout");
-    }
-
-    /// Freezes `voter`'s network: its connections stay open, but it answers
-    /// nothing, stores nothing and sends nothing, as a host that has
-    /// stopped without its sockets closing would. Returns once it is frozen.
-    pub fn freeze(&self, voter: usize) {
-        let host = &self.hosts[voter];
-        host.frozen.store(true, Ordering::SeqCst);
-        let frozen_by = std::time::Instant::now() + TEST_TIMEOUT;
-        while !host.parked.load(Ordering::SeqCst) {
-            assert!(
-                std::time::Instant::now() < frozen_by,
-                "the hosting thread froze within the timeout"
-            );
-            std::thread::sleep(StdDuration::from_millis(1));
-        }
     }
 
     /// Drives the voters until one leads with a lease its scheduler holds
@@ -282,14 +267,10 @@ fn heartbeat_from(worker: &WorkerId) -> ElectionMessage {
     }
 }
 
-/// Runs a `Net`'s swarm on a runtime of its own, so a test can freeze it.
+/// Runs a `Net`'s swarm on a runtime of its own.
 fn host(shard: ShardId) -> (Net, Hosting) {
     let hosting = Hosting::default();
-    let (frozen, parked, stopped) = (
-        hosting.frozen.clone(),
-        hosting.parked.clone(),
-        hosting.stopped.clone(),
-    );
+    let stopped = hosting.stopped.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -300,15 +281,9 @@ fn host(shard: ShardId) -> (Net, Hosting) {
             sender
                 .send(Net::for_shard(shard, None))
                 .expect("the fixture is waiting for the net");
-            // The swarm's task runs whenever this yields. Blocking the
-            // thread instead stops it with its sockets still open.
+            // The swarm's task runs whenever this yields.
             while !stopped.load(Ordering::SeqCst) {
-                if frozen.load(Ordering::SeqCst) {
-                    parked.store(true, Ordering::SeqCst);
-                    std::thread::sleep(StdDuration::from_millis(5));
-                } else {
-                    tokio::time::sleep(StdDuration::from_millis(5)).await;
-                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
             }
         });
     });
@@ -316,13 +291,9 @@ fn host(shard: ShardId) -> (Net, Hosting) {
     (net, hosting)
 }
 
-/// The runtime a `Net` is hosted on: freezes it on request, and ends it when
-/// dropped.
+/// The runtime a `Net` is hosted on, ended when dropped.
 #[derive(Default)]
 struct Hosting {
-    frozen: Arc<AtomicBool>,
-    /// Set by the hosting thread once it has stopped running the swarm.
-    parked: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
 }
 
@@ -404,9 +375,8 @@ async fn submitted_as(worker: &Net, leader: &WorkerId, submitted: Submitted) -> 
     }
 }
 
-/// Has `worker` claim `task` from `leader` and report the run started, and
-/// returns the run.
-pub async fn claimed_and_started(worker: &Net, leader: &WorkerId, task: &TaskId) -> TaskRunId {
+/// Has `worker` claim `task` from `leader`, and returns the run.
+pub async fn claimed(worker: &Net, leader: &WorkerId, task: &TaskId) -> TaskRunId {
     let claimed = worker
         .request_claim(leader.clone(), task.clone())
         .await
@@ -414,7 +384,13 @@ pub async fn claimed_and_started(worker: &Net, leader: &WorkerId, task: &TaskId)
     let Some(claim_response::Result::Accept(claim)) = claimed.result else {
         panic!("expected an accepted claim, got {claimed:?}");
     };
-    let run: TaskRunId = claim.task_run_id.expect("a claim names its run").into();
+    claim.task_run_id.expect("a claim names its run").into()
+}
+
+/// Has `worker` claim `task` from `leader` and report the run started, and
+/// returns the run.
+pub async fn claimed_and_started(worker: &Net, leader: &WorkerId, task: &TaskId) -> TaskRunId {
+    let run = claimed(worker, leader, task).await;
     let started = worker
         .report_started(leader.clone(), run.clone())
         .await

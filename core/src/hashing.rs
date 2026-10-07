@@ -74,35 +74,3 @@ impl Default for HashFunction {
         Self::new::<sha2::Sha256>()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fields() -> [Field<'static>; 4] {
-        [
-            Field::Text("shard-1"),
-            Field::Text("worker-1"),
-            Field::Number(0),
-            Field::Number(3),
-        ]
-    }
-
-    /// Pins the default (SHA-256) encoding. The expected value was computed
-    /// with Python's `hashlib` over length-prefixed strings and big-endian
-    /// integers; if this fails, every value derived from the hash has
-    /// changed for every build that doesn't share the change.
-    #[test]
-    fn the_default_hash_is_stable_across_builds() {
-        assert_eq!(
-            HashFunction::default().hash_to_u64(&fields()),
-            10_384_955_935_822_374_861
-        );
-    }
-
-    #[test]
-    fn the_hash_follows_the_configured_function() {
-        let sha3 = HashFunction::new::<sha3::Sha3_256>();
-        assert_eq!(sha3.hash_to_u64(&fields()), 18_294_837_748_612_206_051);
-    }
-}

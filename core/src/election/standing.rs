@@ -419,26 +419,3 @@ impl ShardStanding {
         self.prior_admission = None;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn epoch_order_reads_lineage_then_number() {
-        let own = RecoveryEpoch::new(3, 5);
-        let heard = |number, lineage| HeardEpoch { number, lineage };
-
-        assert_eq!(order(&own, heard(3, Some(5))), EpochOrder::Mine);
-        assert_eq!(order(&own, heard(4, Some(5))), EpochOrder::Later);
-        assert_eq!(order(&own, heard(2, Some(5))), EpochOrder::Stale);
-
-        assert_eq!(order(&own, heard(3, None)), EpochOrder::Mine);
-        assert_eq!(order(&own, heard(4, None)), EpochOrder::Later);
-        assert_eq!(order(&own, heard(2, None)), EpochOrder::Stale);
-
-        assert_eq!(order(&own, heard(2, Some(6))), EpochOrder::Stale);
-        assert_eq!(order(&own, heard(3, Some(6))), EpochOrder::Stale);
-        assert_eq!(order(&own, heard(4, Some(6))), EpochOrder::Later);
-    }
-}

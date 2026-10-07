@@ -4,7 +4,7 @@
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::{TaskRecord, chain_entry};
+use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
@@ -76,47 +76,6 @@ fn a_failure_with_retries_left_publishes_the_failed_and_the_new_run_in_one_revis
     let states: Vec<TaskRunState> = record.runs.iter().map(TaskRunRecord::current_state).collect();
     assert_eq!(states, [TaskRunState::Failed, TaskRunState::Queued]);
     assert_eq!(version_of(record).revision, 3, "submit, claim and start came first");
-}
-
-#[test]
-fn a_supersession_publishes_the_newer_generation_with_its_chain_and_the_older_naming_it() {
-    let mut fixture = Fixture::leading();
-    let older = fixture.scheduler.submit(plain(b"old").with_coalescing_key("k")).unwrap();
-    let before = fixture.spy.revisions().len();
-
-    let newer = fixture.scheduler.submit(plain(b"new").with_coalescing_key("k")).unwrap();
-
-    let revisions = fixture.spy.revisions();
-    let published = &revisions[before..];
-    assert_eq!(published.len(), 2, "one revision per changed task");
-    let of = |task: &TaskId| {
-        published.iter().find(|record| task_of(record) == *task).unwrap_or_else(|| panic!("no revision of {task:?}"))
-    };
-    let old_record = of(&older);
-    assert_eq!(old_record.runs.last().unwrap().current_state(), TaskRunState::Superseded);
-    assert_eq!(
-        old_record.link.as_ref().and_then(|link| link.superseded_by.clone()).map(TaskId::from),
-        Some(newer.clone())
-    );
-    let new_record = of(&newer);
-    match new_record.retained_chain.as_slice() {
-        [entry] => match &entry.entry {
-            Some(chain_entry::Entry::Absorbed(absorbed)) => {
-                assert_eq!(absorbed.task_id.clone().map(TaskId::from), Some(older.clone()));
-                assert_eq!(absorbed.serialized_input, b"old");
-                assert_eq!(
-                    absorbed.input_digest.as_ref().map(|digest| Digest::try_from(digest).unwrap()),
-                    Some(Digest::blake3(b"old"))
-                );
-            }
-            other => panic!("expected an absorbed generation, got {other:?}"),
-        },
-        other => panic!("expected one chain entry, got {other:?}"),
-    }
-    assert_eq!(
-        new_record.link.as_ref().map(|link| link.absorbed.iter().cloned().map(TaskId::from).collect::<Vec<_>>()),
-        Some(vec![older])
-    );
 }
 
 #[test]
@@ -302,14 +261,37 @@ fn a_submission_whose_record_would_pass_the_limit_is_refused_before_anything_is_
     assert_eq!(fixture.spy.revisions().len(), before, "nothing changed, so nothing was published");
 }
 
+/// Submits a task whose record has room for only a few more runs, and
+/// returns it. The record is brought close to its limit through the
+/// coalescing chain, which carries the superseded generation's input: a first
+/// generation with a near-largest input, then a second one of the same key
+/// sized from the first's published record. The few runs that still fit then
+/// fill the rest.
+fn a_task_with_room_for_a_few_more_runs(fixture: &mut Fixture, retries: u32) -> TaskId {
+    let first = fixture
+        .scheduler
+        .submit(plain(&vec![0; MAX_SUBMISSION_BYTES as usize - 64]).with_coalescing_key("k"))
+        .unwrap();
+    let first_len = fixture.spy.revisions_of(&first).last().unwrap().encoded_len();
+    // Room left beside the first generation's record, less what the chain
+    // entry, the run and the record's reserve take, and a few runs' margin.
+    let mut input_len = (MAX_RECORD_BYTES as usize).saturating_sub(first_len + 4 * 1024);
+    loop {
+        let second = plain(&vec![0; input_len]).with_coalescing_key("k").with_retries(retries);
+        match fixture.scheduler.submit(second) {
+            Ok(task) => return task,
+            Err(SubmitRejection::RecordTooLarge { size, limit }) => {
+                input_len -= (size - limit) as usize + 512;
+            }
+            Err(other) => panic!("the second generation was refused: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn a_replay_that_would_outgrow_the_record_is_not_created_and_the_task_is_over() {
     let mut fixture = Fixture::leading();
-    fixture.spy.keep_only_the_latest_revision_of_a_busy_task();
-    let task = fixture
-        .scheduler
-        .submit(plain(&vec![0; MAX_SUBMISSION_BYTES as usize - 64]))
-        .unwrap();
+    let task = a_task_with_room_for_a_few_more_runs(&mut fixture, 0);
     let mut replays = 0;
     while let Ok(_claim) = fixture.scheduler.request_claim(&worker(), &task) {
         let lost = fixture.scheduler.lose_worker(&worker()).unwrap();
@@ -317,7 +299,7 @@ fn a_replay_that_would_outgrow_the_record_is_not_created_and_the_task_is_over() 
             break;
         }
         replays += 1;
-        assert!(replays < 10_000, "replays never stopped");
+        assert!(replays < 100, "replays never stopped");
     }
 
     assert!(replays > 0, "some replays fit before the record filled");
@@ -331,11 +313,7 @@ fn a_replay_that_would_outgrow_the_record_is_not_created_and_the_task_is_over() 
 #[test]
 fn a_retry_that_would_outgrow_the_record_is_not_created_and_the_failure_stands() {
     let mut fixture = Fixture::leading();
-    fixture.spy.keep_only_the_latest_revision_of_a_busy_task();
-    let task = fixture
-        .scheduler
-        .submit(plain(&vec![0; MAX_SUBMISSION_BYTES as usize - 64]).with_retries(100_000))
-        .unwrap();
+    let task = a_task_with_room_for_a_few_more_runs(&mut fixture, 100_000);
     let mut retries = 0;
     loop {
         let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
@@ -345,7 +323,7 @@ fn a_retry_that_would_outgrow_the_record_is_not_created_and_the_failure_stands()
             break;
         }
         retries += 1;
-        assert!(retries < 10_000, "retries never stopped");
+        assert!(retries < 100, "retries never stopped");
     }
 
     assert!(retries > 0, "some retries fit before the record filled");

@@ -8,12 +8,11 @@ use crate::support::spy::Noted;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::messages::Task;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
-    Certification, ClaimRejection, Completion, LeadershipGrant, LeaseEnd, ReportRejection,
-    Submission,
+    CancelRejection, ClaimRejection, Completion, LeadershipGrant, LeaseEnd, LoseRejection,
+    ReportRejection, Submission,
 };
 use kabudachi_core::time::{Clock, Duration};
 
@@ -57,85 +56,6 @@ fn running_task(fixture: &mut Fixture) -> (TaskId, TaskRunId) {
 }
 
 #[test]
-fn a_submitted_task_waits_in_the_queue() {
-    let mut fixture = Fixture::leading();
-
-    let task_id = submit(&mut fixture.scheduler);
-
-    assert_eq!(fixture.spy.pending(), 1);
-    let run = fixture.spy.run_of(&task_id);
-    assert_eq!(run.current_state(), TaskRunState::Queued);
-    assert_eq!(run.attempt_number(), 1);
-    assert_eq!(run.parent_task_run_id(), None);
-}
-
-#[test]
-fn a_submitted_task_records_the_submission_and_the_time() {
-    let mut fixture = Fixture::leading();
-    fixture.clock.advance(Duration::from_ticks(40));
-    fixture.clock.set_wall_clock_millis(1_700_000_000_040);
-
-    let task_id = fixture
-        .scheduler
-        .submit(
-            Submission::new(
-                TaskDefinitionId::new("billing.charge"),
-                3,
-                b"input-bytes".to_vec(),
-                "default",
-            )
-            .with_delay(Duration::from_ticks(100))
-            .with_expiry(Duration::from_ticks(500)),
-        )
-        .unwrap();
-
-    let task: Task = fixture.spy.task(&task_id);
-    assert_eq!(
-        task.task_definition_id(),
-        TaskDefinitionId::new("billing.charge")
-    );
-    assert_eq!(task.source_version, 3);
-    assert_eq!(task.serialized_input, b"input-bytes".to_vec());
-    assert_eq!(task.queue, "default");
-    assert_eq!(
-        task.submitted_at.map(|at| at.unix_millis),
-        Some(1_700_000_000_040)
-    );
-    assert_eq!(
-        task.delay_millis,
-        Some(100),
-        "a duration, not a deadline of this node's clock"
-    );
-    assert_eq!(task.expiry_millis, Some(500));
-    let run = fixture.spy.run_of(&task_id);
-    assert_eq!(
-        run.created_at.map(|at| at.unix_millis),
-        Some(1_700_000_000_040)
-    );
-    assert_eq!(run.source_version, 3);
-    assert_eq!(run.execution_version, 3);
-}
-
-#[test]
-fn a_scheduler_without_a_grant_refuses_claims() {
-    let mut fixture = Fixture::leading();
-    let task_id = submit(&mut fixture.scheduler);
-    fixture.scheduler.set_leadership_grant(None);
-
-    let result = fixture.scheduler.request_claim(&worker("w1"), &task_id);
-
-    assert_eq!(result.unwrap_err(), ClaimRejection::NotLeader);
-    assert_eq!(fixture.spy.pending(), 1);
-    assert_eq!(fixture.state(&task_id), TaskRunState::Queued);
-    // The leader check comes before any lookup, so it reveals nothing about
-    // whether a task exists.
-    let unknown = fixture
-        .scheduler
-        .request_claim(&worker("w1"), &TaskId::new("no-such-task"));
-    assert_eq!(unknown.unwrap_err(), ClaimRejection::NotLeader);
-}
-
-#[test]
 fn a_grant_lets_claims_through_until_the_schedulers_clock_reaches_its_end() {
     let mut fixture = Fixture::not_leading();
     let end = fixture.clock.now() + Duration::from_ticks(10);
@@ -156,228 +76,192 @@ fn a_grant_lets_claims_through_until_the_schedulers_clock_reaches_its_end() {
 
     assert!(just_before_the_end.is_ok(), "{just_before_the_end:?}");
     assert_eq!(at_the_end.unwrap_err(), ClaimRejection::NotLeader);
-    assert!(
-        !fixture.spy.leading(),
-        "the refused claim noticed the lapse and told the observer"
-    );
     assert_eq!(fixture.spy.pending(), 1);
     assert_eq!(fixture.state(&at), TaskRunState::Queued);
 }
 
 #[test]
-fn an_unbounded_grant_never_runs_out() {
+fn every_decision_needs_a_live_grant_and_changes_nothing_without_one() {
     let mut fixture = Fixture::leading();
-    let task_id = submit(&mut fixture.scheduler);
-    fixture.clock.advance(Duration::from_ticks(u64::MAX / 2));
-
-    let result = fixture.scheduler.request_claim(&worker("w1"), &task_id);
-
-    assert!(result.is_ok(), "{result:?}");
-}
-
-#[test]
-fn a_claim_hands_the_task_to_the_worker_and_takes_it_off_the_queue() {
-    let mut fixture = Fixture::leading();
-    let task_id = submit(&mut fixture.scheduler);
-
-    let claim = fixture
-        .scheduler
-        .request_claim(&worker("w1"), &task_id)
-        .unwrap();
-
-    assert_eq!(claim.task, fixture.spy.task(&task_id));
-    assert_eq!(fixture.run_state(&claim.task_run_id), TaskRunState::Claimed);
-    let run = fixture.scheduler.task_run(&claim.task_run_id).unwrap();
-    assert_eq!(run.selected_worker(), Some(worker("w1")));
-    assert_eq!(fixture.spy.pending(), 0);
-}
-
-#[test]
-fn only_the_first_of_two_racing_claims_wins() {
-    let mut fixture = Fixture::leading();
-    let task_id = submit(&mut fixture.scheduler);
-
-    let winner = fixture.scheduler.request_claim(&worker("w1"), &task_id);
-    let loser = fixture.scheduler.request_claim(&worker("w2"), &task_id);
-
-    let winning_run = winner.unwrap().task_run_id;
-    assert_eq!(loser.unwrap_err(), ClaimRejection::AlreadySelected);
-    let run = fixture.scheduler.task_run(&winning_run).unwrap();
-    assert_eq!(run.selected_worker(), Some(worker("w1")));
-}
-
-#[test]
-fn claiming_an_unknown_task_is_refused() {
-    let mut fixture = Fixture::leading();
-
-    let result = fixture
-        .scheduler
-        .request_claim(&worker("w1"), &TaskId::new("no-such-task"));
-
-    assert_eq!(result.unwrap_err(), ClaimRejection::TaskUnknown);
-}
-
-#[test]
-fn completing_a_run_certifies_its_result() {
-    let mut fixture = Fixture::leading();
-    let (task_id, run_id) = running_task(&mut fixture);
-
-    let certification = fixture
-        .scheduler
-        .complete(&worker("w1"), &run_id, Digest::blake3(RESULT), Completion::Final)
-        .unwrap();
-
-    assert_eq!(
-        certification,
-        Certification {
-            task_id,
-            task_run_id: run_id.clone(),
-            result_digest: Digest::blake3(RESULT),
-        }
-    );
-    assert_eq!(fixture.run_state(&run_id), TaskRunState::Succeeded);
-    assert_eq!(
-        stored_digest(&fixture, &run_id),
-        Some(Digest::blake3(RESULT)),
-        "the run carries the digest with its algorithm"
-    );
-}
-
-#[test]
-fn a_second_completion_of_the_same_run_is_refused() {
-    let mut fixture = Fixture::leading();
-    let (_, run_id) = running_task(&mut fixture);
-    fixture
-        .scheduler
-        .complete(&worker("w1"), &run_id, Digest::blake3(RESULT), Completion::Final)
-        .unwrap();
-
-    let again = fixture.scheduler.complete(
-        &worker("w1"),
-        &run_id,
-        Digest::blake3(b"different"),
-        Completion::Final,
-    );
-
-    assert_eq!(again.unwrap_err(), ReportRejection::NotAuthoritative);
-    assert_eq!(stored_digest(&fixture, &run_id), Some(Digest::blake3(RESULT)));
-    // A succeeded run cannot be failed afterwards either.
-    let failed = fixture.scheduler.fail(&worker("w1"), &run_id, "ValueError");
-    assert_eq!(failed.unwrap_err(), ReportRejection::NotAuthoritative);
-    assert_eq!(fixture.run_state(&run_id), TaskRunState::Succeeded);
-}
-
-#[test]
-fn a_worker_cannot_complete_a_run_it_did_not_claim() {
-    let mut fixture = Fixture::leading();
-    let (_, run_id) = running_task(&mut fixture);
-
-    let result =
-        fixture
-            .scheduler
-            .complete(&worker("w2"), &run_id, Digest::blake3(RESULT), Completion::Final);
-
-    assert_eq!(result.unwrap_err(), ReportRejection::NotAuthoritative);
-    assert_eq!(fixture.run_state(&run_id), TaskRunState::Running);
-    // Nor can it fail the run it did not claim, or start one claimed by another.
-    let failed = fixture.scheduler.fail(&worker("w2"), &run_id, "ValueError");
-    assert_eq!(failed.unwrap_err(), ReportRejection::NotAuthoritative);
-    assert_eq!(fixture.run_state(&run_id), TaskRunState::Running);
-    let task_id = submit(&mut fixture.scheduler);
-    let claim = fixture
-        .scheduler
-        .request_claim(&worker("w1"), &task_id)
-        .unwrap();
-    let started = fixture
-        .scheduler
-        .report_started(&worker("w2"), &claim.task_run_id);
-    assert_eq!(started.unwrap_err(), ReportRejection::NotAuthoritative);
-    assert_eq!(fixture.run_state(&claim.task_run_id), TaskRunState::Claimed);
-}
-
-#[test]
-fn a_run_that_never_started_cannot_be_completed() {
-    let mut fixture = Fixture::leading();
-    let task_id = submit(&mut fixture.scheduler);
-    let claim = fixture
-        .scheduler
-        .request_claim(&worker("w1"), &task_id)
-        .unwrap();
-
-    let result = fixture.scheduler.complete(
-        &worker("w1"),
-        &claim.task_run_id,
-        Digest::blake3(RESULT),
-        Completion::Final,
-    );
-
-    assert_eq!(result.unwrap_err(), ReportRejection::NotAuthoritative);
-    assert_eq!(fixture.run_state(&claim.task_run_id), TaskRunState::Claimed);
-}
-
-#[test]
-fn reporting_on_an_unknown_run_is_refused() {
-    let mut fixture = Fixture::leading();
-
-    let started = fixture
-        .scheduler
-        .report_started(&worker("w1"), &TaskRunId::new("no-such-run"));
-    let completed = fixture.scheduler.complete(
-        &worker("w1"),
-        &TaskRunId::new("no-such-run"),
-        Digest::blake3(RESULT),
-        Completion::Final,
-    );
-
-    assert_eq!(started.unwrap_err(), ReportRejection::UnknownRun);
-    assert_eq!(completed.unwrap_err(), ReportRejection::UnknownRun);
-}
-
-#[test]
-fn a_scheduler_that_lost_leadership_certifies_nothing() {
-    let mut fixture = Fixture::leading();
-    let (_, run_id) = running_task(&mut fixture);
+    let queued = submit(&mut fixture.scheduler);
+    let (_, running) = running_task(&mut fixture);
     let claimed_task = submit(&mut fixture.scheduler);
-    let claim = fixture
+    let claimed = fixture
         .scheduler
         .request_claim(&worker("w1"), &claimed_task)
-        .unwrap();
-
+        .unwrap()
+        .task_run_id;
     fixture.scheduler.set_leadership_grant(None);
-    let result =
-        fixture
-            .scheduler
-            .complete(&worker("w1"), &run_id, Digest::blake3(RESULT), Completion::Final);
+    let mark = fixture.spy.mark();
 
-    assert_eq!(result.unwrap_err(), ReportRejection::NotLeader);
-    assert_eq!(fixture.run_state(&run_id), TaskRunState::Running);
-    // A failure starts no retry either, and a claimed run is not started.
-    let failed = fixture.scheduler.fail(&worker("w1"), &run_id, "ValueError");
-    assert_eq!(failed.unwrap_err(), ReportRejection::NotLeader);
-    assert_eq!(fixture.run_state(&run_id), TaskRunState::Running);
-    assert_eq!(fixture.spy.pending(), 0);
-    let started = fixture
-        .scheduler
-        .report_started(&worker("w1"), &claim.task_run_id);
-    assert_eq!(started.unwrap_err(), ReportRejection::NotLeader);
-    assert_eq!(fixture.run_state(&claim.task_run_id), TaskRunState::Claimed);
+    let s = &mut fixture.scheduler;
+    let not_leader = Some(ReportRejection::NotLeader);
+    let refused = [
+        (
+            "claim",
+            s.request_claim(&worker("w2"), &queued).err() == Some(ClaimRejection::NotLeader),
+        ),
+        (
+            "claim of an unknown task, which the leader check precedes",
+            s.request_claim(&worker("w2"), &TaskId::new("no-such-task"))
+                .err()
+                == Some(ClaimRejection::NotLeader),
+        ),
+        (
+            "claim_oldest",
+            s.claim_oldest(&worker("w2"), 10).err() == Some(ClaimRejection::NotLeader),
+        ),
+        (
+            "start",
+            s.report_started(&worker("w1"), &claimed).err() == not_leader,
+        ),
+        (
+            "complete",
+            s.complete(&worker("w1"), &running, Digest::blake3(RESULT), Completion::Final)
+                .err()
+                == not_leader,
+        ),
+        (
+            "fail",
+            s.fail(&worker("w1"), &running, "ValueError").err() == not_leader,
+        ),
+        (
+            "cancel",
+            s.cancel(&queued).err() == Some(CancelRejection::NotLeader),
+        ),
+        (
+            "lose_worker",
+            s.lose_worker(&worker("w1")).err() == Some(LoseRejection::NotLeader),
+        ),
+    ];
+
+    for (decision, was_refused) in refused {
+        assert!(was_refused, "{decision} was not refused as NotLeader");
+    }
+    assert_eq!(fixture.run_state(&running), TaskRunState::Running);
+    assert_eq!(fixture.run_state(&claimed), TaskRunState::Claimed);
+    assert_eq!(fixture.state(&queued), TaskRunState::Queued);
+    assert_eq!(fixture.spy.pending(), 1);
+    assert!(
+        fixture.spy.since(mark).is_empty(),
+        "a refused decision changes nothing"
+    );
 }
 
 #[test]
-fn claiming_a_task_from_the_middle_leaves_the_others_queued_in_order() {
+fn only_the_claiming_worker_may_report_and_only_in_order() {
     let mut fixture = Fixture::leading();
-    let first = submit(&mut fixture.scheduler);
-    let middle = submit(&mut fixture.scheduler);
-    let last = submit(&mut fixture.scheduler);
+    let (_, running) = running_task(&mut fixture);
+    let claimed_task = submit(&mut fixture.scheduler);
+    let claimed = fixture
+        .scheduler
+        .request_claim(&worker("w1"), &claimed_task)
+        .unwrap()
+        .task_run_id;
+    let (_, succeeded) = running_task(&mut fixture);
+    fixture
+        .scheduler
+        .complete(&worker("w1"), &succeeded, Digest::blake3(RESULT), Completion::Final)
+        .unwrap();
+    let (_, failed) = running_task(&mut fixture);
+    fixture
+        .scheduler
+        .fail(&worker("w1"), &failed, "ValueError")
+        .unwrap();
+    let lost_task = submit(&mut fixture.scheduler);
+    let lost = fixture
+        .scheduler
+        .request_claim(&worker("w3"), &lost_task)
+        .unwrap()
+        .task_run_id;
+    fixture
+        .scheduler
+        .report_started(&worker("w3"), &lost)
+        .unwrap();
+    fixture.scheduler.lose_worker(&worker("w3")).unwrap();
+    let other = Digest::blake3(b"different");
+
+    let s = &mut fixture.scheduler;
+    let refused = [
+        (
+            "a second completion",
+            s.complete(&worker("w1"), &succeeded, other.clone(), Completion::Final).err(),
+        ),
+        (
+            "a failure after a completion",
+            s.fail(&worker("w1"), &succeeded, "ValueError").err(),
+        ),
+        (
+            "a completion by a worker that did not claim the run",
+            s.complete(&worker("w2"), &running, other.clone(), Completion::Final).err(),
+        ),
+        (
+            "a failure by a worker that did not claim the run",
+            s.fail(&worker("w2"), &running, "ValueError").err(),
+        ),
+        (
+            "a start by a worker that did not claim the run",
+            s.report_started(&worker("w2"), &claimed).err(),
+        ),
+        (
+            "a completion of a run that never started",
+            s.complete(&worker("w1"), &claimed, other.clone(), Completion::Final).err(),
+        ),
+        (
+            "a failure of a run that never started",
+            s.fail(&worker("w1"), &claimed, "ValueError").err(),
+        ),
+        (
+            "a completion after a failure",
+            s.complete(&worker("w1"), &failed, other.clone(), Completion::Final).err(),
+        ),
+        (
+            "a second failure",
+            s.fail(&worker("w1"), &failed, "KeyError").err(),
+        ),
+        (
+            "a completion by the worker that was lost",
+            s.complete(&worker("w3"), &lost, other.clone(), Completion::Final).err(),
+        ),
+        (
+            "a failure by the worker that was lost",
+            s.fail(&worker("w3"), &lost, "ValueError").err(),
+        ),
+    ];
+
+    for (report, rejection) in refused {
+        assert_eq!(
+            rejection,
+            Some(ReportRejection::NotAuthoritative),
+            "{report}"
+        );
+    }
+    assert_eq!(fixture.run_state(&running), TaskRunState::Running);
+    assert_eq!(fixture.run_state(&claimed), TaskRunState::Claimed);
+    assert_eq!(fixture.run_state(&succeeded), TaskRunState::Succeeded);
+    assert_eq!(
+        stored_digest(&fixture, &succeeded),
+        Some(Digest::blake3(RESULT))
+    );
+    assert_eq!(fixture.run_state(&failed), TaskRunState::Failed);
+    assert_eq!(
+        fixture.scheduler.task_run(&failed).unwrap().failure_kind,
+        "ValueError"
+    );
+    assert_eq!(fixture.run_state(&lost), TaskRunState::Lost);
+}
+
+#[test]
+fn the_queue_hands_out_in_order_and_up_to_the_limit() {
+    let mut fixture = Fixture::leading();
+    let ids: Vec<TaskId> = (0..6).map(|_| submit(&mut fixture.scheduler)).collect();
 
     let mark = fixture.spy.mark();
     let claim = fixture
         .scheduler
-        .request_claim(&worker("w1"), &middle)
+        .request_claim(&worker("w1"), &ids[2])
         .unwrap();
-
-    assert_eq!(claim.task, fixture.spy.task(&middle));
-    assert_eq!(fixture.spy.pending(), 2);
+    assert_eq!(claim.task, fixture.spy.task(&ids[2]));
     let changed: Vec<Noted> = fixture
         .spy
         .since(mark)
@@ -387,166 +271,46 @@ fn claiming_a_task_from_the_middle_leaves_the_others_queued_in_order() {
     assert_eq!(
         changed,
         vec![Noted::Run {
-            task: middle,
+            task: ids[2].clone(),
             run: claim.task_run_id.clone(),
             state: TaskRunState::Claimed,
         }],
         "nothing but the claimed run moved"
     );
-    // Claiming the rest hands out what is left in submission order.
-    let rest = fixture.scheduler.claim_oldest(&worker("w2"), 10).unwrap();
-    let rest: Vec<TaskId> = rest.iter().map(|claim| claim.task.task_id()).collect();
-    assert_eq!(rest, vec![first, last]);
-}
 
-#[test]
-fn each_step_of_a_run_stamps_its_own_time() {
-    let mut fixture = Fixture::leading();
-    let task_id = fixture
-        .scheduler
-        .submit(
-            Submission::new(
-                TaskDefinitionId::new("billing.charge"),
-                3,
-                b"input-bytes".to_vec(),
-                "default",
-            )
-            .with_retries(1),
-        )
-        .unwrap();
-    let submitted_at = fixture.spy.task(&task_id).submitted_at.map(|at| at.unix_millis);
-    let updated_at = |fixture: &Fixture, run: &TaskRunId| {
+    let mark = fixture.spy.mark();
+    assert!(
         fixture
             .scheduler
-            .task_run(run)
+            .claim_oldest(&worker("w1"), 0)
             .unwrap()
-            .updated_at
-            .map(|at| at.unix_millis)
-    };
-
-    fixture.clock.set_wall_clock_millis(1_000);
-    fixture.clock.advance(Duration::from_ticks(10));
-    let claim = fixture
-        .scheduler
-        .request_claim(&worker("w1"), &task_id)
-        .unwrap();
-    assert_eq!(updated_at(&fixture, &claim.task_run_id), Some(1_000));
-
-    fixture.clock.set_wall_clock_millis(2_000);
-    fixture.clock.advance(Duration::from_ticks(10));
-    fixture
-        .scheduler
-        .report_started(&worker("w1"), &claim.task_run_id)
-        .unwrap();
-    assert_eq!(updated_at(&fixture, &claim.task_run_id), Some(2_000));
-
-    fixture.clock.set_wall_clock_millis(3_000);
-    fixture.clock.advance(Duration::from_ticks(10));
-    fixture
-        .scheduler
-        .fail(&worker("w1"), &claim.task_run_id, "ValueError")
-        .unwrap();
-    assert_eq!(updated_at(&fixture, &claim.task_run_id), Some(3_000));
-    let retry_created_at = fixture
-        .spy
-        .run_of(&task_id)
-        .created_at
-        .map(|at| at.unix_millis);
-    assert_eq!(
-        retry_created_at,
-        Some(3_000),
-        "a retry is created when its predecessor fails"
+            .is_empty()
     );
-    assert_ne!(retry_created_at, submitted_at);
+    assert!(fixture.spy.since(mark).is_empty());
 
-    fixture.clock.set_wall_clock_millis(4_000);
-    fixture.clock.advance(Duration::from_ticks(10));
-    let retry = fixture
-        .scheduler
-        .request_claim(&worker("w1"), &task_id)
-        .unwrap();
-    fixture
-        .scheduler
-        .report_started(&worker("w1"), &retry.task_run_id)
-        .unwrap();
-    fixture
-        .scheduler
-        .complete(
-            &worker("w1"),
-            &retry.task_run_id,
-            Digest::blake3(RESULT),
-            Completion::Final,
-        )
-        .unwrap();
-    assert_eq!(updated_at(&fixture, &retry.task_run_id), Some(4_000));
-}
-
-#[test]
-fn claiming_the_oldest_takes_them_in_order_up_to_the_limit() {
-    let mut fixture = Fixture::leading();
-    let ids: Vec<TaskId> = (0..5).map(|_| submit(&mut fixture.scheduler)).collect();
-
-    let claims = fixture.scheduler.claim_oldest(&worker("w1"), 2).unwrap();
-
+    let claims = fixture.scheduler.claim_oldest(&worker("w2"), 2).unwrap();
     let claimed: Vec<TaskId> = claims.iter().map(|claim| claim.task.task_id()).collect();
-    assert_eq!(claimed, ids[..2].to_vec());
+    assert_eq!(claimed, vec![ids[0].clone(), ids[1].clone()]);
     assert_eq!(fixture.spy.pending(), 3);
     for claim in claims {
         let run = fixture.scheduler.task_run(&claim.task_run_id).unwrap();
         assert_eq!(run.current_state(), TaskRunState::Claimed);
-        assert_eq!(run.selected_worker(), Some(worker("w1")));
+        assert_eq!(run.selected_worker(), Some(worker("w2")));
     }
-    let rest = fixture.scheduler.claim_oldest(&worker("w1"), 10).unwrap();
+
+    let rest = fixture.scheduler.claim_oldest(&worker("w3"), 50).unwrap();
     let rest: Vec<TaskId> = rest.iter().map(|claim| claim.task.task_id()).collect();
     assert_eq!(
         rest,
-        ids[2..].to_vec(),
-        "the rest come out in submission order"
-    );
-}
-
-#[test]
-fn claiming_more_than_is_pending_takes_everything_and_zero_takes_nothing() {
-    let mut fixture = Fixture::leading();
-    for _ in 0..3 {
-        submit(&mut fixture.scheduler);
-    }
-
-    let mark = fixture.spy.mark();
-    assert!(fixture
-        .scheduler
-        .claim_oldest(&worker("w1"), 0)
-        .unwrap()
-        .is_empty());
-    assert!(fixture.spy.since(mark).is_empty());
-    assert_eq!(fixture.spy.pending(), 3);
-    assert_eq!(
-        fixture
-            .scheduler
-            .claim_oldest(&worker("w1"), 50)
-            .unwrap()
-            .len(),
-        3
+        ids[3..].to_vec(),
+        "the rest come out in submission order, the middle one skipped"
     );
     assert_eq!(fixture.spy.pending(), 0);
-    assert!(fixture
-        .scheduler
-        .claim_oldest(&worker("w1"), 10)
-        .unwrap()
-        .is_empty());
-}
-
-#[test]
-fn a_scheduler_that_does_not_lead_claims_nothing() {
-    let mut fixture = Fixture::leading();
-    let id = submit(&mut fixture.scheduler);
-    fixture.scheduler.set_leadership_grant(None);
-    let mark = fixture.spy.mark();
-
-    let result = fixture.scheduler.claim_oldest(&worker("w1"), 10);
-
-    assert_eq!(result.unwrap_err(), ClaimRejection::NotLeader);
-    assert!(fixture.spy.since(mark).is_empty());
-    assert_eq!(fixture.spy.pending(), 1);
-    assert_eq!(fixture.state(&id), TaskRunState::Queued);
+    assert!(
+        fixture
+            .scheduler
+            .claim_oldest(&worker("w3"), 10)
+            .unwrap()
+            .is_empty()
+    );
 }

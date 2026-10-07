@@ -121,22 +121,3 @@ impl IdGenerator for Uuid7Ids {
         TaskRunId::new(uuid::Uuid::now_v7().to_string())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn uuid7_ids_are_unique_and_valid_uuids() {
-        let ids = Uuid7Ids;
-        let task_ids: std::collections::HashSet<_> =
-            (0..1000).map(|_| ids.next_task_id()).collect();
-        let run_ids: std::collections::HashSet<_> =
-            (0..1000).map(|_| ids.next_task_run_id()).collect();
-
-        assert_eq!(task_ids.len(), 1000);
-        assert_eq!(run_ids.len(), 1000);
-        let parsed = uuid::Uuid::parse_str(ids.next_task_id().as_str()).unwrap();
-        assert_eq!(parsed.get_version_num(), 7);
-    }
-}

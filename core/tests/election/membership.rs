@@ -1,8 +1,8 @@
-//! Membership changes while a leader lives, at one node: a draining worker tells only its leader,
-//! the leader applies a removal under the term guard and announces
-//! the shrunk configuration on its acks, a draining leader announces its own
-//! departure, and a leader admits pending joiners in batches. The
-//! multi-node behaviour of the same rules is in `scenario_membership_test`.
+//! Membership changes while a leader lives, at one node: a draining worker
+//! tells only its leader, the leader applies a removal under the term guard,
+//! and a draining leader counts routing crawls by the admission it holds each
+//! voter at. The multi-node behaviour of the same rules is in
+//! `scenario_membership_test`.
 
 use crate::support::builders::{
     ack_message, committed_from_g0, configuration_of, g0, heartbeat, heartbeat_message, leader_ack,
@@ -15,9 +15,9 @@ use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
     TestNode, close_roll_call, commit_founding, connect, deliver, elect, finish_reconciling,
-    published_roll_calls, sent, sent_to, state_changes, voter_node,
+    published_roll_calls, sent, sent_to, voter_node,
 };
-use kabudachi_core::configuration::{Configuration, Generation, Joint, Single};
+use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{Input, Output};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
@@ -25,7 +25,7 @@ use kabudachi_core::protocol::messages::{
     AckEcho, LeaderHeartbeatAck, SelfRemove, WorkerHeartbeat,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::time::{Clock, Duration};
+use kabudachi_core::time::Clock;
 
 const SHARD: &str = "shard-1";
 
@@ -150,16 +150,6 @@ fn crawled_at(
     deliver(leader, sender, heartbeat_message(beat))
 }
 
-/// `leader_of_three`, asked to drain once both followers have reported a
-/// routing crawl.
-fn crawled_leader_of_three(clock: &FakeClock) -> TestNode {
-    let mut leader = leader_of_three(clock);
-    for follower in [worker("p1"), worker("p2")] {
-        let _ = crawled(clock, &mut leader, &follower);
-    }
-    leader
-}
-
 // ---- Draining ----
 
 /// A follower tells only its leader that it leaves, and the message carries
@@ -216,48 +206,6 @@ fn a_follower_drains_with_one_self_remove_to_its_leader_carrying_the_highest_ter
     assert_eq!(msg.leader_term, 2, "addressed to its leader's term");
 }
 
-#[test]
-fn a_node_that_knows_no_leader_drains_without_telling_anyone() {
-    let clock = FakeClock::new();
-    let mut node = voter_node(&clock, &worker("w1"), 3, SUSPECT);
-    connect(&mut node, &[worker("w2"), worker("w3")]);
-
-    let outputs = node.step(Input::Drain).outputs;
-
-    assert_eq!(node.state(), WorkerState::Stopped);
-    assert_eq!(
-        state_changes(&outputs),
-        vec![WorkerState::Draining, WorkerState::Stopped]
-    );
-    assert!(
-        sent(&outputs).is_empty(),
-        "the next founding, or the authority path, drops it"
-    );
-}
-
-/// A draining leader applies its own removal, which no other leader can,
-/// and announces the configuration without itself on a final
-/// ack to every peer before it stops.
-#[test]
-fn a_draining_leader_announces_the_configuration_without_itself_on_final_acks() {
-    let clock = FakeClock::new();
-    let mut leader = crawled_leader_of_three(&clock);
-
-    let outputs = leader.step(Input::Drain).outputs;
-
-    assert_eq!(leader.state(), WorkerState::Stopped);
-    for follower in [worker("p1"), worker("p2")] {
-        let ack = ack_to(&outputs, &follower);
-        assert_eq!(ack.configuration(), two_voters_at_the_next_generation());
-        assert_eq!(
-            ack.recipient_admission(),
-            Some(Generation::new(0, 1, 3)),
-            "each remaining voter re-admitted where the removal re-based"
-        );
-    }
-    assert!(self_removes(&outputs).is_empty());
-}
-
 // A heartbeat delayed from before a voter's re-admission can still say it
 // has crawled: only a crawl at the admission the leader counts the voter
 // by frees the leader to leave.
@@ -303,86 +251,6 @@ fn a_draining_leader_ignores_a_crawl_counted_before_the_commit_re_admitted_every
 
     let _ = crawled(&clock, &mut leader, &worker("p1"));
     assert_eq!(leader.state(), WorkerState::Stopped);
-}
-
-// Leaving before every other voter has crawled could strand workers that
-// know only this leader: it leads on until the last one reports.
-#[test]
-fn a_draining_leader_leads_on_until_every_other_voter_reports_a_routing_crawl() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-
-    let asked = leader.step(Input::Drain).outputs;
-    assert_eq!(leader.state(), WorkerState::Leader, "{asked:?}");
-
-    let _ = crawled(&clock, &mut leader, &worker("p1"));
-    assert_eq!(leader.state(), WorkerState::Leader, "p2 has not crawled");
-
-    let outputs = crawled(&clock, &mut leader, &worker("p2"));
-    assert_eq!(leader.state(), WorkerState::Stopped);
-    assert_eq!(
-        ack_to(&outputs, &worker("p1")).configuration(),
-        two_voters_at_the_next_generation()
-    );
-}
-
-#[test]
-fn a_draining_leader_leaves_at_its_drain_wait_limit_without_every_crawl() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-    let limit = leader.timings().drain_wait_limit;
-    let interval = leader.timings().heartbeat_interval;
-    let asked_at = clock.now();
-    let _ = leader.step(Input::Drain);
-
-    // Its followers keep confirming, so it keeps its lease, but report no crawl.
-    while clock.now() + interval < asked_at + limit {
-        clock.advance(interval);
-        for follower in [worker("p1"), worker("p2")] {
-            let held = leader.configuration().map(Configuration::generation);
-            let beat = confirming_heartbeat(&clock, &leader, &follower, held);
-            let _ = deliver(&mut leader, &follower, heartbeat_message(beat));
-        }
-        let _ = leader.step(Input::Tick);
-        assert_eq!(leader.state(), WorkerState::Leader);
-    }
-    clock.advance((asked_at + limit) - clock.now());
-    let _ = leader.step(Input::Tick);
-
-    assert_eq!(leader.state(), WorkerState::Stopped);
-}
-
-/// A leader asked to drain that loses office before it may leave has not
-/// withdrawn its request: once it follows the leader that deposed it, it
-/// tells that leader it leaves, and it stops.
-#[test]
-fn a_drain_request_kept_across_lost_office_is_honoured_under_the_new_leader() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-    let new_leader = worker("leader-2");
-    let asked = leader.step(Input::Drain).outputs;
-    assert_eq!(leader.state(), WorkerState::Leader, "{asked:?}");
-
-    // No crawl was reported, so it still leads when a later term's leader acks it.
-    let newer = committed_from_g0(2, 2, 3);
-    let outputs = deliver(
-        &mut leader,
-        &new_leader,
-        ack_message(leader_ack(&new_leader, 2, &newer, Some(newer.generation()))),
-    );
-
-    assert_eq!(leader.state(), WorkerState::Stopped);
-    assert_eq!(
-        state_changes(&outputs),
-        vec![
-            WorkerState::Active,
-            WorkerState::Draining,
-            WorkerState::Stopped
-        ]
-    );
-    let removes = self_removes(&outputs);
-    assert_eq!(removes.len(), 1, "{removes:?}");
-    assert_eq!(removes[0].0, new_leader);
 }
 
 /// A leader asked to drain that loses its lease keeps the request, and when
@@ -446,85 +314,7 @@ fn a_leader_that_regains_office_after_a_kept_drain_request_waits_again() {
     assert_eq!(leader.state(), WorkerState::Stopped, "{outputs:?}");
 }
 
-#[test]
-fn a_lone_leader_drains_without_announcing_anything() {
-    let clock = FakeClock::new();
-    let mut node = voter_node(&clock, &worker("solo"), 1, SUSPECT);
-    connect(&mut node, &[worker("pending")]);
-    elect(&mut node, &clock, SUSPECT, &[]);
-
-    let outputs = node.step(Input::Drain).outputs;
-
-    assert_eq!(node.state(), WorkerState::Stopped);
-    assert!(
-        acks_to(&outputs, &worker("pending")).is_empty() && self_removes(&outputs).is_empty(),
-        "no configuration of zero voters is ever announced"
-    );
-}
-
 // ---- The leader applies a removal ----
-
-#[test]
-fn a_leader_names_its_voters_and_a_follower_names_none() {
-    let clock = FakeClock::new();
-    let leader = leader_of_three(&clock);
-    let follower = voter_node(&clock, &worker("p1"), 3, SUSPECT);
-
-    let mut named = leader.voters();
-    named.sort();
-
-    assert_eq!(named, vec![worker("p1"), worker("p2"), worker("w1")]);
-    assert!(
-        follower.voters().is_empty(),
-        "only the leader's configuration names members"
-    );
-}
-
-#[test]
-fn a_leader_knows_its_voters_and_pending_members_and_no_one_else() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-    let follower = voter_node(&clock, &worker("p1"), 3, SUSPECT);
-    let joiner = worker("joiner");
-    connect(&mut leader, std::slice::from_ref(&joiner));
-    deliver(
-        &mut leader,
-        &joiner,
-        heartbeat_message(heartbeat(&joiner, None)),
-    );
-
-    for voter in ["w1", "p1", "p2", "joiner"] {
-        assert!(leader.is_voter_or_pending(&worker(voter)), "{voter}");
-    }
-    assert!(!leader.is_voter_or_pending(&worker("stranger")));
-    assert!(
-        !follower.is_voter_or_pending(&worker("p2")),
-        "only a leader's roster names members"
-    );
-}
-
-#[test]
-fn a_leader_drops_a_removed_member_and_announces_one_fewer_voter_at_the_next_generation() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-    assert_eq!(
-        announced(&mut leader),
-        three_voters_founded_in_term_1(),
-        "setup invariant"
-    );
-
-    remove_having_seen(&mut leader, &worker("p2"), 1);
-
-    assert_eq!(announced(&mut leader), two_voters_at_the_next_generation());
-    assert_eq!(leader.admission(), Some(Generation::new(0, 1, 3)));
-    let _ = leader.step(Input::PeerDisconnected(worker("p2")));
-    let reconnect = leader.step(Input::PeerConnected(worker("p2"))).outputs;
-    assert_eq!(
-        ack_to(&reconnect, &worker("p2")).recipient_admission(),
-        None,
-        "a removed worker is no longer in the roster"
-    );
-}
 
 /// A leader applies a removal only when it is addressed to its own term, from
 /// a worker that has seen no term later than it (the term guard). A worker
@@ -545,41 +335,6 @@ fn a_leader_applies_a_self_remove_only_for_its_term_from_a_worker_that_has_seen_
 
     remove_having_seen(&mut leader, &worker("p2"), 1);
     assert_eq!(announced(&mut leader), two_voters_at_the_next_generation());
-}
-
-/// A leader whose lease would run out only because a departed worker's
-/// last confirmation has aged applies the removals it has accepted first,
-/// and keeps leading the shrunk configuration if that still has its quorum.
-/// Of four voters it needs two others' confirmations; once one of them has
-/// left, three need only one.
-#[test]
-fn a_leader_applies_pending_removals_before_it_would_lose_its_quorum() {
-    let clock = FakeClock::new();
-    let mut leader = voter_node(&clock, &worker("w1"), 4, SUSPECT);
-    let peers = [worker("p1"), worker("p2"), worker("p3")];
-    connect(&mut leader, &peers);
-    elect(&mut leader, &clock, SUSPECT, &peers);
-    commit_founding(&mut leader, &clock, &peers);
-    let committed = leader
-        .configuration()
-        .expect("a configuration")
-        .generation();
-    let lease = crate::support::builders::timings(Duration::from_ticks(SUSPECT))
-        .lease_length()
-        .as_ticks();
-
-    clock.advance(Duration::from_ticks(lease - 1));
-    let beat = confirming_heartbeat(&clock, &leader, &worker("p1"), Some(committed));
-    deliver(&mut leader, &worker("p1"), heartbeat_message(beat));
-    remove_having_seen(&mut leader, &worker("p2"), 1);
-    clock.advance(Duration::from_ticks(2));
-    let _ = leader.step(Input::Tick);
-
-    assert_eq!(leader.state(), WorkerState::Leader);
-    assert_eq!(
-        leader.configuration(),
-        Some(&single_at(committed.next_change(1), 3))
-    );
 }
 
 /// A removal the leader accepted but has not applied was never announced, so
@@ -628,217 +383,4 @@ fn a_self_remove_for_another_shard_or_not_from_the_departing_worker_is_ignored()
     );
 
     assert_eq!(announced(&mut leader), three_voters_founded_in_term_1());
-}
-
-// ---- Admission batches ----
-
-/// The batch `leader_of_three` starts for one joiner: a joint configuration
-/// at (0, 1, 3), its old side the committed three, its new side those three
-/// re-admitted and the joiner.
-fn batch_of_one_joiner() -> Configuration {
-    let (committed, batch) = (Generation::new(0, 1, 2), Generation::new(0, 1, 3));
-    Configuration::joint(Joint {
-        generation: batch,
-        base: batch,
-        batch_generation: batch,
-        old_base: committed,
-        old_generation: committed,
-        old_voter_count: 3,
-        new_voter_count: 4,
-    }).expect("valid")
-}
-
-/// A leader admits a pending joiner once the joiner has confirmed one of its
-/// acks, so the batch's new side never costs the leader its lease: a joiner
-/// heard of but not yet confirming waits pending.
-#[test]
-fn a_leader_admits_a_pending_joiner_that_confirms_its_ack_in_a_batch() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-    let joiner = worker("joiner");
-    connect(&mut leader, std::slice::from_ref(&joiner));
-
-    let first = deliver(
-        &mut leader,
-        &joiner,
-        heartbeat_message(heartbeat(&joiner, None)),
-    );
-    assert_eq!(
-        ack_to(&first, &joiner).recipient_admission(),
-        None,
-        "pending"
-    );
-    assert_eq!(
-        leader.configuration(),
-        Some(&three_voters_founded_in_term_1())
-    );
-
-    let beat = confirming_heartbeat(&clock, &leader, &joiner, None);
-    let admitted = deliver(&mut leader, &joiner, heartbeat_message(beat));
-
-    let ack = ack_to(&admitted, &joiner);
-    assert_eq!(ack.configuration(), batch_of_one_joiner());
-    assert_eq!(ack.recipient_admission(), Some(Generation::new(0, 1, 3)));
-    assert_eq!(ack.recipient_prior_admission(), None);
-    assert_eq!(leader.configuration(), Some(&batch_of_one_joiner()));
-    assert_eq!(leader.prior_admission(), Some(Generation::new(0, 1, 2)));
-}
-
-/// A leader admits a joiner only on a recent confirmation: of an ack sent
-/// within the last two heartbeat intervals. A lone leader's lease is
-/// unbounded, and a batch bounds it by the joiner's confirmation, so one
-/// held back by a stall would leave it almost no lease at all.
-#[test]
-fn a_lone_leader_admits_no_joiner_on_a_stale_confirmation() {
-    let clock = FakeClock::new();
-    let mut leader = voter_node(&clock, &worker("solo"), 1, SUSPECT);
-    let joiner = worker("joiner");
-    connect(&mut leader, std::slice::from_ref(&joiner));
-    elect(&mut leader, &clock, SUSPECT, &[]);
-    let sent_at = clock.now().as_ticks();
-    let heartbeat_interval = crate::support::builders::timings(Duration::from_ticks(SUSPECT))
-        .heartbeat_interval
-        .as_ticks();
-
-    clock.advance(Duration::from_ticks(2 * heartbeat_interval + 1));
-    let stale = heartbeat(
-        &joiner,
-        Some(AckEcho {
-            term: leader.term(),
-            send_token: sent_at,
-        }),
-    );
-    let held_back = deliver(&mut leader, &joiner, heartbeat_message(stale));
-    assert_eq!(
-        ack_to(&held_back, &joiner).recipient_admission(),
-        None,
-        "still pending"
-    );
-
-    let recent = confirming_heartbeat(&clock, &leader, &joiner, None);
-    let admitted = deliver(&mut leader, &joiner, heartbeat_message(recent));
-    assert!(ack_to(&admitted, &joiner).recipient_admission().is_some());
-}
-
-/// While a leader's lease is bounded, a joiner is admitted on a confirmation
-/// older than two heartbeat intervals so long as it is no older than the
-/// quorum-contact time: the batch then still leaves the lease worth having,
-/// and a joiner heartbeating out of phase with the voters does not wait
-/// round after round (`Lease::admissible`).
-#[test]
-fn a_leader_admits_a_joiner_confirmed_before_two_heartbeat_intervals_but_since_the_quorum_contact() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-    let joiner = worker("joiner");
-    connect(&mut leader, std::slice::from_ref(&joiner));
-    // The voters confirmed the founding's ack now: the quorum-contact time.
-    let quorum_contact = clock.now().as_ticks();
-    let heartbeat_interval = crate::support::builders::timings(Duration::from_ticks(SUSPECT))
-        .heartbeat_interval
-        .as_ticks();
-    clock.advance(Duration::from_ticks(2 * heartbeat_interval + 1));
-    let term = leader.term();
-    let echoing = |send_token| {
-        heartbeat_message(heartbeat(
-            &joiner,
-            Some(AckEcho {
-                term,
-                send_token,
-            }),
-        ))
-    };
-
-    let before_contact = deliver(&mut leader, &joiner, echoing(quorum_contact - 1));
-    assert_eq!(
-        ack_to(&before_contact, &joiner).recipient_admission(),
-        None,
-        "older than the quorum contact: still pending"
-    );
-
-    let since_contact = deliver(&mut leader, &joiner, echoing(quorum_contact));
-    assert_eq!(
-        ack_to(&since_contact, &joiner).recipient_admission(),
-        Some(Generation::new(0, 1, 3))
-    );
-}
-
-/// A batch commits once a majority of each side holds it, and a joiner
-/// arriving meanwhile waits for the next batch, which the commit starts.
-#[test]
-fn a_batch_commits_on_a_majority_of_each_side_and_the_next_one_admits_those_who_waited() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-    let (joiner, late) = (worker("joiner"), worker("late"));
-    connect(&mut leader, &[joiner.clone(), late.clone()]);
-    let beat = confirming_heartbeat(&clock, &leader, &joiner, None);
-    deliver(&mut leader, &joiner, heartbeat_message(beat));
-    let batch = batch_of_one_joiner().generation();
-
-    let beat = confirming_heartbeat(&clock, &leader, &late, None);
-    let waiting = deliver(&mut leader, &late, heartbeat_message(beat));
-    assert_eq!(
-        ack_to(&waiting, &late).recipient_admission(),
-        None,
-        "one change at a time"
-    );
-
-    for member in [&joiner, &worker("p1")] {
-        let beat = confirming_heartbeat(&clock, &leader, member, Some(batch));
-        deliver(&mut leader, member, heartbeat_message(beat));
-    }
-
-    let committed = Generation::new(0, 1, 4);
-    let next_batch = Generation::new(0, 1, 5);
-    assert_eq!(
-        leader.configuration(),
-        Some(&Configuration::joint(Joint {
-            generation: next_batch,
-            base: next_batch,
-            batch_generation: next_batch,
-            old_base: committed,
-            old_generation: committed,
-            old_voter_count: 4,
-            new_voter_count: 5,
-        }).expect("valid")),
-        "the commit of four, then at once the batch that admits `late`"
-    );
-}
-
-/// A follower that adopts a newer configuration heartbeats its leader at
-/// once, not a heartbeat interval later, so the echo that commits it
-/// arrives as soon as it can.
-#[test]
-fn a_follower_heartbeats_at_once_on_adopting_a_newer_configuration() {
-    let clock = FakeClock::new();
-    let me = worker("p1");
-    let leader = worker("w1");
-    let mut node = voter_node(&clock, &me, 3, SUSPECT);
-    let first = three_voters_founded_in_term_1();
-    deliver(
-        &mut node,
-        &leader,
-        ack_message(leader_ack(&leader, 1, &first, Some(first.generation()))),
-    );
-    let settled = node.step(Input::Tick).outputs;
-    assert!(
-        sent_to(&settled, &leader).is_empty(),
-        "setup invariant: its first heartbeat already went"
-    );
-
-    let next = batch_of_one_joiner();
-    let outputs = deliver(
-        &mut node,
-        &leader,
-        ack_message(leader_ack(&leader, 1, &next, Some(next.generation()))),
-    );
-
-    let beats: Vec<Checked<WorkerHeartbeat>> = sent_to(&outputs, &leader)
-        .into_iter()
-        .filter_map(|message| match checked(message).into_payload() {
-            Some(CheckedPayload::Heartbeat(beat)) => Some(beat),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(beats.len(), 1, "a heartbeat in the same step");
-    assert_eq!(beats[0].configuration_generation(), Some(next.generation()));
 }

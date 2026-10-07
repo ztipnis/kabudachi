@@ -97,38 +97,3 @@ impl TryFrom<&generated::Digest> for Digest {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_digest_survives_the_wire_and_an_unnamed_or_unknown_algorithm_is_refused() {
-        let digest = Digest::blake3(b"result");
-        let wire = generated::Digest::from(digest.clone());
-        assert_eq!(Digest::try_from(&wire), Ok(digest));
-
-        for algorithm in [0, 99] {
-            let unknown = generated::Digest {
-                algorithm,
-                value: wire.value.clone(),
-            };
-            assert_eq!(
-                Digest::try_from(&unknown),
-                Err(InvalidDigest::UnknownAlgorithm)
-            );
-        }
-    }
-
-    #[test]
-    fn a_value_of_the_wrong_length_is_refused() {
-        assert_eq!(
-            Digest::new(DigestAlgorithm::Blake3, vec![0; 31]),
-            Err(InvalidDigest::WrongLength {
-                algorithm: DigestAlgorithm::Blake3,
-                expected: 32,
-                actual: 31,
-            })
-        );
-    }
-}

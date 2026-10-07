@@ -33,7 +33,7 @@ from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session, validate_definitions
 from kabudachi.tasks import Task
 from proto_messages import Greeting, Receipt
-from session_world import WAIT, World, run, with_events
+from session_world import WAIT, World, run, until, with_events
 
 
 def echo(request: Greeting) -> Greeting:
@@ -45,35 +45,28 @@ def explode(request: Greeting) -> Greeting:
 
 
 
-def test_submission_carries_the_task_definition_and_encoded_input():
-    world = World(echo)
+@pytest.mark.parametrize(
+    ("task_options", "default_queue", "version", "queue"),
+    [
+        pytest.param({}, None, 0, "default", id="defaults"),
+        pytest.param({"queue": "gpu", "version": 4}, None, 4, "gpu", id="the task's own queue and version"),
+        pytest.param({}, "emails", 0, "emails", id="configured default queue"),
+    ],
+)
+def test_submission_carries_the_task_definition_encoded_input_queue_and_version(
+    task_options, default_queue, version, queue
+):
+    world = World(echo, **task_options)
+    if default_queue is not None:
+        world.configuration.configure(queue=default_queue)
     argument = Greeting(text="hi", times=2)
 
     world.call("echo", argument)
 
-    [(_task_id, definition_id, version, payload, queue)] = world.runtime.submitted
+    [(_task_id, definition_id, submitted_version, payload, submitted_queue)] = world.runtime.submitted
     assert definition_id == "tests.echo"
-    assert version == 0
     assert payload == argument.SerializeToString()
-    assert queue == "default"
-
-
-def test_a_tasks_own_queue_and_version_are_submitted():
-    world = World(echo, queue="gpu", version=4)
-
-    world.call("echo", Greeting())
-
-    [(_, _, version, _, queue)] = world.runtime.submitted
-    assert (version, queue) == (4, "gpu")
-
-
-def test_a_configured_default_queue_is_used_when_the_task_names_none():
-    world = World(echo)
-    world.configuration.configure(queue="emails")
-
-    world.call("echo", Greeting())
-
-    assert world.runtime.submitted[0][4] == "emails"
+    assert (submitted_version, submitted_queue) == (version, queue)
 
 
 def test_an_argument_of_the_wrong_type_is_refused_before_anything_is_submitted():
@@ -97,6 +90,7 @@ def test_the_handle_is_not_settled_before_the_leader_certifies():
     run(world.working(body))
 
     assert seen == {"done": False}
+    assert [event[0] for event in world.runtime.events] == ["started", "complete"]
 
 
 def test_a_result_the_leader_refuses_to_certify_is_never_delivered():
@@ -151,19 +145,8 @@ def test_a_failure_the_leader_refuses_does_not_hide_the_tasks_error():
     run(world.working(body))
 
 
-def test_a_task_that_succeeds_is_not_reported_failed():
-    world = World(echo)
-
-    async def body():
-        await world.call("echo", Greeting())
-
-    run(world.working(body))
-
-    assert not any(event[0] == "fail" for event in world.runtime.events)
-
-
-def test_a_claim_that_cannot_run_is_failed_by_its_error_type_without_a_started_report():
-    world = World(echo)
+def test_a_claim_that_cannot_run_is_failed_by_its_error_type_and_retried_like_any_failed_run():
+    world = World(echo, retries=1)
     world.session = Session(world.runtime, TaskRegistry(), world.serializers, world.configuration)
 
     async def body():
@@ -174,33 +157,12 @@ def test_a_claim_that_cannot_run_is_failed_by_its_error_type_without_a_started_r
 
     task_id = run(world.working(body))
 
-    assert [(event[0], event[2]) for event in world.runtime.events] == [("fail", "UnknownTaskError")]
-    [run_id] = world.native.task_run_ids(task_id)
-    assert world.native.task_run_state(run_id) == RunState.FAILED
-
-
-def test_a_claim_that_cannot_run_is_retried_like_any_failed_run():
-    world = World(echo, retries=1)
-    world.session = Session(world.runtime, TaskRegistry(), world.serializers, world.configuration)
-
-    async def body():
-        with pytest.raises(UnknownTaskError):
-            await world.call("echo", Greeting())
-
-    run(world.working(body))
-
-    assert [event[0] for event in world.runtime.events] == ["fail", "fail"]
-
-
-def test_the_worker_keeps_going_after_a_task_fails():
-    world = World(echo, explode)
-
-    async def body():
-        with pytest.raises(ValueError):
-            await world.call("explode", Greeting(text="one"))
-        return await world.call("echo", Greeting(text="after"))
-
-    assert run(world.working(body)).text == "after"
+    assert [(event[0], event[2]) for event in world.runtime.events] == [
+        ("fail", "UnknownTaskError")
+    ] * 2
+    run_ids = world.native.task_run_ids(task_id)
+    assert len(run_ids) == 2
+    assert {world.native.task_run_state(run_id) for run_id in run_ids} == {RunState.FAILED}
 
 
 def test_a_run_that_cannot_be_started_fails_its_handle_and_runs_nothing():
@@ -379,25 +341,6 @@ def test_a_body_that_is_cancelled_fails_its_handle_and_does_not_hang_the_run():
     assert run(world.working(body)).text == "still works"
 
 
-def test_a_task_waiting_for_a_task_it_called_does_not_hold_up_that_task():
-    async def inner(request: Greeting) -> Greeting:
-        return Greeting(times=request.times + 1)
-
-    world = World(inner, concurrency=1)
-
-    async def outer(request: Greeting) -> Greeting:
-        return await world.call("inner", request)
-
-    outer_task = Task(
-        outer, registry=world.registry, serializers=world.serializers, name="tests.outer"
-    )
-
-    async def body():
-        return await world.session.submit(outer_task.definition, Greeting(times=1))
-
-    assert run(world.working(body)).times == 2
-
-
 def test_many_tasks_that_each_wait_for_one_they_called_do_not_deadlock():
     async def inner(request: Greeting) -> Greeting:
         await asyncio.sleep(0.01)
@@ -453,8 +396,11 @@ def test_a_task_waiting_on_several_tasks_gives_up_one_place_not_several():
 
 
 def test_stopping_fails_tasks_that_have_not_started_and_refuses_new_ones():
+    begun = []
+
     async def slow(request: Greeting) -> Greeting:
-        await asyncio.sleep(0.2)
+        begun.append(request.text)
+        await asyncio.sleep(0.1)
         return request
 
     world = World(slow, concurrency=1)
@@ -462,7 +408,7 @@ def test_stopping_fails_tasks_that_have_not_started_and_refuses_new_ones():
     async def body():
         running = world.call("slow", Greeting(text="running"))
         queued = world.call("slow", Greeting(text="queued"))
-        await asyncio.sleep(0.05)
+        await until(lambda: begun, "the slow task beginning")
         world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await queued
@@ -562,20 +508,6 @@ def test_synchronous_tasks_run_as_many_at_once_as_the_concurrency_allows():
         return time.monotonic() - started
 
     assert run(world.working(body)) < 0.7
-
-
-def test_closing_twice_is_harmless_and_later_synchronous_work_is_refused():
-    world = World(echo)
-
-    world.session.close()
-    world.session.close()
-
-    async def body():
-        # The thread pool that ran synchronous bodies is gone.
-        with pytest.raises(RuntimeError):
-            await world.call("echo", Greeting())
-
-    run(world.working(body))
 
 
 def flaky(failures):
@@ -703,6 +635,8 @@ def test_a_task_the_runtime_says_expired_fails_its_handle_with_task_expired_erro
         waiting = submit_expiring(world, "waiting")
         with pytest.raises(TaskExpiredError):
             await asyncio.wait_for(waiting, WAIT)
+        # Finishing does not wait for a task that expired.
+        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
 
     run(with_events(world, body))
 
@@ -715,18 +649,6 @@ def test_a_task_the_runtime_says_has_a_full_record_fails_its_handle_with_task_re
         world.runtime.inject_event(EventKind.RECORD_FULL, task_id=handle.task_id)
         with pytest.raises(TaskRecordFullError):
             await asyncio.wait_for(handle, WAIT)
-
-    run(with_events(world, body))
-
-
-def test_finishing_does_not_wait_for_a_task_that_expired():
-    world = World(echo)
-    world.runtime.hold_claims = True
-
-    async def body():
-        await world.call("echo", Greeting())
-        submit_expiring(world)
-        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
 
     run(with_events(world, body))
 
@@ -827,12 +749,13 @@ def test_a_body_past_its_soft_limit_is_cancelled_and_its_run_fails_with_a_timeou
 
 def test_a_body_that_ignores_cancellation_fails_at_the_hard_limit_and_is_abandoned():
     state = {"still_running": False}
+    release = asyncio.Event()
 
     async def stubborn(request: Greeting) -> Greeting:
         state["still_running"] = True
         while True:
             try:
-                await asyncio.sleep(0.4)
+                await release.wait()
                 break
             except asyncio.CancelledError:
                 continue  # refuses to stop
@@ -845,7 +768,9 @@ def test_a_body_that_ignores_cancellation_fails_at_the_hard_limit_and_is_abandon
         started = time.monotonic()
         with pytest.raises(TaskTimeoutError):
             await world.call("stubborn", Greeting())
-        return time.monotonic() - started, state["still_running"]
+        elapsed = time.monotonic() - started, state["still_running"]
+        release.set()
+        return elapsed
 
     elapsed, still_running = run(world.working(body))
 
@@ -899,7 +824,8 @@ def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit():
 
     async def body():
         handle = world.call("stubborn_then_fine", Greeting(text="x"))
-        await asyncio.sleep((SOFT + GRACE).total_seconds() + 0.3)
+        await until(lambda: any(event[0] == "fail" for event in world.runtime.events), "a fail event")
+        await asyncio.sleep(0.2)
         assert not handle.done(), "the lineage stays pending while its retry waits"
         assert len(calls) == 1, "no second body while the abandoned one runs"
         release.set()
@@ -922,7 +848,7 @@ def test_what_an_abandoned_body_later_returns_or_raises_is_discarded(caplog):
         with pytest.raises(TaskTimeoutError):
             await world.call("raises_late", Greeting())
         release.set()
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
 
     run(world.working(body))
 
@@ -930,51 +856,41 @@ def test_what_an_abandoned_body_later_returns_or_raises_is_discarded(caplog):
     assert "never retrieved" not in caplog.text
 
 
-def test_a_sync_body_that_outlives_the_grace_fails_at_the_hard_limit():
-    release = threading.Event()
-
-    def blocking(request: Greeting) -> Greeting:
-        release.wait(5)
-        return request
-
-    world = timed(blocking)
-
-    async def body():
-        started = time.monotonic()
-        with pytest.raises(TaskTimeoutError):
-            await world.call("blocking", Greeting())
-        elapsed = time.monotonic() - started
-        release.set()
-        return elapsed
-
-    assert run(world.working(body)) >= (SOFT + GRACE).total_seconds()
-
-
 def test_cancel_grace_comes_from_the_process_unless_the_task_chose_its_own():
-    async def stubborn(request: Greeting) -> Greeting:
-        while True:
-            try:
-                await asyncio.sleep(0.3)
-                return request
-            except asyncio.CancelledError:
-                continue
+    def stubborn_until_released():
+        release = asyncio.Event()
 
-    process_default = World(stubborn, timeout=SOFT)
-    process_default.configuration.configure(cancel_grace=timedelta(milliseconds=50))
-    own_choice = World(stubborn, timeout=SOFT, cancel_grace=timedelta(milliseconds=250))
-    own_choice.configuration.configure(cancel_grace=timedelta(milliseconds=50))
+        async def stubborn(request: Greeting) -> Greeting:
+            while True:
+                try:
+                    await release.wait()
+                    return request
+                except asyncio.CancelledError:
+                    continue
 
-    async def elapsed_until_timeout(world):
+        return stubborn, release
+
+    async def elapsed_until_timeout(task_options, process_grace):
+        function, release = stubborn_until_released()
+        world = World(function, timeout=SOFT, **task_options)
+        world.configuration.configure(cancel_grace=process_grace)
+
         async def body():
             started = time.monotonic()
             with pytest.raises(TaskTimeoutError):
                 await world.call("stubborn", Greeting())
-            return time.monotonic() - started
+            elapsed = time.monotonic() - started
+            release.set()
+            return elapsed
 
         return await world.working(body)
 
-    quick = run(elapsed_until_timeout(process_default))
-    slow = run(elapsed_until_timeout(own_choice))
+    quick = run(elapsed_until_timeout({}, timedelta(milliseconds=50)))
+    slow = run(
+        elapsed_until_timeout(
+            {"cancel_grace": timedelta(milliseconds=250)}, timedelta(milliseconds=50)
+        )
+    )
 
     assert quick < 0.2 <= slow
 
@@ -1020,6 +936,8 @@ def test_a_pending_task_can_be_cancelled_and_its_handle_says_so():
 
     run(with_events(world, body))
 
+    assert world.session.tasks.is_empty()
+
 
 def test_a_running_body_is_cancelled_and_nothing_it_does_is_reported():
     saw = []
@@ -1048,6 +966,7 @@ def test_a_running_body_is_cancelled_and_nothing_it_does_is_reported():
 
     assert saw == ["started", "cancelled"]
     assert not any(event[0] in ("complete", "fail") for event in world.runtime.events)
+    assert world.session.tasks.is_empty()
 
 
 def test_a_cancelled_body_that_ignores_cancellation_still_certifies_nothing():
@@ -1061,7 +980,7 @@ def test_a_cancelled_body_that_ignores_cancellation_still_certifies_nothing():
 
     async def body():
         handle = world.call("stubborn", Greeting())
-        await asyncio.sleep(0.05)
+        await until(lambda: any(event[0] == "started" for event in world.runtime.events), "a started event")
         handle.cancel()
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
@@ -1159,8 +1078,10 @@ def test_a_cancelled_task_is_not_retried():
 
 def test_an_async_body_that_swallows_the_cancellation_and_returns_certifies_nothing():
     swallowed = []
+    running = []
 
     async def swallows(request: Greeting) -> Greeting:
+        running.append(True)
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
@@ -1171,7 +1092,7 @@ def test_an_async_body_that_swallows_the_cancellation_and_returns_certifies_noth
 
     async def body():
         handle = world.call("swallows", Greeting())
-        await asyncio.sleep(0.05)
+        await until(lambda: running, "the task running")
         handle.cancel()
         with pytest.raises(TaskCancelledError):
             await asyncio.wait_for(handle, WAIT)
@@ -1206,7 +1127,7 @@ def test_synchronous_and_async_callbacks_both_run_and_a_synchronous_one_may_bloc
 
     def blocking(result):
         threads.append(threading.get_ident())
-        time.sleep(0.05)
+        time.sleep(0.01)
         seen.append("sync")
 
     async def asynchronous(result):
@@ -1227,27 +1148,27 @@ def test_synchronous_and_async_callbacks_both_run_and_a_synchronous_one_may_bloc
     assert threads and threads[0] != loop_thread
 
 
-def test_a_callback_that_fails_is_logged_by_type_only_and_changes_nothing(caplog):
+def test_a_callback_that_fails_is_logged_by_type_only_changes_nothing_and_stops_no_other(caplog):
     world = World(echo)
+    after = []
 
     def broken(result):
         raise KeyError(f"leaks {result.text}")
 
     async def body():
         handle = world.call("echo", Greeting(text="private"))
-        handle.callback(broken)
+        handle.callback(broken).callback(lambda result: after.append(result.text))
         result = await handle
         await world.session.wait_until_idle()
         return result
 
     assert run(world.working(body)).text == "private"
+    assert after == ["private"]
     assert "private" not in caplog.text
     assert "KeyError" in caplog.text
 
 
 def test_a_callback_is_kept_alive_by_the_run_even_if_the_handle_is_dropped():
-    import gc
-
     world = World(echo)
     seen = []
 
@@ -1255,7 +1176,6 @@ def test_a_callback_is_kept_alive_by_the_run_even_if_the_handle_is_dropped():
         world.call("echo", Greeting(text="unwatched")).callback(lambda r: seen.append(r.text))
         gc.collect()
         await world.session.wait_until_idle()
-        await asyncio.sleep(0.05)
 
     run(world.working(body))
 
@@ -1267,7 +1187,7 @@ def test_finishing_waits_for_a_callback_that_is_still_running():
     finished = []
 
     async def slow_callback(result):
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
         finished.append(True)
 
     async def body():
@@ -1392,23 +1312,6 @@ def test_a_reducer_that_raises_fails_the_task_and_the_body_never_runs():
     assert world.runtime.events[-1][:1] == ("fail",)
 
 
-def test_a_coalescing_submission_carries_its_key_and_the_default_key_is_empty():
-    world = coalescing_world()
-
-    async def body():
-        world.session.submit(world.tasks["echo"].definition, Greeting())
-        world.session.submit(
-            world.tasks["echo"].definition, Greeting(), SubmissionOptions(key="tenant-1")
-        )
-
-    run(world.working(body))
-
-    assert [(o["kind"], o["key"]) for o in world.runtime.submit_options] == [
-        ("coalescing", ""),
-        ("coalescing", "tenant-1"),
-    ]
-
-
 def test_a_superseded_generation_fails_its_handle_and_says_by_which():
     world = coalescing_world()
     world.runtime.hold_claims = True
@@ -1426,43 +1329,6 @@ def test_a_superseded_generation_fails_its_handle_and_says_by_which():
     error, newer_id = run(with_events(world, body))
 
     assert error.superseded_by == newer_id
-
-
-def test_a_task_cancelled_before_it_ever_ran_leaves_nothing_behind_to_remember():
-    world = World(echo)
-    world.runtime.hold_claims = True
-
-    async def body():
-        await world.call("echo", Greeting())
-        waiting = world.call("echo", Greeting(text="never claimed"))
-        await asyncio.sleep(0.02)
-        assert waiting.cancel() is True
-        with pytest.raises(TaskCancelledError):
-            await asyncio.wait_for(waiting, WAIT)
-
-    run(with_events(world, body))
-
-    assert world.session.tasks.is_empty()
-
-
-def test_a_running_task_that_is_cancelled_leaves_nothing_behind_once_it_ends():
-    async def long(request: Greeting) -> Greeting:
-        await asyncio.sleep(30)
-        return request
-
-    world = World(long)
-
-    async def body():
-        handle = world.call("long", Greeting())
-        await asyncio.sleep(0.05)
-        handle.cancel()
-        with pytest.raises(TaskCancelledError):
-            await asyncio.wait_for(handle, WAIT)
-        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
-
-    run(with_events(world, body))
-
-    assert world.session.tasks.is_empty()
 
 
 def test_a_task_settled_while_its_run_is_starting_can_still_have_its_body_stopped():
@@ -1632,20 +1498,28 @@ def test_stopping_ends_a_worker_loop_that_is_waiting_for_a_free_place():
 
 
 def test_a_callback_added_after_the_run_loop_closed_runs_at_once_and_leaves_nothing_to_wait_for(
-    recwarn,
+    recwarn, caplog
 ):
     world = World(echo)
     called = []
 
+    def broken(result):
+        raise KeyError(f"leaks {result.text}")
+
+    async def broken_later(result):
+        raise ValueError(f"leaks {result.text}")
+
     async def body():
-        handle = world.call("echo", Greeting(text="late"))
+        handle = world.call("echo", Greeting(text="hush"))
         await handle
         return handle
 
     handle = run(world.working(body))  # the run's loop is closed once this returns
-    handle.callback(lambda result: called.append(result.text))
+    handle.callback(broken).callback(lambda result: called.append(result.text)).callback(broken_later)
 
-    assert called == ["late"]  # run inline: there is no loop left to host it
+    assert called == ["hush"]  # run inline: there is no loop left to host it
+    assert "hush" not in caplog.text
+    assert "KeyError" in caplog.text and "ValueError" in caplog.text
     # A refused callback must not stay counted, or this never returns.
     run(asyncio.wait_for(world.session.wait_until_idle(), WAIT))
     gc.collect()

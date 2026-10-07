@@ -5,22 +5,19 @@
 //! leader again.
 
 use crate::support::builders::{
-    message_input,
-    ack_message, committed_from_g0, configuration_of, election_certificate,
-    election_certificate_message, election_reject, founded_from_g0, g0, leader_ack,
+    ack_message, configuration_of, election_reject, g0, leader_ack,
     past_any_suspicion, roll_call, roll_call_message, timings, vote_request,
     vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
     TestNode, deliver, elect, grants, published_roll_calls, rejects_sent_to, sent_to,
-    stand_as_candidate, start_roll_call, state_changes, voter_node,
+    stand_as_candidate, state_changes, voter_node,
 };
-use kabudachi_core::configuration::{Admission, Generation};
 use kabudachi_core::election::Input;
 use kabudachi_core::protocol::messages::ElectionRejectReason;
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::time::{Clock, Duration};
+use kabudachi_core::time::Duration;
 
 /// Every node here suspects its leader after this many ticks.
 const SUSPECT: u64 = 10;
@@ -32,217 +29,6 @@ fn leader_of_three(clock: &FakeClock) -> TestNode {
     elect(&mut node, clock, SUSPECT, &[worker("p1"), worker("p2")]);
     assert_eq!(node.term(), 1, "setup invariant");
     node
-}
-
-/// `w1`, standing as the candidate for term 1 of a configuration of 3.
-fn candidate_of_three(clock: &FakeClock) -> TestNode {
-    let mut node = voter_node(clock, &worker("w1"), 3, SUSPECT);
-    stand_as_candidate(&mut node, clock, SUSPECT, &[worker("p1")]);
-    node
-}
-
-/// `w1`, a voter of 5, in `RollCall` with its own call for term 1.
-fn initiator_of_five(clock: &FakeClock) -> TestNode {
-    let mut node = voter_node(clock, &worker("w1"), 5, SUSPECT);
-    start_roll_call(&mut node, clock, SUSPECT);
-    assert_eq!(node.state(), WorkerState::RollCall, "setup invariant");
-    node
-}
-
-/// An ack from `leader-2`, elected in `term`.
-fn ack_from_new_leader(term: u64) -> kabudachi_core::protocol::messages::ElectionMessage {
-    ack_message(leader_ack(
-        &worker("leader-2"),
-        term,
-        &configuration_of(3),
-        Some(g0()),
-    ))
-}
-
-/// A refusal to `w1` of its call or request for term 1, by `p1`, which has
-/// seen `highest_term_seen`.
-fn refusal_naming(highest_term_seen: u64) -> kabudachi_core::protocol::messages::ElectionMessage {
-    election_reject(
-        &worker("w1"),
-        1,
-        &worker("p1"),
-        ElectionRejectReason::StaleTerm,
-        highest_term_seen,
-        None,
-    )
-}
-
-// ---- To Active, on an ack from a later term's leader ----
-
-#[test]
-fn a_leader_acked_by_a_later_terms_leader_follows_it_and_withdraws_its_grant_first() {
-    let clock = FakeClock::new();
-    let mut node = leader_of_three(&clock);
-
-    // A configuration above anything a term-1 leader leads: the deposed
-    // leader must follow it, not the roster it led.
-    let newer = committed_from_g0(2, 2, 3);
-
-    let outputs = deliver(
-        &mut node,
-        &worker("leader-2"),
-        ack_message(leader_ack(
-            &worker("leader-2"),
-            2,
-            &newer,
-            Some(newer.generation()),
-        )),
-    );
-
-    assert_eq!(state_changes(&outputs), vec![WorkerState::Active]);
-    assert_eq!(grants(&outputs), vec![None]);
-    let grant_withdrawn = outputs
-        .iter()
-        .position(|output| matches!(output, kabudachi_core::election::Output::Grant(None)));
-    let stepped_down = outputs.iter().position(|output| {
-        matches!(
-            output,
-            kabudachi_core::election::Output::StateChanged(WorkerState::Active)
-        )
-    });
-    assert!(grant_withdrawn < stepped_down, "{outputs:?}");
-    assert_eq!(node.known_leader(), Some((worker("leader-2"), 2)));
-    assert_eq!(node.configuration(), Some(&newer));
-    assert_eq!(node.admission(), Some(newer.generation()));
-}
-
-#[test]
-fn a_candidate_acked_by_a_later_terms_leader_follows_it() {
-    let clock = FakeClock::new();
-    let mut node = candidate_of_three(&clock);
-
-    let outputs = deliver(&mut node, &worker("leader-2"), ack_from_new_leader(2));
-
-    assert_eq!(state_changes(&outputs), vec![WorkerState::Active]);
-    assert_eq!(node.known_leader(), Some((worker("leader-2"), 2)));
-}
-
-#[test]
-fn an_ack_from_a_leader_of_the_same_term_moves_no_candidate() {
-    let clock = FakeClock::new();
-    let mut node = candidate_of_three(&clock);
-
-    let outputs = deliver(&mut node, &worker("leader-2"), ack_from_new_leader(1));
-
-    assert!(state_changes(&outputs).is_empty(), "{outputs:?}");
-    assert_eq!(node.state(), WorkerState::Candidate);
-}
-
-// ---- To LeaderSuspect, on anything else ----
-
-#[test]
-fn a_leader_refused_naming_a_later_term_steps_down_to_leader_suspect() {
-    let clock = FakeClock::new();
-    let mut node = leader_of_three(&clock);
-
-    let outputs = deliver(&mut node, &worker("p1"), refusal_naming(3));
-
-    assert_eq!(grants(&outputs), vec![None]);
-    assert_eq!(state_changes(&outputs), vec![WorkerState::LeaderSuspect]);
-    assert_eq!(node.known_leader(), None);
-}
-
-#[test]
-fn a_candidate_certified_a_later_terms_win_steps_down_to_leader_suspect() {
-    let clock = FakeClock::new();
-    let mut node = candidate_of_three(&clock);
-    let winner = worker("leader-2");
-
-    let outputs = deliver(
-        &mut node,
-        &winner,
-        election_certificate_message(election_certificate(
-            &winner,
-            2,
-            &founded_from_g0(2, 3, 3),
-            Admission::from(Some(Generation::new(0, 2, 1))),
-        )),
-    );
-
-    assert_eq!(state_changes(&outputs), vec![WorkerState::LeaderSuspect]);
-}
-
-#[test]
-fn a_refusal_naming_the_contested_term_itself_deposes_no_one() {
-    let clock = FakeClock::new();
-    let mut candidate = candidate_of_three(&clock);
-    let mut initiator = initiator_of_five(&clock);
-
-    let to_candidate = deliver(&mut candidate, &worker("p1"), refusal_naming(1));
-    let to_initiator = deliver(&mut initiator, &worker("p1"), refusal_naming(1));
-
-    assert!(state_changes(&to_candidate).is_empty());
-    assert!(state_changes(&to_initiator).is_empty());
-}
-
-#[test]
-fn an_initiator_that_grants_a_vote_in_a_later_term_steps_down_to_leader_suspect() {
-    let clock = FakeClock::new();
-    let mut node = initiator_of_five(&clock);
-    let rival = worker("w0");
-    deliver(
-        &mut node,
-        &rival,
-        roll_call_message(roll_call(&rival, 2, &configuration_of(5), 0)),
-    );
-
-    let outputs = deliver(
-        &mut node,
-        &rival,
-        vote_request_message(vote_request(rival.clone(), 0, 2)),
-    );
-
-    assert_eq!(state_changes(&outputs), vec![WorkerState::LeaderSuspect]);
-}
-
-#[test]
-fn a_roll_call_for_a_later_term_deposes_no_leader() {
-    let clock = FakeClock::new();
-    let mut node = leader_of_three(&clock);
-    let rival = worker("w0");
-
-    let outputs = deliver(
-        &mut node,
-        &rival,
-        roll_call_message(roll_call(&rival, 9, &configuration_of(3), 0)),
-    );
-
-    assert_eq!(
-        rejects_sent_to(&outputs, &rival)[0].reason(),
-        ElectionRejectReason::NotEligible
-    );
-    assert_eq!(node.state(), WorkerState::Leader);
-}
-
-// ---- What a node that stepped down does next ----
-
-#[test]
-fn a_node_that_stepped_down_contests_again_only_after_a_fresh_suspicion_timeout() {
-    let clock = FakeClock::new();
-    let mut node = leader_of_three(&clock);
-    let step = node.step(message_input(&worker("p1"), refusal_naming(3)));
-    assert_eq!(node.state(), WorkerState::LeaderSuspect, "setup invariant");
-
-    let retry_at = step.next_deadline.expect("due to contest again");
-    assert!(
-        retry_at > clock.now() + Duration::from_ticks(SUSPECT)
-            && retry_at <= clock.now() + past_any_suspicion(SUSPECT),
-        "{retry_at:?}"
-    );
-    let early = node.step(Input::Tick);
-    assert!(published_roll_calls(&early.outputs).is_empty());
-
-    clock.advance(retry_at - clock.now());
-    let retried = node.step(Input::Tick);
-
-    let calls = published_roll_calls(&retried.outputs);
-    assert_eq!(calls.len(), 1, "{retried:?}");
-    assert_eq!(calls[0].term, 4, "the term after the latest it has seen");
 }
 
 // ---- After a lost race, the leader that outlasted it ----

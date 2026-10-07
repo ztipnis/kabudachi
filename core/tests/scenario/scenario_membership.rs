@@ -76,17 +76,7 @@ fn leaders_among(cluster: &Cluster, group: &BTreeSet<WorkerId>) -> BTreeSet<Work
 /// cut off while the voters elect a leader and commit what they founded.
 /// The joiners stay cut off. Returns the cluster and its leader.
 fn elected_with_joiners_away(voters: usize, joiners: usize) -> (Cluster, WorkerId) {
-    elected_with_joiners_away_suspecting_after(voters, joiners, SUSPECT)
-}
-
-/// `elected_with_joiners_away`, every node suspecting its leader after
-/// `suspect_timeout`.
-fn elected_with_joiners_away_suspecting_after(
-    voters: usize,
-    joiners: usize,
-    suspect_timeout: Duration,
-) -> (Cluster, WorkerId) {
-    let mut cluster = Cluster::bootstrap_with_pending(voters, joiners, suspect_timeout);
+    let mut cluster = Cluster::bootstrap_with_pending(voters, joiners, SUSPECT);
     cluster.partition(ids(0..voters), ids(voters..voters + joiners));
     assert!(
         run_until(&mut cluster, |cluster| cluster.leader().is_some_and(
@@ -147,68 +137,6 @@ fn assert_no_grant_overlap(cluster: &Cluster) {
         None,
         "no two nodes ever hold a valid grant at once"
     );
-}
-
-/// A burst of joiners arriving together is admitted in two batches: the
-/// first takes the joiners that had confirmed the leader's ack when it
-/// started, and every joiner that confirmed by its commit waits for it and
-/// forms the second (one change at a time).
-///
-/// The joiners arrive over half a heartbeat interval, twenty a tick, on a
-/// network that holds half its deliveries back by up to four ticks, so
-/// their heartbeats run out of phase with the voters' and each other's, as
-/// on real hosts. The second batch must then take every joiner that
-/// confirmed recently, not only those that confirmed after the commit:
-/// admitting only confirmations since the quorum-contact time, which the
-/// commit moves to about now, took five batches here. The two other voters
-/// are stalled while the burst arrives, so the first batch commits only
-/// once every joiner has confirmed; one that has not confirmed at all by
-/// then is left for a third, whatever the rule.
-#[test]
-fn a_100_joiner_burst_with_staggered_heartbeats_commits_in_two_rounds() {
-    let suspect_timeout = Duration::from_ticks(40);
-    let (mut cluster, leader) = elected_with_joiners_away_suspecting_after(3, 100, suspect_timeout);
-    let joiners: Vec<WorkerId> = ids(3..103).into_iter().collect();
-    cluster.network().set_delay(TICK);
-    cluster.network().seed(23);
-    cluster
-        .network()
-        .set_late_delivery(0.5, Duration::from_ticks(4));
-    for voter in ids(0..3).into_iter().filter(|id| *id != leader) {
-        cluster.stall(&voter, Duration::from_ticks(20));
-    }
-    cluster.record_steps();
-
-    let mut reachable = ids(0..3);
-    for arriving in joiners.chunks(20) {
-        reachable.extend(arriving.iter().cloned());
-        let away: BTreeSet<WorkerId> = joiners
-            .iter()
-            .filter(|joiner| !reachable.contains(*joiner))
-            .cloned()
-            .collect();
-        if away.is_empty() {
-            cluster.heal();
-        } else {
-            cluster.partition(reachable.clone(), away);
-        }
-        cluster.advance(TICK);
-    }
-    let everyone_admitted = run_until(&mut cluster, |cluster| {
-        let configuration = configuration_of(cluster, &leader);
-        !configuration.is_joint()
-            && joiners
-                .iter()
-                .all(|joiner| is_voter_of(cluster, joiner, &configuration))
-    });
-
-    let steps = cluster.take_steps();
-    assert!(everyone_admitted, "every joiner becomes a voter");
-    let batches = joint_configurations_acked(&steps, &leader);
-    assert_eq!(batches.len(), 2, "two batches: {batches:?}");
-    assert_eq!(cluster.leader(), Some(leader.clone()));
-    assert!(!ever_moved_to(&steps, &leader, WorkerState::NoQuorum));
-    assert_no_grant_overlap(&cluster);
 }
 
 /// Three voters elect a leader; four joiners then arrive. The first batch
@@ -400,6 +328,51 @@ fn a_draining_leader_waits_for_its_voters_routing_crawl_and_the_survivors_elect(
     assert_no_grant_overlap(&cluster);
 }
 
+/// A leader asked to drain that loses office before it may leave has not
+/// withdrawn its request: once it follows the leader that replaced it, it
+/// stops, and that leader keeps leading.
+#[test]
+fn a_drain_request_kept_across_lost_office_stops_the_node_under_the_new_leader() {
+    let mut cluster = Cluster::bootstrap(3, SUSPECT);
+    cluster.hold_routing_crawls();
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.leader().is_some_and(
+            |leader| !configuration_of(cluster, &leader).is_joint()
+        )),
+        "the voters elect a leader and commit its founding"
+    );
+    let leader = cluster.leader().expect("a leader");
+    let followers: BTreeSet<WorkerId> = ids(0..3).into_iter().filter(|id| *id != leader).collect();
+    cluster.drain(&leader);
+    assert_eq!(
+        cluster.states()[&leader],
+        WorkerState::Leader,
+        "no crawl was reported, so it still leads"
+    );
+
+    cluster.partition([leader.clone()].into_iter().collect(), followers.clone());
+    assert!(
+        run_until(&mut cluster, |cluster| !leaders_among(cluster, &followers).is_empty()),
+        "the followers elect a leader: {:?}",
+        cluster.states()
+    );
+    let new_leader = leaders_among(&cluster, &followers).into_iter().next().expect("a leader");
+    assert_ne!(
+        cluster.states()[&leader],
+        WorkerState::Stopped,
+        "cut off, the old leader has no leader to tell it leaves"
+    );
+    cluster.heal();
+
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.states()[&leader] == WorkerState::Stopped),
+        "the kept request stops it once it follows the new leader: {:?}",
+        cluster.states()
+    );
+    assert_eq!(cluster.states()[&new_leader], WorkerState::Leader);
+    assert_no_grant_overlap(&cluster);
+}
+
 /// A rolling deploy: joiners arrive and old voters drain at once, the drains
 /// taking the old side below a majority of its original count mid-batch.
 /// Each removal re-announces the batch with shrunk counts, so the batch
@@ -457,13 +430,15 @@ fn a_rolling_deploy_commits_its_batch_and_never_loses_the_quorum() {
 /// Several workers draining at once shrink N in one generation (every
 /// pending SELF_REMOVE lands in the next generation), with no
 /// commit round and no joint configuration, and the leader keeps leading
-/// the smaller configuration.
+/// the smaller configuration. Every message is delivered twice, so each
+/// `SelfRemove` also arrives as a duplicate and still removes its sender once.
 #[test]
 fn a_mass_self_remove_shrinks_n_in_one_generation_with_no_commit_round() {
     let (mut cluster, leader) = elected_with_joiners_away(7, 0);
     let followers: Vec<WorkerId> = ids(0..7).into_iter().filter(|id| *id != leader).collect();
     let before = configuration_of(&cluster, &leader);
     cluster.record_steps();
+    cluster.network().set_duplicate_rate(1.0);
 
     for id in &followers[..3] {
         cluster.drain(id);

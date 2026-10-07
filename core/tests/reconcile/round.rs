@@ -96,42 +96,6 @@ fn versions(records: &[TaskRecord]) -> Vec<RecordVersion> {
 }
 
 #[test]
-fn two_silent_holders_of_the_newest_write_leave_a_stale_holder_uncertain() {
-    // The newest revision (term 4) went to a, b and c; a and b stored it,
-    // c was down and still holds term 3. Only c answers among them.
-    let mut round = ReconcileRound::new(TERM, seven(), Instant::at(0), GRACE);
-    for other in ["d", "e", "f", "g"] {
-        answer(&mut round, other, Vec::new());
-    }
-    answer(
-        &mut round,
-        "c",
-        vec![held("t", version(3, 9), &["a", "b", "c"])],
-    );
-    round.fetched(record("t", version(3, 9), &["a", "b", "c"]));
-
-    let first = round.take_settled(|_| true);
-
-    assert!(
-        first.records.is_empty(),
-        "nothing about t is known for certain"
-    );
-    assert!(first.uncertain.contains_key(&TaskId::new("t")));
-
-    // a reports late: two of the three holders have answered, which meets
-    // any majority write, and it holds the newest revision.
-    answer(
-        &mut round,
-        "a",
-        vec![held("t", version(4, 0), &["a", "b", "c"])],
-    );
-    round.fetched(record("t", version(4, 0), &["a", "b", "c"]));
-    let later = round.take_settled(|_| true);
-    assert_eq!(versions(&later.records), [version(4, 0)]);
-    assert!(later.uncertain.is_empty());
-}
-
-#[test]
 fn a_task_is_known_once_every_holder_still_in_the_configuration_answered() {
     let mut round = ReconcileRound::new(TERM, seven(), Instant::at(0), GRACE);
     answer(

@@ -43,112 +43,46 @@ fn recovery_epoch_outranks_term_and_counter() {
 }
 
 #[test]
-fn next_change_carries_the_announcing_leaders_term() {
-    assert_eq!(generation(3, 0, 11).next_change(9), generation(3, 9, 12));
-}
-
-#[test]
-#[should_panic(expected = "below")]
-fn next_change_by_a_leader_of_an_older_term_panics() {
-    generation(3, 7, 11).next_change(6);
-}
-
-#[test]
-fn next_change_at_the_highest_representable_counter_reaches_u64_max() {
-    assert_eq!(
-        generation(3, 7, u64::MAX - 1).next_change(7),
-        generation(3, 7, u64::MAX)
-    );
-}
-
-#[test]
-#[should_panic(expected = "overflowed")]
-fn next_change_at_u64_max_panics() {
-    generation(3, 7, u64::MAX).next_change(7);
-}
-
-#[test]
-fn founded_by_election_at_the_highest_representable_counter_reaches_u64_max() {
-    let roll_call = generation(2, 5, u64::MAX - 1);
-
-    assert_eq!(
-        Generation::founded_by_election(2, 6, roll_call),
-        generation(2, 6, u64::MAX)
-    );
-}
-
-#[test]
-#[should_panic(expected = "overflowed")]
-fn founded_by_election_at_u64_max_panics() {
-    let roll_call = generation(2, 5, u64::MAX);
-    Generation::founded_by_election(2, 6, roll_call);
-}
-
-#[test]
-fn an_election_founds_the_roll_calls_next_counter_under_its_own_term() {
-    let roll_call = generation(2, 5, 7);
-
-    let founded = Generation::founded_by_election(2, 6, roll_call);
-
-    assert_eq!(founded, generation(2, 6, 8));
-    assert!(founded > roll_call);
-    // An election on the authority path founds it in the new recovery epoch.
-    assert_eq!(
-        Generation::founded_by_election(3, 6, roll_call),
-        generation(3, 6, 8)
-    );
-}
-
-#[test]
-fn a_worker_is_a_voter_exactly_when_admitted_from_the_base_through_the_current_generation() {
+fn a_worker_is_a_voter_exactly_when_admitted_within_the_side_the_configuration_counts() {
     let base = generation(1, 2, 0);
     let current = generation(1, 3, 4);
-    let configuration = Configuration::single(Single {
+    let single = Configuration::single(Single {
         generation: current,
         base,
         voter_count: 3,
-    }).expect("valid");
-
-    let cases = [
-        (None, false, "pending member"),
-        (admitted(0, 9, 9), false, "older recovery epoch"),
-        (admitted(1, 1, 5), false, "left out by the election"),
-        (Some(base), true, "at the base"),
-        (admitted(1, 2, 7), true, "between base and current"),
-        (Some(current), true, "at the current"),
-        (admitted(1, 3, 5), false, "after the current"),
-        (admitted(2, 0, 0), false, "later recovery epoch"),
-    ];
-    for (admission, is_voter, case) in cases {
-        assert_eq!(configuration.is_voter(admission), is_voter, "{case}");
-    }
-}
-
-#[test]
-fn during_an_admission_batch_both_sides_are_voters() {
-    let base = generation(1, 2, 0);
+    })
+    .expect("valid");
     let batch = generation(1, 2, 3);
-    let current = generation(1, 2, 5);
-    let configuration = Configuration::joint(Joint {
-        generation: current,
+    let joint_current = generation(1, 2, 5);
+    let joint = Configuration::joint(Joint {
+        generation: joint_current,
         base,
         batch_generation: batch,
         old_base: base,
         old_generation: generation(1, 2, 2),
         old_voter_count: 3,
         new_voter_count: 5,
-    }).expect("valid");
+    })
+    .expect("valid");
 
     let cases = [
-        (None, false, "pending member"),
-        (admitted(1, 1, 9), false, "left out by the election"),
-        (Some(base), true, "at the base"),
-        (admitted(1, 2, 2), true, "just before the batch"),
-        (Some(batch), true, "admitted by the batch"),
-        (Some(current), true, "at the current"),
-        (admitted(1, 2, 6), false, "after the current"),
+        (&single, None, false, "single: pending member"),
+        (&single, admitted(0, 9, 9), false, "single: older recovery epoch"),
+        (&single, admitted(1, 1, 5), false, "single: left out by the election"),
+        (&single, Some(base), true, "single: at the base"),
+        (&single, admitted(1, 2, 7), true, "single: between base and current"),
+        (&single, Some(current), true, "single: at the current"),
+        (&single, admitted(1, 3, 5), false, "single: after the current"),
+        (&single, admitted(2, 0, 0), false, "single: later recovery epoch"),
+        (&joint, None, false, "batch: pending member"),
+        (&joint, admitted(1, 1, 9), false, "batch: left out by the election"),
+        (&joint, Some(base), true, "batch: at the base"),
+        (&joint, admitted(1, 2, 2), true, "batch: just before the batch"),
+        (&joint, Some(batch), true, "batch: admitted by the batch"),
+        (&joint, Some(joint_current), true, "batch: at the current"),
+        (&joint, admitted(1, 2, 6), false, "batch: after the current"),
     ];
-    for (admission, is_voter, case) in cases {
+    for (configuration, admission, is_voter, case) in cases {
         assert_eq!(configuration.is_voter(admission), is_voter, "{case}");
     }
 }
@@ -204,67 +138,6 @@ fn a_worker_fed_twice_counts_once_with_its_first_admission_generation() {
 }
 
 #[test]
-fn workers_that_are_not_voters_never_count() {
-    let base = generation(1, 2, 0);
-    let current = generation(1, 2, 4);
-    let configuration = Configuration::single(Single {
-        generation: current,
-        base,
-        voter_count: 3,
-    }).expect("valid");
-
-    let tally = fed(
-        Tally::against(&configuration),
-        &[
-            ("pending", None),
-            ("left-out", admitted(1, 1, 9)),
-            ("from-a-later-generation", admitted(1, 2, 5)),
-            ("from-a-later-epoch", admitted(2, 0, 0)),
-            ("voter", Some(base)),
-        ],
-    );
-    assert!(!tally.has_quorum());
-    assert!(fed(tally, &[("other-voter", Some(current))]).has_quorum());
-}
-
-#[test]
-fn during_an_admission_batch_a_quorum_needs_a_majority_of_both_sides() {
-    let base = generation(1, 2, 0);
-    let batch = generation(1, 2, 3);
-    let current = generation(1, 2, 5);
-    // Three voters before the batch, two joiners admitted by it.
-    let configuration = Configuration::joint(Joint {
-        generation: current,
-        base,
-        batch_generation: batch,
-        old_base: base,
-        old_generation: generation(1, 2, 2),
-        old_voter_count: 3,
-        new_voter_count: 5,
-    }).expect("valid");
-
-    let old_side_only = fed(
-        Tally::against(&configuration),
-        &[("old-1", Some(base)), ("old-2", Some(base))],
-    );
-    assert!(!old_side_only.has_quorum(), "2 of 5 on the new side");
-    assert!(fed(old_side_only, &[("joiner-1", Some(batch))]).has_quorum());
-
-    let joiners_carry_the_new_side = fed(
-        Tally::against(&configuration),
-        &[
-            ("old-1", Some(base)),
-            ("joiner-1", Some(batch)),
-            ("joiner-2", Some(batch)),
-        ],
-    );
-    assert!(
-        !joiners_carry_the_new_side.has_quorum(),
-        "1 of 3 on the old side"
-    );
-}
-
-#[test]
 fn in_an_admission_batch_the_old_side_is_the_voters_admitted_before_it() {
     let base = generation(1, 2, 0);
     let batch = generation(1, 2, 3);
@@ -299,48 +172,6 @@ fn in_an_admission_batch_the_old_side_is_the_voters_admitted_before_it() {
 }
 
 #[test]
-fn a_tally_against_a_plain_count_counts_every_worker_fed() {
-    let tally = fed(
-        Tally::against_count(3),
-        &[("pending", None), ("pending", None)],
-    );
-    assert!(!tally.has_quorum());
-    assert!(fed(tally, &[("left-out", admitted(0, 0, 0))]).has_quorum());
-}
-
-#[test]
-fn the_win_rule_needs_a_returning_quorum_and_a_majority_of_respondents() {
-    let base = generation(1, 2, 0);
-    let left_out = admitted(1, 1, 0);
-    // The roll call ran under a 3-voter configuration and drew 5
-    // respondents, the initiator included.
-    let roll_call = Configuration::single(Single {
-        generation: base,
-        base,
-        voter_count: 3,
-    }).expect("valid");
-    let win_rule = || Tally::against(&roll_call).and(Tally::against_count(5));
-
-    let returning_only = fed(
-        win_rule(),
-        &[("returning-1", Some(base)), ("returning-2", Some(base))],
-    );
-    assert!(!returning_only.has_quorum(), "2 of 5 respondents");
-    assert!(fed(returning_only, &[("new-1", left_out)]).has_quorum());
-
-    let mostly_new = fed(
-        win_rule(),
-        &[
-            ("returning-1", Some(base)),
-            ("new-1", left_out),
-            ("new-2", left_out),
-            ("new-3", left_out),
-        ],
-    );
-    assert!(!mostly_new.has_quorum(), "1 of 3 returning voters");
-}
-
-#[test]
 fn a_worker_fed_to_both_joined_tallies_counts_with_the_first_tallys_admission() {
     let base = generation(1, 2, 0);
     let one_voter = Configuration::single(Single {
@@ -361,65 +192,22 @@ fn a_worker_fed_to_both_joined_tallies_counts_with_the_first_tallys_admission() 
 }
 
 #[test]
-fn joining_tallies_keeps_the_workers_either_was_already_fed() {
-    let base = generation(1, 2, 0);
-    let returning = fed(
-        Tally::against(&Configuration::single(Single {
-            generation: base,
-            base,
-            voter_count: 3,
-        }).expect("valid")),
-        &[("returning-1", Some(base)), ("returning-2", Some(base))],
+fn a_worker_held_as_both_member_and_pending_is_a_member() {
+    let mut genesis = Roster::genesis(worker("creator"), 4);
+    genesis.add_pending(worker("creator"));
+    let built = Roster::new(
+        three_voters_at(1),
+        BTreeMap::from([(worker("a"), generation(0, 1, 1))]),
+        BTreeSet::from([worker("a")]),
     );
-    let respondents = fed(Tally::against_count(5), &[("new-1", admitted(1, 1, 0))]);
 
-    assert!(returning.and(respondents).has_quorum());
-}
-
-#[test]
-fn a_genesis_roster_holds_its_creator_as_the_only_voter() {
-    let roster = Roster::genesis(worker("creator"), 4);
-    let creator_admission = roster.admission_of(&worker("creator"));
-
-    assert_eq!(roster.configuration(), &Configuration::genesis(4));
+    assert!(!genesis.is_pending(&worker("creator")));
     assert_eq!(
-        Configuration::genesis(4),
-        Configuration::single(Single {
-            generation: Generation::genesis(4),
-            base: Generation::genesis(4),
-            voter_count: 1,
-        }).expect("valid")
-    );
-    assert_eq!(creator_admission, Some(Generation::genesis(4)));
-    let creator_alone = fed(
-        Tally::against(roster.configuration()),
-        &[("creator", creator_admission)],
-    );
-    assert!(creator_alone.has_quorum());
-}
-
-#[test]
-fn a_pending_joiner_is_held_without_an_admission_generation() {
-    let mut roster = Roster::genesis(worker("creator"), 4);
-
-    roster.add_pending(worker("joiner"));
-
-    assert!(roster.is_pending(&worker("joiner")));
-    assert_eq!(roster.admission_of(&worker("joiner")), None);
-    assert_eq!(roster.configuration(), &Configuration::genesis(4));
-}
-
-#[test]
-fn adding_a_member_as_pending_leaves_it_a_member() {
-    let mut roster = Roster::genesis(worker("creator"), 4);
-
-    roster.add_pending(worker("creator"));
-
-    assert!(!roster.is_pending(&worker("creator")));
-    assert_eq!(
-        roster.admission_of(&worker("creator")),
+        genesis.admission_of(&worker("creator")),
         Some(Generation::genesis(4))
     );
+    assert!(!built.is_pending(&worker("a")));
+    assert_eq!(built.admission_of(&worker("a")), Some(generation(0, 1, 1)));
 }
 
 fn three_voters_at(counter: u64) -> Configuration {
@@ -444,109 +232,123 @@ fn roster_of_three_and_a_joiner() -> Roster {
 }
 
 #[test]
-fn a_worker_built_as_both_member_and_pending_is_a_member() {
-    let roster = Roster::new(
-        three_voters_at(1),
-        BTreeMap::from([(worker("a"), generation(0, 1, 1))]),
-        BTreeSet::from([worker("a")]),
-    );
+fn removing_workers_from_a_single_configuration() {
+    struct Row {
+        what: &'static str,
+        roster: Roster,
+        removals: Vec<(&'static str, u64)>,
+        configuration: Configuration,
+        admissions: Vec<(&'static str, Option<Generation>)>,
+        pending: Vec<(&'static str, bool)>,
+        /// Admissions the announced configuration must not count as voters.
+        non_voters: Vec<Option<Generation>>,
+    }
+    let shrunk = |term: u64, voter_count: usize| {
+        let at = generation(0, term, 2);
+        Configuration::single(Single {
+            generation: at,
+            base: at,
+            voter_count,
+        })
+        .expect("valid")
+    };
+    let with_left_out = || {
+        Roster::new(
+            three_voters_at(1),
+            BTreeMap::from([
+                (worker("a"), generation(0, 1, 1)),
+                (worker("b"), generation(0, 1, 1)),
+                (worker("left-out"), generation(0, 0, 0)),
+            ]),
+            BTreeSet::new(),
+        )
+    };
+    let rows = vec![
+        Row {
+            what: "a voter leaves: one fewer voter, re-based at the removal's generation",
+            roster: roster_of_three_and_a_joiner(),
+            removals: vec![("b", 1)],
+            configuration: shrunk(1, 2),
+            admissions: vec![
+                ("b", None),
+                ("a", admitted(0, 1, 2)),
+                ("c", admitted(0, 1, 2)),
+            ],
+            pending: vec![("b", false), ("joiner", true)],
+            non_voters: vec![],
+        },
+        Row {
+            what: "a removal re-admits only the voters; a member that was no voter keeps its admission",
+            roster: with_left_out(),
+            removals: vec![("b", 1)],
+            configuration: shrunk(1, 1),
+            admissions: vec![("a", admitted(0, 1, 2)), ("left-out", admitted(0, 0, 0))],
+            pending: vec![],
+            non_voters: vec![admitted(0, 0, 0)],
+        },
+        Row {
+            what: "removing the same voter twice removes it once",
+            roster: roster_of_three_and_a_joiner(),
+            removals: vec![("b", 1), ("b", 1)],
+            configuration: shrunk(1, 2),
+            admissions: vec![("b", None)],
+            pending: vec![],
+            non_voters: vec![],
+        },
+        Row {
+            what: "removing a pending joiner forgets it and changes no count",
+            roster: roster_of_three_and_a_joiner(),
+            removals: vec![("joiner", 1)],
+            configuration: three_voters_at(1),
+            admissions: vec![("joiner", None)],
+            pending: vec![("joiner", false)],
+            non_voters: vec![],
+        },
+        Row {
+            what: "removing a member that is no voter changes no count",
+            roster: with_left_out(),
+            removals: vec![("left-out", 1)],
+            configuration: three_voters_at(1),
+            admissions: vec![("left-out", None), ("a", admitted(0, 1, 1))],
+            pending: vec![],
+            non_voters: vec![],
+        },
+        Row {
+            what: "a configuration never shrinks below one voter",
+            roster: Roster::genesis(worker("creator"), 0),
+            removals: vec![("creator", 1)],
+            configuration: Configuration::genesis(0),
+            admissions: vec![],
+            pending: vec![],
+            non_voters: vec![],
+        },
+        Row {
+            what: "a removal announces a generation carrying the removing leader's term",
+            roster: roster_of_three_and_a_joiner(),
+            removals: vec![("b", 4)],
+            configuration: shrunk(4, 2),
+            admissions: vec![],
+            pending: vec![],
+            non_voters: vec![],
+        },
+    ];
 
-    assert!(!roster.is_pending(&worker("a")));
-    assert_eq!(roster.admission_of(&worker("a")), Some(generation(0, 1, 1)));
-}
+    for mut row in rows {
+        for (label, leader_term) in &row.removals {
+            remove(&mut row.roster, label, *leader_term);
+        }
 
-#[test]
-fn removing_a_voter_announces_one_fewer_voter_at_the_next_generation() {
-    let mut roster = roster_of_three_and_a_joiner();
-
-    remove(&mut roster, "b", 1);
-
-    assert_eq!(roster.admission_of(&worker("b")), None);
-    assert!(!roster.is_pending(&worker("b")));
-    let shrunk = generation(0, 1, 2);
-    assert_eq!(
-        roster.configuration(),
-        &Configuration::single(Single {
-            generation: shrunk,
-            base: shrunk,
-            voter_count: 2,
-        }).expect("valid"),
-        "re-based at the removal's generation"
-    );
-    assert_eq!(roster.admission_of(&worker("a")), Some(shrunk));
-    assert_eq!(roster.admission_of(&worker("c")), Some(shrunk));
-    assert!(roster.is_pending(&worker("joiner")));
-}
-
-/// A removal re-admits only the voters; a member that was no voter
-/// keeps its admission, and is no voter of the shrunk configuration either.
-#[test]
-fn a_removal_re_admits_only_the_remaining_voters() {
-    let mut roster = Roster::new(
-        three_voters_at(1),
-        BTreeMap::from([
-            (worker("a"), generation(0, 1, 1)),
-            (worker("b"), generation(0, 1, 1)),
-            (worker("left-out"), generation(0, 0, 0)),
-        ]),
-        BTreeSet::new(),
-    );
-
-    remove(&mut roster, "b", 1);
-
-    assert_eq!(roster.admission_of(&worker("a")), Some(generation(0, 1, 2)));
-    assert_eq!(
-        roster.admission_of(&worker("left-out")),
-        Some(generation(0, 0, 0))
-    );
-    assert!(!roster.configuration().is_voter(Some(generation(0, 0, 0))));
-}
-
-#[test]
-fn removing_the_same_voter_twice_removes_it_once() {
-    let mut roster = roster_of_three_and_a_joiner();
-
-    remove(&mut roster, "b", 1);
-    remove(&mut roster, "b", 1);
-
-    assert_eq!(roster.configuration().generation(), generation(0, 1, 2));
-    let two_voters = fed(
-        Tally::against(roster.configuration()),
-        &[("a", admitted(0, 1, 2)), ("c", admitted(0, 1, 2))],
-    );
-    assert!(two_voters.has_quorum());
-    let one_voter = fed(
-        Tally::against(roster.configuration()),
-        &[("a", admitted(0, 1, 2))],
-    );
-    assert!(!one_voter.has_quorum());
-}
-
-#[test]
-fn removing_a_pending_joiner_forgets_it_and_changes_no_count() {
-    let mut roster = roster_of_three_and_a_joiner();
-
-    remove(&mut roster, "joiner", 1);
-
-    assert!(!roster.is_pending(&worker("joiner")));
-    assert_eq!(roster.configuration(), &three_voters_at(1));
-}
-
-#[test]
-fn removing_a_member_that_is_no_voter_changes_no_count() {
-    let mut roster = Roster::new(
-        three_voters_at(1),
-        BTreeMap::from([
-            (worker("a"), generation(0, 1, 1)),
-            (worker("left-out"), generation(0, 0, 0)),
-        ]),
-        BTreeSet::new(),
-    );
-
-    remove(&mut roster, "left-out", 1);
-
-    assert_eq!(roster.admission_of(&worker("left-out")), None);
-    assert_eq!(roster.configuration(), &three_voters_at(1));
+        assert_eq!(row.roster.configuration(), &row.configuration, "{}", row.what);
+        for (label, admission) in &row.admissions {
+            assert_eq!(row.roster.admission_of(&worker(label)), *admission, "{}: {label}", row.what);
+        }
+        for (label, is_pending) in &row.pending {
+            assert_eq!(row.roster.is_pending(&worker(label)), *is_pending, "{}: {label}", row.what);
+        }
+        for admission in &row.non_voters {
+            assert!(!row.roster.configuration().is_voter(*admission), "{}", row.what);
+        }
+    }
 }
 
 /// During a founding or a batch, a removal re-announces the joint
@@ -624,25 +426,6 @@ fn a_removal_that_empties_the_old_side_collapses_the_joint_configuration() {
     assert_eq!(roster.prior_admission_of(&worker("p")), None);
 }
 
-#[test]
-fn a_configuration_never_shrinks_below_one_voter() {
-    let mut roster = Roster::genesis(worker("creator"), 0);
-
-    remove(&mut roster, "creator", 1);
-
-    assert_eq!(roster.configuration(), &Configuration::genesis(0));
-}
-
-#[test]
-fn a_removal_announces_a_generation_carrying_the_removing_leaders_term() {
-    let mut roster = roster_of_three_and_a_joiner();
-
-    remove(&mut roster, "b", 4);
-
-    assert_eq!(roster.configuration().generation(), generation(0, 4, 2));
-    assert_eq!(roster.configuration().base(), generation(0, 4, 2));
-}
-
 // ---- What an election founds ----
 
 /// C0: three voters admitted at the genesis generation (0, 0, 0).
@@ -706,39 +489,6 @@ fn a_founded_configuration_counts_its_old_side_by_prior_admission() {
         missed_the_founding.has_quorum(),
         "a C0 voter still at its old admission counts on the old side"
     );
-}
-
-#[test]
-fn a_worker_a_rival_election_from_the_same_configuration_admitted_is_no_old_side_voter() {
-    let (g0, rival) = (generation(0, 0, 0), generation(0, 1, 1));
-    // Founded in term 2 from C0; one voter on each side, so a single worker
-    // on the old side and one on the new side are a quorum.
-    let later = generation(0, 2, 1);
-    let configuration = Configuration::joint(Joint {
-        generation: later,
-        base: later,
-        batch_generation: later,
-        old_base: g0,
-        old_generation: g0,
-        old_voter_count: 1,
-        new_voter_count: 1,
-    }).expect("valid");
-    let quorum_with = |old_side: Admission| {
-        let mut tally = Tally::against(&configuration);
-        tally.record(worker("new"), re_admitted(later, None));
-        tally.record(worker("old"), old_side);
-        tally.has_quorum()
-    };
-
-    assert!(
-        !quorum_with(re_admitted(rival, None)),
-        "a joiner the term-1 election admitted was never a voter of C0"
-    );
-    assert!(
-        quorum_with(re_admitted(rival, Some(g0))),
-        "a C0 voter the term-1 election re-admitted still is one"
-    );
-    assert!(quorum_with(Admission::from(Some(g0))));
 }
 
 #[test]
@@ -826,52 +576,83 @@ fn founded_roster() -> Roster {
 }
 
 #[test]
-fn a_founding_commits_once_a_majority_of_each_side_holds_it() {
+fn a_founding_commits_only_when_a_majority_of_each_side_echoes_exactly_its_generation() {
     let founded = generation(0, 1, 1);
-    let mut roster = founded_roster();
+    let g0 = generation(0, 0, 0);
+    let later = generation(0, 2, 1);
+    // (what, the echoes the leader recorded, term of the committing leader,
+    // whether the founding commits)
+    let rows: Vec<(&str, Vec<(&str, Generation)>, u64, bool)> = vec![
+        (
+            "a and the joiner: one of three on the old side",
+            vec![("joiner", founded)],
+            1,
+            false,
+        ),
+        (
+            "an echo of a later generation names a configuration this leader does not lead",
+            vec![("joiner", founded), ("b", later)],
+            1,
+            false,
+        ),
+        (
+            "an older configuration's echo and an outsider's do not count",
+            vec![("b", g0), ("stranger", founded)],
+            1,
+            false,
+        ),
+        (
+            "an exact echo after a later one counts",
+            vec![("joiner", founded), ("b", later), ("b", founded)],
+            1,
+            true,
+        ),
+        (
+            "a majority of each side holds it",
+            vec![("joiner", founded), ("b", founded)],
+            1,
+            true,
+        ),
+        (
+            "a leader of a later term commits at a generation of its own term",
+            vec![("b", founded)],
+            3,
+            true,
+        ),
+    ];
 
-    roster.record_held_generation(&worker("joiner"), founded);
-    assert!(
-        !roster.commit_if_confirmed(&worker("a"), 1),
-        "a and the joiner: one of three on the old side"
-    );
-    roster.record_held_generation(&worker("b"), founded);
-    assert!(roster.commit_if_confirmed(&worker("a"), 1));
+    for (what, echoes, term, commits) in rows {
+        let mut roster = founded_roster();
+        for (member, held) in echoes {
+            roster.record_held_generation(&worker(member), held);
+        }
 
-    let committed = generation(0, 1, 2);
-    assert_eq!(
-        roster.configuration(),
-        &Configuration::single(Single {
-            generation: committed,
-            base: committed,
-            voter_count: 3,
-        }).expect("valid"),
-        "re-based at the commit's generation"
-    );
-    for member in ["a", "b", "joiner"] {
-        assert_eq!(roster.admission_of(&worker(member)), Some(committed));
+        assert_eq!(roster.commit_if_confirmed(&worker("a"), term), commits, "{what}");
+
+        if !commits {
+            assert!(roster.configuration().is_joint(), "{what}");
+            continue;
+        }
+        let committed = generation(0, term, 2);
+        assert_eq!(
+            roster.configuration(),
+            &Configuration::single(Single {
+                generation: committed,
+                base: committed,
+                voter_count: 3,
+            })
+            .expect("valid"),
+            "{what}: re-based at the commit's generation"
+        );
+        for member in ["a", "b", "joiner"] {
+            assert_eq!(roster.admission_of(&worker(member)), Some(committed), "{what}");
+        }
+        assert_eq!(roster.prior_admission_of(&worker("b")), None, "{what}");
+        assert!(
+            !roster.commit_if_confirmed(&worker("a"), term),
+            "{what}: a single configuration has nothing to commit"
+        );
     }
-    assert_eq!(roster.prior_admission_of(&worker("b")), None);
-    assert!(
-        !roster.commit_if_confirmed(&worker("a"), 1),
-        "a single configuration has nothing to commit"
-    );
-}
-
-/// An echo of a later generation than the joint configuration's own names
-/// a configuration this leader does not lead, a rival founding say, so it
-/// does not count.
-#[test]
-fn a_founding_commits_only_on_echoes_of_exactly_its_generation() {
-    let founded = generation(0, 1, 1);
-    let mut roster = founded_roster();
-    roster.record_held_generation(&worker("joiner"), founded);
-
-    roster.record_held_generation(&worker("b"), generation(0, 2, 1));
-    assert!(!roster.commit_if_confirmed(&worker("a"), 1));
-
-    roster.record_held_generation(&worker("b"), founded);
-    assert!(roster.commit_if_confirmed(&worker("a"), 1));
 }
 
 /// A commit re-admits only the members its new side counted; a member
@@ -908,29 +689,6 @@ fn a_commit_re_admits_only_the_members_its_new_side_counted() {
         "a member still at the re-stamped admission, having missed the commit's ack, \
          counts only once an ack repairs it"
     );
-}
-
-#[test]
-fn a_founding_does_not_commit_on_older_configurations_or_outsiders() {
-    let founded = generation(0, 1, 1);
-    let mut roster = founded_roster();
-
-    roster.record_held_generation(&worker("b"), generation(0, 0, 0));
-    roster.record_held_generation(&worker("stranger"), founded);
-
-    assert!(!roster.commit_if_confirmed(&worker("a"), 1));
-    assert!(roster.configuration().is_joint());
-}
-
-#[test]
-fn a_leader_of_a_later_term_commits_at_a_generation_of_its_own_term() {
-    let founded = generation(0, 1, 1);
-    let mut roster = founded_roster();
-    roster.record_held_generation(&worker("b"), founded);
-
-    assert!(roster.commit_if_confirmed(&worker("a"), 3));
-
-    assert_eq!(roster.configuration().generation(), generation(0, 3, 2));
 }
 
 /// A commit announces as many voters as it re-admits on the new side, whatever

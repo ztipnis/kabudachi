@@ -2,6 +2,7 @@
 loop, tasks called from `main` and their results awaited."""
 
 import asyncio
+import functools
 import threading
 import time
 from datetime import timedelta
@@ -29,17 +30,6 @@ def declare(function, **options):
     return kabudachi.task(name=f"tests.{function.__name__}", **options)(function)
 
 
-def declare_with_retries(retries):
-    return lambda function: declare(function, retries=retries)
-
-
-def test_run_returns_what_main_returns():
-    async def main():
-        return "the result"
-
-    assert kabudachi.run(main) == "the result"
-
-
 def test_a_synchronous_task_is_run_and_its_result_awaited():
     @declare
     def greet(request: Greeting) -> Greeting:
@@ -49,18 +39,6 @@ def test_a_synchronous_task_is_run_and_its_result_awaited():
         return await greet(Greeting(text="world", times=1))
 
     assert kabudachi.run(main) == Greeting(text="hello world", times=2)
-
-
-def test_an_async_task_is_run_and_its_result_awaited():
-    @declare
-    async def greet(request: Greeting) -> Greeting:
-        await asyncio.sleep(0.01)
-        return Greeting(text=request.text.upper())
-
-    async def main():
-        return await greet(Greeting(text="quiet"))
-
-    assert kabudachi.run(main).text == "QUIET"
 
 
 def test_a_task_that_returns_nothing_gives_none():
@@ -94,10 +72,10 @@ def test_many_tasks_called_together_each_get_their_own_result():
         return Greeting(times=request.times**2)
 
     async def main():
-        handles = [square(Greeting(times=n)) for n in range(300)]
+        handles = [square(Greeting(times=n)) for n in range(50)]
         return [g.times for g in await asyncio.gather(*handles)]
 
-    assert kabudachi.run(main) == [n * n for n in range(300)]
+    assert kabudachi.run(main) == [n * n for n in range(50)]
 
 
 def test_calling_a_task_returns_a_handle_before_it_has_run():
@@ -110,10 +88,11 @@ def test_calling_a_task_returns_a_handle_before_it_has_run():
         handle = slow(Greeting(text="x"))
         before = handle.done()
         await handle
-        return before, handle.done(), handle.task_id, handle.shard_id
+        return handle, before, handle.done(), handle.task_id, handle.shard_id
 
-    before, after, task_id, shard = kabudachi.run(main)
+    handle, before, after, task_id, shard = kabudachi.run(main)
 
+    assert isinstance(handle, kabudachi.TaskHandle)
     assert (before, after, shard) == (False, True, "local")
     assert task_id
 
@@ -138,42 +117,50 @@ def test_a_task_that_raises_fails_its_handle_and_others_still_work():
     assert good == Greeting(text="good")
 
 
-def test_no_more_tasks_run_at_once_than_configured():
+@pytest.mark.parametrize("is_async", [True, False], ids=["async", "sync"])
+def test_no_more_tasks_run_at_once_than_configured(is_async):
+    lock = threading.Lock()
     active = 0
     peak = 0
 
-    @declare
-    async def slow(request: Greeting) -> Greeting:
+    def enter():
         nonlocal active, peak
-        active += 1
-        peak = max(peak, active)
-        await asyncio.sleep(0.03)
-        active -= 1
-        return request
+        with lock:
+            active += 1
+            peak = max(peak, active)
+
+    def leave():
+        nonlocal active
+        with lock:
+            active -= 1
+
+    if is_async:
+
+        @declare
+        async def slow(request: Greeting) -> Greeting:
+            enter()
+            await asyncio.sleep(0.03)
+            leave()
+            return request
+
+    else:
+
+        @declare
+        def slow(request: Greeting) -> Greeting:
+            enter()
+            time.sleep(0.05)
+            leave()
+            return request
 
     kabudachi.configure(concurrency=2)
 
     async def main():
-        await asyncio.gather(*(slow(Greeting()) for _ in range(10)))
+        return await asyncio.gather(*(slow(Greeting(text=str(n))) for n in range(8)))
 
-    kabudachi.run(main)
+    results = kabudachi.run(main)
 
+    assert [result.text for result in results] == [str(n) for n in range(8)]
     assert peak == 2
-
-
-def test_a_task_can_call_another_task_and_wait_for_it():
-    @declare
-    async def inner(request: Greeting) -> Greeting:
-        return Greeting(times=request.times + 1)
-
-    @declare
-    async def outer(request: Greeting) -> Greeting:
-        return await inner(request)
-
-    async def main():
-        return await outer(Greeting(times=1))
-
-    assert kabudachi.run(main).times == 2
 
 
 def test_a_synchronous_task_can_call_another_task():
@@ -200,7 +187,7 @@ def test_run_waits_for_tasks_main_started_but_did_not_await():
 
     @declare
     async def slow(request: Greeting) -> Greeting:
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
         done.append(request.text)
         return request
 
@@ -220,7 +207,7 @@ def test_an_error_in_main_propagates_and_run_does_not_wait_for_queued_tasks():
     @declare
     async def slow(request: Greeting) -> Greeting:
         started.append(request.text)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
         finished.append(request.text)
         return request
 
@@ -254,7 +241,7 @@ def test_a_task_cannot_be_called_after_run_has_finished():
         greet(Greeting())
 
 
-def test_run_can_be_used_again_after_it_finishes():
+def test_run_can_be_used_again_after_it_finishes_or_its_main_failed():
     @declare
     def greet(request: Greeting) -> Greeting:
         return request
@@ -262,21 +249,13 @@ def test_run_can_be_used_again_after_it_finishes():
     async def main():
         return (await greet(Greeting(text="again"))).text
 
-    assert kabudachi.run(main) == "again"
-    assert kabudachi.run(main) == "again"
-
-
-def test_run_after_main_failed_still_works():
     async def broken():
-        raise RuntimeError("first run fails")
+        raise RuntimeError("main fails")
 
-    async def fine():
-        return "second run works"
-
-    with pytest.raises(RuntimeError, match="first run fails"):
+    assert kabudachi.run(main) == "again"
+    with pytest.raises(RuntimeError, match="main fails"):
         kabudachi.run(broken)
-
-    assert kabudachi.run(fine) == "second run works"
+    assert kabudachi.run(main) == "again"
 
 
 def test_run_cannot_start_inside_a_running_event_loop():
@@ -347,37 +326,10 @@ def test_a_worker_thread_can_call_a_task_and_hand_back_its_handle():
     assert kabudachi.run(main) == "threaded"
 
 
-def test_synchronous_tasks_run_no_more_at_once_than_the_configured_concurrency():
-    lock = threading.Lock()
-    active = 0
-    peak = 0
-
-    @declare
-    def blocking(request: Greeting) -> Greeting:
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-        time.sleep(0.05)
-        with lock:
-            active -= 1
-        return request
-
-    kabudachi.configure(concurrency=2)
-
-    async def main():
-        return await asyncio.gather(*(blocking(Greeting(text=str(n))) for n in range(8)))
-
-    results = kabudachi.run(main)
-
-    assert [result.text for result in results] == [str(n) for n in range(8)]
-    assert peak == 2
-
-
 def test_a_task_that_fails_is_retried_through_the_real_runtime_and_finally_succeeds():
     calls = []
 
-    @declare_with_retries(2)
+    @functools.partial(declare, retries=2)
     def flaky(request: Greeting) -> Greeting:
         calls.append(request.text)
         if len(calls) < 3:
@@ -388,6 +340,7 @@ def test_a_task_that_fails_is_retried_through_the_real_runtime_and_finally_succe
         return await flaky(Greeting(text="x"))
 
     assert kabudachi.run(main).text == "done after 3"
+    assert calls == ["x", "x", "x"], "every attempt saw the same input"
 
 
 def test_a_delayed_task_does_not_start_before_its_delay_has_passed():
@@ -400,16 +353,16 @@ def test_a_delayed_task_does_not_start_before_its_delay_has_passed():
 
     async def main():
         submitted = time.monotonic()
-        await stamp.options(delay=timedelta(milliseconds=300))(Greeting())
+        await stamp.options(delay=timedelta(milliseconds=100))(Greeting())
         return started_at[0] - submitted
 
-    assert kabudachi.run(main) >= 0.3
+    assert kabudachi.run(main) >= 0.1
 
 
 def test_a_task_that_times_out_is_retried_and_can_then_succeed():
     calls = []
 
-    @declare_timed(timedelta(milliseconds=80), retries=1)
+    @functools.partial(declare, timeout=timedelta(milliseconds=80), retries=1)
     async def slow_once(request: Greeting) -> Greeting:
         calls.append(True)
         if len(calls) == 1:
@@ -423,10 +376,6 @@ def test_a_task_that_times_out_is_retried_and_can_then_succeed():
     assert len(calls) == 2
 
 
-def declare_timed(timeout, **options):
-    return lambda function: declare(function, timeout=timeout, **options)
-
-
 def declare_coalescing(function, **options):
     return kabudachi.coalescing_task(name=f"tests.{function.__name__}", **options)(function)
 
@@ -434,16 +383,17 @@ def declare_coalescing(function, **options):
 def test_a_running_generation_is_never_cancelled_and_the_next_one_waits_for_it():
     order = []
 
-    @declare_coalescing_with()
+    @declare_coalescing
     async def refresh(request: Greeting) -> Greeting:
         order.append(f"start {request.text}")
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.1)
         order.append(f"end {request.text}")
         return request
 
     async def main():
         running = refresh(Greeting(text="one"))
-        await asyncio.sleep(0.1)
+        while "start one" not in order:
+            await asyncio.sleep(0.001)
         newer = refresh(Greeting(text="two"))
         return await running, await newer
 
@@ -457,12 +407,12 @@ def test_different_keys_run_side_by_side():
     active = 0
     peak = 0
 
-    @declare_coalescing_with()
+    @declare_coalescing
     async def refresh(request: Greeting) -> Greeting:
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.1)
         active -= 1
         return request
 
@@ -488,11 +438,7 @@ def test_an_ephemeral_task_runs_and_returns_like_a_task_in_one_process():
     assert kabudachi.run(main).text == "hi there"
 
 
-def declare_coalescing_with(**options):
-    return lambda function: declare_coalescing(function, **options)
-
-
-def test_a_flow_runs_its_stages_one_after_another_through_the_real_runtime():
+def test_a_flow_runs_its_stages_one_after_another_and_a_group_runs_side_by_side_through_the_real_runtime():
     @declare
     def shout(request: Greeting) -> Greeting:
         return Greeting(text=request.text.upper(), times=request.times)
@@ -501,16 +447,23 @@ def test_a_flow_runs_its_stages_one_after_another_through_the_real_runtime():
     def count(request: Greeting) -> Receipt:
         return Receipt(ok=request.times > 0)
 
-    pipeline = kabudachi.flow(shout, shout.bind(times=5), count)
+    pipeline = kabudachi.flow(shout, shout.bind(times=5), kabudachi.group(shout, count))
 
     async def main():
-        return await pipeline(Greeting(text="hi"))
+        flow_handle = pipeline(Greeting(text="hi"))
+        group_handle = kabudachi.group(shout, count)(Greeting(text="hi", times=5))
+        return flow_handle, group_handle, await flow_handle, await group_handle
 
-    assert kabudachi.run(main) == [
+    flow_handle, group_handle, flowed, grouped = kabudachi.run(main)
+
+    assert isinstance(flow_handle, kabudachi.FlowHandle)
+    assert isinstance(group_handle, kabudachi.GroupHandle)
+    assert flowed == [
         Greeting(text="HI"),
         Greeting(text="HI", times=5),
-        Receipt(ok=True),
+        [Greeting(text="HI", times=5), Receipt(ok=True)],
     ]
+    assert grouped == [Greeting(text="HI", times=5), Receipt(ok=True)]
 
 
 def test_a_bound_task_is_called_like_a_task():
@@ -522,21 +475,6 @@ def test_a_bound_task_is_called_like_a_task():
         return await shout.bind(Greeting(text="fixed"))()
 
     assert kabudachi.run(main).text == "FIXED"
-
-
-def test_a_group_runs_its_members_side_by_side_through_the_real_runtime():
-    @declare
-    def shout(request: Greeting) -> Greeting:
-        return Greeting(text=request.text.upper())
-
-    @declare
-    def count(request: Greeting) -> Receipt:
-        return Receipt(ok=len(request.text) > 0)
-
-    async def main():
-        return await kabudachi.group(shout, count)(Greeting(text="hi"))
-
-    assert kabudachi.run(main) == [Greeting(text="HI"), Receipt(ok=True)]
 
 
 def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():

@@ -20,7 +20,7 @@ rust_test(
     crate = ":net",
     edition = "2024",
     tags = ["no-remote-cache"],
-    deps = ["//testkit"] + all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True),
 )
 
 # ":net" alone isn't enough for the tests to `use kabudachi_core::...`

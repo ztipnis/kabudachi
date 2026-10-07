@@ -176,6 +176,16 @@ fn a_majority_without_the_authority_orphans_and_a_minority_with_it_recovers() {
             "{id:?} must lead or follow at the swapped epoch"
         );
     }
+
+    // The shard is now recovered past epoch 0, so when the authority is then
+    // flushed its workers find it at an epoch below their own. That is no
+    // lost data they could wait out but a shard founded afresh, so they
+    // rejoin it rather than stay fenced for good.
+    let ids = cluster.node_ids();
+    let refounded = refound_while_fenced(&mut cluster, &ids);
+    run_for(&mut cluster, ttl(), |_| {});
+
+    assert_rejoining(&cluster, &ids, refounded);
 }
 
 #[test]
@@ -368,36 +378,6 @@ fn assert_rejoining(cluster: &Cluster, ids: &BTreeSet<WorkerId>, refounded: Reco
             "{id:?} rejoins at the epoch founded afresh"
         );
     }
-}
-
-// The same, for a shard already recovered past epoch 0: its workers find the
-// authority at an epoch below their own. That is no lost data they could
-// wait out, but a shard founded afresh, so they rejoin it rather than stay
-// fenced for good.
-#[test]
-fn workers_fenced_through_a_flush_above_epoch_0_rejoin_rather_than_stay_fenced() {
-    let (mut cluster, leader) = elected(5);
-    let others = followers(&cluster, &leader);
-    let majority: BTreeSet<WorkerId> = [leader.clone(), others[0].clone(), others[1].clone()]
-        .into_iter()
-        .collect();
-    let minority: BTreeSet<WorkerId> = others[2..].iter().cloned().collect();
-    set_reachable(&cluster, &majority, false);
-    cluster.partition(majority.clone(), minority.clone());
-    run_for(&mut cluster, ttls(2), |_| {});
-    for id in &minority {
-        assert_eq!(
-            cluster.node(id).recovery_epoch(),
-            1,
-            "the minority recovered"
-        );
-    }
-
-    let ids = cluster.node_ids();
-    let refounded = refound_while_fenced(&mut cluster, &ids);
-    run_for(&mut cluster, ttl(), |_| {});
-
-    assert_rejoining(&cluster, &ids, refounded);
 }
 
 #[test]

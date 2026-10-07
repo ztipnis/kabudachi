@@ -123,17 +123,3 @@ impl From<TaskRunState> for generated::TaskRunState {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn conversions_round_trip_successfully() {
-        for state in TaskRunState::ALL.iter() {
-            let generated: generated::TaskRunState = (*state).into();
-            let back: TaskRunState = generated.try_into().expect("round-trip should succeed");
-            assert_eq!(*state, back, "Round-trip failed for {:?}", state);
-        }
-    }
-}

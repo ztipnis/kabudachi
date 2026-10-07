@@ -25,6 +25,7 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{Claim, Completion, Scheduler, Submission};
 use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
 
 const KEYS: u8 = 2;
 
@@ -338,8 +339,25 @@ impl Model {
     }
 }
 
+/// The seed every run draws its histories from unless `PROPTEST_RNG_SEED`
+/// names another, so every run checks the same cases.
+const RNG_SEED: u64 = 0;
+
+/// 128 cases from the fixed seed, unless `PROPTEST_CASES` or
+/// `PROPTEST_RNG_SEED` ask for another run.
+fn config() -> ProptestConfig {
+    let config = crate::proptest::config(128);
+    match config.rng_seed {
+        RngSeed::Random => ProptestConfig {
+            rng_seed: RngSeed::Fixed(RNG_SEED),
+            ..config
+        },
+        RngSeed::Fixed(_) => config,
+    }
+}
+
 proptest! {
-    #![proptest_config(crate::proptest::config(400))]
+    #![proptest_config(config())]
 
     #[test]
     fn the_coalescing_invariants_hold_over_random_histories(

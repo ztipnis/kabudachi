@@ -594,33 +594,6 @@ fn acked(outputs: &[Output], to: &WorkerId) -> Checked<LeaderHeartbeatAck> {
         .expect("an ack")
 }
 
-#[test]
-fn a_leader_commits_its_founding_once_a_majority_of_each_side_holds_it() {
-    let clock = FakeClock::new();
-    let (mut leader, b, p) = leader_of_a_founding(&clock);
-    let founded = founded_from_g0(1, 3, 3).generation();
-
-    let from_p = deliver(&mut leader, &p, heartbeat_holding(&clock, &p, 1, founded));
-    assert!(
-        acked(&from_p, &p).configuration().is_joint(),
-        "a and p: one of C0's three"
-    );
-    let from_b = deliver(&mut leader, &b, heartbeat_holding(&clock, &b, 1, founded));
-
-    let committed = committed_from_g0(1, 1, 3);
-    assert_eq!(leader.configuration(), Some(&committed));
-    assert_eq!(
-        leader.admission(),
-        Some(committed.generation()),
-        "re-based at the commit"
-    );
-    assert_eq!(leader.prior_admission(), None);
-    let ack = acked(&from_b, &b);
-    assert_eq!(ack.configuration(), committed);
-    assert_eq!(ack.recipient_admission(), Some(committed.generation()));
-    assert_eq!(ack.recipient_prior_admission(), None);
-}
-
 /// A leader counts toward its commit only a heartbeat confirming an
 /// ack of its own term. c, a voter of C0 that missed a's founding in term
 /// 1, founds J2 from C0 in term 2 with b's vote; b then holds J2, a later
@@ -739,43 +712,6 @@ fn j1_re_stamped_in_term_2() -> Configuration {
         old_voter_count: 3,
         new_voter_count: 2,
     }).expect("valid")
-}
-
-#[test]
-fn an_election_under_an_uncommitted_founding_re_stamps_it_at_its_own_term() {
-    let clock = FakeClock::new();
-    let (node, won, [fellow, left_out, joiner]) = leader_re_leading_a_founding(&clock);
-
-    let restamped = j1_re_stamped_in_term_2();
-    assert_eq!(node.configuration(), Some(&restamped));
-    assert_eq!(node.admission(), Some(restamped.generation()));
-    assert_eq!(node.prior_admission(), Some(g0()));
-    let to_fellow = acked(&won, &fellow);
-    assert_eq!(to_fellow.configuration(), restamped);
-    assert_eq!(
-        to_fellow.recipient_admission(),
-        Some(restamped.generation()),
-        "re-admitted where the new side is re-based"
-    );
-    let to_left_out = acked(&won, &left_out);
-    assert_eq!(to_left_out.recipient_admission(), Some(g0()));
-    assert_eq!(
-        acked(&won, &joiner).recipient_admission(),
-        None,
-        "a joiner stays pending until a founding admits it"
-    );
-    let certificate = sent_to(&won, &fellow)
-        .into_iter()
-        .find_map(|message| match checked(message).into_payload() {
-            Some(CheckedPayload::ElectionCertificate(certificate)) => Some(certificate),
-            _ => None,
-        })
-        .expect("a certificate to a respondent");
-    assert_eq!(certificate.configuration(), restamped);
-    assert_eq!(
-        certificate.recipient_admission(),
-        Some(restamped.generation())
-    );
 }
 
 /// A re-stamped founding commits only on echoes of its re-stamped

@@ -1,7 +1,5 @@
 //! Message, ID and configuration builders shared by the election tests.
 
-use std::rc::Rc;
-
 use kabudachi_core::configuration::{Admission, Configuration, Generation, Joint, Single};
 use kabudachi_core::election::{ElectionTimings, Input, KnownConfiguration};
 use kabudachi_core::protocol::checked::{self, CheckedMessage};
@@ -13,9 +11,6 @@ use kabudachi_core::protocol::messages::{
     VoteRequest, WorkerHeartbeat, election_message,
 };
 use kabudachi_core::time::Duration;
-
-use crate::support::clock::FakeClock;
-use crate::support::network::FakeNetwork;
 
 const SHARD: &str = "shard-1";
 
@@ -317,13 +312,4 @@ pub fn self_remove(worker: &WorkerId, shard_id: &str) -> SelfRemove {
 
 pub fn self_remove_message(msg: SelfRemove) -> ElectionMessage {
     message(election_message::Payload::SelfRemove(msg))
-}
-
-/// A `FakeNetwork` sharing `clock`, with every one of `members` registered.
-pub fn make_network(clock: &FakeClock, members: &[WorkerId]) -> FakeNetwork {
-    let network = FakeNetwork::new(Rc::new(clock.clone()));
-    for member in members {
-        network.register(member.clone());
-    }
-    network
 }

@@ -64,19 +64,17 @@ class FaultingRuntime:
         self._claims_given += len(claims)
         return claims
 
-    def inject_event(
-        self, kind, task_id="", task_run_id="", was_running=False, superseded_by=None, active=False
-    ):
+    def inject_event(self, kind, task_id=""):
         """Makes `next_events()` also return an event the real runtime did not
         produce, for one it could never cause (such as one for another session's task)."""
         self._injected.put_nowait(
             SimpleNamespace(
                 kind=kind,
                 task_id=task_id,
-                task_run_id=task_run_id,
-                was_running=was_running,
-                superseded_by=superseded_by,
-                active=active,
+                task_run_id="",
+                was_running=False,
+                superseded_by=None,
+                active=False,
             )
         )
 

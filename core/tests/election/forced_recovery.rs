@@ -1,28 +1,27 @@
 //! A node's life with a coordination authority, driven by hand at the node's
-//! interface: the authority calls it asks its driver to make, its registration
-//! and orphaning, the recovery fence a leader must hold, and the authority
-//! path a roll call short of its returning quorum takes. Every authority call
-//! a step asks for is made on a `FaultingAuthority` at once and its reply
-//! handed straight back, as a driver does.
-
+//! interface: the epoch reads and replies its driver may hand back late or out
+//! of order, how a rejoining node validates a pointer, the recovery fence a
+//! leader must hold, the ack lineages it ignores, and the authority path a
+//! roll call short of its returning quorum takes. Every authority call a step
+//! asks for is made on a `FaultingAuthority` at once and its reply handed
+//! straight back, as a driver does.
 
 use crate::support::builders::{
     message_input,
-    ack_message, configuration_of, election_certificate, election_certificate_message, g0, heartbeat, heartbeat_message, leader_ack, roll_call_reply, shard, timings, voter_of,
+    ack_message, configuration_of, g0, leader_ack, roll_call_reply, shard, timings, voter_of,
     worker,
 };
 
-use kabudachi_core::configuration::{Admission, Configuration, Generation, Single};
-use kabudachi_core::coordination_authority::{AuthorityError, CoordinationAuthority, RecoveryEpoch};
+use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
 use kabudachi_core::election::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, DropMessages,
     ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step, WorkerNode,
     carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
-use kabudachi_core::protocol::messages::election_message;
 use kabudachi_core::protocol::messages::{
-    ElectionCertificate, JoinResponse, LeaderHeartbeatAck, WorkerHeartbeat,
+    JoinResponse, LeaderHeartbeatAck,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::reconcile::Rebuild;
@@ -34,7 +33,7 @@ use crate::support::authority::{
 };
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
-use crate::support::node::{TestNode, grants, published_roll_calls, sent_to, state_changes};
+use crate::support::node::{TestNode, grants, published_roll_calls, state_changes};
 
 const SHARD: &str = "shard-1";
 const SUSPECT_TIMEOUT_TICKS: u64 = 10;
@@ -197,121 +196,6 @@ fn lasting_ticks() -> u64 {
     ttl_ticks() - ttl_ticks().div_ceil(10)
 }
 
-fn live_workers(authority: &FaultingAuthority<FakeClock>) -> Vec<WorkerId> {
-    authority
-        .live_registrations(&shard(SHARD))
-        .expect("the handle is reachable")
-        .addresses()
-        .keys()
-        .cloned()
-        .collect()
-}
-
-#[test]
-fn a_node_registers_at_once_and_renews_every_third_of_its_ttl() {
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    let (mut driven, first) = Driven::voter(&clock, &authority, "w1", 3);
-
-    assert_eq!(authority_calls(&first), vec![AuthorityRequest::Register]);
-    assert_eq!(live_workers(&authority), vec![worker("w1")]);
-
-    // Nothing more until a third of the TTL has passed.
-    let third = ttl_ticks() / 3;
-    driven.clock.advance(Duration::from_ticks(third - 1));
-    assert!(authority_calls(&driven.tick()).is_empty());
-    driven.clock.advance(Duration::from_ticks(1));
-    assert_eq!(
-        authority_calls(&driven.tick()),
-        vec![AuthorityRequest::Register]
-    );
-}
-
-#[test]
-fn a_winner_that_cannot_renew_fences_itself_while_it_reconciles() {
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    seed_shard(&authority, &shard(SHARD), 0, []);
-    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 1);
-    driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
-    driven.tick();
-    driven.advance(SUSPECT_TIMEOUT_TICKS);
-    assert_eq!(driven.node.state(), WorkerState::LeaderReconciling);
-    driven.authority.set_reachable(false);
-
-    let mut outputs = Vec::new();
-    while driven.node.state() == WorkerState::LeaderReconciling {
-        outputs.extend(driven.advance(100));
-    }
-
-    assert_eq!(driven.node.state(), WorkerState::Fenced);
-    assert_eq!(grants(&outputs).last(), Some(&None), "leaving office reports no grant");
-    assert_eq!(driven.node.office_term(), None);
-}
-
-#[test]
-fn a_node_that_cannot_renew_fences_itself_before_its_registration_lapses() {
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    seed_shard(&authority, &shard(SHARD), 0, []);
-    let reconnect_ticks = 50;
-    let (mut driven, _) = Driven::with(
-        &clock,
-        &authority,
-        "w1",
-        voter_of(1),
-        default_timings().with_reconnect_timeout(Duration::from_ticks(reconnect_ticks)),
-        Some(AuthorityTimings {
-            ttl: authority_ttl(),
-        }),
-    );
-    // A lone voter leads once its own roll call closes, and takes the fence.
-    driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
-    driven.tick();
-    driven.advance(SUSPECT_TIMEOUT_TICKS);
-    driven.finish_reconciling();
-    assert_eq!(driven.node.state(), WorkerState::Leader);
-    let registered_at = clock.now();
-    let configuration = driven.node.configuration().cloned();
-    driven.authority.set_reachable(false);
-
-    let mut outputs = Vec::new();
-    while driven.node.state() == WorkerState::Leader {
-        outputs.extend(driven.advance(100));
-    }
-
-    assert_eq!(driven.node.state(), WorkerState::Fenced);
-    let fenced_at = clock.now();
-    assert!(
-        fenced_at - registered_at <= Duration::from_ticks(ttl_ticks()),
-        "it fenced itself {:?} after its last registration, past the TTL",
-        fenced_at - registered_at
-    );
-    assert!(
-        live_workers(&authority).contains(&worker("w1")),
-        "it fenced itself while the authority still counted it"
-    );
-    assert_eq!(grants(&outputs).last(), Some(&None), "its grant is withdrawn");
-    let abort_by = outputs
-        .iter()
-        .filter_map(|output| match output {
-            Output::AbortDeadline(deadline) => Some(*deadline),
-            _ => None,
-        })
-        .next_back()
-        .flatten();
-    assert_eq!(
-        abort_by,
-        Some(fenced_at + Duration::from_ticks(reconnect_ticks - reconnect_ticks.div_ceil(10)))
-    );
-    assert_eq!(
-        driven.node.configuration().cloned(),
-        configuration,
-        "it keeps its configuration"
-    );
-    assert!(driven.node.admission().is_some(), "and its admission");
-}
-
 /// A voter of 3 fenced for having lost its authority, with the authority at
 /// epoch 0.
 fn fenced_voter() -> Driven {
@@ -323,156 +207,6 @@ fn fenced_voter() -> Driven {
     driven.advance(lasting_ticks());
     assert_eq!(driven.node.state(), WorkerState::Fenced);
     driven
-}
-
-#[test]
-fn a_fenced_node_ignores_elections() {
-    let mut driven = fenced_voter();
-    let peer = worker("w2");
-
-    let outputs = driven.step(message_input(&peer, roll_call_message_for(&peer, 7)));
-
-    assert!(sent_to(&outputs, &peer).is_empty(), "it answers no roll call");
-}
-
-fn roll_call_message_for(
-    initiator: &WorkerId,
-    term: u64,
-) -> kabudachi_core::protocol::messages::ElectionMessage {
-    crate::support::builders::roll_call_message(crate::support::builders::roll_call(
-        initiator,
-        term,
-        &configuration_of(3),
-        0,
-    ))
-}
-
-#[test]
-fn a_fenced_node_rejoins_as_pending_once_the_epoch_has_moved_on() {
-    let mut driven = fenced_voter();
-    driven.authority.set_reachable(true);
-    driven
-        .authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
-        .expect("a recovery elsewhere moved the epoch on");
-
-    while driven.node.state() == WorkerState::Fenced {
-        driven.advance(1_000);
-    }
-
-    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
-    assert_eq!(driven.node.configuration(), None);
-    assert!(driven.node.is_pending_member());
-    assert_eq!(driven.node.recovery_epoch(), 1);
-    // A pointer to a leader left on the old epoch does not take it back.
-    let _ = driven.node.step(Input::JoinAnswer(JoinResponse {
-        leader_id: Some(worker("w1").into()),
-        leader_multiaddr: "w1".to_string(),
-        term: 5,
-        recovery_epoch: 0,
-        recovery_epoch_lineage: 0,
-    }));
-    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
-    // Its driver joins it again, to the leader of the new epoch.
-    let _ = driven.node.step(Input::JoinAnswer(JoinResponse {
-        leader_id: Some(worker("w2").into()),
-        leader_multiaddr: "w2".to_string(),
-        term: 1,
-        recovery_epoch: 1,
-        recovery_epoch_lineage: 0,
-    }));
-    assert_eq!(driven.node.state(), WorkerState::Joining);
-    read_epoch(&mut driven.node, 1, epoch(1));
-    assert_eq!(driven.node.state(), WorkerState::Active);
-    assert_eq!(driven.node.recovery_epoch(), 1);
-}
-
-#[test]
-fn a_node_that_rejoins_after_answering_a_call_is_held_by_none_of_the_old_epochs_answer() {
-    // A suspicion timeout longer than a registration's life, and roll calls
-    // nearly as long, so that the hold answering a call gives is still live
-    // when the node, fenced meanwhile, rejoins another epoch.
-    let suspect = 40_000;
-    let timings = ElectionTimings::new(
-        Duration::from_ticks(suspect),
-        Duration::from_ticks(suspect / 4),
-    )
-    .with_roll_call_deadline(Duration::from_ticks(suspect * 9 / 10));
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    seed_shard(&authority, &shard(SHARD), 0, []);
-    let (mut driven, _) = Driven::with(
-        &clock,
-        &authority,
-        "w1",
-        voter_of(3),
-        timings,
-        Some(AuthorityTimings {
-            ttl: authority_ttl(),
-        }),
-    );
-    while driven.node.state() != WorkerState::LeaderSuspect {
-        driven.advance(1_000);
-    }
-    let caller = worker("w2");
-    let answered = driven.step(message_input(&caller, roll_call_message_for(&caller, 1)));
-    assert_eq!(sent_to(&answered, &caller).len(), 1, "setup invariant");
-    // Two roll-call deadlines for the call's census and vote, and a
-    // suspicion timeout for its caller to go quiet.
-    let old_release = clock.now() + Duration::from_ticks(suspect * 9 / 5 + suspect);
-
-    // The authority moves on while the node is cut off. The fenced node
-    // rejoins the epoch it holds through a JOIN pointer and an epoch read,
-    // and learns its configuration from a certificate, hearing no leader's
-    // ack: nothing but the rejoin clears what it answered.
-    driven.authority.set_reachable(false);
-    driven.advance(lasting_ticks());
-    assert_eq!(driven.node.state(), WorkerState::Fenced);
-    driven.authority.set_reachable(true);
-    driven
-        .authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
-        .expect("a recovery elsewhere moved the epoch on");
-    while driven.node.state() == WorkerState::Fenced {
-        driven.advance(1_000);
-    }
-    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
-    let _ = driven.node.step(Input::JoinAnswer(JoinResponse {
-        leader_id: Some(caller.clone().into()),
-        leader_multiaddr: "w2".to_string(),
-        term: 1,
-        recovery_epoch: 1,
-        recovery_epoch_lineage: 0,
-    }));
-    read_epoch(&mut driven.node, 1, epoch(1));
-    assert_eq!(driven.node.state(), WorkerState::Active);
-    driven.step(message_input(
-        &caller,
-        election_certificate_message(ElectionCertificate {
-            recovery_epoch: 1,
-            ..election_certificate(
-                &caller,
-                1,
-                &configuration_at_epoch(1),
-                Admission::from(Some(Generation::new(1, 0, 0))),
-            )
-        }),
-    ));
-    assert!(driven.node.configuration().is_some(), "setup invariant");
-    assert!(clock.now() < old_release, "setup invariant: the old hold is live");
-
-    let mut called_at = None;
-    while called_at.is_none() && clock.now() <= old_release {
-        let outputs = driven.advance(1_000);
-        if !published_roll_calls(&outputs).is_empty() {
-            called_at = Some(clock.now());
-        }
-    }
-
-    assert!(
-        called_at.is_some_and(|at| at < old_release),
-        "it calls once it suspects its new leader, not when the old epoch's hold would end: {called_at:?}"
-    );
 }
 
 // A driver hands authority replies back whenever they arrive, possibly out
@@ -515,54 +249,6 @@ fn a_fenced_node_ignores_an_epoch_read_it_asked_for_before_reconnecting() {
 
     let _ = driven.node.step(answer(second, epoch(1)));
     assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
-}
-
-// A shard founded afresh after a flush may reuse the old shard's epoch
-// number. A node rejoining it refuses a pointer to a leader of another
-// lineage at or below its floor's number, which may be the old shard's at
-// the same number, and takes one numbered above it, which is newer.
-#[test]
-fn a_node_rejoining_a_shard_founded_afresh_takes_another_lineages_pointer_only_above_its_floor() {
-    let mut driven = fenced_voter();
-    driven.authority.flush();
-    driven.authority.set_reachable(true);
-    let refounded = RecoveryEpoch::new(1, 9);
-    driven
-        .authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), None, refounded)
-        .expect("a bootstrapper founds the shard afresh");
-    while driven.node.state() == WorkerState::Fenced {
-        driven.advance(1_000);
-    }
-    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
-
-    let pointer = |number, lineage| JoinResponse {
-        leader_id: Some(worker("w2").into()),
-        leader_multiaddr: "w2".to_string(),
-        term: 1,
-        recovery_epoch: number,
-        recovery_epoch_lineage: lineage,
-    };
-    for number in [0, 1] {
-        let _ = driven.node.step(Input::JoinAnswer(pointer(number, 0)));
-        assert_eq!(
-            driven.node.state(),
-            WorkerState::Bootstrapping,
-            "another lineage's epoch {number} is at or below the floor"
-        );
-    }
-    let _ = driven.node.step(Input::JoinAnswer(pointer(2, 0)));
-    assert_eq!(
-        driven.node.state(),
-        WorkerState::Joining,
-        "the floor takes the pointer, which the authority has yet to confirm"
-    );
-    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(2, 0));
-    assert_eq!(driven.node.state(), WorkerState::Active);
-    assert_eq!(
-        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
-        (2, Some(0))
-    );
 }
 
 /// A node back in `Bootstrapping` at a floor of epoch 2 of lineage 1.
@@ -609,189 +295,108 @@ fn read_token(number: u64) -> ReplyToken {
     }
 }
 
-// A shard flushed and founded afresh may land on a number at or below the
-// floor of a node still rejoining the old one. The authority's epoch, read
-// while it rejoins, becomes its floor when it is another lineage's, so the
-// new shard's leader at that number is taken, not refused for ever.
-#[test]
-fn a_rejoining_node_takes_the_authoritys_epoch_of_another_lineage_as_its_floor() {
-    let mut driven = rejoining_at_floor_two_of_lineage_one();
-
-    let _ = driven.node.step(pointer_at_epoch_two_of(2));
-    assert_eq!(
-        driven.node.state(),
-        WorkerState::Bootstrapping,
-        "before the read, epoch 2 of another lineage is not above the floor"
-    );
-
-    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(2, 2));
-    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
-    assert_eq!(
-        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
-        (2, Some(2))
-    );
-
-    let _ = driven.node.step(pointer_at_epoch_two_of(2));
-    read_epoch(&mut driven.node, 2, RecoveryEpoch::new(2, 2));
-    assert_eq!(driven.node.state(), WorkerState::Active);
-}
-
-// The floor moves only to an epoch of another lineage, and only for a node
-// rejoining.
-#[test]
-fn an_authority_epoch_of_the_floors_own_lineage_or_read_by_a_node_not_rejoining_changes_nothing() {
-    let mut driven = rejoining_at_floor_two_of_lineage_one();
-    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(3, 1));
-    assert_eq!(
-        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
-        (2, Some(1))
-    );
-
-    let mut fenced = fenced_voter();
-    read_epoch(&mut fenced.node, 1, RecoveryEpoch::new(5, 9));
-    assert_eq!(fenced.node.state(), WorkerState::Fenced);
-    assert_eq!(fenced.node.recovery_epoch(), 0);
-}
-
 // A pointer taken from a delayed or lagging search is not the shard's say:
 // the node holds it, still rejoining and settled nowhere, until a read of the
-// authority names the pointer's epoch, lineage included.
+// authority names the pointer's epoch, lineage included. Only the answer to
+// the latest read counts, and each is applied once.
 #[test]
-fn a_node_that_took_a_pointer_becomes_a_member_only_when_a_read_names_its_epoch() {
-    let mut driven = rejoining_at_floor_two_of_lineage_one();
+fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_epoch() {
+    type Script = fn(&mut TestNode);
+    let rows: [Script; 6] = [
+        // A read naming the pointer's epoch makes it a member.
+        |node| {
+            let _ = node.step(pointer_at_epoch_two_of(1));
+            assert_eq!(node.state(), WorkerState::Joining);
+            assert_eq!(node.known_leader(), None);
 
-    let _ = driven.node.step(pointer_at_epoch_two_of(1));
-    assert_eq!(driven.node.state(), WorkerState::Joining);
-    assert_eq!(driven.node.known_leader(), None);
+            read_epoch(node, 1, RecoveryEpoch::new(2, 1));
+            assert_eq!(node.state(), WorkerState::Active);
+            assert_eq!(node.known_leader(), Some((worker("w2"), 1)));
+            assert_eq!((node.recovery_epoch(), node.recovery_lineage()), (2, Some(1)));
+        },
+        // An ack from the held pointer's leader confirms nothing.
+        |node| {
+            let _ = node.step(pointer_at_epoch_two_of(1));
 
-    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(2, 1));
-    assert_eq!(driven.node.state(), WorkerState::Active);
-    assert_eq!(driven.node.known_leader(), Some((worker("w2"), 1)));
-    assert_eq!(
-        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
-        (2, Some(1))
-    );
-}
+            let _ = node.step(message_input(
+                &worker("w2"),
+                ack_message(leader_ack(&worker("w2"), 1, &configuration_of(3), None)),
+            ));
 
-// An ack from the leader the node holds is no confirmation: a bootstrapper
-// ignores acks, and a node validating a pointer is one.
-#[test]
-fn a_node_validating_a_pointer_ignores_acks() {
-    let mut driven = rejoining_at_floor_two_of_lineage_one();
-    let _ = driven.node.step(pointer_at_epoch_two_of(1));
-    assert_eq!(driven.node.state(), WorkerState::Joining);
+            assert_eq!(node.state(), WorkerState::Joining);
+            assert_eq!(node.configuration(), None);
+        },
+        // A read naming another epoch drops the pointer.
+        |node| {
+            let _ = node.step(pointer_at_epoch_two_of(1));
 
-    let _ = driven.node.step(message_input(
-        &worker("w2"),
-        ack_message(leader_ack(&worker("w2"), 1, &configuration_of(3), None)),
-    ));
+            read_epoch(node, 1, RecoveryEpoch::new(1, 2));
 
-    assert_eq!(driven.node.state(), WorkerState::Joining);
-    assert_eq!(driven.node.configuration(), None);
-}
+            assert_eq!(node.state(), WorkerState::Bootstrapping);
+            assert_eq!(node.known_leader(), None);
+            assert_eq!((node.recovery_epoch(), node.recovery_lineage()), (1, Some(2)));
+        },
+        // An answer to an older read than the latest is dropped.
+        |node| {
+            let _ = node.step(pointer_at_epoch_two_of(1));
+            let _ = node.step(Input::AuthorityEpochAsked(read_token(1)));
+            let _ = node.step(Input::AuthorityEpochAsked(read_token(2)));
 
-// A read that names another epoch than the pointer's drops the pointer. The
-// node bootstraps again with the read's epoch as its floor, below the
-// pointer's number or not.
-#[test]
-fn a_read_naming_another_epoch_than_the_held_pointers_sends_the_node_back_to_bootstrap() {
-    let mut driven = rejoining_at_floor_two_of_lineage_one();
-    let _ = driven.node.step(pointer_at_epoch_two_of(1));
-    assert_eq!(driven.node.state(), WorkerState::Joining);
+            let _ = node.step(Input::AuthorityEpochRead {
+                token: read_token(1),
+                held: RecoveryEpoch::new(7, 9),
+            });
+            assert_eq!(node.state(), WorkerState::Joining);
 
-    read_epoch(&mut driven.node, 1, RecoveryEpoch::new(1, 2));
+            let _ = node.step(Input::AuthorityEpochRead {
+                token: read_token(2),
+                held: RecoveryEpoch::new(2, 1),
+            });
+            assert_eq!(node.state(), WorkerState::Active);
 
-    assert_eq!(driven.node.state(), WorkerState::Bootstrapping);
-    assert_eq!(driven.node.known_leader(), None);
-    assert_eq!(
-        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
-        (1, Some(2))
-    );
-}
+            let _ = node.step(Input::AuthorityEpochRead {
+                token: read_token(2),
+                held: RecoveryEpoch::new(7, 9),
+            });
+            assert_eq!(node.state(), WorkerState::Active, "an answer is applied once");
+        },
+        // A read asked before the pointer was taken says nothing of it.
+        |node| {
+            let _ = node.step(Input::AuthorityEpochAsked(read_token(1)));
+            let _ = node.step(pointer_at_epoch_two_of(1));
 
-// Only the answer to the latest read counts: one asked earlier, however late
-// it arrives, names an epoch the authority may have left since.
-#[test]
-fn an_answer_to_an_older_read_than_the_latest_is_dropped() {
-    let mut driven = rejoining_at_floor_two_of_lineage_one();
-    let _ = driven.node.step(pointer_at_epoch_two_of(1));
-    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(1)));
-    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(2)));
+            let _ = node.step(Input::AuthorityEpochRead {
+                token: read_token(1),
+                held: RecoveryEpoch::new(2, 1),
+            });
 
-    let _ = driven.node.step(Input::AuthorityEpochRead {
-        token: read_token(1),
-        held: RecoveryEpoch::new(7, 9),
-    });
-    assert_eq!(driven.node.state(), WorkerState::Joining);
+            assert_eq!(node.state(), WorkerState::Joining);
+        },
+        // A delayed read of a refounded lineage leaves the floor on the new one.
+        |node| {
+            let _ = node.step(Input::AuthorityEpochAsked(read_token(1)));
+            let _ = node.step(Input::AuthorityEpochAsked(read_token(2)));
+            let _ = node.step(Input::AuthorityEpochRead {
+                token: read_token(2),
+                held: RecoveryEpoch::new(1, 2),
+            });
+            let _ = node.step(Input::AuthorityEpochRead {
+                token: read_token(1),
+                held: RecoveryEpoch::new(2, 1),
+            });
+            assert_eq!((node.recovery_epoch(), node.recovery_lineage()), (1, Some(2)));
 
-    let _ = driven.node.step(Input::AuthorityEpochRead {
-        token: read_token(2),
-        held: RecoveryEpoch::new(2, 1),
-    });
-    assert_eq!(driven.node.state(), WorkerState::Active);
+            // Lineage 1's old leader is still reachable and numbered above
+            // the floor.
+            let _ = node.step(pointer_at_epoch_two_of(1));
+            assert_ne!(node.state(), WorkerState::Active);
+        },
+    ];
 
-    // An answer is applied once.
-    let _ = driven.node.step(Input::AuthorityEpochRead {
-        token: read_token(2),
-        held: RecoveryEpoch::new(7, 9),
-    });
-    assert_eq!(driven.node.state(), WorkerState::Active);
-}
-
-// A read asked before the node took its pointer says nothing of that pointer.
-#[test]
-fn a_read_asked_before_the_pointer_was_taken_does_not_validate_it() {
-    let mut driven = rejoining_at_floor_two_of_lineage_one();
-    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(1)));
-    let _ = driven.node.step(pointer_at_epoch_two_of(1));
-
-    let _ = driven.node.step(Input::AuthorityEpochRead {
-        token: read_token(1),
-        held: RecoveryEpoch::new(2, 1),
-    });
-
-    assert_eq!(driven.node.state(), WorkerState::Joining);
-}
-
-// The authority refounds under lineage 2 at a lower number while a read of
-// the old lineage is still on its way. The late read must not put the floor
-// back on lineage 1 and let a lineage-1 leader's pointer make the node a
-// member.
-#[test]
-fn a_delayed_read_of_a_refounded_lineage_cannot_make_the_node_a_member_of_the_old_one() {
-    let mut driven = rejoining_at_floor_two_of_lineage_one();
-    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(1)));
-    let _ = driven.node.step(Input::AuthorityEpochAsked(read_token(2)));
-    let _ = driven.node.step(Input::AuthorityEpochRead {
-        token: read_token(2),
-        held: RecoveryEpoch::new(1, 2),
-    });
-    let _ = driven.node.step(Input::AuthorityEpochRead {
-        token: read_token(1),
-        held: RecoveryEpoch::new(2, 1),
-    });
-    assert_eq!(
-        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
-        (1, Some(2)),
-        "the delayed read of lineage 1 left the floor on lineage 2"
-    );
-
-    // Lineage 1's old leader is still reachable and numbered above the floor.
-    let _ = driven.node.step(pointer_at_epoch_two_of(1));
-    assert_ne!(driven.node.state(), WorkerState::Active);
-}
-
-#[test]
-fn a_fenced_node_stays_fenced_while_the_epoch_is_missing() {
-    let mut driven = fenced_voter();
-    driven.authority.flush();
-    driven.authority.set_reachable(true);
-
-    for _ in 0..10 {
-        driven.advance(ttl_ticks() / 3);
+    for script in rows {
+        let mut driven = rejoining_at_floor_two_of_lineage_one();
+        script(&mut driven.node);
     }
-
-    assert_eq!(driven.node.state(), WorkerState::Fenced);
 }
 
 /// `w1`, the only voter of its configuration, with the authority at epoch 0,
@@ -873,110 +478,6 @@ fn a_new_leader_waits_out_the_fence_another_worker_holds() {
     assert!(clock.now() >= fence_ends, "it acted before the old fence ran out");
 }
 
-#[test]
-fn a_leader_whose_republish_fails_asks_for_its_fence_again_only_when_due() {
-    let (mut driven, _) = lone_winner(Some(AuthorityTimings {
-        ttl: authority_ttl(),
-    }));
-    let now = driven.clock.now();
-
-    let refused = driven.node.step(Input::Authority(AuthorityReply::Fence {
-        token: ReplyToken {
-            issuer: Issuer::Node,
-            kind: CallKind::AcquireFence,
-            number: 0,
-        },
-        recovery_epoch: epoch(0),
-        sent_at: now,
-        result: Err(AuthorityError::EpochConflict { current: None }),
-    }));
-    assert!(
-        authority_calls(&refused.outputs).contains(&AuthorityRequest::SwapRecoveryEpoch {
-            expected: None,
-            new: epoch(0)
-        })
-    );
-    let swap = asked(
-        &refused.outputs,
-        AuthorityRequest::SwapRecoveryEpoch {
-            expected: None,
-            new: epoch(0),
-        },
-    );
-    let unreachable = driven
-        .node
-        .step(Input::Authority(AuthorityReply::RecoveryEpochSwapped {
-            token: swap.token,
-            expected: None,
-            new: epoch(0),
-            sent_at: now,
-            result: Err(AuthorityError::Unavailable),
-        }));
-
-    assert!(
-        !authority_calls(&unreachable.outputs)
-            .contains(&AuthorityRequest::AcquireFence { recovery_epoch: epoch(0) }),
-        "{:?}",
-        unreachable.outputs
-    );
-    assert!(unreachable.next_deadline > Some(now));
-}
-
-#[test]
-fn a_leader_whose_fence_names_a_later_epoch_steps_down() {
-    let (mut driven, _) = lone_winner(Some(AuthorityTimings {
-        ttl: authority_ttl(),
-    }));
-    driven
-        .authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
-        .expect("a recovery elsewhere moved the epoch on");
-
-    let mut outputs = Vec::new();
-    while driven.node.state() == WorkerState::Leader {
-        outputs.extend(driven.advance(1_000));
-    }
-
-    assert_eq!(state_changes(&outputs)[0], WorkerState::LeaderSuspect);
-    assert_eq!(grants(&outputs).first(), Some(&None));
-}
-
-#[test]
-fn a_leader_that_steps_down_stops_renewing_its_fence() {
-    let (mut driven, won) = lone_winner(Some(AuthorityTimings {
-        ttl: authority_ttl(),
-    }));
-    assert!(
-        authority_calls(&won).contains(&AuthorityRequest::AcquireFence { recovery_epoch: epoch(0) }),
-        "setup invariant: it took the fence"
-    );
-    let won_at = driven.clock.now();
-    let later_leader = || message_input(&worker("leader-2"), ack_message(leader_ack(
-            &worker("leader-2"),
-            2,
-            &configuration_of(3),
-            Some(g0()),
-        )));
-    let deposed = driven.step(later_leader());
-    assert_eq!(driven.node.state(), WorkerState::Active, "{deposed:?}");
-
-    // Keep it following past its next fence renewal.
-    let mut outputs = deposed;
-    while driven.clock.now() <= won_at + Duration::from_ticks(ttl_ticks() / 3 + 1) {
-        driven.clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS - 1));
-        outputs.extend(driven.step(later_leader()));
-    }
-
-    assert_eq!(driven.node.state(), WorkerState::Active);
-    assert!(
-        authority_calls(&outputs)
-            .iter()
-            .all(|request| *request == AuthorityRequest::Register),
-        "a node that no longer leads asks for no fence: {:?}",
-        authority_calls(&outputs)
-    );
-}
-
 // `await_authority` read the clock once to remember the call and again to
 // stamp it: a tick between the two reads left the node waiting on an
 // instant no reply carries.
@@ -1014,76 +515,57 @@ fn awaiting_its_live_set_read() -> (Driven, AuthorityCall) {
 }
 
 // A reply is matched by its call's issuer, kind and number, not by when the
-// call was sent: a reply of another kind carrying the awaited number (a
-// stray or a duplicate) must not answer the recovery's live-set read.
+// call was sent: a reply of another kind carrying the awaited number (a stray
+// or a duplicate), or one the bootstrap cascade issued (it numbers its calls
+// from 0, as the node does), must not answer the recovery's live-set read, or
+// empty its slot so the real answer is ignored.
 #[test]
-fn a_reply_of_another_kind_does_not_answer_the_awaited_call() {
-    let (mut driven, read) = awaiting_its_live_set_read();
-
-    let stray = driven.node.step(Input::Authority(AuthorityReply::RecoveryEpoch {
-        token: ReplyToken {
-            kind: CallKind::ReadRecoveryEpoch,
-            ..read.token
+fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
+    type Stray = fn(&Driven, &AuthorityCall) -> AuthorityReply;
+    let strays: [Stray; 2] = [
+        |_, read| AuthorityReply::RecoveryEpoch {
+            token: ReplyToken {
+                kind: CallKind::ReadRecoveryEpoch,
+                ..read.token
+            },
+            sent_at: read.sent_at,
+            result: Ok(Some(epoch(0))),
         },
-        sent_at: read.sent_at,
-        result: Ok(Some(epoch(0))),
-    }));
-    assert!(authority_calls(&stray.outputs).is_empty(), "{:?}", stray.outputs);
-    assert_eq!(driven.node.state(), WorkerState::NoQuorum);
-
-    let answered = driven.node.step(Input::Authority(read.perform(
-        &driven.authority,
-        &shard(SHARD),
-        &worker("w1"),
-        "w1",
-    )));
-    assert!(
-        authority_calls(&answered.outputs).contains(&AuthorityRequest::ReadRecoveryEpoch),
-        "the recovery is still going: {:?}",
-        answered.outputs
-    );
-}
-
-// The bootstrap cascade numbers its calls from 0, as the node does, so a
-// reply to one of its calls can carry the node's awaited kind and number.
-// Its issuer tells them apart: the node never takes it for its own, whatever
-// net does with it at handover.
-#[test]
-fn a_reply_the_cascade_issued_does_not_answer_the_nodes_awaited_call() {
-    let (mut driven, read) = awaiting_its_live_set_read();
-    assert_eq!(read.token.issuer, Issuer::Node, "setup invariant");
-    let cascades = AuthorityCall {
-        token: ReplyToken {
-            issuer: Issuer::Cascade,
-            ..read.token
+        // A real live set, of the awaited kind and number, which would move
+        // the recovery on if it were taken.
+        |driven, read| {
+            AuthorityCall {
+                token: ReplyToken {
+                    issuer: Issuer::Cascade,
+                    ..read.token
+                },
+                ..*read
+            }
+            .perform(&driven.authority, &shard(SHARD), &worker("w1"), "w1")
         },
-        ..read
-    };
+    ];
 
-    // A real live set, of the awaited kind and number, which would move the
-    // recovery on if it were taken.
-    let stray = driven.node.step(Input::Authority(cascades.perform(
-        &driven.authority,
-        &shard(SHARD),
-        &worker("w1"),
-        "w1",
-    )));
-    assert!(authority_calls(&stray.outputs).is_empty(), "{:?}", stray.outputs);
-    assert_eq!(driven.node.state(), WorkerState::NoQuorum);
+    for stray in strays {
+        let (mut driven, read) = awaiting_its_live_set_read();
+        assert_eq!(read.token.issuer, Issuer::Node, "setup invariant");
 
-    // Had the cascade's reply been taken, it would have emptied the slot and
-    // this one would be ignored.
-    let answered = driven.node.step(Input::Authority(read.perform(
-        &driven.authority,
-        &shard(SHARD),
-        &worker("w1"),
-        "w1",
-    )));
-    assert!(
-        authority_calls(&answered.outputs).contains(&AuthorityRequest::ReadRecoveryEpoch),
-        "{:?}",
-        answered.outputs
-    );
+        let reply = stray(&driven, &read);
+        let ignored = driven.node.step(Input::Authority(reply));
+        assert!(authority_calls(&ignored.outputs).is_empty(), "{:?}", ignored.outputs);
+        assert_eq!(driven.node.state(), WorkerState::NoQuorum);
+
+        let answered = driven.node.step(Input::Authority(read.perform(
+            &driven.authority,
+            &shard(SHARD),
+            &worker("w1"),
+            "w1",
+        )));
+        assert!(
+            authority_calls(&answered.outputs).contains(&AuthorityRequest::ReadRecoveryEpoch),
+            "the recovery is still going: {:?}",
+            answered.outputs
+        );
+    }
 }
 
 /// `w1`, a voter of 5, its roll call answered by `w2` alone, with `live`
@@ -1115,106 +597,6 @@ fn short_roll_call(
     let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
     let closed = driven.run_roll_call(&[worker("w2")]);
     (driven, closed)
-}
-
-#[test]
-fn a_roll_call_short_of_its_quorum_recovers_through_a_majority_of_the_live_registrations() {
-    // w3, w4 and w5 are gone: their registrations lapsed, so the authority
-    // counts 2 live workers, and w1 and w2 are a majority of them.
-    let (mut driven, closed) = short_roll_call(&["w1", "w2"], Some(0), true);
-
-    assert_eq!(
-        authority_calls(&closed),
-        vec![
-            AuthorityRequest::ReadLiveRegistrations,
-            AuthorityRequest::ReadRecoveryEpoch,
-            AuthorityRequest::SwapRecoveryEpoch {
-                expected: Some(epoch(0)),
-                new: epoch(1)
-            },
-            AuthorityRequest::AcquireFence { recovery_epoch: epoch(1) },
-        ]
-    );
-    assert_eq!(
-        state_changes(&closed),
-        vec![
-            WorkerState::NoQuorum,
-            WorkerState::Candidate,
-            WorkerState::LeaderReconciling,
-        ]
-    );
-    let term = driven.node.term();
-    let founded = Generation::new(1, term, 1);
-    assert_eq!(driven.node.recovery_epoch(), 1);
-    assert_eq!(
-        driven.node.configuration(),
-        Some(&Configuration::single(Single {
-            generation: founded,
-            base: founded,
-            voter_count: 2,
-        }).expect("valid"))
-    );
-    assert_eq!(driven.node.admission(), Some(founded));
-    assert_eq!(
-        driven.authority.read_recovery_epoch(&shard(SHARD)),
-        Ok(Some(epoch(1)))
-    );
-    // Its ack to w2 carries the new epoch and w2's admission there, which
-    // w2 adopts (see the stale-JOIN test below).
-    let acks: Vec<LeaderHeartbeatAck> = sent_to(
-        &driven.step(Input::PeerConnected(worker("w2"))),
-        &worker("w2"),
-    )
-    .into_iter()
-    .filter_map(|message| match message.payload {
-        Some(election_message::Payload::HeartbeatAck(ack)) => Some(ack),
-        _ => None,
-    })
-    .collect();
-    assert_eq!(acks.len(), 1);
-    assert_eq!(acks[0].recovery_epoch, 1);
-    assert_eq!(acks[0].recipient_admission, Some(founded.into()));
-}
-
-#[test]
-fn a_leader_of_a_recovered_epoch_steps_down_only_for_a_later_term_at_its_own_epoch() {
-    let (mut driven, _) = short_roll_call(&["w1", "w2"], Some(0), true);
-    driven.finish_reconciling();
-    assert_eq!(driven.node.recovery_epoch(), 1, "setup invariant");
-    assert_eq!(driven.node.state(), WorkerState::Leader, "setup invariant");
-    let w2 = worker("w2");
-    let later_term = driven.node.term() + 1;
-    let heartbeat_at = |recovery_epoch_seen| {
-        message_input(
-            &w2,
-            heartbeat_message(WorkerHeartbeat {
-                recovery_epoch_seen,
-                term_seen: later_term,
-                ..heartbeat(&w2, None)
-            }),
-        )
-    };
-
-    // A term counted in the earlier epoch says nothing about this one.
-    driven.step(heartbeat_at(0));
-    assert_eq!(driven.node.state(), WorkerState::Leader);
-
-    let outputs = driven.step(heartbeat_at(1));
-
-    assert_eq!(state_changes(&outputs), vec![WorkerState::LeaderSuspect]);
-    assert_eq!(grants(&outputs), vec![None]);
-}
-
-#[test]
-fn the_authority_path_trusts_no_count_during_warm_up() {
-    let (driven, closed) = short_roll_call(&["w1", "w2"], Some(0), false);
-
-    assert_eq!(
-        authority_calls(&closed),
-        vec![AuthorityRequest::ReadLiveRegistrations]
-    );
-    assert_eq!(driven.node.state(), WorkerState::NoQuorum);
-    assert_eq!(driven.node.recovery_epoch(), 0);
 }
 
 #[test]
@@ -1350,66 +732,42 @@ fn a_leader_whose_fence_names_an_epoch_it_cannot_recover_from_rejoins_it() {
 }
 
 #[test]
-fn a_node_ignores_an_ack_at_its_epoch_number_from_another_lineage() {
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    seed_shard(&authority, &shard(SHARD), 0, []);
-    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 3);
-    let stranger = worker("stranger");
+fn a_node_ignores_an_ack_from_another_lineage_at_or_below_its_epoch_number() {
+    for number in [0, 1] {
+        let clock = FakeClock::new();
+        let authority = warmed_up_authority(&clock);
+        authority
+            .compare_and_swap_recovery_epoch(&shard(SHARD), None, RecoveryEpoch::new(number, 0))
+            .expect("the shard has no epoch yet");
+        let configuration = configuration_at_epoch(number);
+        let (mut driven, _) = Driven::with(
+            &clock,
+            &authority,
+            "w1",
+            KnownConfiguration {
+                admission: Some(configuration.generation()),
+                configuration,
+            },
+            default_timings(),
+            Some(AuthorityTimings {
+                ttl: authority_ttl(),
+            }),
+        );
+        let stranger = worker("stranger");
 
-    driven.step(message_input(&stranger, ack_message(LeaderHeartbeatAck {
-            recovery_epoch: 0,
-            recovery_epoch_lineage: Some(7),
-            ..leader_ack(&stranger, 4, &configuration_of(3), Some(g0()))
-        })));
+        driven.step(message_input(&stranger, ack_message(LeaderHeartbeatAck {
+                recovery_epoch: 0,
+                recovery_epoch_lineage: Some(7),
+                ..leader_ack(&stranger, 4, &configuration_of(3), Some(g0()))
+            })));
 
-    assert_eq!(
-        driven.node.known_leader(),
-        None,
-        "a leader of another shard's epoch 0 is no leader of this one"
-    );
-}
-
-#[test]
-fn a_node_ignores_an_ack_from_a_lower_epoch_of_another_lineage() {
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), None, RecoveryEpoch::new(1, 0))
-        .expect("the shard has no epoch yet");
-    let epoch_1 = Generation::new(1, 0, 0);
-    let known = KnownConfiguration {
-        configuration: Configuration::single(Single {
-            generation: epoch_1,
-            base: epoch_1,
-            voter_count: 3,
-        }).expect("valid"),
-        admission: Some(epoch_1),
-    };
-    let (mut driven, _) = Driven::with(
-        &clock,
-        &authority,
-        "w1",
-        known,
-        default_timings(),
-        Some(AuthorityTimings {
-            ttl: authority_ttl(),
-        }),
-    );
-    let stranger = worker("stranger");
-
-    driven.step(message_input(&stranger, ack_message(LeaderHeartbeatAck {
-            recovery_epoch: 0,
-            recovery_epoch_lineage: Some(7),
-            ..leader_ack(&stranger, 4, &configuration_of(3), Some(g0()))
-        })));
-
-    assert_eq!(
-        driven.node.known_leader(),
-        None,
-        "a lower epoch of another lineage is no leader of this one"
-    );
-    assert_eq!(driven.node.recovery_epoch(), 1);
+        assert_eq!(
+            driven.node.known_leader(),
+            None,
+            "a leader of another lineage's epoch 0 is no leader of this one, at epoch {number}"
+        );
+        assert_eq!(driven.node.recovery_epoch(), number);
+    }
 }
 
 /// A configuration of three voters founded at recovery epoch `number`.
@@ -1533,49 +891,6 @@ fn a_leader_adopts_a_later_epoch_of_its_lineage_and_then_follows_the_plain_order
 }
 
 #[test]
-fn a_node_that_adopts_a_later_epoch_from_an_ack_resumes_it_after_fencing() {
-    // w1 is at epoch 0 of lineage 0; the leader it hears leads epoch 1 of
-    // lineage 7, which the authority holds.
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    let recovered = RecoveryEpoch::new(1, 7);
-    authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), None, recovered)
-        .expect("the shard has no epoch yet");
-    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 3);
-    let leader = worker("leader");
-    let configuration = Configuration::single(Single {
-        generation: Generation::new(1, 2, 1),
-        base: Generation::new(1, 2, 1),
-        voter_count: 3,
-    }).expect("valid");
-    driven.step(message_input(&leader, ack_message(LeaderHeartbeatAck {
-            recovery_epoch: recovered.number,
-            recovery_epoch_lineage: Some(recovered.lineage),
-            ..leader_ack(&leader, 2, &configuration, None)
-        })));
-    assert_eq!(
-        (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
-        (recovered.number, Some(recovered.lineage)),
-        "the ack's epoch comes with its lineage"
-    );
-
-    driven.authority.set_reachable(false);
-    driven.advance(lasting_ticks());
-    assert_eq!(driven.node.state(), WorkerState::Fenced);
-    driven.authority.set_reachable(true);
-    while driven.node.state() == WorkerState::Fenced {
-        driven.advance(1_000);
-    }
-
-    assert_eq!(
-        driven.node.state(),
-        WorkerState::Active,
-        "the authority's epoch is its own: it resumes rather than rejoins"
-    );
-}
-
-#[test]
 fn a_lost_swap_race_leaves_the_node_no_quorum_at_its_epoch() {
     let clock = FakeClock::new();
     let authority = warmed_up_authority(&clock);
@@ -1610,59 +925,4 @@ fn the_authority_path_recovers_a_shard_left_at_a_swapped_epoch_with_no_leader() 
     assert_eq!(driven.node.recovery_epoch(), 2);
     driven.finish_reconciling();
     assert_eq!(driven.node.state(), WorkerState::Leader);
-}
-
-#[test]
-fn a_pending_joiner_pointed_at_a_stale_epoch_adopts_its_leaders_later_one() {
-    // A responder cut off from the leader, which has since recovered the
-    // shard at epoch 1, still answers JOIN with epoch 0.
-    let clock = FakeClock::new();
-    let leader = worker("leader");
-    let mut joiner = WorkerNode::start(
-        Identity {
-            id: worker("w1"),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)),
-        },
-        Entry::Joining(JoinResponse {
-            leader_id: Some(leader.clone().into()),
-            leader_multiaddr: "leader".to_string(),
-            term: 5,
-            recovery_epoch: 0,
-            recovery_epoch_lineage: 0,
-        }),
-        clock.clone(),
-        None,
-    )
-    .0;
-    let recovered = Configuration::single(Single {
-        generation: Generation::new(1, 2, 1),
-        base: Generation::new(1, 2, 1),
-        voter_count: 2,
-    }).expect("valid");
-
-    let _ = joiner.step(message_input(&leader, ack_message(LeaderHeartbeatAck {
-            recovery_epoch: 1,
-            ..leader_ack(&leader, 2, &recovered, None)
-        })));
-    clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)).heartbeat_interval);
-    let outputs = joiner.step(Input::Tick).outputs;
-
-    assert_eq!(joiner.recovery_epoch(), 1, "a later epoch's leader wins over its term");
-    assert_eq!(joiner.configuration(), Some(&recovered));
-    assert_eq!(joiner.known_leader(), Some((leader.clone(), 2)));
-    let heartbeat = sent_to(&outputs, &leader)
-        .into_iter()
-        .find_map(|message| match message.payload {
-            Some(election_message::Payload::Heartbeat(heartbeat)) => Some(heartbeat),
-            _ => None,
-        })
-        .expect("it heartbeats its leader when its next heartbeat is due");
-    assert_eq!(heartbeat.recovery_epoch_seen, 1);
-    assert_eq!(
-        heartbeat.newest_accepted_ack.map(|echo| echo.term),
-        Some(2),
-        "it echoes only the new epoch's ack"
-    );
 }

@@ -85,10 +85,9 @@ impl Seen {
 /// reference once the task's own clone goes with it, which drops the `Net`
 /// in turn (see `kabudachi_net::messenger::Net`'s `Drop`, which aborts its
 /// swarm-driving task). That closes the worker's real listening socket and
-/// every connection it held: the process is gone. Harder and more real
-/// than `Net::disconnect`, which only hangs up a connection its own side
-/// may redial. Also deliberately not `Net::block_peer`, which isolates a
-/// still-alive worker rather than removing the process.
+/// every connection it held: the process is gone. Deliberately not
+/// `Net::block_peer`, which isolates a still-alive worker rather than
+/// removing the process.
 pub struct RunningWorker {
     pub id: WorkerId,
     pub address: Multiaddr,

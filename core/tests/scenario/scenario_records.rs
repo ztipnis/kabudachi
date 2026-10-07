@@ -205,24 +205,42 @@ fn a_certification_whose_acknowledgement_arrives_after_the_lease_ended_is_answer
 #[test]
 fn a_supersession_stores_the_newer_generation_before_marking_the_older_superseded() {
     let (mut cluster, leader) = elected();
-    let older = submitted_with_key(&mut cluster, &leader, "k");
-    cluster.records().set_ack_delay(STEP);
-
-    let ticket = cluster.submit(&leader, plain().with_coalescing_key("k"));
     let holders: Vec<WorkerId> = cluster.node_ids().into_iter().collect();
-    let superseded_anywhere = |cluster: &Cluster| {
+    let superseded_anywhere = |cluster: &Cluster, task: &TaskId| {
         holders.iter().any(|holder| {
-            cluster.records().held_by(holder, &older).is_some_and(|record| {
+            cluster.records().held_by(holder, task).is_some_and(|record| {
                 record.runs.last().map(TaskRunRecord::current_state)
                     == Some(TaskRunState::Superseded)
             })
         })
     };
-    assert!(!superseded_anywhere(&cluster), "the older generation waits for its successor's write");
+    let older = submitted_with_key(&mut cluster, &leader, "k");
+    cluster.records().set_ack_delay(STEP);
+
+    let ticket = cluster.submit(&leader, plain().with_coalescing_key("k"));
+    assert!(
+        !superseded_anywhere(&cluster, &older),
+        "the older generation waits for its successor's write"
+    );
 
     cluster.advance(STEP);
-    assert!(superseded_anywhere(&cluster));
+    assert!(superseded_anywhere(&cluster, &older));
     assert_eq!(cluster.answer(ticket), None, "the client hears only once both are stored");
     cluster.advance(STEP);
-    assert!(matches!(cluster.answer(ticket), Some(Answer::Submitted(_))));
+    let Some(Answer::Submitted(newer)) = cluster.answer(ticket).cloned() else {
+        panic!("the submission is acknowledged once both writes are stored");
+    };
+
+    // When the successor's write misses its quorum, the generation it would
+    // have superseded is left untouched, though the leader's own store would
+    // take the mark, and the client is refused.
+    for holder in holders.iter().filter(|holder| **holder != leader) {
+        cluster.records().set_up(holder, false);
+    }
+    let refused = cluster.submit(&leader, plain().with_coalescing_key("k"));
+    cluster.advance(STEP);
+    cluster.advance(STEP);
+
+    assert_eq!(cluster.answer(refused), Some(&Answer::NotLeader));
+    assert!(!superseded_anywhere(&cluster, &newer));
 }

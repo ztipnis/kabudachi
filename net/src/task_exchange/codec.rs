@@ -78,26 +78,3 @@ impl request_response::Codec for TaskCodec {
         io.write_all(&encode_length_prefixed(&res)).await
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use libp2p::futures::io::Cursor;
-    use libp2p::request_response::Codec as _;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn read_request_rejects_a_request_that_asks_for_nothing() {
-        let mut codec = TaskCodec;
-
-        let mut written = Cursor::new(Vec::new());
-        codec
-            .write_request(&PROTOCOL, &mut written, TaskRequest { request: None })
-            .await
-            .expect("writing a request never fails against an in-memory buffer");
-        let mut to_read = Cursor::new(written.into_inner());
-        let result = codec.read_request(&PROTOCOL, &mut to_read).await;
-
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
-    }
-}

@@ -163,6 +163,14 @@ fn has_a_non_loopback_address() -> bool {
         .is_ok_and(|address| !address.ip().is_loopback() && !address.ip().is_unspecified())
 }
 
+fn is_unspecified(address: &Multiaddr) -> bool {
+    address.iter().any(|protocol| match protocol {
+        Protocol::Ip4(ip) => ip.is_unspecified(),
+        Protocol::Ip6(ip) => ip.is_unspecified(),
+        _ => false,
+    })
+}
+
 fn is_loopback(address: &Multiaddr) -> bool {
     address.iter().any(|protocol| match protocol {
         Protocol::Ip4(ip) => ip.is_loopback(),
@@ -171,17 +179,14 @@ fn is_loopback(address: &Multiaddr) -> bool {
     })
 }
 
-// A leader bound to every interface must not point joiners at its loopback
-// address: a joiner on another host would dial itself. It names an address
-// another host can reach, and a joiner dialing that address reaches it.
-// Skipped, saying so, on a host with no non-loopback interface (a sandbox
-// with networking off), where loopback is all a leader can offer.
+// A leader bound to every interface must not point joiners at the address it
+// is bound to, which no one can dial, nor at its loopback address: a joiner on
+// another host would dial itself. It names an address another host can reach,
+// and a joiner dialing that address reaches it. On a host with no
+// non-loopback interface (a sandbox with networking off), where loopback is
+// all a leader can offer, only the first is checked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_leader_bound_to_every_interface_points_joiners_at_a_non_loopback_address() {
-    if !has_a_non_loopback_address() {
-        eprintln!("skipped: this host has no non-loopback interface");
-        return;
-    }
+async fn a_leader_bound_to_every_interface_points_joiners_at_an_address_they_can_dial() {
     let mut leader = spawn_worker("/ip4/0.0.0.0/tcp/0", None, vec![]).await;
     leader
         .wait_until(|seen| seen.state == WorkerState::Leader)
@@ -208,7 +213,12 @@ async fn a_leader_bound_to_every_interface_points_joiners_at_a_non_loopback_addr
         .leader_multiaddr
         .parse()
         .expect("the pointer names a multiaddr");
-    assert!(!is_loopback(&pointed), "the leader pointed at {pointed}");
+    assert!(!is_unspecified(&pointed), "the leader pointed at {pointed}");
+    if has_a_non_loopback_address() {
+        assert!(!is_loopback(&pointed), "the leader pointed at {pointed}");
+    } else {
+        eprintln!("no non-loopback interface on this host: only the bound address was checked");
+    }
 
     // Another worker, asking at the address the pointer names,
     // reaches the leader there.

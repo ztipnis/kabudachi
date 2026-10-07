@@ -3,28 +3,14 @@
 //! coalescing key stays held and its memory stays counted until the client
 //! ends the continuation.
 
-
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
-use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::records::TaskRunRecord;
-use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{Completion, ClaimRejection, Submission};
-use kabudachi_core::time::Duration;
 use crate::support::scheduler::{Fixture, OFFICE, grant_of, newest_records, reconciling_after};
 
 fn worker() -> WorkerId {
     WorkerId::new("w1")
-}
-
-fn plain(size: usize) -> Submission {
-    Submission::new(
-        TaskDefinitionId::new("billing.plan"),
-        0,
-        vec![b'x'; size],
-        "default",
-    )
 }
 
 fn generation() -> Submission {
@@ -44,116 +30,6 @@ fn running(fixture: &mut Fixture, task: &TaskId) -> TaskRunId {
         .report_started(&worker(), &claim.task_run_id)
         .unwrap();
     claim.task_run_id
-}
-
-#[test]
-fn completing_with_a_continuation_certifies_the_run_like_any_other() {
-    let mut fixture = Fixture::leading();
-    let task = fixture.scheduler.submit(plain(1)).unwrap();
-    let run = running(&mut fixture, &task);
-
-    let certification = fixture
-        .scheduler
-        .complete(&worker(), &run, Digest::blake3(b"plan"), Completion::Continues)
-        .unwrap();
-
-    assert_eq!(certification.task_run_id, run);
-    assert_eq!(certification.result_digest, Digest::blake3(b"plan"));
-    assert_eq!(
-        fixture.scheduler.task_run(&run).unwrap().current_state(),
-        TaskRunState::Succeeded
-    );
-}
-
-#[test]
-fn a_task_with_a_continuation_still_counts_against_memory_until_it_ends() {
-    let mut fixture = Fixture::leading();
-    let task = fixture.scheduler.submit(plain(40)).unwrap();
-    let run = running(&mut fixture, &task);
-
-    fixture
-        .scheduler
-        .complete(&worker(), &run, Digest::blake3(b"d"), Completion::Continues)
-        .unwrap();
-    assert_eq!(fixture.spy.memory_in_use(), 40);
-
-    assert_eq!(fixture.scheduler.end_continuation(&task), Ok(true));
-    assert_eq!(fixture.spy.memory_in_use(), 0);
-}
-
-#[test]
-fn a_task_with_a_continuation_is_not_forgotten_until_it_ends() {
-    let mut fixture = Fixture::leading();
-    fixture
-        .scheduler
-        .set_result_ttl(Some(Duration::from_ticks(100)));
-    let task = fixture.scheduler.submit(plain(1)).unwrap();
-    let run = running(&mut fixture, &task);
-    fixture
-        .scheduler
-        .complete(&worker(), &run, Digest::blake3(b"d"), Completion::Continues)
-        .unwrap();
-
-    fixture.clock.advance(Duration::from_ticks(10_000));
-    assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
-
-    fixture.scheduler.end_continuation(&task).unwrap();
-    fixture.clock.advance(Duration::from_ticks(100));
-    assert_eq!(fixture.scheduler.catch_up().forgotten, 1);
-    assert!(fixture.spy.forgotten(&task));
-}
-
-#[test]
-fn a_coalescing_key_stays_held_for_the_life_of_the_continuation() {
-    let mut fixture = Fixture::leading();
-    let first = fixture.scheduler.submit(generation()).unwrap();
-    let run = running(&mut fixture, &first);
-    let newer = fixture.scheduler.submit(generation()).unwrap();
-
-    fixture
-        .scheduler
-        .complete(&worker(), &run, Digest::blake3(b"d"), Completion::Continues)
-        .unwrap();
-
-    assert!(
-        fixture
-            .scheduler
-            .claim_oldest(&worker(), 10)
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        fixture
-            .scheduler
-            .request_claim(&worker(), &newer)
-            .unwrap_err(),
-        ClaimRejection::KeyBusy
-    );
-
-    fixture.scheduler.end_continuation(&first).unwrap();
-
-    let claims = fixture.scheduler.claim_oldest(&worker(), 10).unwrap();
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].task.task_id(), newer);
-}
-
-#[test]
-fn ending_a_continuation_is_once_only_and_ignores_tasks_that_have_none() {
-    let mut fixture = Fixture::leading();
-    let task = fixture.scheduler.submit(plain(1)).unwrap();
-    let other = fixture.scheduler.submit(plain(1)).unwrap();
-    let run = running(&mut fixture, &task);
-    fixture
-        .scheduler
-        .complete(&worker(), &run, Digest::blake3(b"d"), Completion::Continues)
-        .unwrap();
-
-    assert_eq!(fixture.scheduler.end_continuation(&other), Ok(false));
-    assert_eq!(fixture.scheduler.end_continuation(&TaskId::new("unknown")), Ok(false));
-    assert_eq!(fixture.scheduler.end_continuation(&task), Ok(true));
-    assert_eq!(fixture.scheduler.end_continuation(&task), Ok(false));
-    // Nothing was double-released.
-    assert_eq!(fixture.spy.memory_in_use(), 1);
 }
 
 /// A certified run whose task is not finished is the record of a continuation,

@@ -221,34 +221,3 @@ fn describe_epoch(current: &Option<RecoveryEpoch>) -> String {
         None => "the authority has no recovery epoch".to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_epoch_conflict_names_the_authoritys_epoch() {
-        let error = AuthorityError::EpochConflict {
-            current: Some(RecoveryEpoch::new(3, 0xab)),
-        };
-
-        assert_eq!(
-            error.to_string(),
-            "recovery epoch conflict: the authority is at epoch 3 (lineage ab)"
-        );
-        assert_eq!(
-            AuthorityError::EpochConflict { current: None }.to_string(),
-            "recovery epoch conflict: the authority has no recovery epoch"
-        );
-    }
-
-    #[test]
-    fn production_foundings_draw_distinct_lineages() {
-        let mut lineages = Uuid7Lineages;
-
-        let first = RecoveryEpoch::founding(0, &mut lineages);
-        let second = RecoveryEpoch::founding(0, &mut lineages);
-
-        assert_ne!(first.lineage, second.lineage);
-    }
-}

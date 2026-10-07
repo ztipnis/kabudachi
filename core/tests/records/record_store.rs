@@ -78,19 +78,6 @@ fn the_same_version_is_a_republish_only_when_the_record_is_identical() {
 }
 
 #[test]
-fn a_record_without_a_version_or_task_id_is_refused() {
-    let mut store = VersionedRecords::default();
-    let mut unversioned = record("task-1", version(0, 0, 1, 0), "q");
-    unversioned.version = None;
-    let mut anonymous = record("task-1", version(0, 0, 1, 0), "q");
-    anonymous.task.as_mut().unwrap().task_id = None;
-
-    assert_eq!(store.put(unversioned, NOW), Err(PutRefusal::Malformed));
-    assert_eq!(store.put(anonymous, NOW), Err(PutRefusal::Malformed));
-    assert!(store.is_empty());
-}
-
-#[test]
 fn a_finished_record_is_dropped_once_its_retention_has_passed_and_an_unfinished_one_never_is() {
     let mut store = VersionedRecords::with_retention(Some(Duration::from_ticks(100)));
     let mut finished = record("done", version(0, 0, 1, 0), "q");

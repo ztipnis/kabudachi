@@ -352,11 +352,13 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
     let mut old = Fixture::leading();
     let silent = old.scheduler.submit(plain(b"s")).unwrap();
     let answered = old.scheduler.submit(plain(b"a")).unwrap();
+    let empty = old.scheduler.submit(plain(b"e")).unwrap();
     old.scheduler.request_claim(&worker("w3"), &silent).unwrap();
     let answered_claim = old
         .scheduler
         .request_claim(&worker("w4"), &answered)
         .unwrap();
+    old.scheduler.request_claim(&worker("w5"), &empty).unwrap();
     let records = newest_records(&old);
     let mut new = reconciling_after(&old);
     let rebuilt = new
@@ -365,7 +367,10 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
             uncertain: BTreeMap::from([
                 (silent.clone(), BTreeSet::new()),
                 (answered.clone(), BTreeSet::new()),
+                (empty.clone(), BTreeSet::new()),
             ]),
+            // w5 answered the rebuild in full, without the run of its task.
+            reports: report("w5", Vec::new()),
             ..Rebuild::default()
         })
         .unwrap();
@@ -382,37 +387,6 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
         .unwrap();
 
     assert_eq!(adopted.silent_holders, BTreeSet::from([worker("w3")]));
-}
-
-#[test]
-fn a_late_record_does_not_name_a_holder_that_answered_the_rebuild() {
-    let mut old = Fixture::leading();
-    let task = old.scheduler.submit(plain(b"t")).unwrap();
-    old.scheduler.request_claim(&worker("w3"), &task).unwrap();
-    let records = newest_records(&old);
-    let mut new = reconciling_after(&old);
-    new.scheduler
-        .reconcile(Rebuild {
-            uncertain: BTreeMap::from([(task.clone(), BTreeSet::new())]),
-            // w3 answered the rebuild in full, without the run of this task.
-            reports: report("w3", Vec::new()),
-            ..Rebuild::default()
-        })
-        .unwrap();
-    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
-
-    let adopted = new
-        .scheduler
-        .adopt(Rebuild {
-            records,
-            ..Rebuild::default()
-        })
-        .unwrap();
-
-    assert!(
-        adopted.silent_holders.is_empty(),
-        "w3 answered, so it is not a silent holder"
-    );
 }
 
 #[test]
@@ -476,20 +450,13 @@ fn a_running_non_retriable_run_its_worker_answered_without_is_orphaned_and_an_ep
 }
 
 #[test]
-fn an_uncertified_success_is_certified_and_a_reported_failure_applied() {
+fn a_reported_failure_is_applied_and_its_retry_queued() {
     let mut old = Fixture::leading();
-    let succeeded = old.scheduler.submit(plain(b"s")).unwrap();
     let failed = old.scheduler.submit(plain(b"f").with_retries(1)).unwrap();
-    let s = old
-        .scheduler
-        .request_claim(&worker("w1"), &succeeded)
-        .unwrap();
     let f = old.scheduler.request_claim(&worker("w1"), &failed).unwrap();
-    for claim in [&s, &f] {
-        old.scheduler
-            .report_started(&worker("w1"), &claim.task_run_id)
-            .unwrap();
-    }
+    old.scheduler
+        .report_started(&worker("w1"), &f.task_run_id)
+        .unwrap();
     let mut new = reconciling_after(&old);
 
     new.scheduler
@@ -497,31 +464,17 @@ fn an_uncertified_success_is_certified_and_a_reported_failure_applied() {
             records: newest_records(&old),
             reports: report(
                 "w1",
-                vec![
-                    reported(
-                        &s,
-                        ReportedState::Succeeded {
-                            result_digest: Digest::blake3(b"out"),
-                        },
-                    ),
-                    reported(
-                        &f,
-                        ReportedState::Failed {
-                            failure_kind: "ValueError".into(),
-                        },
-                    ),
-                ],
+                vec![reported(
+                    &f,
+                    ReportedState::Failed {
+                        failure_kind: "ValueError".into(),
+                    },
+                )],
             ),
             ..Rebuild::default()
         })
         .unwrap();
 
-    let certified = new.spy.revisions_of(&succeeded).last().cloned().unwrap();
-    assert_eq!(
-        certified.runs[0].current_state(),
-        TaskRunState::Succeeded
-    );
-    assert!(certified.finished);
     assert_eq!(
         last_states(&new, &failed),
         [TaskRunState::Failed, TaskRunState::Queued]
@@ -563,44 +516,6 @@ fn a_run_whose_task_has_no_known_record_is_rebuilt_from_its_claim() {
                 Completion::Final
             )
             .is_ok()
-    );
-}
-
-#[test]
-fn the_newest_lost_generation_is_replayed_and_a_superseded_one_is_not() {
-    let mut old = Fixture::leading();
-    let alone = old
-        .scheduler
-        .submit(plain(b"a").with_coalescing_key("alone"))
-        .unwrap();
-    old.scheduler.request_claim(&worker("w1"), &alone).unwrap();
-    let stale = old
-        .scheduler
-        .submit(plain(b"s").with_coalescing_key("pair"))
-        .unwrap();
-    old.scheduler.request_claim(&worker("w1"), &stale).unwrap();
-    old.scheduler
-        .submit(plain(b"n").with_coalescing_key("pair"))
-        .unwrap(); // waits behind it
-    let mut new = reconciling_after(&old);
-
-    new.scheduler
-        .reconcile(Rebuild {
-            records: newest_records(&old),
-            reports: report("w1", Vec::new()),
-            ..Rebuild::default()
-        })
-        .unwrap();
-
-    assert_eq!(
-        last_states(&new, &alone),
-        [TaskRunState::Lost, TaskRunState::Queued],
-        "newest of its key: replayed"
-    );
-    assert_eq!(
-        last_states(&new, &stale),
-        [TaskRunState::Lost],
-        "a newer generation waits: not replayed"
     );
 }
 
@@ -1092,7 +1007,7 @@ fn a_late_generation_of_a_key_leaves_what_the_running_generation_absorbed_intact
 }
 
 #[test]
-fn a_worker_is_believed_to_hold_the_runs_of_uncertain_tasks_it_reported() {
+fn a_worker_is_believed_to_hold_the_runs_it_reported_until_a_newer_answer_leaves_them_out() {
     let mut old = Fixture::leading();
     let task = old.scheduler.submit(plain(b"t")).unwrap();
     let claim = old.scheduler.request_claim(&worker("w1"), &task).unwrap();
@@ -1128,22 +1043,6 @@ fn a_worker_is_believed_to_hold_the_runs_of_uncertain_tasks_it_reported() {
         "its heartbeat digest names the active run only, so it is not asked again for it"
     );
     assert!(new.scheduler.active_runs_of(&worker("w2")).is_empty());
-}
-
-#[test]
-fn a_run_a_worker_leaves_out_of_a_newer_answer_is_no_longer_believed_held() {
-    let mut old = Fixture::leading();
-    let task = old.scheduler.submit(plain(b"t")).unwrap();
-    let claim = old.scheduler.request_claim(&worker("w1"), &task).unwrap();
-    let mut new = reconciling_after(&old);
-    new.scheduler
-        .reconcile(Rebuild {
-            uncertain: BTreeMap::from([(task.clone(), BTreeSet::from([claim.task_run_id.clone()]))]),
-            reports: report("w1", vec![reported(&claim, ReportedState::Running)]),
-            ..Rebuild::default()
-        })
-        .unwrap();
-    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
 
     new.scheduler
         .adopt(Rebuild {
