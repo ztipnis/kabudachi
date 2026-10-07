@@ -1240,7 +1240,7 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
                 by = ?by,
                 "this worker cannot show that its leader still hears it, or has fenced itself, \
                  and must abort every TaskRun it is running by this instant unless that \
-                 changes; no task executor exists yet in Phase 2 to carry that out"
+                 changes; this worker runs no task executor that would carry that out"
             ),
             Output::AbortDeadline(None) => tracing::info!(
                 shard = node.shard_id().as_str(),
