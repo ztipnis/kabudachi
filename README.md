@@ -823,7 +823,7 @@ The leader never executes the reducer. It keeps the superseded Tasks' payloads l
 
 Compaction keeps that chain short. When a waiting generation's chain holds more payload than the per-key soft threshold (half of what one claim may carry), or memory is past its soft limit, and some worker has said it runs compaction, the leader creates an internal compaction run naming the oldest entries that fit in one claim. The worker folds exactly those entries with the task's reducer, and the leader swaps them for one folded entry only while the chain still starts with them. Only a claimed compaction holds the newest generation back, and with no worker that runs compaction the newest generation folds its whole chain itself. No claim ever outgrows one message: a submission that would make its key's waiting claim too large is refused (backpressure), and a fold that grows past one message fails the newest generation with `CoalescedPayloadTooLarge`. Past the hard memory threshold, new submissions are backpressured (or dropped-oldest if the task opted in).
 
-After leader change, reconciliation (§13) rebuilds per-key occupancy, including the lifetime of any implicit flow, so a second running generation for the same key is never admitted.
+After leader change, reconciliation (§13) rebuilds per-key occupancy, including the lifetime of any implicit flow, so a second running generation for the same key is never admitted. In core, the scheduler ends an implicit flow's lifetime through `Scheduler::end_continuation`; only the single-process runtime calls it today, and nothing over the network does yet, so a networked implicit flow holds its key and memory until then (Phase 6, durable flow continuations).
 
 ### 8.3 Heartbeats
 
@@ -1661,6 +1661,8 @@ ABANDONED
 
 and replacement workers create a new globally unique shard ID rather than pretending the old shard survived.
 
+Today a re-found keeps the `ShardId` and draws a fresh lineage for its recovery epoch. Phase 4's empty-authority catastrophic reset mints a new `ShardId` instead.
+
 ---
 
 ## 16. Catastrophic shard loss and `ShardLostError`
@@ -2248,7 +2250,7 @@ native core
     protocol types
     peer transport
     DHT adapter
-    ring membership
+    shard peer awareness (roll call, peer book)
     worker/leader state machines
     claim scheduler
     lifecycle/control transport
@@ -2300,7 +2302,7 @@ Responsibilities:
 - reliable addressed messaging;
 - peer identity;
 - DHT record/provider operations;
-- ring-neighbor communication;
+- gossipsub and routing-table communication;
 - reconnect/backoff behavior;
 - protocol framing.
 
@@ -2403,7 +2405,7 @@ Current documentation:
 
 The appeal is not merely Kademlia. libp2p provides composable peer identity, transports, protocols, discovery components, and connection management.
 
-Important caveat from the current Rust libp2p Kademlia documentation: Kademlia does not automatically infer all peer addresses; Identify or another discovery mechanism must be integrated deliberately. That aligns with this design, where Redis/CoordinationAuthority provides cold bootstrap and DHT/ring state provides hot peer awareness.
+Important caveat from the current Rust libp2p Kademlia documentation: Kademlia does not automatically infer all peer addresses; Identify or another discovery mechanism must be integrated deliberately. That aligns with this design, where Redis/CoordinationAuthority provides cold bootstrap and the shard's gossip roll call and peer book provide hot peer awareness.
 
 The project should prototype both:
 
@@ -2743,7 +2745,7 @@ Peer review should focus heavily on invariants. If an implementation violates on
 3. A superseded pending payload is folded, never silently dropped (except under an explicit `drop_oldest` opt-in).
 4. The reducer fold is order-preserving and its result does not depend on chain length or compaction points (except under an explicit `drop_oldest` opt-in).
 5. A lost generation that was the newest for its key is replayed; a lost stale generation is not.
-6. Per-key occupancy, including an implicit flow's lifetime, is rebuilt at reconciliation without admitting a second running generation.
+6. Per-key occupancy, including an implicit flow's lifetime, is rebuilt at reconciliation without admitting a second running generation. (Core rebuilds it; over the network nothing ends a continuation yet, which is Phase 6.)
 7. A continuation is committed atomically with the returning TaskRun's certification, and a continuation failure never re-runs the returning task.
 8. The stage after a group runs as one certified TaskRun per group instance under any single fault.
 
@@ -2761,7 +2763,7 @@ Peer review should focus heavily on invariants. If an implementation violates on
 
 This system should not be validated primarily through happy-path integration tests.
 
-The tests are organised as one Bazel `rust_test` target per area, so a change reruns only the areas that depend on it. `core` has the crates `configuration`, `election`, `proptest`, `scenario` and `scheduler` (`core/tests/<area>/`), and `net` has `bootstrap`, `claim` and `election` (`net/tests/<area>/`), with no in-crate unit tests. The `testkit` crate is the shared test seam: the faulting authority (`FaultingAuthority`) and the step record with the invariants asserted over it, which the core simulator and the real-socket net tests both use.
+The tests are organised as one Bazel `rust_test` target per crate (`//core:core_integration_test`, `//net:net_integration_test`, `//testkit:testkit_integration_test`), each an integration binary whose areas are modules, and a name filter runs one area. `core` has the areas `configuration`, `election`, `proptest`, `reconcile`, `records`, `scenario` and `scheduler` (`core/tests/<area>/`), and `net` has `bootstrap`, `claim`, `discovery`, `driver`, `election`, `join`, `lifecycle`, `reconcile`, `records` and `transport` (`net/tests/<area>/`), with no in-crate unit tests. The `testkit` crate is the shared test seam: the faulting authority (`FaultingAuthority`) and the step record with the invariants asserted over it, which the core simulator and the real-socket net tests both use.
 
 ### 26.1 Deterministic state-machine tests
 
@@ -2808,7 +2810,7 @@ leader isolated with minority
 rapid leader crash/restart
 two candidates with crossing vote requests
 stale election messages arriving after new epoch
-ring fragmentation
+gossip mesh fragmentation
 SELF_REMOVE messages delayed or duplicated
 ```
 
@@ -2914,8 +2916,7 @@ Implement:
 
 - peer identity;
 - direct leader heartbeat;
-- ring neighbors;
-- roll call;
+- roll call, published on a gossipsub topic;
 - voting;
 - worker-pull claim arbitration.
 
@@ -2950,15 +2951,20 @@ The leader does not execute compaction, and a networked worker does not yet run 
 
 ### Phase 4: Redis CoordinationAuthority
 
+The recovery epoch, the low-frequency leader fence and forced reconfiguration already run in core against the in-memory authority (`InMemoryAuthority`). This phase brings the Redis adapter for them.
+
 Implement:
 
-- cold worker bootstrap;
-- leader/shard hints;
-- task->shard cache;
-- recovery epoch;
-- low-frequency leader fence;
-- forced reconfiguration;
-- empty-authority catastrophic reset.
+- the Redis adapter for `CoordinationAuthority`;
+- the `CoordinationAuthority` contract suite, run against Redis, with detection of a Redis restart, flush and outage (restart: `INFO server` uptime under one TTL; flush: a missing sentinel key that records the server `TIME` it was created at);
+- the entry point: `kabudachi_net::worker::Worker` with its `AuthorityConfig` (a Python-hosted networked worker is Phase 5);
+- cold worker bootstrap against Redis;
+- leader hints: a trait read and write, and their republish after a flush (§15.3);
+- empty-authority catastrophic reset, which mints a new ShardId (§15.5);
+- the order of recovery epochs by the pair (number, lineage), so exactly one of two equal-numbered lineages is newer, model-checked before the code is written;
+- the lineage gap in `RollCall` and `VoteRequest`/`Generation`, and the lineage key of the property test;
+- recovery fence timing defaults, conservative and configurable (§28.4);
+- a check of the shared-instance provider constraints (§9.1).
 
 ### Phase 5: Python subprocess execution
 
@@ -2970,7 +2976,12 @@ Implement:
 - cooperative cancellation and soft-to-hard timeout escalation;
 - execution lifecycle hooks in the task subprocess;
 - SIGTERM/SIGKILL behavior;
-- networked workers run the tasks they claim, compaction runs included.
+- networked workers run the tasks they claim, compaction runs included;
+- a TaskRun executor that honors `Output::AbortDeadline` and starts a TaskRun only once the node has contact with its leader (the reconnect-timeout floor, §8.3);
+- a leader's own claims (today the leader's own node answers a claim as `ThisWorkerLeads`);
+- a multi-process SIGKILL harness;
+- a test for a sync body raising `BaseException`, under subprocess isolation;
+- per-queue and per-task `reconnect_timeout`.
 
 ### Phase 6: flow/group/map/reduce
 
@@ -2980,7 +2991,7 @@ Phase 1 already delivers `flow`, `group`, implicit flows and `.map` in a one-nod
 - multi-worker distributed map (one-node `.map` is Phase 1);
 - `.reduce` (a sequential chain of certified steps; a reduction tree only for a seedless reducer declared associative);
 - group ordered result collection across workers and leader changes;
-- durable flow continuations.
+- durable flow continuations: ending a continuation over the network, so that an implicit flow's lifetime holds across a leader change (§8.2).
 
 ### Phase 7: observability
 
@@ -2993,7 +3004,9 @@ Prometheus and tracing should exist earlier for development, but this phase hard
 - plugin interface, including task-submitting plugins;
 - first-party cron scheduler plugin (§3.8);
 - shared custom metric registry;
-- autoscaling examples.
+- autoscaling examples;
+- metrics for a worker in `Bootstrapping`;
+- `BackpressureError` attributes (`hard_limit`, `in_use`, `needed`).
 
 ### Phase 8: sharding and convergence
 
@@ -3005,7 +3018,11 @@ Only after one shard is trustworthy:
 - replacement shards;
 - `ShardLostError`;
 - `.resubmit()`;
-- automatic shard convergence.
+- automatic shard convergence;
+- remote client liveness and the derived `ORPHANED` flow state;
+- networked client result delivery (§8.5);
+- the task-to-shard cache;
+- the disaster-recovery Task store (§9.2).
 
 Trying to implement sharding before single-shard elections are proven would multiply debugging complexity unnecessarily.
 
@@ -3017,9 +3034,9 @@ The coalescing, flow, and failure-detection invariants (§25.1 item 9 and §25.4
 |---|---|
 | 0 (simulator extension) | 25.1.9 (abort before replacement), 25.4.1 (single running generation by authority), 25.4.2 (pending-only supersession), 25.4.6 (occupancy rebuilt at reconciliation) |
 | 1 | 25.4.3 and 25.4.4 (folding, order preservation), 25.4.7 (atomic continuation), 25.4.8 (stage after a group runs once), 25.4.5 in a one-node shard, and the one-node backpressure contract (`SlowDown` past the soft limit, `BackpressureError` past the hard limit, §3.2.1) |
-| 2 | 25.4.5 under worker loss, the measured time from worker unreachable (connection loss) to replacement claim (§8.3), and abort-before-replacement under a simulated (connection-loss) partition |
+| 2 | 25.4.5 under worker loss, and abort-before-replacement under a simulated (connection-loss) partition. The bound on the time from worker unreachable to replacement claim stays tested (`core/tests/scenario/scenario_partition.rs`); its measured value is a §27.2 gate item |
 | 3 | 25.4.5 under leader loss (a new leader can replay only what reconciliation rebuilds), retained-payload chain across DHT replicas and compaction (the one-node soft/hard-limit backpressure contract is a Phase 1 exit criterion) |
-| 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess |
+| 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess; the multi-process SIGKILL harness |
 
 ### 27.2 Production-readiness gate
 
@@ -3027,7 +3044,8 @@ No real workload should adopt kabudachi until the following are closed:
 
 - peer and client authentication, and encrypted transport (§28.10). Authenticating peers also closes the trust the Task record store places in its shard (§8.6): it accepts a record write from any peer that passes its key, size and version checks, with no check of the writer's authority and no cap on how many unfinished records a holder keeps;
 - a minimal orchestrator requirements document. The implementation should minimize what it demands of the deployment environment (no mandatory Kubernetes, §2.3) and then define the small set that remains: how peers discover each other, behavior under address churn, reachability between peers, graceful-termination signals, and health endpoints;
-- measured submit-to-start latency (§28.11).
+- measured submit-to-start latency (§28.11), and the measured time from a worker becoming unreachable to its replacement claim (§8.3);
+- mixed-version clusters: rolling upgrades of the worker fleet, with workers of two versions in one shard.
 
 ---
 
@@ -3047,7 +3065,7 @@ The DHT should not quietly become a database.
 
 ### 28.3 Vote durability
 
-Ordinary per-term votes are described as ephemeral. Determine what local persistence, if any, is needed to protect against a process crash/restart inside one term. A restart has a new incarnation ID, which removes several classic persisted-vote requirements, but this needs formal review.
+Closed. Ordinary per-term votes are ephemeral, and nothing persists a vote. A restarted process takes a fresh `WorkerId` and joins as a new worker, so it cannot cast a second vote in a term its previous incarnation voted in (a `WorkerId` is the node's libp2p `PeerId`, generated with a fresh keypair on every start). Forced reconfiguration does not reopen the question, because the authority's compare-and-swap of the recovery epoch is durable.
 
 ### 28.4 Recovery fence timing
 
@@ -3058,7 +3076,7 @@ short lease -> quicker safe forced recovery, more sensitivity to authority outag
 long lease  -> better Redis outage tolerance, slower catastrophic recovery
 ```
 
-Defaults should probably be conservative and configurable.
+Decided in Phase 4 design; defaults conservative and configurable.
 
 ### 28.5 Result-delivery failure matrix
 
@@ -3248,7 +3266,7 @@ Underneath that small API, the system provides:
 - worker-pull scheduling;
 - a peer DHT for task dissemination;
 - an elected shard leader for ownership/lifecycle authority;
-- ring-based peer roll call;
+- a gossipsub roll call that counts the shard's reachable workers;
 - explicit worker heartbeat;
 - conservative retry and `ORPHANED` semantics;
 - certified result delivery;
