@@ -33,6 +33,15 @@
 //! `node_authority`), and hands the node the reply at the same instant, or
 //! holds it while the node is stalled. It also answers JOIN for a node that
 //! goes back to `Bootstrapping` to rejoin its shard (see `run_pass`).
+//!
+//! The cluster also keeps the shard's Task records (see `records`). After
+//! each step and each scheduler catch-up, the revisions a node's scheduler
+//! published are placed on `replication_factor` of the voters that node
+//! leads, nearest by a fixed hash, and written to the shared `RecordSpace`.
+//! `submit` and `claim` call a node's scheduler and hold its answer, as the
+//! net driver does, until every write the call made is acknowledged within
+//! the lease (see `answer`): a write the space could not store at a quorum,
+//! or a lease that ended first, answers `NotLeader`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -42,13 +51,15 @@ use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, CallKind, Entry, Identity,
     Input, Issuer, KnownConfiguration, MessageSink, Output, ReplyToken, Step, WorkerNode, carry_out,
 };
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{IncarnationId, ShardId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::scheduler::{Claim, Scheduler, Submission};
+use kabudachi_core::task_record::{EffectGate, Settled, Waits, Write, WriteLedger};
 use kabudachi_core::time::{Clock, Duration, Instant};
-pub use kabudachi_testkit::StepRecord;
 use kabudachi_testkit::FaultingAuthority;
+use kabudachi_testkit::RecordSpace;
+pub use kabudachi_testkit::StepRecord;
 
 use crate::support::authority::{authority_ttl, epoch, warmed_up_authority};
 use crate::support::builders::{message_input, timings, voter_of};
@@ -58,6 +69,9 @@ use crate::support::network::FakeNetwork;
 use crate::support::spy::Spy;
 
 const SHARD_ID: &str = "shard-1";
+
+/// How many of its voters a leader places each record on.
+const REPLICATION_FACTOR: usize = 3;
 
 /// More passes than any real exchange needs at one instant: each pass
 /// carries a message one hop further, and roll calls, votes and acks all
@@ -74,6 +88,30 @@ struct Stall {
     /// The messages and connection changes that reached it meanwhile, in
     /// order, to hand it once the stall ends.
     held: Vec<Input>,
+}
+
+/// What `submit` or `claim` asked of a node, to read its answer with
+/// `answer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Ticket(u64);
+
+/// What a node's scheduler answered a call, once the writes it made were
+/// acknowledged.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Answer {
+    Submitted(TaskId),
+    Claimed(Claim),
+    /// The rejection's `Display`, for a call the scheduler refused outright.
+    Refused(String),
+    /// A write was refused or the lease ended first.
+    NotLeader,
+}
+
+/// A leader's held answers and the writes still bearing on what it may tell.
+#[derive(Default)]
+struct Gating {
+    gate: EffectGate<Ticket>,
+    unsettled: WriteLedger,
 }
 
 /// A simulated cluster of `n` real `WorkerNode`s sharing one clock, network and authority.
@@ -119,6 +157,14 @@ pub struct Cluster {
     /// Whether an admitted node is left to report its routing crawl itself
     /// (`routing_crawled`) rather than crawling at once.
     routing_crawls_held: bool,
+    /// The shard's Task records, written by each node's leader.
+    records: RecordSpace,
+    /// Each node's held answers.
+    gating: BTreeMap<WorkerId, Gating>,
+    /// What a held call will answer once released.
+    drafts: BTreeMap<Ticket, Answer>,
+    answers: BTreeMap<Ticket, Answer>,
+    tickets: u64,
 }
 
 /// What the harness did while running its nodes.
@@ -212,6 +258,11 @@ impl Cluster {
             stalls: BTreeMap::new(),
             recorded_steps: None,
             routing_crawls_held: false,
+            records: RecordSpace::default(),
+            gating: BTreeMap::new(),
+            drafts: BTreeMap::new(),
+            answers: BTreeMap::new(),
+            tickets: 0,
         };
         for id in &worker_ids {
             let node_authority = cluster.authority.for_another_worker();
@@ -258,6 +309,7 @@ impl Cluster {
             Scheduler::with_observer((*self.clock).clone(), SequentialIds::new(), spy.clone()),
         );
         self.spies.insert(id.clone(), spy);
+        self.gating.insert(id.clone(), Gating::default());
         self.deadlines.insert(id.clone(), None);
         // A node reports its deadline only when stepped. A `Tick` changes
         // nothing on a node this fresh, but a node no connection event ever
@@ -323,6 +375,11 @@ impl Cluster {
         while let Some(at) = self.next_event_at().filter(|at| *at <= end) {
             self.clock.advance(at - self.clock.now());
             self.catch_up_due_schedulers();
+            // Outcomes settle before held calls of a node that stopped
+            // leading are answered, as the net driver does, so an
+            // acknowledgement due at the instant a lease ends is judged by
+            // the lease check at that instant.
+            self.deliver_acknowledgements();
             activity.progressed |= self.run_passes(true).progressed;
         }
         self.clock.advance(end - self.clock.now());
@@ -350,11 +407,13 @@ impl Cluster {
             .filter_map(|scheduler| scheduler.next_deadline())
             .map(|deadline| deadline.max(now))
             .min();
+        let next_acknowledgement = self.records.next_due().map(|due| due.max(now));
         let next_stall_end = self.stalls.values().map(|stall| stall.until.max(now)).min();
         next_delivery
             .into_iter()
             .chain(next_deadline)
             .chain(next_scheduler_deadline)
+            .chain(next_acknowledgement)
             .chain(next_stall_end)
             .min()
     }
@@ -366,12 +425,14 @@ impl Cluster {
     /// because the clock would never move on.
     fn catch_up_due_schedulers(&mut self) {
         let now = self.clock.now();
+        let mut caught_up = Vec::new();
         for (id, scheduler) in &mut self.schedulers {
             if scheduler
                 .next_deadline()
                 .is_some_and(|deadline| deadline <= now)
             {
                 scheduler.catch_up();
+                caught_up.push(id.clone());
                 assert!(
                     scheduler.next_deadline().is_none_or(|deadline| deadline > now),
                     "Cluster: node {id:?}'s scheduler is still due at {now:?} after catch_up, \
@@ -379,6 +440,164 @@ impl Cluster {
                 );
             }
         }
+        for id in &caught_up {
+            self.write_revisions(id);
+        }
+    }
+
+    /// Places on the node's voters and writes every revision its scheduler
+    /// published since the last call, and returns their writes.
+    fn write_revisions(&mut self, id: &WorkerId) -> Vec<Write> {
+        let (Some(spy), Some(node), Some(gating)) = (
+            self.spies.get(id),
+            self.nodes.get(id),
+            self.gating.get_mut(id),
+        ) else {
+            return Vec::new();
+        };
+        let voters = node.voters();
+        let now = self.clock.now();
+        let mut writes = Vec::new();
+        for mut record in spy.take_revisions() {
+            let write = Write::of(&record);
+            let (holders, quorum) =
+                RecordSpace::placement(&write.task_id, &voters, REPLICATION_FACTOR);
+            record.placement = holders.into_iter().map(Into::into).collect();
+            self.records.write(id, record, quorum, now);
+            writes.push(write);
+        }
+        gating.unsettled.made(&writes);
+        writes
+    }
+
+    /// Hands every write outcome now due to its writer's held answers.
+    fn deliver_acknowledgements(&mut self) {
+        for outcome in self.records.take_due(self.clock.now()) {
+            let (Some(gating), Some(scheduler)) = (
+                self.gating.get_mut(&outcome.writer),
+                self.schedulers.get(&outcome.writer),
+            ) else {
+                continue;
+            };
+            let leading = scheduler.is_leader();
+            gating
+                .unsettled
+                .settled(&outcome.write, outcome.stored, leading);
+            if outcome.stored {
+                for settled in gating.gate.acknowledged(&outcome.write, leading) {
+                    self.resolve(settled);
+                }
+            } else {
+                for ticket in gating.gate.refused(&outcome.write) {
+                    self.resolve(Settled::NotLeader(ticket));
+                }
+            }
+        }
+        self.answer_held_calls_of_nodes_not_leading();
+    }
+
+    /// A node whose scheduler no longer leads answers every call it holds
+    /// `NotLeader` and forgets the writes of the term that ended.
+    fn answer_held_calls_of_nodes_not_leading(&mut self) {
+        let mut ended: Vec<Ticket> = Vec::new();
+        for (id, gating) in &mut self.gating {
+            if self.schedulers.get(id).is_some_and(|s| !s.is_leader()) {
+                ended.extend(gating.gate.lease_ended());
+                gating.unsettled.clear();
+            }
+        }
+        for ticket in ended {
+            self.resolve(Settled::NotLeader(ticket));
+        }
+    }
+
+    fn resolve(&mut self, settled: Settled<Ticket>) {
+        let (ticket, answer) = match settled {
+            Settled::Released(ticket) => {
+                let draft = self.drafts.remove(&ticket);
+                (ticket, draft.expect("a held call has its draft answer"))
+            }
+            Settled::NotLeader(ticket) => {
+                self.drafts.remove(&ticket);
+                (ticket, Answer::NotLeader)
+            }
+        };
+        self.answers.insert(ticket, answer);
+    }
+
+    /// Holds `answer` for `ticket` until every write in `writes` is
+    /// acknowledged within `at`'s lease.
+    fn hold_answer(&mut self, at: &WorkerId, ticket: Ticket, answer: Answer, writes: Vec<Write>) {
+        self.drafts.insert(ticket, answer);
+        let held = self
+            .gating
+            .get_mut(at)
+            .unwrap_or_else(|| unknown_node("hold_answer", at))
+            .gate
+            .hold(ticket, writes);
+        if let Some(settled) = held {
+            self.resolve(settled);
+        }
+    }
+
+    fn next_ticket(&mut self) -> Ticket {
+        self.tickets += 1;
+        Ticket(self.tickets)
+    }
+
+    /// Submits `submission` to the named node's scheduler. The task's answer
+    /// is held until the writes the call made are acknowledged while the node
+    /// still leads; a call the scheduler refuses is answered at once. Panics
+    /// on an unknown ID.
+    pub fn submit(&mut self, at: &WorkerId, submission: Submission) -> Ticket {
+        let ticket = self.next_ticket();
+        match self.scheduler_mut(at).submit(submission) {
+            Err(rejection) => {
+                self.answers
+                    .insert(ticket, Answer::Refused(rejection.to_string()));
+            }
+            Ok(task) => {
+                let writes = self.write_revisions(at);
+                self.hold_answer(at, ticket, Answer::Submitted(task), writes);
+            }
+        }
+        ticket
+    }
+
+    /// Asks the named node's scheduler to claim `task` for `claimant`, and
+    /// holds the answer as `submit` does. A claim that wrote nothing, because
+    /// the task was already decided, waits for that task's writes still
+    /// unsettled, or is answered `NotLeader` at once if one was refused.
+    /// Panics on an unknown ID.
+    pub fn claim(&mut self, at: &WorkerId, claimant: &WorkerId, task: &TaskId) -> Ticket {
+        let ticket = self.next_ticket();
+        let answer = match self.scheduler_mut(at).request_claim(claimant, task) {
+            Ok(claim) => Answer::Claimed(claim),
+            Err(rejection) => Answer::Refused(rejection.to_string()),
+        };
+        let mut writes = self.write_revisions(at);
+        if writes.is_empty() {
+            match self.gating[at].unsettled.waits_on(task) {
+                Waits::Refused => {
+                    self.answers.insert(ticket, Answer::NotLeader);
+                    return ticket;
+                }
+                Waits::Writes(pending) => writes.extend(pending),
+            }
+        }
+        self.hold_answer(at, ticket, answer, writes);
+        ticket
+    }
+
+    /// What `ticket`'s call was answered; `None` while it is held.
+    pub fn answer(&self, ticket: Ticket) -> Option<&Answer> {
+        self.answers.get(&ticket)
+    }
+
+    /// The shard's Task records, as each node holds them: for tests to set
+    /// the acknowledgement delay and read what holders stored.
+    pub fn records(&self) -> &RecordSpace {
+        &self.records
     }
 
     /// Runs passes at the current instant until nothing more is due at it.
@@ -591,6 +810,7 @@ impl Cluster {
     /// partition) and tells every node which of its connections closed.
     pub fn partition(&mut self, group_a: BTreeSet<WorkerId>, group_b: BTreeSet<WorkerId>) {
         let before = self.connections();
+        self.records.partition(&group_a, &group_b);
         self.network.partition(group_a, group_b);
         self.report_connection_changes(before);
     }
@@ -598,6 +818,7 @@ impl Cluster {
     /// Lifts the partition and tells every node which connections reopened.
     pub fn heal(&mut self) {
         let before = self.connections();
+        self.records.heal();
         self.network.heal_partition();
         self.report_connection_changes(before);
     }
@@ -727,6 +948,8 @@ impl Cluster {
         );
         self.nodes.insert(id.clone(), node);
         self.schedulers.insert(id.clone(), scheduler);
+        self.write_revisions(id);
+        self.answer_held_calls_of_nodes_not_leading();
         all
     }
 
@@ -914,6 +1137,7 @@ impl Cluster {
         self.nodes.remove(id);
         self.schedulers.remove(id);
         self.spies.remove(id);
+        self.gating.remove(id);
         self.deadlines.remove(id);
 
         self.restarts += 1;

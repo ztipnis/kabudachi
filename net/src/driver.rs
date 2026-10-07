@@ -22,6 +22,17 @@
 //! the shard's workers stay connected to one another and not only to their
 //! leader.
 //!
+//! A leader's scheduler records each decision as a new revision of its
+//! task's Task record. The driver writes every revision to the voters
+//! the record's placement names (the replication factor nearest the key),
+//! and holds the answer a decision produced, a claim's included, until a
+//! quorum of those voters has stored it and the scheduler still leads. The
+//! held answer is released `NotLeader` when the lease ends, and the driver
+//! wakes just past the lease end so that happens even if nothing else
+//! arrives. A write that misses its quorum while the leader still leads
+//! may or may not have landed, so the driver answers `NotLeader` to every
+//! later question about that task until a newer revision of it is stored.
+//!
 //! With a coordination authority configured, it is also the sole caller of
 //! [`kabudachi_core::election::AuthorityCall::perform`]. Each step's
 //! `Output::Authority(call)` is performed by the worker's
@@ -69,10 +80,13 @@ use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, Input, Issuer, MessageSink, Output, Step,
     WorkerNode, carry_out,
 };
-use kabudachi_core::protocol::ids::{IdGenerator, WorkerId};
-use kabudachi_core::protocol::messages::{ElectionMessage, JoinResponse};
+use kabudachi_core::protocol::ids::{IdGenerator, TaskId, WorkerId};
+use kabudachi_core::protocol::messages::{
+    ClaimResponse, ElectionMessage, JoinResponse, claim_request,
+};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::{Observer, Scheduler};
+use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::task_record::{EffectGate, RecordOutbox, Settled, Waits, Write, WriteLedger};
 use kabudachi_core::time::{Clock, Instant};
 use libp2p::Multiaddr;
 
@@ -80,12 +94,13 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::authority::AuthorityClient;
 use crate::bootstrap::DEFAULT_RETRY_INTERVAL;
-use crate::claim;
+use crate::claim::{self, ClaimRequestHandle};
 use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, pointer_for};
 use crate::leader_search::{JoinOverNet, Rejoin, StrandedWatch};
-use crate::messenger::Net;
+use crate::messenger::{Net, PlacedWrite};
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
 use crate::routing_refresh::{RoutingRefresh, ShardView};
+use crate::task_store::placement::{Placement, ReplicationFactor, placement};
 
 /// How [`run_driver`] runs, beyond the node, transport and scheduler it drives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +116,8 @@ pub struct DriverConfig {
     pub join_peer_timeout: Duration,
     /// How long the leader search waits between rounds.
     pub retry_interval: Duration,
+    /// How many voters each Task record is written to.
+    pub replication_factor: ReplicationFactor,
 }
 
 impl Default for DriverConfig {
@@ -110,6 +127,7 @@ impl Default for DriverConfig {
             seeds: Vec::new(),
             join_peer_timeout: DEFAULT_JOIN_PEER_TIMEOUT,
             retry_interval: DEFAULT_RETRY_INTERVAL,
+            replication_factor: ReplicationFactor::DEFAULT,
         }
     }
 }
@@ -190,6 +208,11 @@ pub use crate::authority::SharedAuthority;
 /// last handed, and a scheduler that holds no grant, or whose grant's lease
 /// has ended, refuses every claim as `NotLeader`.
 ///
+/// The scheduler's observer is a [`RecordOutbox`]: after every step and every
+/// batch of claim answers, the driver places each revision the scheduler
+/// published on the voters its node leads (see `Net::write_records`), and
+/// logs each write that did not reach its quorum.
+///
 /// A run that starts over with a node driven before must be given the
 /// scheduler driven with it before. The node reports a grant only when it
 /// changes, so a different scheduler never learns the grant the node already
@@ -216,11 +239,11 @@ pub use crate::authority::SharedAuthority;
 /// found its shard recovered without it, and so went back to `Bootstrapping`,
 /// reads to learn whom to rejoin through (see
 /// [`crate::leader_search::Rejoin`]); the driver keeps running meanwhile.
-pub async fn run_driver<C, I, R>(
+pub async fn run_driver<C, I>(
     node: &mut WorkerNode<C>,
     first: Step,
     net: &Net,
-    scheduler: &mut Scheduler<C, I, R>,
+    scheduler: &mut Scheduler<C, I, RecordOutbox>,
     clock: C,
     mut authority: Option<AuthorityClient>,
     config: DriverConfig,
@@ -229,7 +252,6 @@ pub async fn run_driver<C, I, R>(
 where
     C: Clock,
     I: IdGenerator,
-    R: Observer,
 {
     let my_id = net.local_worker_id();
     net.subscribe_to_shard(node.shard_id());
@@ -249,6 +271,11 @@ where
     // The epoch read the rejoin asked last round, to tell the node of before
     // its answer arrives.
     let mut epoch_read_asked = None;
+    // The claim answers decided but not yet sent: each waits for the writes
+    // its decision made.
+    let mut held_answers = EffectGate::new();
+    // Every write made and not yet settled, whichever call made it.
+    let mut unsettled = WriteLedger::default();
     let mut routing = RoutingRefresh::new(
         node.timings().suspect_timeout,
         config.routing_refresh_period,
@@ -266,6 +293,8 @@ where
             node: &mut *node,
             scheduler: &mut *scheduler,
             net,
+            replication_factor: config.replication_factor,
+            unsettled: &mut unsettled,
             calls: authority.as_mut(),
             observe: &mut observe,
         };
@@ -322,8 +351,17 @@ where
                 }
             }
         }
+        settle_answers(stepper.scheduler, net, &mut held_answers, stepper.unsettled);
         respond_to_join_requests(stepper.node, net).await;
-        respond_to_claim_requests(stepper.scheduler, net);
+        respond_to_claim_requests(
+            stepper.node,
+            stepper.scheduler,
+            net,
+            &mut held_answers,
+            stepper.unsettled,
+            config.replication_factor,
+        );
+        stepper.write_revisions();
         // A step can report a deadline that has already come: a voter that
         // begins suspecting its leader starts a roll call at its next
         // `Tick`, due at once. Every `Tick` that is due moves the node on or
@@ -402,6 +440,19 @@ where
             }
             None => search = None,
         }
+        // A held answer is released `NotLeader` when the scheduler's lease
+        // ends, and nothing else guarantees a wake then: the election's own
+        // deadlines are not shown to coincide with the grant's end (the
+        // earlier of its quorum and fence ends), and no write outcome or
+        // arrival need come. One tick past the end, so the sleep, which
+        // counts whole ticks, never fires before the lease has ended.
+        let lease_wake = if held_answers.is_empty() {
+            None
+        } else {
+            scheduler
+                .lease_end()
+                .map(|end| end + kabudachi_core::time::Duration::from_ticks(1))
+        };
         let search_wake = search.as_ref().and_then(|(_, search)| search.wake_at());
         let stranded_wake = stranded.wake_at(clock.now());
 
@@ -420,6 +471,7 @@ where
                 () = net.wait_for_arrival() => break,
                 () = wake_at(search_wake) => break,
                 () = sleep_until(&clock, stranded_wake) => break,
+                () = sleep_until(&clock, lease_wake) => break,
                 result = ask_done(&mut search) => {
                     if let Some((purpose, search)) = search.as_mut() {
                         found = search
@@ -438,10 +490,13 @@ where
 }
 
 /// What one batch of [`run_driver`] steps its node with.
-struct Stepper<'a, C: Clock, I: IdGenerator, R: Observer, O> {
+struct Stepper<'a, C: Clock, I: IdGenerator, O> {
     node: &'a mut WorkerNode<C>,
-    scheduler: &'a mut Scheduler<C, I, R>,
+    scheduler: &'a mut Scheduler<C, I, RecordOutbox>,
     net: &'a Net,
+    replication_factor: ReplicationFactor,
+    /// [`run_driver`]'s `unsettled`.
+    unsettled: &'a mut WriteLedger,
     /// The client to perform the node's calls with; `None` answers each at
     /// once as `Unavailable`.
     calls: Option<&'a mut AuthorityClient>,
@@ -449,11 +504,10 @@ struct Stepper<'a, C: Clock, I: IdGenerator, R: Observer, O> {
     observe: &'a mut O,
 }
 
-impl<C, I, R, O> Stepper<'_, C, I, R, O>
+impl<C, I, O> Stepper<'_, C, I, O>
 where
     C: Clock,
     I: IdGenerator,
-    R: Observer,
     O: FnMut(&WorkerNode<C>, Option<&Input>, &Step),
 {
     /// Steps the node with `input`, carries that step out (see
@@ -481,7 +535,7 @@ where
     fn carry(&mut self, stepped: Step, input: Option<&Input>) -> Option<Instant> {
         let mut performer = Calls(self.calls.as_deref_mut());
         let observe = &mut *self.observe;
-        carry_out(
+        let next_deadline = carry_out(
             &mut *self.node,
             stepped,
             &mut *self.scheduler,
@@ -492,8 +546,55 @@ where
                 // Only the first step has no reply for its input.
                 observe(node, reply.or(input), step);
             },
-        )
+        );
+        self.write_revisions();
+        next_deadline
     }
+
+    /// Places and writes every revision the scheduler published since the
+    /// last call.
+    fn write_revisions(&mut self) {
+        write_revisions(
+            self.node,
+            self.scheduler,
+            self.net,
+            self.replication_factor,
+            self.unsettled,
+        );
+    }
+}
+
+/// Places and writes every revision `scheduler` published since the last
+/// call, returns their writes and adds them to `unsettled`. Each write's
+/// outcome arrives at `net`.
+fn write_revisions<C: Clock, I: IdGenerator>(
+    node: &WorkerNode<C>,
+    scheduler: &mut Scheduler<C, I, RecordOutbox>,
+    net: &Net,
+    factor: ReplicationFactor,
+    unsettled: &mut WriteLedger,
+) -> Vec<Write> {
+    let voters = node.voters();
+    let mut writes = Vec::new();
+    let mut placed = Vec::new();
+    for mut record in scheduler.observer_mut().take() {
+        let write = Write::of(&record);
+        match placement(&write.task_id, &voters, factor) {
+            Some(Placement { holders, quorum }) => {
+                record.placement = holders.into_iter().map(Into::into).collect();
+                placed.push(PlacedWrite { record, quorum });
+            }
+            // No placement means either the leader has just stopped leading
+            // (a scheduler publishes only while it leads, so its own roster
+            // no longer holds it), or a voter id is not a peer id, so it
+            // cannot be placed: either way the write counts as refused.
+            None => net.refuse_write(write.clone()),
+        }
+        writes.push(write);
+    }
+    net.write_records(placed);
+    unsettled.made(&writes);
+    writes
 }
 
 /// Performs the node's authority calls through its client, or, with none,
@@ -614,15 +715,92 @@ where
     }
 }
 
-/// Answers every inbound `/kabudachi/claim/1` request queued on `net` with
-/// `scheduler`'s decision (see `claim::answer`).
-fn respond_to_claim_requests<C: Clock, I: IdGenerator, R: Observer>(
-    scheduler: &mut Scheduler<C, I, R>,
+/// A claim answer the leader has decided and holds until the writes its
+/// decision made settle.
+struct HeldAnswer {
+    handle: ClaimRequestHandle,
+    response: ClaimResponse,
+}
+
+/// Decides every inbound `/kabudachi/claim/1` request queued on `net` with
+/// `scheduler`'s decision (see `claim::answer`) and writes the revisions that
+/// decision made. The answer goes out once those writes are acknowledged,
+/// while the scheduler still leads (see [`settle_answers`]). One that made no
+/// write of its own, because the task it names was already decided, waits
+/// for that task's writes still unsettled instead (or, once one was refused,
+/// is answered `NotLeader` at once): it tells the asker of
+/// what an earlier answer decided, which a leader elected next may never
+/// see until those writes land.
+fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
+    node: &WorkerNode<C>,
+    scheduler: &mut Scheduler<C, I, RecordOutbox>,
     net: &Net,
+    held: &mut EffectGate<HeldAnswer>,
+    unsettled: &mut WriteLedger,
+    factor: ReplicationFactor,
 ) {
     for handle in net.poll_claim_requests() {
         let response = claim::answer(scheduler, &handle.from(), handle.request());
-        net.respond_claim(handle, response);
+        let mut writes = write_revisions(node, scheduler, net, factor, unsettled);
+        if let (true, claim_request::Request::TaskId(named)) = (writes.is_empty(), handle.request())
+        {
+            let task = TaskId::from(named.clone());
+            match unsettled.waits_on(&task) {
+                Waits::Refused => {
+                    send_answer(net, Settled::NotLeader(HeldAnswer { handle, response }));
+                    continue;
+                }
+                Waits::Writes(pending) => writes.extend(pending),
+            }
+        }
+        if let Some(settled) = held.hold(HeldAnswer { handle, response }, writes) {
+            send_answer(net, settled);
+        }
+    }
+}
+
+/// Settles the held claim answers on the write outcomes that arrived, and
+/// answers every held one `NotLeader` once the scheduler no longer leads.
+fn settle_answers<C: Clock, I: IdGenerator>(
+    scheduler: &Scheduler<C, I, RecordOutbox>,
+    net: &Net,
+    held: &mut EffectGate<HeldAnswer>,
+    unsettled: &mut WriteLedger,
+) {
+    // Read once per call. A loss and regain of leadership inside one driver
+    // iteration would keep the old term's refused entries, but the scheduler
+    // exposes no term identity to tell the terms apart (a lease's end moves
+    // with every renewal), and the leftover only errs safe: it answers
+    // `NotLeader` for a task until a newer revision of it is stored.
+    let leading = scheduler.is_leader();
+    for outcome in net.take_write_outcomes() {
+        unsettled.settled(&outcome.write, outcome.stored, leading);
+        if outcome.stored {
+            for settled in held.acknowledged(&outcome.write, leading) {
+                send_answer(net, settled);
+            }
+        } else {
+            tracing::debug!(
+                task = outcome.write.task_id.as_str(),
+                "a record revision was not stored at its quorum"
+            );
+            for answer in held.refused(&outcome.write) {
+                send_answer(net, Settled::NotLeader(answer));
+            }
+        }
+    }
+    if !leading {
+        for answer in held.lease_ended() {
+            send_answer(net, Settled::NotLeader(answer));
+        }
+        unsettled.clear();
+    }
+}
+
+fn send_answer(net: &Net, settled: Settled<HeldAnswer>) {
+    match settled {
+        Settled::Released(held) => net.respond_claim(held.handle, held.response),
+        Settled::NotLeader(held) => net.respond_claim(held.handle, claim::not_leader()),
     }
 }
 
@@ -633,15 +811,14 @@ mod tests {
     use kabudachi_core::configuration::{Configuration, Generation, Single};
     use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
     use kabudachi_core::election::{
-        AuthorityTimings, ElectionTimings, Entry, Identity, KnownConfiguration,
+        AuthorityTimings, CallKind, ElectionTimings, Entry, Identity, KnownConfiguration,
     };
     use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids};
     use kabudachi_core::protocol::messages::{
         ElectionMessage, LeaderHeartbeatAck, election_message,
     };
-    use kabudachi_core::time::{Duration as TickDuration, RealClock};
-    use kabudachi_core::election::CallKind;
     use kabudachi_core::protocol::worker_state::WorkerState;
+    use kabudachi_core::time::{Duration as TickDuration, RealClock};
     use kabudachi_testkit::FaultingAuthority;
     use tokio::sync::watch;
     use tokio::time::timeout;
@@ -753,7 +930,7 @@ mod tests {
         let clock = RealClock::new();
         // Its deadline is a minute away, so only an arrival can wake it.
         let (mut node, first) = node_of_two(clock, &me, TickDuration::from_secs(60));
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         let (steps, mut observed) = watch::channel((0_usize, None));
 
         timeout(TEST_TIMEOUT, async {
@@ -825,7 +1002,7 @@ mod tests {
             TickDuration::from_secs(60),
             Some(AuthorityTimings::default()),
         );
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         // The authority is down, and its answer to the node's registration
         // is held: the call is still in flight while everything else runs.
         let authority = FaultingAuthority::new(clock, TickDuration::from_secs(60));
@@ -897,7 +1074,7 @@ mod tests {
         let clock = RealClock::new();
         let suspect_timeout = TickDuration::from_millis(100);
         let (mut node, first) = node_of_two(clock, &me, suspect_timeout);
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         let (steps, mut observed) = watch::channel(Vec::<(Duration, Vec<Output>)>::new());
 
         let steps = timeout(TEST_TIMEOUT, async {
@@ -952,7 +1129,7 @@ mod tests {
 
         let clock = RealClock::new();
         let (mut node, first) = node_of_two(clock, &me, TickDuration::from_secs(60));
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         let (known, mut observed) = watch::channel(None);
 
         // Nothing arrives once it runs, and its deadline is a minute away,
@@ -1014,7 +1191,7 @@ mod tests {
                 timings,
             };
             let (mut node, first) = WorkerNode::start(identity, entry, clock, None);
-            let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+            let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
             let driven = run_driver(
                 &mut node,
                 first,
@@ -1093,7 +1270,7 @@ mod tests {
             TickDuration::from_millis(300),
             Some(AuthorityTimings { ttl }),
         );
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         let (seen, mut observed) = watch::channel((Vec::<WorkerState>::new(), None));
         let client = AuthorityClient::new(&node_net, shard.clone(), Arc::new(node_handle.clone()));
 
@@ -1188,7 +1365,7 @@ mod tests {
             Arc::new(authority.for_another_worker()),
         );
         let (mut node, first) = node_of_two(clock, &me, TickDuration::from_millis(100));
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         let (seen, observed) = watch::channel(node.state());
 
         let driven = run_driver(
@@ -1280,7 +1457,7 @@ mod tests {
             TickDuration::from_secs(60),
             Some(AuthorityTimings { ttl }),
         );
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         let mine = authority.for_another_worker();
         let (seen_tx, mut seen) = watch::channel((WorkerState::Active, None));
         let driven = run_driver(
@@ -1387,7 +1564,7 @@ mod tests {
             TickDuration::from_secs(60),
             Some(AuthorityTimings { ttl }),
         );
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         let mine = authority.for_another_worker();
         let (seen_tx, mut seen) = watch::channel((WorkerState::Active, None));
         let driven = run_driver(

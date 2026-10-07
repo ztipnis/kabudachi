@@ -25,6 +25,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use prost::Message;
+
 use crate::coalescing::{self, Key, Occupancy};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::digest::Digest;
@@ -38,7 +40,9 @@ use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task, retry_of};
 use crate::protocol::task::TaskRunState;
-use crate::task_record::{RecordVersion, VersionOrder};
+use crate::task_record::{
+    HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion, VersionOrder,
+};
 use crate::time::{Clock, Duration, Instant, WallTime};
 
 mod memory_budget;
@@ -83,6 +87,24 @@ const CLAIM_OVERHEAD_BYTES: u64 = 4 * 1024;
 /// claim until then.
 pub const MAX_SUBMISSION_BYTES: u64 = MAX_CLAIM_FRAME_BYTES - CLAIM_OVERHEAD_BYTES;
 
+/// What a size measurement of a record leaves out and so keeps free: the
+/// version and publication time, whose encoding grows with their values, and
+/// the placement.
+const RECORD_RESERVE_BYTES: u64 = 1024;
+
+/// The longest failure kind a record keeps, in bytes. A kind is an error
+/// type's name, so any real one fits; a longer one is cut rather than refused
+/// (the failure is reported either way), so that what a worker supplies can
+/// never push a record past the limit the network refuses to store.
+const MAX_FAILURE_KIND_BYTES: usize = 128;
+
+/// A version for measuring a record's size, which does not depend on it.
+const UNVERSIONED: RecordVersion = RecordVersion {
+    recovery_epoch: RecoveryEpoch::new(0, 0),
+    leader_term: 0,
+    revision: 0,
+};
+
 /// Why a submission was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitRejection {
@@ -100,6 +122,8 @@ pub enum SubmitRejection {
     NotLeader,
     #[error("a task with this id is already recorded")]
     DuplicateId,
+    #[error("the task's record would be {size} bytes, past the {limit} a record may have")]
+    RecordTooLarge { size: u64, limit: u64 },
 }
 
 /// A submission given its task id and its submission time: what its client
@@ -272,6 +296,10 @@ pub enum Event {
         task_run_id: TaskRunId,
         was_running: bool,
     },
+    /// A run of this task ended and the attempt that would follow it was not
+    /// created: its record would have grown past the largest a record may be.
+    /// The task is over.
+    RecordFull { task_id: TaskId },
 }
 
 /// A run that was lost with its worker, and the run that replaces it.
@@ -565,13 +593,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .occupancy
             .chain(task_id)
             .iter()
-            .map(|absorbed| ChainEntry {
-                entry: Some(chain_entry::Entry::Absorbed(AbsorbedGeneration {
-                    task_id: Some(absorbed.clone().into()),
-                    serialized_input: self.tasks[absorbed].serialized_input.clone(),
-                    input_digest: Some(self.input_digests[absorbed].clone().into()),
-                })),
-            })
+            .map(|absorbed| self.chain_entry_of(absorbed))
             .collect();
         TaskRecord {
             version: Some(version.into()),
@@ -587,6 +609,60 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             published_at: Some(published_at.into()),
             finished: self.retention.holds(task_id),
         }
+    }
+
+    fn chain_entry_of(&self, absorbed: &TaskId) -> ChainEntry {
+        ChainEntry {
+            entry: Some(chain_entry::Entry::Absorbed(AbsorbedGeneration {
+                task_id: Some(absorbed.clone().into()),
+                serialized_input: self.tasks[absorbed].serialized_input.clone(),
+                input_digest: Some(self.input_digests[absorbed].clone().into()),
+            })),
+        }
+    }
+
+    /// The most a record's encoded size may be as measured here, which leaves
+    /// room for what a measurement leaves out: the version and publication
+    /// time, whose encoding grows with their values, and the placement.
+    fn record_limit() -> u64 {
+        MAX_RECORD_BYTES - RECORD_RESERVE_BYTES
+    }
+
+    /// How large the record of `task` would be if it were submitted now as
+    /// `run`, with the chain it would absorb from its coalescing key.
+    fn submitted_record_len(&self, task: &Task, run: &TaskRun, digest: &Digest) -> u64 {
+        let retained = task
+            .coalescing_key
+            .as_deref()
+            .map(|key| {
+                self.occupancy
+                    .retained(&coalescing::key(&task.task_definition_id(), key))
+            })
+            .unwrap_or_default();
+        let link = retained.last().map(|older| {
+            let mut absorbed = self
+                .links
+                .get(older)
+                .map(|link| link.absorbed.clone())
+                .unwrap_or_default();
+            absorbed.push(older.clone().into());
+            CoalescingLink {
+                superseded_by: None,
+                absorbed,
+            }
+        });
+        let record = TaskRecord {
+            version: None,
+            task: Some(task.clone()),
+            runs: vec![run.clone()],
+            retained_chain: retained.iter().map(|id| self.chain_entry_of(id)).collect(),
+            input_digest: Some(digest.clone().into()),
+            link,
+            placement: Vec::new(),
+            published_at: None,
+            finished: false,
+        };
+        record.encoded_len() as u64
     }
 
     /// How long a task is kept after it finishes, or `None` to keep tasks
@@ -744,6 +820,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             TaskRunState::Queued
         };
         let run = first_attempt(&task, &self.ids, stamped_at, first_state);
+        let size = self.submitted_record_len(&task, &run, &input_digest);
+        if size > Self::record_limit() {
+            return Err(SubmitRejection::RecordTooLarge {
+                size,
+                limit: Self::record_limit(),
+            });
+        }
 
         let task_id = task.task_id();
         self.current_run.insert(task_id.clone(), run.task_run_id());
@@ -832,10 +915,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         // stays in the answer until one has: the caller that asks "is it due
         // yet?" must still get to `catch_up`. That is why it reads what was
         // noticed, not `is_leader`, which is false from the end's instant on.
-        let lease_end = match self.grant.map(|grant| grant.valid_until) {
-            Some(LeaseEnd::At(end)) if self.noticed_leading => Some(end),
-            _ => None,
-        };
+        let lease_end = self.lease_end().filter(|_| self.noticed_leading);
         let waiting = if self.is_leader() {
             self.waiting.next_deadline()
         } else {
@@ -1091,7 +1171,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// The worker running `run_id` reports that it failed with an error of
-    /// type `failure_kind` (its name, never its message). Like completing,
+    /// type `failure_kind` (its name, never its message; one longer than
+    /// `MAX_FAILURE_KIND_BYTES` is cut). Like completing,
     /// only a `Running` run owned by that worker can fail.
     pub fn fail(
         &mut self,
@@ -1115,7 +1196,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let run = self.run_owned_by(worker, run_id, TaskRunState::Running)?;
         run.transition_to(TaskRunState::Failed, stamped_at)
             .expect("a Running run can always fail");
-        run.failure_kind = failure_kind;
+        run.failure_kind = cut_to_fit(failure_kind, MAX_FAILURE_KIND_BYTES);
         let task_id = run.task_id();
         let attempt = run.attempt_number();
         self.notify_run(run_id);
@@ -1235,7 +1316,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 None
             } else {
                 *self.losses.entry(task_id.clone()).or_default() += 1;
-                Some(self.queue_next_attempt(&task_id, &run_id))
+                let next = self.queue_next_attempt(&task_id, &run_id);
+                if next.is_none() {
+                    self.record_finished(&task_id, now);
+                }
+                next
             };
             lost.push(LostRun {
                 task_id,
@@ -1268,18 +1353,40 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if attempt - lost > retries {
             return None;
         }
-        Some(self.queue_next_attempt(task_id, failed))
+        self.queue_next_attempt(task_id, failed)
     }
 
     /// Queues the attempt that follows `previous`, a terminal run of
-    /// `task_id`, and makes it the one authoritative run.
+    /// `task_id`, and makes it the one authoritative run. If the record would
+    /// then be past the limit, no attempt is created: the task is over (the
+    /// caller finishes it), a `RecordFull` event is raised, and a run that
+    /// has no failure kind of its own gets one saying why.
     fn queue_next_attempt(
         &mut self,
         task_id: &TaskId,
         previous: &TaskRunId,
-    ) -> TaskRunId {
+    ) -> Option<TaskRunId> {
         let stamped_at = WallTime::now(&self.clock);
         let next = retry_of(&self.runs[previous], &self.ids, stamped_at);
+        let record = self.record_of(task_id, UNVERSIONED, stamped_at);
+        // Adding the run to the record also adds its field tag and length prefix.
+        let next_len = next.encoded_len();
+        let run_framing = 1 + prost::encoding::encoded_len_varint(next_len as u64);
+        let grown = (record.encoded_len() + run_framing + next_len) as u64;
+        if grown > Self::record_limit() {
+            let run = self
+                .runs
+                .get_mut(previous)
+                .expect("a previous run is stored");
+            if run.failure_kind.is_empty() {
+                run.failure_kind = HISTORY_TOO_LARGE_FAILURE_KIND.to_owned();
+                self.notify_run(previous);
+            }
+            self.events.push(Event::RecordFull {
+                task_id: task_id.clone(),
+            });
+            return None;
+        }
         let next_id = next.task_run_id();
         self.current_run.insert(task_id.clone(), next_id.clone());
         self.runs_of_task
@@ -1289,7 +1396,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.runs.insert(next_id.clone(), next);
         self.waiting.requeue(task_id);
         self.notify_run(&next_id);
-        next_id
+        Some(next_id)
     }
 
     /// Expires `task_id`, which `take_expired` found still waiting, so its
@@ -1451,6 +1558,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         leased && self.may_publish_under(&grant)
     }
 
+    /// The instant the lease of the grant this scheduler holds ends, or
+    /// `None` for no grant or an unbounded lease. It is still the lease's
+    /// end after that instant has passed.
+    pub fn lease_end(&self) -> Option<Instant> {
+        match self.grant?.valid_until {
+            LeaseEnd::Unbounded => None,
+            LeaseEnd::At(end) => Some(end),
+        }
+    }
+
     /// Its observer, for a driver that takes what the scheduler published.
     pub fn observer_mut(&mut self) -> &mut O {
         &mut self.observer
@@ -1520,4 +1637,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         Ok(run)
     }
+}
+
+/// `text` cut to at most `max` bytes, at a character boundary.
+fn cut_to_fit(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }

@@ -2,7 +2,8 @@
 //! both `cargo` and Bazel, and that two such nodes complete an `identify`
 //! handshake over TCP+noise+yamux.
 //!
-//! `Behaviour` holds `identify`, `gossipsub`, `kad` and three
+//! `Behaviour` holds `identify`, `gossipsub`, two `kad` behaviours (one that
+//! routes, one that stores the shard's Task records) and three
 //! `request_response` behaviours: one carrying the election protocol (see
 //! `crate::codec`), one the bootstrap join protocol (see
 //! `crate::join_codec`), and one the claim arbitration protocol (see
@@ -20,11 +21,11 @@
 //!
 //! ## `kad`: peer routing, not membership
 //!
-//! `kad` runs in [`libp2p::kad::Mode::Server`] (this node answers other
-//! peers' DHT queries, not just makes its own) with no record store actually
-//! used — the routing table (`FIND_NODE`) is the only part of Kademlia this
-//! crate wants. It needs no dedicated bootstrap peer list of its own: `kad`'s
-//! own default (`libp2p_kad::Config`'s `BucketInserts::OnConnected`)
+//! The routing `kad` runs in [`libp2p::kad::Mode::Server`] (this node answers
+//! other peers' DHT queries, not just makes its own) with no record store
+//! actually used — the routing table (`FIND_NODE`) is the only part of
+//! Kademlia it is for. It needs no dedicated bootstrap peer list of its own:
+//! `kad`'s own default (`libp2p_kad::Config`'s `BucketInserts::OnConnected`)
 //! registers a newly connected peer as soon as this node dials it, using the
 //! address it just dialed successfully; `crate::messenger`'s `handle_event`,
 //! in its `identify::Event::Received` arm, also calls `kad.add_address` with
@@ -65,26 +66,48 @@
 //! The routing table itself is never consulted for anything else: it is not
 //! a membership list, a peer in it may not be part of any shard this node
 //! serves, and nothing here reads it directly. No record is ever put or
-//! fetched, so [`libp2p::kad::store::MemoryStore`] — required only because
-//! [`libp2p::kad::Behaviour`] is generic over a `RecordStore` — never
+//! fetched through it, so [`libp2p::kad::store::MemoryStore`] — required only
+//! because [`libp2p::kad::Behaviour`] is generic over a `RecordStore` — never
 //! actually holds one.
+//!
+//! ## `records`: the shard's Task records
+//!
+//! A worker that serves a shard (`crate::messenger::Net::for_shard`) runs a
+//! second `kad` behaviour, `records`, whose record store is the shard's Task
+//! record store (`crate::task_store`). It speaks its own protocol,
+//! `/kabudachi/<shard>/records/1`, so a record written by one shard's leader
+//! can only land at a worker of that shard, whereas the routing `kad` keeps
+//! its shared protocol: a per-shard protocol there would cut routing, and the
+//! JOIN that crawls through it, off from every peer of another shard. It
+//! never routes, bootstraps, republishes or replicates: a leader writes a
+//! record to the holders it names (`put_record_to`), and a worker's records
+//! behaviour only answers those puts and gets. Where a record goes is the
+//! leader's configuration alone; this behaviour's routing table is never read
+//! as membership either. A `Net` that serves no shard (`Net::new`) has it
+//! disabled.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use kabudachi_core::protocol::ids::ShardId;
 use libp2p::core::transport::{
     DialOpts, ListenerId, PortUse, Transport, TransportError, TransportEvent,
 };
 use libp2p::core::upgrade::Version;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{
-    Multiaddr, Swarm, allow_block_list, gossipsub, identify, kad, noise, tcp, yamux,
+    Multiaddr, PeerId, StreamProtocol, Swarm, allow_block_list, gossipsub, identify, kad, noise,
+    tcp, yamux,
 };
 
 use crate::claim::codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
 use crate::codec::{ElectionCodec, PROTOCOL};
 use crate::join_codec::{JoinCodec, PROTOCOL as JOIN_PROTOCOL};
+use crate::task_store::{
+    HeldRecords, MAX_RECORD_PACKET_BYTES, RECORD_WRITE_TIMEOUT, TaskRecordStore,
+};
 
 /// Protocol version string advertised by `identify`. Not yet load-bearing
 /// (nothing checks it), but real peers should agree on it eventually.
@@ -132,6 +155,9 @@ pub struct Behaviour {
     pub identify: identify::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
+    /// The shard's Task record store and its protocol; disabled for a node
+    /// that serves no shard.
+    pub records: Toggle<kad::Behaviour<TaskRecordStore>>,
     pub request_response: request_response::Behaviour<ElectionCodec>,
     pub join: request_response::Behaviour<JoinCodec>,
     pub claim: request_response::Behaviour<ClaimCodec>,
@@ -202,15 +228,45 @@ impl Transport for NewPortTcp {
     }
 }
 
+/// The records `kad` of a worker of `shard`: it stores into `held` what peers
+/// write, on a protocol of the shard alone, and does nothing of its own. No
+/// publication, replication, caching or crawl runs, and a record never
+/// expires by its own timer (the store drops finished records itself).
+fn records_behaviour(
+    local: PeerId,
+    shard: &ShardId,
+    held: HeldRecords,
+) -> kad::Behaviour<TaskRecordStore> {
+    let protocol = StreamProtocol::try_from_owned(format!("/kabudachi/{}/records/1", shard.as_str()))
+        .expect("a protocol name that starts with '/' is valid");
+    let mut config = kad::Config::new(protocol);
+    config
+        .set_record_filtering(kad::StoreInserts::Unfiltered)
+        .set_record_ttl(None)
+        .set_replication_interval(None)
+        .set_publication_interval(None)
+        .set_provider_record_ttl(None)
+        .set_provider_publication_interval(None)
+        .set_caching(kad::Caching::Disabled)
+        .set_periodic_bootstrap_interval(None)
+        .set_max_packet_size(MAX_RECORD_PACKET_BYTES)
+        .set_query_timeout(RECORD_WRITE_TIMEOUT);
+    let mut records = kad::Behaviour::with_config(local, TaskRecordStore::new(held), config);
+    records.set_mode(Some(kad::Mode::Server));
+    records
+}
+
 /// Builds a `Swarm` over TCP+noise+yamux, identified by a keypair it
-/// generates, with every protocol of [`Behaviour`] enabled. Does not listen,
-/// dial or subscribe to any gossip topic; callers do that.
+/// generates, with every protocol of [`Behaviour`] enabled; the Task record
+/// store (see the module doc's "records") only for a worker of `shard`, over
+/// `held`. Does not listen, dial or subscribe to any gossip topic; callers do
+/// that.
 ///
 /// The keypair is new to this process: a worker's id is its peer id, and it
 /// lives for one process incarnation (see `crate::worker`'s "One identity
 /// per process"). Only `crate::messenger::Net` builds a swarm, so no caller
 /// can hand one a reused identity.
-pub(crate) fn build_swarm() -> Swarm<Behaviour> {
+pub(crate) fn build_swarm(shard: Option<&ShardId>, held: HeldRecords) -> Swarm<Behaviour> {
     libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_other_transport(|key| {
@@ -260,6 +316,9 @@ pub(crate) fn build_swarm() -> Swarm<Behaviour> {
                 kad.set_mode(Some(kad::Mode::Server));
                 kad
             },
+            records: shard
+                .map(|shard| records_behaviour(key.public().to_peer_id(), shard, held))
+                .into(),
             request_response: request_response::Behaviour::new(
                 [(PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default(),

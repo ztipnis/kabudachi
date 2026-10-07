@@ -5,6 +5,9 @@ use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId};
 use kabudachi_core::task_record::{Put, PutRefusal, RecordVersion, VersionedRecords};
+use kabudachi_core::time::{Duration, Instant};
+
+const NOW: Instant = Instant::at(0);
 
 fn version(number: u64, lineage: u64, term: u64, revision: u64) -> RecordVersion {
     RecordVersion {
@@ -43,8 +46,8 @@ fn the_store_orders_revisions_by_epoch_then_term_then_revision() {
     ];
     for (case, incoming, expected) in cases {
         let mut store = VersionedRecords::default();
-        store.put(record("task-1", held, "q")).unwrap();
-        assert_eq!(store.put(record("task-1", incoming, "q")), expected, "{case}");
+        store.put(record("task-1", held, "q"), NOW).unwrap();
+        assert_eq!(store.put(record("task-1", incoming, "q"), NOW), expected, "{case}");
         let kept = if expected.is_ok() { incoming } else { held };
         assert_eq!(
             store
@@ -61,11 +64,11 @@ fn the_store_orders_revisions_by_epoch_then_term_then_revision() {
 fn the_same_version_is_a_republish_only_when_the_record_is_identical() {
     let mut store = VersionedRecords::default();
     let held = version(0, 0, 1, 7);
-    store.put(record("task-1", held, "q")).unwrap();
+    store.put(record("task-1", held, "q"), NOW).unwrap();
 
-    assert_eq!(store.put(record("task-1", held, "q")), Ok(Put::Unchanged));
+    assert_eq!(store.put(record("task-1", held, "q"), NOW), Ok(Put::Unchanged));
     assert_eq!(
-        store.put(record("task-1", held, "other")),
+        store.put(record("task-1", held, "other"), NOW),
         Err(PutRefusal::Conflicting)
     );
     assert_eq!(
@@ -82,7 +85,58 @@ fn a_record_without_a_version_or_task_id_is_refused() {
     let mut anonymous = record("task-1", version(0, 0, 1, 0), "q");
     anonymous.task.as_mut().unwrap().task_id = None;
 
-    assert_eq!(store.put(unversioned), Err(PutRefusal::Malformed));
-    assert_eq!(store.put(anonymous), Err(PutRefusal::Malformed));
+    assert_eq!(store.put(unversioned, NOW), Err(PutRefusal::Malformed));
+    assert_eq!(store.put(anonymous, NOW), Err(PutRefusal::Malformed));
     assert!(store.is_empty());
+}
+
+#[test]
+fn a_finished_record_is_dropped_once_its_retention_has_passed_and_an_unfinished_one_never_is() {
+    let mut store = VersionedRecords::with_retention(Some(Duration::from_ticks(100)));
+    let mut finished = record("done", version(0, 0, 1, 0), "q");
+    finished.finished = true;
+    store.put(finished, Instant::at(10)).unwrap();
+    store
+        .put(record("running", version(0, 0, 1, 1), "q"), Instant::at(10))
+        .unwrap();
+
+    assert_eq!(store.sweep(Instant::at(109)), 0);
+    assert_eq!(store.next_due(), Some(Instant::at(110)));
+    assert_eq!(store.sweep(Instant::at(110)), 1);
+    assert!(store.get(&TaskId::new("done")).is_none());
+    assert!(
+        store.get(&TaskId::new("running")).is_some(),
+        "an unfinished record never expires"
+    );
+}
+
+#[test]
+fn a_put_drops_expired_finished_records_first_and_is_never_refused_for_room() {
+    let mut store = VersionedRecords::with_retention(Some(Duration::from_ticks(1)));
+    for n in 0..1_000 {
+        let mut over = record(&format!("over-{n}"), version(0, 0, 1, n), "q");
+        over.finished = true;
+        store.put(over, Instant::at(0)).unwrap();
+    }
+
+    store
+        .put(record("new", version(0, 0, 1, 1_000), "q"), Instant::at(5))
+        .unwrap();
+
+    assert_eq!(
+        store.len(),
+        1,
+        "the expired finished records went first; nothing refused the new one"
+    );
+}
+
+#[test]
+fn a_republished_finished_record_keeps_its_first_retention_deadline() {
+    let mut store = VersionedRecords::with_retention(Some(Duration::from_ticks(100)));
+    let mut finished = record("done", version(0, 0, 1, 0), "q");
+    finished.finished = true;
+    store.put(finished.clone(), Instant::at(10)).unwrap();
+    store.put(finished, Instant::at(90)).unwrap();
+
+    assert_eq!(store.next_due(), Some(Instant::at(110)));
 }

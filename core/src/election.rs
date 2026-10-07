@@ -877,6 +877,18 @@ where
         &self.my_id
     }
 
+    /// The voters of the configuration this node leads, by id, itself
+    /// included; empty unless it is the leader. Count-based configurations
+    /// may hold fewer ids than voters (a voter the roster does not know is
+    /// not named); only the leader's own roster is read, never the routing
+    /// table.
+    pub fn voters(&self) -> Vec<WorkerId> {
+        match (&self.office, self.state) {
+            (Some(office), WorkerState::Leader) => office.voter_ids(&self.my_id),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn shard_id(&self) -> &ShardId {
         &self.shard_id
     }

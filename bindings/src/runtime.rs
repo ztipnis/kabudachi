@@ -133,8 +133,10 @@ impl NativeRuntime {
             clock,
             CoreDuration::from_millis(suspect_timeout_ms),
         );
-        let mut new_scheduler = Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::default());
-        new_scheduler.set_result_ttl(Some(CoreDuration::from_millis(result_ttl_ms)));
+        let retention = CoreDuration::from_millis(result_ttl_ms);
+        let mut new_scheduler =
+            Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::new(worker_id.clone(), clock, Some(retention)));
+        new_scheduler.set_result_ttl(Some(retention));
         new_scheduler.set_memory_limits(limits);
         let door = Arc::new(SchedulerDoor::new(new_scheduler, worker_id));
         let (state_sender, state) = watch::channel(node.state());
@@ -271,7 +273,9 @@ impl NativeRuntime {
                     SubmitRejection::NotLeader | SubmitRejection::DuplicateId => {
                         PyRuntimeError::new_err(rejection.to_string())
                     }
-                    SubmitRejection::TooLarge { .. } | SubmitRejection::Backpressure { .. } => {
+                    SubmitRejection::TooLarge { .. }
+                    | SubmitRejection::RecordTooLarge { .. }
+                    | SubmitRejection::Backpressure { .. } => {
                         errors::backpressure_error(py, rejection.to_string())
                     }
                 })

@@ -1552,6 +1552,7 @@ dependencies = [
  "kabudachi-proto",
  "kabudachi-testkit",
  "proptest",
+ "prost 0.13.5",
  "rand 0.9.5",
  "rand_chacha",
  "sha2 0.10.9",

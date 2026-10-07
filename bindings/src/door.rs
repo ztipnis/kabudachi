@@ -109,7 +109,7 @@ enum Concerned {
 }
 
 /// The scheduler the door guards: it keeps its own records.
-pub type DoorScheduler<C> = Scheduler<C, Uuid7Ids, LocalRecords>;
+pub type DoorScheduler<C> = Scheduler<C, Uuid7Ids, LocalRecords<C>>;
 
 struct Inside<C: Clock> {
     scheduler: DoorScheduler<C>,
@@ -370,7 +370,8 @@ impl<C: Clock> SchedulerDoor<C> {
     }
 
     /// The timer loop's tick: `catch_up`, wake claims (never the timer loop
-    /// itself), and return `next_deadline`. The deadline is read after what
+    /// itself), sweep the local store, and return the earlier of
+    /// `next_deadline` and the store's `next_due`. The deadline is read after what
     /// the catch-up freed has been recorded, since a queued submission
     /// recorded then may carry a delay or expiry the loop must wake for; the
     /// loop is not woken for that, as it learns of it from this result.
@@ -383,8 +384,14 @@ impl<C: Clock> SchedulerDoor<C> {
                 // store refuses here is deliberately not retried: no answer
                 // depends on it.
                 drop(inside.scheduler.observer_mut().take_settled());
+                // The store drops a finished record at its retention; nothing
+                // else would, since only a write sweeps it.
+                inside.scheduler.observer_mut().sweep();
             },
-            |inside, ()| inside.scheduler.next_deadline(),
+            |inside, ()| {
+                let stored = inside.scheduler.observer_mut().records().next_due();
+                [inside.scheduler.next_deadline(), stored].into_iter().flatten().min()
+            },
         )
     }
 
@@ -647,7 +654,7 @@ pub(crate) mod tests {
         clock: ManualClock,
         grant: Option<LeadershipGrant>,
     ) -> Arc<SchedulerDoor<ManualClock>> {
-        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::default());
+        let mut scheduler = Scheduler::with_observer(clock.clone(), Uuid7Ids, LocalRecords::new(worker(), clock, None));
         scheduler.set_leadership_grant(grant);
         Arc::new(SchedulerDoor::new(scheduler, worker()))
     }
@@ -796,7 +803,10 @@ pub(crate) mod tests {
     fn a_submission_before_the_grant_is_refused_when_it_would_pass_the_hard_limit_with_those_queued()
      {
         let mut scheduler =
-            Scheduler::with_observer(ManualClock::default(), Uuid7Ids, LocalRecords::default());
+            {
+                let clock = ManualClock::default();
+                Scheduler::with_observer(clock.clone(), Uuid7Ids, LocalRecords::new(worker(), clock, None))
+            };
         scheduler.set_memory_limits(Some(MemoryLimits { soft: 50, hard: 100 }));
         let door = SchedulerDoor::new(scheduler, worker());
         let sized = |bytes: usize| {
@@ -1039,7 +1049,7 @@ pub(crate) mod tests {
     fn an_answer_is_not_leader_when_the_lease_ends_during_the_call() {
         let clock = LapsingClock::default();
         let mut scheduler =
-            Scheduler::with_observer(clock.clone(), Uuid7Ids, LocalRecords::default());
+            Scheduler::with_observer(clock.clone(), Uuid7Ids, LocalRecords::new(worker(), clock.clone(), None));
         let lease = LeadershipGrant {
             valid_until: LeaseEnd::At(Instant::at(50)),
             ..grant(1)
@@ -1188,7 +1198,10 @@ pub(crate) mod tests {
     /// no synchronous claim.
     fn running_over_the_soft_limit() -> (Arc<SchedulerDoor<ManualClock>>, TaskRunId) {
         let mut scheduler =
-            Scheduler::with_observer(ManualClock::default(), Uuid7Ids, LocalRecords::default());
+            {
+                let clock = ManualClock::default();
+                Scheduler::with_observer(clock.clone(), Uuid7Ids, LocalRecords::new(worker(), clock, None))
+            };
         scheduler.set_memory_limits(Some(MemoryLimits {
             soft: 100,
             hard: 1_000,
@@ -1312,5 +1325,34 @@ pub(crate) mod tests {
                 .is_ok()
         });
         assert!(!woken, "the tick woke the timer loop, which would spin it");
+    }
+
+    #[test]
+    fn a_finished_tasks_record_is_dropped_from_the_local_store_after_the_result_ttl() {
+        let clock = ManualClock::default();
+        let ttl = CoreDuration::from_millis(100);
+        let mut scheduler = Scheduler::with_observer(
+            clock.clone(),
+            Uuid7Ids,
+            LocalRecords::new(worker(), clock.clone(), Some(ttl)),
+        );
+        scheduler.set_result_ttl(Some(ttl));
+        scheduler.set_leadership_grant(Some(UNBOUNDED_GRANT));
+        let door = Arc::new(SchedulerDoor::new(scheduler, worker()));
+        let task = door.submit(submission()).unwrap();
+        assert_eq!(
+            door.cancel(&task).unwrap(),
+            Cancellation::Cancelled { was_running: false }
+        );
+        assert!(door.record(&task).unwrap().is_some_and(|record| record.finished));
+
+        clock.advance(99);
+        door.tick().unwrap();
+        assert!(door.record(&task).unwrap().is_some(), "kept until the TTL passes");
+
+        clock.advance(1);
+        door.tick().unwrap();
+
+        assert_eq!(door.record(&task).unwrap(), None);
     }
 }

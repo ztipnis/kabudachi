@@ -9,9 +9,12 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{Completion, LeadershipGrant, LeaseEnd, Submission, SubmitRejection};
-use kabudachi_core::task_record::RecordVersion;
+use kabudachi_core::scheduler::{
+    Completion, Event, LeadershipGrant, LeaseEnd, MAX_SUBMISSION_BYTES, Submission, SubmitRejection,
+};
+use kabudachi_core::task_record::{HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion};
 use kabudachi_core::time::Instant;
+use prost::Message;
 
 use crate::support::grant::unbounded_grant;
 use crate::support::scheduler::{Fixture, ticks};
@@ -284,4 +287,87 @@ fn a_forward_wall_clock_jump_never_releases_a_delayed_submission_early() {
     assert_eq!(fixture.scheduler.catch_up().queued, 0);
     fixture.clock.advance(ticks(1));
     assert_eq!(fixture.scheduler.catch_up().queued, 1);
+}
+
+#[test]
+fn a_submission_whose_record_would_pass_the_limit_is_refused_before_anything_is_recorded() {
+    let mut fixture = Fixture::leading();
+    let half = (MAX_RECORD_BYTES / 2) as usize;
+    fixture.scheduler.submit(plain(&vec![1; half]).with_coalescing_key("k")).unwrap();
+    let before = fixture.spy.revisions().len();
+
+    let refused = fixture.scheduler.submit(plain(&vec![2; half]).with_coalescing_key("k"));
+
+    assert!(matches!(refused, Err(SubmitRejection::RecordTooLarge { .. })), "{refused:?}");
+    assert_eq!(fixture.spy.revisions().len(), before, "nothing changed, so nothing was published");
+}
+
+#[test]
+fn a_replay_that_would_outgrow_the_record_is_not_created_and_the_task_is_over() {
+    let mut fixture = Fixture::leading();
+    fixture.spy.keep_only_the_latest_revision_of_a_busy_task();
+    let task = fixture
+        .scheduler
+        .submit(plain(&vec![0; MAX_SUBMISSION_BYTES as usize - 64]))
+        .unwrap();
+    let mut replays = 0;
+    while let Ok(_claim) = fixture.scheduler.request_claim(&worker(), &task) {
+        let lost = fixture.scheduler.lose_worker(&worker()).unwrap();
+        if lost[0].replayed.is_none() {
+            break;
+        }
+        replays += 1;
+        assert!(replays < 10_000, "replays never stopped");
+    }
+
+    assert!(replays > 0, "some replays fit before the record filled");
+    assert!(fixture.scheduler.take_events().contains(&Event::RecordFull { task_id: task.clone() }));
+    let last = fixture.spy.revisions().into_iter().rfind(|r| task_of(r) == task).unwrap();
+    assert!(last.finished);
+    assert!(last.encoded_len() as u64 <= MAX_RECORD_BYTES);
+    assert_eq!(last.runs.last().unwrap().failure_kind, HISTORY_TOO_LARGE_FAILURE_KIND);
+}
+
+#[test]
+fn a_retry_that_would_outgrow_the_record_is_not_created_and_the_failure_stands() {
+    let mut fixture = Fixture::leading();
+    fixture.spy.keep_only_the_latest_revision_of_a_busy_task();
+    let task = fixture
+        .scheduler
+        .submit(plain(&vec![0; MAX_SUBMISSION_BYTES as usize - 64]).with_retries(100_000))
+        .unwrap();
+    let mut retries = 0;
+    loop {
+        let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+        fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+        let failure = fixture.scheduler.fail(&worker(), &claim.task_run_id, "Boom").unwrap();
+        if failure.retry.is_none() {
+            break;
+        }
+        retries += 1;
+        assert!(retries < 10_000, "retries never stopped");
+    }
+
+    assert!(retries > 0, "some retries fit before the record filled");
+    assert!(fixture.scheduler.take_events().contains(&Event::RecordFull { task_id: task.clone() }));
+    let last = fixture.spy.revisions().into_iter().rfind(|r| task_of(r) == task).unwrap();
+    assert!(last.finished);
+    assert!(last.encoded_len() as u64 <= MAX_RECORD_BYTES);
+    assert_eq!(last.runs.last().unwrap().failure_kind, "Boom");
+}
+
+#[test]
+fn a_failure_kind_too_long_for_the_record_is_cut_so_the_record_stays_within_the_limit() {
+    let mut fixture = Fixture::leading();
+    let task = fixture.scheduler.submit(plain(b"in")).unwrap();
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let kind = "K".repeat(MAX_RECORD_BYTES as usize);
+
+    fixture.scheduler.fail(&worker(), &claim.task_run_id, kind.as_str()).unwrap();
+
+    let last = fixture.spy.revisions().into_iter().rfind(|r| task_of(r) == task).unwrap();
+    assert!(last.encoded_len() as u64 <= MAX_RECORD_BYTES);
+    let stored = &last.runs.last().unwrap().failure_kind;
+    assert!(!stored.is_empty() && kind.starts_with(stored.as_str()), "the kind is cut, not replaced");
 }

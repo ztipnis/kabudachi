@@ -20,6 +20,8 @@ pub enum PyEventKind {
     SlowDown,
     #[pyo3(name = "CANCELLED")]
     Cancelled,
+    #[pyo3(name = "RECORD_FULL")]
+    RecordFull,
 }
 
 impl From<&Event> for PyEventKind {
@@ -29,6 +31,7 @@ impl From<&Event> for PyEventKind {
             Event::Superseded { .. } => PyEventKind::Superseded,
             Event::SlowDown { .. } => PyEventKind::SlowDown,
             Event::Cancelled { .. } => PyEventKind::Cancelled,
+            Event::RecordFull { .. } => PyEventKind::RecordFull,
         }
     }
 }

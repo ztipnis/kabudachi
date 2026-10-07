@@ -1,11 +1,15 @@
 //! Election helpers shared by the `net/tests/<area>/` crates.
 
-use kabudachi_core::election::{Step, WorkerNode};
+use std::time::Duration as StdDuration;
+
+use kabudachi_core::election::{Input, Step, WorkerNode};
 use kabudachi_core::protocol::ids::Uuid7Ids;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::{Clock, RealClock};
-use kabudachi_net::driver::{DriverConfig, run_driver};
+use kabudachi_net::authority::AuthorityClient;
+use kabudachi_net::driver::{DriverConfig, SharedAuthority, run_driver};
 use kabudachi_net::messenger::Net;
 use tokio::sync::watch;
 
@@ -26,7 +30,7 @@ pub async fn drive_until_leading(
     node: &mut WorkerNode<RealClock>,
     first: Step,
     net: &Net,
-    scheduler: &mut Scheduler<RealClock, Uuid7Ids>,
+    scheduler: &mut Scheduler<RealClock, Uuid7Ids, RecordOutbox>,
     clock: RealClock,
 ) {
     let (state_sender, mut state) = watch::channel(node.state());
@@ -71,5 +75,53 @@ pub fn built_on_one_tick<C: Clock, T>(clock: &C, mut build: impl FnMut() -> T) -
         if clock.now() == before {
             return built;
         }
+    }
+}
+
+/// Polls `condition` every few milliseconds until it holds. Callers bound
+/// the wait with a timeout.
+pub async fn wait_until(mut condition: impl FnMut() -> bool) {
+    while !condition() {
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+    }
+}
+
+/// Runs the driver of each of the three `nodes` on its net, scheduler,
+/// authority and `observe`, until `until` completes, and returns what it
+/// returned. Every node, scheduler and `clock` must read one clock (see
+/// `run_driver`).
+pub async fn drive_three_until<T, F>(
+    nodes: &mut [WorkerNode<RealClock>; 3],
+    nets: [&Net; 3],
+    schedulers: &mut [Scheduler<RealClock, Uuid7Ids, RecordOutbox>; 3],
+    clock: RealClock,
+    authorities: [Option<SharedAuthority>; 3],
+    observers: [F; 3],
+    until: impl Future<Output = T>,
+) -> T
+where
+    F: FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
+{
+    let [node_a, node_b, node_c] = nodes;
+    let [scheduler_a, scheduler_b, scheduler_c] = schedulers;
+    let [observe_a, observe_b, observe_c] = observers;
+    let [authority_a, authority_b, authority_c] = authorities;
+    let client = |net: &Net, node: &WorkerNode<RealClock>, authority: Option<SharedAuthority>| {
+        authority.map(|authority| AuthorityClient::new(net, node.shard_id().clone(), authority))
+    };
+    let authority_a = client(nets[0], node_a, authority_a);
+    let authority_b = client(nets[1], node_b, authority_b);
+    let authority_c = client(nets[2], node_c, authority_c);
+    tokio::select! {
+        _ = run_driver(node_a, due_now(&clock), nets[0], scheduler_a, clock, authority_a, DriverConfig::default(), observe_a) => {
+            unreachable!("run_driver never returns")
+        }
+        _ = run_driver(node_b, due_now(&clock), nets[1], scheduler_b, clock, authority_b, DriverConfig::default(), observe_b) => {
+            unreachable!("run_driver never returns")
+        }
+        _ = run_driver(node_c, due_now(&clock), nets[2], scheduler_c, clock, authority_c, DriverConfig::default(), observe_c) => {
+            unreachable!("run_driver never returns")
+        }
+        output = until => output,
     }
 }

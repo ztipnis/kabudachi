@@ -190,6 +190,22 @@ impl LeaderOffice {
             })
     }
 
+    /// The voters of the committed configuration this office knows by id,
+    /// `me` included when it votes. A voter the roster does not know is not
+    /// named.
+    pub(crate) fn voter_ids(&self, me: &WorkerId) -> Vec<WorkerId> {
+        let configuration = self.roster.configuration();
+        self.roster
+            .members()
+            .keys()
+            .chain(std::iter::once(me))
+            .filter(|worker| configuration.is_voter(self.roster.counted_admission_of(worker)))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     /// A SELF_REMOVE the node accepted (its term guard stays with the
     /// node): `departing` is taken out with every other one accepted, in
     /// the next operation.

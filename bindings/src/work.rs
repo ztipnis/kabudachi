@@ -142,6 +142,10 @@ impl From<Event> for PyEvent {
                 ..nothing
             },
             Event::SlowDown { active } => PyEvent { active, ..nothing },
+            Event::RecordFull { task_id } => PyEvent {
+                task_id: task_id.as_str().to_owned(),
+                ..nothing
+            },
             Event::Superseded {
                 task_id,
                 task_run_id,

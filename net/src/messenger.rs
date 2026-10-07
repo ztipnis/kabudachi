@@ -86,6 +86,15 @@
 //! address comes from" below), and [`Net::send`] dials a peer it holds no
 //! connection to at the address it has on file.
 //!
+//! ## The shard's Task records
+//!
+//! A `Net` built with [`Net::for_shard`] also stores the shard's Task records
+//! for its peers, over a records protocol of that shard alone (see
+//! `crate::swarm`'s "records"), and exposes what it holds
+//! ([`Net::held_records`]). The shard's leader hands it revisions to write to
+//! the voters that hold them, and reads the outcome of each write back;
+//! see `crate::task_store`.
+//!
 //! ## The bootstrap join protocol
 //!
 //! Join and claim are both correlated: `crate::exchange` holds the swarm
@@ -140,17 +149,21 @@
 //! reached, once some other peer's Identify has given `kad` a route to it.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kabudachi_core::election::Input;
 use kabudachi_core::protocol::checked;
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::generated::TaskRecord;
+use kabudachi_core::protocol::ids::{ShardId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
+use kabudachi_core::task_record::{RecordVersion, VersionOrder, Write, identify};
 use libp2p::core::ConnectedPoint;
 use libp2p::core::transport::ListenerId;
 use libp2p::futures::StreamExt;
+use libp2p::kad::store::RecordStore as _;
 use libp2p::request_response::{self, ResponseChannel};
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
@@ -168,6 +181,7 @@ use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm};
+use crate::task_store::{HeldRecords, record_key};
 
 /// What [`Net::dial_for_connection`] dials.
 pub(crate) enum DialTarget {
@@ -229,6 +243,11 @@ enum Command {
         addr: Multiaddr,
         respond_to: oneshot::Sender<Multiaddr>,
     },
+    /// See `Net::get_record`.
+    GetRecord {
+        task: TaskId,
+        respond_to: oneshot::Sender<Option<TaskRecord>>,
+    },
     /// Runs an ask or an answer of one correlated protocol on the swarm
     /// task, which alone owns the swarm and its [`Exchanges`]; see
     /// `Net::ask` and `Net::answer`.
@@ -236,6 +255,24 @@ enum Command {
     /// Runs a read or small change of the swarm task's [`Peers`] on that
     /// task, which alone owns them; see `Net::with_peers`.
     WithPeers(Box<dyn FnOnce(&mut Peers) + Send>),
+    /// See `Net::write_records`.
+    WriteRecords(Vec<PlacedWrite>),
+}
+
+/// A revision to write: `record.placement` names the holders, and `quorum`
+/// of them must store it for the write to count.
+#[derive(Debug, Clone)]
+pub struct PlacedWrite {
+    pub record: TaskRecord,
+    pub quorum: usize,
+}
+
+/// How a write ended: `stored` once `quorum` holders acknowledged it; not
+/// when a holder refused it, too few were reachable, or the write timed out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub write: Write,
+    pub stored: bool,
 }
 
 /// The swarm task's asks in flight, one [`Exchange`] per correlated protocol.
@@ -300,14 +337,16 @@ impl std::error::Error for ListenRejected {}
 pub const DEFAULT_INPUT_LIMIT: usize = 1024;
 
 /// What `drive` hands over for the driver of this `Net`'s node, each queue
-/// in arrival order: the node's inputs, and the join and claim requests the
-/// driver answers. `arrived` is signalled whenever any of them grows.
+/// in arrival order: the node's inputs, the join and claim requests the
+/// driver answers, and the outcomes of the record writes it asked for.
+/// `arrived` is signalled whenever any of them grows.
 pub(crate) struct Inbound {
     inputs: Mutex<VecDeque<Input>>,
     /// See [`Net::with_input_limit`].
     input_limit: AtomicUsize,
     joins: Mutex<VecDeque<Asked<JoinCodec>>>,
     claims: Mutex<VecDeque<Asked<ClaimCodec>>>,
+    writes: Mutex<VecDeque<WriteOutcome>>,
     arrived: Notify,
 }
 
@@ -318,6 +357,7 @@ impl Default for Inbound {
             input_limit: AtomicUsize::new(DEFAULT_INPUT_LIMIT),
             joins: Mutex::default(),
             claims: Mutex::default(),
+            writes: Mutex::default(),
             arrived: Notify::new(),
         }
     }
@@ -370,6 +410,11 @@ impl Inbound {
         self.arrived.notify_one();
     }
 
+    fn queue_write(&self, outcome: WriteOutcome) {
+        push(&self.writes, outcome);
+        self.arrived.notify_one();
+    }
+
     fn queue_asked<T>(&self, queue: &Mutex<VecDeque<T>>, asked: T) {
         push(queue, asked);
         self.arrived.notify_one();
@@ -411,6 +456,11 @@ pub struct Net {
     local_addr: watch::Receiver<Option<Multiaddr>>,
     /// The shard this `Net` subscribed to (see `Self::subscribe_to_shard`).
     shard: Mutex<Option<ShardId>>,
+    /// The shard whose Task records this `Net` stores, for a `Net` built
+    /// with [`Self::for_shard`].
+    records_shard: Option<ShardId>,
+    /// The Task records this `Net` holds (see [`Self::held_records`]).
+    held: HeldRecords,
     driver: JoinHandle<()>,
 }
 
@@ -436,7 +486,28 @@ impl Net {
     /// than the production default to stay fast and deterministic, doesn't
     /// have to change what every other `Net::new` caller gets.
     pub fn new_with_redial_policy(redial_policy: RedialPolicy) -> Self {
-        let swarm = build_swarm();
+        Self::build(redial_policy, None, None)
+    }
+
+    /// A `Net` for a worker of `shard`: besides everything [`Self::new`]
+    /// gives, it holds the shard's Task records and stores and serves them
+    /// over a protocol only the shard's workers speak, so a record never
+    /// lands in another shard. Finished records are dropped `retention`
+    /// after they finish.
+    pub fn for_shard(
+        shard: ShardId,
+        retention: Option<kabudachi_core::time::Duration>,
+    ) -> Self {
+        Self::build(RedialPolicy::default(), Some(shard), retention)
+    }
+
+    fn build(
+        redial_policy: RedialPolicy,
+        records_shard: Option<ShardId>,
+        retention: Option<kabudachi_core::time::Duration>,
+    ) -> Self {
+        let held = HeldRecords::new(retention);
+        let swarm = build_swarm(records_shard.as_ref(), held.clone());
         let local_worker_id = WorkerId::new(swarm.local_peer_id().to_string());
         let (commands, command_rx) = mpsc::unbounded_channel();
         let inbound = Arc::new(Inbound::default());
@@ -451,8 +522,16 @@ impl Net {
             inbound,
             local_addr,
             shard: Mutex::new(None),
+            records_shard,
+            held,
             driver,
         }
+    }
+
+    /// The records this worker holds (empty for a `Net` built with
+    /// [`Self::new`]).
+    pub fn held_records(&self) -> HeldRecords {
+        self.held.clone()
     }
 
     /// Holds at most `limit` inputs for this `Net`'s node (default
@@ -738,6 +817,12 @@ impl Net {
     /// one shard: subscribing to a second, different one is a caller bug,
     /// which fails a debug assertion and is otherwise ignored.
     pub fn subscribe_to_shard(&self, shard: &ShardId) {
+        if let Some(records_shard) = &self.records_shard {
+            debug_assert_eq!(
+                records_shard, shard,
+                "a Net stores the records of one shard; it cannot serve another"
+            );
+        }
         let mut subscribed = self.shard.lock().unwrap_or_else(PoisonError::into_inner);
         match &*subscribed {
             Some(current) => debug_assert_eq!(
@@ -773,6 +858,79 @@ impl Net {
             topic: shard_topic(&shard).hash(),
             message,
         });
+    }
+
+    /// Writes each record to its placement. A holder that is this worker
+    /// gets its copy put into this worker's own store, which counts towards
+    /// the quorum; the others get it over the shard's records protocol, never
+    /// with this worker named as publisher (a holder would acknowledge a
+    /// record naming itself as publisher without storing it). Each outcome
+    /// arrives once, through [`Self::take_write_outcomes`]. A `Net` that
+    /// stores no shard's records ([`Self::new`]) refuses every write at once.
+    pub fn write_records(&self, writes: Vec<PlacedWrite>) {
+        if let Err(mpsc::error::SendError(Command::WriteRecords(writes))) =
+            self.commands.send(Command::WriteRecords(writes))
+        {
+            // The swarm task has stopped: no write will ever be stored.
+            for placed in writes {
+                self.refuse_write(Write::of(&placed.record));
+            }
+        }
+    }
+
+    /// The newest revision of `task`'s record that this worker or any shard
+    /// peer kad reaches holds: every answer of the lookup, this worker's own
+    /// copy included, is compared by version and the newest kept; an
+    /// undecodable one is skipped. Returns when the lookup ends; `None` if no
+    /// one holds the record, this `Net` stores no shard's records
+    /// ([`Self::new`]), or the swarm task has stopped.
+    pub async fn get_record(&self, task: TaskId) -> Option<TaskRecord> {
+        let (respond_to, answer) = oneshot::channel();
+        self.commands
+            .send(Command::GetRecord { task, respond_to })
+            .ok()?;
+        answer.await.ok().flatten()
+    }
+
+    /// The peers in this worker's records `kad` routing table: the shard
+    /// peers a lookup can ask. Empty for a `Net` built with [`Self::new`], or
+    /// if the swarm task has stopped. For tests and logs: these are routing
+    /// candidates, not the shard's membership; nothing decides who belongs to
+    /// the shard from this list.
+    pub async fn records_routing_peers(&self) -> Vec<WorkerId> {
+        let (respond_to, answer) = oneshot::channel();
+        let sent = self.commands.send(Command::Exchange(Box::new(move |swarm, _| {
+            let peers = match swarm.behaviour_mut().records.as_mut() {
+                Some(records) => records
+                    .kbuckets()
+                    .flat_map(|bucket| {
+                        bucket
+                            .iter()
+                            .map(|entry| WorkerId::new(entry.node.key.preimage().to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            let _ = respond_to.send(peers);
+        })));
+        if sent.is_err() {
+            return Vec::new();
+        }
+        answer.await.unwrap_or_default()
+    }
+
+    /// Ends `write` as refused, for a write that was never made.
+    pub(crate) fn refuse_write(&self, write: Write) {
+        self.inbound.queue_write(WriteOutcome {
+            write,
+            stored: false,
+        });
+    }
+
+    /// Every write outcome not yet taken, in arrival order.
+    pub fn take_write_outcomes(&self) -> Vec<WriteOutcome> {
+        drain(&self.inbound.writes)
     }
 
     /// Takes every input for this worker's node queued since the last call,
@@ -881,6 +1039,42 @@ struct Pending {
     listens: HashMap<ListenerId, oneshot::Sender<Multiaddr>>,
     exchanges: Exchanges,
     dials: HashMap<ConnectionId, PendingDial>,
+    /// Record writes in flight to other workers, by their `kad` query.
+    writes: HashMap<kad::QueryId, Write>,
+    /// Record lookups in flight, by their `kad` query.
+    reads: HashMap<kad::QueryId, Read>,
+}
+
+/// A record lookup collecting the answers of its `kad` query.
+struct Read {
+    /// The newest answer so far, with its version.
+    best: Option<(RecordVersion, TaskRecord)>,
+    respond_to: oneshot::Sender<Option<TaskRecord>>,
+}
+
+impl Read {
+    /// Keeps `value` if it decodes to a record newer than the best so far.
+    fn offer(&mut self, value: &[u8]) {
+        let Ok(record) = TaskRecord::decode(value) else {
+            return;
+        };
+        let Ok((_, version)) = identify(&record) else {
+            return;
+        };
+        let newer = self
+            .best
+            .as_ref()
+            .is_none_or(|(best, _)| best.order(&version) == VersionOrder::Newer);
+        if newer {
+            self.best = Some((version, record));
+        }
+    }
+
+    /// Ends the lookup with the best answer, to a caller who may have
+    /// stopped waiting.
+    fn finish(self) {
+        let _ = self.respond_to.send(self.best.map(|(_, record)| record));
+    }
 }
 
 /// A `Command::DialForConnection` in flight.
@@ -940,7 +1134,7 @@ async fn drive(
                     return; // Every Net handle for this swarm was dropped.
                 };
                 let now = Instant::now();
-                handle_command(&mut swarm, command, &mut pending, &mut peers, now);
+                handle_command(&mut swarm, command, &mut pending, &inbound, &mut peers, now);
                 now
             }
             event = swarm.select_next_some() => {
@@ -979,6 +1173,7 @@ fn handle_command(
     swarm: &mut Swarm<Behaviour>,
     command: Command,
     pending: &mut Pending,
+    inbound: &Inbound,
     peers: &mut Peers,
     now: Instant,
 ) {
@@ -1084,6 +1279,86 @@ fn handle_command(
         }
         Command::Exchange(run) => run(swarm, &mut pending.exchanges),
         Command::WithPeers(read) => read(peers),
+        Command::WriteRecords(writes) => {
+            for placed in writes {
+                write_record(swarm, placed, pending, inbound);
+            }
+        }
+        Command::GetRecord { task, respond_to } => {
+            match swarm.behaviour_mut().records.as_mut() {
+                Some(records) => {
+                    let query = records.get_record(record_key(&task));
+                    pending.reads.insert(
+                        query,
+                        Read {
+                            best: None,
+                            respond_to,
+                        },
+                    );
+                }
+                None => {
+                    let _ = respond_to.send(None);
+                }
+            }
+        }
+    }
+}
+
+/// Starts one record write (see [`Net::write_records`]): puts the copy of a
+/// holder that is this worker into its own store, and writes the others'
+/// over the records protocol at the quorum still missing.
+fn write_record(
+    swarm: &mut Swarm<Behaviour>,
+    placed: PlacedWrite,
+    pending: &mut Pending,
+    inbound: &Inbound,
+) {
+    let write = Write::of(&placed.record);
+    let local = *swarm.local_peer_id();
+    let Some(records) = swarm.behaviour_mut().records.as_mut() else {
+        inbound.queue_write(WriteOutcome {
+            write,
+            stored: false,
+        });
+        return;
+    };
+    let value = placed.record.encode_to_vec();
+    let key = record_key(&write.task_id);
+    let mut acked = 0;
+    let mut remote = Vec::new();
+    for holder in &placed.record.placement {
+        let Ok(peer) = PeerId::from_str(WorkerId::from(holder.clone()).as_str()) else {
+            continue;
+        };
+        if peer == local {
+            let stored = records
+                .store_mut()
+                .put(kad::Record::new(key.clone(), value.clone()))
+                .is_ok();
+            acked += usize::from(stored);
+        } else {
+            remote.push(peer);
+        }
+    }
+    let needed = placed.quorum.saturating_sub(acked);
+    if needed == 0 {
+        inbound.queue_write(WriteOutcome {
+            write,
+            stored: true,
+        });
+    } else if remote.len() < needed {
+        inbound.queue_write(WriteOutcome {
+            write,
+            stored: false,
+        });
+    } else {
+        let quorum = kad::Quorum::N(NonZeroUsize::new(needed).expect("needed is not zero here"));
+        let query = records.put_record_to(
+            kad::Record::new(key, value),
+            remote.into_iter(),
+            quorum,
+        );
+        pending.writes.insert(query, write);
     }
 }
 
@@ -1177,12 +1452,28 @@ fn handle_event(
             // Kademlia keeps several addresses per peer, and it is the peer
             // routing this crate wants from it, not this node's own
             // one-address-of-record bookkeeping.
+            // Only a peer that speaks this shard's records protocol is a
+            // routing candidate for the records kad: another shard's peer
+            // cannot answer it, and would only take up its buckets.
+            let speaks_records = swarm.behaviour().records.as_ref().is_some_and(|records| {
+                records
+                    .protocol_names()
+                    .iter()
+                    .any(|name| info.protocols.contains(name))
+            });
             for addr in info
                 .listen_addrs
                 .iter()
                 .filter(|addr| is_dialable_listen_addr(addr))
             {
                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                // The shard's records kad learns them the same way: a peer
+                // that only dialed this node has no address there otherwise
+                // (an inbound connection carries none), so a lookup would
+                // see no one but this node's own store.
+                if speaks_records && let Some(records) = swarm.behaviour_mut().records.as_mut() {
+                    records.add_address(&peer_id, addr.clone());
+                }
             }
             peers.observe(
                 Observation::Identified {
@@ -1257,6 +1548,39 @@ fn handle_event(
                 // Same ordering as for a direct message above.
                 peers.observe(Observation::MessageArrived(&input), now);
                 inbound.queue_input(input);
+            }
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Records(kad::Event::OutboundQueryProgressed {
+            id,
+            result: kad::QueryResult::PutRecord(result),
+            ..
+        })) => {
+            if let Some(write) = pending.writes.remove(&id) {
+                if let Err(error) = &result {
+                    tracing::debug!(task = write.task_id.as_str(), %error, "a record write did not reach its quorum");
+                }
+                inbound.queue_write(WriteOutcome {
+                    write,
+                    stored: result.is_ok(),
+                });
+            }
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Records(kad::Event::OutboundQueryProgressed {
+            id,
+            result: kad::QueryResult::GetRecord(result),
+            step,
+            ..
+        })) => {
+            if let Some(read) = pending.reads.get_mut(&id) {
+                if let Ok(kad::GetRecordOk::FoundRecord(found)) = &result {
+                    read.offer(&found.record.value);
+                }
+            }
+            // The lookup's last step, whether it found records or not.
+            if step.last {
+                if let Some(read) = pending.reads.remove(&id) {
+                    read.finish();
+                }
             }
         }
         SwarmEvent::Behaviour(BehaviourEvent::Join(event)) => {

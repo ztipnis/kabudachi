@@ -8,3 +8,4 @@ mod scenario_membership;
 mod scenario_no_quorum;
 mod scenario_partition;
 mod scenario_random;
+mod scenario_records;

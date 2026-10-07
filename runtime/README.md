@@ -81,6 +81,8 @@ certified it, or raises what the task raised.
   best-effort reaction: a callback that raises is logged and changes nothing.
 - `task.options(delay=, eta=, expires=, key=)(x)` delays the start, or makes the task fail with
   `TaskExpiredError` if it has not started by `expires`. `key` is a coalescing task's key.
+- A task whose run ended and whose record had no room for another attempt raises
+  `TaskRecordFullError`.
 
 ## Composition
 
@@ -117,7 +119,7 @@ re-exports them, so catch them as `kabudachi.errors.*` like the rest. Some nativ
 errors, which `except KabudachiError` does not catch.
 
 The native module reports what happened as typed values rather than strings, all in
-`kabudachi._native`: `EventKind` (`EXPIRED`, `SUPERSEDED`, `SLOW_DOWN`, `CANCELLED`) for scheduler
+`kabudachi._native`: `EventKind` (`EXPIRED`, `SUPERSEDED`, `SLOW_DOWN`, `CANCELLED`, `RECORD_FULL`) for scheduler
 events, `CancelOutcome` (`CANCELLED`, `ALREADY_FINISHED`, `UNKNOWN_TASK`) for how a cancel ended, and
 `RunState` (`SCHEDULED` through `ORPHANED`) for where a run is. The runtime turns these into the
 handle behaviour described above; you meet them only if you call the native module directly.

@@ -18,6 +18,7 @@ pub mod messenger;
 mod peers;
 mod routing_refresh;
 pub mod swarm;
+pub mod task_store;
 #[cfg(test)]
 mod test_support;
 mod wait_log;

@@ -28,6 +28,7 @@ from kabudachi.errors import (
     RuntimeNotStartedError,
     TaskDefinitionError,
     TaskExpiredError,
+    TaskRecordFullError,
     TaskSupersededError,
     UnknownTaskError,
     interrupted,
@@ -172,6 +173,13 @@ class Session:
                         )
                     case EventKind.CANCELLED:
                         self._tasks.cancelled_by_leader(event.task_id)
+                    case EventKind.RECORD_FULL:
+                        self._tasks.failed(
+                            event.task_id,
+                            TaskRecordFullError(
+                                f"task {event.task_id} ended: its record had no room for another attempt"
+                            ),
+                        )
                     case EventKind.SLOW_DOWN if event.active:
                         self._below_soft_limit.clear()
                     case EventKind.SLOW_DOWN:

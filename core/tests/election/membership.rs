@@ -464,6 +464,22 @@ fn a_lone_leader_drains_without_announcing_anything() {
 // ---- The leader applies a removal ----
 
 #[test]
+fn a_leader_names_its_voters_and_a_follower_names_none() {
+    let clock = FakeClock::new();
+    let leader = leader_of_three(&clock);
+    let follower = voter_node(&clock, &worker("p1"), 3, SUSPECT);
+
+    let mut named = leader.voters();
+    named.sort();
+
+    assert_eq!(named, vec![worker("p1"), worker("p2"), worker("w1")]);
+    assert!(
+        follower.voters().is_empty(),
+        "only the leader's configuration names members"
+    );
+}
+
+#[test]
 fn a_leader_drops_a_removed_member_and_announces_one_fewer_voter_at_the_next_generation() {
     let clock = FakeClock::new();
     let mut leader = leader_of_three(&clock);

@@ -11,8 +11,11 @@
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use kabudachi_core::election::{Input, JoinFloor};
-use kabudachi_core::protocol::ids::WorkerId;
+use kabudachi_core::protocol::ids::{Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
+use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::task_record::RecordOutbox;
+use kabudachi_core::time::Clock;
 use kabudachi_net::join::{LeaderSearch, ask_for_leader};
 use kabudachi_net::messenger::{Diagnostics, Net};
 use libp2p::Multiaddr;
@@ -151,4 +154,10 @@ pub async fn connect_full_mesh(nets: &[&Net]) -> Vec<WorkerId> {
     }
 
     ids
+}
+
+/// A scheduler for a driven node: its observer takes the revisions the
+/// driver writes (see `run_driver`).
+pub fn driven_scheduler<C: Clock>(clock: C) -> Scheduler<C, Uuid7Ids, RecordOutbox> {
+    Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default())
 }

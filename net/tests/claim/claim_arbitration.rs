@@ -23,6 +23,7 @@ use kabudachi_core::protocol::ids::{
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{ClaimRejectReason, ClaimResponse, claim_response};
 use kabudachi_core::scheduler::{Scheduler, Submission};
+use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::claim::ClaimFailure;
@@ -31,7 +32,7 @@ use libp2p::Multiaddr;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
-use crate::support::net::ask_until_pointed_at_a_leader;
+use crate::support::net::{ask_until_pointed_at_a_leader, driven_scheduler};
 
 const SHARD: &str = "shard-1";
 
@@ -60,7 +61,7 @@ fn timings() -> ElectionTimings {
 
 type TestNode = WorkerNode<RealClock>;
 
-fn submit(scheduler: &mut Scheduler<RealClock, Uuid7Ids>, payload: Vec<u8>) -> TaskId {
+fn submit(scheduler: &mut Scheduler<RealClock, Uuid7Ids, RecordOutbox>, payload: Vec<u8>) -> TaskId {
     scheduler
         .submit(Submission::new(
             TaskDefinitionId::new("demo.task"),
@@ -91,7 +92,7 @@ async fn join_and_drive(
         clock,
         None,
     );
-    let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+    let mut scheduler = driven_scheduler(clock);
     run_driver(&mut node, first, net, &mut scheduler, clock, None, DriverConfig::default(), |node, _, _| {
         let _ = known_leader.send(node.known_leader().map(|(leader, _)| leader));
     })
@@ -111,9 +112,9 @@ fn claimed_tasks(response: Result<ClaimResponse, ClaimFailure>) -> Vec<TaskId> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_members_claim_from_the_leader_their_nodes_name() {
-    let net_a = Net::new();
-    let net_b = Net::new();
-    let net_c = Net::new();
+    let net_a = Net::for_shard(ShardId::new(SHARD), None);
+    let net_b = Net::for_shard(ShardId::new(SHARD), None);
+    let net_c = Net::for_shard(ShardId::new(SHARD), None);
     let worker_a = net_a.local_worker_id();
     let seed = timeout(
         TEST_TIMEOUT,
@@ -137,7 +138,7 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
         None,
     )
     .0;
-    let mut scheduler_a = Scheduler::new(clock, Uuid7Ids);
+    let mut scheduler_a = driven_scheduler(clock);
     timeout(
         TEST_TIMEOUT,
         drive_until_leading(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock),

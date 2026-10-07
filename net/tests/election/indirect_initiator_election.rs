@@ -30,11 +30,11 @@
 
 use std::time::Duration as StdDuration;
 
+use crate::support::net::driven_scheduler;
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, KnownConfiguration, WorkerNode};
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::messenger::Net;
@@ -180,8 +180,8 @@ async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_an
     let (tx_a, rx_a) = watch::channel(seen(&node_a));
     let (tx_c, rx_c) = watch::channel(seen(&node_c));
     let (last_a, last_c) = (rx_a.clone(), rx_c.clone());
-    let mut scheduler_a = Scheduler::new(clock, Uuid7Ids);
-    let mut scheduler_c = Scheduler::new(clock, Uuid7Ids);
+    let mut scheduler_a = driven_scheduler(clock);
+    let mut scheduler_c = driven_scheduler(clock);
 
     let converged = timeout(TEST_TIMEOUT, async {
         tokio::select! {

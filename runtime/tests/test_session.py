@@ -22,6 +22,7 @@ from kabudachi.errors import (
     TaskDefinitionError,
     TaskExpiredError,
     TaskInterruptedError,
+    TaskRecordFullError,
     TaskSupersededError,
     TaskTimeoutError,
     UnknownTaskError,
@@ -702,6 +703,18 @@ def test_a_task_the_runtime_says_expired_fails_its_handle_with_task_expired_erro
         waiting = submit_expiring(world, "waiting")
         with pytest.raises(TaskExpiredError):
             await asyncio.wait_for(waiting, WAIT)
+
+    run(with_events(world, body))
+
+
+def test_a_task_the_runtime_says_has_a_full_record_fails_its_handle_with_task_record_full_error():
+    world = World(echo)
+
+    async def body():
+        handle = world.call("echo", Greeting(text="no room"))
+        world.runtime.inject_event(EventKind.RECORD_FULL, task_id=handle.task_id)
+        with pytest.raises(TaskRecordFullError):
+            await asyncio.wait_for(handle, WAIT)
 
     run(with_events(world, body))
 

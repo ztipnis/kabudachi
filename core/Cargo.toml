@@ -10,6 +10,7 @@ name = "kabudachi_core"
 blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
 digest = { version = "0.10", features = ["alloc"] }
 kabudachi-proto = { path = "../proto" }
+prost = "0.13"
 sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", default-features = false, features = ["std", "v7"] }

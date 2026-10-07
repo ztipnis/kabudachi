@@ -31,6 +31,7 @@ use std::time::Duration as StdDuration;
 use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
 use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::RealClock;
 use libp2p::Multiaddr;
 
@@ -39,6 +40,7 @@ use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, DEFAULT_SEED_ROUNDS, bootstrap};
 use crate::driver::{DriverConfig, run_driver};
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::{ListenRejected, Net};
+use crate::task_store::placement::ReplicationFactor;
 
 /// A coordination authority and the timings a worker's node keeps its
 /// registration and recovery fence there by (see
@@ -80,6 +82,12 @@ pub struct WorkerConfig {
     /// driver is not taking them (see `Net::with_input_limit`); `None` for
     /// the default (`crate::messenger::DEFAULT_INPUT_LIMIT`).
     pub input_limit: Option<usize>,
+    /// How many voters each Task record is written to.
+    pub replication_factor: ReplicationFactor,
+    /// How long a finished task is kept before it is forgotten, by the
+    /// scheduler and by every worker's record store; `None` keeps finished
+    /// tasks.
+    pub result_ttl: Option<StdDuration>,
 }
 
 impl WorkerConfig {
@@ -103,6 +111,8 @@ impl WorkerConfig {
             seed_rounds: DEFAULT_SEED_ROUNDS,
             routing_refresh_period: None,
             input_limit: None,
+            replication_factor: ReplicationFactor::DEFAULT,
+            result_ttl: None,
         }
     }
 
@@ -142,12 +152,33 @@ impl WorkerConfig {
         self
     }
 
+    /// Writes each Task record to `factor` voters.
+    #[must_use]
+    pub fn with_replication_factor(mut self, factor: ReplicationFactor) -> Self {
+        self.replication_factor = factor;
+        self
+    }
+
+    /// Keeps a finished task, and its record, for `ttl` before forgetting it.
+    #[must_use]
+    pub fn with_result_ttl(mut self, ttl: StdDuration) -> Self {
+        self.result_ttl = Some(ttl);
+        self
+    }
+
     /// Bounds the inputs the worker's network holds while its driver is not taking them.
     #[must_use]
     pub fn with_input_limit(mut self, limit: usize) -> Self {
         self.input_limit = Some(limit);
         self
     }
+}
+
+/// The retention `config` gives finished tasks, in the core's time.
+fn retention_of(config: &WorkerConfig) -> Option<kabudachi_core::time::Duration> {
+    config.result_ttl.map(|ttl| {
+        kabudachi_core::time::Duration::from_millis(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+    })
 }
 
 /// A worker that has its identity and is listening, ready to [`Self::run`].
@@ -161,7 +192,7 @@ impl Worker {
     /// (see this module's "One identity per process"), and listens on
     /// `config.listen_on`, or fails if it cannot.
     pub async fn start(config: WorkerConfig) -> Result<Worker, ListenRejected> {
-        let net = Net::new();
+        let net = Net::for_shard(config.shard_id.clone(), retention_of(&config));
         let net = Arc::new(match config.input_limit {
             Some(limit) => net.with_input_limit(limit),
             None => net,
@@ -230,7 +261,8 @@ impl Worker {
         };
         let authority_timings = config.authority.as_ref().map(|authority| authority.timings);
         let (mut node, first) = WorkerNode::start(identity, entry, clock, authority_timings);
-        let mut scheduler = Scheduler::new(clock, Uuid7Ids);
+        let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
+        scheduler.set_result_ttl(retention_of(&config));
         run_driver(
             &mut node,
             first,
@@ -243,6 +275,7 @@ impl Worker {
                 seeds: config.seeds.clone(),
                 join_peer_timeout: config.join_peer_timeout,
                 retry_interval: config.retry_interval,
+                replication_factor: config.replication_factor,
             },
             observe,
         )

@@ -31,6 +31,7 @@ struct Log {
     forgotten: BTreeSet<TaskId>,
     leading: bool,
     revisions: Vec<TaskRecord>,
+    only_latest_revision: bool,
 }
 
 /// One notification as the spy recorded it.
@@ -88,7 +89,15 @@ impl Observer for Spy {
     }
 
     fn revision(&mut self, revision: TaskRecord) {
-        self.0.borrow_mut().revisions.push(revision);
+        let mut log = self.0.borrow_mut();
+        if log.only_latest_revision
+            && let Some(last) = log.revisions.last_mut()
+            && last.task == revision.task
+        {
+            *last = revision;
+            return;
+        }
+        log.revisions.push(revision);
     }
 }
 
@@ -118,9 +127,23 @@ impl Spy {
         self.0.borrow().leading
     }
 
+    /// From now on keeps only the latest revision while the same task keeps
+    /// being revised, so a test that drives one task through many large
+    /// revisions does not hold every one of them in memory.
+    pub fn keep_only_the_latest_revision_of_a_busy_task(&self) {
+        self.0.borrow_mut().only_latest_revision = true;
+    }
+
     /// Every revision the scheduler published, in order.
     pub fn revisions(&self) -> Vec<TaskRecord> {
         self.0.borrow().revisions.clone()
+    }
+
+    /// Every revision published since the last call, oldest first. A
+    /// `Cluster` drains this after each step to write the revisions, so a
+    /// cluster node's spy has an empty `revisions()` once a step has run.
+    pub fn take_revisions(&self) -> Vec<TaskRecord> {
+        std::mem::take(&mut self.0.borrow_mut().revisions)
     }
 
     /// `task` as `submit` recorded it. Panics if it was never recorded.

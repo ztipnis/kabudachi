@@ -176,7 +176,7 @@ mod tests {
         );
         let (state_sender, mut state) = watch::channel(node.state());
         let door = Arc::new(SchedulerDoor::new(
-            Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::default()),
+            Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::new(WorkerId::new("worker-1"), clock, None)),
             WorkerId::new("worker-1"),
         ));
         let publisher = Publisher {

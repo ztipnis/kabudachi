@@ -6,7 +6,9 @@
 //! the leader the caller names: the transport keeps no leader of its own. The
 //! answering side is [`answer`], which the driver applies to each inbound
 //! request: whether to grant a claim is `core::scheduler::Scheduler`'s decision
-//! alone.
+//! alone. The decision is made at once, but the driver sends the answer only
+//! once the revisions it wrote are acknowledged and the leader still leads;
+//! otherwise the claimant is answered [`not_leader`].
 
 use std::str::FromStr;
 
@@ -172,6 +174,17 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, R: Observer>(
     });
     ClaimResponse {
         result: Some(result),
+    }
+}
+
+/// The answer to a claim whose writes were not acknowledged while the leader
+/// still led: a retryable `NotLeader`. The claim may still have been stored;
+/// the leader elected next decides what it meant.
+pub(crate) fn not_leader() -> ClaimResponse {
+    ClaimResponse {
+        result: Some(claim_response::Result::Reject(ClaimReject {
+            reason: ClaimRejectReason::ClaimRejectNotLeader as i32,
+        })),
     }
 }
 

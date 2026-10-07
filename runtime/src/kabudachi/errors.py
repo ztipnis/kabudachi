@@ -64,6 +64,11 @@ class TaskExpiredError(KabudachiError, RuntimeError):
     never run."""
 
 
+class TaskRecordFullError(KabudachiError, RuntimeError):
+    """A task's run ended and no further attempt was made, because the
+    task's record had no room left for one."""
+
+
 class TaskTimeoutError(KabudachiError, TimeoutError):
     """A task ran past its timeout, so its run failed. The body was asked to
     stop, and if it did not stop within the cancel grace it was abandoned:

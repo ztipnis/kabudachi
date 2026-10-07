@@ -4,4 +4,5 @@
 mod bootstrap;
 mod claim;
 mod election;
+mod records;
 mod support;
