@@ -80,7 +80,12 @@ const RIVAL: RecoveryEpoch = RecoveryEpoch::new(0, 2);
 
 /// `quarters` quarters of the adapter's TTL.
 fn quarters(adapter: &impl AuthorityAdapter, quarters: u64) -> Duration {
-    Duration::from_ticks(adapter.ttl().as_ticks() / 4 * quarters)
+    let ticks = adapter
+        .ttl()
+        .as_ticks()
+        .checked_mul(quarters)
+        .expect("a TTL times a few quarters fits in ticks");
+    Duration::from_ticks(ticks / 4)
 }
 
 /// A fresh authority past its warm-up: five quarters of a TTL have passed.
@@ -223,6 +228,11 @@ fn the_count_is_withheld_for_one_ttl_after_start(
         "{clause}: addresses are reported during warm-up"
     );
     time.pass(quarters(adapter, 3));
+    assert_eq!(
+        count(&authority, clause),
+        None,
+        "{clause}: still warming up a quarter TTL before the end"
+    );
     register(&authority, adapter, &worker_a(), "address-a", clause);
     time.pass(quarters(adapter, 2));
     assert_eq!(count(&authority, clause), Some(1), "{clause}: warmed up");
@@ -308,6 +318,12 @@ fn a_fence_needs_the_current_epoch(adapter: &impl AuthorityAdapter, time: &impl 
         Ok(adapter.ttl()),
         "{clause}: its holder renews it"
     );
+    time.pass(quarters(adapter, 3));
+    fence_held(
+        authority.acquire_fence(&shard(), &worker_b(), FOUNDED),
+        quarters(adapter, 1),
+        clause,
+    );
 }
 
 fn a_fence_held_by_another_is_waited_out_across_epochs(
@@ -346,7 +362,13 @@ fn a_fence_held_by_another_is_waited_out_across_epochs(
         }),
         "{clause}: the old holder cannot renew at the old epoch"
     );
-    time.pass(quarters(adapter, 4));
+    time.pass(quarters(adapter, 2));
+    fence_held(
+        authority.acquire_fence(&shard(), &worker_b(), next),
+        quarters(adapter, 1),
+        clause,
+    );
+    time.pass(quarters(adapter, 2));
     assert_eq!(
         authority.acquire_fence(&shard(), &worker_b(), next),
         Ok(adapter.ttl()),
@@ -364,7 +386,13 @@ fn no_fence_for_one_ttl_after_start(adapter: &impl AuthorityAdapter, time: &impl
         quarters(adapter, 3),
         clause,
     );
-    time.pass(quarters(adapter, 4));
+    time.pass(quarters(adapter, 2));
+    fence_held(
+        authority.acquire_fence(&shard(), &worker_a(), FOUNDED),
+        quarters(adapter, 1),
+        clause,
+    );
+    time.pass(quarters(adapter, 2));
     assert_eq!(
         authority.acquire_fence(&shard(), &worker_a(), FOUNDED),
         Ok(adapter.ttl()),
@@ -400,6 +428,11 @@ fn a_flush_loses_everything_and_restarts_both_waits(
     create(&authority, RIVAL, clause);
     time.pass(quarters(adapter, 1));
     fence_held(
+        authority.acquire_fence(&shard(), &worker_a(), RIVAL),
+        quarters(adapter, 3),
+        clause,
+    );
+    fence_held(
         authority.acquire_fence(&shard(), &worker_b(), RIVAL),
         quarters(adapter, 3),
         clause,
@@ -411,7 +444,19 @@ fn a_flush_loses_everything_and_restarts_both_waits(
         "{clause}: count withheld after the flush"
     );
 
-    time.pass(quarters(adapter, 4));
+    time.pass(quarters(adapter, 2));
+    fence_held(
+        authority.acquire_fence(&shard(), &worker_b(), RIVAL),
+        quarters(adapter, 1),
+        clause,
+    );
+    assert_eq!(
+        count(&authority, clause),
+        None,
+        "{clause}: count still withheld a quarter TTL before the end"
+    );
+
+    time.pass(quarters(adapter, 2));
     register(&authority, adapter, &worker_b(), "address-b", clause);
     assert_eq!(
         count(&authority, clause),
@@ -449,6 +494,16 @@ fn an_outage_keeps_the_data_and_withholds_only_the_count(
         "{clause}: the epoch is kept"
     );
     assert_eq!(
+        live(&authority, &shard(), clause),
+        BTreeMap::from([(worker_a(), "address-a".to_string())]),
+        "{clause}: the registration is kept"
+    );
+    fence_held(
+        authority.acquire_fence(&shard(), &worker_b(), FOUNDED),
+        quarters(adapter, 3),
+        clause,
+    );
+    assert_eq!(
         authority.acquire_fence(&shard(), &worker_a(), FOUNDED),
         Ok(adapter.ttl()),
         "{clause}: the fence is kept, so its holder renews with no wait"
@@ -466,6 +521,11 @@ fn an_outage_keeps_the_data_and_withholds_only_the_count(
     );
 
     time.pass(quarters(adapter, 3));
+    assert_eq!(
+        count(&authority, clause),
+        None,
+        "{clause}: count still withheld a quarter TTL before the end"
+    );
     register(&authority, adapter, &worker_a(), "address-a", clause);
     time.pass(quarters(adapter, 2));
     assert_eq!(
