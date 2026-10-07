@@ -9,8 +9,11 @@
 //!   round asks, what an answer means, and what a round that found no leader
 //!   logs. It is synchronous around the port call: the caller runs the call,
 //!   so neither the port nor the authority is borrowed across an await.
-//! - [`Rejoin`] is the driver's search for a node back in `Bootstrapping`.
-//! - [`DrivenSearch`] is the search a driven node runs: which one its state calls for, the replies to the calls net asked for itself, and what the node must be told.
+//! - [`Rejoin`] searches for a node back in `Bootstrapping`, and for a node
+//!   stranded with no reachable peer.
+//! - [`DrivenSearch`] is the search a driven node runs: which one its state
+//!   calls for, the replies to the calls net asked for itself, and what the
+//!   node must be told.
 
 use std::collections::BTreeMap;
 use std::future::Future;

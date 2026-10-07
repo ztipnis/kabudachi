@@ -134,7 +134,7 @@ Asking addresses who leads, round by round: the seeds, then the workers the auth
 
 **Driven leader search**:
 The leader search a driven node runs, held in one place (`DrivenSearch`): which search the node's state calls for (a rejoin when it is back in `Bootstrapping` or `Joining`, a stranded search when it has sat in `RollCall` or `NoQuorum` for a suspicion timeout), the replies to the calls net asked for itself, and what the node must be told (an epoch read asked, what it found, a pointer to join). It never steps the node; the driver does, at the points of its batch where the search hands something back.
-_Avoid_: rejoin (for the stranded search too)
+_Avoid_: rejoin (in prose, for the stranded search; the type behind both is `Rejoin`)
 
 **Authority client**:
 A worker's one way to call the coordination authority from net (`AuthorityClient`). The bootstrap cascade and the driver share it, so at most one call of each kind is in flight whoever asked; it performs calls on the blocking pool, answers one that panics as unavailable, and numbers the calls net asks for itself with reply tokens issued by net. It is net's authority performer.
