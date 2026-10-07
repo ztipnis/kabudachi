@@ -546,3 +546,23 @@ def test_a_task_completed_with_a_continuation_holds_its_coalescing_key_until_it_
     newer, second = asyncio.run(main())
 
     assert second.task_id == newer
+
+
+def test_a_coalescing_submission_that_would_outgrow_one_claim_is_refused_and_the_rest_still_run(runtime):
+    chunk = 350_000
+
+    async def main():
+        await leader_within_limit(runtime)
+        generation(runtime, b"a" * chunk, key="k")
+        newest = generation(runtime, b"b" * chunk, key="k")
+        # A claim of the third would carry both earlier payloads and its own,
+        # more than one message holds.
+        with pytest.raises(_native.BackpressureError):
+            generation(runtime, b"c" * chunk, key="k")
+        [claimed] = await claim(runtime)
+        return newest, claimed
+
+    newest, claimed = asyncio.run(main())
+
+    assert claimed.task_id == newest
+    assert [len(payload) for payload in claimed.chain] == [chunk]

@@ -69,6 +69,11 @@ class TaskRecordFullError(KabudachiError, RuntimeError):
     task's record had no room left for one."""
 
 
+class CoalescedPayloadTooLargeError(KabudachiError, RuntimeError):
+    """A coalescing task's superseded payloads, folded together, grew larger
+    than one worker can be sent, so its newest generation can never run."""
+
+
 class TaskTimeoutError(KabudachiError, TimeoutError):
     """A task ran past its timeout, so its run failed. The body was asked to
     stop, and if it did not stop within the cancel grace it was abandoned:

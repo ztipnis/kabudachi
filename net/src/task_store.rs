@@ -81,11 +81,19 @@ impl HeldRecords {
 
     /// Each task whose record, as this worker holds it, looks claimable at
     /// `now` (see `looks_claimable`), with when it was submitted, in task id
-    /// order.
-    pub(crate) fn claimable(&self, now: WallTime) -> Vec<(WallTime, TaskId)> {
+    /// order. A compaction run counts only for a worker that
+    /// `runs_compaction`.
+    pub(crate) fn claimable(
+        &self,
+        now: WallTime,
+        runs_compaction: bool,
+    ) -> Vec<(WallTime, TaskId)> {
         self.lock()
             .iter()
             .filter(|record| looks_claimable(record, now))
+            .filter(|record| {
+                runs_compaction || record.task.as_ref().is_some_and(|task| task.compacts.is_none())
+            })
             .filter_map(|record| {
                 let (task, _) = identify(record).ok()?;
                 let submitted_at = record.task.as_ref()?.submitted_at?;

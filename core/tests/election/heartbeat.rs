@@ -132,3 +132,23 @@ fn an_ack_for_another_shard_or_from_other_than_the_leader_it_names_is_ignored() 
         assert_eq!(node.state(), WorkerState::LeaderSuspect, "{sender:?}");
     }
 }
+
+// A worker that runs compaction says so in every heartbeat it sends, from the
+// moment it is told to, so its leader can hand it compaction runs.
+#[test]
+fn a_heartbeat_says_whether_its_sender_runs_compaction() {
+    let clock = FakeClock::new();
+    let mut node = joined_node(&clock);
+    let says = |node: &mut TestNode| {
+        clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT)).heartbeat_interval);
+        let outputs = tick(node);
+        match sent_to(&outputs, &worker("leader-1")).remove(0).payload {
+            Some(election_message::Payload::Heartbeat(heartbeat)) => heartbeat.runs_compaction,
+            other => panic!("expected a heartbeat to the leader, got {other:?}"),
+        }
+    };
+
+    assert!(!says(&mut node), "off unless the worker says it runs compaction");
+    node.set_runs_compaction(true);
+    assert!(says(&mut node));
+}

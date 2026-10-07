@@ -278,7 +278,8 @@ impl NativeRuntime {
                     SubmitRejection::TooLarge { .. }
                     | SubmitRejection::RecordTooLarge { .. }
                     | SubmitRejection::Backpressure { .. }
-                    | SubmitRejection::KeyNotReady => {
+                    | SubmitRejection::KeyNotReady
+                    | SubmitRejection::KeyBackpressure { .. } => {
                         errors::backpressure_error(py, rejection.to_string())
                     }
                 })
@@ -359,6 +360,21 @@ impl NativeRuntime {
         self.door
             .complete(&TaskRunId::new(task_run_id), digest, completion)
             .map(Into::into)
+            .map_err(|refusal| refused(refusal, rejected))
+    }
+
+    /// Reports the fold of a compaction run: the payload made by merging the
+    /// run's `chain`, oldest first. Returns whether the leader swapped it in
+    /// for the entries it replaces; `False` means the chain changed under the
+    /// run (its oldest payloads were dropped, or its generation ended) and
+    /// the fold was discarded.
+    ///
+    /// Raises `RuntimeError` if the run is unknown, is not a compaction run,
+    /// or is not this worker's.
+    fn complete_compaction(&self, task_run_id: &str, folded: &[u8]) -> PyResult<bool> {
+        self.door
+            .complete_compaction(&TaskRunId::new(task_run_id), folded.to_vec())
+            .map(|compacted| compacted.applied)
             .map_err(|refusal| refused(refusal, rejected))
     }
 

@@ -6,6 +6,11 @@ are only provisional, and separately asks the leader to certify them by their
 digest. The handle is settled when the leader's certification arrives and
 matches the bytes the client holds; a result the leader refuses is never
 delivered.
+
+A coalescing key whose waiting payloads pile up past the soft memory limit
+while one generation runs is compacted on a free worker place: the claim names
+the payloads to fold, `_compact` folds them with the task's merge and hands the
+folded payload to the leader, and no handle waits for it.
 """
 
 import asyncio
@@ -25,6 +30,7 @@ from kabudachi.composites import Composites
 from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration
 from kabudachi.errors import (
+    CoalescedPayloadTooLargeError,
     RuntimeNotStartedError,
     TaskDefinitionError,
     TaskExpiredError,
@@ -180,6 +186,13 @@ class Session:
                                 f"task {event.task_id} ended: its record had no room for another attempt"
                             ),
                         )
+                    case EventKind.COALESCED_PAYLOAD_TOO_LARGE:
+                        self._tasks.failed(
+                            event.task_id,
+                            CoalescedPayloadTooLargeError(
+                                f"task {event.task_id}'s folded payloads grew too large to run"
+                            ),
+                        )
                     case EventKind.SLOW_DOWN if event.active:
                         self._below_soft_limit.clear()
                     case EventKind.SLOW_DOWN:
@@ -243,6 +256,10 @@ class Session:
             run_callback_inline(function, value)
 
     def _start(self, claim: Any) -> None:
+        if claim.compaction:
+            # Internal: no handle waits for it, so it is not in the task table.
+            self._places.occupy(asyncio.get_running_loop().create_task(self._compact(claim)))
+            return
         run = self._tasks.claimed(claim.task_id)
         if run is None:
             # Already settled and forgotten (by `stop_claiming`, or any other
@@ -372,17 +389,58 @@ class Session:
 
         handle._outcome.add_done_callback(settled)
 
+    async def _compact(self, claim: Any) -> None:
+        """Folds a compaction run's payloads with the task's merge and hands
+        the result back. A failure is reported by the error's type only, and
+        the leader then leaves the chain as it was."""
+        try:
+            definition = self._registry.get(claim.definition_id)
+            if definition is None:
+                raise UnknownTaskError(f"this process has no task named {claim.definition_id!r}")
+            serializer = self._serializers.get(definition.serializer)
+            folded = self._fold_payloads(definition, serializer, list(claim.chain))
+            encoded = serializer.encode(folded, definition.input_type)
+        except Exception as error:
+            _logger.warning("compaction of %s failed with %s", claim.definition_id, type(error).__name__)
+            _logger.debug("compaction of %s failed", claim.definition_id, exc_info=error)
+            try:
+                self._runtime.report_failure(claim.task_run_id, type(error).__name__)
+            except Exception as refusal:
+                _logger.warning(
+                    "the leader did not record the failed compaction of %s: %s",
+                    claim.definition_id,
+                    type(refusal).__name__,
+                )
+            return
+        try:
+            self._runtime.complete_compaction(claim.task_run_id, encoded)
+        except Exception as refusal:
+            # The merge was fine: the leader refused to take its result (the
+            # run is no longer this worker's), which is no failure to report.
+            _logger.warning(
+                "the leader did not take the fold of %s: %s",
+                claim.definition_id,
+                type(refusal).__name__,
+            )
+
     @staticmethod
-    def _fold(definition: TaskDefinition, serializer: Any, claim: Any) -> Any:
-        """The input of the task: its own payload, folded onto the payloads of
-        the generations it superseded, oldest first. Runs
-        here, on the worker, because the leader never runs user code."""
-        payloads = [*claim.chain, claim.serialized_input]
+    def _fold_payloads(definition: TaskDefinition, serializer: Any, payloads: list[bytes]) -> Any:
+        """Decodes `payloads` and folds them, oldest first, with the task's
+        merge (the newest wins without one). Runs here, on the worker, because
+        the leader never runs user code."""
         values = [serializer.decode(payload, definition.input_type) for payload in payloads]
         if len(values) == 1:
             return values[0]
         merge = definition.merge or (lambda older, newer: newer)
         return functools.reduce(merge, values)
+
+    @staticmethod
+    def _fold(definition: TaskDefinition, serializer: Any, claim: Any) -> Any:
+        """The input of the task: its own payload, folded onto the payloads of
+        the generations it superseded, oldest first."""
+        return Session._fold_payloads(
+            definition, serializer, [*claim.chain, claim.serialized_input]
+        )
 
     def _report_failure(self, claim: Any, error: Exception) -> bool:
         """Tells the leader the run failed and says whether it will be retried.

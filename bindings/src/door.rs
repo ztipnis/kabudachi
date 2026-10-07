@@ -17,7 +17,8 @@
 //! (it carries the input of the generation it supersedes) stays queued until a
 //! change frees room, and so do the later submissions of its coalescing key,
 //! which must not be recorded ahead of it. Every other queued submission is
-//! recorded regardless.
+//! recorded regardless. The one worker this door serves runs compaction, so
+//! it claims the compaction runs of its own scheduler like any other claim.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -31,7 +32,7 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::{Rebuild, ReconcileTerm};
 use kabudachi_core::scheduler::{
-    CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Completion,
+    CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted, Completion,
     ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission, Submitted,
     SubmitRejection,
 };
@@ -230,7 +231,10 @@ pub struct SchedulerDoor<C: Clock> {
 }
 
 impl<C: Clock> SchedulerDoor<C> {
-    pub fn new(scheduler: DoorScheduler<C>, worker: WorkerId) -> Self {
+    /// A door whose own worker runs compaction: the one-node runtime folds the
+    /// chains of its coalescing keys itself, on a free place.
+    pub fn new(mut scheduler: DoorScheduler<C>, worker: WorkerId) -> Self {
+        scheduler.set_compaction_runners(BTreeSet::from([worker.clone()]));
         SchedulerDoor {
             inside: Mutex::new(Inside {
                 scheduler,
@@ -306,6 +310,21 @@ impl<C: Clock> SchedulerDoor<C> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
             settled_change(scheduler, |scheduler| {
                 scheduler.complete(&self.worker, run, result_digest, completion)
+            })
+        }))
+    }
+
+    /// Reports the fold of a compaction run this worker claimed, and whether
+    /// the leader applied it: it does not when the chain it was made for has
+    /// changed since. Gated like `complete`.
+    pub fn complete_compaction(
+        &self,
+        run: &TaskRunId,
+        folded: Vec<u8>,
+    ) -> Result<Compacted, Refusal<ReportRejection>> {
+        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
+            settled_change(scheduler, |scheduler| {
+                scheduler.complete_compaction(&self.worker, run, folded)
             })
         }))
     }
@@ -586,7 +605,8 @@ impl<C: Clock + Send + 'static> SchedulerDoor<C> {
                         | ClaimRejection::AlreadySelected
                         | ClaimRejection::Finished
                         | ClaimRejection::Superseded
-                        | ClaimRejection::KeyBusy,
+                        | ClaimRejection::KeyBusy
+                        | ClaimRejection::CannotRun,
                     ) => {
                         unreachable!("claim_oldest claims from its own queue as leader")
                     }

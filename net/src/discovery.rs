@@ -72,14 +72,23 @@ impl Net {
     /// own records are judged due: a `Net` keeps no clock, so the caller passes
     /// the one its driver answers steal requests by, and every worker of a
     /// process then judges by the same time.
-    pub async fn discover(&self, leader: WorkerId, limit: usize, now: WallTime) -> Found {
+    ///
+    /// A compaction run is a candidate only if `runs_compaction` says this
+    /// worker runs them.
+    pub async fn discover(
+        &self,
+        leader: WorkerId,
+        limit: usize,
+        now: WallTime,
+        runs_compaction: bool,
+    ) -> Found {
         let mut found = Found::default();
         if leader == self.local_worker_id() {
             found.stopped = Some(DiscoveryStop::ThisWorkerLeads);
             return found;
         }
         let mut tried = BTreeSet::new();
-        let own = self.own_candidates(now);
+        let own = self.own_candidates(now, runs_compaction);
         if self
             .claim_each(&leader, Stage::Own, own, limit, &mut tried, &mut found)
             .await
@@ -94,7 +103,7 @@ impl Net {
             // Ids already tried take answer slots without being candidates, so
             // ask for as many more as were tried.
             let asked = (limit - found.claims.len() + tried.len()).min(MAX_STEAL_IDS);
-            let answers = join_all(peers.into_iter().map(|peer| self.steal(peer, asked))).await;
+            let answers = join_all(peers.into_iter().map(|peer| self.steal(peer, asked, runs_compaction))).await;
             let mut offered = BTreeSet::new();
             let candidates: Vec<TaskId> = answers
                 .into_iter()
@@ -119,10 +128,10 @@ impl Net {
 
     /// The tasks of this worker's own records that look claimable now,
     /// nearest first by the distance between a task's key and this worker's.
-    fn own_candidates(&self, now: WallTime) -> Vec<TaskId> {
+    fn own_candidates(&self, now: WallTime, runs_compaction: bool) -> Vec<TaskId> {
         let mut candidates: Vec<TaskId> = self
             .held_records()
-            .claimable(now)
+            .claimable(now, runs_compaction)
             .into_iter()
             .map(|(_, task)| task)
             .collect();
@@ -165,7 +174,8 @@ impl Net {
                         | ClaimRejectReason::ClaimRejectAlreadySelected
                         | ClaimRejectReason::ClaimRejectFinished
                         | ClaimRejectReason::ClaimRejectSuperseded
-                        | ClaimRejectReason::ClaimRejectKeyBusy,
+                        | ClaimRejectReason::ClaimRejectKeyBusy
+                        | ClaimRejectReason::ClaimRejectCannotRun,
                     ) => found.stale += 1,
                     Ok(
                         ClaimRejectReason::ClaimRejectNotLeader

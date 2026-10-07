@@ -21,7 +21,7 @@ use crate::support::builders::past_any_suspicion;
 use crate::support::harness::{Answer, Cluster};
 
 /// A node that is not one of `excluded`.
-fn some_other(cluster: &Cluster, excluded: &[&WorkerId]) -> WorkerId {
+pub(crate) fn some_other(cluster: &Cluster, excluded: &[&WorkerId]) -> WorkerId {
     cluster
         .node_ids()
         .into_iter()
@@ -41,7 +41,7 @@ fn advance_until(cluster: &mut Cluster, reached: impl Fn(&Cluster) -> bool) {
 
 /// Cuts `leader` off from the rest and advances until the others have
 /// elected a leader and it leads; returns it.
-fn leader_loss(cluster: &mut Cluster, leader: &WorkerId) -> WorkerId {
+pub(crate) fn leader_loss(cluster: &mut Cluster, leader: &WorkerId) -> WorkerId {
     cut_off(cluster, leader);
     advance_until(cluster, |cluster| new_leader(cluster, leader).is_some());
     new_leader(cluster, leader).expect("the others elected a leader")

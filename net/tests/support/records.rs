@@ -72,6 +72,8 @@ pub struct Voters {
     states: Vec<watch::Receiver<WorkerState>>,
     senders: Vec<watch::Sender<WorkerState>>,
     killed: Vec<bool>,
+    /// Which voters run compaction, as their drivers are told.
+    runs_compaction: Vec<bool>,
     /// What each voter's driver returned once it had drained and handed its
     /// records over; such a voter is driven no more.
     handed_off: HandedOffBy,
@@ -191,8 +193,15 @@ impl Voters {
             states,
             senders,
             killed,
+            runs_compaction: vec![false; count],
             handed_off,
         }
+    }
+
+    /// Tells `voter`'s driver, from the next `drive_until` on, whether its
+    /// worker runs compaction.
+    pub fn set_runs_compaction(&mut self, voter: usize, runs: bool) {
+        self.runs_compaction[voter] = runs;
     }
 
     /// A reading of every voter's state that stays current while the shard is
@@ -281,6 +290,7 @@ impl Voters {
     pub async fn drive_until<T>(&mut self, until: impl Future<Output = T>) -> T {
         let clock = self.clock;
         let (nets, senders, killed) = (&self.nets, &self.senders, &self.killed);
+        let runs_compaction = self.runs_compaction.clone();
         let handed_off = self.handed_off.clone();
         let config = DriverConfig {
             replication_factor: self.replication_factor,
@@ -294,7 +304,10 @@ impl Voters {
             .filter(|(voter, _)| !killed[*voter] && handed_off.of(*voter).is_none())
             .map(|(voter, (node, scheduler))| {
                 let observe = publish(senders[voter].clone());
-                let config = config.clone();
+                let config = DriverConfig {
+                    runs_compaction: runs_compaction[voter],
+                    ..config.clone()
+                };
                 Box::pin(async move {
                     let returned = run_driver(
                         node,
@@ -358,6 +371,7 @@ fn heartbeat_from(worker: &WorkerId) -> ElectionMessage {
             send_token: 0,
             routing_crawled: false,
             admission_generation: None,
+            runs_compaction: false,
         })),
     }
 }

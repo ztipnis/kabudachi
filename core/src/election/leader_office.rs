@@ -114,6 +114,8 @@ pub(crate) struct LeaderOffice {
     /// The workers whose latest heartbeat reported a routing crawl, with the
     /// admission each crawled at.
     crawled: BTreeMap<WorkerId, Generation>,
+    /// The workers whose latest heartbeat said they run compaction.
+    compaction_runners: BTreeSet<WorkerId>,
 }
 
 impl LeaderOffice {
@@ -141,6 +143,7 @@ impl LeaderOffice {
             voters_at: BTreeMap::new(),
             pending_removals: BTreeSet::new(),
             crawled: BTreeMap::new(),
+            compaction_runners: BTreeSet::new(),
         };
         office.commit_when_due(duties.me);
         if let Some((generation, sides)) = office.roster.called_under() {
@@ -179,6 +182,7 @@ impl LeaderOffice {
         heard: Heard,
         routing_crawled: bool,
         admission: Option<Generation>,
+        runs_compaction: bool,
         duties: &Duties,
     ) {
         // Removals first, so what follows sees who is a member now.
@@ -201,6 +205,11 @@ impl LeaderOffice {
         }
         if !self.unconfirming.contains(&from) {
             self.lost.remove(&from);
+        }
+        if runs_compaction {
+            self.compaction_runners.insert(from.clone());
+        } else {
+            self.compaction_runners.remove(&from);
         }
         match admission.filter(|_| routing_crawled) {
             Some(admission) if Some(admission) == self.roster.admission_of(&from) => {
@@ -250,6 +259,16 @@ impl LeaderOffice {
                     .get(*worker)
                     .is_some_and(|crawled_at| Some(*crawled_at) == self.roster.admission_of(worker))
             })
+    }
+
+    /// The members whose latest heartbeat said they run compaction.
+    pub(crate) fn compaction_runners(&self) -> BTreeSet<WorkerId> {
+        let members = self.roster.members();
+        self.compaction_runners
+            .iter()
+            .filter(|worker| members.contains_key(*worker) || self.roster.pending().contains(*worker))
+            .cloned()
+            .collect()
     }
 
     /// The voters of the committed configuration this office knows by id,

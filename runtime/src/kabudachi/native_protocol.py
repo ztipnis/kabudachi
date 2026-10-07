@@ -21,6 +21,9 @@ class Claim(Protocol):
     attempt_number: int
     serialized_input: bytes
     chain: list[bytes]
+    compaction: bool
+    """A compaction run: `chain` holds the payloads to fold, oldest first;
+    `serialized_input` is empty."""
 
 
 class Event(Protocol):
@@ -86,6 +89,9 @@ class Runtime(Protocol):
         self, task_run_id: str, result_digest: bytes, continues: bool = False
     ) -> Certification:
         ...
+
+    def complete_compaction(self, task_run_id: str, folded: bytes) -> bool:
+        """Reports the fold of a compaction run; whether the leader applied it."""
 
     def end_continuation(self, task_id: str) -> bool:
         """Ends the continuation of a task that returned a step; whether there was one."""

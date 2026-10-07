@@ -74,6 +74,23 @@ message Task {
   // How long after submission the task may wait to start before it expires
   // instead; unset means it never expires.
   optional uint64 expiry_millis = 15;
+  // Set only on a compaction run's task: the front of a coalescing key's
+  // waiting chain it folds.
+  CompactionPrefix compacts = 16;
+}
+
+// The front of a coalescing key's waiting chain a compaction run folds: each
+// entry is one chain entry, named by the generations it holds and the digest
+// of its payload, so the leader can tell whether the chain still starts with
+// exactly these when the result comes back.
+message CompactionPrefix {
+  string coalescing_key = 1;
+  repeated PrefixEntry entries = 2;
+}
+
+message PrefixEntry {
+  repeated TaskId generations = 1;
+  Digest digest = 2;
 }
 
 // One execution attempt of a Task. `identity`, the versions and `created_at`

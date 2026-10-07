@@ -84,6 +84,7 @@ pub fn new_task(new: NewTask) -> Task {
         submitted_at: Some(new.submitted_at.into()),
         delay_millis: new.delay.map(|delay| delay.as_ticks()),
         expiry_millis: new.expiry.map(|expiry| expiry.as_ticks()),
+        compacts: None,
     }
 }
 

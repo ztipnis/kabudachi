@@ -49,6 +49,18 @@
 //! but never answered is returned as a silent holder, for the election to
 //! watch as a lost worker.
 //!
+//! A coalescing key's waiting chain is kept under a bound. Once it holds more
+//! than [`COMPACTION_SOFT_BYTES`] of payload (or memory is past its soft
+//! limit), and some worker has said it runs compaction
+//! ([`Scheduler::set_compaction_runners`]), the scheduler makes an internal
+//! compaction task naming the oldest entries of the chain; a worker folds
+//! them and [`Scheduler::complete_compaction`] swaps in the result only if the
+//! chain still starts with those entries (see `compaction`). With no such
+//! worker the newest generation folds its whole chain itself. No claim ever
+//! outgrows one message: a submission that would make its key's waiting claim
+//! too large is refused with `KeyBackpressure`, and a fold that does so fails
+//! the newest generation (`CoalescedPayloadTooLarge`).
+//!
 //! Tasks and runs are stored privately and handed out only as shared
 //! references or clones, so nothing outside can edit a submitted Task or move
 //! a run without going through the transition table.
@@ -57,11 +69,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use prost::Message;
 
-use crate::coalescing::{self, Key, Occupancy};
+use crate::coalescing::{self, ChainItem, Folded, Key, Occupancy};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::digest::Digest;
 use crate::protocol::generated::{
-    AbsorbedGeneration, ChainEntry, CoalescingLink, TaskRecord, chain_entry,
+    AbsorbedGeneration, ChainEntry, CoalescingLink, FoldedPayload, TaskRecord, chain_entry,
 };
 use crate::protocol::ids::{
     IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId, mint_task_id,
@@ -80,6 +92,7 @@ use crate::task_record::{
 };
 use crate::time::{Clock, Duration, Instant, WallTime};
 
+mod compaction;
 mod memory_budget;
 mod observer;
 mod retention;
@@ -115,12 +128,17 @@ const CLAIM_OVERHEAD_BYTES: u64 = 4 * 1024;
 /// and coalescing key together. A task any bigger could never be handed to a
 /// worker, so it is refused at once instead of sitting pending for ever.
 ///
-/// It does not bound a coalescing task's retained chain, which a claim also
-/// carries: many small superseded payloads can still add up past a frame.
-/// Bounding that is chain compaction, which is not implemented yet; a
-/// claim that has outgrown a frame is passed over by the leader's batch
-/// claim until then.
+/// A coalescing task's claim also carries its retained chain, and the same
+/// bound covers the two together: a submission that would make its key's
+/// waiting claim larger is refused with `KeyBackpressure`, and a fold that
+/// does so fails the newest generation, so no claim ever outgrows a frame.
+/// Compaction folds a chain long before that.
 pub const MAX_SUBMISSION_BYTES: u64 = MAX_CLAIM_FRAME_BYTES - CLAIM_OVERHEAD_BYTES;
+
+/// A waiting generation whose retained chain holds more payload than this
+/// gets a compaction run: half of what one claim may carry, so a chain is
+/// folded long before its newest generation could no longer be handed out.
+pub const COMPACTION_SOFT_BYTES: u64 = MAX_SUBMISSION_BYTES / 2;
 
 /// What a size measurement of a record leaves out and so keeps free: the
 /// version and publication time, whose encoding grows with their values, and
@@ -132,6 +150,14 @@ const RECORD_RESERVE_BYTES: u64 = 1024;
 /// (the failure is reported either way), so that what a worker supplies can
 /// never push a record past the limit the network refuses to store.
 const MAX_FAILURE_KIND_BYTES: usize = 128;
+
+/// What a claim spends on each payload of a chain besides its bytes: the
+/// field's tag and its length.
+const CHAIN_ENTRY_FRAMING_BYTES: u64 = 6;
+
+/// The failure kind of a coalescing generation whose folded chain grew too
+/// large to hand to any worker.
+pub const COALESCED_PAYLOAD_TOO_LARGE: &str = "CoalescedPayloadTooLarge";
 
 /// A version for measuring a record's size, which does not depend on it.
 const UNVERSIONED: RecordVersion = RecordVersion {
@@ -161,6 +187,11 @@ pub enum SubmitRejection {
     /// leader can rely on yet, and may still run: submit again shortly.
     #[error("a generation of the task's coalescing key is not known yet")]
     KeyNotReady,
+    /// The key's waiting generation would carry more than one claim can
+    /// hold: further submissions of the key are refused until its chain is
+    /// folded or claimed.
+    #[error("the coalescing key's claim would be {size} bytes, past the {limit} one claim carries")]
+    KeyBackpressure { size: u64, limit: u64 },
 }
 
 /// A submission given its task id and its submission time: what its client
@@ -369,6 +400,13 @@ pub enum Event {
     /// created: its record would have grown past the largest a record may be.
     /// The task is over.
     RecordFull { task_id: TaskId },
+    /// A compaction folded a key's chain into a payload too large to hand
+    /// out with its newest generation, which therefore failed: its client
+    /// should learn its task will never run.
+    CoalescedPayloadTooLarge {
+        task_id: TaskId,
+        task_run_id: TaskRunId,
+    },
 }
 
 /// A run that was lost with its worker, and the run that replaces it.
@@ -497,6 +535,21 @@ pub enum ClaimRejection {
     Superseded,
     #[error("another generation of the task's coalescing key is running")]
     KeyBusy,
+    /// The task is a compaction run and the asking worker has not said it
+    /// runs them.
+    #[error("the worker does not run compaction")]
+    CannotRun,
+}
+
+/// What a compaction run's result did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compacted {
+    pub task_id: TaskId,
+    pub task_run_id: TaskRunId,
+    /// Whether the fold replaced the front of the chain it was made for:
+    /// false when the key's waiting chain no longer starts with the entries
+    /// the run was given, and the result was discarded.
+    pub applied: bool,
 }
 
 /// Why a worker's report about a run was refused.
@@ -618,6 +671,12 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     /// When this scheduler last changed each run. A worker asked what it
     /// holds may not have received a run decided shortly before the question.
     run_decided_at: BTreeMap<TaskRunId, Instant>,
+    /// The workers that run compaction, as their node's heartbeats say.
+    compaction_runners: BTreeSet<WorkerId>,
+    /// The waiting generation of each key whose last compaction failed: a
+    /// merge that failed once would fail again on the same chain, so no new
+    /// compaction is made for that generation.
+    failed_compactions: BTreeMap<Key, TaskId>,
 }
 
 /// What `Scheduler::settle` made of the records it was given.
@@ -702,6 +761,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             deferred: BTreeMap::new(),
             held_reports: BTreeMap::new(),
             run_decided_at: BTreeMap::new(),
+            compaction_runners: BTreeSet::new(),
+            failed_compactions: BTreeMap::new(),
         }
     }
 
@@ -802,7 +863,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .occupancy
             .chain(task_id)
             .iter()
-            .map(|absorbed| self.chain_entry_of(absorbed))
+            .map(|item| self.chain_entry_of(item))
             .collect();
         TaskRecord {
             version: Some(version.into()),
@@ -821,14 +882,51 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
     }
 
-    fn chain_entry_of(&self, absorbed: &TaskId) -> ChainEntry {
-        ChainEntry {
-            entry: Some(chain_entry::Entry::Absorbed(AbsorbedGeneration {
+    fn chain_entry_of(&self, item: &ChainItem) -> ChainEntry {
+        let entry = match item {
+            ChainItem::Absorbed(absorbed) => chain_entry::Entry::Absorbed(AbsorbedGeneration {
                 task_id: Some(absorbed.clone().into()),
                 serialized_input: self.tasks[absorbed].serialized_input.clone(),
                 input_digest: Some(self.input_digests[absorbed].clone().into()),
-            })),
+            }),
+            ChainItem::Folded(folded) => chain_entry::Entry::Folded(FoldedPayload {
+                generations: folded.generations.iter().cloned().map(Into::into).collect(),
+                serialized_input: folded.payload.clone(),
+                input_digest: Some(folded.digest.clone().into()),
+            }),
+        };
+        ChainEntry { entry: Some(entry) }
+    }
+
+    /// The payload one entry of a chain carries.
+    pub(super) fn item_payload<'a>(&'a self, item: &'a ChainItem) -> &'a [u8] {
+        match item {
+            ChainItem::Absorbed(task_id) => &self.tasks[task_id].serialized_input,
+            ChainItem::Folded(folded) => &folded.payload,
         }
+    }
+
+    /// What a claim of a task with `input_len` bytes of input, `queue`,
+    /// `definition` and `key` weighs once it carries `chain`: the task's own
+    /// size, then each payload and its framing.
+    pub(super) fn claim_bytes<'a>(
+        &self,
+        input_len: usize,
+        queue: &str,
+        definition: &str,
+        key: Option<&str>,
+        chain: impl Iterator<Item = &'a ChainItem>,
+    ) -> u64 {
+        let own = input_len + queue.len() + definition.len() + key.map_or(0, str::len);
+        own as u64
+            + chain
+                .map(|item| self.item_len(item) + CHAIN_ENTRY_FRAMING_BYTES)
+                .sum::<u64>()
+    }
+
+    /// The bytes of the payload one entry of a chain carries.
+    pub(super) fn item_len(&self, item: &ChainItem) -> u64 {
+        self.item_payload(item).len() as u64
     }
 
     /// The most a record's encoded size may be as measured here, which leaves
@@ -849,7 +947,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                     .retained(&coalescing::key(&task.task_definition_id(), key))
             })
             .unwrap_or_default();
-        let link = retained.last().map(|older| {
+        let waiting = retained.last().and_then(|item| match item {
+            ChainItem::Absorbed(waiting) => Some(waiting),
+            ChainItem::Folded(_) => None,
+        });
+        let link = waiting.map(|older| {
             let mut absorbed = self
                 .links
                 .get(older)
@@ -865,7 +967,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             version: None,
             task: Some(task.clone()),
             runs: vec![run.clone()],
-            retained_chain: retained.iter().map(|id| self.chain_entry_of(id)).collect(),
+            retained_chain: retained.iter().map(|item| self.chain_entry_of(item)).collect(),
             input_digest: Some(digest.clone().into()),
             link,
             placement: Vec::new(),
@@ -962,6 +1064,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         for worker in lost {
             let _ = self.lose_runs_of(&worker);
         }
+        self.compact_every_due_key();
         self.end_call();
     }
 
@@ -1144,11 +1247,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let now = self.clock.now();
         let wall_now = WallTime::now(&self.clock);
         install.sort_by_cached_key(submission_order);
-        let mut kept_payloads = BTreeMap::new();
+        let mut kept_chains = BTreeMap::new();
         let mut installed = Vec::new();
         for record in install {
             if let Some(task) = record.task.as_ref() {
-                kept_payloads.insert(task.task_id(), retained_ids(&record));
+                kept_chains.insert(task.task_id(), chain_of(&record));
                 installed.push(task.task_id());
             }
             self.install(record, now, wall_now);
@@ -1173,7 +1276,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .filter_map(|task_id| self.coalescing_key_of(task_id))
                 .collect()
         });
-        self.restore_keys(&kept_payloads, touched.as_ref());
+        self.restore_keys(&kept_chains, touched.as_ref());
+        self.restore_compactions();
         self.update_pressure();
         installed
     }
@@ -1266,9 +1370,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return Supersession::Holds;
         };
         let predecessor = TaskId::from(link.absorbed.last().expect("not empty").clone());
+        // The generations a compaction folded were released with it, and their
+        // records may be forgotten by now.
+        let folded = folded_ids(newer);
         // A chain entry the leader would fold must have its record: the
         // chain's size, release and fold look it up as a held task.
-        let known = |task_id: &TaskId| index.contains_key(task_id) || self.tasks.contains_key(task_id);
+        let known = |task_id: &TaskId| {
+            index.contains_key(task_id) || self.tasks.contains_key(task_id) || folded.contains(task_id)
+        };
         if !retained_ids(newer)
             .iter()
             .chain([&predecessor])
@@ -1282,6 +1391,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         };
         let Some(&at) = index.get(&predecessor) else {
             if names_newer(self.links.get(&predecessor)) {
+                return Supersession::Holds;
+            }
+            if folded.contains(&predecessor) && !self.tasks.contains_key(&predecessor) {
                 return Supersession::Holds;
             }
             // The predecessor was installed before this generation's record
@@ -1455,6 +1567,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("a queued run can be claimed");
         run.selected_worker = Some(worker.clone().into());
         let needed = task.serialized_input.len() as u64;
+        let compaction_key = task.compacts.as_ref().map(|prefix| {
+            coalescing::key(&task.task_definition_id(), &prefix.coalescing_key)
+        });
+        if compaction_key.as_ref().is_some_and(|key| {
+            self.occupancy
+                .compaction_of(key)
+                .is_some_and(|other| *other != task_id)
+        }) {
+            return false;
+        }
         self.input_digests
             .insert(task_id.clone(), Digest::blake3(&task.serialized_input));
         self.current_run
@@ -1467,6 +1589,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.budget.take(needed);
         if let Some(key) = key {
             self.occupancy.start(&key, &task_id);
+        }
+        if let Some(key) = compaction_key {
+            self.occupancy.restore_compaction(&key, &task_id, true);
         }
         self.update_pressure();
         true
@@ -1495,6 +1620,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.deferred.clear();
         self.held_reports.clear();
         self.run_decided_at.clear();
+        self.failed_compactions.clear();
     }
 
     /// Holds the task `record` describes, as its newest revision says.
@@ -1505,6 +1631,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             input_digest,
             link,
             finished,
+            retained_chain,
             ..
         } = record;
         let (Some(task), Some(current)) = (task, runs.last().map(TaskRunRecord::task_run_id))
@@ -1541,6 +1668,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.retention.record(&task_id, now);
         } else {
             self.budget.take(task.serialized_input.len() as u64);
+            self.budget.take(
+                chain_items(&retained_chain)
+                    .iter()
+                    .map(|item| match item {
+                        ChainItem::Folded(folded) => folded.payload.len() as u64,
+                        ChainItem::Absorbed(_) => 0,
+                    })
+                    .sum(),
+            );
             if state == TaskRunState::Succeeded {
                 self.continuing.insert(task_id.clone());
             }
@@ -1577,9 +1713,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Sets what each coalescing key holds from the tasks installed:
-    /// `kept_payloads` says which absorbed generations each one's record
-    /// still carries a payload of. A generation held before and not among
-    /// them keeps the chain it had.
+    /// `kept_chains` is the chain each one's record still carries. A
+    /// generation held before and not among them keeps the chain it had.
     ///
     /// An absorbed generation whose own record is not installed is left out
     /// of the chain, even when the winner's record still holds its payload:
@@ -1590,7 +1725,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// held back and never reaches this function.
     fn restore_keys(
         &mut self,
-        kept_payloads: &BTreeMap<TaskId, BTreeSet<TaskId>>,
+        kept_chains: &BTreeMap<TaskId, Vec<ChainItem>>,
         only: Option<&BTreeSet<Key>>,
     ) {
         let mut generations: BTreeMap<Key, Vec<TaskId>> = BTreeMap::new();
@@ -1637,21 +1772,18 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .flatten()
                 .map(|task_id| {
                     // An absorbed generation whose record is not installed
-                    // cannot be folded either, so it is not chained.
-                    let chain = self.links.get(task_id).into_iter().flat_map(|link| {
-                        link.absorbed
-                            .iter()
-                            .map(|absorbed| TaskId::from(absorbed.clone()))
-                    });
+                    // cannot be folded either, so it is not chained. A task
+                    // not installed in this batch was held before: what its
+                    // chain kept stays kept.
+                    let chain = match kept_chains.get(task_id) {
+                        Some(chain) => chain.clone(),
+                        None => self.occupancy.chain(task_id).to_vec(),
+                    };
                     let chain = chain
-                        .filter(|absorbed| {
-                            // A task not installed in this batch was held
-                            // before: what its chain kept stays kept.
-                            let kept = match kept_payloads.get(task_id) {
-                                Some(kept) => kept.contains(absorbed),
-                                None => self.occupancy.chain(task_id).contains(absorbed),
-                            };
-                            kept && self.tasks.contains_key(absorbed)
+                        .into_iter()
+                        .filter(|item| match item {
+                            ChainItem::Absorbed(absorbed) => self.tasks.contains_key(absorbed),
+                            ChainItem::Folded(_) => true,
                         })
                         .collect();
                     (task_id.clone(), chain)
@@ -1686,6 +1818,24 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 size,
                 limit: MAX_SUBMISSION_BYTES,
             });
+        }
+        if let Some(key) = submission.coalescing_key.as_deref() {
+            // The submission would wait with the key's retained payloads as
+            // its chain, and a claim carries all of it.
+            let key = coalescing::key(&submission.definition_id, key);
+            let claim_size = self.claim_bytes(
+                submission.serialized_input.len(),
+                &submission.queue,
+                submission.definition_id.as_str(),
+                submission.coalescing_key.as_deref(),
+                self.occupancy.retained(&key).iter(),
+            );
+            if claim_size > MAX_SUBMISSION_BYTES {
+                return Err(SubmitRejection::KeyBackpressure {
+                    size: claim_size,
+                    limit: MAX_SUBMISSION_BYTES,
+                });
+            }
         }
         self.check_room(submission, needed + queued_bytes)
     }
@@ -1799,6 +1949,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         self.drop_oldest_until_it_fits(&task_id, now);
         self.update_pressure();
+        if let Some(key) = self.coalescing_key_of(&task_id) {
+            self.compact_if_due(&key);
+        }
         Ok(task_id)
     }
 
@@ -1890,9 +2043,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// shown to `fits` before it is claimed. The first one `fits` refuses
     /// ends the batch and stays pending, first in line for the next call;
     /// except that one refused while nothing is claimed yet, which would
-    /// never fit, is passed over so the tasks behind it still go out. It is
-    /// how a caller that must deliver the claims keeps them within what it
-    /// can deliver.
+    /// never fit, is passed over so the tasks behind it still go out. No
+    /// claim outgrows a frame, so that last rule only guards a caller whose
+    /// limit is smaller. It is how a caller that must deliver the claims
+    /// keeps them within what it can deliver.
     pub fn claim_oldest_fitting(
         &mut self,
         worker: &WorkerId,
@@ -1923,6 +2077,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 break;
             };
             after = Some(position);
+            if self.is_compaction(&task_id) && !self.may_claim_compaction(worker, &task_id) {
+                continue;
+            }
             let claim = self.claim_to_be(&task_id);
             if fits(&claim) {
                 self.mark_claimed(worker, &task_id);
@@ -1972,6 +2129,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         match self.runs[&run_id].current_state() {
             TaskRunState::Queued if self.is_held_back(task_id) => Err(ClaimRejection::NotReady),
             TaskRunState::Queued if self.is_blocked(task_id) => Err(ClaimRejection::KeyBusy),
+            TaskRunState::Queued if self.is_compaction(task_id) => {
+                self.claim_compaction(worker, task_id)
+            }
             TaskRunState::Queued => Ok(self.claim_queued(worker, task_id)),
             TaskRunState::Scheduled => Err(ClaimRejection::NotReady),
             TaskRunState::Claimed | TaskRunState::Running => Err(ClaimRejection::AlreadySelected),
@@ -1992,11 +2152,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     fn claim_to_be(&self, task_id: &TaskId) -> Claim {
         let run_id = self.current_run[task_id].clone();
         let chain = match self.coalescing_key_of(task_id) {
+            None if self.is_compaction(task_id) => {
+                self.compaction_claim_chain(task_id).unwrap_or_default()
+            }
             Some(_) => self
                 .occupancy
                 .chain(task_id)
                 .iter()
-                .map(|absorbed| self.tasks[absorbed].serialized_input.clone())
+                .map(|item| self.item_payload(item).to_vec())
                 .collect(),
             None => Vec::new(),
         };
@@ -2024,6 +2187,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.waiting.claimed(task_id);
         if let Some(key) = self.coalescing_key_of(task_id) {
             self.occupancy.start(&key, task_id);
+        } else if let Some(key) = self.compaction_key_of(task_id) {
+            self.occupancy.compaction_claimed(&key, task_id);
         }
         self.mark_decided(&run_id);
     }
@@ -2078,6 +2243,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         completion: Completion,
     ) -> Result<Certification, ReportRejection> {
         self.require_leader()?;
+        // A compaction run's result is its fold, reported by `complete_compaction`.
+        if self
+            .runs
+            .get(run_id)
+            .is_some_and(|run| self.is_compaction(&run.task_id()))
+        {
+            return Err(ReportRejection::NotAuthoritative);
+        }
         self.certify_owned(worker, run_id, result_digest, completion)
     }
 
@@ -2161,6 +2334,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run_id: &TaskRunId,
         failure_kind: String,
     ) -> Result<Failure, ReportRejection> {
+        self.start_if_claimed_compaction(worker, run_id);
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);
         let run = self.owned_run(worker, run_id, TaskRunState::Running)?;
@@ -2170,6 +2344,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let task_id = run.task_id();
         let attempt = run.attempt_number();
         self.mark_decided(run_id);
+        self.note_failed_compaction(&task_id);
         let retry = self.replace_failed_run(&task_id, run_id, attempt);
         if retry.is_none() {
             self.record_finished(&task_id, now);
@@ -2205,6 +2380,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let Some(run_id) = self.current_run.get(task_id).cloned() else {
             return Ok(Cancellation::UnknownTask);
         };
+        // Compaction runs are internal: no client holds their ids.
+        if self.is_compaction(task_id) {
+            return Ok(Cancellation::UnknownTask);
+        }
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);
         let run = self
@@ -2332,6 +2511,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             }
             next
         };
+        if let Some(key) = self.compaction_key_of(task_id) {
+            self.compact_if_due(&key);
+        }
         LostRun {
             task_id: task_id.clone(),
             task_run_id: run_id,
@@ -2440,11 +2622,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Takes a task that is over out of every place it was waiting in.
     fn record_finished(&mut self, task_id: &TaskId, now: Instant) {
         self.release(task_id, now);
+        if let Some(key) = self.compaction_key_of(task_id) {
+            self.occupancy.end_compaction(&key, task_id);
+        }
         if let Some(key) = self.coalescing_key_of(task_id) {
             // Whatever it absorbed is no longer needed, so it can be forgotten
             // in its turn.
-            for absorbed in self.occupancy.finish(&key, task_id) {
-                self.release(&absorbed, now);
+            for item in self.occupancy.finish(&key, task_id) {
+                self.release_item(&item, now);
             }
         }
         self.update_pressure();
@@ -2455,8 +2640,24 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     fn release(&mut self, task_id: &TaskId, now: Instant) {
         let payload = self.payload_len(task_id);
         self.budget.give_back(payload);
+        self.forget_later(task_id, now);
+    }
+
+    /// `task_id` is over and holds no payload any more: the task is forgotten
+    /// `result_ttl` from now.
+    pub(super) fn forget_later(&mut self, task_id: &TaskId, now: Instant) {
         self.retention.record(task_id, now);
         self.unpublished.insert(task_id.clone());
+    }
+
+    /// An entry of a chain is no longer needed. An absorbed generation is
+    /// released; a folded payload stops counting against memory (the
+    /// generations it replaced were released when it replaced them).
+    fn release_item(&mut self, item: &ChainItem, now: Instant) {
+        match item {
+            ChainItem::Absorbed(task_id) => self.release(task_id, now),
+            ChainItem::Folded(folded) => self.budget.give_back(folded.payload.len() as u64),
+        }
     }
 
     /// The serialized bytes of the task's input, which is what memory use counts.
@@ -2474,7 +2675,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                     self.occupancy
                         .retained(&key)
                         .iter()
-                        .map(|task_id| self.payload_len(task_id))
+                        .map(|item| self.item_len(item))
                         .sum()
                 }
                 _ => 0,
@@ -2490,7 +2691,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             let Some(dropped) = self.occupancy.drop_oldest(task_id) else {
                 break;
             };
-            self.release(&dropped, now);
+            self.release_item(&dropped, now);
         }
     }
 
@@ -2498,7 +2699,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// limit.
     fn update_pressure(&mut self) {
         let event = self.budget.update_pressure();
+        let crossed_soft_limit = matches!(event, Some(Event::SlowDown { active: true }));
         self.announce(event);
+        if crossed_soft_limit {
+            self.compact_every_due_key();
+        }
     }
 
     /// Records for the caller the event the budget returned, if
@@ -2706,6 +2911,45 @@ fn submission_order(record: &TaskRecord) -> (Option<u64>, Option<TaskId>) {
     )
 }
 
+/// The chain `record` still carries, oldest entry first. An absorbed entry
+/// that names no generation is left out; a folded one whose digest is missing
+/// or unreadable gets the digest of its payload.
+fn chain_of(record: &TaskRecord) -> Vec<ChainItem> {
+    chain_items(&record.retained_chain)
+}
+
+fn chain_items(entries: &[ChainEntry]) -> Vec<ChainItem> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry.entry.as_ref()? {
+            chain_entry::Entry::Absorbed(absorbed) => {
+                absorbed.task_id.clone().map(|id| ChainItem::Absorbed(TaskId::from(id)))
+            }
+            chain_entry::Entry::Folded(folded) => Some(ChainItem::Folded(Folded {
+                generations: folded.generations.iter().cloned().map(TaskId::from).collect(),
+                digest: folded
+                    .input_digest
+                    .as_ref()
+                    .and_then(|digest| Digest::try_from(digest).ok())
+                    .unwrap_or_else(|| Digest::blake3(&folded.serialized_input)),
+                payload: folded.serialized_input.clone(),
+            })),
+        })
+        .collect()
+}
+
+/// The generations a compaction folded into the chain `record` carries.
+fn folded_ids(record: &TaskRecord) -> BTreeSet<TaskId> {
+    chain_of(record)
+        .iter()
+        .filter_map(|item| match item {
+            ChainItem::Folded(folded) => Some(folded.generations.iter().cloned()),
+            ChainItem::Absorbed(_) => None,
+        })
+        .flatten()
+        .collect()
+}
+
 /// The generations whose payloads `record` still carries.
 fn retained_ids(record: &TaskRecord) -> BTreeSet<TaskId> {
     record
@@ -2715,6 +2959,7 @@ fn retained_ids(record: &TaskRecord) -> BTreeSet<TaskId> {
             chain_entry::Entry::Absorbed(absorbed) => {
                 absorbed.task_id.clone().map(TaskId::from)
             }
+            chain_entry::Entry::Folded(_) => None,
         })
         .collect()
 }

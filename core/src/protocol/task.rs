@@ -63,6 +63,8 @@ impl TaskRunState {
                 | (TaskRunState::Queued, TaskRunState::Cancelled)
                 | (TaskRunState::Queued, TaskRunState::Expired)
                 | (TaskRunState::Queued, TaskRunState::Superseded)
+                | (TaskRunState::Queued, TaskRunState::Failed)
+                | (TaskRunState::Scheduled, TaskRunState::Failed)
                 | (TaskRunState::Claimed, TaskRunState::Running)
                 | (TaskRunState::Claimed, TaskRunState::Cancelled)
                 | (TaskRunState::Claimed, TaskRunState::Expired)

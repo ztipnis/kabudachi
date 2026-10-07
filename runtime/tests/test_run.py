@@ -497,3 +497,84 @@ def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
     # A kabudachi error and a RuntimeError, as the pure-Python class was.
     assert isinstance(refused, KabudachiError)
     assert isinstance(refused, RuntimeError)
+
+
+def test_a_long_chain_is_compacted_while_its_key_is_busy_and_folds_in_order():
+    """A key's running generation holds it while newer ones pile up past the
+    soft limit; a compaction folds the waiting payloads on a free worker
+    place before the newest generation starts, and the newest still sees
+    every payload folded in submission order."""
+    kabudachi.configure(memory_soft_limit=400, memory_hard_limit=100_000, concurrency=2)
+    holder_running = threading.Event()
+    compacted_while_held = threading.Event()
+
+    def fold_left(older: Greeting, newer: Greeting) -> Greeting:
+        if holder_running.is_set():
+            compacted_while_held.set()
+        return Greeting(text=f"({older.text}>{newer.text})")
+
+    @functools.partial(declare_coalescing, merge=fold_left)
+    async def refresh(request: Greeting) -> Greeting:
+        if request.text == "holder":
+            holder_running.set()
+            # Holds the key until a compaction has folded while it ran.
+            for _ in range(500):
+                if compacted_while_held.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            holder_running.clear()
+        return request
+
+    texts = [letter * 60 for letter in "abcdefgh"]
+
+    async def main():
+        held = refresh(Greeting(text="holder"))
+        while not holder_running.is_set():
+            await asyncio.sleep(0.01)
+        handles = [refresh(Greeting(text=text)) for text in texts]
+        await held
+        return await handles[-1]
+
+    newest = kabudachi.run(main)
+
+    expected = functools.reduce(fold_left, [Greeting(text=text) for text in texts])
+    assert newest.text == expected.text
+    assert compacted_while_held.is_set(), "a compaction folded payloads while the key was busy"
+
+
+def test_a_merge_that_fails_ends_its_compaction_and_fails_the_newest_generation_with_its_error():
+    """The compaction run is internal, so the failure of its merge reaches no
+    handle: it is reported to the leader, and the newest generation, which
+    folds the whole chain itself, fails with the same error."""
+    kabudachi.configure(memory_soft_limit=400, memory_hard_limit=100_000, concurrency=2)
+    holder_running = threading.Event()
+    merge_failed_while_held = threading.Event()
+
+    def broken_merge(older: Greeting, newer: Greeting) -> Greeting:
+        if holder_running.is_set():
+            merge_failed_while_held.set()
+        raise ValueError("these cannot be merged")
+
+    @functools.partial(declare_coalescing, merge=broken_merge)
+    async def refresh(request: Greeting) -> Greeting:
+        if request.text == "holder":
+            holder_running.set()
+            for _ in range(500):
+                if merge_failed_while_held.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            holder_running.clear()
+        return request
+
+    async def main():
+        held = refresh(Greeting(text="holder"))
+        while not holder_running.is_set():
+            await asyncio.sleep(0.01)
+        handles = [refresh(Greeting(text=letter * 60)) for letter in "abcdefgh"]
+        await held
+        with pytest.raises(ValueError, match="cannot be merged"):
+            await handles[-1]
+
+    kabudachi.run(main)
+
+    assert merge_failed_while_held.is_set(), "the compaction ran the merge while the key was busy"

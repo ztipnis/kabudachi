@@ -268,5 +268,6 @@ fn claim_reject_reason(rejection: ClaimRejection) -> ClaimRejectReason {
         ClaimRejection::Finished => ClaimRejectReason::ClaimRejectFinished,
         ClaimRejection::Superseded => ClaimRejectReason::ClaimRejectSuperseded,
         ClaimRejection::KeyBusy => ClaimRejectReason::ClaimRejectKeyBusy,
+        ClaimRejection::CannotRun => ClaimRejectReason::ClaimRejectCannotRun,
     }
 }

@@ -186,6 +186,11 @@ pub struct DriverConfig {
     pub retry_interval: Duration,
     /// How many voters each Task record is written to.
     pub replication_factor: ReplicationFactor,
+    /// Whether this worker runs compaction runs: folds the front of a
+    /// coalescing key's waiting chain when its leader hands it one. Set only
+    /// by a worker whose executor does; off by default, and the leader makes
+    /// no compaction run until some member says it does.
+    pub runs_compaction: bool,
 }
 
 impl Default for DriverConfig {
@@ -196,6 +201,7 @@ impl Default for DriverConfig {
             join_peer_timeout: DEFAULT_JOIN_PEER_TIMEOUT,
             retry_interval: DEFAULT_RETRY_INTERVAL,
             replication_factor: ReplicationFactor::DEFAULT,
+            runs_compaction: false,
         }
     }
 }
@@ -321,6 +327,7 @@ where
     I: IdGenerator,
 {
     let my_id = net.local_worker_id();
+    node.set_runs_compaction(config.runs_compaction);
     net.subscribe_to_shard(node.shard_id());
     let mut first = Some(first);
     let mut next_deadline = None;
@@ -450,6 +457,11 @@ where
             stepper.unsettled,
             outcomes,
         );
+        // A leader makes compaction runs only for members that said they run
+        // them: the scheduler is told who they are as the heartbeats say.
+        stepper
+            .scheduler
+            .set_compaction_runners(stepper.node.compaction_runners());
         respond_to_join_requests(stepper.node, net).await;
         respond_to_claim_requests(
             stepper.node,
@@ -1463,7 +1475,12 @@ fn respond_to_reconcile_requests<C: Clock>(node: &WorkerNode<C>, net: &Net) {
 fn respond_to_steal_requests<C: Clock>(net: &Net, clock: &C) {
     let now = WallTime::now(clock);
     for handle in net.poll_steal_requests() {
-        let task_ids = candidates_for_steal(&net.held_records(), now, handle.limit());
+        let task_ids = candidates_for_steal(
+            &net.held_records(),
+            now,
+            handle.limit(),
+            handle.runs_compaction(),
+        );
         net.respond_steal(handle, task_ids);
     }
 }
@@ -1487,6 +1504,7 @@ fn task_named<C: Clock, I: IdGenerator>(
         task_request::Request::Started(report) => of_run(&report.task_run_id),
         task_request::Request::Completed(report) => of_run(&report.task_run_id),
         task_request::Request::Failed(report) => of_run(&report.task_run_id),
+        task_request::Request::Compacted(report) => of_run(&report.task_run_id),
         task_request::Request::Place(_) => None,
     }
 }

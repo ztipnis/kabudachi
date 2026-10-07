@@ -418,3 +418,32 @@ fn a_follower_cut_off_as_a_new_leader_takes_over_aborts_before_that_leader_repla
         "a winner withdraws the abort deadline it held as a follower"
     );
 }
+
+// ---- Who runs compaction ----
+
+#[test]
+fn a_leader_knows_which_members_run_compaction_from_their_latest_heartbeats() {
+    let clock = FakeClock::new();
+    let mut won = leader_of(&clock, 3);
+    let [first, second] = [won.others[0].clone(), won.others[1].clone()];
+    assert!(won.node.compaction_runners().is_empty(), "nobody has said so");
+
+    let says = |from: &WorkerId, runs_compaction: bool| WorkerHeartbeat {
+        runs_compaction,
+        ..heartbeat(from, None)
+    };
+    let _ = receive(&mut won.node, &first, says(&first, true));
+    let _ = receive(&mut won.node, &second, says(&second, false));
+    assert_eq!(won.node.compaction_runners(), BTreeSet::from([first.clone()]));
+
+    won.node.set_runs_compaction(true);
+    assert_eq!(
+        won.node.compaction_runners(),
+        BTreeSet::from([first.clone(), worker("leader")]),
+        "the leader counts itself when it runs them"
+    );
+
+    let _ = receive(&mut won.node, &first, says(&first, false));
+    won.node.set_runs_compaction(false);
+    assert!(won.node.compaction_runners().is_empty(), "the latest heartbeat decides");
+}

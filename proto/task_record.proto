@@ -50,12 +50,22 @@ message PlacementHolders {
 message ChainEntry {
   oneof entry {
     AbsorbedGeneration absorbed = 1;
+    FoldedPayload folded = 2;
   }
 }
 
 // A superseded generation whose payload the newer one folds in.
 message AbsorbedGeneration {
   TaskId task_id = 1;
+  bytes serialized_input = 2;
+  Digest input_digest = 3;
+}
+
+// Several superseded generations' payloads, folded oldest first into one by a
+// compaction run.
+message FoldedPayload {
+  // The generations folded into it, oldest first.
+  repeated TaskId generations = 1;
   bytes serialized_input = 2;
   Digest input_digest = 3;
 }

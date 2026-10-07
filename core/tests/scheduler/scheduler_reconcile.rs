@@ -1053,3 +1053,70 @@ fn a_worker_is_believed_to_hold_the_runs_it_reported_until_a_newer_answer_leaves
 
     assert!(new.scheduler.active_runs_of(&worker("w1")).is_empty());
 }
+
+#[test]
+fn a_claimed_compaction_still_holds_its_key_after_a_rebuild_and_its_fold_is_accepted() {
+    let limits = Some(MemoryLimits { soft: 300, hard: 10_000 });
+    let generation = |payload: &[u8]| plain(payload).with_coalescing_key("k");
+    let runner = worker("runner");
+    let mut old = Fixture::leading();
+    old.scheduler.set_memory_limits(limits);
+    old.scheduler.set_compaction_runners(BTreeSet::from([runner.clone()]));
+    let holder = old.scheduler.submit(generation(b"h")).unwrap();
+    let held = old.scheduler.request_claim(&worker("w1"), &holder).unwrap();
+    old.scheduler.report_started(&worker("w1"), &held.task_run_id).unwrap();
+    let mut newest = holder;
+    for letter in b'a'..b'g' {
+        newest = old.scheduler.submit(generation(&[letter; 80])).unwrap();
+    }
+    let compaction = old
+        .scheduler
+        .claim_oldest(&runner, 10)
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.task.compacts.is_some())
+        .expect("a compaction was made");
+    let mut new = reconciling_after(&old);
+    new.scheduler.set_memory_limits(limits);
+    new.scheduler.set_compaction_runners(BTreeSet::from([runner.clone()]));
+
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&old),
+            reports: BTreeMap::from([
+                (
+                    runner.clone(),
+                    WorkerRuns {
+                        runs: vec![reported(&compaction, ReportedState::Claimed)],
+                        asked_at: None,
+                    },
+                ),
+                (
+                    worker("w1"),
+                    WorkerRuns {
+                        runs: vec![reported(&held, ReportedState::Running)],
+                        asked_at: None,
+                    },
+                ),
+            ]),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+    new.scheduler
+        .complete(&worker("w1"), &held.task_run_id, Digest::blake3(b"out"), Completion::Final)
+        .unwrap();
+
+    assert_eq!(
+        new.scheduler.request_claim(&worker("w2"), &newest),
+        Err(ClaimRejection::KeyBusy),
+        "the compaction a worker still holds keeps the newest generation back"
+    );
+    let folded = compaction.chain.concat();
+    let done = new
+        .scheduler
+        .complete_compaction(&runner, &compaction.task_run_id, folded)
+        .unwrap();
+    assert!(done.applied);
+    assert!(new.scheduler.request_claim(&worker("w2"), &newest).is_ok());
+}

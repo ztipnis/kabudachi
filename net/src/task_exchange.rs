@@ -19,7 +19,10 @@
 //! driver sends the answer only once the revisions it wrote are acknowledged
 //! by a quorum of the task's placement and the leader still leads;
 //! otherwise the asker is answered [`not_leader`] and keeps the run in its
-//! ledger for the next leader. Only the digest of a result travels.
+//! ledger for the next leader. Only the digest of a result travels, except
+//! for a compaction run, whose result is the folded payload itself
+//! ([`Net::complete_compaction`]): the leader's answer says whether it was
+//! applied.
 
 use std::str::FromStr;
 
@@ -27,9 +30,9 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelTask, PlaceRecords, PlacedKey, RecordPlacements, ReportCompleted, ReportFailed,
-    ReportStarted, StartAccepted, SubmitAccepted, TaskReject, TaskRejectReason, TaskRequest,
-    TaskResponse, task_request, task_response,
+    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, RecordPlacements, ReportCompacted, ReportCompleted,
+    ReportFailed, ReportStarted, StartAccepted, SubmitAccepted, TaskReject, TaskRejectReason,
+    TaskRequest, TaskResponse, task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
@@ -176,6 +179,32 @@ impl Net {
         Ok(response)
     }
 
+    /// Tells `leader` the compaction run `run` folded the entries it was
+    /// given into `folded`. The answer says whether the leader applied the
+    /// fold (`compaction`), or the run was refused. The run stays in this
+    /// worker's ledger until the leader has taken the fold, so that a leader
+    /// that has changed still finds it held. A fold larger than a message
+    /// cannot be sent: report the run failed instead.
+    pub async fn complete_compaction(
+        &self,
+        leader: WorkerId,
+        run: TaskRunId,
+        folded: Vec<u8>,
+    ) -> Result<TaskResponse, TaskFailure> {
+        let request = task_request::Request::Compacted(ReportCompacted {
+            task_run_id: Some(run.clone().into()),
+            folded_payload: folded,
+        });
+        let response = self.ask_task(leader, request).await?;
+        self.note_report(
+            &run,
+            &response,
+            |result| matches!(result, task_response::Result::Compaction(_)),
+            None,
+        );
+        Ok(response)
+    }
+
     /// Asks `leader` to cancel `task`.
     pub async fn cancel(
         &self,
@@ -311,6 +340,16 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
             scheduler
                 .complete(from, &run, digest, Completion::Final)
                 .map(|certification| task_response::Result::Certified(wire::certified(certification)))
+                .map_err(wire::report_reject)
+        }),
+        Request::Compacted(report) => run_id(report.task_run_id.as_ref()).and_then(|run| {
+            scheduler
+                .complete_compaction(from, &run, report.folded_payload.clone())
+                .map(|compacted| {
+                    task_response::Result::Compaction(CompactionApplied {
+                        applied: compacted.applied,
+                    })
+                })
                 .map_err(wire::report_reject)
         }),
         Request::Failed(report) => run_id(report.task_run_id.as_ref()).and_then(|run| {

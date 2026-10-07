@@ -3,6 +3,7 @@
 mod scheduler_backpressure;
 mod scheduler_cancel;
 mod scheduler_coalescing;
+mod scheduler_compaction;
 mod scheduler_continuation;
 mod scheduler_lifecycle;
 mod scheduler_loss;

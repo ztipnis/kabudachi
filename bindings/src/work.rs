@@ -24,6 +24,11 @@ pub struct PyClaim {
     /// Which attempt this is: 1 for the first, then one more per retry.
     #[pyo3(get)]
     attempt_number: u32,
+    /// Whether this is a compaction run: `chain` holds the payloads to fold,
+    /// oldest first, and `serialized_input` is empty. Its result is the folded
+    /// payload, reported with `complete_compaction`.
+    #[pyo3(get)]
+    compaction: bool,
     chain: Vec<Vec<u8>>,
 }
 
@@ -57,6 +62,7 @@ impl From<Claim> for PyClaim {
             serialized_input: claim.task.serialized_input,
             queue: claim.task.queue,
             attempt_number: claim.attempt_number,
+            compaction: claim.task.compacts.is_some(),
             chain: claim.chain,
         }
     }
@@ -144,6 +150,14 @@ impl From<Event> for PyEvent {
             Event::SlowDown { active } => PyEvent { active, ..nothing },
             Event::RecordFull { task_id } => PyEvent {
                 task_id: task_id.as_str().to_owned(),
+                ..nothing
+            },
+            Event::CoalescedPayloadTooLarge {
+                task_id,
+                task_run_id,
+            } => PyEvent {
+                task_id: task_id.as_str().to_owned(),
+                task_run_id: task_run_id.as_str().to_owned(),
                 ..nothing
             },
             Event::Superseded {

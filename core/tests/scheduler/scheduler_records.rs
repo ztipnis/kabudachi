@@ -11,11 +11,12 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
     Completion, Event, LeadershipGrant, LeaseEnd, MAX_SUBMISSION_BYTES, Submission, SubmitRejection,
+    Submitted,
 };
 use kabudachi_core::task_record::{
     HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion, VersionOrder,
 };
-use kabudachi_core::time::Instant;
+use kabudachi_core::time::{Instant, WallTime};
 use prost::Message;
 
 use crate::support::grant::unbounded_grant;
@@ -250,44 +251,58 @@ fn a_forward_wall_clock_jump_never_releases_a_delayed_submission_early() {
     assert_eq!(fixture.scheduler.catch_up().queued, 1);
 }
 
+/// Submits generations of the key `k` until the next would make its record
+/// pass the limit, or, with `room`, until the newest one's record is within
+/// `room` bytes of it, and returns the last one accepted. A chain whose
+/// payloads fit one claim can still outgrow a record, each entry carrying its
+/// generation's id twice and a digest: a large first payload and generations
+/// with the longest ids make that quick. Only the newest revision is kept, as
+/// each is the whole record.
+fn generations_until_the_record_is_full(
+    fixture: &mut Fixture,
+    retries: u32,
+    room: Option<usize>,
+) -> (TaskId, Option<SubmitRejection>) {
+    let large = MAX_SUBMISSION_BYTES as usize - 8 * 1024;
+    let mut newest = None;
+    for n in 0..400 {
+        let id = TaskId::new(format!("{n:0>256}"));
+        let input = if n == 0 { vec![1; large] } else { vec![2] };
+        let submitted = Submitted::received(
+            id,
+            WallTime::from_unix_millis(0),
+            plain(&input).with_coalescing_key("k").with_retries(retries),
+            &fixture.clock,
+        );
+        match fixture.scheduler.submit_minted(submitted) {
+            Ok(task) => {
+                let size = fixture.spy.newest_revision_of(&task).expect("it was published").encoded_len();
+                fixture.spy.take_revisions();
+                newest = Some(task);
+                if room.is_some_and(|room| size + room >= MAX_RECORD_BYTES as usize) {
+                    return (newest.expect("just set"), None);
+                }
+            }
+            Err(rejection) => return (newest.expect("the first generation fits"), Some(rejection)),
+        }
+    }
+    panic!("the record never filled");
+}
+
 #[test]
 fn a_submission_whose_record_would_pass_the_limit_is_refused_before_anything_is_recorded() {
     let mut fixture = Fixture::leading();
-    let half = (MAX_RECORD_BYTES / 2) as usize;
-    fixture.scheduler.submit(plain(&vec![1; half]).with_coalescing_key("k")).unwrap();
-    let before = fixture.spy.revisions().len();
 
-    let refused = fixture.scheduler.submit(plain(&vec![2; half]).with_coalescing_key("k"));
+    let (_, refused) = generations_until_the_record_is_full(&mut fixture, 0, None);
 
-    assert!(matches!(refused, Err(SubmitRejection::RecordTooLarge { .. })), "{refused:?}");
-    assert_eq!(fixture.spy.revisions().len(), before, "nothing changed, so nothing was published");
+    assert!(matches!(refused, Some(SubmitRejection::RecordTooLarge { .. })), "{refused:?}");
+    assert!(fixture.spy.revisions().is_empty(), "nothing changed, so nothing was published");
 }
 
 /// Submits a task whose record has room for only a few more runs, and
-/// returns it. The record is brought close to its limit through the
-/// coalescing chain, which carries the superseded generation's input: a first
-/// generation with a near-largest input, then a second one of the same key
-/// sized from the first's published record. The few runs that still fit then
-/// fill the rest.
+/// returns it: the newest generation of a chain that nearly filled its record.
 fn a_task_with_room_for_a_few_more_runs(fixture: &mut Fixture, retries: u32) -> TaskId {
-    let first = fixture
-        .scheduler
-        .submit(plain(&vec![0; MAX_SUBMISSION_BYTES as usize - 64]).with_coalescing_key("k"))
-        .unwrap();
-    let first_len = fixture.spy.revisions_of(&first).last().unwrap().encoded_len();
-    // Room left beside the first generation's record, less what the chain
-    // entry, the run and the record's reserve take, and a few runs' margin.
-    let mut input_len = (MAX_RECORD_BYTES as usize).saturating_sub(first_len + 4 * 1024);
-    loop {
-        let second = plain(&vec![0; input_len]).with_coalescing_key("k").with_retries(retries);
-        match fixture.scheduler.submit(second) {
-            Ok(task) => return task,
-            Err(SubmitRejection::RecordTooLarge { size, limit }) => {
-                input_len -= (size - limit) as usize + 512;
-            }
-            Err(other) => panic!("the second generation was refused: {other:?}"),
-        }
-    }
+    generations_until_the_record_is_full(fixture, retries, Some(4 * 1024)).0
 }
 
 #[test]

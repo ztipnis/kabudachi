@@ -226,6 +226,8 @@ where
     /// What this node's heartbeats say of the runs it holds (see
     /// [`Self::set_active_runs_digest`]); empty until set.
     active_runs_digest: Vec<u8>,
+    /// Whether this worker runs compaction, which its heartbeats say.
+    runs_compaction: bool,
     /// When a leader asked to drain stops waiting for its voters' routing
     /// crawls and leaves regardless (see [`Self::drain_once_free`]).
     drain_wait_until: Option<Instant>,
@@ -903,6 +905,7 @@ where
             crawled_at_admission: None,
             lost_while_reconciling: BTreeSet::new(),
             active_runs_digest: Vec::new(),
+            runs_compaction: false,
             drain_wait_until: None,
             rejoin: RejoinCheck::default(),
             outputs: Vec::new(),
@@ -1173,6 +1176,28 @@ where
     /// sends from now on carries (see `reconcile::active_runs_digest`).
     pub fn set_active_runs_digest(&mut self, digest: Digest) {
         self.active_runs_digest = digest.value().to_vec();
+    }
+
+    /// Whether this worker runs compaction, which every heartbeat it sends
+    /// from now on says.
+    pub fn set_runs_compaction(&mut self, runs: bool) {
+        self.runs_compaction = runs;
+    }
+
+    /// The members that said in their latest heartbeat that they run
+    /// compaction, this node itself if it does. Empty unless it holds office:
+    /// only the leader's own roster is read.
+    pub fn compaction_runners(&self) -> BTreeSet<WorkerId> {
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => {
+                let mut runners = office.compaction_runners();
+                if self.runs_compaction {
+                    runners.insert(self.my_id.clone());
+                }
+                runners
+            }
+            _ => BTreeSet::new(),
+        }
     }
 
     /// Whether this node has completed a routing crawl since it was admitted
@@ -1668,6 +1693,7 @@ where
             send_token: now.as_ticks(),
             routing_crawled: self.routing_crawled(),
             admission_generation: self.standing.admission().map(Into::into),
+            runs_compaction: self.runs_compaction,
         };
         self.send(
             leader.clone(),
@@ -1829,6 +1855,7 @@ where
                 heard,
                 heartbeat.routing_crawled,
                 heartbeat.admission_generation(),
+                heartbeat.runs_compaction,
                 &duties,
             );
         }

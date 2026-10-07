@@ -55,6 +55,7 @@ enum ClaimRejectReason {
   CLAIM_REJECT_SUPERSEDED = 6;
   CLAIM_REJECT_KEY_BUSY = 7;
   CLAIM_REJECT_NOT_MEMBER = 8;
+  CLAIM_REJECT_CANNOT_RUN = 9;
 }
 
 message ClaimReject {

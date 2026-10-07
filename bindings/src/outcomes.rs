@@ -22,6 +22,8 @@ pub enum PyEventKind {
     Cancelled,
     #[pyo3(name = "RECORD_FULL")]
     RecordFull,
+    #[pyo3(name = "COALESCED_PAYLOAD_TOO_LARGE")]
+    CoalescedPayloadTooLarge,
 }
 
 impl From<&Event> for PyEventKind {
@@ -32,6 +34,7 @@ impl From<&Event> for PyEventKind {
             Event::SlowDown { .. } => PyEventKind::SlowDown,
             Event::Cancelled { .. } => PyEventKind::Cancelled,
             Event::RecordFull { .. } => PyEventKind::RecordFull,
+            Event::CoalescedPayloadTooLarge { .. } => PyEventKind::CoalescedPayloadTooLarge,
         }
     }
 }

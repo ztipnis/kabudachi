@@ -9,6 +9,9 @@ import "ids.proto";
 message StealRequest {
   // The most task ids to return.
   uint32 limit = 1;
+  // Whether the asker runs compaction runs. A record of one is offered only
+  // to an asker that does.
+  bool runs_compaction = 2;
 }
 
 // Task ids, oldest submission first.

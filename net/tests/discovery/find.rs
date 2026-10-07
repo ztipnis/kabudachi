@@ -193,12 +193,12 @@ async fn a_worker_claims_its_own_records_nearest_first_and_then_steals_nearer_pe
                 for (task, holder) in [near, far] {
                     wait_until_held(held_by(&holder), vec![task]).await;
                 }
-                let own = nets[worker].discover(ids[leader].clone(), mine.len(), now()).await;
+                let own = nets[worker].discover(ids[leader].clone(), mine.len(), now(), false).await;
                 let before = steals_received(&nets).await;
-                let near = nets[worker].discover(ids[leader].clone(), 1, now()).await;
+                let near = nets[worker].discover(ids[leader].clone(), 1, now(), false).await;
                 let after = steals_received(&nets).await;
                 let asked: Vec<u64> = before.iter().zip(&after).map(|(before, after)| after - before).collect();
-                let far = nets[worker].discover(ids[leader].clone(), 100, now()).await;
+                let far = nets[worker].discover(ids[leader].clone(), 100, now(), false).await;
                 (own, near, far, asked)
             })
             .await;
@@ -277,7 +277,7 @@ async fn a_claim_the_workers_stale_record_suggested_is_refused_and_discovery_mov
                 client.write_records(vec![PlacedWrite::new(lagging, 1)]);
                 wait_until_held(nets[worker].clone(), vec![task]).await;
 
-                nets[worker].discover(ids[leader].clone(), 1, now()).await
+                nets[worker].discover(ids[leader].clone(), 1, now(), false).await
             })
             .await;
 
@@ -307,7 +307,7 @@ async fn a_worker_that_knows_no_peers_asks_the_leader_for_the_oldest_tasks() {
             .drive_until(async {
                 let first = submitted_through(&nets[submitter], &ids[leader], plain_with(b"first")).await;
                 let second = submitted_through(&nets[submitter], &ids[leader], plain_with(b"second")).await;
-                let found = bare.discover(ids[leader].clone(), 5, now()).await;
+                let found = bare.discover(ids[leader].clone(), 5, now(), false).await;
                 (vec![first, second], found)
             })
             .await;

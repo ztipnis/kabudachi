@@ -47,6 +47,14 @@ message ReportFailed {
   string failure_kind = 2;
 }
 
+// The fold of a compaction run: the payload its worker made by merging the
+// entries it was given, oldest first. The one report that carries a payload
+// back to the leader.
+message ReportCompacted {
+  TaskRunId task_run_id = 1;
+  bytes folded_payload = 2;
+}
+
 message CancelTask {
   TaskId task_id = 1;
 }
@@ -66,6 +74,7 @@ message TaskRequest {
     ReportFailed failed = 4;
     CancelTask cancel = 5;
     PlaceRecords place = 6;
+    ReportCompacted compacted = 7;
   }
 }
 
@@ -131,6 +140,13 @@ message CancelAnswer {
   bool was_running = 2;
 }
 
+message CompactionApplied {
+  // Whether the fold replaced the front of its key's chain: false when the
+  // chain no longer started with the entries the run was given, and the
+  // result was discarded.
+  bool applied = 1;
+}
+
 message PlacedKey {
   TaskId task_id = 1;
   repeated WorkerId holders = 2;
@@ -151,5 +167,6 @@ message TaskResponse {
     CancelAnswer cancelled = 5;
     TaskReject reject = 6;
     RecordPlacements placements = 7;
+    CompactionApplied compaction = 8;
   }
 }

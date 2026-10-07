@@ -67,6 +67,10 @@ impl MemoryBudget {
         self.in_use -= bytes;
     }
 
+    pub(super) fn over_soft_limit(&self) -> bool {
+        self.limits.is_some_and(|limits| self.in_use > limits.soft)
+    }
+
     pub(super) fn over_hard_limit(&self) -> bool {
         self.limits.is_some_and(|limits| self.in_use > limits.hard)
     }

@@ -58,20 +58,37 @@ impl StealRequestHandle {
             .unwrap_or(MAX_STEAL_IDS)
             .min(MAX_STEAL_IDS)
     }
+
+    /// Whether the asker runs compaction, so a compaction run may be offered.
+    pub fn runs_compaction(&self) -> bool {
+        self.0.request.runs_compaction
+    }
 }
 
 impl Net {
     /// Asks `peer` which tasks it holds records of that look claimable, at
     /// most `limit` of them, oldest submission first. `None` if no answer
     /// came within [`STEAL_TIMEOUT`]: the peer could not be reached or did not
-    /// answer, or this `Net` is the peer.
-    pub async fn steal(&self, peer: WorkerId, limit: usize) -> Option<Vec<TaskId>> {
+    /// answer, or this `Net` is the peer. A compaction run is offered only if
+    /// `runs_compaction` says this worker runs them.
+    pub async fn steal(
+        &self,
+        peer: WorkerId,
+        limit: usize,
+        runs_compaction: bool,
+    ) -> Option<Vec<TaskId>> {
         if peer == self.local_worker_id() {
             return None;
         }
         let to = PeerId::from_str(peer.as_str()).ok()?;
         let limit = u32::try_from(limit).unwrap_or(u32::MAX);
-        let asked = self.ask::<StealCodec>(to, StealRequest { limit });
+        let asked = self.ask::<StealCodec>(
+            to,
+            StealRequest {
+                limit,
+                runs_compaction,
+            },
+        );
         let response = tokio::time::timeout(STEAL_TIMEOUT, asked).await.ok()??;
         Some(response.task_ids.into_iter().map(TaskId::from).collect())
     }
@@ -96,9 +113,15 @@ impl Net {
 }
 
 /// The answer to a steal request: the tasks of `held` that look claimable at
-/// `now`, oldest submission first, at most `limit` and [`MAX_STEAL_IDS`].
-pub(crate) fn candidates_for_steal(held: &HeldRecords, now: WallTime, limit: usize) -> Vec<TaskId> {
-    let mut found = held.claimable(now);
+/// `now`, oldest submission first, at most `limit` and [`MAX_STEAL_IDS`]. A
+/// compaction run is among them only when the asker `runs_compaction`.
+pub(crate) fn candidates_for_steal(
+    held: &HeldRecords,
+    now: WallTime,
+    limit: usize,
+    runs_compaction: bool,
+) -> Vec<TaskId> {
+    let mut found = held.claimable(now, runs_compaction);
     found.sort();
     found
         .into_iter()

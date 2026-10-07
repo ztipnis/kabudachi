@@ -1,6 +1,7 @@
 //! Multi-node scenarios driven through the simulated network.
 
 mod scenario_catastrophic_authority;
+mod scenario_compaction;
 mod scenario_election;
 mod scenario_grant_overlap;
 mod scenario_handoff;

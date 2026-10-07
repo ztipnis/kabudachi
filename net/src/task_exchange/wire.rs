@@ -81,6 +81,7 @@ pub(crate) fn submit_reject(rejection: SubmitRejection) -> TaskRejectReason {
         SubmitRejection::NotLeader => TaskRejectReason::TaskRejectNotLeader,
         SubmitRejection::RecordTooLarge { .. } => TaskRejectReason::TaskRejectRecordTooLarge,
         SubmitRejection::KeyNotReady => TaskRejectReason::TaskRejectNotReady,
+        SubmitRejection::KeyBackpressure { .. } => TaskRejectReason::TaskRejectBackpressure,
     }
 }
 

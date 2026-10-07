@@ -16,6 +16,7 @@ from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration
 from kabudachi.errors import (
     CertificationError,
+    CoalescedPayloadTooLargeError,
     RunStoppedError,
     SerializationError,
     TaskCancelledError,
@@ -651,6 +652,42 @@ def test_a_task_the_runtime_says_has_a_full_record_fails_its_handle_with_task_re
             await asyncio.wait_for(handle, WAIT)
 
     run(with_events(world, body))
+
+
+def test_a_task_the_runtime_says_folded_too_large_fails_its_handle_with_coalesced_payload_too_large_error():
+    world = World(echo)
+
+    async def body():
+        handle = world.call("echo", Greeting(text="folded"))
+        world.runtime.inject_event(EventKind.COALESCED_PAYLOAD_TOO_LARGE, task_id=handle.task_id)
+        with pytest.raises(CoalescedPayloadTooLargeError):
+            await asyncio.wait_for(handle, WAIT)
+
+    run(with_events(world, body))
+
+
+def test_a_compaction_the_leader_refuses_to_take_is_not_reported_as_a_failed_merge():
+    from types import SimpleNamespace
+
+    world = World(echo)
+    reported = []
+    world.runtime.report_failure = lambda run, kind: reported.append((run, kind))
+
+    def refuse(run, folded):
+        raise RuntimeError("the leader refused the fold")
+
+    world.runtime.complete_compaction = refuse
+    serializer = world.serializers.get(world.tasks["echo"].definition.serializer)
+    payload = serializer.encode(Greeting(text="a"), Greeting)
+    claim = SimpleNamespace(
+        definition_id=world.tasks["echo"].definition.name,
+        task_run_id="run-1",
+        chain=[payload, payload],
+    )
+
+    run(world.session._compact(claim))
+
+    assert reported == [], "the merge was fine; only the report was refused"
 
 
 def test_an_event_for_a_task_this_session_does_not_have_is_ignored():

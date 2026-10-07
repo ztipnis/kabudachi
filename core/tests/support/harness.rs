@@ -63,7 +63,7 @@ use kabudachi_core::reconcile::{
     ReconcileRound, ReconcileTerm, Republish, ReportPage, ReportedRun, ReportedState, wire,
 };
 use kabudachi_core::scheduler::{
-    Certification, Claim, Completion, Scheduler, Submission,
+    Certification, Claim, Compacted, Completion, Scheduler, Submission,
 };
 use kabudachi_core::task_record::{
     EffectGate, PlacedWrite, Repair, Settled, Settlement, Waits, Write, WriteLedger, WriteOrder,
@@ -121,6 +121,7 @@ pub enum Answer {
     Claimed(Claim),
     Started,
     Certified(Certification),
+    Compacted(Compacted),
     /// The rejection's `Display`, for a call the scheduler refused outright.
     Refused(String),
     /// A write was refused or the lease ended first.
@@ -853,7 +854,7 @@ impl Cluster {
                     held.state = ReportedState::Running;
                 }
             }
-            Answer::Certified(_) => {
+            Answer::Certified(_) | Answer::Compacted(_) => {
                 if let Some(run) = caller.run {
                     ledger.remove(&run);
                 }
@@ -973,6 +974,25 @@ impl Cluster {
             .complete(claimant, run, digest, Completion::Final)
         {
             Ok(certification) => Answer::Certified(certification),
+            Err(rejection) => Answer::Refused(rejection.to_string()),
+        };
+        let ticket = self.hold_call_on(at, &task, answer);
+        self.note_caller(ticket, claimant, Some(run.clone()));
+        ticket
+    }
+
+    /// `claimant` reports that it folded the prefix `run` was given into
+    /// `folded`, and the answer is held as `claim`'s is.
+    pub fn complete_compaction(
+        &mut self,
+        at: &WorkerId,
+        claimant: &WorkerId,
+        run: &TaskRunId,
+        folded: Vec<u8>,
+    ) -> Ticket {
+        let task = self.task_of(at, run);
+        let answer = match self.scheduler_mut(at).complete_compaction(claimant, run, folded) {
+            Ok(compacted) => Answer::Compacted(compacted),
             Err(rejection) => Answer::Refused(rejection.to_string()),
         };
         let ticket = self.hold_call_on(at, &task, answer);

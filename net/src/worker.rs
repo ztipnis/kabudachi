@@ -289,6 +289,8 @@ impl Worker {
                 join_peer_timeout: config.join_peer_timeout,
                 retry_interval: config.retry_interval,
                 replication_factor: config.replication_factor,
+                // This entry point runs no executor, so it folds no chain.
+                runs_compaction: false,
             },
             observe,
         )

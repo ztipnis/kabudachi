@@ -34,6 +34,10 @@ message WorkerHeartbeat {
   // so a delayed heartbeat from before a re-admission does not count.
   // Absent while it holds none.
   optional Generation admission_generation = 12;
+  // Whether the sender runs compaction runs: folds the front of a coalescing
+  // key's waiting chain when its leader hands it one. A leader makes
+  // compaction runs only once some member says so.
+  bool runs_compaction = 13;
 }
 
 // Names one leader ack a heartbeat confirms receiving.
