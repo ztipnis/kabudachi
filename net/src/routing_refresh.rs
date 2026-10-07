@@ -66,8 +66,11 @@ pub(crate) struct Refresh {
 /// quarter of a suspicion timeout, and, failing that, every
 /// [`DEFAULT_ROUTING_REFRESH_SUSPICIONS`] suspicion timeouts.
 ///
-/// That leaves a race open: a leader that exits before the settled crawl
-/// completes strands workers that have no other route to one another.
+/// A crawl that completes is reported to the node as
+/// `Input::RoutingCrawled`. A draining leader waits for its voters'
+/// completed crawls before it leaves, and a node left stranded searches
+/// again, which closes the race of a leader exiting before the settled crawl
+/// completes.
 ///
 /// Waiting for the view to settle bounds the cost. A crawl's first run
 /// connects the node to every peer it finds, a burst of connection

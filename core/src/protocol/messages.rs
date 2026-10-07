@@ -246,7 +246,7 @@ macro_rules! configuration_accessors {
 configuration_accessors!(WorkerHeartbeatConfigurations for Checked<WorkerHeartbeat>, of WorkerHeartbeat {
     configuration: [],
     generation: [],
-    optional_generation: [configuration_generation],
+    optional_generation: [configuration_generation, crawl_admission],
 });
 configuration_accessors!(LeaderHeartbeatAckConfigurations for Checked<LeaderHeartbeatAck>, of LeaderHeartbeatAck {
     configuration: [configuration],

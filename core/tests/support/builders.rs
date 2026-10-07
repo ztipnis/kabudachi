@@ -154,6 +154,8 @@ pub fn heartbeat(sender: &WorkerId, newest_accepted_ack: Option<AckEcho>) -> Wor
         newest_accepted_ack,
         configuration_generation: None,
         send_token: 0,
+        routing_crawled: false,
+        crawl_admission: None,
     }
 }
 

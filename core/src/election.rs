@@ -192,6 +192,12 @@ where
     lease: Lease,
     /// A drain was asked for in a state that cannot drain yet.
     drain_requested: bool,
+    /// The admission generation this node held when its last routing crawl
+    /// completed.
+    crawled_at_admission: Option<Generation>,
+    /// When a leader asked to drain stops waiting for its voters' routing
+    /// crawls and leaves regardless (see [`Self::drain_once_free`]).
+    drain_wait_until: Option<Instant>,
     /// What a node bootstrapping again holds while it checks a JOIN pointer
     /// against the authority.
     rejoin: RejoinCheck,
@@ -293,9 +299,21 @@ pub struct ElectionTimings {
     /// replay the work of a worker still running it. Usually
     /// [`Self::DEFAULT_RECONNECT_TIMEOUT`].
     pub reconnect_timeout: Duration,
+    /// The longest a leader asked to drain keeps leading while it waits for
+    /// every other voter to report a routing crawl since its admission (see
+    /// `WorkerHeartbeat::routing_crawled`). Leaving earlier can strand
+    /// workers that know no one but this leader; past this it leaves anyway,
+    /// so a voter that never reports cannot hold a shutdown up for ever.
+    /// Usually [`Self::DEFAULT_DRAIN_WAIT_SUSPICIONS`] suspicion timeouts.
+    pub drain_wait_limit: Duration,
 }
 
 impl ElectionTimings {
+    /// The default `drain_wait_limit`, in suspicion timeouts: as many as
+    /// separate a worker's unprompted routing crawls, so every voter crawls
+    /// at least once within it.
+    pub const DEFAULT_DRAIN_WAIT_SUSPICIONS: u64 = 10;
+
     /// The default `roll_call_deadline`, set from the census latency
     /// measured during the networked-election work: over 30 leader losses in
     /// a fully connected shard of five, all in one process on one loopback
@@ -333,6 +351,11 @@ impl ElectionTimings {
             roll_call_deadline: Self::DEFAULT_ROLL_CALL_DEADLINE,
             clock_drift_divisor: Self::DEFAULT_CLOCK_DRIFT_DIVISOR,
             reconnect_timeout: Self::DEFAULT_RECONNECT_TIMEOUT,
+            drain_wait_limit: Duration::from_ticks(
+                suspect_timeout
+                    .as_ticks()
+                    .saturating_mul(Self::DEFAULT_DRAIN_WAIT_SUSPICIONS),
+            ),
         }
     }
 
@@ -354,6 +377,13 @@ impl ElectionTimings {
     /// [`Self::reconnect_timeout`]).
     pub fn with_reconnect_timeout(mut self, reconnect_timeout: Duration) -> Self {
         self.reconnect_timeout = reconnect_timeout;
+        self
+    }
+
+    /// Replaces the default `drain_wait_limit` (see
+    /// [`Self::drain_wait_limit`]).
+    pub fn with_drain_wait_limit(mut self, drain_wait_limit: Duration) -> Self {
+        self.drain_wait_limit = drain_wait_limit;
         self
     }
 
@@ -410,11 +440,16 @@ pub enum Input {
     Authority(AuthorityReply),
     /// Leave the shard gracefully: send `SelfRemove` to the leader this node follows, if any, or as
     /// the leader announce the configuration without itself on a final ack
-    /// to every connected peer, and end `Stopped`. From `Active` or `Leader`
-    /// this happens at once; from `Draining` or `Stopped` the request does
+    /// to every connected peer, and end `Stopped`. From `Active` this happens
+    /// at once. A `Leader` keeps leading until every other voter has reported
+    /// a routing crawl since its admission, or `drain_wait_limit` has passed
+    /// (see [`ElectionTimings::drain_wait_limit`]), and then leaves; a leader
+    /// with no other voter leaves at once. From `Draining` or `Stopped` the request does
     /// nothing; from any other state, `Fenced` among them, the node keeps it and
     /// drains as soon as it reaches `Active` or `Leader`, in the same step. A
-    /// driver asks once.
+    /// leader that loses office while it waits keeps the request, and the
+    /// drain wait, its limit included, starts over when it regains
+    /// leadership. A driver asks once.
     ///
     /// A drain kept in a state the node never leaves for `Active` or
     /// `Leader` waits for good: a node whose peers never return, which keeps
@@ -466,6 +501,11 @@ pub enum Input {
     /// holds no epoch answers nothing here, and a node validating a pointer
     /// waits.
     AuthorityEpochRead { token: ReplyToken, held: RecoveryEpoch },
+    /// The node's driver completed a routing crawl: it asked the peers it
+    /// knows for the peers closest to it and connected to those it found.
+    /// The node's heartbeats then say so until its admission generation
+    /// next changes (see [`WorkerNode::routing_crawled`]).
+    RoutingCrawled,
 }
 
 /// Something a [`WorkerNode`] asks its driver to do.
@@ -782,6 +822,8 @@ where
             connected: BTreeSet::new(),
             lease: Lease::new(now),
             drain_requested: false,
+            crawled_at_admission: None,
+            drain_wait_until: None,
             rejoin: RejoinCheck::default(),
             outputs: Vec::new(),
         }
@@ -880,6 +922,12 @@ where
     /// `None` for a joiner that has accepted neither yet.
     pub fn configuration(&self) -> Option<&Configuration> {
         self.led_or_followed_configuration()
+    }
+
+    /// Whether this node has completed a routing crawl since it was admitted
+    /// at the admission generation it holds now. Its heartbeats carry it.
+    pub fn routing_crawled(&self) -> bool {
+        self.admission().is_some() && self.crawled_at_admission == self.admission()
     }
 
     /// The generation at which this node became a voter; `None` for a
@@ -1007,6 +1055,7 @@ where
             Input::AuthorityEpochAsked(token) => self.note_epoch_read_asked(token),
             Input::AuthorityEpochRead { token, held } => self.on_epoch_read(token, held),
             Input::Drain => self.request_drain(),
+            Input::RoutingCrawled => self.crawled_at_admission = self.admission(),
         }
         self.finish_step()
     }
@@ -1085,13 +1134,16 @@ where
             WorkerState::RollCall => earliest(next_heartbeat, self.round.next_deadline()),
             WorkerState::Candidate => self.round.next_deadline(),
             WorkerState::Leader => earliest(
-                self.office.as_ref().and_then(|office| {
-                    self.lease
-                        .no_quorum_at(&self.my_id, office.roster(), &self.timings)
-                }),
-                self.office
-                    .as_ref()
-                    .and_then(|office| office.next_lost_at(self.lost_after())),
+                earliest(
+                    self.office.as_ref().and_then(|office| {
+                        self.lease
+                            .no_quorum_at(&self.my_id, office.roster(), &self.timings)
+                    }),
+                    self.office
+                        .as_ref()
+                        .and_then(|office| office.next_lost_at(self.lost_after())),
+                ),
+                self.drain_wait_until,
             ),
             _ => None,
         }
@@ -1114,6 +1166,11 @@ where
         );
         // No edge leads from `Leader` back to itself.
         if self.state == WorkerState::Leader {
+            // Losing office mid-wait keeps the request: the node drains
+            // when it next reaches `Active` or `Leader`.
+            if self.drain_wait_until.take().is_some() {
+                self.drain_requested = true;
+            }
             self.lease.withdraw_grant(self.clock.now());
             self.outputs.push(Output::Grant(None));
             self.leave_office();
@@ -1130,7 +1187,7 @@ where
 
         if self.drain_requested && matches!(next, WorkerState::Active | WorkerState::Leader) {
             self.drain_requested = false;
-            self.drain();
+            self.request_drain();
         }
     }
 
@@ -1333,6 +1390,11 @@ where
                 .configuration()
                 .map(|configuration| configuration.generation().into()),
             send_token: now.as_ticks(),
+            routing_crawled: self.routing_crawled(),
+            crawl_admission: self
+                .routing_crawled()
+                .then(|| self.admission().map(Into::into))
+                .flatten(),
         };
         self.send(
             leader.clone(),
@@ -1398,7 +1460,12 @@ where
                 let now = self.clock.now();
                 self.decide(|round, view| round.on_deadline(view, now));
             }
-            WorkerState::Leader => self.report_lost_workers(),
+            WorkerState::Leader => {
+                self.drain_once_free();
+                if self.state == WorkerState::Leader {
+                    self.report_lost_workers();
+                }
+            }
             _ => {}
         }
     }
@@ -1482,7 +1549,15 @@ where
                 timings: &self.timings,
                 now,
             };
-            office.take_heartbeat(from.clone(), heard, &duties);
+            let crawl_admission = heartbeat
+                .routing_crawled
+                .then(|| heartbeat.crawl_admission())
+                .flatten();
+            office.take_heartbeat(from.clone(), heard, crawl_admission, &duties);
+        }
+        self.drain_once_free();
+        if self.state != WorkerState::Leader {
+            return;
         }
         // Only a leader that holds a grant vouches for when it heard the
         // sender: no rival can win until that grant ends (see
@@ -1860,9 +1935,31 @@ where
     /// that can never drain again, ignores it.
     fn request_drain(&mut self) {
         match self.state {
-            WorkerState::Active | WorkerState::Leader => self.drain(),
-            WorkerState::Draining | WorkerState::Stopped => {}
+            WorkerState::Active => self.drain(),
+            WorkerState::Leader if self.drain_wait_until.is_none() => {
+                self.drain_wait_until = Some(self.clock.now() + self.timings.drain_wait_limit);
+                self.drain_once_free();
+            }
+            WorkerState::Leader | WorkerState::Draining | WorkerState::Stopped => {}
             _ => self.drain_requested = true,
+        }
+    }
+
+    /// A leader asked to drain leaves once every other voter has reported a
+    /// routing crawl since its admission, so no worker is left knowing only
+    /// this leader, or once its drain wait has run out. Until then it keeps
+    /// leading.
+    fn drain_once_free(&mut self) {
+        let Some(until) = self.drain_wait_until else {
+            return;
+        };
+        let free = self
+            .office
+            .as_mut()
+            .is_some_and(|office| office.remaining_voters_have_crawled(&self.my_id));
+        if free || self.clock.now() >= until {
+            self.drain_wait_until = None;
+            self.drain();
         }
     }
 
@@ -1971,6 +2068,7 @@ where
         if let Some(office) = self.office.as_mut() {
             office.take_removal(departing.clone());
         }
+        self.drain_once_free();
     }
 
     /// Whether this node's state takes part in elections: only `Active`,

@@ -367,6 +367,14 @@ impl Configuration {
         self.base
     }
 
+    /// How many voters a committed configuration has; `None` while joint.
+    pub fn voter_count(&self) -> Option<usize> {
+        match self.electorate {
+            Electorate::Single { voter_count } => Some(voter_count),
+            Electorate::Joint { .. } => None,
+        }
+    }
+
     /// Whether this is a joint configuration, still moving from one
     /// configuration to another.
     pub fn is_joint(&self) -> bool {

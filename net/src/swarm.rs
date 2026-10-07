@@ -43,7 +43,8 @@
 //! directly. That self-triggered crawl runs when a joiner first connects,
 //! before its leader has learned of the workers joining alongside it, so
 //! `crate::driver::run_driver` also asks for one once its node's view of
-//! the shard settles, and periodically (`Net::refresh_peer_routing`).
+//! the shard settles, and periodically (`Net::refresh_peer_routing`). A
+//! completed crawl is reported to the node as `Input::RoutingCrawled`.
 //!
 //! `libp2p-swarm`'s own dial-address aggregation
 //! (`NetworkBehaviour::handle_pending_outbound_connection`) is what makes a
@@ -121,15 +122,19 @@ const IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
+    /// The peers this node refuses to hold a connection to, either way (see
+    /// `crate::messenger::Net::block_peer`). First, so a refused connection
+    /// is denied before any other behaviour holds it. With it last, closing a
+    /// blocked peer's connection could make `request_response` panic or trip
+    /// an assertion, because it saw the connection close before it was told
+    /// it was established; denying first avoids that.
+    pub blocked: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
     pub identify: identify::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub kad: kad::Behaviour<kad::store::MemoryStore>,
     pub request_response: request_response::Behaviour<ElectionCodec>,
     pub join: request_response::Behaviour<JoinCodec>,
     pub claim: request_response::Behaviour<ClaimCodec>,
-    /// The peers this node refuses to hold a connection to, either way (see
-    /// `crate::messenger::Net::block_peer`).
-    pub blocked: allow_block_list::Behaviour<allow_block_list::BlockedPeers>,
 }
 
 /// libp2p's TCP transport, except that every dial it makes leaves from a

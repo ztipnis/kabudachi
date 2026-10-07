@@ -6,14 +6,16 @@
 
 use crate::support::builders::{
     ack_message, committed_from_g0, configuration_of, g0, heartbeat, heartbeat_message, leader_ack,
-    roll_call, roll_call_message, self_remove, self_remove_message, vote_request,
-    vote_request_message, worker,
+    past_any_suspicion, roll_call, roll_call_message, roll_call_reply, self_remove,
+    self_remove_message, vote_grant, vote_grant_message, vote_request, vote_request_message,
+    worker,
 };
 use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, commit_founding, connect, deliver, elect, sent, sent_to, state_changes, voter_node,
+    TestNode, close_roll_call, commit_founding, connect, deliver, elect, published_roll_calls, sent,
+    sent_to, state_changes, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Joint, Single};
 use kabudachi_core::election::{Input, Output};
@@ -123,6 +125,41 @@ fn confirming_heartbeat(
     beat
 }
 
+/// A follower's heartbeat confirming its leader's latest ack and reporting a
+/// routing crawl since its admission.
+fn crawled(clock: &FakeClock, leader: &mut TestNode, sender: &WorkerId) -> Vec<Output> {
+    let founding = leader
+        .configuration()
+        .map(Configuration::generation)
+        .expect("a leader holds a configuration");
+    crawled_at(clock, leader, sender, founding)
+}
+
+/// `crawled`, for a crawl completed while `sender` held the admission
+/// `admission`.
+fn crawled_at(
+    clock: &FakeClock,
+    leader: &mut TestNode,
+    sender: &WorkerId,
+    admission: Generation,
+) -> Vec<Output> {
+    let held = leader.configuration().map(Configuration::generation);
+    let mut beat = confirming_heartbeat(clock, leader, sender, held);
+    beat.routing_crawled = true;
+    beat.crawl_admission = Some(admission.into());
+    deliver(leader, sender, heartbeat_message(beat))
+}
+
+/// `leader_of_three`, asked to drain once both followers have reported a
+/// routing crawl.
+fn crawled_leader_of_three(clock: &FakeClock) -> TestNode {
+    let mut leader = leader_of_three(clock);
+    for follower in [worker("p1"), worker("p2")] {
+        let _ = crawled(clock, &mut leader, &follower);
+    }
+    leader
+}
+
 // ---- Draining ----
 
 /// A follower tells only its leader that it leaves, and the message carries
@@ -204,7 +241,7 @@ fn a_node_that_knows_no_leader_drains_without_telling_anyone() {
 #[test]
 fn a_draining_leader_announces_the_configuration_without_itself_on_final_acks() {
     let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
+    let mut leader = crawled_leader_of_three(&clock);
 
     let outputs = leader.step(Input::Drain).outputs;
 
@@ -219,6 +256,193 @@ fn a_draining_leader_announces_the_configuration_without_itself_on_final_acks() 
         );
     }
     assert!(self_removes(&outputs).is_empty());
+}
+
+// A heartbeat delayed from before a voter's re-admission can still say it
+// has crawled: only a crawl at the admission the leader counts the voter
+// by frees the leader to leave.
+#[test]
+fn a_draining_leader_ignores_a_crawl_report_from_an_earlier_admission() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let _ = leader.step(Input::Drain);
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+
+    let stale = Generation::new(0, 0, 1);
+    let _ = crawled_at(&clock, &mut leader, &worker("p2"), stale);
+    assert_eq!(leader.state(), WorkerState::Leader, "p2's crawl is stale");
+
+    let _ = crawled(&clock, &mut leader, &worker("p2"));
+    assert_eq!(leader.state(), WorkerState::Stopped);
+}
+
+// A crawl reported while the founding configuration was still joint counted
+// at the admission the roster held then; the commit re-admits every voter,
+// so that crawl does not free the leader to leave.
+#[test]
+fn a_draining_leader_ignores_a_crawl_counted_before_the_commit_re_admitted_everyone() {
+    let clock = FakeClock::new();
+    let mut leader = voter_node(&clock, &worker("w1"), 3, SUSPECT);
+    let peers = [worker("p1"), worker("p2")];
+    connect(&mut leader, &peers);
+    elect(&mut leader, &clock, SUSPECT, &peers);
+    // p1's report arrives with the confirmation that commits the founding.
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+    assert!(
+        leader.configuration().is_some_and(|c| !c.is_joint()),
+        "setup invariant: the commit re-admitted p1"
+    );
+    let _ = leader.step(Input::Drain);
+
+    let _ = crawled(&clock, &mut leader, &worker("p2"));
+    assert_eq!(
+        leader.state(),
+        WorkerState::Leader,
+        "p1's crawl was made at its earlier admission"
+    );
+
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+    assert_eq!(leader.state(), WorkerState::Stopped);
+}
+
+// Leaving before every other voter has crawled could strand workers that
+// know only this leader: it leads on until the last one reports.
+#[test]
+fn a_draining_leader_leads_on_until_every_other_voter_reports_a_routing_crawl() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+
+    let asked = leader.step(Input::Drain).outputs;
+    assert_eq!(leader.state(), WorkerState::Leader, "{asked:?}");
+
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+    assert_eq!(leader.state(), WorkerState::Leader, "p2 has not crawled");
+
+    let outputs = crawled(&clock, &mut leader, &worker("p2"));
+    assert_eq!(leader.state(), WorkerState::Stopped);
+    assert_eq!(
+        ack_to(&outputs, &worker("p1")).configuration(),
+        two_voters_at_the_next_generation()
+    );
+}
+
+#[test]
+fn a_draining_leader_leaves_at_its_drain_wait_limit_without_every_crawl() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let limit = leader.timings().drain_wait_limit;
+    let interval = leader.timings().heartbeat_interval;
+    let asked_at = clock.now();
+    let _ = leader.step(Input::Drain);
+
+    // Its followers keep confirming, so it keeps its lease, but report no crawl.
+    while clock.now() + interval < asked_at + limit {
+        clock.advance(interval);
+        for follower in [worker("p1"), worker("p2")] {
+            let held = leader.configuration().map(Configuration::generation);
+            let beat = confirming_heartbeat(&clock, &leader, &follower, held);
+            let _ = deliver(&mut leader, &follower, heartbeat_message(beat));
+        }
+        let _ = leader.step(Input::Tick);
+        assert_eq!(leader.state(), WorkerState::Leader);
+    }
+    clock.advance((asked_at + limit) - clock.now());
+    let _ = leader.step(Input::Tick);
+
+    assert_eq!(leader.state(), WorkerState::Stopped);
+}
+
+/// A leader asked to drain that loses office before it may leave has not
+/// withdrawn its request: once it follows the leader that deposed it, it
+/// tells that leader it leaves, and it stops.
+#[test]
+fn a_drain_request_kept_across_lost_office_is_honoured_under_the_new_leader() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let new_leader = worker("leader-2");
+    let asked = leader.step(Input::Drain).outputs;
+    assert_eq!(leader.state(), WorkerState::Leader, "{asked:?}");
+
+    // No crawl was reported, so it still leads when a later term's leader acks it.
+    let newer = committed_from_g0(2, 2, 3);
+    let outputs = deliver(
+        &mut leader,
+        &new_leader,
+        ack_message(leader_ack(&new_leader, 2, &newer, Some(newer.generation()))),
+    );
+
+    assert_eq!(leader.state(), WorkerState::Stopped);
+    assert_eq!(
+        state_changes(&outputs),
+        vec![
+            WorkerState::Active,
+            WorkerState::Draining,
+            WorkerState::Stopped
+        ]
+    );
+    let removes = self_removes(&outputs);
+    assert_eq!(removes.len(), 1, "{removes:?}");
+    assert_eq!(removes[0].0, new_leader);
+}
+
+/// A leader asked to drain that loses its lease keeps the request, and when
+/// it wins office again it waits again: a crawl reported to the lost office
+/// frees nothing, and it leaves only on the crawls of the new one.
+#[test]
+fn a_leader_that_regains_office_after_a_kept_drain_request_waits_again() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let peers = [worker("p1"), worker("p2")];
+    let _ = leader.step(Input::Drain);
+    let _ = crawled(&clock, &mut leader, &peers[0]);
+    assert_eq!(leader.state(), WorkerState::Leader, "p2 has not crawled");
+
+    // The lease runs out with no confirmation: office is lost, the request kept.
+    let lease_end = leader.step(Input::Tick).next_deadline.expect("a lease end");
+    clock.advance(lease_end - clock.now());
+    let _ = leader.step(Input::Tick);
+    assert_eq!(leader.state(), WorkerState::NoQuorum, "setup invariant");
+
+    // Its next roll call wins it a new term.
+    clock.advance(past_any_suspicion(SUSPECT));
+    let call = published_roll_calls(&leader.step(Input::Tick).outputs).remove(0);
+    let me = call.initiator_id();
+    let admission = leader.admission();
+    for peer in &peers {
+        let _ = deliver(
+            &mut leader,
+            peer,
+            roll_call_reply(&me, call.term, peer, admission),
+        );
+    }
+    let _ = close_roll_call(&mut leader, &clock, SUSPECT);
+    assert_eq!(leader.state(), WorkerState::Candidate, "setup invariant");
+    for peer in &peers {
+        if leader.state() != WorkerState::Candidate {
+            break;
+        }
+        let _ = deliver(
+            &mut leader,
+            peer,
+            vote_grant_message(vote_grant(me.clone(), peer.clone(), call.term)),
+        );
+    }
+    assert_eq!(
+        leader.state(),
+        WorkerState::Leader,
+        "it leads again and waits again, though p1 crawled under the lost office"
+    );
+    // p2 alone commits the founding, so p1 sends the new office nothing.
+    commit_founding(&mut leader, &clock, &peers[1..]);
+
+    let _ = crawled(&clock, &mut leader, &peers[1]);
+    assert_eq!(
+        leader.state(),
+        WorkerState::Leader,
+        "p1's crawl was reported to the lost office"
+    );
+    let outputs = crawled(&clock, &mut leader, &peers[0]);
+    assert_eq!(leader.state(), WorkerState::Stopped, "{outputs:?}");
 }
 
 #[test]

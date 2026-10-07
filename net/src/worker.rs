@@ -35,7 +35,7 @@ use kabudachi_core::time::RealClock;
 use libp2p::Multiaddr;
 
 use crate::authority::{AuthorityClient, SharedAuthority};
-use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, bootstrap};
+use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, DEFAULT_SEED_ROUNDS, bootstrap};
 use crate::driver::{DriverConfig, run_driver};
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::{ListenRejected, Net};
@@ -69,6 +69,9 @@ pub struct WorkerConfig {
     pub join_peer_timeout: StdDuration,
     /// How long bootstrap waits between rounds of its cascade.
     pub retry_interval: StdDuration,
+    /// How many full rounds of silent seeds a worker with no authority waits
+    /// before it founds its shard alone (see `crate::bootstrap`).
+    pub seed_rounds: u32,
     /// How often the driver re-crawls peer routing while nothing else
     /// prompts it (see `crate::driver::DriverConfig`); `None` for the
     /// default.
@@ -97,6 +100,7 @@ impl WorkerConfig {
             election_timings,
             join_peer_timeout: DEFAULT_JOIN_PEER_TIMEOUT,
             retry_interval: DEFAULT_RETRY_INTERVAL,
+            seed_rounds: DEFAULT_SEED_ROUNDS,
             routing_refresh_period: None,
             input_limit: None,
         }
@@ -123,6 +127,12 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_retry_interval(mut self, interval: StdDuration) -> Self {
         self.retry_interval = interval;
+        self
+    }
+
+    #[must_use]
+    pub fn with_seed_rounds(mut self, rounds: u32) -> Self {
+        self.seed_rounds = rounds;
         self
     }
 
@@ -208,6 +218,7 @@ impl Worker {
             config.join_peer_timeout,
             StdDuration::from_millis(config.election_timings.suspect_timeout.as_ticks()),
             config.retry_interval,
+            config.seed_rounds,
         )
         .await;
         let identity = Identity {
@@ -229,6 +240,9 @@ impl Worker {
             authority,
             DriverConfig {
                 routing_refresh_period: config.routing_refresh_period,
+                seeds: config.seeds.clone(),
+                join_peer_timeout: config.join_peer_timeout,
+                retry_interval: config.retry_interval,
             },
             observe,
         )

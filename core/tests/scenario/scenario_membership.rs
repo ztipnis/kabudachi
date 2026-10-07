@@ -347,6 +347,59 @@ fn a_stale_initiator_several_generations_behind_cannot_win() {
     assert_no_grant_overlap(&cluster);
 }
 
+/// A leader asked to leave before its voters have crawled their routing
+/// leads on, however long that takes within its drain wait; once each has
+/// crawled it leaves and the survivors elect one of themselves.
+#[test]
+fn a_draining_leader_waits_for_its_voters_routing_crawl_and_the_survivors_elect() {
+    let mut cluster = Cluster::bootstrap(3, SUSPECT);
+    cluster.hold_routing_crawls();
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.leader().is_some_and(
+            |leader| !configuration_of(cluster, &leader).is_joint()
+        )),
+        "the voters elect a leader and commit its founding"
+    );
+    let leader = cluster.leader().expect("a leader");
+    let followers: Vec<WorkerId> = ids(0..3).into_iter().filter(|id| *id != leader).collect();
+
+    cluster.drain(&leader);
+    for _ in 0..3 * SUSPECT.as_ticks() {
+        cluster.advance(TICK);
+        assert_eq!(
+            cluster.states()[&leader],
+            WorkerState::Leader,
+            "it left before its voters crawled"
+        );
+    }
+
+    for follower in &followers {
+        let _ = cluster.routing_crawled(follower);
+    }
+    // The drain wait lasts ten suspicion timeouts, so only the crawl reports
+    // can release the leader this early: were they ignored, it would hold on
+    // for most of the remaining wait.
+    for _ in 0..2 * SUSPECT.as_ticks() {
+        if cluster.states()[&leader] == WorkerState::Stopped {
+            break;
+        }
+        cluster.advance(TICK);
+    }
+    assert_eq!(
+        cluster.states()[&leader],
+        WorkerState::Stopped,
+        "the crawl reports release the leader long before its drain wait ends"
+    );
+    let survivors_elect = run_until(&mut cluster, |cluster| {
+        cluster
+            .leader()
+            .is_some_and(|new_leader| followers.contains(&new_leader))
+    });
+
+    assert!(survivors_elect, "{:?}", cluster.states());
+    assert_no_grant_overlap(&cluster);
+}
+
 /// A rolling deploy: joiners arrive and old voters drain at once, the drains
 /// taking the old side below a majority of its original count mid-batch.
 /// Each removal re-announces the batch with shrunk counts, so the batch
@@ -478,7 +531,14 @@ fn a_rolling_deploy_that_replaces_the_leader_last_collapses_the_batch() {
         "setup: the old voters are out and the batch is still in flight"
     );
 
+    // The batch is joint, so the leader is never free to leave: it leads on
+    // until its drain wait runs out.
     cluster.drain(&leader);
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.node(&leader).state()
+            == WorkerState::Stopped),
+        "the leader leaves once its drain wait runs out"
+    );
     cluster.deliver_messages();
     let collapsed = configuration_of(&cluster, joiners.first().unwrap());
     assert!(!collapsed.is_joint(), "the batch collapsed to its new side");

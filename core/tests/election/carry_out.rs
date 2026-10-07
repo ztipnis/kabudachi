@@ -18,11 +18,11 @@ use kabudachi_core::scheduler::{Observer, Scheduler};
 use kabudachi_core::time::Duration;
 
 use crate::support::authority::{AtOnce, authority_ttl, warmed_up_authority};
-use crate::support::builders::{shard, timings, voter_of, worker};
+use crate::support::builders::{heartbeat, heartbeat_message, shard, timings, voter_of, worker};
 use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
-use crate::support::node::{TestNode, connect, elect};
+use crate::support::node::{TestNode, commit_founding, connect, deliver, elect};
 use crate::support::spy::Spy;
 
 const SHARD: &str = "shard-1";
@@ -116,6 +116,15 @@ fn grant_is_applied_before_any_message_leaves() {
     carry(&mut node, first, &mut scheduler);
     connect(&mut node, &peers);
     let _ = elect(&mut node, &clock, SUSPECT_TIMEOUT, &peers);
+    commit_founding(&mut node, &clock, &peers);
+    for peer in &peers {
+        let mut beat = heartbeat(peer, None);
+        beat.routing_crawled = true;
+        beat.crawl_admission = node
+            .configuration()
+            .map(|configuration| configuration.generation().into());
+        let _ = deliver(&mut node, peer, heartbeat_message(beat));
+    }
     // The grant a lease of this leader's gave its scheduler.
     scheduler.set_leadership_grant(Some(unbounded_grant()));
 

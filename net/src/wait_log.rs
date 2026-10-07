@@ -1,16 +1,19 @@
-//! Why a round of the bootstrap cascade, or of a rejoin, left the worker in
-//! `Bootstrapping`, and the log that says so.
+//! Why a round of the bootstrap cascade, or of a rejoin, found no leader to
+//! join, and the log that says so.
 
 use kabudachi_core::coordination_authority::AuthorityError;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 
-/// Why a round of the cascade left the worker in `Bootstrapping`.
+/// Why a round of the cascade, or of a rejoin, found no leader to join.
 #[derive(Debug, PartialEq)]
 pub(crate) enum WaitReason {
     AuthorityUnreachable(AuthorityError),
     AuthorityWarmingUp,
     /// The authority has not answered a read within a retry interval.
     AuthorityNotAnswering,
+    /// A round that asked the seeds alone, with no listing to ask beside them,
+    /// heard from none.
+    SeedsNotAnswering,
     /// The shard's recovery epoch is already at `u64::MAX`, so it has no
     /// successor epoch to re-found at.
     RecoveryEpochExhausted,
@@ -29,10 +32,13 @@ pub(crate) enum WaitReason {
     /// A seed or registered peer has answered, in this round or an earlier
     /// one, but none has pointed at a leader this worker could reach.
     NoReachableLeader,
+    /// No seed has answered for `rounds` full rounds; with no authority the
+    /// worker founds its shard alone after `bound`.
+    SeedsSilent { rounds: u32, bound: u32 },
 }
 
 /// Logs the reasons each round of the cascade, or each search of a rejoin
-/// (see `crate::leader_search::Rejoin`), leaves the worker in `Bootstrapping`.
+/// (see `crate::leader_search::Rejoin`), found no leader.
 /// A reason is logged at its own level in the round it first
 /// appears, or changes, and at `debug` in each later round that repeats it
 /// unchanged, so a worker that waits for hours does not warn every round.
@@ -88,37 +94,40 @@ fn log_wait_reason(shard_id: &ShardId, reason: &WaitReason, repeated: bool) {
             warn,
             shard,
             %error,
-            "staying in Bootstrapping: the coordination authority is unreachable"
+            "the coordination authority is unreachable"
         ),
         WaitReason::AuthorityWarmingUp => log_at_level_or_debug!(
             repeated,
             info,
             shard,
-            "staying in Bootstrapping: the coordination authority is still warming up \
-             and may not know every live worker yet"
+            "the coordination authority is still warming up and may not know every live \
+             worker yet"
         ),
         WaitReason::AuthorityNotAnswering => log_at_level_or_debug!(
             repeated,
             warn,
             shard,
-            "staying in Bootstrapping: the coordination authority has not answered a read \
-             of the live registrations within a retry interval; asking the seeds again \
-             meanwhile"
+            "the coordination authority has not answered a read of the live registrations \
+             within a retry interval"
+        ),
+        WaitReason::SeedsNotAnswering => log_at_level_or_debug!(
+            repeated,
+            warn,
+            shard,
+            "no seed answered a round that had no list of registered peers to ask beside them"
         ),
         WaitReason::RecoveryEpochExhausted => log_at_level_or_debug!(
             repeated,
             warn,
             shard,
-            "staying in Bootstrapping: the shard's recovery epoch is already at u64::MAX, \
-             so it cannot be re-founded"
+            "the shard's recovery epoch is already at u64::MAX, so it cannot be re-founded"
         ),
         WaitReason::OwnershipFailed(error) => log_at_level_or_debug!(
             repeated,
             warn,
             shard,
             %error,
-            "staying in Bootstrapping: could not take ownership of the shard \
-             at the coordination authority"
+            "could not take ownership of the shard at the coordination authority"
         ),
         WaitReason::UnparseableAddress {
             worker,
@@ -138,22 +147,30 @@ fn log_wait_reason(shard_id: &ShardId, reason: &WaitReason, repeated: bool) {
             warn,
             shard,
             peers = ?peers.iter().map(WorkerId::as_str).collect::<Vec<_>>(),
-            "staying in Bootstrapping: the authority lists registered peers, \
-             but none has an address that parses"
+            "the authority lists registered peers, but none has an address that parses"
         ),
         WaitReason::RegisteredPeersSilent { peers } => log_at_level_or_debug!(
             repeated,
             warn,
             shard,
             peers = ?peers.iter().map(WorkerId::as_str).collect::<Vec<_>>(),
-            "staying in Bootstrapping: the authority lists registered peers, but none answered"
+            "the authority lists registered peers, but none of the workers asked answered"
         ),
         WaitReason::NoReachableLeader => log_at_level_or_debug!(
             repeated,
             info,
             shard,
-            "staying in Bootstrapping: the shard exists, but no one asked has pointed at a \
-             leader this worker could reach; asking again"
+            "the shard exists, but no one asked has pointed at a leader this worker could \
+             reach; asking again"
+        ),
+        WaitReason::SeedsSilent { rounds, bound } => log_at_level_or_debug!(
+            repeated,
+            info,
+            shard,
+            rounds,
+            bound,
+            "no seed has answered, and with no coordination authority the worker founds the \
+             shard alone only after the bound"
         ),
     }
 }

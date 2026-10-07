@@ -112,6 +112,8 @@ mod tests {
             }),
             configuration_generation: Some(Generation::genesis(1).into()),
             send_token: 43,
+            routing_crawled: false,
+            crawl_admission: None,
         }
     }
 

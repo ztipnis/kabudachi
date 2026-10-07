@@ -4,7 +4,8 @@
 //! shard (see "Gossip" below), and queues the node's inputs as they happen:
 //! every election message received, and every connection to a peer opening
 //! or closing. It also carries the join and claim protocols, whose requests
-//! only the driver can answer (see `crate::driver::run_driver`).
+//! only the driver can answer (see `crate::driver::run_driver`). A completed
+//! routing crawl is reported to the node as `Input::RoutingCrawled`.
 //!
 //! ## `WorkerId` <-> `PeerId` mapping
 //!
@@ -43,6 +44,10 @@
 //! - a peer's first connection opening becomes `Input::PeerConnected`;
 //! - its last connection closing becomes `Input::PeerDisconnected`, and so
 //!   does a failed dial that names a peer this `Net` holds no connection to.
+//!
+//! - a completed routing crawl (see [`Net::refresh_peer_routing`]; the swarm's
+//!   own periodic crawls count too) becomes `Input::RoutingCrawled`, of which
+//!   at most one is queued.
 //!
 //! The queue stays bounded however long no driver takes from it (the
 //! bootstrap cascade can wait indefinitely, say). A connection event that
@@ -149,7 +154,7 @@ use libp2p::futures::StreamExt;
 use libp2p::request_response::{self, ResponseChannel};
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, identify};
+use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, identify, kad};
 use prost::Message as _;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -338,6 +343,12 @@ impl Inbound {
                     return;
                 }
                 _ => {}
+            }
+        } else if input == Input::RoutingCrawled {
+            // The node handles one the same as two, and it is never dropped
+            // for the limit, so at most one is ever queued.
+            if inputs.contains(&input) {
+                return;
             }
         } else if inputs.len() >= self.input_limit.load(Ordering::Relaxed) {
             // Connection events are never dropped: at most two per peer are
@@ -1076,6 +1087,12 @@ fn handle_command(
     }
 }
 
+/// What a finished Kademlia bootstrap tells the node: a crawl that failed
+/// reached nothing it can vouch for, so it reports none.
+fn crawl_report(result: &kad::BootstrapResult) -> Option<Input> {
+    result.is_ok().then_some(Input::RoutingCrawled)
+}
+
 fn handle_event(
     swarm: &mut Swarm<Behaviour>,
     event: SwarmEvent<BehaviourEvent>,
@@ -1095,6 +1112,15 @@ fn handle_event(
             peers.observe(Observation::ListeningOn(address.clone()), now);
             if let Some(respond_to) = pending.listens.remove(&listener_id) {
                 let _ = respond_to.send(address);
+            }
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+            result: kad::QueryResult::Bootstrap(result),
+            step,
+            ..
+        })) if step.last => {
+            if let Some(input) = crawl_report(&result) {
+                inbound.queue_input(input);
             }
         }
         SwarmEvent::ConnectionEstablished {
@@ -1272,7 +1298,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::test_support::{TEST_TIMEOUT, worker_that_never_runs};
+    use crate::test_support::{TEST_TIMEOUT, listening_net, wait_for_input, worker_that_never_runs};
 
     /// The input `message` arriving from `from`, decoded as the edge decodes
     /// it.
@@ -1281,6 +1307,26 @@ mod tests {
             from: from.clone(),
             message: checked::decode(message).expect("a well-formed test message"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completed_routing_crawl_reaches_the_node_as_an_input() {
+        let (a, a_addr) = listening_net().await;
+        let (b, _) = listening_net().await;
+        b.dial(a_addr);
+        wait_for_input(&b, &Input::PeerConnected(a.local_worker_id())).await;
+
+        b.refresh_peer_routing();
+
+        wait_for_input(&b, &Input::RoutingCrawled).await;
+    }
+
+    #[test]
+    fn a_routing_crawl_already_queued_is_not_queued_again() {
+        let inbound = Inbound::default();
+        inbound.queue_input(Input::RoutingCrawled);
+        inbound.queue_input(Input::RoutingCrawled);
+        assert_eq!(queued_inputs(&inbound), vec![Input::RoutingCrawled]);
     }
 
     fn queued_inputs(inbound: &Inbound) -> Vec<Input> {
@@ -1347,6 +1393,8 @@ mod tests {
                 newest_accepted_ack: None,
                 configuration_generation: None,
                 send_token: 0,
+                routing_crawled: false,
+                crawl_admission: None,
             })),
         }
     }

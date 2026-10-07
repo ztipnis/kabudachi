@@ -163,6 +163,8 @@ fn a_follower_heartbeats_a_leader_as_soon_as_an_ack_names_it_then_every_interval
             newest_accepted_ack: echo(1, 7),
             configuration_generation: Some(g0().into()),
             send_token: 2,
+            routing_crawled: false,
+            crawl_admission: None,
         }
     );
 
@@ -204,6 +206,64 @@ fn a_joiner_heartbeats_its_leader_on_joining_with_no_echo_yet() {
     assert_eq!(heartbeats.len(), 1, "{joined:?}");
     assert_eq!(heartbeats[0].newest_accepted_ack, None);
     assert_eq!(heartbeats[0].term_seen, 1);
+}
+
+/// An ack from `leader-1` in term 1 carrying a configuration of 3 at
+/// `generation`, which admits the recipient at that same generation.
+fn ack_admitting(generation: Generation, send_token: u64) -> LeaderHeartbeatAck {
+    LeaderHeartbeatAck {
+        configuration: Some(
+            (&Configuration::single(Single {
+                generation,
+                base: generation,
+                voter_count: 3,
+            })
+            .expect("valid"))
+                .into(),
+        ),
+        recipient_admission: Some(generation.into()),
+        ..ack_sent_at(1, send_token)
+    }
+}
+
+/// Whether the heartbeat `node` sends its leader one interval from now says
+/// it has crawled its routing.
+fn next_heartbeat_reports_a_crawl(node: &mut TestNode, clock: &FakeClock) -> bool {
+    clock.advance(heartbeat_interval());
+    let outputs = tick(node);
+    let heartbeats = heartbeats_to(&outputs, "leader-1");
+    assert_eq!(heartbeats.len(), 1, "{outputs:?}");
+    heartbeats[0].routing_crawled
+}
+
+// A voter's heartbeat says it has crawled only for a crawl completed while
+// it held its current admission: one from before it was admitted, or from
+// before a re-admission, does not count.
+#[test]
+fn a_heartbeat_reports_a_routing_crawl_only_since_the_current_admission() {
+    let clock = FakeClock::new();
+    let (mut node, _) = joined_node(&clock);
+
+    let _ = node.step(Input::RoutingCrawled);
+    assert!(
+        !next_heartbeat_reports_a_crawl(&mut node, &clock),
+        "a pending member has nothing to report"
+    );
+
+    let _ = receive_ack(&mut node, ack_admitting(Generation::new(0, 1, 2), 1));
+    assert!(
+        !next_heartbeat_reports_a_crawl(&mut node, &clock),
+        "the crawl predates the admission"
+    );
+
+    let _ = node.step(Input::RoutingCrawled);
+    assert!(next_heartbeat_reports_a_crawl(&mut node, &clock));
+
+    let _ = receive_ack(&mut node, ack_admitting(Generation::new(0, 1, 3), 2));
+    assert!(
+        !next_heartbeat_reports_a_crawl(&mut node, &clock),
+        "re-admitted: crawl again"
+    );
 }
 
 #[test]

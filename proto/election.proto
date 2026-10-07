@@ -21,6 +21,18 @@ message WorkerHeartbeat {
   // ticks. The leader never interprets it; it only echoes it back in the ack
   // that answers this heartbeat. 0 is a real reading.
   uint64 send_token = 10;
+  // Whether the sender has completed a routing crawl since it was admitted
+  // at the admission generation it now holds. A draining leader waits for
+  // this from every other voter before it leaves, so the shard's workers
+  // are connected to one another and not only to it. False while the
+  // sender is a pending member.
+  bool routing_crawled = 11;
+  // The admission generation the sender held when it completed the crawl
+  // routing_crawled reports. A leader counts the crawl only when this is the
+  // sender's current admission in its roster, so a delayed heartbeat from
+  // before a re-admission does not count. Absent while routing_crawled is
+  // false.
+  optional Generation crawl_admission = 12;
 }
 
 // Names one leader ack a heartbeat confirms receiving.

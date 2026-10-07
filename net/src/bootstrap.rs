@@ -9,7 +9,9 @@
 //!    leader.
 //! 2. **No authority.** With no coordination authority configured, and no
 //!    seed ever having answered, found the shard alone (genesis, at recovery
-//!    epoch 0).
+//!    epoch 0), but only once the seeds have stayed silent for `seed_rounds`
+//!    rounds (each pause twice as long as the last). With no seeds at all
+//!    the worker founds at once.
 //! 3. **Registered peers.** Read the authority's live registrations. If any
 //!    worker other than this one is registered, ask those workers, at the
 //!    addresses they registered, the same way as seeds. One that points at a
@@ -44,7 +46,8 @@
 //! ## Why a configured authority is never bypassed
 //!
 //! Two workers that each found the shard split it in two. With no authority,
-//! silent seeds are the only evidence there is, so the worker trusts them.
+//! silent seeds are the only evidence there is, so the worker trusts them
+//! once they have stayed silent for `seed_rounds` rounds.
 //! With one, only winning ownership shows that no other worker has founded
 //! the shard. An authority that is unreachable shows nothing, and so does
 //! one still warming up, which may not yet have heard from every live
@@ -156,6 +159,10 @@ use crate::wait_log::WaitReason;
 /// cascade.
 pub const DEFAULT_RETRY_INTERVAL: StdDuration = StdDuration::from_millis(500);
 
+/// How many full rounds a worker with seeds and no coordination authority
+/// asks its seeds, all silent, before it founds its shard alone.
+pub const DEFAULT_SEED_ROUNDS: u32 = 3;
+
 /// Runs the bootstrap cascade for `net`'s local worker, `my_id`, into
 /// `shard_id` (see the module doc), and returns how the worker enters its
 /// shard: joining the leader that `seeds`, or the workers `authority` lists,
@@ -187,7 +194,9 @@ pub const DEFAULT_RETRY_INTERVAL: StdDuration = StdDuration::from_millis(500);
 /// [`crate::join::ask_for_leader`]; the shard's suspicion timeout is the
 /// natural value); it is internal to a round, not added to
 /// `per_peer_timeout`. `retry_interval` is the wait between rounds of the
-/// cascade. See `crate::join::DEFAULT_JOIN_PEER_TIMEOUT` and
+/// cascade. `seed_rounds` is how many rounds of silent seeds a worker with
+/// seeds and no authority waits before it founds alone ([`DEFAULT_SEED_ROUNDS`]).
+/// See `crate::join::DEFAULT_JOIN_PEER_TIMEOUT` and
 /// [`DEFAULT_RETRY_INTERVAL`] for defaults.
 ///
 /// A worker that joins is a pending member (see `Entry::Joining`). One that
@@ -208,6 +217,7 @@ pub async fn bootstrap<C: Clock>(
     per_peer_timeout: StdDuration,
     grace: StdDuration,
     retry_interval: StdDuration,
+    seed_rounds: u32,
 ) -> Entry {
     cascade(
         net,
@@ -223,6 +233,7 @@ pub async fn bootstrap<C: Clock>(
         my_id,
         seeds,
         retry_interval,
+        seed_rounds,
     )
     .await
 }
@@ -241,7 +252,10 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
     my_id: &WorkerId,
     seeds: &[Multiaddr],
     retry_interval: StdDuration,
+    seed_rounds: u32,
 ) -> Entry {
+    let seed_rounds = seed_rounds.max(1);
+    let mut silent_rounds: u32 = 0;
     let mut search = SearchRounds::for_bootstrap(shard_id, my_id.clone(), seeds.to_vec());
     loop {
         refuse_requests(net);
@@ -252,12 +266,31 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
             return Entry::Joining(pointer);
         }
 
+        let mut pause = retry_interval;
         match authority.as_deref_mut() {
             None if !search.shard_exists() => {
-                return Entry::Founding {
-                    recovery_epoch: RecoveryEpoch::founding(0, lineages),
-                    registered_at: None,
-                };
+                silent_rounds += 1;
+                if seeds.is_empty() || silent_rounds >= seed_rounds {
+                    // With no authority, silence is the only evidence that no
+                    // shard exists, and a slow seed is silent too. Founding
+                    // after a bounded number of rounds keeps a worker whose
+                    // seeds are really gone from waiting for ever, at the
+                    // cost that a seed that was only slow now leads a second
+                    // shard beside this one. Nothing joins the two yet: that
+                    // needs shard merging, run when the two sides reach each
+                    // other again.
+                    return Entry::Founding {
+                        recovery_epoch: RecoveryEpoch::founding(0, lineages),
+                        registered_at: None,
+                    };
+                }
+                search.log(WaitReason::SeedsSilent {
+                    rounds: silent_rounds,
+                    bound: seed_rounds,
+                });
+                // Each silent round waits twice as long as the last, so a
+                // seed that is slow to start gets longer to answer.
+                pause = retry_interval.saturating_mul(1 << (silent_rounds - 1).min(16));
             }
             None => {}
             Some(calls) => {
@@ -288,7 +321,7 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
         }
 
         search.end_round();
-        tokio::time::sleep(retry_interval).await;
+        tokio::time::sleep(pause).await;
     }
 }
 
@@ -646,6 +679,7 @@ mod tests {
                 &self.me,
                 &self.seeds,
                 RETRY_INTERVAL,
+                DEFAULT_SEED_ROUNDS,
             )
         }
     }
@@ -668,6 +702,28 @@ mod tests {
 
         assert_eq!(joined_leader(entry), (WorkerId::new("seed-leader"), 1));
         assert_eq!(port.passes(), vec![vec![seed]]);
+    }
+
+    // Seeds that never answer are weak evidence that no shard exists: a slow
+    // seed looks the same. A worker with no authority founds alone only after
+    // three silent rounds, a retry interval and then two apart, never before,
+    // and never waits for ever.
+    #[tokio::test(start_paused = true)]
+    async fn silent_seeds_with_no_authority_found_only_after_the_bound() {
+        let port = Scripted::default();
+        let mut cascade = InProcess::new(&port, None, TokioClock::new(), &[address(1)]);
+        let mut running = std::pin::pin!(cascade.run());
+        let started = tokio::time::Instant::now();
+
+        let early = timeout(RETRY_INTERVAL * 3 - StdDuration::from_millis(1), &mut running).await;
+        assert!(early.is_err(), "the worker founded before its seeds' bound");
+
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the worker founded once the bound passed");
+        assert!(founded_at_epoch_0(&entry));
+        assert_eq!(port.passes().len(), 3, "one ask of its seeds per round");
+        assert_eq!(started.elapsed(), RETRY_INTERVAL * 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -841,7 +897,7 @@ mod tests {
         assert_eq!(epoch_number(&authority), None);
     }
 
-    // Review focus 5: an authority whose read hangs holds one blocking
+    // An authority whose read hangs holds one blocking
     // thread, not one more every round, and holds up no seed. The cascade
     // keeps asking its seed each round; were a duplicate read made, it
     // would not be held and would find the shard ownerless, so the worker

@@ -116,6 +116,9 @@ pub struct Cluster {
     /// The steps taken since `record_steps` or the last `take_steps`;
     /// `None` while not recording.
     recorded_steps: Option<Vec<StepRecord>>,
+    /// Whether an admitted node is left to report its routing crawl itself
+    /// (`routing_crawled`) rather than crawling at once.
+    routing_crawls_held: bool,
 }
 
 /// What the harness did while running its nodes.
@@ -208,6 +211,7 @@ impl Cluster {
             grant_steps: Vec::new(),
             stalls: BTreeMap::new(),
             recorded_steps: None,
+            routing_crawls_held: false,
         };
         for id in &worker_ids {
             let node_authority = cluster.authority.for_another_worker();
@@ -630,6 +634,21 @@ impl Cluster {
         self.hand_over(worker, Input::Drain);
     }
 
+    /// Stops nodes crawling their routing on admission: a node reports a
+    /// crawl only once `routing_crawled` tells it one completed.
+    pub fn hold_routing_crawls(&mut self) {
+        self.routing_crawls_held = true;
+    }
+
+    /// Tells the named node that its routing crawl completed, as its driver
+    /// would, and returns its outputs. Panics on an unknown ID.
+    pub fn routing_crawled(&mut self, id: &WorkerId) -> Vec<Output> {
+        if !self.nodes.contains_key(id) {
+            unknown_node("routing_crawled", id);
+        }
+        self.step(id, Input::RoutingCrawled)
+    }
+
     /// Feeds one input to the named node, sends its messages through the
     /// network (delivered by a later `advance` or `deliver_messages`), and
     /// returns its outputs. Panics on an unknown ID.
@@ -640,8 +659,15 @@ impl Cluster {
     /// returned too, in order. While the node is stalled a reply is held
     /// for it like a message.
     pub fn step(&mut self, id: &WorkerId, input: Input) -> Vec<Output> {
+        let admitted_before = self.node_mut(id, "step").admission();
         let step = self.node_mut(id, "step").step(input.clone());
-        self.drive(id, Some(input), step)
+        let mut outputs = self.drive(id, Some(input), step);
+        // The network reaches every node, so a node that was just admitted
+        // has crawled to its shard's other workers by its next heartbeat.
+        if !self.routing_crawls_held && self.node_mut(id, "step").admission() != admitted_before {
+            outputs.extend(self.step(id, Input::RoutingCrawled));
+        }
+        outputs
     }
 
     /// Carries out `first`, a step the named node took on `input`, and every

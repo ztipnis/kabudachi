@@ -84,6 +84,9 @@ pub(crate) struct LeaderOffice {
     /// its configuration, to take out together (see
     /// [`Self::apply_pending_removals`]).
     pending_removals: BTreeSet<WorkerId>,
+    /// The workers whose latest heartbeat reported a routing crawl, with the
+    /// admission each crawled at.
+    crawled: BTreeMap<WorkerId, Generation>,
 }
 
 impl LeaderOffice {
@@ -105,6 +108,7 @@ impl LeaderOffice {
             term,
             last_heard,
             pending_removals: BTreeSet::new(),
+            crawled: BTreeMap::new(),
         };
         office.commit_when_due(duties.me);
         office
@@ -128,9 +132,25 @@ impl LeaderOffice {
 
     /// A worker's heartbeat: heard now. A confirmation records the
     /// generation it holds and commits when due. The sender joins as pending
-    /// if unknown, a batch starts when due, and removals apply.
-    pub(crate) fn take_heartbeat(&mut self, from: WorkerId, heard: Heard, duties: &Duties) {
+    /// if unknown, a batch starts when due, and removals apply. A crawl
+    /// report counts only when `crawl_admission`, the admission the sender
+    /// crawled at, is the one the roster counts it by now.
+    pub(crate) fn take_heartbeat(
+        &mut self,
+        from: WorkerId,
+        heard: Heard,
+        crawl_admission: Option<Generation>,
+        duties: &Duties,
+    ) {
         self.last_heard.insert(from.clone(), duties.now);
+        match crawl_admission {
+            Some(admission) if Some(admission) == self.roster.admission_of(&from) => {
+                self.crawled.insert(from.clone(), admission);
+            }
+            _ => {
+                self.crawled.remove(&from);
+            }
+        }
         if let Heard::Confirmed { held } = heard {
             if let Some(held) = held {
                 self.roster.record_held_generation(&from, held);
@@ -140,6 +160,34 @@ impl LeaderOffice {
         self.roster.add_pending(from);
         self.admit_waiting_joiners(duties);
         self.apply_pending_removals();
+    }
+
+    /// Whether every voter of the committed configuration other than `me`
+    /// is known to the roster and has reported a routing crawl at the
+    /// admission the roster counts it by now. Never while the configuration
+    /// is joint.
+    pub(crate) fn remaining_voters_have_crawled(&mut self, me: &WorkerId) -> bool {
+        self.apply_pending_removals();
+        let configuration = self.roster.configuration();
+        let Some(voter_count) = configuration.voter_count() else {
+            return false;
+        };
+        let others: Vec<&WorkerId> = self
+            .roster
+            .members()
+            .keys()
+            .filter(|worker| {
+                *worker != me && configuration.is_voter(self.roster.counted_admission_of(worker))
+            })
+            .collect();
+        let leader_votes =
+            usize::from(configuration.is_voter(self.roster.counted_admission_of(me)));
+        others.len() + leader_votes == voter_count
+            && others.iter().all(|worker| {
+                self.crawled
+                    .get(*worker)
+                    .is_some_and(|crawled_at| Some(*crawled_at) == self.roster.admission_of(worker))
+            })
     }
 
     /// A SELF_REMOVE the node accepted (its term guard stays with the

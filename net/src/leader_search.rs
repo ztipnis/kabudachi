@@ -22,6 +22,8 @@ use kabudachi_core::election::{
 };
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
+use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::time::{Duration, Instant as CoreInstant};
 use libp2p::Multiaddr;
 use tokio::time::Instant;
 
@@ -65,8 +67,8 @@ impl AskWhoLeads for JoinOverNet<'_> {
 }
 
 /// Whether a search asks seeds and learns that its shard exists (bootstrap),
-/// or knows it exists, has no seeds, and starts each round one listed worker
-/// further along (rejoin).
+/// or knows it exists and starts each round one listed worker further along
+/// (rejoin).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Bootstrap,
@@ -101,10 +103,10 @@ impl SearchRounds {
         }
     }
 
-    pub(crate) fn for_rejoin(shard_id: &ShardId, my_id: WorkerId) -> Self {
+    pub(crate) fn for_rejoin(shard_id: &ShardId, my_id: WorkerId, seeds: Vec<Multiaddr>) -> Self {
         SearchRounds {
             my_id,
-            seeds: Vec::new(),
+            seeds,
             mode: Mode::Rejoin,
             round: 0,
             shard_exists: true,
@@ -113,7 +115,8 @@ impl SearchRounds {
         }
     }
 
-    /// The seeds this round asks, in order (none for a rejoin).
+    /// The seeds a round asks, in order. A rejoin keeps them in place: only
+    /// the listed workers rotate.
     pub(crate) fn seeds(&self) -> &[Multiaddr] {
         &self.seeds
     }
@@ -129,6 +132,16 @@ impl SearchRounds {
             }
             LeaderSearch::NoAnswer => None,
         }
+    }
+
+    /// What an ask of the seeds alone found, in a round with no listing: the
+    /// pointer, if any. Any answer shows the shard exists. Logs `SeedsNotAnswering`
+    /// when none answered.
+    pub(crate) fn heard_from_seeds_alone(&mut self, found: LeaderSearch) -> Option<JoinResponse> {
+        if matches!(found, LeaderSearch::NoAnswer) {
+            self.log.log(WaitReason::SeedsNotAnswering);
+        }
+        self.heard_from_seeds(found)
     }
 
     /// The registered addresses of `peers` to ask this round. An address that
@@ -238,6 +251,9 @@ pub(crate) fn others_listed(
 pub(crate) struct Rejoin<'a, P> {
     search: SearchRounds,
     port: P,
+    /// The floor of the last listing's answer, for a round that asks the seeds
+    /// alone.
+    floor: JoinFloor,
     retry_interval: StdDuration,
     /// When the next round is due, while none is under way.
     next_round_at: Option<Instant>,
@@ -252,6 +268,10 @@ pub(crate) struct Rejoin<'a, P> {
     /// holds no epoch, or lags, is never asked in a loop, and a reply that
     /// arrives late never delays the next read past the next round.
     epoch_ask_due: Instant,
+    /// Whether a round also reads the authority's epoch. A search for a leader
+    /// to reconnect to has no node waiting on that epoch, so it skips the read
+    /// and leaves that call kind free.
+    reads_epoch: bool,
     /// The node is `Joining` on a pointer it took, so this rejoin runs no
     /// round: it only reads the epoch until the node is told of it.
     validating: bool,
@@ -260,6 +280,8 @@ pub(crate) struct Rejoin<'a, P> {
     asked_epoch_read: Option<ReplyToken>,
     /// The round's ask of the listed workers, while it runs.
     asking: Option<Pin<Box<dyn Future<Output = LeaderSearch> + Send + 'a>>>,
+    /// Whether the round's ask is of the seeds alone.
+    asking_seeds_only: bool,
 }
 
 /// A read of the authority's epoch, asked and not yet answered or given up
@@ -285,21 +307,32 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         shard_id: &ShardId,
         my_id: WorkerId,
         port: P,
+        seeds: Vec<Multiaddr>,
         retry_interval: StdDuration,
         now: Instant,
     ) -> Self {
         Rejoin {
-            search: SearchRounds::for_rejoin(shard_id, my_id),
+            search: SearchRounds::for_rejoin(shard_id, my_id, seeds),
             port,
+            floor: JoinFloor::none(),
             retry_interval,
             next_round_at: Some(now),
             read: None,
             epoch_read: None,
             epoch_ask_due: now,
+            reads_epoch: true,
             validating: false,
             asked_epoch_read: None,
             asking: None,
+            asking_seeds_only: false,
         }
+    }
+
+    /// This search runs for a stranded node's leader, not to rejoin: its rounds
+    /// never read the authority's epoch.
+    pub(crate) fn for_leader_search(mut self) -> Self {
+        self.reads_epoch = false;
+        self
     }
 
     /// When the driver must next wake for this rejoin: a round due, or a
@@ -328,10 +361,12 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
     /// round. A due round that finds the kind busy with a call it did not ask
     /// (a read the cascade left in flight) asks nothing and ends the same
     /// way, so the next round is one retry interval later: a busy kind never
-    /// stalls the rejoin and never spins it.
+    /// stalls the rejoin and never spins it. Where a round has no listing to
+    /// ask (no `client`, a failed read, a missed bound, a busy kind), it asks
+    /// the seeds alone, and ends with no seeds.
     pub(crate) fn tick(
         &mut self,
-        client: &mut AuthorityClient,
+        client: Option<&mut AuthorityClient>,
         sent_at: kabudachi_core::time::Instant,
         now: Instant,
     ) {
@@ -339,6 +374,13 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         if self.asking.is_some() {
             return;
         }
+        let Some(client) = client else {
+            if self.next_round_at.is_some_and(|due| now >= due) {
+                self.next_round_at = None;
+                self.ask_seeds_or_end(now);
+            }
+            return;
+        };
         if let Some(read) = &mut self.read
             && let Some(bound) = read.bound
             && now >= bound
@@ -364,7 +406,9 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                 });
                 self.next_round_at = None;
                 // Left unasked when the kind is busy: a later round asks again.
-                self.ask_epoch(client, sent_at, now);
+                if self.reads_epoch {
+                    self.ask_epoch(client, sent_at, now);
+                }
             }
             // Busy with a call this rejoin did not ask.
             None => self.end_round_unanswered(now),
@@ -466,24 +510,37 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         let AuthorityReply::LiveRegistrations { result, .. } = reply else {
             return None;
         };
+        if self.asking.is_some() {
+            // A late reply: the round gave up on this read and is asking the
+            // seeds alone, and that ask is the round's.
+            return None;
+        }
         let was_in_round = self.next_round_at.is_none();
         match result {
             Err(error) => {
                 if was_in_round {
                     self.search.log(WaitReason::AuthorityUnreachable(error));
-                    self.end_round(now);
+                    self.floor = floor;
+                    self.ask_seeds_or_end(now);
                 }
             }
             Ok(registrations) => {
-                self.next_round_at = None;
-                let peers = self.search.others_in(&registrations);
-                let addresses = self.search.to_ask(&peers);
-                if addresses.is_empty() {
-                    self.end_round(now);
+                if !was_in_round {
+                    // A late reply: its round already ended, and the next is
+                    // paced by the retry interval, not by this reply.
                     return None;
                 }
-                let mut port = self.port.clone();
-                self.asking = Some(Box::pin(async move { port.ask(&addresses, floor).await }));
+                self.next_round_at = None;
+                self.floor = floor;
+                let peers = self.search.others_in(&registrations);
+                let mut addresses = self.search.to_ask(&peers);
+                let seeds = self.search.seeds().to_vec();
+                for seed in seeds {
+                    if !addresses.contains(&seed) {
+                        addresses.push(seed);
+                    }
+                }
+                self.ask(addresses, now, false);
             }
         }
         None
@@ -501,7 +558,11 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
     /// to rejoin through, if any.
     pub(crate) fn asked(&mut self, found: LeaderSearch, now: Instant) -> Option<JoinResponse> {
         self.asking = None;
-        let pointer = self.search.heard_from_listed(found);
+        let pointer = if self.asking_seeds_only {
+            self.search.heard_from_seeds_alone(found)
+        } else {
+            self.search.heard_from_listed(found)
+        };
         self.end_round(now);
         pointer
     }
@@ -509,12 +570,67 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
     /// The round ends with no answer from the authority within its bound.
     fn end_round_unanswered(&mut self, now: Instant) {
         self.search.log(WaitReason::AuthorityNotAnswering);
-        self.end_round(now);
+        self.ask_seeds_or_end(now);
+    }
+
+    /// A round with no listing asks the seeds alone, or ends with none.
+    fn ask_seeds_or_end(&mut self, now: Instant) {
+        let seeds = self.search.seeds().to_vec();
+        self.ask(seeds, now, true);
+    }
+
+    /// Starts the round's ask of `addresses`, or ends the round if none.
+    fn ask(&mut self, addresses: Vec<Multiaddr>, now: Instant, seeds_only: bool) {
+        if addresses.is_empty() {
+            self.end_round(now);
+            return;
+        }
+        self.asking_seeds_only = seeds_only;
+        let (mut port, floor) = (self.port.clone(), self.floor);
+        self.asking = Some(Box::pin(async move { port.ask(&addresses, floor).await }));
     }
 
     fn end_round(&mut self, now: Instant) {
         self.search.end_round();
         self.next_round_at = Some(now + self.retry_interval);
+    }
+}
+
+/// When a node that has lost touch with its shard searches for a leader
+/// again: once it has been in `RollCall` or `NoQuorum` for `window`, whether
+/// or not it hears some workers (a reachable island smaller than a quorum
+/// must heal too). It keys on the node's state and time alone. After it
+/// reports a node stranded it waits another `window` before it says so again,
+/// so searches are one window apart.
+pub(crate) struct StrandedWatch {
+    window: Duration,
+    /// Since when the node has been in those states, or since it was last
+    /// reported stranded.
+    since: Option<CoreInstant>,
+}
+
+impl StrandedWatch {
+    pub(crate) fn new(window: Duration) -> Self {
+        StrandedWatch { window, since: None }
+    }
+
+    /// Notes the node's state after a batch. Whether it is stranded now.
+    pub(crate) fn observe(&mut self, state: WorkerState, now: CoreInstant) -> bool {
+        if !matches!(state, WorkerState::RollCall | WorkerState::NoQuorum) {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        let stranded = now - since >= self.window;
+        if stranded {
+            self.since = Some(now);
+        }
+        stranded
+    }
+
+    /// When the node would next be reported stranded, while that is ahead.
+    pub(crate) fn wake_at(&self, now: CoreInstant) -> Option<CoreInstant> {
+        self.since.map(|since| since + self.window).filter(|due| *due > now)
     }
 }
 
@@ -525,7 +641,6 @@ mod tests {
 
     use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, Uuid7Lineages};
     use kabudachi_core::election::{AuthorityRequest, CallKind};
-    use kabudachi_core::time::Instant as CoreInstant;
     use kabudachi_testkit::FaultingAuthority;
     use tokio::time::{Instant, timeout};
 
@@ -567,6 +682,7 @@ mod tests {
             &ShardId::new("shard-1"),
             WorkerId::new(ME),
             fixture.port.clone(),
+            Vec::new(),
             RETRY,
             Instant::now(),
         )
@@ -589,7 +705,7 @@ mod tests {
         until: usize,
     ) {
         while found.len() < until {
-            rejoin.tick(&mut fixture.client, stamp(fixture.clock), Instant::now());
+            rejoin.tick(Some(&mut fixture.client), stamp(fixture.clock), Instant::now());
             let wake = rejoin.wake_at();
             if let Some(at) = wake
                 && wakes.last() != Some(&at)
@@ -665,7 +781,7 @@ mod tests {
         let mut rejoin = rejoin_of(&fixture);
         let floor = JoinFloor::at(RecoveryEpoch::new(5, 1));
 
-        rejoin.tick(&mut fixture.client, stamp(fixture.clock), Instant::now());
+        rejoin.tick(Some(&mut fixture.client), stamp(fixture.clock), Instant::now());
         for _ in 0..2 {
             let reply = fixture
                 .client
@@ -690,7 +806,7 @@ mod tests {
 
             for round in 0..2 {
                 tokio::time::advance(RETRY).await;
-                rejoin.tick(&mut fixture.client, stamp(fixture.clock), Instant::now());
+                rejoin.tick(Some(&mut fixture.client), stamp(fixture.clock), Instant::now());
                 let mut epoch_reads = 0;
                 for _ in 0..2 {
                     let reply = fixture
@@ -737,7 +853,7 @@ mod tests {
 
         // Nobody is listed, so the listing's answer ends the round at once; the
         // epoch's answer follows part of an interval later.
-        rejoin.tick(&mut fixture.client, sent_at, Instant::now());
+        rejoin.tick(Some(&mut fixture.client), sent_at, Instant::now());
         let asked = rejoin.take_asked_epoch_read().expect("the first round asks for the epoch");
         let mut replies = Vec::new();
         for _ in 0..2 {
@@ -754,7 +870,7 @@ mod tests {
 
         tokio::time::advance(RETRY / 2).await;
         assert_eq!(Instant::now(), round_ended + RETRY);
-        rejoin.tick(&mut fixture.client, sent_at, Instant::now());
+        rejoin.tick(Some(&mut fixture.client), sent_at, Instant::now());
         assert!(
             rejoin.take_asked_epoch_read().is_some(),
             "the next round reads the epoch too"
@@ -879,16 +995,16 @@ mod tests {
         let mut rejoin = rejoin_of(&fixture);
         let sent_at = stamp(fixture.clock);
 
-        rejoin.tick(&mut fixture.client, sent_at, t0);
+        rejoin.tick(Some(&mut fixture.client), sent_at, t0);
         wait_until_held(&fixture.authority, CallKind::ReadLiveRegistrations).await;
         assert_eq!(rejoin.wake_at(), Some(t0 + RETRY), "the read is bounded");
         tokio::time::advance(RETRY).await;
-        rejoin.tick(&mut fixture.client, sent_at, Instant::now());
+        rejoin.tick(Some(&mut fixture.client), sent_at, Instant::now());
         assert_eq!(rejoin.wake_at(), Some(t0 + RETRY * 2), "the lagging read ended the round");
 
         // The next round asks nothing new: the held read is its own.
         tokio::time::advance(RETRY).await;
-        rejoin.tick(&mut fixture.client, sent_at, Instant::now());
+        rejoin.tick(Some(&mut fixture.client), sent_at, Instant::now());
         fixture.authority.release(CallKind::ReadLiveRegistrations);
         // The epoch read the first round asked beside it was answered at once.
         for _ in 0..2 {
@@ -929,7 +1045,7 @@ mod tests {
 
         // Nothing is asked: the kind is busy with a read the rejoin did not
         // ask. The round ends, and the next is a retry interval away.
-        rejoin.tick(&mut fixture.client, sent_at, t0);
+        rejoin.tick(Some(&mut fixture.client), sent_at, t0);
         assert_eq!(rejoin.wake_at(), Some(t0 + RETRY));
         assert!(fixture.port.passes().is_empty());
 
@@ -951,7 +1067,7 @@ mod tests {
 
         // A retry interval on, the rejoin reads for itself and gets on.
         tokio::time::advance(RETRY).await;
-        rejoin.tick(&mut fixture.client, sent_at, Instant::now());
+        rejoin.tick(Some(&mut fixture.client), sent_at, Instant::now());
         let own = fixture
             .client
             .next_reply(Some(TEST_TIMEOUT))
@@ -961,5 +1077,205 @@ mod tests {
         let result = rejoin.ask_done().await;
         assert!(rejoin.asked(result, Instant::now()).is_some());
         assert_eq!(fixture.port.passes(), [vec![a1]]);
+    }
+
+    fn rejoin_with_seed(fixture: &Fixture, seed: &Multiaddr) -> Rejoin<'static, Scripted> {
+        Rejoin::new(
+            &ShardId::new("shard-1"),
+            WorkerId::new(ME),
+            fixture.port.clone(),
+            vec![seed.clone()],
+            RETRY,
+            Instant::now(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_round_whose_listing_read_fails_or_is_held_past_its_bound_asks_the_seeds_alone() {
+        for held in [false, true] {
+            let mut fixture = fixture().await;
+            let (listed, seed) = (address(1), address(9));
+            register(&fixture.authority, "w1", &listed.to_string());
+            fixture.port.script(&seed, [Answer::Pointer(pointer_to("leader", &seed))]);
+            let t0 = Instant::now();
+            let mut rejoin = rejoin_with_seed(&fixture, &seed);
+            let sent_at = stamp(fixture.clock);
+
+            if held {
+                fixture.authority.hold_next(CallKind::ReadLiveRegistrations);
+                rejoin.tick(Some(&mut fixture.client), sent_at, t0);
+                wait_until_held(&fixture.authority, CallKind::ReadLiveRegistrations).await;
+                tokio::time::advance(RETRY).await;
+                rejoin.tick(Some(&mut fixture.client), sent_at, Instant::now());
+            } else {
+                fixture.authority.set_reachable(false);
+                rejoin.tick(Some(&mut fixture.client), sent_at, t0);
+                for _ in 0..2 {
+                    let reply = fixture.client.next_reply(Some(TEST_TIMEOUT)).await.unwrap();
+                    rejoin.offer(reply, Instant::now(), JoinFloor::none());
+                }
+            }
+            let result = timeout(TEST_TIMEOUT, rejoin.ask_done()).await.expect("the seeds were asked");
+
+            assert_eq!(
+                rejoin.asked(result, Instant::now()),
+                Some(pointer_to("leader", &seed)),
+                "held: {held}"
+            );
+            assert_eq!(fixture.port.passes(), [vec![seed]], "held: {held}");
+            // Frees the held read's thread so the runtime can shut down.
+            fixture.authority.release(CallKind::ReadLiveRegistrations);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_listing_reply_does_not_drop_the_seed_ask_a_missed_bound_started() {
+        let mut fixture = fixture().await;
+        let (listed, seed) = (address(1), address(9));
+        register(&fixture.authority, "w1", &listed.to_string());
+        fixture.port.script(&seed, [Answer::Pointer(pointer_to("leader", &seed))]);
+        fixture.authority.hold_next(CallKind::ReadLiveRegistrations);
+        let t0 = Instant::now();
+        let mut rejoin = rejoin_with_seed(&fixture, &seed);
+        let sent_at = stamp(fixture.clock);
+
+        rejoin.tick(Some(&mut fixture.client), sent_at, t0);
+        wait_until_held(&fixture.authority, CallKind::ReadLiveRegistrations).await;
+        tokio::time::advance(RETRY).await;
+        rejoin.tick(Some(&mut fixture.client), sent_at, Instant::now());
+
+        // The seed ask is under way when the listing's reply comes in.
+        fixture.authority.release(CallKind::ReadLiveRegistrations);
+        for _ in 0..2 {
+            let reply = fixture.client.next_reply(Some(TEST_TIMEOUT)).await.unwrap();
+            rejoin.offer(reply, Instant::now(), JoinFloor::none());
+        }
+        let result = timeout(TEST_TIMEOUT, rejoin.ask_done()).await.expect("the seeds were asked");
+
+        let ended = Instant::now();
+        assert_eq!(rejoin.asked(result, ended), Some(pointer_to("leader", &seed)));
+        assert_eq!(fixture.port.passes(), [vec![seed]], "only the seed ask ran");
+        assert_eq!(rejoin.wake_at(), Some(ended + RETRY), "the round ended once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_reply_after_its_round_ended_starts_no_ask() {
+        let mut fixture = fixture().await;
+        register(&fixture.authority, "w1", &address(1).to_string());
+        fixture.authority.hold_next(CallKind::ReadLiveRegistrations);
+        let mut rejoin = rejoin_of(&fixture);
+        let sent_at = stamp(fixture.clock);
+
+        rejoin.tick(Some(&mut fixture.client), sent_at, Instant::now());
+        wait_until_held(&fixture.authority, CallKind::ReadLiveRegistrations).await;
+        // With no seeds the round ends at its bound, with nothing asked.
+        tokio::time::advance(RETRY).await;
+        let ended = Instant::now();
+        rejoin.tick(Some(&mut fixture.client), sent_at, ended);
+        assert_eq!(rejoin.wake_at(), Some(ended + RETRY));
+
+        fixture.authority.release(CallKind::ReadLiveRegistrations);
+        for _ in 0..2 {
+            let reply = fixture.client.next_reply(Some(TEST_TIMEOUT)).await.unwrap();
+            rejoin.offer(reply, Instant::now(), JoinFloor::none());
+        }
+
+        assert_eq!(
+            rejoin.wake_at(),
+            Some(ended + RETRY),
+            "the next round is still on its own pace"
+        );
+        assert!(
+            timeout(RETRY, rejoin.ask_done()).await.is_err(),
+            "the late listing started no ask"
+        );
+        assert!(fixture.port.passes().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_search_never_reads_the_authoritys_epoch() {
+        let mut fixture = fixture().await;
+        register(&fixture.authority, "w1", &address(1).to_string());
+        let mut search = rejoin_of(&fixture).for_leader_search();
+
+        search.tick(
+            Some(&mut fixture.client),
+            stamp(fixture.clock),
+            Instant::now(),
+        );
+
+        assert!(search.take_asked_epoch_read().is_none());
+        let reply = fixture.client.next_reply(Some(TEST_TIMEOUT)).await.unwrap();
+        assert_eq!(reply.token().kind, CallKind::ReadLiveRegistrations);
+        assert!(
+            fixture.client.next_reply(Some(RETRY)).await.is_none(),
+            "no epoch read was asked"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_asks_the_listed_workers_then_its_seeds() {
+        let mut fixture = fixture().await;
+        let (listed, seed) = (address(1), address(9));
+        register(&fixture.authority, "w1", &listed.to_string());
+        fixture.port.script(&seed, [Answer::Pointer(pointer_to("leader", &seed))]);
+        let mut search = Rejoin::new(
+            &ShardId::new("shard-1"),
+            WorkerId::new(ME),
+            fixture.port.clone(),
+            vec![seed.clone()],
+            RETRY,
+            Instant::now(),
+        );
+        let (mut found, mut wakes) = (Vec::new(), Vec::new());
+
+        timeout(TEST_TIMEOUT, drive(&mut search, &mut fixture, &mut found, &mut wakes, 1))
+            .await
+            .expect("the search found a leader within the timeout");
+
+        assert_eq!(found[0].0, pointer_to("leader", &seed));
+        assert_eq!(fixture.port.passes(), [vec![listed, seed]]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_with_no_authority_asks_its_seeds() {
+        let seed = address(9);
+        let port = Scripted::default();
+        port.script(&seed, [Answer::Pointer(pointer_to("leader", &seed))]);
+        let mut search: Rejoin<'static, Scripted> = Rejoin::new(
+            &ShardId::new("shard-1"),
+            WorkerId::new(ME),
+            port.clone(),
+            vec![seed.clone()],
+            RETRY,
+            Instant::now(),
+        );
+
+        search.tick(None, CoreInstant::at(0), Instant::now());
+        let result = timeout(TEST_TIMEOUT, search.ask_done()).await.expect("the seeds were asked");
+
+        assert_eq!(search.asked(result, Instant::now()), Some(pointer_to("leader", &seed)));
+        assert_eq!(port.passes(), [vec![seed]]);
+    }
+
+    // Pure decision with real edge density: kept as a focused unit test.
+    #[test]
+    fn a_node_is_stranded_after_a_window_in_roll_call_or_no_quorum_whoever_it_hears() {
+        let at = |ms: u64| CoreInstant::at(1_000 + ms);
+        let ticks = |ms| kabudachi_core::time::Duration::from_millis(ms);
+        let mut watch = StrandedWatch::new(ticks(300));
+        assert!(!watch.observe(WorkerState::Active, at(0)));
+        assert!(!watch.observe(WorkerState::RollCall, at(0)));
+        assert_eq!(watch.wake_at(at(0)), Some(at(300)));
+        assert!(!watch.observe(WorkerState::NoQuorum, at(299)));
+        assert!(watch.observe(WorkerState::NoQuorum, at(300)), "stranded after the window");
+        assert!(!watch.observe(WorkerState::RollCall, at(599)), "re-armed for another window");
+        assert_eq!(watch.wake_at(at(599)), Some(at(600)));
+        assert!(watch.observe(WorkerState::RollCall, at(600)));
+        assert!(!watch.observe(WorkerState::Candidate, at(601)), "leaving clears it");
+        assert_eq!(watch.wake_at(at(601)), None);
+        assert!(!watch.observe(WorkerState::RollCall, at(700)), "a new stay starts a new window");
+        assert!(!watch.observe(WorkerState::RollCall, at(999)));
+        assert!(watch.observe(WorkerState::RollCall, at(1_000)));
     }
 }

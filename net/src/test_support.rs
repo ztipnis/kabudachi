@@ -10,7 +10,7 @@ use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::time::Duration as TickDuration;
-use kabudachi_core::election::{CallKind, JoinFloor};
+use kabudachi_core::election::{CallKind, Input, JoinFloor};
 use kabudachi_testkit::FaultingAuthority;
 use libp2p::{Multiaddr, identity};
 
@@ -187,6 +187,17 @@ pub(crate) async fn listening_net() -> (Net, Multiaddr) {
     .await
     .expect("the net produced a listen address within the timeout");
     (net, address)
+}
+
+/// Takes `net`'s queued inputs until one is `expected`.
+pub(crate) async fn wait_for_input(net: &Net, expected: &Input) {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while !net.take_inputs().contains(expected) {
+            net.wait_for_arrival().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{expected:?} arrived within the timeout"));
 }
 
 /// Answers every `/kabudachi/join/1` request `net` receives with `response`,

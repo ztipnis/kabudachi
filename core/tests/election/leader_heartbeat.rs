@@ -741,6 +741,35 @@ fn draining_withdraws_the_grant_before_the_leader_announces_its_departure() {
     let follower = won.others[0].clone();
     clock.advance(Duration::from_ticks(1));
     let _ = confirm(&mut won.node, &follower, won.won_at);
+    // A leader leaves only once every other voter has crawled its routing at
+    // the admission it holds now: the first round's confirmations commit the
+    // founding and re-admit them, the second round's crawls are counted.
+    for other in won
+        .others
+        .iter()
+        .chain(&won.others)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let mut beat = heartbeat(
+            &other,
+            Some(AckEcho {
+                term: 1,
+                send_token: won.won_at.as_ticks(),
+            }),
+        );
+        beat.configuration_generation = won
+            .node
+            .configuration()
+            .map(|configuration| configuration.generation().into());
+        beat.routing_crawled = true;
+        beat.crawl_admission = won
+            .node
+            .configuration()
+            .map(|configuration| configuration.generation().into());
+        let _ = receive(&mut won.node, &other, beat);
+    }
+    assert_eq!(won.node.state(), WorkerState::Leader, "setup invariant");
 
     let drained = won.node.step(Input::Drain).outputs;
 
