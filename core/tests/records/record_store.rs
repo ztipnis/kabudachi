@@ -3,7 +3,7 @@
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId};
+use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::task_record::{Put, PutRefusal, RecordVersion, VersionedRecords};
 use kabudachi_core::time::{Duration, Instant};
 
@@ -75,6 +75,12 @@ fn the_same_version_is_a_republish_only_when_the_record_is_identical() {
         store.get(&TaskId::new("task-1")).unwrap().task.as_ref().unwrap().queue,
         "q"
     );
+
+    let mut placed_elsewhere = record("task-1", held, "q");
+    let placed_elsewhere_placement = vec![WorkerId::new("w9").into()];
+    placed_elsewhere.placement = placed_elsewhere_placement.clone();
+    assert_eq!(store.put(placed_elsewhere, NOW), Ok(Put::Stored), "only its placement differs");
+    assert_eq!(store.get(&TaskId::new("task-1")).unwrap().placement, placed_elsewhere_placement);
 }
 
 #[test]

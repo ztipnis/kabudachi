@@ -22,7 +22,5 @@ mod routing_refresh;
 pub mod swarm;
 pub mod task_exchange;
 pub mod task_store;
-#[cfg(test)]
-mod test_support;
 mod wait_log;
 pub mod worker;

@@ -262,6 +262,22 @@ impl ReconcileRound {
         rebuild
     }
 
+    /// Takes back what [`Self::take_settled`] handed over and its caller could
+    /// not use: the next call hands it over again, the answers that arrived
+    /// meanwhile superseding the ones given back.
+    pub fn give_back(&mut self, learnt: Rebuild) {
+        for record in &learnt.records {
+            if let Ok((task, version)) = identify(record)
+                && self.handed.get(&task) == Some(&version)
+            {
+                self.handed.remove(&task);
+            }
+        }
+        for (worker, runs) in learnt.reports {
+            self.unhanded.entry(worker).or_insert(runs);
+        }
+    }
+
     /// Whether nothing remains to learn: every worker asked has answered or
     /// left (`is_member` false), and no task is uncertain.
     pub fn is_complete(&self, is_member: impl Fn(&WorkerId) -> bool) -> bool {

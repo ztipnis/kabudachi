@@ -15,19 +15,6 @@ rust_library(
     deps = all_crate_deps(normal = True) + ["//core"],
 )
 
-rust_test(
-    name = "net_test",
-    crate = ":net",
-    edition = "2024",
-    tags = ["no-remote-cache"],
-    deps = all_crate_deps(normal_dev = True),
-)
-
-# ":net" alone isn't enough for the tests to `use kabudachi_core::...`
-# directly: unlike Cargo (where an integration test can reach any of the
-# tested crate's own [dependencies]), a Bazel rust_test is a separate
-# compilation unit that only sees what's explicitly in `deps`. "//core"
-# mirrors the ":net" rust_library target's own `+ ["//core"]` above.
 # One integration-test binary for net, with a module per area under `tests/`.
 #
 # Medium (300 s default timeout) gives the whole crate's tests, which share one

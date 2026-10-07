@@ -2,20 +2,19 @@
 
 use std::collections::VecDeque;
 
-use kabudachi_core::protocol::generated::TaskRecord;
-use kabudachi_core::task_record::{Settlement, Write, WriteOrder};
-use kabudachi_core::time::{Duration, Instant};
-
-use crate::messenger::{PlacedWrite, WriteOutcome};
+use crate::protocol::generated::TaskRecord;
+use crate::task_record::{PlacedWrite, Settlement, Write, WriteOrder, WriteOutcome};
+use crate::time::{Duration, Instant};
 
 /// The most republished records written at once.
-pub(crate) const REPUBLISH_IN_FLIGHT: usize = 64;
+const REPUBLISH_IN_FLIGHT: usize = 64;
 
-/// Writes every republished record, at most [`REPUBLISH_IN_FLIGHT`] at a
-/// time, and writes again any that was not stored, once `retry_after` has
-/// passed, until every one is stored. A record that names its successor is
-/// written only after the successor's is stored (see [`WriteOrder`]).
-pub(crate) struct Republish {
+/// Writes every republished record, a bounded number at a time
+/// (`REPUBLISH_IN_FLIGHT`), and writes again any that was not stored, once
+/// `retry_after` has passed, until every one is stored. A record that names
+/// its successor is written only after the successor's is stored (see
+/// [`WriteOrder`]).
+pub struct Republish {
     retry_after: Duration,
     /// Not yet issued, in the order they must be.
     queued: VecDeque<PlacedWrite>,
@@ -34,7 +33,7 @@ fn is_write_of(placed: &PlacedWrite, write: &Write) -> bool {
 
 impl Republish {
     /// Republishes `writes`, in publication order.
-    pub(crate) fn new(writes: Vec<PlacedWrite>, retry_after: Duration) -> Self {
+    pub fn new(writes: Vec<PlacedWrite>, retry_after: Duration) -> Self {
         let mut order = WriteOrder::default();
         let admitted = order.admit(writes.iter().map(|placed| placed.record.clone()).collect());
         // `admit` keeps the order of what it returns, so what it leaves out is
@@ -61,7 +60,7 @@ impl Republish {
 
     /// The writes to issue now: those whose retry is due, then the queued, up
     /// to the number that may be in flight.
-    pub(crate) fn due(&mut self, now: Instant) -> Vec<PlacedWrite> {
+    pub fn due(&mut self, now: Instant) -> Vec<PlacedWrite> {
         let (due, later): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.retries).into_iter().partition(|(at, _)| *at <= now);
         self.retries = later;
@@ -73,7 +72,7 @@ impl Republish {
     }
 
     /// `outcome` arrived at `now`. Whether it was one of this republish's.
-    pub(crate) fn settled(&mut self, outcome: &WriteOutcome, now: Instant) -> bool {
+    pub fn settled(&mut self, outcome: &WriteOutcome, now: Instant) -> bool {
         let Some(at) = self
             .in_flight
             .iter()
@@ -118,7 +117,7 @@ impl Republish {
 
     /// The voters changed: `replace` places every write not yet stored on
     /// them, and each refused one is written again now, not after its delay.
-    pub(crate) fn re_place(&mut self, mut replace: impl FnMut(&mut PlacedWrite), now: Instant) {
+    pub fn re_place(&mut self, mut replace: impl FnMut(&mut PlacedWrite), now: Instant) {
         let waiting = self.queued.iter_mut().chain(&mut self.behind).chain(&mut self.in_flight);
         for placed in waiting {
             replace(placed);
@@ -137,7 +136,7 @@ impl Republish {
     }
 
     /// Whether every record is stored.
-    pub(crate) fn is_done(&self) -> bool {
+    pub fn is_done(&self) -> bool {
         self.queued.is_empty()
             && self.in_flight.is_empty()
             && self.retries.is_empty()
@@ -145,78 +144,7 @@ impl Republish {
     }
 
     /// When the earliest write not stored is due to be written again.
-    pub(crate) fn wake_at(&self) -> Option<Instant> {
+    pub fn wake_at(&self) -> Option<Instant> {
         self.retries.iter().map(|(at, _)| *at).min()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use kabudachi_core::coordination_authority::RecoveryEpoch;
-    use kabudachi_core::protocol::generated::{Task, TaskRecord};
-    use kabudachi_core::protocol::ids::TaskId;
-    use kabudachi_core::task_record::RecordVersion;
-
-    use super::*;
-
-    fn at(ticks: u64) -> Instant {
-        Instant::at(ticks)
-    }
-
-    fn record(task: &str) -> TaskRecord {
-        TaskRecord {
-            version: Some(
-                RecordVersion {
-                    recovery_epoch: RecoveryEpoch::new(0, 0),
-                    leader_term: 2,
-                    revision: 1,
-                }
-                .into(),
-            ),
-            task: Some(Task {
-                task_id: Some(TaskId::new(task).into()),
-                ..Task::default()
-            }),
-            ..TaskRecord::default()
-        }
-    }
-
-    fn placed(task: &str) -> PlacedWrite {
-        PlacedWrite {
-            record: record(task),
-            quorum: 2,
-        }
-    }
-
-    fn outcome(placed: &PlacedWrite, stored: bool) -> WriteOutcome {
-        WriteOutcome {
-            write: Write::of(&placed.record),
-            stored,
-        }
-    }
-
-    fn named(writes: &[PlacedWrite]) -> Vec<String> {
-        writes
-            .iter()
-            .map(|placed| Write::of(&placed.record).task_id.as_str().to_owned())
-            .collect()
-    }
-
-    #[test]
-    fn a_refused_write_is_written_again_after_the_delay_until_it_is_stored() {
-        let mut republish = Republish::new(vec![placed("task-a")], Duration::from_millis(10));
-        let issued = republish.due(at(0));
-        assert!(!republish.settled(&outcome(&placed("task-other"), true), at(1)), "not its write");
-
-        republish.settled(&outcome(&issued[0], false), at(5));
-
-        assert!(republish.due(at(14)).is_empty(), "not before the delay has passed");
-        assert_eq!(republish.wake_at(), Some(at(15)));
-        let again = republish.due(at(15));
-        assert_eq!(named(&again), ["task-a"]);
-        assert!(!republish.is_done());
-        republish.settled(&outcome(&again[0], true), at(16));
-        assert!(republish.is_done());
-        assert_eq!(republish.wake_at(), None);
     }
 }

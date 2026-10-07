@@ -28,7 +28,7 @@ pub enum PutRefusal {
 
 /// The newest revision of each Task record a worker holds. A put never
 /// replaces a record with an older one, nor with a different one of the same
-/// version.
+/// version, unless it differs only in the voters it is placed on.
 ///
 /// A finished record is dropped once its retention has passed, counted on
 /// this node's own clock from when it first held a finished revision of it.
@@ -44,6 +44,14 @@ pub struct VersionedRecords {
 struct Held {
     record: TaskRecord,
     finished_since: Option<Instant>,
+}
+
+/// Whether `record` is `held` placed on other holders, and nothing else
+/// differs.
+fn only_placed_elsewhere(held: &TaskRecord, record: &TaskRecord) -> bool {
+    let mut replaced = record.clone();
+    replaced.placement.clone_from(&held.placement);
+    replaced == *held
 }
 
 impl VersionedRecords {
@@ -73,6 +81,15 @@ impl VersionedRecords {
                 Ok(Put::Stored)
             }
             VersionOrder::Same if held.record == record => Ok(Put::Unchanged),
+            VersionOrder::Same if only_placed_elsewhere(&held.record, &record) => {
+                // A leader that placed the record anew after its voters
+                // changed writes it again to a holder that kept the first
+                // write: the holder takes the new placement.
+                if let Some(held) = self.records.get_mut(&task) {
+                    held.record.placement = record.placement;
+                }
+                Ok(Put::Stored)
+            }
             VersionOrder::Same => Err(PutRefusal::Conflicting),
             VersionOrder::Older => Err(PutRefusal::Older),
         }

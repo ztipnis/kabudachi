@@ -24,6 +24,7 @@ use kabudachi_testkit::FaultingAuthority;
 use tokio::sync::{Notify, watch};
 use tokio::time::timeout;
 
+use crate::support::deadline::within_deadline;
 use crate::support::net::{
     JoinResponder, driven_scheduler, listening_net, take_inputs_until,
 };
@@ -222,17 +223,26 @@ async fn a_stranded_node_reaches_a_leader_despite(listing: Listing) {
 
 #[tokio::test]
 async fn a_stranded_node_asks_the_workers_the_authority_lists() {
-    a_stranded_node_reaches_a_leader_despite(Listing::Answers).await;
+    within_deadline(async {
+        a_stranded_node_reaches_a_leader_despite(Listing::Answers).await;
+    })
+    .await
 }
 
 #[tokio::test]
 async fn a_stranded_node_whose_listing_read_panicked_reads_it_again_and_reaches_the_worker() {
-    a_stranded_node_reaches_a_leader_despite(Listing::PanicsOnce).await;
+    within_deadline(async {
+        a_stranded_node_reaches_a_leader_despite(Listing::PanicsOnce).await;
+    })
+    .await
 }
 
 #[tokio::test]
 async fn a_stranded_node_whose_listing_read_hangs_asks_its_seed_meanwhile() {
-    a_stranded_node_reaches_a_leader_despite(Listing::HeldWithASeed).await;
+    within_deadline(async {
+        a_stranded_node_reaches_a_leader_despite(Listing::HeldWithASeed).await;
+    })
+    .await
 }
 
 // A rejoining node takes the pointer of a stale leader of the lineage its
@@ -244,103 +254,106 @@ async fn a_stranded_node_whose_listing_read_hangs_asks_its_seed_meanwhile() {
 // its floor accepts only once it has the authority's epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_new_one() {
-    let clock = RealClock::new();
-    let ttl = TickDuration::from_millis(1_000);
-    let authority = FaultingAuthority::new(clock, ttl);
-    let elsewhere = authority.for_another_worker();
-    elsewhere
-        .compare_and_swap_recovery_epoch(&shard(), None, RecoveryEpoch::new(0, 0))
-        .expect("a fresh authority holds no epoch");
-    // Two leaders answer JOIN, each pointing at itself: the old lineage's and
-    // the refounded one's.
-    let mut leaders = Vec::new();
-    for lineage in [1, 2] {
-        let (net, address) = listening_net().await;
-        let net = Arc::new(net);
-        let id = net.local_worker_id();
-        let responder =
-            JoinResponder::start(Arc::clone(&net), Some(pointer(&id, &address, 2, lineage)));
-        leaders.push((net, id, address, responder));
-    }
-    let net = Net::new();
-    let me = net.local_worker_id();
-    let (mut node, first) = node_of_two(
-        clock,
-        &me,
-        TickDuration::from_secs(60),
-        Some(AuthorityTimings { ttl }),
-    );
-    let mut scheduler = driven_scheduler(clock);
-    let mine = authority.for_another_worker();
-    let (seen_tx, mut seen) = watch::channel((WorkerState::Active, None));
-    let driven = run_driver(
-        &mut node,
-        first,
-        &net,
-        &mut scheduler,
-        clock,
-        Some(AuthorityClient::new(&net, shard(), Arc::new(mine.clone()))),
-        DriverConfig::default(),
-        |node, _, _| {
-            seen_tx.send_replace((node.state(), node.recovery_lineage()));
-        },
-    );
-    let last = seen.clone();
-    let listed = Notify::new();
-    let register_leaders = async {
-        listed.notified().await;
-        let listed: Vec<_> = leaders
-            .iter()
-            .map(|(_, id, address, _)| (id.clone(), address.to_string()))
-            .collect();
-        keep_registered(&elsewhere, &listed).await;
-    };
-    let scenario = async {
-        let mut wait_for = async |what: &str, holds: fn(&(WorkerState, Option<u64>)) -> bool| {
-            timeout(TEST_TIMEOUT, seen.wait_for(holds))
-                .await
-                .unwrap_or_else(|_| panic!("{what} within the timeout: {:?}", *last.borrow()))
-                .expect("the driver is running");
+    within_deadline(async {
+        let clock = RealClock::new();
+        let ttl = TickDuration::from_millis(1_000);
+        let authority = FaultingAuthority::new(clock, ttl);
+        let elsewhere = authority.for_another_worker();
+        elsewhere
+            .compare_and_swap_recovery_epoch(&shard(), None, RecoveryEpoch::new(0, 0))
+            .expect("a fresh authority holds no epoch");
+        // Two leaders answer JOIN, each pointing at itself: the old lineage's and
+        // the refounded one's.
+        let mut leaders = Vec::new();
+        for lineage in [1, 2] {
+            let (net, address) = listening_net().await;
+            let net = Arc::new(net);
+            let id = net.local_worker_id();
+            let responder =
+                JoinResponder::start(Arc::clone(&net), Some(pointer(&id, &address, 2, lineage)));
+            leaders.push((net, id, address, responder));
+        }
+        let net = Net::new();
+        let me = net.local_worker_id();
+        let (mut node, first) = node_of_two(
+            clock,
+            &me,
+            TickDuration::from_secs(60),
+            Some(AuthorityTimings { ttl }),
+        );
+        let mut scheduler = driven_scheduler(clock);
+        let mine = authority.for_another_worker();
+        let (seen_tx, mut seen) = watch::channel((WorkerState::Active, None));
+        let driven = run_driver(
+            &mut node,
+            first,
+            &net,
+            &mut scheduler,
+            clock,
+            Some(AuthorityClient::new(&net, shard(), Arc::new(mine.clone()))),
+            DriverConfig::default(),
+            |node, _, _| {
+                seen_tx.send_replace((node.state(), node.recovery_lineage()));
+            },
+        );
+        let last = seen.clone();
+        let listed = Notify::new();
+        let register_leaders = async {
+            listed.notified().await;
+            let listed: Vec<_> = leaders
+                .iter()
+                .map(|(_, id, address, _)| (id.clone(), address.to_string()))
+                .collect();
+            keep_registered(&elsewhere, &listed).await;
         };
-        mine.set_reachable(false);
-        wait_for("the node fenced itself", |seen| seen.0 == WorkerState::Fenced).await;
-        elsewhere
-            .compare_and_swap_recovery_epoch(
-                &shard(),
-                Some(RecoveryEpoch::new(0, 0)),
-                RecoveryEpoch::new(2, 1),
-            )
-            .expect("a recovery elsewhere moved the epoch on");
-        mine.set_reachable(true);
-        wait_for("the node rejoined at epoch 2 of lineage 1", |seen| {
-            *seen == (WorkerState::Bootstrapping, Some(1))
-        })
-        .await;
-        // The node's next read of the epoch lags, and the shard is refounded
-        // under lineage 2 at the same number. Both leaders are listed only
-        // now: the old one's pointer is the only one the node's floor accepts.
-        mine.hold_next(CallKind::ReadRecoveryEpoch);
-        elsewhere
-            .compare_and_swap_recovery_epoch(
-                &shard(),
-                Some(RecoveryEpoch::new(2, 1)),
-                RecoveryEpoch::new(2, 2),
-            )
-            .expect("the shard is refounded");
-        listed.notify_one();
-        wait_for("the node took the old lineage's pointer and awaits the authority", |seen| {
-            *seen == (WorkerState::Joining, Some(1))
-        })
-        .await;
-        mine.release(CallKind::ReadRecoveryEpoch);
-        wait_for("the node is a member in the refounded lineage", |seen| {
-            *seen == (WorkerState::Active, Some(2))
-        })
-        .await;
-    };
-    tokio::select! {
-        _ = driven => unreachable!("run_driver never returns"),
-        () = register_leaders => unreachable!("registering never ends"),
-        () = scenario => {}
-    }
+        let scenario = async {
+            let mut wait_for = async |what: &str, holds: fn(&(WorkerState, Option<u64>)) -> bool| {
+                timeout(TEST_TIMEOUT, seen.wait_for(holds))
+                    .await
+                    .unwrap_or_else(|_| panic!("{what} within the timeout: {:?}", *last.borrow()))
+                    .expect("the driver is running");
+            };
+            mine.set_reachable(false);
+            wait_for("the node fenced itself", |seen| seen.0 == WorkerState::Fenced).await;
+            elsewhere
+                .compare_and_swap_recovery_epoch(
+                    &shard(),
+                    Some(RecoveryEpoch::new(0, 0)),
+                    RecoveryEpoch::new(2, 1),
+                )
+                .expect("a recovery elsewhere moved the epoch on");
+            mine.set_reachable(true);
+            wait_for("the node rejoined at epoch 2 of lineage 1", |seen| {
+                *seen == (WorkerState::Bootstrapping, Some(1))
+            })
+            .await;
+            // The node's next read of the epoch lags, and the shard is refounded
+            // under lineage 2 at the same number. Both leaders are listed only
+            // now: the old one's pointer is the only one the node's floor accepts.
+            mine.hold_next(CallKind::ReadRecoveryEpoch);
+            elsewhere
+                .compare_and_swap_recovery_epoch(
+                    &shard(),
+                    Some(RecoveryEpoch::new(2, 1)),
+                    RecoveryEpoch::new(2, 2),
+                )
+                .expect("the shard is refounded");
+            listed.notify_one();
+            wait_for("the node took the old lineage's pointer and awaits the authority", |seen| {
+                *seen == (WorkerState::Joining, Some(1))
+            })
+            .await;
+            mine.release(CallKind::ReadRecoveryEpoch);
+            wait_for("the node is a member in the refounded lineage", |seen| {
+                *seen == (WorkerState::Active, Some(2))
+            })
+            .await;
+        };
+        tokio::select! {
+            _ = driven => unreachable!("run_driver never returns"),
+            () = register_leaders => unreachable!("registering never ends"),
+            () = scenario => {}
+        }
+    })
+    .await
 }

@@ -19,6 +19,7 @@ use kabudachi_net::bootstrap::{DEFAULT_SEED_ROUNDS, bootstrap};
 use kabudachi_net::messenger::Net;
 use tokio::time::timeout;
 
+use crate::support::deadline::within_deadline;
 use crate::support::net::{JoinResponder, listening_net, pointer_to};
 use crate::support::worker::{
     PER_PEER_TIMEOUT, RETRY_INTERVAL, TEST_TIMEOUT, poll_until, warmed_up_in_memory_authority,
@@ -40,108 +41,114 @@ fn shard() -> ShardId {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seed_that_answered_once_keeps_the_worker_from_founding_until_it_points_at_a_leader() {
-    let (seed, seed_address) = listening_net().await;
-    let (leader, leader_address) = listening_net().await;
-    let pointer = pointer_to(&leader.local_worker_id(), &leader_address);
-    let _leader_answers = JoinResponder::start(Arc::new(leader), Some(pointer.clone()));
-    // The seed answers "no leader known" once, then goes quiet.
-    let seed_answers = JoinResponder::start(Arc::new(seed), Some(JoinResponse::default()));
-    let net = Net::new();
-    let me = net.local_worker_id();
-    let (clock, shard_id, seeds) = (RealClock::new(), shard(), [seed_address]);
-    let mut running = pin!(bootstrap(
-        &net,
-        &clock,
-        None,
-        &shard_id,
-        &me,
-        &seeds,
-        PER_PEER_TIMEOUT,
-        GRACE,
-        RETRY_INTERVAL,
-        DEFAULT_SEED_ROUNDS,
-    ));
+    within_deadline(async {
+        let (seed, seed_address) = listening_net().await;
+        let (leader, leader_address) = listening_net().await;
+        let pointer = pointer_to(&leader.local_worker_id(), &leader_address);
+        let _leader_answers = JoinResponder::start(Arc::new(leader), Some(pointer.clone()));
+        // The seed answers "no leader known" once, then goes quiet.
+        let seed_answers = JoinResponder::start(Arc::new(seed), Some(JoinResponse::default()));
+        let net = Net::new();
+        let me = net.local_worker_id();
+        let (clock, shard_id, seeds) = (RealClock::new(), shard(), [seed_address]);
+        let mut running = pin!(bootstrap(
+            &net,
+            &clock,
+            None,
+            &shard_id,
+            &me,
+            &seeds,
+            PER_PEER_TIMEOUT,
+            GRACE,
+            RETRY_INTERVAL,
+            DEFAULT_SEED_ROUNDS,
+        ));
 
-    tokio::select! {
-        entry = &mut running => panic!("the worker entered before its seed answered: {entry:?}"),
-        () = poll_until("the seed answered", || seed_answers.answered() >= 1) => {}
-    }
-    seed_answers.set(None);
-    let founded = timeout(SILENCE, &mut running).await;
-    assert!(founded.is_err(), "the worker founded a shard after its seed showed one exists");
+        tokio::select! {
+            entry = &mut running => panic!("the worker entered before its seed answered: {entry:?}"),
+            () = poll_until("the seed answered", || seed_answers.answered() >= 1) => {}
+        }
+        seed_answers.set(None);
+        let founded = timeout(SILENCE, &mut running).await;
+        assert!(founded.is_err(), "the worker founded a shard after its seed showed one exists");
 
-    seed_answers.set(Some(pointer.clone()));
-    let entry = timeout(TEST_TIMEOUT, running)
-        .await
-        .expect("the worker joined once its seed pointed at a leader");
-    assert!(matches!(entry, Entry::Joining(joined) if joined == pointer));
+        seed_answers.set(Some(pointer.clone()));
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the worker joined once its seed pointed at a leader");
+        assert!(matches!(entry, Entry::Joining(joined) if joined == pointer));
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lapses() {
-    let authority: InMemoryAuthority<RealClock> =
-        warmed_up_in_memory_authority(&shard(), TickDuration::from_millis(TTL.as_millis() as u64))
-            .await;
-    // The listed peer answers "no leader known", and is never renewed.
-    let (peer, peer_address) = listening_net().await;
-    let peer_id = peer.local_worker_id();
-    let _peer_answers = JoinResponder::start(Arc::new(peer), Some(JoinResponse::default()));
-    authority
-        .register(&shard(), &peer_id, &peer_address.to_string())
-        .expect("the authority is reachable");
-    let net = Net::new();
-    let me = net.local_worker_id();
-    let (clock, shard_id) = (RealClock::new(), shard());
-    let mut client = AuthorityClient::new(&net, shard_id.clone(), Arc::new(authority.clone()));
-    let mut running = pin!(bootstrap(
-        &net,
-        &clock,
-        Some(&mut client),
-        &shard_id,
-        &me,
-        &[],
-        PER_PEER_TIMEOUT,
-        GRACE,
-        RETRY_INTERVAL,
-        DEFAULT_SEED_ROUNDS,
-    ));
-
-    // The listing is warm and empty once the registration lapses, and the
-    // worker, which has been told by that peer that the shard exists, still
-    // does not take ownership of it.
-    let lapsed = async {
-        poll_until("the peer's registration lapsed", || {
-            authority
-                .live_registrations(&shard())
-                .expect("the authority is reachable")
-                .addresses()
-                .is_empty()
-        })
-        .await;
-        tokio::time::sleep(SILENCE).await;
-    };
-    tokio::select! {
-        entry = &mut running => panic!("the worker entered after its only peer left the listing: {entry:?}"),
-        () = lapsed => {}
-    }
-    assert_eq!(
+    within_deadline(async {
+        let authority: InMemoryAuthority<RealClock> =
+            warmed_up_in_memory_authority(&shard(), TickDuration::from_millis(TTL.as_millis() as u64))
+                .await;
+        // The listed peer answers "no leader known", and is never renewed.
+        let (peer, peer_address) = listening_net().await;
+        let peer_id = peer.local_worker_id();
+        let _peer_answers = JoinResponder::start(Arc::new(peer), Some(JoinResponse::default()));
         authority
-            .read_recovery_epoch(&shard())
-            .expect("the authority is reachable"),
-        None,
-        "the worker took ownership of a shard its peer showed exists"
-    );
+            .register(&shard(), &peer_id, &peer_address.to_string())
+            .expect("the authority is reachable");
+        let net = Net::new();
+        let me = net.local_worker_id();
+        let (clock, shard_id) = (RealClock::new(), shard());
+        let mut client = AuthorityClient::new(&net, shard_id.clone(), Arc::new(authority.clone()));
+        let mut running = pin!(bootstrap(
+            &net,
+            &clock,
+            Some(&mut client),
+            &shard_id,
+            &me,
+            &[],
+            PER_PEER_TIMEOUT,
+            GRACE,
+            RETRY_INTERVAL,
+            DEFAULT_SEED_ROUNDS,
+        ));
 
-    // A leader registers, and the worker joins it through the listing.
-    let (leader, leader_address) = listening_net().await;
-    let leader_id: WorkerId = leader.local_worker_id();
-    let pointer = pointer_to(&leader_id, &leader_address);
-    let _leader_answers = JoinResponder::start(Arc::new(leader), Some(pointer.clone()));
-    authority
-        .register(&shard(), &leader_id, &leader_address.to_string())
-        .expect("the authority is reachable");
-    let entry = timeout(TEST_TIMEOUT, running)
-        .await
-        .expect("the worker joined the leader that registered");
-    assert!(matches!(entry, Entry::Joining(joined) if joined == pointer));
+        // The listing is warm and empty once the registration lapses, and the
+        // worker, which has been told by that peer that the shard exists, still
+        // does not take ownership of it.
+        let lapsed = async {
+            poll_until("the peer's registration lapsed", || {
+                authority
+                    .live_registrations(&shard())
+                    .expect("the authority is reachable")
+                    .addresses()
+                    .is_empty()
+            })
+            .await;
+            tokio::time::sleep(SILENCE).await;
+        };
+        tokio::select! {
+            entry = &mut running => panic!("the worker entered after its only peer left the listing: {entry:?}"),
+            () = lapsed => {}
+        }
+        assert_eq!(
+            authority
+                .read_recovery_epoch(&shard())
+                .expect("the authority is reachable"),
+            None,
+            "the worker took ownership of a shard its peer showed exists"
+        );
+
+        // A leader registers, and the worker joins it through the listing.
+        let (leader, leader_address) = listening_net().await;
+        let leader_id: WorkerId = leader.local_worker_id();
+        let pointer = pointer_to(&leader_id, &leader_address);
+        let _leader_answers = JoinResponder::start(Arc::new(leader), Some(pointer.clone()));
+        authority
+            .register(&shard(), &leader_id, &leader_address.to_string())
+            .expect("the authority is reachable");
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the worker joined the leader that registered");
+        assert!(matches!(entry, Entry::Joining(joined) if joined == pointer));
+    })
+    .await
 }

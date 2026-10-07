@@ -30,6 +30,7 @@
 
 use std::time::Duration as StdDuration;
 
+use crate::support::deadline::within_deadline;
 use crate::support::net::driven_scheduler;
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, KnownConfiguration, WorkerNode};
@@ -136,101 +137,104 @@ async fn wait_for_convergence(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_and_leads() {
-    let (net_a, net_b, net_c) = (new_net(), new_net(), new_net());
-    let addr_b = listen(&net_b).await;
-    let addr_c = listen(&net_c).await;
-    let addr_a = listen(&net_a).await;
-    let (worker_a, worker_b, worker_c) = (
-        net_a.local_worker_id(),
-        net_b.local_worker_id(),
-        net_c.local_worker_id(),
-    );
+    within_deadline(async {
+        let (net_a, net_b, net_c) = (new_net(), new_net(), new_net());
+        let addr_b = listen(&net_b).await;
+        let addr_c = listen(&net_c).await;
+        let addr_a = listen(&net_a).await;
+        let (worker_a, worker_b, worker_c) = (
+            net_a.local_worker_id(),
+            net_b.local_worker_id(),
+            net_c.local_worker_id(),
+        );
 
-    // Neither end's inputs are taken: the nodes built afterwards are fed
-    // them.
-    net_a.dial(addr_b.clone());
-    net_c.dial(addr_b);
-    wait_until_registered(&net_a, &worker_b).await;
-    wait_until_registered(&net_c, &worker_b).await;
-    wait_until_registered(&net_b, &worker_a).await;
-    wait_until_registered(&net_b, &worker_c).await;
+        // Neither end's inputs are taken: the nodes built afterwards are fed
+        // them.
+        net_a.dial(addr_b.clone());
+        net_c.dial(addr_b);
+        wait_until_registered(&net_a, &worker_b).await;
+        wait_until_registered(&net_c, &worker_b).await;
+        wait_until_registered(&net_b, &worker_a).await;
+        wait_until_registered(&net_b, &worker_c).await;
 
-    let shard = ShardId::new(SHARD);
-    for net in [&net_a, &net_b, &net_c] {
-        net.subscribe_to_shard(&shard);
-    }
-    wait_until_subscribed(&net_a, &[&worker_b]).await;
-    wait_until_subscribed(&net_b, &[&worker_a, &worker_c]).await;
-    wait_until_subscribed(&net_c, &[&worker_b]).await;
-
-    // Every connection records its peer's address, so an empty record means
-    // the two ends have never connected.
-    assert!(!net_a.diagnostics().await.peer_addresses.contains_key(&worker_c));
-    assert!(!net_c.diagnostics().await.peer_addresses.contains_key(&worker_a));
-
-    // One monotonic clock for every node and scheduler (see run_driver's
-    // doc).
-    let clock = RealClock::new();
-    let (mut node_a, mut node_c) = built_on_one_tick(&clock, || {
-        (
-            make_node(clock, worker_a.clone()),
-            make_node(clock, worker_c.clone()),
-        )
-    });
-    let (tx_a, rx_a) = watch::channel(seen(&node_a));
-    let (tx_c, rx_c) = watch::channel(seen(&node_c));
-    let (last_a, last_c) = (rx_a.clone(), rx_c.clone());
-    let mut scheduler_a = driven_scheduler(clock);
-    let mut scheduler_c = driven_scheduler(clock);
-
-    let converged = timeout(TEST_TIMEOUT, async {
-        tokio::select! {
-            _ = run_driver(
-                &mut node_a,
-                due_now(&clock),
-                &net_a,
-                &mut scheduler_a,
-                clock,
-                None,
-                DriverConfig::default(),
-                |node, _, _| { let _ = tx_a.send(seen(node)); },
-            ) => {
-                unreachable!("run_driver never returns")
-            }
-            _ = run_driver(
-                &mut node_c,
-                due_now(&clock),
-                &net_c,
-                &mut scheduler_c,
-                clock,
-                None,
-                DriverConfig::default(),
-                |node, _, _| { let _ = tx_c.send(seen(node)); },
-            ) => {
-                unreachable!("run_driver never returns")
-            }
-            states = wait_for_convergence(rx_a, rx_c) => states,
+        let shard = ShardId::new(SHARD);
+        for net in [&net_a, &net_b, &net_c] {
+            net.subscribe_to_shard(&shard);
         }
+        wait_until_subscribed(&net_a, &[&worker_b]).await;
+        wait_until_subscribed(&net_b, &[&worker_a, &worker_c]).await;
+        wait_until_subscribed(&net_c, &[&worker_b]).await;
+
+        // Every connection records its peer's address, so an empty record means
+        // the two ends have never connected.
+        assert!(!net_a.diagnostics().await.peer_addresses.contains_key(&worker_c));
+        assert!(!net_c.diagnostics().await.peer_addresses.contains_key(&worker_a));
+
+        // One monotonic clock for every node and scheduler (see run_driver's
+        // doc).
+        let clock = RealClock::new();
+        let (mut node_a, mut node_c) = built_on_one_tick(&clock, || {
+            (
+                make_node(clock, worker_a.clone()),
+                make_node(clock, worker_c.clone()),
+            )
+        });
+        let (tx_a, rx_a) = watch::channel(seen(&node_a));
+        let (tx_c, rx_c) = watch::channel(seen(&node_c));
+        let (last_a, last_c) = (rx_a.clone(), rx_c.clone());
+        let mut scheduler_a = driven_scheduler(clock);
+        let mut scheduler_c = driven_scheduler(clock);
+
+        let converged = timeout(TEST_TIMEOUT, async {
+            tokio::select! {
+                _ = run_driver(
+                    &mut node_a,
+                    due_now(&clock),
+                    &net_a,
+                    &mut scheduler_a,
+                    clock,
+                    None,
+                    DriverConfig::default(),
+                    |node, _, _| { let _ = tx_a.send(seen(node)); },
+                ) => {
+                    unreachable!("run_driver never returns")
+                }
+                _ = run_driver(
+                    &mut node_c,
+                    due_now(&clock),
+                    &net_c,
+                    &mut scheduler_c,
+                    clock,
+                    None,
+                    DriverConfig::default(),
+                    |node, _, _| { let _ = tx_c.send(seen(node)); },
+                ) => {
+                    unreachable!("run_driver never returns")
+                }
+                states = wait_for_convergence(rx_a, rx_c) => states,
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "one of node_a and node_c should lead with the other following within the \
+                 timeout; last seen node_a {:?}, node_c {:?}",
+                last_a.borrow(),
+                last_c.borrow(),
+            )
+        });
+
+        // The follower answered the leader's roll call by dialing it, so it
+        // holds the leader's listen address (see this file's "Why either winner
+        // will do").
+        let (follower_net, follower_node_leader, leader, leader_addr) = match converged {
+            (WorkerState::Active, WorkerState::Leader) => {
+                (&net_a, node_a.known_leader(), worker_c, addr_c)
+            }
+            _ => (&net_c, node_c.known_leader(), worker_a, addr_a),
+        };
+        assert_eq!(follower_node_leader.map(|(id, _)| id), Some(leader.clone()));
+        assert_eq!(follower_net.dialable_address(&leader).await, Some(leader_addr));
     })
     .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "one of node_a and node_c should lead with the other following within the \
-             timeout; last seen node_a {:?}, node_c {:?}",
-            last_a.borrow(),
-            last_c.borrow(),
-        )
-    });
-
-    // The follower answered the leader's roll call by dialing it, so it
-    // holds the leader's listen address (see this file's "Why either winner
-    // will do").
-    let (follower_net, follower_node_leader, leader, leader_addr) = match converged {
-        (WorkerState::Active, WorkerState::Leader) => {
-            (&net_a, node_a.known_leader(), worker_c, addr_c)
-        }
-        _ => (&net_c, node_c.known_leader(), worker_a, addr_a),
-    };
-    assert_eq!(follower_node_leader.map(|(id, _)| id), Some(leader.clone()));
-    assert_eq!(follower_net.dialable_address(&leader).await, Some(leader_addr));
 }

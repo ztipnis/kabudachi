@@ -684,7 +684,7 @@ where
     let current = reconciliation.as_mut()?;
     let mut next_deadline = None;
     loop {
-        match current.progress(node, clock.now()) {
+        match current.progress(node, scheduler.is_leader(), clock.now()) {
             Progress::Waiting => return next_deadline,
             Progress::Rebuild(rebuild) => match scheduler.reconcile(rebuild) {
                 Ok(rebuilt) => {
@@ -754,20 +754,43 @@ where
                 // The grant applied what was lost while reconciling.
                 write_revisions(node, scheduler, net, factor, unsettled);
             }
-            Progress::Learnt(mut queue) => {
+            Progress::Learnt(learnt) => {
+                // As on every input, the node checks its lease first: one
+                // that ended since the node last stepped takes it out of
+                // office, and with it the reconciliation, before the
+                // scheduler is handed anything.
+                let due = Stepper {
+                    node: &mut *node,
+                    scheduler: &mut *scheduler,
+                    net,
+                    replication_factor: factor,
+                    unsettled: &mut *unsettled,
+                    calls: calls.as_deref_mut(),
+                    observe: &mut *observe,
+                    runs_heard: &mut Vec::new(),
+                }
+                .step(Input::Tick);
+                next_deadline = match (next_deadline, due) {
+                    (Some(held), Some(due)) => Some(held.min(due)),
+                    (held, due) => held.or(due),
+                };
+                if node.office_term() != Some(current.office()) {
+                    *reconciliation = None;
+                    return next_deadline;
+                }
                 let mut silent_holders = BTreeSet::new();
-                while let Some(learnt) = queue.pop_front() {
-                    match scheduler.adopt(learnt) {
-                        Ok(adopted) => silent_holders.extend(adopted.silent_holders),
-                        Err(learnt) => {
-                            // Not leading yet, or no more: the round has
-                            // given this knowledge up, so it is offered
-                            // again, in order.
-                            tracing::debug!("late reconciliation answers were not adopted: not leading");
-                            queue.push_front(learnt);
-                            current.stuck(Stuck::Adopt(queue), node.voters(), clock.now());
-                            break;
-                        }
+                match scheduler.adopt(learnt) {
+                    Ok(adopted) => silent_holders.extend(adopted.silent_holders),
+                    // Holding office does not mean leading: the grant also
+                    // ends with the recovery fence, which the node can renew,
+                    // and has not arrived before a quorum confirms the
+                    // office. The round has given the knowledge up, so it
+                    // takes it back and offers it again once the scheduler
+                    // leads.
+                    Err(learnt) => {
+                        tracing::debug!("late reconciliation answers were not adopted: not leading");
+                        current.give_back(learnt);
+                        return next_deadline;
                     }
                 }
                 if !silent_holders.is_empty() {
@@ -1337,6 +1360,3 @@ fn send_answer(net: &Net, settled: Settled<HeldAnswer>) {
         }
     }
 }
-
-#[cfg(test)]
-mod reconcile_tests;

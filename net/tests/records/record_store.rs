@@ -15,6 +15,7 @@ use libp2p::kad::{Record, RecordKey};
 use prost::Message as _;
 use tokio::time::timeout;
 
+use crate::support::deadline::within_deadline;
 use crate::support::net::connect_to;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -120,26 +121,29 @@ async fn write_one(writer: &Net, record: TaskRecord, holders: &[&WorkerId], quor
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_holder_acknowledges_only_records_it_stored() {
-    let (writer, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;
-    let holder_id = holder.local_worker_id();
+    within_deadline(async {
+        let (writer, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;
+        let holder_id = holder.local_worker_id();
 
-    let newer = record("task-1", version(0, 0, 1, 5), "newer");
-    assert!(write_one(&writer, newer.clone(), &[&holder_id], 1).await);
-    let held = placed_at(newer.clone(), &[&holder_id]);
-    assert_eq!(holder.held_records().get(&TaskId::new("task-1")), Some(held.clone()));
+        let newer = record("task-1", version(0, 0, 1, 5), "newer");
+        assert!(write_one(&writer, newer.clone(), &[&holder_id], 1).await);
+        let held = placed_at(newer.clone(), &[&holder_id]);
+        assert_eq!(holder.held_records().get(&TaskId::new("task-1")), Some(held.clone()));
 
-    let older = record("task-1", version(0, 0, 1, 4), "older");
-    let conflicting = record("task-1", version(0, 0, 1, 5), "different");
-    assert_eq!(
-        write_all(&writer, vec![older, conflicting], &[&holder_id], 1).await,
-        [false, false],
-        "neither an older revision nor a different one of the same version is acknowledged"
-    );
-    assert!(
-        write_one(&writer, newer.clone(), &[&holder_id], 1).await,
-        "an identical republish is"
-    );
-    assert_eq!(holder.held_records().get(&TaskId::new("task-1")), Some(held));
+        let older = record("task-1", version(0, 0, 1, 4), "older");
+        let conflicting = record("task-1", version(0, 0, 1, 5), "different");
+        assert_eq!(
+            write_all(&writer, vec![older, conflicting], &[&holder_id], 1).await,
+            [false, false],
+            "neither an older revision nor a different one of the same version is acknowledged"
+        );
+        assert!(
+            write_one(&writer, newer.clone(), &[&holder_id], 1).await,
+            "an identical republish is"
+        );
+        assert_eq!(holder.held_records().get(&TaskId::new("task-1")), Some(held));
+    })
+    .await
 }
 
 /// What `reader` finds when it looks `task` up among its peers and itself.
@@ -155,32 +159,35 @@ fn queue_of(found: Option<TaskRecord>) -> Option<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lookup_finds_the_newest_revision_among_the_peers_and_the_reader_itself() {
-    // The newest revision any peer holds, though one holds only an old one,
-    // and nothing at all for a task no one holds.
-    let [reader, stale, fresh] = three_connected(shard("shard-1")).await;
-    let (stale_id, fresh_id) = (stale.local_worker_id(), fresh.local_worker_id());
-    assert!(
-        write_one(&reader, record("task-1", version(0, 0, 1, 1), "old"), &[&stale_id, &fresh_id], 2)
-            .await
-    );
-    assert!(write_one(&reader, record("task-1", version(0, 0, 2, 0), "new"), &[&fresh_id], 1).await);
-    assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("new"));
-    assert_eq!(lookup(&reader, "task-2").await, None, "no one holds task-2");
+    within_deadline(async {
+        // The newest revision any peer holds, though one holds only an old one,
+        // and nothing at all for a task no one holds.
+        let [reader, stale, fresh] = three_connected(shard("shard-1")).await;
+        let (stale_id, fresh_id) = (stale.local_worker_id(), fresh.local_worker_id());
+        assert!(
+            write_one(&reader, record("task-1", version(0, 0, 1, 1), "old"), &[&stale_id, &fresh_id], 2)
+                .await
+        );
+        assert!(write_one(&reader, record("task-1", version(0, 0, 2, 0), "new"), &[&fresh_id], 1).await);
+        assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("new"));
+        assert_eq!(lookup(&reader, "task-2").await, None, "no one holds task-2");
 
-    // The reader's own copy counts: a newer revision only it holds.
-    let (reader, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;
-    let holders = [&reader.local_worker_id(), &holder.local_worker_id()];
-    assert!(write_one(&reader, record("task-1", version(0, 0, 1, 0), "mine"), &holders, 2).await);
-    assert!(
-        write_one(&reader, record("task-1", version(0, 0, 1, 1), "newer"), &[holders[0]], 1).await
-    );
-    assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("newer"));
+        // The reader's own copy counts: a newer revision only it holds.
+        let (reader, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;
+        let holders = [&reader.local_worker_id(), &holder.local_worker_id()];
+        assert!(write_one(&reader, record("task-1", version(0, 0, 1, 0), "mine"), &holders, 2).await);
+        assert!(
+            write_one(&reader, record("task-1", version(0, 0, 1, 1), "newer"), &[holders[0]], 1).await
+        );
+        assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("newer"));
 
-    // Holders that dialed the reader are found too, though it never dialed them.
-    let [reader, writer, first, second] = reader_dialed_by_holders(shard("shard-1")).await;
-    let holders = [&first.local_worker_id(), &second.local_worker_id()];
-    assert!(write_one(&writer, record("task-1", version(0, 0, 1, 0), "held"), &holders, 2).await);
-    assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("held"));
+        // Holders that dialed the reader are found too, though it never dialed them.
+        let [reader, writer, first, second] = reader_dialed_by_holders(shard("shard-1")).await;
+        let holders = [&first.local_worker_id(), &second.local_worker_id()];
+        assert!(write_one(&writer, record("task-1", version(0, 0, 1, 0), "held"), &holders, 2).await);
+        assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("held"));
+    })
+    .await
 }
 
 /// A reader of `shard` that only its two holders dialed (it never dialed
@@ -213,33 +220,36 @@ async fn eventually(what: &str, mut condition: impl AsyncFnMut() -> bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_never_lands_in_another_shard_and_its_peer_is_never_a_routing_candidate() {
-    let host = Net::for_shard(shard("shard-1"), None);
-    let same_shard = Net::for_shard(shard("shard-1"), None);
-    let other_shard = Net::for_shard(shard("shard-2"), None);
-    let address = host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
-    for dialer in [&same_shard, &other_shard] {
-        // Only a peer that advertises a listen address can be added.
-        dialer.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
-        connect_to(&host, &address, dialer).await;
-    }
-    let (same_id, other_id) = (same_shard.local_worker_id(), other_shard.local_worker_id());
+    within_deadline(async {
+        let host = Net::for_shard(shard("shard-1"), None);
+        let same_shard = Net::for_shard(shard("shard-1"), None);
+        let other_shard = Net::for_shard(shard("shard-2"), None);
+        let address = host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+        for dialer in [&same_shard, &other_shard] {
+            // Only a peer that advertises a listen address can be added.
+            dialer.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+            connect_to(&host, &address, dialer).await;
+        }
+        let (same_id, other_id) = (same_shard.local_worker_id(), other_shard.local_worker_id());
 
-    let stored = write_one(&host, record("task-1", version(0, 0, 1, 0), "q"), &[&other_id], 1).await;
+        let stored = write_one(&host, record("task-1", version(0, 0, 1, 0), "q"), &[&other_id], 1).await;
 
-    assert!(!stored);
-    assert_eq!(other_shard.held_records().get(&TaskId::new("task-1")), None);
+        assert!(!stored);
+        assert_eq!(other_shard.held_records().get(&TaskId::new("task-1")), None);
 
-    // Both were identified by the host, which only an Identify gives it an
-    // address for: the dialers connected inbound.
-    eventually("the host identified both peers", async || {
-        host.dialable_address(&same_id).await.is_some()
-            && host.dialable_address(&other_id).await.is_some()
+        // Both were identified by the host, which only an Identify gives it an
+        // address for: the dialers connected inbound.
+        eventually("the host identified both peers", async || {
+            host.dialable_address(&same_id).await.is_some()
+                && host.dialable_address(&other_id).await.is_some()
+        })
+        .await;
+
+        let routed = host.records_routing_peers().await;
+        assert!(routed.contains(&same_id), "a peer of the same shard is a routing candidate");
+        assert!(!routed.contains(&other_id), "a peer of another shard is not");
     })
-    .await;
-
-    let routed = host.records_routing_peers().await;
-    assert!(routed.contains(&same_id), "a peer of the same shard is a routing candidate");
-    assert!(!routed.contains(&other_id), "a peer of another shard is not");
+    .await
 }
 
 // A store is what kad hands every record it is asked to keep, whatever a

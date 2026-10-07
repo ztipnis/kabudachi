@@ -20,11 +20,13 @@
 
 mod alone;
 mod drift;
+mod republish;
 mod round;
 pub mod wire;
 
 pub use alone::reconcile_alone;
 pub use drift::DriftWatch;
+pub use republish::Republish;
 pub use round::{Cursor, ReconcileRound};
 
 use std::collections::{BTreeMap, BTreeSet};

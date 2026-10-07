@@ -3,7 +3,7 @@
 //! writing the rebuilt records again at its term, and, once it leads, taking
 //! the answers that come late.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::election::WorkerNode;
 use kabudachi_core::protocol::digest::Digest;
@@ -11,7 +11,7 @@ use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::messages::ReconcileRequest;
 use kabudachi_core::reconcile::{
-    Cursor, DriftWatch, Rebuild, ReconcileRound, ReconcileTerm, ReportPage, wire,
+    Cursor, DriftWatch, Rebuild, ReconcileRound, ReconcileTerm, Republish, ReportPage, wire,
 };
 use kabudachi_core::time::{Clock, Duration, Instant};
 use libp2p::futures::StreamExt;
@@ -20,7 +20,6 @@ use libp2p::futures::stream::FuturesUnordered;
 
 use crate::messenger::{Net, PlacedWrite, WriteOutcome};
 use crate::reconcile::report::page_of;
-use crate::reconcile::republish::Republish;
 use crate::reconcile::request_after;
 
 /// How many record lookups a reconciling leader runs at once.
@@ -44,8 +43,8 @@ pub(crate) enum Progress {
     RePlace,
     /// Every republished record is stored: the node may lead.
     Republished(ReconcileTerm),
-    /// What was learnt since, for the leading scheduler to adopt in order.
-    Learnt(VecDeque<Rebuild>),
+    /// What was learnt since, for the leading scheduler to adopt.
+    Learnt(Rebuild),
 }
 
 /// What a reconciliation could not finish, to be done again.
@@ -54,10 +53,6 @@ pub(crate) enum Stuck {
     Rebuild(Rebuild),
     /// These records could not all be placed on the voters.
     Place(Vec<TaskRecord>),
-    /// The scheduler did not lead when this was offered, in order, as what
-    /// late answers taught: it is offered again, with whatever is learnt
-    /// meanwhile after it.
-    Adopt(VecDeque<Rebuild>),
 }
 
 /// Work that failed and is tried again when the voters change and, failing
@@ -92,15 +87,6 @@ impl<T> Retry<T> {
         let mut voters = voters.to_vec();
         voters.sort();
         if self.work.is_some() && (voters != self.voters || now >= self.at) {
-            self.work.take()
-        } else {
-            None
-        }
-    }
-
-    /// The held work if `matches` says so, at once, due or not.
-    fn take_if(&mut self, matches: impl Fn(&T) -> bool) -> Option<T> {
-        if self.work.as_ref().is_some_and(matches) {
             self.work.take()
         } else {
             None
@@ -322,8 +308,15 @@ impl<'n> LeaderReconciliation<'n> {
         }
     }
 
-    /// What the driver should do now, given its node.
-    pub(crate) fn progress<C: Clock>(&mut self, node: &WorkerNode<C>, now: Instant) -> Progress {
+    /// What the driver should do now, given its node and whether its
+    /// scheduler leads. What late answers teach is handed over only while it
+    /// does, and is kept until then.
+    pub(crate) fn progress<C: Clock>(
+        &mut self,
+        node: &WorkerNode<C>,
+        leading: bool,
+        now: Instant,
+    ) -> Progress {
         self.progressed_at = now;
         self.ask_who_is_due(node, now);
         self.fetch_what_is_missing(node, now);
@@ -334,7 +327,8 @@ impl<'n> LeaderReconciliation<'n> {
         // office only while its lease holds, and holding the lease means a
         // quorum of voters has been heard from lately. When the lease ends the
         // node leaves office (`NoQuorum`), the driver drops this
-        // reconciliation, and no further write is issued.
+        // reconciliation. Writes that fell due before the node stepped may
+        // still go out; a holder refuses them against a newer term.
         if let Some(republish) = self.republish.as_mut() {
             let due = republish.due(now);
             if !due.is_empty() {
@@ -355,7 +349,6 @@ impl<'n> LeaderReconciliation<'n> {
             return match stuck {
                 Stuck::Rebuild(rebuild) => Progress::Rebuild(rebuild),
                 Stuck::Place(records) => Progress::Place(records),
-                Stuck::Adopt(learnt) => Progress::Learnt(learnt),
             };
         }
         if !self.rebuilt {
@@ -368,19 +361,21 @@ impl<'n> LeaderReconciliation<'n> {
             }
             return Progress::Waiting;
         }
-        if self.led && self.news {
+        if self.led && self.news && leading {
             self.news = false;
             let learnt = self.round.take_settled(|worker| node.is_member(worker));
             if !learnt.records.is_empty() || !learnt.reports.is_empty() {
-                let mut queue = match self.stuck.take_if(|work| matches!(work, Stuck::Adopt(_))) {
-                    Some(Stuck::Adopt(held)) => held,
-                    _ => VecDeque::new(),
-                };
-                queue.push_back(learnt);
-                return Progress::Learnt(queue);
+                return Progress::Learnt(learnt);
             }
         }
         Progress::Waiting
+    }
+
+    /// Takes back what the scheduler could not adopt because it did not lead:
+    /// it is offered again, with what is learnt meanwhile, once it does.
+    pub(crate) fn give_back(&mut self, learnt: Rebuild) {
+        self.round.give_back(learnt);
+        self.news = true;
     }
 
     /// Asks a worker that joined the roster since, and, once per suspicion

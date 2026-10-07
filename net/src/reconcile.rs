@@ -13,9 +13,8 @@
 //! report must drop to fit is logged, never silently cut. `leader` runs a
 //! new leader's side of the exchange for the driver: it asks, fetches the
 //! records it lacks, decides when to stop waiting and takes late answers.
-//! `republish` writes the rebuilt records again at the leader's term, a
-//! bounded number at a time and in the order a supersession needs, and writes
-//! again any that was refused.
+//! The rebuilt records are written again at the leader's term by core's
+//! `Republish`, which `leader` drives over `Net`.
 
 use std::str::FromStr;
 
@@ -32,7 +31,6 @@ use crate::reconcile::codec::ReconcileCodec;
 pub mod codec;
 pub(crate) mod leader;
 pub(crate) mod report;
-pub(crate) mod republish;
 
 /// The request's cursor for `cursor`.
 pub(crate) fn request_after(cursor: Cursor) -> reconcile_request::After {

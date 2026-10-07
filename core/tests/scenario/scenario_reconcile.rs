@@ -17,6 +17,7 @@ use kabudachi_core::time::Duration;
 use super::scenario_records::{
     STEP, SUSPECT, elected_among, plain, running, submitted, submitted_with, submitted_with_key,
 };
+use crate::support::builders::past_any_suspicion;
 use crate::support::harness::{Answer, Cluster};
 
 /// A node that is not one of `excluded`.
@@ -29,7 +30,7 @@ fn some_other(cluster: &Cluster, excluded: &[&WorkerId]) -> WorkerId {
 }
 
 fn advance_until(cluster: &mut Cluster, reached: impl Fn(&Cluster) -> bool) {
-    for _ in 0..(SUSPECT.as_ticks() * 20 / STEP.as_ticks()) {
+    for _ in 0..(SUSPECT.as_ticks() * 60 / STEP.as_ticks()) {
         if reached(cluster) {
             return;
         }
@@ -301,36 +302,61 @@ fn a_worker_that_died_with_the_old_leader_is_lost_a_reconnect_timeout_after_the_
     }
 }
 
-#[test]
-fn two_silent_holders_of_the_newest_revision_leave_the_task_unscheduled_until_one_answers() {
-    // Seven voters; the task's placement is three of them. Its claim was
-    // stored by two placement holders while the third was down; then the
-    // leader is lost and those two cannot answer the new leader.
-    let (mut cluster, leader) = elected_among(7);
-    let task = submitted(&mut cluster, &leader);
+/// A new leader that cannot yet tell what became of a task: its newest
+/// revision is held by two voters that do not answer, and the third holder
+/// has only an older one.
+struct SilentHolders {
+    cluster: Cluster,
+    deposed: WorkerId,
+    leader: WorkerId,
+    task: TaskId,
+    /// The holder of the older revision, which answers.
+    stale: WorkerId,
+    /// The two holders of the newest revision, which do not answer yet.
+    silent: Vec<WorkerId>,
+}
+
+/// Seven voters; the task's placement is three of them. Its claim was stored
+/// by two placement holders while the third was down; then the leader is lost
+/// and those two cannot answer the new leader, which leads without them.
+fn leader_missing_two_holders() -> SilentHolders {
+    let (cluster, deposed) = elected_among(7);
+    leader_missing_two_holders_in(cluster, deposed)
+}
+
+/// [`leader_missing_two_holders`] in a cluster that is already elected.
+fn leader_missing_two_holders_in(mut cluster: Cluster, deposed: WorkerId) -> SilentHolders {
+    let task = submitted(&mut cluster, &deposed);
     let placement = placement_of(&cluster, &task);
-    // The leader, if it holds a copy, is the one that missed the claim, so
-    // the two silent holders are never the deposed leader.
+    // The deposed leader, if it holds a copy, is the one that missed the
+    // claim, so the two silent holders are never the deposed leader.
     let stale = placement
         .iter()
-        .find(|holder| **holder == leader)
+        .find(|holder| **holder == deposed)
         .or_else(|| placement.first())
         .cloned()
         .expect("a placement holder");
-    let acked: Vec<WorkerId> = placement.iter().filter(|holder| **holder != stale).cloned().collect();
-    assert!(!acked.contains(&leader), "the silent holders are not the deposed leader");
-    let claimant = some_other(&cluster, &[&leader, &stale, &acked[0], &acked[1]]);
+    let silent: Vec<WorkerId> = placement.iter().filter(|holder| **holder != stale).cloned().collect();
+    assert!(!silent.contains(&deposed), "the silent holders are not the deposed leader");
+    let claimant = some_other(&cluster, &[&deposed, &stale, &silent[0], &silent[1]]);
     mute(&cluster, &[stale.clone()], true);
-    let claim = cluster.claim(&leader, &claimant, &task);
+    let claim = cluster.claim(&deposed, &claimant, &task);
     cluster.advance(STEP);
     assert!(matches!(cluster.answer(claim), Some(Answer::Claimed(_))));
     mute(&cluster, &[stale.clone()], false);
-    mute(&cluster, &acked, true);
+    mute(&cluster, &silent, true);
 
-    let next = leader_loss(&mut cluster, &leader);
+    let leader = leader_loss(&mut cluster, &deposed);
+    SilentHolders { cluster, deposed, leader, task, stale, silent }
+}
+
+#[test]
+fn two_silent_holders_of_the_newest_revision_leave_the_task_unscheduled_until_one_answers() {
+    let SilentHolders { mut cluster, deposed, leader: next, task, stale, silent } = leader_missing_two_holders();
+    let placement = placement_of(&cluster, &task);
 
     let term = term_of(&cluster, &next);
-    let other = some_other(&cluster, &[&leader, &stale, &acked[0], &acked[1], &next, &claimant]);
+    let other = some_other(&cluster, &[&deposed, &stale, &silent[0], &silent[1], &next]);
     let asked = cluster.claim(&next, &other, &task);
     cluster.advance(STEP);
     assert_eq!(cluster.answer(asked).cloned(), refused(ClaimRejection::NotReady));
@@ -340,13 +366,40 @@ fn two_silent_holders_of_the_newest_revision_leave_the_task_unscheduled_until_on
     );
 
     // One of the silent holders answers late.
-    mute(&cluster, &acked[..1], false);
+    mute(&cluster, &silent[..1], false);
     advance_until(&mut cluster, |cluster| held_term(cluster, &stale, &task) == Some(term));
     assert_eq!(
         held_states(&cluster, &task),
         [TaskRunState::Claimed],
         "the claim the silent holders stored is the one that stands"
     );
+}
+
+#[test]
+fn an_answer_that_comes_after_the_leader_lost_its_lease_is_adopted_by_the_next_office() {
+    let SilentHolders { mut cluster, deposed, leader, task, stale, silent } = leader_missing_two_holders();
+    let first_term = term_of(&cluster, &leader);
+
+    // Its lease ends before the silent holder answers, with no tick between.
+    let lease = cluster.node(&leader).timings().lease_length();
+    cluster.advance_clock_only(Duration::from_ticks(lease.as_ticks() + STEP.as_ticks()));
+    mute(&cluster, &silent[..1], false);
+    cluster.advance(STEP);
+
+    // The answer was not acted on by the leader whose lease had ended.
+    assert_ne!(cluster.states()[&leader], WorkerState::Leader);
+    assert!(
+        held_term(&cluster, &stale, &task) < Some(first_term),
+        "no record was republished at the lapsed office's term"
+    );
+
+    // Once the cluster has a leader again, it adopts what the answer taught.
+    mute(&cluster, &silent[1..], false);
+    advance_until(&mut cluster, |cluster| new_leader(cluster, &deposed).is_some());
+    let next = new_leader(&cluster, &deposed).expect("a leader");
+    let term = term_of(&cluster, &next);
+    advance_until(&mut cluster, |cluster| held_term(cluster, &stale, &task) == Some(term));
+    assert_eq!(held_states(&cluster, &task), [TaskRunState::Claimed], "the claim the silent holders stored stands");
 }
 
 #[test]
@@ -405,4 +458,31 @@ fn a_supersession_split_across_the_leader_loss_is_finished_by_the_new_leader() {
     cluster.advance(STEP);
     assert_eq!(cluster.answer(stale).cloned(), refused(ClaimRejection::Superseded));
     assert!(matches!(cluster.answer(current), Some(Answer::Claimed(_))));
+}
+
+#[test]
+fn an_answer_that_comes_while_the_fence_is_lapsed_is_adopted_once_it_is_renewed() {
+    let mut cluster = Cluster::bootstrap_with_authority(7, 0, SUSPECT);
+    cluster.advance(past_any_suspicion(SUSPECT.as_ticks()));
+    cluster.run_until_quiescent(Duration::from_millis(500), 100);
+    let deposed = cluster.leader().expect("the voters elect a leader");
+    let SilentHolders { mut cluster, leader, task, stale, silent, .. } =
+        leader_missing_two_holders_in(cluster, deposed);
+    let term = term_of(&cluster, &leader);
+
+    // The new leader reaches the authority no more, so it holds office
+    // without a fence, and its scheduler does not lead.
+    cluster.node_authority(&leader).set_reachable(false);
+    mute(&cluster, &silent[..1], false);
+    cluster.advance(STEP);
+    cluster.advance(STEP);
+    assert_eq!(cluster.states()[&leader], WorkerState::Leader);
+    assert!(!cluster.holds_valid_grant(&leader), "no fence, no grant");
+    assert_ne!(held_term(&cluster, &stale, &task), Some(term), "the answer is not adopted without a grant");
+
+    // The fence is renewed, and the answer that came meanwhile is adopted.
+    cluster.node_authority(&leader).set_reachable(true);
+    advance_until(&mut cluster, |cluster| held_term(cluster, &stale, &task) == Some(term));
+    assert!(cluster.holds_valid_grant(&leader));
+    assert_eq!(held_states(&cluster, &task), [TaskRunState::Claimed], "the claim the silent holders stored stands");
 }

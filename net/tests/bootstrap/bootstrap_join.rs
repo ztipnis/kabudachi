@@ -20,6 +20,7 @@ use libp2p::Multiaddr;
 use libp2p::multiaddr::Protocol;
 use tokio::time::timeout;
 
+use crate::support::deadline::within_deadline;
 use crate::support::worker::{
     PER_PEER_TIMEOUT, RunningWorker, TEST_TIMEOUT, poll_until, warmed_up_in_memory_authority,
     with_in_memory_authority, worker_config,
@@ -107,49 +108,52 @@ async fn three_workers_joined_through_one_seed(
 // each becomes a voter. A drained voter then stops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_workers_that_join_through_one_seed_register_and_are_admitted() {
-    let authority = warmed_up_authority().await;
-    let mut workers = three_workers_joined_through_one_seed(&authority).await;
-    let joiners = &workers[2..];
+    within_deadline(async {
+        let authority = warmed_up_authority().await;
+        let mut workers = three_workers_joined_through_one_seed(&authority).await;
+        let joiners = &workers[2..];
 
-    for joiner in joiners {
-        poll_until("the joiner registered at its listen address", || {
-            authority
-                .live_registrations(&shard())
-                .expect("the in-memory authority is always reachable")
-                .addresses()
-                .get(&joiner.id)
-                == Some(&joiner.address.to_string())
-        })
-        .await;
-    }
-    for joiner in joiners {
-        for other in joiners.iter().filter(|other| other.id != joiner.id) {
-            timeout(TEST_TIMEOUT, async {
-                while !joiner
-                    .net
-                    .diagnostics()
-                    .await
-                    .peer_addresses
-                    .contains_key(&other.id)
-                {
-                    tokio::time::sleep(StdDuration::from_millis(10)).await;
-                }
+        for joiner in joiners {
+            poll_until("the joiner registered at its listen address", || {
+                authority
+                    .live_registrations(&shard())
+                    .expect("the in-memory authority is always reachable")
+                    .addresses()
+                    .get(&joiner.id)
+                    == Some(&joiner.address.to_string())
             })
-            .await
-            .expect("kad connected the joiner to another joiner within the timeout");
+            .await;
         }
-    }
-    for worker in &mut workers[1..] {
-        worker.wait_until(|seen| !seen.pending).await;
-    }
+        for joiner in joiners {
+            for other in joiners.iter().filter(|other| other.id != joiner.id) {
+                timeout(TEST_TIMEOUT, async {
+                    while !joiner
+                        .net
+                        .diagnostics()
+                        .await
+                        .peer_addresses
+                        .contains_key(&other.id)
+                    {
+                        tokio::time::sleep(StdDuration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("kad connected the joiner to another joiner within the timeout");
+            }
+        }
+        for worker in &mut workers[1..] {
+            worker.wait_until(|seen| !seen.pending).await;
+        }
 
-    // A drained voter leaves through its own driver and node: the request
-    // reaches the node, which removes itself and stops.
-    let leaving = workers.last_mut().expect("the shard has workers");
-    leaving.net.request_drain();
-    leaving
-        .wait_until(|seen| seen.state == WorkerState::Stopped)
-        .await;
+        // A drained voter leaves through its own driver and node: the request
+        // reaches the node, which removes itself and stops.
+        let leaving = workers.last_mut().expect("the shard has workers");
+        leaving.net.request_drain();
+        leaving
+            .wait_until(|seen| seen.state == WorkerState::Stopped)
+            .await;
+    })
+    .await
 }
 
 /// Whether this host has an address other than loopback: the local address
@@ -187,47 +191,50 @@ fn is_loopback(address: &Multiaddr) -> bool {
 // all a leader can offer, only the first is checked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_leader_bound_to_every_interface_points_joiners_at_an_address_they_can_dial() {
-    let mut leader = spawn_worker("/ip4/0.0.0.0/tcp/0", None, vec![]).await;
-    leader
-        .wait_until(|seen| seen.state == WorkerState::Leader)
-        .await;
+    within_deadline(async {
+        let mut leader = spawn_worker("/ip4/0.0.0.0/tcp/0", None, vec![]).await;
+        leader
+            .wait_until(|seen| seen.state == WorkerState::Leader)
+            .await;
 
-    let joining_net = Net::new();
-    let search = timeout(
-        TEST_TIMEOUT,
-        ask_for_leader(
-            &joining_net,
-            std::slice::from_ref(&leader.address),
-            JoinFloor::none(),
-            PER_PEER_TIMEOUT,
-            GRACE,
-        ),
-    )
-    .await
-    .expect("the leader answered within the timeout");
-    let LeaderSearch::Found(pointer) = search else {
-        panic!("the leader pointed at itself: {search:?}");
-    };
-    assert_eq!(pointer.leader_id(), Some(leader.id.clone()));
-    let pointed: Multiaddr = pointer
-        .leader_multiaddr
-        .parse()
-        .expect("the pointer names a multiaddr");
-    assert!(!is_unspecified(&pointed), "the leader pointed at {pointed}");
-    if has_a_non_loopback_address() {
-        assert!(!is_loopback(&pointed), "the leader pointed at {pointed}");
-    } else {
-        eprintln!("no non-loopback interface on this host: only the bound address was checked");
-    }
+        let joining_net = Net::new();
+        let search = timeout(
+            TEST_TIMEOUT,
+            ask_for_leader(
+                &joining_net,
+                std::slice::from_ref(&leader.address),
+                JoinFloor::none(),
+                PER_PEER_TIMEOUT,
+                GRACE,
+            ),
+        )
+        .await
+        .expect("the leader answered within the timeout");
+        let LeaderSearch::Found(pointer) = search else {
+            panic!("the leader pointed at itself: {search:?}");
+        };
+        assert_eq!(pointer.leader_id(), Some(leader.id.clone()));
+        let pointed: Multiaddr = pointer
+            .leader_multiaddr
+            .parse()
+            .expect("the pointer names a multiaddr");
+        assert!(!is_unspecified(&pointed), "the leader pointed at {pointed}");
+        if has_a_non_loopback_address() {
+            assert!(!is_loopback(&pointed), "the leader pointed at {pointed}");
+        } else {
+            eprintln!("no non-loopback interface on this host: only the bound address was checked");
+        }
 
-    // Another worker, asking at the address the pointer names,
-    // reaches the leader there.
-    let remote_net = Net::new();
-    let search = timeout(
-        TEST_TIMEOUT,
-        ask_for_leader(&remote_net, &[pointed], JoinFloor::none(), PER_PEER_TIMEOUT, GRACE),
-    )
+        // Another worker, asking at the address the pointer names,
+        // reaches the leader there.
+        let remote_net = Net::new();
+        let search = timeout(
+            TEST_TIMEOUT,
+            ask_for_leader(&remote_net, &[pointed], JoinFloor::none(), PER_PEER_TIMEOUT, GRACE),
+        )
+        .await
+        .expect("the leader answered within the timeout");
+        assert_eq!(search, LeaderSearch::Found(pointer));
+    })
     .await
-    .expect("the leader answered within the timeout");
-    assert_eq!(search, LeaderSearch::Found(pointer));
 }

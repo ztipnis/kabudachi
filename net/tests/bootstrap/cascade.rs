@@ -29,6 +29,7 @@ use kabudachi_testkit::FaultingAuthority;
 use libp2p::Multiaddr;
 use tokio::time::timeout;
 
+use crate::support::deadline::within_deadline;
 use crate::support::clock::TokioClock;
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -133,80 +134,92 @@ async fn wait_until_held(authority: &FaultingAuthority<TokioClock>, kind: CallKi
 // and never waits for ever.
 #[tokio::test(start_paused = true)]
 async fn silent_seeds_with_no_authority_found_only_after_the_bound() {
-    let mut worker = Worker::new(None, TokioClock::new(), &[nowhere(1)]);
-    let started = tokio::time::Instant::now();
+    within_deadline(async {
+        let mut worker = Worker::new(None, TokioClock::new(), &[nowhere(1)]);
+        let started = tokio::time::Instant::now();
 
-    let entry = timeout(TEST_TIMEOUT, worker.bootstrap())
-        .await
-        .expect("the worker founded once the bound passed");
+        let entry = timeout(TEST_TIMEOUT, worker.bootstrap())
+            .await
+            .expect("the worker founded once the bound passed");
 
-    assert!(founded_at(&entry, 0));
-    assert!(
-        started.elapsed() >= RETRY_INTERVAL * 3,
-        "the worker founded after only {:?}, before its seeds' bound",
-        started.elapsed()
-    );
+        assert!(founded_at(&entry, 0));
+        assert!(
+            started.elapsed() >= RETRY_INTERVAL * 3,
+            "the worker founded after only {:?}, before its seeds' bound",
+            started.elapsed()
+        );
+    })
+    .await
 }
 
 #[tokio::test(start_paused = true)]
 async fn an_unreachable_authority_never_leads_to_founding_until_it_answers() {
-    let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
-    authority.set_reachable(false);
-    let mut worker = Worker::new(Some(&authority), clock, &[]);
-    let mut running = std::pin::pin!(worker.bootstrap());
+    within_deadline(async {
+        let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
+        authority.set_reachable(false);
+        let mut worker = Worker::new(Some(&authority), clock, &[]);
+        let mut running = std::pin::pin!(worker.bootstrap());
 
-    let waiting = timeout(WAITING, &mut running).await;
-    assert!(waiting.is_err(), "the worker entered while its authority was unreachable");
-    assert_eq!(epoch_number(&authority), None);
+        let waiting = timeout(WAITING, &mut running).await;
+        assert!(waiting.is_err(), "the worker entered while its authority was unreachable");
+        assert_eq!(epoch_number(&authority), None);
 
-    authority.set_reachable(true);
-    let entry = timeout(TEST_TIMEOUT, running)
-        .await
-        .expect("the worker founded the shard once its authority answered");
-    assert!(founded_at(&entry, 0));
+        authority.set_reachable(true);
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the worker founded the shard once its authority answered");
+        assert!(founded_at(&entry, 0));
+    })
+    .await
 }
 
 #[tokio::test(start_paused = true)]
 async fn registered_peers_that_never_answer_keep_the_worker_from_founding() {
-    let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
-    register(&authority, "peer-a", &nowhere(1).to_string());
-    register(&authority, "peer-b", &nowhere(2).to_string());
-    let mut worker = Worker::new(Some(&authority), clock, &[]);
+    within_deadline(async {
+        let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
+        register(&authority, "peer-a", &nowhere(1).to_string());
+        register(&authority, "peer-b", &nowhere(2).to_string());
+        let mut worker = Worker::new(Some(&authority), clock, &[]);
 
-    let waiting = timeout(WAITING, worker.bootstrap()).await;
+        let waiting = timeout(WAITING, worker.bootstrap()).await;
 
-    assert!(waiting.is_err(), "the worker entered with peers listed and none answering");
-    assert_eq!(epoch_number(&authority), None);
+        assert!(waiting.is_err(), "the worker entered with peers listed and none answering");
+        assert_eq!(epoch_number(&authority), None);
+    })
+    .await
 }
 
 #[tokio::test(start_paused = true)]
 async fn losing_the_create_to_an_unseen_rival_does_not_re_found_the_shard() {
-    let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
-    authority.hold_next(CallKind::SwapRecoveryEpoch);
-    let mut worker = Worker::new(Some(&authority), clock, &[]);
-    let mut running = std::pin::pin!(worker.bootstrap());
+    within_deadline(async {
+        let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
+        authority.hold_next(CallKind::SwapRecoveryEpoch);
+        let mut worker = Worker::new(Some(&authority), clock, &[]);
+        let mut running = std::pin::pin!(worker.bootstrap());
 
-    // The cascade registers and asks to create epoch 0: that call is held. A
-    // rival registers and creates it meanwhile, then the create is let
-    // through, and loses.
-    let rival = authority.for_another_worker();
-    tokio::select! {
-        entry = &mut running => panic!("the cascade entered while its create was held: {entry:?}"),
-        () = async {
-            wait_until_held(&authority, CallKind::SwapRecoveryEpoch).await;
-            let shard = ShardId::new("shard-1");
-            rival.register(&shard, &WorkerId::new("rival"), "not a multiaddr").unwrap();
-            rival
-                .compare_and_swap_recovery_epoch(&shard, None, RecoveryEpoch::founding(0, &mut Uuid7Lineages))
-                .unwrap();
-            authority.release(CallKind::SwapRecoveryEpoch);
-        } => {}
-    }
+        // The cascade registers and asks to create epoch 0: that call is held. A
+        // rival registers and creates it meanwhile, then the create is let
+        // through, and loses.
+        let rival = authority.for_another_worker();
+        tokio::select! {
+            entry = &mut running => panic!("the cascade entered while its create was held: {entry:?}"),
+            () = async {
+                wait_until_held(&authority, CallKind::SwapRecoveryEpoch).await;
+                let shard = ShardId::new("shard-1");
+                rival.register(&shard, &WorkerId::new("rival"), "not a multiaddr").unwrap();
+                rival
+                    .compare_and_swap_recovery_epoch(&shard, None, RecoveryEpoch::founding(0, &mut Uuid7Lineages))
+                    .unwrap();
+                authority.release(CallKind::SwapRecoveryEpoch);
+            } => {}
+        }
 
-    let waiting = timeout(WAITING, &mut running).await;
+        let waiting = timeout(WAITING, &mut running).await;
 
-    assert!(waiting.is_err(), "the worker entered after losing the create");
-    assert_eq!(epoch_number(&authority), Some(0), "no one re-founded the shard");
+        assert!(waiting.is_err(), "the worker entered after losing the create");
+        assert_eq!(epoch_number(&authority), Some(0), "no one re-founded the shard");
+    })
+    .await
 }
 
 // An authority whose read hangs holds one blocking thread, not one more
@@ -215,38 +228,41 @@ async fn losing_the_create_to_an_unseen_rival_does_not_re_found_the_shard() {
 // read is still held.
 #[tokio::test(start_paused = true)]
 async fn a_listing_read_that_hangs_is_not_asked_again_while_it_hangs() {
-    let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
-    authority.hold_next(CallKind::ReadLiveRegistrations);
-    let mut worker = Worker::new(Some(&authority), clock, &[]);
-    let mut running = std::pin::pin!(worker.bootstrap());
+    within_deadline(async {
+        let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
+        authority.hold_next(CallKind::ReadLiveRegistrations);
+        let mut worker = Worker::new(Some(&authority), clock, &[]);
+        let mut running = std::pin::pin!(worker.bootstrap());
 
-    let (still_held, founded_meanwhile) = tokio::select! {
-        entry = &mut running => panic!("the worker entered while its first read was held: {entry:?}"),
-        outcome = async {
-            wait_until_held(&authority, CallKind::ReadLiveRegistrations).await;
-            // Whole rounds run while the read is held. Time moves by hand: a
-            // held call stops auto-advance.
-            for _ in 0..20 {
-                tokio::time::advance(RETRY_INTERVAL).await;
-                for _ in 0..5 {
-                    tokio::task::yield_now().await;
+        let (still_held, founded_meanwhile) = tokio::select! {
+            entry = &mut running => panic!("the worker entered while its first read was held: {entry:?}"),
+            outcome = async {
+                wait_until_held(&authority, CallKind::ReadLiveRegistrations).await;
+                // Whole rounds run while the read is held. Time moves by hand: a
+                // held call stops auto-advance.
+                for _ in 0..20 {
+                    tokio::time::advance(RETRY_INTERVAL).await;
+                    for _ in 0..5 {
+                        tokio::task::yield_now().await;
+                    }
                 }
-            }
-            (authority.is_holding(CallKind::ReadLiveRegistrations), epoch_number(&authority))
-        } => outcome,
-    };
-    // Released before anything can fail, so no path leaves the held thread
-    // parked and hangs the runtime's shutdown.
-    authority.release(CallKind::ReadLiveRegistrations);
+                (authority.is_holding(CallKind::ReadLiveRegistrations), epoch_number(&authority))
+            } => outcome,
+        };
+        // Released before anything can fail, so no path leaves the held thread
+        // parked and hangs the runtime's shutdown.
+        authority.release(CallKind::ReadLiveRegistrations);
 
-    assert!(still_held, "the first read was answered during the rounds");
-    assert_eq!(founded_meanwhile, None, "a second read found the shard ownerless and took it");
-    // The held read, answered at last, is the cascade's: it takes ownership
-    // of the ownerless shard.
-    let entry = timeout(TEST_TIMEOUT, running)
-        .await
-        .expect("the worker founded the shard within the timeout");
-    assert!(founded_at(&entry, 0));
+        assert!(still_held, "the first read was answered during the rounds");
+        assert_eq!(founded_meanwhile, None, "a second read found the shard ownerless and took it");
+        // The held read, answered at last, is the cascade's: it takes ownership
+        // of the ownerless shard.
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the worker founded the shard within the timeout");
+        assert!(founded_at(&entry, 0));
+    })
+    .await
 }
 
 // A full-shard restart: the authority is warm and lists no live
@@ -256,22 +272,25 @@ async fn a_listing_read_that_hangs_is_not_asked_again_while_it_hangs() {
 // workers that are never coming back.
 #[tokio::test(start_paused = true)]
 async fn an_ownerless_epoch_is_re_founded_one_epoch_on() {
-    let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
-    authority
-        .compare_and_swap_recovery_epoch(
-            &ShardId::new("shard-1"),
-            None,
-            RecoveryEpoch::founding(3, &mut Uuid7Lineages),
-        )
-        .expect("creating the epoch directly succeeds against a warm, empty authority");
-    let mut worker = Worker::new(Some(&authority), clock, &[]);
+    within_deadline(async {
+        let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
+        authority
+            .compare_and_swap_recovery_epoch(
+                &ShardId::new("shard-1"),
+                None,
+                RecoveryEpoch::founding(3, &mut Uuid7Lineages),
+            )
+            .expect("creating the epoch directly succeeds against a warm, empty authority");
+        let mut worker = Worker::new(Some(&authority), clock, &[]);
 
-    let entry = timeout(TEST_TIMEOUT, worker.bootstrap())
-        .await
-        .expect("the bootstrapper re-founded the shard within the timeout");
+        let entry = timeout(TEST_TIMEOUT, worker.bootstrap())
+            .await
+            .expect("the bootstrapper re-founded the shard within the timeout");
 
-    assert!(founded_at(&entry, 4), "the shard is re-founded one epoch past the one that existed: {entry:?}");
-    assert_eq!(epoch_number(&authority), Some(4));
+        assert!(founded_at(&entry, 4), "the shard is re-founded one epoch past the one that existed: {entry:?}");
+        assert_eq!(epoch_number(&authority), Some(4));
+    })
+    .await
 }
 
 // The authority reports an empty listing while it warms up, which proves
@@ -279,23 +298,26 @@ async fn an_ownerless_epoch_is_re_founded_one_epoch_on() {
 // warm-up ends.
 #[tokio::test(start_paused = true)]
 async fn a_warming_up_authority_keeps_the_worker_bootstrapping_until_warm_up_ends() {
-    let ttl = Duration::from_millis(300);
-    let clock = TokioClock::new();
-    let authority = FaultingAuthority::new(clock, TickDuration::from_ticks(ttl.as_millis() as u64));
-    let started = tokio::time::Instant::now();
-    let mut worker = Worker::new(Some(&authority), clock, &[]);
+    within_deadline(async {
+        let ttl = Duration::from_millis(300);
+        let clock = TokioClock::new();
+        let authority = FaultingAuthority::new(clock, TickDuration::from_ticks(ttl.as_millis() as u64));
+        let started = tokio::time::Instant::now();
+        let mut worker = Worker::new(Some(&authority), clock, &[]);
 
-    let entry = timeout(TEST_TIMEOUT, worker.bootstrap())
-        .await
-        .expect("the worker founded the shard once warm-up ended");
+        let entry = timeout(TEST_TIMEOUT, worker.bootstrap())
+            .await
+            .expect("the worker founded the shard once warm-up ended");
 
-    assert!(
-        started.elapsed() >= ttl,
-        "the worker founded the shard while the authority was warming up, after {:?}",
-        started.elapsed()
-    );
-    assert!(founded_at(&entry, 0));
-    assert_eq!(epoch_number(&authority), Some(0));
+        assert!(
+            started.elapsed() >= ttl,
+            "the worker founded the shard while the authority was warming up, after {:?}",
+            started.elapsed()
+        );
+        assert!(founded_at(&entry, 0));
+        assert_eq!(epoch_number(&authority), Some(0));
+    })
+    .await
 }
 
 // The founder's registration lapses a TTL after the cascade asked for it,
@@ -305,49 +327,52 @@ async fn a_warming_up_authority_keeps_the_worker_bootstrapping_until_warm_up_end
 // bootstrapper had found the shard with no one registered and re-founded it.
 #[tokio::test(start_paused = true)]
 async fn a_founder_counts_its_registration_from_when_the_cascade_asked_for_it() {
-    let ttl = Duration::from_millis(300);
-    let (authority, clock) = warm_authority(ttl).await;
-    // The registration is slow: the authority holds it for half a TTL.
-    authority.hold_next(CallKind::Register);
-    let mut worker = Worker::new(Some(&authority), clock, &[]);
-    let (me, shard) = (worker.me.clone(), worker.shard.clone());
-    let mut running = std::pin::pin!(worker.bootstrap());
+    within_deadline(async {
+        let ttl = Duration::from_millis(300);
+        let (authority, clock) = warm_authority(ttl).await;
+        // The registration is slow: the authority holds it for half a TTL.
+        authority.hold_next(CallKind::Register);
+        let mut worker = Worker::new(Some(&authority), clock, &[]);
+        let (me, shard) = (worker.me.clone(), worker.shard.clone());
+        let mut running = std::pin::pin!(worker.bootstrap());
 
-    let held_at = tokio::select! {
-        entry = &mut running => panic!("the cascade entered while its registration was held: {entry:?}"),
-        held_at = async {
-            wait_until_held(&authority, CallKind::Register).await;
-            // The cascade has asked to register, so this is no earlier than
-            // the instant the registration is measured against.
-            let held_at = tokio::time::Instant::now();
-            // A held call stops auto-advance: time moves by hand.
-            tokio::time::advance(ttl / 2).await;
-            authority.release(CallKind::Register);
-            held_at
-        } => held_at,
-    };
-    let entry = timeout(TEST_TIMEOUT, running)
-        .await
-        .expect("the worker founded the shard within the timeout");
-    let identity = Identity {
-        id: me,
-        incarnation: IncarnationId::new("incarnation-0"),
-        shard,
-        timings: ElectionTimings::new(TickDuration::from_millis(300), TickDuration::from_millis(10)),
-    };
-    let (mut node, _) = WorkerNode::start(
-        identity,
-        entry,
-        clock,
-        Some(AuthorityTimings {
-            ttl: TickDuration::from_millis(ttl.as_millis() as u64),
-        }),
-    );
+        let held_at = tokio::select! {
+            entry = &mut running => panic!("the cascade entered while its registration was held: {entry:?}"),
+            held_at = async {
+                wait_until_held(&authority, CallKind::Register).await;
+                // The cascade has asked to register, so this is no earlier than
+                // the instant the registration is measured against.
+                let held_at = tokio::time::Instant::now();
+                // A held call stops auto-advance: time moves by hand.
+                tokio::time::advance(ttl / 2).await;
+                authority.release(CallKind::Register);
+                held_at
+            } => held_at,
+        };
+        let entry = timeout(TEST_TIMEOUT, running)
+            .await
+            .expect("the worker founded the shard within the timeout");
+        let identity = Identity {
+            id: me,
+            incarnation: IncarnationId::new("incarnation-0"),
+            shard,
+            timings: ElectionTimings::new(TickDuration::from_millis(300), TickDuration::from_millis(10)),
+        };
+        let (mut node, _) = WorkerNode::start(
+            identity,
+            entry,
+            clock,
+            Some(AuthorityTimings {
+                ttl: TickDuration::from_millis(ttl.as_millis() as u64),
+            }),
+        );
 
-    // Past the registration's TTL less drift, but short of it counted from
-    // when the node was built. The node's own renewal is never answered.
-    tokio::time::sleep_until(held_at + ttl * 19 / 20).await;
-    let _ = node.step(Input::Tick);
+        // Past the registration's TTL less drift, but short of it counted from
+        // when the node was built. The node's own renewal is never answered.
+        tokio::time::sleep_until(held_at + ttl * 19 / 20).await;
+        let _ = node.step(Input::Tick);
 
-    assert_eq!(node.state(), WorkerState::Fenced);
+        assert_eq!(node.state(), WorkerState::Fenced);
+    })
+    .await
 }

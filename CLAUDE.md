@@ -26,7 +26,6 @@ bazel test //core:core_integration_test
 # `--test_arg=--skip --test_arg=scenario::` to get exactly the `election` module:
 bazel test //core:core_integration_test --test_arg=election:: --test_arg=--skip --test_arg=scenario::
 bazel test //net:net_integration_test
-bazel test //net:net_test
 bazel test //runtime/tests:test_native
 bazel test //runtime/tests:test_declaration
 bazel test //runtime/tests:test_serialization
@@ -76,6 +75,8 @@ Prefer a reputable maintained package to a generic utility. Weigh dependency cos
 ## Testing discipline
 
 Use TDD and small commits. Python tests use pytest; Rust tests use `#[test]` through Bazel `rust_test`.
+
+Library crates have no `#[cfg(test)]` test modules. Test through the public API in the crate's `tests/`; a behaviour no public seam reaches is either unreachable (remove it) or needs a deliberate seam. Inline tests force a second full compile of the crate.
 
 ## Completion gate: CI must be green
 

@@ -12,6 +12,7 @@ use kabudachi_core::protocol::messages::task_response;
 use kabudachi_net::claimed_runs::HeldRun;
 use kabudachi_net::messenger::Net;
 
+use crate::support::deadline::within_deadline;
 use crate::support::election::wait_until;
 use crate::support::records::{
     ThreeVoters, claimed, claimed_and_started, plain_with, submitted_through,
@@ -82,37 +83,40 @@ async fn misdirected_completion(
 /// having asked the workers again and certified what they reported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_uncertified_completion_is_certified_after_the_heartbeats_disagree() {
-    let (mut shard, _client) = ThreeVoters::start().await;
-    let (nets, watch) = (shard.nets.clone(), shard.watch());
-    let ids: Vec<WorkerId> = (0..nets.len()).map(|voter| shard.id(voter)).collect();
+    within_deadline(async {
+        let (mut shard, _client) = ThreeVoters::start().await;
+        let (nets, watch) = (shard.nets.clone(), shard.watch());
+        let ids: Vec<WorkerId> = (0..nets.len()).map(|voter| shard.id(voter)).collect();
 
-    // One drive for the whole test: the late answers a leader takes in belong
-    // to the driver that reconciled it.
-    shard
-        .drive_until(async move {
-            wait_until(|| watch.leader().is_some()).await;
-            let leader = watch.leader().expect("a voter leads");
-            let (first, second) = match leader {
-                0 => (1, 2),
-                1 => (0, 2),
-                _ => (0, 1),
-            };
-            let plain =
-                misdirected_completion(&nets, &ids, leader, (first, second), false).await;
-            let late_start =
-                misdirected_completion(&nets, &ids, leader, (second, first), true).await;
+        // One drive for the whole test: the late answers a leader takes in belong
+        // to the driver that reconciled it.
+        shard
+            .drive_until(async move {
+                wait_until(|| watch.leader().is_some()).await;
+                let leader = watch.leader().expect("a voter leads");
+                let (first, second) = match leader {
+                    0 => (1, 2),
+                    1 => (0, 2),
+                    _ => (0, 1),
+                };
+                let plain =
+                    misdirected_completion(&nets, &ids, leader, (first, second), false).await;
+                let late_start =
+                    misdirected_completion(&nets, &ids, leader, (second, first), true).await;
 
-            wait_until(|| {
-                assert_eq!(
-                    watch.leader(),
-                    Some(leader),
-                    "the leader changed while the drift was awaited, so the test proves nothing"
-                );
-                [&plain, &late_start]
-                    .iter()
-                    .all(|task| holders_at(&nets, task, TaskRunState::Succeeded) >= 2)
+                wait_until(|| {
+                    assert_eq!(
+                        watch.leader(),
+                        Some(leader),
+                        "the leader changed while the drift was awaited, so the test proves nothing"
+                    );
+                    [&plain, &late_start]
+                        .iter()
+                        .all(|task| holders_at(&nets, task, TaskRunState::Succeeded) >= 2)
+                })
+                .await;
             })
             .await;
-        })
-        .await;
+    })
+    .await
 }

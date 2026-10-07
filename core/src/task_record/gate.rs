@@ -23,6 +23,22 @@ impl Write {
     }
 }
 
+/// A revision to write: `record.placement` names the holders, and `quorum`
+/// of them must store it for the write to count.
+#[derive(Debug, Clone)]
+pub struct PlacedWrite {
+    pub record: TaskRecord,
+    pub quorum: usize,
+}
+
+/// How a write ended: `stored` once `quorum` holders acknowledged it; not
+/// when a holder refused it, too few were reachable, or the write timed out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOutcome {
+    pub write: Write,
+    pub stored: bool,
+}
+
 /// How a held effect ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settled<E> {

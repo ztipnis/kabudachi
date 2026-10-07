@@ -10,7 +10,7 @@ mod outbox;
 mod store;
 mod version;
 
-pub use gate::{EffectGate, Settled, Write};
+pub use gate::{EffectGate, PlacedWrite, Settled, Write, WriteOutcome};
 pub use ledger::{Waits, WriteLedger};
 pub use local::LocalRecords;
 pub use order::{Settlement, WriteOrder};

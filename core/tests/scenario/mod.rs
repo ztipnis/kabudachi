@@ -3,9 +3,11 @@
 mod scenario_catastrophic_authority;
 mod scenario_election;
 mod scenario_grant_overlap;
+mod scenario_lease_expiry;
 mod scenario_membership;
 mod scenario_no_quorum;
 mod scenario_partition;
 mod scenario_random;
 mod scenario_reconcile;
 mod scenario_records;
+mod scenario_republish;

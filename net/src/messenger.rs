@@ -178,6 +178,7 @@ use kabudachi_core::protocol::checked;
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{ShardId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
+pub use kabudachi_core::task_record::{PlacedWrite, WriteOutcome};
 use kabudachi_core::task_record::{RecordVersion, VersionOrder, Write, identify};
 use libp2p::core::ConnectedPoint;
 use libp2p::core::transport::ListenerId;
@@ -270,22 +271,6 @@ enum Command {
     WithPeers(Box<dyn FnOnce(&mut Peers) + Send>),
     /// See `Net::write_records`.
     WriteRecords(Vec<PlacedWrite>),
-}
-
-/// A revision to write: `record.placement` names the holders, and `quorum`
-/// of them must store it for the write to count.
-#[derive(Debug, Clone)]
-pub struct PlacedWrite {
-    pub record: TaskRecord,
-    pub quorum: usize,
-}
-
-/// How a write ended: `stored` once `quorum` holders acknowledged it; not
-/// when a holder refused it, too few were reachable, or the write timed out.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WriteOutcome {
-    pub write: Write,
-    pub stored: bool,
 }
 
 /// The swarm task's asks in flight, one [`Exchange`] per correlated protocol.

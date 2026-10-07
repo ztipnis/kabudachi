@@ -1049,10 +1049,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// only for a task this leader does not hold; what it already holds it
     /// decided itself. Changes publish as any call's do.
     ///
-    /// A scheduler that does not lead (its grant has not arrived, or its lease
-    /// ran out) takes nothing and hands `learnt` back: the round has already
-    /// given that knowledge up, so the caller offers it again once the
-    /// scheduler leads.
+    /// A scheduler that does not lead (its grant has not arrived, or ended:
+    /// the lease may run out, or the recovery fence lapse, while the node
+    /// still holds office) takes nothing and hands `learnt` back. The round
+    /// has already given that knowledge up, so the caller gives it back to the
+    /// round, which offers it again once the scheduler leads.
     pub fn adopt(&mut self, learnt: Rebuild) -> Result<Adopted, Rebuild> {
         if !self.check_leader() {
             return Err(learnt);

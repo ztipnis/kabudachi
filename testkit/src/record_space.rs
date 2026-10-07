@@ -65,13 +65,18 @@ impl Space {
                 identify(&record).expect("the scheduler builds every record with its task and version");
             let held = self.stores.entry(holder).or_default();
             // The real store refuses an older version and a different record
-            // at the same version; a refused put is no acknowledgement.
+            // at the same version, unless only its placement differs; a
+            // refused put is no acknowledgement.
             let accepted = held.get(&task).is_none_or(|have| {
                 let (_, have_version) =
                     identify(have).expect("a stored record names its task and version");
                 match have_version.order(&version) {
                     VersionOrder::Newer => true,
-                    VersionOrder::Same => *have == record,
+                    VersionOrder::Same => {
+                        let mut moved = record.clone();
+                        moved.placement.clone_from(&have.placement);
+                        moved == *have
+                    }
                     VersionOrder::Older => false,
                 }
             });
@@ -235,13 +240,18 @@ impl RecordSpace {
     }
 }
 
-/// FNV-1a over the voter's id, a separator and the task's id: fixed by
-/// construction, unlike a randomly keyed hasher.
+/// FNV-1a over the voter's id, a separator and the task's id, finalized: fixed
+/// by construction, unlike a randomly keyed hasher.
 fn mixed(voter: &str, task: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in voter.bytes().chain([0xff]).chain(task.bytes()) {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    // FNV's last bytes barely move the high bits, which order the voters: a
+    // finalizer lets the task's id, its last bytes, change the order.
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
     hash
 }
