@@ -85,6 +85,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::configuration::Generation;
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::Output;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::WorkerId;
@@ -1066,12 +1067,12 @@ struct AuthorityCoverage {
 ///   (the harness checks after every step). With an authority every grant
 ///   also needs the recovery fence, which the authority grants to one
 ///   worker at a time, across flushes, outages and epoch swaps.
-/// - A2: at most one node leads any one (recovery epoch, term): every
+/// - A2: at most one node leads any one (recovery epoch, lineage, term): every
 ///   authority path swaps to an epoch no other has, and every election
 ///   within an epoch contests a term of its own.
 /// - A3: every node's configuration generation is of its own recovery
-///   epoch, and its recovery epoch never decreases while it stays a member
-///   of one shard. It may fall only as the node leaves its shard for the
+///   epoch, and its recovery epoch never falls in the pair order while it
+///   stays a member of one shard. It may fall only as the node leaves its shard for the
 ///   one the authority holds (a fenced node reconnecting,
 ///   a `NoQuorum` recovery or a leader's fence finding an epoch lower in
 ///   its lineage, such as one a leader republished after a flush, or of
@@ -1130,8 +1131,12 @@ fn check_authority_case(
     cluster.record_steps();
     let ids: Vec<WorkerId> = cluster.node_ids().into_iter().collect();
 
-    let mut leaders: BTreeMap<(u64, u64), BTreeSet<WorkerId>> = BTreeMap::new();
-    let mut last_epoch: BTreeMap<WorkerId, u64> = ids.iter().cloned().map(|id| (id, 0)).collect();
+    let mut leaders: BTreeMap<(u64, u64, u64), BTreeSet<WorkerId>> = BTreeMap::new();
+    let mut last_epoch: BTreeMap<WorkerId, RecoveryEpoch> = ids
+        .iter()
+        .cloned()
+        .map(|id| (id, RecoveryEpoch::new(0, 0)))
+        .collect();
     for event in events {
         let mut rejoined_now: BTreeSet<WorkerId> = BTreeSet::new();
         match &event {
@@ -1146,12 +1151,7 @@ fn check_authority_case(
         }
 
         let records = cluster.take_steps();
-        let final_record: BTreeMap<&WorkerId, usize> = records
-            .iter()
-            .enumerate()
-            .map(|(index, record)| (&record.node, index))
-            .collect();
-        for (index, record) in records.iter().enumerate() {
+        for record in &records {
             prop_assert!(
                 record.state != WorkerState::LeaderReconciling
                     || !record
@@ -1166,13 +1166,13 @@ fn check_authority_case(
                 match output {
                     Output::StateChanged(WorkerState::LeaderReconciling) => {
                         let holders = leaders
-                            .entry((record.recovery_epoch, record.term))
+                            .entry((record.recovery_epoch, record.recovery_lineage, record.term))
                             .or_default();
                         holders.insert(record.node.clone());
                         prop_assert!(
                             holders.len() == 1,
-                            "A2 violated: (epoch, term) {:?} has more than one leader: {:?}",
-                            (record.recovery_epoch, record.term),
+                            "A2 violated: (epoch, lineage, term) {:?} has more than one leader: {:?}",
+                            (record.recovery_epoch, record.recovery_lineage, record.term),
                             holders
                         );
                     }
@@ -1184,21 +1184,14 @@ fn check_authority_case(
                     Output::Grant(Some(grant)) => {
                         coverage.grants += 1;
                         prop_assert_eq!(
-                            (grant.term, grant.recovery_epoch.number),
-                            (record.term, record.recovery_epoch),
+                            (grant.term, grant.recovery_epoch),
+                            (
+                                record.term,
+                                RecoveryEpoch::new(record.recovery_epoch, record.recovery_lineage)
+                            ),
                             "{:?} was granted leadership of a term or epoch other than its own",
                             record.node
                         );
-                        // The lineage is the node's now, so only the node's
-                        // last step of the event vouches for it.
-                        if final_record[&record.node] == index {
-                            prop_assert_eq!(
-                                Some(grant.recovery_epoch.lineage),
-                                cluster.node(&record.node).recovery_lineage(),
-                                "{:?} was granted leadership of another lineage's epoch",
-                                record.node
-                            );
-                        }
                     }
                     _ => {}
                 }
@@ -1214,26 +1207,31 @@ fn check_authority_case(
             let node = cluster.node(id);
             if let Some(configuration) = node.configuration() {
                 prop_assert_eq!(
-                    configuration.generation().recovery_epoch().number,
-                    node.recovery_epoch(),
+                    (
+                        configuration.generation().recovery_epoch().number,
+                        Some(configuration.generation().recovery_epoch().lineage)
+                    ),
+                    (node.recovery_epoch(), node.recovery_lineage()),
                     "A3 violated: {:?} holds a configuration at {:?} of another recovery epoch",
                     id,
                     configuration.generation()
                 );
             }
+            let now =
+                RecoveryEpoch::new(node.recovery_epoch(), node.recovery_lineage().unwrap_or_default());
             prop_assert!(
-                node.recovery_epoch() >= last_epoch[id]
+                now >= last_epoch[id]
                     || (rejoined_now.contains(id) && node.recovery_lineage().is_some()),
-                "A3 violated: {:?}'s recovery epoch fell from {} to {} without its rejoining \
+                "A3 violated: {:?}'s recovery epoch fell from {:?} to {:?} without its rejoining \
                  the authority's",
                 id,
                 last_epoch[id],
-                node.recovery_epoch()
+                now
             );
-            last_epoch.insert(id.clone(), node.recovery_epoch());
+            last_epoch.insert(id.clone(), now);
         }
     }
-    if last_epoch.values().any(|epoch| *epoch > 0) {
+    if last_epoch.values().any(|epoch| epoch.number > 0) {
         coverage.recovered += 1;
     }
     Ok(())

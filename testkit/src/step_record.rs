@@ -25,6 +25,8 @@ pub struct StepRecord {
     pub state: WorkerState,
     pub term: u64,
     pub recovery_epoch: u64,
+    /// The lineage of `recovery_epoch`; 0 before the node first joins.
+    pub recovery_lineage: u64,
     pub admission: Option<Generation>,
     pub prior_admission: Option<Generation>,
     pub leader: Option<(WorkerId, u64)>,
@@ -46,6 +48,7 @@ impl StepRecord {
             state: node.state(),
             term: node.term(),
             recovery_epoch: node.recovery_epoch(),
+            recovery_lineage: node.recovery_lineage().unwrap_or_default(),
             admission: node.admission(),
             prior_admission: node.prior_admission(),
             leader: node.known_leader(),
