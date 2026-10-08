@@ -90,6 +90,8 @@ class Ready:
     definitions: dict[str, int]
     serializers: tuple[str, ...]
     error: str | None = None
+    hooks: tuple[str, ...] = ()
+    """The lifecycle hooks this process found, each as `<kind> hook <name>`."""
 
 
 @dataclass(frozen=True)

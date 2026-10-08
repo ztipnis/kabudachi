@@ -97,14 +97,13 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
 
 def _executor_for(configuration: Configuration) -> Executor:
     """Task processes as configured, or this process with `processes=0`.
-    Raises `TaskDefinitionError` for a task task processes could not import."""
+    Raises `TaskDefinitionError` for a task or hook task processes could not import."""
     settings = configuration.settings()
     registry = default_registry()
+    hooks = default_hooks()
     if settings.processes == 0:
-        return InProcessExecutor(
-            registry, process_serializers(), settings.concurrency, default_hooks()
-        )
-    return ProcessPool(settings, task_modules(registry, settings.imports), registry)
+        return InProcessExecutor(registry, process_serializers(), settings.concurrency, hooks)
+    return ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
 
 
 async def _cancel(task: "asyncio.Future[object] | None") -> None:

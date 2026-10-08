@@ -16,6 +16,7 @@ import kabudachi
 import pool_tasks
 from kabudachi import config as config_module
 from kabudachi import ipc
+from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi.config import Configuration
 from kabudachi.errors import (
@@ -26,18 +27,23 @@ from kabudachi.errors import (
     TaskLostError,
     TaskTimeoutError,
 )
+from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting
 
 
 @pytest.fixture(autouse=True)
 def markers(monkeypatch, tmp_path):
-    """Fresh settings, the pool tasks alone in the registry, and a directory
-    the test shares with its task processes."""
+    """Fresh settings, the pool tasks and hooks alone in their registries,
+    and a directory the test shares with its task processes."""
     registry = TaskRegistry()
     for definition in registry_module.default_registry().definitions():
         registry.register(definition)
     monkeypatch.setattr(registry_module, "_default_registry", registry)
+    hooks = HookRegistry()
+    for hook in lifecycle_module.default_hooks().all():
+        hooks.register(hook)
+    monkeypatch.setattr(lifecycle_module, "_default_hooks", hooks)
     monkeypatch.setattr(config_module, "_process_configuration", Configuration())
     monkeypatch.setenv(pool_tasks.MARKERS, str(tmp_path))
     return tmp_path
@@ -86,15 +92,34 @@ def test_bodies_run_in_task_processes_spread_over_the_pool_and_send_back_results
     assert kind == "CancelledError"
 
 
-def test_a_task_declared_in_the_script_being_run_is_refused_before_anything_starts():
+def declare_in_script_a_task():
     def scripted(request: Greeting) -> Greeting:
         return request
 
     scripted.__module__ = "__main__"
     kabudachi.task(name="tests.scripted")(scripted)
+
+
+def declare_in_script_a_hook():
+    def scripted_hook(context):
+        pass
+
+    scripted_hook.__module__ = "__main__"
+    kabudachi.before_run(scripted_hook)
+
+
+@pytest.mark.parametrize(
+    "declare, named",
+    [(declare_in_script_a_task, "tests.scripted"), (declare_in_script_a_hook, "scripted_hook")],
+    ids=["task", "hook"],
+)
+def test_a_task_or_hook_declared_in_the_script_being_run_is_refused_before_anything_starts(
+    declare, named
+):
+    declare()
     kabudachi.configure(processes=1)
 
-    with pytest.raises(TaskDefinitionError, match="tests.scripted"):
+    with pytest.raises(TaskDefinitionError, match=named):
         kabudachi.run(nothing)
 
 
@@ -102,6 +127,14 @@ def declare_only_here():
     @kabudachi.task(name="tests.only_here")
     def only_here(request: Greeting) -> Greeting:
         return request
+
+
+def declare_hook_only_here():
+    kabudachi.configure(imports=["pool_tasks"])
+
+    @kabudachi.before_run
+    def noted(context):
+        pass
 
 
 @pytest.mark.parametrize(
@@ -120,8 +153,19 @@ def declare_only_here():
             ),
             r"kabudachi-task-0 was not ready within 3 s while importing pool_slow_import",
         ),
+        (declare_hook_only_here, "before_run hook test_pool.declare_hook_only_here.<locals>.noted is missing"),
+        (
+            lambda: pool_tasks.marker("process-init-fails").touch(),
+            "process_init hook pool_tasks.open_resources raised RuntimeError: resources unavailable",
+        ),
     ],
-    ids=["module_fails_to_import", "task_only_in_the_worker", "import_never_finishes"],
+    ids=[
+        "module_fails_to_import",
+        "task_only_in_the_worker",
+        "import_never_finishes",
+        "hook_only_in_the_worker",
+        "process_init_raises",
+    ],
 )
 def test_task_processes_that_cannot_find_every_task_stop_the_start_with_the_reason(arrange, reason):
     kabudachi.configure(processes=1)
@@ -273,3 +317,48 @@ def test_a_task_process_is_replaced_after_its_run_limit_and_after_a_recycling_ta
     # A draining process still counts: its replacement starts only once it
     # has exited, so there was never more than one task process.
     assert most_alive == 1
+
+
+def test_lifecycle_hooks_prepare_each_run_in_its_task_process_and_a_failed_cleanup_replaces_it(markers):
+    kabudachi.configure(processes=1, concurrency=1)
+
+    async def main():
+        async with asyncio.timeout(30):
+            sync = await pool_tasks.hooked(Greeting())
+            in_loop = await pool_tasks.hooked_async(Greeting())
+            retried = await pool_tasks.refused_once(Greeting())
+            with pytest.raises(LookupError, match="pool.refused is not ready"):
+                await pool_tasks.refused(Greeting())
+            await pool_tasks.where_async(Greeting())  # not on the hooks' queue
+            (markers / "process-init-fails").touch()
+            spoiled = await pool_tasks.hooked(Greeting(text="spoil"))
+            while not (markers / "process-init-failures").exists():
+                await asyncio.sleep(0.05)
+            (markers / "process-init-fails").unlink()
+            after = await pool_tasks.hooked(Greeting())
+            return sync, in_loop, retried, spoiled, after
+
+    sync, in_loop, retried, spoiled, after = kabudachi.run(main)
+
+    assert sync.times != os.getpid()
+    assert (sync.text, in_loop.text) == ("pool.hooked 1 True", "pool.hooked_async 1 True")
+    assert retried.text == "2", "the failing before_run hook failed the first attempt, which was retried"
+    assert (spoiled.text, spoiled.times) == ("spoil", sync.times), "the result stood"
+    assert after.times not in (sync.times, os.getpid()), "the failed cleanup replaced the process"
+    assert after.text == "pool.hooked 1 True", "a later start whose process_init failed was tried again"
+    assert (markers / "hooks.log").read_text().splitlines() == [
+        "before pool.hooked 1",
+        "after pool.hooked 1 Greeting",
+        "before pool.hooked_async 1",
+        "after pool.hooked_async 1 Greeting",
+        "before pool.refused_once 1",
+        "after pool.refused_once 1 LookupError",
+        "before pool.refused_once 2",
+        "after pool.refused_once 2 Greeting",
+        "before pool.refused 1",
+        "after pool.refused 1 LookupError",
+        "before pool.hooked 1",
+        "after pool.hooked 1 Greeting",
+        "before pool.hooked 1",
+        "after pool.hooked 1 Greeting",
+    ]

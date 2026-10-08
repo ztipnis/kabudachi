@@ -26,6 +26,7 @@ from kabudachi.config import Settings
 from kabudachi.errors import StartupError, TaskBodyError, TaskDefinitionError
 from kabudachi.execution import CompactJob, NestedCalls, RunJob, TaskProcessLost
 from kabudachi.handle import TaskHandle
+from kabudachi.lifecycle import HookRegistry
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskRegistry
 
@@ -44,28 +45,32 @@ _FIRST_RESPAWN_DELAY_SECONDS = 0.1
 _MAX_RESPAWN_DELAY_SECONDS = 10.0
 
 
-def task_modules(registry: TaskRegistry, imports: tuple[str, ...] | None) -> tuple[str, ...]:
-    """The modules a task process imports to find every task: `imports` if
-    given, else every module that declared one here.
+def task_modules(
+    registry: TaskRegistry, hooks: HookRegistry, imports: tuple[str, ...] | None
+) -> tuple[str, ...]:
+    """The modules a task process imports to find every task and lifecycle
+    hook: `imports` if given, else every module that declared one here.
 
-    Raises `TaskDefinitionError` naming every task declared in the script
-    being run, which a task process cannot import, whether or not `imports`
-    is given.
+    Raises `TaskDefinitionError` naming every task or hook declared in the
+    script being run, which a task process cannot import, whether or not
+    `imports` is given.
     """
     unreachable = [
         definition.name
         for definition in registry.definitions()
         if definition.module in ("", "__main__")
-    ]
+    ] + [hook.described for hook in hooks.all() if hook.module in ("", "__main__")]
     if unreachable:
         raise TaskDefinitionError(
-            "tasks declared in the script being run cannot run in task processes, "
+            "tasks and hooks declared in the script being run cannot run in task processes, "
             f"which cannot import it: {', '.join(unreachable)}; declare them in a module, "
             "or set processes=0 to run task bodies in this process"
         )
     if imports is not None:
         return imports
-    return tuple(dict.fromkeys(definition.module for definition in registry.definitions()))
+    modules = [definition.module for definition in registry.definitions()]
+    modules += [hook.module for hook in hooks.all()]
+    return tuple(dict.fromkeys(modules))
 
 
 @dataclass(eq=False)
@@ -128,10 +133,17 @@ class _Child:
 class ProcessPool:
     """`processes` task processes with `concurrency` places each."""
 
-    def __init__(self, settings: Settings, modules: tuple[str, ...], registry: TaskRegistry) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        modules: tuple[str, ...],
+        registry: TaskRegistry,
+        hooks: HookRegistry,
+    ) -> None:
         self._settings = settings
         self._modules = modules
         self._registry = registry
+        self._hooks = hooks
         self._context = multiprocessing.get_context("spawn")
         self._loop: asyncio.AbstractEventLoop | None = None
         # The children counted against `processes`, draining ones included;
@@ -457,12 +469,15 @@ class ProcessPool:
                 problems.append(
                     f"{definition.name}'s serializer {definition.serializer!r} is not registered"
                 )
+        for described in (hook.described for hook in self._hooks.all()):
+            if described not in ready.hooks:
+                problems.append(f"{described} is missing")
         if problems:
             raise StartupError(
                 "a task process does not have the tasks this process has ("
                 + "; ".join(problems)
-                + "); declare every task, and register its serializer, in a module the task "
-                "processes import, or list those modules in `imports`"
+                + "); declare every task and hook, and register every serializer, in a module the "
+                "task processes import, or list those modules in `imports`"
             )
         child.ready = True
         child.ready_at = time.monotonic()
@@ -505,6 +520,8 @@ class ProcessPool:
                     slot.waiting = isinstance(frame, ipc.Waiting)
                     self._wake()
                     self._dispatch()
+            case ipc.Recycle():
+                self._retire(child)
             case ipc.Submit():
                 self._submit_for(child, frame)
             case ipc.CancelTask():

@@ -8,11 +8,15 @@ place. The worker decides how many run at once; this process runs what it is
 sent. A task, flow or group a body calls is submitted by the worker, which
 answers at once and later sends its outcome; while a body waits for one, the
 worker counts its place free.
+
+It runs its `process_init` hooks before it says it is ready, and every body
+between its run hooks.
 """
 
 import asyncio
 import concurrent.futures
 import contextvars
+import dataclasses
 import functools
 import importlib
 import itertools
@@ -29,9 +33,10 @@ from typing import Any
 from kabudachi import ipc
 from kabudachi.body import fold_compaction, run_serialized
 from kabudachi.config import Settings
+from kabudachi.errors import StartupError
 from kabudachi.handle import TaskHandle, current_body, run_callback_inline
 from kabudachi.hosted_work import LoopHostedWork
-from kabudachi.lifecycle import RunContext, default_hooks, hooks_for_run
+from kabudachi.lifecycle import RunContext, default_hooks, hooks_for_run, initialize_process
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
@@ -85,6 +90,7 @@ def _import(process: "_TaskProcess", modules: tuple[str, ...]) -> ipc.Ready:
     return ipc.Ready(
         {definition.name: definition.version for definition in default_registry().definitions()},
         tuple(process_serializers().names()),
+        hooks=tuple(hook.described for hook in default_hooks().all()),
     )
 
 
@@ -144,6 +150,13 @@ class _TaskProcess:
             for frame in self._early:
                 loop.call_soon(self._received, frame)
             self._early.clear()
+        try:
+            await initialize_process(self._hooks)
+        except StartupError as error:
+            # Nothing here may run until the process is prepared; the worker
+            # gives up on, or replaces, a process that cannot be.
+            self.send(dataclasses.replace(ready, error=f"could not initialize: {error}"))
+            return
         self.send(ready)
         await self._finished.wait()
 

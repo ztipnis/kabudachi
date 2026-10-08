@@ -6,6 +6,7 @@ processes."""
 import asyncio
 import os
 import signal
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -191,3 +192,73 @@ async def recycles(request: Greeting) -> Greeting:
     process finished it instead of cutting it short."""
     await asyncio.sleep(0.3)
     return Greeting(times=os.getpid())
+
+
+HOOKED = "hooks"
+# What this process's process_init hook prepared.
+PROCESS: dict[str, int] = {}
+_per_thread = threading.local()
+
+
+@kabudachi.process_init
+def open_resources() -> None:
+    """Fails, leaving a mark, while the test's directory asks it to;
+    otherwise notes that this process prepared itself."""
+    if MARKERS not in os.environ:
+        return  # a program that shares no directory with its task processes
+    if marker("process-init-fails").exists():
+        with marker("process-init-failures").open("a") as failures:
+            failures.write(f"{os.getpid()}\n")
+        raise RuntimeError("resources unavailable")
+    PROCESS["opened_in"] = os.getpid()
+
+
+@kabudachi.before_run(queues=[HOOKED])
+async def log_start(context: kabudachi.RunContext) -> None:
+    _log(f"before {context.task_name} {context.attempt}")
+    if context.task_name in ("pool.refused", "pool.refused_once") and context.attempt == 1:
+        raise LookupError(f"{context.task_name} is not ready")
+
+
+@kabudachi.before_run(queues=[HOOKED])
+def check_out(context: kabudachi.RunContext) -> None:
+    _per_thread.context = context
+
+
+@kabudachi.after_run(queues=[HOOKED])
+def check_in(context: kabudachi.RunContext, outcome: object) -> None:
+    _log(f"after {context.task_name} {context.attempt} {type(outcome).__name__}")
+    if isinstance(outcome, Greeting) and outcome.text == "spoil":
+        raise ValueError("could not return the resources")
+
+
+def _log(line: str) -> None:
+    with marker("hooks.log").open("a") as log:
+        log.write(line + "\n")
+
+
+def _prepared() -> str:
+    """The run the before_run hook left on this thread, and whether this
+    process ran its process_init hook."""
+    context = _per_thread.context
+    return f"{context.task_name} {context.attempt} {PROCESS.get('opened_in') == os.getpid()}"
+
+
+@kabudachi.task(name="pool.hooked", queue=HOOKED)
+def hooked(request: Greeting) -> Greeting:
+    return Greeting(times=os.getpid(), text=request.text or _prepared())
+
+
+@kabudachi.task(name="pool.hooked_async", queue=HOOKED)
+async def hooked_async(request: Greeting) -> Greeting:
+    return Greeting(times=os.getpid(), text=request.text or _prepared())
+
+
+@kabudachi.task(name="pool.refused_once", queue=HOOKED, retries=1)
+def refused_once(request: Greeting) -> Greeting:
+    return Greeting(text=str(_per_thread.context.attempt))
+
+
+@kabudachi.task(name="pool.refused", queue=HOOKED)
+def refused(request: Greeting) -> Greeting:
+    return request
