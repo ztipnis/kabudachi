@@ -2079,7 +2079,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.mark_decided(&run_id);
     }
 
-    /// The worker that claimed `run_id` reports that it began executing.
+    /// The worker that claimed `run_id` reports that it began executing. The
+    /// same report again, while the run still runs, is taken and changes
+    /// nothing.
     pub fn report_started(
         &mut self,
         worker: &WorkerId,
@@ -2095,7 +2097,17 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.start_owned(worker, run_id)
     }
 
+    /// Starts `worker`'s claimed run. A start repeated by the worker of a run
+    /// already running (its first went unanswered, or a new leader rebuilt the
+    /// run as running) is taken again and changes nothing, so a report sent
+    /// again never stops a healthy run.
     fn start_owned(&mut self, worker: &WorkerId, run_id: &TaskRunId) -> Result<(), ReportRejection> {
+        let already_running = self.runs.get(run_id).is_some_and(|run| {
+            run.current_state() == TaskRunState::Running && run.selected_worker().as_ref() == Some(worker)
+        });
+        if already_running {
+            return Ok(());
+        }
         let stamped_at = WallTime::now(&self.clock);
         let run = self.owned_run(worker, run_id, TaskRunState::Claimed)?;
         run.transition_to(TaskRunState::Running, stamped_at)

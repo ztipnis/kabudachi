@@ -212,6 +212,14 @@ fn only_the_claiming_worker_may_report_and_only_in_order() {
             s.report_started(&worker("w2"), &claimed).err(),
         ),
         (
+            "a start by a worker that did not claim the running run",
+            s.report_started(&worker("w2"), &running).err(),
+        ),
+        (
+            "a start after a completion",
+            s.report_started(&worker("w1"), &succeeded).err(),
+        ),
+        (
             "a completion of a run that never started",
             s.complete(&worker("w1"), &claimed, other.clone(), Completion::Final).err(),
         ),
@@ -244,6 +252,13 @@ fn only_the_claiming_worker_may_report_and_only_in_order() {
             "{report}"
         );
     }
+    // A start repeated by the run's own worker (its first went unanswered,
+    // or a new leader rebuilt the run as running) is taken again and changes
+    // nothing.
+    fixture
+        .scheduler
+        .report_started(&worker("w1"), &running)
+        .unwrap();
     assert_eq!(fixture.run_state(&running), TaskRunState::Running);
     assert_eq!(fixture.run_state(&claimed), TaskRunState::Claimed);
     assert_eq!(fixture.run_state(&succeeded), TaskRunState::Succeeded);
