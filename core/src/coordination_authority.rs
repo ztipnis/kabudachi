@@ -84,7 +84,9 @@ pub trait CoordinationAuthority {
     /// after that, since the name's first use), it grants no fence at all and
     /// answers [`AuthorityError::FenceHeld`] with the rest of that TTL: every
     /// fence taken before the loss has expired by then. After an outage that
-    /// kept its data, it still knows every fence and needs no such wait.
+    /// kept its data, an authority that knows every fence needs no such wait;
+    /// one that cannot rule out that a restart or failover lost writes it
+    /// acknowledged (a fence among them) waits the same TTL.
     ///
     /// The fence is a lease, not a fencing token: it returns only a TTL, and
     /// the authority mints no token of its own. It bounds how long a leader

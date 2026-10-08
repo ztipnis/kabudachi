@@ -792,16 +792,20 @@ fn an_outage_keeps_the_data_and_withholds_only_the_count(
         BTreeMap::from([(worker_a(), "address-a".to_string())]),
         "{clause}: the registration is kept"
     );
+    // A restart or failover may lose acknowledged writes, so an adapter may
+    // refuse every fence for up to one TTL after it comes back; it may not
+    // hand a second holder the fence while the first one's lasts.
     fence_held(
         authority.acquire_fence(&name(), &worker_b(), &founded()),
-        left_after(adapter, 1),
+        adapter.ttl(),
         clause,
     );
-    assert_eq!(
-        authority.acquire_fence(&name(), &worker_a(), &founded()),
-        Ok(adapter.ttl()),
-        "{clause}: the fence is kept, so its holder renews with no wait"
-    );
+    match authority.acquire_fence(&name(), &worker_a(), &founded()) {
+        Ok(ttl) => assert_eq!(ttl, adapter.ttl(), "{clause}: the holder renews for a TTL"),
+        held => {
+            fence_held(held, adapter.ttl(), clause);
+        }
+    }
     fence_held(
         authority.acquire_fence(&name(), &worker_b(), &founded()),
         adapter.ttl(),
@@ -840,5 +844,10 @@ fn an_outage_keeps_the_data_and_withholds_only_the_count(
         count(&authority, &shard(), clause),
         Some(1),
         "{clause}: count back a TTL after the outage"
+    );
+    assert_eq!(
+        authority.acquire_fence(&name(), &worker_a(), &founded()),
+        Ok(adapter.ttl()),
+        "{clause}: the fence is granted again within a TTL and a quarter of the outage's end"
     );
 }
