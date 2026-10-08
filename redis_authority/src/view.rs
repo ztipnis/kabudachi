@@ -7,7 +7,7 @@ use kabudachi_core::coordination_authority::{AuthorityError, LeaderHint, Recover
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use redis::Connection;
 
-use crate::connection::Failure;
+use crate::connection::{Deadline, Failure, round_trip};
 use crate::keys::{Keys, Part, join, split};
 
 /// When the shard name's data began and last became available, and on which
@@ -49,6 +49,7 @@ impl View {
     /// server's clock and run id, the sentinel and the parts.
     pub(crate) fn read(
         connection: &mut Connection,
+        deadline: &Deadline,
         keys: &Keys,
         parts: &[Part],
     ) -> Result<Self, Failure> {
@@ -68,7 +69,10 @@ impl View {
                 _ => pipe.cmd("GET").arg(keys.key(*part)),
             };
         }
-        let mut replies = pipe.query::<Vec<redis::Value>>(connection)?.into_iter();
+        let count = pipe.len();
+        let mut replies = round_trip(connection, deadline, &pipe, count)?
+            .into_iter()
+            .skip(1);
         let mut next = || replies.next().ok_or(Failure::Corrupt);
         let time: Vec<String> = redis::from_redis_value(next()?).map_err(|_| Failure::Corrupt)?;
         let info: String = redis::from_redis_value(next()?).map_err(|_| Failure::Corrupt)?;

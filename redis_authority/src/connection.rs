@@ -37,6 +37,29 @@ impl Deadline {
     }
 }
 
+/// Sends the pipeline and reads `replies` replies, each read bounded by what
+/// is left of the deadline. The first failure returns at once: redis-rs's
+/// own pipeline would go on reading, a timeout per outstanding reply, and
+/// overrun the deadline. The connection is then out of step: drop it.
+pub(crate) fn round_trip(
+    connection: &mut Connection,
+    deadline: &Deadline,
+    pipe: &redis::Pipeline,
+    replies: usize,
+) -> Result<Vec<redis::Value>, Failure> {
+    deadline.apply(connection)?;
+    connection.send_packed_command(&pipe.get_packed_pipeline())?;
+    let mut values = Vec::with_capacity(replies);
+    for _ in 0..replies {
+        deadline.apply(connection)?;
+        match connection.recv_response()? {
+            redis::Value::ServerError(error) => return Err(RedisError::from(error).into()),
+            value => values.push(value),
+        }
+    }
+    Ok(values)
+}
+
 #[derive(Debug)]
 pub(crate) enum Failure {
     /// The slot lives on the node at this address.
@@ -57,12 +80,8 @@ impl From<RedisError> for Failure {
     fn from(error: RedisError) -> Self {
         match error.code() {
             Some("MOVED") => {
-                if let Some((host, port)) = error.redirect_node() {
-                    return Failure::Moved(format!("{host}:{port}"));
-                }
-                // A pipeline folds its replies' errors into one without the redirect.
-                if let Some(address) = moved_address(&error.to_string()) {
-                    return Failure::Moved(address);
+                if let Some((address, _slot)) = error.redirect_node() {
+                    return Failure::Moved(address.to_string());
                 }
             }
             Some("ASK" | "TRYAGAIN" | "CLUSTERDOWN") => return Failure::Retry,
@@ -77,17 +96,6 @@ impl From<RedisError> for Failure {
             Failure::Server
         }
     }
-}
-
-/// The address in the first `MOVED <slot> <address>` of an error's text,
-/// whatever case or punctuation surrounds it.
-fn moved_address(text: &str) -> Option<String> {
-    let mut words = text
-        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '[' | ']'))
-        .filter(|word| !word.is_empty());
-    words.find(|word| word.trim_end_matches(':').eq_ignore_ascii_case("moved"))?;
-    words.next()?.parse::<u16>().ok()?;
-    Some(words.next()?.to_string())
 }
 
 /// This client's own view of the server's availability: whether its last

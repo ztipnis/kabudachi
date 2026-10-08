@@ -7,7 +7,7 @@ use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::time::Duration;
 
 use crate::config::{ConfigError, RedisAuthorityConfig};
-use crate::connection::{Connections, Deadline, Failure};
+use crate::connection::{Connections, Deadline, Failure, round_trip};
 use crate::keys::{Keys, Part};
 use crate::view::{
     View, encode_fence, encode_hint, encode_registration, encode_shard,
@@ -88,7 +88,7 @@ impl RedisAuthority {
             .with_connection(&keys, &deadline, |connection| {
                 for _ in 0..MAX_ATTEMPTS {
                     deadline.apply(connection)?;
-                    let view = View::read(connection, &keys, parts)?;
+                    let view = View::read(connection, &deadline, &keys, parts)?;
                     let step = body(&view).unwrap_or_else(|error| Step::answer(Err(error)));
                     let repair = view.repair();
                     if step.writes.is_empty() && repair.is_empty() {
@@ -100,16 +100,22 @@ impl RedisAuthority {
                     let mut pipe = redis::pipe();
                     pipe.atomic();
                     if !repair.is_empty() {
-                        pipe.hset_multiple(keys.sentinel(), &repair).ignore();
+                        let hset = pipe.cmd("HSET").arg(keys.sentinel());
+                        for (field, value) in &repair {
+                            hset.arg(field).arg(value);
+                        }
+                        hset.ignore();
                     }
                     for write in &step.writes {
                         write.queue(&mut pipe, &keys);
                     }
-                    deadline.apply(connection)?;
-                    let committed: Option<redis::Value> =
-                        pipe.query(connection).map_err(Failure::from)?;
-                    if committed.is_some() {
-                        return Ok(step.answer);
+                    // MULTI, each command's QUEUED, then EXEC: nil if a writer got in first.
+                    let count = pipe.len() + 2;
+                    let replies = round_trip(connection, &deadline, &pipe, count)?;
+                    match replies.last() {
+                        Some(redis::Value::Nil) => {}
+                        Some(redis::Value::Array(_)) => return Ok(step.answer),
+                        _ => return Err(Failure::Corrupt),
                     }
                 }
                 Err(Failure::Contended)
