@@ -362,3 +362,38 @@ def test_lifecycle_hooks_prepare_each_run_in_its_task_process_and_a_failed_clean
         "before pool.hooked 1",
         "after pool.hooked 1 Greeting",
     ]
+
+
+def test_a_body_raising_system_exit_or_keyboard_interrupt_fails_its_run_and_costs_its_process_after_its_neighbour(
+    markers,
+):
+    kabudachi.configure(processes=1, concurrency=4)
+
+    async def main():
+        async with asyncio.timeout(30):
+            neighbour = pool_tasks.steady(Greeting(text="n"))
+            while not (markers / "steady-n").exists():
+                await asyncio.sleep(0.01)
+            outcomes = await asyncio.gather(
+                pool_tasks.leaves(Greeting(text="SystemExit")),
+                pool_tasks.leaves(Greeting(text="KeyboardInterrupt")),
+                pool_tasks.leaves_async(Greeting()),
+                pool_tasks.cleaned_up(Greeting()),
+                pool_tasks.cleaned_up_async(Greeting()),
+                return_exceptions=True,
+            )
+            finished = (await neighbour).times
+            after = (await pool_tasks.where_async(Greeting())).times
+            return outcomes, finished, after
+
+    outcomes, neighbour, after = kabudachi.run(main)
+
+    assert [(type(outcome), getattr(outcome, "kind", None)) for outcome in outcomes] == [
+        (TaskBodyError, "SystemExit"),
+        (TaskBodyError, "KeyboardInterrupt"),
+        (TaskBodyError, "SystemExit"),
+        (TaskBodyError, "KeyboardInterrupt"),
+        (TaskBodyError, "KeyboardInterrupt"),
+    ], outcomes
+    assert neighbour != os.getpid(), "the neighbour finished where it started"
+    assert after not in (neighbour, os.getpid()), "the process was condemned and replaced"

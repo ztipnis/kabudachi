@@ -135,6 +135,12 @@ class Waiting:
 
 
 @dataclass(frozen=True)
+class Condemn:
+    """A body here raised `SystemExit` or `KeyboardInterrupt`: send this
+    process no new runs, and stop it once its other runs have finished."""
+
+
+@dataclass(frozen=True)
 class Recycle:
     """An `after_run` hook raised, so this process may hold what it failed
     to clean up: send it no new runs; it exits once its runs finish."""

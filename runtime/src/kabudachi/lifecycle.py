@@ -204,6 +204,9 @@ class RunHooks:
     after: tuple[LifecycleHook, ...]
     recycle: Callable[[], None]
     """Called, from any thread, once an `after_run` hook has raised."""
+    condemn: Callable[[], None]
+    """Called, from any thread, when the body or a hook raised `SystemExit`
+    or `KeyboardInterrupt`: the process should take no more runs."""
 
     def around_sync(self, call: Callable[[], Any]) -> Any:
         """Calls the hooks and `call()` on this thread, which is not the event
@@ -292,6 +295,7 @@ def hooks_for_run(
     queue: str,
     *,
     recycle: Callable[[], None],
+    condemn: Callable[[], None],
 ) -> RunHooks:
     """The hooks of `registry` called around the run `context` of a task on `queue`."""
     return RunHooks(
@@ -299,6 +303,7 @@ def hooks_for_run(
         registry.of_kind(HookKind.BEFORE_RUN, queue),
         registry.of_kind(HookKind.AFTER_RUN, queue),
         recycle,
+        condemn,
     )
 
 

@@ -522,6 +522,8 @@ class ProcessPool:
                     self._dispatch()
             case ipc.Recycle():
                 self._retire(child)
+            case ipc.Condemn():
+                self._condemn(child)
             case ipc.Submit():
                 self._submit_for(child, frame)
             case ipc.CancelTask():

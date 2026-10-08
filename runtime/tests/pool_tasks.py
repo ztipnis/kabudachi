@@ -262,3 +262,45 @@ def refused_once(request: Greeting) -> Greeting:
 @kabudachi.task(name="pool.refused", queue=HOOKED)
 def refused(request: Greeting) -> Greeting:
     return request
+
+
+@kabudachi.task(name="pool.steady")
+async def steady(request: Greeting) -> Greeting:
+    """Says it started, then runs for a second: long enough to be running
+    beside bodies that fail."""
+    marker(f"steady-{request.text}").touch()
+    await asyncio.sleep(1)
+    return Greeting(times=os.getpid())
+
+
+LEAVING = {"SystemExit": SystemExit, "KeyboardInterrupt": KeyboardInterrupt}
+
+
+@kabudachi.task(name="pool.leaves")
+def leaves(request: Greeting) -> Greeting:
+    """Raises the exception `request.text` names, in its own thread."""
+    raise LEAVING[request.text]("leaving")
+
+
+@kabudachi.task(name="pool.leaves_async")
+async def leaves_async(request: Greeting) -> Greeting:
+    raise SystemExit("leaving")
+
+
+@kabudachi.after_run(queues=["leaving"])
+def interrupts_cleanup(context: kabudachi.RunContext, outcome: object) -> None:
+    raise KeyboardInterrupt("leaving")
+
+
+@kabudachi.task(name="pool.cleaned_up", queue="leaving")
+def cleaned_up(request: Greeting) -> Greeting:
+    """Succeeds, but its after_run hook raises KeyboardInterrupt."""
+    return request
+
+
+@kabudachi.task(name="pool.cleaned_up_async", queue="leaving")
+async def cleaned_up_async(request: Greeting) -> Greeting:
+    """Succeeds, but its after_run hook raises KeyboardInterrupt on the
+    process's event loop."""
+    return request
+

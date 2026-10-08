@@ -8,6 +8,7 @@ fails, and it is left to finish on its own, its outcome discarded.
 
 import asyncio
 import functools
+import signal
 from collections.abc import Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from typing import Any
 
 from asgiref.sync import sync_to_async
 
-from kabudachi.errors import UnknownTaskError
+from kabudachi.errors import TaskBodyError, UnknownTaskError
 from kabudachi.lifecycle import RunHooks
 from kabudachi.registry import TaskDefinition, TaskRegistry
 from kabudachi.serializers import Serializer, SerializerRegistry
@@ -40,7 +41,15 @@ def start_body(
 ) -> RunningBody:
     """Starts running `definition` on `argument` between its run hooks: as a
     task for an async body, and in `threads` for a synchronous one, whose
-    hooks run in its thread."""
+    hooks run in its thread.
+
+    A body or hook that raises `SystemExit` or `KeyboardInterrupt` fails
+    with `TaskBodyError` naming the type, and `hooks.condemn` is called. One
+    that raises `CancelledError` though nobody asked it to stop fails the
+    same way, without `hooks.condemn`. A `KeyboardInterrupt` on the loop's
+    thread, from an async body or its hooks, is let through unless this
+    process ignores SIGINT: there it can be a real Ctrl-C, which stops the
+    whole run."""
     loop = asyncio.get_running_loop()
     exited: asyncio.Future[None] = loop.create_future()
 
@@ -49,7 +58,25 @@ def start_body(
             exited.set_result(None)
 
     if definition.is_async:
-        outcome = loop.create_task(hooks.around_async(lambda: definition.func(argument)))
+
+        async def contained() -> Any:
+            try:
+                return await hooks.around_async(lambda: definition.func(argument))
+            except Exception:
+                raise
+            except asyncio.CancelledError as error:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise  # asked to stop
+                raise _failure(error) from error
+            except KeyboardInterrupt as error:
+                if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+                    raise  # perhaps Ctrl-C, raised into whatever the loop was running
+                raise _contained(error, hooks) from error
+            except BaseException as error:
+                raise _contained(error, hooks) from error
+
+        outcome = loop.create_task(contained())
         outcome.add_done_callback(lambda _: mark_exited())
     else:
         func = definition.func
@@ -57,6 +84,13 @@ def start_body(
         def in_thread(value: Any) -> Any:
             try:
                 return hooks.around_sync(lambda: func(value))
+            except Exception:
+                raise
+            except asyncio.CancelledError as error:
+                # Nothing can ask a thread to stop, so the body raised it itself.
+                raise _failure(error) from error
+            except BaseException as error:
+                raise _contained(error, hooks) from error
             finally:
                 try:
                     loop.call_soon_threadsafe(mark_exited)
@@ -72,6 +106,22 @@ def start_body(
     # logged as never retrieved.
     outcome.add_done_callback(lambda done: done.cancelled() or done.exception())
     return RunningBody(outcome, exited)
+
+
+def _contained(error: BaseException, hooks: RunHooks) -> TaskBodyError:
+    """`SystemExit` or `KeyboardInterrupt` from a body or its hooks, as the
+    error its run fails with. Left to propagate, it would end the event loop of the whole
+    process, and every run in it with the loop; the process is condemned
+    instead, so its other runs finish first."""
+    hooks.condemn()
+    return _failure(error)
+
+
+def _failure(error: BaseException) -> TaskBodyError:
+    """An error that is not an `Exception`, as one the run can fail with:
+    raised as it is, it would end whoever awaits the run instead."""
+    kind = type(error).__name__
+    return TaskBodyError(f"{kind}: {error}" if str(error) else kind, kind)
 
 
 def task_named(

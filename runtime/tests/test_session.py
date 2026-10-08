@@ -19,10 +19,10 @@ from kabudachi.errors import (
     CoalescedPayloadTooLargeError,
     RunStoppedError,
     SerializationError,
+    TaskBodyError,
     TaskCancelledError,
     TaskDefinitionError,
     TaskExpiredError,
-    TaskInterruptedError,
     TaskRecordFullError,
     TaskSupersededError,
     TaskTimeoutError,
@@ -334,7 +334,7 @@ def test_a_body_that_is_cancelled_fails_its_handle_and_does_not_hang_the_run():
 
     async def body():
         bad = world.call("cancelled", Greeting())
-        with pytest.raises(TaskInterruptedError, match="CancelledError"):
+        with pytest.raises(TaskBodyError, match="CancelledError"):
             await bad
         await world.session.wait_until_idle()
         return await world.call("echo", Greeting(text="still works"))

@@ -271,6 +271,7 @@ class _TaskProcess:
             RunContext(frame.definition_id, frame.run_id, frame.attempt),
             frame.queue,
             recycle=functools.partial(self.send, ipc.Recycle()),
+            condemn=functools.partial(self.send, ipc.Condemn()),
         )
         body = context.run(
             run_serialized,

@@ -16,7 +16,7 @@ from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
 from kabudachi.config import Configuration
-from kabudachi.errors import RuntimeNotStartedError, TaskDefinitionError
+from kabudachi.errors import RuntimeNotStartedError, TaskBodyError, TaskDefinitionError
 from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting, Receipt
@@ -631,3 +631,63 @@ def test_lifecycle_hooks_run_in_this_process_around_the_runs_of_their_queues(cap
     assert hooked_result.times == 1 and hooked_result.text, "the body saw its run's context"
     assert plain_result.text == "untouched", "hooks of another queue left it alone"
     assert "ValueError" in caplog.text, "the failed after_run hook was logged; the result stood"
+
+
+def test_a_body_or_hook_that_raises_system_exit_or_keyboard_interrupt_or_cancels_itself_fails_only_its_run_here():
+    leaving = {"SystemExit": SystemExit, "KeyboardInterrupt": KeyboardInterrupt}
+
+    @kabudachi.after_run(queues=["leaving"])
+    def interrupts_cleanup(context, outcome):
+        raise leaving[outcome.text]("leaving")
+
+    def leaves(request: Greeting) -> Greeting:
+        raise leaving[request.text]("leaving")
+
+    async def leaves_async(request: Greeting) -> Greeting:
+        raise SystemExit("leaving")
+
+    async def cancels_itself(request: Greeting) -> Greeting:
+        raise asyncio.CancelledError
+
+    def cleaned_up(request: Greeting) -> Greeting:
+        return request
+
+    async def cleaned_up_async(request: Greeting) -> Greeting:
+        return request
+
+    async def steady(request: Greeting) -> Greeting:
+        await asyncio.sleep(0.2)
+        return Greeting(text="finished")
+
+    leaves, leaves_async, cancels_itself, steady = map(
+        declare, (leaves, leaves_async, cancels_itself, steady)
+    )
+    cleaned_up = declare(cleaned_up, queue="leaving")
+    cleaned_up_async = declare(cleaned_up_async, queue="leaving")
+
+    async def main():
+        async with asyncio.timeout(10):
+            neighbour = steady(Greeting())
+            outcomes = await asyncio.gather(
+                leaves(Greeting(text="SystemExit")),
+                leaves(Greeting(text="KeyboardInterrupt")),
+                leaves_async(Greeting()),
+                cancels_itself(Greeting()),
+                cleaned_up(Greeting(text="KeyboardInterrupt")),
+                cleaned_up_async(Greeting(text="SystemExit")),
+                return_exceptions=True,
+            )
+            return outcomes, (await neighbour).text
+
+    outcomes, neighbour = kabudachi.run(main)
+
+    assert [(type(outcome), getattr(outcome, "kind", None)) for outcome in outcomes] == [
+        (TaskBodyError, "SystemExit"),
+        (TaskBodyError, "KeyboardInterrupt"),
+        (TaskBodyError, "SystemExit"),
+        (TaskBodyError, "CancelledError"),
+        (TaskBodyError, "KeyboardInterrupt"),
+        (TaskBodyError, "SystemExit"),
+    ], outcomes
+    assert neighbour == "finished", "a body beside them ran to its end"
+

@@ -162,6 +162,7 @@ class InProcessExecutor:
             RunContext(job.definition_id, job.run_id, job.attempt),
             job.queue,
             recycle=_no_process_to_replace,
+            condemn=_no_process_to_replace,
         )
         body = context.run(
             run_serialized,
@@ -211,8 +212,9 @@ class InProcessExecutor:
 
 
 def _no_process_to_replace() -> None:
-    """Bodies here run in the worker itself, which is never replaced; a
-    failed hook is only logged."""
+    """Bodies here run in the worker itself, which is never replaced: a
+    failed hook is only logged, and a body that raised `SystemExit` or
+    `KeyboardInterrupt` only fails its run."""
 
 
 async def run_within(
