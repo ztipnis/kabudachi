@@ -63,7 +63,8 @@ class Settings:
     `__post_init__`. `KABUDACHI_<NAME>` in the environment can set it; a field
     of type `int` is read from the environment as a number, one of type
     `timedelta` as a number of seconds, a `bool` as true/false, yes/no, on/off
-    or 1/0, and `imports` as a comma-separated list.
+    or 1/0, `imports` as a comma-separated list, and an `int | None` field as
+    a number; an empty value leaves `imports` or an `int | None` field unset.
     """
 
     processes: int = field(default_factory=_one_per_cpu)
@@ -229,7 +230,7 @@ def _parse(value_type: Any, raw: str) -> Any:
         modules = tuple(part.strip() for part in raw.split(",") if part.strip())
         return modules or None  # an empty value is "not set", not "no modules"
     if value_type == int | None:
-        return int(raw)
+        return int(raw) if raw.strip() else None  # an empty value is "not set"
     return raw
 
 
@@ -301,8 +302,8 @@ def configure(**settings: Any) -> None:
     allow `concurrency` above 32, `imports`, the modules task processes import
     to find tasks (by default every module that declared one),
     `max_runs_per_process`, how many runs a task process takes before a fresh
-    one replaces it (no limit by default), `process_start_timeout`, the timedelta a task process has to become
-    ready, `queue`, the queue tasks are sent to unless they name their own,
+    one replaces it (no limit by default), `process_start_timeout`, the
+    timedelta a task process has to become ready, `queue`, the queue tasks are sent to unless they name their own,
     `result_ttl`, the seconds a finished task is kept, `cancel_grace`, the
     timedelta a task past its timeout has to stop, and `memory_soft_limit` and
     `memory_hard_limit`, in bytes of pending task input (past the soft one

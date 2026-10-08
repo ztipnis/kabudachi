@@ -134,12 +134,10 @@ class ProcessPool:
         self._registry = registry
         self._context = multiprocessing.get_context("spawn")
         self._loop: asyncio.AbstractEventLoop | None = None
-        # The children counted against `processes`; condemned and retiring
-        # ones are not.
+        # The children counted against `processes`, draining ones included;
+        # condemned ones are not.
         self._children: list[_Child] = []
         self._condemned: set[_Child] = set()
-        # Taking no new runs and exiting on their own once their runs finish.
-        self._retiring: set[_Child] = set()
         self._slots: dict[str, _Slot] = {}
         # Handed over, not yet sent to a child.
         self._pending: list[_Slot] = []
@@ -220,7 +218,7 @@ class ProcessPool:
         for replacing in self._replacing:
             # A child it already spawned is among the children below.
             replacing.cancel()
-        children = [*self._children, *self._condemned, *self._retiring]
+        children = [*self._children, *self._condemned]
         if not kill:
             for child in children:
                 child.draining = True
@@ -550,11 +548,12 @@ class ProcessPool:
 
     def _retire(self, child: _Child) -> None:
         """`child` takes no new runs, finishes the ones it has and exits on
-        its own; nothing it runs is cut short. A replacement starts at once."""
+        its own; nothing it runs is cut short. It still counts against
+        `processes` until it has drained and exited, and its replacement
+        starts then, so long runs never raise the number of processes."""
         if child.condemned or child.draining:
             return
         child.draining = True
-        self._set_aside(child, self._retiring)
         child.send(ipc.Drain())
 
     def _condemn(self, child: _Child) -> None:
@@ -563,16 +562,15 @@ class ProcessPool:
         are never killed for it. A replacement starts at once."""
         if not child.condemned:
             child.condemned = True
-            self._set_aside(child, self._condemned)
+            self._set_aside(child)
         self._end_if_condemned(child)
 
-    def _set_aside(self, child: _Child, into: set[_Child]) -> None:
+    def _set_aside(self, child: _Child) -> None:
         """Moves `child` out of the processes counted against `processes`,
-        into `into`, and starts its replacement at once if it was counted.
-        The replacement starts without the wait after a quick death: the
-        child did not die."""
-        self._retiring.discard(child)
-        into.add(child)
+        into the condemned, and starts its replacement at once if it was
+        counted. The replacement starts without the wait after a quick death:
+        the child did not die."""
+        self._condemned.add(child)
         if child in self._children:
             self._children.remove(child)
             if self._serving:
@@ -623,7 +621,6 @@ class ProcessPool:
         if child in self._children:
             self._children.remove(child)
         self._condemned.discard(child)
-        self._retiring.discard(child)
         _set_done(child.buried)
         if replace:
             self._replace(child)
@@ -631,10 +628,11 @@ class ProcessPool:
 
     def _replace(self, dead: _Child | None) -> None:
         """Starts a child in place of `dead`, or of a child set aside (`None`)
-        at once. After a child that died quickly the start waits, longer for
-        each quick death in a row."""
+        at once. A child that drained and exited as asked is replaced at once
+        too. After a child that died quickly the start waits, longer for each
+        quick death in a row."""
         delay = 0.0
-        if dead is not None:
+        if dead is not None and not dead.draining:
             lived = time.monotonic() - dead.ready_at if dead.ready else 0.0
             self._quick_deaths = self._quick_deaths + 1 if lived < _STABLE_SECONDS else 0
             delay = self._respawn_delay()

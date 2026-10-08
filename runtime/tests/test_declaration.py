@@ -817,6 +817,8 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
 
     monkeypatch.setenv("KABUDACHI_IMPORTS", "")
     assert Configuration().resolve("imports") is None
+    monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "")
+    assert Configuration().resolve("max_runs_per_process") is None
 
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(

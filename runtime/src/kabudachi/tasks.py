@@ -65,7 +65,8 @@ class Task(wrapt.ObjectProxy):
             pass the hard memory limit drops this key's oldest retained
             payloads to fit, instead of being refused.
         recycle_process: Whether the task process that runs it is replaced
-            by a fresh one after the run, once its other runs finish.
+            by a fresh one after the run: it takes no new runs, and is
+            replaced once its other runs have finished and it has exited.
             Ignored with `processes=0`.
         serializers: Where the serializer is looked up to check the task's
             types. Defaults to the registry of this process.
@@ -415,8 +416,9 @@ def task(
 
     The options are those of `Task`; `retries` is how many more times a run
     that raises, or times out, is tried again. `recycle_process=True` replaces the
-    task process after each run of this task, once its other runs finish. `name` defaults to the function's module
-    and name, which must then be defined at package scope. `serializer` must
+    task process after each run of this task, once it has drained: its other
+    runs finish and it exits, and only then is the fresh one started. `name`
+    defaults to the function's module and name, which must then be defined at package scope. `serializer` must
     be registered under the same name on every worker; it is checked here if
     it is already registered, and otherwise before the task first runs.
 

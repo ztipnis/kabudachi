@@ -145,7 +145,8 @@ handle behaviour described above; you meet them only if you call the native modu
 (places per process, at most 32 without `concurrency_override=True`), `imports` (modules task processes
 import; by default every module that declared a task), `process_start_timeout` (seconds a task
 process has to become ready, default 60; `KABUDACHI_PROCESS_START_TIMEOUT`), `max_runs_per_process`
-(runs a task process takes before a fresh one replaces it; no limit by default), `queue`, `result_ttl` (seconds a finished task
+(runs a task process takes before it is replaced; no limit by default; the fresh one starts once it has
+drained and exited, and until then it counts against `processes`), `queue`, `result_ttl` (seconds a finished task
 is kept), `cancel_grace`, `memory_soft_limit` and `memory_hard_limit` (bytes).
 
 ## Logging
