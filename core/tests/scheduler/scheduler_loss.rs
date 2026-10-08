@@ -228,7 +228,6 @@ fn a_task_whose_continuation_is_running_is_not_lost_with_its_worker() {
     assert_eq!(fixture.run_state(&run), TaskRunState::Succeeded);
 }
 
-
 #[test]
 fn losing_one_run_applies_the_loss_rules_to_it_alone() {
     let mut fixture = Fixture::leading();
@@ -240,6 +239,12 @@ fn losing_one_run_applies_the_loss_rules_to_it_alone() {
     let kept = running(&mut fixture, &worker("w1"), &kept_task);
     let ephemeral = running(&mut fixture, &worker("w1"), &ephemeral_task);
     let orphan = running(&mut fixture, &worker("w1"), &orphan_task);
+    let unstarted_task = fixture.scheduler.submit(plain("e").non_retriable()).unwrap();
+    let unstarted = fixture
+        .scheduler
+        .request_claim(&worker("w1"), &unstarted_task)
+        .unwrap()
+        .task_run_id;
 
     let replayed = fixture.scheduler.report_lost(&worker("w1"), &lost).unwrap();
     let not_replayed = fixture
@@ -259,6 +264,15 @@ fn losing_one_run_applies_the_loss_rules_to_it_alone() {
     assert_eq!(
         (orphaned.state, orphaned.replayed),
         (TaskRunState::Orphaned, None)
+    );
+    let never_started = fixture
+        .scheduler
+        .report_lost(&worker("w1"), &unstarted)
+        .unwrap();
+    assert_eq!(
+        (never_started.state, never_started.replayed.is_some()),
+        (TaskRunState::Lost, true),
+        "a run that never started is replayed even when non-retriable"
     );
     assert_eq!(
         fixture.run_state(&kept),
