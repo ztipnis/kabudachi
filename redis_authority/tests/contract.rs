@@ -70,3 +70,15 @@ fn a_standalone_server_keeps_the_coordination_authority_contract() {
     let config = config(vec![server.url()]);
     check_authority_contract(&Redis { server, config }, &RealTime);
 }
+
+#[test]
+fn a_single_node_cluster_keeps_the_coordination_authority_contract() {
+    let server = ValkeyServer::start(ServerMode::Cluster);
+    let mut config = config(vec![server.url()]);
+    config.cluster = true;
+    // A restarted cluster node takes writes only two seconds after it starts,
+    // and the contract's outage keeps a registration alive through the
+    // restart, so the TTL must be well above that.
+    config.ttl = Duration::from_millis(4_000);
+    check_authority_contract(&Redis { server, config }, &RealTime);
+}

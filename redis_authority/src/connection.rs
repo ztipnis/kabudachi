@@ -60,6 +60,10 @@ impl From<RedisError> for Failure {
                 if let Some((host, port)) = error.redirect_node() {
                     return Failure::Moved(format!("{host}:{port}"));
                 }
+                // A pipeline folds its replies' errors into one without the redirect.
+                if let Some(address) = moved_address(&error.to_string()) {
+                    return Failure::Moved(address);
+                }
             }
             Some("ASK" | "TRYAGAIN" | "CLUSTERDOWN") => return Failure::Retry,
             _ => {}
@@ -73,6 +77,17 @@ impl From<RedisError> for Failure {
             Failure::Server
         }
     }
+}
+
+/// The address in the first `MOVED <slot> <address>` of an error's text,
+/// whatever case or punctuation surrounds it.
+fn moved_address(text: &str) -> Option<String> {
+    let mut words = text
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '[' | ']'))
+        .filter(|word| !word.is_empty());
+    words.find(|word| word.trim_end_matches(':').eq_ignore_ascii_case("moved"))?;
+    words.next()?.parse::<u16>().ok()?;
+    Some(words.next()?.to_string())
 }
 
 /// This client's own view of the server's availability: whether its last
