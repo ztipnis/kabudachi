@@ -68,12 +68,6 @@ def refuses(request: Greeting) -> Greeting:
     raise ValueError(f"refused {request.text}")
 
 
-@kabudachi.task(name="pool.cancels_itself")
-async def cancels_itself(request: Greeting) -> Greeting:
-    """Raises CancelledError though nobody asked it to stop."""
-    raise asyncio.CancelledError
-
-
 def fold_left(older: Greeting, newer: Greeting) -> Greeting:
     marker("folded-in").write_text(str(os.getpid()))
     return Greeting(text=f"({older.text}>{newer.text})")

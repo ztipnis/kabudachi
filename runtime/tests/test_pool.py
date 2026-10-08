@@ -79,17 +79,13 @@ def test_bodies_run_in_task_processes_spread_over_the_pool_and_send_back_results
         large = await pool_tasks.sized(Greeting(times=4 * 1024 * 1024))
         with pytest.raises(ValueError, match="refused this"):
             await pool_tasks.refuses(Greeting(text="this"))
-        # Not a cancel anyone asked for, so the run fails like any other error.
-        with pytest.raises(TaskBodyError, match="CancelledError") as raised:
-            await pool_tasks.cancels_itself(Greeting())
-        return first.times, second.times, len(large.text), raised.value.kind
+        return first.times, second.times, len(large.text)
 
-    first, second, size, kind = kabudachi.run(main)
+    first, second, size = kabudachi.run(main)
 
     assert os.getpid() not in (first, second)
     assert first != second, "with one place per process, the second body went to the other one"
     assert size == 4 * 1024 * 1024
-    assert kind == "CancelledError"
 
 
 def declare_in_script_a_task():

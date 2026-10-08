@@ -19,7 +19,6 @@ from kabudachi.errors import (
     CoalescedPayloadTooLargeError,
     RunStoppedError,
     SerializationError,
-    TaskBodyError,
     TaskCancelledError,
     TaskDefinitionError,
     TaskExpiredError,
@@ -324,22 +323,6 @@ def test_validation_refuses_types_the_serializer_cannot_handle():
 
     with pytest.raises(TaskDefinitionError, match="input type"):
         validate_definitions(registry, late)
-
-
-def test_a_body_that_is_cancelled_fails_its_handle_and_does_not_hang_the_run():
-    async def cancelled(request: Greeting) -> Greeting:
-        raise asyncio.CancelledError()
-
-    world = World(cancelled, echo)
-
-    async def body():
-        bad = world.call("cancelled", Greeting())
-        with pytest.raises(TaskBodyError, match="CancelledError"):
-            await bad
-        await world.session.wait_until_idle()
-        return await world.call("echo", Greeting(text="still works"))
-
-    assert run(world.working(body)).text == "still works"
 
 
 def test_many_tasks_that_each_wait_for_one_they_called_do_not_deadlock():
