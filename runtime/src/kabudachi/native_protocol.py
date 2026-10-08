@@ -89,6 +89,11 @@ class Runtime(Protocol):
         """Reports that a claimed run failed, started or not; whether a retry
         is now queued."""
 
+    def report_lost(self, task_run_id: str) -> bool:
+        """Reports that a claimed run was lost with the process that ran it;
+        whether a new attempt now waits. Raises `RuntimeError` if the run is
+        not this worker's to lose."""
+
     def complete(
         self, task_run_id: str, result_digest: bytes, continues: bool = False
     ) -> Certification:

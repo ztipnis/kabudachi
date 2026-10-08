@@ -228,3 +228,63 @@ fn a_task_whose_continuation_is_running_is_not_lost_with_its_worker() {
     assert_eq!(fixture.run_state(&run), TaskRunState::Succeeded);
 }
 
+
+#[test]
+fn losing_one_run_applies_the_loss_rules_to_it_alone() {
+    let mut fixture = Fixture::leading();
+    let plain_task = fixture.scheduler.submit(plain("a")).unwrap();
+    let kept_task = fixture.scheduler.submit(plain("b")).unwrap();
+    let ephemeral_task = fixture.scheduler.submit(plain("c").ephemeral()).unwrap();
+    let orphan_task = fixture.scheduler.submit(plain("d").non_retriable()).unwrap();
+    let lost = running(&mut fixture, &worker("w1"), &plain_task);
+    let kept = running(&mut fixture, &worker("w1"), &kept_task);
+    let ephemeral = running(&mut fixture, &worker("w1"), &ephemeral_task);
+    let orphan = running(&mut fixture, &worker("w1"), &orphan_task);
+
+    let replayed = fixture.scheduler.report_lost(&worker("w1"), &lost).unwrap();
+    let not_replayed = fixture
+        .scheduler
+        .report_lost(&worker("w1"), &ephemeral)
+        .unwrap();
+    let orphaned = fixture.scheduler.report_lost(&worker("w1"), &orphan).unwrap();
+
+    assert_eq!(
+        (replayed.state, replayed.replayed.is_some()),
+        (TaskRunState::Lost, true)
+    );
+    assert_eq!(
+        (not_replayed.state, not_replayed.replayed),
+        (TaskRunState::Lost, None)
+    );
+    assert_eq!(
+        (orphaned.state, orphaned.replayed),
+        (TaskRunState::Orphaned, None)
+    );
+    assert_eq!(
+        fixture.run_state(&kept),
+        TaskRunState::Running,
+        "the worker's other runs go on"
+    );
+    let refused = |fixture: &mut Fixture, who: &str, run: &TaskRunId| {
+        fixture.scheduler.report_lost(&worker(who), run).unwrap_err()
+    };
+    assert_eq!(
+        refused(&mut fixture, "w1", &lost),
+        ReportRejection::NotAuthoritative,
+        "already lost"
+    );
+    assert_eq!(
+        refused(&mut fixture, "w2", &kept),
+        ReportRejection::NotAuthoritative,
+        "not w2's run"
+    );
+    assert_eq!(
+        refused(&mut fixture, "w1", &TaskRunId::new("nope")),
+        ReportRejection::UnknownRun
+    );
+    let mut follower = Fixture::not_leading();
+    assert_eq!(
+        refused(&mut follower, "w1", &kept),
+        ReportRejection::NotLeader
+    );
+}
