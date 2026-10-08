@@ -2727,6 +2727,7 @@ where
             me: &self.my_id,
             shard: &self.shard_id,
             state: self.state,
+            term: self.term,
             own_epoch: self.standing.epoch(),
         };
         self.outputs
@@ -2743,6 +2744,7 @@ where
             me: &self.my_id,
             shard: &self.shard_id,
             state: self.state,
+            term: self.term,
             own_epoch: self.standing.epoch(),
         };
         let verdicts = authority.on_reply(reply, &view, now);

@@ -56,6 +56,11 @@ pub(crate) struct AuthorityStanding {
     /// What this node's latest read of the authority's epoch confirmed, while
     /// it suspects its leader: whether it may stand for election.
     confirmation: EpochConfirmation,
+    /// While in office, a fence reply found no record under the name and this
+    /// node's republish has not landed: it publishes no hint until it has.
+    record_lost: bool,
+    /// Took office, and publishes its hint at its next `calls_due`.
+    hint_now: bool,
     /// `ReplyTokens::new(Issuer::Node)`, made once in `starting_at`. The
     /// standing is never rebuilt (`join` and `registered_at` call
     /// `restart_at`), so the node never repeats a number.
@@ -68,6 +73,8 @@ pub(crate) struct AuthorityView<'a> {
     /// The incarnation of the shard the node belongs to.
     pub(crate) shard: &'a ShardId,
     pub(crate) state: WorkerState,
+    /// The node's current term.
+    pub(crate) term: u64,
     /// The node's recovery epoch; `None` before its first join.
     pub(crate) own_epoch: Option<RecoveryEpoch>,
 }
@@ -121,6 +128,8 @@ impl AuthorityStanding {
             swap_asked_at: None,
             awaited: None,
             confirmation: EpochConfirmation::default(),
+            record_lost: false,
+            hint_now: false,
             tokens: ReplyTokens::new(Issuer::Node),
         }
     }
@@ -167,6 +176,22 @@ impl AuthorityStanding {
         }
         if let Some(recovery_epoch) = fence {
             calls.push(self.ask(AuthorityRequest::AcquireFence { recovery_epoch }, now));
+        }
+        // A leader says where it can be reached on the registration's schedule,
+        // so a hint lasts while the leader does, unless the record under the
+        // name is not yet its own again.
+        if view.in_office()
+            && !self.record_lost
+            && (register || std::mem::take(&mut self.hint_now))
+            && let Some(recovery_epoch) = view.own_epoch
+        {
+            calls.push(self.ask(
+                AuthorityRequest::PublishLeaderHint {
+                    recovery_epoch,
+                    term: view.term,
+                },
+                now,
+            ));
         }
         if view.own_epoch.is_some()
             && self.may_ask_for_confirmation(view.state)
@@ -289,6 +314,10 @@ impl AuthorityStanding {
         ) {
             self.lease.drop_fence();
         }
+        if !matches!(next, WorkerState::LeaderReconciling | WorkerState::Leader) {
+            self.record_lost = false;
+            self.hint_now = false;
+        }
         match next {
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => self.confirmation.end_census(),
             WorkerState::RollCall => self.confirmation.spend_on_roll_call(),
@@ -301,6 +330,7 @@ impl AuthorityStanding {
     /// it holds one, and leads `epoch` from now on.
     pub(crate) fn took_office(&mut self, epoch: Option<RecoveryEpoch>, now: Instant) {
         self.lease.took_office(epoch, now);
+        self.hint_now = true;
     }
 
     /// A roll call of `term` under `configuration` fell short with these
@@ -569,6 +599,15 @@ impl AuthorityStanding {
             && republished
         {
             self.lease.retry_fence_at(now);
+            // The record is this node's again: its hint follows at once.
+            self.record_lost = false;
+            return vec![AuthorityVerdict::Ask(self.ask(
+                AuthorityRequest::PublishLeaderHint {
+                    recovery_epoch: new,
+                    term: view.term,
+                },
+                now,
+            ))];
         }
         Vec::new()
     }
@@ -678,6 +717,7 @@ impl AuthorityStanding {
             }
             Err(AuthorityError::ShardConflict { current: None }) if view.in_office() =>
             {
+                self.record_lost = true;
                 vec![AuthorityVerdict::Ask(self.ask(
                     AuthorityRequest::SwapRecoveryEpoch {
                         expected: None,
