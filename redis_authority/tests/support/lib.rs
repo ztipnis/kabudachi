@@ -106,24 +106,48 @@ impl ValkeyServer {
         }
     }
 
+    /// A port picked here may be taken before the server binds it (another
+    /// test's server, a client's own ephemeral port, a cluster bus port), in
+    /// which case the server exits at once: start again on another port.
     fn launch_new(mode: ServerMode, assign_slots: bool) -> Self {
-        let port = free_port(matches!(mode, ServerMode::Cluster));
-        let base = std::env::var_os("TEST_TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let dir = tempfile::Builder::new()
-            .prefix("valkey-")
-            .tempdir_in(base)
-            .expect("a directory for the server");
-        let server = Self {
-            port,
-            dir,
-            mode,
-            assign_slots,
-            process: Mutex::new(None),
-        };
-        server.launch();
-        server
+        let mut last = String::new();
+        for _ in 0..8 {
+            let port = free_port(matches!(mode, ServerMode::Cluster));
+            let base = std::env::var_os("TEST_TMPDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = tempfile::Builder::new()
+                .prefix("valkey-")
+                .tempdir_in(base)
+                .expect("a directory for the server");
+            let server = Self {
+                port,
+                dir,
+                mode: match &mode {
+                    ServerMode::Standalone => ServerMode::Standalone,
+                    ServerMode::Cluster => ServerMode::Cluster,
+                    ServerMode::StandaloneWithAcl {
+                        user,
+                        password,
+                        key_pattern,
+                    } => ServerMode::StandaloneWithAcl {
+                        user: user.clone(),
+                        password: password.clone(),
+                        key_pattern: key_pattern.clone(),
+                    },
+                },
+                assign_slots,
+                process: Mutex::new(None),
+            };
+            match server.start_process() {
+                Ok(()) => {
+                    server.configure();
+                    return server;
+                }
+                Err(error) => last = error,
+            }
+        }
+        panic!("no valkey server could start: {last}");
     }
 
     fn log(&self) -> PathBuf {
@@ -131,6 +155,12 @@ impl ValkeyServer {
     }
 
     fn launch(&self) {
+        self.start_process().unwrap_or_else(|error| panic!("{error}"));
+        self.configure();
+    }
+
+    /// Starts the server process and returns once that very process answers.
+    fn start_process(&self) -> Result<(), String> {
         let relative = SERVER_PATH.expect("the valkey binary is known only to Bazel builds: run through Bazel");
         let runfiles = std::env::var_os("TEST_SRCDIR").expect("TEST_SRCDIR: run through Bazel");
         let binary = PathBuf::from(runfiles).join(relative);
@@ -158,11 +188,32 @@ impl ValkeyServer {
             .stderr(Stdio::null())
             .spawn()
             .unwrap_or_else(|error| panic!("cannot start {}: {error}", binary.display()));
+        let pid = child.id();
         *self.process.lock().unwrap() = Some(child);
-        self.wait_until("the server to answer PING", || {
-            self.try_admin_connection()
-                .is_some_and(|mut connection| redis::cmd("PING").exec(&mut connection).is_ok())
-        });
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.process.lock().unwrap().as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+                return Err(format!("valkey exited at start ({status}); see {}", self.log().display()));
+            }
+            // A foreign server on the port also answers PING: the process id says whose it is.
+            let ours = self.try_admin_connection().is_some_and(|mut connection| {
+                redis::cmd("INFO")
+                    .arg("server")
+                    .query::<String>(&mut connection)
+                    .is_ok_and(|info| info.contains(&format!("process_id:{pid}\r\n")))
+            });
+            if ours {
+                return Ok(());
+            }
+            if started.elapsed() >= START_TIMEOUT {
+                return Err(format!("valkey did not answer in time; see {}", self.log().display()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Per-mode setup once the process answers.
+    fn configure(&self) {
         match &self.mode {
             ServerMode::Standalone => {}
             ServerMode::Cluster => {
