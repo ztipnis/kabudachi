@@ -56,7 +56,7 @@ use kabudachi_core::protocol::messages::{
 };
 use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::WallTime;
-use libp2p::futures::StreamExt;
+use libp2p::futures::{FutureExt, StreamExt};
 use libp2p::futures::future::BoxFuture;
 use libp2p::futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
@@ -194,8 +194,11 @@ pub(crate) struct Executing<'n> {
 }
 
 impl<'n> Executing<'n> {
+    /// The driver's side for one run of the driver. A claim the last run
+    /// was granted and never handed over (it stopped mid-discovery) is
+    /// reported lost, so the leader replays it.
     pub(crate) fn new(endpoint: &'n mut ExecutorEndpoint, net: &'n Net, retry_after: Duration) -> Self {
-        Executing {
+        let mut executing = Executing {
             endpoint,
             net,
             retry_after,
@@ -209,7 +212,14 @@ impl<'n> Executing<'n> {
             arrived: Vec::new(),
             found: None,
             replies: Vec::new(),
+        };
+        for run in net.claimed_runs().active_ids() {
+            let held = &executing.endpoint.held;
+            if !held.handed.contains(&run) && !held.waiting.contains_key(&run) {
+                executing.queue_lost(run);
+            }
         }
+        executing
     }
 
     /// Waits for the executor's next report, a discovery's end, the answer to
@@ -243,11 +253,26 @@ impl<'n> Executing<'n> {
         }
     }
 
-    /// Acts on what arrived since the last batch: the executor's reports, a
-    /// discovery's claims, and the answers reports got.
+    /// Acts on what arrived since the last batch, and on what is ready now,
+    /// so a burst costs one batch: the executor's reports, a discovery's
+    /// claims, and the answers reports got. Once the executor is gone, every
+    /// run it was handed and has not ended is reported lost.
     pub(crate) fn take_arrived(&mut self) {
+        while !self.endpoint.held.gone {
+            match self.endpoint.reports.try_recv() {
+                Ok(report) => self.arrived.push(report),
+                Err(mpsc::error::TryRecvError::Disconnected) => self.endpoint.held.gone = true,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+        while let Some(Some(reply)) = self.in_flight.next().now_or_never() {
+            self.replies.push(reply);
+        }
         for report in std::mem::take(&mut self.arrived) {
             self.on_report(report);
+        }
+        if self.endpoint.held.gone {
+            self.lose_handed();
         }
         if let Some((reserved, found)) = self.found.take() {
             let claims = found.claims.into_iter().map(|(_, claim)| claim).collect();
@@ -442,6 +467,8 @@ impl<'n> Executing<'n> {
 
     fn hand_over(&mut self, claim: Claim) {
         let Some(run) = claim.task_run_id.clone().map(TaskRunId::from) else {
+            // Not a claim a leader grants: its place is offered again.
+            self.endpoint.held.credits += 1;
             return;
         };
         let compacts = claim.task.as_ref().is_some_and(|task| task.compacts.is_some());
@@ -450,12 +477,25 @@ impl<'n> Executing<'n> {
             // No executor is left to run it: the leader is told at once, so it
             // is replayed rather than held by a worker that will never run it.
             self.endpoint.held.gone = true;
-            self.queue(task_request::Request::Lost(ReportLost {
-                task_run_id: Some(run.into()),
-            }));
+            self.queue_lost(run);
             return;
         }
         self.endpoint.held.handed.insert(run);
+    }
+
+    /// The executor is gone: no run it was handed and has not ended will
+    /// report again, so each is reported lost.
+    fn lose_handed(&mut self) {
+        for run in std::mem::take(&mut self.endpoint.held.handed) {
+            self.endpoint.held.cancelled.remove(&run);
+            self.queue_lost(run);
+        }
+    }
+
+    fn queue_lost(&mut self, run: TaskRunId) {
+        self.queue(task_request::Request::Lost(ReportLost {
+            task_run_id: Some(run.into()),
+        }));
     }
 
     fn ended(&mut self, run: &TaskRunId) {

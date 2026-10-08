@@ -2,7 +2,8 @@
 //! The leader claims for its own executor from its own scheduler and decides
 //! its own reports there. A follower claims from the leader and reports to
 //! it. Each decision reaches the executor, or leaves the ledger, only once a
-//! majority of the task's placement stored it.
+//! majority of the task's placement stored it. A run whose executor stops
+//! before it ends is reported lost.
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRunState;
@@ -88,6 +89,19 @@ async fn a_leader_runs_its_own_claims_and_a_follower_reports_a_run_it_lost() {
         shard
             .drive_until(poll_until("the leader decided the lost run and queued its replay", || {
                 holding(&nets, &lost, &[TaskRunState::Lost, TaskRunState::Queued]) >= QUORUM
+            }))
+            .await;
+
+        // The follower claims the replay, and its executor stops with the run
+        // started and not ended: no outcome will come, so the run is reported
+        // lost and replayed again.
+        executors[follower].grant(1);
+        let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
+        executors[follower].report(Report::Started(run));
+        drop(executors.remove(follower));
+        shard
+            .drive_until(poll_until("the leader replays the run its executor abandoned", || {
+                holding(&nets, &lost, &[TaskRunState::Lost, TaskRunState::Lost, TaskRunState::Queued]) >= QUORUM
             }))
             .await;
     })
