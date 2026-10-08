@@ -623,16 +623,16 @@ class ProcessPool:
         self._condemned.discard(child)
         _set_done(child.buried)
         if replace:
-            self._replace(child)
+            self._replace(child, drained=child.draining and code == 0)
         self._dispatch()
 
-    def _replace(self, dead: _Child | None) -> None:
+    def _replace(self, dead: _Child | None, *, drained: bool = False) -> None:
         """Starts a child in place of `dead`, or of a child set aside (`None`)
-        at once. A child that drained and exited as asked is replaced at once
-        too. After a child that died quickly the start waits, longer for each
-        quick death in a row."""
+        at once. A child that `drained`, exiting cleanly as asked, is replaced
+        at once too; one that died while draining did not. After a child that
+        died quickly the start waits, longer for each quick death in a row."""
         delay = 0.0
-        if dead is not None and not dead.draining:
+        if dead is not None and not drained:
             lived = time.monotonic() - dead.ready_at if dead.ready else 0.0
             self._quick_deaths = self._quick_deaths + 1 if lived < _STABLE_SECONDS else 0
             delay = self._respawn_delay()

@@ -303,17 +303,17 @@ def configure(**settings: Any) -> None:
     to find tasks (by default every module that declared one),
     `max_runs_per_process`, how many runs a task process takes before a fresh
     one replaces it (no limit by default), `process_start_timeout`, the
-    timedelta a task process has to become ready, `queue`, the queue tasks are sent to unless they name their own,
-    `result_ttl`, the seconds a finished task is kept, `cancel_grace`, the
-    timedelta a task past its timeout has to stop, and `memory_soft_limit` and
-    `memory_hard_limit`, in bytes of pending task input (past the soft one
-    `group` and `map` pause, past the hard one a submission raises
-    `BackpressureError`); `KABUDACHI_<NAME>`
-    in the environment sets each too, below what is configured here. A
-    setting a task makes for itself always wins over these. `concurrency`,
-    `processes`, `imports`, `max_runs_per_process`, `process_start_timeout`, the memory limits and
-    `result_ttl` are read when `run()` starts, so changing them during a run
-    has no effect on that run.
+    timedelta a task process has to become ready, `queue`, the queue tasks
+    are sent to unless they name their own, `result_ttl`, the seconds a
+    finished task is kept, `cancel_grace`, the timedelta a task past its
+    timeout has to stop, and `memory_soft_limit` and `memory_hard_limit`, in
+    bytes of pending task input (past the soft one `group` and `map` pause,
+    past the hard one a submission raises `BackpressureError`);
+    `KABUDACHI_<NAME>` in the environment sets each too, below what is
+    configured here. A setting a task makes for itself always wins over
+    these. `concurrency`, `processes`, `imports`, `max_runs_per_process`,
+    `process_start_timeout`, the memory limits and `result_ttl` are read when
+    `run()` starts, so changing them during a run has no effect on that run.
 
     Raises `ConfigurationError` for an unknown setting or an invalid value,
     and then applies none of the settings in this call.

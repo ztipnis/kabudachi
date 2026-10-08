@@ -415,12 +415,13 @@ def task(
     because a task is sent to a worker by name.
 
     The options are those of `Task`; `retries` is how many more times a run
-    that raises, or times out, is tried again. `recycle_process=True` replaces the
-    task process after each run of this task, once it has drained: its other
-    runs finish and it exits, and only then is the fresh one started. `name`
-    defaults to the function's module and name, which must then be defined at package scope. `serializer` must
-    be registered under the same name on every worker; it is checked here if
-    it is already registered, and otherwise before the task first runs.
+    that raises, or times out, is tried again. `recycle_process=True`
+    replaces the task process after each run of this task, once it has
+    drained: its other runs finish and it exits, and only then is the fresh
+    one started. `name` defaults to the function's module and name, which
+    must then be defined at package scope. `serializer` must be registered
+    under the same name on every worker; it is checked here if it is already
+    registered, and otherwise before the task first runs.
 
     Raises `TaskDefinitionError` or `DuplicateTaskError` as `Task` does, and
     `TypeError` if given something other than a function or keyword options.

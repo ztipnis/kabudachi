@@ -245,12 +245,21 @@ def test_a_cancelled_body_stops_when_asked_and_one_that_will_not_costs_its_proce
 
 def test_a_task_process_is_replaced_after_its_run_limit_and_after_a_recycling_task_once_its_run_finishes():
     kabudachi.configure(processes=1, concurrency=1, max_runs_per_process=3)
+    most_alive = 0
+
+    async def count_task_processes():
+        nonlocal most_alive
+        while True:
+            most_alive = max(most_alive, len(multiprocessing.active_children()))
+            await asyncio.sleep(0.005)
 
     async def main():
         async with asyncio.timeout(30):
+            counting = asyncio.create_task(count_task_processes())
             pids = [(await pool_tasks.where_async(Greeting())).times for _ in range(4)]
             pids.append((await pool_tasks.recycles(Greeting())).times)
             pids.append((await pool_tasks.where_async(Greeting())).times)
+            counting.cancel()
             return pids
 
     pids = kabudachi.run(main)
@@ -261,3 +270,6 @@ def test_a_task_process_is_replaced_after_its_run_limit_and_after_a_recycling_ta
     first, second, third = pids[0], pids[3], pids[5]
     assert pids == [first] * 3 + [second] * 2 + [third], pids
     assert len({first, second, third, os.getpid()}) == 4
+    # A draining process still counts: its replacement starts only once it
+    # has exited, so there was never more than one task process.
+    assert most_alive == 1
