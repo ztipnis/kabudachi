@@ -25,18 +25,17 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kabudachi_core::election::{DropMessages, Input, NoAuthority, Step, WorkerNode, carry_out};
-use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::reconcile::{Rebuild, ReconcileTerm};
+use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted, Completion,
     ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission, Submitted,
     SubmitRejection,
 };
-use kabudachi_core::task_record::LocalRecords;
+use kabudachi_core::task_record::{LocalRecords, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};
 use tokio::sync::{Notify, watch};
 
@@ -210,17 +209,6 @@ fn settle_pending<C: Clock>(inside: &mut Inside<C>) {
         });
     }
     record_queued(inside);
-}
-
-/// The office the node holds while it waits to be told it has reconciled,
-/// if its scheduler is waiting for the same one.
-fn reconciling_office<C: Clock>(
-    node: &WorkerNode<C>,
-    scheduler: &DoorScheduler<C>,
-) -> Option<ReconcileTerm> {
-    let office = node.office_term()?;
-    (node.state() == WorkerState::LeaderReconciling && scheduler.reconciling() == Some(office))
-        .then_some(office)
 }
 
 /// The bindings' one way into the shared scheduler.
@@ -439,14 +427,14 @@ impl<C: Clock> SchedulerDoor<C> {
                 |_, _, _, step| observe(step),
             );
             drop(inside.scheduler.observer_mut().take_settled());
-            if let Some(office) = reconciling_office(node, &inside.scheduler) {
+            if let Some(office) = office_to_reconcile(node, &inside.scheduler) {
                 // A lone node has nothing stored to rebuild from: a record is
                 // only ever written once the node leads, and it is the one
                 // that wrote it.
                 inside
                     .scheduler
                     // Cannot fail: the caller found the scheduler reconciling this office
-                    // (`reconciling_office`), and the rebuild runs once, before the node
+                    // (`office_to_reconcile`), and the rebuild runs once, before the node
                     // is told it has reconciled, which is what ends the reconciliation.
                     .reconcile(Rebuild::default())
                     .expect("a lone node reconciles the office its scheduler waits for");

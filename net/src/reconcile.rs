@@ -15,10 +15,10 @@
 //! of each record it holds, in task id order, each page within the message
 //! limit and each carrying the cursor the next request continues from. What a
 //! report must drop to fit is logged, never silently cut. `leader` runs a
-//! new leader's side of the exchange for the driver: it asks, fetches the
-//! records it lacks, decides when to stop waiting and takes late answers.
-//! The rebuilt records are written again at the leader's term by core's
-//! `Republish`, which `leader` drives over `Net`.
+//! new leader's side of the exchange for the driver: it asks and fetches the
+//! records it lacks. What the answers decide, when to stop waiting, the
+//! rebuild's republish at the leader's term and the late answers, is core's
+//! `OfficeReconciliation`.
 
 use std::str::FromStr;
 

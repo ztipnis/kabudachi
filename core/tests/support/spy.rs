@@ -10,6 +10,7 @@ use kabudachi_core::protocol::ids::TaskId;
 use kabudachi_core::protocol::messages::Task;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::Observer;
+use kabudachi_core::task_record::PublishedRevisions;
 
 /// Hand the scheduler a clone (`Scheduler::with_observer`) and read through
 /// the one you keep: every clone shares one log.
@@ -19,6 +20,12 @@ pub struct Spy(Rc<RefCell<Vec<TaskRecord>>>);
 impl Observer for Spy {
     fn revision(&mut self, revision: TaskRecord) {
         self.0.borrow_mut().push(revision);
+    }
+}
+
+impl PublishedRevisions for Spy {
+    fn take_published(&mut self) -> Vec<TaskRecord> {
+        self.take_revisions()
     }
 }
 

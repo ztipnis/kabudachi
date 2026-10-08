@@ -78,6 +78,10 @@ _Avoid_: leader state
 **Lease change**:
 A grant or abort-deadline change the lease reports, which the node turns into its grant output or its abort-deadline output.
 
+**Leader records**:
+What a leader office does with its scheduler's revisions, without I/O: it places and writes each, holding a superseded generation's revision back until its successor's is stored; keeps the writes whose outcome still bears on what the leader may tell; holds each answer until the writes its decision made are stored while the scheduler leads; writes records again where they belong when the voters change or a write is refused; and, while the office reconciles, rebuilds the scheduler, republishes at the office's term and retries stuck work. Placement and writing are its ports: kad's distance and the transport in a networked worker, a fixed hash and the record space in the simulator. In code `LeaderRecords` (`core/src/task_record/leader_records.rs`), with the reconciliation's decisions in `OfficeReconciliation`; net keeps only the asking.
+_Avoid_: record path (for the type), unsettled writes, gating
+
 ## Knowing the shard and the authority
 
 **Checked message**:

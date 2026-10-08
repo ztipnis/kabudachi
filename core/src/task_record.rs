@@ -4,6 +4,7 @@
 
 mod candidate;
 mod gate;
+mod leader_records;
 mod ledger;
 mod local;
 mod order;
@@ -14,6 +15,10 @@ mod version;
 
 pub use candidate::looks_claimable;
 pub use gate::{EffectGate, PlacedWrite, PriorPlacement, Settled, Write, WriteOutcome};
+pub use leader_records::{
+    LeaderRecords, OfficeReconciliation, Placement, PublishedRevisions, RecordPorts, Turn,
+    office_to_reconcile,
+};
 pub use ledger::{Waits, WriteLedger};
 pub use local::LocalRecords;
 pub use order::{Settlement, WriteOrder};

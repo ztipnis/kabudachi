@@ -131,6 +131,22 @@ impl RecordSpace {
         space.deliver(writer, &placed, now, false);
     }
 
+    /// Records that `writer`'s write of `write` was refused before any holder
+    /// was asked (it could not be placed): its outcome, not stored, comes due
+    /// after the acknowledgement delay, as any write's does.
+    pub fn refuse(&self, writer: &WorkerId, write: Write, now: Instant) {
+        let mut space = self.0.borrow_mut();
+        let due = now + space.ack_delay.unwrap_or(Duration::from_ticks(0));
+        space.acknowledgements.push((
+            due,
+            SpaceWrite {
+                writer: writer.clone(),
+                write,
+                stored: false,
+            },
+        ));
+    }
+
     /// From now on `writer`'s writes stay in flight: they land on no holder
     /// and are acknowledged by none until released.
     pub fn hold_writes_from(&self, writer: &WorkerId) {

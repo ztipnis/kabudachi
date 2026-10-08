@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::str::FromStr;
 
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
+pub use kabudachi_core::task_record::Placement;
 use libp2p::PeerId;
 use libp2p::kad::{KBucketDistance, KBucketKey};
 
@@ -29,19 +30,9 @@ impl Default for ReplicationFactor {
     }
 }
 
-/// Where one revision of a record is written and how many must store it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Placement {
-    /// The voters nearest the record's key by kad's XOR distance, nearest first.
-    pub holders: Vec<WorkerId>,
-    /// How many of them must store it before the write counts: a majority,
-    /// so any later read of `holders.len() - quorum + 1` of them meets it.
-    pub quorum: usize,
-}
-
-/// The `factor` voters nearest `task`'s key (the task id's bytes, as kad
-/// keys the record), each voter at its peer id's kad key. `None` without
-/// voters, or when a voter's id is not a peer id.
+/// The `factor` voters nearest `task`'s key by kad's XOR distance (the task
+/// id's bytes, as kad keys the record), each voter at its peer id's kad key.
+/// `None` without voters, or when a voter's id is not a peer id.
 pub fn placement(
     task: &TaskId,
     voters: &[WorkerId],
