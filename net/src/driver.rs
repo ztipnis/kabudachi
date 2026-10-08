@@ -175,7 +175,7 @@ use crate::reconcile::leader::LeaderReconciliation;
 use crate::reconcile::report::page_of;
 use crate::steal::candidates_for_steal;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
-use crate::executor::{Executing, ExecutorEndpoint, OwnAnswer, RunReport};
+use crate::executor::{Executing, granted, ExecutorEndpoint, OwnAnswer, RunReport};
 use crate::routing_refresh::{RoutingRefresh, ShardView};
 use crate::task_exchange::{self, TaskRequestHandle};
 use crate::task_store::placement::{Placement, ReplicationFactor, placement};
@@ -741,6 +741,12 @@ fn decide_own_claim<C: Clock, I: IdGenerator>(
 ) {
     let request = claim_request::Request::Oldest(ClaimOldest { limit: places });
     let response = claim::answer(scheduler, &net.local_worker_id(), &request);
+    // The ledger takes each grant now, as a remote claim's is entered inside
+    // its discovery, so a driver dropped before the grant is stored or handed
+    // over still finds the runs when the next one starts.
+    for claim in granted(&response) {
+        net.claimed_runs().claimed(claim);
+    }
     let made = records.write(node, scheduler, &mut NetRecords { net, factor });
     let held = HeldAnswer::Own(OwnAnswer::Claim { response, reserved: places });
     if let Some(settled) = records.hold(held, made, None) {

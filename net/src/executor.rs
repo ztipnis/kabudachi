@@ -334,23 +334,21 @@ impl<'n> Executing<'n> {
     }
 
     /// Acts on an answer of this worker's own once its writes settled:
-    /// claims granted are entered in the ledger and handed over; a report
+    /// claims granted (already entered in the ledger) are handed over; a report
     /// taken updates the ledger, as a remote leader's answer would.
     pub(crate) fn own_settled(&mut self, settled: Settled<OwnAnswer>) {
         match settled {
             Settled::Released(OwnAnswer::Claim { response, reserved }) => {
-                let claims = granted(response);
-                for claim in &claims {
-                    self.net.claimed_runs().claimed(claim.clone());
-                }
+                // `decide_own_claim` entered these in the ledger when it
+                // decided them, as a remote claim is entered when it is answered.
                 self.own_claim = None;
-                self.claimed(reserved, claims);
+                self.claimed(reserved, granted(&response));
             }
             Settled::NotLeader(OwnAnswer::Claim { response, reserved }) => {
                 // Its own scheduler granted these, but the grant was never
                 // stored: none is handed over, and each is reported lost so
                 // whichever leader decides it replays it.
-                for claim in granted(response) {
+                for claim in granted(&response) {
                     if let Some(run) = claim.task_run_id {
                         self.queue_lost(run.into());
                     }
@@ -498,7 +496,8 @@ impl<'n> Executing<'n> {
     fn hand_over(&mut self, claim: Claim) {
         let Some(run) = claim.task_run_id.clone().map(TaskRunId::from) else {
             // Not a claim a leader grants: its place is offered again.
-            self.endpoint.held.credits += 1;
+            let held = &mut self.endpoint.held;
+            held.credits = held.credits.saturating_add(1);
             return;
         };
         let compacts = claim.task.as_ref().is_some_and(|task| task.compacts.is_some());
@@ -563,9 +562,9 @@ impl Drop for Executing<'_> {
 }
 
 /// The claims `response` grants.
-fn granted(response: ClaimResponse) -> Vec<Claim> {
-    match response.result {
-        Some(claim_response::Result::Batch(batch)) => batch.claims,
+pub(crate) fn granted(response: &ClaimResponse) -> Vec<Claim> {
+    match &response.result {
+        Some(claim_response::Result::Batch(batch)) => batch.claims.clone(),
         _ => Vec::new(),
     }
 }
