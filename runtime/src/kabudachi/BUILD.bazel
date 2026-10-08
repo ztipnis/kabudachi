@@ -11,6 +11,7 @@ py_library(
         "concurrency_places.py",
         "config.py",
         "errors.py",
+        "execution.py",
         "flow.py",
         "handle.py",
         "hosted_work.py",

@@ -501,7 +501,7 @@ def test_synchronous_tasks_run_as_many_at_once_as_the_concurrency_allows():
         return request
 
     # More than the default thread pool ever has, so a small pool would take turns.
-    world = World(blocking, concurrency=48)
+    world = World(blocking, concurrency=48, concurrency_override=True)
 
     async def body():
         started = time.monotonic()
@@ -680,12 +680,17 @@ def test_a_compaction_the_leader_refuses_to_take_is_not_reported_as_a_failed_mer
     serializer = world.serializers.get(world.tasks["echo"].definition.serializer)
     payload = serializer.encode(Greeting(text="a"), Greeting)
     claim = SimpleNamespace(
+        compaction=True,
         definition_id=world.tasks["echo"].definition.name,
         task_run_id="run-1",
         chain=[payload, payload],
     )
 
-    run(world.session._compact(claim))
+    async def body():
+        world.session._start(claim)
+        await world.session.wait_until_running_finish()
+
+    run(body())
 
     assert reported == [], "the merge was fine; only the report was refused"
 

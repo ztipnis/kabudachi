@@ -15,6 +15,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from kabudachi._native import RunState
+from kabudachi.body import fold_payloads
 from kabudachi.errors import (
     RunStoppedError,
     RuntimeNotStartedError,
@@ -1167,7 +1168,8 @@ def test_the_claiming_worker_folds_every_absorbed_payload_in_order(payloads):
     """
     definition = coalescing_definition()
 
-    folded = Session._fold(definition, PROTOBUF, claim_of(payloads))
+    claim = claim_of(payloads)
+    folded = fold_payloads(definition, PROTOBUF, [*claim.chain, claim.serialized_input])
 
     expected = functools.reduce(fold_left, [Greeting(text=t) for t in payloads])
     assert folded == expected

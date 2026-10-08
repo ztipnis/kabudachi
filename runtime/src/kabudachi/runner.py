@@ -586,6 +586,5 @@ async def _run_with_worker(main: Callable[[], Awaitable[T]]) -> T:
             # deactivated a thread can still submit, and would never be served.
             session.stop_claiming()
             deactivate(session)
-            session.close()
         await _cancel(worker)
         native.shutdown()
