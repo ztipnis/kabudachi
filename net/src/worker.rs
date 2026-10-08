@@ -16,19 +16,17 @@
 //! ## One authority, paired with its timings
 //!
 //! The bootstrap cascade and the driver consult the same coordination
-//! authority, and the node keeps its registration and fence by the TTL it
-//! expects that authority to grant. [`AuthorityConfig`] carries the two
-//! together, so both paths always get the same authority and timings, and
-//! never one with an authority and the other without. Nothing checks the
-//! TTL against what the authority grants; the node counts each
-//! registration and fence for the shorter of the two, so a mismatch costs
-//! renewals, not safety.
+//! authority, and the node keeps its registration and fence by the TTL that
+//! authority grants. [`AuthorityConfig`] carries the two together, and takes
+//! the timings from the authority's own `ttl()`, so both paths always get
+//! the same authority and timings, and never one with an authority and the
+//! other without.
 
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode};
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::ids::{IncarnationId, ShardId, ShardName, Uuid7Ids, WorkerId};
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::RealClock;
@@ -44,19 +42,32 @@ use crate::task_store::placement::ReplicationFactor;
 
 /// A coordination authority and the timings a worker's node keeps its
 /// registration and recovery fence there by (see
-/// `kabudachi_core::election::AuthorityTimings`). `timings.ttl` must be the
-/// TTL `authority` grants.
+/// `kabudachi_core::election::AuthorityTimings`). The timings come from the
+/// authority's own TTL.
 #[derive(Clone)]
 pub struct AuthorityConfig {
-    pub authority: SharedAuthority,
-    pub timings: AuthorityTimings,
+    authority: SharedAuthority,
+    timings: AuthorityTimings,
+}
+
+impl AuthorityConfig {
+    /// `authority`, with timings from the TTL it grants.
+    pub fn new(authority: SharedAuthority) -> Self {
+        let timings = AuthorityTimings::from_authority(&*authority);
+        AuthorityConfig { authority, timings }
+    }
+
+    /// The authority the worker consults.
+    pub fn authority(&self) -> &SharedAuthority {
+        &self.authority
+    }
 }
 
 /// How a worker joins and takes part in its shard.
 #[derive(Clone)]
 pub struct WorkerConfig {
-    /// The shard the worker serves.
-    pub shard_id: ShardId,
+    /// The name of the shard the worker serves.
+    pub shard_name: ShardName,
     /// The address the worker listens on, such as `/ip4/0.0.0.0/tcp/4001`.
     pub listen_on: Multiaddr,
     /// Workers to ask who leads the shard. Empty for none.
@@ -91,7 +102,7 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
-    /// A worker of `shard_id` listening on `listen_on`, on `election_timings`,
+    /// A worker of the shard `shard_name` listening on `listen_on`, on `election_timings`,
     /// with no seeds and no authority, and the default bootstrap timeouts
     /// ([`DEFAULT_JOIN_PEER_TIMEOUT`], [`DEFAULT_RETRY_INTERVAL`]).
     ///
@@ -99,9 +110,13 @@ impl WorkerConfig {
     /// on a roll-call deadline that is not shorter than the suspicion
     /// timeout (unless the worker is alone a quorum), as it does on an
     /// invalid heartbeat interval (see `WorkerNode::start`).
-    pub fn new(shard_id: ShardId, listen_on: Multiaddr, election_timings: ElectionTimings) -> Self {
+    pub fn new(
+        shard_name: ShardName,
+        listen_on: Multiaddr,
+        election_timings: ElectionTimings,
+    ) -> Self {
         WorkerConfig {
-            shard_id,
+            shard_name,
             listen_on,
             seeds: Vec::new(),
             authority: None,
@@ -114,6 +129,11 @@ impl WorkerConfig {
             replication_factor: ReplicationFactor::DEFAULT,
             result_ttl: None,
         }
+    }
+
+    /// The id of the shard the worker serves: its name's own string.
+    pub(crate) fn shard_id(&self) -> ShardId {
+        ShardId::new(self.shard_name.as_str())
     }
 
     #[must_use]
@@ -192,7 +212,7 @@ impl Worker {
     /// (see this module's "One identity per process"), and listens on
     /// `config.listen_on`, or fails if it cannot.
     pub async fn start(config: WorkerConfig) -> Result<Worker, ListenRejected> {
-        let net = Net::for_shard(config.shard_id.clone(), retention_of(&config));
+        let net = Net::for_shard(config.shard_id(), retention_of(&config));
         let net = Arc::new(match config.input_limit {
             Some(limit) => net.with_input_limit(limit),
             None => net,
@@ -244,11 +264,13 @@ impl Worker {
         let Worker { net, config } = self;
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
+        let shard_id = config.shard_id();
         let mut authority = config.authority.as_ref().map(|authority| {
             AuthorityClient::new(
                 &net,
-                config.shard_id.clone(),
-                Arc::clone(&authority.authority),
+                config.shard_name.clone(),
+                shard_id.clone(),
+                Arc::clone(authority.authority()),
                 authority.timings,
             )
         });
@@ -256,7 +278,7 @@ impl Worker {
             &net,
             &clock,
             authority.as_mut(),
-            &config.shard_id,
+            &shard_id,
             &my_id,
             &config.seeds,
             config.join_peer_timeout,
@@ -269,7 +291,7 @@ impl Worker {
             id: my_id.clone(),
             // The worker's id is already unique to this incarnation.
             incarnation: IncarnationId::new(my_id.as_str()),
-            shard: config.shard_id.clone(),
+            shard: shard_id,
             timings: config.election_timings,
         };
         let authority_timings = config.authority.as_ref().map(|authority| authority.timings);

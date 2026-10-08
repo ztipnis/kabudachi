@@ -13,7 +13,7 @@ use crate::support::builders::{
 };
 
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, ShardRecord};
 use kabudachi_core::election::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, DropMessages,
     ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step, WorkerNode,
@@ -29,7 +29,8 @@ use kabudachi_core::scheduler::{LeaseEnd, Scheduler};
 use kabudachi_core::time::{Clock, Duration};
 use kabudachi_testkit::FaultingAuthority;
 use crate::support::authority::{
-    AtOnce, asked, authority_ttl, epoch, register_all, seed_shard, warmed_up_authority,
+    AtOnce, asked, authority_ttl, epoch, name_of, read_epoch as held_epoch, register_all,
+    seed_shard, swap_epoch, warmed_up_authority,
 };
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
@@ -266,9 +267,7 @@ fn a_fenced_node_ignores_an_epoch_read_it_asked_for_before_reconnecting() {
 fn a_fenced_node_reconnecting_to_a_later_epoch_of_its_lineage_resumes_instead_of_rejoining() {
     let mut driven = fenced_voter();
     driven.authority.set_reachable(true);
-    driven
-        .authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
+    swap_epoch(&driven.authority, &shard(SHARD), Some(epoch(0)), epoch(1))
         .expect("the swap lands");
 
     driven.advance(lasting_ticks());
@@ -281,9 +280,7 @@ fn a_fenced_node_reconnecting_to_a_later_epoch_of_its_lineage_resumes_instead_of
 fn rejoining_at_floor_two_of_lineage_one() -> Driven {
     let mut driven = fenced_voter();
     driven.authority.set_reachable(true);
-    driven
-        .authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), RecoveryEpoch::new(2, 1))
+    swap_epoch(&driven.authority, &shard(SHARD), Some(epoch(0)), RecoveryEpoch::new(2, 1))
         .expect("a recovery elsewhere moved the epoch on");
     while driven.node.state() == WorkerState::Fenced {
         driven.advance(1_000);
@@ -486,7 +483,14 @@ fn a_new_leader_waits_out_the_fence_another_worker_holds() {
     let authority = warmed_up_authority(&clock);
     seed_shard(&authority, &shard(SHARD), 0, []);
     authority
-        .acquire_fence(&shard(SHARD), &worker("old-leader"), epoch(0))
+        .acquire_fence(
+            &name_of(&shard(SHARD)),
+            &worker("old-leader"),
+            &ShardRecord {
+                shard_id: shard(SHARD),
+                recovery_epoch: epoch(0),
+            },
+        )
         .expect("the old leader holds the fence");
     let fence_ends = clock.now() + authority_ttl();
     let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 1);
@@ -528,8 +532,7 @@ fn a_fenced_node_resumes_on_its_epoch_read_even_when_its_clock_moves_while_it_as
 fn awaiting_its_live_set_read() -> (Driven, AuthorityCall) {
     let clock = FakeClock::new();
     let authority = warmed_up_authority(&clock);
-    authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), None, epoch(0))
+    swap_epoch(&authority, &shard(SHARD), None, epoch(0))
         .expect("the shard has no epoch yet");
     register_all(&authority, &shard(SHARD), &[worker("w2")]);
     let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
@@ -569,7 +572,7 @@ fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
                 },
                 ..*read
             }
-            .perform(&driven.authority, &shard(SHARD), &worker("w1"), "w1")
+            .perform(&driven.authority, &name_of(&shard(SHARD)), &shard(SHARD), &worker("w1"), "w1")
         },
     ];
 
@@ -584,6 +587,7 @@ fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
 
         let answered = driven.node.step(Input::Authority(read.perform(
             &driven.authority,
+            &name_of(&shard(SHARD)),
             &shard(SHARD),
             &worker("w1"),
             "w1",
@@ -611,8 +615,7 @@ fn short_roll_call(
         FaultingAuthority::new(clock.clone(), authority_ttl())
     };
     if let Some(number) = epoch {
-        authority
-            .compare_and_swap_recovery_epoch(&shard(SHARD), None, self::epoch(number))
+        swap_epoch(&authority, &shard(SHARD), None, self::epoch(number))
             .expect("the shard has no epoch yet");
     }
     // `w1` registers itself on its first step.
@@ -643,7 +646,7 @@ fn the_authority_path_needs_a_majority_of_the_live_registrations() {
     );
     assert_eq!(driven.node.state(), WorkerState::NoQuorum);
     assert_eq!(
-        driven.authority.read_recovery_epoch(&shard(SHARD)),
+        held_epoch(&driven.authority, &shard(SHARD)),
         Ok(Some(epoch(0)))
     );
 }
@@ -663,8 +666,7 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
     for (held, lineage) in [(2, 0), (9, 7)] {
         let clock = FakeClock::new();
         let authority = warmed_up_authority(&clock);
-        authority
-            .compare_and_swap_recovery_epoch(&shard(SHARD), None, RecoveryEpoch::new(5, 0))
+        swap_epoch(&authority, &shard(SHARD), None, RecoveryEpoch::new(5, 0))
             .expect("the shard has no epoch yet");
         register_all(&authority, &shard(SHARD), &[worker("w2")]);
         let (mut driven, _) = Driven::with(
@@ -686,12 +688,12 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
         );
 
         driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
-        authority
-            .compare_and_swap_recovery_epoch(
-                &shard(SHARD),
-                Some(RecoveryEpoch::new(5, 0)),
-                RecoveryEpoch::new(held, lineage),
-            )
+        swap_epoch(
+            &authority,
+            &shard(SHARD),
+            Some(RecoveryEpoch::new(5, 0)),
+            RecoveryEpoch::new(held, lineage),
+        )
             .expect("the epoch moves on after the node's read");
         driven.start_roll_call(&[worker("w2")]);
         let closed = driven.advance(default_timings().roll_call_deadline.as_ticks());
@@ -710,7 +712,7 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
         );
         assert_eq!(driven.node.configuration(), None);
         assert_eq!(
-            driven.authority.read_recovery_epoch(&shard(SHARD)),
+            held_epoch(&driven.authority, &shard(SHARD)),
             Ok(Some(RecoveryEpoch::new(held, lineage)))
         );
 
@@ -755,9 +757,7 @@ fn a_leader_whose_fence_names_an_epoch_it_cannot_recover_from_rejoins_it() {
     }));
     // The shard was founded afresh under it.
     let refounded = RecoveryEpoch::new(0, 7);
-    driven
-        .authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), refounded)
+    swap_epoch(&driven.authority, &shard(SHARD), Some(epoch(0)), refounded)
         .expect("a founder replaced the epoch");
 
     let mut outputs = Vec::new();
@@ -792,8 +792,7 @@ fn nodes_at_one_epoch_number_of_two_lineages_agree_which_epoch_is_newer() {
     for (own, heard, follows) in rows {
         let clock = FakeClock::new();
         let authority = warmed_up_authority(&clock);
-        authority
-            .compare_and_swap_recovery_epoch(&shard(SHARD), None, own)
+        swap_epoch(&authority, &shard(SHARD), None, own)
             .expect("the shard has no epoch yet");
         let configuration = configuration_at_epoch(own);
         let (mut driven, _) = Driven::with(
@@ -990,7 +989,13 @@ fn a_swap_reply_after_the_rolls_retry_within_the_call_timeout_still_makes_the_no
     let closed = driven.node.step(Input::Tick);
 
     let perform = |driven: &Driven, call: AuthorityCall| {
-        Input::Authority(call.perform(&driven.authority, &shard(SHARD), &worker("w1"), "w1"))
+        Input::Authority(call.perform(
+            &driven.authority,
+            &name_of(&shard(SHARD)),
+            &shard(SHARD),
+            &worker("w1"),
+            "w1",
+        ))
     };
     let live = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
     let read = driven.node.step(perform(&driven, live));
@@ -1029,8 +1034,7 @@ fn a_roll_call_that_returns_a_quorum_beside_a_later_epoch_is_a_census_not_an_ele
     let authority = warmed_up_authority(&clock);
     seed_shard(&authority, &shard(SHARD), 0, [&worker("w2"), &worker("w3")]);
     let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 3);
-    authority
-        .compare_and_swap_recovery_epoch(&shard(SHARD), Some(epoch(0)), epoch(1))
+    swap_epoch(&authority, &shard(SHARD), Some(epoch(0)), epoch(1))
         .expect("the ambiguous swap");
 
     let _ = driven.run_roll_call(&[worker("w2")]);

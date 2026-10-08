@@ -12,7 +12,7 @@ use kabudachi_core::election::{
     AuthorityCall, AuthorityTimings, AuthorityPerformer, AuthorityReply, AuthorityRequest, CallKind, Issuer,
     ReplyToken, ReplyTokens,
 };
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::time::Instant;
 use libp2p::Multiaddr;
 use tokio::sync::{mpsc, watch};
@@ -41,6 +41,7 @@ pub type SharedAuthority = Arc<dyn CoordinationAuthority + Send + Sync>;
 /// epoch again at its next registration.
 pub struct AuthorityClient {
     authority: SharedAuthority,
+    name: ShardName,
     shard_id: ShardId,
     my_id: WorkerId,
     /// Whose address a registration names.
@@ -60,12 +61,14 @@ pub struct AuthorityClient {
 impl AuthorityClient {
     pub fn new(
         net: &Net,
+        name: ShardName,
         shard_id: ShardId,
         authority: SharedAuthority,
         timings: AuthorityTimings,
     ) -> Self {
         Self::from_parts(
             authority,
+            name,
             shard_id,
             timings,
             net.local_worker_id(),
@@ -75,6 +78,7 @@ impl AuthorityClient {
 
     fn from_parts(
         authority: SharedAuthority,
+        name: ShardName,
         shard_id: ShardId,
         timings: AuthorityTimings,
         my_id: WorkerId,
@@ -83,6 +87,7 @@ impl AuthorityClient {
         let (sender, replies) = mpsc::unbounded_channel();
         AuthorityClient {
             authority,
+            name,
             shard_id,
             my_id,
             own_address,
@@ -138,6 +143,7 @@ impl AuthorityClient {
         }
         self.in_flight.insert(call.token.kind, call.token);
         let authority = Arc::clone(&self.authority);
+        let name = self.name.clone();
         let shard_id = self.shard_id.clone();
         let my_id = self.my_id.clone();
         let address = self
@@ -151,7 +157,7 @@ impl AuthorityClient {
         tokio::spawn(async move {
             let performing = tokio::task::spawn_blocking(move || {
                 std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    call.perform(&*authority, &shard_id, &my_id, &address)
+                    call.perform(&*authority, &name, &shard_id, &my_id, &address)
                 }))
             });
             // On a timeout `performing` is dropped, not aborted: a running

@@ -6,7 +6,7 @@ use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::CallKind;
-use kabudachi_core::protocol::ids::ShardId;
+use kabudachi_core::protocol::ids::ShardName;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_testkit::FaultingAuthority;
 
@@ -23,7 +23,7 @@ fn a_held_call_returns_once_no_handle_outside_held_calls_is_left() {
     authority.hold_next(CallKind::ReadRecoveryEpoch);
     let (returned, call_returned) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = client.read_recovery_epoch(&ShardId::new("shard-1"));
+        let _ = client.read_shard(&ShardName::new("shard-1"));
         let _ = returned.send(());
     });
     while !authority.is_holding(CallKind::ReadRecoveryEpoch) {

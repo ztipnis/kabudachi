@@ -20,7 +20,9 @@
 use std::collections::BTreeMap;
 
 use crate::configuration::{Admission, Configuration, Generation, Roster, Single, Tally};
-use crate::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
+use crate::coordination_authority::{
+    AuthorityError, LiveRegistrations, RecoveryEpoch, ShardRecord,
+};
 use crate::election::standing::{EpochOrder, order};
 use crate::protocol::ids::WorkerId;
 
@@ -212,8 +214,12 @@ impl ForcedRecovery {
         }
         match result {
             Ok(()) => {}
-            Err(AuthorityError::EpochConflict {
-                current: Some(winner),
+            Err(AuthorityError::ShardConflict {
+                current:
+                    Some(ShardRecord {
+                        recovery_epoch: winner,
+                        ..
+                    }),
             }) => return Next::Rejoin(*winner),
             Err(_) => return Next::GiveUp,
         }

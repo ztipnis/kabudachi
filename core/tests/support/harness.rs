@@ -49,7 +49,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use kabudachi_core::coordination_authority::CoordinationAuthority;
 use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, CallKind, Entry, HandOffTo,
     Identity, Input, Issuer, KnownConfiguration, MessageSink, Output, ReplyToken, Step, WorkerNode, carry_out,
@@ -73,7 +72,7 @@ use kabudachi_testkit::FaultingAuthority;
 use kabudachi_testkit::RecordSpace;
 pub use kabudachi_testkit::StepRecord;
 
-use crate::support::authority::{authority_ttl, epoch};
+use crate::support::authority::{authority_ttl, epoch, name_of, read_epoch, swap_epoch};
 use crate::support::builders::{message_input, timings, voter_of};
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
@@ -340,8 +339,7 @@ impl Cluster {
         clock.advance(ttl);
         let shard_id = ShardId::new(SHARD_ID);
         if authority_timings.is_some() {
-            authority
-                .compare_and_swap_recovery_epoch(&shard_id, None, epoch(0))
+            swap_epoch(&authority, &shard_id, None, epoch(0))
                 .expect("a fresh authority holds no epoch, so create-if-absent succeeds");
         }
 
@@ -1584,7 +1582,7 @@ impl Cluster {
             .map(|(id, _)| id.clone())
             .collect();
         for id in validating {
-            let Ok(Some(held)) = self.node_authorities[&id].read_recovery_epoch(&self.shard_id)
+            let Ok(Some(held)) = read_epoch(&self.node_authorities[&id], &self.shard_id)
             else {
                 continue;
             };
@@ -1835,7 +1833,13 @@ struct HarnessPerformer<'a> {
 
 impl AuthorityPerformer for HarnessPerformer<'_> {
     fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
-        let reply = call.perform(self.authority, self.shard_id, self.me, self.me.as_str());
+        let reply = call.perform(
+            self.authority,
+            &name_of(self.shard_id),
+            self.shard_id,
+            self.me,
+            self.me.as_str(),
+        );
         match self.stall.as_mut() {
             Some(stall) => {
                 stall.held.push(Input::Authority(reply));

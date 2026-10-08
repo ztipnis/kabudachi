@@ -7,10 +7,12 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::coordination_authority::CoordinationAuthority;
-use kabudachi_core::election::{AuthorityTimings, ElectionTimings, WorkerNode};
+use kabudachi_core::coordination_authority::{
+    AuthorityError, CoordinationAuthority, RecoveryEpoch, ShardRecord,
+};
+use kabudachi_core::election::{ElectionTimings, WorkerNode};
 use kabudachi_core::in_memory_authority::InMemoryAuthority;
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::messenger::Net;
@@ -31,6 +33,39 @@ pub const PER_PEER_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 /// Short, so a waiting worker goes round its cascade many times per test.
 pub const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(50);
 
+/// The name a shard identified by `shard_id` lives under: the same string.
+pub fn name_of(shard_id: &ShardId) -> ShardName {
+    ShardName::new(shard_id.as_str())
+}
+
+/// The epoch the authority holds under `shard_id`'s name.
+pub fn read_epoch(
+    authority: &impl CoordinationAuthority,
+    shard_id: &ShardId,
+) -> Result<Option<RecoveryEpoch>, AuthorityError> {
+    Ok(authority
+        .read_shard(&name_of(shard_id))?
+        .map(|held| held.recovery_epoch))
+}
+
+/// Compare-and-swaps `shard_id`'s record from `expected` to `new`.
+pub fn swap_epoch(
+    authority: &impl CoordinationAuthority,
+    shard_id: &ShardId,
+    expected: Option<RecoveryEpoch>,
+    new: RecoveryEpoch,
+) -> Result<(), AuthorityError> {
+    let record = |recovery_epoch| ShardRecord {
+        shard_id: shard_id.clone(),
+        recovery_epoch,
+    };
+    authority.compare_and_swap_shard(
+        &name_of(shard_id),
+        expected.map(record).as_ref(),
+        &record(new),
+    )
+}
+
 /// A worker of `shard` bound to `bind`, bootstrapping through `seeds` on
 /// `timings`, with the test-scale join timeout and retry interval above
 /// and no authority.
@@ -40,22 +75,22 @@ pub fn worker_config(
     timings: ElectionTimings,
     seeds: Vec<Multiaddr>,
 ) -> WorkerConfig {
-    WorkerConfig::new(shard, bind.parse().expect("a valid multiaddr"), timings)
-        .with_seeds(seeds)
-        .with_join_peer_timeout(PER_PEER_TIMEOUT)
-        .with_retry_interval(RETRY_INTERVAL)
+    WorkerConfig::new(
+        name_of(&shard),
+        bind.parse().expect("a valid multiaddr"),
+        timings,
+    )
+    .with_seeds(seeds)
+    .with_join_peer_timeout(PER_PEER_TIMEOUT)
+    .with_retry_interval(RETRY_INTERVAL)
 }
 
-/// `config` with `authority` as its coordination authority, granting `ttl`.
+/// `config` with `authority` as its coordination authority.
 pub fn with_in_memory_authority(
     config: WorkerConfig,
     authority: InMemoryAuthority<RealClock>,
-    ttl: Duration,
 ) -> WorkerConfig {
-    config.with_authority(AuthorityConfig {
-        authority: Arc::new(authority),
-        timings: AuthorityTimings { ttl },
-    })
+    config.with_authority(AuthorityConfig::new(Arc::new(authority)))
 }
 
 /// What a worker's driver last showed of its node.
@@ -185,7 +220,7 @@ pub async fn warmed_up_in_memory_authority(
     let authority =
         kabudachi_core::in_memory_authority::InMemoryAuthority::new(RealClock::new(), ttl);
     while authority
-        .live_registrations(shard_id)
+        .live_registrations(&name_of(shard_id), shard_id)
         .expect("the in-memory authority is always reachable")
         .authoritative_count()
         .is_none()

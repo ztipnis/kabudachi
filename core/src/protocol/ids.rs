@@ -54,6 +54,29 @@ id_newtype!(
     /// Identifies a shard (an independently-elected partition of the cluster).
     ShardId
 );
+
+/// The name an operator gives a shard. It never changes: it names the shard's
+/// gossip topic and its key space at the coordination authority. Each
+/// incarnation of the shard under that name has its own [`ShardId`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShardName(String);
+
+impl ShardName {
+    pub fn new(value: impl Into<String>) -> Self {
+        ShardName(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ShardName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 id_newtype!(
     /// Identifies a task (the durable, user-defined unit of work).
     TaskId

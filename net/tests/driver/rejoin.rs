@@ -28,6 +28,7 @@ use crate::support::deadline::within_deadline;
 use crate::support::net::{
     JoinResponder, driven_scheduler, listening_net, take_inputs_until,
 };
+use crate::support::worker::{name_of, swap_epoch};
 
 const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
@@ -95,8 +96,7 @@ async fn keep_registered(
 ) {
     loop {
         for (id, address) in workers {
-            authority
-                .register(&shard(), id, address)
+            authority.register(&name_of(&shard()), &shard(), id, address)
                 .expect("the authority is reachable");
         }
         tokio::time::sleep(StdDuration::from_millis(100)).await;
@@ -174,7 +174,13 @@ async fn a_stranded_node_reaches_a_leader_despite(listing: Listing) {
     };
     // Long enough that the held listing read of `HeldWithASeed` is not given up.
     let timings = AuthorityTimings { ttl: TickDuration::from_secs(60) };
-    let client = AuthorityClient::new(&node_net, shard(), Arc::new(node_handle.clone()), timings);
+    let client = AuthorityClient::new(
+        &node_net,
+        name_of(&shard()),
+        shard(),
+        Arc::new(node_handle.clone()),
+        timings,
+    );
     let (mut node, first) = node_of_two(clock, &me, TickDuration::from_millis(100), None);
     let mut scheduler = driven_scheduler(clock);
     let (seen, observed) = watch::channel(node.state());
@@ -261,8 +267,7 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
         let ttl = TickDuration::from_millis(1_000);
         let authority = FaultingAuthority::new(clock, ttl);
         let elsewhere = authority.for_another_worker();
-        elsewhere
-            .compare_and_swap_recovery_epoch(&shard(), None, RecoveryEpoch::new(0, 0))
+        swap_epoch(&elsewhere, &shard(), None, RecoveryEpoch::new(0, 0))
             .expect("a fresh authority holds no epoch");
         // Two leaders answer JOIN, each pointing at itself: the old lineage's and
         // the refounded one's.
@@ -294,6 +299,7 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
             clock,
             Some(AuthorityClient::new(
                 &net,
+                name_of(&shard()),
                 shard(),
                 Arc::new(mine.clone()),
                 AuthorityTimings { ttl },
@@ -322,12 +328,12 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
             };
             mine.set_reachable(false);
             wait_for("the node fenced itself", |seen| seen.0 == WorkerState::Fenced).await;
-            elsewhere
-                .compare_and_swap_recovery_epoch(
-                    &shard(),
-                    Some(RecoveryEpoch::new(0, 0)),
-                    RecoveryEpoch::new(2, 1),
-                )
+            swap_epoch(
+                &elsewhere,
+                &shard(),
+                Some(RecoveryEpoch::new(0, 0)),
+                RecoveryEpoch::new(2, 1),
+            )
                 .expect("a recovery elsewhere moved the epoch on");
             mine.set_reachable(true);
             wait_for("the node rejoined at epoch 2 of lineage 1", |seen| {
@@ -350,12 +356,12 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
             })
             .await
             .expect("the node's next read of the epoch was held within the timeout");
-            elsewhere
-                .compare_and_swap_recovery_epoch(
-                    &shard(),
-                    Some(RecoveryEpoch::new(2, 1)),
-                    RecoveryEpoch::new(2, 2),
-                )
+            swap_epoch(
+                &elsewhere,
+                &shard(),
+                Some(RecoveryEpoch::new(2, 1)),
+                RecoveryEpoch::new(2, 2),
+            )
                 .expect("the shard is refounded");
             listed.notify_one();
             wait_for("the node took the old lineage's pointer and awaits the authority", |seen| {
