@@ -51,9 +51,10 @@ use std::time::{Duration, Instant};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    Claim, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, TaskRejectReason,
-    TaskResponse, task_request, task_response,
+    Claim, ClaimResponse, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, TaskRejectReason,
+    TaskResponse, claim_response, task_request, task_response,
 };
+use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::WallTime;
 use libp2p::futures::StreamExt;
 use libp2p::futures::future::BoxFuture;
@@ -63,7 +64,7 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::discovery::{Found, IdleBackoff};
 use crate::messenger::Net;
-use crate::task_exchange::{TaskFailure, reported_run};
+use crate::task_exchange::{self, TaskFailure, reported_run};
 
 /// What the driver hands the executor (see the module doc).
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +155,14 @@ pub(crate) struct Held {
     pub(crate) gone: bool,
 }
 
+/// A claim or report of this worker's own, decided by its own scheduler
+/// while it leads, and held like a remote worker's until the writes the
+/// decision made are stored.
+pub(crate) enum OwnAnswer {
+    Claim { response: ClaimResponse, reserved: u32 },
+    Report { request: RunReport, response: TaskResponse },
+}
+
 /// A report sent, with the answer it got or why it got none.
 type Reply = (RunReport, Result<TaskResponse, TaskFailure>);
 
@@ -169,6 +178,8 @@ pub(crate) struct Executing<'n> {
     retry_after: Duration,
     /// A discovery under way at a remote leader, with the places it reserved.
     discovering: Option<(u32, BoxFuture<'n, Found>)>,
+    /// Places this leader's own claim reserved, until its answer settles.
+    own_claim: Option<u32>,
     idle: IdleBackoff,
     /// No claim before this, after one that found nothing.
     next_claim_at: Option<TokioInstant>,
@@ -189,6 +200,7 @@ impl<'n> Executing<'n> {
             net,
             retry_after,
             discovering: None,
+            own_claim: None,
             idle: IdleBackoff::default(),
             next_claim_at: None,
             sending: BTreeSet::new(),
@@ -278,7 +290,7 @@ impl<'n> Executing<'n> {
     /// recently. The caller claims them at once.
     pub(crate) fn places_to_claim(&mut self) -> Option<u32> {
         let held = &mut self.endpoint.held;
-        let busy = self.discovering.is_some() || self.found.is_some();
+        let busy = self.discovering.is_some() || self.found.is_some() || self.own_claim.is_some();
         if held.gone || held.credits == 0 || busy || self.next_claim_at.is_some() {
             return None;
         }
@@ -292,6 +304,42 @@ impl<'n> Executing<'n> {
         let limit = usize::try_from(places).unwrap_or(usize::MAX);
         let discovery = self.net.discover(leader, limit, now, true);
         self.discovering = Some((places, Box::pin(discovery)));
+    }
+
+    /// This worker leads: the `places` just reserved are claimed from its own
+    /// scheduler, whose answer arrives through [`Self::own_settled`].
+    pub(crate) fn claiming_own(&mut self, places: u32) {
+        self.own_claim = Some(places);
+    }
+
+    /// Acts on an answer of this worker's own once its writes settled:
+    /// claims granted are entered in the ledger and handed over; a report
+    /// taken updates the ledger, as a remote leader's answer would.
+    pub(crate) fn own_settled(&mut self, settled: Settled<OwnAnswer>) {
+        match settled {
+            Settled::Released(OwnAnswer::Claim { response, reserved }) => {
+                let claims = match response.result {
+                    Some(claim_response::Result::Batch(batch)) => batch.claims,
+                    _ => Vec::new(),
+                };
+                for claim in &claims {
+                    self.net.claimed_runs().claimed(claim.clone());
+                }
+                self.own_claim = None;
+                self.claimed(reserved, claims);
+            }
+            Settled::NotLeader(OwnAnswer::Claim { reserved, .. }) => {
+                self.own_claim = None;
+                self.claimed(reserved, Vec::new());
+            }
+            Settled::Released(OwnAnswer::Report { request, response }) => {
+                self.net.note_answer(&request, &response);
+                self.on_reply(request, Ok(response));
+            }
+            Settled::NotLeader(OwnAnswer::Report { request, .. }) => {
+                self.on_reply(request, Ok(task_exchange::not_leader()));
+            }
+        }
     }
 
     /// Tells the executor to stop `run`'s body, once, if it was handed over
@@ -427,6 +475,7 @@ impl Drop for Executing<'_> {
     fn drop(&mut self) {
         self.take_arrived();
         let reserved = self.discovering.take().map_or(0, |(reserved, _)| reserved);
+        let reserved = reserved + self.own_claim.take().unwrap_or(0);
         let held = &mut self.endpoint.held;
         held.credits = held.credits.saturating_add(reserved);
     }

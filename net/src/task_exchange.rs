@@ -59,8 +59,9 @@ pub(crate) const MAX_PLACE_IDS: usize = 256;
 /// Why a task-exchange call got no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskFailure {
-    /// The leader named is this worker: its scheduler decides in process,
-    /// and nothing was sent.
+    /// The leader named is this worker: its own scheduler decides, in its
+    /// driver, and nothing was sent. A worker's driver decides its own
+    /// executor's reports so.
     ThisWorkerLeads,
     /// No answer came: the request failed outright (such as a leader that
     /// cannot be dialed), the leader disconnected before answering, or

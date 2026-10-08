@@ -3,7 +3,9 @@
 //! transport's generic request/response machinery.
 //!
 //! The asking side is [`Net::request_claim`] and [`Net::claim_oldest`], sent to
-//! the leader the caller names: the transport keeps no leader of its own. The
+//! the leader the caller names: the transport keeps no leader of its own; a
+//! worker's driver claims for its executor (see `crate::executor`), and claims
+//! from its own scheduler while it leads. The
 //! answering side is [`answer`], which the driver applies to each inbound
 //! request: whether to grant a claim is `core::scheduler::Scheduler`'s decision
 //! alone. The decision is made at once, but the driver sends the answer only
@@ -38,13 +40,10 @@ pub mod codec;
 /// a leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimFailure {
-    /// The leader named is this worker. Its own claims are its own scheduler's to
-    /// decide, not a peer's, so nothing was sent.
-    ThisWorkerLeads,
     /// No answer came: the request failed outright (such as a leader that
     /// cannot be dialed), the leader disconnected before answering, or
     /// nothing could be sent (this `Net` has stopped, or the leader's id
-    /// names no libp2p peer).
+    /// names no libp2p peer), or the leader named is this worker.
     Unanswered,
 }
 
@@ -147,7 +146,9 @@ impl Net {
         request: claim_request::Request,
     ) -> Result<ClaimResponse, ClaimFailure> {
         if leader == self.local_worker_id() {
-            return Err(ClaimFailure::ThisWorkerLeads);
+            // This worker's own claims are its driver's to decide, from its own
+            // scheduler (see `crate::executor`): nothing is sent.
+            return Err(ClaimFailure::Unanswered);
         }
         let to = PeerId::from_str(leader.as_str()).map_err(|_| ClaimFailure::Unanswered)?;
         self.ask::<ClaimCodec>(
