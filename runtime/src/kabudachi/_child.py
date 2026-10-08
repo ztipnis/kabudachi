@@ -144,10 +144,12 @@ class _TaskProcess:
         await self._finished.wait()
 
     def _read(self) -> None:
-        ipc.read_frames(self._connection, self._received_on_reader)
-        # The worker has gone or closed its end: nothing done here could
-        # reach it any more.
-        _exit(0)
+        try:
+            ipc.read_frames(self._connection, self._received_on_reader)
+        finally:
+            # The worker has gone or closed its end: nothing done here could
+            # reach it any more.
+            _exit(0)
 
     def _received_on_reader(self, frame: Any) -> None:
         # Answers are taken here, not on the loop: a body waiting on its own

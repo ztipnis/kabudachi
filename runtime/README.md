@@ -3,7 +3,9 @@
 The Python package of kabudachi, a peer-to-peer task queue with a compiled native core. This package
 runs one worker, which is its own leader, with no network: the tasks you call are queued and certified
 inside the process that calls them, and their bodies run in task processes it starts (one per CPU), or
-in the process itself with `processes=0`.
+in the process itself with `processes=0`. Task processes are started with `spawn` and re-import your
+script, so put the call to `kabudachi.run(...)` under `if __name__ == "__main__":` whenever
+`processes` is above 0.
 
 Tasks take one input and return one result, both protobuf messages (`pip install kabudachi[protobuf]`),
 or other types if you register a serializer.
@@ -141,7 +143,8 @@ handle behaviour described above; you meet them only if you call the native modu
 
 `processes` (task processes; one per CPU by default, `0` runs bodies in this process), `concurrency`
 (places per process, at most 32 without `concurrency_override=True`), `imports` (modules task processes
-import; by default every module that declared a task), `queue`, `result_ttl` (seconds a finished task
+import; by default every module that declared a task), `process_start_timeout` (seconds a task
+process has to become ready, default 60; `KABUDACHI_PROCESS_START_TIMEOUT`), `queue`, `result_ttl` (seconds a finished task
 is kept), `cancel_grace`, `memory_soft_limit` and `memory_hard_limit` (bytes).
 
 ## Logging

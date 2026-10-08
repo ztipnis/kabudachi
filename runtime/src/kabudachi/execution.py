@@ -65,6 +65,10 @@ class NestedCalls(Protocol):
 
 
 class Executor(Protocol):
+    @property
+    def stops_bodies_at_once(self) -> bool:
+        """Whether `stop(kill=True)` ends running bodies, as killing their processes does."""
+
     def free(self) -> int:
         """Places free now, across the executor; can be negative."""
 
@@ -117,6 +121,10 @@ class InProcessExecutor:
             max_workers=concurrency, thread_name_prefix="kabudachi-task"
         )
         self._bodies: dict[str, RunningBody] = {}
+
+    @property
+    def stops_bodies_at_once(self) -> bool:
+        return False
 
     def free(self) -> int:
         return self._places.free()

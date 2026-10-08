@@ -230,6 +230,22 @@ class ProcessPool:
             self._terminate(child)
         if children:
             await asyncio.wait({child.buried for child in children})
+        # Every child is gone, so a run still waiting for one (or gated behind
+        # an earlier body) can never run.
+        for slot in list(self._slots.values()):
+            if slot.child is not None or slot.exited.done():
+                continue
+            if slot in self._pending:
+                self._pending.remove(slot)
+            if not slot.outcome.done():
+                slot.outcome.set_exception(
+                    TaskProcessLost("the task processes were stopped before it could run")
+                )
+            self._finish(slot)
+
+    @property
+    def stops_bodies_at_once(self) -> bool:
+        return True
 
     # handing over
 
@@ -307,7 +323,10 @@ class ProcessPool:
         open_children = [
             child
             for child in self._children
-            if child.ready and not child.draining and child.busy() < self._settings.concurrency
+            if child.ready
+            and not child.draining
+            and not child.terminating
+            and child.busy() < self._settings.concurrency
         ]
         return min(open_children, key=lambda child: (child.busy(), child.number), default=None)
 

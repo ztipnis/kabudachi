@@ -612,7 +612,7 @@ async def _run_with_worker(
                 session.stop_claiming()
                 await _cancel(worker)
                 forced = serving and isinstance(error, (asyncio.CancelledError, KeyboardInterrupt))
-                if forced and not isinstance(executor, InProcessExecutor):
+                if forced and executor.stops_bodies_at_once:
                     # Their runs settle as lost once their processes are gone.
                     await executor.stop(kill=True)
                 await session.wait_until_running_finish()

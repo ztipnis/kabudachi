@@ -46,6 +46,12 @@ MAX_CONCURRENCY = 32
 
 
 def _one_per_cpu() -> int:
+    # The CPUs this process may use, not the host's: a container or `taskset`
+    # can allow fewer.
+    if hasattr(os, "process_cpu_count"):
+        return os.process_cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0)) or 1
     return os.cpu_count() or 1
 
 
@@ -131,12 +137,18 @@ class Settings:
                 f"not {self.process_start_timeout!r}"
             )
         if self.imports is not None:
-            if isinstance(self.imports, str) or not all(
-                isinstance(module, str) and module.strip() for module in self.imports
-            ):
-                raise ValueError(f"imports must be a list of module names, not {self.imports!r}")
+            complaint = f"imports must be a list of module names, not {self.imports!r}"
+            if isinstance(self.imports, str):
+                raise ValueError(complaint)
+            try:
+                # Once: a generator would be used up by checking it.
+                modules = tuple(self.imports)
+            except TypeError:
+                raise ValueError(complaint) from None
+            if not all(isinstance(module, str) and module.strip() for module in modules):
+                raise ValueError(complaint)
             # Frozen: a list given by the caller is kept as a tuple.
-            object.__setattr__(self, "imports", tuple(self.imports))
+            object.__setattr__(self, "imports", modules)
         if (
             not isinstance(self.result_ttl, int)
             or isinstance(self.result_ttl, bool)

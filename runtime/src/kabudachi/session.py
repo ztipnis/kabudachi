@@ -466,6 +466,18 @@ class Session:
         then leaves the chain as it was."""
         try:
             folded = await body.outcome
+        except TaskProcessLost:
+            # The process died, not the merge: the leader may replay it.
+            _logger.warning("compaction of %s was lost with its process", claim.definition_id)
+            try:
+                self._runtime.report_lost(claim.task_run_id)
+            except Exception as refusal:
+                _logger.warning(
+                    "the leader did not record the lost compaction of %s: %s",
+                    claim.definition_id,
+                    type(refusal).__name__,
+                )
+            return
         except Exception as error:
             kind = _kind_of(error)
             _logger.warning("compaction of %s failed with %s", claim.definition_id, kind)
