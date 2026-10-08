@@ -131,11 +131,6 @@ impl WorkerConfig {
         }
     }
 
-    /// The id of the shard the worker serves: its name's own string.
-    pub(crate) fn shard_id(&self) -> ShardId {
-        ShardId::new(self.shard_name.as_str())
-    }
-
     #[must_use]
     pub fn with_seeds(mut self, seeds: Vec<Multiaddr>) -> Self {
         self.seeds = seeds;
@@ -264,12 +259,11 @@ impl Worker {
         let Worker { net, config } = self;
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
-        let shard_id = config.shard_id();
         let mut authority = config.authority.as_ref().map(|authority| {
             AuthorityClient::new(
                 &net,
                 config.shard_name.clone(),
-                shard_id.clone(),
+                ShardId::mint(&config.shard_name),
                 Arc::clone(authority.authority()),
                 authority.timings,
             )
@@ -278,7 +272,7 @@ impl Worker {
             &net,
             &clock,
             authority.as_mut(),
-            &shard_id,
+            &config.shard_name,
             &my_id,
             &config.seeds,
             config.join_peer_timeout,
@@ -287,11 +281,17 @@ impl Worker {
             config.seed_rounds,
         )
         .await;
+        let shard_id = entry
+            .shard_id()
+            .expect("the cascade ends founding or joining");
+        if let Some(client) = authority.as_mut() {
+            client.serve(shard_id.clone());
+        }
         let identity = Identity {
             id: my_id.clone(),
             // The worker's id is already unique to this incarnation.
             incarnation: IncarnationId::new(my_id.as_str()),
-            shard: entry.shard_id().unwrap_or_else(|| shard_id.clone()),
+            shard: shard_id,
             timings: config.election_timings,
         };
         let authority_timings = config.authority.as_ref().map(|authority| authority.timings);

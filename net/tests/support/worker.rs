@@ -103,6 +103,8 @@ pub struct Seen {
     /// configuration counts the joiner.
     pub voter: bool,
     pub leader: Option<WorkerId>,
+    /// The incarnation of the shard the node belongs to.
+    pub shard_id: ShardId,
 }
 
 impl Seen {
@@ -114,6 +116,7 @@ impl Seen {
                 .configuration()
                 .is_some_and(|configuration| configuration.is_voter(node.admission())),
             leader: node.known_leader().map(|(leader, _)| leader),
+            shard_id: node.shard_id().clone(),
         }
     }
 }

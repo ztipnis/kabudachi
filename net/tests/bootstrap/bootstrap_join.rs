@@ -129,10 +129,20 @@ async fn three_workers_that_join_through_one_seed_register_and_are_admitted() {
         let mut workers = three_workers_joined_through_one_seed(&authority).await;
         let joiners = &workers[2..];
 
+        // Every worker belongs to the one incarnation the founder minted.
+        let shard_id = workers[0].seen.borrow().as_ref().expect("the founder is driven").shard_id.clone();
+        assert!(shard_id.as_str().starts_with(&format!("{SHARD}/")), "{shard_id:?}");
+        for worker in &workers {
+            assert_eq!(
+                worker.seen.borrow().as_ref().expect("the worker is driven").shard_id,
+                shard_id
+            );
+        }
+
         for joiner in joiners {
             poll_until("the joiner registered at its listen address", || {
                 authority
-                    .live_registrations(&name_of(&shard()), &shard())
+                    .live_registrations(&name_of(&shard()), &shard_id)
                     .expect("the in-memory authority is always reachable")
                     .addresses()
                     .get(&joiner.id)

@@ -15,16 +15,16 @@
 //!   calls for, the replies to the calls net asked for itself, and what the
 //!   node must be told.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::coordination_authority::{LiveRegistrations, ShardRecord};
+use kabudachi_core::coordination_authority::{LeaderHint, LiveRegistrations, ShardRecord};
 use kabudachi_core::election::{
     AuthorityReply, AuthorityRequest, CallKind, Input, JoinFloor, ReplyToken,
 };
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Duration, Instant as CoreInstant};
@@ -95,7 +95,7 @@ pub(crate) struct SearchRounds {
 }
 
 impl SearchRounds {
-    pub(crate) fn for_bootstrap(shard_id: &ShardId, my_id: WorkerId, seeds: Vec<Multiaddr>) -> Self {
+    pub(crate) fn for_bootstrap(name: &ShardName, my_id: WorkerId, seeds: Vec<Multiaddr>) -> Self {
         SearchRounds {
             my_id,
             seeds,
@@ -103,7 +103,7 @@ impl SearchRounds {
             round: 0,
             shard_exists: false,
             listed: Vec::new(),
-            log: WaitLog::new(&shard_id.name()),
+            log: WaitLog::new(name),
         }
     }
 
@@ -148,15 +148,36 @@ impl SearchRounds {
         self.heard_from_seeds(found)
     }
 
-    /// The registered addresses of `peers` to ask this round. An address that
-    /// does not parse is logged and skipped, and so is a list none of whose
-    /// addresses parse. They are asked from the first in a bootstrap, and
-    /// rotated by the round number in a rejoin.
-    pub(crate) fn to_ask(&mut self, peers: &BTreeMap<WorkerId, String>) -> Vec<Multiaddr> {
-        let mut addresses: Vec<Multiaddr> = Vec::new();
-        for (worker, address) in peers {
+    /// The addresses to ask this round: the hinted leader's first, then the
+    /// registered addresses of `peers`. An address that does not parse is
+    /// logged and skipped, and so is a list none of whose addresses parse.
+    /// The hinted leader is always asked first and never rotated; `peers`
+    /// are asked from the first in a bootstrap, and rotated by the round
+    /// number in a rejoin. The hinted worker is asked once, at its hinted
+    /// address, even if `peers` lists it too.
+    pub(crate) fn to_ask(
+        &mut self,
+        hinted: Option<&LeaderHint>,
+        peers: &BTreeMap<WorkerId, String>,
+    ) -> Vec<Multiaddr> {
+        let mut first: Vec<Multiaddr> = Vec::new();
+        let mut rest: Vec<Multiaddr> = Vec::new();
+        if let Some(hint) = hinted {
+            match hint.address.parse() {
+                Ok(address) => first.push(address),
+                Err(error) => self.log.log(WaitReason::UnparseableAddress {
+                    worker: hint.leader.clone(),
+                    address: hint.address.clone(),
+                    error: error.to_string(),
+                }),
+            }
+        }
+        let others = peers
+            .iter()
+            .filter(|(worker, _)| hinted.is_none_or(|hint| hint.leader != **worker));
+        for (worker, address) in others {
             match address.parse() {
-                Ok(address) => addresses.push(address),
+                Ok(address) => rest.push(address),
                 Err(error) => self.log.log(WaitReason::UnparseableAddress {
                     worker: worker.clone(),
                     address: address.clone(),
@@ -164,7 +185,7 @@ impl SearchRounds {
                 }),
             }
         }
-        if addresses.is_empty() {
+        if first.is_empty() && rest.is_empty() {
             // No one else listed is not an address problem: stay quiet.
             if !peers.is_empty() {
                 self.log.log(WaitReason::NoRegisteredAddressParses {
@@ -172,14 +193,21 @@ impl SearchRounds {
                 });
             }
             self.listed.clear();
-            return addresses;
+            return Vec::new();
         }
-        self.listed = peers.keys().cloned().collect();
-        if self.mode == Mode::Rejoin {
-            let len = addresses.len();
-            addresses.rotate_left(self.round % len);
+        self.listed = peers
+            .keys()
+            .cloned()
+            .chain(hinted.map(|hint| hint.leader.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if self.mode == Mode::Rejoin && !rest.is_empty() {
+            let len = rest.len();
+            rest.rotate_left(self.round % len);
         }
-        addresses
+        first.extend(rest);
+        first
     }
 
     /// What an ask of [`Self::to_ask`]'s addresses found: the pointer, if any.
@@ -537,7 +565,7 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                 self.next_round_at = None;
                 self.floor = floor;
                 let peers = self.search.others_in(&registrations);
-                let mut addresses = self.search.to_ask(&peers);
+                let mut addresses = self.search.to_ask(None, &peers);
                 let seeds = self.search.seeds().to_vec();
                 for seed in seeds {
                     if !addresses.contains(&seed) {
