@@ -36,7 +36,8 @@
 //! makes to the leader, in order per run, asking again as leaders change
 //! until one takes it. When the node reports an abort deadline, every run
 //! handed over is told to abort by its own deadline, from its reconnect
-//! timeout, and told again when the deadline is lifted; no more work is claimed while one stands.
+//! timeout, and told again when the deadline is lifted; no more work is
+//! claimed while one stands.
 //!
 //! A leader's scheduler records each decision as a new revision of its
 //! task's Task record. The driver writes every revision to the voters

@@ -423,8 +423,6 @@ def add_greetings(older: Greeting, newer: Greeting) -> Greeting:
 
 
 def test_a_coalescing_task_is_registered_with_its_kind_and_reducer(fresh_registry):
-    from kabudachi import coalescing_task
-
     defined = coalescing_task(
         name="coalesce.merged", merge=add_greetings, drop_oldest=True
     )(charge_greeting).definition
@@ -448,8 +446,6 @@ def three_arguments(a: Greeting, b: Greeting, c: Greeting) -> Greeting:
 
 @pytest.mark.parametrize("bad", ["not callable", 3, one_argument, three_arguments])
 def test_a_reducer_must_be_a_function_of_two_arguments(fresh_registry, bad):
-    from kabudachi import coalescing_task
-
     with pytest.raises(TaskDefinitionError, match="merge"):
         coalescing_task(name="coalesce.bad", merge=bad)(charge_greeting)
 
@@ -749,11 +745,19 @@ def test_configure_wins_over_the_environment(monkeypatch):
     assert configuration.resolve("concurrency") == 9
 
 
-def test_an_invalid_environment_value_is_a_configuration_error(monkeypatch):
-    monkeypatch.setenv("KABUDACHI_CONCURRENCY", "many")
+@pytest.mark.parametrize(
+    "setting, raw",
+    [
+        ("concurrency", "many"),
+        # A queue named twice: which of its timeouts was meant is unknowable.
+        ("reconnect_timeouts", "slow=90, slow=5"),
+    ],
+)
+def test_an_invalid_environment_value_is_a_configuration_error(monkeypatch, setting, raw):
+    monkeypatch.setenv("KABUDACHI_" + setting.upper(), raw)
 
-    with pytest.raises(ConfigurationError, match="concurrency"):
-        Configuration().resolve("concurrency")
+    with pytest.raises(ConfigurationError, match=setting):
+        Configuration().resolve(setting)
 
 
 def test_the_environment_is_read_when_a_setting_is_first_needed(monkeypatch):

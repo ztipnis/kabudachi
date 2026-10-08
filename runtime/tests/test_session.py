@@ -1559,9 +1559,18 @@ def queue_reconnect(request: Greeting) -> Greeting:
     return request
 
 
+def tiny_reconnect(request: Greeting) -> Greeting:
+    return request
+
+
 def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
     world = World()
-    world.configuration.configure(reconnect_timeouts={"slow": 90})
+    timeouts = {"slow": 90, "tiny": 1e-9}
+    world.configuration.configure(reconnect_timeouts=timeouts)
+    # Changing the mapping after configuring it changes nothing, even once
+    # another setting is configured.
+    timeouts["slow"] = 1
+    world.configuration.configure(result_ttl=60)
     own = Task(
         quick_reconnect,
         registry=world.registry,
@@ -1577,7 +1586,15 @@ def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
         name="tests.queue_reconnect",
         queue="slow",
     )
-    for task in (own, from_queue):
+    # Under a millisecond, which still waits at least one.
+    tiny = Task(
+        tiny_reconnect,
+        registry=world.registry,
+        serializers=world.serializers,
+        name="tests.tiny_reconnect",
+        queue="tiny",
+    )
+    for task in (own, from_queue, tiny):
         world.session.submit(task.definition, Greeting(text="hi"))
 
     async def claimed():
@@ -1588,4 +1605,5 @@ def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
     assert {claim.definition_id: claim.reconnect_timeout_ms for claim in claims} == {
         "tests.quick_reconnect": 5_000,
         "tests.queue_reconnect": 90_000,
+        "tests.tiny_reconnect": 1,
     }

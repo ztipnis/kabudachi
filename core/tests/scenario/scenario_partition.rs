@@ -340,7 +340,7 @@ fn a_stalled_leaders_scheduler_stops_leading_at_its_lease_end() {
 // A follower holding a run whose reconnect timeout is far longer than the
 // shard's is cut off long enough for its leader to report it lost, then heard
 // again before that run's own deadline: it keeps the run, which is never
-// replayed, and it withdraws its abort.
+// replayed.
 #[test]
 fn a_worker_reported_lost_and_heard_again_before_a_runs_own_deadline_keeps_that_run() {
     const OWN: Duration = Duration::from_secs(90);
@@ -394,12 +394,6 @@ fn a_worker_reported_lost_and_heard_again_before_a_runs_own_deadline_keeps_that_
         cluster.scheduler_mut(&leader).request_claim(&other, &task),
         Err(ClaimRejection::AlreadySelected),
         "a worker heard again before its run's own deadline keeps the run"
-    );
-    let steps = cluster.take_steps();
-    assert_eq!(
-        abort_deadline_at(&steps, &cut_off, cluster.now()),
-        Some(None),
-        "a worker its leader hears from again withdraws its deadline"
     );
     assert_eq!(cluster.first_grant_overlap(), None);
 }

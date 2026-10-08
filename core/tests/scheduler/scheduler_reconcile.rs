@@ -362,6 +362,9 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
         .scheduler
         .request_claim(&worker("w4"), &answered)
         .unwrap();
+    old.scheduler
+        .report_started(&worker("w4"), &answered_claim.task_run_id)
+        .unwrap();
     old.scheduler.request_claim(&worker("w5"), &empty).unwrap();
     let records = newest_records(&old);
     let mut new = reconciling_after(&old);
@@ -380,6 +383,8 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
         .unwrap();
     new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
     assert!(rebuilt.silent_holders.is_empty(), "no record is installed yet");
+    // w4 was reported silent before its late answer arrived.
+    new.scheduler.note_silence(&worker("w4"), Some(new.clock.now()));
 
     let adopted = new
         .scheduler
@@ -391,47 +396,16 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
         .unwrap();
 
     assert_eq!(adopted.silent_holders, BTreeSet::from([worker("w3")]));
-}
-
-// A worker reported silent answers the rebuild late, with a record that
-// arrives after the grant: its report counts as hearing it, so its silence
-// ends and its run is kept past the reconnect timeout that silence counted.
-#[test]
-fn a_silent_worker_whose_late_report_is_adopted_is_heard_and_keeps_its_run() {
-    let mut old = Fixture::leading();
-    let task = old.scheduler.submit(plain(b"late")).unwrap();
-    let claim = old.scheduler.request_claim(&worker("w1"), &task).unwrap();
-    old.scheduler
-        .report_started(&worker("w1"), &claim.task_run_id)
-        .unwrap();
-    let records = newest_records(&old);
-    let mut new = reconciling_after(&old);
-    new.scheduler
-        .reconcile(Rebuild {
-            uncertain: BTreeMap::from([(task.clone(), BTreeSet::new())]),
-            ..Rebuild::default()
-        })
-        .unwrap();
-    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
-    new.scheduler.note_silence(&worker("w1"), Some(new.clock.now()));
-
-    let adopted = new
-        .scheduler
-        .adopt(Rebuild {
-            records,
-            reports: report("w1", vec![reported(&claim, ReportedState::Running)]),
-            ..Rebuild::default()
-        })
-        .unwrap();
+    // The late answer counts as hearing w4: its silence ends, and its run is
+    // kept past the reconnect timeout that silence counted.
+    assert!(
+        adopted.answered.contains(&worker("w4")),
+        "its node is told the worker was heard"
+    );
     new.clock.advance(ElectionTimings::DEFAULT_RECONNECT_TIMEOUT);
     new.clock.advance(ticks(1));
     new.scheduler.catch_up();
-
-    assert!(
-        adopted.answered.contains(&worker("w1")),
-        "its node is told the worker was heard"
-    );
-    assert_eq!(last_states(&new, &task), [TaskRunState::Running]);
+    assert_eq!(last_states(&new, &answered), [TaskRunState::Running]);
 }
 
 #[test]

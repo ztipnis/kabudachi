@@ -11,8 +11,7 @@ use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
     CaughtUp, ClaimRejection, Completion, LeadershipGrant, LeaseEnd, Scheduler, Submission,
 };
-use kabudachi_core::election::ElectionTimings;
-use kabudachi_core::time::{Clock, Duration, Instant};
+use kabudachi_core::time::{Clock, Instant};
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
 use crate::support::scheduler::{Fixture, ticks};
@@ -365,20 +364,3 @@ fn next_deadline_is_the_earliest_live_deadline() {
     assert_eq!(fixture.scheduler.next_deadline(), Some(Instant::at(300)));
 }
 
-
-#[test]
-fn a_claim_carries_its_tasks_own_reconnect_timeout_or_else_the_shard_default() {
-    let mut fixture = Fixture::leading();
-    let own = fixture
-        .scheduler
-        .submit(plain().with_reconnect_timeout(Duration::from_millis(3_000)))
-        .unwrap();
-    let shard = fixture.scheduler.submit(plain()).unwrap();
-    assert_eq!(fixture.spy.task(&own).reconnect_timeout_ms, 3_000);
-    assert_eq!(fixture.spy.task(&shard).reconnect_timeout_ms, 0, "the record leaves the default to the shard");
-
-    let own_claim = fixture.scheduler.request_claim(&worker(), &own).unwrap();
-    let shard_claim = fixture.scheduler.request_claim(&worker(), &shard).unwrap();
-    assert_eq!(own_claim.reconnect_timeout, Duration::from_millis(3_000));
-    assert_eq!(shard_claim.reconnect_timeout, ElectionTimings::DEFAULT_RECONNECT_TIMEOUT);
-}

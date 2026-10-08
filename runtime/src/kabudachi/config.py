@@ -250,7 +250,8 @@ def _positive_seconds(value: Any) -> bool:
 
 def _queue_seconds(raw: str) -> dict[str, float]:
     """`queue=seconds` pairs separated by commas, as a mapping. Raises
-    `ValueError` for a pair without `=` or seconds that are not a number."""
+    `ValueError` for a pair without `=`, seconds that are not a number, or
+    a queue named twice."""
     pairs: dict[str, float] = {}
     for item in raw.split(","):
         if not item.strip():
@@ -258,7 +259,10 @@ def _queue_seconds(raw: str) -> dict[str, float]:
         queue, separator, seconds = item.partition("=")
         if not separator:
             raise ValueError(raw)
-        pairs[queue.strip()] = float(seconds)
+        queue = queue.strip()
+        if queue in pairs:
+            raise ValueError(raw)
+        pairs[queue] = float(seconds)
     return pairs
 
 
@@ -301,6 +305,9 @@ class Configuration:
         """
         configured = {**self._configured, **settings}
         validated = self._validate(configured)
+        if "reconnect_timeouts" in settings:
+            # A copy: a mapping the caller changes later changes nothing here.
+            configured["reconnect_timeouts"] = dict(validated.reconnect_timeouts)
         self._configured, self._settings = configured, validated
 
     def resolve(self, name: str, task_value: Any = UNSET) -> Any:

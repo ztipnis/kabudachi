@@ -414,10 +414,11 @@ impl LeaderOffice {
     /// `workers` answered this office's rebuild at `now`: each is heard, as
     /// by a heartbeat, so it counts as silent again only from now, and a
     /// silence reported for it is forgotten. A counted member that still
-    /// confirms no ack stays lost, and is silent by its last confirmation,
-    /// as for a heartbeat (see [`Self::silent_from`]): it is reported silent
-    /// again a suspicion timeout after that confirmation, at once if that
-    /// has passed.
+    /// confirms no ack stays lost, and is silent again a suspicion timeout
+    /// after the first heartbeat heard from it since it was reported lost,
+    /// or after this answer if none has been heard since (see
+    /// [`Self::silent_from`]); it is reported silent at once if that has
+    /// passed.
     pub(crate) fn heard_answers(&mut self, workers: BTreeSet<WorkerId>, me: &WorkerId, now: Instant) {
         for worker in workers.into_iter().filter(|worker| worker != me) {
             self.last_heard.insert(worker.clone(), now);

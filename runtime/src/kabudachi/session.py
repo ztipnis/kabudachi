@@ -134,16 +134,16 @@ class Session:
 
     def _reconnect_timeout_ms(self, definition: TaskDefinition, queue: str) -> int | None:
         """The reconnect timeout a run of `definition` sent to `queue`
-        carries, in whole milliseconds rounded up so it is never replayed
-        early: the task's own, else the one configured for the queue. `None`
-        leaves it to the shard."""
+        carries, in whole milliseconds rounded up, and at least one, so it
+        is never replayed early: the task's own, else the one configured for
+        the queue. `None` leaves it to the shard."""
         timeout = definition.reconnect_timeout
         if timeout is None:
             seconds = self._configuration.resolve("reconnect_timeouts").get(queue)
             if seconds is None:
                 return None
             timeout = timedelta(seconds=seconds)
-        return math.ceil(timeout / timedelta(milliseconds=1))
+        return max(1, math.ceil(timeout / timedelta(milliseconds=1)))
 
     def submit_serialized(
         self, definition_id: str, payload: bytes, options: SubmissionOptions

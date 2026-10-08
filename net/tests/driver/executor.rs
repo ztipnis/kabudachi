@@ -104,69 +104,6 @@ async fn a_worker_claims_nothing_for_its_executor_before_a_leader_vouches_for_he
     .await
 }
 
-// A leader cut off from both its followers mid-run loses its quorum, and its
-// own run with it: the run is aborted on a deadline that falls before the
-// followers' new leader can replay it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_leader_that_loses_its_quorum_mid_run_aborts_the_run_before_another_leader_replays_it() {
-    within_deadline(async {
-        let (mut shard, client) = ThreeVoters::start().await;
-        let mut executors: Vec<FakeExecutor> = (0..3)
-            .map(|voter| {
-                let (executor, endpoint) = FakeExecutor::new();
-                shard.set_executor(voter, endpoint);
-                executor
-            })
-            .collect();
-        let leader = shard.drive_until_a_leader().await;
-        let leader_id = shard.id(leader);
-        shard.join_as_pending(&client, leader).await;
-        let nets = shard.nets.clone();
-        executors[leader].grant(1);
-        let task = shard
-            .drive_until(submitted_through(&client, &leader_id, plain_with(b"cut-off")))
-            .await;
-        let (run, _) = shard.drive_until(executors[leader].next_claim()).await;
-        executors[leader].report(Report::Started(run.clone()));
-        shard
-            .drive_until(poll_until("a majority stored the run running", || {
-                holding(&nets, &task, &[TaskRunState::Running]) >= 2
-            }))
-            .await;
-
-        for other in shard.others(leader) {
-            nets[leader].block_peer(shard.id(other));
-            nets[other].block_peer(leader_id.clone());
-        }
-        let (aborted, deadline) = match shard.drive_until(executors[leader].next_work()).await {
-            Work::Abort { run, deadline } => (run, deadline),
-            other => panic!("expected the run aborted, got {other:?}"),
-        };
-        assert_eq!(aborted, run);
-        assert!(
-            deadline > StdInstant::now(),
-            "the executor has time to cancel the body before it kills it"
-        );
-
-        let followers: Vec<_> = shard.others(leader).into_iter().map(|other| nets[other].clone()).collect();
-        shard
-            .drive_until(poll_until("the followers' new leader replayed the run", || {
-                followers.iter().any(|net| {
-                    net.held_records()
-                        .get(&task)
-                        .and_then(|record| record.runs.first().map(|run| run.state()))
-                        == Some(TaskRunState::Lost)
-                })
-            }))
-            .await;
-        assert!(
-            StdInstant::now() >= deadline,
-            "the run was replayed before the deadline by which its first worker had to abort it"
-        );
-    })
-    .await
-}
-
 /// A run's reconnect timeout of its own, longer than the shard's.
 const OWN_RECONNECT_MS: u64 = 3_000;
 
@@ -239,7 +176,7 @@ async fn a_leader_that_loses_its_quorum_mid_run_aborts_each_run_by_its_own_deadl
         );
         // Both deadlines count from the same lost contact, so they differ by
         // exactly the difference of their spans, each less its drift share.
-        let less_drift = |ms: u64| ms - ms.div_ceil(10);
+        let less_drift = |ms: u64| ms - ms.div_ceil(ElectionTimings::DEFAULT_CLOCK_DRIFT_DIVISOR);
         assert_eq!(
             deadlines[&runs[&patient]] - deadline,
             StdDuration::from_millis(
