@@ -95,6 +95,9 @@ class _TaskProcess:
         self._outcomes: dict[str, asyncio.Future[Any]] = {}
         self._running: set[str] = set()
         self._draining = False
+        # Set by SIGTERM: what the bodies do from then on is not reported,
+        # so the worker counts their runs lost with this process.
+        self._stopping = False
         self._finished = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._buffer_lock = threading.Lock()
@@ -123,6 +126,7 @@ class _TaskProcess:
 
     async def serve(self, ready: ipc.Ready) -> None:
         loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, self._stop_now)
         self._hosted.attach(loop)
         # A stand-in with only what a body reaches through `kabudachi`.
         activate(_ChildSession(self))  # type: ignore[arg-type]
@@ -210,6 +214,21 @@ class _TaskProcess:
                 self._draining = True
                 self._finish_if_idle()
 
+    def _stop_now(self) -> None:
+        """SIGTERM: cancels every body and ends the process once the async
+        ones have stopped, without reporting their runs, which the worker
+        counts lost when this process exits. A synchronous body cannot be
+        stopped; the exit ends it. An async body that ignores the cancel
+        keeps this process up until the worker's SIGKILL ends it."""
+        self._stopping = True
+        outcomes = list(self._outcomes.values())
+        for outcome in outcomes:
+            outcome.cancel()
+        if not outcomes:
+            _exit(0)
+        stopped = asyncio.get_running_loop().create_task(asyncio.wait(outcomes))
+        stopped.add_done_callback(lambda _: _exit(0))
+
     def _start_run(self, frame: ipc.Run) -> None:
         # A body that waits for a task it called gives its place back meanwhile.
         context = contextvars.copy_context()
@@ -245,6 +264,8 @@ class _TaskProcess:
 
     def _report_result(self, run_id: str, outcome: "asyncio.Future[Any]") -> None:
         self._outcomes.pop(run_id, None)
+        if self._stopping:
+            return
         asked = run_id in self._cancel_asked
         self._cancel_asked.discard(run_id)
         if outcome.cancelled():
@@ -267,6 +288,8 @@ class _TaskProcess:
 
     def _report_compaction(self, run_id: str, outcome: "asyncio.Future[Any]") -> None:
         self._outcomes.pop(run_id, None)
+        if self._stopping:
+            return
         asked = run_id in self._cancel_asked
         self._cancel_asked.discard(run_id)
         if outcome.cancelled():
@@ -286,6 +309,8 @@ class _TaskProcess:
 
     def _exited(self, run_id: str) -> None:
         self._running.discard(run_id)
+        if self._stopping:
+            return
         self.send(ipc.Exited(run_id))
         self._finish_if_idle()
 

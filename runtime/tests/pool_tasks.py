@@ -158,6 +158,21 @@ async def cancellable(request: Greeting) -> Greeting:
     return request
 
 
+@kabudachi.task(name="pool.reports_and_sleeps")
+async def reports_and_sleeps(request: Greeting) -> Greeting:
+    """Sleeps `request.text` seconds, saying on stdout, which a task process
+    shares with its worker, when it starts (with its process id), ends, or
+    is cancelled."""
+    print(f"task started {os.getpid()}", flush=True)
+    try:
+        await asyncio.sleep(float(request.text))
+    except asyncio.CancelledError:
+        print("task cancelled", flush=True)
+        raise
+    print("task done", flush=True)
+    return request
+
+
 @kabudachi.task(name="pool.ignores_cancel", cancel_grace=timedelta(milliseconds=200))
 async def ignores_cancel(request: Greeting) -> Greeting:
     marker("ignoring").touch()

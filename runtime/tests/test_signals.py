@@ -2,7 +2,9 @@
 can be sent. With no `main` it serves as a worker until SIGINT or SIGTERM: the
 first signal drains gracefully and a second gives up waiting. With a `main`,
 Ctrl-C cancels it, everything is cleaned up, the KeyboardInterrupt reaches the
-caller, and `run()` works again afterwards."""
+caller, and `run()` works again afterwards. With task processes, those ignore
+Ctrl-C, a second signal stops them at once, and they never outlive a killed
+worker."""
 
 import json
 import os
@@ -209,6 +211,136 @@ def test_a_second_signal_while_a_synchronous_task_runs_raises_at_once_and_the_th
     assert lines[0] == "forced", errors
     assert "handlers restored: True" in lines, errors
     assert process.returncode == 0, errors
+
+
+# --- Task processes --------------------------------------------------------
+
+POOL_PROGRAM = textwrap.dedent(
+    """
+    import json
+    import sys
+    import threading
+    import time
+
+    sys.path[:0] = json.loads(sys.argv[1])
+
+    import kabudachi
+    import pool_tasks
+    from kabudachi import session
+    from proto_messages import Greeting
+
+
+    def call_once_serving():
+        while session.active_session() is None:
+            time.sleep(0.01)
+        pool_tasks.reports_and_sleeps(Greeting(text=sys.argv[2]))
+
+
+    if __name__ == "__main__":
+        kabudachi.configure(processes=1)
+        threading.Thread(target=call_once_serving, daemon=True).start()
+        try:
+            print("serving result:", kabudachi.run(), flush=True)
+        except KeyboardInterrupt:
+            print("forced", flush=True)
+    """
+)
+
+
+@pytest.fixture
+def pool_served():
+    """Starts a worker with one task process, in a process group of its own,
+    and gives back a function that waits for its task to start and returns
+    the worker and the task process's id; the worker is always killed and
+    reaped afterwards."""
+    processes = []
+
+    def start(task_seconds):
+        process = subprocess.Popen(
+            [sys.executable, "-c", POOL_PROGRAM, json.dumps(sys.path), str(task_seconds)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        processes.append(process)
+        ready, _, _ = select.select([process.stdout], [], [], STARTUP_SECONDS)
+        assert ready, "the task did not start in time"
+        started, pid = process.stdout.readline().strip().rsplit(" ", 1)
+        assert started == "task started"
+        return process, int(pid)
+
+    yield start
+    for process in processes:
+        process.kill()
+        process.communicate()
+
+
+def gone(pid, within=10):
+    """Whether process `pid` has ended, waiting up to `within` seconds. A
+    zombie counts as ended: an orphan waits for whichever process adopted it
+    to reap it."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as stat:
+                if stat.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    return True
+        except OSError:
+            pass  # no /proc (macOS), or the process ended meanwhile
+        time.sleep(0.05)
+    return False
+
+
+def test_task_processes_ignore_ctrl_c_and_finish_while_the_worker_drains(pool_served):
+    process, task_process = pool_served(task_seconds=0.5)
+    os.killpg(process.pid, signal.SIGINT)  # a terminal's Ctrl-C reaches the whole group
+
+    lines, errors = finish(process)
+
+    assert lines == ["task done", "serving result: None"], errors
+    assert gone(task_process)
+
+
+def next_line(process, within=STARTUP_SECONDS):
+    ready, _, _ = select.select([process.stdout], [], [], within)
+    assert ready, "the worker printed nothing in time"
+    return process.stdout.readline().strip()
+
+
+def test_sigterm_cancels_a_task_process_s_bodies_and_a_second_signal_sends_it(pool_served):
+    process, first = pool_served(task_seconds=60)
+
+    # Stopped on its own, its body is cancelled, not failed: lost with the
+    # process, it runs again in the replacement.
+    os.kill(first, signal.SIGTERM)
+    assert next_line(process) == "task cancelled"
+    started, second = next_line(process).rsplit(" ", 1)
+    assert started == "task started" and int(second) != first
+    assert gone(first)
+
+    process.send_signal(signal.SIGTERM)
+    time.sleep(0.5)
+    assert process.poll() is None, "the first signal must wait for the running task"
+    process.send_signal(signal.SIGTERM)
+
+    lines, errors = finish(process, timeout=30)
+
+    assert lines == ["task cancelled", "forced"], errors
+    assert gone(int(second))
+
+
+def test_task_processes_exit_when_their_worker_is_killed(pool_served):
+    process, task_process = pool_served(task_seconds=60)
+
+    process.kill()
+    process.communicate()
+
+    assert gone(task_process)
 
 
 SERVE_SLOW_START_PROGRAM = textwrap.dedent(

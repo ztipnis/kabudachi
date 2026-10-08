@@ -134,6 +134,7 @@ py_test(
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",  # keep
         "//runtime/tests:faulting_runtime",  # keep
+        "//runtime/tests:pool_tasks",  # keep
         "@pypi//pytest",  # keep
     ],
 )
