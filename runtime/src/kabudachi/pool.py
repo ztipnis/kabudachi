@@ -90,6 +90,8 @@ class _Child:
     ) -> None:
         self.number = number
         self.process = process
+        # Runs sent to it, compactions not counted.
+        self.runs = 0
         self.connection = connection
         self.slots: dict[str, _Slot] = {}
         # Tasks bodies here called, until their outcome is sent here.
@@ -132,9 +134,12 @@ class ProcessPool:
         self._registry = registry
         self._context = multiprocessing.get_context("spawn")
         self._loop: asyncio.AbstractEventLoop | None = None
-        # The children counted against `processes`; condemned ones are not.
+        # The children counted against `processes`; condemned and retiring
+        # ones are not.
         self._children: list[_Child] = []
         self._condemned: set[_Child] = set()
+        # Taking no new runs and exiting on their own once their runs finish.
+        self._retiring: set[_Child] = set()
         self._slots: dict[str, _Slot] = {}
         # Handed over, not yet sent to a child.
         self._pending: list[_Slot] = []
@@ -215,7 +220,7 @@ class ProcessPool:
         for replacing in self._replacing:
             # A child it already spawned is among the children below.
             replacing.cancel()
-        children = [*self._children, *self._condemned]
+        children = [*self._children, *self._condemned, *self._retiring]
         if not kill:
             for child in children:
                 child.draining = True
@@ -282,15 +287,7 @@ class ProcessPool:
             slot.outcome.cancel()  # never sent: nothing runs, nothing to stop
             return
         slot.abandoned = True
-        child = slot.child
-        if not child.condemned:
-            child.condemned = True
-            if child in self._children:
-                self._children.remove(child)
-            self._condemned.add(child)
-            if self._serving:
-                self._replace(None)
-        self._end_if_condemned(child)
+        self._condemn(slot.child)
 
     def _hand_over(self, job: RunJob | CompactJob) -> _Slot:
         loop = self._started_loop()
@@ -318,6 +315,20 @@ class ProcessPool:
             slot.child = child
             child.slots[slot.job.run_id] = slot
             child.send(_frame_for(slot.job))
+            if isinstance(slot.job, RunJob):
+                child.runs += 1
+                if self._recycles_after(child, slot.job):
+                    self._retire(child)
+
+    def _recycles_after(self, child: _Child, job: RunJob) -> bool:
+        """Whether `child` takes no run after `job`: it has reached
+        `max_runs_per_process`, or `job`'s task asks for a fresh process
+        after each run."""
+        limit = self._settings.max_runs_per_process
+        if limit is not None and child.runs >= limit:
+            return True
+        definition = self._registry.get(job.definition_id)
+        return definition is not None and definition.recycle_process
 
     def _least_busy(self) -> _Child | None:
         open_children = [
@@ -537,6 +548,36 @@ class ProcessPool:
 
         handle._outcome.add_done_callback(settled)
 
+    def _retire(self, child: _Child) -> None:
+        """`child` takes no new runs, finishes the ones it has and exits on
+        its own; nothing it runs is cut short. A replacement starts at once."""
+        if child.condemned or child.draining:
+            return
+        child.draining = True
+        self._set_aside(child, self._retiring)
+        child.send(ipc.Drain())
+
+    def _condemn(self, child: _Child) -> None:
+        """`child` takes no new runs, and is stopped (SIGTERM, then SIGKILL)
+        once every body on it has exited or been given up on; its other runs
+        are never killed for it. A replacement starts at once."""
+        if not child.condemned:
+            child.condemned = True
+            self._set_aside(child, self._condemned)
+        self._end_if_condemned(child)
+
+    def _set_aside(self, child: _Child, into: set[_Child]) -> None:
+        """Moves `child` out of the processes counted against `processes`,
+        into `into`, and starts its replacement at once if it was counted.
+        The replacement starts without the wait after a quick death: the
+        child did not die."""
+        self._retiring.discard(child)
+        into.add(child)
+        if child in self._children:
+            self._children.remove(child)
+            if self._serving:
+                self._replace(None)
+
     def _end_if_condemned(self, child: _Child) -> None:
         if child.condemned and all(slot.abandoned for slot in child.slots.values()):
             self._terminate(child)
@@ -582,13 +623,14 @@ class ProcessPool:
         if child in self._children:
             self._children.remove(child)
         self._condemned.discard(child)
+        self._retiring.discard(child)
         _set_done(child.buried)
         if replace:
             self._replace(child)
         self._dispatch()
 
     def _replace(self, dead: _Child | None) -> None:
-        """Starts a child in place of `dead`, or of a condemned child (`None`)
+        """Starts a child in place of `dead`, or of a child set aside (`None`)
         at once. After a child that died quickly the start waits, longer for
         each quick death in a row."""
         delay = 0.0

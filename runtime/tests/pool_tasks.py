@@ -183,3 +183,11 @@ async def ignores_cancel(request: Greeting) -> Greeting:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             continue
+
+
+@kabudachi.task(name="pool.recycles", recycle_process=True)
+async def recycles(request: Greeting) -> Greeting:
+    """Still running when its process stops taking runs, so it shows the
+    process finished it instead of cutting it short."""
+    await asyncio.sleep(0.3)
+    return Greeting(times=os.getpid())

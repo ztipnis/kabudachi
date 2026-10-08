@@ -241,3 +241,23 @@ def test_a_cancelled_body_stops_when_asked_and_one_that_will_not_costs_its_proce
     # A cancel racing a result in flight: each handle ends once, either way.
     assert all(isinstance(outcome, (Greeting, TaskCancelledError)) for outcome in outcomes), outcomes
     assert replaced != kept, "a body that ignored the cancel past its grace cost its process"
+
+
+def test_a_task_process_is_replaced_after_its_run_limit_and_after_a_recycling_task_once_its_run_finishes():
+    kabudachi.configure(processes=1, concurrency=1, max_runs_per_process=3)
+
+    async def main():
+        async with asyncio.timeout(30):
+            pids = [(await pool_tasks.where_async(Greeting())).times for _ in range(4)]
+            pids.append((await pool_tasks.recycles(Greeting())).times)
+            pids.append((await pool_tasks.where_async(Greeting())).times)
+            return pids
+
+    pids = kabudachi.run(main)
+
+    # The recycling run returning the second process's id shows the drain was
+    # graceful: a killed process would have lost it, and its replay would
+    # have reported the third.
+    first, second, third = pids[0], pids[3], pids[5]
+    assert pids == [first] * 3 + [second] * 2 + [third], pids
+    assert len({first, second, third, os.getpid()}) == 4
