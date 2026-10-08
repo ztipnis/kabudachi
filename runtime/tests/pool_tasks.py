@@ -3,8 +3,13 @@ processes find them by importing this module. Bodies leave marks in the
 directory `KABUDACHI_TEST_MARKERS` names, which a test shares with its task
 processes."""
 
+import asyncio
 import os
+import time
 from pathlib import Path
+
+import kabudachi
+from proto_messages import Greeting
 
 MARKERS = "KABUDACHI_TEST_MARKERS"
 
@@ -20,3 +25,48 @@ def first_time(name: str) -> bool:
     except FileExistsError:
         return False
     return True
+
+
+@kabudachi.task(name="pool.where_async")
+async def where_async(request: Greeting) -> Greeting:
+    """Sleeps `request.text` seconds; gives this process's id and the time it ended."""
+    await asyncio.sleep(float(request.text or 0))
+    return Greeting(times=os.getpid(), text=repr(time.time()))
+
+
+@kabudachi.task(name="pool.where_sync")
+def where_sync(request: Greeting) -> Greeting:
+    time.sleep(float(request.text or 0))
+    return Greeting(times=os.getpid(), text=repr(time.time()))
+
+
+@kabudachi.task(name="pool.sized")
+def sized(request: Greeting) -> Greeting:
+    return Greeting(text="x" * request.times)
+
+
+@kabudachi.task(name="pool.refuses")
+def refuses(request: Greeting) -> Greeting:
+    raise ValueError(f"refused {request.text}")
+
+
+@kabudachi.task(name="pool.cancels_itself")
+async def cancels_itself(request: Greeting) -> Greeting:
+    """Raises CancelledError though nobody asked it to stop."""
+    raise asyncio.CancelledError
+
+
+def fold_left(older: Greeting, newer: Greeting) -> Greeting:
+    marker("folded-in").write_text(str(os.getpid()))
+    return Greeting(text=f"({older.text}>{newer.text})")
+
+
+@kabudachi.coalescing_task(name="pool.refresh", merge=fold_left)
+async def refresh(request: Greeting) -> Greeting:
+    if request.text == "holder":
+        marker("holding").touch()
+        for _ in range(500):  # holds the key until a compaction has folded
+            if marker("folded-in").exists():
+                return Greeting(text="held until folded")
+            await asyncio.sleep(0.01)
+    return request

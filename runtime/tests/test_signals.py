@@ -5,6 +5,7 @@ Ctrl-C cancels it, everything is cleaned up, the KeyboardInterrupt reaches the
 caller, and `run()` works again afterwards."""
 
 import json
+import os
 import select
 import signal
 import subprocess
@@ -85,6 +86,9 @@ SERVE_PROGRAM = textwrap.dedent(
 
 
 STARTUP_SECONDS = 30
+# The programs declare their tasks in themselves (`__main__`), which no task
+# process could import, so bodies run in the program's own process.
+IN_PROCESS = {**os.environ, "KABUDACHI_PROCESSES": "0"}
 
 
 @pytest.fixture
@@ -99,6 +103,7 @@ def served():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=IN_PROCESS,
         )
         processes.append(process)
         ready, _, _ = select.select([process.stdout], [], [], STARTUP_SECONDS)
@@ -257,6 +262,7 @@ def test_a_signal_before_leadership_stops_the_worker_once_it_is_up():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=IN_PROCESS,
     )
     try:
         ready, _, _ = select.select([process.stdout], [], [], STARTUP_SECONDS)
@@ -312,6 +318,7 @@ def test_ctrl_c_interrupts_run_cleanly_and_run_works_again():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=IN_PROCESS,
     )
     try:
         ready, _, _ = select.select([process.stdout], [], [], STARTUP_SECONDS)
@@ -375,6 +382,7 @@ def test_ctrl_c_before_leadership_interrupts_run_cleanly_and_run_works_again():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=IN_PROCESS,
     )
     try:
         ready, _, _ = select.select([process.stdout], [], [], STARTUP_SECONDS)

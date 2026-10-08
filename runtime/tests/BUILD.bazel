@@ -162,6 +162,20 @@ py_library(
     srcs = ["pool_tasks.py"],
     imports = ["."],
     visibility = ["//:__subpackages__"],
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+    ],
+)
+
+# A module only task processes import, through `imports`.
+# gazelle:resolve py pool_slow_import //runtime/tests:pool_slow_import
+py_library(
+    name = "pool_slow_import",
+    testonly = True,
+    srcs = ["pool_slow_import.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
 )
 
 py_test(
@@ -172,6 +186,9 @@ py_test(
     deps = [
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
+        "//runtime/tests:pool_slow_import",  # keep
+        "//runtime/tests:pool_tasks",
+        "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
     ],
 )

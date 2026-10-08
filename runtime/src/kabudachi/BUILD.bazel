@@ -19,6 +19,7 @@ py_library(
         "ipc.py",
         "native_protocol.py",
         "options.py",
+        "pool.py",
         "protobuf_serializer.py",
         "registry.py",
         "runner.py",
