@@ -111,11 +111,11 @@
 //!
 //! The same client serves a node that fenced itself and found its shard
 //! recovered without it, and so went back to `Bootstrapping`: it rejoins
-//! through [`crate::leader_search::Rejoin`], which reads the authority's
+//! through [`crate::leader_search::DrivenSearch`], which reads the authority's
 //! listing through the client and asks the listed workers who leads. The
 //! driver is the client's one reader, and hands each reply to whom asked for
 //! it: a reply under the node's own token steps the node, and one under
-//! net's own goes to the rejoin.
+//! net's own goes to the search.
 //!
 //! A node that stays in `RollCall` or `NoQuorum` for one suspicion timeout
 //! has lost touch with its shard, and may be cut off from a leader that
@@ -141,7 +141,7 @@ use kabudachi_core::election::{
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    ClaimResponse, ElectionMessage, JoinResponse, TaskResponse, claim_request, task_request,
+    ClaimResponse, ElectionMessage, TaskResponse, claim_request, task_request,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::reconcile::active_runs_digest;
@@ -159,8 +159,8 @@ use crate::authority::AuthorityClient;
 use crate::bootstrap::DEFAULT_RETRY_INTERVAL;
 use crate::claim::{self, ClaimRequestHandle};
 use crate::handoff::{HandedOff, hand_off_held_records};
-use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, LeaderSearch, pointer_for};
-use crate::leader_search::{JoinOverNet, Rejoin, StrandedWatch};
+use crate::join::{DEFAULT_JOIN_PEER_TIMEOUT, pointer_for};
+use crate::leader_search::{DrivenSearch, JoinOverNet};
 use crate::messenger::{Net, PlacedWrite, WriteOutcome};
 use crate::reconcile::leader::{LeaderReconciliation, Progress, Stuck};
 use crate::reconcile::report::page_of;
@@ -204,36 +204,6 @@ impl Default for DriverConfig {
             runs_compaction: false,
         }
     }
-}
-
-/// The search the driver runs for a node in `state`, if any. A rejoin needs
-/// an authority to confirm a pointer against. A stranded node's leader
-/// search needs someone to ask, an authority's listing or a seed: with
-/// neither it would run empty rounds every retry interval.
-fn search_purpose(
-    state: WorkerState,
-    authority_present: bool,
-    seeds_present: bool,
-    stranded_search: bool,
-) -> Option<SearchFor> {
-    match state {
-        WorkerState::Bootstrapping | WorkerState::Joining if authority_present => {
-            Some(SearchFor::Rejoin)
-        }
-        _ if stranded_search && (authority_present || seeds_present) => Some(SearchFor::Leader),
-        _ => None,
-    }
-}
-
-/// Why the driver runs a leader search.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SearchFor {
-    /// The node fenced itself and is back in `Bootstrapping` (or `Joining` on
-    /// a pointer it took): a pointer is joined through `Input::JoinAnswer`.
-    Rejoin,
-    /// The node is stranded: the search's own dials reconnect it, and a leader
-    /// it reaches acks it as a newly connected peer.
-    Leader,
 }
 
 pub use crate::authority::SharedAuthority;
@@ -311,7 +281,7 @@ pub use crate::authority::SharedAuthority;
 /// holds across the handover. It is also what a node that fenced itself and
 /// found its shard recovered without it, and so went back to `Bootstrapping`,
 /// reads to learn whom to rejoin through (see
-/// [`crate::leader_search::Rejoin`]); the driver keeps running meanwhile.
+/// [`crate::leader_search::DrivenSearch`]); the driver keeps running meanwhile.
 pub async fn run_driver<C, I>(
     node: &mut WorkerNode<C>,
     first: Step,
@@ -333,18 +303,21 @@ where
     let mut next_deadline = None;
     // The reply whose arrival ended the last sleep, if one did.
     let mut woken_by = None;
-    // While the node is back in `Bootstrapping` or `Joining`: its search for a
-    // leader to rejoin, and the pointer the last round found.
-    // A node in `RollCall` or `NoQuorum` for a suspicion timeout runs one too,
-    // for a leader to reconnect it.
-    let mut search: Option<(SearchFor, Rejoin<'_, JoinOverNet<'_>>)> = None;
-    let mut found: Option<(SearchFor, JoinResponse)> = None;
-    let mut stranded = StrandedWatch::new(node.timings().suspect_timeout);
-    // Whether the last firing of `stranded` still calls for a search.
-    let mut stranded_search = false;
-    // The epoch read the rejoin asked last round, to tell the node of before
-    // its answer arrives.
-    let mut epoch_read_asked = None;
+    // The leader search: a rejoin while the node is back in `Bootstrapping`
+    // or `Joining`, or a stranded node's search for a leader to reconnect to.
+    let mut search = DrivenSearch::new(
+        node.shard_id(),
+        my_id.clone(),
+        JoinOverNet {
+            net,
+            per_peer_timeout: config.join_peer_timeout,
+            grace: Duration::from_millis(node.timings().suspect_timeout.as_ticks()),
+        },
+        config.seeds.clone(),
+        config.retry_interval,
+        node.timings().suspect_timeout,
+        authority.is_some(),
+    );
     // The claim answers decided but not yet sent: each waits for the writes
     // its decision made.
     let mut held_answers = EffectGate::new();
@@ -386,55 +359,26 @@ where
         if let Some(first) = first.take() {
             next_deadline = stepper.carry(first, None);
         }
-        if let Some(token) = epoch_read_asked.take() {
-            next_deadline = stepper.step(Input::AuthorityEpochAsked(token));
+        if let Some(asked) = search.take_epoch_asked() {
+            next_deadline = stepper.step(asked);
         }
         for reply in arrived_replies {
             match reply.token().issuer {
                 Issuer::Node => next_deadline = stepper.step(Input::Authority(reply)),
-                // One net asked for itself: the rejoin's read, if this is it.
-                Issuer::Cascade => match search.as_mut() {
-                    Some((purpose, search)) => {
-                        let epoch = search.offer(
-                            reply,
-                            TokioInstant::now(),
-                            stepper.node.join_floor(),
-                        );
-                        // Only a rejoin's node takes the epoch as its floor.
-                        if let Some((token, held)) = epoch
-                            && *purpose == SearchFor::Rejoin
-                        {
-                            next_deadline =
-                                stepper.step(Input::AuthorityEpochRead { token, held });
-                        }
+                // One net asked for itself: the search's, if it asked it.
+                Issuer::Cascade => {
+                    let floor = stepper.node.join_floor();
+                    if let Some(read) = search.offer(reply, floor, TokioInstant::now()) {
+                        next_deadline = stepper.step(read);
                     }
-                    None => tracing::debug!(
-                        "dropping a reply to a call net asked for itself: no search is running"
-                    ),
-                },
+                }
             }
         }
         for input in net.take_inputs() {
             next_deadline = stepper.step(input);
         }
-        if let Some((purpose, pointer)) = found.take() {
-            match purpose {
-                // A pointer the node would not take (to its old epoch's leader,
-                // or another lineage's) leaves it in `Bootstrapping`, and the
-                // rejoin, which has already paced its next round, goes on.
-                SearchFor::Rejoin => next_deadline = stepper.rejoin(pointer),
-                // Reaching the leader was the search's own work: it has dialed
-                // it, and the leader's ack follows as an ordinary input.
-                SearchFor::Leader => {
-                    tracing::info!(
-                        shard = stepper.node.shard_id().as_str(),
-                        leader = ?pointer.leader_id,
-                        "a node that had lost touch with its shard reached a leader"
-                    );
-                    stranded_search = false;
-                    search = None;
-                }
-            }
+        if let Some(pointer) = search.take_found() {
+            next_deadline = stepper.step(pointer);
         }
         // A new office (even one won as soon as the last was lost) starts
         // with no memory of the last one's writes, and tells nothing the last
@@ -551,69 +495,9 @@ where
             net.refresh_peer_routing();
         }
 
-        // A fenced node that found its shard recovered without it went back
-        // to `Bootstrapping` to join again. Only a node with an authority
-        // fences itself, and that authority lists whom to ask. A stranded node
-        // searches too, for a leader to reconnect to, and a stranded search
-        // restarts each time the watch fires, once per suspicion timeout.
-        if stranded.observe(node.state(), clock.now()) {
-            stranded_search = true;
-            if matches!(search, Some((SearchFor::Leader, _))) {
-                search = None;
-            }
-        }
-        if !matches!(node.state(), WorkerState::RollCall | WorkerState::NoQuorum) {
-            stranded_search = false;
-        }
-        let purpose = search_purpose(
-            node.state(),
-            authority.is_some(),
-            !config.seeds.is_empty(),
-            stranded_search,
-        );
-        match purpose {
-            Some(purpose) => {
-                if search.as_ref().map(|(running, _)| *running) != Some(purpose) {
-                    let rejoin = Rejoin::new(
-                        node.shard_id(),
-                        my_id.clone(),
-                        JoinOverNet {
-                            net,
-                            per_peer_timeout: config.join_peer_timeout,
-                            grace: Duration::from_millis(
-                                node.timings().suspect_timeout.as_ticks(),
-                            ),
-                        },
-                        config.seeds.clone(),
-                        config.retry_interval,
-                        TokioInstant::now(),
-                    );
-                    search = Some((
-                        purpose,
-                        if purpose == SearchFor::Leader {
-                            rejoin.for_leader_search()
-                        } else {
-                            rejoin
-                        },
-                    ));
-                }
-                let (_, running) = search.as_mut().expect("set above");
-                if node.state() == WorkerState::Joining {
-                    // `Joining` on a pointer it took: the authority's epoch
-                    // is what confirms it.
-                    if let Some(client) = authority.as_mut() {
-                        running.validate(client, clock.now(), TokioInstant::now());
-                    }
-                } else {
-                    running.tick(authority.as_mut(), clock.now(), TokioInstant::now());
-                }
-                let asked = running.take_asked_epoch_read();
-                if purpose == SearchFor::Rejoin {
-                    epoch_read_asked = asked.or(epoch_read_asked);
-                }
-            }
-            None => search = None,
-        }
+        // A fenced node that found its shard recovered without it rejoins; a
+        // stranded node searches for a leader to reconnect to.
+        search.follow(node.state(), authority.as_mut(), clock.now(), TokioInstant::now());
         // A held answer is released `NotLeader` when the scheduler's lease
         // ends, and nothing else guarantees a wake then: the election's own
         // deadlines are not shown to coincide with the grant's end (the
@@ -627,8 +511,8 @@ where
                 .lease_end()
                 .map(|end| end + kabudachi_core::time::Duration::from_ticks(1))
         };
-        let search_wake = search.as_ref().and_then(|(_, search)| search.wake_at());
-        let stranded_wake = stranded.wake_at(clock.now());
+        let search_wake = search.round_wake_at();
+        let stranded_wake = search.stranded_wake_at(clock.now());
         let reconcile_wake = reconciliation
             .as_ref()
             .and_then(|current| current.wake_at(node));
@@ -654,12 +538,8 @@ where
                 () = sleep_until(&clock, reconcile_wake) => break,
                 () = sleep_until(&clock, repair_wake) => break,
                 () = next_reconciliation(&mut reconciliation) => break,
-                result = ask_done(&mut search) => {
-                    if let Some((purpose, search)) = search.as_mut() {
-                        found = search
-                            .asked(result, TokioInstant::now())
-                            .map(|pointer| (*purpose, pointer));
-                    }
+                result = search.ask_done() => {
+                    search.asked(result, TokioInstant::now());
                     break;
                 }
                 Some(reply) = next_reply(&mut authority) => {
@@ -1048,14 +928,6 @@ where
         self.carry(stepped, Some(&input))
     }
 
-    /// Joins the node, back in `Bootstrapping`, to the leader `pointer`
-    /// names, as [`Self::step`] does with an [`Input::JoinAnswer`]. A node
-    /// with a floor only enters `Joining`: its registration restarts when a
-    /// read of the authority validates the pointer.
-    fn rejoin(&mut self, pointer: JoinResponse) -> Option<Instant> {
-        self.step(Input::JoinAnswer(pointer))
-    }
-
     /// Carries out `stepped`, a step the node has just taken on `input`,
     /// through `carry_out`: its messages go out through the `Net` and its
     /// authority calls to the [`AuthorityClient`]. With no authority, each
@@ -1240,7 +1112,7 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
                 by = ?by,
                 "this worker cannot show that its leader still hears it, or has fenced itself, \
                  and must abort every TaskRun it is running by this instant unless that \
-                 changes; no task executor exists yet in Phase 2 to carry that out"
+                 changes; this worker runs no task executor that would carry that out"
             ),
             Output::AbortDeadline(None) => tracing::info!(
                 shard = node.shard_id().as_str(),
@@ -1282,17 +1154,6 @@ async fn sleep_until<C: Clock>(clock: &C, deadline: Option<Instant>) {
 async fn wake_at(at: Option<TokioInstant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// The round's ask of a running rejoin, once it finishes; for ever when none
-/// runs. Cancel-safe.
-async fn ask_done<'a>(
-    search: &mut Option<(SearchFor, Rejoin<'a, JoinOverNet<'a>>)>,
-) -> LeaderSearch {
-    match search {
-        Some((_, search)) => search.ask_done().await,
         None => std::future::pending().await,
     }
 }
