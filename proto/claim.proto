@@ -12,7 +12,7 @@ import "task.proto";
 //
 // Like `JoinRequest`/`JoinResponse` (join.proto), this is a genuine
 // request/response exchange used directly as a `request_response::Codec`'s
-// `Request`/`Response` types (see `kabudachi_net::claim_codec`).
+// `Request`/`Response` types (see `kabudachi_net::claim::codec`).
 
 message ClaimRequest {
   oneof request {
@@ -43,7 +43,7 @@ message Claim {
 // `core::scheduler::ClaimRejection`, and `CLAIM_REJECT_NOT_MEMBER` for a
 // claimant that is neither a voter nor a pending member of the shard, which
 // must join it first. This is the same enum-plus-reason shape
-// `VoteRejectReason` (election.proto) uses for "why was this request
+// `ElectionRejectReason` (election.proto) uses for "why was this request
 // refused", rather than a separate empty message type for each reason.
 enum ClaimRejectReason {
   CLAIM_REJECT_REASON_UNSPECIFIED = 0;

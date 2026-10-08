@@ -1,7 +1,7 @@
 # kabudachi (Python runtime)
 
-The Python package of kabudachi, a peer-to-peer task queue with a compiled native core. This is
-**Phase 1**: everything runs in one process. There is one worker, which is its own leader, and no
+The Python package of kabudachi, a peer-to-peer task queue with a compiled native core. This package
+runs everything in one process: there is one worker, which is its own leader, and no
 network, so the tasks you call are queued, run and certified inside the process that calls them.
 
 Tasks take one input and return one result, both protobuf messages (`pip install kabudachi[protobuf]`),

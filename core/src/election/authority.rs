@@ -1,6 +1,6 @@
 //! The calls a [`super::WorkerNode`] asks its driver to make on the
-//! coordination authority, and the replies the driver feeds back (design
-//! 3.1). The node does no I/O: it names a call in an [`super::Output`], the
+//! coordination authority, and the replies the driver feeds back. The node
+//! does no I/O: it names a call in an [`super::Output`], the
 //! driver performs it (see [`AuthorityCall::perform`]) and hands the node
 //! the reply as an [`super::Input`]. So an authority that answers late, or
 //! from another task, times the node's lease exactly as one that answers
@@ -66,7 +66,7 @@ pub enum Issuer {
     /// A `WorkerNode`, for the calls its steps ask.
     Node,
     /// Net, for the calls it asks for itself, not for a node: the bootstrap
-    /// cascade's, and (from net #7+#9) the driver's rejoin reads.
+    /// cascade's, and the driver's rejoin reads.
     Cascade,
 }
 
