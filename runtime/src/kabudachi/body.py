@@ -8,7 +8,6 @@ fails, and it is left to finish on its own, its outcome discarded.
 
 import asyncio
 import functools
-import signal
 from collections.abc import Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
@@ -16,7 +15,7 @@ from typing import Any
 
 from asgiref.sync import sync_to_async
 
-from kabudachi.errors import TaskBodyError, UnknownTaskError
+from kabudachi.errors import TaskBodyError, UnknownTaskError, body_error, may_be_ctrl_c
 from kabudachi.lifecycle import RunHooks
 from kabudachi.registry import TaskDefinition, TaskRegistry
 from kabudachi.serializers import Serializer, SerializerRegistry
@@ -46,10 +45,10 @@ def start_body(
     A body or hook that raises `SystemExit` or `KeyboardInterrupt` fails
     with `TaskBodyError` naming the type, and `hooks.condemn` is called. One
     that raises `CancelledError` though nobody asked it to stop fails the
-    same way, without `hooks.condemn`. A `KeyboardInterrupt` on the loop's
-    thread, from an async body or its hooks, is let through unless this
-    process ignores SIGINT: there it can be a real Ctrl-C, which stops the
-    whole run."""
+    same way, without `hooks.condemn`. A `KeyboardInterrupt` from an async
+    body or its hooks is let through when the loop runs on the main thread
+    and this process does not ignore SIGINT: there it can be a real Ctrl-C,
+    which stops the whole run."""
     loop = asyncio.get_running_loop()
     exited: asyncio.Future[None] = loop.create_future()
 
@@ -68,9 +67,9 @@ def start_body(
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise  # asked to stop
-                raise _failure(error) from error
+                raise body_error(error) from error
             except KeyboardInterrupt as error:
-                if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+                if may_be_ctrl_c():
                     raise  # perhaps Ctrl-C, raised into whatever the loop was running
                 raise _contained(error, hooks) from error
             except BaseException as error:
@@ -88,7 +87,7 @@ def start_body(
                 raise
             except asyncio.CancelledError as error:
                 # Nothing can ask a thread to stop, so the body raised it itself.
-                raise _failure(error) from error
+                raise body_error(error) from error
             except BaseException as error:
                 raise _contained(error, hooks) from error
             finally:
@@ -114,14 +113,7 @@ def _contained(error: BaseException, hooks: RunHooks) -> TaskBodyError:
     process, and every run in it with the loop; the process is condemned
     instead, so its other runs finish first."""
     hooks.condemn()
-    return _failure(error)
-
-
-def _failure(error: BaseException) -> TaskBodyError:
-    """An error that is not an `Exception`, as one the run can fail with:
-    raised as it is, it would end whoever awaits the run instead."""
-    kind = type(error).__name__
-    return TaskBodyError(f"{kind}: {error}" if str(error) else kind, kind)
+    return body_error(error)
 
 
 def task_named(

@@ -28,7 +28,7 @@ from typing import Any
 
 from asgiref.sync import async_to_sync
 
-from kabudachi.errors import StartupError
+from kabudachi.errors import StartupError, may_be_ctrl_c
 
 _logger = logging.getLogger("kabudachi")
 
@@ -182,20 +182,32 @@ def after_run(func: Any = None, /, *, queues: Iterable[str] | None = None) -> An
 async def initialize_process(hooks: HookRegistry) -> None:
     """Runs every `process_init` hook, in the order declared: a synchronous
     one on this thread, an async one on the running loop. Raises
-    `StartupError` naming the first that raises, `SystemExit` and
-    `KeyboardInterrupt` included; the rest do not run."""
+    `StartupError` naming the first that raises, and the rest do not run.
+    That includes `SystemExit`, a `CancelledError` though the start was not
+    stopped, and a `KeyboardInterrupt` that cannot be a Ctrl-C (off the main
+    thread, or while SIGINT is ignored); one that can be is let through, as
+    is the start's own cancellation."""
     for hook in hooks.of_kind(HookKind.PROCESS_INIT):
         try:
             if hook.is_async:
                 await hook.func()
             else:
                 hook.func()
-        except asyncio.CancelledError:
-            raise  # the start itself was stopped
+        except asyncio.CancelledError as error:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise  # the start itself was stopped
+            raise _startup_failed(hook, error) from error
+        except KeyboardInterrupt as error:
+            if may_be_ctrl_c():
+                raise
+            raise _startup_failed(hook, error) from error
         except BaseException as error:
-            raise StartupError(
-                f"{hook.described} raised {type(error).__name__}: {error}"
-            ) from error
+            raise _startup_failed(hook, error) from error
+
+
+def _startup_failed(hook: LifecycleHook, error: BaseException) -> StartupError:
+    return StartupError(f"{hook.described} raised {type(error).__name__}: {error}")
 
 
 @dataclass(frozen=True)

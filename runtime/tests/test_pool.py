@@ -376,10 +376,8 @@ def test_a_body_raising_system_exit_or_keyboard_interrupt_fails_its_run_and_cost
                 await asyncio.sleep(0.01)
             outcomes = await asyncio.gather(
                 pool_tasks.leaves(Greeting(text="SystemExit")),
-                pool_tasks.leaves(Greeting(text="KeyboardInterrupt")),
-                pool_tasks.leaves_async(Greeting()),
-                pool_tasks.cleaned_up(Greeting()),
-                pool_tasks.cleaned_up_async(Greeting()),
+                # On the loop of a process that ignores SIGINT: no Ctrl-C.
+                pool_tasks.leaves_async(Greeting(text="KeyboardInterrupt")),
                 return_exceptions=True,
             )
             finished = (await neighbour).times
@@ -390,9 +388,6 @@ def test_a_body_raising_system_exit_or_keyboard_interrupt_fails_its_run_and_cost
 
     assert [(type(outcome), getattr(outcome, "kind", None)) for outcome in outcomes] == [
         (TaskBodyError, "SystemExit"),
-        (TaskBodyError, "KeyboardInterrupt"),
-        (TaskBodyError, "SystemExit"),
-        (TaskBodyError, "KeyboardInterrupt"),
         (TaskBodyError, "KeyboardInterrupt"),
     ], outcomes
     assert neighbour != os.getpid(), "the neighbour finished where it started"

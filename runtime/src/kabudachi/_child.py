@@ -344,7 +344,8 @@ class _TaskProcess:
 
     def _report_cancelled(self, run_id: str, asked: bool) -> None:
         """A cancelled run is silent when the worker asked for it, and has
-        stopped waiting for it; a body that raised CancelledError itself failed."""
+        stopped waiting for it. One nobody asked to stop failed: its task's
+        merge or serializer raised CancelledError itself."""
         if not asked:
             self.send(ipc.failed(run_id, asyncio.CancelledError()))
 

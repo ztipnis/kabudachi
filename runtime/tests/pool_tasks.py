@@ -284,23 +284,5 @@ def leaves(request: Greeting) -> Greeting:
 
 @kabudachi.task(name="pool.leaves_async")
 async def leaves_async(request: Greeting) -> Greeting:
-    raise SystemExit("leaving")
-
-
-@kabudachi.after_run(queues=["leaving"])
-def interrupts_cleanup(context: kabudachi.RunContext, outcome: object) -> None:
-    raise KeyboardInterrupt("leaving")
-
-
-@kabudachi.task(name="pool.cleaned_up", queue="leaving")
-def cleaned_up(request: Greeting) -> Greeting:
-    """Succeeds, but its after_run hook raises KeyboardInterrupt."""
-    return request
-
-
-@kabudachi.task(name="pool.cleaned_up_async", queue="leaving")
-async def cleaned_up_async(request: Greeting) -> Greeting:
-    """Succeeds, but its after_run hook raises KeyboardInterrupt on the
-    process's event loop."""
-    return request
-
+    """Raises the exception `request.text` names, on its process's event loop."""
+    raise LEAVING[request.text]("leaving")

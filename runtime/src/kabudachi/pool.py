@@ -23,7 +23,7 @@ from typing import Any
 from kabudachi import _child, ipc
 from kabudachi.body import RunningBody
 from kabudachi.config import Settings
-from kabudachi.errors import StartupError, TaskBodyError, TaskDefinitionError
+from kabudachi.errors import StartupError, TaskDefinitionError, body_error
 from kabudachi.execution import CompactJob, NestedCalls, RunJob, TaskProcessLost
 from kabudachi.handle import TaskHandle
 from kabudachi.lifecycle import HookRegistry
@@ -692,13 +692,13 @@ class ProcessPool:
 
 def _raisable(frame: ipc.Failed) -> BaseException:
     """The error a failed body raised, with the child's traceback as a note.
-    One that is not an `Exception` (a body raising `CancelledError` though
-    nobody asked it to stop) would end whoever awaits the outcome instead of
-    failing the run, so it arrives as a `TaskBodyError` of its kind."""
+    One that is not an `Exception` (a task's merge or serializer raising
+    `CancelledError` though nobody asked the run to stop) would end whoever
+    awaits the outcome instead of failing the run, so it arrives as a
+    `TaskBodyError` of its kind."""
     error = frame.error
     if not isinstance(error, Exception):
-        kind = type(error).__name__
-        error = TaskBodyError(f"{kind}: {error}" if str(error) else kind, kind)
+        error = body_error(error)
     error.add_note(f"raised in a task process:\n{frame.traceback}")
     return error
 

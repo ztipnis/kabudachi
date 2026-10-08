@@ -1,5 +1,7 @@
 """The exceptions kabudachi raises on purpose."""
 
+import signal
+import threading
 from typing import Any
 
 # Defined by the native module, which raises BackpressureError itself;
@@ -129,3 +131,20 @@ def interrupted(subject: str, error: BaseException) -> TaskInterruptedError:
     an exception. `subject` names what was interrupted, and only the type name
     of `error` is repeated, never its message, which can hold task input."""
     return TaskInterruptedError(f"{subject} was interrupted by {type(error).__name__}")
+
+
+def body_error(error: BaseException) -> TaskBodyError:
+    """`error`, which is not an `Exception`, as a `TaskBodyError` of its kind
+    that a run can fail with: raised as it is, it would end whoever awaits
+    the run instead."""
+    kind = type(error).__name__
+    return TaskBodyError(f"{kind}: {error}" if str(error) else kind, kind)
+
+
+def may_be_ctrl_c() -> bool:
+    """Whether a `KeyboardInterrupt` raised here can be a real Ctrl-C: Python
+    raises one only on the main thread, and never while SIGINT is ignored."""
+    return (
+        threading.current_thread() is threading.main_thread()
+        and signal.getsignal(signal.SIGINT) is not signal.SIG_IGN
+    )

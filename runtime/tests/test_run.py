@@ -2,6 +2,7 @@
 loop, tasks called from `main` and their results awaited."""
 
 import asyncio
+import concurrent.futures
 import functools
 import logging
 import threading
@@ -701,14 +702,44 @@ def test_a_body_or_hook_that_raises_system_exit_or_keyboard_interrupt_or_cancels
     assert neighbour == "finished", "a body beside them ran to its end"
 
 
-def test_a_process_init_hook_that_raises_system_exit_stops_the_start_with_its_name():
+def test_off_the_main_thread_what_is_not_an_exception_fails_only_what_raised_it():
+    """No signal reaches a loop off the main thread, so a `KeyboardInterrupt`
+    there is never a Ctrl-C, nor a `CancelledError` nobody asked for a stop:
+    each fails the start or the run that raised it."""
+    raising = [
+        SystemExit("no resources"),
+        KeyboardInterrupt("no resources"),
+        asyncio.CancelledError("no resources"),
+    ]
+
     @kabudachi.process_init
     def gives_up():
-        raise SystemExit("no resources")
+        if raising:
+            raise raising.pop(0)
+
+    @declare
+    async def leaves_async(request: Greeting) -> Greeting:
+        raise KeyboardInterrupt("leaving")
 
     async def main():
-        pass
+        (outcome,) = await asyncio.gather(leaves_async(Greeting()), return_exceptions=True)
+        return outcome
 
-    with pytest.raises(StartupError, match=r"gives_up raised SystemExit: no resources"):
-        kabudachi.run(main)
+    def run_three_failed_starts_then_one_run():
+        failed = []
+        for _ in range(3):
+            try:
+                kabudachi.run(main)
+            except StartupError as error:
+                failed.append(str(error))
+        return failed, kabudachi.run(main)
 
+    with concurrent.futures.ThreadPoolExecutor(1) as thread:
+        failed, outcome = thread.submit(run_three_failed_starts_then_one_run).result(timeout=30)
+
+    assert [message.partition("gives_up raised ")[2] for message in failed] == [
+        "SystemExit: no resources",
+        "KeyboardInterrupt: no resources",
+        "CancelledError: no resources",
+    ], failed
+    assert (type(outcome), getattr(outcome, "kind", None)) == (TaskBodyError, "KeyboardInterrupt")

@@ -213,8 +213,9 @@ class InProcessExecutor:
 
 def _no_process_to_replace() -> None:
     """Bodies here run in the worker itself, which is never replaced: a
-    failed hook is only logged, and a body that raised `SystemExit` or
-    `KeyboardInterrupt` only fails its run."""
+    failed hook is only logged, and a body that raised `SystemExit`, or a
+    `KeyboardInterrupt` that cannot be a Ctrl-C (one raised off the main
+    thread), only fails its run."""
 
 
 async def run_within(
