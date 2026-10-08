@@ -67,6 +67,9 @@ pub(crate) enum Failure {
     /// A cluster in transition: ask again shortly.
     Retry,
     Io,
+    /// The first round trip on a pooled connection failed with an I/O
+    /// error: the server may have restarted since the connection was pooled.
+    Stale,
     TimedOut,
     /// Every attempt of a transaction was overtaken by a writer.
     Contended,
@@ -166,9 +169,9 @@ impl Connections {
                     return Ok(value);
                 }
                 // The connection may hold a half-run transaction: drop it.
-                Err(Failure::Moved(address)) => node = self.moved(keys, address),
+                Err(Failure::Moved(address)) => node = self.moved(keys, &node, address),
                 Err(Failure::Retry) => self.sleep_at_most(RETRY_PAUSE, deadline)?,
-                Err(Failure::Io) if pooled && !retried_stale => {
+                Err(Failure::Stale) if pooled && !retried_stale => {
                     // A server that restarted closed every pooled connection.
                     retried_stale = true;
                     self.pool.lock().unwrap().remove(&node);
@@ -220,11 +223,18 @@ impl Connections {
     }
 
     fn connect(&self, node: &str, timeout: Duration) -> redis::RedisResult<Connection> {
+        let invalid = |what: &str| {
+            RedisError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{what} in node address {node:?}"),
+            ))
+        };
+        let (host, port) = node.rsplit_once(':').ok_or_else(|| invalid("no port"))?;
+        let port: u16 = port.parse().map_err(|_| invalid("bad port"))?;
         let mut url = self.seeds[0].clone();
-        if let Some((host, port)) = node.rsplit_once(':') {
-            let _ = url.set_host(Some(host));
-            let _ = url.set_port(port.parse().ok());
-        }
+        // A bracketed IPv6 host is accepted as it is.
+        url.set_host(Some(host)).map_err(|_| invalid("bad host"))?;
+        url.set_port(Some(port)).map_err(|_| invalid("bad port"))?;
         redis::Client::open(url.as_str())?.get_connection_with_timeout(timeout)
     }
 
@@ -288,9 +298,14 @@ impl Connections {
         Err(AuthorityError::Unavailable)
     }
 
-    fn moved(&self, keys: &Keys, address: String) -> String {
+    /// Records that the slot of `keys` now lives at `address`, which the node
+    /// `from` gave; an address without a host means `from`'s own host.
+    fn moved(&self, keys: &Keys, from: &str, address: String) -> String {
         let address = match address.strip_prefix(':') {
-            Some(port) => format!("{}:{port}", self.seeds[0].host_str().unwrap_or("127.0.0.1")),
+            Some(port) => {
+                let host = from.rsplit_once(':').map_or(from, |(host, _)| host);
+                format!("{host}:{port}")
+            }
             None => address,
         };
         self.owners.lock().unwrap().insert(keys.slot(), address.clone());

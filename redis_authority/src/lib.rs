@@ -25,9 +25,11 @@
 //!
 //! The sentinel records when a name's data began, when it last became
 //! available, and the server's run id. A missing sentinel (the server is new
-//! or was flushed) restarts both waits: no fence for one TTL, no
-//! authoritative count for one TTL. A new run id (the server restarted and
-//! kept its data) withholds only the count for one TTL. A name first used on
+//! or was flushed) or a new run id (the server restarted, or a replica took
+//! over) restarts both waits from the call that sees it: no fence for one
+//! TTL, no authoritative count for one TTL. A restart or failover may lose
+//! writes the server acknowledged, a granted fence among them, so no fence
+//! is granted until every fence it might have lost has expired. A name first used on
 //! a long-running server starts its own warm-up at that first call. The
 //! count is also withheld for one TTL from the first success after a call
 //! this client saw fail.
@@ -46,8 +48,8 @@
 //! - The server must never evict the sentinel: use `noeviction` or a
 //!   `volatile-*` policy, since this adapter sets no key TTLs.
 //! - A cluster has only database 0.
-//! - The contract suite runs against a TTL of one second; a restarted
-//!   cluster node refuses writes for its first seconds.
+//! - A restarted cluster node refuses writes for its first seconds, so a
+//!   call right after a restart may answer `Unavailable`.
 
 mod authority;
 mod config;

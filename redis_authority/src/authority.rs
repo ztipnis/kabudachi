@@ -15,6 +15,11 @@ use crate::view::{
 
 const MAX_ATTEMPTS: usize = 8;
 
+const _: fn() = || {
+    fn shared_across_threads<T: Send + Sync>() {}
+    shared_across_threads::<RedisAuthority>();
+};
+
 pub struct RedisAuthority {
     config: RedisAuthorityConfig,
     connections: Connections,
@@ -86,17 +91,15 @@ impl RedisAuthority {
         let keys = Keys::new(&self.config.key_prefix, name);
         self.connections
             .with_connection(&keys, &deadline, |connection| {
-                for _ in 0..MAX_ATTEMPTS {
-                    deadline.apply(connection)?;
-                    let view = View::read(connection, &deadline, &keys, parts)?;
+                for attempt in 0..MAX_ATTEMPTS {
+                    let view = match View::read(connection, &deadline, &keys, parts) {
+                        Err(Failure::Io) if attempt == 0 => return Err(Failure::Stale),
+                        read => read?,
+                    };
                     let step = body(&view).unwrap_or_else(|error| Step::answer(Err(error)));
                     let repair = view.repair();
-                    if step.writes.is_empty() && repair.is_empty() {
-                        redis::cmd("UNWATCH")
-                            .exec(connection)
-                            .map_err(Failure::from)?;
-                        return Ok(step.answer);
-                    }
+                    // Even a call with nothing to write ends in EXEC: a nil
+                    // reply says a watched key changed since it was read.
                     let mut pipe = redis::pipe();
                     pipe.atomic();
                     if !repair.is_empty() {
@@ -109,12 +112,21 @@ impl RedisAuthority {
                     for write in &step.writes {
                         write.queue(&mut pipe, &keys);
                     }
-                    // MULTI, each command's QUEUED, then EXEC: nil if a writer got in first.
+                    // MULTI, each command's QUEUED, then EXEC.
                     let count = pipe.len() + 2;
                     let replies = round_trip(connection, &deadline, &pipe, count)?;
                     match replies.last() {
                         Some(redis::Value::Nil) => {}
-                        Some(redis::Value::Array(_)) => return Ok(step.answer),
+                        Some(redis::Value::Array(results)) => {
+                            if results
+                                .iter()
+                                .any(|result| matches!(result, redis::Value::ServerError(_)))
+                            {
+                                tracing::warn!("the server refused a command inside a transaction");
+                                return Err(Failure::Server);
+                            }
+                            return Ok(step.answer);
+                        }
                         _ => return Err(Failure::Corrupt),
                     }
                 }
@@ -151,7 +163,7 @@ impl CoordinationAuthority for RedisAuthority {
             writes.push(Write::HSet(
                 Part::Regs,
                 worker_id.as_str().to_string(),
-                encode_registration(shard_id, now + ttl_ms, address),
+                encode_registration(shard_id, now.saturating_add(ttl_ms), address),
             ));
             Ok(Step::write(writes, Ok(self.config.ttl)))
         })
@@ -226,7 +238,7 @@ impl CoordinationAuthority for RedisAuthority {
             }
             // Fences taken before the data was lost are unknown here; all
             // have expired one TTL later.
-            let warm_up_ends = view.created_ms() + ttl_ms;
+            let warm_up_ends = view.created_ms().saturating_add(ttl_ms);
             if now < warm_up_ends {
                 return Ok(Step::answer(Err(AuthorityError::FenceHeld {
                     remaining: Duration::from_millis(warm_up_ends - now),
@@ -235,7 +247,7 @@ impl CoordinationAuthority for RedisAuthority {
             Ok(Step::write(
                 vec![Write::Set(
                     Part::Fence,
-                    encode_fence(holder, record, now + ttl_ms),
+                    encode_fence(holder, record, now.saturating_add(ttl_ms)),
                 )],
                 Ok(self.config.ttl),
             ))
@@ -252,7 +264,7 @@ impl CoordinationAuthority for RedisAuthority {
             Ok(Step::write(
                 vec![Write::Set(
                     Part::Hint,
-                    encode_hint(hint, view.now_ms + ttl_ms),
+                    encode_hint(hint, view.now_ms.saturating_add(ttl_ms)),
                 )],
                 Ok(()),
             ))

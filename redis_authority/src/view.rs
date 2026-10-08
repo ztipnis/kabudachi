@@ -108,29 +108,27 @@ impl View {
         })
     }
 
-    /// The sentinel fields this call must write. A missing sentinel restarts
-    /// both waits; one from another server run (a restart that kept its
-    /// data) restarts only the count's.
+    /// The sentinel fields this call must write. A missing sentinel (new or
+    /// flushed server) and one from another server run (a restart or a
+    /// failover, which may have lost writes it acknowledged, a fence among
+    /// them) both restart both waits.
     pub(crate) fn repair(&self) -> Vec<(&'static str, String)> {
         match &self.sentinel {
-            None => vec![
+            Some(sentinel) if sentinel.run_id == self.run_id => Vec::new(),
+            _ => vec![
                 ("created_ms", self.now_ms.to_string()),
                 ("available_ms", self.now_ms.to_string()),
                 ("run_id", self.run_id.clone()),
             ],
-            Some(sentinel) if sentinel.run_id != self.run_id => vec![
-                ("available_ms", self.now_ms.to_string()),
-                ("run_id", self.run_id.clone()),
-            ],
-            Some(_) => Vec::new(),
         }
     }
 
     /// When the name's data began, as the sentinel will read after the repair.
     pub(crate) fn created_ms(&self) -> u64 {
-        self.sentinel
-            .as_ref()
-            .map_or(self.now_ms, |sentinel| sentinel.created_ms)
+        match &self.sentinel {
+            Some(sentinel) if sentinel.run_id == self.run_id => sentinel.created_ms,
+            _ => self.now_ms,
+        }
     }
 
     /// When the name last became available, as the sentinel will read after the repair.
