@@ -100,7 +100,7 @@
 //! but only when the stamp names the sender `Net` vouches for (a gossip
 //! message's signed author, or the peer at the other end of a direct
 //! message's connection), so no peer can redirect traffic meant for another.
-//! A stamp is the peer's own choice among its listen addresses, not one this
+//! A stamp is the peer's own choice among its listen addresses (or its external address), not one this
 //! node has seen work, so it ranks below a dialed address and, being one
 //! address where Identify advertises them all, below Identify; it ranks above
 //! an inbound source address, which is usually not dialable at all.
