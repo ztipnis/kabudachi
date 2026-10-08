@@ -29,6 +29,13 @@
 //! the shard's workers stay connected to one another and not only to their
 //! leader.
 //!
+//! A worker given an executor (see `crate::executor`) claims work for it: while
+//! the executor has offered room, the node knows its leader, and some leader
+//! has vouched for hearing this worker, it discovers and claims work from
+//! that leader and hands each run over. It takes each report the executor
+//! makes to the leader, in order per run, asking again as leaders change
+//! until one takes it.
+//!
 //! A leader's scheduler records each decision as a new revision of its
 //! task's Task record. The driver writes every revision to the voters
 //! the record's placement names (the replication factor nearest the key),
@@ -163,7 +170,7 @@ use crate::reconcile::leader::LeaderReconciliation;
 use crate::reconcile::report::page_of;
 use crate::steal::candidates_for_steal;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
-use crate::executor::ExecutorEndpoint;
+use crate::executor::{Executing, ExecutorEndpoint};
 use crate::routing_refresh::{RoutingRefresh, ShardView};
 use crate::task_exchange::{self, TaskRequestHandle};
 use crate::task_store::placement::{Placement, ReplicationFactor, placement};
@@ -297,6 +304,9 @@ where
 {
     let my_id = net.local_worker_id();
     node.set_runs_compaction(executor.is_some());
+    // The driver's side of the executor, for this run of the driver.
+    let retry_after = Duration::from_millis(node.timings().heartbeat_interval.as_ticks());
+    let mut executing = executor.map(|endpoint| Executing::new(endpoint, net, retry_after));
     net.subscribe_to_shard(node.shard_id());
     let mut first = Some(first);
     let mut next_deadline = None;
@@ -436,6 +446,9 @@ where
         if let Some(deadline) = reconcile_office(&mut reconciliation, net, &mut stepper, &clock) {
             next_deadline = Some(deadline);
         }
+        if let Some(executing) = executing.as_mut() {
+            drive_executor(executing, stepper.node, net, &clock);
+        }
         compare_run_digests(
             &mut reconciliation,
             stepper.scheduler,
@@ -505,6 +518,7 @@ where
                 () = sleep_until(&clock, reconcile_wake) => break,
                 () = sleep_until(&clock, records_wake) => break,
                 () = next_reconciliation(&mut reconciliation) => break,
+                () = executor_wake(&mut executing) => break,
                 result = search.ask_done() => {
                     search.asked(result, TokioInstant::now());
                     break;
@@ -546,6 +560,42 @@ async fn next_reconciliation(reconciliation: &mut Option<LeaderReconciliation<'_
     match reconciliation {
         Some(reconciliation) => reconciliation.next().await,
         None => std::future::pending().await,
+    }
+}
+
+/// The executor's next report, the end of a claim or report under way, or
+/// the time to claim or report again; for ever without an executor.
+/// Cancel-safe.
+async fn executor_wake(executing: &mut Option<Executing<'_>>) {
+    match executing {
+        Some(executing) => executing.wake().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Acts on what the executor reported and on the answers its claims and
+/// reports got, sends each report the leader has yet to take, and claims
+/// more work while the executor has room, the node knows its leader, and
+/// some leader has vouched for hearing this worker
+/// (`WorkerNode::has_contact_floor`): a run started before that would have no
+/// abort deadline.
+fn drive_executor<C: Clock>(executing: &mut Executing<'_>, node: &WorkerNode<C>, net: &Net, clock: &C) {
+    executing.expire(TokioInstant::now());
+    executing.take_arrived();
+    let Some((leader, _)) = node.known_leader() else {
+        return;
+    };
+    // This worker's own claims and reports, while it leads, go to no one.
+    if leader == net.local_worker_id() {
+        return;
+    }
+    for request in executing.reports_to_send() {
+        executing.send_report(leader.clone(), request);
+    }
+    if node.has_contact_floor()
+        && let Some(places) = executing.places_to_claim()
+    {
+        executing.discover(leader, places, WallTime::now(clock));
     }
 }
 

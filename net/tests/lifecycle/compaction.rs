@@ -1,17 +1,19 @@
 //! Over real sockets a leader makes compaction runs only once a worker says
-//! it runs them, hands them only to such a worker, and applies a fold that
-//! worker reports. The test plays that worker's executor.
+//! it runs them (it has an executor), hands them only to such a worker, and
+//! applies the fold that worker's executor makes.
 
 use kabudachi_core::protocol::generated::chain_entry;
 use kabudachi_core::protocol::ids::TaskId;
-use kabudachi_core::protocol::messages::{ClaimRejectReason, claim_response, task_response};
+use kabudachi_core::protocol::messages::{ClaimRejectReason, claim_response};
 use kabudachi_core::scheduler::MemoryLimits;
+use kabudachi_net::executor::Report;
 
 use crate::support::deadline::within_deadline;
 use crate::support::executor::FakeExecutor;
 use crate::support::records::{
     ThreeVoters, claimed_and_started, plain_with, submitted_through,
 };
+use crate::support::worker::poll_until;
 
 /// Not associative, so a fold in the wrong order or grouping shows.
 fn merge(older: &[u8], newer: &[u8]) -> Vec<u8> {
@@ -25,7 +27,7 @@ fn fold_all(payloads: &[Vec<u8>]) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_leader_compacts_a_chain_for_a_worker_that_runs_compaction_and_applies_its_fold() {
+async fn a_worker_that_runs_compaction_folds_the_chain_its_leader_hands_it() {
     within_deadline(async {
         let (mut shard, client) = ThreeVoters::start().await;
         let mut executors = Vec::new();
@@ -50,7 +52,7 @@ async fn a_leader_compacts_a_chain_for_a_worker_that_runs_compaction_and_applies
         let nets = shard.nets.clone();
         let keyed = |payload: &[u8]| plain_with(payload).with_coalescing_key("k");
 
-        let (answer, newest) = shard
+        let newest = shard
             .drive_until(async {
                 let holder = submitted_through(&client, &leader_id, keyed(b"h")).await;
                 claimed_and_started(&runner_net, &leader_id, &holder).await;
@@ -82,38 +84,37 @@ async fn a_leader_compacts_a_chain_for_a_worker_that_runs_compaction_and_applies
                 };
                 assert_eq!(reject.reason, ClaimRejectReason::ClaimRejectCannotRun as i32);
 
-                let granted = runner_net
-                    .request_claim(leader_id.clone(), compaction)
-                    .await
-                    .expect("the leader answered");
-                let Some(claim_response::Result::Accept(claim)) = granted.result else {
-                    panic!("expected the claim granted, got {granted:?}");
-                };
-                let folded = fold_all(&claim.chain);
-                let run = claim.task_run_id.expect("a claim names its run").into();
-                let answer = runner_net
-                    .complete_compaction(leader_id.clone(), run, folded)
-                    .await
-                    .expect("the leader answered");
-                (answer, newest.expect("generations were submitted"))
+                // The runner's executor offers a place: its driver claims the
+                // compaction run and hands it over as a fold to make.
+                executors[runner].grant(1);
+                let (run, claim) = executors[runner].next_claim().await;
+                assert_eq!(
+                    claim.task.as_ref().and_then(|task| task.task_id.clone()).map(TaskId::from),
+                    Some(compaction)
+                );
+                executors[runner].report(Report::Compacted {
+                    run,
+                    payload: fold_all(&claim.chain),
+                });
+                newest.expect("generations were submitted")
             })
             .await;
 
-        assert!(
-            matches!(&answer.result, Some(task_response::Result::Compaction(done)) if done.applied),
-            "{answer:?}"
-        );
-        let folded_on = nets
-            .iter()
-            .filter_map(|net| net.held_records().get(&newest))
-            .filter(|record| {
-                matches!(
-                    record.retained_chain.first().and_then(|entry| entry.entry.as_ref()),
-                    Some(chain_entry::Entry::Folded(_))
-                )
-            })
-            .count();
-        assert!(folded_on >= 2, "a majority holds the record with the fold");
+        let nets_now = nets.clone();
+        poll_until("a majority holds the record with the fold", || {
+            nets_now
+                .iter()
+                .filter_map(|net| net.held_records().get(&newest))
+                .filter(|record| {
+                    matches!(
+                        record.retained_chain.first().and_then(|entry| entry.entry.as_ref()),
+                        Some(chain_entry::Entry::Folded(_))
+                    )
+                })
+                .count()
+                >= 2
+        })
+        .await;
     })
     .await
 }

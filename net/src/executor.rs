@@ -46,12 +46,24 @@
 //! quorum of the task's placement has stored it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::ids::TaskRunId;
-use kabudachi_core::protocol::messages::{Claim, task_request};
+use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
+use kabudachi_core::protocol::messages::{
+    Claim, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, TaskRejectReason,
+    TaskResponse, task_request, task_response,
+};
+use kabudachi_core::time::WallTime;
+use libp2p::futures::StreamExt;
+use libp2p::futures::future::BoxFuture;
+use libp2p::futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
+use tokio::time::Instant as TokioInstant;
+
+use crate::discovery::{Found, IdleBackoff};
+use crate::messenger::Net;
+use crate::task_exchange::{TaskFailure, reported_run};
 
 /// What the driver hands the executor (see the module doc).
 #[derive(Debug, Clone, PartialEq)]
@@ -140,4 +152,308 @@ pub(crate) struct Held {
     pub(crate) waiting: BTreeMap<TaskRunId, VecDeque<RunReport>>,
     /// The executor dropped its handle: nothing more is claimed for it.
     pub(crate) gone: bool,
+}
+
+/// A report sent, with the answer it got or why it got none.
+type Reply = (RunReport, Result<TaskResponse, TaskFailure>);
+
+/// The driver's side of the seam for one run of the driver: what the
+/// executor reported and the driver has yet to act on, and the claims and
+/// reports under way. What must outlive the run is kept in the endpoint's
+/// [`Held`].
+pub(crate) struct Executing<'n> {
+    endpoint: &'n mut ExecutorEndpoint,
+    net: &'n Net,
+    /// How long a report waits after one was refused, or got no answer,
+    /// before reports are sent again.
+    retry_after: Duration,
+    /// A discovery under way at a remote leader, with the places it reserved.
+    discovering: Option<(u32, BoxFuture<'n, Found>)>,
+    idle: IdleBackoff,
+    /// No claim before this, after one that found nothing.
+    next_claim_at: Option<TokioInstant>,
+    /// The runs whose first waiting report is with a leader now.
+    sending: BTreeSet<TaskRunId>,
+    in_flight: FuturesUnordered<BoxFuture<'n, Reply>>,
+    /// No report is sent before this, after one was refused or unanswered.
+    retry_at: Option<TokioInstant>,
+    arrived: Vec<Report>,
+    found: Option<(u32, Found)>,
+    replies: Vec<Reply>,
+}
+
+impl<'n> Executing<'n> {
+    pub(crate) fn new(endpoint: &'n mut ExecutorEndpoint, net: &'n Net, retry_after: Duration) -> Self {
+        Executing {
+            endpoint,
+            net,
+            retry_after,
+            discovering: None,
+            idle: IdleBackoff::default(),
+            next_claim_at: None,
+            sending: BTreeSet::new(),
+            in_flight: FuturesUnordered::new(),
+            retry_at: None,
+            arrived: Vec::new(),
+            found: None,
+            replies: Vec::new(),
+        }
+    }
+
+    /// Waits for the executor's next report, a discovery's end, the answer to
+    /// a report, or the time to claim or report again. Cancel-safe: what
+    /// arrives is kept for [`Self::take_arrived`].
+    pub(crate) async fn wake(&mut self) {
+        let due = match (self.next_claim_at, self.retry_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let gone = self.endpoint.held.gone;
+        tokio::select! {
+            report = self.endpoint.reports.recv(), if !gone => match report {
+                Some(report) => self.arrived.push(report),
+                None => self.endpoint.held.gone = true,
+            },
+            found = next_found(&mut self.discovering) => self.found = Some(found),
+            Some(reply) = self.in_flight.next(), if !self.in_flight.is_empty() => self.replies.push(reply),
+            () = sleep_until(due) => {}
+        }
+    }
+
+    /// Forgets the waits that have passed by `now`, so a wait that cannot
+    /// be acted on yet (no leader known) never wakes the driver again.
+    pub(crate) fn expire(&mut self, now: TokioInstant) {
+        if self.next_claim_at.is_some_and(|at| at <= now) {
+            self.next_claim_at = None;
+        }
+        if self.retry_at.is_some_and(|at| at <= now) {
+            self.retry_at = None;
+        }
+    }
+
+    /// Acts on what arrived since the last batch: the executor's reports, a
+    /// discovery's claims, and the answers reports got.
+    pub(crate) fn take_arrived(&mut self) {
+        for report in std::mem::take(&mut self.arrived) {
+            self.on_report(report);
+        }
+        if let Some((reserved, found)) = self.found.take() {
+            let claims = found.claims.into_iter().map(|(_, claim)| claim).collect();
+            self.claimed(reserved, claims);
+        }
+        for (request, reply) in std::mem::take(&mut self.replies) {
+            self.on_reply(request, reply);
+        }
+    }
+
+    /// The first waiting report of every run that has none with a leader
+    /// now, marked as sent; none while a retry is pending.
+    pub(crate) fn reports_to_send(&mut self) -> Vec<RunReport> {
+        if self.retry_at.is_some() {
+            return Vec::new();
+        }
+        let mut due = Vec::new();
+        for (run, waiting) in &self.endpoint.held.waiting {
+            if let Some(first) = waiting.front()
+                && self.sending.insert(run.clone())
+            {
+                due.push(first.clone());
+            }
+        }
+        due
+    }
+
+    /// Sends `request` to `leader`, a remote leader.
+    pub(crate) fn send_report(&mut self, leader: WorkerId, request: RunReport) {
+        let net = self.net;
+        self.in_flight.push(Box::pin(async move {
+            let reply = net.report(leader, request.clone()).await;
+            (request, reply)
+        }));
+    }
+
+    /// How many places to claim now, reserved until the claim is answered:
+    /// all the places offered and not taken, unless the executor is gone, no
+    /// place is offered, a claim is under way, or one found nothing too
+    /// recently. The caller claims them at once.
+    pub(crate) fn places_to_claim(&mut self) -> Option<u32> {
+        let held = &mut self.endpoint.held;
+        let busy = self.discovering.is_some() || self.found.is_some();
+        if held.gone || held.credits == 0 || busy || self.next_claim_at.is_some() {
+            return None;
+        }
+        Some(std::mem::take(&mut held.credits))
+    }
+
+    /// Claims `places` from `leader`, a remote leader, through discovery
+    /// (see `Net::discover`); `now` judges which of this worker's own
+    /// records are due.
+    pub(crate) fn discover(&mut self, leader: WorkerId, places: u32, now: WallTime) {
+        let limit = usize::try_from(places).unwrap_or(usize::MAX);
+        let discovery = self.net.discover(leader, limit, now, true);
+        self.discovering = Some((places, Box::pin(discovery)));
+    }
+
+    /// Tells the executor to stop `run`'s body, once, if it was handed over
+    /// and has not ended. A leader lists a cancelled run in every ack until
+    /// it sees the run gone, so the same cancel arrives more than once.
+    pub(crate) fn cancel(&mut self, run: &TaskRunId) {
+        let held = &mut self.endpoint.held;
+        if held.handed.contains(run) && held.cancelled.insert(run.clone()) {
+            let _ = self.endpoint.work.send(Work::Cancel(run.clone()));
+        }
+    }
+
+    fn on_report(&mut self, report: Report) {
+        let request = match report {
+            Report::Capacity(places) => {
+                let held = &mut self.endpoint.held;
+                held.credits = held.credits.saturating_add(places);
+                return;
+            }
+            Report::Started(run) => task_request::Request::Started(ReportStarted {
+                task_run_id: Some(run.into()),
+            }),
+            Report::Completed { run, digest } => {
+                self.ended(&run);
+                task_request::Request::Completed(ReportCompleted {
+                    task_run_id: Some(run.into()),
+                    result_digest: Some(digest.into()),
+                })
+            }
+            Report::Failed { run, reason } => {
+                self.ended(&run);
+                task_request::Request::Failed(ReportFailed {
+                    task_run_id: Some(run.into()),
+                    failure_kind: reason,
+                })
+            }
+            Report::Lost(run) => {
+                self.ended(&run);
+                task_request::Request::Lost(ReportLost {
+                    task_run_id: Some(run.into()),
+                })
+            }
+            Report::Compacted { run, payload } => {
+                self.ended(&run);
+                task_request::Request::Compacted(ReportCompacted {
+                    task_run_id: Some(run.into()),
+                    folded_payload: payload,
+                })
+            }
+        };
+        self.queue(request);
+    }
+
+    /// A report got `reply`. One the leader may take later (it did not
+    /// lead, did not know the run yet, or no answer came) waits to be sent
+    /// again; any other answer ends it, and the run's next report may go. A
+    /// start refused because the run is not this worker's stops its body.
+    fn on_reply(&mut self, request: RunReport, reply: Result<TaskResponse, TaskFailure>) {
+        let run = reported_run(&request).expect("every report the driver sends names its run");
+        self.sending.remove(&run);
+        let retry = match &reply {
+            Err(_) => true,
+            Ok(response) => match rejection(response) {
+                Some(TaskRejectReason::TaskRejectNotLeader | TaskRejectReason::TaskRejectNotReady) => true,
+                Some(TaskRejectReason::TaskRejectUnknownRun | TaskRejectReason::TaskRejectNotAuthoritative) => {
+                    if matches!(request, task_request::Request::Started(_)) {
+                        self.cancel(&run);
+                    }
+                    false
+                }
+                _ => false,
+            },
+        };
+        if retry {
+            self.retry_at.get_or_insert(TokioInstant::now() + self.retry_after);
+            return;
+        }
+        let waiting = &mut self.endpoint.held.waiting;
+        if let Some(reports) = waiting.get_mut(&run) {
+            reports.pop_front();
+            if reports.is_empty() {
+                waiting.remove(&run);
+            }
+        }
+    }
+
+    /// A claim that reserved `reserved` places was granted `claims`: the
+    /// places left over are offered again, the claims are handed over, and a
+    /// claim that found nothing waits out the idle backoff.
+    fn claimed(&mut self, reserved: u32, claims: Vec<Claim>) {
+        let taken = u32::try_from(claims.len()).unwrap_or(u32::MAX);
+        let held = &mut self.endpoint.held;
+        held.credits = held.credits.saturating_add(reserved.saturating_sub(taken));
+        let wait = self.idle.after(claims.len());
+        self.next_claim_at = (!wait.is_zero()).then(|| TokioInstant::now() + wait);
+        for claim in claims {
+            self.hand_over(claim);
+        }
+    }
+
+    fn hand_over(&mut self, claim: Claim) {
+        let Some(run) = claim.task_run_id.clone().map(TaskRunId::from) else {
+            return;
+        };
+        let compacts = claim.task.as_ref().is_some_and(|task| task.compacts.is_some());
+        let work = if compacts { Work::Compact(claim) } else { Work::Run(claim) };
+        if self.endpoint.work.send(work).is_err() {
+            // No executor is left to run it: the leader is told at once, so it
+            // is replayed rather than held by a worker that will never run it.
+            self.endpoint.held.gone = true;
+            self.queue(task_request::Request::Lost(ReportLost {
+                task_run_id: Some(run.into()),
+            }));
+            return;
+        }
+        self.endpoint.held.handed.insert(run);
+    }
+
+    fn ended(&mut self, run: &TaskRunId) {
+        self.endpoint.held.handed.remove(run);
+        self.endpoint.held.cancelled.remove(run);
+    }
+
+    fn queue(&mut self, request: RunReport) {
+        let run = reported_run(&request).expect("every report the driver makes names its run");
+        self.endpoint.held.waiting.entry(run).or_default().push_back(request);
+    }
+}
+
+impl Drop for Executing<'_> {
+    /// Acts on what already arrived, and offers again the places a claim
+    /// still under way reserved, so the next run of the driver counts them.
+    fn drop(&mut self) {
+        self.take_arrived();
+        let reserved = self.discovering.take().map_or(0, |(reserved, _)| reserved);
+        let held = &mut self.endpoint.held;
+        held.credits = held.credits.saturating_add(reserved);
+    }
+}
+
+/// The reason `response` refuses its report, if it does.
+fn rejection(response: &TaskResponse) -> Option<TaskRejectReason> {
+    match &response.result {
+        Some(task_response::Result::Reject(reject)) => TaskRejectReason::try_from(reject.reason).ok(),
+        _ => None,
+    }
+}
+
+/// The discovery's claims once it ends, with the places it reserved; for
+/// ever without one. Cancel-safe: the discovery is polled where it lies.
+async fn next_found<'n>(discovering: &mut Option<(u32, BoxFuture<'n, Found>)>) -> (u32, Found) {
+    let Some((_, discovery)) = discovering.as_mut() else {
+        return std::future::pending().await;
+    };
+    let found = discovery.await;
+    let (reserved, _) = discovering.take().expect("the discovery just ended");
+    (reserved, found)
+}
+
+async fn sleep_until(at: Option<TokioInstant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
