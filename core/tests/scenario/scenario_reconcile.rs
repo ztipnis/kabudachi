@@ -1,7 +1,7 @@
 //! A new leader schedules nothing until it has reconciled, and rebuilds
 //! only what the shard's records and its workers' answers say.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRecord;
@@ -258,47 +258,59 @@ fn a_non_retriable_run_on_a_worker_that_answers_survives_the_election() {
     assert!(matches!(cluster.answer(ticket), Some(Answer::Certified(_))));
 }
 
+// A worker dies with the old leader holding two runs: one of a task with a
+// reconnect timeout of its own, shorter than the shard's, and one of a
+// non-retriable task at the shard's. The new leader knows each run's timeout
+// only from its record, and decides each that long after it took office and
+// the worker had gone a suspicion timeout unheard: the first lost and
+// replayed, the second orphaned.
 #[test]
-fn a_worker_that_died_with_the_old_leader_is_lost_a_reconnect_timeout_after_the_new_one_took_office() {
-    for retriable in [true, false] {
-        let (mut cluster, leader) = elected_among(5);
-        let worker = some_other(&cluster, &[&leader]);
-        let submission = if retriable { plain() } else { plain().non_retriable() };
-        let task = submitted_with(&mut cluster, &leader, submission);
-        running(&mut cluster, &leader, &worker, &task);
-        // The worker and the old leader are cut off from the other three
-        // together, so the worker never answers the new leader's roll call.
-        let rest: BTreeSet<WorkerId> = cluster
-            .node_ids()
-            .into_iter()
-            .filter(|id| *id != leader && *id != worker)
-            .collect();
-        cluster.partition(BTreeSet::from([leader.clone(), worker.clone()]), rest);
-        advance_until(&mut cluster, |cluster| new_leader(cluster, &leader).is_some());
-        let took_office = cluster.now();
-        let lost_after = (SUSPECT.as_ticks() + ElectionTimings::DEFAULT_RECONNECT_TIMEOUT.as_ticks())
-            as i64;
+fn a_new_leader_decides_each_run_of_a_worker_lost_with_the_old_one_at_that_runs_own_reconnect_timeout() {
+    const OWN: Duration = Duration::from_millis(3_000);
+    let shard = ElectionTimings::DEFAULT_RECONNECT_TIMEOUT;
+    let (mut cluster, leader) = elected_among(5);
+    let worker = some_other(&cluster, &[&leader]);
+    let quick = submitted_with(&mut cluster, &leader, plain().with_reconnect_timeout(OWN));
+    let patient = submitted_with(&mut cluster, &leader, plain().non_retriable());
+    running(&mut cluster, &leader, &worker, &quick);
+    running(&mut cluster, &leader, &worker, &patient);
+    // The worker and the old leader are cut off from the other three
+    // together, so the worker never answers the new leader's roll call.
+    let rest: BTreeSet<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != leader && *id != worker)
+        .collect();
+    cluster.partition(BTreeSet::from([leader.clone(), worker.clone()]), rest);
+    advance_until(&mut cluster, |cluster| new_leader(cluster, &leader).is_some());
+    let took_office = cluster.now();
 
-        let mut lost_in = None;
-        for _ in 0..(lost_after as u64 * 2 / STEP.as_ticks()) {
-            if held_states(&cluster, &task) != [TaskRunState::Running] {
-                lost_in = Some((cluster.now() - took_office).as_ticks() as i64);
-                break;
+    let mut decided_at = BTreeMap::new();
+    for _ in 0..((SUSPECT.as_ticks() + shard.as_ticks()) * 2 / STEP.as_ticks()) {
+        for task in [&quick, &patient] {
+            if !decided_at.contains_key(task) && held_states(&cluster, task) != [TaskRunState::Running] {
+                decided_at.insert(task.clone(), cluster.now());
             }
-            cluster.advance(STEP);
         }
-
-        let lost_in = lost_in.unwrap_or_else(|| panic!("its run stayed running, retriable: {retriable}"));
+        if decided_at.len() == 2 {
+            break;
+        }
+        cluster.advance(STEP);
+    }
+    for (task, reconnect, decided) in [
+        (&quick, OWN, &[TaskRunState::Lost, TaskRunState::Queued][..]),
+        (&patient, shard, &[TaskRunState::Orphaned][..]),
+    ] {
+        let at = *decided_at
+            .get(task)
+            .unwrap_or_else(|| panic!("{task:?} stayed running"));
+        let decided_in = (at - took_office).as_ticks() as i64;
+        let due_in = (SUSPECT.as_ticks() + reconnect.as_ticks()) as i64;
         assert!(
-            (lost_in - lost_after).abs() <= SUSPECT.as_ticks() as i64,
-            "lost {lost_in} ticks after the takeover, retriable: {retriable}"
+            (decided_in - due_in).abs() <= SUSPECT.as_ticks() as i64,
+            "{task:?} was decided {decided_in} ticks after the takeover, not about {due_in}"
         );
-        let expected: &[TaskRunState] = if retriable {
-            &[TaskRunState::Lost, TaskRunState::Queued]
-        } else {
-            &[TaskRunState::Orphaned]
-        };
-        assert_eq!(held_states(&cluster, &task), expected, "retriable: {retriable}");
+        assert_eq!(held_states(&cluster, task), decided, "{task:?}");
     }
 }
 

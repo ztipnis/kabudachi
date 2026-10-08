@@ -1078,7 +1078,8 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
             | Output::RunsHeard { .. }
             | Output::RunsCancelled(_)
             | Output::HandOff(_)
-            | Output::WorkerLost(_) => {}
+            | Output::WorkerLost(_)
+            | Output::WorkerSilence { .. } => {}
         }
     }
 }

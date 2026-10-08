@@ -108,8 +108,9 @@
 //! leader it reads the authority's epoch, stands while that read names its own
 //! (or the authority holds none), and otherwise rejoins at the epoch the read
 //! names (see the `authority_standing` module). A leader also reports each
-//! worker it has not heard from for a suspicion timeout and a reconnect
-//! timeout as lost.
+//! worker it has not heard from for a suspicion timeout as silent, which
+//! times the loss of each run it holds, and after a reconnect timeout more as
+//! lost.
 //!
 //! Known gaps:
 //! - With no authority, no removal reaches a leaderless `NoQuorum` shard:
@@ -363,12 +364,17 @@ pub struct ElectionTimings {
     /// Lower it on hosts whose clock rates can differ more. Every worker in
     /// the shard must use the same value. Must not be zero.
     pub clock_drift_divisor: u64,
-    /// How long a leader waits, after it would first suspect a silent
-    /// worker, before it reports that worker lost and its TaskRuns are
-    /// replayed; and, less drift, how long a worker cut off from its leader
-    /// or fenced has to abort its own.
-    /// Every worker in the shard must use the same value, or a leader could
-    /// replay the work of a worker still running it. Usually
+    /// The shard's default reconnect timeout. For a TaskRun of a task
+    /// submitted without one of its own, it is how long a leader waits,
+    /// after the run's worker has gone a suspicion timeout unheard, before
+    /// the run is lost and may be replayed. Less drift, it is how long a
+    /// worker cut off from its leader, or fenced, has to abort the run. A
+    /// task with its own carries it in its Task record, so every leader and
+    /// its worker time that run alike. It is also how long, past that
+    /// suspicion timeout, a leader waits before it reports a silent worker
+    /// lost (see [`Output::WorkerLost`]). Every worker in the shard must use
+    /// the same value, or a leader could replay a run of the default timeout
+    /// while its worker still runs it. Usually
     /// [`Self::DEFAULT_RECONNECT_TIMEOUT`].
     pub reconnect_timeout: Duration,
     /// The longest a leader asked to drain keeps leading while it waits for
@@ -590,7 +596,8 @@ pub enum Input {
     /// adopted, and none of them answered: they may have died with the old
     /// leader, and never be heard from. A node holding an office reports each
     /// not yet heard from lost a suspicion timeout and a reconnect timeout
-    /// after this input (see [`Output::WorkerLost`]); a worker it already
+    /// after this input (see [`Output::WorkerLost`]) and silent a suspicion
+    /// timeout after it (see [`Output::WorkerSilence`]); a worker it already
     /// tracks keeps the time it was last heard. Ignored without an office.
     WatchWorkers(BTreeSet<WorkerId>),
 }
@@ -635,13 +642,27 @@ pub enum Output {
     /// Only a node with an authority asks.
     Authority(AuthorityCall),
     /// While the node holds office: the worker has not been heard from for
-    /// a suspicion timeout and then a reconnect timeout, so every TaskRun it
-    /// holds is lost and may be replayed (see [`carry_out`]). A counted
+    /// a suspicion timeout and then a reconnect timeout, so it no longer
+    /// counts as placeable. Its TaskRuns are not decided by this report but
+    /// by its silence, each at its own reconnect timeout (see
+    /// [`Output::WorkerSilence`]). A counted
     /// member whose heartbeats keep arriving but which confirms none of the
     /// leader's acks for that long is lost too, and the leader also removes
     /// it from its configuration, one at a time; a silent worker is only
     /// reported. Reported once; a worker heard from again is watched afresh.
     WorkerLost(WorkerId),
+    /// While the node holds office: `worker` has gone a suspicion timeout
+    /// unheard (or, a counted member whose heartbeats arrive, as long
+    /// without confirming an ack), so each TaskRun it holds is lost, and may
+    /// be replayed (see [`carry_out`]), once that run's own reconnect
+    /// timeout has passed since `reconnect_from`. `None`: it was heard
+    /// again, and its runs are kept. Reported whenever it changes. The
+    /// worker's abort deadline for each run comes first (see
+    /// [`Output::AbortDeadline`]).
+    WorkerSilence {
+        worker: WorkerId,
+        reconnect_from: Option<Instant>,
+    },
     /// While in office: a heartbeat from `worker` said the runs it holds have
     /// this digest, empty if it sent none. For the driver to compare with
     /// what the scheduler believes.
@@ -661,7 +682,7 @@ pub enum Output {
     /// nothing to do with it.
     ///
     /// The deadline comes before any leader can replay those runs. A leader
-    /// replays a worker's runs (see [`Output::WorkerLost`]) a suspicion
+    /// replays a worker's runs (see [`Output::WorkerSilence`]) a suspicion
     /// timeout and a reconnect timeout after it last heard the worker, or
     /// after it won if it has not heard it since. An ack from a leader that
     /// holds a grant echoes the send instant of the heartbeat it answers, so
@@ -733,9 +754,8 @@ pub struct Step {
 
 /// Applies to `scheduler` what `outputs`, one step of a worker's election,
 /// ask of it, in order: each leadership grant the step reports, and each
-/// worker it reports lost, whose TaskRuns `Scheduler::lose_worker` replays.
-/// A lost worker reported to a scheduler that no longer leads changes
-/// nothing. Messages, authority calls, state changes, the abort deadline and
+/// worker's silence, which `Scheduler::note_silence` turns into the loss of
+/// each run the worker holds at that run's own reconnect timeout. Messages, authority calls, state changes, the abort deadline and
 /// alerts are the driver's to carry out and leave it alone.
 ///
 /// `scheduler` must read the clock the node reads: a grant's lease ends at
@@ -749,12 +769,12 @@ pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator, O: Observer>(
         match output {
             Output::Grant(grant) => scheduler.set_leadership_grant(*grant),
             Output::Reconcile(term) => scheduler.begin_reconcile(*term),
-            Output::WorkerLost(worker) => {
-                // Refused only when this scheduler no longer leads, and then
-                // the next leader decides what the worker held.
-                let _ = scheduler.lose_worker(worker);
-            }
-            Output::Send { .. }
+            Output::WorkerSilence {
+                worker,
+                reconnect_from,
+            } => scheduler.note_silence(worker, *reconnect_from),
+            Output::WorkerLost(_)
+            | Output::Send { .. }
             | Output::Publish { .. }
             | Output::StateChanged(_)
             | Output::Authority(_)
@@ -1422,6 +1442,7 @@ where
     fn finish_step(&mut self) -> Step {
         self.ask_authority_if_due();
         self.heartbeat_leader_if_due();
+        self.report_silences();
         self.report_lease_changes();
         Step {
             outputs: std::mem::take(&mut self.outputs),
@@ -1451,8 +1472,8 @@ where
     /// - `Candidate`: its vote's deadline.
     /// - `LeaderReconciling` and `Leader`: when it goes `NoQuorum` unless
     ///   more confirmations arrive (never, for a leader that alone is a
-    ///   quorum), or when it next has a worker to report lost, whichever
-    ///   comes first.
+    ///   quorum), or when it next has a worker to report silent or lost,
+    ///   whichever comes first.
     /// - Every other state: `None`.
     ///
     /// With an authority, also the lease's next registration or fence
@@ -1503,7 +1524,12 @@ where
                             )
                         }),
                 ),
-                self.drain_request.wakes_at(),
+                earliest(
+                    self.drain_request.wakes_at(),
+                    self.office.as_ref().and_then(|office| {
+                        office.next_silent_at(self.clock.now(), self.timings.suspect_timeout)
+                    }),
+                ),
             ),
             _ => None,
         }
@@ -3013,8 +3039,11 @@ where
     }
 
     /// Reports every worker this leader has not heard from for a suspicion
-    /// timeout and a reconnect timeout as lost, once each.
+    /// timeout and a reconnect timeout as lost, once each. Silences go
+    /// first, so a worker lost at the instant it falls silent (a reconnect
+    /// timeout of zero) still has its silence reported.
     fn report_lost_workers(&mut self) {
+        self.report_silences();
         let now = self.clock.now();
         let lost_after = self.lost_after();
         let suspect_timeout = self.timings.suspect_timeout;
@@ -3029,9 +3058,26 @@ where
             if self.state == WorkerState::LeaderReconciling {
                 self.lost_while_reconciling.insert(worker.clone());
             }
-            // Its runs are replayed, so nothing cancelled on it needs telling.
-            self.cancelled_runs.remove(&worker);
+            // Its cancelled runs stay listed: its own runs are decided by its
+            // silence, each at its own reconnect timeout, so a worker heard
+            // again may still hold one and must still be told.
             self.outputs.push(Output::WorkerLost(worker));
+        }
+    }
+
+    /// Reports each change in which workers this leader counts silent (see
+    /// [`Output::WorkerSilence`]).
+    fn report_silences(&mut self) {
+        if !self.holds_office() {
+            return;
+        }
+        let now = self.clock.now();
+        let suspect_timeout = self.timings.suspect_timeout;
+        let Some(office) = self.office.as_mut() else {
+            return;
+        };
+        for (worker, reconnect_from) in office.silence_changes(now, suspect_timeout) {
+            self.outputs.push(Output::WorkerSilence { worker, reconnect_from });
         }
     }
 }

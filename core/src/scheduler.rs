@@ -47,7 +47,9 @@
 //! as ordinary losses at the grant; one that answered the reconciliation is
 //! alive and its loss is dropped. A worker that holds a run the records name
 //! but never answered is returned as a silent holder, for the election to
-//! watch as a lost worker.
+//! watch as a lost worker. A worker the election reports silent has each run
+//! it holds lost once that run's own reconnect timeout has passed (see
+//! [`Scheduler::note_silence`]).
 //!
 //! A coalescing key's waiting chain is kept under a bound. Once it holds more
 //! than [`COMPACTION_SOFT_BYTES`] of payload (or memory is past its soft
@@ -692,6 +694,10 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     run_decided_at: BTreeMap<TaskRunId, Instant>,
     /// The workers that run compaction, as their node's heartbeats say.
     compaction_runners: BTreeSet<WorkerId>,
+    /// The workers its node's office counts silent, each with the instant
+    /// from which the reconnect timeouts of the runs it holds count (see
+    /// [`Scheduler::note_silence`]).
+    silent: BTreeMap<WorkerId, Instant>,
     /// The waiting generation of each key whose last compaction failed: a
     /// merge that failed once would fail again on the same chain, so no new
     /// compaction is made for that generation.
@@ -762,6 +768,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             reconciliation: Reconciliation::default(),
             run_decided_at: BTreeMap::new(),
             compaction_runners: BTreeSet::new(),
+            silent: BTreeMap::new(),
             failed_compactions: BTreeMap::new(),
         }
     }
@@ -1042,6 +1049,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         for worker in lost.unwrap_or_default() {
             let _ = self.lose_runs_of(&worker);
         }
+        if self.is_leader() {
+            self.lose_overdue();
+        }
         self.compact_every_due_key();
         self.end_call();
     }
@@ -1051,8 +1061,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// kept, not applied (see [`Self::lose_worker`]), and the scheduler,
     /// holding no grant, refuses every claim and report as `NotLeader`. A
     /// grant of `None` meanwhile (the node left office) drops the
-    /// reconciliation.
+    /// reconciliation. It forgets every silence its node reported in an
+    /// earlier office: a worker silent then may have been heard by another
+    /// leader since, and the new office counts every worker afresh.
     pub fn begin_reconcile(&mut self, term: ReconcileTerm) {
+        self.silent.clear();
         self.grant = None;
         self.check_leader();
         self.reconciliation.begin(term);
@@ -1892,10 +1905,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// sake: it forgets every task that finished at least `result_ttl` ago,
     /// and, only while this scheduler leads, makes due delayed tasks pending
     /// and expires pending tasks past their expiry (reported through
-    /// [`Self::take_events`]). Call it when [`Self::next_deadline`] comes.
+    /// [`Self::take_events`]), and loses the runs of silent workers whose
+    /// reconnect timeouts have passed (see [`Self::note_silence`]). Call it
+    /// when [`Self::next_deadline`] comes.
     pub fn catch_up(&mut self) -> CaughtUp {
         let mut caught_up = if self.check_leader() {
-            self.release_due()
+            let released = self.release_due();
+            self.lose_overdue();
+            released
         } else {
             CaughtUp::default()
         };
@@ -1933,7 +1950,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// scheduler leads. Also the end of a bounded lease while this scheduler
     /// has found itself leading: that end stays in the answer until a call
     /// finds it passed, since finding the lapse is then `catch_up`'s to do.
-    /// An unbounded lease adds nothing.
+    /// An unbounded lease adds nothing. Also the next replay of a silent
+    /// worker's run, only while this scheduler leads.
     pub fn next_deadline(&self) -> Option<Instant> {
         let forgetting = self.retention.next_due();
         // A lapse is found by a call that reads the clock, so the lease end
@@ -1946,7 +1964,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         } else {
             None
         };
-        [waiting, forgetting, lease_end].into_iter().flatten().min()
+        let replays = if self.is_leader() {
+            self.replays_due().into_iter().map(|(at, _)| at).min()
+        } else {
+            None
+        };
+        [waiting, forgetting, lease_end, replays].into_iter().flatten().min()
     }
 
     /// Whether [`Self::take_events`] has anything to return.
@@ -2415,6 +2438,56 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .map(|task_id| self.lose_run(&task_id, now, stamped_at))
             .collect();
         Ok(lost)
+    }
+
+    /// Its node's office counts `worker` silent from `reconnect_from` on:
+    /// each claimed or running run the worker holds is lost once that run's
+    /// own reconnect timeout has passed since then (a run of a task
+    /// submitted without one at the shard's, which the grant carries). A
+    /// lost run is replayed at once and uses up no retry, except that an
+    /// ephemeral task's stays `Lost`, a running run of a non-retriable task
+    /// is `Orphaned`, and a coalescing generation with a newer one waiting
+    /// stays lost. `None`: the worker was heard again, and the runs it holds
+    /// are kept. Kept while this scheduler does not lead, and acted on while
+    /// it does, here and by [`Self::catch_up`] at [`Self::next_deadline`].
+    pub fn note_silence(&mut self, worker: &WorkerId, reconnect_from: Option<Instant>) {
+        match reconnect_from {
+            Some(from) => {
+                self.silent.insert(worker.clone(), from);
+            }
+            None => {
+                self.silent.remove(worker);
+            }
+        }
+        if self.check_leader() {
+            self.lose_overdue();
+        }
+        self.end_call();
+    }
+
+    /// Each claimed or running current run of a silent worker, by its task,
+    /// with the instant from which it may be replayed.
+    fn replays_due(&self) -> Vec<(Instant, TaskId)> {
+        let mut due = Vec::new();
+        for (worker, from) in &self.silent {
+            for task_id in self.held_by(worker) {
+                due.push((*from + self.reconnect_timeout_of(&task_id), task_id));
+            }
+        }
+        due
+    }
+
+    /// Loses every run of a silent worker whose reconnect timeout has
+    /// passed (see [`Self::note_silence`]). Only a leader decides this, so
+    /// its callers check.
+    fn lose_overdue(&mut self) {
+        let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
+        for (at, task_id) in self.replays_due() {
+            if at <= now {
+                self.lose_run(&task_id, now, stamped_at);
+            }
+        }
     }
 
     /// One run `worker` holds is gone while the worker is not: the process

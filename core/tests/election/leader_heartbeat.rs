@@ -207,13 +207,22 @@ fn confirmations_from_different_members_combine_into_the_quorum_contact() {
     // Itself, plus acks sent at w+3 and w+5: the majority has heard from it
     // as late as w+3.
     let two = confirm(&mut won.node, &others[1], ticks_after(w, 5));
-    assert_eq!(two.next_deadline, Some(ticks_after(w, 3 + LEASE_TICKS)));
+    assert_eq!(
+        grants(&two.outputs),
+        vec![Some(term_1_grant(LeaseEnd::At(ticks_after(w, 3 + LEASE_TICKS))))]
+    );
 
     let three = confirm(&mut won.node, &others[2], ticks_after(w, 4));
-    assert_eq!(three.next_deadline, Some(ticks_after(w, 4 + LEASE_TICKS)));
+    assert_eq!(
+        grants(&three.outputs),
+        vec![Some(term_1_grant(LeaseEnd::At(ticks_after(w, 4 + LEASE_TICKS))))]
+    );
 
     let newer = confirm(&mut won.node, &others[0], ticks_after(w, 5));
-    assert_eq!(newer.next_deadline, Some(ticks_after(w, 5 + LEASE_TICKS)));
+    assert_eq!(
+        grants(&newer.outputs),
+        vec![Some(term_1_grant(LeaseEnd::At(ticks_after(w, 5 + LEASE_TICKS))))]
+    );
 }
 
 #[test]
@@ -222,7 +231,6 @@ fn stale_future_and_pending_member_echoes_never_extend_the_lease() {
     let mut won = leader_of(&clock, 3);
     let w = won.won_at;
     let follower = won.others[0].clone();
-    let stand_in_end = Some(ticks_after(w, LEASE_TICKS));
     clock.advance(Duration::from_ticks(3));
 
     let stale_term = heartbeat(
@@ -232,22 +240,24 @@ fn stale_future_and_pending_member_echoes_never_extend_the_lease() {
             send_token: ticks_after(w, 3).as_ticks(),
         }),
     );
-    assert_eq!(
-        receive(&mut won.node, &follower, stale_term).next_deadline,
-        stand_in_end
-    );
+    // The lease end stays at the win's stand-in: no grant is reported.
+    let stale = receive(&mut won.node, &follower, stale_term);
+    assert_eq!(grants(&stale.outputs), vec![]);
     let from_the_future = confirm(&mut won.node, &follower, ticks_after(w, 4));
-    assert_eq!(from_the_future.next_deadline, stand_in_end);
+    assert_eq!(grants(&from_the_future.outputs), vec![]);
     let joiner = worker("joiner");
     let pending = confirm(&mut won.node, &joiner, ticks_after(w, 3));
-    assert_eq!(pending.next_deadline, stand_in_end);
+    assert_eq!(grants(&pending.outputs), vec![]);
 
     // The same follower's real confirmation does extend it, and an older one
     // arriving late does not take the extension back.
     let real = confirm(&mut won.node, &follower, ticks_after(w, 3));
-    assert_eq!(real.next_deadline, Some(ticks_after(w, 3 + LEASE_TICKS)));
+    assert_eq!(
+        grants(&real.outputs),
+        vec![Some(term_1_grant(LeaseEnd::At(ticks_after(w, 3 + LEASE_TICKS))))]
+    );
     let late = confirm(&mut won.node, &follower, ticks_after(w, 1));
-    assert_eq!(late.next_deadline, Some(ticks_after(w, 3 + LEASE_TICKS)));
+    assert_eq!(grants(&late.outputs), vec![]);
 }
 
 // ---- The leadership grant ----
