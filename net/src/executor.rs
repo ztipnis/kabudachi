@@ -35,6 +35,8 @@
 //! running it. Runs sharing that process die with it, which is safe: they
 //! share the lost contact, and so the deadline. A run killed this way is
 //! reported `Lost`. A later `Abort` for the same run replaces its deadline.
+//! Each run's deadline follows from its own reconnect timeout, which its
+//! claim carries.
 //! `AbortWithdrawn(run)`: the leader hears the worker again before the
 //! deadline; drop the pending abort and let the run go on.
 //!
@@ -48,6 +50,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use kabudachi_core::election::AbortBy;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
@@ -55,7 +58,7 @@ use kabudachi_core::protocol::messages::{
     TaskResponse, claim_response, task_request, task_response,
 };
 use kabudachi_core::task_record::Settled;
-use kabudachi_core::time::WallTime;
+use kabudachi_core::time::{Clock, Duration as CoreDuration, Instant as NodeInstant, WallTime};
 use libp2p::futures::{FutureExt, StreamExt};
 use libp2p::futures::future::BoxFuture;
 use libp2p::futures::stream::FuturesUnordered;
@@ -145,16 +148,47 @@ pub(crate) type RunReport = task_request::Request;
 pub(crate) struct Held {
     /// Places the executor offered that no run has taken.
     pub(crate) credits: u32,
-    /// The runs handed over whose end the executor has not reported.
-    pub(crate) handed: BTreeSet<TaskRunId>,
+    /// The runs handed over whose end the executor has not reported, each
+    /// with its reconnect timeout, which sets its abort deadline.
+    pub(crate) handed: BTreeMap<TaskRunId, CoreDuration>,
     /// The runs of `handed` the executor was already told to stop.
     pub(crate) cancelled: BTreeSet<TaskRunId>,
     /// Per run, the reports no leader has taken yet, oldest first.
     pub(crate) waiting: BTreeMap<TaskRunId, VecDeque<RunReport>>,
     /// The executor dropped its handle: nothing more is claimed for it.
     pub(crate) gone: bool,
-    /// The abort deadline every run in `handed` was given, while one stands.
-    pub(crate) abort_by: Option<Instant>,
+    /// The abort deadline the node last reported, while one stands.
+    pub(crate) abort_by: Option<HostAbort>,
+}
+
+/// An abort deadline the node reported, with what its clock and this host's
+/// monotonic clock read when it did, so each run's deadline can be turned
+/// into an instant the executor can wait for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostAbort {
+    by: AbortBy,
+    node_now: NodeInstant,
+    host_now: Instant,
+}
+
+impl HostAbort {
+    /// `by`, reported now by the node whose clock `clock` is.
+    pub(crate) fn reported_now<C: Clock>(by: AbortBy, clock: &C) -> Self {
+        HostAbort {
+            by,
+            node_now: clock.now(),
+            host_now: Instant::now(),
+        }
+    }
+
+    /// By when, on this host's clock, a run whose reconnect timeout is
+    /// `reconnect_timeout` must have been aborted. The node's clock ticks
+    /// once a millisecond; a deadline already past is the instant it was
+    /// reported.
+    pub(crate) fn for_run(&self, reconnect_timeout: CoreDuration) -> Instant {
+        let ahead = self.by.deadline(reconnect_timeout) - self.node_now;
+        self.host_now + Duration::from_millis(ahead.as_ticks())
+    }
 }
 
 /// A claim or report of this worker's own, decided by its own scheduler
@@ -178,6 +212,8 @@ pub(crate) struct Executing<'n> {
     /// How long a report waits after one was refused, or got no answer,
     /// before reports are sent again.
     retry_after: Duration,
+    /// The shard's reconnect timeout, for a claim that names none.
+    default_reconnect: CoreDuration,
     /// A discovery under way at a remote leader, with the places it reserved.
     discovering: Option<(u32, BoxFuture<'n, Found>)>,
     /// Places this leader's own claim reserved, until its answer settles.
@@ -199,11 +235,17 @@ impl<'n> Executing<'n> {
     /// The driver's side for one run of the driver. A claim the last run
     /// was granted and never handed over (it stopped mid-discovery) is
     /// reported lost, so the leader replays it.
-    pub(crate) fn new(endpoint: &'n mut ExecutorEndpoint, net: &'n Net, retry_after: Duration) -> Self {
+    pub(crate) fn new(
+        endpoint: &'n mut ExecutorEndpoint,
+        net: &'n Net,
+        retry_after: Duration,
+        default_reconnect: CoreDuration,
+    ) -> Self {
         let mut executing = Executing {
             endpoint,
             net,
             retry_after,
+            default_reconnect,
             discovering: None,
             own_claim: None,
             idle: IdleBackoff::default(),
@@ -217,7 +259,7 @@ impl<'n> Executing<'n> {
         };
         for run in net.claimed_runs().active_ids() {
             let held = &executing.endpoint.held;
-            if !held.handed.contains(&run) && !held.waiting.contains_key(&run) {
+            if !held.handed.contains_key(&run) && !held.waiting.contains_key(&run) {
                 executing.queue_lost(run);
             }
         }
@@ -371,21 +413,24 @@ impl<'n> Executing<'n> {
     /// it sees the run gone, so the same cancel arrives more than once.
     pub(crate) fn cancel(&mut self, run: &TaskRunId) {
         let held = &mut self.endpoint.held;
-        if held.handed.contains(run) && held.cancelled.insert(run.clone()) {
+        if held.handed.contains_key(run) && held.cancelled.insert(run.clone()) {
             let _ = self.endpoint.work.send(Work::Cancel(run.clone()));
         }
     }
 
-    /// The node reported a new abort deadline, on this host's clock, or
-    /// lifted the one it had: every run handed over is told, a lifted
-    /// deadline withdrawing each pending abort.
-    pub(crate) fn follow_abort_deadline(&mut self, deadline: Option<Instant>) {
+    /// The node reported a new abort deadline, or lifted the one it had:
+    /// every run handed over is told its own deadline, a lifted deadline
+    /// withdrawing each pending abort.
+    pub(crate) fn follow_abort_deadline(&mut self, abort: Option<HostAbort>) {
         let held = &mut self.endpoint.held;
-        let withdrawn = deadline.is_none() && held.abort_by.is_some();
-        held.abort_by = deadline;
-        for run in &held.handed {
-            let work = match deadline {
-                Some(deadline) => Work::Abort { run: run.clone(), deadline },
+        let withdrawn = abort.is_none() && held.abort_by.is_some();
+        held.abort_by = abort;
+        for (run, reconnect) in &held.handed {
+            let work = match abort {
+                Some(abort) => Work::Abort {
+                    run: run.clone(),
+                    deadline: abort.for_run(*reconnect),
+                },
                 None if withdrawn => Work::AbortWithdrawn(run.clone()),
                 None => continue,
             };
@@ -500,6 +545,10 @@ impl<'n> Executing<'n> {
             held.credits = held.credits.saturating_add(1);
             return;
         };
+        let reconnect = match claim.reconnect_timeout_ms {
+            0 => self.default_reconnect,
+            ms => CoreDuration::from_millis(ms),
+        };
         let compacts = claim.task.as_ref().is_some_and(|task| task.compacts.is_some());
         let work = if compacts { Work::Compact(claim) } else { Work::Run(claim) };
         if self.endpoint.work.send(work).is_err() {
@@ -517,16 +566,19 @@ impl<'n> Executing<'n> {
             self.lose_handed();
             return;
         }
-        if let Some(deadline) = self.endpoint.held.abort_by {
-            let _ = self.endpoint.work.send(Work::Abort { run: run.clone(), deadline });
+        if let Some(abort) = self.endpoint.held.abort_by {
+            let _ = self.endpoint.work.send(Work::Abort {
+                run: run.clone(),
+                deadline: abort.for_run(reconnect),
+            });
         }
-        self.endpoint.held.handed.insert(run);
+        self.endpoint.held.handed.insert(run, reconnect);
     }
 
     /// The executor is gone: no run it was handed and has not ended will
     /// report again, so each is reported lost.
     fn lose_handed(&mut self) {
-        for run in std::mem::take(&mut self.endpoint.held.handed) {
+        for run in std::mem::take(&mut self.endpoint.held.handed).into_keys() {
             self.endpoint.held.cancelled.remove(&run);
             self.queue_lost(run);
         }

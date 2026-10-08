@@ -35,8 +35,8 @@
 //! that leader and hands each run over. It takes each report the executor
 //! makes to the leader, in order per run, asking again as leaders change
 //! until one takes it. When the node reports an abort deadline, every run
-//! handed over is told to abort by it, and told again when the deadline is
-//! lifted; no more work is claimed while one stands.
+//! handed over is told to abort by its own deadline, from its reconnect
+//! timeout, and told again when the deadline is lifted; no more work is claimed while one stands.
 //!
 //! A leader's scheduler records each decision as a new revision of its
 //! task's Task record. The driver writes every revision to the voters
@@ -175,7 +175,7 @@ use crate::reconcile::leader::LeaderReconciliation;
 use crate::reconcile::report::page_of;
 use crate::steal::candidates_for_steal;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
-use crate::executor::{Executing, granted, ExecutorEndpoint, OwnAnswer, RunReport};
+use crate::executor::{Executing, ExecutorEndpoint, HostAbort, OwnAnswer, RunReport, granted};
 use crate::routing_refresh::{RoutingRefresh, ShardView};
 use crate::task_exchange::{self, TaskRequestHandle};
 use crate::task_store::placement::{Placement, ReplicationFactor, placement};
@@ -311,7 +311,9 @@ where
     node.set_runs_compaction(executor.is_some());
     // The driver's side of the executor, for this run of the driver.
     let retry_after = Duration::from_millis(node.timings().heartbeat_interval.as_ticks());
-    let mut executing = executor.map(|endpoint| Executing::new(endpoint, net, retry_after));
+    let default_reconnect = node.timings().reconnect_timeout;
+    let mut executing =
+        executor.map(|endpoint| Executing::new(endpoint, net, retry_after, default_reconnect));
     net.subscribe_to_shard(node.shard_id());
     let mut first = Some(first);
     let mut next_deadline = None;
@@ -423,9 +425,7 @@ where
         // A deadline the node reported is handed on before the await below: it
         // is not reported again, so a driver dropped there must not lose it.
         if let (Some(executing), Some(deadline)) = (executing.as_mut(), stepper.collected.abort_deadline.take()) {
-            executing.follow_abort_deadline(deadline.map(|by| {
-                on_this_host(&clock, by.deadline(stepper.node.timings().reconnect_timeout))
-            }));
+            executing.follow_abort_deadline(deadline.map(|by| HostAbort::reported_now(by, &clock)));
         }
         respond_to_join_requests(stepper.node, net).await;
         respond_to_claim_requests(
@@ -467,9 +467,7 @@ where
         let cancelled_runs = std::mem::take(&mut stepper.collected.cancelled_runs);
         if let Some(executing) = executing.as_mut() {
             if let Some(deadline) = abort_deadline {
-                executing.follow_abort_deadline(deadline.map(|by| {
-                    on_this_host(&clock, by.deadline(stepper.node.timings().reconnect_timeout))
-                }));
+                executing.follow_abort_deadline(deadline.map(|by| HostAbort::reported_now(by, &clock)));
             }
             for run in &cancelled_runs {
                 executing.cancel(run);
@@ -1086,13 +1084,6 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
             | Output::WorkerSilence { .. } => {}
         }
     }
-}
-
-/// `at`, an instant of `clock`, as an instant of this host's monotonic clock,
-/// for an executor that does not read the node's clock. `clock` ticks once a
-/// millisecond (see [`run_driver`]); an instant already past is now.
-fn on_this_host<C: Clock>(clock: &C, at: Instant) -> std::time::Instant {
-    std::time::Instant::now() + Duration::from_millis((at - clock.now()).as_ticks())
 }
 
 /// Sleeps until `clock` reaches `deadline`, or for ever when there is none.
