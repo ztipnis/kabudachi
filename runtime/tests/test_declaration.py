@@ -810,6 +810,9 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         for name in ("processes", "concurrency", "imports", "process_start_timeout")
     ] == [2, 40, ("app.tasks", "app.more_tasks"), timedelta(seconds=2.5)]
 
+    monkeypatch.setenv("KABUDACHI_IMPORTS", "")
+    assert Configuration().resolve("imports") is None
+
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(
     monkeypatch,

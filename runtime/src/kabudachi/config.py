@@ -199,7 +199,8 @@ def _parse(value_type: Any, raw: str) -> Any:
             return False
         raise ValueError(raw)
     if value_type == tuple[str, ...] | None:
-        return tuple(part.strip() for part in raw.split(",") if part.strip())
+        modules = tuple(part.strip() for part in raw.split(",") if part.strip())
+        return modules or None  # an empty value is "not set", not "no modules"
     return raw
 
 
@@ -270,7 +271,8 @@ def configure(**settings: Any) -> None:
     the number of tasks one process runs at once, `concurrency_override` to
     allow `concurrency` above 32, `imports`, the modules task processes import
     to find tasks (by default every module that declared one),
-    `process_start_timeout`, the timedelta a task process has to become ready, `queue`, the queue tasks are sent to unless they name their own,
+    `process_start_timeout`, the timedelta a task process has to become
+    ready, `queue`, the queue tasks are sent to unless they name their own,
     `result_ttl`, the seconds a finished task is kept, `cancel_grace`, the
     timedelta a task past its timeout has to stop, and `memory_soft_limit` and
     `memory_hard_limit`, in bytes of pending task input (past the soft one
