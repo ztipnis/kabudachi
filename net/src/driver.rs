@@ -145,8 +145,8 @@
 use std::time::Duration;
 
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, HandOffTo, Input, Issuer, MessageSink,
-    Output, Step, WorkerNode, carry_out,
+    AbortBy, AuthorityCall, AuthorityPerformer, AuthorityReply, HandOffTo, Input, Issuer,
+    MessageSink, Output, Step, WorkerNode, carry_out,
 };
 use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
@@ -423,7 +423,9 @@ where
         // A deadline the node reported is handed on before the await below: it
         // is not reported again, so a driver dropped there must not lose it.
         if let (Some(executing), Some(deadline)) = (executing.as_mut(), stepper.collected.abort_deadline.take()) {
-            executing.follow_abort_deadline(deadline.map(|at| on_this_host(&clock, at)));
+            executing.follow_abort_deadline(deadline.map(|by| {
+                on_this_host(&clock, by.deadline(stepper.node.timings().reconnect_timeout))
+            }));
         }
         respond_to_join_requests(stepper.node, net).await;
         respond_to_claim_requests(
@@ -465,7 +467,9 @@ where
         let cancelled_runs = std::mem::take(&mut stepper.collected.cancelled_runs);
         if let Some(executing) = executing.as_mut() {
             if let Some(deadline) = abort_deadline {
-                executing.follow_abort_deadline(deadline.map(|at| on_this_host(&clock, at)));
+                executing.follow_abort_deadline(deadline.map(|by| {
+                    on_this_host(&clock, by.deadline(stepper.node.timings().reconnect_timeout))
+                }));
             }
             for run in &cancelled_runs {
                 executing.cancel(run);
@@ -925,7 +929,7 @@ struct Collected {
     /// Where the node, once it drained, said to hand the records it holds.
     hand_off: Option<HandOffTo>,
     /// The latest abort deadline a step reported, if one did this batch.
-    abort_deadline: Option<Option<Instant>>,
+    abort_deadline: Option<Option<AbortBy>>,
     /// The runs the leader's acks said were cancelled, for the executor.
     cancelled_runs: Vec<TaskRunId>,
 }
@@ -1056,7 +1060,7 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
                 shard = node.shard_id().as_str(),
                 by = ?by,
                 "this worker cannot show that its leader still hears it, or has fenced itself, \
-                 and must abort every TaskRun it is running by this instant unless that \
+                 and must abort each TaskRun it is running by that run's deadline unless that \
                  changes"
             ),
             Output::AbortDeadline(None) => tracing::info!(

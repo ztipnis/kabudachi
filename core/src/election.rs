@@ -145,6 +145,7 @@ pub use authority::{
 };
 pub use carry_out::{AuthorityPerformer, DropMessages, MessageSink, NoAuthority, carry_out};
 pub use entry::{Entry, Identity};
+pub use lease::AbortBy;
 
 use crate::configuration::{Admission, Configuration, Generation, Roster, Tally};
 use crate::coordination_authority::{RecoveryEpoch, ShardRecord};
@@ -672,8 +673,9 @@ pub enum Output {
     /// worker holds: the worker's executor stops their bodies. Reported with
     /// every ack that lists them, so the same run can be reported again.
     RunsCancelled(Vec<TaskRunId>),
-    /// By when, on the node's clock, this worker must have aborted every
-    /// TaskRun it is running: `Some` once it has gone
+    /// By when, on the node's clock, this worker must have aborted each
+    /// TaskRun it is running, as an [`AbortBy`] that gives each run's
+    /// deadline from that run's reconnect timeout: `Some` once it has gone
     /// a suspicion timeout, less drift, without evidence that its leader
     /// still hears it, or once it has fenced itself;
     /// `None` while it has nothing to abort. Reported whenever it changes,
@@ -684,7 +686,8 @@ pub enum Output {
     ///
     /// The deadline comes before any leader can replay those runs. A leader
     /// replays a worker's runs (see [`Output::WorkerSilence`]) a suspicion
-    /// timeout and a reconnect timeout after it last heard the worker, or
+    /// timeout and the run's own reconnect timeout after it last heard the
+    /// worker, or
     /// after it won if it has not heard it since. An ack from a leader that
     /// holds a grant echoes the send instant of the heartbeat it answers, so
     /// the follower knows that leader heard it no earlier than that, and no
@@ -692,11 +695,12 @@ pub enum Output {
     /// a leader that stops leading knows no rival won before its own grant
     /// ended. From
     /// the latest such instant the deadline is the suspicion timeout plus the
-    /// reconnect timeout, less a tenth for clock drift (the same rate bound
-    /// the leader lease assumes). Every worker in the shard must use the same
-    /// `suspect_timeout` and reconnect timeout (see
-    /// [`ElectionTimings::reconnect_timeout`]).
-    AbortDeadline(Option<Instant>),
+    /// run's reconnect timeout, less a tenth for clock drift (the same rate
+    /// bound the leader lease assumes). Every worker in the shard must use
+    /// the same `suspect_timeout`, and the same default reconnect timeout
+    /// (see [`ElectionTimings::reconnect_timeout`]); a run's own timeout
+    /// travels with its claim.
+    AbortDeadline(Option<AbortBy>),
     /// An alert: the node found the shard gone (no record, or a record of
     /// another incarnation of it), so the shard is abandoned and the node has stopped
     /// (see [`StopReason::Abandoned`]). A restart re-enters the bootstrap
@@ -2058,7 +2062,6 @@ where
             grant,
             self.state == WorkerState::Leader,
             &self.timings,
-            self.lost_after(),
             self.clock.now(),
         );
         for change in changes {
@@ -2933,7 +2936,7 @@ where
         self.round.stop();
         self.drop_recovery();
         self.transition_to(WorkerState::Fenced);
-        self.lease.orphaned(now, &self.timings);
+        self.lease.orphaned(now);
         true
     }
 
@@ -3023,8 +3026,8 @@ where
 
     /// How long a leader goes without hearing from a worker before it
     /// reports that worker lost: a suspicion timeout and then a reconnect
-    /// timeout. The worker's own abort deadline counts from the same span
-    /// (see [`Lease::report`]), so it aborts before any leader replays it.
+    /// timeout. Membership only: a run's replay is timed by its own
+    /// reconnect timeout (see [`Output::WorkerSilence`]).
     fn lost_after(&self) -> Duration {
         Duration::from_ticks(
             self.timings

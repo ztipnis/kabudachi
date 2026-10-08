@@ -19,6 +19,7 @@ use super::scenario_records::{
 };
 use crate::support::builders::past_any_suspicion;
 use crate::support::harness::{Answer, Cluster};
+use crate::support::scenarios::abort_deadline_at;
 
 /// A node that is not one of `excluded`.
 pub(crate) fn some_other(cluster: &Cluster, excluded: &[&WorkerId]) -> WorkerId {
@@ -281,6 +282,7 @@ fn a_new_leader_decides_each_run_of_a_worker_lost_with_the_old_one_at_that_runs_
         .into_iter()
         .filter(|id| *id != leader && *id != worker)
         .collect();
+    cluster.record_steps();
     cluster.partition(BTreeSet::from([leader.clone(), worker.clone()]), rest);
     advance_until(&mut cluster, |cluster| new_leader(cluster, &leader).is_some());
     let took_office = cluster.now();
@@ -311,6 +313,22 @@ fn a_new_leader_decides_each_run_of_a_worker_lost_with_the_old_one_at_that_runs_
             "{task:?} was decided {decided_in} ticks after the takeover, not about {due_in}"
         );
         assert_eq!(held_states(&cluster, task), decided, "{task:?}");
+    }
+
+    // The worker, cut off with the old leader, was told to abort each run
+    // before that run was decided: a deadline at the shard's timeout would
+    // have come long after the quick run's replay.
+    let steps = cluster.take_steps();
+    for (task, reconnect) in [(&quick, OWN), (&patient, shard)] {
+        let at = decided_at[task];
+        let abort = abort_deadline_at(&steps, &worker, at)
+            .flatten()
+            .expect("the cut-off worker was told to abort its runs");
+        assert!(
+            abort.deadline(reconnect) < at,
+            "{task:?} was decided at {at:?}, before its worker had to abort it at {:?}",
+            abort.deadline(reconnect)
+        );
     }
 }
 

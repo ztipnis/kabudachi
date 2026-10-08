@@ -715,7 +715,9 @@ fn abort_deadline_as_of(
         .filter(|step| step.node == *worker && step.at <= at)
         .flat_map(|step| &step.outputs)
         .filter_map(|output| match output {
-            Output::AbortDeadline(deadline) => Some(*deadline),
+            Output::AbortDeadline(deadline) => {
+                Some(deadline.map(|by| by.deadline(ElectionTimings::DEFAULT_RECONNECT_TIMEOUT)))
+            }
             _ => None,
         })
         .next_back()
