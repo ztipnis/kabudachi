@@ -13,11 +13,11 @@ use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::reconcile::{
     CoalescingKey,
-    ANSWER_IN_FLIGHT, Rebuild, ReportedRun, ReportedState, WorkerRuns,
+    ANSWER_IN_FLIGHT, Rebuild, ReconcileTerm, ReportedRun, ReportedState, WorkerRuns,
 };
 use kabudachi_core::scheduler::{
     CancelRejection, Claim, ClaimRejection, Completion, MemoryLimits,
-    ReportRejection, Submission, SubmitRejection,
+    ReconcileRejection, ReportRejection, Submission, SubmitRejection,
 };
 use kabudachi_core::task_record::RecordVersion;
 use kabudachi_core::time::{Clock, WallTime};
@@ -1119,4 +1119,55 @@ fn a_claimed_compaction_still_holds_its_key_after_a_rebuild_and_its_fold_is_acce
         .unwrap();
     assert!(done.applied);
     assert!(new.scheduler.request_claim(&worker("w2"), &newest).is_ok());
+}
+
+#[test]
+fn only_the_grant_of_the_office_rebuilt_for_ends_a_reconciliation_and_a_rebuild_is_taken_once() {
+    let mut fixture = Fixture::not_leading();
+    let refused = fixture.scheduler.reconcile(Rebuild::default()).unwrap_err();
+    assert_eq!(refused.rejection, ReconcileRejection::NotReconciling);
+
+    fixture.scheduler.begin_reconcile(OFFICE);
+    fixture.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+    assert!(!fixture.scheduler.is_leader(), "not before the rebuild");
+
+    fixture.scheduler.reconcile(Rebuild::default()).unwrap();
+    let again = fixture.scheduler.reconcile(Rebuild::default()).unwrap_err();
+    assert_eq!(again.rejection, ReconcileRejection::AlreadyRebuilt);
+
+    let later = ReconcileTerm {
+        term: OFFICE.term + 1,
+        ..OFFICE
+    };
+    fixture.scheduler.set_leadership_grant(Some(grant_of(later)));
+    assert!(!fixture.scheduler.is_leader(), "not another office's grant");
+    assert_eq!(fixture.scheduler.reconciling(), Some(OFFICE));
+
+    fixture.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+    assert!(fixture.scheduler.is_leader());
+    assert_eq!(fixture.scheduler.reconciling(), None);
+}
+
+#[test]
+fn a_worker_lost_while_reconciling_that_answered_the_rebuild_is_not_lost_at_the_grant() {
+    let mut old = Fixture::leading();
+    let task = old.scheduler.submit(plain(b"t")).unwrap();
+    let claim = old.scheduler.request_claim(&worker("w1"), &task).unwrap();
+    let mut new = reconciling_after(&old);
+
+    new.scheduler.lose_worker(&worker("w1")).unwrap();
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&old),
+            reports: report("w1", vec![reported(&claim, ReportedState::Claimed)]),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+
+    assert_eq!(
+        last_states(&new, &task),
+        [TaskRunState::Claimed],
+        "w1 answered, so it is not lost"
+    );
 }

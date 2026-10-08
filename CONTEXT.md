@@ -160,6 +160,10 @@ Whoever the scheduler hands each published task record to (the `Observer` trait)
 **Waiting room**, **Memory budget**, **Retention**:
 The scheduler's private parts for pending tasks, the payload memory of unfinished tasks, and how long finished tasks are kept.
 
+**Scheduler reconciliation**:
+The scheduler's private part for what a rebuild left it: the office it reconciles for until that office's grant (only that grant takes effect, and it applies the losses of workers reported lost meanwhile that the rebuild did not hear from), the workers the rebuild heard from, and the tasks whose newest record is not known yet, with their coalescing keys, the records held back with those keys and the reports held for them. It decides nothing about tasks it does not hold back; installing records is the scheduler's.
+_Avoid_: rebuild state, uncertainty table
+
 ## The Python runtime
 
 **Task table**:

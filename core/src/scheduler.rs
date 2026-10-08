@@ -84,22 +84,24 @@ use crate::protocol::messages::{Task, TaskRun, TaskRunIdentity};
 use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task, retry_of};
 use crate::protocol::task::TaskRunState;
 use crate::reconcile::{
-    ANSWER_IN_FLIGHT, CoalescingKey, RECONCILE_SKEW_MARGIN, Rebuild, ReconcileTerm, ReportedRun, ReportedState,
+    ANSWER_IN_FLIGHT, RECONCILE_SKEW_MARGIN, Rebuild, ReconcileTerm, ReportedRun, ReportedState,
     WorkerRuns,
 };
 use crate::task_record::{
-    HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion, VersionOrder, identify,
+    HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion, VersionOrder,
 };
 use crate::time::{Clock, Duration, Instant, WallTime};
 
 mod compaction;
 mod memory_budget;
 mod observer;
+mod reconciliation;
 mod retention;
 mod waiting_room;
 
 pub use observer::{NoObserver, Observer};
 use memory_budget::MemoryBudget;
+use reconciliation::Reconciliation;
 use retention::Retention;
 use waiting_room::WaitingRoom;
 
@@ -648,26 +650,8 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     input_digests: BTreeMap<TaskId, Digest>,
     /// Each coalescing generation's links: who superseded it, whom it absorbed.
     links: BTreeMap<TaskId, CoalescingLink>,
-    /// While its node reconciles: the office, whether `reconcile` has run,
-    /// and the workers reported lost meanwhile.
-    reconciling: Option<Reconciling>,
-    /// The workers whose answer the last rebuild used, kept after the
-    /// reconciliation ends: a late record that names one of them as holding a
-    /// run does not make it a silent holder.
-    rebuild_answered: BTreeSet<WorkerId>,
-    /// Tasks some worker holds whose newest record cannot be known yet, with
-    /// the run ids known to be theirs. Not scheduled, not republished; claims,
-    /// cancels and reports of them are answered `NotReady`.
-    uncertain: BTreeMap<TaskId, BTreeSet<TaskRunId>>,
-    /// The coalescing key of each task in `uncertain` that has one. While any
-    /// generation of a key is in here, no generation of that key is installed.
-    uncertain_keys: BTreeMap<TaskId, Key>,
-    /// Records known for certain that are held back with their key: a
-    /// generation of the key has no record this leader can rely on yet.
-    deferred: BTreeMap<TaskId, TaskRecord>,
-    /// What workers reported about runs of uncertain tasks, applied when the
-    /// task's record is installed.
-    held_reports: BTreeMap<TaskId, Vec<(WorkerId, ReportedRun)>>,
+    /// What a rebuild left it: see [`Reconciliation`].
+    reconciliation: Reconciliation,
     /// When this scheduler last changed each run. A worker asked what it
     /// holds may not have received a run decided shortly before the question.
     run_decided_at: BTreeMap<TaskRunId, Instant>,
@@ -689,13 +673,6 @@ struct Settled {
     finish_live: Vec<(TaskId, TaskId)>,
 }
 
-/// The coalescing keys of the tasks of `keys`.
-fn key_map(keys: BTreeMap<TaskId, CoalescingKey>) -> BTreeMap<TaskId, Key> {
-    keys.into_iter()
-        .map(|(task_id, key)| (task_id, coalescing::key(&key.definition, &key.key)))
-        .collect()
-}
-
 /// Whether a generation that absorbed another agrees with that one's record.
 enum Supersession {
     /// The older record names the newer one, or the generation absorbed
@@ -710,14 +687,6 @@ enum Supersession {
     /// The older record is not known, or cannot be reconciled with the newer
     /// one: the key is not known yet.
     Broken,
-}
-
-struct Reconciling {
-    term: ReconcileTerm,
-    rebuilt: bool,
-    lost: BTreeSet<WorkerId>,
-    /// The workers whose answer the rebuild used: they are alive.
-    answered: BTreeSet<WorkerId>,
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
@@ -754,12 +723,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             revisions: None,
             input_digests: BTreeMap::new(),
             links: BTreeMap::new(),
-            reconciling: None,
-            rebuild_answered: BTreeSet::new(),
-            uncertain: BTreeMap::new(),
-            uncertain_keys: BTreeMap::new(),
-            deferred: BTreeMap::new(),
-            held_reports: BTreeMap::new(),
+            reconciliation: Reconciliation::default(),
             run_decided_at: BTreeMap::new(),
             compaction_runners: BTreeSet::new(),
             failed_compactions: BTreeMap::new(),
@@ -1036,32 +1000,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// node watches it again once it leads, so it is reported lost once more
     /// if it is dead.
     pub fn set_leadership_grant(&mut self, grant: Option<LeadershipGrant>) {
-        let mut lost = BTreeSet::new();
-        self.grant = match (grant, self.reconciling.as_ref()) {
-            (None, _) => {
-                self.reconciling = None;
-                None
-            }
-            (Some(grant), Some(reconciling))
-                if !(reconciling.rebuilt
-                    && reconciling.term.recovery_epoch == grant.recovery_epoch
-                    && reconciling.term.term == grant.term) =>
-            {
-                None
-            }
-            (Some(grant), Some(_)) => {
-                let reconciling = self.reconciling.take().expect("just seen");
-                lost = reconciling
-                    .lost
-                    .difference(&reconciling.answered)
-                    .cloned()
-                    .collect();
-                Some(grant)
-            }
-            (Some(grant), None) => Some(grant),
-        };
+        let lost = self.reconciliation.takes_grant(grant.as_ref());
+        self.grant = grant.filter(|_| lost.is_some());
         self.check_leader();
-        for worker in lost {
+        for worker in lost.unwrap_or_default() {
             let _ = self.lose_runs_of(&worker);
         }
         self.compact_every_due_key();
@@ -1077,18 +1019,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     pub fn begin_reconcile(&mut self, term: ReconcileTerm) {
         self.grant = None;
         self.check_leader();
-        self.rebuild_answered.clear();
-        self.reconciling = Some(Reconciling {
-            term,
-            rebuilt: false,
-            lost: BTreeSet::new(),
-            answered: BTreeSet::new(),
-        });
+        self.reconciliation.begin(term);
     }
 
     /// The office it reconciles for, until that office's grant arrives.
     pub fn reconciling(&self) -> Option<ReconcileTerm> {
-        self.reconciling.as_ref().map(|reconciling| reconciling.term)
+        self.reconciliation.office()
     }
 
     /// Replaces everything this scheduler holds with what `rebuild` says,
@@ -1104,43 +1040,40 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// still installed but nothing is republished and `republished` is 0:
     /// there is no live term left to fence a late write at.
     pub fn reconcile(&mut self, rebuild: Rebuild) -> Result<Reconciled, ReconcileRefused> {
-        let rejection = match self.reconciling.as_ref() {
-            None => Some(ReconcileRejection::NotReconciling),
-            Some(reconciling) if reconciling.rebuilt => Some(ReconcileRejection::AlreadyRebuilt),
-            Some(_) => None,
-        };
-        if let Some(rejection) = rejection {
+        if let Some(rejection) = self.reconciliation.refusal() {
             return Err(ReconcileRefused { rejection, rebuild });
         }
-        let reconciling = self.reconciling.as_mut().expect("just seen");
-        reconciling.rebuilt = true;
-        reconciling.answered = rebuild.reports.keys().cloned().collect();
-        let office = reconciling.term;
-
+        let Rebuild {
+            records,
+            uncertain,
+            uncertain_keys,
+            reports,
+        } = rebuild;
         self.clear_tasks();
-        self.rebuild_answered = rebuild.reports.keys().cloned().collect();
-        self.uncertain = rebuild.uncertain;
-        self.uncertain_keys = key_map(rebuild.uncertain_keys);
-        self.install_settled(rebuild.records, false);
+        let office = self.reconciliation.rebuilt(
+            reports.keys().cloned().collect(),
+            uncertain,
+            uncertain_keys,
+        );
+        self.install_settled(records, false);
         // What applying the reports did (runs lost, certified or failed) is
         // not reported back: the caller learns of it from the revisions the
         // scheduler publishes and from the events it queues.
         let mut applied = Adopted::default();
-        self.apply_reports(rebuild.reports, &mut applied);
+        self.apply_reports(reports, &mut applied);
         let republished = if self.may_publish_under(office.recovery_epoch, office.term) {
             self.publish_unpublished(office.recovery_epoch, office.term)
         } else {
             0
         };
-        let answered = &self.reconciling.as_ref().expect("still reconciling").answered;
         let silent_holders = self
             .holders_of(self.current_run.keys())
-            .difference(answered)
+            .difference(self.reconciliation.answered())
             .cloned()
             .collect();
         Ok(Reconciled {
             republished,
-            uncertain: self.uncertain.len(),
+            uncertain: self.reconciliation.uncertain_count(),
             silent_holders,
         })
     }
@@ -1166,39 +1099,19 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             uncertain_keys,
             reports,
         } = learnt;
-        let mut candidates = std::mem::take(&mut self.deferred);
-        for record in records {
-            let Ok((task_id, version)) = identify(&record) else {
-                continue;
-            };
-            if self.tasks.contains_key(&task_id) {
-                continue;
-            }
-            // Its record is known now, so it no longer holds its key back.
-            self.uncertain_keys.remove(&task_id);
-            let newer = candidates.get(&task_id).is_none_or(|held| {
-                identify(held).is_ok_and(|(_, held)| held.order(&version) == VersionOrder::Older)
+        let tasks = &self.tasks;
+        let candidates = self
+            .reconciliation
+            .learn(records, uncertain, uncertain_keys, |task| {
+                tasks.contains_key(task)
             });
-            if newer {
-                candidates.insert(task_id, record);
-            }
-        }
-        let mut uncertain_keys = key_map(uncertain_keys);
-        for (task_id, runs) in uncertain {
-            if !self.tasks.contains_key(&task_id) {
-                if let Some(key) = uncertain_keys.remove(&task_id) {
-                    self.uncertain_keys.insert(task_id.clone(), key);
-                }
-                self.uncertain.entry(task_id).or_default().extend(runs);
-            }
-        }
         let mut adopted = Adopted::default();
-        let installed = self.install_settled(candidates.into_values().collect(), true);
+        let installed = self.install_settled(candidates, true);
         adopted.installed = installed.len();
         let mut answered: BTreeSet<WorkerId> = reports.keys().cloned().collect();
-        answered.extend(self.rebuild_answered.iter().cloned());
+        answered.extend(self.reconciliation.answered().iter().cloned());
         for task_id in &installed {
-            for (worker, run) in self.held_reports.remove(task_id).unwrap_or_default() {
+            for (worker, run) in self.reconciliation.take_reports_for(task_id) {
                 answered.insert(worker.clone());
                 self.apply_reported(&worker, run, &mut adopted);
             }
@@ -1218,19 +1131,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// reported as claimed or running (a heartbeat digest covers no others).
     /// What `worker`'s heartbeat digest is compared with.
     pub fn active_runs_of(&self, worker: &WorkerId) -> Vec<TaskRunId> {
-        let reported = self
-            .held_reports
-            .values()
-            .flatten()
-            .filter(|(reporter, run)| {
-                reporter == worker
-                    && matches!(run.state, ReportedState::Claimed | ReportedState::Running)
-            })
-            .map(|(_, run)| run.claim.task_run_id.clone());
         self.held_by(worker)
             .iter()
             .map(|task_id| self.current_run[task_id].clone())
-            .chain(reported)
+            .chain(self.reconciliation.active_runs_reported_by(worker))
             .collect()
     }
 
@@ -1256,16 +1160,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             }
             self.install(record, now, wall_now);
         }
-        for task_id in &installed {
-            self.uncertain.remove(task_id);
-        }
+        self.reconciliation.installed(&installed);
         for record in held_back {
-            let Some(task_id) = record.task.as_ref().map(Task::task_id) else {
-                continue;
-            };
-            let runs = record.runs.iter().map(TaskRunRecord::task_run_id);
-            self.uncertain.entry(task_id.clone()).or_default().extend(runs);
-            self.deferred.insert(task_id, record);
+            self.reconciliation.hold_back(record);
         }
         for (older, newer) in finish_live {
             self.supersede(&older, &newer);
@@ -1306,7 +1203,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         // A key with a generation whose record is unknown is held whole, like
         // one found broken: the generations decide each other's fate, and one
         // not yet known may have absorbed a generation known already.
-        let mut broken: BTreeSet<Key> = self.uncertain_keys.values().cloned().collect();
+        let mut broken: BTreeSet<Key> = self.reconciliation.unknown_keys();
         let mut unfinished: Vec<(usize, TaskId)> = Vec::new();
         let mut finish_live: Vec<(TaskId, TaskId)> = Vec::new();
         for record in &records {
@@ -1463,12 +1360,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .iter()
                 .map(|run| run.claim.task_run_id.clone())
                 .collect();
-            for held in self.held_reports.values_mut() {
-                held.retain(|(holder, run)| {
-                    *holder != worker || reported.contains(&run.claim.task_run_id)
-                });
-            }
-            self.held_reports.retain(|_, held| !held.is_empty());
+            self.reconciliation.drop_unreported(&worker, &reported);
             for task_id in self.held_by(&worker) {
                 let run_id = &self.current_run[&task_id];
                 let in_flight = answer.asked_at.is_some_and(|asked_at| {
@@ -1488,14 +1380,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// Applies one run `worker` reported (see [`Self::apply_reports`]).
     fn apply_reported(&mut self, worker: &WorkerId, reported: ReportedRun, out: &mut Adopted) {
+        let Some(reported) = self.reconciliation.hold_report(worker, reported) else {
+            return;
+        };
         let task_id = reported.claim.task.task_id();
         let run_id = reported.claim.task_run_id.clone();
-        if self.uncertain.contains_key(&task_id) {
-            let held = self.held_reports.entry(task_id).or_default();
-            held.retain(|(_, known)| known.claim.task_run_id != run_id);
-            held.push((worker.clone(), reported));
-            return;
-        }
         if !self.tasks.contains_key(&task_id) && !self.rebuild_from_claim(worker, &reported.claim) {
             return;
         }
@@ -1614,11 +1503,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.links.clear();
         self.unpublished.clear();
         self.events.clear();
-        self.rebuild_answered.clear();
-        self.uncertain.clear();
-        self.uncertain_keys.clear();
-        self.deferred.clear();
-        self.held_reports.clear();
         self.run_decided_at.clear();
         self.failed_compactions.clear();
     }
@@ -1873,7 +1757,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.check_submission(&submitted.submission, 0)?;
         if let Some(key) = submitted.submission.coalescing_key.as_deref() {
             let key = coalescing::key(&submitted.submission.definition_id, key);
-            if self.key_held_back(&key) {
+            if self.reconciliation.holds_key_back(&key) {
                 return Err(SubmitRejection::KeyNotReady);
             }
         }
@@ -2118,7 +2002,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return Err(ClaimRejection::NotLeader);
         }
         self.release_due();
-        if self.uncertain.contains_key(task_id) {
+        if self.reconciliation.is_uncertain(task_id) {
             return Err(ClaimRejection::NotReady);
         }
         let run_id = self
@@ -2374,7 +2258,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if !self.check_leader() {
             return Err(CancelRejection::NotLeader);
         }
-        if self.uncertain.contains_key(task_id) {
+        if self.reconciliation.is_uncertain(task_id) {
             return Err(CancelRejection::NotReady);
         }
         let Some(run_id) = self.current_run.get(task_id).cloned() else {
@@ -2423,8 +2307,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// While its node reconciles, a lost worker is kept and applied once the
     /// grant arrives; the call returns no runs then.
     pub fn lose_worker(&mut self, worker: &WorkerId) -> Result<Vec<LostRun>, LoseRejection> {
-        if let Some(reconciling) = self.reconciling.as_mut() {
-            reconciling.lost.insert(worker.clone());
+        if self.reconciliation.keeps_lost(worker) {
             return Ok(Vec::new());
         }
         let outcome = self.lose_runs_of(worker);
@@ -2735,20 +2618,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         });
     }
 
-    /// Whether a generation of `key` is held back, unknown or deferred, so
-    /// that no generation of it is installed and occupancy cannot tell
-    /// whether one is still running.
-    fn key_held_back(&self, key: &Key) -> bool {
-        self.uncertain_keys.values().any(|held| held == key)
-            || self.deferred.values().any(|record| {
-                record.task.as_ref().is_some_and(|task| {
-                    task.coalescing_key.as_deref().is_some_and(|name| {
-                        coalescing::key(&task.task_definition_id(), name) == *key
-                    })
-                })
-            })
-    }
-
     fn coalescing_key_of(&self, task_id: &TaskId) -> Option<Key> {
         let task = self.tasks.get(task_id)?;
         Some(coalescing::key(
@@ -2758,11 +2627,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Whether a task has to wait because a generation of its coalescing key
-    /// is held back (see [`Self::key_held_back`]): none of them may run while
+    /// is held back (see [`Reconciliation::holds_key_back`]): none of them may run while
     /// one might already be running, however late that was learnt.
     fn is_held_back(&self, task_id: &TaskId) -> bool {
         self.coalescing_key_of(task_id)
-            .is_some_and(|key| self.key_held_back(&key))
+            .is_some_and(|key| self.reconciliation.holds_key_back(&key))
     }
 
     /// Whether a task has to wait because another generation of its
@@ -2782,7 +2651,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let eligible: BTreeSet<&TaskId> = tasks
             .iter()
-            .filter(|task| self.tasks.contains_key(*task) && !self.uncertain.contains_key(*task))
+            .filter(|task| {
+                self.tasks.contains_key(*task) && !self.reconciliation.is_uncertain(task)
+            })
             .collect();
         self.unpublished.extend(eligible.iter().map(|task| (*task).clone()));
         self.end_call();
@@ -2792,7 +2663,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Whether `task`'s newest record is not yet known to it: held back until
     /// a holder answers or leaves.
     pub fn is_uncertain(&self, task: &TaskId) -> bool {
-        self.uncertain.contains_key(task)
+        self.reconciliation.is_uncertain(task)
     }
 
     /// Whether it holds `task`: it decides the task, and a driver that kept
@@ -2880,7 +2751,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         expected: TaskRunState,
     ) -> Result<&mut TaskRun, ReportRejection> {
         if !self.runs.contains_key(run_id) {
-            let uncertain = self.uncertain.values().any(|runs| runs.contains(run_id));
+            let uncertain = self.reconciliation.holds_uncertain_run(run_id);
             return Err(if uncertain {
                 ReportRejection::NotReady
             } else {
