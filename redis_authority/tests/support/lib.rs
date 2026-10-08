@@ -30,6 +30,9 @@ pub struct ValkeyServer {
     mode: ServerMode,
     assign_slots: bool,
     process: Mutex<Option<Child>>,
+    /// Holds the port while the server is down, so no other test's server
+    /// takes it before `restart`.
+    reserved_port: Mutex<Option<TcpListener>>,
 }
 
 impl ValkeyServer {
@@ -81,6 +84,7 @@ impl ValkeyServer {
             );
         }
         *process = None;
+        *self.reserved_port.lock().unwrap() = TcpListener::bind(("127.0.0.1", self.port)).ok();
     }
 
     pub fn restart(&self) {
@@ -98,8 +102,7 @@ impl ValkeyServer {
         node.admin(&["CLUSTER", "MEET", "127.0.0.1", &self.port.to_string()]);
         self.wait_until("the cluster to hold two nodes", || {
             [self, &node].iter().all(|n| {
-                let info = n.cluster_info();
-                info.contains("cluster_known_nodes:2") && info.contains("cluster_state:ok")
+                n.cluster_info().contains("cluster_known_nodes:2") && n.cluster_serving()
             })
         });
         node
@@ -123,6 +126,12 @@ impl ValkeyServer {
         for node in [to, self] {
             node.admin(&["CLUSTER", "SETSLOT", &slot, "NODE", &to_id]);
         }
+        let slot: u16 = slot.parse().expect("a slot number");
+        self.wait_until("both nodes to see the slot moved", || {
+            [self, to]
+                .iter()
+                .all(|n| n.slot_owner_port(slot) == Some(to.port))
+        });
     }
 
     /// A port picked here may be taken before the server binds it (another
@@ -157,6 +166,7 @@ impl ValkeyServer {
                 },
                 assign_slots,
                 process: Mutex::new(None),
+                reserved_port: Mutex::new(None),
             };
             match server.start_process() {
                 Ok(()) => {
@@ -180,6 +190,7 @@ impl ValkeyServer {
 
     /// Starts the server process and returns once that very process answers.
     fn start_process(&self) -> Result<(), String> {
+        drop(self.reserved_port.lock().unwrap().take());
         let relative = SERVER_PATH.expect("the valkey binary is known only to Bazel builds: run through Bazel");
         let runfiles = std::env::var_os("TEST_SRCDIR").expect("TEST_SRCDIR: run through Bazel");
         let binary = PathBuf::from(runfiles).join(relative);
@@ -240,9 +251,7 @@ impl ValkeyServer {
                     self.admin(&["CLUSTER", "ADDSLOTSRANGE", "0", "16383"]);
                 }
                 if self.assign_slots {
-                    self.wait_until("the cluster to be ok", || {
-                        self.cluster_info().contains("cluster_state:ok")
-                    });
+                    self.wait_until("the cluster to serve", || self.cluster_serving());
                 }
             }
             ServerMode::StandaloneWithAcl {
@@ -316,6 +325,34 @@ impl ValkeyServer {
             .unwrap_or_else(|error| {
                 panic!("{args:?} failed: {error}; see {}", self.log().display())
             })
+    }
+
+    /// The port of the node that `CLUSTER SLOTS`, asked of this node, gives as
+    /// owner of `slot`.
+    fn slot_owner_port(&self, slot: u16) -> Option<u16> {
+        let mut connection = self.try_admin_connection()?;
+        let ranges: Vec<Vec<redis::Value>> = redis::cmd("CLUSTER")
+            .arg("SLOTS")
+            .query(&mut connection)
+            .ok()?;
+        ranges.into_iter().find_map(|range| {
+            let [start, end, master, ..] = range.as_slice() else {
+                return None;
+            };
+            let start: u16 = redis::from_redis_value(start.clone()).ok()?;
+            let end: u16 = redis::from_redis_value(end.clone()).ok()?;
+            let master: Vec<redis::Value> = redis::from_redis_value(master.clone()).ok()?;
+            let port: u16 = redis::from_redis_value(master.get(1)?.clone()).ok()?;
+            (start..=end).contains(&slot).then_some(port)
+        })
+    }
+
+    /// Whether the node is serving: the cluster is ok and `CLUSTER SLOTS`
+    /// gives an owner for the first and the last slot.
+    fn cluster_serving(&self) -> bool {
+        self.cluster_info().contains("cluster_state:ok")
+            && self.slot_owner_port(0).is_some()
+            && self.slot_owner_port(16383).is_some()
     }
 
     fn cluster_info(&self) -> String {
