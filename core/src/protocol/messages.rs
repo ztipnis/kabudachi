@@ -30,8 +30,8 @@ pub use generated::{
 };
 pub use generated::{
     CancelAnswer, CancelOutcome, CancelTask, CompactionApplied, PlaceRecords, PlacedKey,
-    RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportStarted,
-    RunCertified, RunFailed, StartAccepted, SubmitAccepted, SubmitTask, TaskReject,
+    RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted,
+    RunCertified, RunFailed, RunLost, StartAccepted, SubmitAccepted, SubmitTask, TaskReject,
     TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
 };
 pub use generated::{

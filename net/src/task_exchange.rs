@@ -3,8 +3,8 @@
 //!
 //! [`codec`] frames the `/kabudachi/task/1` messages; `wire` maps them to and
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
-//! [`Net::report_started`], [`Net::complete`], [`Net::fail`] and
-//! [`Net::cancel`], each sent to the leader the caller names: the transport
+//! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
+//! [`Net::report_lost`] and [`Net::cancel`], each sent to the leader the caller names: the transport
 //! keeps no leader of its own. The calls about a run also keep this worker's
 //! [`ClaimedRuns`](crate::claimed_runs::ClaimedRuns) ledger, from the answers
 //! they get.
@@ -31,7 +31,7 @@ use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     CancelTask, CompactionApplied, PlaceRecords, PlacedKey, RecordPlacements, ReportCompacted, ReportCompleted,
-    ReportFailed, ReportStarted, StartAccepted, SubmitAccepted, TaskReject, TaskRejectReason,
+    ReportFailed, ReportLost, ReportStarted, StartAccepted, SubmitAccepted, TaskReject, TaskRejectReason,
     TaskRequest, TaskResponse, task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
@@ -111,17 +111,10 @@ impl Net {
         leader: WorkerId,
         run: TaskRunId,
     ) -> Result<TaskResponse, TaskFailure> {
-        let request = task_request::Request::Started(ReportStarted {
-            task_run_id: Some(run.clone().into()),
-        });
-        let response = self.ask_task(leader, request).await?;
-        self.note_report(
-            &run,
-            &response,
-            |result| matches!(result, task_response::Result::Started(_)),
-            Some(HeldRun::Running),
-        );
-        Ok(response)
+        self.report(leader, task_request::Request::Started(ReportStarted {
+            task_run_id: Some(run.into()),
+        }))
+        .await
     }
 
     /// Tells `leader` `run` succeeded with a result of digest
@@ -132,24 +125,11 @@ impl Net {
         run: TaskRunId,
         result_digest: Digest,
     ) -> Result<TaskResponse, TaskFailure> {
-        self.claimed.set(
-            &run,
-            HeldRun::Completed {
-                result_digest: result_digest.clone(),
-            },
-        );
-        let request = task_request::Request::Completed(ReportCompleted {
-            task_run_id: Some(run.clone().into()),
+        self.report(leader, task_request::Request::Completed(ReportCompleted {
+            task_run_id: Some(run.into()),
             result_digest: Some(result_digest.into()),
-        });
-        let response = self.ask_task(leader, request).await?;
-        self.note_report(
-            &run,
-            &response,
-            |result| matches!(result, task_response::Result::Certified(_)),
-            None,
-        );
-        Ok(response)
+        }))
+        .await
     }
 
     /// Tells `leader` `run` failed with an error of type `failure_kind`.
@@ -159,24 +139,11 @@ impl Net {
         run: TaskRunId,
         failure_kind: String,
     ) -> Result<TaskResponse, TaskFailure> {
-        self.claimed.set(
-            &run,
-            HeldRun::Failed {
-                failure_kind: failure_kind.clone(),
-            },
-        );
-        let request = task_request::Request::Failed(ReportFailed {
-            task_run_id: Some(run.clone().into()),
+        self.report(leader, task_request::Request::Failed(ReportFailed {
+            task_run_id: Some(run.into()),
             failure_kind,
-        });
-        let response = self.ask_task(leader, request).await?;
-        self.note_report(
-            &run,
-            &response,
-            |result| matches!(result, task_response::Result::Failed(_)),
-            None,
-        );
-        Ok(response)
+        }))
+        .await
     }
 
     /// Tells `leader` the compaction run `run` folded the entries it was
@@ -191,18 +158,94 @@ impl Net {
         run: TaskRunId,
         folded: Vec<u8>,
     ) -> Result<TaskResponse, TaskFailure> {
-        let request = task_request::Request::Compacted(ReportCompacted {
-            task_run_id: Some(run.clone().into()),
+        self.report(leader, task_request::Request::Compacted(ReportCompacted {
+            task_run_id: Some(run.into()),
             folded_payload: folded,
-        });
-        let response = self.ask_task(leader, request).await?;
-        self.note_report(
-            &run,
-            &response,
-            |result| matches!(result, task_response::Result::Compaction(_)),
-            None,
-        );
+        }))
+        .await
+    }
+
+    /// Tells `leader` the run `run` ended with no outcome known: the process
+    /// running its body died. The leader decides it as a run lost with its
+    /// worker: lost and replayed, or orphaned. The run stays in this worker's
+    /// ledger until a leader has taken the report.
+    pub async fn report_lost(
+        &self,
+        leader: WorkerId,
+        run: TaskRunId,
+    ) -> Result<TaskResponse, TaskFailure> {
+        self.report(leader, task_request::Request::Lost(ReportLost {
+            task_run_id: Some(run.into()),
+        }))
+        .await
+    }
+
+    /// Sends `request`, a report on one of this worker's runs, to `leader`,
+    /// and keeps the ledger by it: by what the report says before it is sent
+    /// (see [`Self::note_sending`]), then by the answer (see
+    /// [`Self::note_answer`]).
+    pub(crate) async fn report(
+        &self,
+        leader: WorkerId,
+        request: task_request::Request,
+    ) -> Result<TaskResponse, TaskFailure> {
+        self.note_sending(&request);
+        let response = self.ask_task(leader, request.clone()).await?;
+        self.note_answer(&request, &response);
         Ok(response)
+    }
+
+    /// Records in the ledger what a report says before any leader takes it:
+    /// a run reported completed or failed stays so, whoever leads next.
+    pub(crate) fn note_sending(&self, request: &task_request::Request) {
+        let Some(run) = reported_run(request) else {
+            return;
+        };
+        match request {
+            task_request::Request::Completed(report) => {
+                if let Ok(result_digest) = wire::digest(report.result_digest.as_ref()) {
+                    self.claimed.set(&run, HeldRun::Completed { result_digest });
+                }
+            }
+            task_request::Request::Failed(report) => self.claimed.set(
+                &run,
+                HeldRun::Failed {
+                    failure_kind: report.failure_kind.clone(),
+                },
+            ),
+            _ => {}
+        }
+    }
+
+    /// Updates the ledger from `response`, a leader's answer to `request`,
+    /// a report on one of this worker's runs (see [`Self::note_report`]).
+    pub(crate) fn note_answer(&self, request: &task_request::Request, response: &TaskResponse) {
+        use task_request::Request;
+        use task_response::Result as Answer;
+        let Some(run) = reported_run(request) else {
+            return;
+        };
+        match request {
+            Request::Started(_) => self.note_report(
+                &run,
+                response,
+                |answer| matches!(answer, Answer::Started(_)),
+                Some(HeldRun::Running),
+            ),
+            Request::Completed(_) => {
+                self.note_report(&run, response, |answer| matches!(answer, Answer::Certified(_)), None)
+            }
+            Request::Failed(_) => {
+                self.note_report(&run, response, |answer| matches!(answer, Answer::Failed(_)), None)
+            }
+            Request::Compacted(_) => {
+                self.note_report(&run, response, |answer| matches!(answer, Answer::Compaction(_)), None)
+            }
+            Request::Lost(_) => {
+                self.note_report(&run, response, |answer| matches!(answer, Answer::Lost(_)), None)
+            }
+            Request::Submit(_) | Request::Cancel(_) | Request::Place(_) => {}
+        }
     }
 
     /// Asks `leader` to cancel `task`.
@@ -358,6 +401,12 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
                 .map(|failure| task_response::Result::Failed(wire::failed(failure)))
                 .map_err(wire::report_reject)
         }),
+        Request::Lost(report) => run_id(report.task_run_id.as_ref()).and_then(|run| {
+            scheduler
+                .report_lost(from, &run)
+                .map(|lost| task_response::Result::Lost(wire::lost(lost)))
+                .map_err(wire::report_reject)
+        }),
         Request::Cancel(cancel) => match cancel.task_id.clone() {
             Some(task) => scheduler
                 .cancel(&TaskId::from(task))
@@ -381,6 +430,21 @@ fn run_id(run: Option<&generated::TaskRunId>) -> Result<TaskRunId, TaskRejectRea
     run.cloned()
         .map(TaskRunId::from)
         .ok_or(TaskRejectReason::TaskRejectMalformed)
+}
+
+/// The run a report names; `None` for a request that reports on no run, or a
+/// report that names none.
+pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId> {
+    use task_request::Request;
+    let run = match request {
+        Request::Started(report) => &report.task_run_id,
+        Request::Completed(report) => &report.task_run_id,
+        Request::Failed(report) => &report.task_run_id,
+        Request::Compacted(report) => &report.task_run_id,
+        Request::Lost(report) => &report.task_run_id,
+        Request::Submit(_) | Request::Cancel(_) | Request::Place(_) => return None,
+    };
+    run.clone().map(TaskRunId::from)
 }
 
 /// The leader's answer to `request`: where each task it names would be placed

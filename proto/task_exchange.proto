@@ -55,6 +55,12 @@ message ReportCompacted {
   bytes folded_payload = 2;
 }
 
+// The run ended with no outcome known: the process running its body died.
+// The leader decides it as it decides a run lost with its worker.
+message ReportLost {
+  TaskRunId task_run_id = 1;
+}
+
 message CancelTask {
   TaskId task_id = 1;
 }
@@ -75,6 +81,7 @@ message TaskRequest {
     CancelTask cancel = 5;
     PlaceRecords place = 6;
     ReportCompacted compacted = 7;
+    ReportLost lost = 8;
   }
 }
 
@@ -127,6 +134,16 @@ message RunFailed {
   TaskRunId retry = 3;
 }
 
+// What a run reported lost became: LOST, or ORPHANED for a running run of a
+// non-retriable task, which is never replayed; and the attempt queued in its
+// place, if any.
+message RunLost {
+  TaskId task_id = 1;
+  TaskRunId task_run_id = 2;
+  TaskRunState state = 3;
+  TaskRunId replay = 4;
+}
+
 enum CancelOutcome {
   CANCEL_OUTCOME_UNSPECIFIED = 0;
   CANCEL_OUTCOME_CANCELLED = 1;
@@ -168,5 +185,6 @@ message TaskResponse {
     TaskReject reject = 6;
     RecordPlacements placements = 7;
     CompactionApplied compaction = 8;
+    RunLost lost = 9;
   }
 }

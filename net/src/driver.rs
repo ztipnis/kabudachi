@@ -1054,6 +1054,7 @@ fn task_named<C: Clock, I: IdGenerator>(
         task_request::Request::Completed(report) => of_run(&report.task_run_id),
         task_request::Request::Failed(report) => of_run(&report.task_run_id),
         task_request::Request::Compacted(report) => of_run(&report.task_run_id),
+        task_request::Request::Lost(report) => of_run(&report.task_run_id),
         task_request::Request::Place(_) => None,
     }
 }

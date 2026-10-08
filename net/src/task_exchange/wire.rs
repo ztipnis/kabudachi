@@ -7,11 +7,11 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId};
 use kabudachi_core::protocol::messages::{
-    CancelAnswer, CancelOutcome, RunCertified, RunFailed, SubmitTask, TaskReject, TaskRejectReason,
+    CancelAnswer, CancelOutcome, RunCertified, RunFailed, RunLost, SubmitTask, TaskReject, TaskRejectReason,
     TaskResponse, task_response,
 };
 use kabudachi_core::scheduler::{
-    CancelRejection, Cancellation, Certification, Failure, ReportRejection, Submission, Submitted,
+    CancelRejection, Cancellation, Certification, Failure, LostRun, ReportRejection, Submission, Submitted,
     SubmitRejection,
 };
 use kabudachi_core::time::{Clock, Duration, WallTime};
@@ -114,6 +114,15 @@ pub(crate) fn failed(failure: Failure) -> RunFailed {
         task_id: Some(failure.task_id.into()),
         task_run_id: Some(failure.task_run_id.into()),
         retry: failure.retry.map(Into::into),
+    }
+}
+
+pub(crate) fn lost(lost: LostRun) -> RunLost {
+    RunLost {
+        task_id: Some(lost.task_id.into()),
+        task_run_id: Some(lost.task_run_id.into()),
+        state: generated::TaskRunState::from(lost.state) as i32,
+        replay: lost.replayed.map(Into::into),
     }
 }
 
