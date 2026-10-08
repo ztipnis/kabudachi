@@ -697,6 +697,7 @@ def test_an_unknown_setting_is_refused():
         ({"reconnect_timeouts": {"slow": True}}, "reconnect_timeouts"),
         ({"reconnect_timeouts": {"slow": "90"}}, "reconnect_timeouts"),
         ({"reconnect_timeouts": {"slow": float("inf")}}, "reconnect_timeouts"),
+        ({"reconnect_timeouts": {"slow": 1e300}}, "reconnect_timeouts"),
         ({"reconnect_timeouts": {"": 5}}, "reconnect_timeouts"),
         ({"reconnect_timeouts": [("slow", 5)]}, "reconnect_timeouts"),
     ],

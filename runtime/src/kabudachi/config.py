@@ -240,12 +240,12 @@ class Settings:
 
 
 def _positive_seconds(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value > 0
-    )
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and 0 < value <= timedelta.max.total_seconds()
+    except OverflowError:
+        return False
 
 
 def _queue_seconds(raw: str) -> dict[str, float]:

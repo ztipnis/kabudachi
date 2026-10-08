@@ -73,9 +73,10 @@ class Runtime(Protocol):
     ) -> str:
         """Records a new task. `kind` is its `TaskKind` value; a coalescing
         task always has a `key` (its default is ""), and no other kind has
-        one. `reconnect_timeout_ms`, when given, is the run's own reconnect
-        timeout. Raises `ValueError` if they disagree, and
-        `BackpressureError` past the hard memory limit."""
+        one. Raises `ValueError` if `kind` and `key` disagree, or
+        `reconnect_timeout_ms` is 0, and `BackpressureError` past the hard
+        memory limit. `reconnect_timeout_ms`, when given, is the run's own
+        reconnect timeout."""
 
     async def claim_pending(self, limit: int) -> list[Claim]:
         ...
