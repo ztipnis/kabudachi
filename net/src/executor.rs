@@ -153,6 +153,8 @@ pub(crate) struct Held {
     pub(crate) waiting: BTreeMap<TaskRunId, VecDeque<RunReport>>,
     /// The executor dropped its handle: nothing more is claimed for it.
     pub(crate) gone: bool,
+    /// The abort deadline every run in `handed` was given, while one stands.
+    pub(crate) abort_by: Option<Instant>,
 }
 
 /// A claim or report of this worker's own, decided by its own scheduler
@@ -311,12 +313,12 @@ impl<'n> Executing<'n> {
 
     /// How many places to claim now, reserved until the claim is answered:
     /// all the places offered and not taken, unless the executor is gone, no
-    /// place is offered, a claim is under way, or one found nothing too
-    /// recently. The caller claims them at once.
+    /// place is offered, a claim is under way, one found nothing too
+    /// recently, or an abort deadline stands. The caller claims them at once.
     pub(crate) fn places_to_claim(&mut self) -> Option<u32> {
         let held = &mut self.endpoint.held;
         let busy = self.discovering.is_some() || self.found.is_some() || self.own_claim.is_some();
-        if held.gone || held.credits == 0 || busy || self.next_claim_at.is_some() {
+        if held.gone || held.credits == 0 || busy || self.next_claim_at.is_some() || held.abort_by.is_some() {
             return None;
         }
         Some(std::mem::take(&mut held.credits))
@@ -379,6 +381,23 @@ impl<'n> Executing<'n> {
         let held = &mut self.endpoint.held;
         if held.handed.contains(run) && held.cancelled.insert(run.clone()) {
             let _ = self.endpoint.work.send(Work::Cancel(run.clone()));
+        }
+    }
+
+    /// The node reported a new abort deadline, on this host's clock, or
+    /// lifted the one it had: every run handed over is told, a lifted
+    /// deadline withdrawing each pending abort.
+    pub(crate) fn follow_abort_deadline(&mut self, deadline: Option<Instant>) {
+        let held = &mut self.endpoint.held;
+        let withdrawn = deadline.is_none() && held.abort_by.is_some();
+        held.abort_by = deadline;
+        for run in &held.handed {
+            let work = match deadline {
+                Some(deadline) => Work::Abort { run: run.clone(), deadline },
+                None if withdrawn => Work::AbortWithdrawn(run.clone()),
+                None => continue,
+            };
+            let _ = self.endpoint.work.send(work);
         }
     }
 
@@ -484,6 +503,9 @@ impl<'n> Executing<'n> {
             self.endpoint.held.gone = true;
             self.queue_lost(run);
             return;
+        }
+        if let Some(deadline) = self.endpoint.held.abort_by {
+            let _ = self.endpoint.work.send(Work::Abort { run: run.clone(), deadline });
         }
         self.endpoint.held.handed.insert(run);
     }

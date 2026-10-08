@@ -34,7 +34,9 @@
 //! has vouched for hearing this worker, it discovers and claims work from
 //! that leader and hands each run over. It takes each report the executor
 //! makes to the leader, in order per run, asking again as leaders change
-//! until one takes it.
+//! until one takes it. When the node reports an abort deadline, every run
+//! handed over is told to abort by it, and told again when the deadline is
+//! lifted; no more work is claimed while one stands.
 //!
 //! A leader's scheduler records each decision as a new revision of its
 //! task's Task record. The driver writes every revision to the voters
@@ -452,7 +454,12 @@ where
         if let Some(deadline) = reconcile_office(&mut reconciliation, net, &mut stepper, &clock) {
             next_deadline = Some(deadline);
         }
+        // A new abort deadline reaches the executor before any more work.
+        let abort_deadline = stepper.collected.abort_deadline.take();
         if let Some(executing) = executing.as_mut() {
+            if let Some(deadline) = abort_deadline {
+                executing.follow_abort_deadline(deadline.map(|at| on_this_host(&clock, at)));
+            }
             drive_executor(
                 executing,
                 stepper.node,
@@ -845,6 +852,8 @@ struct Collected {
     runs_heard: Vec<(WorkerId, Vec<u8>)>,
     /// Where the node, once it drained, said to hand the records it holds.
     hand_off: Option<HandOffTo>,
+    /// The latest abort deadline a step reported, if one did this batch.
+    abort_deadline: Option<Option<Instant>>,
 }
 
 impl<C, I, O> Stepper<'_, C, I, O>
@@ -885,6 +894,7 @@ where
                             collected.runs_heard.push((worker.clone(), digest.clone()));
                         }
                         Output::HandOff(to) => collected.hand_off = Some(to.clone()),
+                        Output::AbortDeadline(by) => collected.abort_deadline = Some(*by),
                         _ => {}
                     }
                 }
@@ -959,7 +969,7 @@ impl MessageSink for &Net {
 }
 
 /// Logs what `outputs`, one step of `node`'s, report that an operator must
-/// know of and nothing yet acts on: the deadline by which the worker must
+/// know of: the deadline by which the worker must
 /// abort its TaskRuns, or its lifting, and the shard's recovery epoch gone
 /// from the authority.
 fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
@@ -970,7 +980,7 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
                 by = ?by,
                 "this worker cannot show that its leader still hears it, or has fenced itself, \
                  and must abort every TaskRun it is running by this instant unless that \
-                 changes; this worker runs no task executor that would carry that out"
+                 changes"
             ),
             Output::AbortDeadline(None) => tracing::info!(
                 shard = node.shard_id().as_str(),
@@ -993,6 +1003,13 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
             | Output::WorkerLost(_) => {}
         }
     }
+}
+
+/// `at`, an instant of `clock`, as an instant of this host's monotonic clock,
+/// for an executor that does not read the node's clock. `clock` ticks once a
+/// millisecond (see [`run_driver`]); an instant already past is now.
+fn on_this_host<C: Clock>(clock: &C, at: Instant) -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_millis((at - clock.now()).as_ticks())
 }
 
 /// Sleeps until `clock` reaches `deadline`, or for ever when there is none.
