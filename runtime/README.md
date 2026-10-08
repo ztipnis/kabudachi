@@ -161,5 +161,6 @@ matters.
   until it does.
 - A task process that dies (a crash, running out of memory, a kill) takes its runs with it and is
   replaced, after a growing wait while replacements keep dying quickly. Each run it held is tried again
-  without using up a retry, except an `@ephemeral_task`'s, whose call raises `TaskLostError`. With
+  without using up a retry, except an `@ephemeral_task`'s, and a `@coalescing_task` generation's that a
+  newer generation of its key is waiting to supersede; their handles raise `TaskLostError`. With
   `processes=0` there is no such loss, and `@ephemeral_task` behaves like `@task`.

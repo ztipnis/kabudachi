@@ -194,6 +194,10 @@ class ProcessPool:
             await self.stop(kill=True)
             raise
         self._serving = True
+        # A child that died after it was ready, while a sibling was still
+        # starting, was not replaced then.
+        for _ in range(self._settings.processes - len(self._children)):
+            self._replace(None)
 
     def accept_nested_calls(self, calls: NestedCalls) -> None:
         self._nested = calls
@@ -356,7 +360,12 @@ class ProcessPool:
             args=(child_end, self._settings, self._modules),
             name=f"kabudachi-task-{number}",
         )
-        process.start()
+        try:
+            process.start()
+        except BaseException:
+            parent_end.close()
+            child_end.close()
+            raise
         # Only the child holds its end now, so the pipe closes when it exits.
         child_end.close()
         loop = self._started_loop()
@@ -566,18 +575,34 @@ class ProcessPool:
         if dead is not None:
             lived = time.monotonic() - dead.ready_at if dead.ready else 0.0
             self._quick_deaths = self._quick_deaths + 1 if lived < _STABLE_SECONDS else 0
-            if self._quick_deaths:
-                delay = min(
-                    _FIRST_RESPAWN_DELAY_SECONDS * 2 ** (self._quick_deaths - 1),
-                    _MAX_RESPAWN_DELAY_SECONDS,
-                )
+            delay = self._respawn_delay()
+        self._replace_later(delay)
+
+    def _respawn_delay(self) -> float:
+        if not self._quick_deaths:
+            return 0.0
+        return min(
+            _FIRST_RESPAWN_DELAY_SECONDS * 2 ** (self._quick_deaths - 1),
+            _MAX_RESPAWN_DELAY_SECONDS,
+        )
+
+    def _replace_later(self, delay: float) -> None:
         task = self._started_loop().create_task(self._replace_after(delay))
         self._replacing.add(task)
         task.add_done_callback(self._replacing.discard)
 
     async def _replace_after(self, delay: float) -> None:
         await asyncio.sleep(delay)
-        child = self._spawn()
+        try:
+            child = self._spawn()
+        except Exception as error:
+            # Out of processes or file descriptors, say: a start that failed
+            # at once, tried again later like a child that died at once.
+            _logger.error("a replacement task process could not be started: %s", error)
+            self._quick_deaths += 1
+            if self._serving:
+                self._replace_later(self._respawn_delay())
+            return
         try:
             self._accept(child, await self._until_ready(child))
         except StartupError as error:
