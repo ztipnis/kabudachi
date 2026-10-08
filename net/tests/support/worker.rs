@@ -33,7 +33,7 @@ pub const PER_PEER_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 /// Short, so a waiting worker goes round its cascade many times per test.
 pub const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(50);
 
-/// The name a shard identified by `shard_id` lives under: the same string.
+/// The name a shard identified by `shard_id` lives under: the id up to its last `/`.
 pub fn name_of(shard_id: &ShardId) -> ShardName {
     shard_id.name()
 }

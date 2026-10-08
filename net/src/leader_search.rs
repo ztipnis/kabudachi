@@ -542,6 +542,7 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                         result: Ok(Some(hint)),
                         ..
                     } if hint.shard_id == self.shard_id
+                        && hint.leader != self.search.my_id
                         && floor.epoch().is_none_or(|floor| hint.recovery_epoch >= floor) =>
                     {
                         Some(hint)

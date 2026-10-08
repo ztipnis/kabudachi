@@ -158,11 +158,12 @@ use kabudachi_core::coordination_authority::{
 };
 use kabudachi_core::election::{AuthorityReply, AuthorityRequest, Entry, JoinFloor};
 use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
-use kabudachi_core::protocol::messages::JoinResponse;
+use kabudachi_core::protocol::messages::{JoinResponse, JoinResponseIds};
 use kabudachi_core::time::{Clock, Instant};
 use libp2p::Multiaddr;
 
 use crate::authority::AuthorityClient;
+use crate::join::LeaderSearch;
 use crate::leader_search::{AskWhoLeads, JoinOverNet, SearchRounds, others_listed};
 use crate::messenger::Net;
 use crate::wait_log::WaitReason;
@@ -277,7 +278,7 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
         refuse_requests(net);
 
         // With no seeds this finds no answer at once.
-        let found = port.ask(search.seeds(), JoinFloor::none()).await;
+        let found = of_shard(port.ask(search.seeds(), JoinFloor::none()).await, name, None);
         if let Some(pointer) = search.heard_from_seeds(found) {
             return Entry::Joining(pointer);
         }
@@ -342,6 +343,28 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
 
         search.end_round();
         tokio::time::sleep(pause).await;
+    }
+}
+
+/// `found`, unless it points at a leader of another shard than this worker
+/// bootstraps into: one under another name, or, given the incarnation the
+/// authority's record names, another incarnation of it. Such a leader is not
+/// this worker's to join, so the pointer is dropped, but its answer still
+/// shows a shard exists, which keeps this worker from founding beside it.
+fn of_shard(found: LeaderSearch, name: &ShardName, record: Option<&ShardId>) -> LeaderSearch {
+    match found {
+        LeaderSearch::Found(pointer)
+            if !pointer.shard_id().is_some_and(|shard| {
+                shard.name() == *name && record.is_none_or(|record| *record == shard)
+            }) =>
+        {
+            tracing::debug!(
+                shard = ?pointer.shard_id(),
+                "ignoring a pointer to a leader of another shard"
+            );
+            LeaderSearch::NoReachableLeader
+        }
+        found => found,
     }
 }
 
@@ -418,9 +441,17 @@ async fn consult_authority<C: Clock, P: AskWhoLeads>(
                 calls.ask(request, clock.now());
                 stage = then;
             }
-            Decision::AskPeers { hinted, listed } => {
+            Decision::AskPeers {
+                hinted,
+                listed,
+                record,
+            } => {
                 let addresses = search.to_ask(hinted.as_ref(), &listed);
-                let found = port.ask(&addresses, JoinFloor::none()).await;
+                let found = of_shard(
+                    port.ask(&addresses, JoinFloor::none()).await,
+                    &candidate.name(),
+                    record.as_ref(),
+                );
                 return match search.heard_from_listed(found) {
                     Some(pointer) => AuthorityRound::Joined(pointer),
                     None => AuthorityRound::Wait,
@@ -485,6 +516,9 @@ pub(crate) enum Decision {
     AskPeers {
         hinted: Option<LeaderHint>,
         listed: BTreeMap<WorkerId, String>,
+        /// The incarnation the authority's record names, if it holds one: a
+        /// leader of any other is not this worker's to join.
+        record: Option<ShardId>,
     },
     /// This worker won the shard's record (see
     /// [`AuthorityRound::OwnershipWon`]); the incarnation is the one the
@@ -576,7 +610,11 @@ pub(crate) fn decide_round(
             // A hint is asked even while the authority warms up: that is how
             // a worker joins a leader that republished after a flush.
             if hinted.is_some() || !listed.is_empty() {
-                return Decision::AskPeers { hinted, listed };
+                return Decision::AskPeers {
+                    hinted,
+                    listed,
+                    record: record.map(|record| record.shard_id),
+                };
             }
             if shard_exists {
                 return Decision::Wait(None);

@@ -707,6 +707,17 @@ impl AuthorityStanding {
                 self.lease.fence_acquired(epoch, sent_at, granted);
                 if view.state == WorkerState::Candidate {
                     self.lead_recovered()
+                } else if std::mem::take(&mut self.record_lost) {
+                    // A fence needs the record: it is this node's again, though
+                    // the reply to its republish never said so. Its hint
+                    // follows at once.
+                    vec![AuthorityVerdict::Ask(self.ask(
+                        AuthorityRequest::PublishLeaderHint {
+                            recovery_epoch: epoch,
+                            term: view.term,
+                        },
+                        now,
+                    ))]
                 } else {
                     Vec::new()
                 }

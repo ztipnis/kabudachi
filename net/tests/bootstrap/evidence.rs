@@ -75,6 +75,16 @@ async fn a_seed_that_answered_once_keeps_the_worker_from_founding_until_it_point
         let founded = timeout(SILENCE, &mut running).await;
         assert!(founded.is_err(), "the worker founded a shard after its seed showed one exists");
 
+        // A leader of a shard under another name is not this worker's to join,
+        // however reachable: the seed's answer shows a shard exists, no more.
+        let foreign = JoinResponse {
+            shard_id: Some(ShardId::new("shard-2/a").into()),
+            ..pointer.clone()
+        };
+        seed_answers.set(Some(foreign));
+        let joined = timeout(SILENCE, &mut running).await;
+        assert!(joined.is_err(), "the worker joined a leader of another shard: {joined:?}");
+
         seed_answers.set(Some(pointer.clone()));
         let entry = timeout(TEST_TIMEOUT, running)
             .await
@@ -165,7 +175,7 @@ async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lap
 
 // A bootstrapper that finds the shard's record asks the leader the authority
 // hints at first, even while the authority warms up and lists no one; a hint
-// of another incarnation, or of an older epoch, says nothing of the shard.
+// of another incarnation says nothing of the shard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bootstrapper_asks_the_leader_its_authority_hints_at_and_ignores_another_incarnations_hint() {
     within_deadline(async {
@@ -214,12 +224,12 @@ async fn a_bootstrapper_asks_the_leader_its_authority_hints_at_and_ignores_anoth
 
         // 1. The hint names the recorded incarnation: the worker joins that
         //    leader before the warm-up ends.
+        let started = tokio::time::Instant::now();
         let authority = case();
         authority
             .publish_leader_hint(&name_of(&incarnation), &hint(&incarnation, &leader_id, &leader_address))
             .expect("the authority is reachable");
         let (net, me, mut client) = start(authority);
-        let started = tokio::time::Instant::now();
         let entry = timeout(
             TEST_TIMEOUT,
             bootstrap(
@@ -246,6 +256,9 @@ async fn a_bootstrapper_asks_the_leader_its_authority_hints_at_and_ignores_anoth
         // 2. The hint names another incarnation: it is passed over, nothing
         //    joins before the warm-up ends, and after it the worker re-founds
         //    the recorded incarnation, keeping its id.
+        // Taken before the authority exists, so its warm-up cannot have begun
+        // before it.
+        let started = tokio::time::Instant::now();
         let authority = case();
         authority
             .publish_leader_hint(
@@ -254,7 +267,6 @@ async fn a_bootstrapper_asks_the_leader_its_authority_hints_at_and_ignores_anoth
             )
             .expect("the authority is reachable");
         let (net, me, mut client) = start(authority);
-        let started = tokio::time::Instant::now();
         let entry = timeout(
             TEST_TIMEOUT,
             bootstrap(

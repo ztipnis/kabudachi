@@ -29,7 +29,7 @@ pub fn epoch(number: u64) -> RecoveryEpoch {
     RecoveryEpoch::new(number, 0)
 }
 
-/// The name a shard identified by `shard_id` lives under: the same string.
+/// The name a shard identified by `shard_id` lives under: the id up to its last `/`.
 pub fn name_of(shard_id: &ShardId) -> ShardName {
     shard_id.name()
 }
