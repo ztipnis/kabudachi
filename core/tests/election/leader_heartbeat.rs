@@ -10,7 +10,7 @@
 //! last tests run end to end on the `Cluster` harness.
 
 use crate::support::builders::{
-    message_input, g0, heartbeat, heartbeat_message, roll_call_reply, self_remove,
+    epoch, g0, heartbeat, heartbeat_message, message_input, roll_call_reply, self_remove,
     self_remove_message, shard, timings, vote_grant, vote_grant_message, voter_of, worker,
 };
 
@@ -316,7 +316,7 @@ fn a_respondent_that_was_no_voter_of_the_roll_call_counts_toward_the_lease_on_th
     .0;
     let call =
         published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT_TIMEOUT_TICKS)).remove(0);
-    let outside = Generation::new(0, 0, 7);
+    let outside = Generation::new(epoch(0), 0, 7);
     deliver(
         &mut node,
         &left_out,

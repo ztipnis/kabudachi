@@ -3,12 +3,12 @@
 //! candidate wins once its granters are a majority of its call's respondents
 //! and the voters of the call's configuration among them a quorum of it.
 
-use crate::support::builders::{
-    ack_message, configuration_of, g0, leader_ack,
-    past_any_suspicion, roll_call, roll_call_message, roll_call_reply, shard, vote_grant,
-    vote_grant_message, vote_request, vote_request_message, worker,
-};
 use crate::support::builders::checked;
+use crate::support::builders::{
+    ack_message, configuration_of, epoch, g0, leader_ack, past_any_suspicion, roll_call,
+    roll_call_message, roll_call_reply, shard, vote_grant, vote_grant_message, vote_request,
+    vote_request_message, worker,
+};
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
@@ -96,7 +96,11 @@ fn the_refusal(outputs: &[Output], candidate: &WorkerId) -> ElectionRejectReason
 
 #[test]
 fn a_voter_refuses_a_request_it_must_not_grant_and_says_why() {
-    let rows: [(&str, ElectionRejectReason, fn(&FakeClock) -> (TestNode, VoteRequest)); 7] = [
+    let rows: [(
+        &str,
+        ElectionRejectReason,
+        fn(&FakeClock) -> (TestNode, VoteRequest),
+    ); 8] = [
         (
             "a granted vote never switches, even to a better call",
             ElectionRejectReason::AlreadyVoted,
@@ -135,7 +139,7 @@ fn a_voter_refuses_a_request_it_must_not_grant_and_says_why() {
                 // a newer configuration; its contact with that leader then
                 // goes stale too.
                 let newer = Configuration::single(Single {
-                    generation: Generation::new(0, 0, 1),
+                    generation: Generation::new(epoch(0), 0, 1),
                     base: g0(),
                     voter_count: 3,
                 })
@@ -179,6 +183,22 @@ fn a_voter_refuses_a_request_it_must_not_grant_and_says_why() {
                 let candidate = worker("w1");
                 answer(&mut node, &candidate, 1, 0);
                 (node, vote_request(candidate, 1, 1))
+            },
+        ),
+        (
+            "another lineage at the same epoch number",
+            ElectionRejectReason::WrongRecoveryEpoch,
+            |clock| {
+                let mut node = stale_voter(clock, &worker("voter"));
+                let candidate = worker("w1");
+                answer(&mut node, &candidate, 1, 0);
+                (
+                    node,
+                    VoteRequest {
+                        recovery_epoch_lineage: 9,
+                        ..vote_request(candidate, 0, 1)
+                    },
+                )
             },
         ),
     ];

@@ -232,7 +232,7 @@ impl Reconnect {
             (_, None) => Reconnect::StayFenced,
             // Never resumes: without a lineage it cannot tell its own epoch.
             (None, Some(epoch)) => Reconnect::Rejoin(epoch),
-            (Some(own), Some(epoch)) => match order(&own, epoch.into()) {
+            (Some(own), Some(epoch)) => match order(own, epoch) {
                 EpochOrder::Mine => Reconnect::Resume,
                 EpochOrder::Later if own.lineage == epoch.lineage => Reconnect::Resume,
                 _ => Reconnect::Rejoin(epoch),

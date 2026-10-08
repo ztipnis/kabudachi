@@ -33,6 +33,7 @@ use std::time::Duration as StdDuration;
 use crate::support::deadline::within_deadline;
 use crate::support::net::driven_scheduler;
 use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, KnownConfiguration, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
@@ -92,11 +93,11 @@ fn make_node(clock: RealClock, my_id: WorkerId) -> WorkerNode<RealClock> {
         },
         Entry::Known(KnownConfiguration {
             configuration: Configuration::single(Single {
-                generation: Generation::genesis(0),
-                base: Generation::genesis(0),
+                generation: Generation::genesis(RecoveryEpoch::new(0, 0)),
+                base: Generation::genesis(RecoveryEpoch::new(0, 0)),
                 voter_count: 3,
             }).expect("valid"),
-            admission: Some(Generation::genesis(0)),
+            admission: Some(Generation::genesis(RecoveryEpoch::new(0, 0))),
         }),
         clock,
         None,

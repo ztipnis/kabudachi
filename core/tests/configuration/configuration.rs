@@ -2,6 +2,7 @@
 //! generation identity, the voter test, the quorum tally and the leader's
 //! roster.
 
+use crate::support::builders::epoch;
 use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::configuration::{
@@ -10,7 +11,7 @@ use kabudachi_core::configuration::{
 use kabudachi_core::protocol::ids::WorkerId;
 
 fn generation(recovery_epoch: u64, term: u64, counter: u64) -> Generation {
-    Generation::new(recovery_epoch, term, counter)
+    Generation::new(epoch(recovery_epoch), term, counter)
 }
 
 fn admitted(recovery_epoch: u64, term: u64, counter: u64) -> Option<Generation> {
@@ -193,7 +194,7 @@ fn a_worker_fed_to_both_joined_tallies_counts_with_the_first_tallys_admission() 
 
 #[test]
 fn a_worker_held_as_both_member_and_pending_is_a_member() {
-    let mut genesis = Roster::genesis(worker("creator"), 4);
+    let mut genesis = Roster::genesis(worker("creator"), epoch(4));
     genesis.add_pending(worker("creator"));
     let built = Roster::new(
         three_voters_at(1),
@@ -204,7 +205,7 @@ fn a_worker_held_as_both_member_and_pending_is_a_member() {
     assert!(!genesis.is_pending(&worker("creator")));
     assert_eq!(
         genesis.admission_of(&worker("creator")),
-        Some(Generation::genesis(4))
+        Some(Generation::genesis(epoch(4)))
     );
     assert!(!built.is_pending(&worker("a")));
     assert_eq!(built.admission_of(&worker("a")), Some(generation(0, 1, 1)));
@@ -315,9 +316,9 @@ fn removing_workers_from_a_single_configuration() {
         },
         Row {
             what: "a configuration never shrinks below one voter",
-            roster: Roster::genesis(worker("creator"), 0),
+            roster: Roster::genesis(worker("creator"), epoch(0)),
             removals: vec![("creator", 1)],
-            configuration: Configuration::genesis(0),
+            configuration: Configuration::genesis(epoch(0)),
             admissions: vec![],
             pending: vec![],
             non_voters: vec![],
@@ -400,9 +401,10 @@ fn a_removal_that_empties_the_old_side_collapses_the_joint_configuration() {
         generation: g0,
         base: g0,
         voter_count: 1,
-    }).expect("valid");
+    })
+    .expect("valid");
     let mut roster = Roster::after_election(
-        0,
+        epoch(0),
         1,
         &one_voter,
         &BTreeMap::from([
@@ -500,7 +502,7 @@ fn an_election_under_a_single_configuration_founds_a_joint_one_admitting_every_r
         (worker("joiner"), Admission::from(None)),
     ]);
 
-    let roster = Roster::after_election(0, 1, &c0(), &respondents);
+    let roster = Roster::after_election(epoch(0), 1, &c0(), &respondents);
 
     let founded = generation(0, 1, 1);
     assert_eq!(roster.configuration(), &founded_from_c0(1, 3));
@@ -529,7 +531,7 @@ fn an_election_under_a_joint_configuration_re_stamps_it_at_the_winners_term() {
         (worker("joiner"), Admission::from(None)),
     ]);
 
-    let roster = Roster::after_election(0, 3, &founded_from_c0(1, 4), &respondents);
+    let roster = Roster::after_election(epoch(0), 3, &founded_from_c0(1, 4), &respondents);
 
     let restamped = generation(0, 3, 2);
     assert_eq!(
@@ -564,7 +566,7 @@ fn an_election_under_a_joint_configuration_re_stamps_it_at_the_winners_term() {
 fn founded_roster() -> Roster {
     let g0 = generation(0, 0, 0);
     Roster::after_election(
-        0,
+        epoch(0),
         1,
         &c0(),
         &BTreeMap::from([
@@ -662,7 +664,7 @@ fn a_founding_commits_only_when_a_majority_of_each_side_echoes_exactly_its_gener
 fn a_commit_re_admits_only_the_members_its_new_side_counted() {
     let (g0, founded) = (generation(0, 0, 0), generation(0, 1, 1));
     let mut roster = Roster::after_election(
-        0,
+        epoch(0),
         3,
         &founded_from_c0(1, 3),
         &BTreeMap::from([

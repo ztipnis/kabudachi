@@ -101,7 +101,7 @@ What a node knows of its shard: its recovery epoch, the highest term it has seen
 _Avoid_: shard state
 
 **Epoch ordering**:
-How another node's recovery epoch compares with this node's: mine, later, stale, or foreign, which is another lineage's epoch and keeps its number ordering. An epoch that names no lineage compares by number alone.
+How another node's recovery epoch compares with this node's: mine, later or stale, by number and then lineage, so any two nodes agree which of two epochs is newer.
 
 **Authority standing**:
 A node's standing with the coordination authority: its registration and fence timers, forced recovery, reconnect once fenced, and the one reply it awaits. It numbers every call it asks and turns replies into authority verdicts, so the node never builds an authority call.

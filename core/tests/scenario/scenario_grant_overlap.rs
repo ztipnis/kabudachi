@@ -25,6 +25,7 @@ fn reports(node: &str, at: u64, grant: Option<LeadershipGrant>) -> StepRecord {
         state: WorkerState::Leader,
         term: 1,
         recovery_epoch: 0,
+        recovery_lineage: 0,
         admission: None,
         prior_admission: None,
         leader: None,

@@ -18,7 +18,8 @@ use std::ops::Bound;
 
 use super::roll_call::CallRank;
 use crate::configuration::Generation;
-use crate::election::standing::{EpochOrder, order_numbers};
+use crate::coordination_authority::RecoveryEpoch;
+use crate::election::standing::{EpochOrder, order};
 use crate::protocol::ids::WorkerId;
 use crate::protocol::messages::ElectionRejectReason;
 
@@ -53,7 +54,8 @@ struct TermBallot {
 pub(crate) struct Voter {
     /// Whether the node's state takes part in elections at all.
     pub(crate) takes_part: bool,
-    pub(crate) recovery_epoch: u64,
+    /// `None` before the node first joins a shard.
+    pub(crate) recovery_epoch: Option<RecoveryEpoch>,
     pub(crate) highest_term_seen: u64,
     /// The generation of the node's configuration; `None` with none.
     pub(crate) configuration_generation: Option<Generation>,
@@ -102,18 +104,17 @@ impl Ballot {
         configuration_generation: Generation,
         rank: CallRank,
     ) -> RollCallVerdict {
-        let epoch = order_numbers(
-            voter.recovery_epoch,
-            configuration_generation.recovery_epoch(),
-        );
+        let epoch = voter
+            .recovery_epoch
+            .map(|own| order(own, configuration_generation.recovery_epoch()));
         // A node cannot adopt a newer recovery epoch.
-        if epoch == EpochOrder::Later {
+        if epoch == Some(EpochOrder::Later) {
             return RollCallVerdict::Drop;
         }
         if !voter.takes_part {
             return RollCallVerdict::Reject(ElectionRejectReason::NotEligible);
         }
-        if epoch == EpochOrder::Stale {
+        if epoch == Some(EpochOrder::Stale) {
             return RollCallVerdict::Reject(ElectionRejectReason::StaleGeneration);
         }
         if term <= voter.highest_term_seen {
@@ -158,7 +159,7 @@ impl Ballot {
     pub(crate) fn on_vote_request(
         &mut self,
         voter: &Voter,
-        recovery_epoch: u64,
+        recovery_epoch: RecoveryEpoch,
         term: u64,
         roll_call_generation: Generation,
         candidate: &WorkerId,
@@ -166,7 +167,7 @@ impl Ballot {
         if !voter.takes_part {
             return VoteVerdict::Reject(ElectionRejectReason::NotEligible);
         }
-        if order_numbers(voter.recovery_epoch, recovery_epoch) != EpochOrder::Mine {
+        if voter.recovery_epoch.map(|own| order(own, recovery_epoch)) != Some(EpochOrder::Mine) {
             return VoteVerdict::Reject(ElectionRejectReason::WrongRecoveryEpoch);
         }
         // Read only: a refused request leaves no entry for its term.

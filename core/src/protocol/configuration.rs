@@ -15,6 +15,7 @@
 //! type's private `Electorate` field.
 
 use crate::configuration::{self, InvalidConfiguration, Joint, Single};
+use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::generated;
 
 impl TryFrom<&generated::Generation> for configuration::Generation {
@@ -25,7 +26,7 @@ impl TryFrom<&generated::Generation> for configuration::Generation {
             return Err(InvalidConfiguration::CounterAtMax);
         }
         Ok(configuration::Generation::new(
-            raw.recovery_epoch,
+            RecoveryEpoch::new(raw.recovery_epoch, raw.recovery_epoch_lineage),
             raw.term,
             raw.counter,
         ))

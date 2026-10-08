@@ -23,7 +23,9 @@ use kabudachi_core::protocol::ids::IncarnationId;
 use kabudachi_core::time::Duration;
 use proptest::prelude::*;
 
-use crate::support::builders::{self, configuration_of, g0, no_leader_yet, shard, timings, worker};
+use crate::support::builders::{
+    self, configuration_of, epoch, g0, no_leader_yet, shard, timings, worker,
+};
 use crate::support::clock::FakeClock;
 use crate::support::node::{TestNode, elect, voter_node};
 
@@ -69,6 +71,7 @@ fn generation() -> impl Strategy<Value = generated::Generation> {
     (0..2u64, 0..4u64, counter()).prop_map(|(recovery_epoch, term, counter)| {
         generated::Generation {
             recovery_epoch,
+            recovery_epoch_lineage: 0,
             term,
             counter,
         }
@@ -132,6 +135,7 @@ fn heartbeat_ack() -> impl Strategy<Value = Payload> {
                     shard_id,
                     leader_id,
                     recovery_epoch,
+                    recovery_epoch_lineage: 0,
                     term,
                     configuration,
                     recipient_admission: admission,
@@ -264,6 +268,7 @@ fn election_certificate() -> impl Strategy<Value = Payload> {
                     shard_id,
                     leader_id,
                     recovery_epoch,
+                    recovery_epoch_lineage: 0,
                     term,
                     configuration,
                     recipient_admission: admission,
@@ -414,6 +419,7 @@ fn decode_refuses_each_malformed_message_and_accepts_its_boundary_twin() {
     fn at_max() -> generated::Generation {
         generated::Generation {
             recovery_epoch: 0,
+            recovery_epoch_lineage: 0,
             term: 0,
             counter: u64::MAX,
         }
@@ -424,6 +430,7 @@ fn decode_refuses_each_malformed_message_and_accepts_its_boundary_twin() {
     fn generation(recovery_epoch: u64, term: u64, counter: u64) -> generated::Generation {
         generated::Generation {
             recovery_epoch,
+            recovery_epoch_lineage: 0,
             term,
             counter,
         }
@@ -542,14 +549,15 @@ fn decode_refuses_each_malformed_message_and_accepts_its_boundary_twin() {
         ("a rejection naming no leader and no configuration", reject(|m| m.leader = None)),
         ("a rejection with a valid configuration", reject(|m| m.configuration = Some((&configuration_of(1)).into()))),
         ("a message with no payload", ElectionMessage { payload: None }),
-        ("a configuration from an earlier term", certificate(|m| m.configuration = Some(single_of(Generation::new(0, 2, 1))))),
+        ("a configuration from an earlier term", certificate(|m| m.configuration = Some(single_of(Generation::new(epoch(0), 2, 1))))),
         ("a counter one below u64::MAX", roll_call_carrying(configuration(|c| c.generation = Some(generation(0, 0, u64::MAX - 1))))),
         ("a valid joint configuration", roll_call_carrying(Some(joint(|_| {})))),
     ];
     let refused = [
-        ("a certificate whose configuration is from a later term", certificate(|m| m.configuration = Some(single_of(Generation::new(0, 4, 1))))),
-        ("a certificate whose configuration is from another recovery epoch", certificate(|m| m.configuration = Some(single_of(Generation::new(1, 0, 1))))),
-        ("an ack whose configuration is from a later term", ack(|m| m.configuration = Some(single_of(Generation::new(0, 4, 1))))),
+        ("a certificate whose configuration is from a later term", certificate(|m| m.configuration = Some(single_of(Generation::new(epoch(0), 4, 1))))),
+        ("a certificate whose configuration is from another recovery epoch", certificate(|m| m.configuration = Some(single_of(Generation::new(epoch(1), 0, 1))))),
+        ("a certificate whose configuration is of another lineage", certificate(|m| m.recovery_epoch_lineage = 1)),
+        ("an ack whose configuration is from a later term", ack(|m| m.configuration = Some(single_of(Generation::new(epoch(0), 4, 1))))),
         ("a certificate with no configuration", certificate(|m| m.configuration = None)),
         ("a certificate with an invalid prior admission", certificate(|m| m.recipient_prior_admission = Some(at_max()))),
         ("a certificate with a prior admission and no admission", certificate(|m| {

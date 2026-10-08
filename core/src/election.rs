@@ -166,8 +166,8 @@ use election_round::{ElectionRound, Verdict, View};
 use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice};
 use lease::{Lease, LeaseChange, Office};
 pub use standing::JoinFloor;
-use standing::{ShardStanding, order_numbers};
-pub(crate) use standing::{EpochOrder, HeardEpoch, order as order_epochs};
+use standing::ShardStanding;
+pub(crate) use standing::EpochOrder;
 
 pub struct WorkerNode<C>
 where
@@ -731,7 +731,7 @@ where
     /// shard, [`Self::genesis`]. The leader-contact timer starts now so a
     /// new node isn't immediately suspicious. The node starts connected to
     /// no one: its driver reports the connections it holds as
-    /// [`Input::PeerConnected`]. Its recovery epoch is of `lineage`.
+    /// [`Input::PeerConnected`].
     ///
     /// # Panics
     ///
@@ -748,7 +748,6 @@ where
         shard_id: ShardId,
         clock: C,
         known: KnownConfiguration,
-        lineage: u64,
         authority: Option<AuthorityTimings>,
         timings: ElectionTimings,
     ) -> Self {
@@ -767,7 +766,7 @@ where
             assert_heartbeats_keep_a_lease(&timings);
             assert_roll_call_deadline_leaves_room_to_widen(&timings);
         }
-        node.standing = ShardStanding::known(known, lineage);
+        node.standing = ShardStanding::known(known);
         node
     }
 
@@ -801,10 +800,9 @@ where
             shard_id,
             clock,
             KnownConfiguration {
-                configuration: Configuration::genesis(recovery_epoch.number),
-                admission: Some(Generation::genesis(recovery_epoch.number)),
+                configuration: Configuration::genesis(recovery_epoch),
+                admission: Some(Generation::genesis(recovery_epoch)),
             },
-            recovery_epoch.lineage,
             authority,
             timings,
         )
@@ -1013,6 +1011,7 @@ where
         Some(ElectionCertificate {
             shard_id: Some(self.shard_id.clone().into()),
             recovery_epoch: self.standing.epoch_number(),
+            recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
             term: self.term,
             leader_id: Some(self.my_id.clone().into()),
             configuration: Some(office.configuration().into()),
@@ -1030,7 +1029,8 @@ where
     /// compare with this node's, so one is accepted as a newer office). A
     /// requester that is neither, such as a deposed leader, is refused, so
     /// what a worker holds is told only to the office that may act on it.
-    /// The certificate is checked as one received over the wire is.
+    /// The certificate is checked as one received over the wire is. A node
+    /// that never joined a shard answers no one.
     pub fn may_answer_reconcile(
         &self,
         from: &WorkerId,
@@ -1058,10 +1058,12 @@ where
         if certificate.leader_id() != *from || certificate.shard_id() != self.shard_id {
             return false;
         }
-        match order_numbers(self.standing.epoch_number(), certificate.recovery_epoch) {
-            EpochOrder::Later => true,
-            EpochOrder::Stale => false,
-            EpochOrder::Mine => {
+        let named =
+            RecoveryEpoch::new(certificate.recovery_epoch, certificate.recovery_epoch_lineage);
+        match self.standing.order(named) {
+            Some(EpochOrder::Later) => true,
+            Some(EpochOrder::Stale) | None => false,
+            Some(EpochOrder::Mine) => {
                 certificate.term >= self.standing.highest_term_seen()
                     && self
                         .led_or_followed_configuration()
@@ -1544,10 +1546,7 @@ where
         {
             return;
         }
-        let heard = HeardEpoch {
-            number: ack.recovery_epoch,
-            lineage: ack.recovery_epoch_lineage,
-        };
+        let heard = RecoveryEpoch::new(ack.recovery_epoch, ack.recovery_epoch_lineage);
         // Never having joined a shard is `Bootstrapping`, returned above.
         let Some(order) = self.standing.order(heard) else {
             return;
@@ -1558,12 +1557,8 @@ where
             EpochOrder::Mine => false,
         };
         // A leader with an authority leads the epoch it took office at, which
-        // no other lineage's number outranks.
-        if later_epoch
-            && heard
-                .lineage
-                .is_some_and(|lineage| self.leads_its_office_epoch(lineage))
-        {
+        // no other lineage's epoch displaces, a higher number or lineage included.
+        if later_epoch && self.leads_its_office_epoch(heard.lineage) {
             return;
         }
         if !later_epoch && ack.term < self.ack_floor() {
@@ -1662,6 +1657,7 @@ where
             worker_id: Some(self.my_id.clone().into()),
             incarnation_id: Some(self.incarnation_id.clone().into()),
             recovery_epoch_seen: self.standing.epoch_number(),
+            recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
             term_seen: self.standing.highest_term_seen(),
             // Nothing reports this node's capacity yet.
             available_capacity: 0,
@@ -1791,14 +1787,16 @@ where
     /// generation rule, not on that worker's vote. The term fence above only
     /// keeps echoes of other leaderships' acks from counting here.
     fn on_heartbeat(&mut self, from: WorkerId, heartbeat: &Checked<WorkerHeartbeat>) {
-        let epoch = order_numbers(self.standing.epoch_number(), heartbeat.recovery_epoch_seen);
+        let seen =
+            RecoveryEpoch::new(heartbeat.recovery_epoch_seen, heartbeat.recovery_epoch_lineage);
+        let epoch = self.standing.order(seen);
         if !self.holds_office()
             || heartbeat.shard_id() != self.shard_id
-            || epoch == EpochOrder::Later
+            || matches!(epoch, None | Some(EpochOrder::Later))
         {
             return;
         }
-        let same_epoch = epoch == EpochOrder::Mine;
+        let same_epoch = epoch == Some(EpochOrder::Mine);
         // A heartbeat naming a later term than this leader's: its sender
         // voted, or heard of a vote, in that term. Some roll call of that term found
         // a returning quorum of stale voters, so this leader is all but
@@ -1888,7 +1886,7 @@ where
             recipient_prior_admission: content.recipient_prior_admission.map(Into::into),
             send_token: self.clock.now().as_ticks(),
             heartbeat_token,
-            recovery_epoch_lineage: self.standing.epoch().map(|epoch| epoch.lineage),
+            recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
         };
         self.send(to, election_message::Payload::HeartbeatAck(ack));
     }
@@ -2418,7 +2416,7 @@ where
         let view = View {
             me: &self.my_id,
             shard: &self.shard_id,
-            recovery_epoch: self.standing.epoch_number(),
+            recovery_epoch: self.standing.epoch(),
             highest_term_seen: self.standing.highest_term_seen(),
             configuration: led_or_followed(&self.office, &self.standing),
             admission,
@@ -2554,7 +2552,7 @@ where
             leader,
             configuration: self.led_or_followed_configuration().map(Into::into),
             recovery_epoch: self.standing.epoch().map(|epoch| epoch.number),
-            recovery_epoch_lineage: self.standing.epoch().map(|epoch| epoch.lineage),
+            recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
         };
         self.send(initiator, election_message::Payload::ElectionReject(reject));
     }
@@ -2603,10 +2601,9 @@ where
             return;
         }
         let offered = reject.configuration();
-        let refuser_epoch = reject.recovery_epoch.map(|number| HeardEpoch {
-            number,
-            lineage: reject.recovery_epoch_lineage,
-        });
+        let refuser_epoch = reject
+            .recovery_epoch
+            .map(|number| RecoveryEpoch::new(number, reject.recovery_epoch_lineage));
         match refuser_epoch.and_then(|heard| self.standing.order(heard)) {
             // A newer epoch's terms are not this epoch's, so they raise
             // nothing here; the named leader's ack moves this node.
@@ -2682,8 +2679,10 @@ where
             self.state,
             WorkerState::Bootstrapping | WorkerState::Joining
         ) || certificate.shard_id() != self.shard_id
-            || order_numbers(self.standing.epoch_number(), certificate.recovery_epoch)
-                != EpochOrder::Mine
+            || self.standing.order(RecoveryEpoch::new(
+                certificate.recovery_epoch,
+                certificate.recovery_epoch_lineage,
+            )) != Some(EpochOrder::Mine)
         {
             return;
         }

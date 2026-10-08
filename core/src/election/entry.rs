@@ -48,7 +48,7 @@ pub enum Entry {
     /// that names none leaves the node `Bootstrapping`.
     Joining(JoinResponse),
     /// Start `Active` inside a configuration already known, at that
-    /// configuration's recovery epoch, of lineage 0.
+    /// configuration's recovery epoch, of that configuration's lineage.
     Known(KnownConfiguration),
 }
 
@@ -114,7 +114,7 @@ impl<C: Clock> WorkerNode<C> {
                 (node, first)
             }
             Entry::Known(known) => {
-                let node = Self::new(id, incarnation, shard, clock, known, 0, authority, timings);
+                let node = Self::new(id, incarnation, shard, clock, known, authority, timings);
                 let first = node.due_now();
                 (node, first)
             }

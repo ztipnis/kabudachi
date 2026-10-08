@@ -38,8 +38,8 @@ fn shard() -> ShardId {
 /// A configuration of two voters, both admitted at genesis.
 fn two_voters() -> Configuration {
     Configuration::single(Single {
-        generation: Generation::genesis(0),
-        base: Generation::genesis(0),
+        generation: Generation::genesis(RecoveryEpoch::new(0, 0)),
+        base: Generation::genesis(RecoveryEpoch::new(0, 0)),
         voter_count: 2,
     })
     .expect("valid")
@@ -64,7 +64,7 @@ fn node_of_two(
     };
     let known = KnownConfiguration {
         configuration: two_voters(),
-        admission: Some(Generation::genesis(0)),
+        admission: Some(Generation::genesis(RecoveryEpoch::new(0, 0))),
     };
     WorkerNode::start(identity, Entry::Known(known), clock, authority)
 }

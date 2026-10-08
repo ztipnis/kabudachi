@@ -3,11 +3,11 @@
 //! after answering, the roll calls a node drops, and what an initiator does
 //! with a refusal from another recovery epoch or lineage.
 
+use crate::support::builders::checked;
 use crate::support::builders::{
-    ack_message, leader_ack, configuration_of, g0, message, past_any_suspicion, roll_call,
+    ack_message, configuration_of, epoch, g0, leader_ack, message, past_any_suspicion, roll_call,
     roll_call_message, roll_call_reply, shard, timings, worker,
 };
-use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
@@ -229,7 +229,7 @@ fn a_roll_call_a_node_cannot_use_is_dropped() {
             "a newer recovery epoch",
             at_epoch_1,
             initiator.clone(),
-            roll_call(&initiator, 1, &Configuration::genesis(2), 0),
+            roll_call(&initiator, 1, &Configuration::genesis(epoch(2)), 0),
         ),
     ];
 
@@ -262,14 +262,14 @@ fn reject_message(
             term,
         }),
         recovery_epoch: Some(0),
-        recovery_epoch_lineage: None,
+        recovery_epoch_lineage: 0,
     }))
 }
 
 /// `me`, a voter of `voters` at recovery epoch 1, whose leader contact has
 /// not yet gone stale.
 fn voter_at_epoch_1(clock: &FakeClock, me: &WorkerId, voters: usize) -> TestNode {
-    let epoch_1 = Generation::new(1, 0, 0);
+    let epoch_1 = Generation::new(epoch(1), 0, 0);
     WorkerNode::start(
         Identity {
             id: me.clone(),
@@ -294,7 +294,7 @@ fn voter_at_epoch_1(clock: &FakeClock, me: &WorkerId, voters: usize) -> TestNode
 // A refusal from a lower recovery
 // epoch counts that epoch's terms, which order nothing here.
 fn epoch_1_configuration(voters: usize) -> Configuration {
-    let epoch_1 = Generation::new(1, 0, 0);
+    let epoch_1 = Generation::new(epoch(1), 0, 0);
     Configuration::single(Single {
         generation: epoch_1,
         base: epoch_1,
@@ -315,15 +315,15 @@ fn refusal_at(
         panic!("reject_message builds a refusal");
     };
     reject.recovery_epoch = epoch;
-    reject.recovery_epoch_lineage = lineage;
+    reject.recovery_epoch_lineage = lineage.unwrap_or_default();
     reject.configuration = configuration.as_ref().map(Into::into);
     refusal
 }
 
 // A refusal that names no epoch (its rejecter has joined no shard) is read as
-// this node's own; one from a lower epoch, or from another lineage at this
-// node's own epoch number, counts terms and holds a configuration that mean
-// nothing here and is dropped; one from a higher-numbered foreign epoch only
+// this node's own; one from a lower epoch counts terms and holds a
+// configuration that mean nothing here and is dropped; one from a later
+// epoch, a higher number or a higher lineage at this node's own number, only
 // names its leader, which the node heartbeats, and raises no term.
 #[test]
 fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
@@ -348,12 +348,12 @@ fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
             (0, WorkerState::RollCall, false),
         ),
         (
-            "another lineage at this epoch number",
+            "a higher lineage at this epoch number",
             Some(1),
             Some(1),
             Some(epoch_1_configuration(3)),
             ElectionRejectReason::LeaderStillValid,
-            (0, WorkerState::RollCall, false),
+            (0, WorkerState::RollCall, true),
         ),
         (
             "a higher-numbered foreign epoch",
@@ -424,7 +424,7 @@ fn a_refusal_names_the_leader_whatever_its_reason() {
     let follower = worker("follower");
     let mut following = voter_node(&clock, &follower, 3, SUSPECT);
     let newer = Configuration::single(Single {
-        generation: Generation::new(0, 0, 1),
+        generation: Generation::new(epoch(0), 0, 1),
         base: g0(),
         voter_count: 3,
     })
@@ -464,7 +464,7 @@ fn a_node_that_refused_a_stale_roll_call_calls_for_a_later_term_than_it() {
     let leader = worker("leader");
     let mut following = voter_node(&clock, &worker("follower"), 3, SUSPECT);
     let newer = Configuration::single(Single {
-        generation: Generation::new(0, 0, 1),
+        generation: Generation::new(epoch(0), 0, 1),
         base: g0(),
         voter_count: 3,
     })

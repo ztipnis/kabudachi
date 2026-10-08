@@ -38,6 +38,9 @@ message WorkerHeartbeat {
   // key's waiting chain when its leader hands it one. A leader makes
   // compaction runs only once some member says so.
   bool runs_compaction = 13;
+  // The lineage of `recovery_epoch_seen` (see the coordination authority's
+  // `RecoveryEpoch`).
+  uint64 recovery_epoch_lineage = 14;
 }
 
 // Names one leader ack a heartbeat confirms receiving.
@@ -73,10 +76,13 @@ message LeaderHeartbeatAck {
   // the leader holds no grant, and for an ack that answers no heartbeat,
   // such as the one a new leader sends every connected peer.
   optional uint64 heartbeat_token = 9;
-  // The lineage of the leader's recovery epoch (see the coordination
-  // authority's `RecoveryEpoch`), which a recipient that adopts that epoch
-  // takes with it. Absent from a leader that never learned its lineage.
-  optional uint64 recovery_epoch_lineage = 10;
+  // The lineage of `recovery_epoch` (see the coordination authority's
+  // `RecoveryEpoch`). A peer that predates this field omits it, which decodes
+  // as lineage 0 and can rank behind a node holding a nonzero lineage at the
+  // same epoch, so such a peer's election messages are rejected as stale.
+  // Mixed-version election traffic is therefore unsupported: every worker of
+  // a shard must run the same build.
+  uint64 recovery_epoch_lineage = 10;
 }
 
 // A census of the shard's workers ahead of a vote, published on the shard's
@@ -125,6 +131,9 @@ message VoteRequest {
   WorkerId candidate_id = 4;
   // The generation of the configuration the candidate's roll call ran under.
   Generation roll_call_generation = 5;
+  // The lineage of `recovery_epoch` (see the coordination authority's
+  // `RecoveryEpoch`).
+  uint64 recovery_epoch_lineage = 6;
 }
 
 message VoteGrant {
@@ -133,6 +142,9 @@ message VoteGrant {
   uint64 term = 3;
   WorkerId candidate_id = 4;
   WorkerId voter_id = 5;
+  // The lineage of `recovery_epoch` (see the coordination authority's
+  // `RecoveryEpoch`).
+  uint64 recovery_epoch_lineage = 6;
 }
 
 // Why a worker refused a roll call or a vote request.
@@ -186,14 +198,14 @@ message ElectionReject {
   // on the joint configuration this one directly commits adopts it: the
   // commit it missed.
   optional Configuration configuration = 9;
-  // The recovery epoch the rejecter stands in and its lineage (see the
-  // coordination authority), so the initiator can tell a refusal from a
-  // later, an earlier or another lineage's epoch, whose terms do not compare
-  // with its own. Absent from a rejecter that has joined no shard, and the
-  // lineage from one that never learned it; a refusal without an epoch is
-  // read as the initiator's own.
+  // The recovery epoch the rejecter stands in, so the initiator can tell a
+  // refusal from a later or an earlier epoch, whose terms do not compare with
+  // its own. Absent from a rejecter that has joined no shard; a refusal
+  // without an epoch is read as the initiator's own.
   optional uint64 recovery_epoch = 10;
-  optional uint64 recovery_epoch_lineage = 11;
+  // The lineage of `recovery_epoch` (see the coordination authority's
+  // `RecoveryEpoch`). Read only when `recovery_epoch` is present.
+  uint64 recovery_epoch_lineage = 11;
 }
 
 // What an election's winner leads, sent to every respondent of its roll
@@ -218,6 +230,9 @@ message ElectionCertificate {
   // The admission generation the recipient held before the election that
   // founded the configuration admitted it. Absent otherwise.
   optional Generation recipient_prior_admission = 11;
+  // The lineage of `recovery_epoch` (see the coordination authority's
+  // `RecoveryEpoch`).
+  uint64 recovery_epoch_lineage = 12;
 }
 
 message SelfRemove {
@@ -236,12 +251,15 @@ message SelfRemove {
   uint64 leader_term = 6;
 }
 
-// The identity of a configuration, compared
-// lexicographically in field order.
+// The identity of a configuration, compared lexicographically: recovery
+// epoch (number, then lineage), term, counter.
 message Generation {
   uint64 recovery_epoch = 1;
   uint64 term = 2;
   uint64 counter = 3;
+  // The lineage of `recovery_epoch` (see the coordination authority's
+  // `RecoveryEpoch`).
+  uint64 recovery_epoch_lineage = 4;
 }
 
 // A voter configuration as every worker knows it: a generation, a base

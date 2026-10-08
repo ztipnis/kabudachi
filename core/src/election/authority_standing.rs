@@ -526,13 +526,13 @@ impl AuthorityStanding {
         let republished = match &result {
             Ok(()) => true,
             Err(AuthorityError::EpochConflict { current }) => {
-                current.is_some_and(|current| order(&new, current.into()) == EpochOrder::Mine)
+                current.is_some_and(|current| order(new, current) == EpochOrder::Mine)
             }
             Err(_) => false,
         };
         if view.in_office()
             && expected.is_none()
-            && view.own_epoch.map(|own| order(&own, new.into())) == Some(EpochOrder::Mine)
+            && view.own_epoch.map(|own| order(own, new)) == Some(EpochOrder::Mine)
             && republished
         {
             self.lease.retry_fence_at(now);
@@ -625,7 +625,7 @@ impl AuthorityStanding {
                 .is_some_and(ForcedRecovery::is_awaiting_fence),
             _ => false,
         };
-        let own_epoch_is_it = view.own_epoch.map(|own| order(&own, epoch.into())) == Some(EpochOrder::Mine);
+        let own_epoch_is_it = view.own_epoch.map(|own| order(own, epoch)) == Some(EpochOrder::Mine);
         if !seeking || !own_epoch_is_it {
             return Vec::new();
         }
