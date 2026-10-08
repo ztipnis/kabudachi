@@ -41,7 +41,8 @@ fn the_store_orders_revisions_by_epoch_then_term_then_revision() {
         ("a later epoch of the lineage with an earlier term", version(4, 5, 1, 0), Ok(Put::Stored)),
         ("an earlier epoch of the lineage with a later term", version(2, 5, 9, 0), Err(PutRefusal::Older)),
         ("another lineage's epoch numbered above", version(4, 6, 1, 0), Ok(Put::Stored)),
-        ("another lineage's epoch at the same number", version(3, 6, 9, 0), Err(PutRefusal::Older)),
+        ("another lineage's epoch at the same number, ranked above", version(3, 6, 1, 0), Ok(Put::Stored)),
+        ("another lineage's epoch at the same number, ranked below", version(3, 4, 9, 0), Err(PutRefusal::Older)),
         ("another lineage's epoch numbered below", version(2, 6, 9, 0), Err(PutRefusal::Older)),
     ];
     for (case, incoming, expected) in cases {

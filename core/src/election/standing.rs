@@ -3,10 +3,9 @@
 //! [`ShardStanding`] holds a node's recovery epoch, the highest term it has
 //! seen, and the configuration and admission generations it follows. It
 //! changes only through the transitions named on it, so no site writes one of
-//! those fields beside the others. [`order`] and [`order_numbers`] are the
-//! one place two recovery epochs are compared: every site that reads an epoch
-//! off a message, an ack or the authority matches on the [`EpochOrder`] they
-//! return.
+//! those fields beside the others. [`order`] is the one place two recovery
+//! epochs are compared: every site that reads an epoch off a message, an ack
+//! or the authority matches on the [`EpochOrder`] it returns.
 
 use std::cmp::Ordering;
 
@@ -16,56 +15,21 @@ use crate::protocol::ids::WorkerId;
 use crate::protocol::messages::JoinResponse;
 
 /// How another node's, or the authority's, recovery epoch compares with this
-/// node's own. An epoch is a number and a lineage; numbers order epochs of
-/// one lineage, and also order another lineage's against this one, except
-/// at an equal number: two foundings can both start there, and nothing says
-/// which came later.
+/// node's own. Epochs are totally ordered, by number and then lineage, so any
+/// two nodes agree which of two epochs is newer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EpochOrder {
-    /// The same epoch: same number, and the same lineage or none named.
+    /// The same epoch: number and lineage.
     Mine,
-    /// A newer epoch: a later one of this lineage (or of an unnamed one), or
-    /// another lineage's numbered above this one.
+    /// A newer epoch.
     Later,
-    /// An older epoch: an earlier one of this lineage (or of an unnamed
-    /// one), or another lineage's at or below this one's number.
+    /// An older epoch.
     Stale,
 }
 
-/// A recovery epoch as a message or the authority names it: its number, and
-/// its lineage when the message carries one (`RecoveryEpoch` always does; a
-/// `LeaderHeartbeatAck` may; a heartbeat, roll call, vote, refusal or
-/// certificate never does).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HeardEpoch {
-    pub(crate) number: u64,
-    pub(crate) lineage: Option<u64>,
-}
-
-impl From<RecoveryEpoch> for HeardEpoch {
-    fn from(epoch: RecoveryEpoch) -> Self {
-        HeardEpoch {
-            number: epoch.number,
-            lineage: Some(epoch.lineage),
-        }
-    }
-}
-
-/// Where `other` stands against `own`. With no lineage named, only numbers
-/// are compared (see [`order_numbers`]).
-pub(crate) fn order(own: &RecoveryEpoch, other: HeardEpoch) -> EpochOrder {
-    match other.lineage {
-        Some(lineage) if lineage != own.lineage && other.number <= own.number => {
-            EpochOrder::Stale
-        }
-        _ => order_numbers(own.number, other.number),
-    }
-}
-
-/// [`order`] where neither lineage is in play: `Mine`, `Later` or `Stale` by
-/// number.
-pub(crate) fn order_numbers(own: u64, other: u64) -> EpochOrder {
-    match other.cmp(&own) {
+/// Where `heard` stands against `own`.
+pub(crate) fn order(own: RecoveryEpoch, heard: RecoveryEpoch) -> EpochOrder {
+    match heard.cmp(&own) {
         Ordering::Equal => EpochOrder::Mine,
         Ordering::Greater => EpochOrder::Later,
         Ordering::Less => EpochOrder::Stale,
@@ -78,11 +42,9 @@ pub(crate) fn order_numbers(own: u64, other: u64) -> EpochOrder {
 /// for a leader, and asks it instead of comparing epochs itself.
 ///
 /// A pointer is accepted when its epoch is the floor's own or later (see
-/// [`EpochOrder`]): another lineage's epoch is accepted only when numbered
-/// above the floor. A floor of `None`, a node that never joined, accepts every
-/// pointer. Among accepted pointers a higher number is newer, and a later term
-/// is newer only within one lineage; pointers of different lineages at one
-/// number are equally new.
+/// [`EpochOrder`]). A floor of `None`, a node that never joined, accepts every
+/// pointer. Among accepted pointers a later epoch is newer, and of one epoch a
+/// later term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinFloor {
     epoch: Option<RecoveryEpoch>,
@@ -111,7 +73,7 @@ impl JoinFloor {
 
     fn accepts_epoch(&self, named: RecoveryEpoch) -> bool {
         self.epoch
-            .is_none_or(|floor| order(&floor, named.into()) != EpochOrder::Stale)
+            .is_none_or(|floor| order(floor, named) != EpochOrder::Stale)
     }
 
     /// The newest of the pointers this floor accepts; of equally new ones,
@@ -123,28 +85,17 @@ impl JoinFloor {
         self.newest_first(pointers).into_iter().next()
     }
 
-    /// The pointers this floor accepts, newest first; equally new ones keep
-    /// the order they were given in.
+    /// The pointers this floor accepts, newest first: by epoch, then term;
+    /// equally new ones keep the order they were given in.
     pub fn newest_first<'a>(
         &self,
         pointers: impl IntoIterator<Item = &'a JoinResponse>,
     ) -> Vec<&'a JoinResponse> {
-        let mut remaining: Vec<_> = pointers
+        let mut ranked: Vec<_> = pointers
             .into_iter()
             .filter(|pointer| self.accepts(pointer))
             .collect();
-        let mut ranked = Vec::with_capacity(remaining.len());
-        // Not a sort: equal newness across lineages is not transitive with
-        // the terms inside one, so it picks the newest still remaining.
-        while !remaining.is_empty() {
-            let mut best = 0;
-            for (index, pointer) in remaining.iter().enumerate().skip(1) {
-                if newer_than(pointer, remaining[best]) {
-                    best = index;
-                }
-            }
-            ranked.push(remaining.remove(best));
-        }
+        ranked.sort_by_key(|pointer| std::cmp::Reverse((pointer_epoch(pointer), pointer.term)));
         ranked
     }
 
@@ -161,18 +112,6 @@ impl JoinFloor {
 
 fn pointer_epoch(pointer: &JoinResponse) -> RecoveryEpoch {
     RecoveryEpoch::new(pointer.recovery_epoch, pointer.recovery_epoch_lineage)
-}
-
-/// Whether `a` names a newer leader than `b`: a higher epoch number, or at one
-/// number of one lineage a later term.
-fn newer_than(a: &JoinResponse, b: &JoinResponse) -> bool {
-    match a.recovery_epoch.cmp(&b.recovery_epoch) {
-        Ordering::Greater => true,
-        Ordering::Less => false,
-        Ordering::Equal => {
-            a.recovery_epoch_lineage == b.recovery_epoch_lineage && a.term > b.term
-        }
-    }
 }
 
 /// What a node knows of its shard: its recovery epoch (`None` only before
@@ -246,10 +185,10 @@ impl ShardStanding {
         self.epoch.map_or(0, |epoch| epoch.number)
     }
 
-    /// Where `other` stands against this standing's epoch; `None` before the
+    /// Where `heard` stands against this standing's epoch; `None` before the
     /// first join, when it has none.
-    pub(crate) fn order(&self, other: HeardEpoch) -> Option<EpochOrder> {
-        self.epoch.map(|own| order(&own, other))
+    pub(crate) fn order(&self, heard: RecoveryEpoch) -> Option<EpochOrder> {
+        self.epoch.map(|own| order(own, heard))
     }
 
     pub(crate) fn highest_term_seen(&self) -> u64 {
@@ -289,15 +228,15 @@ impl ShardStanding {
     /// Accepts `term` and what an ack of `heard`'s epoch carries. An ack of a
     /// newer epoch (see [`EpochOrder::Later`]) first moves this standing to
     /// that epoch, forgetting the old one's configuration: the epochs' terms
-    /// are not comparable, so `term` becomes the highest seen. The epoch
-    /// takes `heard`'s lineage when the ack names one: a recovery usually
-    /// keeps the lineage, but an epoch recovered from a shard founded afresh
-    /// does not, and a node that kept its old lineage would not recognise the
-    /// epoch as its own when it next reconnected. Then the offered
-    /// configuration is taken on as [`Self::adopt`] says.
+    /// are not comparable, so `term` becomes the highest seen. The epoch is
+    /// `heard` whole, lineage included: a recovery usually keeps the lineage,
+    /// but a shard founded afresh does not, and a node that kept its old
+    /// lineage would not recognise the epoch as its own when it next
+    /// reconnected. Then the offered configuration is taken on as
+    /// [`Self::adopt`] says.
     pub(crate) fn accept_ack(
         &mut self,
-        heard: HeardEpoch,
+        heard: RecoveryEpoch,
         term: u64,
         offered: Configuration,
         admission: Option<Generation>,
@@ -306,11 +245,7 @@ impl ShardStanding {
         let epoch_moved = self.order(heard) == Some(EpochOrder::Later);
         if epoch_moved {
             self.forget();
-            let lineage = heard
-                .lineage
-                .or(self.epoch.map(|epoch| epoch.lineage))
-                .unwrap_or_default();
-            self.epoch = Some(RecoveryEpoch::new(heard.number, lineage));
+            self.epoch = Some(heard);
             self.highest_term_seen = term;
         }
         self.saw_term(term);

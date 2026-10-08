@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
 
 use crate::coordination_authority::RecoveryEpoch;
-use crate::election::{EpochOrder, HeardEpoch, order_epochs};
 use crate::protocol::generated;
 
-/// Which revision of a Task record a record is (see [`RecordVersion::order`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which revision of a Task record a record is: ordered by recovery epoch
+/// (number, then lineage), then leader term, then revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RecordVersion {
     pub recovery_epoch: RecoveryEpoch,
     pub leader_term: u64,
@@ -21,22 +21,12 @@ pub enum VersionOrder {
 }
 
 impl RecordVersion {
-    /// Where `other` stands against `self`. Recovery epochs are compared as
-    /// a worker compares an epoch it hears of with its own: a later epoch of
-    /// the same lineage, or another lineage's epoch numbered above this one,
-    /// is newer; another lineage's at or below this one's number is older,
-    /// whatever its term. Within one epoch, term then revision decide.
+    /// Where `other` stands against `self`.
     pub fn order(&self, other: &RecordVersion) -> VersionOrder {
-        match order_epochs(&self.recovery_epoch, HeardEpoch::from(other.recovery_epoch)) {
-            EpochOrder::Later => VersionOrder::Newer,
-            EpochOrder::Stale => VersionOrder::Older,
-            EpochOrder::Mine => {
-                match (other.leader_term, other.revision).cmp(&(self.leader_term, self.revision)) {
-                    Ordering::Greater => VersionOrder::Newer,
-                    Ordering::Equal => VersionOrder::Same,
-                    Ordering::Less => VersionOrder::Older,
-                }
-            }
+        match other.cmp(self) {
+            Ordering::Greater => VersionOrder::Newer,
+            Ordering::Equal => VersionOrder::Same,
+            Ordering::Less => VersionOrder::Older,
         }
     }
 }

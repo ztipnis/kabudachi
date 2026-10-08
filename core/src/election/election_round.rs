@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use crate::configuration::{Admission, Configuration, Roster};
 use crate::coordination_authority::RecoveryEpoch;
-use crate::election::standing::{EpochOrder, order_numbers};
+use crate::election::standing::{EpochOrder, order};
 use crate::protocol::checked::Checked;
 use crate::protocol::ids::{ShardId, WorkerId};
 use crate::protocol::messages::prelude::*;
@@ -468,10 +468,9 @@ impl ElectionRound {
                 // A caller left on an earlier recovery epoch learns who leads
                 // the current one, whose ack then moves it on.
                 let name_leader = reason == ElectionRejectReason::LeaderStillValid
-                    || order_numbers(
-                        view.epoch_number(),
-                        call.configuration().generation().recovery_epoch().number,
-                    ) == EpochOrder::Stale;
+                    || view.recovery_epoch.map(|own| {
+                        order(own, call.configuration().generation().recovery_epoch())
+                    }) == Some(EpochOrder::Stale);
                 vec![Verdict::Reject {
                     to: initiator,
                     term: call.term,
@@ -613,7 +612,12 @@ impl ElectionRound {
         };
         if grant.term != vote.term()
             || grant.shard_id() != *view.shard
-            || order_numbers(view.epoch_number(), grant.recovery_epoch) != EpochOrder::Mine
+            || view.recovery_epoch.map(|own| {
+                order(
+                    own,
+                    RecoveryEpoch::new(grant.recovery_epoch, grant.recovery_epoch_lineage),
+                )
+            }) != Some(EpochOrder::Mine)
             || grant.candidate_id() != *view.me
         {
             return Vec::new();

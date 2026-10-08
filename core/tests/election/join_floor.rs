@@ -26,23 +26,24 @@ fn floor_at(number: u64, lineage: u64) -> JoinFloor {
     JoinFloor::at(RecoveryEpoch::new(number, lineage))
 }
 
-// A floor of (5, A) can be offered (5, B) at a higher term: the equal number
-// of another lineage is not above the floor, so the pass must not pick it
-// over the pointer the floor can take.
+// Of two lineages at one number the higher is the newer epoch whichever
+// floor asks, so two rejoining nodes take the same leader.
 #[test]
-fn a_floor_takes_its_own_epoch_over_an_equal_numbered_epoch_of_another_lineage() {
-    let floor = floor_at(5, A);
-    let mine = pointer(5, A, 1);
-    let foreign = pointer(5, B, 10);
+fn every_floor_takes_the_higher_of_two_lineages_at_one_number_as_newer() {
+    let lower = pointer(5, A, 10);
+    let higher = pointer(5, B, 1);
 
-    assert!(floor.accepts(&mine));
-    assert!(!floor.accepts(&foreign));
-    assert_eq!(floor.newest([&foreign, &mine]), Some(&mine));
-    assert_eq!(floor.newest([&foreign]), None);
+    let low_floor = floor_at(5, A);
+    assert!(low_floor.accepts(&higher));
+    assert_eq!(low_floor.newest([&lower, &higher]), Some(&higher));
+
+    let high_floor = floor_at(5, B);
+    assert!(!high_floor.accepts(&lower));
+    assert_eq!(high_floor.newest([&lower, &higher]), Some(&higher));
 }
 
 #[test]
-fn a_floor_ranks_accepted_pointers_by_number_then_by_term_within_one_lineage() {
+fn a_floor_ranks_accepted_pointers_by_epoch_then_by_term() {
     let floor = floor_at(5, A);
     let same_epoch_late_term = pointer(5, A, 9);
     let same_epoch_early_term = pointer(5, A, 2);
@@ -63,11 +64,8 @@ fn a_floor_ranks_accepted_pointers_by_number_then_by_term_within_one_lineage() {
          pointer below the floor is left out"
     );
 
-    // Terms are not compared across lineages: a high term in a third lineage
-    // does not outrank the pointer heard first at the same number.
-    let first = pointer(7, B, 1);
-    let second = pointer(7, 3, 50);
-    assert_eq!(floor.newest([&first, &second]), Some(&first));
+    let (lower, higher) = (pointer(7, B, 50), pointer(7, 3, 1));
+    assert_eq!(floor.newest([&lower, &higher]), Some(&higher));
 }
 
 #[test]

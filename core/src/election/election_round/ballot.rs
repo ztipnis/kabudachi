@@ -19,7 +19,7 @@ use std::ops::Bound;
 use super::roll_call::CallRank;
 use crate::configuration::Generation;
 use crate::coordination_authority::RecoveryEpoch;
-use crate::election::standing::{EpochOrder, order_numbers};
+use crate::election::standing::{EpochOrder, order};
 use crate::protocol::ids::WorkerId;
 use crate::protocol::messages::ElectionRejectReason;
 
@@ -63,12 +63,6 @@ pub(crate) struct Voter {
     pub(crate) leader_contact_is_fresh: bool,
 }
 
-impl Voter {
-    fn epoch_number(&self) -> u64 {
-        self.recovery_epoch.map_or(0, |epoch| epoch.number)
-    }
-}
-
 /// What a node does with a roll call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RollCallVerdict {
@@ -110,18 +104,17 @@ impl Ballot {
         configuration_generation: Generation,
         rank: CallRank,
     ) -> RollCallVerdict {
-        let epoch = order_numbers(
-            voter.epoch_number(),
-            configuration_generation.recovery_epoch().number,
-        );
+        let epoch = voter
+            .recovery_epoch
+            .map(|own| order(own, configuration_generation.recovery_epoch()));
         // A node cannot adopt a newer recovery epoch.
-        if epoch == EpochOrder::Later {
+        if epoch == Some(EpochOrder::Later) {
             return RollCallVerdict::Drop;
         }
         if !voter.takes_part {
             return RollCallVerdict::Reject(ElectionRejectReason::NotEligible);
         }
-        if epoch == EpochOrder::Stale {
+        if epoch == Some(EpochOrder::Stale) {
             return RollCallVerdict::Reject(ElectionRejectReason::StaleGeneration);
         }
         if term <= voter.highest_term_seen {
@@ -174,7 +167,7 @@ impl Ballot {
         if !voter.takes_part {
             return VoteVerdict::Reject(ElectionRejectReason::NotEligible);
         }
-        if order_numbers(voter.epoch_number(), recovery_epoch.number) != EpochOrder::Mine {
+        if voter.recovery_epoch.map(|own| order(own, recovery_epoch)) != Some(EpochOrder::Mine) {
             return VoteVerdict::Reject(ElectionRejectReason::WrongRecoveryEpoch);
         }
         // Read only: a refused request leaves no entry for its term.

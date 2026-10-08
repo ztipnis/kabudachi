@@ -104,7 +104,11 @@ pub trait CoordinationAuthority {
 /// leader that republishes its epoch after a flush puts back
 /// the same one. A worker cut off from the authority resumes only if the
 /// epoch it finds there is exactly its own, lineage included.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Epochs are ordered by number, then lineage: lineages are random, so the
+/// lineage is a fixed tie-break between two foundings at one number, not a
+/// sign of which came later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RecoveryEpoch {
     pub number: u64,
     pub lineage: u64,

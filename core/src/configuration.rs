@@ -76,29 +76,14 @@ pub enum InvalidConfiguration {
 /// different leaders never share a generation. The recovery epoch leads so the
 /// order stays right whether or not a forced reconfiguration resets the term.
 /// The counter rises by one with every change and never resets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation {
+    // The derived `Ord` compares fields in declaration order, so this order is
+    // the comparison order: recovery epoch (number, then lineage), term,
+    // counter.
     recovery_epoch: RecoveryEpoch,
     term: u64,
     counter: u64,
-}
-
-// Compares recovery epoch number, term, counter. Until recovery epochs are
-// ordered by lineage too, the lineage does not take part.
-impl Ord for Generation {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.recovery_epoch.number, self.term, self.counter).cmp(&(
-            other.recovery_epoch.number,
-            other.term,
-            other.counter,
-        ))
-    }
-}
-
-impl PartialOrd for Generation {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 impl Generation {

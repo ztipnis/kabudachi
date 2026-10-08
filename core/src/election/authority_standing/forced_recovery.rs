@@ -89,7 +89,7 @@ pub(crate) fn cannot_recover_from(
     match own_epoch {
         None => true,
         Some(own) => {
-            own.lineage != held.lineage || order(&own, held.into()) == EpochOrder::Stale
+            own.lineage != held.lineage || order(own, held) == EpochOrder::Stale
         }
     }
 }
@@ -207,8 +207,8 @@ impl ForcedRecovery {
             return Next::GiveUp;
         };
         let asked_for_this_swap = expected
-            .is_some_and(|expected| order(from, expected.into()) == EpochOrder::Mine)
-            && order(to, new.into()) == EpochOrder::Mine;
+            .is_some_and(|expected| order(*from, expected) == EpochOrder::Mine)
+            && order(*to, new) == EpochOrder::Mine;
         if !asked_for_this_swap {
             return Next::GiveUp;
         }

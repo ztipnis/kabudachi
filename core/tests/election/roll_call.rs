@@ -321,9 +321,9 @@ fn refusal_at(
 }
 
 // A refusal that names no epoch (its rejecter has joined no shard) is read as
-// this node's own; one from a lower epoch, or from another lineage at this
-// node's own epoch number, counts terms and holds a configuration that mean
-// nothing here and is dropped; one from a higher-numbered foreign epoch only
+// this node's own; one from a lower epoch counts terms and holds a
+// configuration that mean nothing here and is dropped; one from a later
+// epoch, a higher number or a higher lineage at this node's own number, only
 // names its leader, which the node heartbeats, and raises no term.
 #[test]
 fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
@@ -348,12 +348,12 @@ fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
             (0, WorkerState::RollCall, false),
         ),
         (
-            "another lineage at this epoch number",
+            "a higher lineage at this epoch number",
             Some(1),
             Some(1),
             Some(epoch_1_configuration(3)),
             ElectionRejectReason::LeaderStillValid,
-            (0, WorkerState::RollCall, false),
+            (0, WorkerState::RollCall, true),
         ),
         (
             "a higher-numbered foreign epoch",

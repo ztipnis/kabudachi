@@ -772,38 +772,44 @@ fn a_leader_whose_fence_names_an_epoch_it_cannot_recover_from_rejoins_it() {
     );
 }
 
+// Two nodes at one epoch number of two lineages agree which epoch is newer:
+// the node of the lower lineage follows the other's leader, the node of the
+// higher lineage ignores the lower one's, and an epoch numbered below is
+// older whatever its lineage.
 #[test]
-fn a_node_ignores_an_ack_from_another_lineage_at_or_below_its_epoch_number() {
-    for number in [0, 1] {
+fn nodes_at_one_epoch_number_of_two_lineages_agree_which_epoch_is_newer() {
+    // (the node's epoch, the ack's epoch, whether the node follows it)
+    let rows = [
+        (RecoveryEpoch::new(1, 5), RecoveryEpoch::new(1, 7), true),
+        (RecoveryEpoch::new(1, 7), RecoveryEpoch::new(1, 5), false),
+        (RecoveryEpoch::new(1, 5), RecoveryEpoch::new(0, 9), false),
+    ];
+    for (own, heard, follows) in rows {
         let clock = FakeClock::new();
         let authority = warmed_up_authority(&clock);
         authority
-            .compare_and_swap_recovery_epoch(&shard(SHARD), None, RecoveryEpoch::new(number, 0))
+            .compare_and_swap_recovery_epoch(&shard(SHARD), None, own)
             .expect("the shard has no epoch yet");
-        let configuration = configuration_at_epoch(epoch(number));
+        let configuration = configuration_at_epoch(own);
         let (mut driven, _) = Driven::with(
             &clock,
             &authority,
             "w1",
-            KnownConfiguration {
-                admission: Some(configuration.generation()),
-                configuration,
-            },
+            KnownConfiguration { admission: Some(configuration.generation()), configuration },
             default_timings(),
-            Some(AuthorityTimings {
-                ttl: authority_ttl(),
-            }),
+            Some(AuthorityTimings { ttl: authority_ttl() }),
         );
         let stranger = worker("stranger");
 
-        driven.step(ack_of_epoch(&stranger, RecoveryEpoch::new(0, 7)));
+        driven.step(ack_of_epoch(&stranger, heard));
 
+        let now_at = if follows { heard } else { own };
         assert_eq!(
-            driven.node.known_leader(),
-            None,
-            "a leader of another lineage's epoch 0 is no leader of this one, at epoch {number}"
+            (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
+            (now_at.number, Some(now_at.lineage)),
+            "a node at {own:?} hearing {heard:?}"
         );
-        assert_eq!(driven.node.recovery_epoch(), number);
+        assert_eq!(driven.node.known_leader().is_some(), follows, "a node at {own:?} hearing {heard:?}");
     }
 }
 

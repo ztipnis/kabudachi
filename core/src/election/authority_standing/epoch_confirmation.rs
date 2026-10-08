@@ -172,7 +172,7 @@ impl EpochConfirmation {
                 self.refusals = 0;
                 Answer::Confirmed
             }
-            Ok(Some(held)) if order(&own, held.into()) == EpochOrder::Mine => {
+            Ok(Some(held)) if order(own, held) == EpochOrder::Mine => {
                 // Refusals of roll calls at an epoch the authority holds say
                 // nothing of a leaderless later one.
                 self.confirmed = Some(Confirmed::Epoch(held));
@@ -182,7 +182,7 @@ impl EpochConfirmation {
             Ok(Some(held))
                 if self.refusals < REFUSALS_BEFORE_REJOINING
                     && held.lineage == own.lineage
-                    && order(&own, held.into()) == EpochOrder::Later =>
+                    && order(own, held) == EpochOrder::Later =>
             {
                 self.confirmed = Some(Confirmed::Behind);
                 Answer::Confirmed
