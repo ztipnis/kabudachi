@@ -785,7 +785,13 @@ def test_the_soft_limit_may_not_be_above_the_hard_limit():
 
 
 def test_task_processes_default_to_one_per_cpu():
-    assert Configuration().resolve("processes") == (os.cpu_count() or 1)
+    if hasattr(os, "process_cpu_count"):
+        expected = os.process_cpu_count() or 1
+    elif hasattr(os, "sched_getaffinity"):
+        expected = len(os.sched_getaffinity(0)) or 1
+    else:
+        expected = os.cpu_count() or 1
+    assert Configuration().resolve("processes") == expected
 
 
 def test_worker_settings_are_read_from_the_environment(monkeypatch):

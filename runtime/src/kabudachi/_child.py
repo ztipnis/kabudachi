@@ -20,6 +20,7 @@ import pickle
 import signal
 import sys
 import threading
+import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -146,10 +147,13 @@ class _TaskProcess:
     def _read(self) -> None:
         try:
             ipc.read_frames(self._connection, self._received_on_reader)
-        finally:
-            # The worker has gone or closed its end: nothing done here could
-            # reach it any more.
-            _exit(0)
+        except BaseException:
+            # The reader broke: say so, rather than exit as if the worker left.
+            traceback.print_exc()
+            _exit(1)
+        # The worker has gone or closed its end: nothing done here could
+        # reach it any more.
+        _exit(0)
 
     def _received_on_reader(self, frame: Any) -> None:
         # Answers are taken here, not on the loop: a body waiting on its own
