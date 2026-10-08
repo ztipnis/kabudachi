@@ -13,6 +13,7 @@ worker counts its place free.
 import asyncio
 import concurrent.futures
 import contextvars
+import functools
 import importlib
 import itertools
 import os
@@ -30,6 +31,7 @@ from kabudachi.body import fold_compaction, run_serialized
 from kabudachi.config import Settings
 from kabudachi.handle import TaskHandle, current_body, run_callback_inline
 from kabudachi.hosted_work import LoopHostedWork
+from kabudachi.lifecycle import RunContext, default_hooks, hooks_for_run
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
@@ -93,6 +95,7 @@ class _TaskProcess:
         self._connection = connection
         self._send_lock = threading.Lock()
         self._registry = default_registry()
+        self._hooks = default_hooks()
         self.serializers = process_serializers()
         self._threads = ThreadPoolExecutor(
             max_workers=settings.concurrency, thread_name_prefix="kabudachi-task"
@@ -250,6 +253,12 @@ class _TaskProcess:
         # A body that waits for a task it called gives its place back meanwhile.
         context = contextvars.copy_context()
         context.run(current_body.set, _BodyWaits(self, frame.run_id))
+        hooks = hooks_for_run(
+            self._hooks,
+            RunContext(frame.definition_id, frame.run_id, frame.attempt),
+            frame.queue,
+            recycle=functools.partial(self.send, ipc.Recycle()),
+        )
         body = context.run(
             run_serialized,
             self._registry,
@@ -259,6 +268,7 @@ class _TaskProcess:
             frame.source_version,
             frame.chain,
             frame.serialized_input,
+            hooks,
         )
         self._track(frame.run_id, body.outcome, body.exited, self._report_result)
 

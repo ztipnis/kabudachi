@@ -3,6 +3,7 @@ loop, tasks called from `main` and their results awaited."""
 
 import asyncio
 import functools
+import logging
 import threading
 import time
 from datetime import timedelta
@@ -11,18 +12,22 @@ import pytest
 
 import kabudachi
 from kabudachi import config as config_module
+from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
 from kabudachi.config import Configuration
 from kabudachi.errors import RuntimeNotStartedError, TaskDefinitionError
+from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting, Receipt
 
 
 @pytest.fixture(autouse=True)
 def fresh_process_state(monkeypatch):
-    """Each test declares its own tasks and settings, and starts with none left over."""
+    """Each test declares its own tasks, hooks and settings, and starts with
+    none left over."""
     monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
+    monkeypatch.setattr(lifecycle_module, "_default_hooks", HookRegistry())
     # Bodies here share state with the test through closures, which only a
     # body running in this process can see.
     configuration = Configuration()
@@ -583,3 +588,46 @@ def test_a_merge_that_fails_ends_its_compaction_and_fails_the_newest_generation_
     kabudachi.run(main)
 
     assert merge_failed_while_held.is_set(), "the compaction ran the merge while the key was busy"
+
+
+def test_lifecycle_hooks_run_in_this_process_around_the_runs_of_their_queues(caplog):
+    seen = []
+    per_thread = threading.local()
+
+    @kabudachi.process_init
+    async def opened():
+        seen.append("init")
+
+    @kabudachi.before_run(queues=["hooked"])
+    async def started(context):
+        seen.append(f"before {context.task_name} {context.attempt}")
+
+    @kabudachi.before_run(queues=["hooked"])
+    def checked_out(context):
+        per_thread.context = context
+
+    @kabudachi.after_run(queues=["hooked"])
+    def checked_in(context, outcome):
+        seen.append(f"after {context.task_name} {type(outcome).__name__}")
+        raise ValueError("could not return the connection")
+
+    def hooked(request: Greeting) -> Greeting:
+        context = per_thread.context  # left by the before_run hook, on this body's thread
+        return Greeting(text=context.run_id, times=context.attempt)
+
+    def plain(request: Greeting) -> Greeting:
+        return request
+
+    hooked = declare(hooked, queue="hooked")
+    plain = declare(plain)
+
+    async def main():
+        return await hooked(Greeting()), await plain(Greeting(text="untouched"))
+
+    with caplog.at_level(logging.WARNING, logger="kabudachi"):
+        hooked_result, plain_result = kabudachi.run(main)
+
+    assert seen == ["init", "before tests.hooked 1", "after tests.hooked Greeting"]
+    assert hooked_result.times == 1 and hooked_result.text, "the body saw its run's context"
+    assert plain_result.text == "untouched", "hooks of another queue left it alone"
+    assert "ValueError" in caplog.text, "the failed after_run hook was logged; the result stood"

@@ -17,6 +17,7 @@ py_library(
         "handle.py",
         "hosted_work.py",
         "ipc.py",
+        "lifecycle.py",
         "native_protocol.py",
         "options.py",
         "pool.py",

@@ -16,6 +16,7 @@ from typing import TypeVar, overload
 from kabudachi import _native
 from kabudachi.config import Configuration, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
+from kabudachi.lifecycle import default_hooks
 from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
@@ -100,7 +101,9 @@ def _executor_for(configuration: Configuration) -> Executor:
     settings = configuration.settings()
     registry = default_registry()
     if settings.processes == 0:
-        return InProcessExecutor(registry, process_serializers(), settings.concurrency)
+        return InProcessExecutor(
+            registry, process_serializers(), settings.concurrency, default_hooks()
+        )
     return ProcessPool(settings, task_modules(registry, settings.imports), registry)
 
 

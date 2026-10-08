@@ -687,7 +687,15 @@ def _raisable(frame: ipc.Failed) -> BaseException:
 def _frame_for(job: RunJob | CompactJob) -> ipc.Run | ipc.Compact:
     if isinstance(job, CompactJob):
         return ipc.Compact(job.run_id, job.definition_id, job.payloads)
-    return ipc.Run(job.run_id, job.definition_id, job.source_version, job.serialized_input, job.chain)
+    return ipc.Run(
+        job.run_id,
+        job.definition_id,
+        job.source_version,
+        job.serialized_input,
+        job.chain,
+        job.queue,
+        job.attempt,
+    )
 
 
 def _set_done(future: "asyncio.Future[None]") -> None:

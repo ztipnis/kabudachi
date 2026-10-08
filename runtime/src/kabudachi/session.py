@@ -50,6 +50,7 @@ from kabudachi.execution import (
 )
 from kabudachi.hosted_work import LoopHostedWork
 from kabudachi.handle import TaskHandle, run_callback_inline
+from kabudachi.lifecycle import default_hooks
 from kabudachi.native_protocol import Runtime
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskDefinition, TaskRegistry
@@ -85,7 +86,7 @@ class Session:
         self._executor = (
             executor
             if executor is not None
-            else InProcessExecutor(registry, serializers, self.concurrency)
+            else InProcessExecutor(registry, serializers, self.concurrency, default_hooks())
         )
         self._executor.accept_nested_calls(self)
         # Every run and compaction this session sees through to its end.
@@ -318,6 +319,8 @@ class Session:
                     source_version=claim.source_version,
                     serialized_input=claim.serialized_input,
                     chain=tuple(claim.chain),
+                    queue=claim.queue,
+                    attempt=claim.attempt_number,
                     cancel_grace=self._cancel_grace(definition),
                     # A retry does not run beside the abandoned body it replaces.
                     after=after,
