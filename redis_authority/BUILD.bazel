@@ -1,0 +1,40 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@crates//:defs.bzl", "all_crate_deps")
+
+rust_library(
+    name = "redis_authority",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "kabudachi_redis_authority",
+    edition = "2024",
+    deps = all_crate_deps(normal = True) + ["//core"],
+    visibility = ["//visibility:public"],
+)
+
+# Test-only: a valkey server per test. The binary is a data dependency, so
+# every test target that links this library gets it in its runfiles.
+rust_library(
+    name = "valkey_test_support",
+    srcs = glob(["tests/support/*.rs"]),
+    crate_root = "tests/support/lib.rs",
+    crate_name = "valkey_test_support",
+    edition = "2024",
+    testonly = True,
+    data = ["@valkey//:valkey-server"],
+    rustc_env = {"VALKEY_SERVER": "$(rlocationpath @valkey//:valkey-server)"},
+    deps = [":redis_authority"] + all_crate_deps(normal = True, package_name = "redis_authority/tests/support"),
+    visibility = ["//net:__pkg__"],
+)
+
+# Real-time tests against real servers: they sleep through TTLs of about a
+# second, so medium (300 s) leaves room on a loaded CI host.
+rust_test(
+    name = "redis_authority_integration_test",
+    srcs = glob(["tests/*.rs"]),
+    crate_root = "tests/redis_authority_integration.rs",
+    edition = "2024",
+    size = "medium",
+    # About 20 s of real-time waits; a short timeout fails a stuck server fast.
+    timeout = "short",
+    tags = ["no-remote-cache"],
+    deps = [":redis_authority", ":valkey_test_support", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
+)

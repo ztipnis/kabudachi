@@ -1,0 +1,24 @@
+[package]
+name = "kabudachi-redis-authority"
+version = "0.1.0"
+edition = "2024"
+autotests = false
+
+[lib]
+name = "kabudachi_redis_authority"
+
+[dependencies]
+crc16 = "0.4"
+kabudachi-core = { path = "../core" }
+redis = { version = "1.7", default-features = false }
+thiserror = "2"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+kabudachi-testkit = { path = "../testkit" }
+kabudachi-valkey-test-support = { path = "tests/support" }
+
+[[test]]
+name = "redis_authority_integration"
+path = "tests/redis_authority_integration.rs"

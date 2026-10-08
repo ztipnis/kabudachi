@@ -46,6 +46,13 @@ pub trait AuthorityAdapter {
 
     /// Brings `authority` back from [`Self::go_down`] now.
     fn come_back(&self, authority: &Self::Authority);
+
+    /// Whether the adapter can take an authority down and bring it back
+    /// within a fraction of its TTL. When `false`, the suite skips only the
+    /// outage clause; another run of the contract must cover outages.
+    fn has_outages(&self) -> bool {
+        true
+    }
 }
 
 /// Runs every clause of the contract against fresh authorities from
@@ -64,7 +71,9 @@ pub fn check_authority_contract(adapter: &impl AuthorityAdapter, time: &impl Pas
     a_fence_held_by_another_is_waited_out_across_records(adapter, time);
     no_fence_for_one_ttl_after_start(adapter, time);
     a_flush_loses_everything_and_restarts_both_waits(adapter, time);
-    an_outage_keeps_the_data_and_withholds_only_the_count(adapter, time);
+    if adapter.has_outages() {
+        an_outage_keeps_the_data_and_may_withhold_the_count_and_the_fence(adapter, time);
+    }
 }
 
 fn name() -> ShardName {
@@ -748,11 +757,11 @@ fn a_flush_loses_everything_and_restarts_both_waits(
     );
 }
 
-fn an_outage_keeps_the_data_and_withholds_only_the_count(
+fn an_outage_keeps_the_data_and_may_withhold_the_count_and_the_fence(
     adapter: &impl AuthorityAdapter,
     time: &impl PassTime,
 ) {
-    let clause = "an outage keeps the data and withholds only the count";
+    let clause = "an outage keeps the data and may withhold the count and the fence for a TTL";
     let authority = warmed_up(adapter, time);
     create(&authority, &founded(), clause);
     register(
@@ -783,16 +792,20 @@ fn an_outage_keeps_the_data_and_withholds_only_the_count(
         BTreeMap::from([(worker_a(), "address-a".to_string())]),
         "{clause}: the registration is kept"
     );
+    // A restart or failover may lose acknowledged writes, so an adapter may
+    // refuse every fence for up to one TTL after it comes back; it may not
+    // hand a second holder the fence while the first one's lasts.
     fence_held(
         authority.acquire_fence(&name(), &worker_b(), &founded()),
-        left_after(adapter, 1),
+        adapter.ttl(),
         clause,
     );
-    assert_eq!(
-        authority.acquire_fence(&name(), &worker_a(), &founded()),
-        Ok(adapter.ttl()),
-        "{clause}: the fence is kept, so its holder renews with no wait"
-    );
+    match authority.acquire_fence(&name(), &worker_a(), &founded()) {
+        Ok(ttl) => assert_eq!(ttl, adapter.ttl(), "{clause}: the holder renews for a TTL"),
+        held => {
+            fence_held(held, adapter.ttl(), clause);
+        }
+    }
     fence_held(
         authority.acquire_fence(&name(), &worker_b(), &founded()),
         adapter.ttl(),
@@ -831,5 +844,10 @@ fn an_outage_keeps_the_data_and_withholds_only_the_count(
         count(&authority, &shard(), clause),
         Some(1),
         "{clause}: count back a TTL after the outage"
+    );
+    assert_eq!(
+        authority.acquire_fence(&name(), &worker_a(), &founded()),
+        Ok(adapter.ttl()),
+        "{clause}: the fence is granted again within a TTL and a quarter of the outage's end"
     );
 }
