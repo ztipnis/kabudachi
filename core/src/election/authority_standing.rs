@@ -27,7 +27,7 @@ use crate::election::authority::{
     ReplyTokens,
 };
 use crate::election::standing::{EpochOrder, order};
-use crate::protocol::ids::WorkerId;
+use crate::protocol::ids::{ShardId, WorkerId};
 use crate::protocol::worker_state::WorkerState;
 use crate::time::{Duration, Instant};
 
@@ -65,6 +65,8 @@ pub(crate) struct AuthorityStanding {
 /// What the standing reads of the node, as of the reply or step it handles.
 pub(crate) struct AuthorityView<'a> {
     pub(crate) me: &'a WorkerId,
+    /// The incarnation of the shard the node belongs to.
+    pub(crate) shard: &'a ShardId,
     pub(crate) state: WorkerState,
     /// The node's recovery epoch; `None` before its first join.
     pub(crate) own_epoch: Option<RecoveryEpoch>,
@@ -338,6 +340,17 @@ impl AuthorityStanding {
         view: &AuthorityView,
         now: Instant,
     ) -> Vec<AuthorityVerdict> {
+        if Self::reads_records_in(view.state)
+            && reply
+                .held_record()
+                .is_some_and(|held| held.shard_id != *view.shard)
+        {
+            // The authority holds another incarnation of the shard under its
+            // name: this one is gone, whatever epoch either is at.
+            self.recovery = None;
+            self.awaited = None;
+            return vec![AuthorityVerdict::Abandon];
+        }
         match reply {
             AuthorityReply::Registered {
                 sent_at, result, ..
@@ -364,6 +377,7 @@ impl AuthorityStanding {
                 }
             }
             AuthorityReply::RecoveryEpoch { token, result, .. } => {
+                let result = result.map(|held| held.map(|held| held.recovery_epoch));
                 if self.confirmation.is_awaiting(token) {
                     self.on_member_read(token, result, view, now)
                 } else if !self.take_awaited(token) {
@@ -393,7 +407,24 @@ impl AuthorityStanding {
                 result,
                 ..
             } => self.on_fence(recovery_epoch, sent_at, result, view, now),
+            AuthorityReply::LeaderHint { .. } | AuthorityReply::LeaderHintPublished { .. } => {
+                Vec::new()
+            }
         }
+    }
+
+    /// Whether a node in `state` reads the authority's record, so that it
+    /// may find another incarnation of its shard there.
+    fn reads_records_in(state: WorkerState) -> bool {
+        matches!(
+            state,
+            WorkerState::LeaderSuspect
+                | WorkerState::NoQuorum
+                | WorkerState::Candidate
+                | WorkerState::LeaderReconciling
+                | WorkerState::Leader
+                | WorkerState::Fenced
+        )
     }
 
     /// Asks for `request` at `now`, with a fresh token.

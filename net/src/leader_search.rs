@@ -20,7 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::coordination_authority::{LiveRegistrations, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{LiveRegistrations, ShardRecord};
 use kabudachi_core::election::{
     AuthorityReply, AuthorityRequest, CallKind, Input, JoinFloor, ReplyToken,
 };
@@ -488,7 +488,7 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         reply: AuthorityReply,
         now: Instant,
         floor: JoinFloor,
-    ) -> Option<(ReplyToken, RecoveryEpoch)> {
+    ) -> Option<(ReplyToken, ShardRecord)> {
         if let Some(read) = self.epoch_read
             && read.token == reply.token()
         {

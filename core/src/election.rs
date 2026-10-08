@@ -145,7 +145,7 @@ pub use carry_out::{AuthorityPerformer, DropMessages, MessageSink, NoAuthority, 
 pub use entry::{Entry, Identity};
 
 use crate::configuration::{Admission, Configuration, Generation, Roster, Tally};
-use crate::coordination_authority::RecoveryEpoch;
+use crate::coordination_authority::{RecoveryEpoch, ShardRecord};
 use crate::hashing::{Field, HashFunction};
 use crate::protocol::checked::{Checked, CheckedMessage, CheckedPayload, decode};
 use crate::protocol::digest::Digest;
@@ -520,9 +520,11 @@ pub enum Input {
     /// read is applied (see [`Self::AuthorityEpochRead`]), so an older read
     /// answered late is dropped. Every other state ignores it.
     AuthorityEpochAsked(ReplyToken),
-    /// The answer to the read named by `token`: the recovery epoch `held` the
+    /// The answer to the read named by `token`: the record `held` the
     /// coordination authority held when it answered. It is applied only when
-    /// `token` is the latest read the node was told of, and once.
+    /// `token` is the latest read the node was told of, and once. A record of
+    /// another incarnation of the node's shard shows the node's is gone: it
+    /// stops, abandoned, from `Bootstrapping` or `Joining`.
     ///
     /// In `Bootstrapping`, a held epoch of another lineage than the floor's
     /// becomes the floor, so that a leader of that epoch is one the node can
@@ -534,7 +536,7 @@ pub enum Input {
     /// epoch as its floor. Every other state ignores it. An authority that
     /// holds no epoch answers nothing here, and a node validating a pointer
     /// waits.
-    AuthorityEpochRead { token: ReplyToken, held: RecoveryEpoch },
+    AuthorityEpochRead { token: ReplyToken, held: ShardRecord },
     /// The node's driver completed a routing crawl: it asked the peers it
     /// knows for the peers closest to it and connected to those it found.
     /// The node's heartbeats then say so until its admission generation
@@ -630,8 +632,8 @@ pub enum Output {
     /// `suspect_timeout` and reconnect timeout (see
     /// [`ElectionTimings::reconnect_timeout`]).
     AbortDeadline(Option<Instant>),
-    /// An alert: the authority path found the shard's recovery epoch gone,
-    /// so the shard is abandoned and the node has stopped
+    /// An alert: the node found the shard gone (no record, or a record of
+    /// another incarnation of it), so the shard is abandoned and the node has stopped
     /// (see [`StopReason::Abandoned`]). A restart re-enters the bootstrap
     /// cascade.
     ShardAbandoned,
@@ -2160,11 +2162,16 @@ where
     /// asked (see [`Input::AuthorityEpochRead`]): a bootstrapping node
     /// refreshes its floor, and one validating a pointer becomes a member or
     /// drops the pointer.
-    fn on_epoch_read(&mut self, token: ReplyToken, held: RecoveryEpoch) {
+    fn on_epoch_read(&mut self, token: ReplyToken, held: ShardRecord) {
         if self.rejoin.awaited_read != Some(token) {
             return;
         }
         self.rejoin.awaited_read = None;
+        if held.shard_id != self.shard_id {
+            self.abandon_shard();
+            return;
+        }
+        let held = held.recovery_epoch;
         match self.state {
             WorkerState::Bootstrapping => {
                 let mut floor = self.standing.join_floor();
@@ -2718,6 +2725,7 @@ where
         };
         let view = AuthorityView {
             me: &self.my_id,
+            shard: &self.shard_id,
             state: self.state,
             own_epoch: self.standing.epoch(),
         };
@@ -2733,6 +2741,7 @@ where
         };
         let view = AuthorityView {
             me: &self.my_id,
+            shard: &self.shard_id,
             state: self.state,
             own_epoch: self.standing.epoch(),
         };
@@ -2842,8 +2851,9 @@ where
         self.transition_to(WorkerState::Bootstrapping);
     }
 
-    /// The authority path found the recovery epoch missing: the shard is
-    /// abandoned, and this node stops for good,
+    /// The node found the shard gone: no record under its name, or a record
+    /// of another incarnation of it. The shard is abandoned, and this node
+    /// stops for good,
     /// raising an alert. A restart re-enters the bootstrap cascade.
     fn abandon_shard(&mut self) {
         self.stop_reason = Some(StopReason::Abandoned);

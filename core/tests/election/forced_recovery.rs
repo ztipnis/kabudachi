@@ -16,7 +16,8 @@ use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, ShardRecord};
 use kabudachi_core::election::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, DropMessages,
-    ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step, WorkerNode,
+    ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step,
+    StopReason, WorkerNode,
     carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
@@ -249,7 +250,7 @@ fn a_fenced_node_ignores_an_epoch_read_it_asked_for_before_reconnecting() {
         Input::Authority(AuthorityReply::RecoveryEpoch {
             token: call.token,
             sent_at: call.sent_at,
-            result: Ok(Some(epoch)),
+            result: Ok(Some(record_at(epoch))),
         })
     };
     let _ = driven.node.step(answer(first, epoch(0)));
@@ -303,7 +304,15 @@ fn pointer_at_epoch_two_of(lineage: u64) -> Input {
 
 /// A read of the authority's epoch asked for with a token of its own number,
 /// as a driver does, and answered at once with `held`.
-fn read_epoch(node: &mut TestNode, number: u64, held: RecoveryEpoch) {
+/// The authority's record of the node's own shard, at `recovery_epoch`.
+fn record_at(recovery_epoch: RecoveryEpoch) -> ShardRecord {
+    ShardRecord {
+        shard_id: shard(SHARD),
+        recovery_epoch,
+    }
+}
+
+fn read_epoch(node: &mut TestNode, number: u64, held: ShardRecord) {
     let _ = node.step(Input::AuthorityEpochAsked(read_token(number)));
     let _ = node.step(Input::AuthorityEpochRead {
         token: read_token(number),
@@ -326,14 +335,14 @@ fn read_token(number: u64) -> ReplyToken {
 #[test]
 fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_epoch() {
     type Script = fn(&mut TestNode);
-    let rows: [Script; 6] = [
+    let rows: [Script; 7] = [
         // A read naming the pointer's epoch makes it a member.
         |node| {
             let _ = node.step(pointer_at_epoch_two_of(1));
             assert_eq!(node.state(), WorkerState::Joining);
             assert_eq!(node.known_leader(), None);
 
-            read_epoch(node, 1, RecoveryEpoch::new(2, 1));
+            read_epoch(node, 1, record_at(RecoveryEpoch::new(2, 1)));
             assert_eq!(node.state(), WorkerState::Active);
             assert_eq!(node.known_leader(), Some((worker("w2"), 1)));
             assert_eq!((node.recovery_epoch(), node.recovery_lineage()), (2, Some(1)));
@@ -354,7 +363,7 @@ fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_
         |node| {
             let _ = node.step(pointer_at_epoch_two_of(1));
 
-            read_epoch(node, 1, RecoveryEpoch::new(1, 2));
+            read_epoch(node, 1, record_at(RecoveryEpoch::new(1, 2)));
 
             assert_eq!(node.state(), WorkerState::Bootstrapping);
             assert_eq!(node.known_leader(), None);
@@ -368,19 +377,19 @@ fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_
 
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(1),
-                held: RecoveryEpoch::new(7, 9),
+                held: record_at(RecoveryEpoch::new(7, 9)),
             });
             assert_eq!(node.state(), WorkerState::Joining);
 
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(2),
-                held: RecoveryEpoch::new(2, 1),
+                held: record_at(RecoveryEpoch::new(2, 1)),
             });
             assert_eq!(node.state(), WorkerState::Active);
 
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(2),
-                held: RecoveryEpoch::new(7, 9),
+                held: record_at(RecoveryEpoch::new(7, 9)),
             });
             assert_eq!(node.state(), WorkerState::Active, "an answer is applied once");
         },
@@ -391,10 +400,27 @@ fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_
 
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(1),
-                held: RecoveryEpoch::new(2, 1),
+                held: record_at(RecoveryEpoch::new(2, 1)),
             });
 
             assert_eq!(node.state(), WorkerState::Joining);
+        },
+        // A read naming another incarnation of the shard, whatever its epoch,
+        // finds the shard gone: the node stops, abandoned.
+        |node| {
+            let _ = node.step(pointer_at_epoch_two_of(1));
+
+            read_epoch(
+                node,
+                1,
+                ShardRecord {
+                    shard_id: shard("shard-1/successor"),
+                    recovery_epoch: RecoveryEpoch::new(2, 1),
+                },
+            );
+
+            assert_eq!(node.state(), WorkerState::Stopped);
+            assert_eq!(node.stop_reason(), Some(StopReason::Abandoned));
         },
         // A delayed read of a refounded lineage leaves the floor on the new one.
         |node| {
@@ -402,11 +428,11 @@ fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_
             let _ = node.step(Input::AuthorityEpochAsked(read_token(2)));
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(2),
-                held: RecoveryEpoch::new(1, 2),
+                held: record_at(RecoveryEpoch::new(1, 2)),
             });
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(1),
-                held: RecoveryEpoch::new(2, 1),
+                held: record_at(RecoveryEpoch::new(2, 1)),
             });
             assert_eq!((node.recovery_epoch(), node.recovery_lineage()), (1, Some(2)));
 
@@ -561,7 +587,7 @@ fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
                 ..read.token
             },
             sent_at: read.sent_at,
-            result: Ok(Some(epoch(0))),
+            result: Ok(Some(record_at(epoch(0)))),
         },
         // A real live set, of the awaited kind and number, which would move
         // the recovery on if it were taken.
@@ -650,6 +676,32 @@ fn the_authority_path_needs_a_majority_of_the_live_registrations() {
         held_epoch(&driven.authority, &shard(SHARD)),
         Ok(Some(epoch(0)))
     );
+}
+
+// A swap to epoch 1 landed but its reply was lost, so a leader no one knows of
+// may have used epoch 1. Then the authority is flushed: nothing says epoch 1 was
+// ever reached, so the shard cannot be recovered at any epoch. Its node
+// abandons it, and republishes nothing a later founding would have to replace.
+#[test]
+fn a_shard_whose_authority_is_flushed_after_a_lost_swap_is_abandoned() {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
+    swap_epoch(&authority, &shard(SHARD), Some(epoch(0)), epoch(1)).expect("the swap whose reply was lost");
+    authority.flush();
+    // The flushed authority refuses registrations while it warms up, so the
+    // node starts, registered, once that is over.
+    clock.advance(authority_ttl());
+    register_all(&authority, &shard(SHARD), &[worker("w2")]);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
+
+    let outputs = driven.run_roll_call(&[worker("w2")]);
+
+    assert_eq!(driven.node.state(), WorkerState::Stopped);
+    assert_eq!(driven.node.stop_reason(), Some(StopReason::Abandoned));
+    assert!(outputs.contains(&Output::ShardAbandoned));
+    clock.advance(authority_ttl());
+    assert_eq!(held_epoch(&authority, &shard(SHARD)), Ok(None), "the old shard is not brought back");
 }
 
 #[test]

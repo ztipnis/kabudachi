@@ -7,7 +7,8 @@
 //! at once.
 
 use crate::coordination_authority::{
-    AuthorityError, CoordinationAuthority, LiveRegistrations, RecoveryEpoch, ShardRecord,
+    AuthorityError, CoordinationAuthority, LeaderHint, LiveRegistrations, RecoveryEpoch,
+    ShardRecord,
 };
 use crate::protocol::ids::{ShardId, ShardName, WorkerId};
 use crate::time::{Duration, Instant};
@@ -54,6 +55,14 @@ pub enum AuthorityRequest {
     },
     /// Acquire or renew the shard's recovery fence at `recovery_epoch`.
     AcquireFence { recovery_epoch: RecoveryEpoch },
+    /// Read the shard's leader hint.
+    ReadLeaderHint,
+    /// Publish a hint naming this worker, at its address, as the leader of
+    /// `term` at `recovery_epoch`, which the driver supplies with the rest.
+    PublishLeaderHint {
+        recovery_epoch: RecoveryEpoch,
+        term: u64,
+    },
 }
 
 /// Who minted a reply token. Each issuer numbers its own calls from 0, so
@@ -78,6 +87,8 @@ pub enum CallKind {
     ReadRecoveryEpoch,
     SwapRecoveryEpoch,
     AcquireFence,
+    ReadLeaderHint,
+    PublishLeaderHint,
 }
 
 impl CallKind {
@@ -89,6 +100,8 @@ impl CallKind {
             AuthorityRequest::ReadRecoveryEpoch => CallKind::ReadRecoveryEpoch,
             AuthorityRequest::SwapRecoveryEpoch { .. } => CallKind::SwapRecoveryEpoch,
             AuthorityRequest::AcquireFence { .. } => CallKind::AcquireFence,
+            AuthorityRequest::ReadLeaderHint => CallKind::ReadLeaderHint,
+            AuthorityRequest::PublishLeaderHint { .. } => CallKind::PublishLeaderHint,
         }
     }
 }
@@ -161,10 +174,12 @@ pub enum AuthorityReply {
         sent_at: Instant,
         result: Result<LiveRegistrations, AuthorityError>,
     },
+    /// The record the authority holds under the shard's name, whichever
+    /// incarnation of the shard it names.
     RecoveryEpoch {
         token: ReplyToken,
         sent_at: Instant,
-        result: Result<Option<RecoveryEpoch>, AuthorityError>,
+        result: Result<Option<ShardRecord>, AuthorityError>,
     },
     RecoveryEpochSwapped {
         token: ReplyToken,
@@ -179,6 +194,16 @@ pub enum AuthorityReply {
         sent_at: Instant,
         result: Result<Duration, AuthorityError>,
     },
+    LeaderHint {
+        token: ReplyToken,
+        sent_at: Instant,
+        result: Result<Option<LeaderHint>, AuthorityError>,
+    },
+    LeaderHintPublished {
+        token: ReplyToken,
+        sent_at: Instant,
+        result: Result<(), AuthorityError>,
+    },
 }
 
 impl AuthorityReply {
@@ -189,7 +214,27 @@ impl AuthorityReply {
             | AuthorityReply::LiveRegistrations { token, .. }
             | AuthorityReply::RecoveryEpoch { token, .. }
             | AuthorityReply::RecoveryEpochSwapped { token, .. }
-            | AuthorityReply::Fence { token, .. } => *token,
+            | AuthorityReply::Fence { token, .. }
+            | AuthorityReply::LeaderHint { token, .. }
+            | AuthorityReply::LeaderHintPublished { token, .. } => *token,
+        }
+    }
+
+    /// The record of the shard's name that this reply shows the authority
+    /// holds, if it shows one: a read's answer, or the record a swap or fence
+    /// found in the way.
+    pub fn held_record(&self) -> Option<&ShardRecord> {
+        match self {
+            AuthorityReply::RecoveryEpoch { result: Ok(held), .. } => held.as_ref(),
+            AuthorityReply::RecoveryEpochSwapped {
+                result: Err(AuthorityError::ShardConflict { current }),
+                ..
+            }
+            | AuthorityReply::Fence {
+                result: Err(AuthorityError::ShardConflict { current }),
+                ..
+            } => current.as_ref(),
+            _ => None,
         }
     }
 }
@@ -209,8 +254,9 @@ impl AuthorityCall {
     /// Makes this call on `authority` for the shard `shard_id` under `name`
     /// and for `worker_id`, whose registration names `address`, and returns
     /// the reply to hand back to the node that asked for it. The node speaks
-    /// in epochs; this is where an epoch becomes a record of `shard_id`, and
-    /// a record back its epoch.
+    /// in epochs, where an epoch becomes a record of `shard_id`; except that
+    /// a read returns the authority's whole record, so the node can tell its
+    /// own shard from another incarnation's.
     pub fn perform(
         &self,
         authority: &dyn CoordinationAuthority,
@@ -238,9 +284,7 @@ impl AuthorityCall {
             AuthorityRequest::ReadRecoveryEpoch => AuthorityReply::RecoveryEpoch {
                 token,
                 sent_at,
-                result: authority
-                    .read_shard(name)
-                    .map(|held| held.map(|held| held.recovery_epoch)),
+                result: authority.read_shard(name),
             },
             AuthorityRequest::SwapRecoveryEpoch { expected, new } => {
                 AuthorityReply::RecoveryEpochSwapped {
@@ -260,6 +304,28 @@ impl AuthorityCall {
                 recovery_epoch,
                 sent_at,
                 result: authority.acquire_fence(name, worker_id, &record(recovery_epoch)),
+            },
+            AuthorityRequest::ReadLeaderHint => AuthorityReply::LeaderHint {
+                token,
+                sent_at,
+                result: authority.read_leader_hint(name),
+            },
+            AuthorityRequest::PublishLeaderHint {
+                recovery_epoch,
+                term,
+            } => AuthorityReply::LeaderHintPublished {
+                token,
+                sent_at,
+                result: authority.publish_leader_hint(
+                    name,
+                    &LeaderHint {
+                        shard_id: shard_id.clone(),
+                        leader: worker_id.clone(),
+                        address: address.to_string(),
+                        recovery_epoch,
+                        term,
+                    },
+                ),
             },
         }
     }
@@ -296,6 +362,16 @@ impl AuthorityCall {
             AuthorityRequest::AcquireFence { recovery_epoch } => AuthorityReply::Fence {
                 token,
                 recovery_epoch,
+                sent_at,
+                result: Err(AuthorityError::Unavailable),
+            },
+            AuthorityRequest::ReadLeaderHint => AuthorityReply::LeaderHint {
+                token,
+                sent_at,
+                result: Err(AuthorityError::Unavailable),
+            },
+            AuthorityRequest::PublishLeaderHint { .. } => AuthorityReply::LeaderHintPublished {
+                token,
                 sent_at,
                 result: Err(AuthorityError::Unavailable),
             },

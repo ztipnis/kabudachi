@@ -383,10 +383,12 @@ impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
         name: &ShardName,
         hint: &LeaderHint,
     ) -> Result<(), AuthorityError> {
+        self.pass_gate(CallKind::PublishLeaderHint);
         self.reach()?.publish_leader_hint(name, hint)
     }
 
     fn read_leader_hint(&self, name: &ShardName) -> Result<Option<LeaderHint>, AuthorityError> {
+        self.pass_gate(CallKind::ReadLeaderHint);
         self.reach()?.read_leader_hint(name)
     }
 }
