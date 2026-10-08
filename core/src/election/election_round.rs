@@ -287,16 +287,6 @@ impl ElectionRound {
         self.roll_call.as_ref().map(RollCallRound::term)
     }
 
-    /// The workers that have answered the roll call in progress, the node
-    /// itself included: none once it gave the call up for a better one.
-    pub(crate) fn respondents(&self) -> impl Iterator<Item = &WorkerId> {
-        self.roll_call
-            .as_ref()
-            .filter(|round| !round.is_abandoned())
-            .into_iter()
-            .flat_map(|round| round.respondents().keys())
-    }
-
     /// The candidate this node granted its vote in `term`, if any.
     pub(crate) fn granted_in(&self, term: u64) -> Option<&WorkerId> {
         self.ballot.granted_in(term)

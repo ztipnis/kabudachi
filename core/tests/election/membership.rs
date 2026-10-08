@@ -382,6 +382,39 @@ fn a_draining_leader_ignores_a_crawl_counted_before_the_commit_re_admitted_every
     assert_eq!(leader.state(), WorkerState::Stopped);
 }
 
+/// A voter that never reports a crawl cannot hold a leader's shutdown up
+/// for ever: the leader keeps leading, its lease kept by both voters'
+/// confirmations, until its drain wait limit has passed, and then leaves.
+#[test]
+fn a_draining_leader_leaves_once_its_drain_wait_runs_out_though_a_voter_never_crawls() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let wait_limit =
+        crate::support::builders::timings(Duration::from_ticks(SUSPECT)).drain_wait_limit;
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let wait_ends = clock.now() + wait_limit;
+    let _ = leader.step(Input::Drain);
+
+    let beat_every = Duration::from_ticks(SUSPECT / 4);
+    while clock.now() + beat_every < wait_ends {
+        clock.advance(beat_every);
+        let _ = crawled(&clock, &mut leader, &p1);
+        let held = leader.configuration().map(Configuration::generation);
+        let beat = confirming_heartbeat(&clock, &leader, &p2, held);
+        let _ = deliver(&mut leader, &p2, heartbeat_message(beat));
+        let _ = leader.step(Input::Tick);
+        assert_eq!(
+            leader.state(),
+            WorkerState::Leader,
+            "p2 has not crawled and the drain wait has not run out"
+        );
+    }
+
+    clock.advance(wait_ends - clock.now());
+    let _ = leader.step(Input::Tick);
+    assert_eq!(leader.state(), WorkerState::Stopped);
+}
+
 /// A leader asked to drain that loses its lease keeps the request, and when
 /// it wins office again it waits again: a crawl reported to the lost office
 /// frees nothing, and it leaves only on the crawls of the new one.

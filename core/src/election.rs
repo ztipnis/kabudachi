@@ -128,6 +128,7 @@
 mod authority;
 mod authority_standing;
 mod carry_out;
+mod drain;
 mod election_round;
 mod entry;
 mod leader_office;
@@ -160,6 +161,7 @@ use crate::scheduler::{LeadershipGrant, LeaseEnd, Observer, Scheduler};
 use crate::time::{Clock, Duration, Instant};
 
 use authority_standing::{AuthorityStanding, AuthorityVerdict, AuthorityView};
+use drain::{Asked, DrainRequest};
 use election_round::{ElectionRound, Verdict, View};
 use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice};
 use lease::{Lease, LeaseChange, Office};
@@ -218,8 +220,9 @@ where
     /// Its grant while `Leader`, and its abort deadline (see
     /// [`Output::Grant`] and [`Output::AbortDeadline`]).
     lease: Lease,
-    /// A drain was asked for in a state that cannot drain yet.
-    drain_requested: bool,
+    /// A drain asked for and not yet carried out: kept until the node can
+    /// drain, or, while it leads, waiting for its voters' routing crawls.
+    drain_request: DrainRequest,
     /// The admission generation this node held when its last routing crawl
     /// completed.
     crawled_at_admission: Option<Generation>,
@@ -228,9 +231,6 @@ where
     active_runs_digest: Vec<u8>,
     /// Whether this worker runs compaction, which its heartbeats say.
     runs_compaction: bool,
-    /// When a leader asked to drain stops waiting for its voters' routing
-    /// crawls and leaves regardless (see [`Self::drain_once_free`]).
-    drain_wait_until: Option<Instant>,
     /// What a node bootstrapping again holds while it checks a JOIN pointer
     /// against the authority.
     rejoin: RejoinCheck,
@@ -901,12 +901,11 @@ where
             next_heartbeat: None,
             connected: BTreeSet::new(),
             lease: Lease::new(now),
-            drain_requested: false,
+            drain_request: DrainRequest::default(),
             crawled_at_admission: None,
             lost_while_reconciling: BTreeSet::new(),
             active_runs_digest: Vec::new(),
             runs_compaction: false,
-            drain_wait_until: None,
             rejoin: RejoinCheck::default(),
             outputs: Vec::new(),
         }
@@ -1247,15 +1246,6 @@ where
         }
     }
 
-    /// The workers that have answered the roll call this node is running,
-    /// itself included: none unless it is `RollCall` with a call it has not
-    /// given up for a better one. For observing how long a census takes to
-    /// come back (the roll-call deadline must outlast it: see
-    /// [`ElectionTimings::roll_call_deadline`]).
-    pub fn roll_call_respondents(&self) -> impl Iterator<Item = &WorkerId> {
-        self.round.respondents()
-    }
-
     /// The leader this node would point a joining worker at, with the term
     /// that leader was elected in: itself while `Leader`, and while `Active`
     /// the leader whose heartbeat ack it last accepted, or that a JOIN
@@ -1437,7 +1427,7 @@ where
                             )
                         }),
                 ),
-                self.drain_wait_until,
+                self.drain_request.wakes_at(),
             ),
             _ => None,
         }
@@ -1462,9 +1452,7 @@ where
         if self.holds_office() && next != WorkerState::Leader {
             // Losing office mid-wait keeps the request: the node drains
             // when it next reaches `Active`, `LeaderReconciling` or `Leader`.
-            if self.drain_wait_until.take().is_some() {
-                self.drain_requested = true;
-            }
+            self.drain_request.office_lost();
             self.lease.withdraw_grant(self.clock.now());
             self.outputs.push(Output::Grant(None));
             self.leave_office();
@@ -1479,13 +1467,7 @@ where
         self.state = next;
         self.outputs.push(Output::StateChanged(next));
 
-        if self.drain_requested
-            && matches!(
-                next,
-                WorkerState::Active | WorkerState::LeaderReconciling | WorkerState::Leader
-            )
-        {
-            self.drain_requested = false;
+        if self.drain_request.take_kept_for(next) {
             self.request_drain();
         }
     }
@@ -2266,19 +2248,13 @@ where
     /// [`Self::transition_to`] to apply; a node already draining, or one
     /// that can never drain again, ignores it.
     fn request_drain(&mut self) {
-        match self.state {
-            WorkerState::Active => self.drain(),
-            WorkerState::LeaderReconciling | WorkerState::Leader
-                if self.drain_wait_until.is_none() =>
-            {
-                self.drain_wait_until = Some(self.clock.now() + self.timings.drain_wait_limit);
-                self.drain_once_free();
-            }
-            WorkerState::LeaderReconciling
-            | WorkerState::Leader
-            | WorkerState::Draining
-            | WorkerState::Stopped => {}
-            _ => self.drain_requested = true,
+        let asked =
+            self.drain_request
+                .ask(self.state, &self.clock, self.timings.drain_wait_limit);
+        match asked {
+            Asked::DrainNow => self.drain(),
+            Asked::WaitForCrawls => self.drain_once_free(),
+            Asked::Nothing => {}
         }
     }
 
@@ -2287,15 +2263,12 @@ where
     /// this leader, or once its drain wait has run out. Until then it keeps
     /// leading.
     fn drain_once_free(&mut self) {
-        let Some(until) = self.drain_wait_until else {
-            return;
-        };
-        let free = self
-            .office
-            .as_mut()
-            .is_some_and(|office| office.remaining_voters_have_crawled(&self.my_id));
-        if free || self.clock.now() >= until {
-            self.drain_wait_until = None;
+        let leaves = self.drain_request.leave_if_free(&self.clock, || {
+            self.office
+                .as_mut()
+                .is_some_and(|office| office.remaining_voters_have_crawled(&self.my_id))
+        });
+        if leaves {
             self.drain();
         }
     }
