@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use kabudachi_core::coordination_authority::{
-    AuthorityError, CoordinationAuthority, RecoveryEpoch, ShardRecord,
+    AuthorityError, CoordinationAuthority, LeaderHint, RecoveryEpoch, ShardRecord,
 };
 use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::time::Duration;
@@ -53,12 +53,15 @@ pub trait AuthorityAdapter {
 /// first one the adapter breaks.
 pub fn check_authority_contract(adapter: &impl AuthorityAdapter, time: &impl PassTime) {
     registrations_last_one_ttl_unless_renewed(adapter, time);
-    shards_are_independent(adapter, time);
+    shard_names_are_independent(adapter, time);
     the_count_is_withheld_for_one_ttl_after_start(adapter, time);
-    a_missing_epoch_is_created_by_exactly_one_swap(adapter);
-    a_swap_changes_the_epoch_only_from_the_expected_one(adapter);
-    a_fence_needs_the_current_epoch(adapter, time);
-    a_fence_held_by_another_is_waited_out_across_epochs(adapter, time);
+    registrations_count_only_their_own_shard_id(adapter, time);
+    a_leader_hint_lasts_one_ttl_and_the_last_write_wins(adapter, time);
+    the_authority_reports_the_ttl_it_grants(adapter, time);
+    a_missing_record_is_created_by_exactly_one_swap(adapter);
+    a_swap_changes_the_record_only_from_the_expected_one(adapter);
+    a_fence_needs_the_current_record(adapter, time);
+    a_fence_held_by_another_is_waited_out_across_records(adapter, time);
     no_fence_for_one_ttl_after_start(adapter, time);
     a_flush_loses_everything_and_restarts_both_waits(adapter, time);
     an_outage_keeps_the_data_and_withholds_only_the_count(adapter, time);
@@ -101,6 +104,24 @@ fn founded_next() -> ShardRecord {
     ShardRecord {
         shard_id: shard(),
         recovery_epoch: founded().recovery_epoch.next().expect("0 has a successor"),
+    }
+}
+
+/// `founded()`'s epoch under another shard id.
+fn successor() -> ShardRecord {
+    ShardRecord {
+        shard_id: ShardId::new("contract-shard/successor"),
+        recovery_epoch: founded().recovery_epoch,
+    }
+}
+
+fn hint(leader: WorkerId, term: u64) -> LeaderHint {
+    LeaderHint {
+        shard_id: shard(),
+        address: format!("{}-address", leader.as_str()),
+        leader,
+        recovery_epoch: founded().recovery_epoch,
+        term,
     }
 }
 
@@ -164,6 +185,20 @@ fn register(
         Ok(adapter.ttl()),
         "{clause}: register returns the registration TTL"
     );
+}
+
+fn publish(authority: &impl CoordinationAuthority, hint: &LeaderHint, clause: &str) {
+    assert_eq!(
+        authority.publish_leader_hint(&name(), hint),
+        Ok(()),
+        "{clause}: publish_leader_hint"
+    );
+}
+
+fn read_hint(authority: &impl CoordinationAuthority, clause: &str) -> Option<LeaderHint> {
+    authority
+        .read_leader_hint(&name())
+        .unwrap_or_else(|error| panic!("{clause}: read_leader_hint failed: {error}"))
 }
 
 fn create(authority: &impl CoordinationAuthority, record: &ShardRecord, clause: &str) {
@@ -240,8 +275,8 @@ fn registrations_last_one_ttl_unless_renewed(
     );
 }
 
-fn shards_are_independent(adapter: &impl AuthorityAdapter, time: &impl PassTime) {
-    let clause = "shards are independent";
+fn shard_names_are_independent(adapter: &impl AuthorityAdapter, time: &impl PassTime) {
+    let clause = "shard names are independent";
     let authority = adapter.fresh();
     let other = ShardName::new("contract-other-shard");
     // Both names are first touched right after `fresh`, so an adapter that
@@ -269,6 +304,12 @@ fn shards_are_independent(adapter: &impl AuthorityAdapter, time: &impl PassTime)
         "{clause}: setup: a takes the fence"
     );
     assert_eq!(authority.read_shard(&other), Ok(None), "{clause}: record");
+    publish(&authority, &hint(worker_a(), 1), clause);
+    assert_eq!(
+        authority.read_leader_hint(&other),
+        Ok(None),
+        "{clause}: hint"
+    );
     assert_eq!(
         authority.compare_and_swap_shard(&other, None, &rival()),
         Ok(()),
@@ -327,7 +368,109 @@ fn the_count_is_withheld_for_one_ttl_after_start(
     );
 }
 
-fn a_missing_epoch_is_created_by_exactly_one_swap(adapter: &impl AuthorityAdapter) {
+fn registrations_count_only_their_own_shard_id(
+    adapter: &impl AuthorityAdapter,
+    time: &impl PassTime,
+) {
+    let clause = "registrations count only their own shard id";
+    let authority = warmed_up(adapter, time);
+    let successor = successor().shard_id;
+    register(
+        &authority,
+        adapter,
+        &shard(),
+        &worker_a(),
+        "address-a",
+        clause,
+    );
+    register(
+        &authority,
+        adapter,
+        &successor,
+        &worker_b(),
+        "address-b",
+        clause,
+    );
+    assert_eq!(
+        live(&authority, &shard(), clause),
+        BTreeMap::from([(worker_a(), "address-a".to_string())]),
+        "{clause}: b registered with another shard id"
+    );
+    register(
+        &authority,
+        adapter,
+        &successor,
+        &worker_a(),
+        "address-a",
+        clause,
+    );
+    assert_eq!(
+        live(&authority, &shard(), clause),
+        BTreeMap::new(),
+        "{clause}: a re-registered with the other id is no longer listed under the first"
+    );
+    assert_eq!(
+        live(&authority, &successor, clause).len(),
+        2,
+        "{clause}: both are listed under the other id"
+    );
+}
+
+fn a_leader_hint_lasts_one_ttl_and_the_last_write_wins(
+    adapter: &impl AuthorityAdapter,
+    time: &impl PassTime,
+) {
+    let clause = "a leader hint lasts one TTL from its write and the last write wins";
+    let authority = adapter.fresh();
+    assert_eq!(
+        read_hint(&authority, clause),
+        None,
+        "{clause}: never published"
+    );
+    publish(&authority, &hint(worker_a(), 1), clause);
+    assert_eq!(
+        read_hint(&authority, clause),
+        Some(hint(worker_a(), 1)),
+        "{clause}: published"
+    );
+    time.pass(quarters(adapter, 2));
+    publish(&authority, &hint(worker_b(), 2), clause);
+    time.pass(quarters(adapter, 3));
+    assert_eq!(
+        read_hint(&authority, clause),
+        Some(hint(worker_b(), 2)),
+        "{clause}: the second write replaced the first and lasts a TTL from its own write"
+    );
+    time.pass(quarters(adapter, 2));
+    assert_eq!(
+        read_hint(&authority, clause),
+        None,
+        "{clause}: lapsed a TTL after the second write"
+    );
+}
+
+fn the_authority_reports_the_ttl_it_grants(adapter: &impl AuthorityAdapter, time: &impl PassTime) {
+    let clause = "ttl() is the TTL register and acquire_fence grant";
+    let authority = warmed_up(adapter, time);
+    assert_eq!(
+        authority.ttl(),
+        adapter.ttl(),
+        "{clause}: the adapter's TTL"
+    );
+    create(&authority, &founded(), clause);
+    assert_eq!(
+        authority.register(&name(), &shard(), &worker_a(), "address-a"),
+        Ok(authority.ttl()),
+        "{clause}: register"
+    );
+    assert_eq!(
+        authority.acquire_fence(&name(), &worker_a(), &founded()),
+        Ok(authority.ttl()),
+        "{clause}: acquire_fence"
+    );
+}
+
+fn a_missing_record_is_created_by_exactly_one_swap(adapter: &impl AuthorityAdapter) {
     let clause = "create-if-absent succeeds exactly once";
     let authority = adapter.fresh();
     assert_eq!(
@@ -337,7 +480,7 @@ fn a_missing_epoch_is_created_by_exactly_one_swap(adapter: &impl AuthorityAdapte
     );
     create(&authority, &founded(), clause);
     assert_eq!(
-        authority.compare_and_swap_shard(&name(), None, &rival()),
+        authority.compare_and_swap_shard(&name(), None, &successor()),
         Err(AuthorityError::ShardConflict {
             current: Some(founded())
         }),
@@ -350,12 +493,12 @@ fn a_missing_epoch_is_created_by_exactly_one_swap(adapter: &impl AuthorityAdapte
     );
 }
 
-fn a_swap_changes_the_epoch_only_from_the_expected_one(adapter: &impl AuthorityAdapter) {
-    let clause = "a swap needs the exact current epoch";
+fn a_swap_changes_the_record_only_from_the_expected_one(adapter: &impl AuthorityAdapter) {
+    let clause = "a swap needs the exact current record";
     let authority = adapter.fresh();
     create(&authority, &founded(), clause);
     let next = founded_next();
-    for wrong in [rival(), next.clone()] {
+    for wrong in [rival(), next.clone(), successor()] {
         assert_eq!(
             authority.compare_and_swap_shard(
                 &name(),
@@ -385,8 +528,8 @@ fn a_swap_changes_the_epoch_only_from_the_expected_one(adapter: &impl AuthorityA
     );
 }
 
-fn a_fence_needs_the_current_epoch(adapter: &impl AuthorityAdapter, time: &impl PassTime) {
-    let clause = "a fence needs the current epoch";
+fn a_fence_needs_the_current_record(adapter: &impl AuthorityAdapter, time: &impl PassTime) {
+    let clause = "a fence needs the current record";
     let authority = warmed_up(adapter, time);
     assert_eq!(
         authority.acquire_fence(&name(), &worker_a(), &founded()),
@@ -400,6 +543,13 @@ fn a_fence_needs_the_current_epoch(adapter: &impl AuthorityAdapter, time: &impl 
             current: Some(founded())
         }),
         "{clause}: same number, other lineage"
+    );
+    assert_eq!(
+        authority.acquire_fence(&name(), &worker_a(), &successor()),
+        Err(AuthorityError::ShardConflict {
+            current: Some(founded())
+        }),
+        "{clause}: same epoch, other shard id"
     );
     assert_eq!(
         authority.acquire_fence(&name(), &worker_a(), &founded()),
@@ -420,11 +570,11 @@ fn a_fence_needs_the_current_epoch(adapter: &impl AuthorityAdapter, time: &impl 
     );
 }
 
-fn a_fence_held_by_another_is_waited_out_across_epochs(
+fn a_fence_held_by_another_is_waited_out_across_records(
     adapter: &impl AuthorityAdapter,
     time: &impl PassTime,
 ) {
-    let clause = "another holder's fence is waited out whatever its epoch";
+    let clause = "another holder's fence is waited out whatever its record";
     let authority = warmed_up(adapter, time);
     create(&authority, &founded(), clause);
     assert_eq!(
@@ -515,11 +665,17 @@ fn a_flush_loses_everything_and_restarts_both_waits(
         "{clause}: setup: a takes the fence"
     );
 
+    publish(&authority, &hint(worker_a(), 1), clause);
     adapter.flush(&authority);
     assert_eq!(
         authority.read_shard(&name()),
         Ok(None),
-        "{clause}: epoch lost"
+        "{clause}: record lost"
+    );
+    assert_eq!(
+        authority.read_leader_hint(&name()),
+        Ok(None),
+        "{clause}: hint lost"
     );
     assert_eq!(
         live(&authority, &shard(), clause),
