@@ -260,13 +260,7 @@ impl<'n> Executing<'n> {
     /// claims, and the answers reports got. Once the executor is gone, every
     /// run it was handed and has not ended is reported lost.
     pub(crate) fn take_arrived(&mut self) {
-        while !self.endpoint.held.gone {
-            match self.endpoint.reports.try_recv() {
-                Ok(report) => self.arrived.push(report),
-                Err(mpsc::error::TryRecvError::Disconnected) => self.endpoint.held.gone = true,
-                Err(mpsc::error::TryRecvError::Empty) => break,
-            }
-        }
+        self.drain_reports();
         while let Some(Some(reply)) = self.in_flight.next().now_or_never() {
             self.replies.push(reply);
         }
@@ -401,6 +395,18 @@ impl<'n> Executing<'n> {
         }
     }
 
+    /// Keeps every report the executor has sent, until none is left or the
+    /// executor is gone.
+    fn drain_reports(&mut self) {
+        while !self.endpoint.held.gone {
+            match self.endpoint.reports.try_recv() {
+                Ok(report) => self.arrived.push(report),
+                Err(mpsc::error::TryRecvError::Disconnected) => self.endpoint.held.gone = true,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+    }
+
     fn on_report(&mut self, report: Report) {
         let request = match report {
             Report::Capacity(places) => {
@@ -501,7 +507,13 @@ impl<'n> Executing<'n> {
             // No executor is left to run it: the leader is told at once, so it
             // is replayed rather than held by a worker that will never run it,
             // and so is every run handed over before it, this batch or earlier.
+            // What it reported before it went is acted on first, so a run it
+            // finished is not replayed.
+            self.drain_reports();
             self.endpoint.held.gone = true;
+            for report in std::mem::take(&mut self.arrived) {
+                self.on_report(report);
+            }
             self.queue_lost(run);
             self.lose_handed();
             return;

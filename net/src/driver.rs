@@ -420,6 +420,11 @@ where
         stepper
             .scheduler
             .set_compaction_runners(stepper.node.compaction_runners());
+        // A deadline the node reported is handed on before the await below: it
+        // is not reported again, so a driver dropped there must not lose it.
+        if let (Some(executing), Some(deadline)) = (executing.as_mut(), stepper.collected.abort_deadline.take()) {
+            executing.follow_abort_deadline(deadline.map(|at| on_this_host(&clock, at)));
+        }
         respond_to_join_requests(stepper.node, net).await;
         respond_to_claim_requests(
             stepper.node,
