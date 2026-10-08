@@ -93,7 +93,8 @@ def test_calling_a_task_returns_a_handle_before_it_has_run():
     handle, before, after, task_id, shard = kabudachi.run(main)
 
     assert isinstance(handle, kabudachi.TaskHandle)
-    assert (before, after, shard) == (False, True, "local")
+    assert (before, after) == (False, True)
+    assert shard.startswith("local/") and len(shard) > len("local/")
     assert task_id
 
 

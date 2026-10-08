@@ -57,6 +57,8 @@ pub struct NativeRuntime {
     timers: Mutex<Option<JoinHandle<()>>>,
     stop: Arc<Notify>,
     state: watch::Receiver<WorkerState>,
+    /// The incarnation of the shard this runtime founded at start.
+    shard_id: String,
     /// The one way into the scheduler, which refuses everything once the
     /// runtime has shut down.
     door: Arc<SchedulerDoor<RealClock>>,
@@ -139,6 +141,7 @@ impl NativeRuntime {
         new_scheduler.set_result_ttl(Some(retention));
         new_scheduler.set_memory_limits(limits);
         let door = Arc::new(SchedulerDoor::new(new_scheduler, worker_id));
+        let shard_id = node.shard_id().as_str().to_owned();
         let (state_sender, state) = watch::channel(node.state());
         let stop = Arc::new(Notify::new());
         let publisher = Publisher {
@@ -162,8 +165,15 @@ impl NativeRuntime {
             timers: Mutex::new(Some(timers)),
             stop,
             state,
+            shard_id,
             door,
         })
+    }
+
+    /// The incarnation of the shard this runtime founded at start: `local/`
+    /// and an id unique to this start.
+    fn shard_id(&self) -> String {
+        self.shard_id.clone()
     }
 
     /// Returns an awaitable that resolves once this worker is the leader.
