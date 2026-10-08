@@ -136,7 +136,7 @@ class Waiting:
 
 @dataclass(frozen=True)
 class Condemn:
-    """A body here raised `SystemExit` or `KeyboardInterrupt`: send this
+    """A body or one of its hooks raised `SystemExit` or `KeyboardInterrupt`: send this
     process no new runs, and stop it once its other runs have finished."""
 
 

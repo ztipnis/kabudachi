@@ -170,7 +170,10 @@ def after_run(func: Any = None, /, *, queues: Iterable[str] | None = None) -> An
     logged: nothing is replaced. A hook that raises what is not an
     `Exception` (`KeyboardInterrupt`, or a cancellation) fails the same way,
     and is raised again once the other hooks have run, unless the run had
-    already failed, whose error then stands.
+    already failed, whose error then stands. For such a hook the run fails
+    with `TaskBodyError` naming its type (a cancellation that was asked for
+    stays a cancellation), and for `SystemExit` or `KeyboardInterrupt` the
+    task process is stopped once its other runs finish.
 
     Returns the function itself. Raises `TypeError` if `func` cannot be
     called with two arguments or `queues` is not a list of queue names, and
