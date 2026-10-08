@@ -9,7 +9,6 @@
 //! auto-advance until it is released, so a test that holds one moves time by
 //! hand. Every address a worker could ask has nothing listening on it.
 
-use crate::support::worker::{name_of, read_epoch, swap_epoch};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +31,7 @@ use tokio::time::timeout;
 
 use crate::support::deadline::within_deadline;
 use crate::support::clock::TokioClock;
+use crate::support::worker::{name_of, read_epoch, swap_epoch};
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// Far longer than the rounds a waiting worker is given, and counted on the

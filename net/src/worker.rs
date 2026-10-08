@@ -46,7 +46,7 @@ use crate::task_store::placement::ReplicationFactor;
 /// authority's own TTL.
 #[derive(Clone)]
 pub struct AuthorityConfig {
-    pub authority: SharedAuthority,
+    authority: SharedAuthority,
     timings: AuthorityTimings,
 }
 
@@ -55,6 +55,11 @@ impl AuthorityConfig {
     pub fn new(authority: SharedAuthority) -> Self {
         let timings = AuthorityTimings::from_authority(&*authority);
         AuthorityConfig { authority, timings }
+    }
+
+    /// The authority the worker consults.
+    pub fn authority(&self) -> &SharedAuthority {
+        &self.authority
     }
 }
 
@@ -265,7 +270,7 @@ impl Worker {
                 &net,
                 config.shard_name.clone(),
                 shard_id.clone(),
-                Arc::clone(&authority.authority),
+                Arc::clone(authority.authority()),
                 authority.timings,
             )
         });

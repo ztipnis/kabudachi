@@ -4,7 +4,6 @@
 //! itself rejoins the shard the authority says recovered, and ends up a
 //! member of the lineage the authority holds, not a stale leader's.
 
-use crate::support::worker::{name_of, swap_epoch};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -29,6 +28,7 @@ use crate::support::deadline::within_deadline;
 use crate::support::net::{
     JoinResponder, driven_scheduler, listening_net, take_inputs_until,
 };
+use crate::support::worker::{name_of, swap_epoch};
 
 const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 

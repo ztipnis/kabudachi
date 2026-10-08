@@ -79,11 +79,12 @@ pub trait CoordinationAuthority {
     ///
     /// A fence taken before the authority lost its data is lost with the
     /// data, so the authority cannot make a new holder wait it out. Instead,
-    /// until one TTL has passed since it started or last lost its data, it
-    /// grants no fence at all and answers [`AuthorityError::FenceHeld`] with
-    /// the rest of that TTL: every fence taken before the loss has expired
-    /// by then. After an outage that kept its data, it still knows every
-    /// fence and needs no such wait.
+    /// until one TTL has passed since it started or last lost its data (or,
+    /// for an authority that starts a name's warm-up at that name's first use
+    /// after that, since the name's first use), it grants no fence at all and
+    /// answers [`AuthorityError::FenceHeld`] with the rest of that TTL: every
+    /// fence taken before the loss has expired by then. After an outage that
+    /// kept its data, it still knows every fence and needs no such wait.
     ///
     /// The fence is a lease, not a fencing token: it returns only a TTL, and
     /// the authority mints no token of its own. It bounds how long a leader
@@ -210,7 +211,9 @@ pub struct LeaderHint {
 ///
 /// An authority reports an authoritative count only once one full TTL has
 /// passed since it last became available: since it started, since it lost
-/// its data, or since an outage ended. That TTL is the warm-up. Until it
+/// its data, or since an outage ended. That TTL is the warm-up. An authority
+/// may start a name's warm-up at that name's first use after it started or
+/// lost its data, rather than for every name at once. Until it
 /// ends, the authority cannot tell a worker that has not registered yet from
 /// one that is gone. A registration made before it started or lost its data
 /// is unknown to it until renewed, and after an outage longer than a TTL

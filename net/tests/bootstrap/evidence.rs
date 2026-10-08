@@ -4,7 +4,6 @@
 //! shard exists for as long as the worker bootstraps, and it keeps asking
 //! until a peer points at a leader.
 
-use crate::support::worker::{name_of, read_epoch};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +22,8 @@ use tokio::time::timeout;
 use crate::support::deadline::within_deadline;
 use crate::support::net::{JoinResponder, listening_net, pointer_to};
 use crate::support::worker::{
-    PER_PEER_TIMEOUT, RETRY_INTERVAL, TEST_TIMEOUT, poll_until, warmed_up_in_memory_authority,
+    PER_PEER_TIMEOUT, RETRY_INTERVAL, TEST_TIMEOUT, name_of, poll_until, read_epoch,
+    warmed_up_in_memory_authority,
 };
 
 /// How long a worker that must not found the shard is given to: many times

@@ -145,6 +145,13 @@ fn left_after(adapter: &impl AuthorityAdapter, quarters: u64) -> Duration {
 /// A fresh authority past its warm-up: five quarters of a TTL have passed.
 fn warmed_up<A: AuthorityAdapter>(adapter: &A, time: &impl PassTime) -> A::Authority {
     let authority = adapter.fresh();
+    // The name is first touched right after `fresh`, so an adapter that
+    // starts a name's warm-up at its first use is warmed up for it below.
+    assert_eq!(
+        authority.read_shard(&name()),
+        Ok(None),
+        "a fresh authority holds no record"
+    );
     time.pass(quarters(adapter, 5));
     authority
 }

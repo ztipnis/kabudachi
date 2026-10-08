@@ -13,10 +13,9 @@
 //! roll calls first. A node "crashed" here is stalled for good: it neither
 //! renews its registration nor fences itself, as a dead process would not.
 
-use crate::support::authority::{name_of, read_epoch, swap_epoch};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::support::authority::authority_ttl;
+use crate::support::authority::{authority_ttl, name_of, read_epoch, swap_epoch};
 use crate::support::builders::{past_any_suspicion, shard};
 use crate::support::harness::{Cluster, StepRecord};
 use kabudachi_core::configuration::Admission;
@@ -91,7 +90,8 @@ fn set_reachable(cluster: &Cluster, ids: &BTreeSet<WorkerId>, reachable: bool) {
 /// The workers the authority lists as live now.
 fn live(cluster: &Cluster) -> BTreeSet<WorkerId> {
     cluster
-        .authority().live_registrations(&name_of(&shard("shard-1")), &shard("shard-1"))
+        .authority()
+        .live_registrations(&name_of(&shard("shard-1")), &shard("shard-1"))
         .expect("the seeding handle reaches the authority")
         .addresses()
         .keys()
@@ -100,8 +100,7 @@ fn live(cluster: &Cluster) -> BTreeSet<WorkerId> {
 }
 
 fn authority_epoch(cluster: &Cluster) -> Option<u64> {
-    read_epoch(cluster
-        .authority(), &shard("shard-1"))
+    read_epoch(cluster.authority(), &shard("shard-1"))
         .expect("the seeding handle reaches the authority")
         .map(|epoch| epoch.number)
 }
@@ -360,8 +359,7 @@ fn refound_while_fenced(cluster: &mut Cluster, cut_off: &BTreeSet<WorkerId>) -> 
             bootstrapper.as_str(),
         )
         .expect("the seeding handle reaches the authority");
-    swap_epoch(cluster
-        .authority(), &shard("shard-1"), None, refounded)
+    swap_epoch(cluster.authority(), &shard("shard-1"), None, refounded)
         .expect("the flushed authority holds no epoch, so create-if-absent succeeds");
     set_reachable(cluster, cut_off, true);
     refounded
@@ -782,8 +780,7 @@ fn members_stranded_at_a_dead_epoch_rejoin_the_authoritys_instead_of_electing_th
     crash(&mut cluster, &leader);
     cluster.authority().flush();
     let refounded = RecoveryEpoch::founding(0, &mut Uuid7Lineages);
-    swap_epoch(cluster
-        .authority(), &shard("shard-1"), None, refounded)
+    swap_epoch(cluster.authority(), &shard("shard-1"), None, refounded)
         .expect("the flushed authority holds no epoch, so create-if-absent succeeds");
 
     run_for(&mut cluster, ttls(1), |_| {});
@@ -804,13 +801,11 @@ fn a_shard_left_at_an_epoch_a_lost_swap_made_recovers_under_one_leader() {
     let survivors: BTreeSet<WorkerId> = followers(&cluster, &leader).into_iter().collect();
     crash(&mut cluster, &leader);
     cluster.partition(BTreeSet::from([leader.clone()]), survivors.clone());
-    let held = read_epoch(cluster
-        .authority(), &shard("shard-1"))
+    let held = read_epoch(cluster.authority(), &shard("shard-1"))
         .expect("the seeding handle reaches the authority")
         .expect("the elected shard has an epoch");
     let lost_swap = held.next().expect("the epoch can be swapped");
-    swap_epoch(cluster
-        .authority(), &shard("shard-1"), Some(held), lost_swap)
+    swap_epoch(cluster.authority(), &shard("shard-1"), Some(held), lost_swap)
         .expect("the swap whose reply was lost");
 
     run_for(&mut cluster, ttls(4), |cluster| {

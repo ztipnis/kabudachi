@@ -6,7 +6,6 @@
 //! asks for is made on a `FaultingAuthority` at once and its reply handed
 //! straight back, as a driver does.
 
-use crate::support::authority::{name_of, read_epoch as held_epoch, swap_epoch};
 use crate::support::builders::{
     message_input,
     ack_message, configuration_of, g0, leader_ack, roll_call_reply, shard, timings, voter_of,
@@ -30,7 +29,8 @@ use kabudachi_core::scheduler::{LeaseEnd, Scheduler};
 use kabudachi_core::time::{Clock, Duration};
 use kabudachi_testkit::FaultingAuthority;
 use crate::support::authority::{
-    AtOnce, asked, authority_ttl, epoch, register_all, seed_shard, warmed_up_authority,
+    AtOnce, asked, authority_ttl, epoch, name_of, read_epoch as held_epoch, register_all,
+    seed_shard, swap_epoch, warmed_up_authority,
 };
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
@@ -267,8 +267,7 @@ fn a_fenced_node_ignores_an_epoch_read_it_asked_for_before_reconnecting() {
 fn a_fenced_node_reconnecting_to_a_later_epoch_of_its_lineage_resumes_instead_of_rejoining() {
     let mut driven = fenced_voter();
     driven.authority.set_reachable(true);
-    swap_epoch(&driven
-        .authority, &shard(SHARD), Some(epoch(0)), epoch(1))
+    swap_epoch(&driven.authority, &shard(SHARD), Some(epoch(0)), epoch(1))
         .expect("the swap lands");
 
     driven.advance(lasting_ticks());
@@ -281,8 +280,7 @@ fn a_fenced_node_reconnecting_to_a_later_epoch_of_its_lineage_resumes_instead_of
 fn rejoining_at_floor_two_of_lineage_one() -> Driven {
     let mut driven = fenced_voter();
     driven.authority.set_reachable(true);
-    swap_epoch(&driven
-        .authority, &shard(SHARD), Some(epoch(0)), RecoveryEpoch::new(2, 1))
+    swap_epoch(&driven.authority, &shard(SHARD), Some(epoch(0)), RecoveryEpoch::new(2, 1))
         .expect("a recovery elsewhere moved the epoch on");
     while driven.node.state() == WorkerState::Fenced {
         driven.advance(1_000);
@@ -759,8 +757,7 @@ fn a_leader_whose_fence_names_an_epoch_it_cannot_recover_from_rejoins_it() {
     }));
     // The shard was founded afresh under it.
     let refounded = RecoveryEpoch::new(0, 7);
-    swap_epoch(&driven
-        .authority, &shard(SHARD), Some(epoch(0)), refounded)
+    swap_epoch(&driven.authority, &shard(SHARD), Some(epoch(0)), refounded)
         .expect("a founder replaced the epoch");
 
     let mut outputs = Vec::new();

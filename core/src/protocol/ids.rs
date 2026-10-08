@@ -54,6 +54,7 @@ id_newtype!(
     /// Identifies a shard (an independently-elected partition of the cluster).
     ShardId
 );
+
 /// The name an operator gives a shard. It never changes: it names the shard's
 /// gossip topic and its key space at the coordination authority. Each
 /// incarnation of the shard under that name has its own [`ShardId`].

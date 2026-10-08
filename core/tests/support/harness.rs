@@ -46,7 +46,6 @@
 //! space could not store at a quorum, or a lease that ended first, answers
 //! `NotLeader`.
 
-use crate::support::authority::{name_of, read_epoch, swap_epoch};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -73,7 +72,7 @@ use kabudachi_testkit::FaultingAuthority;
 use kabudachi_testkit::RecordSpace;
 pub use kabudachi_testkit::StepRecord;
 
-use crate::support::authority::{authority_ttl, epoch};
+use crate::support::authority::{authority_ttl, epoch, name_of, read_epoch, swap_epoch};
 use crate::support::builders::{message_input, timings, voter_of};
 use crate::support::clock::FakeClock;
 use crate::support::ids::SequentialIds;
