@@ -58,7 +58,8 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     Without `main`, `run` serves as a worker (on the main thread) until it
     receives SIGINT or SIGTERM, then drains like the end of `main`: it waits
     for every task that was called and returns `None`. A second signal stops
-    the waiting: tasks not finished are abandoned, `run` raises
+    the waiting: task processes are stopped at once, tasks not finished are
+    abandoned, `run` raises
     `KeyboardInterrupt`, and a synchronous task still in its thread keeps the
     interpreter from exiting until it returns.
 
@@ -89,7 +90,7 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
                 async def serve() -> None:
                     await signals.stop.wait()
 
-                return runner.run(_run_with_worker(serve, executor))
+                return runner.run(_run_with_worker(serve, executor, serving=True))
         return runner.run(_run_with_worker(main, executor))
 
 
@@ -571,7 +572,14 @@ async def _until_done_or_worker_stops(work: Awaitable[T], worker: "asyncio.Task[
         await _cancel(task)
 
 
-async def _run_with_worker(main: Callable[[], Awaitable[T]], executor: Executor) -> T:
+async def _run_with_worker(
+    main: Callable[[], Awaitable[T]], executor: Executor, *, serving: bool = False
+) -> T:
+    """With `serving`, `main` only waits for the first signal, so a cancel is
+    the second one: task processes are then stopped at once, not after their
+    running bodies, which a body that ignores the cancel would hold up for its
+    cancel grace. In this process nothing can be killed, so running bodies are
+    still waited for."""
     configuration = process_configuration()
     # Set once every body has finished: the task processes are then let go
     # idle. Otherwise (a second signal, or a run cancelled while it waited
@@ -599,10 +607,14 @@ async def _run_with_worker(main: Callable[[], Awaitable[T]], executor: Executor)
             await _until_done_or_worker_stops(session.wait_until_idle(), worker)
             graceful = True
             return result
-        except BaseException:
+        except BaseException as error:
             if session is not None:
                 session.stop_claiming()
                 await _cancel(worker)
+                forced = serving and isinstance(error, (asyncio.CancelledError, KeyboardInterrupt))
+                if forced and not isinstance(executor, InProcessExecutor):
+                    # Their runs settle as lost once their processes are gone.
+                    await executor.stop(kill=True)
                 await session.wait_until_running_finish()
                 graceful = True
             raise

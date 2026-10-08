@@ -162,18 +162,15 @@ async def cancellable(request: Greeting) -> Greeting:
 async def reports_and_sleeps(request: Greeting) -> Greeting:
     """Sleeps `request.text` seconds, saying on stdout, which a task process
     shares with its worker, when it starts (with its process id), ends, or
-    is cancelled. Its first run ignores the cancel and sleeps on: only its
-    process's end stops it."""
+    is cancelled. It ignores the cancel and sleeps on: only its process's
+    end stops it."""
     print(f"task started {os.getpid()}", flush=True)
-    stubborn = first_time("reports-and-sleeps")
     while True:
         try:
             await asyncio.sleep(float(request.text))
             break
         except asyncio.CancelledError:
             print("task cancelled", flush=True)
-            if not stubborn:
-                raise
     print("task done", flush=True)
     return request
 

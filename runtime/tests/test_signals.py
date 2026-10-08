@@ -318,7 +318,7 @@ def test_sigterm_cancels_a_task_process_s_bodies_and_a_second_signal_sends_it(po
 
     # Stopped on its own, its body is cancelled, not failed. The body ignores
     # the cancel, yet the process still ends: lost with it, the run runs again
-    # in the replacement, where it no longer ignores one.
+    # in the replacement.
     os.kill(first, signal.SIGTERM)
     assert next_line(process) == "task cancelled"
     started, second = next_line(process).rsplit(" ", 1)
@@ -328,11 +328,15 @@ def test_sigterm_cancels_a_task_process_s_bodies_and_a_second_signal_sends_it(po
     process.send_signal(signal.SIGTERM)
     time.sleep(0.5)
     assert process.poll() is None, "the first signal must wait for the running task"
+    forced_at = time.monotonic()
     process.send_signal(signal.SIGTERM)
 
-    lines, errors = finish(process, timeout=30)
+    lines, errors = finish(process, timeout=10)
 
-    assert lines == ["task cancelled", "forced"], errors
+    # The body ignores this cancel too, yet its process is stopped at once,
+    # not after the task's 30 s cancel grace.
+    assert time.monotonic() - forced_at < 5, errors
+    assert lines[-1] == "forced", errors
     assert gone(int(second))
 
 

@@ -659,40 +659,40 @@ def test_an_unknown_setting_is_refused():
 
 
 @pytest.mark.parametrize(
-    "settings",
+    "settings, refused",
     [
-        {"concurrency": 0},
-        {"concurrency": -1},
-        {"concurrency": 1.5},
-        {"concurrency": "many"},
-        {"concurrency": True},
-        {"concurrency": None},
-        {"queue": ""},
-        {"queue": "   "},
-        {"queue": 3},
-        {"queue": None},
-        {"result_ttl": 0},
-        {"result_ttl": -1},
-        {"result_ttl": 1.5},
-        {"result_ttl": True},
-        {"result_ttl": "1h"},
-        {"cancel_grace": timedelta(seconds=-1)},
-        {"cancel_grace": 5},
-        {"cancel_grace": "5"},
-        {"cancel_grace": True},
-        {"processes": -1},
-        {"processes": True},
+        ({"concurrency": 0}, "concurrency"),
+        ({"concurrency": -1}, "concurrency"),
+        ({"concurrency": 1.5}, "concurrency"),
+        ({"concurrency": "many"}, "concurrency"),
+        ({"concurrency": True}, "concurrency"),
+        ({"concurrency": None}, "concurrency"),
+        ({"queue": ""}, "queue"),
+        ({"queue": "   "}, "queue"),
+        ({"queue": 3}, "queue"),
+        ({"queue": None}, "queue"),
+        ({"result_ttl": 0}, "result_ttl"),
+        ({"result_ttl": -1}, "result_ttl"),
+        ({"result_ttl": 1.5}, "result_ttl"),
+        ({"result_ttl": True}, "result_ttl"),
+        ({"result_ttl": "1h"}, "result_ttl"),
+        ({"cancel_grace": timedelta(seconds=-1)}, "cancel_grace"),
+        ({"cancel_grace": 5}, "cancel_grace"),
+        ({"cancel_grace": "5"}, "cancel_grace"),
+        ({"cancel_grace": True}, "cancel_grace"),
+        ({"processes": -1}, "processes"),
+        ({"processes": True}, "processes"),
         # Above the cap without `concurrency_override`.
-        {"concurrency": 33},
-        {"imports": "app.tasks"},
-        {"process_start_timeout": timedelta(0)},
+        ({"concurrency": 33}, "concurrency_override"),
+        ({"imports": "app.tasks"}, "imports"),
+        ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
     ],
 )
-def test_an_invalid_value_is_refused_and_changes_nothing(settings):
+def test_an_invalid_value_is_refused_and_changes_nothing(settings, refused):
     configuration = Configuration()
     configuration.configure(queue="emails")
 
-    with pytest.raises(ConfigurationError):
+    with pytest.raises(ConfigurationError, match=refused):
         configuration.configure(**settings)
 
     assert configuration.resolve("queue") == "emails"
