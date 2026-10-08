@@ -46,6 +46,13 @@ pub trait AuthorityAdapter {
 
     /// Brings `authority` back from [`Self::go_down`] now.
     fn come_back(&self, authority: &Self::Authority);
+
+    /// Whether the adapter can take an authority down and bring it back
+    /// within a fraction of its TTL. When `false`, the suite skips only the
+    /// outage clause; another run of the contract must cover outages.
+    fn has_outages(&self) -> bool {
+        true
+    }
 }
 
 /// Runs every clause of the contract against fresh authorities from
@@ -64,7 +71,9 @@ pub fn check_authority_contract(adapter: &impl AuthorityAdapter, time: &impl Pas
     a_fence_held_by_another_is_waited_out_across_records(adapter, time);
     no_fence_for_one_ttl_after_start(adapter, time);
     a_flush_loses_everything_and_restarts_both_waits(adapter, time);
-    an_outage_keeps_the_data_and_withholds_only_the_count(adapter, time);
+    if adapter.has_outages() {
+        an_outage_keeps_the_data_and_withholds_only_the_count(adapter, time);
+    }
 }
 
 fn name() -> ShardName {
