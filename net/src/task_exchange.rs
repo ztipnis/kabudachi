@@ -4,8 +4,9 @@
 //! [`codec`] frames the `/kabudachi/task/1` messages; `wire` maps them to and
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
 //! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
-//! [`Net::report_lost`] and [`Net::cancel`], each sent to the leader the caller names: the transport
-//! keeps no leader of its own. The calls about a run also keep this worker's
+//! [`Net::report_lost`] and [`Net::cancel`], each sent to the leader the
+//! caller names: the transport keeps no leader of its own. The calls about a
+//! run also keep this worker's
 //! [`ClaimedRuns`](crate::claimed_runs::ClaimedRuns) ledger, from the answers
 //! they get.
 //!
@@ -125,6 +126,14 @@ impl Net {
         run: TaskRunId,
         result_digest: Digest,
     ) -> Result<TaskResponse, TaskFailure> {
+        // From the digest in hand, so that a ledger entry never depends on
+        // decoding it again.
+        self.claimed.set(
+            &run,
+            HeldRun::Completed {
+                result_digest: result_digest.clone(),
+            },
+        );
         self.report(leader, task_request::Request::Completed(ReportCompleted {
             task_run_id: Some(run.into()),
             result_digest: Some(result_digest.into()),
