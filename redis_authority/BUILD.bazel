@@ -33,6 +33,8 @@ rust_test(
     crate_root = "tests/redis_authority_integration.rs",
     edition = "2024",
     size = "medium",
+    # About 20 s of real-time waits; a short timeout fails a stuck server fast.
+    timeout = "short",
     tags = ["no-remote-cache"],
     deps = [":redis_authority", ":valkey_test_support", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
 )
