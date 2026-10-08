@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{
-    IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
+    IncarnationId, ShardName, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
@@ -31,7 +31,7 @@ const DEFAULT_WORKER_THREADS: usize = 2;
 /// once, and leads once its one-voter roll call closes a millisecond later.
 const DEFAULT_SUSPECT_TIMEOUT_MS: u64 = 0;
 /// The shard of a process that runs no cluster: just this worker.
-const LOCAL_SHARD_ID: &str = "local";
+const LOCAL_SHARD_NAME: &str = "local";
 /// Finished tasks are kept this long unless the caller says otherwise.
 const DEFAULT_RESULT_TTL_MS: u64 = 60 * 60 * 1000;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -129,7 +129,7 @@ impl NativeRuntime {
         let (node, first) = local_node(
             worker_id.clone(),
             IncarnationId::new(incarnation_id),
-            ShardId::new(LOCAL_SHARD_ID),
+            &ShardName::new(LOCAL_SHARD_NAME),
             clock,
             CoreDuration::from_millis(suspect_timeout_ms),
         );

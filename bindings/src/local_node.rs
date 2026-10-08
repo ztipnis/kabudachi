@@ -21,7 +21,7 @@
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, Step, WorkerNode};
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{IncarnationId, ShardId, ShardName, WorkerId};
 use kabudachi_core::time::{Clock, Duration};
 
 /// How often the node would heartbeat its leader as a follower. A lone node
@@ -42,8 +42,8 @@ const ROLL_CALL_DEADLINE_MS: u64 = 1;
 /// voter, here only itself, both of which `election::run_election` drops.
 pub type LocalNode<C> = WorkerNode<C>;
 
-/// A node that is the whole shard: the worker that creates it, the only
-/// voter of its genesis configuration (at recovery epoch 0). Its quorum is
+/// A node that is the whole shard: the worker that creates it, a new
+/// incarnation of `shard_name` each start, the only voter of its genesis configuration (at recovery epoch 0). Its quorum is
 /// itself, so it becomes leader on its own once `suspect_timeout` has
 /// passed and its roll call has run its one millisecond: a lone worker has
 /// no peer to falsely suspect, so the single-process runtime passes 0 unless
@@ -57,10 +57,11 @@ pub type LocalNode<C> = WorkerNode<C>;
 pub fn local_node<C: Clock>(
     worker_id: WorkerId,
     incarnation_id: IncarnationId,
-    shard_id: ShardId,
+    shard_name: &ShardName,
     clock: C,
     suspect_timeout: Duration,
 ) -> (LocalNode<C>, Step) {
+    let shard_id = ShardId::mint(shard_name);
     let identity = Identity {
         id: worker_id,
         incarnation: incarnation_id,
@@ -72,7 +73,7 @@ pub fn local_node<C: Clock>(
         .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS)),
     };
     let entry = Entry::Founding {
-        shard_id: shard_id.clone(),
+        shard_id,
         recovery_epoch: RecoveryEpoch::new(0, 0),
         registered_at: None,
     };
