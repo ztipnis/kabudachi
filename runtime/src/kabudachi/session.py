@@ -273,11 +273,13 @@ class Session:
 
     def _hand_over(
         self, claim: Any, run: Run
-    ) -> "tuple[TaskDefinition, RunningBody] | Exception":
+    ) -> "tuple[TaskDefinition, RunningBody, asyncio.Future[Any] | None] | BaseException":
         """Tells the leader the run started and hands it to the executor. Done
         here rather than in `_run`, which starts later, so the place the run
         takes is counted before the next claim asks for more. What went wrong
-        instead is returned, for `_run` to settle."""
+        instead is returned, for `_run` to settle. The future is the abandoned
+        body this one waits for, if any."""
+        after = run.previous_body_exited
         try:
             definition = self._registry.get(claim.definition_id)
             if definition is None:
@@ -292,13 +294,13 @@ class Session:
                     chain=tuple(claim.chain),
                     cancel_grace=self._cancel_grace(definition),
                     # A retry does not run beside the abandoned body it replaces.
-                    after=run.previous_body_exited,
+                    after=after,
                 )
             )
-        except Exception as error:
+        except BaseException as error:
             return error
         run.body_started(body)
-        return definition, body
+        return definition, body, after
 
     def _track(self, coroutine: Any) -> None:
         task = asyncio.get_running_loop().create_task(coroutine)
@@ -309,7 +311,7 @@ class Session:
         return self._configuration.resolve("cancel_grace", definition.cancel_grace)
 
     async def _run(
-        self, claim: Any, run: Run, handed: "tuple[TaskDefinition, RunningBody] | Exception"
+        self, claim: Any, run: Run, handed: "tuple[TaskDefinition, RunningBody, asyncio.Future[Any] | None] | BaseException"
     ) -> None:
         """Sees one handed-over run to its end and settles its handle,
         whatever happens.
@@ -319,12 +321,11 @@ class Session:
         """
         body: RunningBody | None = None
         try:
-            if isinstance(handed, Exception):
+            if isinstance(handed, BaseException):
                 raise handed
-            definition, body = handed
+            definition, body, previous = handed
             # The body waits for an abandoned one of this task to exit before
             # it starts; its timeout counts from when it does.
-            previous = run.previous_body_exited
             if previous is not None:
                 await asyncio.wait({previous})
             outcome = await run_within(
