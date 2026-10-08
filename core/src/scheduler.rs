@@ -43,9 +43,8 @@
 //! was asked is not lost for being missing from its answer, since the
 //! worker's claim answer may still be on its way.
 //!
-//! Workers reported lost while the scheduler reconciles are kept and applied
-//! as ordinary losses at the grant; one that answered the reconciliation is
-//! alive and its loss is dropped. A worker that holds a run the records name
+//! Silences reported while the scheduler reconciles are kept and acted on
+//! once the grant arrives. A worker that holds a run the records name
 //! but never answered is returned as a silent holder, for the election to
 //! watch as a lost worker. A worker the election reports silent has each run
 //! it holds lost once that run's own reconnect timeout has passed (see
@@ -454,13 +453,6 @@ pub struct LostRun {
     pub replayed: Option<TaskRunId>,
 }
 
-/// Why losing a worker was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum LoseRejection {
-    #[error("this node is not the leader")]
-    NotLeader,
-}
-
 /// What cancelling a task did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cancellation {
@@ -511,6 +503,10 @@ pub struct Adopted {
     /// Workers holding a claimed or running run among the installed records
     /// that have not answered: the election must watch them as lost workers.
     pub silent_holders: BTreeSet<WorkerId>,
+    /// Workers that answered: they have been heard, so the silence their
+    /// node reported for any of them is over (its node must count them heard
+    /// now, see `Input::WatchWorkers`).
+    pub answered: BTreeSet<WorkerId>,
 }
 
 /// What a rebuild did.
@@ -524,6 +520,10 @@ pub struct Reconciled {
     /// that did not answer. They may be dead with the old leader and may
     /// never be heard from, so the election must watch them as lost workers.
     pub silent_holders: BTreeSet<WorkerId>,
+    /// Workers that answered: they have been heard, so the silence their
+    /// node reported for any of them is over (its node must count them heard
+    /// now, see `Input::WatchWorkers`).
+    pub answered: BTreeSet<WorkerId>,
 }
 
 /// What one call to [`Scheduler::catch_up`] did.
@@ -1038,18 +1038,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// While its node reconciles, a grant takes effect only once
     /// [`Self::reconcile`] has rebuilt for the same office; any other is not
     /// held, since leading before the rebuild would decide on nothing. The
-    /// grant that ends the reconciliation applies the losses of workers that
-    /// did not answer it. A lost worker that did answer is not applied: its
-    /// node watches it again once it leads, so it is reported lost once more
-    /// if it is dead.
+    /// grant that ends the reconciliation loses the runs of every worker
+    /// reported silent meanwhile whose reconnect timeouts have passed (see
+    /// [`Self::note_silence`]).
     pub fn set_leadership_grant(&mut self, grant: Option<LeadershipGrant>) {
-        let lost = self.reconciliation.takes_grant(grant.as_ref());
-        self.grant = grant.filter(|_| lost.is_some());
-        self.check_leader();
-        for worker in lost.unwrap_or_default() {
-            let _ = self.lose_runs_of(&worker);
-        }
-        if self.is_leader() {
+        let takes_effect = self.reconciliation.takes_grant(grant.as_ref());
+        self.grant = grant.filter(|_| takes_effect);
+        if self.check_leader() {
             self.lose_overdue();
         }
         self.compact_every_due_key();
@@ -1057,8 +1052,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Its node took office for `term` and reconciles before it leads.
-    /// Until the grant of that office arrives, workers reported lost are
-    /// kept, not applied (see [`Self::lose_worker`]), and the scheduler,
+    /// Until the grant of that office arrives, the silences its node reports
+    /// are kept, not acted on, and the scheduler,
     /// holding no grant, refuses every claim and report as `NotLeader`. A
     /// grant of `None` meanwhile (the node left office) drops the
     /// reconciliation. It forgets every silence its node reported in an
@@ -1120,10 +1115,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .difference(self.reconciliation.answered())
             .cloned()
             .collect();
+        let answered = self.reconciliation.answered().clone();
+        for worker in &answered {
+            self.silent.remove(worker);
+        }
         Ok(Reconciled {
             republished,
             uncertain: self.reconciliation.uncertain_count(),
             silent_holders,
+            answered,
         })
     }
 
@@ -1157,7 +1157,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let mut adopted = Adopted::default();
         let installed = self.install_settled(candidates, true);
         adopted.installed = installed.len();
-        let mut answered: BTreeSet<WorkerId> = reports.keys().cloned().collect();
+        let reporters: BTreeSet<WorkerId> = reports.keys().cloned().collect();
+        for worker in &reporters {
+            self.silent.remove(worker);
+        }
+        let mut answered = reporters.clone();
         answered.extend(self.reconciliation.answered().iter().cloned());
         for task_id in &installed {
             for (worker, run) in self.reconciliation.take_reports_for(task_id) {
@@ -1171,6 +1175,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .difference(&answered)
             .cloned()
             .collect();
+        adopted.answered = reporters;
         self.end_call();
         Ok(adopted)
     }
@@ -2401,43 +2406,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             was_running,
         });
         Ok(Cancellation::Cancelled { was_running })
-    }
-
-    /// `worker` is lost, its reconnect timeout having passed: every
-    /// run it held, claimed or running, becomes `Lost` and nothing it reports
-    /// afterwards counts. Each is replayed by a new queued attempt, which is
-    /// at-least-once and does not use up a retry (a loss is not a failure), except a coalescing
-    /// generation that a newer one is waiting behind: that one stays lost and
-    /// its payload is not folded into the newer one. Two kinds
-    /// are not replayed: an ephemeral task's run stays `Lost`,
-    /// and the running run of a non-retriable task becomes `Orphaned`, since
-    /// its effects may have happened. A non-retriable task's claimed run never
-    /// started, so it is replayed. Either way the task is over. Only a leader
-    /// decides.
-    ///
-    /// While its node reconciles, a lost worker is kept and applied once the
-    /// grant arrives; the call returns no runs then.
-    pub fn lose_worker(&mut self, worker: &WorkerId) -> Result<Vec<LostRun>, LoseRejection> {
-        if self.reconciliation.keeps_lost(worker) {
-            return Ok(Vec::new());
-        }
-        let outcome = self.lose_runs_of(worker);
-        self.end_call();
-        outcome
-    }
-
-    fn lose_runs_of(&mut self, worker: &WorkerId) -> Result<Vec<LostRun>, LoseRejection> {
-        if !self.check_leader() {
-            return Err(LoseRejection::NotLeader);
-        }
-        let now = self.clock.now();
-        let stamped_at = WallTime::now(&self.clock);
-        let held = self.held_by(worker);
-        let lost = held
-            .into_iter()
-            .map(|task_id| self.lose_run(&task_id, now, stamped_at))
-            .collect();
-        Ok(lost)
     }
 
     /// Its node's office counts `worker` silent from `reconnect_from` on:

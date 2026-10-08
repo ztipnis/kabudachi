@@ -4,13 +4,16 @@
 use std::collections::BTreeMap;
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
+use kabudachi_core::election::ElectionTimings;
 use kabudachi_core::protocol::generated::TaskRecord;
-use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId};
+use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::ReconcileTerm;
-use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, MemoryLimits, Observer, Scheduler};
+use kabudachi_core::scheduler::{
+    LeadershipGrant, LeaseEnd, LostRun, MemoryLimits, Observer, Scheduler,
+};
 use kabudachi_core::time::{Clock, Duration};
 
 use crate::support::clock::FakeClock;
@@ -165,4 +168,50 @@ pub fn reconciling_after(previous: &Fixture) -> Fixture {
 
 pub fn reconciling() -> Fixture {
     reconciling_after(&Fixture::not_leading())
+}
+
+/// Loses every run `worker` holds the way a leader does: its node's office
+/// reports it silent, the shard's reconnect timeout passes, and the
+/// scheduler catches up. The worker is then heard again, so a run it claims
+/// afterwards is its own to keep. Returns what became of each run it held.
+/// Every run lost must be of a task with no reconnect timeout of its own.
+pub fn lose_silent(
+    scheduler: &mut TestScheduler,
+    clock: &FakeClock,
+    worker: &WorkerId,
+) -> Vec<LostRun> {
+    let held = scheduler.active_runs_of(worker);
+    scheduler.note_silence(worker, Some(clock.now()));
+    clock.advance(ElectionTimings::DEFAULT_RECONNECT_TIMEOUT);
+    scheduler.catch_up();
+    scheduler.note_silence(worker, None);
+    held.into_iter()
+        .filter_map(|run_id| {
+            let run = scheduler.task_run(&run_id)?;
+            let state = run.current_state();
+            if !matches!(state, TaskRunState::Lost | TaskRunState::Orphaned) {
+                return None;
+            }
+            let task_id = run.task_id();
+            let replayed = scheduler.runs_of(&task_id).into_iter().find(|next| {
+                scheduler
+                    .task_run(next)
+                    .and_then(|next| next.parent_task_run_id())
+                    == Some(run_id.clone())
+            });
+            Some(LostRun {
+                task_id,
+                task_run_id: run_id,
+                state,
+                replayed,
+            })
+        })
+        .collect()
+}
+
+impl Fixture {
+    /// [`lose_silent`] on this fixture's scheduler and clock.
+    pub fn lose_silent(&mut self, worker: &WorkerId) -> Vec<LostRun> {
+        lose_silent(&mut self.scheduler, &self.clock, worker)
+    }
 }

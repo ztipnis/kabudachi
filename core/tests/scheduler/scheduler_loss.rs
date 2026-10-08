@@ -1,5 +1,5 @@
-//! A worker that is lost while it holds runs:
-//! its runs become `Lost`, and are replayed by a new run of the same task
+//! A worker that falls silent while it holds runs: once each run's reconnect
+//! timeout has passed, its runs become `Lost`, and are replayed by a new run of the same task
 //! (at-least-once), except that a coalescing generation is only replayed if it
 //! is the newest for its key. An ephemeral task's lost run is not replayed, and a
 //! non-retriable task's running run is orphaned instead.
@@ -54,7 +54,7 @@ fn a_replay_after_a_loss_does_not_use_up_a_retry() {
         .submit(plain("p").with_retries(1))
         .unwrap();
     let first = running(&mut fixture, &worker("w1"), &task);
-    fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+    fixture.lose_silent(&worker("w1"));
 
     // The replay is attempt 2, but only failures count against retries: one
     // failure of it is still retried, and a second is not.
@@ -130,7 +130,7 @@ fn what_a_lost_worker_leaves_behind() {
     let waiting = fixture.scheduler.submit(plain("e")).unwrap();
     assert_eq!(fixture.scheduler.memory_in_use(), 8);
 
-    let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+    let lost = fixture.lose_silent(&worker("w1"));
 
     assert_eq!(lost.len(), rows.len(), "only the lost worker's held runs");
     for ((task, run), state, replayed) in rows {
@@ -174,7 +174,7 @@ fn a_lost_coalescing_generation_that_is_the_newest_is_replayed() {
     let task = fixture.scheduler.submit(generation("a")).unwrap();
     let run = running(&mut fixture, &worker("w1"), &task);
 
-    let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+    let lost = fixture.lose_silent(&worker("w1"));
 
     assert_eq!(fixture.run_state(&run), TaskRunState::Lost);
     let replay = lost[0].replayed.clone().expect("replayed");
@@ -193,7 +193,7 @@ fn a_lost_coalescing_generation_with_a_newer_one_waiting_is_not_replayed() {
     let run = running(&mut fixture, &worker("w1"), &task);
     let newer = fixture.scheduler.submit(generation("b")).unwrap();
 
-    let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+    let lost = fixture.lose_silent(&worker("w1"));
 
     assert_eq!(fixture.run_state(&run), TaskRunState::Lost);
     assert_eq!(lost[0].replayed, None);
@@ -222,7 +222,7 @@ fn a_task_whose_continuation_is_running_is_not_lost_with_its_worker() {
         .complete(&worker("w1"), &run, Digest::blake3(b"d"), Completion::Continues)
         .unwrap();
 
-    let lost = fixture.scheduler.lose_worker(&worker("w1")).unwrap();
+    let lost = fixture.lose_silent(&worker("w1"));
 
     assert!(lost.is_empty());
     assert_eq!(fixture.run_state(&run), TaskRunState::Succeeded);

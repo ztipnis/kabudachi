@@ -238,10 +238,6 @@ where
     /// While it is held it, not `standing`, holds the configuration and
     /// admissions this node leads (see [`Self::led_or_followed_configuration`]).
     office: Option<LeaderOffice>,
-    /// The workers reported lost while this node reconciled, which its
-    /// scheduler keeps rather than applies. Watched again once the node leads
-    /// (see [`Self::on_reconciled`]).
-    lost_while_reconciling: BTreeSet<WorkerId>,
     /// The leader whose heartbeat ack this node last accepted, or that a JOIN
     /// pointed it at, or that a roll-call refusal named, or this node itself
     /// once it wins, with the term that leader was elected in.
@@ -592,14 +588,19 @@ pub enum Input {
     /// that office moves to `Leader`, and its grant follows. Ignored for any
     /// other office, or in any other state.
     Reconciled(ReconcileTerm),
-    /// The node's scheduler found these workers holding runs it rebuilt or
-    /// adopted, and none of them answered: they may have died with the old
-    /// leader, and never be heard from. A node holding an office reports each
-    /// not yet heard from lost a suspicion timeout and a reconnect timeout
-    /// after this input (see [`Output::WorkerLost`]) and silent a suspicion
-    /// timeout after it (see [`Output::WorkerSilence`]); a worker it already
-    /// tracks keeps the time it was last heard. Ignored without an office.
-    WatchWorkers(BTreeSet<WorkerId>),
+    /// The node's scheduler rebuilt, or adopted late answers. It found the
+    /// workers in `silent_holders` holding runs and not answering: they may
+    /// have died with the old leader, and never be heard from. A node holding
+    /// an office reports each of them not yet heard from silent a suspicion
+    /// timeout after this input (see [`Output::WorkerSilence`]), and lost a
+    /// reconnect timeout later (see [`Output::WorkerLost`]); a worker it
+    /// already tracks keeps the time it was last heard. The workers in
+    /// `answered` answered, and are heard now, as by a heartbeat. Ignored
+    /// without an office.
+    WatchWorkers {
+        silent_holders: BTreeSet<WorkerId>,
+        answered: BTreeSet<WorkerId>,
+    },
 }
 
 /// Something a [`WorkerNode`] asks its driver to do.
@@ -968,7 +969,6 @@ where
             lease: Lease::new(now),
             drain_request: DrainRequest::default(),
             crawled_at_admission: None,
-            lost_while_reconciling: BTreeSet::new(),
             active_runs_digest: Vec::new(),
             runs_compaction: false,
             cancelled_runs: BTreeMap::new(),
@@ -1178,17 +1178,9 @@ where
         )
     }
 
-    /// Its scheduler reconciled for `office`: the node leads. A worker lost
-    /// while it reconciled may have answered the reconciliation first and died
-    /// after, which the scheduler cannot tell from one that is alive; watching
-    /// each again from now loses a dead one once more, this time applied.
+    /// Its scheduler reconciled for `office`: the node leads.
     fn on_reconciled(&mut self, office: ReconcileTerm) {
         if self.state == WorkerState::LeaderReconciling && self.office_term() == Some(office) {
-            let now = self.clock.now();
-            let lost = std::mem::take(&mut self.lost_while_reconciling);
-            if let Some(held) = self.office.as_mut() {
-                held.watch(lost, &self.my_id, now);
-            }
             self.transition_to(WorkerState::Leader);
         }
     }
@@ -1423,10 +1415,14 @@ where
             Input::Drain => self.request_drain(),
             Input::RoutingCrawled => self.crawled_at_admission = self.admission(),
             Input::Reconciled(office) => self.on_reconciled(office),
-            Input::WatchWorkers(workers) => {
+            Input::WatchWorkers {
+                silent_holders,
+                answered,
+            } => {
                 let now = self.clock.now();
                 if let Some(office) = self.office.as_mut() {
-                    office.watch(workers, &self.my_id, now);
+                    office.watch(silent_holders, &self.my_id, now);
+                    office.heard_answers(answered, &self.my_id, now);
                 }
             }
         }
@@ -3003,7 +2999,6 @@ where
             now,
         };
         self.office = Some(LeaderOffice::take(roster, self.term, &duties));
-        self.lost_while_reconciling.clear();
 
         self.lease.won(now);
         if let Some(authority) = self.authority.as_mut() {
@@ -3055,9 +3050,6 @@ where
             lost_after,
             suspect_timeout,
         ) {
-            if self.state == WorkerState::LeaderReconciling {
-                self.lost_while_reconciling.insert(worker.clone());
-            }
             // Its cancelled runs stay listed: its own runs are decided by its
             // silence, each at its own reconnect timeout, so a worker heard
             // again may still hold one and must still be told.

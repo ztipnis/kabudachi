@@ -22,7 +22,13 @@ fn a_leader_whose_lease_ends_between_ticks_is_no_leader_on_its_next_input() {
     cluster.advance_clock_only(Duration::from_ticks(lease.as_ticks() + STEP.as_ticks()));
     assert!(!cluster.scheduler_mut(&leader).is_leader(), "the grant ended");
 
-    let outputs = cluster.step(&leader, Input::WatchWorkers(BTreeSet::new()));
+    let outputs = cluster.step(
+        &leader,
+        Input::WatchWorkers {
+            silent_holders: BTreeSet::new(),
+            answered: BTreeSet::new(),
+        },
+    );
 
     assert_eq!(cluster.states()[&leader], WorkerState::NoQuorum);
     assert!(

@@ -314,8 +314,11 @@ impl<E> LeaderRecords<E> {
             match scheduler.adopt(learnt) {
                 Ok(adopted) => {
                     self.repair.found(&found);
-                    if !adopted.silent_holders.is_empty() {
-                        return Turn::Step(Input::WatchWorkers(adopted.silent_holders));
+                    if !(adopted.silent_holders.is_empty() && adopted.answered.is_empty()) {
+                        return Turn::Step(Input::WatchWorkers {
+                            silent_holders: adopted.silent_holders,
+                            answered: adopted.answered,
+                        });
                     }
                 }
                 // Holding office does not mean leading: the grant also ends
@@ -348,8 +351,11 @@ impl<E> LeaderRecords<E> {
                             );
                             let revisions = scheduler.observer_mut().take_published();
                             self.place_republish(reconciliation, node, revisions, &*ports);
-                            if !rebuilt.silent_holders.is_empty() {
-                                return Turn::Step(Input::WatchWorkers(rebuilt.silent_holders));
+                            if !(rebuilt.silent_holders.is_empty() && rebuilt.answered.is_empty()) {
+                                return Turn::Step(Input::WatchWorkers {
+                                    silent_holders: rebuilt.silent_holders,
+                                    answered: rebuilt.answered,
+                                });
                             }
                         }
                         Err(ReconcileRefused { rejection, rebuild }) => {

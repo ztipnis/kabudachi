@@ -316,7 +316,7 @@ fn a_lost_compaction_is_never_replayed_and_does_not_count_as_a_loss() {
     held.submit_all(&payloads_of(0..6));
     let compaction = held.compaction_claim().unwrap();
 
-    let lost = held.fixture.scheduler.lose_worker(&runner()).unwrap();
+    let lost = held.fixture.lose_silent(&runner());
 
     let run = lost
         .iter()

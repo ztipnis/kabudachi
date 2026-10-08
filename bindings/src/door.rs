@@ -350,7 +350,10 @@ impl<C: Clock> SchedulerDoor<C> {
                     // is told it has reconciled, which is what ends the reconciliation.
                     .reconcile(Rebuild::default())
                     .expect("a lone node reconciles the office its scheduler waits for");
-                let watching = node.step(Input::WatchWorkers(BTreeSet::new()));
+                let watching = node.step(Input::WatchWorkers {
+                    silent_holders: BTreeSet::new(),
+                    answered: BTreeSet::new(),
+                });
                 carry_out(
                     node,
                     watching,
