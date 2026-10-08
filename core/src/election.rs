@@ -756,8 +756,9 @@ pub struct Step {
 /// Applies to `scheduler` what `outputs`, one step of a worker's election,
 /// ask of it, in order: each leadership grant the step reports, and each
 /// worker's silence, which `Scheduler::note_silence` turns into the loss of
-/// each run the worker holds at that run's own reconnect timeout. Messages, authority calls, state changes, the abort deadline and
-/// alerts are the driver's to carry out and leave it alone.
+/// each run the worker holds at that run's own reconnect timeout. Messages,
+/// authority calls, state changes, the abort deadline and alerts are the
+/// driver's to carry out and leave it alone.
 ///
 /// `scheduler` must read the clock the node reads: a grant's lease ends at
 /// an instant of the node's clock, and the scheduler compares it with its

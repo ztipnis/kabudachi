@@ -2434,15 +2434,26 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Each claimed or running current run of a silent worker, by its task,
-    /// with the instant from which it may be replayed.
+    /// with the instant from which it may be replayed. One pass over the
+    /// current runs, and none while no worker is silent.
     fn replays_due(&self) -> Vec<(Instant, TaskId)> {
-        let mut due = Vec::new();
-        for (worker, from) in &self.silent {
-            for task_id in self.held_by(worker) {
-                due.push((*from + self.reconnect_timeout_of(&task_id), task_id));
-            }
+        if self.silent.is_empty() {
+            return Vec::new();
         }
-        due
+        self.current_run
+            .iter()
+            .filter_map(|(task_id, run_id)| {
+                let run = &self.runs[run_id];
+                if !matches!(
+                    run.current_state(),
+                    TaskRunState::Claimed | TaskRunState::Running
+                ) {
+                    return None;
+                }
+                let from = self.silent.get(run.selected_worker().as_ref()?)?;
+                Some((*from + self.reconnect_timeout_of(task_id), task_id.clone()))
+            })
+            .collect()
     }
 
     /// Loses every run of a silent worker whose reconnect timeout has
