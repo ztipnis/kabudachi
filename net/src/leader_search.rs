@@ -270,7 +270,8 @@ pub(crate) fn others_listed(
 }
 
 /// A node back in `Bootstrapping`, rejoining its shard through the driver.
-/// It never founds: nothing here can register or
+/// Each round also reads the authority's leader hint beside the listing, and
+/// asks the hinted leader first with the latest hint answered by then. It never founds: nothing here can register or
 /// swap an epoch. Each round reads the authority's listing through the
 /// driver's client, under the client's `Issuer::Cascade` mint, bounded by one
 /// retry interval, then asks the listed workers through the port. It also
@@ -282,6 +283,14 @@ pub(crate) fn others_listed(
 /// it reads the epoch, at most once a retry interval, until the node is told.
 pub(crate) struct Rejoin<'a, P> {
     search: SearchRounds,
+    /// The incarnation of the shard the node belongs to: a hint of another is
+    /// passed over.
+    shard_id: ShardId,
+    /// The latest hint answered that is of this shard and no older than the
+    /// floor, which the round asks first.
+    hint: Option<LeaderHint>,
+    /// The hint read asked and not yet answered.
+    hint_read: Option<ReplyToken>,
     port: P,
     /// The floor of the last listing's answer, for a round that asks the seeds
     /// alone.
@@ -345,6 +354,9 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
     ) -> Self {
         Rejoin {
             search: SearchRounds::for_rejoin(shard_id, my_id, seeds),
+            shard_id: shard_id.clone(),
+            hint: None,
+            hint_read: None,
             port,
             floor: JoinFloor::none(),
             retry_interval,
@@ -441,6 +453,9 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                 if self.reads_epoch {
                     self.ask_epoch(client, sent_at, now);
                 }
+                if self.hint_read.is_none() {
+                    self.hint_read = client.ask(AuthorityRequest::ReadLeaderHint, sent_at);
+                }
             }
             // Busy with a call this rejoin did not ask.
             None => self.end_round_unanswered(now),
@@ -517,6 +532,25 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         now: Instant,
         floor: JoinFloor,
     ) -> Option<(ReplyToken, ShardRecord)> {
+        if reply.token().kind == CallKind::ReadLeaderHint {
+            // The hint read of this rejoin sets the hint; any other (one given
+            // up on) only frees its kind.
+            if self.hint_read == Some(reply.token()) {
+                self.hint_read = None;
+                self.hint = match reply {
+                    AuthorityReply::LeaderHint {
+                        result: Ok(Some(hint)),
+                        ..
+                    } if hint.shard_id == self.shard_id
+                        && floor.epoch().is_none_or(|floor| hint.recovery_epoch >= floor) =>
+                    {
+                        Some(hint)
+                    }
+                    _ => None,
+                };
+            }
+            return None;
+        }
         if let Some(read) = self.epoch_read
             && read.token == reply.token()
         {
@@ -565,7 +599,7 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                 self.next_round_at = None;
                 self.floor = floor;
                 let peers = self.search.others_in(&registrations);
-                let mut addresses = self.search.to_ask(None, &peers);
+                let mut addresses = self.search.to_ask(self.hint.as_ref(), &peers);
                 let seeds = self.search.seeds().to_vec();
                 for seed in seeds {
                     if !addresses.contains(&seed) {
