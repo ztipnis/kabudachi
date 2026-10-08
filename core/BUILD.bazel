@@ -12,7 +12,7 @@ rust_library(
     crate_name = "kabudachi_core",
     edition = "2024",
     deps = all_crate_deps(normal = True) + ["//proto:kabudachi_prost"],
-    visibility = ["//bindings:__pkg__", "//net:__pkg__", "//testkit:__pkg__"],
+    visibility = ["//bindings:__pkg__", "//net:__pkg__", "//redis_authority:__pkg__", "//testkit:__pkg__"],
 )
 
 # One integration-test binary for core, with a module per area under

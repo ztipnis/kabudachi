@@ -6,6 +6,9 @@ module(
 # --- Rust toolchain ---
 bazel_dep(name = "rules_rust", version = "0.74.0")
 
+# Test-only: every Redis-backed test starts its own valkey server.
+bazel_dep(name = "valkey", version = "7.2.13", dev_dependency = True)
+
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
@@ -34,7 +37,7 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
-    manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml", "//net:Cargo.toml", "//testkit:Cargo.toml"],
+    manifests = ["//:Cargo.toml", "//core:Cargo.toml", "//bindings:Cargo.toml", "//proto:Cargo.toml", "//net:Cargo.toml", "//testkit:Cargo.toml", "//redis_authority:Cargo.toml", "//redis_authority:tests/support/Cargo.toml"],
 )
 
 # PyO3 builds the extension against Python's stable ABI (the `abi3-py312`

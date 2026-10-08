@@ -13,7 +13,7 @@ rust_library(
     edition = "2024",
     testonly = True,
     deps = all_crate_deps(normal = True) + ["//core"],
-    visibility = ["//core:__pkg__", "//net:__pkg__"],
+    visibility = ["//core:__pkg__", "//net:__pkg__", "//redis_authority:__pkg__"],
 )
 
 rust_test(

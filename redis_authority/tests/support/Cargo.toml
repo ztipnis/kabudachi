@@ -1,0 +1,14 @@
+[package]
+name = "kabudachi-valkey-test-support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "valkey_test_support"
+path = "lib.rs"
+
+[dependencies]
+kabudachi-redis-authority = { path = "../.." }
+redis = { version = "1.7", default-features = false }
+tempfile = "3"
