@@ -216,7 +216,7 @@ pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
 use crate::reconcile::codec::ReconcileCodec;
 use crate::steal::codec::StealCodec;
-use crate::swarm::{Behaviour, BehaviourEvent, build_swarm};
+use crate::swarm::{Behaviour, BehaviourEvent, build_swarm, hide_listen_addresses};
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_store::{HeldRecords, record_key};
 
@@ -270,6 +270,10 @@ enum Command {
     ListenOn {
         addr: Multiaddr,
         respond_to: oneshot::Sender<Multiaddr>,
+    },
+    /// See `Net::set_external_address`.
+    SetExternalAddress {
+        address: Multiaddr,
     },
     /// See `Net::get_record`.
     GetRecord {
@@ -587,14 +591,14 @@ impl Net {
         retention: Option<kabudachi_core::time::Duration>,
     ) -> Self {
         let held = HeldRecords::new(retention);
-        let swarm = build_swarm(records_shard.as_ref(), held.clone());
+        let (swarm, identify_config) = build_swarm(records_shard.as_ref(), held.clone());
         let local_worker_id = WorkerId::new(swarm.local_peer_id().to_string());
         let (commands, command_rx) = mpsc::unbounded_channel();
         let inbound = Arc::new(Inbound::default());
         let (local_addr_tx, local_addr) = watch::channel(None);
         let peers = Peers::new(local_addr_tx, redial_policy);
 
-        let driver = tokio::spawn(drive(swarm, command_rx, inbound.clone(), peers));
+        let driver = tokio::spawn(drive(swarm, identify_config, command_rx, inbound.clone(), peers));
 
         Self {
             local_worker_id,
@@ -662,6 +666,16 @@ impl Net {
             })
             .map_err(|_| ListenRejected(addr.clone()))?;
         response.await.map_err(|_| ListenRejected(addr))
+    }
+
+    /// Gives `address` as this node's own from now on: in its registration,
+    /// its leader hint, the JOIN pointers it hands out and its message stamps,
+    /// in place of any address it listens on, and to the peers that connect
+    /// to it through Identify, which then names no listen address. For a node
+    /// behind NAT or bound to a wildcard. Send before listening and before
+    /// any connection, so no listen address is ever given.
+    pub fn set_external_address(&self, address: Multiaddr) {
+        let _ = self.commands.send(Command::SetExternalAddress { address });
     }
 
     /// Fire-and-forget dial: initiates a connection attempt and returns
@@ -1214,6 +1228,7 @@ fn gossip_of(swarm: &Swarm<Behaviour>) -> Observation<'static> {
 /// observation of that iteration carries the reading.
 async fn drive(
     mut swarm: Swarm<Behaviour>,
+    identify_config: identify::Config,
     mut commands: mpsc::UnboundedReceiver<Command>,
     inbound: Arc<Inbound>,
     mut peers: Peers,
@@ -1229,7 +1244,7 @@ async fn drive(
                     return; // Every Net handle for this swarm was dropped.
                 };
                 let now = Instant::now();
-                handle_command(&mut swarm, command, &mut pending, &inbound, &mut peers, now);
+                handle_command(&mut swarm, &identify_config, command, &mut pending, &inbound, &mut peers, now);
                 now
             }
             event = swarm.select_next_some() => {
@@ -1266,6 +1281,7 @@ async fn drive(
 
 fn handle_command(
     swarm: &mut Swarm<Behaviour>,
+    identify_config: &identify::Config,
     command: Command,
     pending: &mut Pending,
     inbound: &Inbound,
@@ -1360,6 +1376,11 @@ fn handle_command(
             // On error, dropping `respond_to` closes the channel;
             // `Net::listen_on`'s awaiter observes that as a panic with a
             // message pointing at the cause.
+        }
+        Command::SetExternalAddress { address } => {
+            hide_listen_addresses(swarm, identify_config);
+            swarm.add_external_address(address.clone());
+            peers.observe(Observation::ExternalAddress(address), now);
         }
         Command::Exchange(run) => run(swarm, &mut pending.exchanges),
         Command::WithPeers(read) => read(peers),

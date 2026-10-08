@@ -280,8 +280,15 @@ fn records_behaviour(
 /// lives for one process incarnation (see `crate::worker`'s "One identity
 /// per process"). Only `crate::messenger::Net` builds a swarm, so no caller
 /// can hand one a reused identity.
-pub(crate) fn build_swarm(shard: Option<&ShardName>, held: HeldRecords) -> Swarm<Behaviour> {
-    libp2p::SwarmBuilder::with_new_identity()
+///
+/// Also returns the `identify` configuration it built the swarm's `identify`
+/// with, for [`hide_listen_addresses`].
+pub(crate) fn build_swarm(
+    shard: Option<&ShardName>,
+    held: HeldRecords,
+) -> (Swarm<Behaviour>, identify::Config) {
+    let mut identify_config = None;
+    let swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_other_transport(|key| {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
@@ -304,8 +311,12 @@ pub(crate) fn build_swarm(shard: Option<&ShardName>, held: HeldRecords) -> Swarm
             // is what a `JOIN_RESPONSE` hands a joining node, so a five-minute
             // staleness window is a real correctness cost, not a cosmetic one.
             identify: identify::Behaviour::new(
-                identify::Config::new(IDENTIFY_PROTOCOL_VERSION.to_string(), key.public())
-                    .with_push_listen_addr_updates(true),
+                identify_config
+                    .insert(
+                        identify::Config::new(IDENTIFY_PROTOCOL_VERSION.to_string(), key.public())
+                            .with_push_listen_addr_updates(true),
+                    )
+                    .clone(),
             ),
             gossipsub: gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
@@ -382,5 +393,17 @@ pub(crate) fn build_swarm(shard: Option<&ShardName>, held: HeldRecords) -> Swarm
         })
         .expect("behaviour construction never fails")
         .with_swarm_config(|config| config.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
-        .build()
+        .build();
+    (swarm, identify_config.expect("the behaviour was built"))
+}
+
+/// Makes `swarm`'s `identify` advertise the swarm's external addresses and
+/// no listen address, for a node whose listen addresses others cannot reach
+/// (see `crate::messenger::Net::set_external_address`). `identify` takes
+/// this only at construction, so this builds it anew from `config` (the one
+/// [`build_swarm`] returned): call it before the swarm listens or connects,
+/// when `identify` has nothing to lose.
+pub(crate) fn hide_listen_addresses(swarm: &mut Swarm<Behaviour>, config: &identify::Config) {
+    swarm.behaviour_mut().identify =
+        identify::Behaviour::new(config.clone().with_hide_listen_addrs(true));
 }

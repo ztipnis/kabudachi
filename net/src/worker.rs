@@ -70,6 +70,10 @@ pub struct WorkerConfig {
     pub shard_name: ShardName,
     /// The address the worker listens on, such as `/ip4/0.0.0.0/tcp/4001`.
     pub listen_on: Multiaddr,
+    /// The address other workers reach this one at, when it is not the one it
+    /// listens on (a wildcard bind, NAT, a container port mapping). `None`
+    /// gives the listen address.
+    pub external_address: Option<Multiaddr>,
     /// Workers to ask who leads the shard. Empty for none.
     pub seeds: Vec<Multiaddr>,
     /// The shard's coordination authority; `None` for none.
@@ -118,6 +122,7 @@ impl WorkerConfig {
         WorkerConfig {
             shard_name,
             listen_on,
+            external_address: None,
             seeds: Vec::new(),
             authority: None,
             election_timings,
@@ -129,6 +134,14 @@ impl WorkerConfig {
             replication_factor: ReplicationFactor::DEFAULT,
             result_ttl: None,
         }
+    }
+
+    /// Gives `address` as the one others reach this worker at, in place of the
+    /// address it listens on.
+    #[must_use]
+    pub fn with_external_address(mut self, address: Multiaddr) -> Self {
+        self.external_address = Some(address);
+        self
     }
 
     #[must_use]
@@ -212,6 +225,9 @@ impl Worker {
             Some(limit) => net.with_input_limit(limit),
             None => net,
         });
+        if let Some(address) = &config.external_address {
+            net.set_external_address(address.clone());
+        }
         net.try_listen_on(config.listen_on.clone()).await?;
         Ok(Worker { net, config })
     }
@@ -221,8 +237,8 @@ impl Worker {
         self.net.local_worker_id()
     }
 
-    /// The address this worker gives other workers to reach it (see
-    /// `Net::local_multiaddr`).
+    /// The address this worker gives other workers to reach it: the external
+    /// address if one was given (see `Net::local_multiaddr`).
     pub fn address(&self) -> Option<Multiaddr> {
         self.net.local_multiaddr()
     }

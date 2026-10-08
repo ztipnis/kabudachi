@@ -114,7 +114,8 @@
 //! joiners when it leads (`Net::local_multiaddr`), follows the same rule: a
 //! node listening on a wildcard bind is told one listen address per
 //! interface, in no set order, and a later one replaces the recorded one
-//! unless it would swap a non-loopback address for loopback.
+//! unless it would swap a non-loopback address for loopback, unless the node
+//! was given an external address, which is the only one it gives.
 //!
 //! Best-effort, deliberately: on a multi-homed host the chosen address may
 //! be one the particular asking peer cannot route to — a general
@@ -349,6 +350,9 @@ pub(crate) enum Observation<'a> {
     /// The swarm reported a listen address (a wildcard bind reports one per
     /// interface).
     ListeningOn(Multiaddr),
+    /// The address configured for others to reach this node, which no listen
+    /// address replaces.
+    ExternalAddress(Multiaddr),
     /// A connection to `peer` opened; `address` is
     /// `ConnectedPoint::get_remote_address`.
     ConnectionOpened {
@@ -393,6 +397,9 @@ pub(crate) struct Peers {
     addresses: BTreeMap<PeerId, KnownAddress>,
     /// The address this node gives other nodes for itself.
     local_addr: watch::Sender<Option<Multiaddr>>,
+    /// Whether `local_addr` is a configured external address, which no listen
+    /// address replaces.
+    external: bool,
     redial: RedialTracker,
     /// The connected peers whose subscription to this node's shard topic has
     /// reached it.
@@ -412,6 +419,7 @@ impl Peers {
             connected: BTreeSet::new(),
             addresses: BTreeMap::new(),
             local_addr: own_address,
+            external: false,
             redial: RedialTracker::new(policy),
             subscribers: BTreeSet::new(),
             mesh: BTreeSet::new(),
@@ -423,6 +431,11 @@ impl Peers {
     /// Takes one observation. The only way the book changes.
     pub(crate) fn observe(&mut self, observation: Observation<'_>, now: Instant) {
         match observation {
+            Observation::ExternalAddress(address) => {
+                self.external = true;
+                self.local_addr.send_replace(Some(address));
+            }
+            Observation::ListeningOn(_) if self.external => {}
             Observation::ListeningOn(address) => {
                 // A later address replaces the recorded one unless that would
                 // swap a non-loopback address for loopback.

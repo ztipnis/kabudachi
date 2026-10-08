@@ -264,3 +264,88 @@ async fn a_leader_bound_to_every_interface_points_joiners_at_an_address_they_can
     })
     .await
 }
+
+// A worker behind a wildcard bind or NAT is reached at an address it cannot
+// see from its sockets. Given one, it registers it with the authority,
+// publishes it in its leader hint, points joiners at it, and tells the peers
+// that connect to it no other address (a listen address behind NAT is one
+// they would redial in vain).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_given_an_external_address_registers_hints_and_points_joiners_at_it() {
+    within_deadline(async {
+        let authority = warmed_up_authority().await;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let listen: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}").parse().expect("valid");
+        let external: Multiaddr = format!("/ip4/127.0.0.2/tcp/{port}")
+            .parse()
+            .expect("valid");
+        let config = worker_config(shard(), &listen.to_string(), timings(), vec![])
+            .with_external_address(external.clone());
+        let mut leader = crate::support::worker::spawn_worker(with_in_memory_authority(
+            config,
+            authority.clone(),
+        ))
+        .await;
+        let seen = leader
+            .wait_until(|seen| seen.state == WorkerState::Leader)
+            .await;
+        let name = name_of(&shard());
+
+        poll_until("the leader registered at its external address", || {
+            authority
+                .live_registrations(&name, &seen.shard_id)
+                .expect("the in-memory authority is always reachable")
+                .addresses()
+                .get(&leader.id)
+                == Some(&external.to_string())
+        })
+        .await;
+        poll_until("the leader hinted its external address", || {
+            authority
+                .read_leader_hint(&name)
+                .expect("the in-memory authority is always reachable")
+                .is_some_and(|hint| hint.address == external.to_string())
+        })
+        .await;
+        let asking_net = Net::new();
+        let search = timeout(
+            TEST_TIMEOUT,
+            ask_for_leader(
+                &asking_net,
+                std::slice::from_ref(&listen),
+                JoinFloor::none(),
+                PER_PEER_TIMEOUT,
+                GRACE,
+            ),
+        )
+        .await
+        .expect("the leader answered within the timeout");
+        let LeaderSearch::Found(pointer) = search else {
+            panic!("the leader gave no pointer: {search:?}");
+        };
+        assert_eq!(pointer.leader_multiaddr, external.to_string());
+
+        // Identify tells a connecting peer the external address and no listen
+        // address. Which of several advertised addresses a peer takes is
+        // arbitrary, so several fresh peers must each take the external one.
+        let peer: libp2p::PeerId = leader.id.as_str().parse().expect("a worker id is a peer id");
+        let dial_address = listen.clone().with(Protocol::P2p(peer));
+        let askers: Vec<Net> = (0..6).map(|_| Net::new()).collect();
+        for asker in &askers {
+            asker.dial(dial_address.clone());
+        }
+        for asker in &askers {
+            timeout(TEST_TIMEOUT, async {
+                while asker.diagnostics().await.peer_addresses.get(&leader.id) != Some(&external) {
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a connecting peer learned the leader's external address from Identify");
+        }
+    })
+    .await
+}
