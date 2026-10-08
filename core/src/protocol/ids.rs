@@ -55,6 +55,22 @@ id_newtype!(
     ShardId
 );
 
+impl ShardId {
+    /// A new id for an incarnation of the shard `name`: the name, a `/`, and a
+    /// UUIDv7. Every founding mints one, so two foundings under one name
+    /// never share an id.
+    pub fn mint(name: &ShardName) -> ShardId {
+        ShardId(format!("{name}/{}", uuid::Uuid::now_v7()))
+    }
+
+    /// The name this id is an incarnation of: the id up to its last `/`. An
+    /// id with no `/` was not minted and names itself.
+    pub fn name(&self) -> ShardName {
+        let name = self.0.rsplit_once('/').map_or(self.0.as_str(), |(name, _)| name);
+        ShardName::new(name)
+    }
+}
+
 /// The name an operator gives a shard. It never changes: it names the shard's
 /// gossip topic and its key space at the coordination authority. Each
 /// incarnation of the shard under that name has its own [`ShardId`].

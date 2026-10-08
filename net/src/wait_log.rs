@@ -2,7 +2,7 @@
 //! join, and the log that says so.
 
 use kabudachi_core::coordination_authority::AuthorityError;
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardName, WorkerId};
 
 /// Why a round of the cascade, or of a rejoin, found no leader to join.
 #[derive(Debug, PartialEq)]
@@ -43,15 +43,15 @@ pub(crate) enum WaitReason {
 /// appears, or changes, and at `debug` in each later round that repeats it
 /// unchanged, so a worker that waits for hours does not warn every round.
 pub(crate) struct WaitLog {
-    shard_id: ShardId,
+    shard: ShardName,
     previous_round: Vec<WaitReason>,
     this_round: Vec<WaitReason>,
 }
 
 impl WaitLog {
-    pub(crate) fn new(shard_id: &ShardId) -> Self {
+    pub(crate) fn new(shard: &ShardName) -> Self {
         Self {
-            shard_id: shard_id.clone(),
+            shard: shard.clone(),
             previous_round: Vec::new(),
             this_round: Vec::new(),
         }
@@ -64,7 +64,7 @@ impl WaitLog {
 
     pub(crate) fn log(&mut self, reason: WaitReason) {
         let repeated = self.repeats(&reason);
-        log_wait_reason(&self.shard_id, &reason, repeated);
+        log_wait_reason(&self.shard, &reason, repeated);
         self.this_round.push(reason);
     }
 
@@ -86,8 +86,8 @@ macro_rules! log_at_level_or_debug {
     };
 }
 
-fn log_wait_reason(shard_id: &ShardId, reason: &WaitReason, repeated: bool) {
-    let shard = shard_id.as_str();
+fn log_wait_reason(shard: &ShardName, reason: &WaitReason, repeated: bool) {
+    let shard = shard.as_str();
     match reason {
         WaitReason::AuthorityUnreachable(error) => log_at_level_or_debug!(
             repeated,

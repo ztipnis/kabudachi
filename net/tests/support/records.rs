@@ -169,7 +169,7 @@ impl Voters {
     /// voters, so that with fewer than `count` of them, voters differ in what
     /// they hold.
     pub async fn start_with(count: usize, replication_factor: ReplicationFactor) -> (Voters, Net) {
-        let claimant = Net::for_shard(ShardId::new(SHARD), None);
+        let claimant = Net::for_shard(ShardId::new(SHARD).name(), None);
         let shard = Self::meshed(count, replication_factor, Some(&claimant)).await;
         (shard, claimant)
     }
@@ -552,7 +552,7 @@ fn host(shard: ShardId) -> (Net, Hosting) {
             .expect("a runtime to host a net");
         runtime.block_on(async {
             sender
-                .send(Net::for_shard(shard, None))
+                .send(Net::for_shard(shard.name(), None))
                 .expect("the fixture is waiting for the net");
             // The swarm's task runs whenever this yields.
             while !stopped.load(Ordering::SeqCst) {

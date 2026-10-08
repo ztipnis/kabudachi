@@ -31,7 +31,7 @@ pub fn epoch(number: u64) -> RecoveryEpoch {
 
 /// The name a shard identified by `shard_id` lives under: the same string.
 pub fn name_of(shard_id: &ShardId) -> ShardName {
-    ShardName::new(shard_id.as_str())
+    shard_id.name()
 }
 
 /// The epoch the authority holds under `shard_id`'s name.

@@ -139,9 +139,9 @@ fn claimed_tasks(response: Result<ClaimResponse, ClaimFailure>) -> Vec<TaskId> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_members_claim_from_the_leader_their_nodes_name() {
     within_deadline(async {
-        let net_a = Net::for_shard(ShardId::new(SHARD), None);
-        let net_b = Net::for_shard(ShardId::new(SHARD), None);
-        let net_c = Net::for_shard(ShardId::new(SHARD), None);
+        let net_a = Net::for_shard(ShardId::new(SHARD).name(), None);
+        let net_b = Net::for_shard(ShardId::new(SHARD).name(), None);
+        let net_c = Net::for_shard(ShardId::new(SHARD).name(), None);
         let worker_a = net_a.local_worker_id();
         let seed = timeout(
             TEST_TIMEOUT,

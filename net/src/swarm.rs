@@ -79,7 +79,7 @@
 //! A worker that serves a shard (`crate::messenger::Net::for_shard`) runs a
 //! second `kad` behaviour, `records`, whose record store is the shard's Task
 //! record store (`crate::task_store`). It speaks its own protocol,
-//! `/kabudachi/<shard>/records/1`, so a record written by one shard's leader
+//! `/kabudachi/<name>/records/1`, so a record written by one shard's leader
 //! can only land at a worker of that shard, whereas the routing `kad` keeps
 //! its shared protocol: a per-shard protocol there would cut routing, and the
 //! JOIN that crawls through it, off from every peer of another shard. It
@@ -96,7 +96,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardName, WorkerId};
 use libp2p::core::transport::{
     DialOpts, ListenerId, PortUse, Transport, TransportError, TransportEvent,
 };
@@ -247,10 +247,10 @@ impl Transport for NewPortTcp {
 /// expires by its own timer (the store drops finished records itself).
 fn records_behaviour(
     local: PeerId,
-    shard: &ShardId,
+    shard: &ShardName,
     held: HeldRecords,
 ) -> kad::Behaviour<TaskRecordStore> {
-    let protocol = StreamProtocol::try_from_owned(format!("/kabudachi/{}/records/1", shard.as_str()))
+    let protocol = StreamProtocol::try_from_owned(format!("/kabudachi/{shard}/records/1"))
         .expect("a protocol name that starts with '/' is valid");
     let mut config = kad::Config::new(protocol);
     config
@@ -280,7 +280,7 @@ fn records_behaviour(
 /// lives for one process incarnation (see `crate::worker`'s "One identity
 /// per process"). Only `crate::messenger::Net` builds a swarm, so no caller
 /// can hand one a reused identity.
-pub(crate) fn build_swarm(shard: Option<&ShardId>, held: HeldRecords) -> Swarm<Behaviour> {
+pub(crate) fn build_swarm(shard: Option<&ShardName>, held: HeldRecords) -> Swarm<Behaviour> {
     libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_other_transport(|key| {

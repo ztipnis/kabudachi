@@ -103,7 +103,7 @@ impl SearchRounds {
             round: 0,
             shard_exists: false,
             listed: Vec::new(),
-            log: WaitLog::new(shard_id),
+            log: WaitLog::new(&shard_id.name()),
         }
     }
 
@@ -115,7 +115,7 @@ impl SearchRounds {
             round: 0,
             shard_exists: true,
             listed: Vec::new(),
-            log: WaitLog::new(shard_id),
+            log: WaitLog::new(&shard_id.name()),
         }
     }
 

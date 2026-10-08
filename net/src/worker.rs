@@ -212,7 +212,7 @@ impl Worker {
     /// (see this module's "One identity per process"), and listens on
     /// `config.listen_on`, or fails if it cannot.
     pub async fn start(config: WorkerConfig) -> Result<Worker, ListenRejected> {
-        let net = Net::for_shard(config.shard_id(), retention_of(&config));
+        let net = Net::for_shard(config.shard_name.clone(), retention_of(&config));
         let net = Arc::new(match config.input_limit {
             Some(limit) => net.with_input_limit(limit),
             None => net,
