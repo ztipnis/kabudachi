@@ -107,7 +107,8 @@ pub(crate) enum AuthorityVerdict {
     },
     /// The fence came: lead the recovered roster.
     Lead(Roster),
-    /// The recovery epoch is gone: the shard is abandoned.
+    /// The shard is gone: the authority holds no record of it, or a record of
+    /// another incarnation. The shard is abandoned.
     Abandon,
     LoseQuorum,
     SuspectAgain,

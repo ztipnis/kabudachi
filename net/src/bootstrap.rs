@@ -486,7 +486,7 @@ pub(crate) enum Decision {
         hinted: Option<LeaderHint>,
         listed: BTreeMap<WorkerId, String>,
     },
-    /// This worker won the shard's recovery epoch (see
+    /// This worker won the shard's record (see
     /// [`AuthorityRound::OwnershipWon`]); the incarnation is the one the
     /// client serves.
     OwnershipWon {

@@ -46,7 +46,7 @@ pub enum AuthorityRequest {
     Register,
     /// Read the shard's live registrations.
     ReadLiveRegistrations,
-    /// Read the shard's recovery epoch.
+    /// Read the shard's record: its epoch, and the incarnation it names.
     ReadRecoveryEpoch,
     /// Compare-and-swap the shard's recovery epoch from `expected` to `new`.
     SwapRecoveryEpoch {
