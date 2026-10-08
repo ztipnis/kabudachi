@@ -1,7 +1,13 @@
 //! A [`CoordinationAuthority`](kabudachi_core::coordination_authority::CoordinationAuthority)
 //! over Redis or Valkey.
 
+mod authority;
 mod config;
+mod connection;
+mod keys;
+mod view;
+
+pub use authority::RedisAuthority;
 
 pub use config::{ConfigError, DEFAULT_TTL, RedisAuthorityConfig};
 
@@ -22,19 +28,3 @@ pub const COMMANDS: &[&str] = &[
     "select",
     "cluster|slots",
 ];
-
-pub struct RedisAuthority {
-    #[allow(dead_code)]
-    config: RedisAuthorityConfig,
-    #[allow(dead_code)]
-    urls: Vec<String>,
-}
-
-impl RedisAuthority {
-    /// Checks `config` and opens no connection: a worker that starts while
-    /// the server is down gets `Unavailable` from its calls, as in any outage.
-    pub fn connect(config: RedisAuthorityConfig) -> Result<Self, ConfigError> {
-        let urls = config.validated_urls()?;
-        Ok(Self { config, urls })
-    }
-}
