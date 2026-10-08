@@ -12,7 +12,7 @@ use kabudachi_core::coordination_authority::{
 use kabudachi_core::election::CallKind;
 use kabudachi_core::in_memory_authority::InMemoryAuthority;
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
-use kabudachi_core::time::{Clock, Duration, Instant};
+use kabudachi_core::time::{Clock, Duration};
 
 /// One worker's connection to a shared `InMemoryAuthority`, with faults a
 /// test can switch on for that worker alone, and an outage it can switch on
@@ -88,29 +88,19 @@ struct Slot {
     panics: bool,
 }
 
-/// What every handle reaches. `flush` swaps `current` for a fresh authority,
-/// so the clock and TTL to build one are kept beside it.
+/// What every handle reaches.
 ///
-/// Lock order: `current` first, then `availability` or a handle's `faults`,
-/// one at a time. An operation reads the faults and the outage while it
-/// holds `current`, and every switch that changes them takes `current`
+/// Lock order: `authority` first, then `down` or a handle's `faults`, one
+/// at a time. An operation reads the faults and the outage while it holds
+/// `authority`, and every switch that changes them takes `authority`
 /// first. So a switch cannot land between an operation's check and its
 /// action: once `set_available(false)` returns, no operation reaches the
 /// authority, and once `set_reachable(false)` returns, none through that
 /// handle does.
 struct SharedAuthority<C> {
-    clock: C,
-    ttl: Duration,
-    current: Mutex<InMemoryAuthority<C>>,
-    availability: Mutex<Availability>,
-}
-
-/// Whether the whole authority is up. The default is up, with no outage.
-#[derive(Default)]
-struct Availability {
-    down: bool,
-    /// When the authority last came back from an outage.
-    back_up_at: Option<Instant>,
+    authority: Mutex<InMemoryAuthority<C>>,
+    /// Whether the whole authority is down.
+    down: Mutex<bool>,
 }
 
 /// One connection's faults. The default is a healthy connection.
@@ -146,13 +136,10 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// last `ttl` on `clock`. It starts warming up at `clock`'s current
     /// reading.
     pub fn new(clock: C, ttl: Duration) -> Self {
-        let authority = InMemoryAuthority::new(clock.clone(), ttl);
         Self {
             shared: Arc::new(SharedAuthority {
-                clock,
-                ttl,
-                current: Mutex::new(authority),
-                availability: Mutex::new(Availability::default()),
+                authority: Mutex::new(InMemoryAuthority::new(clock, ttl)),
+                down: Mutex::new(false),
             }),
             faults: Arc::new(Mutex::new(Faults::default())),
             gate: new_gate(),
@@ -174,7 +161,7 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// While unreachable, every operation through this handle (and its
     /// clones) returns `Unavailable` and leaves the authority untouched.
     pub fn set_reachable(&self, reachable: bool) {
-        let _operations_paused = lock(&self.shared.current);
+        let _operations_paused = lock(&self.shared.authority);
         self.faults().unreachable = !reachable;
     }
 
@@ -194,13 +181,13 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// register again must not pass for the whole shard. Making an available
     /// authority available changes nothing.
     pub fn set_available(&self, available: bool) {
-        let _operations_paused = lock(&self.shared.current);
-        let mut availability = lock(&self.shared.availability);
+        let authority = lock(&self.shared.authority);
+        let mut down = lock(&self.shared.down);
         if !available {
-            availability.down = true;
-        } else if availability.down {
-            availability.down = false;
-            availability.back_up_at = Some(self.shared.clock.now());
+            *down = true;
+        } else if *down {
+            *down = false;
+            authority.back_from_outage();
         }
     }
 
@@ -209,7 +196,7 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// `new` lands just before it, so the caller gets
     /// `EpochConflict { current: Some(new) }`.
     pub fn lose_next_race(&self) {
-        let _operations_paused = lock(&self.shared.current);
+        let _operations_paused = lock(&self.shared.authority);
         self.faults().lose_next_race = true;
     }
 
@@ -305,8 +292,7 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// clock's current reading. Each handle's faults, and whether the authority
     /// is down, are kept.
     pub fn flush(&self) {
-        let fresh = InMemoryAuthority::new(self.shared.clock.clone(), self.shared.ttl);
-        *lock(&self.shared.current) = fresh;
+        lock(&self.shared.authority).flush();
     }
 
     fn faults(&self) -> MutexGuard<'_, Faults> {
@@ -317,21 +303,13 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// the authority is down. The caller keeps the authority locked until it
     /// is done, so no fault can change under it.
     fn reach(&self) -> Result<MutexGuard<'_, InMemoryAuthority<C>>, AuthorityError> {
-        let authority = lock(&self.shared.current);
+        let authority = lock(&self.shared.authority);
         let unreachable = self.faults().unreachable;
-        let down = lock(&self.shared.availability).down;
+        let down = *lock(&self.shared.down);
         if unreachable || down {
             return Err(AuthorityError::Unavailable);
         }
         Ok(authority)
-    }
-
-    /// Whether less than one TTL has passed since the authority last came
-    /// back from an outage.
-    fn warming_up_after_outage(&self) -> bool {
-        lock(&self.shared.availability)
-            .back_up_at
-            .is_some_and(|back_up_at| self.shared.clock.now() - back_up_at < self.shared.ttl)
     }
 }
 
@@ -354,14 +332,7 @@ impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
 
     fn live_registrations(&self, shard_id: &ShardId) -> Result<LiveRegistrations, AuthorityError> {
         self.pass_gate(CallKind::ReadLiveRegistrations);
-        let authority = self.reach()?;
-        let live = authority.live_registrations(shard_id)?;
-        // The in-memory authority below warms up only from its construction
-        // or a flush, so the warm-up after an outage is applied here.
-        if self.warming_up_after_outage() {
-            return Ok(LiveRegistrations::new(live.addresses().clone(), false));
-        }
-        Ok(live)
+        self.reach()?.live_registrations(shard_id)
     }
 
     fn read_recovery_epoch(
