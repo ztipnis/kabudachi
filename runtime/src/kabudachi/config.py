@@ -82,6 +82,12 @@ class Settings:
     """The modules a task process imports to find its tasks. `None` imports
     every module that declared a task in this process."""
 
+    max_runs_per_process: int | None = None
+    """How many runs a task process takes before a fresh one replaces it,
+    which bounds what bodies leak (memory, global state). The process takes
+    no run past the limit, finishes the ones it has and exits; nothing it
+    runs is cut short. `None` never replaces a process for this."""
+
     process_start_timeout: timedelta = timedelta(seconds=60)
     """How long a task process has, from its start, to import its modules
     and say it is ready, before it is killed. `KABUDACHI_PROCESS_START_TIMEOUT`
@@ -149,6 +155,15 @@ class Settings:
                 raise ValueError(complaint)
             # Frozen: a list given by the caller is kept as a tuple.
             object.__setattr__(self, "imports", modules)
+        if self.max_runs_per_process is not None and (
+            not isinstance(self.max_runs_per_process, int)
+            or isinstance(self.max_runs_per_process, bool)
+            or self.max_runs_per_process <= 0
+        ):
+            raise ValueError(
+                "max_runs_per_process must be a positive integer or None, "
+                f"not {self.max_runs_per_process!r}"
+            )
         if (
             not isinstance(self.result_ttl, int)
             or isinstance(self.result_ttl, bool)
@@ -213,6 +228,8 @@ def _parse(value_type: Any, raw: str) -> Any:
     if value_type == tuple[str, ...] | None:
         modules = tuple(part.strip() for part in raw.split(",") if part.strip())
         return modules or None  # an empty value is "not set", not "no modules"
+    if value_type == int | None:
+        return int(raw)
     return raw
 
 
@@ -283,7 +300,8 @@ def configure(**settings: Any) -> None:
     the number of tasks one process runs at once, `concurrency_override` to
     allow `concurrency` above 32, `imports`, the modules task processes import
     to find tasks (by default every module that declared one),
-    `process_start_timeout`, the timedelta a task process has to become
+    `max_runs_per_process`, how many runs a task process takes before a fresh
+    one replaces it (no limit by default), `process_start_timeout`, the timedelta a task process has to become
     ready, `queue`, the queue tasks are sent to unless they name their own,
     `result_ttl`, the seconds a finished task is kept, `cancel_grace`, the
     timedelta a task past its timeout has to stop, and `memory_soft_limit` and
@@ -292,7 +310,7 @@ def configure(**settings: Any) -> None:
     `BackpressureError`); `KABUDACHI_<NAME>`
     in the environment sets each too, below what is configured here. A
     setting a task makes for itself always wins over these. `concurrency`,
-    `processes`, `imports`, `process_start_timeout`, the memory limits and
+    `processes`, `imports`, `max_runs_per_process`, `process_start_timeout`, the memory limits and
     `result_ttl` are read when `run()` starts, so changing them during a run
     has no effect on that run.
 

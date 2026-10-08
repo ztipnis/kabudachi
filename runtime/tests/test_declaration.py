@@ -188,6 +188,7 @@ BAD_OPTIONS = (
     + [("retries", bad, "retries") for bad in [-1, True, 1.5, "2", None]]
     + [("timeout", bad, "timeout") for bad in [timedelta(0), timedelta(seconds=-1), 5, "5s", True]]
     + [("cancel_grace", bad, "cancel_grace") for bad in [timedelta(seconds=-1), 5, "5s", None, True]]
+    + [("recycle_process", bad, "recycle_process") for bad in ["yes", 1, None]]
 )
 
 
@@ -686,6 +687,8 @@ def test_an_unknown_setting_is_refused():
         ({"concurrency": 33}, "concurrency_override"),
         ({"imports": "app.tasks"}, "imports"),
         ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
+        ({"max_runs_per_process": 0}, "max_runs_per_process"),
+        ({"max_runs_per_process": True}, "max_runs_per_process"),
     ],
 )
 def test_an_invalid_value_is_refused_and_changes_nothing(settings, refused):
@@ -800,12 +803,17 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_CONCURRENCY_OVERRIDE", "true")
     monkeypatch.setenv("KABUDACHI_IMPORTS", "app.tasks, app.more_tasks")
     monkeypatch.setenv("KABUDACHI_PROCESS_START_TIMEOUT", "2.5")
+    monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "50")
     configuration = Configuration()
 
-    assert [
-        configuration.resolve(name)
-        for name in ("processes", "concurrency", "imports", "process_start_timeout")
-    ] == [2, 40, ("app.tasks", "app.more_tasks"), timedelta(seconds=2.5)]
+    names = ("processes", "concurrency", "imports", "process_start_timeout", "max_runs_per_process")
+    assert [configuration.resolve(name) for name in names] == [
+        2,
+        40,
+        ("app.tasks", "app.more_tasks"),
+        timedelta(seconds=2.5),
+        50,
+    ]
 
     monkeypatch.setenv("KABUDACHI_IMPORTS", "")
     assert Configuration().resolve("imports") is None
