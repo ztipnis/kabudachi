@@ -92,6 +92,7 @@ use crate::task_record::{
 };
 use crate::time::{Clock, Duration, Instant, WallTime};
 
+mod backlog;
 mod compaction;
 mod memory_budget;
 mod observer;
@@ -99,6 +100,7 @@ mod reconciliation;
 mod retention;
 mod waiting_room;
 
+pub use backlog::Backlog;
 pub use observer::{NoObserver, Observer};
 use memory_budget::MemoryBudget;
 use reconciliation::Reconciliation;

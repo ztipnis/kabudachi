@@ -149,13 +149,17 @@ The one module for the claim protocol on the network (`net/src/claim.rs`): askin
 ## The scheduler
 
 **Scheduler door**:
-The bindings' one way into the shared scheduler (`bindings/src/door.rs`): the lock around it, the wake-ups after every change to claims, timers and events, and the closed flag. Once the runtime is closed it refuses everything.
+The bindings' one way into the shared scheduler (`bindings/src/door.rs`): the lock around it, the wake-ups after every change to claims, timers and events, and the closed flag. It holds the scheduler's backlog and hands it over after every change but a claim. Once the runtime is closed it refuses everything.
 
 **Catch up**:
 The scheduler's one time-driven call (`Scheduler::catch_up`), made when its next deadline comes: it forgets every finished task past its retention, and, only while this scheduler leads, makes due delayed tasks pending and expires pending tasks past their expiry.
 
 **Scheduler observer**:
 Whoever the scheduler hands each published task record to (the `Observer` trait). The runtime's record store in production, `NoObserver` where nobody watches, a recording spy in tests.
+
+**Backlog**:
+What a scheduler cannot take yet, kept by its caller in order (`scheduler::Backlog`): submissions made before it leads, and those behind a refused submission of the same coalescing key, with the input bytes they hold counted against the hard limit; and continuation ends it refused for want of leadership. Once the scheduler leads, a hand-over ends those continuations, then records the submissions, a key's in the order they were made.
+_Avoid_: pre-leadership queue, pending submissions (pending tasks are the waiting room's)
 
 **Waiting room**, **Memory budget**, **Retention**:
 The scheduler's private parts for pending tasks, the payload memory of unfinished tasks, and how long finished tasks are kept.

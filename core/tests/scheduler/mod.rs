@@ -1,5 +1,6 @@
 //! Scheduler behaviour: backpressure, cancellation, coalescing, loss, retention, timing and task records.
 
+mod scheduler_backlog;
 mod scheduler_backpressure;
 mod scheduler_cancel;
 mod scheduler_coalescing;
