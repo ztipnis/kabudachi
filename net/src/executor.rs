@@ -499,9 +499,11 @@ impl<'n> Executing<'n> {
         let work = if compacts { Work::Compact(claim) } else { Work::Run(claim) };
         if self.endpoint.work.send(work).is_err() {
             // No executor is left to run it: the leader is told at once, so it
-            // is replayed rather than held by a worker that will never run it.
+            // is replayed rather than held by a worker that will never run it,
+            // and so is every run handed over before it, this batch or earlier.
             self.endpoint.held.gone = true;
             self.queue_lost(run);
+            self.lose_handed();
             return;
         }
         if let Some(deadline) = self.endpoint.held.abort_by {
