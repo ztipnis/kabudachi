@@ -615,4 +615,8 @@ async def _run_with_worker(main: Callable[[], Awaitable[T]], executor: Executor)
             await _cancel(worker)
             native.shutdown()
     finally:
-        await executor.stop(kill=not graceful)
+        try:
+            await executor.stop(kill=not graceful)
+        except BaseException:
+            await executor.stop(kill=True)  # a second cancel must not leave children
+            raise

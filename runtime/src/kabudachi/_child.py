@@ -200,9 +200,8 @@ class _TaskProcess:
                 self._track(frame.run_id, outcome, outcome, self._report_compaction)
             case ipc.Cancel():
                 outcome = self._outcomes.get(frame.run_id)
-                if outcome is not None:
+                if outcome is not None and outcome.cancel():
                     self._cancel_asked.add(frame.run_id)
-                    outcome.cancel()
             case ipc.Drain():
                 self._draining = True
                 self._finish_if_idle()
@@ -242,8 +241,10 @@ class _TaskProcess:
 
     def _report_result(self, run_id: str, outcome: "asyncio.Future[Any]") -> None:
         self._outcomes.pop(run_id, None)
+        asked = run_id in self._cancel_asked
+        self._cancel_asked.discard(run_id)
         if outcome.cancelled():
-            self._report_cancelled(run_id)
+            self._report_cancelled(run_id, asked)
             return
         error = outcome.exception()
         if error is not None:
@@ -262,8 +263,10 @@ class _TaskProcess:
 
     def _report_compaction(self, run_id: str, outcome: "asyncio.Future[Any]") -> None:
         self._outcomes.pop(run_id, None)
+        asked = run_id in self._cancel_asked
+        self._cancel_asked.discard(run_id)
         if outcome.cancelled():
-            self._report_cancelled(run_id)
+            self._report_cancelled(run_id, asked)
             return
         error = outcome.exception()
         if error is not None:
@@ -271,12 +274,10 @@ class _TaskProcess:
         else:
             self.send(ipc.Compacted(run_id, outcome.result()))
 
-    def _report_cancelled(self, run_id: str) -> None:
+    def _report_cancelled(self, run_id: str, asked: bool) -> None:
         """A cancelled run is silent when the worker asked for it, and has
         stopped waiting for it; a body that raised CancelledError itself failed."""
-        if run_id in self._cancel_asked:
-            self._cancel_asked.discard(run_id)
-        else:
+        if not asked:
             self.send(ipc.failed(run_id, asyncio.CancelledError()))
 
     def _exited(self, run_id: str) -> None:

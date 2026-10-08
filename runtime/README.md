@@ -152,7 +152,7 @@ matters.
 
 ## Limits of this phase
 
-- Everything is in memory in one process, and lost when it ends.
+- Everything the worker holds is in memory, and lost when it ends.
 - A body that ignores a timeout or a cancel cannot be killed in-process: its run fails and the body is
   abandoned to finish on its own, holding its concurrency place until it does.
 - `@ephemeral_task` behaves like `@task` in one process; worker loss does not exist yet.

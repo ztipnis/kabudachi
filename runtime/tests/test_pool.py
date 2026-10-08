@@ -108,10 +108,10 @@ def declare_only_here():
         (
             functools.partial(
                 kabudachi.configure,
-                imports=["pool_tasks", "pool_slow_import"],
-                process_start_timeout=timedelta(seconds=1),
+                imports=["pool_slow_import"],
+                process_start_timeout=timedelta(seconds=3),
             ),
-            r"kabudachi-task-0 was not ready within 1 s while importing pool_slow_import",
+            r"kabudachi-task-0 was not ready within 3 s while importing pool_slow_import",
         ),
     ],
     ids=["module_fails_to_import", "task_only_in_the_worker", "import_never_finishes"],
