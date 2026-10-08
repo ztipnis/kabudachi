@@ -18,6 +18,7 @@ use std::ops::Bound;
 
 use super::roll_call::CallRank;
 use crate::configuration::Generation;
+use crate::coordination_authority::RecoveryEpoch;
 use crate::election::standing::{EpochOrder, order_numbers};
 use crate::protocol::ids::WorkerId;
 use crate::protocol::messages::ElectionRejectReason;
@@ -53,12 +54,19 @@ struct TermBallot {
 pub(crate) struct Voter {
     /// Whether the node's state takes part in elections at all.
     pub(crate) takes_part: bool,
-    pub(crate) recovery_epoch: u64,
+    /// `None` before the node first joins a shard.
+    pub(crate) recovery_epoch: Option<RecoveryEpoch>,
     pub(crate) highest_term_seen: u64,
     /// The generation of the node's configuration; `None` with none.
     pub(crate) configuration_generation: Option<Generation>,
     /// Whether the node heard from its leader within its suspicion timeout.
     pub(crate) leader_contact_is_fresh: bool,
+}
+
+impl Voter {
+    fn epoch_number(&self) -> u64 {
+        self.recovery_epoch.map_or(0, |epoch| epoch.number)
+    }
 }
 
 /// What a node does with a roll call.
@@ -103,8 +111,8 @@ impl Ballot {
         rank: CallRank,
     ) -> RollCallVerdict {
         let epoch = order_numbers(
-            voter.recovery_epoch,
-            configuration_generation.recovery_epoch(),
+            voter.epoch_number(),
+            configuration_generation.recovery_epoch().number,
         );
         // A node cannot adopt a newer recovery epoch.
         if epoch == EpochOrder::Later {
@@ -158,7 +166,7 @@ impl Ballot {
     pub(crate) fn on_vote_request(
         &mut self,
         voter: &Voter,
-        recovery_epoch: u64,
+        recovery_epoch: RecoveryEpoch,
         term: u64,
         roll_call_generation: Generation,
         candidate: &WorkerId,
@@ -166,7 +174,7 @@ impl Ballot {
         if !voter.takes_part {
             return VoteVerdict::Reject(ElectionRejectReason::NotEligible);
         }
-        if order_numbers(voter.recovery_epoch, recovery_epoch) != EpochOrder::Mine {
+        if order_numbers(voter.epoch_number(), recovery_epoch.number) != EpochOrder::Mine {
             return VoteVerdict::Reject(ElectionRejectReason::WrongRecoveryEpoch);
         }
         // Read only: a refused request leaves no entry for its term.

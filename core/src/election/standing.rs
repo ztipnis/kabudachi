@@ -221,13 +221,10 @@ impl ShardStanding {
     }
 
     /// The standing of a node started inside `known`, at its configuration's
-    /// recovery epoch of `lineage`.
-    pub(crate) fn known(known: crate::election::KnownConfiguration, lineage: u64) -> Self {
+    /// recovery epoch.
+    pub(crate) fn known(known: crate::election::KnownConfiguration) -> Self {
         ShardStanding {
-            epoch: Some(RecoveryEpoch::new(
-                known.configuration.generation().recovery_epoch(),
-                lineage,
-            )),
+            epoch: Some(known.configuration.generation().recovery_epoch()),
             highest_term_seen: 0,
             configuration: Some(known.configuration),
             admission: known.admission,

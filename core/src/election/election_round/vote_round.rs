@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 
 use super::roll_call::RollCallRound;
 use crate::configuration::{Admission, Generation, Tally};
+use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::ids::{ShardId, WorkerId};
 use crate::protocol::messages::VoteRequest;
 use crate::time::Instant;
@@ -104,10 +105,11 @@ impl VoteRound {
 
     /// The message that asks a respondent for its vote in `shard_id` at
     /// `recovery_epoch`.
-    pub(crate) fn request(&self, shard_id: &ShardId, recovery_epoch: u64) -> VoteRequest {
+    pub(crate) fn request(&self, shard_id: &ShardId, recovery_epoch: RecoveryEpoch) -> VoteRequest {
         VoteRequest {
             shard_id: Some(shard_id.clone().into()),
-            recovery_epoch,
+            recovery_epoch: recovery_epoch.number,
+            recovery_epoch_lineage: recovery_epoch.lineage,
             term: self.census.term(),
             candidate_id: Some(self.census.rank().initiator().clone().into()),
             roll_call_generation: Some(self.census.configuration().generation().into()),

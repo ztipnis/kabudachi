@@ -5,7 +5,7 @@
 //! acks repair a lost certificate; and a worker adopts admission generations
 //! only together with the configuration they belong to.
 
-use crate::support::builders::{
+use crate::support::builders::{epoch, 
     ack_message, configuration_of, election_certificate,
     election_certificate_message, founded_from_g0, g0, leader_ack,
     past_any_suspicion, roll_call, roll_call_message, shard, timings, vote_request,
@@ -161,8 +161,8 @@ fn a_certificate_for_another_shard_or_recovery_epoch_is_ignored() {
     other_shard.shard_id = Some(shard("shard-2").into());
     // A certificate of epoch 1 carries a configuration of epoch 1.
     let founded_in_epoch_1 = Configuration::single(Single {
-        generation: Generation::new(1, 1, 1),
-        base: Generation::new(1, 1, 1),
+        generation: Generation::new(epoch(1), 1, 1),
+        base: Generation::new(epoch(1), 1, 1),
         voter_count: 3,
     })
     .expect("valid");

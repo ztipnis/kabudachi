@@ -4,7 +4,7 @@
 //! voter at. The multi-node behaviour of the same rules is in
 //! `scenario_membership_test`.
 
-use crate::support::builders::{
+use crate::support::builders::{epoch, 
     ack_message, committed_from_g0, configuration_of, g0, heartbeat, heartbeat_message, leader_ack,
     past_any_suspicion, roll_call, roll_call_message, roll_call_reply, self_remove,
     self_remove_message, vote_grant, vote_grant_message, vote_request, vote_request_message,
@@ -66,7 +66,7 @@ fn three_voters_founded_in_term_1() -> Configuration {
 /// `leader_of_three`'s configuration once one voter has left: two voters,
 /// at and based at (0, 1, 3).
 fn two_voters_at_the_next_generation() -> Configuration {
-    single_at(Generation::new(0, 1, 3), 2)
+    single_at(Generation::new(epoch(0), 1, 3), 2)
 }
 
 fn single_at(generation: Generation, voter_count: usize) -> Configuration {
@@ -345,7 +345,7 @@ fn a_draining_leader_ignores_a_crawl_report_from_an_earlier_admission() {
     let _ = leader.step(Input::Drain);
     let _ = crawled(&clock, &mut leader, &worker("p1"));
 
-    let stale = Generation::new(0, 0, 1);
+    let stale = Generation::new(epoch(0), 0, 1);
     let _ = crawled_at(&clock, &mut leader, &worker("p2"), stale);
     assert_eq!(leader.state(), WorkerState::Leader, "p2's crawl is stale");
 

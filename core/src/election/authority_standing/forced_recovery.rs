@@ -240,7 +240,7 @@ impl ForcedRecovery {
             return None;
         };
         let founded = Generation::founded_by_election(
-            epoch.number,
+            *epoch,
             self.term,
             self.roll_call_configuration.generation(),
         );

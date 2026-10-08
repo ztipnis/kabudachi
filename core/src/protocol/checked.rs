@@ -85,7 +85,12 @@ pub fn decode(message: ElectionMessage) -> Result<CheckedMessage, MalformedMessa
             let name = "LeaderHeartbeatAck";
             has_ids_and_configurations(m, name)?;
             check_term(m.term, name)?;
-            check_announceable(m.configuration.as_ref(), m.recovery_epoch, m.term, name)?;
+            check_announceable(
+                m.configuration.as_ref(),
+                (m.recovery_epoch, m.recovery_epoch_lineage),
+                m.term,
+                name,
+            )?;
             check_prior(
                 m.recipient_admission.as_ref(),
                 m.recipient_prior_admission.as_ref(),
@@ -129,7 +134,12 @@ pub fn decode(message: ElectionMessage) -> Result<CheckedMessage, MalformedMessa
             let name = "ElectionCertificate";
             has_ids_and_configurations(m, name)?;
             check_term(m.term, name)?;
-            check_announceable(m.configuration.as_ref(), m.recovery_epoch, m.term, name)?;
+            check_announceable(
+                m.configuration.as_ref(),
+                (m.recovery_epoch, m.recovery_epoch_lineage),
+                m.term,
+                name,
+            )?;
             check_prior(
                 m.recipient_admission.as_ref(),
                 m.recipient_prior_admission.as_ref(),
@@ -178,14 +188,15 @@ pub(crate) fn is_a_term(term: u64) -> bool {
 /// `recovery_epoch`, could have announced (see [`decode`]).
 fn check_announceable(
     configuration: Option<&generated::Configuration>,
-    recovery_epoch: u64,
+    recovery_epoch: (u64, u64),
     term: u64,
     name: &'static str,
 ) -> Result<(), MalformedMessage> {
     configuration
         .and_then(|configuration| configuration.generation.as_ref())
         .is_some_and(|generation| {
-            generation.recovery_epoch == recovery_epoch && generation.term <= term
+            (generation.recovery_epoch, generation.recovery_epoch_lineage) == recovery_epoch
+                && generation.term <= term
         })
         .then_some(())
         .ok_or(MalformedMessage::Unannounceable { message: name })

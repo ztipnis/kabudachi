@@ -28,6 +28,7 @@
 //! follower, holds the winner's listen address.
 
 
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use std::time::Duration as StdDuration;
 
 use crate::support::deadline::within_deadline;
@@ -92,11 +93,11 @@ fn make_node(clock: RealClock, my_id: WorkerId) -> WorkerNode<RealClock> {
         },
         Entry::Known(KnownConfiguration {
             configuration: Configuration::single(Single {
-                generation: Generation::genesis(0),
-                base: Generation::genesis(0),
+                generation: Generation::genesis(RecoveryEpoch::new(0, 0)),
+                base: Generation::genesis(RecoveryEpoch::new(0, 0)),
                 voter_count: 3,
             }).expect("valid"),
-            admission: Some(Generation::genesis(0)),
+            admission: Some(Generation::genesis(RecoveryEpoch::new(0, 0))),
         }),
         clock,
         None,

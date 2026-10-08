@@ -731,7 +731,7 @@ where
     /// shard, [`Self::genesis`]. The leader-contact timer starts now so a
     /// new node isn't immediately suspicious. The node starts connected to
     /// no one: its driver reports the connections it holds as
-    /// [`Input::PeerConnected`]. Its recovery epoch is of `lineage`.
+    /// [`Input::PeerConnected`].
     ///
     /// # Panics
     ///
@@ -748,7 +748,6 @@ where
         shard_id: ShardId,
         clock: C,
         known: KnownConfiguration,
-        lineage: u64,
         authority: Option<AuthorityTimings>,
         timings: ElectionTimings,
     ) -> Self {
@@ -767,7 +766,7 @@ where
             assert_heartbeats_keep_a_lease(&timings);
             assert_roll_call_deadline_leaves_room_to_widen(&timings);
         }
-        node.standing = ShardStanding::known(known, lineage);
+        node.standing = ShardStanding::known(known);
         node
     }
 
@@ -801,10 +800,9 @@ where
             shard_id,
             clock,
             KnownConfiguration {
-                configuration: Configuration::genesis(recovery_epoch.number),
-                admission: Some(Generation::genesis(recovery_epoch.number)),
+                configuration: Configuration::genesis(recovery_epoch),
+                admission: Some(Generation::genesis(recovery_epoch)),
             },
-            recovery_epoch.lineage,
             authority,
             timings,
         )
@@ -1013,6 +1011,7 @@ where
         Some(ElectionCertificate {
             shard_id: Some(self.shard_id.clone().into()),
             recovery_epoch: self.standing.epoch_number(),
+            recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
             term: self.term,
             leader_id: Some(self.my_id.clone().into()),
             configuration: Some(office.configuration().into()),
@@ -1546,7 +1545,7 @@ where
         }
         let heard = HeardEpoch {
             number: ack.recovery_epoch,
-            lineage: ack.recovery_epoch_lineage,
+            lineage: Some(ack.recovery_epoch_lineage),
         };
         // Never having joined a shard is `Bootstrapping`, returned above.
         let Some(order) = self.standing.order(heard) else {
@@ -1662,6 +1661,7 @@ where
             worker_id: Some(self.my_id.clone().into()),
             incarnation_id: Some(self.incarnation_id.clone().into()),
             recovery_epoch_seen: self.standing.epoch_number(),
+            recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
             term_seen: self.standing.highest_term_seen(),
             // Nothing reports this node's capacity yet.
             available_capacity: 0,
@@ -1888,7 +1888,7 @@ where
             recipient_prior_admission: content.recipient_prior_admission.map(Into::into),
             send_token: self.clock.now().as_ticks(),
             heartbeat_token,
-            recovery_epoch_lineage: self.standing.epoch().map(|epoch| epoch.lineage),
+            recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
         };
         self.send(to, election_message::Payload::HeartbeatAck(ack));
     }
@@ -2418,7 +2418,7 @@ where
         let view = View {
             me: &self.my_id,
             shard: &self.shard_id,
-            recovery_epoch: self.standing.epoch_number(),
+            recovery_epoch: self.standing.epoch(),
             highest_term_seen: self.standing.highest_term_seen(),
             configuration: led_or_followed(&self.office, &self.standing),
             admission,
@@ -2554,7 +2554,7 @@ where
             leader,
             configuration: self.led_or_followed_configuration().map(Into::into),
             recovery_epoch: self.standing.epoch().map(|epoch| epoch.number),
-            recovery_epoch_lineage: self.standing.epoch().map(|epoch| epoch.lineage),
+            recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
         };
         self.send(initiator, election_message::Payload::ElectionReject(reject));
     }
@@ -2605,7 +2605,7 @@ where
         let offered = reject.configuration();
         let refuser_epoch = reject.recovery_epoch.map(|number| HeardEpoch {
             number,
-            lineage: reject.recovery_epoch_lineage,
+            lineage: Some(reject.recovery_epoch_lineage),
         });
         match refuser_epoch.and_then(|heard| self.standing.order(heard)) {
             // A newer epoch's terms are not this epoch's, so they raise

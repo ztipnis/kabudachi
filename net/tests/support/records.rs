@@ -1,6 +1,7 @@
 //! A shard of voters driven in the background over real loopback sockets, for
 //! tests of what a leader does with its records.
 
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -524,6 +525,7 @@ fn heartbeat_from(worker: &WorkerId) -> ElectionMessage {
                 IncarnationId::new(format!("{}-incarnation-0", worker.as_str())).into(),
             ),
             recovery_epoch_seen: 0,
+            recovery_epoch_lineage: 0,
             term_seen: 0,
             available_capacity: 0,
             active_task_runs_digest: Vec::new(),
@@ -597,12 +599,12 @@ fn voter(clock: RealClock, id: WorkerId, count: usize) -> WorkerNode<RealClock> 
         },
         Entry::Known(KnownConfiguration {
             configuration: Configuration::single(Single {
-                generation: Generation::genesis(0),
-                base: Generation::genesis(0),
+                generation: Generation::genesis(RecoveryEpoch::new(0, 0)),
+                base: Generation::genesis(RecoveryEpoch::new(0, 0)),
                 voter_count: count,
             })
             .expect("valid"),
-            admission: Some(Generation::genesis(0)),
+            admission: Some(Generation::genesis(RecoveryEpoch::new(0, 0))),
         }),
         clock,
         None,
@@ -689,7 +691,7 @@ pub async fn claimed_and_started(worker: &Net, leader: &WorkerId, task: &TaskId)
 /// A certificate that `leader` leads `term` of the voters' shard, over the
 /// configuration the voters start in.
 pub fn proof_of_office(leader: &WorkerId, term: u64) -> ElectionCertificate {
-    let genesis = Generation::genesis(0);
+    let genesis = Generation::genesis(RecoveryEpoch::new(0, 0));
     let configuration = Configuration::single(Single {
         generation: genesis,
         base: genesis,
@@ -699,6 +701,7 @@ pub fn proof_of_office(leader: &WorkerId, term: u64) -> ElectionCertificate {
     ElectionCertificate {
         shard_id: Some(ShardId::new(SHARD).into()),
         recovery_epoch: 0,
+        recovery_epoch_lineage: 0,
         term,
         leader_id: Some(leader.clone().into()),
         configuration: Some((&configuration).into()),

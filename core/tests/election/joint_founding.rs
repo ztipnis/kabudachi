@@ -21,7 +21,7 @@ use kabudachi_core::protocol::messages::{
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
 use kabudachi_core::time::{Clock, Duration, Instant};
-use crate::support::builders::{
+use crate::support::builders::{epoch, 
     ack_message, committed_from_g0, configuration_of, founded_from_g0, g0, heartbeat,
     election_reject, heartbeat_message, leader_ack, past_any_suspicion, roll_call, roll_call_message,
     roll_call_reply, shard, timings, vote_grant, vote_grant_message, vote_request,
@@ -726,7 +726,7 @@ fn leader_re_leading_a_founding(clock: &FakeClock) -> (TestNode, Vec<Output>, [W
 /// there: its new side counts the two respondents it re-admitted, b and d,
 /// not J1's three.
 fn j1_re_stamped_in_term_2() -> Configuration {
-    let restamped = Generation::new(0, 2, 2);
+    let restamped = Generation::new(epoch(0), 2, 2);
     Configuration::joint(Joint {
         generation: restamped,
         base: restamped,

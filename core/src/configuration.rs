@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::generated;
 use crate::protocol::ids::WorkerId;
 
@@ -75,17 +76,33 @@ pub enum InvalidConfiguration {
 /// different leaders never share a generation. The recovery epoch leads so the
 /// order stays right whether or not a forced reconfiguration resets the term.
 /// The counter rises by one with every change and never resets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Generation {
-    // The derived `Ord` compares fields in declaration order, so this order is
-    // the comparison order.
-    recovery_epoch: u64,
+    recovery_epoch: RecoveryEpoch,
     term: u64,
     counter: u64,
 }
 
+// Compares recovery epoch number, term, counter. Until recovery epochs are
+// ordered by lineage too, the lineage does not take part.
+impl Ord for Generation {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.recovery_epoch.number, self.term, self.counter).cmp(&(
+            other.recovery_epoch.number,
+            other.term,
+            other.counter,
+        ))
+    }
+}
+
+impl PartialOrd for Generation {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl Generation {
-    pub fn new(recovery_epoch: u64, term: u64, counter: u64) -> Self {
+    pub fn new(recovery_epoch: RecoveryEpoch, term: u64, counter: u64) -> Self {
         Generation {
             recovery_epoch,
             term,
@@ -96,11 +113,11 @@ impl Generation {
     /// A new shard's first generation: term 0, counter 0. It is the genesis
     /// configuration's generation and base generation, and its creator's
     /// admission generation.
-    pub fn genesis(recovery_epoch: u64) -> Self {
+    pub fn genesis(recovery_epoch: RecoveryEpoch) -> Self {
         Generation::new(recovery_epoch, 0, 0)
     }
 
-    pub fn recovery_epoch(&self) -> u64 {
+    pub fn recovery_epoch(&self) -> RecoveryEpoch {
         self.recovery_epoch
     }
 
@@ -157,7 +174,7 @@ impl Generation {
     /// See [`Generation::next_change`]: the roll call generation's counter
     /// reaching `u64::MAX` needs the same peer bug.
     pub fn founded_by_election(
-        recovery_epoch: u64,
+        recovery_epoch: RecoveryEpoch,
         election_term: u64,
         roll_call_generation: Generation,
     ) -> Self {
@@ -180,7 +197,8 @@ impl Generation {
 impl From<Generation> for generated::Generation {
     fn from(generation: Generation) -> Self {
         generated::Generation {
-            recovery_epoch: generation.recovery_epoch,
+            recovery_epoch: generation.recovery_epoch.number,
+            recovery_epoch_lineage: generation.recovery_epoch.lineage,
             term: generation.term,
             counter: generation.counter,
         }
@@ -282,7 +300,7 @@ pub struct Joint {
 impl Configuration {
     /// A new shard's first configuration: its creator alone, at the genesis
     /// generation, which is also the base generation.
-    pub fn genesis(recovery_epoch: u64) -> Self {
+    pub fn genesis(recovery_epoch: RecoveryEpoch) -> Self {
         let genesis = Generation::genesis(recovery_epoch);
         Configuration::single(Single {
             generation: genesis,
@@ -820,7 +838,7 @@ impl Roster {
     ///
     /// See [`Generation::founded_by_election`].
     pub fn after_election(
-        recovery_epoch: u64,
+        recovery_epoch: RecoveryEpoch,
         term: u64,
         roll_call_configuration: &Configuration,
         respondents: &BTreeMap<WorkerId, Admission>,
@@ -1041,7 +1059,7 @@ impl Roster {
 
     /// A new shard's roster: its creator as the only member, admitted at the
     /// genesis generation.
-    pub fn genesis(creator: WorkerId, recovery_epoch: u64) -> Self {
+    pub fn genesis(creator: WorkerId, recovery_epoch: RecoveryEpoch) -> Self {
         Roster {
             called_under: None,
             configuration: Configuration::genesis(recovery_epoch),

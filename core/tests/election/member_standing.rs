@@ -4,7 +4,7 @@
 //! when, and whether, the authority answers the read the node asks for.
 
 use crate::support::authority::{asked, authority_ttl};
-use crate::support::builders::{ack_message, leader_ack, message_input, shard, timings, worker};
+use crate::support::builders::{epoch, ack_message, leader_ack, message_input, shard, timings, worker};
 use crate::support::clock::FakeClock;
 use crate::support::node::{TestNode, published_roll_calls};
 
@@ -34,7 +34,7 @@ impl Member {
     /// lineage 0 (the lineage of every node started on a known
     /// configuration).
     fn at_epoch(number: u64) -> Self {
-        let generation = Generation::genesis(number);
+        let generation = Generation::genesis(epoch(number));
         let known = KnownConfiguration {
             configuration: Configuration::single(Single {
                 generation,
@@ -235,8 +235,8 @@ fn a_member_reads_again_after_adopting_another_epoch_from_an_ack() {
 
     let leader = worker("w2");
     let recovered = Configuration::single(Single {
-        generation: Generation::new(1, 2, 1),
-        base: Generation::new(1, 2, 1),
+        generation: Generation::new(epoch(1), 2, 1),
+        base: Generation::new(epoch(1), 2, 1),
         voter_count: 2,
     })
     .expect("valid");
@@ -299,8 +299,8 @@ fn a_read_answered_after_the_member_followed_a_leader_again_changes_nothing() {
     let read = member.suspects_its_leader();
     let leader = worker("w2");
     let current = Configuration::single(Single {
-        generation: Generation::genesis(0),
-        base: Generation::genesis(0),
+        generation: Generation::genesis(epoch(0)),
+        base: Generation::genesis(epoch(0)),
         voter_count: 3,
     })
     .expect("valid");

@@ -48,10 +48,12 @@ pub fn no_leader_yet() -> JoinResponse {
     JoinResponse::default()
 }
 
+pub use crate::support::authority::epoch;
+
 /// The genesis generation at recovery epoch 0, which the tests' statically
 /// configured nodes are all admitted at.
 pub fn g0() -> Generation {
-    Generation::genesis(0)
+    Generation::genesis(epoch(0))
 }
 
 /// A configuration of `voter_count` voters admitted at [`g0`].
@@ -143,6 +145,7 @@ pub fn heartbeat(sender: &WorkerId, newest_accepted_ack: Option<AckEcho>) -> Wor
         worker_id: Some(sender.clone().into()),
         incarnation_id: Some(IncarnationId::new("incarnation-1").into()),
         recovery_epoch_seen: 0,
+        recovery_epoch_lineage: 0,
         term_seen: 1,
         available_capacity: 0,
         active_task_runs_digest: vec![],
@@ -179,7 +182,7 @@ pub fn leader_ack(
         send_token: 0,
         recipient_prior_admission: None,
         heartbeat_token: None,
-        recovery_epoch_lineage: None,
+        recovery_epoch_lineage: 0,
     }
 }
 
@@ -212,7 +215,7 @@ pub fn election_reject(
             term,
         }),
         recovery_epoch: Some(0),
-        recovery_epoch_lineage: None,
+        recovery_epoch_lineage: 0,
     }))
 }
 
@@ -221,6 +224,7 @@ pub fn vote_request(candidate: WorkerId, recovery_epoch: u64, term: u64) -> Vote
     VoteRequest {
         shard_id: Some(shard(SHARD).into()),
         recovery_epoch,
+        recovery_epoch_lineage: 0,
         term,
         candidate_id: Some(candidate.into()),
         roll_call_generation: Some(g0().into()),
@@ -236,6 +240,7 @@ pub fn vote_grant(candidate: WorkerId, voter: WorkerId, term: u64) -> VoteGrant 
     VoteGrant {
         shard_id: Some(shard(SHARD).into()),
         recovery_epoch: 0,
+        recovery_epoch_lineage: 0,
         term,
         candidate_id: Some(candidate.into()),
         voter_id: Some(voter.into()),
@@ -258,6 +263,7 @@ pub fn election_certificate(
     ElectionCertificate {
         shard_id: Some(shard(SHARD).into()),
         recovery_epoch: 0,
+        recovery_epoch_lineage: 0,
         term,
         leader_id: Some(leader.clone().into()),
         configuration: Some(configuration.into()),
@@ -271,7 +277,7 @@ pub fn election_certificate(
 /// respondents: its new side at generation and base (0, `term`, 1), its old
 /// side the configuration at [`g0`].
 pub fn founded_from_g0(term: u64, old_voter_count: usize, respondents: usize) -> Configuration {
-    let founded = Generation::new(0, term, 1);
+    let founded = Generation::new(epoch(0), term, 1);
     Configuration::joint(Joint {
         generation: founded,
         base: founded,
@@ -287,7 +293,7 @@ pub fn founded_from_g0(term: u64, old_voter_count: usize, respondents: usize) ->
 /// the next generation a leader of `leader_term` announces, which is also its
 /// base (the commit re-bases it there).
 pub fn committed_from_g0(term: u64, leader_term: u64, respondents: usize) -> Configuration {
-    let committed = Generation::new(0, term, 1).next_change(leader_term);
+    let committed = Generation::new(epoch(0), term, 1).next_change(leader_term);
     Configuration::single(Single {
         generation: committed,
         base: committed,

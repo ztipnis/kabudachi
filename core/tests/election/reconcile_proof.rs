@@ -2,7 +2,7 @@
 //! the leader it follows, or a requester that proves a leader's office with
 //! an election certificate for a term no earlier than the worker's highest.
 
-use crate::support::builders::{
+use crate::support::builders::{epoch, 
     ack_message, configuration_of, election_certificate_message, leader_ack, past_any_suspicion,
     roll_call, roll_call_message, shard, timings, vote_grant, vote_grant_message, vote_request,
     vote_request_message, worker,
@@ -27,7 +27,7 @@ fn follower_of(clock: &FakeClock, me: &WorkerId, old: &WorkerId) -> TestNode {
             old,
             1,
             &configuration_of(3),
-            Some(Generation::genesis(0)),
+            Some(Generation::genesis(epoch(0))),
         )),
     );
     node
@@ -99,7 +99,7 @@ fn a_deposed_leader_is_refused_once_the_worker_has_seen_a_later_term() {
         &mut f.worker,
         &f.new,
         election_certificate_message(ElectionCertificate {
-            recipient_admission: Some(Generation::genesis(0).into()),
+            recipient_admission: Some(Generation::genesis(epoch(0)).into()),
             ..f.new_proof.clone()
         }),
     );
@@ -152,8 +152,8 @@ fn a_certificate_for_another_shard_is_refused() {
 fn a_certificate_of_a_later_recovery_epoch_is_answered_and_of_an_earlier_one_refused() {
     let f = fixture();
     let later = Configuration::single(Single {
-        generation: Generation::genesis(1),
-        base: Generation::genesis(1),
+        generation: Generation::genesis(epoch(1)),
+        base: Generation::genesis(epoch(1)),
         voter_count: 3,
     })
     .expect("valid");
@@ -173,7 +173,7 @@ fn a_certificate_of_a_later_recovery_epoch_is_answered_and_of_an_earlier_one_ref
             &f.old,
             5,
             &configuration_of(3),
-            Some(Generation::genesis(0)),
+            Some(Generation::genesis(epoch(0))),
         )),
     );
     assert!(at_epoch_0.may_answer_reconcile(&f.new, Some(&of_epoch_1)));
@@ -188,7 +188,7 @@ fn a_certificate_of_a_later_recovery_epoch_is_answered_and_of_an_earlier_one_ref
         },
         Entry::Known(KnownConfiguration {
             configuration: later,
-            admission: Some(Generation::genesis(1)),
+            admission: Some(Generation::genesis(epoch(1))),
         }),
         clock.clone(),
         None,
@@ -208,8 +208,8 @@ fn a_certificate_older_than_the_configuration_the_worker_holds_is_refused() {
     // term seen yet: a certificate for term 3 passes the term rule, so only
     // the configuration can refuse it.
     let held = Configuration::single(Single {
-        generation: Generation::new(0, 5, 1),
-        base: Generation::new(0, 5, 1),
+        generation: Generation::new(epoch(0), 5, 1),
+        base: Generation::new(epoch(0), 5, 1),
         voter_count: 3,
     })
     .expect("valid");
@@ -223,7 +223,7 @@ fn a_certificate_older_than_the_configuration_the_worker_holds_is_refused() {
         },
         Entry::Known(KnownConfiguration {
             configuration: held,
-            admission: Some(Generation::new(0, 5, 1)),
+            admission: Some(Generation::new(epoch(0), 5, 1)),
         }),
         clock,
         None,

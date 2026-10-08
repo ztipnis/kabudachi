@@ -510,7 +510,7 @@ fn departed_workers_stop_blocking_a_leaderless_shard_once_their_registrations_la
         .configuration()
         .expect("a leader holds its configuration")
         .generation();
-    assert_eq!(founded.recovery_epoch(), 1);
+    assert_eq!(founded.recovery_epoch().number, 1);
 }
 
 #[test]

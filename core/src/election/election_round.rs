@@ -31,6 +31,7 @@ mod vote_round;
 use std::collections::BTreeMap;
 
 use crate::configuration::{Admission, Configuration, Roster};
+use crate::coordination_authority::RecoveryEpoch;
 use crate::election::standing::{EpochOrder, order_numbers};
 use crate::protocol::checked::Checked;
 use crate::protocol::ids::{ShardId, WorkerId};
@@ -48,7 +49,8 @@ use vote_round::VoteRound;
 pub(crate) struct View<'a> {
     pub(crate) me: &'a WorkerId,
     pub(crate) shard: &'a ShardId,
-    pub(crate) recovery_epoch: u64,
+    /// `None` before the node first joins a shard.
+    pub(crate) recovery_epoch: Option<RecoveryEpoch>,
     pub(crate) highest_term_seen: u64,
     /// `None` for a joiner that has accepted no leader ack yet: it starts
     /// no roll call.
@@ -69,6 +71,17 @@ pub(crate) struct View<'a> {
     /// The suspicion timeout, which caps how far backoff widens that
     /// deadline (see [`ElectionRound::roll_call_span`]).
     pub(crate) suspect_timeout: Duration,
+}
+
+impl View<'_> {
+    /// The node's recovery epoch, epoch 0 of lineage 0 before it first joins.
+    fn epoch(&self) -> RecoveryEpoch {
+        self.recovery_epoch.unwrap_or(RecoveryEpoch::new(0, 0))
+    }
+
+    fn epoch_number(&self) -> u64 {
+        self.epoch().number
+    }
 }
 
 /// What the node does with what the round decided, in order.
@@ -456,8 +469,8 @@ impl ElectionRound {
                 // the current one, whose ack then moves it on.
                 let name_leader = reason == ElectionRejectReason::LeaderStillValid
                     || order_numbers(
-                        view.recovery_epoch,
-                        call.configuration().generation().recovery_epoch(),
+                        view.epoch_number(),
+                        call.configuration().generation().recovery_epoch().number,
                     ) == EpochOrder::Stale;
                 vec![Verdict::Reject {
                     to: initiator,
@@ -497,7 +510,7 @@ impl ElectionRound {
         {
             return vec![Verdict::AskVotes {
                 voters: vec![responder],
-                request: vote.request(view.shard, view.recovery_epoch),
+                request: vote.request(view.shard, view.epoch()),
             }];
         }
         Vec::new()
@@ -559,7 +572,7 @@ impl ElectionRound {
         let voter = self.voter(view);
         let verdict = self.ballot.on_vote_request(
             &voter,
-            req.recovery_epoch,
+            RecoveryEpoch::new(req.recovery_epoch, req.recovery_epoch_lineage),
             req.term,
             req.roll_call_generation(),
             &candidate,
@@ -568,7 +581,8 @@ impl ElectionRound {
             VoteVerdict::Grant => {
                 let grant = VoteGrant {
                     shard_id: Some(view.shard.clone().into()),
-                    recovery_epoch: view.recovery_epoch,
+                    recovery_epoch: view.epoch_number(),
+                    recovery_epoch_lineage: view.epoch().lineage,
                     term: req.term,
                     candidate_id: Some(candidate.clone().into()),
                     voter_id: Some(view.me.clone().into()),
@@ -599,7 +613,7 @@ impl ElectionRound {
         };
         if grant.term != vote.term()
             || grant.shard_id() != *view.shard
-            || order_numbers(view.recovery_epoch, grant.recovery_epoch) != EpochOrder::Mine
+            || order_numbers(view.epoch_number(), grant.recovery_epoch) != EpochOrder::Mine
             || grant.candidate_id() != *view.me
         {
             return Vec::new();
@@ -678,7 +692,7 @@ impl ElectionRound {
             Verdict::Stand { term },
             Verdict::AskVotes {
                 voters: vote.voters_to_ask(),
-                request: vote.request(view.shard, view.recovery_epoch),
+                request: vote.request(view.shard, view.epoch()),
             },
         ];
         self.vote = Some(vote);
@@ -702,7 +716,7 @@ impl ElectionRound {
         };
         let census = vote.census();
         let mut roster = Roster::after_election(
-            view.recovery_epoch,
+            view.epoch(),
             vote.term(),
             census.configuration(),
             census.respondents(),
@@ -716,7 +730,8 @@ impl ElectionRound {
                 respondent: respondent.clone(),
                 certificate: ElectionCertificate {
                     shard_id: Some(view.shard.clone().into()),
-                    recovery_epoch: view.recovery_epoch,
+                    recovery_epoch: view.epoch_number(),
+                    recovery_epoch_lineage: view.epoch().lineage,
                     term: vote.term(),
                     leader_id: Some(view.me.clone().into()),
                     configuration: Some(roster.configuration().into()),

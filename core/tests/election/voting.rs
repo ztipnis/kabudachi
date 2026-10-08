@@ -3,7 +3,7 @@
 //! candidate wins once its granters are a majority of its call's respondents
 //! and the voters of the call's configuration among them a quorum of it.
 
-use crate::support::builders::{
+use crate::support::builders::{epoch, 
     ack_message, configuration_of, g0, leader_ack,
     past_any_suspicion, roll_call, roll_call_message, roll_call_reply, shard, vote_grant,
     vote_grant_message, vote_request, vote_request_message, worker,
@@ -135,7 +135,7 @@ fn a_voter_refuses_a_request_it_must_not_grant_and_says_why() {
                 // a newer configuration; its contact with that leader then
                 // goes stale too.
                 let newer = Configuration::single(Single {
-                    generation: Generation::new(0, 0, 1),
+                    generation: Generation::new(epoch(0), 0, 1),
                     base: g0(),
                     voter_count: 3,
                 })

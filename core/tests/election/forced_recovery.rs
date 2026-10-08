@@ -673,11 +673,11 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
             "w1",
             KnownConfiguration {
                 configuration: Configuration::single(Single {
-                    generation: Generation::genesis(5),
-                    base: Generation::genesis(5),
+                    generation: Generation::genesis(epoch(5)),
+                    base: Generation::genesis(epoch(5)),
                     voter_count: 5,
                 }).expect("valid"),
-                admission: Some(Generation::genesis(5)),
+                admission: Some(Generation::genesis(epoch(5))),
             },
             default_timings(),
             Some(AuthorityTimings {
@@ -718,8 +718,8 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
         // it rejoins through JOIN alone.
         let old_leader = worker("w3");
         let epoch_5 = Configuration::single(Single {
-            generation: Generation::genesis(5),
-            base: Generation::genesis(5),
+            generation: Generation::genesis(epoch(5)),
+            base: Generation::genesis(epoch(5)),
             voter_count: 5,
         })
         .expect("valid");
@@ -727,8 +727,8 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
             &old_leader,
             ack_message(LeaderHeartbeatAck {
                 recovery_epoch: 5,
-                recovery_epoch_lineage: Some(0),
-                ..leader_ack(&old_leader, 9, &epoch_5, Some(Generation::genesis(5)))
+                recovery_epoch_lineage: 0,
+                ..leader_ack(&old_leader, 9, &epoch_5, Some(Generation::genesis(epoch(5))))
             }),
         ));
         assert_eq!(
@@ -780,7 +780,7 @@ fn a_node_ignores_an_ack_from_another_lineage_at_or_below_its_epoch_number() {
         authority
             .compare_and_swap_recovery_epoch(&shard(SHARD), None, RecoveryEpoch::new(number, 0))
             .expect("the shard has no epoch yet");
-        let configuration = configuration_at_epoch(number);
+        let configuration = configuration_at_epoch(epoch(number));
         let (mut driven, _) = Driven::with(
             &clock,
             &authority,
@@ -796,11 +796,7 @@ fn a_node_ignores_an_ack_from_another_lineage_at_or_below_its_epoch_number() {
         );
         let stranger = worker("stranger");
 
-        driven.step(message_input(&stranger, ack_message(LeaderHeartbeatAck {
-                recovery_epoch: 0,
-                recovery_epoch_lineage: Some(7),
-                ..leader_ack(&stranger, 4, &configuration_of(3), Some(g0()))
-            })));
+        driven.step(ack_of_epoch(&stranger, RecoveryEpoch::new(0, 7)));
 
         assert_eq!(
             driven.node.known_leader(),
@@ -811,9 +807,9 @@ fn a_node_ignores_an_ack_from_another_lineage_at_or_below_its_epoch_number() {
     }
 }
 
-/// A configuration of three voters founded at recovery epoch `number`.
-fn configuration_at_epoch(number: u64) -> Configuration {
-    let generation = Generation::new(number, 0, 0);
+/// A configuration of three voters founded at `recovery_epoch`.
+fn configuration_at_epoch(recovery_epoch: RecoveryEpoch) -> Configuration {
+    let generation = Generation::new(recovery_epoch, 0, 0);
     Configuration::single(Single {
         generation,
         base: generation,
@@ -822,12 +818,17 @@ fn configuration_at_epoch(number: u64) -> Configuration {
     .expect("valid")
 }
 
-/// An ack from `leader` of recovery epoch `number` of `lineage`, term 9.
-fn ack_of_epoch(leader: &WorkerId, number: u64, lineage: u64) -> Input {
+/// An ack from `leader` of `recovery_epoch`, term 9.
+fn ack_of_epoch(leader: &WorkerId, recovery_epoch: RecoveryEpoch) -> Input {
     message_input(leader, ack_message(LeaderHeartbeatAck {
-        recovery_epoch: number,
-        recovery_epoch_lineage: Some(lineage),
-        ..leader_ack(leader, 9, &configuration_at_epoch(number), Some(Generation::new(number, 0, 0)))
+        recovery_epoch: recovery_epoch.number,
+        recovery_epoch_lineage: recovery_epoch.lineage,
+        ..leader_ack(
+            leader,
+            9,
+            &configuration_at_epoch(recovery_epoch),
+            Some(Generation::new(recovery_epoch, 0, 0)),
+        )
     }))
 }
 
@@ -889,7 +890,7 @@ fn a_leader_that_took_office_at_the_authoritys_epoch_ignores_an_ack_of_another_l
         );
         disturb(&mut driven);
 
-        driven.step(ack_of_epoch(&worker("stranger"), 5, 7));
+        driven.step(ack_of_epoch(&worker("stranger"), RecoveryEpoch::new(5, 7)));
 
         assert_eq!(driven.node.state(), WorkerState::Leader, "{stands}");
         assert_eq!(
@@ -918,11 +919,11 @@ fn a_leader_adopts_a_later_epoch_of_its_lineage_and_then_follows_the_plain_order
             lapse_the_fence(&mut driven);
         }
 
-        driven.step(ack_of_epoch(&own_leader, 1, 0));
+        driven.step(ack_of_epoch(&own_leader, epoch(1)));
         assert_eq!(driven.node.state(), WorkerState::Active, "{stands}");
         assert_eq!(driven.node.recovery_epoch(), 1, "{stands}");
 
-        driven.step(ack_of_epoch(&stranger, 5, 7));
+        driven.step(ack_of_epoch(&stranger, RecoveryEpoch::new(5, 7)));
         assert_eq!(
             (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
             (5, Some(7)),

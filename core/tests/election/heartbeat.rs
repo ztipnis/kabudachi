@@ -1,7 +1,7 @@
 //! A follower's half of leader liveness: the routing crawl its heartbeats
 //! report, and the acks it ignores.
 
-use crate::support::builders::{
+use crate::support::builders::{epoch, 
     ack_message, configuration_of, g0, leader_ack, shard, timings, worker,
 };
 use crate::support::clock::FakeClock;
@@ -91,7 +91,7 @@ fn a_heartbeat_reports_a_routing_crawl_only_since_the_current_admission() {
         "a pending member has nothing to report"
     );
 
-    receive_ack(&mut node, ack_admitting(Generation::new(0, 1, 2), 1));
+    receive_ack(&mut node, ack_admitting(Generation::new(epoch(0), 1, 2), 1));
     assert!(
         !next_heartbeat_reports_a_crawl(&mut node, &clock),
         "the crawl predates the admission"
@@ -100,7 +100,7 @@ fn a_heartbeat_reports_a_routing_crawl_only_since_the_current_admission() {
     let _ = node.step(Input::RoutingCrawled);
     assert!(next_heartbeat_reports_a_crawl(&mut node, &clock));
 
-    receive_ack(&mut node, ack_admitting(Generation::new(0, 1, 3), 2));
+    receive_ack(&mut node, ack_admitting(Generation::new(epoch(0), 1, 3), 2));
     assert!(
         !next_heartbeat_reports_a_crawl(&mut node, &clock),
         "re-admitted: crawl again"

@@ -80,6 +80,7 @@
 //! (A1-A3, see there).
 
 
+use crate::support::builders::epoch;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -669,7 +670,7 @@ impl Ledger {
 
     /// L4 for `node` holding or answering with `admission`.
     fn check_admission(&self, node: &WorkerId, admission: Rank) -> Result<(), TestCaseError> {
-        if admission == rank(Generation::genesis(0)) {
+        if admission == rank(Generation::genesis(epoch(0))) {
             return Ok(());
         }
         let (_, term, _) = admission;
@@ -708,7 +709,7 @@ fn check_configurations(cluster: &Cluster, ids: &[WorkerId]) -> Result<(), TestC
             node.highest_term_seen()
         );
         prop_assert_eq!(
-            generation.recovery_epoch(),
+            generation.recovery_epoch().number,
             node.recovery_epoch(),
             "L5 violated: {:?} holds a configuration at {:?} of another recovery epoch",
             id,
@@ -1213,7 +1214,7 @@ fn check_authority_case(
             let node = cluster.node(id);
             if let Some(configuration) = node.configuration() {
                 prop_assert_eq!(
-                    configuration.generation().recovery_epoch(),
+                    configuration.generation().recovery_epoch().number,
                     node.recovery_epoch(),
                     "A3 violated: {:?} holds a configuration at {:?} of another recovery epoch",
                     id,
