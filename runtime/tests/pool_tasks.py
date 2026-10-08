@@ -129,3 +129,40 @@ async def calls_others(request: Greeting) -> Greeting:
         ended = "cancelled"
     total = one.times + stages[-1].times + sum(result.times for result in mapped)
     return Greeting(times=total, text=f"{cancelled} {ended} {failed} {refused}")
+
+
+LIMIT = {"timeout": timedelta(milliseconds=300), "cancel_grace": timedelta(milliseconds=200)}
+
+
+@kabudachi.task(name="pool.stubborn_then_quick", retries=1, **LIMIT)
+def stubborn_then_quick(request: Greeting) -> Greeting:
+    if first_time(f"stubborn-{request.text}"):
+        time.sleep(30)  # a synchronous body cannot be cancelled, only killed
+    return Greeting(times=os.getpid(), text=repr(time.time()))
+
+
+@kabudachi.task(name="pool.stubborn", **LIMIT)
+def stubborn(request: Greeting) -> Greeting:
+    time.sleep(30)
+    return request
+
+
+@kabudachi.task(name="pool.cancellable")
+async def cancellable(request: Greeting) -> Greeting:
+    marker(f"started-{request.text}").write_text(str(os.getpid()))
+    try:
+        await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        marker(f"cancelled-{request.text}").touch()
+        raise
+    return request
+
+
+@kabudachi.task(name="pool.ignores_cancel", cancel_grace=timedelta(milliseconds=200))
+async def ignores_cancel(request: Greeting) -> Greeting:
+    marker("ignoring").touch()
+    while True:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            continue

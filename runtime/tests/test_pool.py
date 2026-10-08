@@ -18,7 +18,14 @@ from kabudachi import config as config_module
 from kabudachi import ipc
 from kabudachi import registry as registry_module
 from kabudachi.config import Configuration
-from kabudachi.errors import StartupError, TaskBodyError, TaskDefinitionError, TaskLostError
+from kabudachi.errors import (
+    StartupError,
+    TaskBodyError,
+    TaskCancelledError,
+    TaskDefinitionError,
+    TaskLostError,
+    TaskTimeoutError,
+)
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting
 
@@ -162,13 +169,73 @@ def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_
     kabudachi.configure(processes=1)
 
     async def main():
-        replayed = await pool_tasks.dies_once(Greeting(text="a"))
-        with pytest.raises(TaskLostError):
-            await pool_tasks.ephemeral_dies(Greeting())
-        after = await pool_tasks.where_async(Greeting())
-        return replayed.times, after.times
+        async with asyncio.timeout(30):
+            replayed = await pool_tasks.dies_once(Greeting(text="a"))
+            with pytest.raises(TaskLostError):
+                await pool_tasks.ephemeral_dies(Greeting())
+            after = await pool_tasks.where_async(Greeting())
+            return replayed.times, after.times
 
     replayed, after = kabudachi.run(main)
 
     assert os.getpid() not in (replayed, after)
     assert replayed != after, "the ephemeral body's death replaced the process again"
+
+
+def test_a_body_past_its_hard_limit_settles_at_once_and_its_process_is_replaced_once_its_neighbour_finishes():
+    kabudachi.configure(processes=1, concurrency=3)
+
+    async def main():
+        async with asyncio.timeout(30):
+            loop = asyncio.get_running_loop()
+            neighbour = pool_tasks.where_async(Greeting(text="1.5"))
+            retried = pool_tasks.stubborn_then_quick(Greeting(text="r"))
+            started = loop.time()
+            with pytest.raises(TaskTimeoutError):
+                await pool_tasks.stubborn(Greeting())
+            failed_after = loop.time() - started
+            return failed_after, await neighbour, await retried
+
+    failed_after, neighbour, retried = kabudachi.run(main)
+
+    # Settled at its hard limit (0.3 s + 0.2 s), not when the process died.
+    assert failed_after < 1.2
+    assert neighbour.times != os.getpid(), "the neighbour finished in the condemned process"
+    assert retried.times != neighbour.times, "the retry ran in the replacement"
+    assert float(retried.text) >= float(neighbour.text), "the retry waited for the old body's exit"
+
+
+def test_a_cancelled_body_stops_when_asked_and_one_that_will_not_costs_its_process(markers):
+    kabudachi.configure(processes=1, concurrency=2)
+
+    async def main():
+        async with asyncio.timeout(30):
+            handle = pool_tasks.cancellable(Greeting(text="c"))
+            while not (markers / "started-c").exists():
+                await asyncio.sleep(0.01)
+            assert handle.cancel()
+            with pytest.raises(TaskCancelledError):
+                await handle
+            kept = (await pool_tasks.where_async(Greeting())).times
+            racing = []
+            for _ in range(20):
+                racing.append(pool_tasks.where_async(Greeting()))
+                await asyncio.sleep(0.002)
+                racing[-1].cancel()
+            outcomes = await asyncio.gather(*racing, return_exceptions=True)
+            stuck = pool_tasks.ignores_cancel(Greeting())
+            while not (markers / "ignoring").exists():
+                await asyncio.sleep(0.01)
+            stuck.cancel()
+            # Past its 0.2 s grace, so the next body cannot land beside it.
+            await asyncio.sleep(0.4)
+            replaced = (await pool_tasks.where_async(Greeting())).times
+            return kept, outcomes, replaced
+
+    kept, outcomes, replaced = kabudachi.run(main)
+
+    assert (markers / "cancelled-c").exists(), "the body was cancelled in its process"
+    assert kept == int((markers / "started-c").read_text()), "a body that stopped cost nothing"
+    # A cancel racing a result in flight: each handle ends once, either way.
+    assert all(isinstance(outcome, (Greeting, TaskCancelledError)) for outcome in outcomes), outcomes
+    assert replaced != kept, "a body that ignored the cancel past its grace cost its process"

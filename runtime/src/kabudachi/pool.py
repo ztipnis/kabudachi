@@ -312,11 +312,22 @@ class ProcessPool:
             return
         if slot.child is not None:
             slot.child.send(ipc.Cancel(slot.job.run_id))
+            if isinstance(slot.job, RunJob):
+                timer = self._started_loop().call_later(
+                    slot.job.cancel_grace.total_seconds(), self._give_up_on, slot
+                )
+                slot.exited.add_done_callback(lambda _: timer.cancel())
             return
         # Never sent to a child: nothing runs, so it is over at once.
         if slot in self._pending:
             self._pending.remove(slot)
         self._finish(slot)
+
+    def _give_up_on(self, slot: _Slot) -> None:
+        """A body asked to stop that has not within its grace is treated as
+        past its hard limit: its process is condemned."""
+        if not slot.exited.done():
+            self.condemn_host_of(slot.job.run_id)
 
     def _finish(self, slot: _Slot) -> None:
         """The slot's body has exited: its place is free."""

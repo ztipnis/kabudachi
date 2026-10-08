@@ -153,8 +153,12 @@ matters.
 ## Limits of this phase
 
 - Everything the worker holds is in memory, and lost when it ends.
-- A body that ignores a timeout or a cancel cannot be killed in-process: its run fails and the body is
-  abandoned to finish on its own, holding its concurrency place until it does.
+- A body that ignores a timeout or a cancel for longer than its `cancel_grace` costs its task process:
+  the run settles at once (failed, cancelled, or its retry queued to start once the old body exits), the
+  process takes no new runs and is replaced at once, and it is stopped once its other bodies have
+  finished, so they are never killed for it. With `processes=0` such a body cannot be killed: its run
+  settles the same way and the body is abandoned to finish on its own, holding its concurrency place
+  until it does.
 - A task process that dies (a crash, running out of memory, a kill) takes its runs with it and is
   replaced, after a growing wait while replacements keep dying quickly. Each run it held is tried again
   without using up a retry, except an `@ephemeral_task`'s, whose call raises `TaskLostError`. With
