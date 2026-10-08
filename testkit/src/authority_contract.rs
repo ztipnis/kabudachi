@@ -72,7 +72,7 @@ pub fn check_authority_contract(adapter: &impl AuthorityAdapter, time: &impl Pas
     no_fence_for_one_ttl_after_start(adapter, time);
     a_flush_loses_everything_and_restarts_both_waits(adapter, time);
     if adapter.has_outages() {
-        an_outage_keeps_the_data_and_withholds_only_the_count(adapter, time);
+        an_outage_keeps_the_data_and_may_withhold_the_count_and_the_fence(adapter, time);
     }
 }
 
@@ -757,11 +757,11 @@ fn a_flush_loses_everything_and_restarts_both_waits(
     );
 }
 
-fn an_outage_keeps_the_data_and_withholds_only_the_count(
+fn an_outage_keeps_the_data_and_may_withhold_the_count_and_the_fence(
     adapter: &impl AuthorityAdapter,
     time: &impl PassTime,
 ) {
-    let clause = "an outage keeps the data and withholds only the count";
+    let clause = "an outage keeps the data and may withhold the count and the fence for a TTL";
     let authority = warmed_up(adapter, time);
     create(&authority, &founded(), clause);
     register(

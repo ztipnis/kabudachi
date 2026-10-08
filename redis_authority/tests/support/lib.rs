@@ -52,16 +52,35 @@ impl ValkeyServer {
 
     /// Saves the data to disk and stops; `restart` brings it back with that data.
     pub fn shutdown_save(&self) {
-        let _closed_by_shutdown = redis::cmd("SHUTDOWN")
+        // A server that shuts down closes the connection without a reply.
+        let reply = redis::cmd("SHUTDOWN")
             .arg("SAVE")
             .exec(&mut self.admin_connection());
-        self.process
-            .lock()
-            .unwrap()
-            .take()
-            .expect("running")
-            .wait()
-            .expect("valkey exits");
+        let mut process = self.process.lock().unwrap();
+        let child = process.as_mut().expect("running");
+        let started = Instant::now();
+        let stopped = loop {
+            if reply.is_ok() {
+                break false;
+            }
+            if child.try_wait().expect("valkey status").is_some() {
+                break true;
+            }
+            if started.elapsed() >= START_TIMEOUT {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if !stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+            *process = None;
+            panic!(
+                "SHUTDOWN SAVE did not stop the server (reply {reply:?}); see {}",
+                self.log().display()
+            );
+        }
+        *process = None;
     }
 
     pub fn restart(&self) {

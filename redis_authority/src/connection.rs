@@ -178,6 +178,12 @@ impl Connections {
                 }
                 Err(Failure::Contended) => return Err(AuthorityError::Unavailable),
                 Err(failure) => {
+                    // A fresh connection's first failure is no stale one.
+                    let failure = if matches!(failure, Failure::Stale) {
+                        Failure::Io
+                    } else {
+                        failure
+                    };
                     tracing::warn!(?failure, node, "authority call failed");
                     self.failed();
                     return Err(AuthorityError::Unavailable);
