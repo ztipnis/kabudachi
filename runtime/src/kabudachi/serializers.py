@@ -1,5 +1,6 @@
 """What a serializer backend is, and how backends are found by name."""
 
+import pickle
 from typing import Any, Protocol
 
 from kabudachi.errors import (
@@ -104,6 +105,13 @@ class SerializerRegistry:
         """The backend registered as `name`, whether or not it can run here,
         or `None` if there is none. Unlike `get` it never raises."""
         return self._serializers.get(name)
+
+    def __reduce__(self) -> tuple[Any, tuple[()]]:
+        # A step sent to a task process names the serializers of the process
+        # it lands in; any other registry is local to a test or a caller.
+        if self is not _process_serializers:
+            raise pickle.PicklingError("only the process's own serializers can be sent")
+        return (process_serializers, ())
 
     def names(self) -> list[str]:
         """The names of the registered serializers, sorted."""

@@ -6,6 +6,7 @@ py_library(
     # rule names in srcs, so with a glob no `kabudachi.*` import resolves.
     srcs = [
         "__init__.py",
+        "_child.py",
         "body.py",
         "composites.py",
         "concurrency_places.py",
@@ -15,6 +16,7 @@ py_library(
         "flow.py",
         "handle.py",
         "hosted_work.py",
+        "ipc.py",
         "native_protocol.py",
         "options.py",
         "protobuf_serializer.py",

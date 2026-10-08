@@ -153,3 +153,25 @@ py_test(
         "@pypi//pytest",  # keep
     ],
 )
+
+# Tasks at module scope, which task processes import by name.
+# gazelle:resolve py pool_tasks //runtime/tests:pool_tasks
+py_library(
+    name = "pool_tasks",
+    testonly = True,
+    srcs = ["pool_tasks.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+)
+
+py_test(
+    name = "test_pool",
+    srcs = ["test_pool.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",
+        "@pypi//pytest",  # keep
+    ],
+)
