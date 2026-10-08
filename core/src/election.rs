@@ -136,6 +136,7 @@ mod lease;
 mod standing;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 pub use authority::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, Issuer,
@@ -171,6 +172,38 @@ pub(crate) use standing::EpochOrder;
 
 /// The most cancelled runs one ack lists; the rest follow in later acks.
 const MAX_CANCELLED_RUNS_PER_ACK: usize = 64;
+
+/// The runs a leader cancelled on one worker, and how far its acks have
+/// listed them: each ack lists the next batch after the last run listed,
+/// wrapping round, so every run goes out within a few acks however many there
+/// are.
+#[derive(Default)]
+struct CancelledRuns {
+    runs: BTreeSet<TaskRunId>,
+    last_listed: Option<TaskRunId>,
+}
+
+impl CancelledRuns {
+    /// The next batch for an ack, advancing the cursor past it.
+    fn next_batch(&mut self) -> Vec<TaskRunId> {
+        let after = match &self.last_listed {
+            Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        let wrapped = self.last_listed.iter().flat_map(|last| self.runs.range(..=last));
+        let batch: Vec<TaskRunId> = self
+            .runs
+            .range(after)
+            .chain(wrapped)
+            .take(MAX_CANCELLED_RUNS_PER_ACK)
+            .cloned()
+            .collect();
+        if let Some(last) = batch.last() {
+            self.last_listed = Some(last.clone());
+        }
+        batch
+    }
+}
 
 pub struct WorkerNode<C>
 where
@@ -236,7 +269,7 @@ where
     runs_compaction: bool,
     /// While it holds office: per worker, the runs that worker holds which
     /// this leader cancelled and stored, to list in its acks to it.
-    cancelled_runs: BTreeMap<WorkerId, BTreeSet<TaskRunId>>,
+    cancelled_runs: BTreeMap<WorkerId, CancelledRuns>,
     /// What a node bootstrapping again holds while it checks a JOIN pointer
     /// against the authority.
     rejoin: RejoinCheck,
@@ -1215,7 +1248,7 @@ where
     /// until [`Self::forget_cancelled`].
     pub fn tell_cancelled(&mut self, worker: WorkerId, run: TaskRunId) {
         if self.holds_office() {
-            self.cancelled_runs.entry(worker).or_default().insert(run);
+            self.cancelled_runs.entry(worker).or_default().runs.insert(run);
         }
     }
 
@@ -1636,7 +1669,12 @@ where
         );
         self.leader = Some((ack.leader_id(), ack.term));
         if !ack.cancelled_runs.is_empty() {
-            let runs = ack.cancelled_runs.iter().cloned().map(TaskRunId::from).collect();
+            let runs = ack
+                .cancelled_runs
+                .iter()
+                .cloned()
+                .map(TaskRunId::from)
+                .collect();
             self.outputs.push(Output::RunsCancelled(runs));
         }
         self.newest_accepted_ack = Some(AckEcho {
@@ -1925,11 +1963,11 @@ where
     fn send_ack_with(&mut self, to: WorkerId, content: AckContent, heartbeat_token: Option<u64>) {
         let cancelled_runs = self
             .cancelled_runs
-            .get(&to)
+            .get_mut(&to)
+            .map(CancelledRuns::next_batch)
+            .unwrap_or_default()
             .into_iter()
-            .flatten()
-            .take(MAX_CANCELLED_RUNS_PER_ACK)
-            .map(|run| run.clone().into())
+            .map(Into::into)
             .collect();
         let ack = LeaderHeartbeatAck {
             shard_id: Some(self.shard_id.clone().into()),
@@ -2455,6 +2493,7 @@ where
         }
         if let Some(office) = self.office.as_mut() {
             office.take_removal(departing.clone());
+            self.cancelled_runs.remove(departing);
         }
         self.drain_once_free();
     }
@@ -2990,6 +3029,8 @@ where
             if self.state == WorkerState::LeaderReconciling {
                 self.lost_while_reconciling.insert(worker.clone());
             }
+            // Its runs are replayed, so nothing cancelled on it needs telling.
+            self.cancelled_runs.remove(&worker);
             self.outputs.push(Output::WorkerLost(worker));
         }
     }
