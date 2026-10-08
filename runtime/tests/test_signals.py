@@ -248,7 +248,7 @@ POOL_PROGRAM = textwrap.dedent(
 
 
 @pytest.fixture
-def pool_served():
+def pool_served(tmp_path):
     """Starts a worker with one task process, in a process group of its own,
     and gives back a function that waits for its task to start and returns
     the worker and the task process's id; the worker is always killed and
@@ -262,6 +262,7 @@ def pool_served():
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
+            env={**os.environ, "KABUDACHI_TEST_MARKERS": str(tmp_path)},
         )
         processes.append(process)
         ready, _, _ = select.select([process.stdout], [], [], STARTUP_SECONDS)
@@ -306,17 +307,18 @@ def test_task_processes_ignore_ctrl_c_and_finish_while_the_worker_drains(pool_se
     assert gone(task_process)
 
 
-def next_line(process, within=STARTUP_SECONDS):
-    ready, _, _ = select.select([process.stdout], [], [], within)
-    assert ready, "the worker printed nothing in time"
+def next_line(process):
+    """The worker's next line. It may already be in the reader's buffer, which
+    a select on the pipe cannot see, so this blocks; the test's timeout bounds it."""
     return process.stdout.readline().strip()
 
 
 def test_sigterm_cancels_a_task_process_s_bodies_and_a_second_signal_sends_it(pool_served):
     process, first = pool_served(task_seconds=60)
 
-    # Stopped on its own, its body is cancelled, not failed: lost with the
-    # process, it runs again in the replacement.
+    # Stopped on its own, its body is cancelled, not failed. The body ignores
+    # the cancel, yet the process still ends: lost with it, the run runs again
+    # in the replacement, where it no longer ignores one.
     os.kill(first, signal.SIGTERM)
     assert next_line(process) == "task cancelled"
     started, second = next_line(process).rsplit(" ", 1)

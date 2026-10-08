@@ -31,8 +31,9 @@ from kabudachi.registry import TaskRegistry
 
 _logger = logging.getLogger("kabudachi")
 
-# How long a child asked to stop (SIGTERM) has before it is killed (SIGKILL).
-_TERMINATE_GRACE_SECONDS = 1.0
+# How long a child asked to stop (SIGTERM) has before it is killed (SIGKILL):
+# the grace after which it exits of its own accord.
+_TERMINATE_GRACE_SECONDS = _child.STOP_GRACE_SECONDS
 # How long, once a child has died, the frames it wrote just before may still
 # take to be read.
 _LAST_FRAMES_SECONDS = 1.0

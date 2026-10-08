@@ -34,6 +34,10 @@ from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
 from kabudachi.session import activate, invoke_callback
 
+# How long a task process asked to stop (SIGTERM) waits for its async bodies
+# to end before it exits anyway. Its worker kills it after the same grace.
+STOP_GRACE_SECONDS = 1.0
+
 
 def main(connection: Any, settings: Settings, modules: tuple[str, ...]) -> None:
     """Runs this task process to its end. It always ends with `os._exit`: a
@@ -200,6 +204,9 @@ class _TaskProcess:
             run_callback_inline(function, value)
 
     def _received(self, frame: Any) -> None:
+        if self._stopping and isinstance(frame, (ipc.Run, ipc.Compact)):
+            # Lost with this process, which is ending; the worker runs it again.
+            return
         match frame:
             case ipc.Run():
                 self._start_run(frame)
@@ -218,15 +225,19 @@ class _TaskProcess:
         """SIGTERM: cancels every body and ends the process once the async
         ones have stopped, without reporting their runs, which the worker
         counts lost when this process exits. A synchronous body cannot be
-        stopped; the exit ends it. An async body that ignores the cancel
-        keeps this process up until the worker's SIGKILL ends it."""
+        stopped; the exit ends it. An async body that ignores the cancel is
+        ended by the exit after a grace, whoever sent the SIGTERM."""
+        if self._stopping:
+            return
         self._stopping = True
         outcomes = list(self._outcomes.values())
         for outcome in outcomes:
             outcome.cancel()
         if not outcomes:
             _exit(0)
-        stopped = asyncio.get_running_loop().create_task(asyncio.wait(outcomes))
+        loop = asyncio.get_running_loop()
+        loop.call_later(STOP_GRACE_SECONDS, _exit, 0)
+        stopped = loop.create_task(asyncio.wait(outcomes))
         stopped.add_done_callback(lambda _: _exit(0))
 
     def _start_run(self, frame: ipc.Run) -> None:
