@@ -19,8 +19,10 @@ import functools
 import inspect
 import json
 import logging
+import math
 import threading
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
 from kabudachi._native import EventKind
@@ -116,8 +118,32 @@ class Session:
         """
         serializer = self._serializers.get(definition.serializer)
         payload = serializer.encode(argument, definition.input_type)
+        return self._record(definition, payload, options or SubmissionOptions())
+
+    def _record(
+        self, definition: TaskDefinition, payload: bytes, options: SubmissionOptions
+    ) -> TaskHandle:
         queue = self._configuration.resolve("queue", definition.queue)
-        return self._tasks.submit(definition, payload, queue, options or SubmissionOptions())
+        return self._tasks.submit(
+            definition,
+            payload,
+            queue,
+            options,
+            reconnect_timeout_ms=self._reconnect_timeout_ms(definition, queue),
+        )
+
+    def _reconnect_timeout_ms(self, definition: TaskDefinition, queue: str) -> int | None:
+        """The reconnect timeout a run of `definition` sent to `queue`
+        carries, in whole milliseconds rounded up so it is never replayed
+        early: the task's own, else the one configured for the queue. `None`
+        leaves it to the shard."""
+        timeout = definition.reconnect_timeout
+        if timeout is None:
+            seconds = self._configuration.resolve("reconnect_timeouts").get(queue)
+            if seconds is None:
+                return None
+            timeout = timedelta(seconds=seconds)
+        return math.ceil(timeout / timedelta(milliseconds=1))
 
     def submit_serialized(
         self, definition_id: str, payload: bytes, options: SubmissionOptions
@@ -128,8 +154,7 @@ class Session:
         definition = self._registry.get(definition_id)
         if definition is None:
             raise UnknownTaskError(f"this process has no task named {definition_id!r}")
-        queue = self._configuration.resolve("queue", definition.queue)
-        return self._tasks.submit(definition, payload, queue, options)
+        return self._record(definition, payload, options)
 
     def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle:
         """Starts a flow (`kind` "flow") or group a body in a task process called."""

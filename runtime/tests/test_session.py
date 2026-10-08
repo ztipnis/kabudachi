@@ -1549,3 +1549,43 @@ def test_a_callback_added_after_the_run_loop_closed_runs_at_once_and_leaves_noth
     run(asyncio.wait_for(world.session.wait_until_idle(), WAIT))
     gc.collect()
     assert not [w for w in recwarn if "was never awaited" in str(w.message)]
+
+
+def quick_reconnect(request: Greeting) -> Greeting:
+    return request
+
+
+def queue_reconnect(request: Greeting) -> Greeting:
+    return request
+
+
+def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
+    world = World()
+    world.configuration.configure(reconnect_timeouts={"slow": 90})
+    own = Task(
+        quick_reconnect,
+        registry=world.registry,
+        serializers=world.serializers,
+        name="tests.quick_reconnect",
+        queue="slow",
+        reconnect_timeout=timedelta(seconds=5),
+    )
+    from_queue = Task(
+        queue_reconnect,
+        registry=world.registry,
+        serializers=world.serializers,
+        name="tests.queue_reconnect",
+        queue="slow",
+    )
+    for task in (own, from_queue):
+        world.session.submit(task.definition, Greeting(text="hi"))
+
+    async def claimed():
+        await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
+        return await asyncio.wait_for(world.native.claim_pending(10), WAIT)
+
+    claims = run(claimed())
+    assert {claim.definition_id: claim.reconnect_timeout_ms for claim in claims} == {
+        "tests.quick_reconnect": 5_000,
+        "tests.queue_reconnect": 90_000,
+    }

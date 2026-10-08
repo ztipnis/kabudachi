@@ -57,6 +57,11 @@ class Task(wrapt.ObjectProxy):
         cancel_grace: How long a run has to stop once asked, before it is
             failed anyway and its body abandoned. Defaults to
             the process's.
+        reconnect_timeout: How long a run may go without its worker being
+            heard, past the time it takes to suspect a silent worker, before
+            the leader replays it on another; and so how long a worker cut
+            off from its leader has to stop it. Defaults to the queue's
+            `reconnect_timeouts` setting, else the shard's.
         merge: For a coalescing task, a pure reducer `(older, newer) -> merged`
             that combines the payloads of superseded generations, oldest
             first, on the worker that claims the newest one. Without it the
@@ -93,6 +98,7 @@ class Task(wrapt.ObjectProxy):
         merge: Callable[[Any, Any], Any] | None = None,
         drop_oldest: bool = False,
         recycle_process: bool = False,
+        reconnect_timeout: timedelta | None = None,
         serializers: SerializerRegistry | None = None,
     ) -> None:
         if not callable(func):
@@ -109,7 +115,7 @@ class Task(wrapt.ObjectProxy):
                 f"the task retries must be a non-negative integer, not {retries!r}"
             )
 
-        self._check_timing(timeout, cancel_grace)
+        self._check_timing(timeout, cancel_grace, reconnect_timeout)
         self._check_merge(merge, kind)
         self._check_drop_oldest(drop_oldest, kind)
         if not isinstance(recycle_process, bool):
@@ -136,6 +142,7 @@ class Task(wrapt.ObjectProxy):
             merge=merge,
             drop_oldest=drop_oldest,
             recycle_process=recycle_process,
+            reconnect_timeout=reconnect_timeout,
             continues=is_step_type(output_type),
         )
         self._check_serializer_supports(
@@ -279,7 +286,7 @@ class Task(wrapt.ObjectProxy):
             raise TypeError("only a coalescing task takes drop_oldest")
 
     @staticmethod
-    def _check_timing(timeout: Any, cancel_grace: Any) -> None:
+    def _check_timing(timeout: Any, cancel_grace: Any, reconnect_timeout: Any) -> None:
         if timeout is not None and (
             not isinstance(timeout, timedelta) or timeout <= timedelta(0)
         ):
@@ -291,6 +298,13 @@ class Task(wrapt.ObjectProxy):
         ):
             raise TaskDefinitionError(
                 f"the task cancel_grace must be a non-negative timedelta, not {cancel_grace!r}"
+            )
+        if reconnect_timeout is not None and (
+            not isinstance(reconnect_timeout, timedelta) or reconnect_timeout <= timedelta(0)
+        ):
+            raise TaskDefinitionError(
+                "the task reconnect_timeout must be a positive timedelta or None, "
+                f"not {reconnect_timeout!r}"
             )
 
     @staticmethod
@@ -392,6 +406,7 @@ def task(
     timeout: timedelta | None = ...,
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
+    reconnect_timeout: timedelta | None = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def task(
     func: Any = None,
@@ -405,6 +420,7 @@ def task(
     timeout: timedelta | None = None,
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
+    reconnect_timeout: timedelta | None = None,
 ) -> Any:
     """Declares a durable task: work that survives the loss of the worker
     running it. Use it bare (`@task`) or with options (`@task(queue="gpu")`).
@@ -435,6 +451,7 @@ def task(
         "timeout": timeout,
         "cancel_grace": cancel_grace,
         "recycle_process": recycle_process,
+        "reconnect_timeout": reconnect_timeout,
     }
     return Task.declare(func, TaskKind.TASK, options)
 
@@ -451,6 +468,7 @@ def ephemeral_task(
     timeout: timedelta | None = ...,
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
+    reconnect_timeout: timedelta | None = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def ephemeral_task(
     func: Any = None,
@@ -463,6 +481,7 @@ def ephemeral_task(
     timeout: timedelta | None = None,
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
+    reconnect_timeout: timedelta | None = None,
 ) -> Any:
     """Declares a best-effort task: it is never replayed after the loss of the
     worker running it, and losing every worker may lose it.
@@ -478,6 +497,7 @@ def ephemeral_task(
         "timeout": timeout,
         "cancel_grace": cancel_grace,
         "recycle_process": recycle_process,
+        "reconnect_timeout": reconnect_timeout,
     }
     return Task.declare(func, TaskKind.EPHEMERAL, options)
 
@@ -497,6 +517,7 @@ def coalescing_task(
     merge: Callable[[Any, Any], Any] | None = ...,
     drop_oldest: bool = ...,
     recycle_process: bool = ...,
+    reconnect_timeout: timedelta | None = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def coalescing_task(
     func: Any = None,
@@ -512,6 +533,7 @@ def coalescing_task(
     merge: Callable[[Any, Any], Any] | None = None,
     drop_oldest: bool = False,
     recycle_process: bool = False,
+    reconnect_timeout: timedelta | None = None,
 ) -> Any:
     """Declares continuously replaced work: a newer pending submission with
     the same key supersedes an older one, but never a running one, and only
@@ -543,5 +565,6 @@ def coalescing_task(
         "merge": merge,
         "drop_oldest": drop_oldest,
         "recycle_process": recycle_process,
+        "reconnect_timeout": reconnect_timeout,
     }
     return Task.declare(func, TaskKind.COALESCING, options)
