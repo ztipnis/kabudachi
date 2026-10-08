@@ -142,7 +142,9 @@ def test_a_long_chain_is_compacted_in_a_task_process(markers):
     assert newest == functools.reduce(lambda older, newer: f"({older}>{newer})", texts)
 
 
-def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_place_back_while_it_waits():
+def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_place_back_while_it_waits(
+    markers,
+):
     # One place in all: the called tasks can only run while the caller waits.
     kabudachi.configure(processes=1, concurrency=1)
 
@@ -152,7 +154,8 @@ def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_pla
     result = kabudachi.run(main)
 
     assert result.times == 1 + 2 + 11 + 21
-    assert result.text == "True cancelled"
+    assert result.text == "True cancelled ValueError UnknownTaskError"
+    assert (markers / "called-back").read_text() == "101", "the task process ran the callback out"
 
 
 def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_is_ephemeral():

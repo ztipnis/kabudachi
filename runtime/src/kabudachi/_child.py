@@ -188,7 +188,11 @@ class _TaskProcess:
         return self.ask(lambda request: ipc.CancelTask(request, task_id), submission=False)
 
     def _run_callback(self, function: Any, value: Any) -> None:
-        if not self._hosted.spawn(invoke_callback(function, value)):
+        # A drain waits for it too; checked again once it no longer counts.
+        def ended() -> None:
+            asyncio.get_running_loop().call_soon(self._finish_if_idle)
+
+        if not self._hosted.spawn(invoke_callback(function, value), when_done=ended):
             run_callback_inline(function, value)
 
     def _received(self, frame: Any) -> None:
@@ -286,7 +290,7 @@ class _TaskProcess:
         self._finish_if_idle()
 
     def _finish_if_idle(self) -> None:
-        if self._draining and not self._running:
+        if self._draining and not self._running and self._hosted.outstanding == 0:
             self._finished.set()
 
 
@@ -316,8 +320,6 @@ class _BodyWaits:
 class _ChildSession:
     """What a body here reaches through `kabudachi`: tasks, flows and groups
     are submitted to the worker, and handles settle when it says so."""
-
-    stopping = False
 
     def __init__(self, process: _TaskProcess) -> None:
         self._process = process

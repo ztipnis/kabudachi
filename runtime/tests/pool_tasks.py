@@ -11,7 +11,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import kabudachi
-from kabudachi.errors import TaskCancelledError
+from kabudachi.errors import TaskCancelledError, UnknownTaskError
 from proto_messages import Greeting
 
 MARKERS = "KABUDACHI_TEST_MARKERS"
@@ -94,9 +94,30 @@ async def leaf(request: Greeting) -> Greeting:
     return Greeting(times=request.times + 1)
 
 
+async def note_slowly(result: Greeting) -> None:
+    await asyncio.sleep(0.3)
+    marker("called-back").write_text(str(result.times))
+
+
+def declared_late(request: Greeting) -> Greeting:
+    return request
+
+
 @kabudachi.task(name="pool.calls_others")
 async def calls_others(request: Greeting) -> Greeting:
+    # Still running when this body has returned: the process waits for it.
+    leaf(Greeting(times=100)).callback(note_slowly)
     one = await leaf(request)
+    try:
+        await refuses(Greeting(text="nested"))
+    except ValueError as error:
+        failed = type(error).__name__
+    # Only this process has it, so the worker refuses the call.
+    late = kabudachi.task(name="pool.declared_late")(declared_late)
+    try:
+        late(request)
+    except UnknownTaskError as error:
+        refused = type(error).__name__
     stages = await kabudachi.flow(leaf, leaf)(request)
     mapped = await leaf.map([Greeting(times=10), Greeting(times=20)])
     later = leaf.options(delay=timedelta(seconds=30))(request)
@@ -107,4 +128,4 @@ async def calls_others(request: Greeting) -> Greeting:
     except TaskCancelledError:
         ended = "cancelled"
     total = one.times + stages[-1].times + sum(result.times for result in mapped)
-    return Greeting(times=total, text=f"{cancelled} {ended}")
+    return Greeting(times=total, text=f"{cancelled} {ended} {failed} {refused}")
