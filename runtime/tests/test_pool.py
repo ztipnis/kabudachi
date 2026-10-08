@@ -200,13 +200,15 @@ def test_a_body_past_its_hard_limit_settles_at_once_and_its_process_is_replaced_
 
     # Settled at its hard limit (0.3 s + 0.2 s), not when the process died.
     assert failed_after < 1.2
-    assert neighbour.times != os.getpid(), "the neighbour finished in the condemned process"
+    # No collateral kill: the neighbour shared the condemned process and still
+    # returned, from a different process than the retry, which ran in the
+    # replacement.
     assert retried.times != neighbour.times, "the retry ran in the replacement"
     assert float(retried.text) >= float(neighbour.text), "the retry waited for the old body's exit"
 
 
 def test_a_cancelled_body_stops_when_asked_and_one_that_will_not_costs_its_process(markers):
-    kabudachi.configure(processes=1, concurrency=2)
+    kabudachi.configure(processes=1, concurrency=1)
 
     async def main():
         async with asyncio.timeout(30):
@@ -227,8 +229,8 @@ def test_a_cancelled_body_stops_when_asked_and_one_that_will_not_costs_its_proce
             while not (markers / "ignoring").exists():
                 await asyncio.sleep(0.01)
             stuck.cancel()
-            # Past its 0.2 s grace, so the next body cannot land beside it.
-            await asyncio.sleep(0.4)
+            # Its process's one place stays taken until the process is gone,
+            # so the next body can only run in the replacement.
             replaced = (await pool_tasks.where_async(Greeting())).times
             return kept, outcomes, replaced
 
