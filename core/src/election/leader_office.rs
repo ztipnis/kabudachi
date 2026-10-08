@@ -414,8 +414,10 @@ impl LeaderOffice {
     /// `workers` answered this office's rebuild at `now`: each is heard, as
     /// by a heartbeat, so it counts as silent again only from now, and a
     /// silence reported for it is forgotten. A counted member that still
-    /// confirms no ack is silent by its last confirmation, as for a
-    /// heartbeat, and is reported silent again at once.
+    /// confirms no ack stays lost, and is silent by its last confirmation,
+    /// as for a heartbeat (see [`Self::silent_from`]): it is reported silent
+    /// again a suspicion timeout after that confirmation, at once if that
+    /// has passed.
     pub(crate) fn heard_answers(&mut self, workers: BTreeSet<WorkerId>, me: &WorkerId, now: Instant) {
         for worker in workers.into_iter().filter(|worker| worker != me) {
             self.last_heard.insert(worker.clone(), now);
@@ -476,21 +478,26 @@ impl LeaderOffice {
     /// [`Self::silent_from`]), and `None` for one reported silent and heard
     /// since. A worker reported lost and not heard since keeps its silence,
     /// as does a lost member that still confirms no ack: nothing has ended
-    /// either silence. A silence once reported keeps its instant until it
-    /// ends, so a replay it times never moves earlier.
+    /// either silence. Such a member whose answer to a rebuild ended its
+    /// silence (see [`Self::heard_answers`]) is reported silent again. A
+    /// silence once reported keeps its instant until it ends, so a replay it
+    /// times never moves earlier.
     pub(crate) fn silence_changes(
         &mut self,
         now: Instant,
         suspect_timeout: Duration,
     ) -> Vec<(WorkerId, Option<Instant>)> {
         let mut changes = Vec::new();
-        for worker in self.last_heard.keys().filter(|worker| !self.lost.contains(*worker)) {
+        for worker in self.last_heard.keys().filter(|worker| self.may_fall_silent(worker)) {
             let silent = self
                 .silent_from(worker, now, suspect_timeout)
                 .filter(|from| *from <= now);
+            // A lost member's heartbeats do not end its silence: only a
+            // confirmation, which takes it out of `lost`, or an answer does.
+            let ends = !self.lost.contains(worker);
             match (silent, self.reported_silence.contains_key(worker)) {
                 (Some(from), false) => changes.push((worker.clone(), Some(from))),
-                (None, true) => changes.push((worker.clone(), None)),
+                (None, true) if ends => changes.push((worker.clone(), None)),
                 _ => {}
             }
         }
@@ -512,10 +519,19 @@ impl LeaderOffice {
     pub(crate) fn next_silent_at(&self, now: Instant, suspect_timeout: Duration) -> Option<Instant> {
         self.last_heard
             .keys()
-            .filter(|worker| !self.lost.contains(*worker) && !self.reported_silence.contains_key(*worker))
+            .filter(|worker| {
+                self.may_fall_silent(worker) && !self.reported_silence.contains_key(*worker)
+            })
             .filter_map(|worker| self.silent_from(worker, now, suspect_timeout))
             .filter(|from| *from > now)
             .min()
+    }
+
+    /// Whether `worker` can be reported silent: it is not lost, or it is a
+    /// lost member still heard but confirming no ack, whose silence its
+    /// answer to a rebuild can end while it stays lost.
+    fn may_fall_silent(&self, worker: &WorkerId) -> bool {
+        !self.lost.contains(worker) || self.unconfirming.contains(worker)
     }
 
     /// The workers not heard from for `lost_after` by `now`, each reported

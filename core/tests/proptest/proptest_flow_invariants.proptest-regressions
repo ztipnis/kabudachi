@@ -5,4 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 2bffdc3a0e1ea4a3303f67d18b6e30e93241cf8d4ab39631eb05bb3c9b4bd176 # shrinks to ops = [Submit { key: Some(0), size: 1 }, Claim { limit: 1 }, Submit { key: Some(0), size: 1 }, Claim { limit: 1 }]
-cc 18f3d6196e219445877eaf298756f4ee4942b4f49c942693e5be02e91d9f4caa # shrinks to ops = [Submit { key: None, size: 1 }, Submit { key: None, size: 1 }, Submit { key: Some(0), size: 1 }, Claim { limit: 3 }, Submit { key: Some(0), size: 1 }, LoseWorker]
+cc 18f3d6196e219445877eaf298756f4ee4942b4f49c942693e5be02e91d9f4caa # shrinks to ops = [Submit { key: None, size: 1 }, Submit { key: None, size: 1 }, Submit { key: Some(0), size: 1 }, Claim { limit: 3 }, Submit { key: Some(0), size: 1 }, WorkerFallsSilent]

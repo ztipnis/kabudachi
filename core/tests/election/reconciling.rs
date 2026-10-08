@@ -142,3 +142,76 @@ fn a_worker_that_answered_the_rebuild_counts_as_heard_and_falls_silent_afresh() 
         "silent afresh, counted from its answer"
     );
 }
+
+/// Heartbeats from `confirming`, echoing a fresh ack, and from `unconfirming`,
+/// echoing none, then a tick, `Duration::from_ticks(5)` apart, at most
+/// `rounds` times, until an output satisfies `until`; returns it, or `None`
+/// if none did.
+fn beat_until(
+    node: &mut TestNode,
+    clock: &FakeClock,
+    confirming: &WorkerId,
+    unconfirming: &WorkerId,
+    rounds: usize,
+    until: impl Fn(&Output) -> bool,
+) -> Option<Output> {
+    let term = node.term();
+    for _ in 0..rounds {
+        clock.advance(Duration::from_ticks(5));
+        let echo = AckEcho {
+            term,
+            send_token: clock.now().as_ticks(),
+        };
+        let mut outputs = node
+            .step(message_input(confirming, heartbeat_message(heartbeat(confirming, Some(echo)))))
+            .outputs;
+        outputs.extend(
+            node.step(message_input(unconfirming, heartbeat_message(heartbeat(unconfirming, None))))
+                .outputs,
+        );
+        outputs.extend(node.step(Input::Tick).outputs);
+        if let Some(found) = outputs.into_iter().find(|output| until(output)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+// A member whose heartbeats arrive but which confirms no ack is lost to its
+// leader. Its answer to the rebuild ends the silence reported for it, but it
+// still confirms nothing, so it is reported silent again, within a suspicion
+// timeout, rather than keeping its runs for good.
+#[test]
+fn a_lost_member_that_answered_the_rebuild_but_confirms_no_ack_is_reported_silent_again() {
+    let clock = FakeClock::new();
+    let (mut node, _me, a, b) = reconciling_leader(&clock);
+    beat_until(&mut node, &clock, &a, &b, 10_000, |output| {
+        *output == Output::WorkerLost(b.clone())
+    })
+    .expect("a member that confirms no ack is lost");
+    let still_silent = beat_until(&mut node, &clock, &a, &b, 10, |output| {
+        matches!(output, Output::WorkerSilence { worker, reconnect_from: None } if *worker == b)
+    });
+    assert_eq!(still_silent, None, "its heartbeats alone do not end its silence");
+
+    let answered_at = clock.now();
+    let silent_again = |output: &Output| {
+        matches!(output, Output::WorkerSilence { worker, reconnect_from: Some(_) } if *worker == b)
+    };
+    let answered = node.step(Input::WatchWorkers {
+        silent_holders: BTreeSet::new(),
+        answered: BTreeSet::from([b.clone()]),
+    });
+    let silent = answered
+        .outputs
+        .into_iter()
+        .find(silent_again)
+        .or_else(|| beat_until(&mut node, &clock, &a, &b, 10_000, silent_again));
+    assert!(silent.is_some(), "its silence is reported again");
+    assert!(
+        clock.now() <= answered_at + Duration::from_ticks(SUSPECT_TIMEOUT + 5),
+        "reported silent at {:?}, not within a suspicion timeout of its answer at \
+         {answered_at:?}",
+        clock.now()
+    );
+}
