@@ -291,7 +291,7 @@ impl Worker {
             id: my_id.clone(),
             // The worker's id is already unique to this incarnation.
             incarnation: IncarnationId::new(my_id.as_str()),
-            shard: shard_id,
+            shard: entry.shard_id().unwrap_or_else(|| shard_id.clone()),
             timings: config.election_timings,
         };
         let authority_timings = config.authority.as_ref().map(|authority| authority.timings);

@@ -156,7 +156,7 @@ id_accessors!(TaskRunIdentityIds for TaskRunIdentity, of TaskRunIdentity {
 });
 id_accessors!(JoinResponseIds for JoinResponse, of JoinResponse {
     required: [],
-    optional: [leader_id: WorkerId],
+    optional: [leader_id: WorkerId, shard_id: ShardId],
     repeated: [],
 });
 id_accessors!(ClaimIds for Claim, of Claim {
@@ -353,13 +353,15 @@ impl WellFormed for JoinRequest {
 }
 
 impl WellFormed for JoinResponse {
-    /// A leader pointer names a leader together with its address, or, for "no
-    /// leader known", neither: one without the other is nothing a joiner can
-    /// act on. Its term is one this node can act on (see [`checked::is_a_term`]).
+    /// A leader pointer names a leader together with its address and the
+    /// shard incarnation it leads, or, for "no leader known", none of them:
+    /// one without the others is nothing a joiner can act on. Its term is one this node can act on (see [`checked::is_a_term`]).
     fn is_well_formed(&self) -> bool {
         let names_a_leader = self.leader_id.is_some();
         let gives_an_address = !self.leader_multiaddr.is_empty();
-        names_a_leader == gives_an_address && checked::is_a_term(self.term)
+        names_a_leader == gives_an_address
+            && names_a_leader == self.shard_id.is_some()
+            && checked::is_a_term(self.term)
     }
 }
 

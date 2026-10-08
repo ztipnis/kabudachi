@@ -262,14 +262,22 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
         None,
         "a joining node waits for its answer with no deadline"
     );
-    let first = joiner.step(Input::JoinAnswer(JoinResponse {
-            leader_id: Some(w2.clone().into()),
-            leader_multiaddr: "/ip4/127.0.0.1/tcp/4001".into(),
-            term: 1,
-            recovery_epoch: 0,
-            recovery_epoch_lineage: 0,
-        }))
-        .next_deadline;
+    let pointer = JoinResponse {
+        leader_id: Some(w2.clone().into()),
+        leader_multiaddr: "/ip4/127.0.0.1/tcp/4001".into(),
+        term: 1,
+        recovery_epoch: 0,
+        recovery_epoch_lineage: 0,
+        shard_id: Some(shard(SHARD).into()),
+    };
+    // A leader of another incarnation of the shard leads nothing this node
+    // belongs to.
+    let _ = joiner.step(Input::JoinAnswer(JoinResponse {
+        shard_id: Some(shard("shard-2").into()),
+        ..pointer.clone()
+    }));
+    assert_eq!(joiner.state(), WorkerState::Bootstrapping);
+    let first = joiner.step(Input::JoinAnswer(pointer)).next_deadline;
     let ticked_in = tick_at_every_deadline(&mut joiner, &clock, first, 50);
     assert_ticked_in(&ticked_in, &[WorkerState::Active, WorkerState::LeaderSuspect]);
     assert!(

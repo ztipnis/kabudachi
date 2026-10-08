@@ -64,7 +64,7 @@ pub fn local_node<C: Clock>(
     let identity = Identity {
         id: worker_id,
         incarnation: incarnation_id,
-        shard: shard_id,
+        shard: shard_id.clone(),
         timings: ElectionTimings::new(
             suspect_timeout,
             Duration::from_millis(HEARTBEAT_INTERVAL_MS),
@@ -72,6 +72,7 @@ pub fn local_node<C: Clock>(
         .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS)),
     };
     let entry = Entry::Founding {
+        shard_id: shard_id.clone(),
         recovery_epoch: RecoveryEpoch::new(0, 0),
         registered_at: None,
     };

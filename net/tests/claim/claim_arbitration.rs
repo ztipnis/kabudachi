@@ -158,6 +158,7 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
                 timings: timings(),
             },
             Entry::Founding {
+                shard_id: ShardId::new(SHARD),
                 recovery_epoch: RecoveryEpoch::new(0, 0),
                 registered_at: None,
             },

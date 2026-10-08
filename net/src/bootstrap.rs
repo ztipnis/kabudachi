@@ -280,6 +280,7 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
                     // needs shard merging, run when the two sides reach each
                     // other again.
                     return Entry::Founding {
+                        shard_id: shard_id.clone(),
                         recovery_epoch: RecoveryEpoch::founding(0, lineages),
                         registered_at: None,
                     };
@@ -311,6 +312,7 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
                         registered_at,
                     } => {
                         return Entry::Founding {
+                            shard_id: shard_id.clone(),
                             recovery_epoch,
                             registered_at: Some(registered_at),
                         };

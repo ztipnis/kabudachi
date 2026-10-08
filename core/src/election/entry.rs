@@ -4,7 +4,7 @@
 
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::ids::{IncarnationId, ShardId, WorkerId};
-use crate::protocol::messages::JoinResponse;
+use crate::protocol::messages::{JoinResponse, JoinResponseIds};
 use crate::time::{Clock, Instant};
 
 use super::{AuthorityTimings, ElectionTimings, Input, KnownConfiguration, Step, WorkerNode};
@@ -31,6 +31,9 @@ pub enum Entry {
     /// [`RecoveryEpoch::founding`]), which a node with an authority must know
     /// to recognise its own epoch there.
     ///
+    /// `shard_id` is the incarnation it founds, minted by the founder, or kept
+    /// from the record it re-founds.
+    ///
     /// `registered_at` is when the founder asked the authority to register
     /// it, before it took ownership of the shard; `None` with no authority.
     /// Its orphan deadline counts from then, not from when the node is
@@ -38,6 +41,7 @@ pub enum Entry {
     /// registration had lapsed, and after another worker had found the
     /// shard with no one registered and re-founded it.
     Founding {
+        shard_id: ShardId,
         recovery_epoch: RecoveryEpoch,
         registered_at: Option<Instant>,
     },
@@ -50,6 +54,19 @@ pub enum Entry {
     /// Start `Active` inside a configuration already known, at that
     /// configuration's recovery epoch, of that configuration's lineage.
     Known(KnownConfiguration),
+}
+
+impl Entry {
+    /// The incarnation of the shard this entry enters: the founded one, or
+    /// the one the JOIN pointer's leader leads. `None` for `Known`, whose
+    /// shard is the identity's.
+    pub fn shard_id(&self) -> Option<ShardId> {
+        match self {
+            Entry::Founding { shard_id, .. } => Some(shard_id.clone()),
+            Entry::Joining(pointer) => pointer.shard_id(),
+            Entry::Known(_) => None,
+        }
+    }
 }
 
 impl<C: Clock> WorkerNode<C> {
@@ -68,6 +85,7 @@ impl<C: Clock> WorkerNode<C> {
     ///
     /// # Panics
     ///
+    /// Panics if a founding entry names another shard than `identity.shard`.
     /// Panics if `identity.timings.heartbeat_interval`,
     /// `roll_call_deadline` or `clock_drift_divisor` is zero, or if the node
     /// is not alone a quorum of its shard and either twice its heartbeat
@@ -89,9 +107,14 @@ impl<C: Clock> WorkerNode<C> {
         } = identity;
         match entry {
             Entry::Founding {
+                shard_id,
                 recovery_epoch,
                 registered_at,
             } => {
+                assert_eq!(
+                    shard_id, shard,
+                    "a node founds the shard incarnation its identity names"
+                );
                 let mut node = Self::genesis(
                     id,
                     incarnation,

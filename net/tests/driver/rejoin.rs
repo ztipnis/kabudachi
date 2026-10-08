@@ -84,6 +84,7 @@ fn pointer(
         term: 1,
         recovery_epoch,
         recovery_epoch_lineage: lineage,
+        shard_id: Some(shard().into()),
     }
 }
 

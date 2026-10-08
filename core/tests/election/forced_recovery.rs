@@ -297,6 +297,7 @@ fn pointer_at_epoch_two_of(lineage: u64) -> Input {
         term: 1,
         recovery_epoch: 2,
         recovery_epoch_lineage: lineage,
+        shard_id: Some(shard(SHARD).into()),
     })
 }
 

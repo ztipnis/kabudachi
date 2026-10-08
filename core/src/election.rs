@@ -495,7 +495,8 @@ pub enum Input {
     /// `Bootstrapping` records that leader and moves through `Joining` to
     /// `Active` as a pending member. It learns the configuration from its
     /// leader's first ack. It stays `Bootstrapping`, so its driver can ask
-    /// again, for an answer that names no leader, and for one the node's
+    /// again, for an answer that names no leader, for one that names a leader
+    /// of another incarnation of the node's shard, and for one the node's
     /// floor does not accept (see [`JoinFloor::accepts`]). Every other state
     /// ignores it.
     ///
@@ -1295,6 +1296,7 @@ where
             term,
             recovery_epoch: self.standing.epoch_number(),
             recovery_epoch_lineage: self.recovery_lineage().unwrap_or_default(),
+            shard_id: Some(self.shard_id.clone().into()),
         })
     }
 
@@ -2097,6 +2099,11 @@ where
         let Some(leader_id) = pointer.leader_id() else {
             return;
         };
+        // A leader of another incarnation of the shard leads nothing this node
+        // belongs to.
+        if pointer.shard_id().as_ref() != Some(&self.shard_id) {
+            return;
+        }
         // A first join takes any pointer. After that, a pointer the floor the
         // node rejoins at does not accept leads nothing the node can return
         // to.
