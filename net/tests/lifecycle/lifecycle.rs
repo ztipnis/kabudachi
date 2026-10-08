@@ -85,7 +85,8 @@ async fn a_worker_submits_claims_starts_and_completes_a_task_through_the_leader(
             .await
             .expect("the leader answered");
         assert_eq!(reject_reason(&refused), Some(TaskRejectReason::TaskRejectNotMember));
-        assert!(shard.schedulers[leader].runs_of(&submitted.task_id).is_empty());
+        let task = submitted.task_id.clone();
+        assert!(shard.with(leader, move |_, scheduler| scheduler.runs_of(&task).is_empty()).await);
         let refused = shard
             .drive_until(client.request_claim(leader_id.clone(), submitted.task_id.clone()))
             .await

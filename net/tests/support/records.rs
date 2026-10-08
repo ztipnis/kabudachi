@@ -1,7 +1,6 @@
-//! A shard of driven voters over real loopback sockets, for tests of what a
-//! leader does with its records.
+//! A shard of voters driven in the background over real loopback sockets, for
+//! tests of what a leader does with its records.
 
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -25,7 +24,6 @@ use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::handoff::HandedOff;
 use kabudachi_net::messenger::Net;
 use kabudachi_net::task_store::placement::ReplicationFactor;
-use libp2p::futures::future::select_all;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -53,18 +51,41 @@ const ROLL_CALL_DEADLINE_MS: u64 = 100;
 /// A "something is actually broken" backstop for every wait of the fixture.
 const TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
-type Scheduled = Scheduler<RealClock, Uuid7Ids, RecordOutbox>;
+pub type Scheduled = Scheduler<RealClock, Uuid7Ids, RecordOutbox>;
+
+/// A voter's node and scheduler, and how its driver runs.
+struct Driven {
+    node: WorkerNode<RealClock>,
+    scheduler: Scheduled,
+    runs_compaction: bool,
+}
+
+/// Something a test does to a voter's node and scheduler between two runs of
+/// its driver.
+type Command = Box<dyn FnOnce(&mut WorkerNode<RealClock>, &mut Scheduled) + Send>;
+
+/// A voter: idle until the shard is first driven, then driven on a task of its
+/// own until it is killed or its driver returns.
+enum Voter {
+    Idle(Box<Driven>),
+    Running {
+        commands: tokio::sync::mpsc::UnboundedSender<Command>,
+        task: tokio::task::JoinHandle<()>,
+    },
+    /// Killed, or its driver returned after the voter drained.
+    Gone,
+}
 
 /// Voters of one known configuration, fully meshed, each with its own
-/// `Net::for_shard`, node and scheduler. Nothing runs until a `drive_*` call;
-/// each call drives every voter not killed and leaves the nodes where they
-/// stood.
+/// `Net::for_shard`, node and scheduler. Nothing runs until the first
+/// `drive_*` call; from then on every voter not killed is driven on a task of
+/// its own until its driver returns. A test reaches a voter's node or
+/// scheduler through [`Self::with`].
 pub struct Voters {
-    /// Shared, so a test can ask through a voter's net while driving the shard.
+    /// Shared, so a test can ask through a voter's net while the shard runs.
     pub nets: Vec<Arc<Net>>,
-    pub nodes: Vec<WorkerNode<RealClock>>,
-    pub schedulers: Vec<Scheduled>,
     pub clock: RealClock,
+    voters: Vec<Voter>,
     ids: Vec<WorkerId>,
     replication_factor: ReplicationFactor,
     /// Keeps each net's hosting thread running for as long as the voters live.
@@ -72,8 +93,6 @@ pub struct Voters {
     states: Vec<watch::Receiver<WorkerState>>,
     senders: Vec<watch::Sender<WorkerState>>,
     killed: Vec<bool>,
-    /// Which voters run compaction, as their drivers are told.
-    runs_compaction: Vec<bool>,
     /// What each voter's driver returned once it had drained and handed its
     /// records over; such a voter is driven no more.
     handed_off: HandedOffBy,
@@ -89,12 +108,12 @@ impl HandedOffBy {
         HandedOffBy(Arc::new(watch::channel(vec![None; voters]).0))
     }
 
-    fn of(&self, voter: usize) -> Option<HandedOff> {
-        self.0.borrow()[voter].clone()
-    }
-
     fn record(&self, voter: usize, handed_off: HandedOff) {
         self.0.send_modify(|returned| returned[voter] = Some(handed_off));
+    }
+
+    fn has_returned(&self, voter: usize) -> bool {
+        self.0.borrow()[voter].is_some()
     }
 
     /// Resolves once `voter`'s driver has returned (it does once the voter
@@ -176,32 +195,125 @@ impl Voters {
         let nodes = built_on_one_tick(&clock, || {
             ids.iter().map(|id| voter(clock, id.clone(), count)).collect::<Vec<_>>()
         });
-        let schedulers = nodes.iter().map(|_| driven_scheduler(clock)).collect();
         let channels: Vec<_> = nodes.iter().map(|node| watch::channel(node.state())).collect();
         let senders = channels.iter().map(|(sender, _)| sender.clone()).collect();
         let states = channels.into_iter().map(|(_, receiver)| receiver).collect();
-        let killed = vec![false; nodes.len()];
-        let handed_off = HandedOffBy::new(nodes.len());
+        let killed = vec![false; count];
+        let handed_off = HandedOffBy::new(count);
+        let voters = nodes
+            .into_iter()
+            .map(|node| {
+                Voter::Idle(Box::new(Driven {
+                    node,
+                    scheduler: driven_scheduler(clock),
+                    runs_compaction: false,
+                }))
+            })
+            .collect();
         Voters {
             nets,
-            nodes,
-            schedulers,
             clock,
+            voters,
             ids,
             replication_factor,
             _hosts: hosts,
             states,
             senders,
             killed,
-            runs_compaction: vec![false; count],
             handed_off,
         }
     }
 
-    /// Tells `voter`'s driver, from the next `drive_until` on, whether its
-    /// worker runs compaction.
+    /// Tells `voter`'s driver whether its worker runs compaction. Only before
+    /// the shard is first driven.
     pub fn set_runs_compaction(&mut self, voter: usize, runs: bool) {
-        self.runs_compaction[voter] = runs;
+        let Voter::Idle(driven) = &mut self.voters[voter] else {
+            panic!("set before the shard is first driven");
+        };
+        driven.runs_compaction = runs;
+    }
+
+    /// Runs `act` on `voter`'s node and scheduler and returns what it
+    /// returned. A running voter's driver stops for it and starts again after,
+    /// as a driver does at every new run; an idle voter's runs it in place.
+    /// Panics for a voter killed or done, or past the backstop.
+    pub async fn with<R: Send + 'static>(
+        &mut self,
+        voter: usize,
+        act: impl FnOnce(&mut WorkerNode<RealClock>, &mut Scheduled) -> R + Send + 'static,
+    ) -> R {
+        self.check_drivers().await;
+        let gone = || panic!("voter {voter} is no longer driven");
+        match &mut self.voters[voter] {
+            Voter::Idle(driven) => act(&mut driven.node, &mut driven.scheduler),
+            Voter::Running { commands, .. } => {
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                // A panic in `act` goes back to the caller, so the test fails
+                // with its own message and the driver keeps running.
+                let command: Command = Box::new(move |node, scheduler| {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        act(node, scheduler)
+                    }));
+                    let _ = reply.send(outcome);
+                });
+                if commands.send(command).is_err() {
+                    gone();
+                }
+                match timeout(TEST_TIMEOUT, answer).await {
+                    Ok(Ok(Ok(answer))) => answer,
+                    Ok(Ok(Err(panic))) => std::panic::resume_unwind(panic),
+                    Ok(Err(_)) => gone(),
+                    Err(_) => panic!("voter {voter} ran the command within the timeout"),
+                }
+            }
+            Voter::Gone => gone(),
+        }
+    }
+
+    /// Fails the test if a voter's driver ended without handing off: a driver
+    /// runs on a task nobody awaits, so its panic would otherwise go unseen.
+    async fn check_drivers(&mut self) {
+        for voter in 0..self.voters.len() {
+            let Voter::Running { task, .. } = &mut self.voters[voter] else {
+                continue;
+            };
+            if !task.is_finished() || self.handed_off.has_returned(voter) {
+                continue;
+            }
+            // The task has finished, so this resolves at once.
+            match timeout(StdDuration::ZERO, task).await {
+                Ok(Err(error)) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                _ => panic!("voter {voter}'s driver stopped without handing off"),
+            }
+        }
+    }
+
+    /// Starts driving every idle voter not killed.
+    fn start_idle(&mut self) {
+        let config = DriverConfig {
+            replication_factor: self.replication_factor,
+            ..DriverConfig::default()
+        };
+        for voter in 0..self.voters.len() {
+            if self.killed[voter] || !matches!(self.voters[voter], Voter::Idle(_)) {
+                continue;
+            }
+            let Voter::Idle(driven) = std::mem::replace(&mut self.voters[voter], Voter::Gone) else {
+                unreachable!("checked idle above");
+            };
+            let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(drive_in_background(
+                voter,
+                *driven,
+                self.nets[voter].clone(),
+                self.clock,
+                config.clone(),
+                self.senders[voter].clone(),
+                receiver,
+                self.handed_off.clone(),
+            ));
+            self.voters[voter] = Voter::Running { commands, task };
+        }
     }
 
     /// A reading of every voter's state that stays current while the shard is
@@ -216,6 +328,10 @@ impl Voters {
     /// Stops driving `voter` and cuts it off from every other voter, as a
     /// host that died would be: its connections close and none reopens.
     pub fn kill(&mut self, voter: usize) {
+        if let Voter::Running { task, .. } = &self.voters[voter] {
+            task.abort();
+        }
+        self.voters[voter] = Voter::Gone;
         self.killed[voter] = true;
         for other in (0..self.nets.len()).filter(|other| *other != voter) {
             self.nets[other].block_peer(self.ids[voter].clone());
@@ -240,18 +356,23 @@ impl Voters {
         let leader_id = self.id(leader);
         timeout(TEST_TIMEOUT, async {
             client.send(leader_id.clone(), heartbeat_from(&joiner));
-            while !self.nodes[leader].is_voter_or_pending(&joiner) {
+            while !self.holds_pending(leader, &joiner).await {
                 self.drive_until(tokio::time::sleep(StdDuration::from_millis(10)))
                     .await;
                 // A heartbeat sent before the leader's lease or the
                 // connection was ready is dropped, so send another.
-                if !self.nodes[leader].is_voter_or_pending(&joiner) {
+                if !self.holds_pending(leader, &joiner).await {
                     client.send(leader_id.clone(), heartbeat_from(&joiner));
                 }
             }
         })
         .await
         .expect("the leader's roster held the joiner within the timeout");
+    }
+
+    async fn holds_pending(&mut self, leader: usize, joiner: &WorkerId) -> bool {
+        let joiner = joiner.clone();
+        self.with(leader, move |node, _| node.is_voter_or_pending(&joiner)).await
     }
 
     /// Drives the voters until one leads with a lease its scheduler holds
@@ -289,7 +410,12 @@ impl Voters {
             // loaded host can cost the leader its office meanwhile: then wait
             // for the next one.
             while *self.states[leader].borrow() == WorkerState::Leader {
-                if self.schedulers[leader].is_leader() && self.all_hold_the_full_configuration_of(leader) {
+                let (leads, led) = self
+                    .with(leader, |node, scheduler| {
+                        (scheduler.is_leader(), node.configuration().cloned())
+                    })
+                    .await;
+                if leads && self.all_hold(led).await {
                     return leader;
                 }
                 self.drive_until(tokio::time::sleep(StdDuration::from_millis(10)))
@@ -298,86 +424,94 @@ impl Voters {
         }
     }
 
-    /// Whether `leader`'s configuration is committed with every voter of the
-    /// shard in it, and every voter holds it as one of its voters.
-    fn all_hold_the_full_configuration_of(&self, leader: usize) -> bool {
-        let Some(led) = self.nodes[leader].configuration() else {
+    /// Whether `led`, a leader's configuration, is committed with every voter
+    /// of the shard in it, and every voter still driven holds it as one of
+    /// its voters.
+    async fn all_hold(&mut self, led: Option<Configuration>) -> bool {
+        let Some(led) = led else {
             return false;
         };
-        led.voter_count() == Some(self.nodes.len())
-            && self.nodes.iter().all(|node| {
-                node.configuration().map(Configuration::generation) == Some(led.generation())
-                    && led.is_voter(node.admission())
-            })
+        if led.voter_count() != Some(self.voters.len()) {
+            return false;
+        }
+        for voter in 0..self.voters.len() {
+            if matches!(self.voters[voter], Voter::Gone) {
+                continue;
+            }
+            let led = led.clone();
+            let holds = self
+                .with(voter, move |node, _| {
+                    node.configuration().map(Configuration::generation) == Some(led.generation())
+                        && led.is_voter(node.admission())
+                })
+                .await;
+            if !holds {
+                return false;
+            }
+        }
+        true
     }
 
-    /// Drives every voter not killed, and not one that has handed its
-    /// records over, until `until` completes, and returns what it returned;
-    /// panics if that takes past the backstop. A voter whose driver returns
-    /// meanwhile is driven no more (see [`Self::handed_off`]).
+    /// Starts driving any idle voter, then waits for `until` while the voters
+    /// run, and returns what it returned; panics if that takes past the
+    /// backstop. A voter whose driver returns meanwhile is driven no more
+    /// (see [`Self::handed_off`]).
     pub async fn drive_until<T>(&mut self, until: impl Future<Output = T>) -> T {
-        let clock = self.clock;
-        let (nets, senders, killed) = (&self.nets, &self.senders, &self.killed);
-        let runs_compaction = self.runs_compaction.clone();
-        let handed_off = self.handed_off.clone();
-        let config = DriverConfig {
-            replication_factor: self.replication_factor,
-            ..DriverConfig::default()
-        };
-        let drivers: Vec<Pin<Box<dyn Future<Output = (usize, HandedOff)> + '_>>> = self
-            .nodes
-            .iter_mut()
-            .zip(self.schedulers.iter_mut())
-            .enumerate()
-            .filter(|(voter, _)| !killed[*voter] && handed_off.of(*voter).is_none())
-            .map(|(voter, (node, scheduler))| {
-                let observe = publish(senders[voter].clone());
-                let config = DriverConfig {
-                    runs_compaction: runs_compaction[voter],
-                    ..config.clone()
-                };
-                Box::pin(async move {
-                    let returned = run_driver(
-                        node,
-                        due_now(&clock),
-                        &*nets[voter],
-                        scheduler,
-                        clock,
-                        None,
-                        config,
-                        observe,
-                    )
-                    .await;
-                    (voter, returned)
-                }) as Pin<Box<dyn Future<Output = (usize, HandedOff)> + '_>>
-            })
-            .collect();
-        let output = timeout(TEST_TIMEOUT, async {
-            let mut running = drivers;
-            let mut until = std::pin::pin!(until);
-            loop {
-                if running.is_empty() {
-                    return until.await;
-                }
-                tokio::select! {
-                    ((voter, done), _, rest) = select_all(running) => {
-                        handed_off.record(voter, done);
-                        running = rest;
-                    }
-                    output = &mut until => return output,
-                }
-            }
-        })
-        .await
-        .expect("the awaited event happened within the timeout");
-        output
+        self.start_idle();
+        let awaited = timeout(TEST_TIMEOUT, until)
+            .await
+            .expect("the awaited event happened within the timeout");
+        self.check_drivers().await;
+        awaited
     }
 
     /// What the drivers of drained voters returned, to wait on inside
-    /// [`Self::drive_until`]: the shard's drivers keep what they know of their
-    /// leader's writes only for as long as one call drives them.
+    /// [`Self::drive_until`]; resolves once the voter's driver returned.
     pub fn handed_off(&self) -> HandedOffBy {
         self.handed_off.clone()
+    }
+}
+
+impl Drop for Voters {
+    /// Stops every voter's task, so none outlives the test.
+    fn drop(&mut self) {
+        for voter in &self.voters {
+            if let Voter::Running { task, .. } = voter {
+                task.abort();
+            }
+        }
+    }
+}
+
+/// Drives `driven` on `net` until its driver returns, running each command
+/// between two runs of the driver.
+#[allow(clippy::too_many_arguments)]
+async fn drive_in_background(
+    voter: usize,
+    mut driven: Driven,
+    net: Arc<Net>,
+    clock: RealClock,
+    config: DriverConfig,
+    state: watch::Sender<WorkerState>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
+    handed_off: HandedOffBy,
+) {
+    loop {
+        let config = DriverConfig {
+            runs_compaction: driven.runs_compaction,
+            ..config.clone()
+        };
+        let Driven { node, scheduler, .. } = &mut driven;
+        let command = tokio::select! {
+            returned = run_driver(node, due_now(&clock), &net, scheduler, clock, None, config, publish(state.clone())) => {
+                handed_off.record(voter, returned);
+                return;
+            }
+            command = commands.recv() => command,
+        };
+        // The sender lives in `Voters`; once it is gone, so is the test.
+        let Some(command) = command else { return };
+        command(&mut driven.node, &mut driven.scheduler);
     }
 }
 

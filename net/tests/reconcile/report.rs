@@ -27,9 +27,11 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
         let big = vec![7u8; 200 * 1024];
         let mut tasks = Vec::new();
         for _ in 0..8 {
+            let big = big.clone();
             tasks.push(
-                shard.schedulers[leader]
-                    .submit(plain_with(&big))
+                shard
+                    .with(leader, move |_, scheduler| scheduler.submit(plain_with(&big)))
+                    .await
                     .expect("the leader accepts a submission"),
             );
         }
@@ -40,8 +42,9 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
         // fixed number of bytes would split one.
         let long_kind = "\u{20ac}".repeat(300);
         tasks.push(
-            shard.schedulers[leader]
-                .submit(plain_with(b"input"))
+            shard
+                .with(leader, |_, scheduler| scheduler.submit(plain_with(b"input")))
+                .await
                 .expect("the leader accepts a submission"),
         );
         let failing = tasks.last().expect("a task was just added").clone();

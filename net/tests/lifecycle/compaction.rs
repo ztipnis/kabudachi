@@ -29,10 +29,14 @@ async fn a_leader_compacts_a_chain_for_a_worker_that_runs_compaction_and_applies
         let (mut shard, client) = ThreeVoters::start().await;
         for voter in 0..3 {
             shard.set_runs_compaction(voter, true);
-            shard.schedulers[voter].set_memory_limits(Some(MemoryLimits {
-                soft: 300,
-                hard: 1_000_000,
-            }));
+            shard
+                .with(voter, |_, scheduler| {
+                    scheduler.set_memory_limits(Some(MemoryLimits {
+                        soft: 300,
+                        hard: 1_000_000,
+                    }))
+                })
+                .await;
         }
         let leader = shard.drive_until_a_leader().await;
         let leader_id = shard.id(leader);

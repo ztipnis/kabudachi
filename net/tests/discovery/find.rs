@@ -83,10 +83,13 @@ async fn steal_targets_once_routed(shard: &mut Voters, voter: usize) -> Vec<Vec<
 /// Drives the shard until `leader` places records among every voter, and
 /// returns them: where a task's record goes is then [`placement`] over them.
 async fn placing_among_every_voter(shard: &mut Voters, leader: usize) -> Vec<WorkerId> {
-    while shard.nodes[leader].voters().len() < shard.nets.len() {
+    loop {
+        let voters = shard.with(leader, |node, _| node.voters()).await;
+        if voters.len() == shard.nets.len() {
+            return voters;
+        }
         shard.drive_until(tokio::time::sleep(Duration::from_millis(10))).await;
     }
-    shard.nodes[leader].voters()
 }
 
 /// How many task ids [`laid_out`] tries before the voters' identities count
