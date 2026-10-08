@@ -22,10 +22,25 @@ rust_library(
 # there is no shard_count.
 rust_test(
     name = "net_integration_test",
-    srcs = glob(["tests/**/*.rs"]),
+    srcs = glob(["tests/**/*.rs"], exclude = ["tests/redis_end_to_end.rs"]),
     crate_root = "tests/net_integration.rs",
     edition = "2024",
     size = "medium",
     tags = ["no-remote-cache"],
     deps = [":net", "//core", "//testkit"] + all_crate_deps(normal = True, normal_dev = True),
+)
+
+# Workers against a real valkey server: cold bootstrap, flush, restart, and a
+# flush after quorum loss. The server binary comes in through the support
+# library's data. Real-time waits on a 2 s authority TTL, about 10 s in all.
+rust_test(
+    name = "redis_end_to_end_test",
+    srcs = ["tests/redis_end_to_end.rs", "tests/support/deadline.rs", "tests/support/worker.rs"],
+    crate_root = "tests/redis_end_to_end.rs",
+    edition = "2024",
+    size = "medium",
+    timeout = "short",
+    tags = ["no-remote-cache"],
+    deps = [":net", "//core", "//redis_authority", "//redis_authority:valkey_test_support"] +
+           all_crate_deps(normal = True, normal_dev = True),
 )
