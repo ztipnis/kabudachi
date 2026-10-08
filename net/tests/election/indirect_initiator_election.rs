@@ -28,12 +28,12 @@
 //! follower, holds the winner's listen address.
 
 
-use kabudachi_core::coordination_authority::RecoveryEpoch;
 use std::time::Duration as StdDuration;
 
 use crate::support::deadline::within_deadline;
 use crate::support::net::driven_scheduler;
 use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, KnownConfiguration, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;

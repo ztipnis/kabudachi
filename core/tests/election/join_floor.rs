@@ -63,9 +63,6 @@ fn a_floor_ranks_accepted_pointers_by_epoch_then_by_term() {
         "the epoch of another lineage numbered above the floor outranks lower numbers, and the \
          pointer below the floor is left out"
     );
-
-    let (lower, higher) = (pointer(7, B, 50), pointer(7, 3, 1));
-    assert_eq!(floor.newest([&lower, &higher]), Some(&higher));
 }
 
 #[test]

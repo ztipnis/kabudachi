@@ -4,13 +4,13 @@
 //! voter at. The multi-node behaviour of the same rules is in
 //! `scenario_membership_test`.
 
-use crate::support::builders::{epoch, 
-    ack_message, committed_from_g0, configuration_of, g0, heartbeat, heartbeat_message, leader_ack,
-    past_any_suspicion, roll_call, roll_call_message, roll_call_reply, self_remove,
+use crate::support::builders::checked;
+use crate::support::builders::{
+    ack_message, committed_from_g0, configuration_of, epoch, g0, heartbeat, heartbeat_message,
+    leader_ack, past_any_suspicion, roll_call, roll_call_message, roll_call_reply, self_remove,
     self_remove_message, vote_grant, vote_grant_message, vote_request, vote_request_message,
     worker,
 };
-use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{

@@ -5,11 +5,10 @@
 //! acks repair a lost certificate; and a worker adopts admission generations
 //! only together with the configuration they belong to.
 
-use crate::support::builders::{epoch, 
-    ack_message, configuration_of, election_certificate,
-    election_certificate_message, founded_from_g0, g0, leader_ack,
-    past_any_suspicion, roll_call, roll_call_message, shard, timings, vote_request,
-    vote_request_message, worker,
+use crate::support::builders::{
+    ack_message, configuration_of, election_certificate, election_certificate_message, epoch,
+    founded_from_g0, g0, leader_ack, past_any_suspicion, roll_call, roll_call_message, shard,
+    timings, vote_request, vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{TestNode, deliver, sent_to, voter_node};

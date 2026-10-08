@@ -1,12 +1,12 @@
 //! A shard of voters driven in the background over real loopback sockets, for
 //! tests of what a leader does with its records.
 
-use kabudachi_core::coordination_authority::RecoveryEpoch;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{
     ElectionTimings, Entry, Identity, Input, KnownConfiguration, Step, WorkerNode,
 };

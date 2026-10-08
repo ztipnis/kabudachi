@@ -80,7 +80,6 @@
 //! (A1-A3, see there).
 
 
-use crate::support::builders::epoch;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -94,6 +93,7 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
 use proptest::prelude::*;
 use proptest::test_runner::{RngSeed, TestRunner};
+use crate::support::builders::epoch;
 use crate::support::harness::{Cluster, StepRecord};
 
 const MAX_NODES: usize = 7;
@@ -1217,8 +1217,10 @@ fn check_authority_case(
                     configuration.generation()
                 );
             }
-            let now =
-                RecoveryEpoch::new(node.recovery_epoch(), node.recovery_lineage().unwrap_or_default());
+            let now = RecoveryEpoch::new(
+                node.recovery_epoch(),
+                node.recovery_lineage().unwrap_or_default(),
+            );
             prop_assert!(
                 now >= last_epoch[id]
                     || (rejoined_now.contains(id) && node.recovery_lineage().is_some()),

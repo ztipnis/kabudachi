@@ -1,8 +1,8 @@
 //! A follower's half of leader liveness: the routing crawl its heartbeats
 //! report, and the acks it ignores.
 
-use crate::support::builders::{epoch, 
-    ack_message, configuration_of, g0, leader_ack, shard, timings, worker,
+use crate::support::builders::{
+    ack_message, configuration_of, epoch, g0, leader_ack, shard, timings, worker,
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{TestNode, deliver, sent_to, tick, voter_node};

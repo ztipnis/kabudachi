@@ -1029,7 +1029,8 @@ where
     /// compare with this node's, so one is accepted as a newer office). A
     /// requester that is neither, such as a deposed leader, is refused, so
     /// what a worker holds is told only to the office that may act on it.
-    /// The certificate is checked as one received over the wire is.
+    /// The certificate is checked as one received over the wire is. A node
+    /// that never joined a shard answers no one.
     pub fn may_answer_reconcile(
         &self,
         from: &WorkerId,
@@ -1057,7 +1058,8 @@ where
         if certificate.leader_id() != *from || certificate.shard_id() != self.shard_id {
             return false;
         }
-        let named = RecoveryEpoch::new(certificate.recovery_epoch, certificate.recovery_epoch_lineage);
+        let named =
+            RecoveryEpoch::new(certificate.recovery_epoch, certificate.recovery_epoch_lineage);
         match self.standing.order(named) {
             Some(EpochOrder::Later) => true,
             Some(EpochOrder::Stale) | None => false,

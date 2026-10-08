@@ -23,7 +23,9 @@ use kabudachi_core::protocol::ids::IncarnationId;
 use kabudachi_core::time::Duration;
 use proptest::prelude::*;
 
-use crate::support::builders::{epoch, self, configuration_of, g0, no_leader_yet, shard, timings, worker};
+use crate::support::builders::{
+    self, configuration_of, epoch, g0, no_leader_yet, shard, timings, worker,
+};
 use crate::support::clock::FakeClock;
 use crate::support::node::{TestNode, elect, voter_node};
 

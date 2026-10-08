@@ -84,29 +84,30 @@ async fn the_newest_pointer_among_the_peers_is_the_one_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_pointer_the_floor_accepts_beats_a_higher_term_of_a_lower_lineage() {
+async fn the_only_pointer_is_below_the_floor() {
     within_deadline(async {
-        // The floor is epoch 5 of lineage 2. Seed A, listed first, points at
-        // epoch 5 of lineage 1 at a much later term: an older epoch, a leader
-        // the floor refuses. Seed B points at the floor's own lineage.
+        // The floor is epoch 5 of lineage 2. Seed A points at epoch 5 of
+        // lineage 1 at a much later term: an older epoch, a leader the floor
+        // refuses. Seed B knows no leader.
         let (net_a, addr_a) = listening_net().await;
         let (net_b, addr_b) = listening_net().await;
         let joiner = Net::new();
-        let (worker_a, worker_b) = (net_a.local_worker_id(), net_b.local_worker_id());
-        let other_lineage = JoinResponse {
+        let worker_a = net_a.local_worker_id();
+        let below_floor = JoinResponse {
             recovery_epoch_lineage: 1,
             ..pointer_at(&worker_a, &addr_a, 5, 10)
         };
-        let own_lineage = JoinResponse {
-            recovery_epoch_lineage: 2,
-            ..pointer_at(&worker_b, &addr_b, 5, 1)
-        };
-        let _responder_a = JoinResponder::start(Arc::new(net_a), Some(other_lineage));
-        let _responder_b = JoinResponder::start(Arc::new(net_b), Some(own_lineage.clone()));
+        let _responder_a = JoinResponder::start(Arc::new(net_a), Some(below_floor));
+        let _responder_b = JoinResponder::start(Arc::new(net_b), None);
 
-        let found = search(&joiner, &[addr_a, addr_b], JoinFloor::at(RecoveryEpoch::new(5, 2))).await;
+        let found = search(
+            &joiner,
+            &[addr_a, addr_b],
+            JoinFloor::at(RecoveryEpoch::new(5, 2)),
+        )
+        .await;
 
-        assert_eq!(found, LeaderSearch::Found(own_lineage));
+        assert_eq!(found, LeaderSearch::NoReachableLeader);
     })
     .await
 }

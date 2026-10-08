@@ -4,7 +4,9 @@
 //! when, and whether, the authority answers the read the node asks for.
 
 use crate::support::authority::{asked, authority_ttl};
-use crate::support::builders::{epoch, ack_message, leader_ack, message_input, shard, timings, worker};
+use crate::support::builders::{
+    ack_message, epoch, leader_ack, message_input, shard, timings, worker,
+};
 use crate::support::clock::FakeClock;
 use crate::support::node::{TestNode, published_roll_calls};
 

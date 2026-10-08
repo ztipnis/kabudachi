@@ -2,10 +2,10 @@
 //! the leader it follows, or a requester that proves a leader's office with
 //! an election certificate for a term no earlier than the worker's highest.
 
-use crate::support::builders::{epoch, 
-    ack_message, configuration_of, election_certificate_message, leader_ack, past_any_suspicion,
-    roll_call, roll_call_message, shard, timings, vote_grant, vote_grant_message, vote_request,
-    vote_request_message, worker,
+use crate::support::builders::{
+    ack_message, configuration_of, election_certificate_message, epoch, leader_ack,
+    past_any_suspicion, roll_call, roll_call_message, shard, timings, vote_grant,
+    vote_grant_message, vote_request, vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{TestNode, deliver, stand_as_candidate, voter_node};

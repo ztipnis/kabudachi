@@ -29,7 +29,6 @@
 //! model checks that part). Several removed together could otherwise make
 //! up a quorum of the configuration before, as a single one never can.
 
-use crate::support::builders::epoch;
 use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::configuration::{
@@ -37,6 +36,8 @@ use kabudachi_core::configuration::{
 };
 use kabudachi_core::protocol::ids::WorkerId;
 use proptest::prelude::*;
+
+use crate::support::builders::epoch;
 
 #[derive(Debug, Clone)]
 struct Worker {
@@ -58,8 +59,9 @@ impl Worker {
 }
 
 fn generation_strategy() -> impl Strategy<Value = Generation> {
-    (0u64..3, 0u64..3, 0u64..4)
-        .prop_map(|(recovery_epoch, term, counter)| Generation::new(epoch(recovery_epoch), term, counter))
+    (0u64..3, 0u64..3, 0u64..4).prop_map(|(recovery_epoch, term, counter)| {
+        Generation::new(epoch(recovery_epoch), term, counter)
+    })
 }
 
 /// The generations a joint configuration is built from: the old side's base

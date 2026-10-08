@@ -88,9 +88,7 @@ pub(crate) fn cannot_recover_from(
 ) -> bool {
     match own_epoch {
         None => true,
-        Some(own) => {
-            own.lineage != held.lineage || order(own, held) == EpochOrder::Stale
-        }
+        Some(own) => own.lineage != held.lineage || order(own, held) == EpochOrder::Stale,
     }
 }
 

@@ -728,7 +728,12 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
             ack_message(LeaderHeartbeatAck {
                 recovery_epoch: 5,
                 recovery_epoch_lineage: 0,
-                ..leader_ack(&old_leader, 9, &epoch_5, Some(Generation::genesis(epoch(5))))
+                ..leader_ack(
+                    &old_leader,
+                    9,
+                    &epoch_5,
+                    Some(Generation::genesis(epoch(5))),
+                )
             }),
         ));
         assert_eq!(
@@ -795,9 +800,14 @@ fn nodes_at_one_epoch_number_of_two_lineages_agree_which_epoch_is_newer() {
             &clock,
             &authority,
             "w1",
-            KnownConfiguration { admission: Some(configuration.generation()), configuration },
+            KnownConfiguration {
+                admission: Some(configuration.generation()),
+                configuration,
+            },
             default_timings(),
-            Some(AuthorityTimings { ttl: authority_ttl() }),
+            Some(AuthorityTimings {
+                ttl: authority_ttl(),
+            }),
         );
         let stranger = worker("stranger");
 
@@ -809,7 +819,11 @@ fn nodes_at_one_epoch_number_of_two_lineages_agree_which_epoch_is_newer() {
             (now_at.number, Some(now_at.lineage)),
             "a node at {own:?} hearing {heard:?}"
         );
-        assert_eq!(driven.node.known_leader().is_some(), follows, "a node at {own:?} hearing {heard:?}");
+        assert_eq!(
+            driven.node.known_leader().is_some(),
+            follows,
+            "a node at {own:?} hearing {heard:?}"
+        );
     }
 }
 
@@ -826,16 +840,19 @@ fn configuration_at_epoch(recovery_epoch: RecoveryEpoch) -> Configuration {
 
 /// An ack from `leader` of `recovery_epoch`, term 9.
 fn ack_of_epoch(leader: &WorkerId, recovery_epoch: RecoveryEpoch) -> Input {
-    message_input(leader, ack_message(LeaderHeartbeatAck {
-        recovery_epoch: recovery_epoch.number,
-        recovery_epoch_lineage: recovery_epoch.lineage,
-        ..leader_ack(
-            leader,
-            9,
-            &configuration_at_epoch(recovery_epoch),
-            Some(Generation::new(recovery_epoch, 0, 0)),
-        )
-    }))
+    message_input(
+        leader,
+        ack_message(LeaderHeartbeatAck {
+            recovery_epoch: recovery_epoch.number,
+            recovery_epoch_lineage: recovery_epoch.lineage,
+            ..leader_ack(
+                leader,
+                9,
+                &configuration_at_epoch(recovery_epoch),
+                Some(Generation::new(recovery_epoch, 0, 0)),
+            )
+        }),
+    )
 }
 
 /// Moves a leader's clock to the instant its fence lapses while its

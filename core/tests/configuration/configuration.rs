@@ -401,8 +401,10 @@ fn a_removal_that_empties_the_old_side_collapses_the_joint_configuration() {
         generation: g0,
         base: g0,
         voter_count: 1,
-    }).expect("valid");
-    let mut roster = Roster::after_election(epoch(0),
+    })
+    .expect("valid");
+    let mut roster = Roster::after_election(
+        epoch(0),
         1,
         &one_voter,
         &BTreeMap::from([
@@ -563,7 +565,8 @@ fn an_election_under_a_joint_configuration_re_stamps_it_at_the_winners_term() {
 /// A roster founded from C0 in term 1 by a, b and the joiner.
 fn founded_roster() -> Roster {
     let g0 = generation(0, 0, 0);
-    Roster::after_election(epoch(0),
+    Roster::after_election(
+        epoch(0),
         1,
         &c0(),
         &BTreeMap::from([
@@ -660,7 +663,8 @@ fn a_founding_commits_only_when_a_majority_of_each_side_echoes_exactly_its_gener
 #[test]
 fn a_commit_re_admits_only_the_members_its_new_side_counted() {
     let (g0, founded) = (generation(0, 0, 0), generation(0, 1, 1));
-    let mut roster = Roster::after_election(epoch(0),
+    let mut roster = Roster::after_election(
+        epoch(0),
         3,
         &founded_from_c0(1, 3),
         &BTreeMap::from([

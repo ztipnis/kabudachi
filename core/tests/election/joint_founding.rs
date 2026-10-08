@@ -21,9 +21,9 @@ use kabudachi_core::protocol::messages::{
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
 use kabudachi_core::time::{Clock, Duration, Instant};
-use crate::support::builders::{epoch, 
-    ack_message, committed_from_g0, configuration_of, founded_from_g0, g0, heartbeat,
-    election_reject, heartbeat_message, leader_ack, past_any_suspicion, roll_call, roll_call_message,
+use crate::support::builders::{
+    ack_message, committed_from_g0, configuration_of, election_reject, epoch, founded_from_g0, g0,
+    heartbeat, heartbeat_message, leader_ack, past_any_suspicion, roll_call, roll_call_message,
     roll_call_reply, shard, timings, vote_grant, vote_grant_message, vote_request,
     vote_request_message, worker,
 };

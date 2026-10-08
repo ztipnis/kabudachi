@@ -1221,6 +1221,7 @@ WORKER_HEARTBEAT {
     incarnation_id
     shard_id
     recovery_epoch_seen
+    recovery_epoch_lineage
     term_seen
     available_capacity
     active_task_runs_digest
@@ -1376,6 +1377,7 @@ The candidate asks its respondents for their votes over the connections their re
 VOTE_REQUEST {
     shard_id
     recovery_epoch
+    recovery_epoch_lineage
     term
     candidate_id
     roll_call_generation    // the generation of the configuration the call ran under
@@ -1397,6 +1399,7 @@ A respondent that replies after the candidate stood joins the census, is asked f
 ELECTION_CERTIFICATE {
     shard_id
     recovery_epoch
+    recovery_epoch_lineage
     term
     leader_id
     configuration

@@ -3,11 +3,11 @@
 //! after answering, the roll calls a node drops, and what an initiator does
 //! with a refusal from another recovery epoch or lineage.
 
-use crate::support::builders::{epoch, 
-    ack_message, leader_ack, configuration_of, g0, message, past_any_suspicion, roll_call,
+use crate::support::builders::checked;
+use crate::support::builders::{
+    ack_message, configuration_of, epoch, g0, leader_ack, message, past_any_suspicion, roll_call,
     roll_call_message, roll_call_reply, shard, timings, worker,
 };
-use crate::support::builders::checked;
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{

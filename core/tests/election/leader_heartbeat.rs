@@ -9,8 +9,8 @@
 //! of the roster that election built, each at its admission generation. The
 //! last tests run end to end on the `Cluster` harness.
 
-use crate::support::builders::{epoch, 
-    message_input, g0, heartbeat, heartbeat_message, roll_call_reply, self_remove,
+use crate::support::builders::{
+    epoch, g0, heartbeat, heartbeat_message, message_input, roll_call_reply, self_remove,
     self_remove_message, shard, timings, vote_grant, vote_grant_message, voter_of, worker,
 };
 
