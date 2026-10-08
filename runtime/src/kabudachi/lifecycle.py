@@ -18,6 +18,7 @@ imports the task modules declares them too. They are kept for the life of
 the process.
 """
 
+import asyncio
 import enum
 import inspect
 import logging
@@ -181,14 +182,17 @@ def after_run(func: Any = None, /, *, queues: Iterable[str] | None = None) -> An
 async def initialize_process(hooks: HookRegistry) -> None:
     """Runs every `process_init` hook, in the order declared: a synchronous
     one on this thread, an async one on the running loop. Raises
-    `StartupError` naming the first that raises; the rest do not run."""
+    `StartupError` naming the first that raises, `SystemExit` and
+    `KeyboardInterrupt` included; the rest do not run."""
     for hook in hooks.of_kind(HookKind.PROCESS_INIT):
         try:
             if hook.is_async:
                 await hook.func()
             else:
                 hook.func()
-        except Exception as error:
+        except asyncio.CancelledError:
+            raise  # the start itself was stopped
+        except BaseException as error:
             raise StartupError(
                 f"{hook.described} raised {type(error).__name__}: {error}"
             ) from error
@@ -279,12 +283,13 @@ class RunHooks:
 
     def _cleanup_failed(self, hook: LifecycleHook, error: BaseException) -> None:
         # The type only: an error's message can hold task input, which only
-        # DEBUG logs.
+        # DEBUG logs. One that is not an `Exception` fails the run instead.
         _logger.warning(
-            "%s raised %s after a run of %s; the run's result stands",
+            "%s raised %s after a run of %s%s",
             hook.described,
             type(error).__name__,
             self.context.task_name,
+            "; the run's result stands" if isinstance(error, Exception) else "",
         )
         _logger.debug("%s raised", hook.described, exc_info=error)
 

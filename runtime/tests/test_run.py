@@ -16,7 +16,7 @@ from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
 from kabudachi.config import Configuration
-from kabudachi.errors import RuntimeNotStartedError, TaskBodyError, TaskDefinitionError
+from kabudachi.errors import RuntimeNotStartedError, StartupError, TaskBodyError, TaskDefinitionError
 from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting, Receipt
@@ -611,6 +611,10 @@ def test_lifecycle_hooks_run_in_this_process_around_the_runs_of_their_queues(cap
         seen.append(f"after {context.task_name} {type(outcome).__name__}")
         raise ValueError("could not return the connection")
 
+    @kabudachi.after_run(queues=["hooked"])
+    async def closed(context, outcome):
+        seen.append(f"closed {context.task_name}")
+
     def hooked(request: Greeting) -> Greeting:
         context = per_thread.context  # left by the before_run hook, on this body's thread
         return Greeting(text=context.run_id, times=context.attempt)
@@ -627,7 +631,12 @@ def test_lifecycle_hooks_run_in_this_process_around_the_runs_of_their_queues(cap
     with caplog.at_level(logging.WARNING, logger="kabudachi"):
         hooked_result, plain_result = kabudachi.run(main)
 
-    assert seen == ["init", "before tests.hooked 1", "after tests.hooked Greeting"]
+    assert seen == [
+        "init",
+        "before tests.hooked 1",
+        "after tests.hooked Greeting",
+        "closed tests.hooked",
+    ], "the after_run hooks all ran, the second after the first raised"
     assert hooked_result.times == 1 and hooked_result.text, "the body saw its run's context"
     assert plain_result.text == "untouched", "hooks of another queue left it alone"
     assert "ValueError" in caplog.text, "the failed after_run hook was logged; the result stood"
@@ -690,4 +699,16 @@ def test_a_body_or_hook_that_raises_system_exit_or_keyboard_interrupt_or_cancels
         (TaskBodyError, "SystemExit"),
     ], outcomes
     assert neighbour == "finished", "a body beside them ran to its end"
+
+
+def test_a_process_init_hook_that_raises_system_exit_stops_the_start_with_its_name():
+    @kabudachi.process_init
+    def gives_up():
+        raise SystemExit("no resources")
+
+    async def main():
+        pass
+
+    with pytest.raises(StartupError, match=r"gives_up raised SystemExit: no resources"):
+        kabudachi.run(main)
 

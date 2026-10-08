@@ -474,7 +474,7 @@ class ProcessPool:
                 problems.append(f"{described} is missing")
         if problems:
             raise StartupError(
-                "a task process does not have the tasks this process has ("
+                "a task process does not have the tasks and hooks this process has ("
                 + "; ".join(problems)
                 + "); declare every task and hook, and register every serializer, in a module the "
                 "task processes import, or list those modules in `imports`"
