@@ -32,20 +32,36 @@ def main(connection: Any, settings: Settings, modules: tuple[str, ...]) -> None:
     # Ctrl-C in a terminal reaches every process of the group; only the
     # worker decides what it means.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    ready = _import(connection, modules)
-    if ready.error is None:
-        asyncio.run(_TaskProcess(connection, settings).serve(ready))
-    else:
-        connection.send(ready)
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(0)
+    code = 1
+    try:
+        process = _TaskProcess(connection, settings)
+        # Reading starts before the imports, which can take long: a worker
+        # that dies meanwhile must not leave this process behind.
+        process.start_reading()
+        ready = _import(process, modules)
+        if ready.error is None:
+            asyncio.run(process.serve(ready))
+        else:
+            process.send(ready)
+        code = 0
+    finally:
+        _exit(code)
 
 
-def _import(connection: Any, modules: tuple[str, ...]) -> ipc.Ready:
+def _exit(code: int) -> None:
+    """Ends the process at once, after what the bodies printed is written."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
+def _import(process: "_TaskProcess", modules: tuple[str, ...]) -> ipc.Ready:
     """Imports `modules` and lists the tasks and serializers they registered."""
     for module in modules:
-        connection.send(ipc.Importing(module))
+        process.send(ipc.Importing(module))
         try:
             importlib.import_module(module)
         except BaseException as error:
@@ -71,7 +87,12 @@ class _TaskProcess:
         self._running: set[str] = set()
         self._draining = False
         self._finished = asyncio.Event()
-        self._loop: asyncio.AbstractEventLoop
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._buffer_lock = threading.Lock()
+        self._early: list[Any] = []
+        # Runs the worker asked to cancel; a body that raises CancelledError
+        # of its own accord is a failure unless it is one of these.
+        self._cancel_asked: set[str] = set()
 
     def send(self, frame: Any) -> None:
         """Sends `frame` to the worker, from any thread. A worker that is gone
@@ -82,9 +103,17 @@ class _TaskProcess:
         except OSError:
             pass
 
-    async def serve(self, ready: ipc.Ready) -> None:
-        self._loop = asyncio.get_running_loop()
+    def start_reading(self) -> None:
         threading.Thread(target=self._read, name="kabudachi-pipe", daemon=True).start()
+
+    async def serve(self, ready: ipc.Ready) -> None:
+        loop = asyncio.get_running_loop()
+        with self._buffer_lock:
+            self._loop = loop
+            # Frames that arrived during the imports are handled now, in order.
+            for frame in self._early:
+                loop.call_soon(self._received, frame)
+            self._early.clear()
         self.send(ready)
         await self._finished.wait()
 
@@ -92,9 +121,13 @@ class _TaskProcess:
         ipc.read_frames(self._connection, self._received_on_reader)
         # The worker has gone or closed its end: nothing done here could
         # reach it any more.
-        os._exit(0)
+        _exit(0)
 
     def _received_on_reader(self, frame: Any) -> None:
+        with self._buffer_lock:
+            if self._loop is None:
+                self._early.append(frame)
+                return
         self._loop.call_soon_threadsafe(self._received, frame)
 
     def _received(self, frame: Any) -> None:
@@ -102,11 +135,12 @@ class _TaskProcess:
             case ipc.Run():
                 self._start_run(frame)
             case ipc.Compact():
-                outcome = self._loop.create_task(self._fold(frame))
+                outcome = asyncio.get_running_loop().create_task(self._fold(frame))
                 self._track(frame.run_id, outcome, outcome, self._report_compaction)
             case ipc.Cancel():
                 outcome = self._outcomes.get(frame.run_id)
                 if outcome is not None:
+                    self._cancel_asked.add(frame.run_id)
                     outcome.cancel()
             case ipc.Drain():
                 self._draining = True
@@ -144,7 +178,8 @@ class _TaskProcess:
     def _report_result(self, run_id: str, outcome: "asyncio.Future[Any]") -> None:
         self._outcomes.pop(run_id, None)
         if outcome.cancelled():
-            return  # the worker asked for it and has stopped waiting for this run
+            self._report_cancelled(run_id)
+            return
         error = outcome.exception()
         if error is not None:
             self.send(ipc.failed(run_id, error))
@@ -163,12 +198,21 @@ class _TaskProcess:
     def _report_compaction(self, run_id: str, outcome: "asyncio.Future[Any]") -> None:
         self._outcomes.pop(run_id, None)
         if outcome.cancelled():
+            self._report_cancelled(run_id)
             return
         error = outcome.exception()
         if error is not None:
             self.send(ipc.failed(run_id, error))
         else:
             self.send(ipc.Compacted(run_id, outcome.result()))
+
+    def _report_cancelled(self, run_id: str) -> None:
+        """A cancelled run is silent when the worker asked for it, and has
+        stopped waiting for it; a body that raised CancelledError itself failed."""
+        if run_id in self._cancel_asked:
+            self._cancel_asked.discard(run_id)
+        else:
+            self.send(ipc.failed(run_id, asyncio.CancelledError()))
 
     def _exited(self, run_id: str) -> None:
         self._running.discard(run_id)
