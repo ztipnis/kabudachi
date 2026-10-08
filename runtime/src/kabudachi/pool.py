@@ -197,10 +197,11 @@ class ProcessPool:
                 child.draining = True
                 child.send(ipc.Drain())
             await self.drain()
-            # Each child is still tearing down its loop and flushing output.
-            await asyncio.wait(
-                {child.buried for child in children}, timeout=_TERMINATE_GRACE_SECONDS
-            )
+            if children:
+                # Each child is still tearing down its loop and flushing output.
+                await asyncio.wait(
+                    {child.buried for child in children}, timeout=_TERMINATE_GRACE_SECONDS
+                )
         for child in children:
             self._terminate(child)
         if children:
