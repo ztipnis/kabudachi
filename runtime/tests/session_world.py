@@ -42,7 +42,7 @@ class World:
         self.serializers = SerializerRegistry.with_defaults()
         self.configuration = Configuration()
         if concurrency is not None:
-            self.configuration.configure(concurrency=concurrency)
+            self.configuration.configure(concurrency=concurrency, concurrency_override=True)
         self.tasks = {
             function.__name__: Task(
                 function,

@@ -7,6 +7,7 @@ thread, on the awaiting loop."""
 
 import asyncio
 import inspect
+import os
 import sys
 import threading
 import types
@@ -775,6 +776,39 @@ def test_the_soft_limit_may_not_be_above_the_hard_limit():
     with pytest.raises(ConfigurationError, match="soft"):
         Configuration().configure(memory_soft_limit=2000, memory_hard_limit=1000)
     Configuration().configure(memory_soft_limit=1000, memory_hard_limit=1000)
+
+
+def test_task_processes_default_to_one_per_cpu():
+    assert Configuration().resolve("processes") == (os.cpu_count() or 1)
+
+
+@pytest.mark.parametrize(
+    "settings, refused",
+    [
+        ({"processes": -1}, "processes"),
+        ({"processes": True}, "processes"),
+        ({"concurrency": 33}, "concurrency_override"),
+        ({"imports": "app.tasks"}, "imports"),
+        ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
+    ],
+)
+def test_worker_settings_that_cannot_work_are_refused(settings, refused):
+    with pytest.raises(ConfigurationError, match=refused):
+        Configuration().configure(**settings)
+
+
+def test_worker_settings_are_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("KABUDACHI_PROCESSES", "2")
+    monkeypatch.setenv("KABUDACHI_CONCURRENCY", "40")
+    monkeypatch.setenv("KABUDACHI_CONCURRENCY_OVERRIDE", "true")
+    monkeypatch.setenv("KABUDACHI_IMPORTS", "app.tasks, app.more_tasks")
+    monkeypatch.setenv("KABUDACHI_PROCESS_START_TIMEOUT", "2.5")
+    configuration = Configuration()
+
+    assert [
+        configuration.resolve(name)
+        for name in ("processes", "concurrency", "imports", "process_start_timeout")
+    ] == [2, 40, ("app.tasks", "app.more_tasks"), timedelta(seconds=2.5)]
 
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(

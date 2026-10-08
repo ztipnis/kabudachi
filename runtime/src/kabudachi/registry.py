@@ -33,6 +33,9 @@ class TaskDefinition:
     input_type: Any
     output_type: Any
     is_async: bool
+    module: str
+    """The module that declared the task, which a task process imports to
+    find it; empty if the callable names none."""
     retries: int = 0
     """How many times a failed run is replaced by a new attempt."""
     timeout: timedelta | None = None

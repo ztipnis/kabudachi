@@ -1,5 +1,7 @@
 """The exceptions kabudachi raises on purpose."""
 
+from typing import Any
+
 # Defined by the native module, which raises BackpressureError itself;
 # re-exported so callers catch them as kabudachi.errors.*.
 from kabudachi._native import BackpressureError as BackpressureError
@@ -92,6 +94,33 @@ class TaskSupersededError(KabudachiError, RuntimeError):
     def __init__(self, message: str, superseded_by: str) -> None:
         super().__init__(message)
         self.superseded_by = superseded_by
+
+    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
+        return (TaskSupersededError, (str(self), self.superseded_by))
+
+
+class StartupError(KabudachiError, RuntimeError):
+    """The worker's task processes could not start: one could not import the
+    task modules, did not find the same tasks as the worker, or exited first."""
+
+
+class TaskLostError(KabudachiError, RuntimeError):
+    """The process running a task died before it finished, and the task is
+    not run again: an ephemeral task is never replayed, and a non-retriable
+    one may already have had its effects."""
+
+
+class TaskBodyError(KabudachiError, RuntimeError):
+    """A task body in a task process raised an error that could not be sent
+    back as it was. `kind` is the type name of the original error; the
+    message is its text."""
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
+        return (TaskBodyError, (str(self), self.kind))
 
 
 def interrupted(subject: str, error: BaseException) -> TaskInterruptedError:
