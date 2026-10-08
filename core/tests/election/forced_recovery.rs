@@ -77,9 +77,11 @@ impl AuthorityPerformer for FoundingBeforeSwap<'_> {
                     None,
                     &ShardRecord {
                         shard_id: shard("shard-1/successor"),
-                        // Newer than the leader's, so the leader does not take
-                        // the conflict for its own republish having landed and
-                        // ask its fence again, which would show it the same.
+                        // The guard on a reply abandons at any epoch. This one is
+                        // newer than the leader's so that the conflict is not
+                        // read as the leader's own republish having landed: the
+                        // fence it would then ask for at once would abandon it
+                        // in the same tick, hiding the swap reply's own effect.
                         recovery_epoch: epoch(5),
                     },
                 )
@@ -737,6 +739,56 @@ fn the_authority_path_needs_a_majority_of_the_live_registrations() {
     assert_eq!(
         held_epoch(&driven.authority, &shard(SHARD)),
         Ok(Some(epoch(0)))
+    );
+}
+
+// A swap to epoch 1 landed but its reply was lost, so a leader no one knows of
+// may have used epoch 1. Then the authority is flushed: nothing says epoch 1 was
+// ever reached, so the shard cannot be recovered at any epoch. The node, whose
+// own swap it was, abandons the shard when its next recovery finds no record,
+// and republishes nothing a later founding would have to replace.
+#[test]
+fn a_shard_whose_authority_is_flushed_after_its_own_swap_was_lost_is_abandoned() {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
+    driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
+    driven.start_roll_call(&[worker("w2")]);
+
+    // The roll call falls short and the node's authority path swaps to epoch
+    // 1; the swap lands and the node never hears.
+    driven.advance_losing_swap_replies(default_timings().roll_call_deadline.as_ticks());
+    assert_eq!(
+        held_epoch(&authority, &shard(SHARD)),
+        Ok(Some(epoch(1))),
+        "the swap landed, though its reply did not"
+    );
+    authority.flush();
+
+    // The node keeps registering through the flushed authority's warm-up, and
+    // the peer answers each roll call the node calls, short of its quorum of 5.
+    let mut outputs = Vec::new();
+    for _ in 0..40 {
+        if driven.node.state() == WorkerState::Stopped {
+            break;
+        }
+        register_all(&authority, &shard(SHARD), &[worker("w2")]);
+        let step = driven.advance(ttl_ticks() / 6);
+        for call in published_roll_calls(&step) {
+            let reply = roll_call_reply(&driven.me, call.term, &worker("w2"), Some(g0()));
+            driven.step(message_input(&worker("w2"), reply));
+        }
+        outputs.extend(step);
+    }
+
+    assert_eq!(driven.node.state(), WorkerState::Stopped);
+    assert_eq!(driven.node.stop_reason(), Some(StopReason::Abandoned));
+    assert!(outputs.contains(&Output::ShardAbandoned));
+    assert_eq!(
+        held_epoch(&authority, &shard(SHARD)),
+        Ok(None),
+        "the old shard is not brought back"
     );
 }
 

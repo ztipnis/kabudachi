@@ -274,11 +274,18 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
     let candidate = authority
         .as_deref()
         .map_or_else(|| ShardId::mint(name), |calls| calls.shard_id().clone());
+    // The incarnation the authority's record named when it was last read, if
+    // it held one: the seeds' leaders must be of it too.
+    let mut record_seen: Option<ShardId> = None;
     loop {
         refuse_requests(net);
 
         // With no seeds this finds no answer at once.
-        let found = of_shard(port.ask(search.seeds(), JoinFloor::none()).await, name, None);
+        let found = of_shard(
+            port.ask(search.seeds(), JoinFloor::none()).await,
+            name,
+            record_seen.as_ref(),
+        );
         if let Some(pointer) = search.heard_from_seeds(found) {
             return Entry::Joining(pointer);
         }
@@ -320,6 +327,7 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
                     clock,
                     my_id,
                     &candidate,
+                    &mut record_seen,
                     retry_interval,
                 )
                 .await
@@ -419,6 +427,7 @@ async fn consult_authority<C: Clock, P: AskWhoLeads>(
     clock: &C,
     my_id: &WorkerId,
     candidate: &ShardId,
+    record_seen: &mut Option<ShardId>,
     retry_interval: StdDuration,
 ) -> AuthorityRound {
     let mut stage = Stage::ReadingShard;
@@ -429,6 +438,11 @@ async fn consult_authority<C: Clock, P: AskWhoLeads>(
             search.log(WaitReason::AuthorityNotAnswering);
             return AuthorityRound::Wait;
         };
+        if let (Stage::ReadingShard, AuthorityReply::RecoveryEpoch { result: Ok(held), .. }) =
+            (&stage, &reply)
+        {
+            *record_seen = held.as_ref().map(|record| record.shard_id.clone());
+        }
         match decide_round(stage.clone(), reply, my_id, candidate, search.shard_exists(), lineages) {
             Decision::Ask {
                 request,

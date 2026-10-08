@@ -47,10 +47,10 @@ pub type LocalNode<C> = WorkerNode<C>;
 /// configuration (at recovery epoch 0). Its quorum is itself, so it becomes
 /// leader on its own once `suspect_timeout` has passed and its roll call has
 /// run its one millisecond: a lone worker has no peer to falsely suspect, so
-/// the single-process runtime passes 0 unless told otherwise (see the module doc for why that is specific to this
-/// runtime, not the generic one-voter case). The node only acts as `clock`
-/// advances and it is stepped. Returns the node with its first step, for
-/// `election::run_election` to carry out.
+/// the single-process runtime passes 0 unless told otherwise (see the module
+/// doc for why that is specific to this runtime, not the generic one-voter
+/// case). The node only acts as `clock` advances and it is stepped. Returns
+/// the node with its first step, for `election::run_election` to carry out.
 ///
 /// The shard's recovery epoch is of lineage 0: with no authority, no other
 /// founding of this shard can exist to tell apart from this one.
