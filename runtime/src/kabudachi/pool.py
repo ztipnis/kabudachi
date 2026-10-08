@@ -23,6 +23,8 @@ from kabudachi.body import RunningBody
 from kabudachi.config import Settings
 from kabudachi.errors import StartupError, TaskBodyError, TaskDefinitionError
 from kabudachi.execution import CompactJob, NestedCalls, RunJob, TaskProcessLost
+from kabudachi.handle import TaskHandle
+from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskRegistry
 
 # How long a child asked to stop (SIGTERM) has before it is killed (SIGKILL).
@@ -80,6 +82,8 @@ class _Child:
         self.process = process
         self.connection = connection
         self.slots: dict[str, _Slot] = {}
+        # Tasks bodies here called, until their outcome is sent here.
+        self.handles: dict[str, TaskHandle] = {}
         self.ready = False
         self.ready_at = 0.0
         # The module it said it was importing last, until it is ready.
@@ -420,6 +424,50 @@ class ProcessPool:
                     self._finish(slot)
                     self._dispatch()
                     self._end_if_condemned(child)
+            case ipc.Waiting() | ipc.Resumed():
+                slot = child.slots.get(frame.run_id)
+                if slot is not None:
+                    slot.waiting = isinstance(frame, ipc.Waiting)
+                    self._wake()
+                    self._dispatch()
+            case ipc.Submit():
+                self._submit_for(child, frame)
+            case ipc.CancelTask():
+                handle = child.handles.get(frame.task_id)
+                try:
+                    cancelled = handle is not None and handle.cancel()
+                except Exception as error:
+                    child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
+                else:
+                    child.send(ipc.Reply(frame.request, cancelled))
+
+    def _submit_for(self, child: _Child, frame: ipc.Submit) -> None:
+        """Submits what a body in `child` called, answers at once with the
+        new task's id or the error, and sends the outcome once it settles."""
+        nested = self._nested
+        try:
+            if nested is None:
+                raise RuntimeError("the process pool takes no nested calls before a session")
+            if frame.definition_id is not None and frame.payload is not None:
+                options = frame.options or SubmissionOptions()
+                handle = nested.submit_serialized(frame.definition_id, frame.payload, options)
+            elif frame.composite is not None and frame.step is not None and frame.previous is not None:
+                handle = nested.submit_composite(
+                    frame.composite, pickle.loads(frame.step), pickle.loads(frame.previous)
+                )
+            else:
+                raise ValueError("a submission names neither a task nor a flow or group")
+        except Exception as error:
+            child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
+            return
+        child.handles[handle.task_id] = handle
+        child.send(ipc.Reply(frame.request, (handle.task_id, handle.shard_id)))
+
+        def settled(outcome: Any) -> None:
+            child.handles.pop(handle.task_id, None)
+            child.send(ipc.outcome_of(handle.task_id, outcome))
+
+        handle._outcome.add_done_callback(settled)
 
     def _end_if_condemned(self, child: _Child) -> None:
         if child.condemned and all(slot.abandoned for slot in child.slots.values()):

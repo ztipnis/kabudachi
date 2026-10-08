@@ -140,3 +140,16 @@ def test_a_long_chain_is_compacted_in_a_task_process(markers):
     assert held == "held until folded", "a compaction folded while the key was busy"
     assert int((markers / "folded-in").read_text()) != os.getpid(), "the merge ran in a task process"
     assert newest == functools.reduce(lambda older, newer: f"({older}>{newer})", texts)
+
+
+def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_place_back_while_it_waits():
+    # One place in all: the called tasks can only run while the caller waits.
+    kabudachi.configure(processes=1, concurrency=1)
+
+    async def main():
+        return await pool_tasks.calls_others(Greeting(times=0))
+
+    result = kabudachi.run(main)
+
+    assert result.times == 1 + 2 + 11 + 21
+    assert result.text == "True cancelled"

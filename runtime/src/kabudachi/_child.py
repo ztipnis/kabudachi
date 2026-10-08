@@ -5,11 +5,16 @@ worker closes the pipe or tells it to stop.
 Bodies run as they would in the worker: an async body on this process's
 event loop, a synchronous one in a thread of a pool with one thread per
 place. The worker decides how many run at once; this process runs what it is
-sent.
+sent. A task, flow or group a body calls is submitted by the worker, which
+answers at once and later sends its outcome; while a body waits for one, the
+worker counts its place free.
 """
 
 import asyncio
+import concurrent.futures
+import contextvars
 import importlib
+import itertools
 import os
 import pickle
 import signal
@@ -22,8 +27,12 @@ from typing import Any
 from kabudachi import ipc
 from kabudachi.body import fold_compaction, run_serialized
 from kabudachi.config import Settings
+from kabudachi.handle import TaskHandle, current_body, run_callback_inline
+from kabudachi.hosted_work import LoopHostedWork
+from kabudachi.options import SubmissionOptions
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
+from kabudachi.session import activate, invoke_callback
 
 
 def main(connection: Any, settings: Settings, modules: tuple[str, ...]) -> None:
@@ -93,6 +102,12 @@ class _TaskProcess:
         # Runs the worker asked to cancel; a body that raises CancelledError
         # of its own accord is a failure unless it is one of these.
         self._cancel_asked: set[str] = set()
+        self._requests = itertools.count()
+        # Requests waiting for the worker's answer: (answer, whether it is a submission).
+        self._asked: dict[int, tuple[concurrent.futures.Future[Any], bool]] = {}
+        # Handles of tasks bodies here submitted, until the worker sends their outcome.
+        self._handles: dict[str, TaskHandle] = {}
+        self._hosted = LoopHostedWork()
 
     def send(self, frame: Any) -> None:
         """Sends `frame` to the worker, from any thread. A worker that is gone
@@ -108,6 +123,9 @@ class _TaskProcess:
 
     async def serve(self, ready: ipc.Ready) -> None:
         loop = asyncio.get_running_loop()
+        self._hosted.attach(loop)
+        # A stand-in with only what a body reaches through `kabudachi`.
+        activate(_ChildSession(self))  # type: ignore[arg-type]
         with self._buffer_lock:
             self._loop = loop
             # Frames that arrived during the imports are handled now, in order.
@@ -124,11 +142,54 @@ class _TaskProcess:
         _exit(0)
 
     def _received_on_reader(self, frame: Any) -> None:
+        # Answers are taken here, not on the loop: a body waiting on its own
+        # thread for one must not need the loop to get it.
+        match frame:
+            case ipc.Reply():
+                self._answered(frame)
+                return
+            case ipc.WaitDone():
+                handle = self._handles.pop(frame.task_id, None)
+                if handle is not None and frame.error is not None:
+                    handle._fail(frame.error)
+                elif handle is not None:
+                    handle._resolve(frame.value)
+                return
         with self._buffer_lock:
             if self._loop is None:
                 self._early.append(frame)
                 return
         self._loop.call_soon_threadsafe(self._received, frame)
+
+    def ask(self, make: Callable[[int], Any], *, submission: bool) -> Any:
+        """Sends the request `make(request)` builds and waits for the worker's
+        answer on this thread (the loop's, for an async body: the worker
+        answers at once). A submission is answered with a handle."""
+        request = next(self._requests)
+        answer: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        self._asked[request] = (answer, submission)
+        self.send(make(request))
+        return answer.result()
+
+    def _answered(self, reply: ipc.Reply) -> None:
+        answer, submission = self._asked.pop(reply.request)
+        if reply.error is not None:
+            answer.set_exception(reply.error)
+        elif submission:
+            task_id, shard_id = reply.value
+            handle = TaskHandle(task_id, self._cancel, self._run_callback, shard_id=shard_id)
+            # Kept before the asker gets it: the outcome can follow at once.
+            self._handles[task_id] = handle
+            answer.set_result(handle)
+        else:
+            answer.set_result(reply.value)
+
+    def _cancel(self, task_id: str) -> bool:
+        return self.ask(lambda request: ipc.CancelTask(request, task_id), submission=False)
+
+    def _run_callback(self, function: Any, value: Any) -> None:
+        if not self._hosted.spawn(invoke_callback(function, value)):
+            run_callback_inline(function, value)
 
     def _received(self, frame: Any) -> None:
         match frame:
@@ -147,7 +208,11 @@ class _TaskProcess:
                 self._finish_if_idle()
 
     def _start_run(self, frame: ipc.Run) -> None:
-        body = run_serialized(
+        # A body that waits for a task it called gives its place back meanwhile.
+        context = contextvars.copy_context()
+        context.run(current_body.set, _BodyWaits(self, frame.run_id))
+        body = context.run(
+            run_serialized,
             self._registry,
             self.serializers,
             self._threads,
@@ -222,6 +287,70 @@ class _TaskProcess:
     def _finish_if_idle(self) -> None:
         if self._draining and not self._running:
             self._finished.set()
+
+
+class _BodyWaits:
+    """Tells the worker when one run's body starts and stops waiting for
+    tasks it called, so the worker counts its place free meanwhile."""
+
+    def __init__(self, process: _TaskProcess, run_id: str) -> None:
+        self._process = process
+        self._run_id = run_id
+        self._lock = threading.Lock()
+        self._waits = 0
+
+    def waiting_started(self) -> None:
+        with self._lock:
+            self._waits += 1
+            if self._waits == 1:
+                self._process.send(ipc.Waiting(self._run_id))
+
+    def waiting_finished(self) -> None:
+        with self._lock:
+            self._waits -= 1
+            if self._waits == 0:
+                self._process.send(ipc.Resumed(self._run_id))
+
+
+class _ChildSession:
+    """What a body here reaches through `kabudachi`: tasks, flows and groups
+    are submitted to the worker, and handles settle when it says so."""
+
+    stopping = False
+
+    def __init__(self, process: _TaskProcess) -> None:
+        self._process = process
+        self.composites = _ChildComposites(process)
+
+    def submit(
+        self, definition: Any, argument: Any, options: SubmissionOptions | None = None
+    ) -> TaskHandle:
+        serializer = self._process.serializers.get(definition.serializer)
+        payload = serializer.encode(argument, definition.input_type)
+        chosen = options or SubmissionOptions()
+        return self._process.ask(
+            lambda request: ipc.Submit(request, definition.name, payload, chosen), submission=True
+        )
+
+
+class _ChildComposites:
+    """Flows and groups called here: started by the worker, which holds them."""
+
+    def __init__(self, process: _TaskProcess) -> None:
+        self._process = process
+
+    def submit_flow(self, flow: Any, previous: Any) -> TaskHandle:
+        return self._submit("flow", flow, previous)
+
+    def submit_group(self, group: Any, previous: Any) -> TaskHandle:
+        return self._submit("group", group, previous)
+
+    def _submit(self, kind: str, step: Any, previous: Any) -> TaskHandle:
+        sent, before = pickle.dumps(step), pickle.dumps(previous)
+        return self._process.ask(
+            lambda request: ipc.Submit(request, composite=kind, step=sent, previous=before),
+            submission=True,
+        )
 
 
 def _after(outcome: "asyncio.Future[Any]", then: Callable[[], None]) -> None:

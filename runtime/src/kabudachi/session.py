@@ -110,6 +110,24 @@ class Session:
         queue = self._configuration.resolve("queue", definition.queue)
         return self._tasks.submit(definition, payload, queue, options or SubmissionOptions())
 
+    def submit_serialized(
+        self, definition_id: str, payload: bytes, options: SubmissionOptions
+    ) -> TaskHandle:
+        """Submits a task a body in a task process called, its input already
+        encoded there. Raises as `submit` does, and `UnknownTaskError` for a
+        task this process does not have."""
+        definition = self._registry.get(definition_id)
+        if definition is None:
+            raise UnknownTaskError(f"this process has no task named {definition_id!r}")
+        queue = self._configuration.resolve("queue", definition.queue)
+        return self._tasks.submit(definition, payload, queue, options)
+
+    def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle:
+        """Starts a flow (`kind` "flow") or group a body in a task process called."""
+        if kind == "flow":
+            return self._composites.submit_flow(composite, previous)
+        return self._composites.submit_group(composite, previous)
+
     async def work(self) -> None:
         """Claims pending tasks and runs them, up to the concurrency limit,
         until the runtime shuts down or the caller cancels it.
@@ -254,7 +272,7 @@ class Session:
     def _run_callback(self, function: Any, value: Any) -> None:
         """Runs a task callback on the event loop, from whichever thread the
         task was settled on; inline if there is no loop left to run it."""
-        if not self._hosted.spawn(_invoke_callback(function, value)):
+        if not self._hosted.spawn(invoke_callback(function, value)):
             run_callback_inline(function, value)
 
     def _start(self, claim: Any) -> None:
@@ -488,7 +506,9 @@ def _kind_of(error: BaseException) -> str:
     return error.kind if isinstance(error, TaskBodyError) else type(error).__name__
 
 
-async def _invoke_callback(function: Any, value: Any) -> None:
+async def invoke_callback(function: Any, value: Any) -> None:
+    """Calls a task callback with `value`: an async one on the running loop, a
+    synchronous one off it. A failure is logged, by type only."""
     try:
         if inspect.iscoroutinefunction(function):
             await function(value)

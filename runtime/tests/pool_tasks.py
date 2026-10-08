@@ -6,9 +6,11 @@ processes."""
 import asyncio
 import os
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import kabudachi
+from kabudachi.errors import TaskCancelledError
 from proto_messages import Greeting
 
 MARKERS = "KABUDACHI_TEST_MARKERS"
@@ -70,3 +72,24 @@ async def refresh(request: Greeting) -> Greeting:
                 return Greeting(text="held until folded")
             await asyncio.sleep(0.01)
     return request
+
+
+@kabudachi.task(name="pool.leaf")
+async def leaf(request: Greeting) -> Greeting:
+    return Greeting(times=request.times + 1)
+
+
+@kabudachi.task(name="pool.calls_others")
+async def calls_others(request: Greeting) -> Greeting:
+    one = await leaf(request)
+    stages = await kabudachi.flow(leaf, leaf)(request)
+    mapped = await leaf.map([Greeting(times=10), Greeting(times=20)])
+    later = leaf.options(delay=timedelta(seconds=30))(request)
+    cancelled = later.cancel()
+    try:
+        await later
+        ended = "ran"
+    except TaskCancelledError:
+        ended = "cancelled"
+    total = one.times + stages[-1].times + sum(result.times for result in mapped)
+    return Greeting(times=total, text=f"{cancelled} {ended}")
