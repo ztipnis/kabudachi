@@ -8,6 +8,7 @@ use kabudachi_core::protocol::messages::{ClaimRejectReason, claim_response, task
 use kabudachi_core::scheduler::MemoryLimits;
 
 use crate::support::deadline::within_deadline;
+use crate::support::executor::FakeExecutor;
 use crate::support::records::{
     ThreeVoters, claimed_and_started, plain_with, submitted_through,
 };
@@ -27,8 +28,11 @@ fn fold_all(payloads: &[Vec<u8>]) -> Vec<u8> {
 async fn a_leader_compacts_a_chain_for_a_worker_that_runs_compaction_and_applies_its_fold() {
     within_deadline(async {
         let (mut shard, client) = ThreeVoters::start().await;
+        let mut executors = Vec::new();
         for voter in 0..3 {
-            shard.set_runs_compaction(voter, true);
+            let (executor, endpoint) = FakeExecutor::new();
+            shard.set_executor(voter, endpoint);
+            executors.push(executor);
             shard
                 .with(voter, |_, scheduler| {
                     scheduler.set_memory_limits(Some(MemoryLimits {

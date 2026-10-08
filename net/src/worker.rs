@@ -35,6 +35,7 @@ use libp2p::Multiaddr;
 use crate::authority::{AuthorityClient, SharedAuthority};
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, DEFAULT_SEED_ROUNDS, bootstrap};
 use crate::driver::{DriverConfig, run_driver};
+use crate::executor::ExecutorEndpoint;
 use crate::handoff::HandedOff;
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::{ListenRejected, Net};
@@ -64,7 +65,6 @@ impl AuthorityConfig {
 }
 
 /// How a worker joins and takes part in its shard.
-#[derive(Clone)]
 pub struct WorkerConfig {
     /// The name of the shard the worker serves.
     pub shard_name: ShardName,
@@ -103,6 +103,11 @@ pub struct WorkerConfig {
     /// scheduler and by every worker's record store; `None` keeps finished
     /// tasks.
     pub result_ttl: Option<StdDuration>,
+    /// The executor that runs the tasks this worker claims; `None` for none.
+    /// With one, the driver claims work while the executor has room and
+    /// hands it over, and the worker says it runs compaction. With none it
+    /// claims nothing and runs no compaction.
+    pub executor: Option<ExecutorEndpoint>,
 }
 
 impl WorkerConfig {
@@ -133,6 +138,7 @@ impl WorkerConfig {
             input_limit: None,
             replication_factor: ReplicationFactor::DEFAULT,
             result_ttl: None,
+            executor: None,
         }
     }
 
@@ -153,6 +159,14 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_authority(mut self, authority: AuthorityConfig) -> Self {
         self.authority = Some(authority);
+        self
+    }
+
+    /// Runs the tasks this worker claims on `endpoint`'s executor (see
+    /// `crate::executor`).
+    #[must_use]
+    pub fn with_executor(mut self, endpoint: ExecutorEndpoint) -> Self {
+        self.executor = Some(endpoint);
         self
     }
 
@@ -244,8 +258,8 @@ impl Worker {
     }
 
     /// This worker's network, for what its node does not do itself, such as
-    /// claiming tasks from the leader its node names (`Net::request_claim`,
-    /// given the leader `observe` last saw in [`Self::run`]). Only
+    /// submitting tasks to the leader its node names (`Net::submit`, given
+    /// the leader `observe` last saw in [`Self::run`]). Only
     /// [`Self::run`] drives a node on it.
     pub fn net(&self) -> Arc<Net> {
         Arc::clone(&self.net)
@@ -272,7 +286,8 @@ impl Worker {
         self,
         observe: impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
     ) -> HandedOff {
-        let Worker { net, config } = self;
+        let Worker { net, mut config } = self;
+        let mut executor = config.executor.take();
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
         let mut authority = config.authority.as_ref().map(|authority| {
@@ -321,14 +336,13 @@ impl Worker {
             &mut scheduler,
             clock,
             authority,
+            executor.as_mut(),
             DriverConfig {
                 routing_refresh_period: config.routing_refresh_period,
                 seeds: config.seeds.clone(),
                 join_peer_timeout: config.join_peer_timeout,
                 retry_interval: config.retry_interval,
                 replication_factor: config.replication_factor,
-                // This entry point runs no executor, so it folds no chain.
-                runs_compaction: false,
             },
             observe,
         )

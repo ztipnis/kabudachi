@@ -214,6 +214,7 @@ async fn a_stranded_node_reaches_a_leader_despite(listing: Listing) {
         &mut scheduler,
         clock,
         Some(client),
+        None,
         config,
         |node, _, _| {
             seen.send_replace(node.state());
@@ -334,6 +335,7 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
                 Arc::new(mine.clone()),
                 AuthorityTimings { ttl },
             )),
+            None,
             DriverConfig::default(),
             |node, _, _| {
                 seen_tx.send_replace((node.state(), node.recovery_lineage()));

@@ -96,7 +96,7 @@ async fn join_and_drive(
         None,
     );
     let mut scheduler = driven_scheduler(clock);
-    run_driver(&mut node, first, net, &mut scheduler, clock, None, DriverConfig::default(), |node, _, _| {
+    run_driver(&mut node, first, net, &mut scheduler, clock, None, None, DriverConfig::default(), |node, _, _| {
         let _ = known_leader.send(node.known_leader().map(|(leader, _)| leader));
     })
     .await;
@@ -192,7 +192,7 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
 
         let (claimed, refused, batch, huge_batches) = timeout(TEST_TIMEOUT, async {
             tokio::select! {
-                _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, DriverConfig::default(), |_, _, _| {}) => {
+                _ = run_driver(&mut node_a, due_now(&clock), &net_a, &mut scheduler_a, clock, None, None, DriverConfig::default(), |_, _, _| {}) => {
                     unreachable!("this test never drains a node, so its driver never returns")
                 }
                 () = join_and_drive(&net_b, &seed, clock, &b_leader) => {

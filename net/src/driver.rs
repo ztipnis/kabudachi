@@ -163,6 +163,7 @@ use crate::reconcile::leader::LeaderReconciliation;
 use crate::reconcile::report::page_of;
 use crate::steal::candidates_for_steal;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
+use crate::executor::ExecutorEndpoint;
 use crate::routing_refresh::{RoutingRefresh, ShardView};
 use crate::task_exchange::{self, TaskRequestHandle};
 use crate::task_store::placement::{Placement, ReplicationFactor, placement};
@@ -183,11 +184,6 @@ pub struct DriverConfig {
     pub retry_interval: Duration,
     /// How many voters each Task record is written to.
     pub replication_factor: ReplicationFactor,
-    /// Whether this worker runs compaction runs: folds the front of a
-    /// coalescing key's waiting chain when its leader hands it one. Set only
-    /// by a worker whose executor does; off by default, and the leader makes
-    /// no compaction run until some member says it does.
-    pub runs_compaction: bool,
 }
 
 impl Default for DriverConfig {
@@ -198,7 +194,6 @@ impl Default for DriverConfig {
             join_peer_timeout: DEFAULT_JOIN_PEER_TIMEOUT,
             retry_interval: DEFAULT_RETRY_INTERVAL,
             replication_factor: ReplicationFactor::DEFAULT,
-            runs_compaction: false,
         }
     }
 }
@@ -279,6 +274,12 @@ pub use crate::authority::SharedAuthority;
 /// found its shard recovered without it, and so went back to `Bootstrapping`,
 /// reads to learn whom to rejoin through (see
 /// [`crate::leader_search::DrivenSearch`]); the driver keeps running meanwhile.
+///
+/// `executor` is the endpoint of the executor that runs this worker's
+/// TaskRuns (see [`crate::executor`]), or `None` for a worker that runs none:
+/// it then claims nothing and says it runs no compaction. A run that starts
+/// over with a node driven before must be given the same endpoint, which
+/// keeps what the driver knew of its executor between runs.
 pub async fn run_driver<C, I>(
     node: &mut WorkerNode<C>,
     first: Step,
@@ -286,6 +287,7 @@ pub async fn run_driver<C, I>(
     scheduler: &mut Scheduler<C, I, RecordOutbox>,
     clock: C,
     mut authority: Option<AuthorityClient>,
+    executor: Option<&mut ExecutorEndpoint>,
     config: DriverConfig,
     mut observe: impl FnMut(&WorkerNode<C>, Option<&Input>, &Step),
 ) -> HandedOff
@@ -294,7 +296,7 @@ where
     I: IdGenerator,
 {
     let my_id = net.local_worker_id();
-    node.set_runs_compaction(config.runs_compaction);
+    node.set_runs_compaction(executor.is_some());
     net.subscribe_to_shard(node.shard_id());
     let mut first = Some(first);
     let mut next_deadline = None;
