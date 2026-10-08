@@ -680,6 +680,12 @@ def test_an_unknown_setting_is_refused():
         {"cancel_grace": 5},
         {"cancel_grace": "5"},
         {"cancel_grace": True},
+        {"processes": -1},
+        {"processes": True},
+        # Above the cap without `concurrency_override`.
+        {"concurrency": 33},
+        {"imports": "app.tasks"},
+        {"process_start_timeout": timedelta(0)},
     ],
 )
 def test_an_invalid_value_is_refused_and_changes_nothing(settings):
@@ -780,21 +786,6 @@ def test_the_soft_limit_may_not_be_above_the_hard_limit():
 
 def test_task_processes_default_to_one_per_cpu():
     assert Configuration().resolve("processes") == (os.cpu_count() or 1)
-
-
-@pytest.mark.parametrize(
-    "settings, refused",
-    [
-        ({"processes": -1}, "processes"),
-        ({"processes": True}, "processes"),
-        ({"concurrency": 33}, "concurrency_override"),
-        ({"imports": "app.tasks"}, "imports"),
-        ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
-    ],
-)
-def test_worker_settings_that_cannot_work_are_refused(settings, refused):
-    with pytest.raises(ConfigurationError, match=refused):
-        Configuration().configure(**settings)
 
 
 def test_worker_settings_are_read_from_the_environment(monkeypatch):
