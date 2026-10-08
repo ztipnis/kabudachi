@@ -164,6 +164,25 @@ impl std::fmt::Display for RecoveryEpoch {
     }
 }
 
+/// What the authority holds for one shard name: which incarnation of the
+/// shard lives under it, and that incarnation's recovery epoch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ShardRecord {
+    pub shard_id: ShardId,
+    pub recovery_epoch: RecoveryEpoch,
+}
+
+/// Where a shard's leader last said it could be reached. A hint only says
+/// whom to ask first: the asked worker's answer decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaderHint {
+    pub shard_id: ShardId,
+    pub leader: WorkerId,
+    pub address: String,
+    pub recovery_epoch: RecoveryEpoch,
+    pub term: u64,
+}
+
 /// A shard's unexpired registrations, each worker with the address it
 /// registered.
 ///
