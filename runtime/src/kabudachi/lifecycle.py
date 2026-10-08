@@ -86,7 +86,11 @@ class HookRegistry:
         """Adds `hook`. Raises `ValueError` if a hook of the same kind and
         name is already declared, and then keeps the one that was there."""
         if any(existing.described == hook.described for existing in self._hooks):
-            raise ValueError(f"{hook.described} is already declared")
+            raise ValueError(
+                f"{hook.described} is already declared; hooks are found by module and "
+                "qualified name, so give each its own named function (lambdas in one "
+                "scope share a name, as do any two partials)"
+            )
         self._hooks.append(hook)
 
     def all(self) -> tuple[LifecycleHook, ...]:
@@ -153,9 +157,19 @@ def after_run(func: Any = None, /, *, queues: Iterable[str] | None = None) -> An
     hook raised (a cancellation included). It may be async, runs where
     `before_run` hooks run, and finishes before the run's result is sent.
 
-    If it raises, the error is logged by its type and the run's result
-    stands; the task process is then replaced by a fresh one once its runs
-    finish, since what the hook did not clean up may be left in it.
+    A synchronous body cannot be stopped: one that ran past its time limit,
+    or was cancelled, and returns later still gives this hook what it
+    returned, though its run has already ended with `TaskTimeoutError` or
+    `TaskCancelledError`.
+
+    If it raises, the error is logged by its type, the hooks declared after
+    it still run, and the run's result stands; the task process is then
+    replaced by a fresh one once its runs finish, since what the hook did
+    not clean up may be left in it. With `processes=0` the error is only
+    logged: nothing is replaced. A hook that raises what is not an
+    `Exception` (`KeyboardInterrupt`, or a cancellation) fails the same way,
+    and is raised again once the other hooks have run, unless the run had
+    already failed, whose error then stands.
 
     Returns the function itself. Raises `TypeError` if `func` cannot be
     called with two arguments or `queues` is not a list of queue names, and
@@ -201,9 +215,12 @@ class RunHooks:
                 _call_from_thread(hook, self.context)
             outcome = call()
         except BaseException as error:
+            # The run's own error stands over any an after_run hook raised.
             self._after_from_thread(error)
             raise
-        self._after_from_thread(outcome)
+        escaped = self._after_from_thread(outcome)
+        if escaped is not None:
+            raise escaped
         return outcome
 
     async def around_async(self, call: Callable[[], Awaitable[Any]]) -> Any:
@@ -215,34 +232,49 @@ class RunHooks:
                 await _call_on_loop(hook, self.context)
             outcome = await call()
         except BaseException as error:
+            # The run's own error stands over any an after_run hook raised.
             await self._after_on_loop(error)
             raise
-        await self._after_on_loop(outcome)
+        escaped = await self._after_on_loop(outcome)
+        if escaped is not None:
+            raise escaped
         return outcome
 
-    def _after_from_thread(self, outcome: Any) -> None:
+    def _after_from_thread(self, outcome: Any) -> BaseException | None:
+        """Calls every `after_run` hook, whichever raise. Returns the first
+        error a hook raised that is not an `Exception`, for the caller to
+        raise again."""
         failed = False
+        escaped: BaseException | None = None
         for hook in self.after:
             try:
                 _call_from_thread(hook, self.context, outcome)
-            except Exception as error:
+            except BaseException as error:
                 self._cleanup_failed(hook, error)
                 failed = True
+                if escaped is None and not isinstance(error, Exception):
+                    escaped = error
         if failed:
             self.recycle()
+        return escaped
 
-    async def _after_on_loop(self, outcome: Any) -> None:
+    async def _after_on_loop(self, outcome: Any) -> BaseException | None:
+        """As `_after_from_thread`, on the running loop."""
         failed = False
+        escaped: BaseException | None = None
         for hook in self.after:
             try:
                 await _call_on_loop(hook, self.context, outcome)
-            except Exception as error:
+            except BaseException as error:
                 self._cleanup_failed(hook, error)
                 failed = True
+                if escaped is None and not isinstance(error, Exception):
+                    escaped = error
         if failed:
             self.recycle()
+        return escaped
 
-    def _cleanup_failed(self, hook: LifecycleHook, error: Exception) -> None:
+    def _cleanup_failed(self, hook: LifecycleHook, error: BaseException) -> None:
         # The type only: an error's message can hold task input, which only
         # DEBUG logs.
         _logger.warning(

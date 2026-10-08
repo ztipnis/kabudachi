@@ -995,3 +995,15 @@ def test_a_lifecycle_hook_that_could_never_be_called_is_refused_where_declared(
         declare_hook()
 
     assert lifecycle_module.default_hooks().all() == ()
+
+
+def test_a_second_hook_with_the_same_name_is_refused_with_how_to_tell_them_apart(monkeypatch):
+    monkeypatch.setattr(lifecycle_module, "_default_hooks", HookRegistry())
+    # Two lambdas in one scope share a qualified name.
+    first, second = (lambda context: None), (lambda context: None)
+    kabudachi.before_run(first)
+
+    with pytest.raises(ValueError, match="already declared.*its own named function"):
+        kabudachi.before_run(second)
+
+    assert [hook.func for hook in lifecycle_module.default_hooks().all()] == [first]
