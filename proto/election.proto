@@ -77,7 +77,11 @@ message LeaderHeartbeatAck {
   // such as the one a new leader sends every connected peer.
   optional uint64 heartbeat_token = 9;
   // The lineage of `recovery_epoch` (see the coordination authority's
-  // `RecoveryEpoch`).
+  // `RecoveryEpoch`). A peer that predates this field omits it, which decodes
+  // as lineage 0 and can rank behind a node holding a nonzero lineage at the
+  // same epoch, so such a peer's election messages are rejected as stale.
+  // Mixed-version election traffic is therefore unsupported: every worker of
+  // a shard must run the same build.
   uint64 recovery_epoch_lineage = 10;
 }
 
