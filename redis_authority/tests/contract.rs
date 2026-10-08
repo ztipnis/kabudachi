@@ -8,6 +8,7 @@ use valkey_test_support::{ServerMode, ValkeyServer};
 pub struct Redis {
     pub server: ValkeyServer,
     pub config: RedisAuthorityConfig,
+    pub has_outages: bool,
 }
 
 pub fn config(urls: Vec<String>) -> RedisAuthorityConfig {
@@ -25,14 +26,11 @@ impl AuthorityAdapter for Redis {
 
     fn fresh(&self) -> RedisAuthority {
         self.server.flushall();
-        let authority = RedisAuthority::connect(self.config.clone()).expect("valid config");
-        touch_contract_names(&authority);
-        authority
+        RedisAuthority::connect(self.config.clone()).expect("valid config")
     }
 
-    fn flush(&self, authority: &RedisAuthority) {
+    fn flush(&self, _authority: &RedisAuthority) {
         self.server.flushall();
-        touch_contract_names(authority);
     }
 
     fn go_down(&self, _authority: &RedisAuthority) {
@@ -42,17 +40,11 @@ impl AuthorityAdapter for Redis {
     fn come_back(&self, _authority: &RedisAuthority) {
         self.server.restart();
     }
-}
 
-/// The contract expects an authority to start its warm-up when it starts or
-/// loses its data. This one starts a name's warm-up at the first call that
-/// names it, so the adapter makes that call right away for each name the
-/// contract uses.
-fn touch_contract_names(authority: &RedisAuthority) {
-    for name in ["contract-shard", "contract-other-shard"] {
-        authority
-            .read_shard(&ShardName::new(name))
-            .expect("the server answers");
+    // A restarted cluster node refuses writes for its first seconds, longer
+    // than a TTL of a second; the standalone ACL run covers outages.
+    fn has_outages(&self) -> bool {
+        self.has_outages
     }
 }
 
@@ -74,7 +66,11 @@ fn an_acl_user_limited_to_its_prefix_and_commands_keeps_the_contract_and_sees_no
     let mut config = config(vec![server.url()]);
     config.key_prefix = "kabu:one:".into();
     config.database = 1;
-    let redis = Redis { server, config };
+    let redis = Redis {
+        server,
+        config,
+        has_outages: true,
+    };
     check_authority_contract(&redis, &RealTime);
 
     let one = redis.fresh();
@@ -112,9 +108,12 @@ fn a_single_node_cluster_keeps_the_coordination_authority_contract() {
     let server = ValkeyServer::start(ServerMode::Cluster);
     let mut config = config(vec![server.url()]);
     config.cluster = true;
-    // A restarted cluster node takes writes only two seconds after it starts,
-    // and the contract's outage keeps a registration alive through the
-    // restart, so the TTL must be well above that.
-    config.ttl = Duration::from_millis(4_000);
-    check_authority_contract(&Redis { server, config }, &RealTime);
+    check_authority_contract(
+        &Redis {
+            server,
+            config,
+            has_outages: false,
+        },
+        &RealTime,
+    );
 }
