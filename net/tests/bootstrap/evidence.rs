@@ -175,7 +175,8 @@ async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lap
 
 // A bootstrapper that finds the shard's record asks the leader the authority
 // hints at first, even while the authority warms up and lists no one; a hint
-// of another incarnation says nothing of the shard.
+// of another incarnation says nothing of the shard, and neither does a leader
+// of one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bootstrapper_asks_the_leader_its_authority_hints_at_and_ignores_another_incarnations_hint() {
     within_deadline(async {
@@ -292,6 +293,40 @@ async fn a_bootstrapper_asks_the_leader_its_authority_hints_at_and_ignores_anoth
             }
             other => panic!("expected a re-founding: {other:?}"),
         }
+
+        // 3. A registered peer of the recorded incarnation answers with a
+        //    pointer to a leader of the same name but another incarnation:
+        //    that leader is not this shard's to join. The answer shows a
+        //    shard exists, so the worker keeps asking and founds nothing.
+        let (stranger, stranger_address) = listening_net().await;
+        let stranger_id = stranger.local_worker_id();
+        let other_incarnation = JoinResponse {
+            shard_id: Some(ShardId::new("shard-1/b").into()),
+            ..pointer_to(&stranger_id, &stranger_address)
+        };
+        let _stranger_answers = JoinResponder::start(Arc::new(stranger), Some(other_incarnation));
+        let authority = case();
+        authority
+            .register(&name_of(&incarnation), &incarnation, &stranger_id, &stranger_address.to_string())
+            .expect("the authority is reachable");
+        let (net, me, mut client) = start(authority.clone());
+        let refused = timeout(
+            SILENCE,
+            bootstrap(
+                &net,
+                &RealClock::new(),
+                Some(&mut client),
+                &incarnation.name(),
+                &me,
+                &[],
+                PER_PEER_TIMEOUT,
+                GRACE,
+                RETRY_INTERVAL,
+                DEFAULT_SEED_ROUNDS,
+            ),
+        )
+        .await;
+        assert!(refused.is_err(), "the worker entered beside another incarnation: {refused:?}");
     })
     .await
 }

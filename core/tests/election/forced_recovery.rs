@@ -60,6 +60,35 @@ impl AuthorityPerformer for LosingSwapReplies<'_> {
     }
 }
 
+/// Performs a node's authority calls at once, as [`AtOnce`] does, except that
+/// another incarnation of the shard is founded under its name just before a
+/// swap of the record is made.
+struct FoundingBeforeSwap<'a> {
+    inner: AtOnce<'a>,
+    founder: &'a FaultingAuthority<FakeClock>,
+}
+
+impl AuthorityPerformer for FoundingBeforeSwap<'_> {
+    fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
+        if matches!(call.request, AuthorityRequest::SwapRecoveryEpoch { .. }) {
+            self.founder
+                .compare_and_swap_shard(
+                    &name_of(&shard(SHARD)),
+                    None,
+                    &ShardRecord {
+                        shard_id: shard("shard-1/successor"),
+                        // Newer than the leader's, so the leader does not take
+                        // the conflict for its own republish having landed and
+                        // ask its fence again, which would show it the same.
+                        recovery_epoch: epoch(5),
+                    },
+                )
+                .expect("a founder took the flushed name");
+        }
+        self.inner.perform(call)
+    }
+}
+
 /// A node and the authority its driver reaches for it.
 struct Driven {
     me: WorkerId,
@@ -869,6 +898,38 @@ fn a_leader_whose_fence_names_an_epoch_it_cannot_recover_from_rejoins_it_and_ano
     );
     assert_eq!(driven.node.stop_reason(), Some(StopReason::Abandoned));
     assert!(outputs.contains(&Output::ShardAbandoned));
+
+    // The same, found by the republish after a flush instead: the authority is
+    // flushed, the leader's fence meets no record and republishes its own, and
+    // another incarnation is founded under the name just before that swap
+    // lands. The swap's own conflict names it, and the leader stops there and
+    // then.
+    let (mut driven, _) = lone_winner(Some(AuthorityTimings {
+        ttl: authority_ttl(),
+    }));
+    driven.authority.flush();
+    let founder = driven.authority.for_another_worker();
+    driven.clock.advance(Duration::from_ticks(ttl_ticks() / 3));
+    let step = driven.node.step(Input::Tick);
+    let mut outputs = Vec::new();
+    let _ = carry_out(
+        &mut driven.node,
+        step,
+        &mut driven.scheduler,
+        &mut DropMessages,
+        &mut FoundingBeforeSwap {
+            inner: AtOnce::new(&driven.authority, shard(SHARD), driven.me.clone()),
+            founder: &founder,
+        },
+        |_, _, _, step| outputs.extend(step.outputs.iter().cloned()),
+    );
+
+    assert_eq!(
+        state_changes(&outputs),
+        vec![WorkerState::Stopped],
+        "the republish's own conflict shows the shard gone: {outputs:?}"
+    );
+    assert_eq!(driven.node.stop_reason(), Some(StopReason::Abandoned));
 }
 
 // A leader that finds the authority flushed republishes its record, and says
