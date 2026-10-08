@@ -97,9 +97,10 @@
 //! expiry expires, a finished task is forgotten) and writes what that
 //! changed, and the driver sleeps no later than that deadline. The events the
 //! scheduler raises are drained each batch: they are logged and dropped, as
-//! no client lives on a networked worker to hear them (except that a cancel
-//! of a run this worker's executor holds stops it), and the revisions
-//! published when that ends the scheduler's call are written too.
+//! no client lives on a networked worker to hear them, except a cancel of a
+//! running run, which is told to the run's worker in its leader's next ack,
+//! or to this worker's own executor, once stored. The revisions published
+//! when draining ends the scheduler's call are written too.
 //!
 //! With a coordination authority configured, it is also the sole caller of
 //! [`kabudachi_core::election::AuthorityCall::perform`]. Each step's
@@ -151,6 +152,7 @@ use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     ClaimOldest, ClaimResponse, ElectionMessage, TaskResponse, claim_request, task_request,
 };
+use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::reconcile::active_runs_digest;
 use kabudachi_core::scheduler::{Event, Scheduler};
@@ -346,9 +348,8 @@ where
     );
 
     loop {
-        // This worker's own claims and reports whose writes settled this
-        // batch, for its executor.
-        let mut own = Vec::new();
+        // What settled answers leave this worker itself to act on this batch.
+        let mut local = Local::default();
         // Every reply that has arrived, read before the stepper borrows the
         // client to perform the node's calls.
         let mut arrived_replies: Vec<AuthorityReply> = woken_by.take().into_iter().collect();
@@ -395,7 +396,7 @@ where
         // with no memory of the last one's writes, and tells nothing the last
         // one decided.
         for answer in stepper.records.follow_office(stepper.node.office_term()) {
-            send_answer(net, Settled::NotLeader(answer), &mut own);
+            send_answer(net, Settled::NotLeader(answer), &mut local);
         }
         let now = clock.now();
         let mut ports = stepper.ports();
@@ -412,7 +413,7 @@ where
             &mut ports,
         );
         for answer in settled {
-            send_answer(net, answer, &mut own);
+            send_answer(net, answer, &mut local);
         }
         // A leader makes compaction runs only for members that said they run
         // them: the scheduler is told who they are as the heartbeats say.
@@ -426,7 +427,7 @@ where
             net,
             stepper.records,
             config.replication_factor,
-            &mut own,
+            &mut local,
         );
         respond_to_task_requests(
             stepper.node,
@@ -435,7 +436,7 @@ where
             &clock,
             stepper.records,
             config.replication_factor,
-            &mut own,
+            &mut local,
         );
         respond_to_reconcile_requests(stepper.node, net);
         respond_to_steal_requests(net, &clock);
@@ -456,9 +457,13 @@ where
         }
         // A new abort deadline reaches the executor before any more work.
         let abort_deadline = stepper.collected.abort_deadline.take();
+        let cancelled_runs = std::mem::take(&mut stepper.collected.cancelled_runs);
         if let Some(executing) = executing.as_mut() {
             if let Some(deadline) = abort_deadline {
                 executing.follow_abort_deadline(deadline.map(|at| on_this_host(&clock, at)));
+            }
+            for run in &cancelled_runs {
+                executing.cancel(run);
             }
             drive_executor(
                 executing,
@@ -468,15 +473,12 @@ where
                 &clock,
                 stepper.records,
                 config.replication_factor,
-                std::mem::take(&mut own),
+                std::mem::take(&mut local.own),
             );
         }
-        compare_run_digests(
-            &mut reconciliation,
-            stepper.scheduler,
-            &clock,
-            std::mem::take(&mut stepper.collected.runs_heard),
-        );
+        let heard = std::mem::take(&mut stepper.collected.runs_heard);
+        forget_told_cancels(stepper.node, stepper.scheduler, &heard);
+        compare_run_digests(&mut reconciliation, stepper.scheduler, &clock, heard);
         let mut ports = stepper.ports();
         let scheduler_deadline = catch_up_if_due(
             stepper.node,
@@ -490,8 +492,19 @@ where
             stepper.scheduler,
             stepper.records,
             &mut ports,
-            executing.as_mut(),
+            net,
+            &mut local,
         );
+        let my_id = net.local_worker_id();
+        for (worker, run) in std::mem::take(&mut local.cancelled) {
+            if worker == my_id {
+                if let Some(executing) = executing.as_mut() {
+                    executing.cancel(&run);
+                }
+            } else {
+                node.tell_cancelled(worker, run);
+            }
+        }
         // A node that drained has nothing more to do but hand its records
         // over; the worker may exit once that is done.
         if node.state() == WorkerState::Stopped
@@ -582,6 +595,24 @@ fn compare_run_digests<C: Clock, I: IdGenerator>(
     }
 }
 
+/// A worker whose heartbeat shows exactly the runs the scheduler believes
+/// it holds no longer holds any run this leader told it was cancelled, so
+/// its acks stop listing them.
+fn forget_told_cancels<C: Clock, I: IdGenerator>(
+    node: &mut WorkerNode<C>,
+    scheduler: &Scheduler<C, I, RecordOutbox>,
+    heard: &[(WorkerId, Vec<u8>)],
+) {
+    if !scheduler.is_leader() {
+        return;
+    }
+    for (worker, digest) in heard {
+        if active_runs_digest(&scheduler.active_runs_of(worker)).value() == digest.as_slice() {
+            node.forget_cancelled(worker);
+        }
+    }
+}
+
 /// The reconciliation's next answer or lookup, taken in; for ever without one.
 /// Cancel-safe.
 async fn next_reconciliation(reconciliation: &mut Option<LeaderReconciliation<'_>>) {
@@ -630,10 +661,12 @@ fn drive_executor<C: Clock, I: IdGenerator>(
     };
     let leads = leader == net.local_worker_id();
     loop {
-        let mut own = Vec::new();
+        let mut local = Local::default();
         for request in executing.reports_to_send() {
             if leads {
-                decide_own_report(request, node, scheduler, net, clock, records, factor, &mut own);
+                decide_own_report(
+                    request, node, scheduler, net, clock, records, factor, &mut local,
+                );
             } else {
                 executing.send_report(leader.clone(), request);
             }
@@ -648,17 +681,17 @@ fn drive_executor<C: Clock, I: IdGenerator>(
         {
             if leads {
                 executing.claiming_own(places);
-                decide_own_claim(places, node, scheduler, net, records, factor, &mut own);
+                decide_own_claim(places, node, scheduler, net, records, factor, &mut local);
             } else {
                 executing.discover(leader.clone(), places, WallTime::now(clock));
             }
         }
         // An answer with no write to wait for settles at once, and may let
         // the next report of its run go.
-        if own.is_empty() {
+        if local.own.is_empty() {
             return;
         }
-        for answer in own {
+        for answer in local.own {
             executing.own_settled(answer);
         }
     }
@@ -676,7 +709,7 @@ fn decide_own_report<C: Clock, I: IdGenerator>(
     clock: &C,
     records: &mut LeaderRecords<HeldAnswer>,
     factor: ReplicationFactor,
-    own: &mut Vec<Settled<OwnAnswer>>,
+    local: &mut Local,
 ) {
     let named = task_named(scheduler, &request);
     net.note_sending(&request);
@@ -684,7 +717,7 @@ fn decide_own_report<C: Clock, I: IdGenerator>(
     let made = records.write(node, scheduler, &mut NetRecords { net, factor });
     let held = HeldAnswer::Own(OwnAnswer::Report { request, response });
     if let Some(settled) = records.hold(held, made, named.as_ref()) {
-        send_answer(net, settled, own);
+        send_answer(net, settled, local);
     }
 }
 
@@ -699,14 +732,14 @@ fn decide_own_claim<C: Clock, I: IdGenerator>(
     net: &Net,
     records: &mut LeaderRecords<HeldAnswer>,
     factor: ReplicationFactor,
-    own: &mut Vec<Settled<OwnAnswer>>,
+    local: &mut Local,
 ) {
     let request = claim_request::Request::Oldest(ClaimOldest { limit: places });
     let response = claim::answer(scheduler, &net.local_worker_id(), &request);
     let made = records.write(node, scheduler, &mut NetRecords { net, factor });
     let held = HeldAnswer::Own(OwnAnswer::Claim { response, reserved: places });
     if let Some(settled) = records.hold(held, made, None) {
-        send_answer(net, settled, own);
+        send_answer(net, settled, local);
     }
 }
 
@@ -802,27 +835,44 @@ fn catch_up_if_due<C: Clock, I: IdGenerator>(
 
 /// No client lives on a worker of a networked shard yet, so the events the
 /// scheduler raises for one are logged and dropped rather than kept for ever,
-/// except that a cancel of a run this worker's executor holds stops it.
-/// Taking them ends the scheduler's call, which can publish the revisions
-/// the call made, so they are written too; nothing waits on those writes.
+/// except a cancel of a running run: it is held until the cancel is stored,
+/// then left in `local` for the run's worker to be told. Taking the events
+/// ends the scheduler's call, which can publish the revisions the call made,
+/// so they are written first; nothing else waits on those writes.
 fn drain_events<C: Clock, I: IdGenerator>(
     node: &WorkerNode<C>,
     scheduler: &mut Scheduler<C, I, RecordOutbox>,
     records: &mut LeaderRecords<HeldAnswer>,
     ports: &mut NetRecords<'_>,
-    mut executing: Option<&mut Executing<'_>>,
+    net: &Net,
+    local: &mut Local,
 ) {
-    for event in scheduler.take_events() {
-        // A run of this worker's own that its own scheduler cancelled is
-        // stopped; nothing more it reports about the run counts.
-        if let (Event::Cancelled { task_run_id, was_running: true, .. }, Some(executing)) =
-            (&event, executing.as_deref_mut())
+    let events = scheduler.take_events();
+    records.write(node, scheduler, ports);
+    for event in events {
+        // A running run that was cancelled is stopped where it runs, once
+        // the cancel is stored: told to its worker in its next ack, or, for
+        // a run of this worker's own, to its executor. Telling it earlier
+        // could stop a body whose cancel the next leader never sees.
+        if let Event::Cancelled {
+            task_id,
+            task_run_id,
+            was_running: true,
+        } = &event
+            && let Some(worker) = scheduler
+                .task_run(task_run_id)
+                .and_then(|run| run.selected_worker())
         {
-            executing.cancel(task_run_id);
+            let held = HeldAnswer::CancelledRun {
+                worker,
+                run: task_run_id.clone(),
+            };
+            if let Some(settled) = records.hold(held, Vec::new(), Some(task_id)) {
+                send_answer(net, settled, local);
+            }
         }
         tracing::debug!(?event, "scheduler event with no client to tell");
     }
-    records.write(node, scheduler, ports);
 }
 
 /// What one batch of [`run_driver`] steps its node with.
@@ -854,6 +904,8 @@ struct Collected {
     hand_off: Option<HandOffTo>,
     /// The latest abort deadline a step reported, if one did this batch.
     abort_deadline: Option<Option<Instant>>,
+    /// The runs the leader's acks said were cancelled, for the executor.
+    cancelled_runs: Vec<TaskRunId>,
 }
 
 impl<C, I, O> Stepper<'_, C, I, O>
@@ -895,6 +947,9 @@ where
                         }
                         Output::HandOff(to) => collected.hand_off = Some(to.clone()),
                         Output::AbortDeadline(by) => collected.abort_deadline = Some(*by),
+                        Output::RunsCancelled(runs) => {
+                            collected.cancelled_runs.extend(runs.iter().cloned());
+                        }
                         _ => {}
                     }
                 }
@@ -999,6 +1054,7 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
             | Output::Reconcile(_)
             | Output::Authority(_)
             | Output::RunsHeard { .. }
+            | Output::RunsCancelled(_)
             | Output::HandOff(_)
             | Output::WorkerLost(_) => {}
         }
@@ -1075,6 +1131,17 @@ enum HeldAnswer {
     },
     /// A claim or report of this worker's own, for its executor.
     Own(OwnAnswer),
+    /// A cancel of a run `worker` holds, told to it once the cancel is stored.
+    CancelledRun { worker: WorkerId, run: TaskRunId },
+}
+
+/// What settled answers leave this worker itself to act on.
+#[derive(Default)]
+struct Local {
+    /// Its own claims and reports, for its executor.
+    own: Vec<Settled<OwnAnswer>>,
+    /// Stored cancels of running runs, with the worker holding each.
+    cancelled: Vec<(WorkerId, TaskRunId)>,
 }
 
 /// Decides every inbound `/kabudachi/claim/1` request queued on `net` with
@@ -1092,7 +1159,7 @@ fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
     net: &Net,
     records: &mut LeaderRecords<HeldAnswer>,
     factor: ReplicationFactor,
-    own: &mut Vec<Settled<OwnAnswer>>,
+    local: &mut Local,
 ) {
     for handle in net.poll_claim_requests() {
         if scheduler.is_leader() && !node.is_voter_or_pending(&handle.from()) {
@@ -1108,7 +1175,7 @@ fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
         if let Some(settled) =
             records.hold(HeldAnswer::Claim { handle, response }, made, task.as_ref())
         {
-            send_answer(net, settled, own);
+            send_answer(net, settled, local);
         }
     }
 }
@@ -1130,7 +1197,7 @@ fn respond_to_task_requests<C: Clock, I: IdGenerator>(
     clock: &C,
     records: &mut LeaderRecords<HeldAnswer>,
     factor: ReplicationFactor,
-    own: &mut Vec<Settled<OwnAnswer>>,
+    local: &mut Local,
 ) {
     for handle in net.poll_task_requests() {
         // A worker that drained has been taken out of the roster by the time
@@ -1161,7 +1228,7 @@ fn respond_to_task_requests<C: Clock, I: IdGenerator>(
         if let Some(settled) =
             records.hold(HeldAnswer::Task { handle, response }, made, named.as_ref())
         {
-            send_answer(net, settled, own);
+            send_answer(net, settled, local);
         }
     }
 }
@@ -1243,7 +1310,7 @@ fn task_named<C: Clock, I: IdGenerator>(
     }
 }
 
-fn send_answer(net: &Net, settled: Settled<HeldAnswer>, own: &mut Vec<Settled<OwnAnswer>>) {
+fn send_answer(net: &Net, settled: Settled<HeldAnswer>, local: &mut Local) {
     match settled {
         Settled::Released(HeldAnswer::Claim { handle, response }) => {
             net.respond_claim(handle, response);
@@ -1257,7 +1324,13 @@ fn send_answer(net: &Net, settled: Settled<HeldAnswer>, own: &mut Vec<Settled<Ow
         Settled::NotLeader(HeldAnswer::Task { handle, .. }) => {
             net.respond_task(handle, task_exchange::not_leader());
         }
-        Settled::Released(HeldAnswer::Own(answer)) => own.push(Settled::Released(answer)),
-        Settled::NotLeader(HeldAnswer::Own(answer)) => own.push(Settled::NotLeader(answer)),
+        Settled::Released(HeldAnswer::Own(answer)) => local.own.push(Settled::Released(answer)),
+        Settled::NotLeader(HeldAnswer::Own(answer)) => local.own.push(Settled::NotLeader(answer)),
+        Settled::Released(HeldAnswer::CancelledRun { worker, run }) => {
+            local.cancelled.push((worker, run));
+        }
+        // The cancel may not have been stored: the worker learns what the
+        // next leader decided when it next reports on the run.
+        Settled::NotLeader(HeldAnswer::CancelledRun { .. }) => {}
     }
 }

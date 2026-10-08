@@ -83,6 +83,11 @@ message LeaderHeartbeatAck {
   // Mixed-version election traffic is therefore unsupported: every worker of
   // a shard must run the same build.
   uint64 recovery_epoch_lineage = 10;
+  // Runs of the recipient's that the leader cancelled, once each cancel is
+  // stored: the recipient stops their bodies. Listed in every ack until the
+  // recipient's heartbeats show it no longer holds them, at most a bounded
+  // number at a time.
+  repeated TaskRunId cancelled_runs = 11;
 }
 
 // A census of the shard's workers ahead of a vote, published on the shard's

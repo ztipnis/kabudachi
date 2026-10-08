@@ -3,7 +3,10 @@
 //! its own reports there. A follower claims from the leader and reports to
 //! it. Each decision reaches the executor, or leaves the ledger, only once a
 //! majority of the task's placement stored it. A run whose executor stops
-//! before it ends is reported lost.
+//! before it ends is reported lost. A follower's cancelled run reaches its
+//! executor through the leader's next ack.
+
+use std::time::Duration as StdDuration;
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRunState;
@@ -19,7 +22,7 @@ const RESULT: &[u8] = b"the-result";
 const QUORUM: usize = 2;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_leader_runs_its_own_claims_and_a_follower_reports_a_run_it_lost() {
+async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_reports_losses() {
     within_deadline(async {
         let (mut shard, client) = ThreeVoters::start().await;
         let mut executors: Vec<FakeExecutor> = (0..3)
@@ -75,6 +78,33 @@ async fn a_leader_runs_its_own_claims_and_a_follower_reports_a_run_it_lost() {
             .await
             .expect("the leader answered");
         assert_eq!(shard.drive_until(executors[leader].next_work()).await, Work::Cancel(run));
+
+        // A run a follower runs is cancelled: the leader's next ack to the
+        // follower lists it, and the follower's executor is told to stop the
+        // body within a few heartbeat intervals.
+        executors[follower].grant(1);
+        let remote = shard
+            .drive_until(submitted_through(&client, &leader_id, plain_with(b"remote")))
+            .await;
+        let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
+        executors[follower].report(Report::Started(run.clone()));
+        shard
+            .drive_until(poll_until("the leader stored the follower's run running", || {
+                holding(&nets, &remote, &[TaskRunState::Running]) >= QUORUM
+            }))
+            .await;
+        shard
+            .drive_until(client.cancel(leader_id.clone(), remote))
+            .await
+            .expect("the leader answered");
+        let told = shard
+            .drive_until(tokio::time::timeout(
+                StdDuration::from_millis(500),
+                executors[follower].next_work(),
+            ))
+            .await
+            .expect("the follower heard of the cancel within five heartbeat intervals");
+        assert_eq!(told, Work::Cancel(run));
 
         // Only a follower's executor offers a place now: it claims from the
         // leader. The process running the body dies: the run is lost and
