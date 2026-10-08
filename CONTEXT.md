@@ -27,18 +27,36 @@ _Avoid_: runner, event loop
 ## Starting a node
 
 **Identity**:
-Who a node is: its worker, that worker's process incarnation, its shard, and the timers it runs its election on.
+Who a node is: its worker, that worker's process incarnation, its shard incarnation, and the timers it runs its election on.
 
 **Entry**:
 How a node enters its shard: founding it alone, joining the leader a pointer names, or starting inside a configuration already known. The bootstrap cascade ends by choosing one.
 _Avoid_: bootstrap result, join mode
 
 **Founding**:
-Entering a shard as its only voter, at a recovery epoch of a lineage the founder drew.
+Entering a shard as its only voter, at a recovery epoch of a lineage the founder drew and, when founding anew, under a new shard id.
 _Avoid_: genesis (for the entry itself; the genesis configuration is what a founder starts with)
 
 **Joining**:
 Entering a shard as a pending member of the leader a JOIN answer points at.
+
+## Naming a shard
+
+**Shard name**:
+The operator's name for a shard. It names the shard's gossip topic, records protocol and authority keys, and never changes.
+
+**Shard id**:
+One incarnation of a named shard: the name plus a UUIDv7. Every founding against an empty authority, or with none, mints one; a re-founding keeps it. Election and JOIN messages carry it, and a node drops another incarnation's.
+_Avoid_: shard id for the name
+
+**Shard record**:
+What the authority holds under a name: the incarnation and its recovery epoch. Exactly one swap creates it.
+
+**Leader hint**:
+Where the authority says a shard's leader can be reached. It only orders whom to ask, lapses after one TTL, and is ignored when it names another incarnation or an older epoch.
+
+**External address**:
+The address a worker gives others when it is not the one it listens on.
 
 ## Deciding an election
 

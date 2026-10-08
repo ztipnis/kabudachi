@@ -1578,7 +1578,9 @@ name = "kabudachi-net"
 version = "0.1.0"
 dependencies = [
  "kabudachi-core",
+ "kabudachi-redis-authority",
  "kabudachi-testkit",
+ "kabudachi-valkey-test-support",
  "libp2p",
  "prost 0.13.5",
  "tokio",

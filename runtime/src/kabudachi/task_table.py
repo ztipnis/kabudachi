@@ -166,7 +166,9 @@ class TaskTable:
                 expires_in_ms=options.expires_in_ms,
                 drop_oldest=definition.drop_oldest,
             )
-            handle = TaskHandle(task_id, self.cancel, self._run_callback)
+            handle = TaskHandle(
+                task_id, self.cancel, self._run_callback, shard_id=self._runtime.shard_id()
+            )
             self._records[task_id] = _Record(handle, definition.name)
         return handle
 

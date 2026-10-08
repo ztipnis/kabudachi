@@ -42,6 +42,10 @@ Native runs share one Bazel disk cache, `~/.cache/kabudachi-bazel`, capped at 6 
 
 See `CLAUDE.md`'s `Commands` section for the native (non-Docker) build/test commands, including the note that Python tests run through Bazel and not `uv run pytest`, and the lockfile restore after Bazel commands.
 
+### Redis-backed tests
+
+The Redis-backed tests (`//redis_authority:redis_authority_integration_test`, `//net:redis_end_to_end_test`) start their own valkey server, built by Bazel from the BCR `valkey` module, on a free port in the test's temporary directory. No Redis or valkey on the host is needed or used. The first build compiles valkey once; later runs take it from the cache.
+
 ### Deep property-test runs
 
 The property tests (`core/tests/proptest/`) check 256 cases each by default (the flow test 400, the authority test 40), from a fixed seed in the leadership tests, and each test stops checking after a 60 s wall-clock budget, noting how many cases ran (visible with `--test_arg=--nocapture`, since libtest hides the output of a passing test), so a slow host truncates a run rather than hanging it. Before closing a change to the election, run a deeper one with more cases and another seed:
@@ -58,6 +62,8 @@ PROPTEST_CASES=5000 PROPTEST_RNG_SEED=7 bazel test //core:core_integration_test 
 `.circleci/config.yml` runs one CircleCI job on every push: `bazel test --config=ci //...`. The job is built to make the Free plan's 30,000 credits a month last.
 
 **Time guard.** The test step stops after 5 minutes (`timeout 300` around the Bazel command), so a hung test fails the job quickly instead of spending credits until CircleCI's own limit. A healthy run takes well under that. Each property test has its own budget, so on a starved host the budgets of the tests sharing the binary can add up.
+
+**The Redis-backed tests run here unchanged.** The job builds valkey from the same module and runs the same two targets, with no service container.
 
 **Incremental testing is Bazel's own.** Bazel reruns only the actions whose inputs changed, and third-party outputs come from a remote cache. There is no test-selection script.
 

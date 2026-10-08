@@ -760,7 +760,7 @@ A handle can report how durably its Task is held, and callers may await a strong
 ```text
 in_memory            held by the receiving peer
 replicated           stored at a majority of the record's placement (§8.6)
-dr_store_written     written to the disaster-recovery store (§9.2); not yet implemented (Phase 4 and later)
+dr_store_written     written to the disaster-recovery store (§9.2); not yet implemented (Phase 8)
 ```
 
 Submission is acknowledged only once its record is `replicated` in this sense.
@@ -961,18 +961,19 @@ Purpose:
 
 - cold shard/worker discovery;
 - leader endpoint hints;
-- task-to-shard mapping cache;
+- task-to-shard mapping cache (Phase 8);
 - recovery epoch/fencing for `NO_QUORUM`;
 - initial bootstrap arbitration.
 
 It is not the task queue and is not on the normal execution path.
 
-Provider constraints, so that the default Redis provider coexists with other tenants of a shared instance:
+Provider constraints, so that the default Redis provider coexists with other tenants of a shared instance. The Redis provider (`kabudachi_redis_authority`):
 
-- a configurable key prefix and, outside cluster mode, a database number; Redis Cluster supports only database `0`, so cluster mode isolates tenants by key prefix alone and rejects a non-zero database selection;
-- never `SCAN` or `KEYS`; every key it reads is addressed by name;
-- a documented minimal command set, stating whether Lua scripting or `WATCH`/`MULTI` are required, with a fallback that avoids Lua where feasible;
-- tolerance of cluster mode through hash-tagged keys.
+- keeps every key of a shard name under `<prefix>{<name>}:` (one hash tag, so one cluster slot), with a configurable key prefix;
+- takes a database number outside cluster mode and rejects a non-zero one in cluster mode, which supports only database `0` and so isolates tenants by key prefix alone;
+- never sends `SCAN` or `KEYS`; every key it reads is addressed by name;
+- needs no Lua, only `WATCH`/`MULTI`/`EXEC`; its crate documentation lists the exact command set (`COMMANDS`), which an ACL user limited to those commands and `~<prefix>*` suffices for;
+- requires an eviction policy that never evicts its keys (`noeviction` or a `volatile-*` policy), because it sets no key TTLs.
 
 ### 9.2 Disaster-recovery Task store
 
@@ -1172,9 +1173,12 @@ LEADER_SUSPECT                        DRAINING
       |    from ------------------------------------> BOOTSTRAPPING (rejoins)
       |
       +--> authority holds no recovery epoch --------> STOPPED (shard ABANDONED)
+      |
+      +--> authority holds another incarnation
+           of the shard ----------------------------> STOPPED (shard ABANDONED)
 ```
 
-A candidate that loses its vote, or an initiator that abandoned its call for a better one or finds its term already holds a vote or a leader, returns to `LEADER_SUSPECT` and tries again at a later term after a fresh jittered suspicion timeout; a call short of quorum at its deadline goes to `NO_QUORUM`. A `CANDIDATE` waiting out the fence that the authority refuses for good goes back to `NO_QUORUM`. A leader asked to drain goes to `DRAINING`. With an authority configured, a `LEADER_SUSPECT` member first reads the authority's recovery epoch and starts its roll call only if the read names its own epoch (or the authority holds none); otherwise it rejoins at the epoch the read names. A worker in any state from `ACTIVE` through `LEADER`, `NO_QUORUM` included, becomes `FENCED` if it fails to renew its authority registration. A leader's grant to schedule ends at the earlier of its recovery fence and its quorum-contact lease.
+A candidate that loses its vote, or an initiator that abandoned its call for a better one or finds its term already holds a vote or a leader, returns to `LEADER_SUSPECT` and tries again at a later term after a fresh jittered suspicion timeout; a call short of quorum at its deadline goes to `NO_QUORUM`. A `CANDIDATE` waiting out the fence that the authority refuses for good goes back to `NO_QUORUM`. A leader asked to drain goes to `DRAINING`. With an authority configured, a `LEADER_SUSPECT` member first reads the authority's shard record and starts its roll call only if the read names its own epoch (or the authority holds none); if it names another epoch it rejoins at that epoch. A worker that finds the record naming another incarnation of its shard (another `ShardId` under its name) stops, its shard abandoned, from any state that reads the record: a rejoining node in `BOOTSTRAPPING` or `JOINING`, `LEADER_SUSPECT`, `NO_QUORUM`, `CANDIDATE`, `LEADER_RECONCILING`, `LEADER` and `FENCED`. A worker in any state from `ACTIVE` through `LEADER`, `NO_QUORUM` included, becomes `FENCED` if it fails to renew its authority registration. A leader's grant to schedule ends at the earlier of its recovery fence and its quorum-contact lease.
 
 ---
 
@@ -1190,7 +1194,7 @@ A shard needs three things from its peers' connections, and none of them is all-
 
 ### 11.2 The peer book
 
-Each worker's swarm task keeps a peer book: which peers are connected, the address of record for each, its own address, which peers share its shard's gossip topic and mesh, and the traffic it has carried. A peer's address is taken, in order of preference, from its `identify` listen addresses, the address this worker successfully dialed, the address the peer stamped on a roll call or reply it sent (accepted only when the stamp names the peer that gossip or the connection vouches for), and, as a last resort, the source address of an inbound connection, which is never handed to a joiner or dialed by a send.
+Each worker's swarm task keeps a peer book: which peers are connected, the address of record for each, its own address, which peers share its shard's gossip topic and mesh, and the traffic it has carried. A peer's address is taken, in order of preference, from its `identify` listen addresses, the address this worker successfully dialed, the address the peer stamped on a roll call or reply it sent (accepted only when the stamp names the peer that gossip or the connection vouches for), and, as a last resort, the source address of an inbound connection, which is never handed to a joiner or dialed by a send. A worker given an external address (`WorkerConfig::with_external_address`, for a wildcard bind, NAT or a container port mapping) gives only that one: in its registration, its leader hint, the JOIN pointers it hands out and its message stamps, and `identify` advertises it and no listen address.
 
 ### 11.3 Redial schedule
 
@@ -1523,7 +1527,7 @@ Only a leader applies a `SELF_REMOVE` (§12.3), so this path protects a shard th
 
 ### 14.3 Exit path C: forced reconfiguration through CoordinationAuthority
 
-Redis or another configured authority stores a per-shard `recovery_epoch`, which is a number and a lineage. The lineage is drawn fresh whoever founds a shard, kept by every epoch recovered from it, and put back unchanged when a leader republishes its epoch after the authority lost its data; it tells two epochs that share a number apart. The authority also holds each worker's TTL registration and the leader's recovery fence (§14.4).
+Redis or another configured authority stores, per shard **name**, a shard record `{shard_id, recovery_epoch}`: which incarnation of the shard lives under the name, and that incarnation's recovery epoch, which is a number and a lineage. Registrations, the fence and the leader hint are kept under the name too, and tagged with the `ShardId`. The lineage is drawn fresh whoever founds a shard, kept by every epoch recovered from it, and put back unchanged when a leader republishes its epoch after the authority lost its data; it tells two epochs that share a number apart. The authority also holds each worker's TTL registration and the leader's recovery fence (§14.4).
 
 Every election message that is authoritative carries the recovery epoch and the term (leader acks, vote requests and grants, certificates, refusals). `ClaimResponse` deliberately carries neither: the claims an earlier leader grants are bounded by that leader's lease (§12.1), so a late claim response needs no epoch to reject it.
 
@@ -1534,7 +1538,7 @@ attempt_forced_recovery(respondents):
     if state != NO_QUORUM:
         return
 
-    live = authority.live_registrations(shard_id)
+    live = authority.live_registrations(shard_name, shard_id)
 
     # The authority gives no authoritative count until one full TTL has
     # passed since it started or last lost its data: a few registrations
@@ -1549,25 +1553,28 @@ attempt_forced_recovery(respondents):
     if len(counted) < floor(live.authoritative_count() / 2) + 1:
         give_up()                    # other registered workers were not heard from
 
-    held = authority.read_recovery_epoch(shard_id)
+    held = authority.read_shard(shard_name)
 
     if held is missing:
         abandon_shard()              # state = STOPPED
+        return
+    if held.shard_id != shard_id:
+        abandon_shard()              # another incarnation
         return
     if held is of another lineage, or lower in own lineage,
        or own lineage is unknown:
         rejoin_at(held)              # swapping from it could reuse a number
         return
 
-    swapped = authority.compare_and_swap_recovery_epoch(
-        shard_id, expected=held, new=held.next())
+    swapped = authority.compare_and_swap_shard(
+        shard_name, expected=held, new=held with epoch held.epoch.next())
 
     if lost the race to another swap:
         rejoin_at(the epoch that won)
         return
 
     state = CANDIDATE                # while it waits out the fence
-    acquire_fence(held.next())       # FenceHeld: ask again after what remains
+    acquire_fence(shard_name, held.next())  # FenceHeld: ask again after what remains
     on fence granted:
         lead a configuration founded at the new epoch
 ```
@@ -1577,6 +1584,8 @@ Respondents must be a majority of the live registrations, so a minority that can
 The configuration the recovery founds is a single configuration, at the generation (the new epoch, the roll call's term, the roll call configuration's counter plus one), with one voter per counted respondent, each admitted at that generation; every other respondent is a pending member. It needs no joint configuration, because every generation of the new epoch outranks every generation of the old one, so no worker of the new epoch counts a quorum of the old. If the fence is refused for good (the epoch moved on), the candidate goes back to `NO_QUORUM`, or rejoins when the epoch it finds is one it cannot recover from.
 
 A single surviving worker may recover if it is a majority of the live registrations, which happens once the registrations of the others have lapsed.
+
+The `ShardId` travels on election and JOIN messages only. Task records, claims and step records do not carry it, because records are placed, reconciled, claimed and stolen only among the voters of the configuration (by `WorkerId`) and task ids are UUIDv7, so a new incarnation never asks for or places an old one's records.
 
 ### 14.4 Low-frequency recovery fencing
 
@@ -1634,16 +1643,13 @@ Expected behavior:
 - already-connected clients continue;
 - new cold clients may have slower/failing bootstrap until peer hints are available.
 
+A restart or failover of the authority may have lost acknowledged writes (an older snapshot, a lagging replica), so the provider treats a new server run id like lost data for the fence: no fence and no authoritative count for one TTL. The shard keeps working, and its leader may fence itself until the window ends.
+
 ### 15.3 Redis cleared while live shard has quorum
 
 Missing external directory state is reconstructible.
 
-The live leader/peers republish:
-
-- shard membership hints;
-- leader hint;
-- current recovery metadata;
-- task-to-shard cache as observed.
+The live leader republishes, within a third of a TTL, its shard record (create-if-absent, unchanged id and epoch) and its leader hint; every worker re-registers on its renewal; the task-to-shard cache is Phase 8. The registrations are the shard membership hints. The warm-up keeps a bootstrapper from founding a second incarnation before the republish lands, and a bootstrapper asks the hinted leader first.
 
 A `FLUSHALL` should not automatically destroy a healthy queue.
 
@@ -1665,7 +1671,7 @@ ABANDONED
 
 and replacement workers create a new globally unique shard ID rather than pretending the old shard survived.
 
-Today a re-found keeps the `ShardId` and draws a fresh lineage for its recovery epoch. Phase 4's empty-authority catastrophic reset mints a new `ShardId` instead.
+An empty authority is a new incarnation's: a founding against it mints a new `ShardId` (the name, `/`, a UUIDv7). A re-found (record present, no one registered, warm-up over) keeps the record's `ShardId` and draws a fresh lineage one epoch on. A shard that still has quorum after a flush keeps its id and republishes it (§15.3).
 
 ---
 
@@ -2935,7 +2941,7 @@ Both runtimes drive the node through `core::election::carry_out`: `bindings/src/
 
 The bootstrap join changes no one's configuration by itself. `bootstrap` only returns an `Entry`: for a join, `Entry::Joining` with the leader a seed or registered peer pointed at, found through the net `join` module (`net/src/join.rs`: `ask_for_leader` asks peers who leads, and `pointer_for` builds the pointer a node hands a joiner; the leader search in `net/src/leader_search.rs` decides whom to ask: bootstrap queries the configured seeds and then the workers the authority lists, while a rejoining node, which has no seeds, reads the live authority registrations first and then asks those workers). `WorkerNode::start` then makes the worker a pending member of that leader's shard, which no quorum counts; the members that answered it keep their configuration until the leader admits the joiner (§12.4). A join asks a full pass of its candidates and takes the newest pointer by the epoch order of §12.4, not the first reachable one.
 
-The authority step of the bootstrap cascade reads `CoordinationAuthority::live_registrations`, which returns each registered worker's address, so a node asks the registered peers the way it asks seeds. A worker that finds no other worker registered registers itself and founds the shard only by winning a compare-and-swap of the shard's recovery epoch (created at 0, or one epoch on when re-founding), so two workers never found the same shard. Until a real remote `CoordinationAuthority` exists (Phase 4), the only production implementation is the in-memory one (tests also use `kabudachi_testkit::FaultingAuthority`), and nodes in tests join through seeds or a shared in-memory authority.
+The authority step of the bootstrap cascade reads `CoordinationAuthority::live_registrations`, which returns each registered worker's address, so a node asks the registered peers the way it asks seeds. A worker that finds no other worker registered registers itself and founds the shard only by winning a compare-and-swap of the shard's record (created at epoch 0, or one epoch on when re-founding), so two workers never found the same shard. The production implementations are the Redis adapter (`kabudachi_redis_authority::RedisAuthority`, Phase 4) and the in-memory one; tests also use `kabudachi_testkit::FaultingAuthority`.
 
 The one-node window between startup and the worker becoming leader is tested by running the runtime with a non-zero suspicion timeout, which widens the window before leadership so a signal can arrive inside it.
 
@@ -2954,20 +2960,21 @@ The leader does not execute compaction, and a networked worker does not yet run 
 
 ### Phase 4: Redis CoordinationAuthority
 
-The recovery epoch, the low-frequency leader fence and forced reconfiguration already run in core against the in-memory authority (`InMemoryAuthority`). This phase brings the Redis adapter for them.
+Implemented:
 
-Implement:
+- the Redis/Valkey adapter for `CoordinationAuthority` (`WATCH`/`MULTI`/`EXEC`, standalone and cluster, key prefix and database, bounded call timeout);
+- the `CoordinationAuthority` contract suite run against valkey (standalone under a restricted ACL user, and a single-node cluster), with detection of a flush (a missing sentinel), a restart or failover (a new server run id) and an outage the client saw;
+- the entry point `kabudachi_net::worker::Worker` with `AuthorityConfig::new(authority)`, whose timings come from the authority's TTL, and `WorkerConfig::with_external_address`;
+- cold bootstrap, flush with a live leader, restart, and quorum loss plus flush, each against a real valkey server end to end (`//net:redis_end_to_end_test`);
+- leader hints and their republish after a flush (§15.3);
+- a minted `ShardId` per founding, kept by a re-founding, and abandonment of a shard whose name holds another incarnation's record (§15.5);
+- the order of recovery epochs by the pair (number, lineage), model-checked, with the lineage on every authoritative election message;
+- recovery fence timing (§28.4);
+- the shared-instance provider constraints (§9.1).
 
-- the Redis adapter for `CoordinationAuthority`;
-- the `CoordinationAuthority` contract suite, run against Redis, with detection of a Redis restart, flush and outage (restart: `INFO server` uptime under one TTL; flush: a missing sentinel key that records the server `TIME` it was created at);
-- the entry point: `kabudachi_net::worker::Worker` with its `AuthorityConfig` (a Python-hosted networked worker is Phase 5);
-- cold worker bootstrap against Redis;
-- leader hints: a trait read and write, and their republish after a flush (§15.3);
-- empty-authority catastrophic reset, which mints a new ShardId (§15.5);
-- the order of recovery epochs by the pair (number, lineage), so exactly one of two equal-numbered lineages is newer, model-checked before the code is written;
-- the lineage gap in `RollCall` and `VoteRequest`/`Generation`, and the lineage key of the property test;
-- recovery fence timing defaults, conservative and configurable (§28.4);
-- a check of the shared-instance provider constraints (§9.1).
+A Python-hosted networked worker is Phase 5; the task-to-shard cache, the client shard map and `ShardLostError` are Phase 8.
+
+Open: two Redis test flakes were seen once each and never reproduced or explained. `//redis_authority:redis_authority_integration_test` hung after its tests had passed, before the port-ownership fixes; and a cluster test's first call once answered `Unavailable`. The port-ownership fixes may have removed both. If either recurs, find the cause before rerunning.
 
 ### Phase 5: Python subprocess execution
 
@@ -3039,6 +3046,7 @@ The coalescing, flow, and failure-detection invariants (§25.1 item 9 and §25.4
 | 1 | 25.4.3 and 25.4.4 (folding, order preservation), 25.4.7 (atomic continuation), 25.4.8 (stage after a group runs once), 25.4.5 in a one-node shard, and the one-node backpressure contract (`SlowDown` past the soft limit, `BackpressureError` past the hard limit, §3.2.1) |
 | 2 | 25.4.5 under worker loss, and abort-before-replacement under a simulated (connection-loss) partition. The bound on the time from worker unreachable to replacement claim stays tested (`core/tests/scenario/scenario_partition.rs`); its measured value is a §27.2 gate item |
 | 3 | 25.4.5 under leader loss (a new leader can replay only what reconciliation rebuilds), retained-payload chain across DHT replicas and compaction (the one-node soft/hard-limit backpressure contract is a Phase 1 exit criterion) |
+| 4 | Cold bootstrap, flush with a live leader, restart, and quorum loss plus flush, each against a real Redis-compatible server, with one ShardId per incarnation |
 | 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess; the multi-process SIGKILL harness |
 
 ### 27.2 Production-readiness gate
@@ -3079,7 +3087,7 @@ short lease -> quicker safe forced recovery, more sensitivity to authority outag
 long lease  -> better Redis outage tolerance, slower catastrophic recovery
 ```
 
-Decided in Phase 4 design; defaults conservative and configurable.
+Closed. One TTL governs registrations, the fence and the warm-up; it defaults to 30 s and is set on the authority, which is its only source. Workers renew every third of it and treat each grant as lapsing a tenth early for clock drift. After lost data or a server restart the fence is refused for one TTL, so a fence granted before it has lapsed before another can be (the delayed-restart rule). A shorter TTL recovers a lost shard sooner and fences leaders sooner in an outage.
 
 ### 28.5 Result-delivery failure matrix
 

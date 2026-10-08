@@ -8,8 +8,6 @@ import logging
 from collections.abc import Awaitable, Callable, Generator
 from typing import Any, Protocol
 
-LOCAL_SHARD_ID = "local"
-
 _logger = logging.getLogger("kabudachi")
 
 
@@ -72,6 +70,9 @@ class TaskHandle:
     task raised, awaiting the handle raises that error. It can be awaited more
     than once, from any event loop, and one awaiter giving up (a timeout, a
     cancellation) does not affect the task or any other awaiter.
+
+    `shard_id` names the incarnation of the shard that holds the task; `None`
+    for a handle made outside a run.
     """
 
     def __init__(
@@ -79,9 +80,11 @@ class TaskHandle:
         task_id: str,
         canceller: Callable[[str], bool] | None = None,
         callback_runner: Callable[[Callable[[Any], Any], Any], None] = run_callback_inline,
+        *,
+        shard_id: str | None = None,
     ) -> None:
         self.task_id = task_id
-        self.shard_id = LOCAL_SHARD_ID
+        self.shard_id = shard_id
         self._canceller = canceller
         self._callback_runner = callback_runner
         # Thread-safe, because the result can arrive from any thread.

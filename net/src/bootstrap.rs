@@ -26,7 +26,8 @@
 //!    another incarnation is not counted.
 //! 4. **Ownership.** If no other worker is registered, no seed or
 //!    registered peer has ever answered, and the authority has warmed up,
-//!    register this worker at its listen address, then try to take
+//!    register this worker at its address (its external address, if it was
+//!    given one, else its listen address), then try to take
 //!    ownership of the shard: create its record, a new incarnation minted by
 //!    this worker at recovery epoch 0, if the name has none, or, if it holds
 //!    one whose incarnation lists no other live worker (see "Re-founding a

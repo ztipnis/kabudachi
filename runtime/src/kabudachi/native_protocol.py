@@ -50,6 +50,10 @@ class Certification(Protocol):
 class Runtime(Protocol):
     """What a session needs of the native runtime."""
 
+    def shard_id(self) -> str:
+        """The incarnation of the shard this runtime founded at start."""
+        ...
+
     def submit(
         self,
         definition_id: str,
