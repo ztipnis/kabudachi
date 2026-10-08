@@ -6,11 +6,13 @@ Each child imports the modules that declare tasks, says which tasks it found,
 and then runs what it is sent on its own event loop. The worker sends a child
 each run's serialized input and gets the encoded result back; it certifies
 and settles as for a body it runs itself. Every run goes to the least busy
-child with a free place. A child that dies takes its runs with it.
+child with a free place. A child that dies takes its runs with it, and
+another is started in its place.
 """
 
 import asyncio
 import itertools
+import logging
 import multiprocessing
 import pickle
 import threading
@@ -27,11 +29,18 @@ from kabudachi.handle import TaskHandle
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskRegistry
 
+_logger = logging.getLogger("kabudachi")
+
 # How long a child asked to stop (SIGTERM) has before it is killed (SIGKILL).
 _TERMINATE_GRACE_SECONDS = 1.0
 # How long, once a child has died, the frames it wrote just before may still
 # take to be read.
 _LAST_FRAMES_SECONDS = 1.0
+# A child that dies sooner than this after becoming ready counts as dying
+# quickly; each quick death in a row doubles the wait before the next start.
+_STABLE_SECONDS = 1.0
+_FIRST_RESPAWN_DELAY_SECONDS = 0.1
+_MAX_RESPAWN_DELAY_SECONDS = 10.0
 
 
 def task_modules(registry: TaskRegistry, imports: tuple[str, ...] | None) -> tuple[str, ...]:
@@ -134,6 +143,11 @@ class ProcessPool:
         self._nested: NestedCalls | None = None
         self._numbers = itertools.count()
         self._background: set[asyncio.Task[None]] = set()
+        # Replacement starts under way, stopped with the pool.
+        self._replacing: set[asyncio.Task[None]] = set()
+        # Dead children are replaced only between a successful start and stop.
+        self._serving = False
+        self._quick_deaths = 0
 
     # places
 
@@ -179,6 +193,7 @@ class ProcessPool:
         except BaseException:
             await self.stop(kill=True)
             raise
+        self._serving = True
 
     def accept_nested_calls(self, calls: NestedCalls) -> None:
         self._nested = calls
@@ -191,6 +206,10 @@ class ProcessPool:
         """Without `kill`, every body is let finish and each child exits on its
         own; with it, or for a child still there after that, SIGTERM and then
         SIGKILL. Returns once every child has exited."""
+        self._serving = False
+        for replacing in self._replacing:
+            # A child it already spawned is among the children below.
+            replacing.cancel()
         children = [*self._children, *self._condemned]
         if not kill:
             for child in children:
@@ -248,6 +267,8 @@ class ProcessPool:
             if child in self._children:
                 self._children.remove(child)
             self._condemned.add(child)
+            if self._serving:
+                self._replace(None)
         self._end_if_condemned(child)
 
     def _hand_over(self, job: RunJob | CompactJob) -> _Slot:
@@ -469,8 +490,10 @@ class ProcessPool:
         child.send(ipc.Reply(frame.request, (handle.task_id, handle.shard_id)))
 
         def settled(outcome: Any) -> None:
-            child.handles.pop(handle.task_id, None)
-            child.send(ipc.outcome_of(handle.task_id, outcome))
+            # A dead child's handles are dropped with it: the tasks it called
+            # run on, but nobody there waits for them any more.
+            if child.handles.pop(handle.task_id, None) is not None:
+                child.send(ipc.outcome_of(handle.task_id, outcome))
 
         handle._outcome.add_done_callback(settled)
 
@@ -514,11 +537,42 @@ class ProcessPool:
                     TaskProcessLost(f"the task process running it exited with code {code}")
                 )
             self._finish(slot)
+        child.handles.clear()
+        replace = child in self._children and self._serving
         if child in self._children:
             self._children.remove(child)
         self._condemned.discard(child)
         _set_done(child.buried)
+        if replace:
+            self._replace(child)
         self._dispatch()
+
+    def _replace(self, dead: _Child | None) -> None:
+        """Starts a child in place of `dead`, or of a condemned child (`None`)
+        at once. After a child that died quickly the start waits, longer for
+        each quick death in a row."""
+        delay = 0.0
+        if dead is not None:
+            lived = time.monotonic() - dead.ready_at if dead.ready else 0.0
+            self._quick_deaths = self._quick_deaths + 1 if lived < _STABLE_SECONDS else 0
+            if self._quick_deaths:
+                delay = min(
+                    _FIRST_RESPAWN_DELAY_SECONDS * 2 ** (self._quick_deaths - 1),
+                    _MAX_RESPAWN_DELAY_SECONDS,
+                )
+        task = self._started_loop().create_task(self._replace_after(delay))
+        self._replacing.add(task)
+        task.add_done_callback(self._replacing.discard)
+
+    async def _replace_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        child = self._spawn()
+        try:
+            self._accept(child, await self._until_ready(child))
+        except StartupError as error:
+            # Its exit is buried like any other, which tries again, later.
+            _logger.error("a replacement task process could not start: %s", error)
+            self._terminate(child)
 
 
 def _raisable(frame: ipc.Failed) -> BaseException:

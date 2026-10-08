@@ -5,6 +5,7 @@ processes."""
 
 import asyncio
 import os
+import signal
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -40,6 +41,20 @@ async def where_async(request: Greeting) -> Greeting:
 def where_sync(request: Greeting) -> Greeting:
     time.sleep(float(request.text or 0))
     return Greeting(times=os.getpid(), text=repr(time.time()))
+
+
+@kabudachi.task(name="pool.dies_once")
+def dies_once(request: Greeting) -> Greeting:
+    """Kills its own process the first time it runs for `request.text`."""
+    if first_time(f"dies-once-{request.text}"):
+        os.kill(os.getpid(), signal.SIGKILL)
+    return Greeting(times=os.getpid())
+
+
+@kabudachi.ephemeral_task(name="pool.ephemeral_dies")
+def ephemeral_dies(request: Greeting) -> Greeting:
+    os.kill(os.getpid(), signal.SIGKILL)
+    return request
 
 
 @kabudachi.task(name="pool.sized")

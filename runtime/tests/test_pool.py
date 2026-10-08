@@ -18,7 +18,7 @@ from kabudachi import config as config_module
 from kabudachi import ipc
 from kabudachi import registry as registry_module
 from kabudachi.config import Configuration
-from kabudachi.errors import StartupError, TaskBodyError, TaskDefinitionError
+from kabudachi.errors import StartupError, TaskBodyError, TaskDefinitionError, TaskLostError
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting
 
@@ -153,3 +153,19 @@ def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_pla
 
     assert result.times == 1 + 2 + 11 + 21
     assert result.text == "True cancelled"
+
+
+def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_is_ephemeral():
+    kabudachi.configure(processes=1)
+
+    async def main():
+        replayed = await pool_tasks.dies_once(Greeting(text="a"))
+        with pytest.raises(TaskLostError):
+            await pool_tasks.ephemeral_dies(Greeting())
+        after = await pool_tasks.where_async(Greeting())
+        return replayed.times, after.times
+
+    replayed, after = kabudachi.run(main)
+
+    assert os.getpid() not in (replayed, after)
+    assert replayed != after, "the ephemeral body's death replaced the process again"

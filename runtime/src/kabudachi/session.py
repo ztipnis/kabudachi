@@ -33,13 +33,21 @@ from kabudachi.errors import (
     TaskBodyError,
     TaskDefinitionError,
     TaskExpiredError,
+    TaskLostError,
     TaskRecordFullError,
     TaskSupersededError,
     UnknownTaskError,
     interrupted,
 )
 from kabudachi.config import UNSET
-from kabudachi.execution import CompactJob, Executor, InProcessExecutor, RunJob, run_within
+from kabudachi.execution import (
+    CompactJob,
+    Executor,
+    InProcessExecutor,
+    RunJob,
+    TaskProcessLost,
+    run_within,
+)
 from kabudachi.hosted_work import LoopHostedWork
 from kabudachi.handle import TaskHandle, run_callback_inline
 from kabudachi.native_protocol import Runtime
@@ -364,6 +372,11 @@ class Session:
             self._tasks.result_held(claim.task_id, outcome)
             certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
             self._tasks.certified(certification)
+        except TaskProcessLost:
+            # Cancelled first, the leader's `cancelled` event settles the
+            # handle, as for a cancelled body that failed.
+            if run.outcome_counts:
+                self._lost(claim)
         except asyncio.CancelledError as error:
             current = asyncio.current_task()
             if run.cancelled_by_leader and current is not None and not current.cancelling():
@@ -475,6 +488,30 @@ class Session:
                 "the leader did not take the fold of %s: %s",
                 claim.definition_id,
                 type(refusal).__name__,
+            )
+
+    def _lost(self, claim: Any) -> None:
+        """The process running the body died. The leader decides, as for a
+        lost worker: a new attempt (the handle waits for it), or the task is
+        over (an ephemeral one, or a non-retriable one that may have had its
+        effects). A refused report ends the task here too; failing a handle
+        the leader already settled changes nothing."""
+        _logger.warning("task %s was lost with the process that ran it", claim.task_id)
+        try:
+            replayed = self._runtime.report_lost(claim.task_run_id)
+        except Exception as refusal:
+            _logger.warning(
+                "the leader did not record the loss of task %s: %s",
+                claim.task_id,
+                type(refusal).__name__,
+            )
+            replayed = False
+        if replayed:
+            self._tasks.retry_queued(claim.task_id)
+        else:
+            self._tasks.failed(
+                claim.task_id,
+                TaskLostError(f"task {claim.task_id} was lost with the process that ran it"),
             )
 
     def _report_failure(self, claim: Any, kind: str) -> bool:

@@ -155,4 +155,7 @@ matters.
 - Everything the worker holds is in memory, and lost when it ends.
 - A body that ignores a timeout or a cancel cannot be killed in-process: its run fails and the body is
   abandoned to finish on its own, holding its concurrency place until it does.
-- `@ephemeral_task` behaves like `@task` in one process; worker loss does not exist yet.
+- A task process that dies (a crash, running out of memory, a kill) takes its runs with it and is
+  replaced, after a growing wait while replacements keep dying quickly. Each run it held is tried again
+  without using up a retry, except an `@ephemeral_task`'s, whose call raises `TaskLostError`. With
+  `processes=0` there is no such loss, and `@ephemeral_task` behaves like `@task`.
