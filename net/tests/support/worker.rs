@@ -33,9 +33,9 @@ pub const PER_PEER_TIMEOUT: StdDuration = StdDuration::from_secs(1);
 /// Short, so a waiting worker goes round its cascade many times per test.
 pub const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(50);
 
-/// The name a shard identified by `shard_id` lives under: the same string.
+/// The name a shard identified by `shard_id` lives under: the id up to its last `/`.
 pub fn name_of(shard_id: &ShardId) -> ShardName {
-    ShardName::new(shard_id.as_str())
+    shard_id.name()
 }
 
 /// The epoch the authority holds under `shard_id`'s name.
@@ -103,6 +103,8 @@ pub struct Seen {
     /// configuration counts the joiner.
     pub voter: bool,
     pub leader: Option<WorkerId>,
+    /// The incarnation of the shard the node belongs to.
+    pub shard_id: ShardId,
 }
 
 impl Seen {
@@ -114,6 +116,7 @@ impl Seen {
                 .configuration()
                 .is_some_and(|configuration| configuration.is_voter(node.admission())),
             leader: node.known_leader().map(|(leader, _)| leader),
+            shard_id: node.shard_id().clone(),
         }
     }
 }

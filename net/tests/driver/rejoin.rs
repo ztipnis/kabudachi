@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{CoordinationAuthority, LeaderHint, RecoveryEpoch};
 use kabudachi_core::election::{
     AuthorityTimings, CallKind, ElectionTimings, Entry, Identity, Input, KnownConfiguration,
     Step, WorkerNode,
@@ -84,19 +84,27 @@ fn pointer(
         term: 1,
         recovery_epoch,
         recovery_epoch_lineage: lineage,
+        shard_id: Some(shard().into()),
     }
 }
 
-/// Registers every one of `workers` at `authority` again and again, for
-/// ever: a registration lasts one `ttl`, so a test that must keep a worker
-/// listed while it waits keeps registering it.
+/// Registers every one of `workers` at `authority`, and publishes `hint`,
+/// again and again, for ever: a registration or a hint lasts one `ttl`, so a
+/// test that must keep a worker listed or hinted while it waits keeps
+/// writing it.
 async fn keep_registered(
     authority: &FaultingAuthority<RealClock>,
     workers: &[(WorkerId, String)],
+    hint: Option<&LeaderHint>,
 ) {
     loop {
         for (id, address) in workers {
             authority.register(&name_of(&shard()), &shard(), id, address)
+                .expect("the authority is reachable");
+        }
+        if let Some(hint) = hint {
+            authority
+                .publish_leader_hint(&name_of(&shard()), hint)
                 .expect("the authority is reachable");
         }
         tokio::time::sleep(StdDuration::from_millis(100)).await;
@@ -111,6 +119,9 @@ enum Listing {
     PanicsOnce,
     /// The read hangs, and the node has a seed that answers JOIN.
     HeldWithASeed,
+    /// No worker is registered; the authority's leader hint names a worker
+    /// that answers JOIN.
+    Hinted,
 }
 
 // A node that has been in `RollCall` or `NoQuorum` for a suspicion timeout is
@@ -147,13 +158,24 @@ async fn a_stranded_node_reaches_a_leader_despite(listing: Listing) {
 
     let authority = FaultingAuthority::new(clock, TickDuration::from_millis(1_000));
     let node_handle = authority.for_another_worker();
-    let listed = vec![(worker.clone(), worker_address.to_string())];
+    let listed = if matches!(listing, Listing::Hinted) {
+        Vec::new()
+    } else {
+        vec![(worker.clone(), worker_address.to_string())]
+    };
+    let hint = matches!(listing, Listing::Hinted).then(|| LeaderHint {
+        shard_id: shard(),
+        leader: worker.clone(),
+        address: worker_address.to_string(),
+        recovery_epoch: RecoveryEpoch::new(1, 0),
+        term: 1,
+    });
     let mut config = DriverConfig::default();
     // Keeps a seed's answers going for as long as the test runs.
     let mut _seed_answers = None;
     // The net a stranded node is expected to reach.
     let reached_net = match listing {
-        Listing::Answers => Arc::clone(&worker_net),
+        Listing::Answers | Listing::Hinted => Arc::clone(&worker_net),
         Listing::PanicsOnce => {
             node_handle.panic_next(CallKind::ReadLiveRegistrations);
             Arc::clone(&worker_net)
@@ -204,7 +226,7 @@ async fn a_stranded_node_reaches_a_leader_despite(listing: Listing) {
     let state_when_it_reached_out = timeout(TEST_TIMEOUT, async {
         tokio::select! {
             _ = driven => unreachable!("this test never drains a node, so its driver never returns"),
-            () = keep_registered(&authority, &listed) => unreachable!("registers for ever"),
+            () = keep_registered(&authority, &listed, hint.as_ref()) => unreachable!("registers for ever"),
             state = reached_out => state,
         }
     })
@@ -233,6 +255,14 @@ async fn a_stranded_node_reaches_a_leader_despite(listing: Listing) {
 async fn a_stranded_node_asks_the_workers_the_authority_lists() {
     within_deadline(async {
         a_stranded_node_reaches_a_leader_despite(Listing::Answers).await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_stranded_node_asks_the_leader_its_authority_hints_at() {
+    within_deadline(async {
+        a_stranded_node_reaches_a_leader_despite(Listing::Hinted).await;
     })
     .await
 }
@@ -317,7 +347,7 @@ async fn a_node_that_took_a_pointer_of_a_refounded_lineage_ends_active_in_the_ne
                 .iter()
                 .map(|(_, id, address, _)| (id.clone(), address.to_string()))
                 .collect();
-            keep_registered(&elsewhere, &listed).await;
+            keep_registered(&elsewhere, &listed, None).await;
         };
         let scenario = async {
             let mut wait_for = async |what: &str, holds: fn(&(WorkerState, Option<u64>)) -> bool| {

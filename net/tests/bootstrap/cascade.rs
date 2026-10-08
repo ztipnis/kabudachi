@@ -19,7 +19,7 @@ use kabudachi_core::coordination_authority::{
 use kabudachi_core::election::{
     AuthorityTimings, CallKind, ElectionTimings, Entry, Identity, Input, WorkerNode,
 };
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{IncarnationId, ShardId, ShardName, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration as TickDuration;
 use kabudachi_net::authority::AuthorityClient;
@@ -41,10 +41,12 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const WAITING: Duration = Duration::from_millis(50 * 20);
 
 /// A worker bootstrapping into `shard-1`, through `seeds` and `authority` if
-/// it has them. Its net never listens, so no socket of its own opens.
+/// it has them. Its net never listens, so no socket of its own opens. `shard`
+/// is the incarnation it would found: minted, as a real worker's is.
 struct Worker {
     net: Net,
     shard: ShardId,
+    name: ShardName,
     me: WorkerId,
     clock: TokioClock,
     client: Option<AuthorityClient>,
@@ -69,7 +71,7 @@ impl Worker {
         call_timeout: Duration,
     ) -> Self {
         let net = Net::new();
-        let shard = ShardId::new("shard-1");
+        let shard = ShardId::mint(&ShardName::new("shard-1"));
         let timings = AuthorityTimings {
             ttl: TickDuration::from_ticks(call_timeout.as_millis() as u64),
         };
@@ -86,6 +88,7 @@ impl Worker {
             me: net.local_worker_id(),
             net,
             shard,
+            name: ShardName::new("shard-1"),
             clock,
             client,
             seeds: seeds.to_vec(),
@@ -97,7 +100,7 @@ impl Worker {
             &self.net,
             &self.clock,
             self.client.as_mut(),
-            &self.shard,
+            &self.name,
             &self.me,
             &self.seeds,
             Duration::from_millis(100),
@@ -121,10 +124,10 @@ async fn warm_authority(ttl: Duration) -> (FaultingAuthority<TokioClock>, TokioC
     (authority, clock)
 }
 
-fn register(authority: &FaultingAuthority<TokioClock>, worker: &str, at: &str) {
+fn register(authority: &FaultingAuthority<TokioClock>, shard: &ShardId, worker: &str, at: &str) {
     authority.register(
-        &name_of(&ShardId::new("shard-1")),
-        &ShardId::new("shard-1"),
+        &shard.name(),
+        shard,
         &WorkerId::new(worker),
         at,
     )
@@ -169,6 +172,10 @@ async fn silent_seeds_with_no_authority_found_only_after_the_bound() {
 
         assert!(founded_at(&entry, 0));
         assert!(
+            entry.shard_id().is_some_and(|id| id.as_str().starts_with("shard-1/")),
+            "seed-only founding mints an id: {entry:?}"
+        );
+        assert!(
             started.elapsed() >= RETRY_INTERVAL * 3,
             "the worker founded after only {:?}, before its seeds' bound",
             started.elapsed()
@@ -202,9 +209,9 @@ async fn an_unreachable_authority_never_leads_to_founding_until_it_answers() {
 async fn registered_peers_that_never_answer_keep_the_worker_from_founding() {
     within_deadline(async {
         let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
-        register(&authority, "peer-a", &nowhere(1).to_string());
-        register(&authority, "peer-b", &nowhere(2).to_string());
         let mut worker = Worker::new(Some(&authority), clock, &[]);
+        register(&authority, &worker.shard, "peer-a", &nowhere(1).to_string());
+        register(&authority, &worker.shard, "peer-b", &nowhere(2).to_string());
 
         let waiting = timeout(WAITING, worker.bootstrap()).await;
 
@@ -349,6 +356,11 @@ async fn an_ownerless_epoch_is_re_founded_one_epoch_on() {
             .expect("the bootstrapper re-founded the shard within the timeout");
 
         assert!(founded_at(&entry, 4), "the shard is re-founded one epoch past the one that existed: {entry:?}");
+        assert_eq!(
+            entry.shard_id(),
+            Some(ShardId::new("shard-1")),
+            "re-founding keeps the id of the record it re-founds"
+        );
         assert_eq!(epoch_number(&authority), Some(4));
     })
     .await
@@ -377,6 +389,17 @@ async fn a_warming_up_authority_keeps_the_worker_bootstrapping_until_warm_up_end
         );
         assert!(founded_at(&entry, 0));
         assert_eq!(epoch_number(&authority), Some(0));
+        let founded = entry.shard_id().expect("a founding names its shard");
+        assert!(founded.as_str().starts_with("shard-1/"), "founding against an empty authority mints: {founded:?}");
+        assert_eq!(
+            authority
+                .for_another_worker()
+                .read_shard(&founded.name())
+                .expect("the authority is reachable")
+                .map(|record| record.shard_id),
+            Some(founded),
+            "the authority's record names the incarnation the worker founded"
+        );
     })
     .await
 }

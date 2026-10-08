@@ -43,4 +43,7 @@ message JoinResponse {
   // descends from, since a flush of the coordination authority can reset
   // epoch numbers. See `kabudachi_core::coordination_authority::RecoveryEpoch`.
   uint64 recovery_epoch_lineage = 6;
+  // The incarnation of the shard the leader leads. A response naming a
+  // leader names its shard too; "no leader known" names neither.
+  ShardId shard_id = 7;
 }

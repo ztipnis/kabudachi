@@ -31,6 +31,7 @@ fn joined_node(clock: &FakeClock) -> TestNode {
             term: 1,
             recovery_epoch: 0,
             recovery_epoch_lineage: 0,
+            shard_id: Some(shard("shard-1").into()),
         }),
         clock.clone(),
         None,

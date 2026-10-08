@@ -7,6 +7,8 @@ use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::JoinFloor;
 use kabudachi_core::protocol::messages::JoinResponse;
 
+use kabudachi_core::protocol::ids::ShardId;
+
 use crate::support::builders::worker;
 
 const A: u64 = 1;
@@ -19,6 +21,7 @@ fn pointer(number: u64, lineage: u64, term: u64) -> JoinResponse {
         term,
         recovery_epoch: number,
         recovery_epoch_lineage: lineage,
+        shard_id: Some(ShardId::new("shard-1").into()),
     }
 }
 

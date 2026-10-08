@@ -48,8 +48,8 @@ fn shard(name: &str) -> ShardId {
 
 /// A writer of shard `a` connected to a holder of shard `b`.
 async fn two_connected(a: ShardId, b: ShardId) -> (Net, Net) {
-    let writer = Net::for_shard(a, None);
-    let holder = Net::for_shard(b, None);
+    let writer = Net::for_shard(a.name(), None);
+    let holder = Net::for_shard(b.name(), None);
     let address = holder.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
     connect_to(&holder, &address, &writer).await;
     (writer, holder)
@@ -58,9 +58,9 @@ async fn two_connected(a: ShardId, b: ShardId) -> (Net, Net) {
 /// A reader of `shard` connected to two more of its workers, which it
 /// dialed: the reader, then the other two.
 async fn three_connected(shard: ShardId) -> [Net; 3] {
-    let reader = Net::for_shard(shard.clone(), None);
-    let first = Net::for_shard(shard.clone(), None);
-    let second = Net::for_shard(shard, None);
+    let reader = Net::for_shard(shard.name(), None);
+    let first = Net::for_shard(shard.name(), None);
+    let second = Net::for_shard(shard.name(), None);
     for holder in [&first, &second] {
         let address = holder.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
         connect_to(holder, &address, &reader).await;
@@ -200,10 +200,10 @@ async fn a_lookup_finds_the_newest_revision_among_the_peers_and_the_reader_itsel
 /// them), and a writer that dialed the holders: the reader, then the writer
 /// and the two holders.
 async fn reader_dialed_by_holders(shard: ShardId) -> [Net; 4] {
-    let reader = Net::for_shard(shard.clone(), None);
-    let writer = Net::for_shard(shard.clone(), None);
-    let first = Net::for_shard(shard.clone(), None);
-    let second = Net::for_shard(shard, None);
+    let reader = Net::for_shard(shard.name(), None);
+    let writer = Net::for_shard(shard.name(), None);
+    let first = Net::for_shard(shard.name(), None);
+    let second = Net::for_shard(shard.name(), None);
     let reader_address = reader.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
     for holder in [&first, &second] {
         let address = holder.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
@@ -227,9 +227,9 @@ async fn eventually(what: &str, mut condition: impl AsyncFnMut() -> bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_never_lands_in_another_shard_and_its_peer_is_never_a_routing_candidate() {
     within_deadline(async {
-        let host = Net::for_shard(shard("shard-1"), None);
-        let same_shard = Net::for_shard(shard("shard-1"), None);
-        let other_shard = Net::for_shard(shard("shard-2"), None);
+        let host = Net::for_shard(shard("shard-1").name(), None);
+        let same_shard = Net::for_shard(shard("shard-1").name(), None);
+        let other_shard = Net::for_shard(shard("shard-2").name(), None);
         let address = host.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
         for dialer in [&same_shard, &other_shard] {
             // Only a peer that advertises a listen address can be added.

@@ -13,12 +13,12 @@ use crate::support::node::{TestNode, published_roll_calls};
 use std::collections::BTreeMap;
 
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch, ShardRecord};
 use kabudachi_core::election::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, Entry, Identity, Input,
-    KnownConfiguration, Output, WorkerNode,
+    KnownConfiguration, Output, StopReason, WorkerNode,
 };
-use kabudachi_core::protocol::ids::IncarnationId;
+use kabudachi_core::protocol::ids::{IncarnationId, ShardId};
 use kabudachi_core::protocol::messages::LeaderHeartbeatAck;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::Duration;
@@ -77,11 +77,11 @@ impl Member {
         asked(&outputs, AuthorityRequest::ReadRecoveryEpoch)
     }
 
-    /// The authority answers `call`, a read of its epoch, with `result`.
-    fn authority_answers(
+    /// The authority answers `call`, a read of its record, with `result`.
+    fn authority_answers_record(
         &mut self,
         call: &AuthorityCall,
-        result: Result<Option<RecoveryEpoch>, AuthorityError>,
+        result: Result<Option<ShardRecord>, AuthorityError>,
     ) -> Vec<Output> {
         self.node
             .step(Input::Authority(AuthorityReply::RecoveryEpoch {
@@ -90,6 +90,24 @@ impl Member {
                 result,
             }))
             .outputs
+    }
+
+    /// The authority answers `call`, a read of its epoch, with `result`: the
+    /// record of this node's own shard at that epoch.
+    fn authority_answers(
+        &mut self,
+        call: &AuthorityCall,
+        result: Result<Option<RecoveryEpoch>, AuthorityError>,
+    ) -> Vec<Output> {
+        self.authority_answers_record(
+            call,
+            result.map(|held| {
+                held.map(|recovery_epoch| ShardRecord {
+                    shard_id: shard("shard-1"),
+                    recovery_epoch,
+                })
+            }),
+        )
     }
 
     /// Lets `ticks` pass in renewal-sized steps, answering every registration
@@ -139,7 +157,7 @@ fn own_epoch() -> RecoveryEpoch {
 // authority's epoch. (A later epoch of its own lineage it stands beside only
 // to roll a census, and rejoins after repeated refusals.)
 #[test]
-fn a_member_whose_read_names_another_epoch_rejoins_instead_of_standing() {
+fn a_member_whose_read_names_another_epoch_or_shard_never_stands_at_its_own() {
     let cases = [
         (0, RecoveryEpoch::new(0, 9)),
         (3, RecoveryEpoch::new(7, 9)),
@@ -156,6 +174,24 @@ fn a_member_whose_read_names_another_epoch_rejoins_instead_of_standing() {
         assert!(published_roll_calls(&answered).is_empty());
         assert!(!member.stands(), "{own} vs {named:?}");
     }
+
+    // The same epoch, held for another incarnation of the shard: the member's
+    // shard is gone, so it stops rather than stand or rejoin.
+    let mut member = Member::at_epoch(0);
+    let read = member.suspects_its_leader();
+
+    let answered = member.authority_answers_record(
+        &read,
+        Ok(Some(ShardRecord {
+            shard_id: ShardId::new("shard-1/successor"),
+            recovery_epoch: own_epoch(),
+        })),
+    );
+
+    assert_eq!(member.node.state(), WorkerState::Stopped);
+    assert_eq!(member.node.stop_reason(), Some(StopReason::Abandoned));
+    assert!(answered.contains(&Output::ShardAbandoned));
+    assert!(!member.stands());
 }
 
 #[test]

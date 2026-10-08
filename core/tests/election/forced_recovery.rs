@@ -15,8 +15,10 @@ use crate::support::builders::{
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch, ShardRecord};
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, DropMessages,
-    ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step, WorkerNode,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind,
+    DropMessages,
+    ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step,
+    StopReason, WorkerNode,
     carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
@@ -42,6 +44,51 @@ const SUSPECT_TIMEOUT_TICKS: u64 = 10;
 /// The timings every node here runs, unless a test sets its own.
 fn default_timings() -> ElectionTimings {
     timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS))
+}
+
+/// Performs a node's authority calls at once, as [`AtOnce`] does, but hands
+/// back no reply to a swap of the record, though the swap is made.
+struct LosingSwapReplies<'a>(AtOnce<'a>);
+
+impl AuthorityPerformer for LosingSwapReplies<'_> {
+    fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
+        let reply = self.0.perform(call);
+        match call.request {
+            AuthorityRequest::SwapRecoveryEpoch { .. } => None,
+            _ => reply,
+        }
+    }
+}
+
+/// Performs a node's authority calls at once, as [`AtOnce`] does, except that
+/// another incarnation of the shard is founded under its name just before a
+/// swap of the record is made.
+struct FoundingBeforeSwap<'a> {
+    inner: AtOnce<'a>,
+    founder: &'a FaultingAuthority<FakeClock>,
+}
+
+impl AuthorityPerformer for FoundingBeforeSwap<'_> {
+    fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
+        if matches!(call.request, AuthorityRequest::SwapRecoveryEpoch { .. }) {
+            self.founder
+                .compare_and_swap_shard(
+                    &name_of(&shard(SHARD)),
+                    None,
+                    &ShardRecord {
+                        shard_id: shard("shard-1/successor"),
+                        // The guard on a reply abandons at any epoch. This one is
+                        // newer than the leader's so that the conflict is not
+                        // read as the leader's own republish having landed: the
+                        // fence it would then ask for at once would abandon it
+                        // in the same tick, hiding the swap reply's own effect.
+                        recovery_epoch: epoch(5),
+                    },
+                )
+                .expect("a founder took the flushed name");
+        }
+        self.inner.perform(call)
+    }
 }
 
 /// A node and the authority its driver reaches for it.
@@ -131,6 +178,24 @@ impl Driven {
 
     fn tick(&mut self) -> Vec<Output> {
         self.step(Input::Tick)
+    }
+
+    /// Lets `ticks` pass and ticks the node, carrying out its authority calls
+    /// as [`Self::carry`] does, except that the reply to a swap of the record
+    /// is lost: the swap lands, and the node never hears.
+    fn advance_losing_swap_replies(&mut self, ticks: u64) -> Vec<Output> {
+        self.clock.advance(Duration::from_ticks(ticks));
+        let step = self.node.step(Input::Tick);
+        let mut all = Vec::new();
+        let _ = carry_out(
+            &mut self.node,
+            step,
+            &mut self.scheduler,
+            &mut DropMessages,
+            &mut LosingSwapReplies(AtOnce::new(&self.authority, shard(SHARD), self.me.clone())),
+            |_, _, _, step| all.extend(step.outputs.iter().cloned()),
+        );
+        all
     }
 
     /// Hands the node, which has just won, the end of its reconciliation, as
@@ -249,7 +314,7 @@ fn a_fenced_node_ignores_an_epoch_read_it_asked_for_before_reconnecting() {
         Input::Authority(AuthorityReply::RecoveryEpoch {
             token: call.token,
             sent_at: call.sent_at,
-            result: Ok(Some(epoch)),
+            result: Ok(Some(record_at(epoch))),
         })
     };
     let _ = driven.node.step(answer(first, epoch(0)));
@@ -297,12 +362,21 @@ fn pointer_at_epoch_two_of(lineage: u64) -> Input {
         term: 1,
         recovery_epoch: 2,
         recovery_epoch_lineage: lineage,
+        shard_id: Some(shard(SHARD).into()),
     })
 }
 
 /// A read of the authority's epoch asked for with a token of its own number,
 /// as a driver does, and answered at once with `held`.
-fn read_epoch(node: &mut TestNode, number: u64, held: RecoveryEpoch) {
+/// The authority's record of the node's own shard, at `recovery_epoch`.
+fn record_at(recovery_epoch: RecoveryEpoch) -> ShardRecord {
+    ShardRecord {
+        shard_id: shard(SHARD),
+        recovery_epoch,
+    }
+}
+
+fn read_epoch(node: &mut TestNode, number: u64, held: ShardRecord) {
     let _ = node.step(Input::AuthorityEpochAsked(read_token(number)));
     let _ = node.step(Input::AuthorityEpochRead {
         token: read_token(number),
@@ -325,14 +399,14 @@ fn read_token(number: u64) -> ReplyToken {
 #[test]
 fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_epoch() {
     type Script = fn(&mut TestNode);
-    let rows: [Script; 6] = [
+    let rows: [Script; 7] = [
         // A read naming the pointer's epoch makes it a member.
         |node| {
             let _ = node.step(pointer_at_epoch_two_of(1));
             assert_eq!(node.state(), WorkerState::Joining);
             assert_eq!(node.known_leader(), None);
 
-            read_epoch(node, 1, RecoveryEpoch::new(2, 1));
+            read_epoch(node, 1, record_at(RecoveryEpoch::new(2, 1)));
             assert_eq!(node.state(), WorkerState::Active);
             assert_eq!(node.known_leader(), Some((worker("w2"), 1)));
             assert_eq!((node.recovery_epoch(), node.recovery_lineage()), (2, Some(1)));
@@ -353,7 +427,7 @@ fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_
         |node| {
             let _ = node.step(pointer_at_epoch_two_of(1));
 
-            read_epoch(node, 1, RecoveryEpoch::new(1, 2));
+            read_epoch(node, 1, record_at(RecoveryEpoch::new(1, 2)));
 
             assert_eq!(node.state(), WorkerState::Bootstrapping);
             assert_eq!(node.known_leader(), None);
@@ -367,19 +441,19 @@ fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_
 
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(1),
-                held: RecoveryEpoch::new(7, 9),
+                held: record_at(RecoveryEpoch::new(7, 9)),
             });
             assert_eq!(node.state(), WorkerState::Joining);
 
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(2),
-                held: RecoveryEpoch::new(2, 1),
+                held: record_at(RecoveryEpoch::new(2, 1)),
             });
             assert_eq!(node.state(), WorkerState::Active);
 
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(2),
-                held: RecoveryEpoch::new(7, 9),
+                held: record_at(RecoveryEpoch::new(7, 9)),
             });
             assert_eq!(node.state(), WorkerState::Active, "an answer is applied once");
         },
@@ -390,10 +464,27 @@ fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_
 
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(1),
-                held: RecoveryEpoch::new(2, 1),
+                held: record_at(RecoveryEpoch::new(2, 1)),
             });
 
             assert_eq!(node.state(), WorkerState::Joining);
+        },
+        // A read naming another incarnation of the shard, whatever its epoch,
+        // finds the shard gone: the node stops, abandoned.
+        |node| {
+            let _ = node.step(pointer_at_epoch_two_of(1));
+
+            read_epoch(
+                node,
+                1,
+                ShardRecord {
+                    shard_id: shard("shard-1/successor"),
+                    recovery_epoch: RecoveryEpoch::new(2, 1),
+                },
+            );
+
+            assert_eq!(node.state(), WorkerState::Stopped);
+            assert_eq!(node.stop_reason(), Some(StopReason::Abandoned));
         },
         // A delayed read of a refounded lineage leaves the floor on the new one.
         |node| {
@@ -401,11 +492,11 @@ fn a_rejoining_node_takes_a_pointer_only_once_a_read_of_the_authority_names_its_
             let _ = node.step(Input::AuthorityEpochAsked(read_token(2)));
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(2),
-                held: RecoveryEpoch::new(1, 2),
+                held: record_at(RecoveryEpoch::new(1, 2)),
             });
             let _ = node.step(Input::AuthorityEpochRead {
                 token: read_token(1),
-                held: RecoveryEpoch::new(2, 1),
+                held: record_at(RecoveryEpoch::new(2, 1)),
             });
             assert_eq!((node.recovery_epoch(), node.recovery_lineage()), (1, Some(2)));
 
@@ -560,7 +651,7 @@ fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
                 ..read.token
             },
             sent_at: read.sent_at,
-            result: Ok(Some(epoch(0))),
+            result: Ok(Some(record_at(epoch(0)))),
         },
         // A real live set, of the awaited kind and number, which would move
         // the recovery on if it were taken.
@@ -648,6 +739,56 @@ fn the_authority_path_needs_a_majority_of_the_live_registrations() {
     assert_eq!(
         held_epoch(&driven.authority, &shard(SHARD)),
         Ok(Some(epoch(0)))
+    );
+}
+
+// A swap to epoch 1 landed but its reply was lost, so a leader no one knows of
+// may have used epoch 1. Then the authority is flushed: nothing says epoch 1 was
+// ever reached, so the shard cannot be recovered at any epoch. The node, whose
+// own swap it was, abandons the shard when its next recovery finds no record,
+// and republishes nothing a later founding would have to replace.
+#[test]
+fn a_shard_whose_authority_is_flushed_after_its_own_swap_was_lost_is_abandoned() {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
+    driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
+    driven.start_roll_call(&[worker("w2")]);
+
+    // The roll call falls short and the node's authority path swaps to epoch
+    // 1; the swap lands and the node never hears.
+    driven.advance_losing_swap_replies(default_timings().roll_call_deadline.as_ticks());
+    assert_eq!(
+        held_epoch(&authority, &shard(SHARD)),
+        Ok(Some(epoch(1))),
+        "the swap landed, though its reply did not"
+    );
+    authority.flush();
+
+    // The node keeps registering through the flushed authority's warm-up, and
+    // the peer answers each roll call the node calls, short of its quorum of 5.
+    let mut outputs = Vec::new();
+    for _ in 0..40 {
+        if driven.node.state() == WorkerState::Stopped {
+            break;
+        }
+        register_all(&authority, &shard(SHARD), &[worker("w2")]);
+        let step = driven.advance(ttl_ticks() / 6);
+        for call in published_roll_calls(&step) {
+            let reply = roll_call_reply(&driven.me, call.term, &worker("w2"), Some(g0()));
+            driven.step(message_input(&worker("w2"), reply));
+        }
+        outputs.extend(step);
+    }
+
+    assert_eq!(driven.node.state(), WorkerState::Stopped);
+    assert_eq!(driven.node.stop_reason(), Some(StopReason::Abandoned));
+    assert!(outputs.contains(&Output::ShardAbandoned));
+    assert_eq!(
+        held_epoch(&authority, &shard(SHARD)),
+        Ok(None),
+        "the old shard is not brought back"
     );
 }
 
@@ -751,7 +892,7 @@ fn a_node_whose_authority_holds_an_epoch_it_cannot_recover_from_rejoins_it() {
 }
 
 #[test]
-fn a_leader_whose_fence_names_an_epoch_it_cannot_recover_from_rejoins_it() {
+fn a_leader_whose_fence_names_an_epoch_it_cannot_recover_from_rejoins_it_and_another_shard_abandons_it() {
     let (mut driven, _) = lone_winner(Some(AuthorityTimings {
         ttl: authority_ttl(),
     }));
@@ -775,6 +916,109 @@ fn a_leader_whose_fence_names_an_epoch_it_cannot_recover_from_rejoins_it() {
         (driven.node.recovery_epoch(), driven.node.recovery_lineage()),
         (refounded.number, Some(refounded.lineage))
     );
+
+    // Another incarnation of the shard was founded under its name, at the
+    // very epoch it leads: its fence finds a record that is not its shard's,
+    // and it stops, abandoned, rather than rejoin or win again.
+    let (mut driven, _) = lone_winner(Some(AuthorityTimings {
+        ttl: authority_ttl(),
+    }));
+    driven
+        .authority
+        .compare_and_swap_shard(
+            &name_of(&shard(SHARD)),
+            Some(&ShardRecord {
+                shard_id: shard(SHARD),
+                recovery_epoch: epoch(0),
+            }),
+            &ShardRecord {
+                shard_id: shard("shard-1/successor"),
+                recovery_epoch: epoch(0),
+            },
+        )
+        .expect("a founder replaced the incarnation");
+
+    let mut outputs = Vec::new();
+    while driven.node.state() == WorkerState::Leader {
+        outputs.extend(driven.advance(1_000));
+    }
+
+    assert_eq!(
+        state_changes(&outputs),
+        vec![WorkerState::Stopped],
+        "the fence reply itself shows the shard gone, with no suspicion of a leader first"
+    );
+    assert_eq!(driven.node.stop_reason(), Some(StopReason::Abandoned));
+    assert!(outputs.contains(&Output::ShardAbandoned));
+
+    // The same, found by the republish after a flush instead: the authority is
+    // flushed, the leader's fence meets no record and republishes its own, and
+    // another incarnation is founded under the name just before that swap
+    // lands. The swap's own conflict names it, and the leader stops there and
+    // then.
+    let (mut driven, _) = lone_winner(Some(AuthorityTimings {
+        ttl: authority_ttl(),
+    }));
+    driven.authority.flush();
+    let founder = driven.authority.for_another_worker();
+    driven.clock.advance(Duration::from_ticks(ttl_ticks() / 3));
+    let step = driven.node.step(Input::Tick);
+    let mut outputs = Vec::new();
+    let _ = carry_out(
+        &mut driven.node,
+        step,
+        &mut driven.scheduler,
+        &mut DropMessages,
+        &mut FoundingBeforeSwap {
+            inner: AtOnce::new(&driven.authority, shard(SHARD), driven.me.clone()),
+            founder: &founder,
+        },
+        |_, _, _, step| outputs.extend(step.outputs.iter().cloned()),
+    );
+
+    assert_eq!(
+        state_changes(&outputs),
+        vec![WorkerState::Stopped],
+        "the republish's own conflict shows the shard gone: {outputs:?}"
+    );
+    assert_eq!(driven.node.stop_reason(), Some(StopReason::Abandoned));
+}
+
+// A leader that finds the authority flushed republishes its record, and says
+// where it can be reached once the record is its own again. If the republish
+// lands but its reply is lost, the leader never hears that it did; its
+// granted fence, which needs the record, says so just as well, and the leader
+// publishes its hint again from then on.
+#[test]
+fn a_leader_whose_republish_reply_was_lost_publishes_its_hint_once_its_fence_is_granted_again() {
+    let (mut driven, _) = lone_winner(Some(AuthorityTimings {
+        ttl: authority_ttl(),
+    }));
+    let name = name_of(&shard(SHARD));
+    let hinted = |driven: &Driven| {
+        driven
+            .authority
+            .read_leader_hint(&name)
+            .expect("the authority is reachable")
+            .is_some_and(|hint| hint.leader == worker("w1") && hint.shard_id == shard(SHARD))
+    };
+    assert!(hinted(&driven), "a leader says where it can be reached on taking office");
+    driven.authority.flush();
+    let flushed_at = driven.clock.now();
+
+    // A hint written before the leader learns of the flush lapses a TTL
+    // later, so one still held after that was renewed.
+    let end = flushed_at + Duration::from_ticks(ttl_ticks() * 3);
+    while driven.clock.now() < end {
+        driven.advance_losing_swap_replies(ttl_ticks() / 3);
+    }
+
+    assert_eq!(
+        held_epoch(&driven.authority, &shard(SHARD)),
+        Ok(Some(epoch(0))),
+        "the republish landed, though its reply did not"
+    );
+    assert!(hinted(&driven), "the leader keeps publishing its hint");
 }
 
 // Two nodes at one epoch number of two lineages agree which epoch is newer:

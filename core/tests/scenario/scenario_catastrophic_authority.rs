@@ -424,14 +424,27 @@ fn a_worker_with_no_authority_never_orphans_itself() {
 }
 
 #[test]
-fn a_flush_under_a_live_quorum_is_repaired_by_its_leader() {
+fn a_flush_under_a_live_quorum_is_repaired_by_its_leader_before_anyone_could_found_another_shard() {
     let (mut cluster, leader) = elected(5);
     let ids = cluster.node_ids();
+    let name = shard("shard-1").name();
+    let hinted_by_leader = |cluster: &Cluster| {
+        cluster
+            .authority()
+            .read_leader_hint(&name)
+            .expect("reachable")
+            .is_some_and(|hint| hint.leader == leader && hint.shard_id == shard("shard-1"))
+    };
+    // A hint lasts a TTL, so one still held after more than that was renewed.
+    run_for(&mut cluster, ttls(2), |cluster| {
+        assert!(hinted_by_leader(cluster), "an elected leader says where it can be reached");
+    });
 
     cluster.authority().flush();
     let flushed_at = cluster.now();
     let warm_at = flushed_at + ttl();
     let mut republished_by = None;
+    let mut hinted_by = None;
 
     run_for(&mut cluster, ttls(2), |cluster| {
         assert_eq!(
@@ -458,6 +471,28 @@ fn a_flush_under_a_live_quorum_is_repaired_by_its_leader() {
         if republished_by.is_none() && authority_epoch(cluster) == Some(0) {
             republished_by = Some(cluster.now());
         }
+        let record = cluster.authority().read_shard(&name).expect("reachable");
+        let listing = cluster
+            .authority()
+            .live_registrations(&name, &shard("shard-1"))
+            .expect("reachable");
+        assert!(
+            record.is_some() || listing.authoritative_count().is_none(),
+            "a bootstrapper would find the name empty and the authority warm, and found a second shard"
+        );
+        if hinted_by.is_none()
+            && cluster
+                .authority()
+                .read_leader_hint(&name)
+                .expect("reachable")
+                .is_some_and(|hint| {
+                    hint.leader == leader
+                        && hint.shard_id == shard("shard-1")
+                        && hint.recovery_epoch.number == 0
+                })
+        {
+            hinted_by = Some(cluster.now());
+        }
         let at = cluster.now();
         if at + CHECK_EVERY >= warm_at && at < warm_at {
             assert!(
@@ -470,6 +505,11 @@ fn a_flush_under_a_live_quorum_is_repaired_by_its_leader() {
     let republished_by = republished_by.expect("the leader republishes its epoch");
     assert!(
         republished_by <= flushed_at + Duration::from_ticks(ticks(ttl()) / 3 + ticks(CHECK_EVERY))
+    );
+    assert!(hinted_by_leader(&cluster), "the leader keeps renewing its hint after the repair");
+    let hinted_by = hinted_by.expect("the leader republishes its hint");
+    assert!(
+        hinted_by <= flushed_at + Duration::from_ticks(ticks(ttl()) / 3 + ticks(CHECK_EVERY))
     );
     assert!(
         cluster.holds_valid_grant(&leader),

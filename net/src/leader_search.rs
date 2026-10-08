@@ -15,16 +15,16 @@
 //!   calls for, the replies to the calls net asked for itself, and what the
 //!   node must be told.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::coordination_authority::{LiveRegistrations, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{LeaderHint, LiveRegistrations, ShardRecord};
 use kabudachi_core::election::{
     AuthorityReply, AuthorityRequest, CallKind, Input, JoinFloor, ReplyToken,
 };
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Duration, Instant as CoreInstant};
@@ -95,7 +95,7 @@ pub(crate) struct SearchRounds {
 }
 
 impl SearchRounds {
-    pub(crate) fn for_bootstrap(shard_id: &ShardId, my_id: WorkerId, seeds: Vec<Multiaddr>) -> Self {
+    pub(crate) fn for_bootstrap(name: &ShardName, my_id: WorkerId, seeds: Vec<Multiaddr>) -> Self {
         SearchRounds {
             my_id,
             seeds,
@@ -103,7 +103,7 @@ impl SearchRounds {
             round: 0,
             shard_exists: false,
             listed: Vec::new(),
-            log: WaitLog::new(shard_id),
+            log: WaitLog::new(name),
         }
     }
 
@@ -115,7 +115,7 @@ impl SearchRounds {
             round: 0,
             shard_exists: true,
             listed: Vec::new(),
-            log: WaitLog::new(shard_id),
+            log: WaitLog::new(&shard_id.name()),
         }
     }
 
@@ -148,15 +148,36 @@ impl SearchRounds {
         self.heard_from_seeds(found)
     }
 
-    /// The registered addresses of `peers` to ask this round. An address that
-    /// does not parse is logged and skipped, and so is a list none of whose
-    /// addresses parse. They are asked from the first in a bootstrap, and
-    /// rotated by the round number in a rejoin.
-    pub(crate) fn to_ask(&mut self, peers: &BTreeMap<WorkerId, String>) -> Vec<Multiaddr> {
-        let mut addresses: Vec<Multiaddr> = Vec::new();
-        for (worker, address) in peers {
+    /// The addresses to ask this round: the hinted leader's first, then the
+    /// registered addresses of `peers`. An address that does not parse is
+    /// logged and skipped, and so is a list none of whose addresses parse.
+    /// The hinted leader is always asked first and never rotated; `peers`
+    /// are asked from the first in a bootstrap, and rotated by the round
+    /// number in a rejoin. The hinted worker is asked once, at its hinted
+    /// address, even if `peers` lists it too.
+    pub(crate) fn to_ask(
+        &mut self,
+        hinted: Option<&LeaderHint>,
+        peers: &BTreeMap<WorkerId, String>,
+    ) -> Vec<Multiaddr> {
+        let mut first: Vec<Multiaddr> = Vec::new();
+        let mut rest: Vec<Multiaddr> = Vec::new();
+        if let Some(hint) = hinted {
+            match hint.address.parse() {
+                Ok(address) => first.push(address),
+                Err(error) => self.log.log(WaitReason::UnparseableAddress {
+                    worker: hint.leader.clone(),
+                    address: hint.address.clone(),
+                    error: error.to_string(),
+                }),
+            }
+        }
+        let others = peers
+            .iter()
+            .filter(|(worker, _)| hinted.is_none_or(|hint| hint.leader != **worker));
+        for (worker, address) in others {
             match address.parse() {
-                Ok(address) => addresses.push(address),
+                Ok(address) => rest.push(address),
                 Err(error) => self.log.log(WaitReason::UnparseableAddress {
                     worker: worker.clone(),
                     address: address.clone(),
@@ -164,7 +185,7 @@ impl SearchRounds {
                 }),
             }
         }
-        if addresses.is_empty() {
+        if first.is_empty() && rest.is_empty() {
             // No one else listed is not an address problem: stay quiet.
             if !peers.is_empty() {
                 self.log.log(WaitReason::NoRegisteredAddressParses {
@@ -172,14 +193,21 @@ impl SearchRounds {
                 });
             }
             self.listed.clear();
-            return addresses;
+            return Vec::new();
         }
-        self.listed = peers.keys().cloned().collect();
-        if self.mode == Mode::Rejoin {
-            let len = addresses.len();
-            addresses.rotate_left(self.round % len);
+        self.listed = peers
+            .keys()
+            .cloned()
+            .chain(hinted.map(|hint| hint.leader.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if self.mode == Mode::Rejoin && !rest.is_empty() {
+            let len = rest.len();
+            rest.rotate_left(self.round % len);
         }
-        addresses
+        first.extend(rest);
+        first
     }
 
     /// What an ask of [`Self::to_ask`]'s addresses found: the pointer, if any.
@@ -242,7 +270,8 @@ pub(crate) fn others_listed(
 }
 
 /// A node back in `Bootstrapping`, rejoining its shard through the driver.
-/// It never founds: nothing here can register or
+/// Each round also reads the authority's leader hint beside the listing, and
+/// asks the hinted leader first with the latest hint answered by then. It never founds: nothing here can register or
 /// swap an epoch. Each round reads the authority's listing through the
 /// driver's client, under the client's `Issuer::Cascade` mint, bounded by one
 /// retry interval, then asks the listed workers through the port. It also
@@ -254,6 +283,14 @@ pub(crate) fn others_listed(
 /// it reads the epoch, at most once a retry interval, until the node is told.
 pub(crate) struct Rejoin<'a, P> {
     search: SearchRounds,
+    /// The incarnation of the shard the node belongs to: a hint of another is
+    /// passed over.
+    shard_id: ShardId,
+    /// The latest hint answered that is of this shard and no older than the
+    /// floor, which the round asks first.
+    hint: Option<LeaderHint>,
+    /// The hint read asked and not yet answered.
+    hint_read: Option<ReplyToken>,
     port: P,
     /// The floor of the last listing's answer, for a round that asks the seeds
     /// alone.
@@ -317,6 +354,9 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
     ) -> Self {
         Rejoin {
             search: SearchRounds::for_rejoin(shard_id, my_id, seeds),
+            shard_id: shard_id.clone(),
+            hint: None,
+            hint_read: None,
             port,
             floor: JoinFloor::none(),
             retry_interval,
@@ -413,6 +453,9 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                 if self.reads_epoch {
                     self.ask_epoch(client, sent_at, now);
                 }
+                if self.hint_read.is_none() {
+                    self.hint_read = client.ask(AuthorityRequest::ReadLeaderHint, sent_at);
+                }
             }
             // Busy with a call this rejoin did not ask.
             None => self.end_round_unanswered(now),
@@ -488,7 +531,27 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         reply: AuthorityReply,
         now: Instant,
         floor: JoinFloor,
-    ) -> Option<(ReplyToken, RecoveryEpoch)> {
+    ) -> Option<(ReplyToken, ShardRecord)> {
+        if reply.token().kind == CallKind::ReadLeaderHint {
+            // The hint read of this rejoin sets the hint; any other (one given
+            // up on) only frees its kind.
+            if self.hint_read == Some(reply.token()) {
+                self.hint_read = None;
+                self.hint = match reply {
+                    AuthorityReply::LeaderHint {
+                        result: Ok(Some(hint)),
+                        ..
+                    } if hint.shard_id == self.shard_id
+                        && hint.leader != self.search.my_id
+                        && floor.epoch().is_none_or(|floor| hint.recovery_epoch >= floor) =>
+                    {
+                        Some(hint)
+                    }
+                    _ => None,
+                };
+            }
+            return None;
+        }
         if let Some(read) = self.epoch_read
             && read.token == reply.token()
         {
@@ -537,7 +600,7 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
                 self.next_round_at = None;
                 self.floor = floor;
                 let peers = self.search.others_in(&registrations);
-                let mut addresses = self.search.to_ask(&peers);
+                let mut addresses = self.search.to_ask(self.hint.as_ref(), &peers);
                 let seeds = self.search.seeds().to_vec();
                 for seed in seeds {
                     if !addresses.contains(&seed) {

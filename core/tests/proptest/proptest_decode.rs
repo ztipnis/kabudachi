@@ -19,7 +19,7 @@ use kabudachi_core::protocol::messages::{
     SelfRemove, TaskRequest, VoteGrant, VoteRequest, WellFormed, WorkerHeartbeat, claim_response,
     election_message::Payload,
 };
-use kabudachi_core::protocol::ids::IncarnationId;
+use kabudachi_core::protocol::ids::{IncarnationId, ShardId};
 use kabudachi_core::time::Duration;
 use proptest::prelude::*;
 
@@ -392,6 +392,7 @@ fn a_claim_or_join_message_missing_what_a_node_needs_is_not_well_formed() {
                 leader_id: a_leader(),
                 leader_multiaddr: "/ip4/127.0.0.1/tcp/1".into(),
                 term: u64::MAX,
+                shard_id: Some(ShardId::new("shard-1").into()),
                 ..Default::default()
             }
             .is_well_formed(),

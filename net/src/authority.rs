@@ -99,6 +99,19 @@ impl AuthorityClient {
         }
     }
 
+    /// The incarnation every call started from now on names.
+    pub(crate) fn shard_id(&self) -> &ShardId {
+        &self.shard_id
+    }
+
+    /// Serves `shard_id` for calls started after this: the incarnation every
+    /// later call names. The cascade serves the one it is reading or
+    /// founding, `Worker::run` the one it entered. A call already in flight
+    /// keeps the id it started with.
+    pub(crate) fn serve(&mut self, shard_id: ShardId) {
+        self.shard_id = shard_id;
+    }
+
     /// Asks for `request`, stamped `sent_at`, under the next token of this
     /// client's `Issuer::Cascade` mint: a call net asks for itself (the
     /// cascade's, a rejoin's). `None`, and nothing asked or minted, while a

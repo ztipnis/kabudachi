@@ -49,6 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use kabudachi_core::coordination_authority::ShardRecord;
 use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, CallKind, Entry, HandOffTo,
     Identity, Input, Issuer, KnownConfiguration, MessageSink, Output, ReplyToken, Step, WorkerNode, carry_out,
@@ -1594,7 +1595,13 @@ impl Cluster {
             self.rejoin_reads += 1;
             for input in [
                 Input::AuthorityEpochAsked(token),
-                Input::AuthorityEpochRead { token, held },
+                Input::AuthorityEpochRead {
+                    token,
+                    held: ShardRecord {
+                        shard_id: self.shard_id.clone(),
+                        recovery_epoch: held,
+                    },
+                },
             ] {
                 let step = self.node_mut(&id, "validate").step(input.clone());
                 self.drive(&id, Some(input), step);

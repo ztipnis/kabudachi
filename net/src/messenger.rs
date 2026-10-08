@@ -75,13 +75,17 @@
 //! ## Gossip
 //!
 //! A `Net` serves one shard. [`Net::subscribe_to_shard`] subscribes it to
-//! that shard's gossipsub topic, `/kabudachi/<shard>/election/2`, and
+//! that shard's gossipsub topic, `/kabudachi/<name>/election/2`, and
 //! [`Net::publish`] publishes on it, fire-and-forget like `send`. A publish
 //! gossipsub refuses (no subscribed peer yet, say) is dropped like a lost
 //! message, logged at `debug`. Every gossip message is signed by its author
 //! (see `crate::swarm`), so an arriving one becomes `Input::Message` from the
 //! author, not from whichever peer relayed it. One with no author, or whose
 //! body is not a well-formed `ElectionMessage`, is dropped.
+//!
+//! The topic and the records protocol are the shard's name, shared by every
+//! incarnation of the shard under it. Election messages carry the `ShardId`,
+//! and a node drops another incarnation's.
 //!
 //! A relayed roll call can reach a worker that holds no connection to its
 //! initiator, and that worker answers the initiator directly. So a roll call
@@ -185,7 +189,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kabudachi_core::election::Input;
 use kabudachi_core::protocol::checked;
 use kabudachi_core::protocol::generated::TaskRecord;
-use kabudachi_core::protocol::ids::{ShardId, TaskId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardId, ShardName, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 pub use kabudachi_core::task_record::{PlacedWrite, WriteOutcome};
 use kabudachi_core::task_record::{RecordVersion, VersionOrder, Write, identify};
@@ -532,7 +536,7 @@ pub struct Net {
     shard: Mutex<Option<ShardId>>,
     /// The shard whose Task records this `Net` stores, for a `Net` built
     /// with [`Self::for_shard`].
-    records_shard: Option<ShardId>,
+    records_shard: Option<ShardName>,
     /// The Task records this `Net` holds (see [`Self::held_records`]).
     held: HeldRecords,
     /// The runs this worker claimed (see [`Self::claimed_runs`]).
@@ -565,21 +569,21 @@ impl Net {
         Self::build(redial_policy, None, None)
     }
 
-    /// A `Net` for a worker of `shard`: besides everything [`Self::new`]
+    /// A `Net` for a worker of the shard `name`: besides everything [`Self::new`]
     /// gives, it holds the shard's Task records and stores and serves them
     /// over a protocol only the shard's workers speak, so a record never
     /// lands in another shard. Finished records are dropped `retention`
     /// after they finish.
     pub fn for_shard(
-        shard: ShardId,
+        name: ShardName,
         retention: Option<kabudachi_core::time::Duration>,
     ) -> Self {
-        Self::build(RedialPolicy::default(), Some(shard), retention)
+        Self::build(RedialPolicy::default(), Some(name), retention)
     }
 
     fn build(
         redial_policy: RedialPolicy,
-        records_shard: Option<ShardId>,
+        records_shard: Option<ShardName>,
         retention: Option<kabudachi_core::time::Duration>,
     ) -> Self {
         let held = HeldRecords::new(retention);
@@ -853,7 +857,8 @@ impl Net {
     pub fn subscribe_to_shard(&self, shard: &ShardId) {
         if let Some(records_shard) = &self.records_shard {
             debug_assert_eq!(
-                records_shard, shard,
+                *records_shard,
+                shard.name(),
                 "a Net stores the records of one shard; it cannot serve another"
             );
         }
@@ -867,7 +872,7 @@ impl Net {
                 *subscribed = Some(shard.clone());
                 // Same reasoning as in `send` for a stopped driver task.
                 let _ = self.commands.send(Command::Subscribe {
-                    topic: shard_topic(shard),
+                    topic: shard_topic(&shard.name()),
                 });
             }
         }
@@ -889,7 +894,7 @@ impl Net {
         };
         // Same reasoning as in `send` for a stopped driver task.
         let _ = self.commands.send(Command::Publish {
-            topic: shard_topic(&shard).hash(),
+            topic: shard_topic(&shard.name()).hash(),
             message,
         });
     }
@@ -1059,14 +1064,14 @@ impl Net {
     }
 }
 
-/// The gossip topic `shard`'s workers publish election messages on. Every
+/// The gossip topic the workers of the shard `name` publish election messages on. Every
 /// worker in the shard must name it the same way, or they cannot hear each
 /// other. It carries the same `ElectionMessage` schema as the direct
 /// protocol ([`crate::codec::PROTOCOL`]), so its version moves in step with
 /// that protocol's: a peer of another schema version never hears a message
 /// it would misread.
-fn shard_topic(shard: &ShardId) -> gossipsub::IdentTopic {
-    gossipsub::IdentTopic::new(format!("/kabudachi/{}/election/2", shard.as_str()))
+fn shard_topic(name: &ShardName) -> gossipsub::IdentTopic {
+    gossipsub::IdentTopic::new(format!("/kabudachi/{name}/election/2"))
 }
 
 /// The input an arriving gossip `message` is for this worker's node: a

@@ -77,12 +77,18 @@ impl WorkerState {
     /// JOIN pointer waits in `Joining` for the authority to confirm it
     /// (`-> Active`), and goes back (`Joining -> Bootstrapping`) when the
     /// authority holds another epoch.
+    ///
+    /// A node that finds the authority's record naming another incarnation of
+    /// its shard has lost it and stops, abandoned, from any state that reads
+    /// the record (`-> Stopped`).
     pub fn can_transition_to(self, next: WorkerState) -> bool {
         matches!(
             (self, next),
             (WorkerState::Bootstrapping, WorkerState::Joining)
                 | (WorkerState::Joining, WorkerState::Active)
                 | (WorkerState::Joining, WorkerState::Bootstrapping)
+                | (WorkerState::Joining, WorkerState::Stopped)
+                | (WorkerState::Bootstrapping, WorkerState::Stopped)
                 | (WorkerState::Active, WorkerState::LeaderSuspect)
                 | (WorkerState::Active, WorkerState::Draining)
                 | (WorkerState::Active, WorkerState::Fenced)
@@ -91,6 +97,7 @@ impl WorkerState {
                 | (WorkerState::LeaderSuspect, WorkerState::NoQuorum)
                 | (WorkerState::LeaderSuspect, WorkerState::Bootstrapping)
                 | (WorkerState::LeaderSuspect, WorkerState::Fenced)
+                | (WorkerState::LeaderSuspect, WorkerState::Stopped)
                 | (WorkerState::RollCall, WorkerState::Active)
                 | (WorkerState::RollCall, WorkerState::LeaderSuspect)
                 | (WorkerState::RollCall, WorkerState::Candidate)
@@ -101,17 +108,20 @@ impl WorkerState {
                 | (WorkerState::Candidate, WorkerState::LeaderReconciling)
                 | (WorkerState::Candidate, WorkerState::NoQuorum)
                 | (WorkerState::Candidate, WorkerState::Fenced)
+                | (WorkerState::Candidate, WorkerState::Stopped)
                 | (WorkerState::LeaderReconciling, WorkerState::Leader)
                 | (WorkerState::LeaderReconciling, WorkerState::Active)
                 | (WorkerState::LeaderReconciling, WorkerState::LeaderSuspect)
                 | (WorkerState::LeaderReconciling, WorkerState::NoQuorum)
                 | (WorkerState::LeaderReconciling, WorkerState::Fenced)
                 | (WorkerState::LeaderReconciling, WorkerState::Draining)
+                | (WorkerState::LeaderReconciling, WorkerState::Stopped)
                 | (WorkerState::Leader, WorkerState::Active)
                 | (WorkerState::Leader, WorkerState::LeaderSuspect)
                 | (WorkerState::Leader, WorkerState::NoQuorum)
                 | (WorkerState::Leader, WorkerState::Draining)
                 | (WorkerState::Leader, WorkerState::Fenced)
+                | (WorkerState::Leader, WorkerState::Stopped)
                 | (WorkerState::NoQuorum, WorkerState::Active)
                 | (WorkerState::NoQuorum, WorkerState::RollCall)
                 | (WorkerState::NoQuorum, WorkerState::Candidate)
@@ -120,6 +130,7 @@ impl WorkerState {
                 | (WorkerState::NoQuorum, WorkerState::Fenced)
                 | (WorkerState::Fenced, WorkerState::Active)
                 | (WorkerState::Fenced, WorkerState::Bootstrapping)
+                | (WorkerState::Fenced, WorkerState::Stopped)
                 | (WorkerState::Draining, WorkerState::Stopped)
         )
     }

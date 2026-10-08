@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use kabudachi_core::election::{Input, JoinFloor};
-use kabudachi_core::protocol::ids::{Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::ids::{ShardId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::JoinResponse;
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::task_record::RecordOutbox;
@@ -232,5 +232,6 @@ pub fn pointer_to(leader: &WorkerId, at: &Multiaddr) -> JoinResponse {
         term: 1,
         recovery_epoch: 0,
         recovery_epoch_lineage: 0,
+        shard_id: Some(ShardId::new("shard-1").into()),
     }
 }
