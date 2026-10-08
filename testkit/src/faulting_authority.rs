@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use kabudachi_core::coordination_authority::{
-    AuthorityError, CoordinationAuthority, LiveRegistrations, RecoveryEpoch,
+    AuthorityError, CoordinationAuthority, LeaderHint, LiveRegistrations, ShardRecord,
 };
 use kabudachi_core::election::CallKind;
 use kabudachi_core::in_memory_authority::InMemoryAuthority;
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::time::{Clock, Duration};
 
 /// One worker's connection to a shared `InMemoryAuthority`, with faults a
@@ -194,7 +194,7 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
     /// Makes this handle's next compare-and-swap that reaches the authority
     /// lose a race: a rival compare-and-swap with the same `expected` and
     /// `new` lands just before it, so the caller gets
-    /// `EpochConflict { current: Some(new) }`.
+    /// `ShardConflict { current: Some(new) }`.
     pub fn lose_next_race(&self) {
         let _operations_paused = lock(&self.shared.authority);
         self.faults().lose_next_race = true;
@@ -287,8 +287,8 @@ impl<C: Clock + Clone> FaultingAuthority<C> {
         }
     }
 
-    /// Wipes the authority for every handle, like Redis `FLUSHALL`: all epochs,
-    /// registrations and fences are gone, and warm-up starts again from the
+    /// Wipes the authority for every handle, like Redis `FLUSHALL`: all records,
+    /// registrations, fences and hints are gone, and warm-up starts again from the
     /// clock's current reading. Each handle's faults, and whether the authority
     /// is down, are kept.
     pub fn flush(&self) {
@@ -320,34 +320,42 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
+    /// The TTL is configuration, not a call: it answers while the authority
+    /// is down or this handle is cut off.
+    fn ttl(&self) -> Duration {
+        lock(&self.shared.authority).ttl()
+    }
+
     fn register(
         &self,
+        name: &ShardName,
         shard_id: &ShardId,
         worker_id: &WorkerId,
         address: &str,
     ) -> Result<Duration, AuthorityError> {
         self.pass_gate(CallKind::Register);
-        self.reach()?.register(shard_id, worker_id, address)
+        self.reach()?.register(name, shard_id, worker_id, address)
     }
 
-    fn live_registrations(&self, shard_id: &ShardId) -> Result<LiveRegistrations, AuthorityError> {
+    fn live_registrations(
+        &self,
+        name: &ShardName,
+        shard_id: &ShardId,
+    ) -> Result<LiveRegistrations, AuthorityError> {
         self.pass_gate(CallKind::ReadLiveRegistrations);
-        self.reach()?.live_registrations(shard_id)
+        self.reach()?.live_registrations(name, shard_id)
     }
 
-    fn read_recovery_epoch(
-        &self,
-        shard_id: &ShardId,
-    ) -> Result<Option<RecoveryEpoch>, AuthorityError> {
+    fn read_shard(&self, name: &ShardName) -> Result<Option<ShardRecord>, AuthorityError> {
         self.pass_gate(CallKind::ReadRecoveryEpoch);
-        self.reach()?.read_recovery_epoch(shard_id)
+        self.reach()?.read_shard(name)
     }
 
-    fn compare_and_swap_recovery_epoch(
+    fn compare_and_swap_shard(
         &self,
-        shard_id: &ShardId,
-        expected: Option<RecoveryEpoch>,
-        new: RecoveryEpoch,
+        name: &ShardName,
+        expected: Option<&ShardRecord>,
+        new: &ShardRecord,
     ) -> Result<(), AuthorityError> {
         self.pass_gate(CallKind::SwapRecoveryEpoch);
         let authority = self.reach()?;
@@ -355,19 +363,30 @@ impl<C: Clock + Clone> CoordinationAuthority for FaultingAuthority<C> {
         if loses_race {
             // The rival's own outcome does not matter: if it fails, so does
             // the caller's identical swap, for the same reason.
-            let _ = authority.compare_and_swap_recovery_epoch(shard_id, expected, new);
+            let _ = authority.compare_and_swap_shard(name, expected, new);
         }
-        authority.compare_and_swap_recovery_epoch(shard_id, expected, new)
+        authority.compare_and_swap_shard(name, expected, new)
     }
 
     fn acquire_fence(
         &self,
-        shard_id: &ShardId,
+        name: &ShardName,
         holder: &WorkerId,
-        recovery_epoch: RecoveryEpoch,
+        record: &ShardRecord,
     ) -> Result<Duration, AuthorityError> {
         self.pass_gate(CallKind::AcquireFence);
-        self.reach()?
-            .acquire_fence(shard_id, holder, recovery_epoch)
+        self.reach()?.acquire_fence(name, holder, record)
+    }
+
+    fn publish_leader_hint(
+        &self,
+        name: &ShardName,
+        hint: &LeaderHint,
+    ) -> Result<(), AuthorityError> {
+        self.reach()?.publish_leader_hint(name, hint)
+    }
+
+    fn read_leader_hint(&self, name: &ShardName) -> Result<Option<LeaderHint>, AuthorityError> {
+        self.reach()?.read_leader_hint(name)
     }
 }

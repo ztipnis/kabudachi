@@ -4,6 +4,7 @@
 //! shard exists for as long as the worker bootstraps, and it keeps asking
 //! until a peer points at a leader.
 
+use crate::support::worker::{name_of, read_epoch};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,8 +92,7 @@ async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lap
         let (peer, peer_address) = listening_net().await;
         let peer_id = peer.local_worker_id();
         let _peer_answers = JoinResponder::start(Arc::new(peer), Some(JoinResponse::default()));
-        authority
-            .register(&shard(), &peer_id, &peer_address.to_string())
+        authority.register(&name_of(&shard()), &shard(), &peer_id, &peer_address.to_string())
             .expect("the authority is reachable");
         let net = Net::new();
         let me = net.local_worker_id();
@@ -101,7 +101,13 @@ async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lap
             ttl: TickDuration::from_millis(TTL.as_millis() as u64),
         };
         let mut client =
-            AuthorityClient::new(&net, shard_id.clone(), Arc::new(authority.clone()), timings);
+            AuthorityClient::new(
+                &net,
+                name_of(&shard_id),
+                shard_id.clone(),
+                Arc::new(authority.clone()),
+                timings,
+            );
         let mut running = pin!(bootstrap(
             &net,
             &clock,
@@ -120,8 +126,7 @@ async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lap
         // does not take ownership of it.
         let lapsed = async {
             poll_until("the peer's registration lapsed", || {
-                authority
-                    .live_registrations(&shard())
+                authority.live_registrations(&name_of(&shard()), &shard())
                     .expect("the authority is reachable")
                     .addresses()
                     .is_empty()
@@ -134,8 +139,7 @@ async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lap
             () = lapsed => {}
         }
         assert_eq!(
-            authority
-                .read_recovery_epoch(&shard())
+            read_epoch(&authority, &shard())
                 .expect("the authority is reachable"),
             None,
             "the worker took ownership of a shard its peer showed exists"
@@ -146,8 +150,7 @@ async fn a_listed_peer_that_answered_keeps_the_worker_from_founding_after_it_lap
         let leader_id: WorkerId = leader.local_worker_id();
         let pointer = pointer_to(&leader_id, &leader_address);
         let _leader_answers = JoinResponder::start(Arc::new(leader), Some(pointer.clone()));
-        authority
-            .register(&shard(), &leader_id, &leader_address.to_string())
+        authority.register(&name_of(&shard()), &shard(), &leader_id, &leader_address.to_string())
             .expect("the authority is reachable");
         let entry = timeout(TEST_TIMEOUT, running)
             .await

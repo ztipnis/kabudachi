@@ -1,11 +1,13 @@
 //! The coordination authority the election tests run against: a
 //! `FaultingAuthority` on the tests' `FakeClock`.
 
-use kabudachi_core::coordination_authority::{CoordinationAuthority, RecoveryEpoch};
+use kabudachi_core::coordination_authority::{
+    AuthorityError, CoordinationAuthority, RecoveryEpoch, ShardRecord,
+};
 use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, Output,
 };
-use kabudachi_core::protocol::ids::{ShardId, WorkerId};
+use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::time::Duration;
 use kabudachi_testkit::FaultingAuthority;
 
@@ -27,6 +29,39 @@ pub fn epoch(number: u64) -> RecoveryEpoch {
     RecoveryEpoch::new(number, 0)
 }
 
+/// The name a shard identified by `shard_id` lives under: the same string.
+pub fn name_of(shard_id: &ShardId) -> ShardName {
+    ShardName::new(shard_id.as_str())
+}
+
+/// The epoch the authority holds under `shard_id`'s name.
+pub fn read_epoch(
+    authority: &impl CoordinationAuthority,
+    shard_id: &ShardId,
+) -> Result<Option<RecoveryEpoch>, AuthorityError> {
+    Ok(authority
+        .read_shard(&name_of(shard_id))?
+        .map(|held| held.recovery_epoch))
+}
+
+/// Compare-and-swaps `shard_id`'s record from `expected` to `new`.
+pub fn swap_epoch(
+    authority: &impl CoordinationAuthority,
+    shard_id: &ShardId,
+    expected: Option<RecoveryEpoch>,
+    new: RecoveryEpoch,
+) -> Result<(), AuthorityError> {
+    let record = |recovery_epoch| ShardRecord {
+        shard_id: shard_id.clone(),
+        recovery_epoch,
+    };
+    authority.compare_and_swap_shard(
+        &name_of(shard_id),
+        expected.map(record).as_ref(),
+        &record(new),
+    )
+}
+
 /// A new authority on `clock` that is already past its warm-up: building it
 /// advances `clock` by one TTL.
 pub fn warmed_up_authority(clock: &FakeClock) -> FaultingAuthority<FakeClock> {
@@ -43,7 +78,7 @@ pub fn register_all<'a>(
 ) {
     for worker in workers {
         authority
-            .register(shard_id, worker, worker.as_str())
+            .register(&name_of(shard_id), shard_id, worker, worker.as_str())
             .expect("the seeding handle is reachable");
     }
 }
@@ -57,8 +92,7 @@ pub fn seed_shard<'a>(
     epoch: u64,
     workers: impl IntoIterator<Item = &'a WorkerId>,
 ) {
-    authority
-        .compare_and_swap_recovery_epoch(shard_id, None, self::epoch(epoch))
+    swap_epoch(authority, shard_id, None, self::epoch(epoch))
         .expect("the shard has no epoch yet, so create-if-absent succeeds");
     register_all(authority, shard_id, workers);
 }
@@ -91,7 +125,13 @@ impl<'a> AtOnce<'a> {
 impl AuthorityPerformer for AtOnce<'_> {
     fn perform(&mut self, call: AuthorityCall) -> Option<AuthorityReply> {
         self.performed.push(call.request);
-        Some(call.perform(self.authority, &self.shard_id, &self.me, self.me.as_str()))
+        Some(call.perform(
+            self.authority,
+            &name_of(&self.shard_id),
+            &self.shard_id,
+            &self.me,
+            self.me.as_str(),
+        ))
     }
 }
 

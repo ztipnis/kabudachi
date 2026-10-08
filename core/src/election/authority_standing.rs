@@ -19,7 +19,9 @@ mod forced_recovery;
 use std::collections::BTreeMap;
 
 use crate::configuration::{Admission, Configuration, Roster};
-use crate::coordination_authority::{AuthorityError, LiveRegistrations, RecoveryEpoch};
+use crate::coordination_authority::{
+    AuthorityError, LiveRegistrations, RecoveryEpoch, ShardRecord,
+};
 use crate::election::authority::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, Issuer, ReplyToken,
     ReplyTokens,
@@ -525,9 +527,9 @@ impl AuthorityStanding {
         // keeps failing is not asked again within the same instant.
         let republished = match &result {
             Ok(()) => true,
-            Err(AuthorityError::EpochConflict { current }) => {
-                current.is_some_and(|current| order(new, current) == EpochOrder::Mine)
-            }
+            Err(AuthorityError::ShardConflict { current }) => current
+                .as_ref()
+                .is_some_and(|current| order(new, current.recovery_epoch) == EpochOrder::Mine),
             Err(_) => false,
         };
         if view.in_office()
@@ -602,7 +604,7 @@ impl AuthorityStanding {
     /// - Granted: the fence lets it act until a TTL, less drift, after it
     ///   asked. A waiting candidate now leads.
     /// - Held by another worker: it asks again once that fence has run out.
-    /// - The epoch is missing (the authority lost its data): a leader
+    /// - The record is missing (the authority lost its data): a leader
     ///   republishes it and asks again; a waiting candidate
     ///   gives up, its swap lost with the data.
     /// - The epoch has moved on: the shard was recovered without it. A
@@ -643,7 +645,7 @@ impl AuthorityStanding {
                     .retry_fence_at(now + remaining + Duration::from_ticks(1));
                 Vec::new()
             }
-            Err(AuthorityError::EpochConflict { current: None }) if view.in_office() =>
+            Err(AuthorityError::ShardConflict { current: None }) if view.in_office() =>
             {
                 vec![AuthorityVerdict::Ask(self.ask(
                     AuthorityRequest::SwapRecoveryEpoch {
@@ -656,12 +658,16 @@ impl AuthorityStanding {
             // An epoch this node cannot recover from: it rejoins the shard
             // at it, as a reconnecting fenced node and a `NoQuorum` node's
             // recovery do, rather than win again and meet it again.
-            Err(AuthorityError::EpochConflict {
-                current: Some(held),
+            Err(AuthorityError::ShardConflict {
+                current:
+                    Some(ShardRecord {
+                        recovery_epoch: held,
+                        ..
+                    }),
             }) if cannot_recover_from(view.own_epoch, held) => {
                 vec![AuthorityVerdict::LoseQuorum, AuthorityVerdict::RejoinAt(held)]
             }
-            Err(AuthorityError::EpochConflict { .. }) => {
+            Err(AuthorityError::ShardConflict { .. }) => {
                 if view.in_office() {
                     vec![AuthorityVerdict::SuspectAgain]
                 } else {

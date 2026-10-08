@@ -22,8 +22,8 @@ use tokio::time::timeout;
 
 use crate::support::deadline::within_deadline;
 use crate::support::worker::{
-    PER_PEER_TIMEOUT, RunningWorker, TEST_TIMEOUT, poll_until, warmed_up_in_memory_authority,
-    with_in_memory_authority, worker_config,
+    PER_PEER_TIMEOUT, RunningWorker, TEST_TIMEOUT, name_of, poll_until,
+    warmed_up_in_memory_authority, with_in_memory_authority, worker_config,
 };
 
 const SHARD: &str = "shard-1";
@@ -134,7 +134,7 @@ async fn three_workers_that_join_through_one_seed_register_and_are_admitted() {
         for joiner in joiners {
             poll_until("the joiner registered at its listen address", || {
                 authority
-                    .live_registrations(&shard())
+                    .live_registrations(&name_of(&shard()), &shard())
                     .expect("the in-memory authority is always reachable")
                     .addresses()
                     .get(&joiner.id)

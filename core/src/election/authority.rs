@@ -7,9 +7,9 @@
 //! at once.
 
 use crate::coordination_authority::{
-    AuthorityError, CoordinationAuthority, LiveRegistrations, RecoveryEpoch,
+    AuthorityError, CoordinationAuthority, LiveRegistrations, RecoveryEpoch, ShardRecord,
 };
-use crate::protocol::ids::{ShardId, WorkerId};
+use crate::protocol::ids::{ShardId, ShardName, WorkerId};
 use crate::time::{Duration, Instant};
 
 /// How long a node with a coordination authority expects its registration
@@ -208,32 +208,41 @@ impl AuthorityCall {
         }
     }
 
-    /// Makes this call on `authority` for `shard_id` and `worker_id`, whose
-    /// registration names `address`, and returns the reply to hand back to
-    /// the node that asked for it.
+    /// Makes this call on `authority` for the shard `shard_id` under `name`
+    /// and for `worker_id`, whose registration names `address`, and returns
+    /// the reply to hand back to the node that asked for it. The node speaks
+    /// in epochs; this is where an epoch becomes a record of `shard_id`, and
+    /// a record back its epoch.
     pub fn perform(
         &self,
         authority: &dyn CoordinationAuthority,
+        name: &ShardName,
         shard_id: &ShardId,
         worker_id: &WorkerId,
         address: &str,
     ) -> AuthorityReply {
         let (token, sent_at) = (self.token, self.sent_at);
+        let record = |recovery_epoch| ShardRecord {
+            shard_id: shard_id.clone(),
+            recovery_epoch,
+        };
         match self.request {
             AuthorityRequest::Register => AuthorityReply::Registered {
                 token,
                 sent_at,
-                result: authority.register(shard_id, worker_id, address),
+                result: authority.register(name, shard_id, worker_id, address),
             },
             AuthorityRequest::ReadLiveRegistrations => AuthorityReply::LiveRegistrations {
                 token,
                 sent_at,
-                result: authority.live_registrations(shard_id),
+                result: authority.live_registrations(name, shard_id),
             },
             AuthorityRequest::ReadRecoveryEpoch => AuthorityReply::RecoveryEpoch {
                 token,
                 sent_at,
-                result: authority.read_recovery_epoch(shard_id),
+                result: authority
+                    .read_shard(name)
+                    .map(|held| held.map(|held| held.recovery_epoch)),
             },
             AuthorityRequest::SwapRecoveryEpoch { expected, new } => {
                 AuthorityReply::RecoveryEpochSwapped {
@@ -241,14 +250,18 @@ impl AuthorityCall {
                     expected,
                     new,
                     sent_at,
-                    result: authority.compare_and_swap_recovery_epoch(shard_id, expected, new),
+                    result: authority.compare_and_swap_shard(
+                        name,
+                        expected.map(record).as_ref(),
+                        &record(new),
+                    ),
                 }
             }
             AuthorityRequest::AcquireFence { recovery_epoch } => AuthorityReply::Fence {
                 token,
                 recovery_epoch,
                 sent_at,
-                result: authority.acquire_fence(shard_id, worker_id, recovery_epoch),
+                result: authority.acquire_fence(name, worker_id, &record(recovery_epoch)),
             },
         }
     }

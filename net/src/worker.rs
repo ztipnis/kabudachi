@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode};
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::ids::{IncarnationId, ShardId, ShardName, Uuid7Ids, WorkerId};
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::RealClock;
@@ -247,6 +247,7 @@ impl Worker {
         let mut authority = config.authority.as_ref().map(|authority| {
             AuthorityClient::new(
                 &net,
+                ShardName::new(config.shard_id.as_str()),
                 config.shard_id.clone(),
                 Arc::clone(&authority.authority),
                 authority.timings,

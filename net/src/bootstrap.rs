@@ -75,7 +75,7 @@
 //!
 //! That makes it safe to treat "epoch exists, no one registered" the same as
 //! "no epoch at all": re-found the shard one epoch on, of a new lineage
-//! (`compare_and_swap_recovery_epoch(Some(e), e + 1)`) rather than wait
+//! (`compare_and_swap_shard(Some(e), e + 1)`) rather than wait
 //! forever for workers that are never coming back — the authority still lets
 //! only one bootstrapper win, and any worker still holding the fence from the
 //! epoch being replaced (impossible by the argument above, but the authority
@@ -142,7 +142,7 @@ use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::{
-    AuthorityError, LineageSource, RecoveryEpoch, Uuid7Lineages,
+    AuthorityError, LineageSource, RecoveryEpoch, ShardRecord, Uuid7Lineages,
 };
 use kabudachi_core::election::{AuthorityReply, AuthorityRequest, Entry, JoinFloor};
 use kabudachi_core::protocol::ids::{ShardId, WorkerId};
@@ -529,8 +529,12 @@ pub(crate) fn decide_round(
             // A conflict here cannot itself report the epoch as absent: the
             // create-if-absent's own `expected` was `None`, so a live
             // conflict's `current` is always `Some`.
-            Err(AuthorityError::EpochConflict {
-                current: Some(epoch),
+            Err(AuthorityError::ShardConflict {
+                current:
+                    Some(ShardRecord {
+                        recovery_epoch: epoch,
+                        ..
+                    }),
             }) => Decision::Ask {
                 request: AuthorityRequest::ReadLiveRegistrations,
                 then: Stage::ReReading {

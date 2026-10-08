@@ -1,16 +1,17 @@
-//! The external coordination service: it holds each
-//! worker's TTL registration, each shard's recovery epoch and each shard's
-//! recovery fence. Workers consult it for bootstrap, forced recovery and
-//! fencing; it is off the hot path.
+//! The external coordination service: it holds each worker's TTL
+//! registration, each shard name's shard record (which incarnation lives
+//! under it, and its recovery epoch), its recovery fence and its leader hint.
+//! Workers consult it for bootstrap, forced recovery and fencing; it is off
+//! the hot path.
 
 use std::collections::BTreeMap;
 
-use crate::protocol::ids::{ShardId, WorkerId};
+use crate::protocol::ids::{ShardId, ShardName, WorkerId};
 use crate::time::Duration;
 
 /// One coordination service shared by every worker of a shard. Every
-/// registration and fence it grants lasts one TTL, the same TTL it reports
-/// back, unless renewed.
+/// registration, fence and hint it grants lasts one TTL, the same TTL it
+/// reports back, unless renewed.
 ///
 /// Calls block, and a worker makes them off its event loop, at most one of
 /// each kind at a time. An implementation over a remote service must bound
@@ -19,51 +20,61 @@ use crate::time::Duration;
 /// passes: a call that hangs holds up that worker's next call of the same
 /// kind, and a worker that cannot renew fences itself.
 pub trait CoordinationAuthority {
-    /// Registers `worker_id` at `address` for the shard, or renews an
-    /// existing registration (replacing its address), and returns the
-    /// registration TTL. The registration lapses one TTL from now unless it
-    /// is renewed before then.
+    /// The TTL every registration, fence, hint and warm-up lasts; `register`
+    /// and `acquire_fence` return exactly it. Every worker of a shard derives
+    /// its renewal timing from it.
+    fn ttl(&self) -> Duration;
+
+    /// Registers `worker_id` at `address` under `name`, tagged `shard_id`, or
+    /// renews an existing registration (replacing its address and id), and
+    /// returns the registration TTL. The registration lapses one TTL from now
+    /// unless it is renewed before then.
     fn register(
         &self,
+        name: &ShardName,
         shard_id: &ShardId,
         worker_id: &WorkerId,
         address: &str,
     ) -> Result<Duration, AuthorityError>;
 
-    /// The shard's unexpired registrations. See [`LiveRegistrations`] for why
-    /// their count may not be authoritative yet.
-    fn live_registrations(&self, shard_id: &ShardId) -> Result<LiveRegistrations, AuthorityError>;
+    /// The unexpired registrations under `name`. Only registrations tagged
+    /// `shard_id` are listed; a worker has one registration under a name,
+    /// tagged with the id it last registered. See [`LiveRegistrations`] for
+    /// why their count may not be authoritative yet.
+    fn live_registrations(
+        &self,
+        name: &ShardName,
+        shard_id: &ShardId,
+    ) -> Result<LiveRegistrations, AuthorityError>;
 
-    /// The shard's recovery epoch, or `None` when the shard has none: it was
+    /// The record under `name`, or `None` when the name has none: it was
     /// never created, or the authority lost it (a flush).
-    fn read_recovery_epoch(
-        &self,
-        shard_id: &ShardId,
-    ) -> Result<Option<RecoveryEpoch>, AuthorityError>;
+    fn read_shard(&self, name: &ShardName) -> Result<Option<ShardRecord>, AuthorityError>;
 
-    /// Sets the shard's recovery epoch to `new`, but only if it is currently
-    /// `expected`, number and lineage alike. `expected = None` means "the
-    /// epoch is missing", which makes this a create-if-absent: of several
-    /// workers racing to found a shard, exactly one succeeds. On a mismatch
-    /// it returns [`AuthorityError::EpochConflict`] carrying the actual
-    /// epoch, and changes nothing.
-    fn compare_and_swap_recovery_epoch(
+    /// Sets the record under `name` to `new`, but only if it is currently
+    /// `expected`, shard id, number and lineage alike. `expected = None` means
+    /// "the record is missing", which makes this a create-if-absent: of
+    /// several workers racing to found a shard, exactly one succeeds.
+    /// `expected` and the current record are compared field by field; on a
+    /// mismatch it returns [`AuthorityError::ShardConflict`] carrying the
+    /// current record, and changes nothing.
+    fn compare_and_swap_shard(
         &self,
-        shard_id: &ShardId,
-        expected: Option<RecoveryEpoch>,
-        new: RecoveryEpoch,
+        name: &ShardName,
+        expected: Option<&ShardRecord>,
+        new: &ShardRecord,
     ) -> Result<(), AuthorityError>;
 
-    /// Acquires the shard's recovery fence for `holder`, or renews it if
-    /// `holder` already holds it, and returns the fence TTL. A leader must
-    /// hold the fence to act.
+    /// Acquires the fence under `name` for `holder`, or renews it if `holder`
+    /// already holds it, and returns the fence TTL. A leader must hold the
+    /// fence to act.
     ///
-    /// `recovery_epoch` must be the shard's current epoch, number and
-    /// lineage alike; otherwise this returns [`AuthorityError::EpochConflict`],
+    /// `record` must be the current record under `name`, shard id, number and
+    /// lineage alike; otherwise this returns [`AuthorityError::ShardConflict`],
     /// so a leader from before a forced recovery, or of a shard founded
     /// afresh after the authority lost its data, cannot renew. While another holder's fence is
     /// unexpired, it returns [`AuthorityError::FenceHeld`] with the time left
-    /// on that fence, whatever epoch that fence was taken at: a new leader
+    /// on that fence, whatever record that fence was taken at: a new leader
     /// waits the old one out.
     ///
     /// A fence taken before the authority lost its data is lost with the
@@ -85,10 +96,21 @@ pub trait CoordinationAuthority {
     /// leader lease instead.
     fn acquire_fence(
         &self,
-        shard_id: &ShardId,
+        name: &ShardName,
         holder: &WorkerId,
-        recovery_epoch: RecoveryEpoch,
+        record: &ShardRecord,
     ) -> Result<Duration, AuthorityError>;
+
+    /// Replaces the name's hint. It lapses one TTL after this write and is
+    /// lost with the authority's data.
+    fn publish_leader_hint(
+        &self,
+        name: &ShardName,
+        hint: &LeaderHint,
+    ) -> Result<(), AuthorityError>;
+
+    /// The unexpired hint, or `None`.
+    fn read_leader_hint(&self, name: &ShardName) -> Result<Option<LeaderHint>, AuthorityError>;
 }
 
 /// A shard's recovery epoch as the authority holds it: its number, which
@@ -225,12 +247,12 @@ impl LiveRegistrations {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthorityError {
     #[error("coordination authority is unavailable")]
     Unavailable,
-    #[error("recovery epoch conflict: {}", describe_epoch(.current))]
-    EpochConflict { current: Option<RecoveryEpoch> },
+    #[error("shard record conflict: {}", describe_record(.current))]
+    ShardConflict { current: Option<ShardRecord> },
     #[error(
         "recovery fence is held by another worker for {} more ms",
         .remaining.as_ticks()
@@ -238,9 +260,13 @@ pub enum AuthorityError {
     FenceHeld { remaining: Duration },
 }
 
-fn describe_epoch(current: &Option<RecoveryEpoch>) -> String {
+fn describe_record(current: &Option<ShardRecord>) -> String {
     match current {
-        Some(epoch) => format!("the authority is at epoch {epoch}"),
-        None => "the authority has no recovery epoch".to_string(),
+        Some(record) => format!(
+            "the authority holds shard {} at epoch {}",
+            record.shard_id.as_str(),
+            record.recovery_epoch
+        ),
+        None => "the authority holds no record for the shard".to_string(),
     }
 }

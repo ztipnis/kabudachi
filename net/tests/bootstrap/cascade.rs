@@ -9,6 +9,7 @@
 //! auto-advance until it is released, so a test that holds one moves time by
 //! hand. Every address a worker could ask has nothing listening on it.
 
+use crate::support::worker::{name_of, read_epoch, swap_epoch};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,7 +74,13 @@ impl Worker {
             ttl: TickDuration::from_ticks(call_timeout.as_millis() as u64),
         };
         let client = authority.map(|authority| {
-            AuthorityClient::new(&net, shard.clone(), Arc::new(authority.clone()), timings)
+            AuthorityClient::new(
+                &net,
+                name_of(&shard),
+                shard.clone(),
+                Arc::new(authority.clone()),
+                timings,
+            )
         });
         Worker {
             me: net.local_worker_id(),
@@ -115,15 +122,18 @@ async fn warm_authority(ttl: Duration) -> (FaultingAuthority<TokioClock>, TokioC
 }
 
 fn register(authority: &FaultingAuthority<TokioClock>, worker: &str, at: &str) {
-    authority
-        .register(&ShardId::new("shard-1"), &WorkerId::new(worker), at)
+    authority.register(
+        &name_of(&ShardId::new("shard-1")),
+        &ShardId::new("shard-1"),
+        &WorkerId::new(worker),
+        at,
+    )
         .expect("the authority is reachable");
 }
 
 fn epoch_number(authority: &FaultingAuthority<TokioClock>) -> Option<u64> {
-    authority
-        .for_another_worker()
-        .read_recovery_epoch(&ShardId::new("shard-1"))
+    read_epoch(&authority
+        .for_another_worker(), &ShardId::new("shard-1"))
         .expect("the authority is reachable")
         .map(|epoch| epoch.number)
 }
@@ -221,9 +231,10 @@ async fn losing_the_create_to_an_unseen_rival_does_not_re_found_the_shard() {
             () = async {
                 wait_until_held(&authority, CallKind::SwapRecoveryEpoch).await;
                 let shard = ShardId::new("shard-1");
-                rival.register(&shard, &WorkerId::new("rival"), "not a multiaddr").unwrap();
                 rival
-                    .compare_and_swap_recovery_epoch(&shard, None, RecoveryEpoch::founding(0, &mut Uuid7Lineages))
+                    .register(&name_of(&shard), &shard, &WorkerId::new("rival"), "not a multiaddr")
+                    .unwrap();
+                swap_epoch(&rival, &shard, None, RecoveryEpoch::founding(0, &mut Uuid7Lineages))
                     .unwrap();
                 authority.release(CallKind::SwapRecoveryEpoch);
             } => {}
@@ -324,12 +335,12 @@ async fn a_listing_read_that_never_returns_is_given_up_and_asked_again() {
 async fn an_ownerless_epoch_is_re_founded_one_epoch_on() {
     within_deadline(async {
         let (authority, clock) = warm_authority(Duration::from_secs(5)).await;
-        authority
-            .compare_and_swap_recovery_epoch(
-                &ShardId::new("shard-1"),
-                None,
-                RecoveryEpoch::founding(3, &mut Uuid7Lineages),
-            )
+        swap_epoch(
+            &authority,
+            &ShardId::new("shard-1"),
+            None,
+            RecoveryEpoch::founding(3, &mut Uuid7Lineages),
+        )
             .expect("creating the epoch directly succeeds against a warm, empty authority");
         let mut worker = Worker::new(Some(&authority), clock, &[]);
 
