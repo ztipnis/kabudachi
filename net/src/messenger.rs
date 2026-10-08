@@ -674,7 +674,7 @@ impl Net {
     /// to it through Identify, which then names no listen address. For a node
     /// behind NAT or bound to a wildcard. Send before listening and before
     /// any connection, so no listen address is ever given.
-    pub fn set_external_address(&self, address: Multiaddr) {
+    pub(crate) fn set_external_address(&self, address: Multiaddr) {
         let _ = self.commands.send(Command::SetExternalAddress { address });
     }
 

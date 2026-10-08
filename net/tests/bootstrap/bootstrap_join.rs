@@ -330,10 +330,13 @@ async fn a_worker_given_an_external_address_registers_hints_and_points_joiners_a
 
         // Identify tells a connecting peer the external address and no listen
         // address. Which of several advertised addresses a peer takes is
-        // arbitrary, so several fresh peers must each take the external one.
+        // arbitrary (a coin flip between two addresses if the listen address
+        // were advertised too), and the peer book keeps only the one taken, so
+        // 14 fresh peers must each take the external one: a leak would pass
+        // all of them with odds below 1e-4.
         let peer: libp2p::PeerId = leader.id.as_str().parse().expect("a worker id is a peer id");
         let dial_address = listen.clone().with(Protocol::P2p(peer));
-        let askers: Vec<Net> = (0..6).map(|_| Net::new()).collect();
+        let askers: Vec<Net> = (0..14).map(|_| Net::new()).collect();
         for asker in &askers {
             asker.dial(dial_address.clone());
         }

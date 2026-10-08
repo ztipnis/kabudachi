@@ -1178,7 +1178,7 @@ LEADER_SUSPECT                        DRAINING
            of the shard ----------------------------> STOPPED (shard ABANDONED)
 ```
 
-A candidate that loses its vote, or an initiator that abandoned its call for a better one or finds its term already holds a vote or a leader, returns to `LEADER_SUSPECT` and tries again at a later term after a fresh jittered suspicion timeout; a call short of quorum at its deadline goes to `NO_QUORUM`. A `CANDIDATE` waiting out the fence that the authority refuses for good goes back to `NO_QUORUM`. A leader asked to drain goes to `DRAINING`. With an authority configured, a `LEADER_SUSPECT` member first reads the authority's shard record and starts its roll call only if the read names its own epoch (or the authority holds none); if it names another epoch it rejoins at that epoch. A worker that finds the record naming another incarnation of its shard (another `ShardId` under its name) stops, its shard abandoned, from any state that reads the record: `BOOTSTRAPPING`, `JOINING`, `LEADER_SUSPECT`, `NO_QUORUM`, `CANDIDATE`, `LEADER_RECONCILING`, `LEADER` and `FENCED`. A worker in any state from `ACTIVE` through `LEADER`, `NO_QUORUM` included, becomes `FENCED` if it fails to renew its authority registration. A leader's grant to schedule ends at the earlier of its recovery fence and its quorum-contact lease.
+A candidate that loses its vote, or an initiator that abandoned its call for a better one or finds its term already holds a vote or a leader, returns to `LEADER_SUSPECT` and tries again at a later term after a fresh jittered suspicion timeout; a call short of quorum at its deadline goes to `NO_QUORUM`. A `CANDIDATE` waiting out the fence that the authority refuses for good goes back to `NO_QUORUM`. A leader asked to drain goes to `DRAINING`. With an authority configured, a `LEADER_SUSPECT` member first reads the authority's shard record and starts its roll call only if the read names its own epoch (or the authority holds none); if it names another epoch it rejoins at that epoch. A worker that finds the record naming another incarnation of its shard (another `ShardId` under its name) stops, its shard abandoned, from any state that reads the record: a rejoining node in `BOOTSTRAPPING` or `JOINING`, `LEADER_SUSPECT`, `NO_QUORUM`, `CANDIDATE`, `LEADER_RECONCILING`, `LEADER` and `FENCED`. A worker in any state from `ACTIVE` through `LEADER`, `NO_QUORUM` included, becomes `FENCED` if it fails to renew its authority registration. A leader's grant to schedule ends at the earlier of its recovery fence and its quorum-contact lease.
 
 ---
 
@@ -2973,6 +2973,8 @@ Implemented:
 - the shared-instance provider constraints (§9.1).
 
 A Python-hosted networked worker is Phase 5; the task-to-shard cache, the client shard map and `ShardLostError` are Phase 8.
+
+Open: two Redis test flakes were seen once each and never reproduced or explained. `//redis_authority:redis_authority_integration_test` hung after its tests had passed, before the port-ownership fixes; and a cluster test's first call once answered `Unavailable`. The port-ownership fixes may have removed both. If either recurs, find the cause before rerunning.
 
 ### Phase 5: Python subprocess execution
 

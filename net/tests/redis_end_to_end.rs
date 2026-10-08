@@ -152,14 +152,12 @@ async fn three_workers_found_one_shard_cold_and_keep_it_through_a_flush_and_a_re
         server.shutdown_save();
         server.restart();
         let fresh = probe(&server);
-        // Its first answer, before the workers have noticed anything.
-        let mut first = None;
-        poll_until("the restarted server answers", || {
-            first = fresh.live_registrations(&name, &id).ok();
-            first.is_some()
-        })
-        .await;
-        assert_eq!(first.expect("answered").authoritative_count(), None);
+        // Its very first call succeeds, so the count it withholds comes from
+        // the changed run id and not from an outage this client saw.
+        let first = fresh
+            .live_registrations(&name, &id)
+            .expect("the first call after the restart succeeded");
+        assert_eq!(first.authoritative_count(), None);
         let outcome = fresh.acquire_fence(&name, &leader, &before);
         assert!(
             matches!(outcome, Err(AuthorityError::FenceHeld { .. })),
@@ -179,8 +177,8 @@ async fn three_workers_found_one_shard_cold_and_keep_it_through_a_flush_and_a_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_shard_that_loses_quorum_while_its_authority_is_flushed_is_abandoned_and_a_new_one_founded()
-{
+async fn a_shard_that_loses_quorum_while_its_authority_is_flushed_is_abandoned_and_a_new_one_founded(
+) {
     within_deadline(async {
         let server = ValkeyServer::start(ServerMode::Standalone);
         let (first, second, third) = tokio::join!(
