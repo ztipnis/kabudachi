@@ -16,24 +16,22 @@ use crate::time::{Duration, Instant};
 /// and, while it leads, its recovery fence to last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorityTimings {
-    /// The TTL the node expects the authority to grant. The node renews its
-    /// registration, and while it leads its fence, every third of it, and
-    /// treats each as lapsing a tenth of it early, for clock drift, or
-    /// earlier still when the authority grants a shorter TTL. Every worker
-    /// of a shard must use the same value: a worker that renews less often
-    /// than the authority expires registrations drops out of its count.
+    /// The TTL the authority grants (see [`Self::from_authority`]). The node
+    /// renews its registration, and while it leads its fence, every third of
+    /// it, and treats each as lapsing a tenth of it early, for clock drift,
+    /// or earlier still when the authority grants a shorter TTL. Every worker
+    /// of a shard takes it from the same authority: a worker that renews
+    /// less often than the authority expires registrations drops out of its
+    /// count.
     pub ttl: Duration,
 }
 
 impl AuthorityTimings {
-    /// The default TTL: 30 s, renewed every 10 s.
-    pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
-}
-
-impl Default for AuthorityTimings {
-    fn default() -> Self {
+    /// The timings a node keeps by on `authority`: its TTL is the one the
+    /// authority grants, so the two cannot differ.
+    pub fn from_authority(authority: &dyn CoordinationAuthority) -> Self {
         AuthorityTimings {
-            ttl: Self::DEFAULT_TTL,
+            ttl: authority.ttl(),
         }
     }
 }

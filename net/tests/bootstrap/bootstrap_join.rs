@@ -74,9 +74,7 @@ async fn spawn_worker(
 ) -> RunningWorker {
     let config = worker_config(shard(), bind, timings(), seeds);
     let config = match authority {
-        Some(authority) => {
-            with_in_memory_authority(config, authority, Duration::from_millis(AUTHORITY_TTL_MS))
-        }
+        Some(authority) => with_in_memory_authority(config, authority),
         None => config,
     };
     crate::support::worker::spawn_worker(config).await

@@ -10,7 +10,7 @@ use std::time::Duration as StdDuration;
 use kabudachi_core::coordination_authority::{
     AuthorityError, CoordinationAuthority, RecoveryEpoch, ShardRecord,
 };
-use kabudachi_core::election::{AuthorityTimings, ElectionTimings, WorkerNode};
+use kabudachi_core::election::{ElectionTimings, WorkerNode};
 use kabudachi_core::in_memory_authority::InMemoryAuthority;
 use kabudachi_core::protocol::ids::{ShardId, ShardName, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
@@ -75,22 +75,22 @@ pub fn worker_config(
     timings: ElectionTimings,
     seeds: Vec<Multiaddr>,
 ) -> WorkerConfig {
-    WorkerConfig::new(shard, bind.parse().expect("a valid multiaddr"), timings)
-        .with_seeds(seeds)
-        .with_join_peer_timeout(PER_PEER_TIMEOUT)
-        .with_retry_interval(RETRY_INTERVAL)
+    WorkerConfig::new(
+        name_of(&shard),
+        bind.parse().expect("a valid multiaddr"),
+        timings,
+    )
+    .with_seeds(seeds)
+    .with_join_peer_timeout(PER_PEER_TIMEOUT)
+    .with_retry_interval(RETRY_INTERVAL)
 }
 
-/// `config` with `authority` as its coordination authority, granting `ttl`.
+/// `config` with `authority` as its coordination authority.
 pub fn with_in_memory_authority(
     config: WorkerConfig,
     authority: InMemoryAuthority<RealClock>,
-    ttl: Duration,
 ) -> WorkerConfig {
-    config.with_authority(AuthorityConfig {
-        authority: Arc::new(authority),
-        timings: AuthorityTimings { ttl },
-    })
+    config.with_authority(AuthorityConfig::new(Arc::new(authority)))
 }
 
 /// What a worker's driver last showed of its node.
