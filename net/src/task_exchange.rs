@@ -127,14 +127,6 @@ impl Net {
         run: TaskRunId,
         result_digest: Digest,
     ) -> Result<TaskResponse, TaskFailure> {
-        // From the digest in hand, so that a ledger entry never depends on
-        // decoding it again.
-        self.claimed.set(
-            &run,
-            HeldRun::Completed {
-                result_digest: result_digest.clone(),
-            },
-        );
         self.report(leader, task_request::Request::Completed(ReportCompleted {
             task_run_id: Some(run.into()),
             result_digest: Some(result_digest.into()),

@@ -631,7 +631,12 @@ fn drive_executor<C: Clock, I: IdGenerator>(
                 executing.send_report(leader.clone(), request);
             }
         }
+        // While its own scheduler cannot grant yet (it holds no grant, or
+        // reconciles), a claim of its own is not made: it would be refused,
+        // and back off as one that found nothing.
+        let can_claim = !leads || (scheduler.is_leader() && scheduler.reconciling().is_none());
         if node.has_contact_floor()
+            && can_claim
             && let Some(places) = executing.places_to_claim()
         {
             if leads {

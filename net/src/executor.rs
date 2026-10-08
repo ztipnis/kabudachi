@@ -343,17 +343,22 @@ impl<'n> Executing<'n> {
     pub(crate) fn own_settled(&mut self, settled: Settled<OwnAnswer>) {
         match settled {
             Settled::Released(OwnAnswer::Claim { response, reserved }) => {
-                let claims = match response.result {
-                    Some(claim_response::Result::Batch(batch)) => batch.claims,
-                    _ => Vec::new(),
-                };
+                let claims = granted(response);
                 for claim in &claims {
                     self.net.claimed_runs().claimed(claim.clone());
                 }
                 self.own_claim = None;
                 self.claimed(reserved, claims);
             }
-            Settled::NotLeader(OwnAnswer::Claim { reserved, .. }) => {
+            Settled::NotLeader(OwnAnswer::Claim { response, reserved }) => {
+                // Its own scheduler granted these, but the grant was never
+                // stored: none is handed over, and each is reported lost so
+                // whichever leader decides it replays it.
+                for claim in granted(response) {
+                    if let Some(run) = claim.task_run_id {
+                        self.queue_lost(run.into());
+                    }
+                }
                 self.own_claim = None;
                 self.claimed(reserved, Vec::new());
             }
@@ -518,6 +523,14 @@ impl Drop for Executing<'_> {
         let reserved = reserved + self.own_claim.take().unwrap_or(0);
         let held = &mut self.endpoint.held;
         held.credits = held.credits.saturating_add(reserved);
+    }
+}
+
+/// The claims `response` grants.
+fn granted(response: ClaimResponse) -> Vec<Claim> {
+    match response.result {
+        Some(claim_response::Result::Batch(batch)) => batch.claims,
+        _ => Vec::new(),
     }
 }
 
