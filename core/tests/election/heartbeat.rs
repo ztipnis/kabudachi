@@ -11,7 +11,7 @@ use kabudachi_core::election::{Entry, Identity, Input, WorkerNode};
 use kabudachi_core::protocol::ids::IncarnationId;
 use kabudachi_core::protocol::messages::{JoinResponse, LeaderHeartbeatAck, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::time::Duration;
+use kabudachi_core::time::{Clock, Duration};
 
 const SUSPECT_TIMEOUT: u64 = 10;
 
@@ -152,4 +152,41 @@ fn a_heartbeat_says_whether_its_sender_runs_compaction() {
     assert!(!says(&mut node), "off unless the worker says it runs compaction");
     node.set_runs_compaction(true);
     assert!(says(&mut node));
+}
+
+// A worker may start a TaskRun only once it can name the instant by which it
+// would have to abort it: once a leader holding a grant has vouched for
+// hearing one of its heartbeats, or while it leads alone, with a grant no
+// rival can outlast and so no leader that could replay its runs.
+#[test]
+fn a_worker_has_a_contact_floor_once_a_leader_vouches_for_hearing_it() {
+    let clock = FakeClock::new();
+    let mut node = joined_node(&clock);
+    assert!(!node.has_contact_floor(), "no leader has heard the joiner yet");
+
+    receive_ack(&mut node, ack_admitting(g0(), 1));
+    assert!(
+        !node.has_contact_floor(),
+        "an ack that echoes no heartbeat vouches for nothing"
+    );
+
+    receive_ack(
+        &mut node,
+        LeaderHeartbeatAck {
+            heartbeat_token: Some(clock.now().as_ticks()),
+            ..ack_admitting(g0(), 2)
+        },
+    );
+    assert!(node.has_contact_floor());
+
+    let mut alone = voter_node(&clock, &worker("alone"), 1, SUSPECT_TIMEOUT);
+    for _ in 0..1_000 {
+        if matches!(alone.state(), WorkerState::LeaderReconciling | WorkerState::Leader) {
+            break;
+        }
+        clock.advance(Duration::from_ticks(1));
+        let _ = tick(&mut alone);
+    }
+    assert!(matches!(alone.state(), WorkerState::LeaderReconciling | WorkerState::Leader));
+    assert!(alone.has_contact_floor(), "no other leader can replay a lone leader's runs");
 }

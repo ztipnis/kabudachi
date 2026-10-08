@@ -1188,6 +1188,16 @@ where
         self.runs_compaction = runs;
     }
 
+    /// Whether this worker may start a TaskRun now: only once it could abort
+    /// the run in time if it lost its leader's ear, which needs a leader to
+    /// have vouched for hearing it (an ack echoing one of its heartbeats), or
+    /// a grant of its own that ends, or a grant no rival can outlast. Before
+    /// then no abort deadline could be named for the run (see
+    /// [`Output::AbortDeadline`]).
+    pub fn has_contact_floor(&self) -> bool {
+        self.lease.has_contact_floor()
+    }
+
     /// The members that said in their latest heartbeat that they run
     /// compaction, this node itself if it does. Empty unless it holds office:
     /// only the leader's own roster is read.

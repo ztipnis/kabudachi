@@ -254,6 +254,18 @@ impl Lease {
         self.contact_floor = self.contact_floor.max(Some(floor));
     }
 
+    /// Whether this node can name an abort deadline for a TaskRun it starts
+    /// now: some leader holding a grant has vouched for hearing it, or it
+    /// holds a grant that ends (both give it a contact floor), or it holds a
+    /// grant that never ends, which only a leader alone in a quorum with no
+    /// authority does, and whose runs no rival can ever replay.
+    pub(crate) fn has_contact_floor(&self) -> bool {
+        let unbounded = self
+            .reported_grant
+            .is_some_and(|grant| matches!(grant.valid_until, LeaseEnd::Unbounded));
+        unbounded || self.effective_contact_floor().is_some()
+    }
+
     /// This node's contact floor, counting the end of the grant it holds,
     /// which no rival leader can precede. `None` while that grant is
     /// unbounded, since no rival can win at all, and before any leader has
