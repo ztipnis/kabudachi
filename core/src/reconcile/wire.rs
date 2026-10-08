@@ -7,6 +7,7 @@ use crate::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use crate::reconcile::{CoalescingKey, HeldKey, ReportPage, ReportedRun, ReportedState};
 use crate::scheduler::Claim;
 use crate::task_record::{RecordVersion, identify};
+use crate::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("a reconciliation report this worker cannot read")]
@@ -19,6 +20,7 @@ impl From<Claim> for generated::Claim {
             task_run_id: Some(claim.task_run_id.into()),
             attempt_number: claim.attempt_number,
             chain: claim.chain,
+            reconnect_timeout_ms: claim.reconnect_timeout.as_ticks(),
         }
     }
 }
@@ -36,6 +38,7 @@ impl TryFrom<&generated::Claim> for Claim {
                 .ok_or(MalformedReport)?,
             attempt_number: claim.attempt_number,
             chain: claim.chain.clone(),
+            reconnect_timeout: Duration::from_millis(claim.reconnect_timeout_ms),
         })
     }
 }

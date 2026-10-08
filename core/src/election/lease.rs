@@ -237,6 +237,7 @@ impl Lease {
             term: office.term,
             recovery_epoch: office.recovery_epoch,
             valid_until,
+            reconnect_timeout: timings.reconnect_timeout,
         })
     }
 

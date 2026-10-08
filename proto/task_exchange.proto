@@ -28,6 +28,9 @@ message SubmitTask {
   bool drop_oldest = 11;
   bool ephemeral = 12;
   bool non_retriable = 13;
+  // The task's own reconnect timeout (see `Task.reconnect_timeout_ms`); zero
+  // for the shard's.
+  uint64 reconnect_timeout_ms = 14;
 }
 
 message ReportStarted {

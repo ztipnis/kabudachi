@@ -258,6 +258,7 @@ fn term_1_grant(valid_until: LeaseEnd) -> LeadershipGrant {
         term: 1,
         recovery_epoch: kabudachi_core::coordination_authority::RecoveryEpoch::new(0, 0),
         valid_until,
+        reconnect_timeout: kabudachi_core::election::ElectionTimings::DEFAULT_RECONNECT_TIMEOUT,
     }
 }
 

@@ -141,6 +141,7 @@ pub fn grant_of(office: ReconcileTerm) -> LeadershipGrant {
         term: office.term,
         recovery_epoch: office.recovery_epoch,
         valid_until: LeaseEnd::Unbounded,
+        reconnect_timeout: kabudachi_core::election::ElectionTimings::DEFAULT_RECONNECT_TIMEOUT,
     }
 }
 

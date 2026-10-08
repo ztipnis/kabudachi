@@ -269,6 +269,11 @@ pub struct Submission {
     /// A non-retriable task's run that was running when its worker was lost
     /// is orphaned, not replayed.
     pub non_retriable: bool,
+    /// How long after its worker falls silent a run of the task may be
+    /// replayed, and so how long, less drift, a worker cut off from its
+    /// leader has to abort it. `None`, or zero, leaves it to the shard's
+    /// default (`ElectionTimings::reconnect_timeout`).
+    pub reconnect_timeout: Option<Duration>,
 }
 
 impl Submission {
@@ -291,6 +296,7 @@ impl Submission {
             drop_oldest: false,
             ephemeral: false,
             non_retriable: false,
+            reconnect_timeout: None,
         }
     }
 
@@ -338,6 +344,13 @@ impl Submission {
         self.expiry = Some(expiry);
         self
     }
+
+    /// A run of the task may be replayed `timeout` after its worker falls
+    /// silent, instead of after the shard's reconnect timeout.
+    pub fn with_reconnect_timeout(mut self, timeout: Duration) -> Self {
+        self.reconnect_timeout = Some(timeout);
+        self
+    }
 }
 
 /// A worker's permission to run a task: the Task itself and the run it now
@@ -348,6 +361,9 @@ pub struct Claim {
     pub task_run_id: TaskRunId,
     /// Which attempt this run is: 1 for the first, then one more per retry.
     pub attempt_number: u32,
+    /// The run's reconnect timeout: its task's own, or else the shard's
+    /// default from this leader's grant.
+    pub reconnect_timeout: Duration,
     /// The serialized inputs of the generations this one superseded, oldest
     /// first, for the worker to fold before running the task.
     /// Empty unless the task is a coalescing one that absorbed others.
@@ -595,6 +611,11 @@ pub struct LeadershipGrant {
     /// record this leader writes is versioned by.
     pub recovery_epoch: RecoveryEpoch,
     pub valid_until: LeaseEnd,
+    /// The shard's default reconnect timeout (`ElectionTimings::reconnect_timeout`),
+    /// for runs of tasks submitted without their own: what their claims tell
+    /// their workers, and how long after a worker falls silent they may be
+    /// replayed.
+    pub reconnect_timeout: Duration,
 }
 
 /// Why ending a continuation was refused.
@@ -1819,6 +1840,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             coalescing_key: submission.coalescing_key,
             ephemeral: submission.ephemeral,
             non_retriable: submission.non_retriable,
+            reconnect_timeout: submission.reconnect_timeout,
         });
         let first_state = if not_before.is_some() {
             TaskRunState::Scheduled
@@ -2089,8 +2111,23 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         Claim {
             task: self.tasks[task_id].clone(),
             attempt_number: self.runs[&run_id].attempt_number(),
+            reconnect_timeout: self.reconnect_timeout_of(task_id),
             task_run_id: run_id,
             chain,
+        }
+    }
+
+    /// How long after its worker falls silent `task_id`'s current run may be
+    /// replayed: the task's own reconnect timeout, or else the shard's, from
+    /// the grant. Asked only while leading, so a grant is held.
+    fn reconnect_timeout_of(&self, task_id: &TaskId) -> Duration {
+        match self.tasks[task_id].reconnect_timeout_ms {
+            0 => {
+                self.grant
+                    .expect("only a leader resolves a run's reconnect timeout, and a leader holds a grant")
+                    .reconnect_timeout
+            }
+            own => Duration::from_millis(own),
         }
     }
 

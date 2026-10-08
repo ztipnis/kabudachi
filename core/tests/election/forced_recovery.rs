@@ -563,6 +563,7 @@ fn a_leader_with_an_authority_acts_only_while_it_holds_the_fence() {
             term: 1,
             recovery_epoch: epoch(0),
             valid_until: LeaseEnd::At(driven.clock.now() + Duration::from_ticks(lasting_ticks())),
+            reconnect_timeout: kabudachi_core::election::ElectionTimings::DEFAULT_RECONNECT_TIMEOUT,
         })),
         "even a lone leader's grant ends with its fence"
     );

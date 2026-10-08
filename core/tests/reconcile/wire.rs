@@ -16,6 +16,7 @@ fn claim(run: &str) -> Claim {
         },
         task_run_id: TaskRunId::new(run),
         attempt_number: 2,
+        reconnect_timeout: kabudachi_core::election::ElectionTimings::DEFAULT_RECONNECT_TIMEOUT,
         chain: vec![b"absorbed".to_vec()],
     }
 }
