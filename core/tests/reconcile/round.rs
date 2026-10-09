@@ -65,6 +65,7 @@ fn running(task: &str, run: &str) -> ReportedRun {
             },
             task_run_id: TaskRunId::new(run),
             attempt_number: 1,
+            reconnect_timeout: kabudachi_core::election::ElectionTimings::DEFAULT_RECONNECT_TIMEOUT,
             chain: Vec::new(),
         },
         state: ReportedState::Running,

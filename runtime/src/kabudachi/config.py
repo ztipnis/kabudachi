@@ -5,7 +5,9 @@ the environment), then the task's own explicit setting. A task setting of
 `None` is a choice like any other; only `UNSET` means the task chose nothing.
 """
 
+import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from typing import Any, get_type_hints
@@ -63,8 +65,9 @@ class Settings:
     `__post_init__`. `KABUDACHI_<NAME>` in the environment can set it; a field
     of type `int` is read from the environment as a number, one of type
     `timedelta` as a number of seconds, a `bool` as true/false, yes/no, on/off
-    or 1/0, `imports` as a comma-separated list, and an `int | None` field as
-    a number; an empty value leaves `imports` or an `int | None` field unset.
+    or 1/0, `imports` as a comma-separated list, an `int | None` field as a
+    number, and `reconnect_timeouts` as `queue=seconds` pairs separated by
+    commas; an empty value leaves `imports` or an `int | None` field unset.
     """
 
     processes: int = field(default_factory=_one_per_cpu)
@@ -111,6 +114,14 @@ class Settings:
     """How long a task past its timeout has to stop once asked, before its
     run is failed and its body abandoned. `KABUDACHI_CANCEL_GRACE` gives it
     in seconds."""
+
+    reconnect_timeouts: Mapping[str, float] = field(default_factory=dict)
+    """Per queue, the seconds a run of a task sent there may go without its
+    worker being heard, past the time it takes to suspect a silent worker,
+    before the leader replays it, and so how long a worker cut off from its
+    leader has to stop it. A task's own `reconnect_timeout` wins; a queue not
+    named here uses the shard's. `KABUDACHI_RECONNECT_TIMEOUTS` gives it as
+    `queue=seconds` pairs separated by commas."""
 
     def __post_init__(self) -> None:
         # `True` is an int to Python, but never what someone meant by a count.
@@ -191,6 +202,21 @@ class Settings:
             )
         if not isinstance(self.queue, str) or not self.queue.strip():
             raise ValueError(f"queue must be a non-empty string, not {self.queue!r}")
+        if not isinstance(self.reconnect_timeouts, Mapping) or not all(
+            isinstance(queue, str) and queue.strip() and _positive_seconds(seconds)
+            for queue, seconds in self.reconnect_timeouts.items()
+        ):
+            raise ValueError(
+                "reconnect_timeouts must map queue names to positive numbers of seconds, "
+                f"not {self.reconnect_timeouts!r}"
+            )
+        # A copy, as a plain dict: a mapping the caller changes later changes
+        # nothing here, and the settings pickle into task processes.
+        object.__setattr__(
+            self,
+            "reconnect_timeouts",
+            {queue: float(seconds) for queue, seconds in self.reconnect_timeouts.items()},
+        )
 
     @classmethod
     def names(cls) -> tuple[str, ...]:
@@ -213,6 +239,33 @@ class Settings:
         return found
 
 
+def _positive_seconds(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and 0 < value <= timedelta.max.total_seconds()
+    except OverflowError:
+        return False
+
+
+def _queue_seconds(raw: str) -> dict[str, float]:
+    """`queue=seconds` pairs separated by commas, as a mapping. Raises
+    `ValueError` for a pair without `=`, seconds that are not a number, or
+    a queue named twice."""
+    pairs: dict[str, float] = {}
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        queue, separator, seconds = item.partition("=")
+        if not separator:
+            raise ValueError(raw)
+        queue = queue.strip()
+        if queue in pairs:
+            raise ValueError(raw)
+        pairs[queue] = float(seconds)
+    return pairs
+
+
 def _parse(value_type: Any, raw: str) -> Any:
     """An environment variable's text as a setting of `value_type`."""
     if value_type is int:
@@ -231,6 +284,8 @@ def _parse(value_type: Any, raw: str) -> Any:
         return modules or None  # an empty value is "not set", not "no modules"
     if value_type == int | None:
         return int(raw) if raw.strip() else None  # an empty value is "not set"
+    if value_type == Mapping[str, float]:
+        return _queue_seconds(raw)
     return raw
 
 
@@ -250,6 +305,9 @@ class Configuration:
         """
         configured = {**self._configured, **settings}
         validated = self._validate(configured)
+        if "reconnect_timeouts" in settings:
+            # A copy: a mapping the caller changes later changes nothing here.
+            configured["reconnect_timeouts"] = dict(validated.reconnect_timeouts)
         self._configured, self._settings = configured, validated
 
     def resolve(self, name: str, task_value: Any = UNSET) -> Any:
@@ -306,14 +364,17 @@ def configure(**settings: Any) -> None:
     timedelta a task process has to become ready, `queue`, the queue tasks
     are sent to unless they name their own, `result_ttl`, the seconds a
     finished task is kept, `cancel_grace`, the timedelta a task past its
-    timeout has to stop, and `memory_soft_limit` and `memory_hard_limit`, in
-    bytes of pending task input (past the soft one `group` and `map` pause,
-    past the hard one a submission raises `BackpressureError`);
-    `KABUDACHI_<NAME>` in the environment sets each too, below what is
-    configured here. A setting a task makes for itself always wins over
-    these. `concurrency`, `processes`, `imports`, `max_runs_per_process`,
-    `process_start_timeout`, the memory limits and `result_ttl` are read when
-    `run()` starts, so changing them during a run has no effect on that run.
+    timeout has to stop, `reconnect_timeouts`, the seconds a run of a task in
+    each named queue may go unheard past a suspicion before the leader
+    replays it (a task's own `reconnect_timeout` wins), and
+    `memory_soft_limit` and `memory_hard_limit`, in bytes of pending task
+    input (past the soft one `group` and `map` pause, past the hard one a
+    submission raises `BackpressureError`); `KABUDACHI_<NAME>` in the
+    environment sets each too, below what is configured here. A setting a
+    task makes for itself always wins over these. `concurrency`, `processes`,
+    `imports`, `max_runs_per_process`, `process_start_timeout`, the memory
+    limits and `result_ttl` are read when `run()` starts, so changing them
+    during a run has no effect on that run.
 
     Raises `ConfigurationError` for an unknown setting or an invalid value,
     and then applies none of the settings in this call.

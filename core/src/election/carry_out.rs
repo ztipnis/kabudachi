@@ -56,7 +56,7 @@ impl AuthorityPerformer for NoAuthority {
 /// Carries out `first`, a step `node` has just taken, and every step it
 /// leads to. For each step, in order:
 ///
-/// 1. its leadership grant and lost workers go to `scheduler`, so a grant
+/// 1. its leadership grant and worker silences go to `scheduler`, so a grant
 ///    the step withdraws is gone before anything the step sends can let
 ///    another leader act;
 /// 2. `observe` is called with the node, the scheduler, the input that
@@ -73,7 +73,7 @@ impl AuthorityPerformer for NoAuthority {
 /// `scheduler` must read the clock the node reads: a grant's lease ends at
 /// an instant of the node's clock, and the scheduler compares it with its
 /// own. The scheduler may carry any [`Observer`]: `carry_out` only hands the
-/// step's grant and lost workers to it.
+/// step's grant and worker silences to it.
 pub fn carry_out<C, I, O, S, P>(
     node: &mut WorkerNode<C>,
     first: Step,

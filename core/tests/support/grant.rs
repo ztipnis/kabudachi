@@ -10,5 +10,6 @@ pub fn unbounded_grant() -> LeadershipGrant {
         term: 1,
         recovery_epoch: RecoveryEpoch::new(0, 0),
         valid_until: LeaseEnd::Unbounded,
+        reconnect_timeout: kabudachi_core::election::ElectionTimings::DEFAULT_RECONNECT_TIMEOUT,
     }
 }

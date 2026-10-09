@@ -10,8 +10,8 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
-    CancelRejection, ClaimRejection, Completion, LeadershipGrant, LeaseEnd, LoseRejection,
-    ReportRejection, Submission,
+    CancelRejection, ClaimRejection, Completion, LeadershipGrant, LeaseEnd, ReportRejection,
+    Submission,
 };
 use kabudachi_core::time::{Clock, Duration};
 
@@ -128,10 +128,6 @@ fn every_decision_needs_a_live_grant_and_changes_nothing_without_one() {
             "cancel",
             s.cancel(&queued).err() == Some(CancelRejection::NotLeader),
         ),
-        (
-            "lose_worker",
-            s.lose_worker(&worker("w1")).err() == Some(LoseRejection::NotLeader),
-        ),
     ];
 
     for (decision, was_refused) in refused {
@@ -186,7 +182,7 @@ fn only_the_claiming_worker_may_report_and_only_in_order() {
         .scheduler
         .report_started(&worker("w3"), &lost)
         .unwrap();
-    fixture.scheduler.lose_worker(&worker("w3")).unwrap();
+    fixture.lose_silent(&worker("w3"));
     let other = Digest::blake3(b"different");
 
     let s = &mut fixture.scheduler;

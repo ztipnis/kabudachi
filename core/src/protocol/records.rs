@@ -39,6 +39,7 @@ pub struct NewTask {
     pub coalescing_key: Option<String>,
     pub ephemeral: bool,
     pub non_retriable: bool,
+    pub reconnect_timeout: Option<Duration>,
 }
 
 impl NewTask {
@@ -64,6 +65,7 @@ impl NewTask {
             coalescing_key: None,
             ephemeral: false,
             non_retriable: false,
+            reconnect_timeout: None,
         }
     }
 }
@@ -85,6 +87,7 @@ pub fn new_task(new: NewTask) -> Task {
         delay_millis: new.delay.map(|delay| delay.as_ticks()),
         expiry_millis: new.expiry.map(|expiry| expiry.as_ticks()),
         compacts: None,
+        reconnect_timeout_ms: new.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
     }
 }
 

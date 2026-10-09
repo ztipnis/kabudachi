@@ -37,6 +37,10 @@ message Claim {
   // The serialized inputs of coalescing generations this claim's run
   // absorbed, oldest first (see `core::scheduler::Claim::chain`).
   repeated bytes chain = 4;
+  // The run's reconnect timeout (see `Task.reconnect_timeout_ms`), resolved:
+  // the task's own, or else the shard default of the leader that granted the
+  // claim. Never zero.
+  uint64 reconnect_timeout_ms = 5;
 }
 
 // The reasons a leader refuses a claim: one enum value for each variant of

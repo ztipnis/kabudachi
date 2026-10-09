@@ -145,7 +145,13 @@ class TaskTable:
     # submitted
 
     def submit(
-        self, definition: TaskDefinition, payload: bytes, queue: str, options: SubmissionOptions
+        self,
+        definition: TaskDefinition,
+        payload: bytes,
+        queue: str,
+        options: SubmissionOptions,
+        *,
+        reconnect_timeout_ms: int | None = None,
     ) -> TaskHandle:
         """Refuses with `RunStoppedError` once stopping; otherwise submits to
         the native runtime and registers the handle under one lock, so a
@@ -165,6 +171,7 @@ class TaskTable:
                 delay_ms=options.delay_ms,
                 expires_in_ms=options.expires_in_ms,
                 drop_oldest=definition.drop_oldest,
+                reconnect_timeout_ms=reconnect_timeout_ms,
             )
             handle = TaskHandle(
                 task_id, self.cancel, self._run_callback, shard_id=self._runtime.shard_id()

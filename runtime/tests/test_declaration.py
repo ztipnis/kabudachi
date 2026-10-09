@@ -17,7 +17,7 @@ import pytest
 
 import kabudachi
 import proto_messages
-from kabudachi import ephemeral_task, task
+from kabudachi import coalescing_task, ephemeral_task, task
 from kabudachi import config as config_module
 from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
@@ -192,6 +192,10 @@ BAD_OPTIONS = (
     + [("timeout", bad, "timeout") for bad in [timedelta(0), timedelta(seconds=-1), 5, "5s", True]]
     + [("cancel_grace", bad, "cancel_grace") for bad in [timedelta(seconds=-1), 5, "5s", None, True]]
     + [("recycle_process", bad, "recycle_process") for bad in ["yes", 1, None]]
+    + [
+        ("reconnect_timeout", bad, "reconnect_timeout")
+        for bad in [timedelta(0), timedelta(seconds=-1), 5, "5s", True]
+    ]
 )
 
 
@@ -419,8 +423,6 @@ def add_greetings(older: Greeting, newer: Greeting) -> Greeting:
 
 
 def test_a_coalescing_task_is_registered_with_its_kind_and_reducer(fresh_registry):
-    from kabudachi import coalescing_task
-
     defined = coalescing_task(
         name="coalesce.merged", merge=add_greetings, drop_oldest=True
     )(charge_greeting).definition
@@ -444,8 +446,6 @@ def three_arguments(a: Greeting, b: Greeting, c: Greeting) -> Greeting:
 
 @pytest.mark.parametrize("bad", ["not callable", 3, one_argument, three_arguments])
 def test_a_reducer_must_be_a_function_of_two_arguments(fresh_registry, bad):
-    from kabudachi import coalescing_task
-
     with pytest.raises(TaskDefinitionError, match="merge"):
         coalescing_task(name="coalesce.bad", merge=bad)(charge_greeting)
 
@@ -692,6 +692,14 @@ def test_an_unknown_setting_is_refused():
         ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
         ({"max_runs_per_process": 0}, "max_runs_per_process"),
         ({"max_runs_per_process": True}, "max_runs_per_process"),
+        ({"reconnect_timeouts": {"slow": 0}}, "reconnect_timeouts"),
+        ({"reconnect_timeouts": {"slow": -1}}, "reconnect_timeouts"),
+        ({"reconnect_timeouts": {"slow": True}}, "reconnect_timeouts"),
+        ({"reconnect_timeouts": {"slow": "90"}}, "reconnect_timeouts"),
+        ({"reconnect_timeouts": {"slow": float("inf")}}, "reconnect_timeouts"),
+        ({"reconnect_timeouts": {"slow": 1e300}}, "reconnect_timeouts"),
+        ({"reconnect_timeouts": {"": 5}}, "reconnect_timeouts"),
+        ({"reconnect_timeouts": [("slow", 5)]}, "reconnect_timeouts"),
     ],
 )
 def test_an_invalid_value_is_refused_and_changes_nothing(settings, refused):
@@ -738,11 +746,19 @@ def test_configure_wins_over_the_environment(monkeypatch):
     assert configuration.resolve("concurrency") == 9
 
 
-def test_an_invalid_environment_value_is_a_configuration_error(monkeypatch):
-    monkeypatch.setenv("KABUDACHI_CONCURRENCY", "many")
+@pytest.mark.parametrize(
+    "setting, raw",
+    [
+        ("concurrency", "many"),
+        # A queue named twice: which of its timeouts was meant is unknowable.
+        ("reconnect_timeouts", "slow=90, slow=5"),
+    ],
+)
+def test_an_invalid_environment_value_is_a_configuration_error(monkeypatch, setting, raw):
+    monkeypatch.setenv("KABUDACHI_" + setting.upper(), raw)
 
-    with pytest.raises(ConfigurationError, match="concurrency"):
-        Configuration().resolve("concurrency")
+    with pytest.raises(ConfigurationError, match=setting):
+        Configuration().resolve(setting)
 
 
 def test_the_environment_is_read_when_a_setting_is_first_needed(monkeypatch):
@@ -807,15 +823,24 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_IMPORTS", "app.tasks, app.more_tasks")
     monkeypatch.setenv("KABUDACHI_PROCESS_START_TIMEOUT", "2.5")
     monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "50")
+    monkeypatch.setenv("KABUDACHI_RECONNECT_TIMEOUTS", "slow=90, gpu=2.5")
     configuration = Configuration()
 
-    names = ("processes", "concurrency", "imports", "process_start_timeout", "max_runs_per_process")
+    names = (
+        "processes",
+        "concurrency",
+        "imports",
+        "process_start_timeout",
+        "max_runs_per_process",
+        "reconnect_timeouts",
+    )
     assert [configuration.resolve(name) for name in names] == [
         2,
         40,
         ("app.tasks", "app.more_tasks"),
         timedelta(seconds=2.5),
         50,
+        {"slow": 90.0, "gpu": 2.5},
     ]
 
     monkeypatch.setenv("KABUDACHI_IMPORTS", "")
@@ -1007,3 +1032,19 @@ def test_a_second_hook_with_the_same_name_is_refused_with_how_to_tell_them_apart
         kabudachi.before_run(second)
 
     assert [hook.func for hook in lifecycle_module.default_hooks().all()] == [first]
+
+
+def test_every_kind_of_task_keeps_its_own_reconnect_timeout(fresh_registry):
+    durable = task(name="reconnect.durable", reconnect_timeout=timedelta(seconds=5))(charge)
+    best_effort = ephemeral_task(
+        name="reconnect.ephemeral", reconnect_timeout=timedelta(seconds=6)
+    )(charge)
+    replaced = coalescing_task(
+        name="reconnect.coalescing", reconnect_timeout=timedelta(seconds=7)
+    )(charge_greeting)
+
+    assert [declared.definition.reconnect_timeout for declared in (durable, best_effort, replaced)] == [
+        timedelta(seconds=5),
+        timedelta(seconds=6),
+        timedelta(seconds=7),
+    ]

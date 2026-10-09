@@ -336,3 +336,64 @@ fn a_stalled_leaders_scheduler_stops_leading_at_its_lease_end() {
     );
     assert_eq!(cluster.first_grant_overlap(), None);
 }
+
+// A follower holding a run whose reconnect timeout is far longer than the
+// shard's is cut off long enough for its leader to report it lost, then heard
+// again before that run's own deadline: it keeps the run, which is never
+// replayed.
+#[test]
+fn a_worker_reported_lost_and_heard_again_before_a_runs_own_deadline_keeps_that_run() {
+    const OWN: Duration = Duration::from_secs(90);
+    let suspect_timeout = Duration::from_secs(2);
+    let (mut cluster, leader) =
+        bootstrap_5_and_elect_leader(suspect_timeout, Duration::from_secs(1));
+    let followers: Vec<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != leader)
+        .collect();
+    let (cut_off, other) = (followers[0].clone(), followers[1].clone());
+
+    let scheduler = cluster.scheduler_mut(&leader);
+    let task = scheduler
+        .submit(
+            Submission::new(TaskDefinitionId::new("demo.task"), 1, b"payload".to_vec(), "default")
+                .with_reconnect_timeout(OWN),
+        )
+        .expect("the leader's scheduler leads");
+    let first = scheduler
+        .request_claim(&cut_off, &task)
+        .expect("the task is queued");
+    scheduler
+        .report_started(&cut_off, &first.task_run_id)
+        .expect("the claim is fresh");
+
+    let rest: BTreeSet<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != cut_off)
+        .collect();
+    cluster.record_steps();
+    cluster.partition(rest, [cut_off.clone()].into_iter().collect());
+    // Past the shard's reconnect timeout, so the leader reports the follower
+    // lost, but well short of the run's own.
+    let shard_window = suspect_timeout.as_ticks() + ElectionTimings::DEFAULT_RECONNECT_TIMEOUT.as_ticks();
+    cluster.advance(Duration::from_ticks(shard_window + suspect_timeout.as_ticks()));
+    reported_lost_at(&cluster.take_steps(), &leader, &cut_off);
+
+    // Heard again, and then past the instant the run's own timeout would have
+    // run out had the follower stayed silent.
+    cluster.heal();
+    cluster.advance(OWN);
+    assert_eq!(
+        cluster.states()[&leader],
+        WorkerState::Leader,
+        "setup invariant: the leader kept its quorum throughout"
+    );
+    assert_eq!(
+        cluster.scheduler_mut(&leader).request_claim(&other, &task),
+        Err(ClaimRejection::AlreadySelected),
+        "a worker heard again before its run's own deadline keeps the run"
+    );
+    assert_eq!(cluster.first_grant_overlap(), None);
+}

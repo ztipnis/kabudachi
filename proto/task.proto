@@ -77,6 +77,10 @@ message Task {
   // Set only on a compaction run's task: the front of a coalescing key's
   // waiting chain it folds.
   CompactionPrefix compacts = 16;
+  // How long after this task's worker falls silent (a suspicion timeout
+  // unheard) a run of it may be replayed, and so how long, less drift, its
+  // worker has to abort it once cut off. Zero: the shard's default.
+  uint64 reconnect_timeout_ms = 17;
 }
 
 // The front of a coalescing key's waiting chain a compaction run folds: each

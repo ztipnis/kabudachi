@@ -311,7 +311,7 @@ fn a_replay_that_would_outgrow_the_record_is_not_created_and_the_task_is_over() 
     let task = a_task_with_room_for_a_few_more_runs(&mut fixture, 0);
     let mut replays = 0;
     while let Ok(_claim) = fixture.scheduler.request_claim(&worker(), &task) {
-        let lost = fixture.scheduler.lose_worker(&worker()).unwrap();
+        let lost = fixture.lose_silent(&worker());
         if lost[0].replayed.is_none() {
             break;
         }

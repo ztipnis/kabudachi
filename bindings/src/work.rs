@@ -30,6 +30,10 @@ pub struct PyClaim {
     #[pyo3(get)]
     compaction: bool,
     chain: Vec<Vec<u8>>,
+    /// The run's reconnect timeout in milliseconds, resolved: its task's
+    /// own, or the shard's.
+    #[pyo3(get)]
+    reconnect_timeout_ms: u64,
 }
 
 #[pymethods]
@@ -64,6 +68,7 @@ impl From<Claim> for PyClaim {
             attempt_number: claim.attempt_number,
             compaction: claim.task.compacts.is_some(),
             chain: claim.chain,
+            reconnect_timeout_ms: claim.reconnect_timeout.as_ticks(),
         }
     }
 }

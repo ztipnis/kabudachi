@@ -100,6 +100,10 @@ pub(crate) struct LeaderOffice {
     /// The workers reported lost and not heard since: one that confirmed no
     /// ack stays here until it confirms one, its heartbeats notwithstanding.
     lost: BTreeSet<WorkerId>,
+    /// The workers reported silent and not heard since, each with the
+    /// instant from which the reconnect timeouts of the runs it holds count
+    /// (see [`Self::silence_changes`]).
+    reported_silence: BTreeMap<WorkerId, Instant>,
     /// The voters taken out for confirming no ack, each with the generation
     /// it last echoed before (see [`Self::may_remove_one_unconfirming`]).
     removed: Vec<(WorkerId, Option<Generation>)>,
@@ -139,6 +143,7 @@ impl LeaderOffice {
             confirmed_at: BTreeMap::new(),
             unconfirming: BTreeSet::new(),
             lost: BTreeSet::new(),
+            reported_silence: BTreeMap::new(),
             removed: Vec::new(),
             voters_at: BTreeMap::new(),
             pending_removals: BTreeSet::new(),
@@ -406,6 +411,24 @@ impl LeaderOffice {
         }
     }
 
+    /// `workers` answered this office's rebuild at `now`: each is heard, as
+    /// by a heartbeat, so it counts as silent again only from now, and a
+    /// silence reported for it is forgotten. A counted member that still
+    /// confirms no ack stays lost, and is silent again a suspicion timeout
+    /// after the first heartbeat heard from it since it was reported lost,
+    /// or after this answer if none has been heard since (see
+    /// [`Self::silent_from`]); it is reported silent at once if that has
+    /// passed.
+    pub(crate) fn heard_answers(&mut self, workers: BTreeSet<WorkerId>, me: &WorkerId, now: Instant) {
+        for worker in workers.into_iter().filter(|worker| worker != me) {
+            self.last_heard.insert(worker.clone(), now);
+            if !self.unconfirming.contains(&worker) {
+                self.lost.remove(&worker);
+            }
+            self.reported_silence.remove(&worker);
+        }
+    }
+
     /// When the office next has a worker to report lost: `lost_after`
     /// after it last heard from each, or, for a counted member whose
     /// heartbeats still arrive (heard within `still_heard` of `now`), after
@@ -431,6 +454,85 @@ impl LeaderOffice {
                 }
             })
             .min()
+    }
+
+    /// When `worker`'s runs' reconnect timeouts start to count: a suspicion
+    /// timeout after it was last heard or, for a counted member whose
+    /// heartbeats still arrive (one heard within `suspect_timeout` of `now`)
+    /// but which confirms no ack, after it last confirmed one, if that is
+    /// earlier, as [`Self::lost_by`] counts. `None` for a worker not tracked.
+    fn silent_from(&self, worker: &WorkerId, now: Instant, suspect_timeout: Duration) -> Option<Instant> {
+        let heard = *self.last_heard.get(worker)?;
+        let since = match self.confirmed_at.get(worker) {
+            Some(confirmed)
+                if self.roster.members().contains_key(worker) && now < heard + suspect_timeout =>
+            {
+                heard.min(*confirmed)
+            }
+            _ => heard,
+        };
+        Some(since + suspect_timeout)
+    }
+
+    /// The silences to report at `now`, each once: a worker newly silent,
+    /// with the instant its runs' reconnect timeouts count from (see
+    /// [`Self::silent_from`]), and `None` for one reported silent and heard
+    /// since. A worker reported lost and not heard since keeps its silence,
+    /// as does a lost member that still confirms no ack: nothing has ended
+    /// either silence. Such a member whose answer to a rebuild ended its
+    /// silence (see [`Self::heard_answers`]) is reported silent again. A
+    /// silence once reported keeps its instant until it ends, so a replay it
+    /// times never moves earlier.
+    pub(crate) fn silence_changes(
+        &mut self,
+        now: Instant,
+        suspect_timeout: Duration,
+    ) -> Vec<(WorkerId, Option<Instant>)> {
+        let mut changes = Vec::new();
+        for worker in self.last_heard.keys().filter(|worker| self.may_fall_silent(worker)) {
+            let silent = self
+                .silent_from(worker, now, suspect_timeout)
+                .filter(|from| *from <= now);
+            // A lost member's heartbeats do not end its silence: only a
+            // confirmation, which takes it out of `lost`, or an answer does.
+            let ends = !self.lost.contains(worker);
+            match (silent, self.reported_silence.contains_key(worker)) {
+                (Some(from), false) => changes.push((worker.clone(), Some(from))),
+                (None, true) if ends => changes.push((worker.clone(), None)),
+                _ => {}
+            }
+        }
+        for (worker, from) in &changes {
+            match from {
+                Some(from) => {
+                    self.reported_silence.insert(worker.clone(), *from);
+                }
+                None => {
+                    self.reported_silence.remove(worker);
+                }
+            }
+        }
+        changes
+    }
+
+    /// When the next worker not yet reported silent falls silent, while
+    /// that is ahead of `now`.
+    pub(crate) fn next_silent_at(&self, now: Instant, suspect_timeout: Duration) -> Option<Instant> {
+        self.last_heard
+            .keys()
+            .filter(|worker| {
+                self.may_fall_silent(worker) && !self.reported_silence.contains_key(*worker)
+            })
+            .filter_map(|worker| self.silent_from(worker, now, suspect_timeout))
+            .filter(|from| *from > now)
+            .min()
+    }
+
+    /// Whether `worker` can be reported silent: it is not lost, or it is a
+    /// lost member still heard but confirming no ack, whose silence its
+    /// answer to a rebuild can end while it stays lost.
+    fn may_fall_silent(&self, worker: &WorkerId) -> bool {
+        !self.lost.contains(worker) || self.unconfirming.contains(worker)
     }
 
     /// The workers not heard from for `lost_after` by `now`, each reported

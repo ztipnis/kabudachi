@@ -2,7 +2,7 @@
 //! leader among chosen nodes with one roll call it picks the initiator of,
 //! and let a leader that has been cut off run out its lease.
 
-use kabudachi_core::election::{Input, Output};
+use kabudachi_core::election::{AbortBy, ElectionTimings, Input, Output};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Duration, Instant};
@@ -154,7 +154,7 @@ pub fn abort_deadline_at(
     steps: &[StepRecord],
     worker: &WorkerId,
     at: Instant,
-) -> Option<Option<Instant>> {
+) -> Option<Option<AbortBy>> {
     steps
         .iter()
         .filter(|step| step.node == *worker && step.at <= at)
@@ -167,9 +167,12 @@ pub fn abort_deadline_at(
 }
 
 /// Asserts that by `replayed_at`, when a leader replays `worker`'s runs,
-/// `worker` has been told to abort them no later than that.
+/// `worker` has been told to abort a run at the default reconnect timeout no
+/// later than that.
 pub fn assert_aborts_by(steps: &[StepRecord], worker: &WorkerId, replayed_at: Instant) {
-    let deadline = abort_deadline_at(steps, worker, replayed_at).flatten();
+    let deadline = abort_deadline_at(steps, worker, replayed_at)
+        .flatten()
+        .map(|by| by.deadline(ElectionTimings::DEFAULT_RECONNECT_TIMEOUT));
     assert!(
         deadline.is_some_and(|by| by < replayed_at),
         "{worker:?} must abort before its runs are replayed at {replayed_at:?}, but its \

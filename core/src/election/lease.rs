@@ -7,11 +7,11 @@
 //! `quorum_contact_lease` module) is private to it.
 //!
 //! What moved and why. The lease owns the fields only these two answers
-//! read: the leader's confirmed acks, the contact floor, the orphan abort
-//! deadline, and the grant and abort deadline last reported. What it reads
+//! read: the leader's confirmed acks, the contact floor, when it fenced
+//! itself, and the grant and abort deadline last reported. What it reads
 //! of the node, the node hands it: while it leads, its [`Office`] (its id,
 //! roster, term, recovery epoch and the end of its recovery fence); its
-//! election timings and reconnect timeout; the time. Its last leader
+//! election timings; the time. Its last leader
 //! contact stays with the node, which suspects its leader by it; the lease
 //! learns of that contact only through the ack that proves it
 //! ([`Lease::acked`]).
@@ -24,6 +24,7 @@ use crate::protocol::ids::WorkerId;
 use crate::scheduler::{LeadershipGrant, LeaseEnd};
 use crate::time::{Duration, Instant};
 
+use super::authority::less_drift;
 use super::{ElectionTimings, earliest};
 use quorum_contact_lease::QuorumContactLease;
 
@@ -44,7 +45,47 @@ pub(crate) struct Office<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LeaseChange {
     Grant(Option<LeadershipGrant>),
-    AbortDeadline(Option<Instant>),
+    AbortDeadline(Option<AbortBy>),
+}
+
+/// By when a worker must have aborted each TaskRun it is running: before any
+/// leader can replay it, which a leader does a suspicion timeout and the
+/// run's own reconnect timeout after it last heard the worker, or won (see
+/// `Output::WorkerSilence`). Kept as what the deadline counts from, since
+/// runs differ in their reconnect timeouts: [`Self::deadline`] gives one
+/// run's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbortBy {
+    /// Out of contact: the contact floor, gone stale. No leader that may
+    /// replay this worker's runs heard it, or could have won, after it.
+    out_of_contact_since: Option<Instant>,
+    /// When the worker fenced itself.
+    fenced_at: Option<Instant>,
+    suspect_timeout: Duration,
+    clock_drift_divisor: u64,
+}
+
+impl AbortBy {
+    /// The instant, on the node's clock, by which a run whose reconnect
+    /// timeout is `reconnect_timeout` must have been aborted. Out of contact,
+    /// the deadline is the contact floor plus a suspicion timeout and that
+    /// reconnect timeout. Fenced, it is the fence plus that reconnect
+    /// timeout. Each span gives up its share for clock drift, and the
+    /// earlier deadline wins.
+    pub fn deadline(&self, reconnect_timeout: Duration) -> Instant {
+        let less_drift = |span: Duration| less_drift(span, self.clock_drift_divisor);
+        let out_of_contact = self.out_of_contact_since.map(|floor| {
+            floor
+                + less_drift(Duration::from_ticks(
+                    self.suspect_timeout
+                        .as_ticks()
+                        .saturating_add(reconnect_timeout.as_ticks()),
+                ))
+        });
+        let fenced = self.fenced_at.map(|at| at + less_drift(reconnect_timeout));
+        earliest(out_of_contact, fenced)
+            .expect("an abort deadline stands only out of contact or fenced")
+    }
 }
 
 /// This node's lease as a leader, and its abort deadline as a worker.
@@ -57,10 +98,9 @@ pub(crate) struct Lease {
     /// that may yet replay this worker's TaskRuns had heard from it or had
     /// not yet won; `None` until any has.
     contact_floor: Option<Instant>,
-    /// Since it last fenced itself, orphaned: by when it must have aborted
-    /// its TaskRuns. Cleared once it resumes, or once a leader acks it
-    /// after it rejoined.
-    orphan_abort_by: Option<Instant>,
+    /// Since it last fenced itself: when it did. Cleared once it resumes,
+    /// or once a leader acks it after it rejoined.
+    fenced_at: Option<Instant>,
     /// The grant this node last held, whether or not it handed it over: the
     /// end its contact floor counts, and from which it reports changes.
     reported_grant: Option<LeadershipGrant>,
@@ -69,7 +109,7 @@ pub(crate) struct Lease {
     handed_over_grant: Option<LeadershipGrant>,
     /// The abort deadline this node last reported, so it reports each
     /// change once.
-    reported_abort_deadline: Option<Instant>,
+    reported_abort: Option<AbortBy>,
 }
 
 impl Lease {
@@ -78,10 +118,10 @@ impl Lease {
         Lease {
             quorum: QuorumContactLease::starting_at(now),
             contact_floor: None,
-            orphan_abort_by: None,
+            fenced_at: None,
             reported_grant: None,
             handed_over_grant: None,
-            reported_abort_deadline: None,
+            reported_abort: None,
         }
     }
 
@@ -101,18 +141,18 @@ impl Lease {
     /// again, no longer orphaned.
     pub(crate) fn acked(&mut self, heard_at: Option<Instant>) {
         self.contact_floor = self.contact_floor.max(heard_at);
-        self.orphan_abort_by = None;
+        self.fenced_at = None;
     }
 
-    /// The node fenced itself at `now`: it must abort within a reconnect
-    /// timeout, less drift.
-    pub(crate) fn orphaned(&mut self, now: Instant, timings: &ElectionTimings) {
-        self.orphan_abort_by = Some(now + timings.less_drift(timings.reconnect_timeout));
+    /// The node fenced itself at `now`: it must abort each run within that
+    /// run's reconnect timeout, less drift (see [`AbortBy`]).
+    pub(crate) fn orphaned(&mut self, now: Instant) {
+        self.fenced_at = Some(now);
     }
 
     /// The node resumed from its fence: it is no longer orphaned.
     pub(crate) fn resumed(&mut self) {
-        self.orphan_abort_by = None;
+        self.fenced_at = None;
     }
 
     /// The node stopped leading at `now`: it holds no grant from here on.
@@ -144,17 +184,14 @@ impl Lease {
     /// (see [`Self::grant`]): its grant, then its abort deadline, which a
     /// changed grant can move. The grant counts toward the contact floor
     /// as soon as it is held, but is handed over only when `hand_over` is
-    /// set, and then once. `lost_after` is how long a leader goes
-    /// without hearing from a worker before it reports that worker lost and
-    /// replays its TaskRuns; the node hands over the same span its own
-    /// leader side counts, so the abort deadline, drift taken off it, always
-    /// falls before any such replay.
+    /// set, and then once. The abort deadline is reported as an
+    /// [`AbortBy`], from which each run's own deadline follows, so each
+    /// falls, drift taken off, before any leader replays that run.
     pub(crate) fn report(
         &mut self,
         grant: Option<LeadershipGrant>,
         hand_over: bool,
         timings: &ElectionTimings,
-        lost_after: Duration,
         now: Instant,
     ) -> Vec<LeaseChange> {
         let mut changes = Vec::new();
@@ -166,10 +203,10 @@ impl Lease {
             self.handed_over_grant = grant;
             changes.push(LeaseChange::Grant(grant));
         }
-        let deadline = self.abort_deadline(timings, lost_after, now);
-        if deadline != self.reported_abort_deadline {
-            self.reported_abort_deadline = deadline;
-            changes.push(LeaseChange::AbortDeadline(deadline));
+        let abort = self.abort_by(timings, now);
+        if abort != self.reported_abort {
+            self.reported_abort = abort;
+            changes.push(LeaseChange::AbortDeadline(abort));
         }
         changes
     }
@@ -237,6 +274,7 @@ impl Lease {
             term: office.term,
             recovery_epoch: office.recovery_epoch,
             valid_until,
+            reconnect_timeout: timings.reconnect_timeout,
         })
     }
 
@@ -286,21 +324,18 @@ impl Lease {
             .map(|floor| floor + timings.lease_length())
     }
 
-    /// The instant by which this node must have aborted its TaskRuns, if
-    /// any: `lost_after`, less drift, past its contact floor, once that
-    /// floor is stale, or the deadline it took when it fenced itself,
-    /// whichever is earlier.
-    fn abort_deadline(
-        &self,
-        timings: &ElectionTimings,
-        lost_after: Duration,
-        now: Instant,
-    ) -> Option<Instant> {
-        let out_of_contact = self
+    /// What this node's abort deadline counts from, if it has one: its
+    /// contact floor, once stale, and the instant it fenced itself.
+    fn abort_by(&self, timings: &ElectionTimings, now: Instant) -> Option<AbortBy> {
+        let out_of_contact_since = self
             .leader_contact_stale_at(timings)
             .filter(|stale_at| *stale_at <= now)
-            .and(self.effective_contact_floor())
-            .map(|floor| floor + timings.less_drift(lost_after));
-        earliest(out_of_contact, self.orphan_abort_by)
+            .and(self.effective_contact_floor());
+        (out_of_contact_since.is_some() || self.fenced_at.is_some()).then_some(AbortBy {
+            out_of_contact_since,
+            fenced_at: self.fenced_at,
+            suspect_timeout: timings.suspect_timeout,
+            clock_drift_divisor: timings.clock_drift_divisor,
+        })
     }
 }

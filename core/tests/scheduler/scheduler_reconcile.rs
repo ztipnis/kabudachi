@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use kabudachi_core::election::ElectionTimings;
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
@@ -181,16 +182,19 @@ fn a_delay_counts_from_submission_by_the_wall_clock_and_errs_late() {
 }
 
 #[test]
-fn a_worker_lost_while_reconciling_is_applied_when_the_grant_arrives() {
+fn a_worker_silent_while_reconciling_loses_its_runs_once_the_grant_arrives() {
     let mut old = Fixture::leading();
     let task = old.scheduler.submit(plain(b"t")).unwrap();
     old.scheduler.request_claim(&worker("w1"), &task).unwrap();
     let mut new = reconciling_after(&old);
 
-    assert_eq!(
-        new.scheduler.lose_worker(&worker("w1")),
-        Ok(Vec::new()),
-        "kept, not applied"
+    // Its office reports the worker silent while the scheduler reconciles,
+    // and the worker's reconnect timeout passes before the grant.
+    new.scheduler.note_silence(&worker("w1"), Some(new.clock.now()));
+    new.clock.advance(ElectionTimings::DEFAULT_RECONNECT_TIMEOUT);
+    assert!(
+        new.scheduler.take_events().is_empty() && new.spy.revisions_of(&task).is_empty(),
+        "kept, not applied: the scheduler does not lead"
     );
     new.scheduler
         .reconcile(Rebuild {
@@ -358,6 +362,9 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
         .scheduler
         .request_claim(&worker("w4"), &answered)
         .unwrap();
+    old.scheduler
+        .report_started(&worker("w4"), &answered_claim.task_run_id)
+        .unwrap();
     old.scheduler.request_claim(&worker("w5"), &empty).unwrap();
     let records = newest_records(&old);
     let mut new = reconciling_after(&old);
@@ -376,6 +383,8 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
         .unwrap();
     new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
     assert!(rebuilt.silent_holders.is_empty(), "no record is installed yet");
+    // w4 was reported silent before its late answer arrived.
+    new.scheduler.note_silence(&worker("w4"), Some(new.clock.now()));
 
     let adopted = new
         .scheduler
@@ -387,6 +396,16 @@ fn a_late_record_names_its_holder_unless_that_worker_answered() {
         .unwrap();
 
     assert_eq!(adopted.silent_holders, BTreeSet::from([worker("w3")]));
+    // The late answer counts as hearing w4: its silence ends, and its run is
+    // kept past the reconnect timeout that silence counted.
+    assert!(
+        adopted.answered.contains(&worker("w4")),
+        "its node is told the worker was heard"
+    );
+    new.clock.advance(ElectionTimings::DEFAULT_RECONNECT_TIMEOUT);
+    new.clock.advance(ticks(1));
+    new.scheduler.catch_up();
+    assert_eq!(last_states(&new, &answered), [TaskRunState::Running]);
 }
 
 #[test]
@@ -1149,26 +1168,32 @@ fn only_the_grant_of_the_office_rebuilt_for_ends_a_reconciliation_and_a_rebuild_
 }
 
 #[test]
-fn a_worker_lost_while_reconciling_that_answered_the_rebuild_is_not_lost_at_the_grant() {
+fn a_worker_its_office_counted_silent_that_answered_the_rebuild_keeps_its_runs_at_the_grant() {
     let mut old = Fixture::leading();
     let task = old.scheduler.submit(plain(b"t")).unwrap();
     let claim = old.scheduler.request_claim(&worker("w1"), &task).unwrap();
     let mut new = reconciling_after(&old);
 
-    new.scheduler.lose_worker(&worker("w1")).unwrap();
-    new.scheduler
+    // Its office counted w1 silent, and w1's reconnect timeout has passed, but
+    // w1 answered the rebuild: it was heard, so its run is its own.
+    new.scheduler.note_silence(&worker("w1"), Some(new.clock.now()));
+    new.clock.advance(ElectionTimings::DEFAULT_RECONNECT_TIMEOUT);
+    let rebuilt = new
+        .scheduler
         .reconcile(Rebuild {
             records: newest_records(&old),
             reports: report("w1", vec![reported(&claim, ReportedState::Claimed)]),
             ..Rebuild::default()
         })
         .unwrap();
+    assert!(rebuilt.answered.contains(&worker("w1")), "its node is told w1 was heard");
     new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+    new.scheduler.catch_up();
 
     assert_eq!(
         last_states(&new, &task),
         [TaskRunState::Claimed],
-        "w1 answered, so it is not lost"
+        "w1 answered, so its run is not replayed"
     );
 }
 

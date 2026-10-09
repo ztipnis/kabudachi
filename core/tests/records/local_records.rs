@@ -16,6 +16,7 @@ fn a_submitted_task_is_stored_with_this_node_as_its_placement() {
         term: 1,
         recovery_epoch: RecoveryEpoch::new(0, 0),
         valid_until: LeaseEnd::Unbounded,
+        reconnect_timeout: kabudachi_core::election::ElectionTimings::DEFAULT_RECONNECT_TIMEOUT,
     }));
 
     let task = scheduler

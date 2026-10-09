@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::support::clock::FakeClock;
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
-use crate::support::scheduler::state_of;
+use crate::support::scheduler::{lose_silent, state_of};
 use crate::support::spy::Spy;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
@@ -57,7 +57,7 @@ enum Op {
     Cancel {
         pick: u8,
     },
-    LoseWorker,
+    WorkerFallsSilent,
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -71,7 +71,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => any::<u8>().prop_map(|pick| Op::EndContinuation { pick }),
         1 => any::<u8>().prop_map(|pick| Op::Fail { pick }),
         1 => any::<u8>().prop_map(|pick| Op::Cancel { pick }),
-        1 => Just(Op::LoseWorker),
+        1 => Just(Op::WorkerFallsSilent),
     ]
 }
 
@@ -85,6 +85,7 @@ struct Submitted {
 
 struct Model {
     scheduler: Scheduler<FakeClock, SequentialIds, Spy>,
+    clock: FakeClock,
     spy: Spy,
     worker: WorkerId,
     next_number: u32,
@@ -106,11 +107,13 @@ fn number_of(payload: &[u8]) -> u32 {
 impl Model {
     fn new() -> Self {
         let spy = Spy::default();
+        let clock = FakeClock::new();
         let mut scheduler =
-            Scheduler::with_observer(FakeClock::new(), SequentialIds::new(), spy.clone());
+            Scheduler::with_observer(clock.clone(), SequentialIds::new(), spy.clone());
         scheduler.set_leadership_grant(Some(unbounded_grant()));
         Model {
             scheduler,
+            clock,
             spy,
             worker: WorkerId::new("w1"),
             next_number: 0,
@@ -230,20 +233,21 @@ impl Model {
                     }
                 }
             }
-            Op::LoseWorker => self.lose_worker(),
+            Op::WorkerFallsSilent => self.worker_falls_silent(),
         }
     }
 
-    /// A lost coalescing generation is replayed only if no newer one
-    /// waits for its key.
-    fn lose_worker(&mut self) {
+    /// The worker falls silent past its runs' reconnect timeouts: a lost
+    /// coalescing generation is replayed only if no newer one waits for its
+    /// key.
+    fn worker_falls_silent(&mut self) {
         let waiting_keys: BTreeSet<u8> = self
             .tasks
             .iter()
             .filter(|(task, _)| self.state_of(task) == TaskRunState::Queued)
             .filter_map(|(_, submitted)| submitted.key)
             .collect();
-        let lost = self.scheduler.lose_worker(&self.worker).unwrap();
+        let lost = lose_silent(&mut self.scheduler, &self.clock, &self.worker);
         for run in &lost {
             let key = self.tasks[&run.task_id].key;
             match key {

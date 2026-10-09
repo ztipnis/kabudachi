@@ -38,6 +38,7 @@ pub(crate) fn submit_task(submitted: &Submitted) -> SubmitTask {
         drop_oldest: submission.drop_oldest,
         ephemeral: submission.ephemeral,
         non_retriable: submission.non_retriable,
+        reconnect_timeout_ms: submission.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
     }
 }
 
@@ -62,6 +63,8 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
             drop_oldest: task.drop_oldest,
             ephemeral: task.ephemeral,
             non_retriable: task.non_retriable,
+            reconnect_timeout: (task.reconnect_timeout_ms > 0)
+                .then(|| Duration::from_millis(task.reconnect_timeout_ms)),
         },
         clock,
     ))

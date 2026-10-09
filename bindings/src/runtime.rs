@@ -210,9 +210,13 @@ impl NativeRuntime {
     /// `expires_in_ms` it expires instead of running if it is still unclaimed
     /// after that long. With `drop_oldest`, a coalescing task that would pass
     /// the hard memory limit loses its key's oldest retained payloads to fit
-    /// instead of being refused.
+    /// instead of being refused. With `reconnect_timeout_ms`, a run of the
+    /// task may be replayed that long after its worker goes a suspicion
+    /// timeout unheard, instead of after the shard's reconnect timeout; it
+    /// must be positive.
     ///
-    /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree,
+    /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree or
+    /// `reconnect_timeout_ms` is zero,
     /// `BackpressureError` if the task does not fit under the hard memory
     /// limit, is too large to be claimed (about 1 MiB with its queue and
     /// key), or, transiently, its coalescing key's newest generation is not
@@ -234,6 +238,7 @@ impl NativeRuntime {
         delay_ms = None,
         expires_in_ms = None,
         drop_oldest = false,
+        reconnect_timeout_ms = None,
     ))]
     #[allow(
         clippy::too_many_arguments,
@@ -251,6 +256,7 @@ impl NativeRuntime {
         delay_ms: Option<u64>,
         expires_in_ms: Option<u64>,
         drop_oldest: bool,
+        reconnect_timeout_ms: Option<u64>,
         py: Python<'_>,
     ) -> PyResult<String> {
         let coalescing =
@@ -270,6 +276,13 @@ impl NativeRuntime {
         }
         if let Some(expires_in_ms) = expires_in_ms {
             submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
+        }
+        if let Some(reconnect_timeout_ms) = reconnect_timeout_ms {
+            if reconnect_timeout_ms == 0 {
+                return Err(PyValueError::new_err("reconnect_timeout_ms must be positive"));
+            }
+            submission =
+                submission.with_reconnect_timeout(CoreDuration::from_millis(reconnect_timeout_ms));
         }
         if let Some((key, drop_oldest)) = coalescing {
             submission = submission.with_coalescing_key(key);

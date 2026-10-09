@@ -14,6 +14,7 @@ fn grant(valid_until: LeaseEnd) -> Option<LeadershipGrant> {
         term: 1,
         recovery_epoch: RecoveryEpoch::new(0, 0),
         valid_until,
+        reconnect_timeout: kabudachi_core::election::ElectionTimings::DEFAULT_RECONNECT_TIMEOUT,
     })
 }
 

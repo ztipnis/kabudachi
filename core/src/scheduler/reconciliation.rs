@@ -22,8 +22,7 @@ use super::{LeadershipGrant, ReconcileRejection};
 /// task, and handed back when that task's record is installed.
 #[derive(Debug, Default)]
 pub(super) struct Reconciliation {
-    /// While its node reconciles: the office, whether the rebuild ran, and
-    /// the workers reported lost meanwhile.
+    /// While its node reconciles: the office, and whether the rebuild ran.
     office: Option<Office>,
     /// The workers whose answer the last rebuild used, kept after the
     /// reconciliation ends: a late record that names one of them as holding
@@ -48,7 +47,6 @@ pub(super) struct Reconciliation {
 struct Office {
     term: ReconcileTerm,
     rebuilt: bool,
-    lost: BTreeSet<WorkerId>,
 }
 
 /// The coalescing keys of the tasks of `keys`.
@@ -211,7 +209,6 @@ impl Reconciliation {
         self.office = Some(Office {
             term,
             rebuilt: false,
-            lost: BTreeSet::new(),
         });
     }
 
@@ -220,42 +217,25 @@ impl Reconciliation {
         self.office.as_ref().map(|office| office.term)
     }
 
-    /// Keeps `worker` as lost while reconciling, to apply once the grant
-    /// arrives; whether it did.
-    pub(super) fn keeps_lost(&mut self, worker: &WorkerId) -> bool {
-        match self.office.as_mut() {
-            Some(office) => {
-                office.lost.insert(worker.clone());
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Whether `grant` takes effect, with the workers to lose then: those
-    /// reported lost while reconciling that the rebuild did not hear from.
-    /// `None` when it does not: while reconciling, only the grant of the
-    /// office rebuilt for is taken; any other is not held. A grant of `None`
-    /// ends the reconciliation (the node left office).
-    pub(super) fn takes_grant(
-        &mut self,
-        grant: Option<&LeadershipGrant>,
-    ) -> Option<BTreeSet<WorkerId>> {
+    /// Whether `grant` takes effect: while reconciling, only the grant of the
+    /// office rebuilt for is taken, and any other is not held. A grant of
+    /// `None` ends the reconciliation (the node left office).
+    pub(super) fn takes_grant(&mut self, grant: Option<&LeadershipGrant>) -> bool {
         let Some(grant) = grant else {
             self.office = None;
-            return None;
+            return false;
         };
         let Some(office) = self.office.as_ref() else {
-            return Some(BTreeSet::new());
+            return true;
         };
         if !(office.rebuilt
             && office.term.recovery_epoch == grant.recovery_epoch
             && office.term.term == grant.term)
         {
-            return None;
+            return false;
         }
-        let office = self.office.take().expect("just seen");
-        Some(office.lost.difference(&self.answered).cloned().collect())
+        self.office = None;
+        true
     }
 
     /// Why a rebuild would be refused now, if it would.

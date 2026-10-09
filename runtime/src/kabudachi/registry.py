@@ -56,6 +56,10 @@ class TaskDefinition:
     """Whether a task process that runs this task takes no more runs after
     it and is replaced by a fresh one once its runs finish: for a body that
     leaves its process unfit for more work."""
+    reconnect_timeout: timedelta | None = None
+    """How long a run may go without its worker being heard, past the time
+    it takes to suspect a silent worker, before the leader replays it.
+    `None` leaves it to the queue's setting, else the shard's."""
 
     def __reduce__(self) -> tuple[Any, tuple[str]]:
         # Sent between a worker and its task processes by name: both imported
