@@ -628,8 +628,12 @@ async def _drain_held_runs(
     Claiming and taking have stopped, so the claim loop ends on its own. The
     event loop that ran all along goes on meanwhile, so no event it has taken
     is lost: a run the leader cancels, or whose abort deadline nears, stops.
-    A runtime that fails ends the wait."""
-    await _until_done_or_worker_stops(claiming, events)
+    A runtime that fails ends the wait. The claim loop is neither cancelled
+    nor read here: how it ended is the caller's to read, and a claim loop
+    that failed still leaves the held runs to finish and report."""
+    await asyncio.wait({claiming, events}, return_when=asyncio.FIRST_COMPLETED)
+    if events.done():
+        raise _worker_ended(events)
     await _until_done_or_worker_stops(session.wait_until_running_finish(), events)
     await _until_done_or_worker_stops(native.wait_until_reported(), events)
 
@@ -677,6 +681,9 @@ async def _run_with_worker(
                 session.stop_claiming()
                 native.stop_taking()
                 await _drain_held_runs(session, native, claiming, events)
+                # A claim loop that failed fails the run, once its held runs
+                # have reported.
+                claiming.result()
             graceful = True
             return result
         except BaseException as error:

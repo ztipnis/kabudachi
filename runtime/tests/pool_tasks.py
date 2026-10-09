@@ -180,6 +180,22 @@ async def ignores_cancel(request: Greeting) -> Greeting:
             continue
 
 
+@kabudachi.ephemeral_task(name="pool.outlives_its_deadline", cancel_grace=timedelta(seconds=3))
+async def outlives_its_deadline(request: Greeting) -> Greeting:
+    """Leaves its process id in `outliving`, and runs on for 30 s whatever
+    it is asked: only its process's end stops it. Its cancel grace is longer
+    than the abort deadline a test gives it, so a cancel that it ignores
+    costs its process only after that deadline."""
+    marker("outliving").write_text(str(os.getpid()))
+    end = time.monotonic() + 30
+    while time.monotonic() < end:
+        try:
+            await asyncio.sleep(end - time.monotonic())
+        except asyncio.CancelledError:
+            marker("asked to stop").touch()
+    return request
+
+
 @kabudachi.task(name="pool.recycles", recycle_process=True)
 async def recycles(request: Greeting) -> Greeting:
     """Still running when its process stops taking runs, so it shows the

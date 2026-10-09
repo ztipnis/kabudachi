@@ -189,6 +189,7 @@ py_test(
     deps = [
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
+        "//runtime/tests:faulting_runtime",
         "//runtime/tests:pool_slow_import",  # keep
         "//runtime/tests:pool_tasks",
         "//runtime/tests:proto_messages",

@@ -832,7 +832,15 @@ def test_an_abandoned_body_keeps_its_place_until_it_exits():
     assert seen_before_exit == ["first"]
 
 
-def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit():
+@pytest.mark.parametrize(
+    "delivers_results",
+    [
+        pytest.param(True, id="its own handle"),
+        # Runs a shard's leader hands a worker, which settle no handle here.
+        pytest.param(False, id="a run handed over by a shard"),
+    ],
+)
+def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit(delivers_results):
     release = threading.Event()
     calls = []
 
@@ -846,44 +854,20 @@ def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit():
         return request
 
     world = World(stubborn_then_fine, retries=1, timeout=SOFT, cancel_grace=GRACE)
+    world.runtime.delivers_results = delivers_results
 
     async def body():
         handle = world.call("stubborn_then_fine", Greeting(text="x"))
         await until(lambda: any(event[0] == "fail" for event in world.runtime.events), "a fail event")
         await asyncio.sleep(0.2)
-        assert not handle.done(), "the lineage stays pending while its retry waits"
+        if delivers_results:
+            assert not handle.done(), "the lineage stays pending while its retry waits"
         assert len(calls) == 1, "no second body while the abandoned one runs"
         release.set()
-        return await handle
-
-    assert run(world.working(body)).text == "x"
-    assert calls == ["first body started", "first body exited", "second body ran"]
-
-
-def test_a_retry_handed_back_to_a_worker_serving_a_shard_waits_for_its_abandoned_body_to_exit():
-    release = threading.Event()
-    calls = []
-
-    def stubborn_then_fine(request: Greeting) -> Greeting:
-        if not calls:
-            calls.append("first body started")
-            release.wait(5)
-            calls.append("first body exited")
-            return request
-        calls.append("second body ran")
-        return request
-
-    world = World(stubborn_then_fine, retries=1, timeout=SOFT, cancel_grace=GRACE)
-    # Runs the shard's leader hands it, which settle no handle here.
-    world.runtime.delivers_results = False
-
-    async def body():
-        world.call("stubborn_then_fine", Greeting(text="x"))
-        await until(lambda: any(event[0] == "fail" for event in world.runtime.events), "a fail event")
-        await asyncio.sleep(0.2)
-        assert len(calls) == 1, "no second body while the abandoned one runs"
-        release.set()
-        await until(lambda: len(calls) == 3, "the retry to run")
+        if delivers_results:
+            assert (await handle).text == "x"
+        else:
+            await until(lambda: len(calls) == 3, "the retry to run")
 
     run(world.working(body))
     assert calls == ["first body started", "first body exited", "second body ran"]

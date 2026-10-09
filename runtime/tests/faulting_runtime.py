@@ -78,6 +78,18 @@ class FaultingRuntime:
             )
         )
 
+    def inject_abort(self, task_run_id, seconds_left):
+        """Makes `next_events()` also return the abort deadline a shard's
+        leader would send a worker that lost contact with it."""
+        self._injected.put_nowait(
+            SimpleNamespace(
+                kind=_native.EventKind.ABORT,
+                task_id="",
+                task_run_id=task_run_id,
+                seconds_left=seconds_left,
+            )
+        )
+
     async def next_events(self):
         if self.event_error is not None:
             raise self.event_error
