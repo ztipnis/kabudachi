@@ -156,8 +156,9 @@ def test_a_cut_off_worker_stops_its_run_by_its_deadline_and_runs_certify_once_wh
     finally:
         for worker in others:
             os.kill(worker.pid, signal.SIGCONT)
-    # Asked to stop its cancel grace before the deadline, which falls a
-    # clock-drift margin inside the reconnect timeout.
+    # The abort deadline falls (suspicion + reconnect timeout) x 0.9 after
+    # the last heartbeat the leader acknowledged, about 2.7 s here; the body
+    # is asked to stop its cancel grace before that, about 2.2 s.
     assert 0.5 <= waited <= RECONNECT_TIMEOUT + 1
     record = certified_once(cluster, cut_off, digest_of(hold, Greeting(text=text)))
     assert states(record)[0] == "LOST"

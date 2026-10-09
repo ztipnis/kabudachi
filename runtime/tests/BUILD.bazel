@@ -228,8 +228,9 @@ py_library(
     ],
 )
 
-# Three real worker processes on loopback: a task process and a
-# worker killed with SIGKILL. About 13 s on a laptop.
+# Three real worker processes on loopback: kills a task process, a follower
+# and the leader with SIGKILL, SIGSTOPs workers to cut one off, compacts and
+# cancels. About 28 s on a laptop.
 py_test(
     name = "test_networked",
     size = "medium",

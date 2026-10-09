@@ -5,8 +5,12 @@ environment (`KABUDACHI_*`), as a deployed worker's would. Each task's
 handle is awaited once, and a `settled` line says how that ended."""
 
 import asyncio
+import ctypes
 import json
+import os
+import signal
 import sys
+import threading
 
 import kabudachi
 from kabudachi import _native, session
@@ -37,6 +41,13 @@ async def settled(handle) -> None:
 
 # The handle of every task submitted here, by task id.
 HANDLES = {}
+
+# How long the drain after stdin closes may take before the worker exits
+# anyway, so one whose test was killed (by a Bazel timeout, say) cannot linger.
+DRAIN_SECONDS = 10.0
+
+# Linux's prctl option that signals this process when its parent dies.
+_PR_SET_PDEATHSIG = 1
 
 
 async def answer(native, command: dict) -> dict:
@@ -75,9 +86,20 @@ async def main() -> None:
     while line := await asyncio.to_thread(sys.stdin.readline):
         command = json.loads(line)
         say(id=command.pop("id"), **(await answer(native, command)))
+    # Stdin closed: `kabudachi.run` drains after this returns, within a bound.
+    bound = threading.Timer(DRAIN_SECONDS, os._exit, (3,))
+    bound.daemon = True
+    bound.start()
+
+
+def die_with_parent() -> None:
+    """On Linux, a SIGKILL once the test process that started this one dies."""
+    if sys.platform.startswith("linux"):
+        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
 
 
 if __name__ == "__main__":
     # Task processes are started with spawn, which imports this script again
     # in each of them: only the worker itself may run.
+    die_with_parent()
     kabudachi.run(main)
