@@ -256,6 +256,10 @@ enum Command {
     Block {
         peer: PeerId,
     },
+    /// See `Net::unblock_peer`.
+    Unblock {
+        peer: PeerId,
+    },
     /// Like `Dial`, but the caller wants to know *which* connection this
     /// specific dial produces — see `Net::dial_for_connection`, the only
     /// caller. The `DialOpts` built from `target` carries a `ConnectionId`
@@ -738,8 +742,7 @@ impl Net {
     /// refuses: `peer` may see its own dial connect for an instant before
     /// the refusal closes it. So a partition is blocked on both sides, or
     /// the unblocked side would see each of its dials connect for an
-    /// instant. There is no way back: a test that needs the peer again
-    /// starts a new node.
+    /// instant. [`Net::unblock_peer`] heals the partition.
     /// Gossip still reaches `peer` through any other peer both are
     /// connected to, as it would across a partial partition: a test that
     /// cuts one group off from another blocks every pair across the cut.
@@ -755,6 +758,18 @@ impl Net {
             return;
         };
         let _ = self.commands.send(Command::Block { peer });
+    }
+
+    /// Lets `peer` through again after [`Net::block_peer`], as a healed
+    /// partition would: connections either way are allowed from now on, and
+    /// the next send or redial to `peer` connects. Heal both sides, as both
+    /// were blocked. Fire-and-forget, like `block_peer`; a no-op for a peer
+    /// never blocked, or one this mapping never produced.
+    pub fn unblock_peer(&self, peer: WorkerId) {
+        let Ok(peer) = PeerId::from_str(peer.as_str()) else {
+            return;
+        };
+        let _ = self.commands.send(Command::Unblock { peer });
     }
 
     /// Makes the dial `target` describes and resolves to the `PeerId` of the
@@ -1378,6 +1393,9 @@ fn handle_command(
         }
         Command::Block { peer } => {
             swarm.behaviour_mut().blocked.block_peer(peer);
+        }
+        Command::Unblock { peer } => {
+            swarm.behaviour_mut().blocked.unblock_peer(peer);
         }
         Command::DialForConnection { target, respond_to } => {
             let (opts, asked_at) = match target {
