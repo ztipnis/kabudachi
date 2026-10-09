@@ -9,6 +9,11 @@ from types import SimpleNamespace
 from kabudachi import _native
 
 
+def _read_failure(future):
+    if not future.cancelled():
+        future.exception()
+
+
 class FaultingRuntime:
     """Wraps a `_native.NativeRuntime`: records what the session asks of it, and
     can make chosen calls fail, be refused or be held back. `before_started`,
@@ -109,6 +114,10 @@ class FaultingRuntime:
         # is kept running across calls and never cancelled here.
         if self._native_events is None:
             self._native_events = asyncio.ensure_future(self.native.next_events())
+            # A runtime shut down while this waits fails it, and no call may
+            # come to read the failure: read it as it lands, so it is not
+            # reported as never retrieved. A later call still raises it.
+            self._native_events.add_done_callback(_read_failure)
         injected = asyncio.ensure_future(self._injected.get())
         try:
             await asyncio.wait({self._native_events, injected}, return_when=asyncio.FIRST_COMPLETED)
