@@ -34,7 +34,7 @@ pub async fn drive_until_leading(
 ) {
     let (state_sender, mut state) = watch::channel(node.state());
     tokio::select! {
-        _ = run_driver(node, first, net, scheduler, clock, None, DriverConfig::default(), |node, _, _| {
+        _ = run_driver(node, first, net, scheduler, clock, None, None, DriverConfig::default(), |node, _, _| {
             let _ = state_sender.send(node.state());
         }) => unreachable!("this test never drains a node, so its driver never returns"),
         led = state.wait_for(|state| *state == WorkerState::Leader) => {

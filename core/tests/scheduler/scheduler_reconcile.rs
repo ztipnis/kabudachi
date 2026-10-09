@@ -16,7 +16,7 @@ use kabudachi_core::reconcile::{
     ANSWER_IN_FLIGHT, Rebuild, ReconcileTerm, ReportedRun, ReportedState, WorkerRuns,
 };
 use kabudachi_core::scheduler::{
-    CancelRejection, Claim, ClaimRejection, Completion, MemoryLimits,
+    CancelRejection, Claim, ClaimRejection, Completion, HeldCancel, MemoryLimits,
     ReconcileRejection, ReportRejection, Submission, SubmitRejection,
 };
 use kabudachi_core::task_record::RecordVersion;
@@ -1170,4 +1170,56 @@ fn a_worker_lost_while_reconciling_that_answered_the_rebuild_is_not_lost_at_the_
         [TaskRunState::Claimed],
         "w1 answered, so it is not lost"
     );
+}
+
+#[test]
+fn a_successor_learns_a_worker_still_holds_a_run_stored_cancelled_and_names_it_once_it_leads() {
+    let mut old = Fixture::leading();
+    let cancelled = old.scheduler.submit(plain(b"cancelled")).unwrap();
+    let kept = old.scheduler.submit(plain(b"kept")).unwrap();
+    let cancelled_claim = old.scheduler.request_claim(&worker("w1"), &cancelled).unwrap();
+    old.scheduler
+        .report_started(&worker("w1"), &cancelled_claim.task_run_id)
+        .unwrap();
+    let kept_claim = old.scheduler.request_claim(&worker("w1"), &kept).unwrap();
+    // The old leader stored the cancel, and stepped down before its ack told
+    // w1: w1 still runs the body.
+    old.scheduler.cancel(&cancelled).unwrap();
+    let mut new = reconciling_after(&old);
+    let held = || {
+        vec![
+            reported(&cancelled_claim, ReportedState::Running),
+            reported(&kept_claim, ReportedState::Claimed),
+        ]
+    };
+
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&old),
+            reports: report("w1", held()),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    assert!(
+        new.scheduler.take_held_cancels().is_empty(),
+        "no worker is told before the successor leads"
+    );
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+
+    let told = HeldCancel {
+        task_id: cancelled.clone(),
+        task_run_id: cancelled_claim.task_run_id.clone(),
+        worker: worker("w1"),
+    };
+    assert_eq!(new.scheduler.take_held_cancels(), [told.clone()]);
+    assert!(new.scheduler.take_held_cancels().is_empty());
+
+    // Its heartbeats still disagree, so it is asked again, and still holds it.
+    new.scheduler
+        .adopt(Rebuild {
+            reports: report("w1", held()),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    assert_eq!(new.scheduler.take_held_cancels(), [told]);
 }

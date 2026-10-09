@@ -2,16 +2,18 @@
 //! report, and the acks it ignores.
 
 use crate::support::builders::{
-    ack_message, configuration_of, epoch, g0, leader_ack, shard, timings, worker,
+    ack_message, configuration_of, epoch, g0, heartbeat, heartbeat_message, leader_ack, shard,
+    timings, worker,
 };
 use crate::support::clock::FakeClock;
-use crate::support::node::{TestNode, deliver, sent_to, tick, voter_node};
+use crate::support::node::{TestNode, deliver, elect, sent_to, tick, voter_node};
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::election::{Entry, Identity, Input, WorkerNode};
-use kabudachi_core::protocol::ids::IncarnationId;
+use kabudachi_core::election::{Entry, Identity, Input, Output, WorkerNode};
+use kabudachi_core::protocol::ids::{IncarnationId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{JoinResponse, LeaderHeartbeatAck, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::time::Duration;
+use kabudachi_core::time::{Clock, Duration};
+use std::collections::BTreeSet;
 
 const SUSPECT_TIMEOUT: u64 = 10;
 
@@ -152,4 +154,107 @@ fn a_heartbeat_says_whether_its_sender_runs_compaction() {
     assert!(!says(&mut node), "off unless the worker says it runs compaction");
     node.set_runs_compaction(true);
     assert!(says(&mut node));
+}
+
+// A worker may start a TaskRun only once it can name the instant by which it
+// would have to abort it: once a leader holding a grant has vouched for
+// hearing one of its heartbeats, or while it leads alone, with a grant no
+// rival can outlast and so no leader that could replay its runs.
+#[test]
+fn a_worker_has_a_contact_floor_once_a_leader_vouches_for_hearing_it() {
+    let clock = FakeClock::new();
+    let mut node = joined_node(&clock);
+    assert!(!node.has_contact_floor(), "no leader has heard the joiner yet");
+
+    receive_ack(&mut node, ack_admitting(g0(), 1));
+    assert!(
+        !node.has_contact_floor(),
+        "an ack that echoes no heartbeat vouches for nothing"
+    );
+
+    receive_ack(
+        &mut node,
+        LeaderHeartbeatAck {
+            heartbeat_token: Some(clock.now().as_ticks()),
+            ..ack_admitting(g0(), 2)
+        },
+    );
+    assert!(node.has_contact_floor());
+
+    let mut alone = voter_node(&clock, &worker("alone"), 1, SUSPECT_TIMEOUT);
+    for _ in 0..1_000 {
+        if matches!(alone.state(), WorkerState::LeaderReconciling | WorkerState::Leader) {
+            break;
+        }
+        clock.advance(Duration::from_ticks(1));
+        let _ = tick(&mut alone);
+    }
+    assert!(matches!(alone.state(), WorkerState::LeaderReconciling | WorkerState::Leader));
+    assert!(alone.has_contact_floor(), "no other leader can replay a lone leader's runs");
+}
+
+/// The ack `leader` sends `follower` in answer to a heartbeat from it.
+fn ack_to(leader: &mut TestNode, follower: &WorkerId) -> LeaderHeartbeatAck {
+    let outputs = deliver(leader, follower, heartbeat_message(heartbeat(follower, None)));
+    let mut acks = sent_to(&outputs, follower)
+        .into_iter()
+        .filter_map(|message| match message.payload {
+            Some(election_message::Payload::HeartbeatAck(ack)) => Some(ack),
+            _ => None,
+        });
+    let ack = acks.next().unwrap_or_else(|| panic!("no ack in {outputs:?}"));
+    assert!(acks.next().is_none(), "one ack per heartbeat");
+    ack
+}
+
+fn cancelled_in(ack: &LeaderHeartbeatAck) -> Vec<TaskRunId> {
+    ack.cancelled_runs.iter().cloned().map(TaskRunId::from).collect()
+}
+
+// A leader tells a worker which of its runs it cancelled in its acks, at most
+// 64 at a time, rotating through them so none is starved by the others, until
+// told to stop, and holds none for a node that does not lead.
+#[test]
+fn a_leader_lists_the_runs_it_cancelled_in_its_acks_in_rotation_until_told_to_stop() {
+    const SUSPECT: u64 = 10;
+    let clock = FakeClock::new();
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let mut leader = voter_node(&clock, &worker("w1"), 3, SUSPECT);
+    elect(&mut leader, &clock, SUSPECT, &[p1.clone(), p2.clone()]);
+    let runs: Vec<TaskRunId> = (0..150).map(|n| TaskRunId::new(format!("run-{n:03}"))).collect();
+    for run in &runs {
+        leader.tell_cancelled(p1.clone(), run.clone());
+    }
+
+    let mut follower = voter_node(&clock, &p1, 3, SUSPECT);
+    let mut told = BTreeSet::new();
+    for _ in 0..3 {
+        let ack = ack_to(&mut leader, &p1);
+        let listed = cancelled_in(&ack);
+        assert!(listed.len() <= 64, "{} runs in one ack", listed.len());
+        let raised: Vec<_> = deliver(&mut follower, &worker("w1"), ack_message(ack))
+            .into_iter()
+            .filter_map(|output| match output {
+                Output::RunsCancelled(runs) => Some(runs),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raised, vec![listed.clone()], "the follower raises what the ack listed");
+        told.extend(listed);
+    }
+    assert_eq!(told, runs.iter().cloned().collect(), "three acks reach all 150 runs");
+    assert!(
+        cancelled_in(&ack_to(&mut leader, &p2)).is_empty(),
+        "another worker is told nothing"
+    );
+
+    leader.forget_cancelled(&p1);
+    assert!(cancelled_in(&ack_to(&mut leader, &p1)).is_empty());
+
+    // A cancel handed to a node that holds no office is dropped, not told by
+    // the office it wins later.
+    let mut fresh = voter_node(&clock, &worker("w1"), 3, SUSPECT);
+    fresh.tell_cancelled(p1.clone(), runs[0].clone());
+    elect(&mut fresh, &clock, SUSPECT, &[p1.clone(), p2]);
+    assert!(cancelled_in(&ack_to(&mut fresh, &p1)).is_empty());
 }

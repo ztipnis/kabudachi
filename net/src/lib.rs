@@ -12,6 +12,7 @@ pub mod codec;
 pub mod discovery;
 pub mod driver;
 mod exchange;
+pub mod executor;
 mod framing;
 pub mod handoff;
 pub mod join;

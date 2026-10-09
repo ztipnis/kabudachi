@@ -23,7 +23,6 @@ use libp2p::PeerId;
 use libp2p::futures::future::join_all;
 use libp2p::kad::KBucketKey;
 
-use crate::claim::ClaimFailure;
 use crate::messenger::Net;
 use crate::steal::MAX_STEAL_IDS;
 use crate::task_store::record_key;
@@ -43,11 +42,9 @@ pub enum Stage {
 /// Why a discovery stopped before it tried every stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryStop {
-    /// The leader named is this worker: its own claims are its scheduler's,
-    /// so nothing was asked.
-    ThisWorkerLeads,
     /// The leader refused as not leading, refused this worker as no member,
-    /// or did not answer sensibly: asking more would get the same.
+    /// did not answer sensibly, or did not answer at all (a leader that is
+    /// this worker is never asked): asking more would get the same.
     LeaderRefused,
 }
 
@@ -83,10 +80,6 @@ impl Net {
         runs_compaction: bool,
     ) -> Found {
         let mut found = Found::default();
-        if leader == self.local_worker_id() {
-            found.stopped = Some(DiscoveryStop::ThisWorkerLeads);
-            return found;
-        }
         let mut tried = BTreeSet::new();
         let own = self.own_candidates(now, runs_compaction);
         if self
@@ -185,7 +178,7 @@ impl Net {
                     | Err(_) => return stop(found, DiscoveryStop::LeaderRefused),
                 },
                 Ok(_) => return stop(found, DiscoveryStop::LeaderRefused),
-                Err(failure) => return stop(found, stop_for(failure)),
+                Err(_) => return stop(found, DiscoveryStop::LeaderRefused),
             }
         }
         ControlFlow::Continue(())
@@ -202,7 +195,7 @@ impl Net {
                 .claims
                 .extend(batch.claims.into_iter().map(|claim| (Stage::Oldest, claim))),
             Ok(_) => found.stopped = Some(DiscoveryStop::LeaderRefused),
-            Err(failure) => found.stopped = Some(stop_for(failure)),
+            Err(_) => found.stopped = Some(DiscoveryStop::LeaderRefused),
         }
     }
 }
@@ -210,13 +203,6 @@ impl Net {
 fn stop(found: &mut Found, why: DiscoveryStop) -> ControlFlow<()> {
     found.stopped = Some(why);
     ControlFlow::Break(())
-}
-
-fn stop_for(failure: ClaimFailure) -> DiscoveryStop {
-    match failure {
-        ClaimFailure::ThisWorkerLeads => DiscoveryStop::ThisWorkerLeads,
-        ClaimFailure::Unanswered => DiscoveryStop::LeaderRefused,
-    }
 }
 
 /// The wait before the next discovery after one that found nothing: doubling

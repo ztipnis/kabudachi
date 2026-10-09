@@ -195,6 +195,7 @@ async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_an
                     &mut scheduler_a,
                     clock,
                     None,
+                    None,
                     DriverConfig::default(),
                     |node, _, _| { let _ = tx_a.send(seen(node)); },
                 ) => {
@@ -206,6 +207,7 @@ async fn an_initiator_reachable_only_through_the_mesh_collects_a_direct_reply_an
                     &net_c,
                     &mut scheduler_c,
                     clock,
+                    None,
                     None,
                     DriverConfig::default(),
                     |node, _, _| { let _ = tx_c.send(seen(node)); },

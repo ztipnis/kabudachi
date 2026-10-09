@@ -10,7 +10,7 @@ use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{
     ElectionTimings, Entry, Identity, Input, KnownConfiguration, Step, WorkerNode,
 };
-use kabudachi_core::protocol::generated::ElectionCertificate;
+use kabudachi_core::protocol::generated::{ElectionCertificate, TaskRunState};
 use kabudachi_core::protocol::ids::{
     IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
@@ -22,6 +22,7 @@ use kabudachi_core::scheduler::{Scheduler, Submission, Submitted, mint};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::{Duration, RealClock, WallTime};
 use kabudachi_net::driver::{DriverConfig, run_driver};
+use kabudachi_net::executor::ExecutorEndpoint;
 use kabudachi_net::handoff::HandedOff;
 use kabudachi_net::messenger::Net;
 use kabudachi_net::task_store::placement::ReplicationFactor;
@@ -58,7 +59,7 @@ pub type Scheduled = Scheduler<RealClock, Uuid7Ids, RecordOutbox>;
 struct Driven {
     node: WorkerNode<RealClock>,
     scheduler: Scheduled,
-    runs_compaction: bool,
+    executor: Option<ExecutorEndpoint>,
 }
 
 /// Something a test does to a voter's node and scheduler between two runs of
@@ -207,7 +208,7 @@ impl Voters {
                 Voter::Idle(Box::new(Driven {
                     node,
                     scheduler: driven_scheduler(clock),
-                    runs_compaction: false,
+                    executor: None,
                 }))
             })
             .collect();
@@ -225,13 +226,14 @@ impl Voters {
         }
     }
 
-    /// Tells `voter`'s driver whether its worker runs compaction. Only before
-    /// the shard is first driven.
-    pub fn set_runs_compaction(&mut self, voter: usize, runs: bool) {
+    /// Gives `voter`'s driver `executor` to run the tasks it claims; its
+    /// worker then also says it runs compaction. Only before the shard is
+    /// first driven.
+    pub fn set_executor(&mut self, voter: usize, executor: ExecutorEndpoint) {
         let Voter::Idle(driven) = &mut self.voters[voter] else {
             panic!("set before the shard is first driven");
         };
-        driven.runs_compaction = runs;
+        driven.executor = Some(executor);
     }
 
     /// Runs `act` on `voter`'s node and scheduler and returns what it
@@ -498,13 +500,9 @@ async fn drive_in_background(
     handed_off: HandedOffBy,
 ) {
     loop {
-        let config = DriverConfig {
-            runs_compaction: driven.runs_compaction,
-            ..config.clone()
-        };
-        let Driven { node, scheduler, .. } = &mut driven;
+        let Driven { node, scheduler, executor } = &mut driven;
         let command = tokio::select! {
-            returned = run_driver(node, due_now(&clock), &net, scheduler, clock, None, config, publish(state.clone())) => {
+            returned = run_driver(node, due_now(&clock), &net, scheduler, clock, None, executor.as_mut(), config.clone(), publish(state.clone())) => {
                 handed_off.record(voter, returned);
                 return;
             }
@@ -708,4 +706,12 @@ pub fn proof_of_office(leader: &WorkerId, term: u64) -> ElectionCertificate {
         recipient_admission: None,
         recipient_prior_admission: None,
     }
+}
+
+/// How many of `nets` hold `task` with exactly these runs, oldest first.
+pub fn holding(nets: &[Arc<Net>], task: &TaskId, runs: &[TaskRunState]) -> usize {
+    nets.iter()
+        .filter_map(|net| net.held_records().get(task))
+        .filter(|record| record.runs.iter().map(|run| run.state()).eq(runs.iter().copied()))
+        .count()
 }

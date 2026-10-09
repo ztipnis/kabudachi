@@ -135,7 +135,8 @@ mod leader_office;
 mod lease;
 mod standing;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 pub use authority::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, Issuer,
@@ -149,7 +150,7 @@ use crate::coordination_authority::{RecoveryEpoch, ShardRecord};
 use crate::hashing::{Field, HashFunction};
 use crate::protocol::checked::{Checked, CheckedMessage, CheckedPayload, decode};
 use crate::protocol::digest::Digest;
-use crate::protocol::ids::{IdGenerator, IncarnationId, ShardId, WorkerId};
+use crate::protocol::ids::{IdGenerator, IncarnationId, ShardId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{
     AckEcho, ElectionCertificate, ElectionMessage, ElectionReject, ElectionRejectReason,
@@ -168,6 +169,41 @@ use lease::{Lease, LeaseChange, Office};
 pub use standing::JoinFloor;
 use standing::ShardStanding;
 pub(crate) use standing::EpochOrder;
+
+/// The most cancelled runs one ack lists; the rest follow in later acks.
+const MAX_CANCELLED_RUNS_PER_ACK: usize = 64;
+
+/// The runs a leader cancelled on one worker, and how far its acks have
+/// listed them: each ack lists the next batch after the last run listed,
+/// wrapping round, so every run goes out within a few acks however many there
+/// are.
+#[derive(Default)]
+struct CancelledRuns {
+    runs: BTreeSet<TaskRunId>,
+    last_listed: Option<TaskRunId>,
+}
+
+impl CancelledRuns {
+    /// The next batch for an ack, advancing the cursor past it.
+    fn next_batch(&mut self) -> Vec<TaskRunId> {
+        let after = match &self.last_listed {
+            Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
+            None => (Bound::Unbounded, Bound::Unbounded),
+        };
+        let wrapped = self.last_listed.iter().flat_map(|last| self.runs.range(..=last));
+        let batch: Vec<TaskRunId> = self
+            .runs
+            .range(after)
+            .chain(wrapped)
+            .take(MAX_CANCELLED_RUNS_PER_ACK)
+            .cloned()
+            .collect();
+        if let Some(last) = batch.last() {
+            self.last_listed = Some(last.clone());
+        }
+        batch
+    }
+}
 
 pub struct WorkerNode<C>
 where
@@ -231,6 +267,9 @@ where
     active_runs_digest: Vec<u8>,
     /// Whether this worker runs compaction, which its heartbeats say.
     runs_compaction: bool,
+    /// While it holds office: per worker, the runs that worker holds which
+    /// this leader cancelled and stored, to list in its acks to it.
+    cancelled_runs: BTreeMap<WorkerId, CancelledRuns>,
     /// What a node bootstrapping again holds while it checks a JOIN pointer
     /// against the authority.
     rejoin: RejoinCheck,
@@ -607,6 +646,10 @@ pub enum Output {
     /// this digest, empty if it sent none. For the driver to compare with
     /// what the scheduler believes.
     RunsHeard { worker: WorkerId, digest: Vec<u8> },
+    /// The leader this node follows says it cancelled these runs, which this
+    /// worker holds: the worker's executor stops their bodies. Reported with
+    /// every ack that lists them, so the same run can be reported again.
+    RunsCancelled(Vec<TaskRunId>),
     /// By when, on the node's clock, this worker must have aborted every
     /// TaskRun it is running: `Some` once it has gone
     /// a suspicion timeout, less drift, without evidence that its leader
@@ -717,6 +760,7 @@ pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator, O: Observer>(
             | Output::Authority(_)
             | Output::AbortDeadline(_)
             | Output::RunsHeard { .. }
+            | Output::RunsCancelled(_)
             | Output::HandOff(_)
             | Output::ShardAbandoned => {}
         }
@@ -907,6 +951,7 @@ where
             lost_while_reconciling: BTreeSet::new(),
             active_runs_digest: Vec::new(),
             runs_compaction: false,
+            cancelled_runs: BTreeMap::new(),
             rejoin: RejoinCheck::default(),
             outputs: Vec::new(),
         }
@@ -1186,6 +1231,31 @@ where
     /// from now on says.
     pub fn set_runs_compaction(&mut self, runs: bool) {
         self.runs_compaction = runs;
+    }
+
+    /// Whether this worker may start a TaskRun now: only once it could abort
+    /// the run in time if it lost its leader's ear, which needs a leader to
+    /// have vouched for hearing it (an ack echoing one of its heartbeats), or
+    /// a grant of its own that ends, or a grant no rival can outlast. Before
+    /// then no abort deadline could be named for the run (see
+    /// [`Output::AbortDeadline`]).
+    pub fn has_contact_floor(&self) -> bool {
+        self.lease.has_contact_floor()
+    }
+
+    /// While it holds office: `worker` holds `run`, which is stored as
+    /// cancelled, by this leader or an earlier one. Every ack to `worker`
+    /// lists it until [`Self::forget_cancelled`].
+    pub fn tell_cancelled(&mut self, worker: WorkerId, run: TaskRunId) {
+        if self.holds_office() {
+            self.cancelled_runs.entry(worker).or_default().runs.insert(run);
+        }
+    }
+
+    /// `worker`'s heartbeats show it holds no run this leader told it was
+    /// cancelled: its acks stop listing them.
+    pub fn forget_cancelled(&mut self, worker: &WorkerId) {
+        self.cancelled_runs.remove(worker);
     }
 
     /// The members that said in their latest heartbeat that they run
@@ -1487,6 +1557,8 @@ where
         if let Some(office) = self.office.take() {
             office.hand_back(&mut self.standing, &self.my_id);
         }
+        // A new office tells only what it cancelled itself.
+        self.cancelled_runs.clear();
     }
 
     fn send(&mut self, to: WorkerId, payload: election_message::Payload) {
@@ -1596,6 +1668,15 @@ where
                 .map(Instant::at),
         );
         self.leader = Some((ack.leader_id(), ack.term));
+        if !ack.cancelled_runs.is_empty() {
+            let runs = ack
+                .cancelled_runs
+                .iter()
+                .cloned()
+                .map(TaskRunId::from)
+                .collect();
+            self.outputs.push(Output::RunsCancelled(runs));
+        }
         self.newest_accepted_ack = Some(AckEcho {
             term: ack.term,
             send_token: ack.send_token,
@@ -1880,6 +1961,14 @@ where
 
     /// Sends `to` an ack carrying `content` from this leader.
     fn send_ack_with(&mut self, to: WorkerId, content: AckContent, heartbeat_token: Option<u64>) {
+        let cancelled_runs = self
+            .cancelled_runs
+            .get_mut(&to)
+            .map(CancelledRuns::next_batch)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect();
         let ack = LeaderHeartbeatAck {
             shard_id: Some(self.shard_id.clone().into()),
             leader_id: Some(self.my_id.clone().into()),
@@ -1891,6 +1980,7 @@ where
             send_token: self.clock.now().as_ticks(),
             heartbeat_token,
             recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
+            cancelled_runs,
         };
         self.send(to, election_message::Payload::HeartbeatAck(ack));
     }
@@ -2403,6 +2493,7 @@ where
         }
         if let Some(office) = self.office.as_mut() {
             office.take_removal(departing.clone());
+            self.cancelled_runs.remove(departing);
         }
         self.drain_once_free();
     }
@@ -2938,6 +3029,8 @@ where
             if self.state == WorkerState::LeaderReconciling {
                 self.lost_while_reconciling.insert(worker.clone());
             }
+            // Its runs are replayed, so nothing cancelled on it needs telling.
+            self.cancelled_runs.remove(&worker);
             self.outputs.push(Output::WorkerLost(worker));
         }
     }

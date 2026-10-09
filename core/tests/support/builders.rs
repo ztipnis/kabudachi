@@ -183,6 +183,7 @@ pub fn leader_ack(
         recipient_prior_admission: None,
         heartbeat_token: None,
         recovery_epoch_lineage: 0,
+        cancelled_runs: Vec::new(),
     }
 }
 
