@@ -1243,9 +1243,9 @@ where
         self.lease.has_contact_floor()
     }
 
-    /// While it holds office: `worker` holds `run`, which this leader
-    /// cancelled and has stored as cancelled. Every ack to `worker` lists it
-    /// until [`Self::forget_cancelled`].
+    /// While it holds office: `worker` holds `run`, which is stored as
+    /// cancelled, by this leader or an earlier one. Every ack to `worker`
+    /// lists it until [`Self::forget_cancelled`].
     pub fn tell_cancelled(&mut self, worker: WorkerId, run: TaskRunId) {
         if self.holds_office() {
             self.cancelled_runs.entry(worker).or_default().runs.insert(run);

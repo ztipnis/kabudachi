@@ -847,9 +847,11 @@ fn catch_up_if_due<C: Clock, I: IdGenerator>(
 /// No client lives on a worker of a networked shard yet, so the events the
 /// scheduler raises for one are logged and dropped rather than kept for ever,
 /// except a cancel of a running run: it is held until the cancel is stored,
-/// then left in `local` for the run's worker to be told. Taking the events
-/// ends the scheduler's call, which can publish the revisions the call made,
-/// so they are written first; nothing else waits on those writes.
+/// then left in `local` for the run's worker to be told. So is a run stored
+/// as cancelled, perhaps by an earlier leader, that its worker reported it
+/// still holds. Taking the events ends the scheduler's call, which can
+/// publish the revisions the call made, so they are written first; nothing
+/// else waits on those writes.
 fn drain_events<C: Clock, I: IdGenerator>(
     node: &WorkerNode<C>,
     scheduler: &mut Scheduler<C, I, RecordOutbox>,
@@ -883,6 +885,15 @@ fn drain_events<C: Clock, I: IdGenerator>(
             }
         }
         tracing::debug!(?event, "scheduler event with no client to tell");
+    }
+    for held in scheduler.take_held_cancels() {
+        let answer = HeldAnswer::CancelledRun {
+            worker: held.worker,
+            run: held.task_run_id,
+        };
+        if let Some(settled) = records.hold(answer, Vec::new(), Some(&held.task_id)) {
+            send_answer(net, settled, local);
+        }
     }
 }
 

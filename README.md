@@ -2993,8 +2993,6 @@ Implement:
 - a test for a sync body raising `BaseException`, under subprocess isolation;
 - per-queue and per-task `reconnect_timeout`.
 
-Open: cancelling a run held by another worker is best-effort. A cancel the leader stored but answered `NotLeader`, because it stepped down before acknowledging, is not told again by the next leader, and a remote body learns of the cancel only at its next report.
-
 ### Phase 6: flow/group/map/reduce
 
 Phase 1 already delivers `flow`, `group`, implicit flows and `.map` in a one-node shard. Add:

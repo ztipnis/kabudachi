@@ -413,6 +413,15 @@ pub enum Event {
     },
 }
 
+/// A run stored as cancelled that its worker reported it still holds: the
+/// worker has to be told to stop the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldCancel {
+    pub task_id: TaskId,
+    pub task_run_id: TaskRunId,
+    pub worker: WorkerId,
+}
+
 /// A run that was lost with its worker, and the run that replaces it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LostRun {
@@ -630,6 +639,9 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     retention: Retention,
     /// What the scheduler decided on its own, waiting to be taken.
     events: Vec<Event>,
+    /// Runs stored as cancelled that their workers reported they still hold,
+    /// waiting to be taken once the scheduler leads.
+    held_cancels: Vec<HeldCancel>,
     /// Which generation of each coalescing key waits, and which one runs.
     occupancy: Occupancy,
     /// The bytes tasks hold, the limits on them and `SlowDown`.
@@ -717,6 +729,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             waiting: WaitingRoom::default(),
             retention: Retention::default(),
             events: Vec::new(),
+            held_cancels: Vec::new(),
             occupancy: Occupancy::default(),
             budget: MemoryBudget::default(),
             continuing: BTreeSet::new(),
@@ -1394,9 +1407,20 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return;
         }
         let recorded = self.runs[&run_id].current_state();
-        if !matches!(recorded, TaskRunState::Claimed | TaskRunState::Running)
-            || self.runs[&run_id].selected_worker().as_ref() != Some(worker)
+        if self.runs[&run_id].selected_worker().as_ref() != Some(worker) {
+            return;
+        }
+        if recorded == TaskRunState::Cancelled
+            && matches!(reported.state, ReportedState::Claimed | ReportedState::Running)
         {
+            self.held_cancels.push(HeldCancel {
+                task_id,
+                task_run_id: run_id,
+                worker: worker.clone(),
+            });
+            return;
+        }
+        if !matches!(recorded, TaskRunState::Claimed | TaskRunState::Running) {
             return;
         }
         let beyond_claimed = !matches!(reported.state, ReportedState::Claimed);
@@ -1505,6 +1529,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.links.clear();
         self.unpublished.clear();
         self.events.clear();
+        self.held_cancels.clear();
         self.run_decided_at.clear();
         self.failed_compactions.clear();
     }
@@ -1913,6 +1938,18 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let events = std::mem::take(&mut self.events);
         self.end_call();
         events
+    }
+
+    /// The runs stored as cancelled that their workers reported they still
+    /// hold, each time one reported it: whichever leader stored the cancel,
+    /// the worker must still be told to stop the body. Nothing while the
+    /// scheduler does not lead: what a rebuild installed is told of only once
+    /// it is stored again at this leader's term. Kept until then.
+    pub fn take_held_cancels(&mut self) -> Vec<HeldCancel> {
+        if !self.is_leader() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.held_cancels)
     }
 
     /// A worker asks for up to `limit` of the oldest pending tasks at once.
