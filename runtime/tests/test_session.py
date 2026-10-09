@@ -873,7 +873,14 @@ def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit(deliv
     assert calls == ["first body started", "first body exited", "second body ran"]
 
 
-def test_an_abort_deadline_that_arrives_before_its_held_run_starts_still_stops_the_run():
+@pytest.mark.parametrize(
+    ("early", "reported"),
+    [
+        pytest.param("abort", ["lost"], id="an abort deadline, then reported lost"),
+        pytest.param("cancel", [], id="a cancellation, then nothing reported"),
+    ],
+)
+def test_what_the_leader_says_before_its_held_run_starts_still_stops_the_run(early, reported):
     async def sleeps(request: Greeting) -> Greeting:
         await asyncio.sleep(30)
         return request
@@ -883,21 +890,30 @@ def test_an_abort_deadline_that_arrives_before_its_held_run_starts_still_stops_t
     world.runtime.delivers_results = False
     claim_pending = world.runtime.claim_pending
 
-    async def deadline_before_start(limit):
+    async def word_before_start(limit):
         claims = await claim_pending(limit)
         for claim in claims:
-            world.runtime.inject_abort(claim.task_run_id, 0.2)
-        # The event watcher takes the deadline before the claim loop starts the run.
+            if early == "abort":
+                world.runtime.inject_abort(claim.task_run_id, 0.2)
+            else:
+                world.runtime.inject_cancel(claim.task_id, claim.task_run_id)
+        # The event watcher takes the word before the claim loop starts the run.
         await asyncio.sleep(0.05)
         return claims
 
-    world.runtime.claim_pending = deadline_before_start
+    world.runtime.claim_pending = word_before_start
 
     async def body():
         world.call("sleeps", Greeting())
-        await until(lambda: any(event[0] == "lost" for event in world.runtime.events), "a lost report")
+        await until(lambda: world.runtime.events, "the run to start")
+        # Its body would sleep on for 30 s.
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
 
     run(with_events(world, body))
+
+    assert [
+        event[0] for event in world.runtime.events if event[0] in ("complete", "fail", "lost")
+    ] == reported
 
 
 def test_what_an_abandoned_body_later_returns_or_raises_is_discarded(caplog):

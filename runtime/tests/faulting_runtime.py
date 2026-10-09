@@ -90,6 +90,18 @@ class FaultingRuntime:
             )
         )
 
+    def inject_cancel(self, task_id, task_run_id):
+        """Makes `next_events()` also return the cancellation a shard's leader
+        would send the worker holding the task's run."""
+        self._injected.put_nowait(
+            SimpleNamespace(
+                kind=_native.EventKind.CANCELLED,
+                task_id=task_id,
+                task_run_id=task_run_id,
+                was_running=True,
+            )
+        )
+
     async def next_events(self):
         if self.event_error is not None:
             raise self.event_error
