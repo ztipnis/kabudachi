@@ -499,6 +499,11 @@ impl<'n> Executing<'n> {
             // Nothing reads reports any more: a report sent now fails with
             // `DriverGone` rather than vanishing.
             self.endpoint.reports.close();
+            // A report sent between the drain above and the close is still
+            // buffered: keep it too.
+            while let Ok(report) = self.endpoint.reports.try_recv() {
+                self.arrived.push(report);
+            }
         }
     }
 
