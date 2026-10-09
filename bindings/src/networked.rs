@@ -66,8 +66,18 @@ struct Observed {
     leader: Option<(WorkerId, u64)>,
     voters: usize,
     shard_id: String,
-    /// The worker is out of its shard: `Worker::run` returned.
+    /// The worker is out of its shard: `Worker::run` ended, however it did.
     gone: bool,
+}
+
+/// Marks the worker out of its shard when dropped: when `Worker::run`
+/// returns, and also when it panics or is aborted, so no wait outlives it.
+struct LeftOnDrop(Arc<watch::Sender<Observed>>);
+
+impl Drop for LeftOnDrop {
+    fn drop(&mut self) {
+        self.0.send_modify(|seen| seen.gone = true);
+    }
 }
 
 /// What passes between the driver and Python.
@@ -94,8 +104,6 @@ struct Shared {
     reports: ReportSink,
     net: Arc<Net>,
     observed: watch::Receiver<Observed>,
-    /// The shard's reconnect timeout, for a claim that names none.
-    default_reconnect: CoreDuration,
     /// How long to wait before asking a leader again.
     retry_after: StdDuration,
     /// How long a leader may take to answer.
@@ -136,16 +144,6 @@ impl Shared {
         }
     }
 
-    /// `wire` as the core reads a claim, with the shard's reconnect timeout
-    /// for a claim that names none.
-    fn read_claim(&self, wire: &kabudachi_core::protocol::messages::Claim) -> Option<Claim> {
-        let mut claim = Claim::try_from(wire).ok()?;
-        if claim.reconnect_timeout.as_ticks() == 0 {
-            claim.reconnect_timeout = self.default_reconnect;
-        }
-        Some(claim)
-    }
-
     fn on_work(&self, work: Work) {
         let (report, wake) = {
             let mut guard = self.seam();
@@ -154,7 +152,7 @@ impl Shared {
             match work {
                 Work::Run(wire) | Work::Compact(wire) => {
                     seam.offered = seam.offered.saturating_sub(1);
-                    match self.read_claim(&wire) {
+                    match Claim::try_from(&wire).ok() {
                         Some(claim) if seam.closed => (Some(Report::Lost(claim.task_run_id)), false),
                         Some(claim) => {
                             seam.handed.push_back(claim);
@@ -318,6 +316,9 @@ async fn deliver(shared: Arc<Shared>, submitted: Submitted) {
     let task = submitted.task_id.clone();
     let event = loop {
         let Some(leader) = shared.leader().await else {
+            // Out of its shard: no leader will answer, and a cancel waiting
+            // for this submission must not wait for ever.
+            shared.seam().delivering.remove(&task);
             return;
         };
         let asked = shared.net.submit(leader, submitted.clone());
@@ -328,13 +329,7 @@ async fn deliver(shared: Arc<Shared>, submitted: Submitted) {
                 }
                 Some(task_response::Result::Reject(reject)) => {
                     match TaskRejectReason::try_from(reject.reason) {
-                        // Not leading, not ready, or not yet sure of this
-                        // worker: ask again.
-                        Ok(
-                            TaskRejectReason::TaskRejectNotLeader
-                            | TaskRejectReason::TaskRejectNotReady
-                            | TaskRejectReason::TaskRejectNotMember,
-                        ) => {}
+                        Ok(reason) if asks_again(reason) => {}
                         Ok(reason) => break PyEvent::refused(task.as_str(), reason.as_str_name()),
                         Err(_) => {
                             break PyEvent::refused(task.as_str(), "a reason this worker cannot read");
@@ -356,12 +351,26 @@ async fn deliver(shared: Arc<Shared>, submitted: Submitted) {
     shared.wake();
 }
 
+/// Whether a refusal says to ask again: the node asked is not leading, not
+/// ready, or not yet sure of this worker.
+fn asks_again(reason: TaskRejectReason) -> bool {
+    matches!(
+        reason,
+        TaskRejectReason::TaskRejectNotLeader
+            | TaskRejectReason::TaskRejectNotReady
+            | TaskRejectReason::TaskRejectNotMember
+    )
+}
+
 /// Asks leaders to cancel `task` until one answers, once its own submission
 /// from here (if any) has been answered. How the cancel ended is not
 /// reported: a run it stopped is ended by the driver's `Cancel`, wherever
 /// it runs, and a task it found finished or unknown needs nothing.
 async fn cancel_at_leader(shared: Arc<Shared>, task: TaskId) {
     while shared.seam().delivering.contains(&task) {
+        if shared.observed.borrow().gone {
+            return;
+        }
         tokio::time::sleep(shared.retry_after).await;
     }
     loop {
@@ -371,9 +380,10 @@ async fn cancel_at_leader(shared: Arc<Shared>, task: TaskId) {
         let asked = shared.net.cancel(leader, task.clone());
         if let Ok(Ok(response)) = tokio::time::timeout(shared.answer_within, asked).await {
             match response.result {
-                // Not leading or not ready yet: ask again.
-                Some(task_response::Result::Reject(_)) => {}
-                // Cancelled, already finished or unknown: the leader decided.
+                Some(task_response::Result::Reject(reject))
+                    if TaskRejectReason::try_from(reject.reason).is_ok_and(asks_again) => {}
+                // Cancelled, already finished, unknown, or refused for good:
+                // the leader decided.
                 _ => return,
             }
         }
@@ -438,8 +448,8 @@ impl NetworkedRuntime {
     /// worker of it. `memory_soft_limit` and `memory_hard_limit` bound
     /// pending task input while this worker leads, as for `NativeRuntime`.
     ///
-    /// Raises `ValueError` for an address that cannot be read, only one
-    /// memory limit or no worker threads, and `RuntimeError` if it cannot
+    /// Raises `ValueError` for an address that cannot be read, a timing of
+    /// zero, only one memory limit or no worker threads, and `RuntimeError` if it cannot
     /// listen on `listen`.
     #[new]
     #[pyo3(signature = (
@@ -476,6 +486,15 @@ impl NetworkedRuntime {
     ) -> PyResult<Self> {
         if worker_threads == 0 {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));
+        }
+        for (name, value) in [
+            ("heartbeat_interval_ms", heartbeat_interval_ms),
+            ("heartbeat_timeout_ms", heartbeat_timeout_ms),
+            ("reconnect_timeout_ms", reconnect_timeout_ms),
+        ] {
+            if value == 0 {
+                return Err(PyValueError::new_err(format!("{name} must be positive")));
+            }
         }
         let timings = ElectionTimings::new(
             CoreDuration::from_millis(heartbeat_timeout_ms),
@@ -526,20 +545,20 @@ impl NetworkedRuntime {
             reports,
             net: worker.net(),
             observed,
-            default_reconnect: CoreDuration::from_millis(reconnect_timeout_ms),
             retry_after: StdDuration::from_millis(heartbeat_interval_ms),
             answer_within: StdDuration::from_millis(heartbeat_timeout_ms),
         });
 
         let seen = Arc::clone(&sender);
-        let left = Arc::clone(&sender);
+        let left = LeftOnDrop(Arc::clone(&sender));
         let running = tokio.spawn(async move {
+            // Dropped however this ends, a panic or an abort included.
+            let _left = left;
             let _ = worker
                 .run(move |node: &WorkerNode<RealClock>, _: Option<&Input>, _: &Step| {
                     publish(&seen, node);
                 })
                 .await;
-            left.send_modify(|seen| seen.gone = true);
         });
         let pumped = Arc::clone(&shared);
         let pump = tokio.spawn(async move {
@@ -704,8 +723,12 @@ impl NetworkedRuntime {
     /// Offers the driver up to `limit` free places, and returns an
     /// awaitable that resolves to the runs it hands over, at most `limit`,
     /// as soon as there is one. An empty list once `stop_taking()` was
-    /// called. Raises `ValueError` if `limit` is zero, and `RuntimeError` if
-    /// the worker leaves its shard.
+    /// called, which also ends a claim already waiting. Raises `ValueError`
+    /// if `limit` is zero, and `RuntimeError` if the worker leaves its shard.
+    ///
+    /// The awaitable must not be cancelled while it waits, except at
+    /// shutdown: runs handed over after the cancel stay held here and are
+    /// never run. Call `stop_taking()` to end a waiting claim instead.
     fn claim_pending<'py>(&self, py: Python<'py>, limit: usize) -> PyResult<Bound<'py, PyAny>> {
         if limit == 0 {
             return Err(PyValueError::new_err("limit must be at least 1"));
@@ -718,7 +741,11 @@ impl NetworkedRuntime {
     }
 
     /// Returns an awaitable that resolves to the events raised since the
-    /// last call, oldest first, as soon as there is one.
+    /// last call, oldest first, as soon as there is one. Raises
+    /// `RuntimeError` if the worker leaves its shard.
+    ///
+    /// The awaitable must not be cancelled while it waits, except at
+    /// shutdown: events it took before the cancel are lost.
     fn next_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let shared = Arc::clone(&self.shared);
         self.bridge
@@ -817,7 +844,9 @@ impl NetworkedRuntime {
     }
 
     /// Takes no more runs: those handed over and not taken are reported
-    /// lost, later ones too, and a claim waiting resolves empty.
+    /// lost, later ones too, and a claim waiting resolves empty. The driver
+    /// may still hand over up to the places already offered; each is
+    /// reported lost as it arrives.
     fn stop_taking(&self) {
         let unstarted: Vec<TaskRunId> = {
             let mut seam = self.shared.seam();
@@ -835,14 +864,15 @@ impl NetworkedRuntime {
 
     /// Returns an awaitable that resolves once the leader has taken the
     /// last report on every run this worker claimed (`True`), or the
-    /// reconnect timeout has passed (`False`).
+    /// reconnect timeout has passed or the worker left its shard (`False`).
     fn wait_until_reported<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let net = Arc::clone(&self.shared.net);
+        let observed = self.shared.observed.clone();
         let within = self.reconnect_timeout;
         self.bridge.spawn_into_py(py, async move {
             let deadline = tokio::time::Instant::now() + within;
             while !net.claimed_runs().snapshot().is_empty() {
-                if tokio::time::Instant::now() >= deadline {
+                if observed.borrow().gone || tokio::time::Instant::now() >= deadline {
                     return Ok(false);
                 }
                 tokio::time::sleep(REPORTED_POLL).await;
