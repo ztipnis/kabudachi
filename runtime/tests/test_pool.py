@@ -342,6 +342,88 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
         os.kill(int((markers / "outliving").read_text()), 0)
 
 
+@pytest.mark.parametrize(
+    "ended_by",
+    [
+        pytest.param("abort", id="still folding at its abort deadline: killed with its process and failed"),
+        pytest.param("cancel", id="cancelled by the leader: reports nothing once its fold ends"),
+    ],
+)
+def test_a_compaction_handed_over_by_a_shard_ends_as_the_leader_says(markers, ended_by):
+    kabudachi.configure(processes=1, concurrency=2)
+    configuration = config_module.process_configuration()
+    settings = configuration.settings()
+    registry = registry_module.default_registry()
+    hooks = lifecycle_module.default_hooks()
+    seconds_left = 0.5
+
+    async def main():
+        pool = ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
+        native = _native.NativeRuntime(
+            "worker", "incarnation", memory_soft_limit=400, memory_hard_limit=100_000
+        )
+        runtime = FaultingRuntime(native)
+        # Runs a shard's leader hands this worker, which settle no handle here.
+        runtime.delivers_results = False
+        compactions = []
+        claim_pending = runtime.claim_pending
+
+        async def noting_compactions(limit):
+            claims = await claim_pending(limit)
+            compactions.extend(claim for claim in claims if claim.compaction)
+            return claims
+
+        runtime.claim_pending = noting_compactions
+        serving = None
+        await pool.start()
+        try:
+            async with asyncio.timeout(30):
+                await native.wait_until_leader()
+                session = Session(runtime, registry, process_serializers(), configuration, executor=pool)
+                serving = asyncio.ensure_future(session.serve())
+                definition = pool_tasks.compacted_slowly.definition
+                session.submit(definition, Greeting(text="holder"))
+                while not (markers / "holding").exists():
+                    await asyncio.sleep(0.01)
+                for letter in "abcdefgh":
+                    session.submit(definition, Greeting(text=letter * 60))
+                while not (compactions and (markers / "merging").exists()):
+                    await asyncio.sleep(0.01)
+                run_id = compactions[0].task_run_id
+                since = time.monotonic()
+                if ended_by == "abort":
+                    # As the leader would once this worker lost contact with it.
+                    runtime.inject_abort(run_id, seconds_left)
+                    while not any(event[:2] == ("fail", run_id) for event in runtime.events):
+                        await asyncio.sleep(0.01)
+                else:
+                    runtime.inject_cancel("", run_id)
+                    await asyncio.sleep(0.1)
+                    (markers / "release merge").touch()
+                    while not (markers / "merged").exists():
+                        await asyncio.sleep(0.01)
+                    # Time for what the fold sent back to reach the session.
+                    await asyncio.sleep(0.3)
+                return time.monotonic() - since, [event for event in runtime.events if event[1] == run_id]
+        finally:
+            if serving is not None:
+                serving.cancel()
+                await asyncio.gather(serving, return_exceptions=True)
+            await pool.stop(kill=True)
+            native.shutdown()
+
+    ended, reported = asyncio.run(main())
+
+    if ended_by == "abort":
+        # Its fold blocks its process for 30 s: it failed because the process
+        # was killed at the deadline.
+        assert seconds_left <= ended < seconds_left + 2.0, ended
+        assert [event[0] for event in reported] == ["fail"], reported
+        assert not (markers / "merged").exists()
+    else:
+        assert reported == [], reported
+
+
 def test_a_task_process_is_replaced_after_its_run_limit_and_after_a_recycling_task_once_its_run_finishes():
     kabudachi.configure(processes=1, concurrency=1, max_runs_per_process=3)
     most_alive = 0

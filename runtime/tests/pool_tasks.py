@@ -85,6 +85,33 @@ async def refresh(request: Greeting) -> Greeting:
     return request
 
 
+def fold_once_released(older: Greeting, newer: Greeting) -> Greeting:
+    """Leaves its process id in `merging`, then blocks its whole task process
+    until `release merge` exists (at most 30 s), and leaves `merged` once it has."""
+    marker("merging").write_text(str(os.getpid()))
+    end = time.monotonic() + 30
+    while time.monotonic() < end and not marker("release merge").exists():
+        time.sleep(0.01)
+    marker("merged").touch()
+    return Greeting(text=f"({older.text}>{newer.text})")
+
+
+@kabudachi.coalescing_task(
+    name="pool.compacted_slowly", merge=fold_once_released, cancel_grace=timedelta(seconds=3)
+)
+async def compacted_slowly(request: Greeting) -> Greeting:
+    """The `holder` generation holds the key until a fold has begun, so the
+    payloads queued behind it are compacted. The cancel grace is longer than
+    the abort deadline a test gives the compaction."""
+    if request.text == "holder":
+        marker("holding").touch()
+        for _ in range(3000):
+            if marker("merging").exists():
+                break
+            await asyncio.sleep(0.01)
+    return request
+
+
 @kabudachi.task(name="pool.leaf")
 async def leaf(request: Greeting) -> Greeting:
     return Greeting(times=request.times + 1)
