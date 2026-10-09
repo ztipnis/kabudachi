@@ -27,10 +27,10 @@ use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, ShardName, Uuid7Ids, WorkerId};
-use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::scheduler::{MemoryLimits, Scheduler};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::RealClock;
-use libp2p::Multiaddr;
+pub use libp2p::Multiaddr;
 
 use crate::authority::{AuthorityClient, SharedAuthority};
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, DEFAULT_SEED_ROUNDS, bootstrap};
@@ -103,6 +103,10 @@ pub struct WorkerConfig {
     /// scheduler and by every worker's record store; `None` keeps finished
     /// tasks.
     pub result_ttl: Option<StdDuration>,
+    /// The memory limits the worker's scheduler holds pending task input to
+    /// while it leads (see `kabudachi_core::scheduler::MemoryLimits`); `None`
+    /// for none.
+    pub memory_limits: Option<MemoryLimits>,
     /// The executor that runs the tasks this worker claims; `None` for none.
     /// With one, the driver claims work while the executor has room and
     /// hands it over, and the worker says it runs compaction. With none it
@@ -138,6 +142,7 @@ impl WorkerConfig {
             input_limit: None,
             replication_factor: ReplicationFactor::DEFAULT,
             result_ttl: None,
+            memory_limits: None,
             executor: None,
         }
     }
@@ -205,6 +210,13 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_result_ttl(mut self, ttl: StdDuration) -> Self {
         self.result_ttl = Some(ttl);
+        self
+    }
+
+    /// Holds pending task input to `limits` while this worker leads.
+    #[must_use]
+    pub fn with_memory_limits(mut self, limits: MemoryLimits) -> Self {
+        self.memory_limits = Some(limits);
         self
     }
 
@@ -329,6 +341,7 @@ impl Worker {
         let (mut node, first) = WorkerNode::start(identity, entry, clock, authority_timings);
         let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         scheduler.set_result_ttl(retention_of(&config));
+        scheduler.set_memory_limits(config.memory_limits);
         run_driver(
             &mut node,
             first,

@@ -5,7 +5,9 @@
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
 //! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
 //! [`Net::report_lost`] and [`Net::cancel`], each sent to the leader the
-//! caller names: the transport keeps no leader of its own. The calls about a
+//! caller names: the transport keeps no leader of its own. A call addressed
+//! to this worker itself, while it leads, is answered by its own driver the
+//! same way. The calls about a
 //! run also keep this worker's
 //! [`ClaimedRuns`](crate::claimed_runs::ClaimedRuns) ledger, from the answers
 //! they get.
@@ -39,6 +41,7 @@ use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
 use kabudachi_core::time::Clock;
 use libp2p::PeerId;
+use tokio::sync::oneshot;
 
 use crate::claimed_runs::{ClaimedRuns, HeldRun};
 use crate::exchange::Asked;
@@ -59,37 +62,53 @@ pub(crate) const MAX_PLACE_IDS: usize = 256;
 /// Why a task-exchange call got no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskFailure {
-    /// The leader named is this worker: its own scheduler decides, in its
-    /// driver, and nothing was sent. A worker's driver decides its own
-    /// executor's reports so.
-    ThisWorkerLeads,
     /// No answer came: the request failed outright (such as a leader that
     /// cannot be dialed), the leader disconnected before answering, or
     /// nothing could be sent (this `Net` has stopped, or the leader's id
-    /// names no libp2p peer).
+    /// names no libp2p peer); or, for a request this worker made of itself,
+    /// its driver stopped before answering.
     Unanswered,
 }
 
-/// An unanswered inbound `/kabudachi/task/1` request, returned by
-/// [`Net::poll_task_requests`]. Answer it with [`Net::respond_task`];
-/// dropping it unanswered just lets the requester's substream eventually fail
-/// with `OutboundFailure` on their side, the same contract as
-/// `ClaimRequestHandle`.
-pub struct TaskRequestHandle(Asked<TaskCodec>);
+/// A task-exchange request this worker made of itself while its node names
+/// it leader: its own driver answers it, as it answers a peer's.
+pub(crate) struct OwnTask {
+    pub(crate) request: TaskRequest,
+    pub(crate) reply: oneshot::Sender<TaskResponse>,
+}
+
+/// Who asked a request, and where its answer goes.
+enum Asker {
+    Peer(Asked<TaskCodec>),
+    Own { from: WorkerId, task: OwnTask },
+}
+
+/// An unanswered `/kabudachi/task/1` request, returned by
+/// [`Net::poll_task_requests`]: a peer's, or one this worker made of itself
+/// while it leads. Answer it with [`Net::respond_task`]; dropping it
+/// unanswered lets a peer's substream fail with `OutboundFailure` on their
+/// side, and this worker's own ask end `Unanswered`.
+pub struct TaskRequestHandle(Asker);
 
 impl TaskRequestHandle {
     /// The `WorkerId` of whoever sent this request.
     pub fn from(&self) -> WorkerId {
-        worker_id_of(&self.0.from)
+        match &self.0 {
+            Asker::Peer(asked) => worker_id_of(&asked.from),
+            Asker::Own { from, .. } => from.clone(),
+        }
     }
 
     /// What this request asks for.
     pub fn request(&self) -> &task_request::Request {
-        self.0
-            .request
+        let request = match &self.0 {
+            Asker::Peer(asked) => &asked.request,
+            Asker::Own { task, .. } => &task.request,
+        };
+        request
             .request
             .as_ref()
-            .expect("the task codec only accepts a request that asks for something")
+            .expect("every task request this worker reads asks for something")
     }
 }
 
@@ -278,20 +297,34 @@ impl Net {
         self.ask_task(leader, request).await
     }
 
-    /// Drains every inbound `/kabudachi/task/1` request not yet answered.
-    /// Answer each with [`Self::respond_task`].
+    /// Drains every `/kabudachi/task/1` request not yet answered: peers', and
+    /// this worker's own. Answer each with [`Self::respond_task`].
     pub fn poll_task_requests(&self) -> Vec<TaskRequestHandle> {
-        self.take_asked::<TaskCodec>()
+        let me = self.local_worker_id();
+        let mut handles: Vec<TaskRequestHandle> = self
+            .take_asked::<TaskCodec>()
             .into_iter()
-            .map(TaskRequestHandle)
-            .collect()
+            .map(|asked| TaskRequestHandle(Asker::Peer(asked)))
+            .collect();
+        handles.extend(self.inbound.take_own_tasks().into_iter().map(|task| {
+            TaskRequestHandle(Asker::Own {
+                from: me.clone(),
+                task,
+            })
+        }));
+        handles
     }
 
     /// Answers a request obtained from [`Self::poll_task_requests`].
-    /// Fire-and-forget like `respond_claim`: if the driver task has already
-    /// stopped, there's nowhere for the answer to go, and that's fine to drop.
+    /// Fire-and-forget: an asker that stopped waiting, or a swarm task that
+    /// stopped, drops the answer, and that is fine.
     pub fn respond_task(&self, handle: TaskRequestHandle, response: TaskResponse) {
-        self.answer::<TaskCodec>(handle.0.channel, response);
+        match handle.0 {
+            Asker::Peer(asked) => self.answer::<TaskCodec>(asked.channel, response),
+            Asker::Own { task, .. } => {
+                let _ = task.reply.send(response);
+            }
+        }
     }
 
     /// The runs this worker claimed and has not heard the end of.
@@ -305,7 +338,17 @@ impl Net {
         request: task_request::Request,
     ) -> Result<TaskResponse, TaskFailure> {
         if leader == self.local_worker_id() {
-            return Err(TaskFailure::ThisWorkerLeads);
+            // This worker leads: its own driver decides, from its own
+            // scheduler, and answers once the writes it made are stored,
+            // as it answers a peer.
+            let (reply, answer) = oneshot::channel();
+            self.inbound.queue_own_task(OwnTask {
+                request: TaskRequest {
+                    request: Some(request),
+                },
+                reply,
+            });
+            return answer.await.map_err(|_| TaskFailure::Unanswered);
         }
         let to = PeerId::from_str(leader.as_str()).map_err(|_| TaskFailure::Unanswered)?;
         self.ask::<TaskCodec>(

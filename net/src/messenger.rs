@@ -217,6 +217,7 @@ use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, w
 use crate::reconcile::codec::ReconcileCodec;
 use crate::steal::codec::StealCodec;
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm, hide_listen_addresses};
+use crate::task_exchange::OwnTask;
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_store::{HeldRecords, record_key};
 
@@ -414,7 +415,8 @@ pub const DEFAULT_INPUT_LIMIT: usize = 1024;
 
 /// What `drive` hands over for the driver of this `Net`'s node, each queue
 /// in arrival order: the node's inputs, the join, claim, task, reconcile and steal requests the
-/// driver answers, and the outcomes of the record writes it asked for.
+/// driver answers, this worker's own task requests, and the outcomes of the record writes it
+/// asked for.
 /// `arrived` is signalled whenever any of them grows.
 pub(crate) struct Inbound {
     inputs: Mutex<VecDeque<Input>>,
@@ -425,6 +427,7 @@ pub(crate) struct Inbound {
     tasks: Mutex<VecDeque<Asked<TaskCodec>>>,
     reconciles: Mutex<VecDeque<Asked<ReconcileCodec>>>,
     steals: Mutex<VecDeque<Asked<StealCodec>>>,
+    own_tasks: Mutex<VecDeque<OwnTask>>,
     writes: Mutex<VecDeque<WriteOutcome>>,
     arrived: Notify,
 }
@@ -439,6 +442,7 @@ impl Default for Inbound {
             tasks: Mutex::default(),
             reconciles: Mutex::default(),
             steals: Mutex::default(),
+            own_tasks: Mutex::default(),
             writes: Mutex::default(),
             arrived: Notify::new(),
         }
@@ -501,6 +505,15 @@ impl Inbound {
         push(queue, asked);
         self.arrived.notify_one();
     }
+
+    /// Queues a task-exchange request this worker made of itself.
+    pub(crate) fn queue_own_task(&self, task: OwnTask) {
+        self.queue_asked(&self.own_tasks, task);
+    }
+
+    pub(crate) fn take_own_tasks(&self) -> Vec<OwnTask> {
+        drain(&self.own_tasks)
+    }
 }
 
 /// The peer a connection event is about; `None` for any other input.
@@ -532,7 +545,7 @@ fn drain<T>(queue: &Mutex<VecDeque<T>>) -> Vec<T> {
 pub struct Net {
     local_worker_id: WorkerId,
     commands: mpsc::UnboundedSender<Command>,
-    inbound: Arc<Inbound>,
+    pub(crate) inbound: Arc<Inbound>,
     /// The address this `Net` gives other nodes for itself (see
     /// `Self::local_multiaddr`), as the swarm task last published it.
     local_addr: watch::Receiver<Option<Multiaddr>>,
