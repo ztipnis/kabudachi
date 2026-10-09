@@ -32,8 +32,10 @@ rust_shared_library(
         "//conditions:default": [],
     }),
     visibility = ["//visibility:private"],
+    # The networked runtime hosts a net worker.
     deps = [
         "//core:core",
+        "//net",
         "@crates//:pyo3",
         "@crates//:tokio",
     ],

@@ -523,3 +523,43 @@ def test_a_coalescing_submission_that_would_outgrow_one_claim_is_refused_and_the
 
     assert claimed.task_id == newest
     assert [len(payload) for payload in claimed.chain] == [chunk]
+
+
+def test_scaffold_a_lone_networked_runtime_runs_and_records_its_own_task():
+    native = _native.NetworkedRuntime(
+        "solo",
+        "/ip4/127.0.0.1/tcp/0",
+        heartbeat_interval_ms=100,
+        heartbeat_timeout_ms=1000,
+        reconnect_timeout_ms=2000,
+    )
+
+    async def body():
+        await native.wait_until_ready()
+        assert native.leader() == (native.worker_id(), native.leader()[1])
+        task_id = native.submit("demo", 1, b"in", "default", "task", None)
+        kinds = set()
+        while _native.EventKind.ACCEPTED not in kinds:
+            kinds |= {event.kind for event in await native.next_events() if event.task_id == task_id}
+        [claim] = await native.claim_pending(1)
+        assert (claim.task_id, bytes(claim.serialized_input)) == (task_id, b"in")
+        native.report_started(claim.task_run_id)
+        native.complete(claim.task_run_id, _native.result_digest(b"out"))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            record = await native.task_record(task_id)
+            if record is not None and record.finished:
+                return record
+            await asyncio.sleep(0.05)
+        raise AssertionError("the run was never recorded as finished")
+
+    try:
+        record = asyncio.run(body())
+    finally:
+        native.shutdown()
+    [run] = record.runs
+    assert (run.state, run.worker, run.result_digest) == (
+        RunState.SUCCEEDED,
+        native.worker_id(),
+        _native.result_digest(b"out"),
+    )

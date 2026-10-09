@@ -1561,6 +1561,7 @@ name = "kabudachi-bindings"
 version = "0.1.0"
 dependencies = [
  "kabudachi-core",
+ "kabudachi-net",
  "pyo3",
  "tokio",
 ]

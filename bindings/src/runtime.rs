@@ -170,6 +170,13 @@ impl NativeRuntime {
         })
     }
 
+    /// Whether a run's certification comes back to this process, so a
+    /// handle can be settled with its result: always, for a shard of one.
+    #[getter]
+    fn delivers_results(&self) -> bool {
+        true
+    }
+
     /// The incarnation of the shard this runtime founded at start: `local/`
     /// and an id unique to this start.
     fn shard_id(&self) -> String {
