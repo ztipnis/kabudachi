@@ -46,6 +46,9 @@ DEFAULT_MEMORY_HARD_LIMIT = 512 * 1024 * 1024
 # The key prefix of an `authority` URL that does not set its own.
 DEFAULT_KEY_PREFIX = "kabudachi:"
 
+# The highest database number an `authority` URL may name.
+MAX_DATABASE = 65535
+
 # Above this many places per process, `concurrency_override=True` is needed:
 # every place may hold a thread for a synchronous body.
 MAX_CONCURRENCY = 32
@@ -108,9 +111,11 @@ class Settings:
     authority: str | None = None
     """The shard's coordination authority, a Redis or Valkey server:
     `redis://` or `rediss://` (TLS), with user and password if it needs them,
-    the database as the path (`/0` unless given), and the key prefix as
-    `?key_prefix=` (`kabudachi:` unless given). `None` bootstraps from seeds
-    alone."""
+    the database as the path (`/0` unless given), the key prefix as
+    `?key_prefix=` (`kabudachi:` unless given), and as `?ttl=` the seconds a
+    worker's registration outlives its last renewal (30 unless given; a
+    cold worker waits this long before it founds the shard). `None`
+    bootstraps from seeds alone."""
 
     shard: str = "default"
     """The name of the shard a networked worker serves."""
@@ -315,9 +320,10 @@ class Settings:
         return found
 
 
-def authority_parts(url: str) -> tuple[str, str, int]:
-    """The server URL, key prefix and database an `authority` setting names.
-    Raises `ValueError` for a URL the authority cannot use."""
+def authority_parts(url: str) -> tuple[str, str, int, float | None]:
+    """The server URL, key prefix, database and TTL in seconds an `authority`
+    setting names; the TTL is `None` when the URL does not set one. Raises
+    `ValueError` for a URL the authority cannot use."""
     if not isinstance(url, str):
         raise ValueError(f"authority must be a redis:// or rediss:// URL, not {url!r}")
     parts = urlsplit(url)
@@ -328,16 +334,32 @@ def authority_parts(url: str) -> tuple[str, str, int]:
     if parts.scheme not in ("redis", "rediss") or not parts.hostname:
         raise ValueError(f"authority must be a redis:// or rediss:// URL with a host, not {url!r}")
     path = parts.path.strip("/")
-    if path and not (path.isascii() and path.isdigit()):
-        raise ValueError(f"the authority URL's path must be a database number, not {parts.path!r}")
+    if path and not (path.isascii() and path.isdigit() and int(path) <= MAX_DATABASE):
+        raise ValueError(
+            f"the authority URL's path must be a database number up to {MAX_DATABASE}, "
+            f"not {parts.path!r}"
+        )
     query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=bool(parts.query))
-    unknown = sorted(set(query) - {"key_prefix"})
+    unknown = sorted(set(query) - {"key_prefix", "ttl"})
     if unknown or any(len(values) != 1 for values in query.values()):
-        raise ValueError(f"the authority URL may set key_prefix once, and nothing else: {url!r}")
+        raise ValueError(
+            f"the authority URL may set key_prefix and ttl once each, and nothing else: {url!r}"
+        )
     prefix = query.get("key_prefix", [DEFAULT_KEY_PREFIX])[0]
     if "{" in prefix or "}" in prefix:
         raise ValueError(f"the authority's key prefix may not contain braces: {prefix!r}")
-    return f"{parts.scheme}://{parts.netloc}/", prefix, int(path or 0)
+    ttl = None
+    if "ttl" in query:
+        raw = query["ttl"][0]
+        try:
+            ttl = float(raw)
+        except ValueError:
+            ttl = None
+        if ttl is None or not _positive_seconds(ttl):
+            raise ValueError(
+                f"the authority's ttl must be a positive number of seconds, not {raw!r}"
+            )
+    return f"{parts.scheme}://{parts.netloc}/", prefix, int(path or 0), ttl
 
 
 def _positive_seconds(value: Any) -> bool:
@@ -476,7 +498,8 @@ def configure(**settings: Any) -> None:
     input (past the soft one `group` and `map` pause, past the hard one a
     submission raises `BackpressureError`). `listen`, `seeds`,
     `external_address`, `authority` and `shard` make this a worker of a
-    networked shard (see each setting); `heartbeat_interval`,
+    networked shard (see each setting; `authority` is a URL that may set
+    `?key_prefix=` and `?ttl=`); `heartbeat_interval`,
     `heartbeat_timeout` and `reconnect_timeout` are its shard's timings. All
     of them are read when `run()` starts. `KABUDACHI_<NAME>` in the
     environment sets each too, below what is configured here. A setting a

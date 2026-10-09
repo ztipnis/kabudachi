@@ -245,11 +245,13 @@ py_test(
 )
 
 # One worker against a real valkey server built from the BCR module; the
-# server binary comes in as data. About 35 s on a laptop, 30 s of it the
-# authority's TTL, which a cold worker waits out before it founds its shard.
+# server binary comes in as data. About 8 s on a laptop, 3 s of it the
+# authority's TTL (set short by the URL's `ttl`), which a cold worker waits out
+# before it founds its shard.
 py_test(
     name = "test_networked_valkey",
     size = "medium",
+    timeout = "short",
     srcs = ["test_networked_valkey.py"],
     data = ["@valkey//:valkey-server"],  # keep
     env = {"VALKEY_SERVER": "$(rlocationpath @valkey//:valkey-server)"},  # keep

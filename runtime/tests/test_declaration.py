@@ -707,7 +707,13 @@ def test_an_unknown_setting_is_refused():
         ({"shard": " "}, "shard"),
         ({"authority": "http://127.0.0.1:6379/"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/x"}, "authority"),
-        ({"authority": "redis://127.0.0.1:6379/?ttl=3"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/70000"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?timeout=3"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=0"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=-1"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=abc"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=inf"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=2&ttl=3"}, "authority"),
         ({"heartbeat_interval": timedelta(0)}, "heartbeat_interval"),
         # Three intervals must fit in the timeout (10 s by default).
         ({"heartbeat_interval": timedelta(seconds=4)}, "heartbeat_timeout"),
@@ -838,7 +844,7 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_RECONNECT_TIMEOUTS", "slow=90, gpu=2.5")
     monkeypatch.setenv("KABUDACHI_LISTEN", "/ip4/0.0.0.0/tcp/4001")
     monkeypatch.setenv("KABUDACHI_SEEDS", "/ip4/10.0.0.1/tcp/4001, /dns4/seed.example/tcp/4001")
-    monkeypatch.setenv("KABUDACHI_AUTHORITY", "rediss://user:secret@cache.example:6380/3?key_prefix=app:")
+    monkeypatch.setenv("KABUDACHI_AUTHORITY", "rediss://user:secret@cache.example:6380/3?key_prefix=app:&ttl=2.5")
     monkeypatch.setenv("KABUDACHI_HEARTBEAT_TIMEOUT", "3.5")
     configuration = Configuration()
 
@@ -872,8 +878,14 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         "rediss://user:secret@cache.example:6380/",
         "app:",
         3,
+        2.5,
     )
-    assert authority_parts("redis://127.0.0.1:6379") == ("redis://127.0.0.1:6379/", "kabudachi:", 0)
+    assert authority_parts("redis://127.0.0.1:6379") == (
+        "redis://127.0.0.1:6379/",
+        "kabudachi:",
+        0,
+        None,
+    )
 
     monkeypatch.setenv("KABUDACHI_IMPORTS", "")
     assert Configuration().resolve("imports") is None

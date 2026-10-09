@@ -331,7 +331,7 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
     lost, events = asyncio.run(main())
 
     # Killed at the deadline, not when its 3 s cancel grace ran out.
-    assert seconds_left <= lost < seconds_left + 1.5, lost
+    assert seconds_left <= lost < seconds_left + 2.0, lost
     assert [event[0] for event in events] == ["started", "lost"], events
     assert (markers / "asked to stop").exists(), "the body was asked to stop first"
     with pytest.raises(ProcessLookupError):

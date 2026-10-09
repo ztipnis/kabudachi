@@ -1,8 +1,8 @@
 """One networked worker, cold, against a valkey server of the test's own: it
-founds its shard through the authority (once the authority's 30 s TTL has
-passed, so that any worker registered before it would show), runs a task that
-calls another, and when its program ends lets the run it still holds finish
-before it exits."""
+founds its shard through the authority (once the authority's TTL, cut to 3 s
+by the URL's `ttl`, has passed, so that any worker registered before it would
+show), runs a task that calls another, and when its program ends lets the run
+it still holds finish before it exits."""
 
 import os
 import socket
@@ -16,6 +16,9 @@ from networked_tasks import nests
 from proto_messages import Greeting
 
 PREFIX = "py-e2e:"
+# The authority derives a call timeout of a tenth of this, 300 ms: ample for a
+# server on loopback, and well below the third of the TTL it must stay under.
+TTL_SECONDS = 3
 SERVER_STARTS = 5
 
 
@@ -90,7 +93,7 @@ def test_a_worker_founds_its_shard_through_valkey_runs_a_task_that_calls_another
     worker = Worker({
         **TIMINGS,
         "KABUDACHI_LISTEN": "/ip4/127.0.0.1/tcp/0",
-        "KABUDACHI_AUTHORITY": f"redis://127.0.0.1:{valkey}/0?key_prefix={PREFIX}",
+        "KABUDACHI_AUTHORITY": f"redis://127.0.0.1:{valkey}/0?key_prefix={PREFIX}&ttl={TTL_SECONDS}",
         "KABUDACHI_PROCESSES": "1",
         "KABUDACHI_TEST_MARKERS": str(markers),
     })

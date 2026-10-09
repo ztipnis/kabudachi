@@ -449,13 +449,14 @@ impl NetworkedRuntime {
     /// worker of it. `memory_soft_limit` and `memory_hard_limit` bound
     /// pending task input while this worker leads, as for `NativeRuntime`.
     /// `authority_url`, a `redis://` or `rediss://` server URL, with
-    /// `authority_key_prefix` and `authority_database`, is the shard's
+    /// `authority_key_prefix`, `authority_database` and `authority_ttl_ms`
+    /// (the authority's own default unless given), is the shard's
     /// coordination authority: the worker then bootstraps through it, and its
     /// timings come from the authority's TTL.
     ///
-    /// Raises `ValueError` for an address that cannot be read, a timing of
-    /// zero, only one memory limit, no worker threads or an authority that
-    /// cannot be used, and `RuntimeError` if it cannot listen on `listen`.
+    /// Raises `ValueError` for an address that cannot be read, a timing or
+    /// authority TTL of zero, only one memory limit, no worker threads or an
+    /// authority that cannot be used, and `RuntimeError` if it cannot listen on `listen`.
     #[new]
     #[pyo3(signature = (
         shard,
@@ -469,6 +470,7 @@ impl NetworkedRuntime {
         authority_url = None,
         authority_key_prefix = None,
         authority_database = 0,
+        authority_ttl_ms = None,
         result_ttl_ms = DEFAULT_RESULT_TTL_MS,
         memory_soft_limit = None,
         memory_hard_limit = None,
@@ -490,6 +492,7 @@ impl NetworkedRuntime {
         authority_url: Option<String>,
         authority_key_prefix: Option<String>,
         authority_database: u16,
+        authority_ttl_ms: Option<u64>,
         result_ttl_ms: u64,
         memory_soft_limit: Option<u64>,
         memory_hard_limit: Option<u64>,
@@ -502,6 +505,7 @@ impl NetworkedRuntime {
             ("heartbeat_interval_ms", heartbeat_interval_ms),
             ("heartbeat_timeout_ms", heartbeat_timeout_ms),
             ("reconnect_timeout_ms", reconnect_timeout_ms),
+            ("authority_ttl_ms", authority_ttl_ms.unwrap_or(1)),
         ] {
             if value == 0 {
                 return Err(PyValueError::new_err(format!("{name} must be positive")));
@@ -538,6 +542,9 @@ impl NetworkedRuntime {
                 redis.key_prefix = prefix;
             }
             redis.database = authority_database;
+            if let Some(ttl) = authority_ttl_ms {
+                redis = redis.with_ttl(CoreDuration::from_millis(ttl));
+            }
             let authority = RedisAuthority::connect(redis).map_err(|error| {
                 PyValueError::new_err(format!("the authority cannot be used: {error}"))
             })?;

@@ -132,12 +132,14 @@ def _native_runtime(settings: Settings) -> Any:
         return _native.NativeRuntime(uuid.uuid4().hex, uuid.uuid4().hex, **limits)
     authority = {}
     if settings.authority is not None:
-        url, prefix, database = authority_parts(settings.authority)
+        url, prefix, database, ttl = authority_parts(settings.authority)
         authority = {
             "authority_url": url,
             "authority_key_prefix": prefix,
             "authority_database": database,
         }
+        if ttl is not None:
+            authority["authority_ttl_ms"] = _millis(timedelta(seconds=ttl))
     return _native.NetworkedRuntime(
         settings.shard,
         settings.listen,
