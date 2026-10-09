@@ -28,6 +28,9 @@ fn connect_refuses_each_config_the_adapter_cannot_honour_and_opens_no_connection
         connect(RedisAuthorityConfig::new(http)),
         Err(ConfigError::BadUrl("http://127.0.0.1:6379/".into()))
     );
+    // TLS: accepted, and still no connection is made.
+    let tls = vec!["rediss://127.0.0.1:6380/".to_string()];
+    assert_eq!(connect(RedisAuthorityConfig::new(tls)), Ok(()));
 
     let mut braces = RedisAuthorityConfig::new(url());
     braces.key_prefix = "a{b:".into();

@@ -9,7 +9,8 @@ const MAX_DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 /// its data in, and the time bounds it keeps.
 #[derive(Clone, Debug)]
 pub struct RedisAuthorityConfig {
-    /// One URL for a standalone server; seed nodes for a cluster.
+    /// One `redis://` (or `rediss://`, over TLS) URL for a standalone server;
+    /// seed nodes for a cluster.
     pub urls: Vec<String>,
     pub cluster: bool,
     /// Prepended to every key. May not contain braces, which delimit hash tags.
@@ -48,7 +49,7 @@ fn default_call_timeout(ttl: Duration) -> Duration {
 pub enum ConfigError {
     #[error("at least one server URL is needed, and exactly one without cluster mode")]
     Urls,
-    #[error("server URL {0:?} is not a redis:// URL")]
+    #[error("server URL {0:?} is not a redis:// or rediss:// URL")]
     BadUrl(String),
     #[error("the key prefix may not contain '{{' or '}}'")]
     PrefixBraces,
@@ -68,7 +69,7 @@ impl RedisAuthorityConfig {
         for text in &self.urls {
             let mut url = url::Url::parse(text)
                 .ok()
-                .filter(|url| url.scheme() == "redis" && url.has_host())
+                .filter(|url| matches!(url.scheme(), "redis" | "rediss") && url.has_host())
                 .ok_or_else(|| ConfigError::BadUrl(text.clone()))?;
             url.set_path(&format!("/{}", self.database));
             urls.push(url.into());

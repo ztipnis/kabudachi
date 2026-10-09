@@ -63,6 +63,9 @@ impl RedisAuthority {
     /// Checks `config` and opens no connection: a worker that starts while
     /// the server is down gets `Unavailable` from its calls, as in any outage.
     pub fn connect(config: RedisAuthorityConfig) -> Result<Self, ConfigError> {
+        // rustls needs a process-wide crypto provider before its first TLS
+        // connection; one installed already (by this or anything else) stays.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let urls = config.validated_urls()?;
         let connections = Connections::new(&urls, config.cluster);
         Ok(Self {
