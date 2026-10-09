@@ -522,6 +522,8 @@ class Session:
             abandoned = body is not None and not body.exited.done()
             if abandoned:
                 run.body_abandoned(body)
+                if not run.holds_handle:
+                    self._tasks.held_body_abandoned(claim.task_id, body.exited)
             retried = self._report_failure(claim, kind)
             if run.holds_handle:
                 if retried:

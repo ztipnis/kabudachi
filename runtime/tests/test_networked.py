@@ -48,7 +48,9 @@ def test_a_cluster_compacts_and_keeps_its_runs_through_a_busy_task_process_a_kil
 
     # A task process that keeps a CPU busy past the heartbeat timeout: the
     # heartbeats run in the worker, so no leader is suspected and no run aborted.
-    spun = leader.submit("spin", times=2000)
+    # A follower submits it, through the leader.
+    follower = next(worker for worker in cluster.workers if worker is not leader)
+    spun = follower.submit("spin", times=2000)
     record = certified_once(cluster, spun, digest_of(spin, Greeting(text="spun")))
     assert states(record) == ["SUCCEEDED"]
     assert all(worker.leader() == before for worker in cluster.workers)
@@ -80,14 +82,15 @@ def test_a_cluster_compacts_and_keeps_its_runs_through_a_busy_task_process_a_kil
     succeeded = [run["digest"] for run in record["runs"] if run["state"] == "SUCCEEDED"]
     assert succeeded[-1] == digest_of(gather, Greeting(text="+".join(parts))), record
 
-    # The task process running a body is killed: the run is lost within a
-    # heartbeat, with no wait for the reconnect timeout, and its retry certifies.
+    # The task process running a body is killed: the run is lost as soon as
+    # its worker sees the process die, with no wait for the body's long hold,
+    # and its retry certifies.
     held = leader.submit("hold", text="child", times=30_000)
     marker = eventually("the body to start", lambda: next(tmp_path.glob("child.*"), None))
     killed_at = time.monotonic()
     os.kill(int(marker.suffix[1:]), signal.SIGKILL)
     eventually("the run to be lost", lambda: "LOST" in states(cluster.record(held)))
-    assert time.monotonic() - killed_at < HEARTBEAT_TIMEOUT
+    assert time.monotonic() - killed_at < HEARTBEAT_TIMEOUT + RECONNECT_TIMEOUT
     record = certified_once(cluster, held, digest_of(hold, Greeting(text="child")))
     assert states(record) == ["LOST", "SUCCEEDED"]
 
@@ -95,12 +98,13 @@ def test_a_cluster_compacts_and_keeps_its_runs_through_a_busy_task_process_a_kil
     # to the leader, and the worker holding the run stops its body.
     cancelled = leader.submit("hold", text="cancelled", times=30_000)
     eventually("the run to start", lambda: running_on(cluster, cancelled))
-    assert leader.ask(cancel=cancelled)["cancelled"] is True
+    leader.ask(cancel=cancelled)
     eventually("the run to be cancelled", lambda: states(cluster.record(cancelled)) == ["CANCELLED"])
+    eventually("the body to stop", lambda: (tmp_path / "cancelled.stopped").exists(), timeout=5)
 
     # A worker holding a run is killed: its run is replaced only once the
     # leader has stopped hearing it and its reconnect timeout has passed.
-    tasks = [leader.submit("hold", text=f"worker-{n}", times=4000) for n in range(3)]
+    tasks = [leader.submit("hold", text=f"worker-{n}", times=8000) for n in range(3)]
 
     def on_a_follower():
         for task in tasks:

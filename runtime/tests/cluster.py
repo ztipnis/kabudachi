@@ -149,7 +149,10 @@ class Cluster:
         workers = [founder]
         try:
             seeded = {**environment, "KABUDACHI_SEEDS": founder.address}
-            workers += [Worker(seeded) for _ in range(size - 1)]
+            # One at a time, so a start that fails leaves the earlier ones
+            # listed, and closed below.
+            for _ in range(size - 1):
+                workers.append(Worker(seeded))
             cluster = cls(workers)
             eventually("every worker to follow one leader of three voters", cluster.led)
         except BaseException:

@@ -860,6 +860,35 @@ def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit():
     assert calls == ["first body started", "first body exited", "second body ran"]
 
 
+def test_a_retry_handed_back_to_a_worker_serving_a_shard_waits_for_its_abandoned_body_to_exit():
+    release = threading.Event()
+    calls = []
+
+    def stubborn_then_fine(request: Greeting) -> Greeting:
+        if not calls:
+            calls.append("first body started")
+            release.wait(5)
+            calls.append("first body exited")
+            return request
+        calls.append("second body ran")
+        return request
+
+    world = World(stubborn_then_fine, retries=1, timeout=SOFT, cancel_grace=GRACE)
+    # Runs the shard's leader hands it, which settle no handle here.
+    world.runtime.delivers_results = False
+
+    async def body():
+        world.call("stubborn_then_fine", Greeting(text="x"))
+        await until(lambda: any(event[0] == "fail" for event in world.runtime.events), "a fail event")
+        await asyncio.sleep(0.2)
+        assert len(calls) == 1, "no second body while the abandoned one runs"
+        release.set()
+        await until(lambda: len(calls) == 3, "the retry to run")
+
+    run(world.working(body))
+    assert calls == ["first body started", "first body exited", "second body ran"]
+
+
 def test_what_an_abandoned_body_later_returns_or_raises_is_discarded(caplog):
     release = threading.Event()
 

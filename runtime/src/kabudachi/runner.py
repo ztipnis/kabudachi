@@ -594,33 +594,35 @@ def _worker_ended(worker: "asyncio.Task[None]") -> BaseException:
     return worker.exception() or RuntimeError("the kabudachi worker loop stopped unexpectedly")
 
 
-async def _until_done_or_worker_stops(work: Awaitable[T], worker: "asyncio.Task[None]") -> T:
-    """The result of `work`, unless the worker loop ends first: then `work`
-    is cancelled and the worker's error raised, so a dead worker is never
+async def _until_done_or_worker_stops(work: Awaitable[T], *workers: "asyncio.Task[None]") -> T:
+    """The result of `work`, unless a worker loop ends first: then `work`
+    is cancelled and that loop's error raised, so a dead worker is never
     waited on."""
     task = asyncio.ensure_future(work)
     try:
-        await asyncio.wait({task, worker}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait({task, *workers}, return_when=asyncio.FIRST_COMPLETED)
         # A worker that ended wins even if `work` finished at the same moment,
         # so its failure is never swallowed.
-        if worker.done():
-            raise _worker_ended(worker)
+        for worker in workers:
+            if worker.done():
+                raise _worker_ended(worker)
         return task.result()
     finally:
         await _cancel(task)
 
 
-async def _drain_held_runs(session: Session, native: Any) -> None:
+async def _drain_held_runs(
+    session: Session, native: Any, claiming: "asyncio.Task[None]", events: "asyncio.Task[None]"
+) -> None:
     """Lets the runs a networked worker holds finish, then waits until its
     leader has taken their reports, or its reconnect timeout has passed.
-    The claim loop has stopped; events are still acted on meanwhile, so a
-    run the leader cancels stops. A runtime that fails ends the wait."""
-    events = asyncio.create_task(session.watch_events())
-    try:
-        await _until_done_or_worker_stops(session.wait_until_running_finish(), events)
-        await _until_done_or_worker_stops(native.wait_until_reported(), events)
-    finally:
-        await _cancel(events)
+    Claiming and taking have stopped, so the claim loop ends on its own. The
+    event loop that ran all along goes on meanwhile, so no event it has taken
+    is lost: a run the leader cancels, or whose abort deadline nears, stops.
+    A runtime that fails ends the wait."""
+    await _until_done_or_worker_stops(claiming, events)
+    await _until_done_or_worker_stops(session.wait_until_running_finish(), events)
+    await _until_done_or_worker_stops(native.wait_until_reported(), events)
 
 
 async def _run_with_worker(
@@ -642,7 +644,8 @@ async def _run_with_worker(
     try:
         native = _native_runtime(settings)
         session = None
-        worker = None
+        claiming = None
+        events = None
         try:
             if networked:
                 # Joined, with a leader it knows, which may be another process.
@@ -653,16 +656,18 @@ async def _run_with_worker(
                 native, default_registry(), process_serializers(), configuration, executor=executor
             )
             activate(session)
-            worker = asyncio.create_task(session.serve())
-            result = await _until_done_or_worker_stops(main(), worker)
-            await _until_done_or_worker_stops(session.wait_until_idle(), worker)
+            # Two loops, not `serve`: the event loop must outlive the claim loop,
+            # through the drain, or events it has taken would be lost with it.
+            claiming = asyncio.create_task(session.work())
+            events = asyncio.create_task(session.watch_events())
+            result = await _until_done_or_worker_stops(main(), claiming, events)
+            await _until_done_or_worker_stops(session.wait_until_idle(), claiming, events)
             if networked:
                 # It also holds runs no handle here waits for: they finish,
                 # and the leader takes their reports, before the worker goes.
                 session.stop_claiming()
                 native.stop_taking()
-                await _cancel(worker)
-                await _drain_held_runs(session, native)
+                await _drain_held_runs(session, native, claiming, events)
             graceful = True
             return result
         except BaseException as error:
@@ -671,14 +676,20 @@ async def _run_with_worker(
                 if networked:
                     # Ends a waiting claim, which must not be cancelled.
                     native.stop_taking()
-                await _cancel(worker)
                 forced = serving and isinstance(error, (asyncio.CancelledError, KeyboardInterrupt))
+                if networked and not forced and events is not None and not events.done():
+                    try:
+                        await _drain_held_runs(session, native, claiming, events)
+                    except Exception:
+                        # The error being raised says why the run ended; a
+                        # runtime failing meanwhile only cuts the drain short.
+                        pass
+                await _cancel(claiming)
+                await _cancel(events)
                 if forced and executor.stops_bodies_at_once:
                     # Their runs settle as lost once their processes are gone.
                     await executor.stop(kill=True)
                 await session.wait_until_running_finish()
-                if networked and not forced:
-                    await native.wait_until_reported()
                 graceful = True
             raise
         finally:
@@ -687,7 +698,8 @@ async def _run_with_worker(
                 # deactivated a thread can still submit, and would never be served.
                 session.stop_claiming()
                 deactivate(session)
-            await _cancel(worker)
+            await _cancel(claiming)
+            await _cancel(events)
             native.shutdown()
     finally:
         try:

@@ -166,6 +166,10 @@ class TaskTable:
         self._lock = threading.Lock()
         self._records: dict[str, _Record] = {}
         self._stopping = False
+        # The bodies of runs a shard's leader handed this worker that outlived
+        # their hard limit, by task id, until each exits: a retry of the task
+        # handed back here waits for it.
+        self._held_abandoned: dict[str, asyncio.Future[None]] = {}
 
     # submitted
 
@@ -258,8 +262,25 @@ class TaskTable:
     def detached(self, task_id: str) -> Run:
         """A run of `task_id` that a shard's leader handed this worker, which
         settles no handle and is not kept in the table: its record's handle
-        is one nobody holds."""
-        return Run(task_id, _Record(TaskHandle(task_id), ""), 1, holds_handle=False)
+        is one nobody holds. It starts no body before an abandoned one of an
+        earlier run of the task here has exited."""
+        record = _Record(TaskHandle(task_id), "")
+        with self._lock:
+            record.abandoned = self._held_abandoned.get(task_id)
+        return Run(task_id, record, 1, holds_handle=False)
+
+    def held_body_abandoned(self, task_id: str, exited: "asyncio.Future[None]") -> None:
+        """The body of a run handed this worker outlived its hard limit: a
+        later run of the task here waits for `exited`."""
+        with self._lock:
+            self._held_abandoned[task_id] = exited
+
+        def forget(_: object) -> None:
+            with self._lock:
+                if self._held_abandoned.get(task_id) is exited:
+                    del self._held_abandoned[task_id]
+
+        exited.add_done_callback(forget)
 
     # claimed, run ended
 
