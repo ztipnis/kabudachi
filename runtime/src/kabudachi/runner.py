@@ -15,7 +15,7 @@ from datetime import timedelta
 from typing import Any, TypeVar, overload
 
 from kabudachi import _native
-from kabudachi.config import Configuration, Settings, process_configuration
+from kabudachi.config import Configuration, Settings, authority_parts, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
 from kabudachi.pool import ProcessPool, task_modules
@@ -130,6 +130,14 @@ def _native_runtime(settings: Settings) -> Any:
     }
     if settings.listen is None:
         return _native.NativeRuntime(uuid.uuid4().hex, uuid.uuid4().hex, **limits)
+    authority = {}
+    if settings.authority is not None:
+        url, prefix, database = authority_parts(settings.authority)
+        authority = {
+            "authority_url": url,
+            "authority_key_prefix": prefix,
+            "authority_database": database,
+        }
     return _native.NetworkedRuntime(
         settings.shard,
         settings.listen,
@@ -138,6 +146,7 @@ def _native_runtime(settings: Settings) -> Any:
         heartbeat_interval_ms=_millis(settings.heartbeat_interval),
         heartbeat_timeout_ms=_millis(settings.heartbeat_timeout),
         reconnect_timeout_ms=_millis(settings.reconnect_timeout),
+        **authority,
         **limits,
     )
 

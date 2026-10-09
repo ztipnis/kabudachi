@@ -1562,6 +1562,7 @@ version = "0.1.0"
 dependencies = [
  "kabudachi-core",
  "kabudachi-net",
+ "kabudachi-redis-authority",
  "pyo3",
  "tokio",
 ]

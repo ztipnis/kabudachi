@@ -32,10 +32,11 @@ rust_shared_library(
         "//conditions:default": [],
     }),
     visibility = ["//visibility:private"],
-    # The networked runtime hosts a net worker.
+    # The networked runtime hosts a net worker, with a Redis authority.
     deps = [
         "//core:core",
         "//net",
+        "//redis_authority",
         "@crates//:pyo3",
         "@crates//:tokio",
     ],

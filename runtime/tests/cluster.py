@@ -114,8 +114,10 @@ class Worker:
         self.process.wait()
 
     def stop(self, timeout: float = 30.0) -> int:
-        """SIGTERM, then the exit code once it has drained."""
-        self.process.send_signal(signal.SIGTERM)
+        """Closes its standard input, which ends its program's main: it then
+        drains as `kabudachi.run` does after main (a signal would not, since
+        `run` with main leaves signals alone). The exit code once it has."""
+        self.process.stdin.close()
         return self.process.wait(timeout=timeout)
 
     def close(self) -> None:

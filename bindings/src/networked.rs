@@ -36,7 +36,8 @@ use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
 use kabudachi_net::executor::{Report, ReportSink, Work, WorkSource, executor_channel};
 use kabudachi_net::messenger::Net;
-use kabudachi_net::worker::{Multiaddr, Worker, WorkerConfig};
+use kabudachi_net::worker::{AuthorityConfig, Multiaddr, Worker, WorkerConfig};
+use kabudachi_redis_authority::{RedisAuthority, RedisAuthorityConfig};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -447,10 +448,14 @@ impl NetworkedRuntime {
     /// reconnect timeout are the shard's election timings, the same on every
     /// worker of it. `memory_soft_limit` and `memory_hard_limit` bound
     /// pending task input while this worker leads, as for `NativeRuntime`.
+    /// `authority_url`, a `redis://` or `rediss://` server URL, with
+    /// `authority_key_prefix` and `authority_database`, is the shard's
+    /// coordination authority: the worker then bootstraps through it, and its
+    /// timings come from the authority's TTL.
     ///
     /// Raises `ValueError` for an address that cannot be read, a timing of
-    /// zero, only one memory limit or no worker threads, and `RuntimeError` if it cannot
-    /// listen on `listen`.
+    /// zero, only one memory limit, no worker threads or an authority that
+    /// cannot be used, and `RuntimeError` if it cannot listen on `listen`.
     #[new]
     #[pyo3(signature = (
         shard,
@@ -461,6 +466,9 @@ impl NetworkedRuntime {
         reconnect_timeout_ms,
         seeds = Vec::new(),
         external_address = None,
+        authority_url = None,
+        authority_key_prefix = None,
+        authority_database = 0,
         result_ttl_ms = DEFAULT_RESULT_TTL_MS,
         memory_soft_limit = None,
         memory_hard_limit = None,
@@ -479,6 +487,9 @@ impl NetworkedRuntime {
         reconnect_timeout_ms: u64,
         seeds: Vec<String>,
         external_address: Option<String>,
+        authority_url: Option<String>,
+        authority_key_prefix: Option<String>,
+        authority_database: u16,
         result_ttl_ms: u64,
         memory_soft_limit: Option<u64>,
         memory_hard_limit: Option<u64>,
@@ -520,6 +531,17 @@ impl NetworkedRuntime {
         }
         if let Some(limits) = memory_limits(memory_soft_limit, memory_hard_limit)? {
             config = config.with_memory_limits(limits);
+        }
+        if let Some(url) = authority_url {
+            let mut redis = RedisAuthorityConfig::new(vec![url]);
+            if let Some(prefix) = authority_key_prefix {
+                redis.key_prefix = prefix;
+            }
+            redis.database = authority_database;
+            let authority = RedisAuthority::connect(redis).map_err(|error| {
+                PyValueError::new_err(format!("the authority cannot be used: {error}"))
+            })?;
+            config = config.with_authority(AuthorityConfig::new(Arc::new(authority)));
         }
 
         let tokio = Builder::new_multi_thread()
