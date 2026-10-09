@@ -13,6 +13,7 @@ from pathlib import Path
 
 import kabudachi
 from kabudachi.errors import TaskCancelledError, UnknownTaskError
+from kabudachi.session import current_session
 from proto_messages import Greeting
 
 MARKERS = "KABUDACHI_TEST_MARKERS"
@@ -185,7 +186,16 @@ async def outlives_its_deadline(request: Greeting) -> Greeting:
     """Leaves its process id in `outliving`, and runs on for 30 s whatever
     it is asked: only its process's end stops it. Its cancel grace is longer
     than the abort deadline a test gives it, so a cancel that it ignores
-    costs its process only after that deadline."""
+    costs its process only after that deadline.
+
+    First it calls two tasks that will not start for 30 s, on a worker whose
+    results never come back, and cancels one: `nested` says whether the
+    cancel took, and how many handles this process still keeps for them."""
+    later = leaf.options(delay=timedelta(seconds=30))
+    later(request)
+    cancelled = later(request).cancel()
+    kept = len(current_session()._process._handles)
+    marker("nested").write_text(f"{cancelled} {kept}")
     marker("outliving").write_text(str(os.getpid()))
     end = time.monotonic() + 30
     while time.monotonic() < end:

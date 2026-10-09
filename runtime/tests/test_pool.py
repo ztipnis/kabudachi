@@ -314,13 +314,15 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
                 session.submit(pool_tasks.outlives_its_deadline.definition, Greeting())
                 while not (markers / "outliving").exists():
                     await asyncio.sleep(0.01)
+                # The calls it made settle nothing here, so nothing keeps them.
+                kept = [dict(child.handles) for child in pool._children]
                 [run_id] = [event[1] for event in runtime.events if event[0] == "started"]
                 # As the leader would once this worker lost contact with it.
                 runtime.inject_abort(run_id, seconds_left)
                 aborted = time.monotonic()
                 while ("lost", run_id) not in runtime.events:
                     await asyncio.sleep(0.01)
-                return time.monotonic() - aborted, list(runtime.events)
+                return time.monotonic() - aborted, list(runtime.events), kept
         finally:
             if serving is not None:
                 serving.cancel()
@@ -328,12 +330,14 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
             await pool.stop(kill=True)
             native.shutdown()
 
-    lost, events = asyncio.run(main())
+    lost, events, kept = asyncio.run(main())
 
     # Killed at the deadline, not when its 3 s cancel grace ran out.
     assert seconds_left <= lost < seconds_left + 2.0, lost
     assert [event[0] for event in events] == ["started", "lost"], events
     assert (markers / "asked to stop").exists(), "the body was asked to stop first"
+    assert (markers / "nested").read_text() == "True 0", "a nested cancel took, and no handle was kept"
+    assert kept == [{}], kept
     with pytest.raises(ProcessLookupError):
         os.kill(int((markers / "outliving").read_text()), 0)
 

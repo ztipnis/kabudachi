@@ -873,6 +873,33 @@ def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit(deliv
     assert calls == ["first body started", "first body exited", "second body ran"]
 
 
+def test_an_abort_deadline_that_arrives_before_its_held_run_starts_still_stops_the_run():
+    async def sleeps(request: Greeting) -> Greeting:
+        await asyncio.sleep(30)
+        return request
+
+    world = World(sleeps, cancel_grace=timedelta(milliseconds=50))
+    # Runs a shard's leader hands a worker, which settle no handle here.
+    world.runtime.delivers_results = False
+    claim_pending = world.runtime.claim_pending
+
+    async def deadline_before_start(limit):
+        claims = await claim_pending(limit)
+        for claim in claims:
+            world.runtime.inject_abort(claim.task_run_id, 0.2)
+        # The event watcher takes the deadline before the claim loop starts the run.
+        await asyncio.sleep(0.05)
+        return claims
+
+    world.runtime.claim_pending = deadline_before_start
+
+    async def body():
+        world.call("sleeps", Greeting())
+        await until(lambda: any(event[0] == "lost" for event in world.runtime.events), "a lost report")
+
+    run(with_events(world, body))
+
+
 def test_what_an_abandoned_body_later_returns_or_raises_is_discarded(caplog):
     release = threading.Event()
 

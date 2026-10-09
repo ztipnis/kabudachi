@@ -26,6 +26,7 @@ import signal
 import sys
 import threading
 import traceback
+import weakref
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -124,6 +125,12 @@ class _TaskProcess:
         self._asked: dict[int, tuple[concurrent.futures.Future[Any], bool]] = {}
         # Handles of tasks bodies here submitted, until the worker sends their outcome.
         self._handles: dict[str, TaskHandle] = {}
+        # Handles whose result never comes back (a networked worker's), which
+        # may never settle: held only while a body holds them, so a refusal
+        # still reaches one that is awaited.
+        self._unsettled: weakref.WeakValueDictionary[str, TaskHandle] = (
+            weakref.WeakValueDictionary()
+        )
         self._hosted = LoopHostedWork()
 
     def send(self, frame: Any) -> None:
@@ -180,6 +187,8 @@ class _TaskProcess:
                 return
             case ipc.WaitDone():
                 handle = self._handles.pop(frame.task_id, None)
+                if handle is None:
+                    handle = self._unsettled.pop(frame.task_id, None)
                 if handle is not None and frame.error is not None:
                     handle._fail(frame.error)
                 elif handle is not None:
@@ -215,7 +224,10 @@ class _TaskProcess:
                 results_delivered=results_delivered,
             )
             # Kept before the asker gets it: the outcome can follow at once.
-            self._handles[task_id] = handle
+            if results_delivered:
+                self._handles[task_id] = handle
+            else:
+                self._unsettled[task_id] = handle
             answer.set_result(handle)
         else:
             answer.set_result(reply.value)

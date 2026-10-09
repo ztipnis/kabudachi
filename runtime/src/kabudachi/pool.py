@@ -537,7 +537,12 @@ class ProcessPool:
             case ipc.CancelTask():
                 handle = child.handles.get(frame.task_id)
                 try:
-                    cancelled = handle is not None and handle.cancel()
+                    if handle is not None:
+                        cancelled = handle.cancel()
+                    else:
+                        # A task whose result never comes back keeps no handle
+                        # here: the cancel goes by its id.
+                        cancelled = self._nested is not None and self._nested.cancel_task(frame.task_id)
                 except Exception as error:
                     child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
                 else:
@@ -562,15 +567,19 @@ class ProcessPool:
         except Exception as error:
             child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
             return
-        child.handles[handle.task_id] = handle
-        child.send(
-            ipc.Reply(frame.request, (handle.task_id, handle.shard_id, handle._results_delivered))
-        )
+        delivered = handle._results_delivered
+        if delivered:
+            # Kept until it settles, which a handle whose result never comes
+            # back may never do: such a handle is not kept, so nested calls on
+            # a networked worker cost nothing once their tasks are stored.
+            child.handles[handle.task_id] = handle
+        child.send(ipc.Reply(frame.request, (handle.task_id, handle.shard_id, delivered)))
 
         def settled(outcome: Any) -> None:
             # A dead child's handles are dropped with it: the tasks it called
             # run on, but nobody there waits for them any more.
-            if child.handles.pop(handle.task_id, None) is not None:
+            kept = child.handles.pop(handle.task_id, None) is not None
+            if kept or (not delivered and not child.buried.done()):
                 child.send(ipc.outcome_of(handle.task_id, outcome))
 
         handle._outcome.add_done_callback(settled)

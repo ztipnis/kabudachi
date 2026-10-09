@@ -68,6 +68,11 @@ class NestedCalls(Protocol):
 
     def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle: ...
 
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancels a task such a body called whose handle is no longer kept,
+        by its id, and says whether it was cancelled."""
+        ...
+
 
 class Executor(Protocol):
     @property
