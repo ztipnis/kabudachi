@@ -304,13 +304,42 @@ class Session:
                                 f"the leader refused task {event.task_id}: {event.reason}"
                             ),
                         )
-                    case EventKind.ABORT | EventKind.ABORT_WITHDRAWN:
-                        # Not acted on yet.
-                        pass
+                    case EventKind.ABORT:
+                        self._abort_at(event.task_run_id, event.seconds_left)
+                    case EventKind.ABORT_WITHDRAWN:
+                        self._clear_abort(event.task_run_id)
                     case unknown:
                         raise RuntimeError(
                             f"the native runtime reported an event of unknown kind {unknown!r}"
                         )
+
+    def _abort_at(self, run_id: str, seconds_left: float) -> None:
+        """The run may be run again elsewhere `seconds_left` from now: its body
+        is asked to stop its cancel grace before that, and its task process is
+        killed then if it has not. A later deadline for the run replaces this one."""
+        here = self._here.get(run_id)
+        if here is None:
+            return
+        self._clear_abort(run_id)
+        loop = asyncio.get_running_loop()
+        stop_in = max(0.0, seconds_left - here.cancel_grace.total_seconds())
+        here.abort = [
+            loop.call_later(stop_in, self._abort, here, run_id),
+            loop.call_later(seconds_left, self._executor.kill_host_of, run_id),
+        ]
+
+    def _abort(self, here: _HeldHere, run_id: str) -> None:
+        here.run.abort()
+        self._executor.cancel(run_id)
+
+    def _clear_abort(self, run_id: str) -> None:
+        """The leader hears this worker again: a pending abort is dropped. A
+        body already asked to stop is not asked to go on."""
+        here = self._here.get(run_id)
+        if here is not None:
+            for timer in here.abort:
+                timer.cancel()
+            here.abort = []
 
     async def serve(self) -> None:
         """Runs `work` and `watch_events` together, until either ends. The
@@ -463,7 +492,15 @@ class Session:
                 self._lost(claim, run)
         except asyncio.CancelledError as error:
             current = asyncio.current_task()
-            if run.cancelled_by_leader and current is not None and not current.cancelling():
+            cancelling = current is not None and current.cancelling()
+            if run.aborted and not cancelling:
+                # Another leader may run it again once the deadline passes:
+                # it is lost only once its body has really stopped.
+                if body is not None:
+                    await asyncio.wait({body.exited})
+                self._report_lost_quietly(claim)
+                return
+            if run.cancelled_by_leader and current is not None and not cancelling:
                 # Only the body was cancelled, because the task was: this is
                 # not this run being interrupted, and its handle is settled.
                 return
@@ -508,6 +545,7 @@ class Session:
                 # leaves the newer run's state alone when this stale one ends.
                 self._tasks.run_ended(run)
             else:
+                self._clear_abort(claim.task_run_id)
                 self._here.pop(claim.task_run_id, None)
 
     def _interrupted(self, task_id: str, error: BaseException) -> None:
@@ -612,6 +650,16 @@ class Session:
             self._tasks.failed(
                 claim.task_id,
                 TaskLostError(f"task {claim.task_id} was lost with the process that ran it"),
+            )
+
+    def _report_lost_quietly(self, claim: Any) -> None:
+        try:
+            self._runtime.report_lost(claim.task_run_id)
+        except Exception as refusal:
+            _logger.warning(
+                "the leader was not told task %s's run stopped at its abort deadline: %s",
+                claim.task_id,
+                type(refusal).__name__,
             )
 
     def _report_failure(self, claim: Any, kind: str) -> bool | None:

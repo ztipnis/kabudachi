@@ -121,3 +121,64 @@ def test_a_cluster_compacts_and_keeps_its_runs_through_a_busy_task_process_a_kil
     assert HEARTBEAT_TIMEOUT + RECONNECT_TIMEOUT - 0.5 <= waited <= HEARTBEAT_TIMEOUT + RECONNECT_TIMEOUT + 6
     for n, each in enumerate(tasks):
         certified_once(cluster, each, digest_of(hold, Greeting(text=f"worker-{n}")))
+
+
+def test_a_cut_off_worker_stops_its_run_by_its_deadline_and_runs_certify_once_when_their_leader_is_killed(
+    cluster, tmp_path
+):
+    leader = cluster.leader()
+    held = {leader.submit("hold", text=f"cut-{n}", times=30_000): f"cut-{n}" for n in range(3)}
+
+    def on_a_follower():
+        for task in held:
+            holder = running_on(cluster, task)
+            if holder is not None and holder is not leader:
+                return task, holder
+
+    cut_off, holder = eventually("a follower to run one of them", on_a_follower)
+    for task in held:
+        if task != cut_off:
+            leader.ask(cancel=task)
+    text = held[cut_off]
+    # With the other two stopped, nobody can tell the holder to stop its run:
+    # only its own abort deadline can.
+    others = [worker for worker in cluster.workers if worker is not holder]
+    stopped_at = time.monotonic()
+    for worker in others:
+        os.kill(worker.pid, signal.SIGSTOP)
+    try:
+        eventually("the cut-off run to stop", lambda: (tmp_path / f"{text}.stopped").exists(), timeout=5)
+        waited = time.monotonic() - stopped_at
+    finally:
+        for worker in others:
+            os.kill(worker.pid, signal.SIGCONT)
+    # Asked to stop its cancel grace before the deadline, which falls a
+    # clock-drift margin inside the reconnect timeout.
+    assert 0.5 <= waited <= RECONNECT_TIMEOUT + 1
+    record = certified_once(cluster, cut_off, digest_of(hold, Greeting(text=text)))
+    assert states(record)[0] == "LOST"
+
+    # The leader is killed while it and a follower each run a task: every
+    # run certifies once under the leader the other two elect.
+    eventually("the shard to settle on one leader", cluster.led)
+    leader = cluster.leader()
+    follower = next(worker for worker in cluster.workers if worker is not leader)
+    tasks = [follower.submit("hold", text=f"leader-{n}", times=3000) for n in range(3)]
+
+    def spread():
+        holders = {running_on(cluster, task) for task in tasks}
+        return leader in holders and len(holders - {None, leader}) >= 1
+
+    eventually("the leader and a follower to each run one", spread)
+    leader.kill()
+
+    def new_leader():
+        seen = {worker.leader() for worker in cluster.live()}
+        if len(seen) != 1 or None in seen:
+            return None
+        [(chosen, _)] = seen
+        return chosen if chosen != leader.id else None
+
+    eventually("the others to elect a new leader", new_leader, timeout=15)
+    for n, task in enumerate(tasks):
+        certified_once(cluster, task, digest_of(hold, Greeting(text=f"leader-{n}")))

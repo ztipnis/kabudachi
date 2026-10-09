@@ -99,6 +99,7 @@ class Run:
         self._record = record
         self._generation = generation
         self._holds_handle = holds_handle
+        self._aborted = False
 
     @property
     def holds_handle(self) -> bool:
@@ -106,6 +107,16 @@ class Run:
         leader handed a networked worker settles none, whoever submitted its
         task: its result is never certified back here."""
         return self._holds_handle
+
+    def abort(self) -> None:
+        """The run's abort deadline is near: it is being stopped, and is
+        reported lost once its body has exited."""
+        self._aborted = True
+
+    @property
+    def aborted(self) -> bool:
+        """Whether the run is being stopped before its abort deadline."""
+        return self._aborted
 
     def cancel_by_leader(self) -> None:
         """The leader cancelled this run: nothing it ends with counts."""

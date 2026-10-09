@@ -299,6 +299,14 @@ class ProcessPool:
         slot.abandoned = True
         self._condemn(slot.child)
 
+    def kill_host_of(self, run_id: str) -> None:
+        slot = self._slots.get(run_id)
+        if slot is None or slot.child is None:
+            # Ended already, or never sent: its cancel ended it.
+            return
+        # The death is buried as any other: its runs lost, and a replacement.
+        slot.child.process.kill()
+
     def _hand_over(self, job: RunJob | CompactJob) -> _Slot:
         loop = self._started_loop()
         slot = _Slot(job, loop.create_future(), loop.create_future())
