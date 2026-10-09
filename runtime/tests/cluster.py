@@ -173,7 +173,9 @@ class Cluster:
         return [worker for worker in self.workers if worker.process.poll() is None]
 
     def leader(self) -> Worker:
-        leader_id, _ = self.live()[0].leader()
+        seen = self.live()[0].leader()
+        assert seen is not None, "the first live worker knows no leader"
+        leader_id, _ = seen
         return self.by_id(leader_id)
 
     def by_id(self, worker_id: str) -> Worker:

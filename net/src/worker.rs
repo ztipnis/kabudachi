@@ -342,7 +342,11 @@ impl Worker {
         let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         scheduler.set_result_ttl(retention_of(&config));
         scheduler.set_memory_limits(config.memory_limits);
-        let stopped = run_driver(
+        // However the driver ends (returns, is dropped, aborted or panics),
+        // no driver answers this worker's own requests any more: tell each
+        // asker so, now and from here on.
+        let _close_own_tasks = CloseOwnTasks(&net);
+        run_driver(
             &mut node,
             first,
             &net,
@@ -359,10 +363,16 @@ impl Worker {
             },
             observe,
         )
-        .await;
-        // No driver answers this worker's own requests any more: tell each
-        // asker so, now and from here on.
-        net.inbound.close_own_tasks();
-        stopped
+        .await
+    }
+}
+
+/// Closes the worker's own-task queue when dropped, so a future that ends
+/// early still tells every asker that nobody will answer.
+struct CloseOwnTasks<'a>(&'a Net);
+
+impl Drop for CloseOwnTasks<'_> {
+    fn drop(&mut self) {
+        self.0.inbound.close_own_tasks();
     }
 }
