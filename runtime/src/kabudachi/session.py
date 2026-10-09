@@ -11,6 +11,12 @@ A coalescing key whose waiting payloads pile up past the soft memory limit
 while one generation runs is compacted on a free worker place: the claim names
 the payloads to fold, the executor folds them with the task's merge and hands the
 folded payload to the leader, and no handle waits for it.
+
+A worker of a networked shard runs whatever the shard's leader hands it,
+whoever submitted the task, and its reports go to that leader: no
+certification comes back, so its runs settle no handle. A task it submits is
+forgotten once the leader has stored it; awaiting its handle raises
+`RemoteResultUnavailableError`, and cancelling it asks the leader.
 """
 
 import asyncio
@@ -22,6 +28,7 @@ import logging
 import math
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
@@ -30,7 +37,9 @@ from kabudachi.body import RunningBody
 from kabudachi.composites import Composites
 from kabudachi.config import Configuration
 from kabudachi.errors import (
+    BackpressureError,
     CoalescedPayloadTooLargeError,
+    RemoteResultUnavailableError,
     RuntimeNotStartedError,
     TaskBodyError,
     TaskDefinitionError,
@@ -64,6 +73,30 @@ SLOW_DOWN_POLL_SECONDS = 0.05
 
 _logger = logging.getLogger("kabudachi")
 
+# How many held runs an abort deadline or a cancel can wait for: one that
+# arrives after the run was claimed but before it started here.
+_EARLY_LIMIT = 1024
+
+
+@dataclass
+class _HeldHere:
+    """A run a networked worker holds for its shard, and the abort timers it
+    is under. A compaction run has no `run`: it settles no task."""
+
+    run: Run | None
+    cancel_grace: timedelta
+    abort: list[asyncio.TimerHandle] = field(default_factory=list)
+    aborted: bool = False
+
+
+@dataclass
+class _Early:
+    """An abort deadline (on the loop's clock) or a cancel that came for a
+    held run before it started here."""
+
+    deadline: float | None = None
+    cancelled: bool = False
+
 
 class Session:
     """The tasks of one running worker: what it submitted and what it runs."""
@@ -93,6 +126,11 @@ class Session:
         self._executor.accept_nested_calls(self)
         # Every run and compaction this session sees through to its end.
         self._running: set[asyncio.Task[None]] = set()
+        # Runs held for the shard, by run id: they settle no handle, so the
+        # table does not keep them.
+        self._here: dict[str, _HeldHere] = {}
+        # What came for held runs not started yet, by run id, oldest first.
+        self._early: dict[str, _Early] = {}
         try:
             # Built inside the run's loop, as `run()` does.
             self._hosted.attach(asyncio.get_running_loop())
@@ -162,6 +200,11 @@ class Session:
             return self._composites.submit_flow(composite, previous)
         return self._composites.submit_group(composite, previous)
 
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancels a task a body in a task process called, by its id, as its
+        handle's `cancel` does."""
+        return self._tasks.cancel(task_id)
+
     async def work(self) -> None:
         """Claims pending tasks and runs them, up to the concurrency limit,
         until the runtime shuts down or the caller cancels it.
@@ -182,6 +225,11 @@ class Session:
                 continue
             for claim in await self._runtime.claim_pending(free):
                 self._start(claim)
+
+    @property
+    def runtime(self) -> Runtime:
+        """The native runtime this session drives."""
+        return self._runtime
 
     @property
     def stopping(self) -> bool:
@@ -235,7 +283,12 @@ class Session:
                             ),
                         )
                     case EventKind.CANCELLED:
-                        self._tasks.cancelled_by_leader(event.task_id)
+                        here = self._here.get(event.task_run_id)
+                        if here is None:
+                            self._tasks.cancelled_by_leader(event.task_id)
+                            self._hold_early(event.task_run_id).cancelled = True
+                        else:
+                            self._cancel_held(here, event.task_run_id)
                     case EventKind.RECORD_FULL:
                         self._tasks.failed(
                             event.task_id,
@@ -262,10 +315,92 @@ class Session:
                                 event.superseded_by,
                             ),
                         )
+                    case EventKind.ACCEPTED:
+                        # Stored, and its result never comes back here: its
+                        # handle stays open for `cancel`, and nothing waits for it.
+                        self._tasks.stored(event.task_id)
+                    case EventKind.REFUSED:
+                        self._tasks.failed(
+                            event.task_id,
+                            BackpressureError(
+                                f"the leader refused task {event.task_id}: {event.reason}"
+                            ),
+                        )
+                    case EventKind.ABORT:
+                        self._abort_at(event.task_run_id, event.seconds_left)
+                    case EventKind.ABORT_WITHDRAWN:
+                        self._clear_abort(event.task_run_id)
                     case unknown:
                         raise RuntimeError(
                             f"the native runtime reported an event of unknown kind {unknown!r}"
                         )
+
+    def _hold_early(self, run_id: str) -> _Early:
+        """What came for `run_id` before it started here, kept for `_start`
+        on a networked worker, which may have claimed it already. The oldest
+        is dropped past `_EARLY_LIMIT`: most are for runs held elsewhere."""
+        early = self._early.get(run_id)
+        if early is not None:
+            return early
+        early = _Early()
+        if self._runtime.delivers_results or not run_id:
+            return early
+        if len(self._early) >= _EARLY_LIMIT:
+            del self._early[next(iter(self._early))]
+        self._early[run_id] = early
+        return early
+
+    def _apply_early(self, run_id: str) -> None:
+        """Applies what came for a held run before it started here."""
+        early = self._early.pop(run_id, None)
+        here = self._here.get(run_id)
+        if early is None or here is None:
+            return
+        if early.cancelled:
+            self._cancel_held(here, run_id)
+        elif early.deadline is not None:
+            self._abort_at(run_id, early.deadline - asyncio.get_running_loop().time())
+
+    def _cancel_held(self, here: _HeldHere, run_id: str) -> None:
+        if here.run is not None:
+            here.run.cancel_by_leader()
+        self._executor.cancel(run_id)
+
+    def _abort_at(self, run_id: str, seconds_left: float) -> None:
+        """The run may be run again elsewhere `seconds_left` from now: its body
+        is asked to stop its cancel grace before that, and its task process is
+        killed then if it has not. A later deadline for the run replaces this one."""
+        loop = asyncio.get_running_loop()
+        here = self._here.get(run_id)
+        if here is None:
+            self._hold_early(run_id).deadline = loop.time() + seconds_left
+            return
+        self._clear_abort(run_id)
+        stop_in = max(0.0, seconds_left - here.cancel_grace.total_seconds())
+        here.abort = [
+            loop.call_later(stop_in, self._abort, here, run_id),
+            loop.call_later(seconds_left, self._executor.kill_host_of, run_id),
+        ]
+
+    def _abort(self, here: _HeldHere, run_id: str) -> None:
+        here.aborted = True
+        if here.run is not None:
+            here.run.abort()
+        self._executor.cancel(run_id)
+
+    def _clear_abort(self, run_id: str) -> None:
+        """The leader hears this worker again: a pending abort is dropped. A
+        body already asked to stop is not asked to go on."""
+        early = self._early.get(run_id)
+        if early is not None:
+            early.deadline = None
+            if not early.cancelled:
+                del self._early[run_id]
+        here = self._here.get(run_id)
+        if here is not None:
+            for timer in here.abort:
+                timer.cancel()
+            here.abort = []
 
     async def serve(self) -> None:
         """Runs `work` and `watch_events` together, until either ends. The
@@ -312,16 +447,36 @@ class Session:
     def _start(self, claim: Any) -> None:
         if claim.compaction:
             # Internal: no handle waits for it, so it is not in the task table.
+            # Held for the shard, it is under an abort deadline like any run.
+            if not self._runtime.delivers_results:
+                definition = self._registry.get(claim.definition_id)
+                grace = (
+                    self._cancel_grace(definition)
+                    if definition is not None
+                    else self._configuration.resolve("cancel_grace")
+                )
+                self._here[claim.task_run_id] = _HeldHere(None, grace)
             job = CompactJob(claim.task_run_id, claim.definition_id, tuple(claim.chain))
             self._track(self._compact(claim, self._executor.compact(job)))
+            self._apply_early(claim.task_run_id)
             return
-        run = self._tasks.claimed(claim.task_id)
-        if run is None:
-            # Already settled and forgotten (by `stop_claiming`, or any other
-            # route): its handle is settled, so running the body now would
-            # contradict that.
-            return
-        self._track(self._run(claim, run, self._hand_over(claim, run)))
+        if self._runtime.delivers_results:
+            run = self._tasks.claimed(claim.task_id)
+            if run is None:
+                # Already settled and forgotten (by `stop_claiming`, or any other
+                # route): its handle is settled, so running the body now would
+                # contradict that.
+                return
+        else:
+            # The shard's leader handed this worker the run, whoever
+            # submitted the task: it runs, and settles no handle here.
+            run = self._tasks.detached(claim.task_id)
+            self._here[claim.task_run_id] = _HeldHere(run, self._configuration.resolve("cancel_grace"))
+        handed = self._hand_over(claim, run)
+        if not isinstance(handed, BaseException) and claim.task_run_id in self._here:
+            self._here[claim.task_run_id].cancel_grace = self._cancel_grace(handed[0])
+        self._track(self._run(claim, run, handed))
+        self._apply_early(claim.task_run_id)
 
     def _hand_over(
         self, claim: Any, run: Run
@@ -397,21 +552,32 @@ class Session:
             if definition.continues:
                 self._continue(claim, run, outcome)
                 return
-            self._tasks.result_held(claim.task_id, outcome)
+            if run.holds_handle:
+                self._tasks.result_held(claim.task_id, outcome)
             certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
-            self._tasks.certified(certification)
+            if certification is not None:
+                self._tasks.certified(certification)
         except TaskProcessLost:
             # Cancelled first, the leader's `cancelled` event settles the
             # handle, as for a cancelled body that failed.
             if run.outcome_counts:
-                self._lost(claim)
+                self._lost(claim, run)
         except asyncio.CancelledError as error:
             current = asyncio.current_task()
-            if run.cancelled_by_leader and current is not None and not current.cancelling():
+            cancelling = current is not None and current.cancelling()
+            if run.aborted and not cancelling:
+                # Another leader may run it again once the deadline passes:
+                # it is lost only once its body has really stopped.
+                if body is not None:
+                    await asyncio.wait({body.exited})
+                self._report_lost_quietly(claim)
+                return
+            if run.cancelled_by_leader and current is not None and not cancelling:
                 # Only the body was cancelled, because the task was: this is
                 # not this run being interrupted, and its handle is settled.
                 return
-            self._interrupted(claim.task_id, error)
+            if run.holds_handle:
+                self._interrupted(claim.task_id, error)
             raise
         except Exception as error:
             if not run.outcome_counts:
@@ -428,10 +594,14 @@ class Session:
             abandoned = body is not None and not body.exited.done()
             if abandoned:
                 run.body_abandoned(body)
-            if self._report_failure(claim, kind):
-                self._tasks.retry_queued(claim.task_id)
-            else:
-                self._tasks.failed(claim.task_id, error)
+                if not run.holds_handle:
+                    self._tasks.held_body_abandoned(claim.task_id, body.exited)
+            retried = self._report_failure(claim, kind)
+            if run.holds_handle:
+                if retried:
+                    self._tasks.retry_queued(claim.task_id)
+                else:
+                    self._tasks.failed(claim.task_id, error)
             if abandoned:
                 # It keeps its place until it has really stopped.
                 await asyncio.wait({body.exited})
@@ -439,13 +609,17 @@ class Session:
         except BaseException as error:
             # Worse than cancelled: the task has no result, and whoever waits
             # for it must not wait forever.
-            self._interrupted(claim.task_id, error)
+            if run.holds_handle:
+                self._interrupted(claim.task_id, error)
             raise
         finally:
-            # On the abandoned-body retry path a newer run of this task can
-            # begin while this one still awaits `body.exited`; the table
-            # leaves the newer run's state alone when this stale one ends.
-            self._tasks.run_ended(run)
+            if run.holds_handle:
+                # On the abandoned-body retry path a newer run of this task can
+                # begin while this one still awaits `body.exited`; the table
+                # leaves the newer run's state alone when this stale one ends.
+                self._tasks.run_ended(run)
+            else:
+                self._forget_held(claim.task_run_id)
 
     def _interrupted(self, task_id: str, error: BaseException) -> None:
         self._tasks.failed(task_id, interrupted(f"task {task_id}", error))
@@ -455,6 +629,13 @@ class Session:
         and only then start the step as the task's continuation, so a run the
         leader does not certify leaves no continuation behind.
         The task is over, and its handle settled, when the continuation is."""
+        if not self._runtime.delivers_results:
+            raise RemoteResultUnavailableError(
+                f"task {claim.definition_id} returned a flow, group or bound task, whose stages "
+                "need results this worker cannot deliver: results are not yet sent back across "
+                "workers",
+                claim.task_id,
+            )
         if not getattr(step, "is_step", False):
             raise TaskDefinitionError(
                 f"task {claim.definition_id} is declared to return a flow, group or bound task, "
@@ -488,12 +669,38 @@ class Session:
 
         handle._outcome.add_done_callback(settled)
 
+    def _forget_held(self, run_id: str) -> None:
+        self._clear_abort(run_id)
+        self._here.pop(run_id, None)
+        self._early.pop(run_id, None)
+
     async def _compact(self, claim: Any, body: RunningBody) -> None:
         """Waits for a compaction run's fold and hands the folded payload to the
         leader. A failure is reported by the error's type only, and the leader
         then leaves the chain as it was."""
         try:
-            folded = await body.outcome
+            await self._fold(claim, body)
+        finally:
+            self._forget_held(claim.task_run_id)
+
+    async def _fold(self, claim: Any, body: RunningBody) -> None:
+        try:
+            try:
+                folded = await body.outcome
+            except asyncio.CancelledError:
+                here = self._here.get(claim.task_run_id)
+                current = asyncio.current_task()
+                if here is None or (current is not None and current.cancelling()):
+                    raise
+                if not here.aborted:
+                    # The leader cancelled it: there is nothing to report.
+                    return
+                # Stopped at its abort deadline: failed, as a compaction lost
+                # with its process is, once its body has really stopped.
+                await asyncio.wait({body.exited})
+                raise TaskProcessLost(
+                    "the compaction was stopped at its abort deadline"
+                ) from None
         except Exception as error:
             kind = _kind_of(error)
             _logger.warning("compaction of %s failed with %s", claim.definition_id, kind)
@@ -518,7 +725,7 @@ class Session:
                 type(refusal).__name__,
             )
 
-    def _lost(self, claim: Any) -> None:
+    def _lost(self, claim: Any, run: Run) -> None:
         """The process running the body died. The leader decides, as for a
         lost worker: a new attempt (the handle waits for it), or the task is
         over (an ephemeral one, or a non-retriable one that may have had its
@@ -534,6 +741,8 @@ class Session:
                 type(refusal).__name__,
             )
             replayed = False
+        if not run.holds_handle:
+            return
         if replayed:
             self._tasks.retry_queued(claim.task_id)
         else:
@@ -542,7 +751,17 @@ class Session:
                 TaskLostError(f"task {claim.task_id} was lost with the process that ran it"),
             )
 
-    def _report_failure(self, claim: Any, kind: str) -> bool:
+    def _report_lost_quietly(self, claim: Any) -> None:
+        try:
+            self._runtime.report_lost(claim.task_run_id)
+        except Exception as refusal:
+            _logger.warning(
+                "the leader was not told task %s's run stopped at its abort deadline: %s",
+                claim.task_id,
+                type(refusal).__name__,
+            )
+
+    def _report_failure(self, claim: Any, kind: str) -> bool | None:
         """Tells the leader the run failed and says whether it will be retried.
         Only the failure's kind goes, never the error's message. A refusal is
         logged, counts as no retry, and does not replace the error, which is

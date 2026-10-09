@@ -5,8 +5,12 @@
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
 //! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
 //! [`Net::report_lost`] and [`Net::cancel`], each sent to the leader the
-//! caller names: the transport keeps no leader of its own. The calls about a
-//! run also keep this worker's
+//! caller names. [`Net::submit_to_leader`] and [`Net::cancel_at_leader`]
+//! instead find the leader themselves, the one the worker's node names, and
+//! ask again until a leader decides, as the executor's reports are asked
+//! again (see `crate::executor`). A call addressed to this worker itself,
+//! while it leads, is answered by its own driver the same way. The calls
+//! about a run also keep this worker's
 //! [`ClaimedRuns`](crate::claimed_runs::ClaimedRuns) ledger, from the answers
 //! they get.
 //!
@@ -26,6 +30,7 @@
 //! applied.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
@@ -39,6 +44,7 @@ use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
 use kabudachi_core::time::Clock;
 use libp2p::PeerId;
+use tokio::sync::oneshot;
 
 use crate::claimed_runs::{ClaimedRuns, HeldRun};
 use crate::exchange::Asked;
@@ -59,37 +65,53 @@ pub(crate) const MAX_PLACE_IDS: usize = 256;
 /// Why a task-exchange call got no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskFailure {
-    /// The leader named is this worker: its own scheduler decides, in its
-    /// driver, and nothing was sent. A worker's driver decides its own
-    /// executor's reports so.
-    ThisWorkerLeads,
     /// No answer came: the request failed outright (such as a leader that
     /// cannot be dialed), the leader disconnected before answering, or
     /// nothing could be sent (this `Net` has stopped, or the leader's id
-    /// names no libp2p peer).
+    /// names no libp2p peer); or, for a request this worker made of itself,
+    /// its driver stopped before answering.
     Unanswered,
 }
 
-/// An unanswered inbound `/kabudachi/task/1` request, returned by
-/// [`Net::poll_task_requests`]. Answer it with [`Net::respond_task`];
-/// dropping it unanswered just lets the requester's substream eventually fail
-/// with `OutboundFailure` on their side, the same contract as
-/// `ClaimRequestHandle`.
-pub struct TaskRequestHandle(Asked<TaskCodec>);
+/// A task-exchange request this worker made of itself while its node names
+/// it leader: its own driver answers it, as it answers a peer's.
+pub(crate) struct OwnTask {
+    pub(crate) request: TaskRequest,
+    pub(crate) reply: oneshot::Sender<TaskResponse>,
+}
+
+/// Who asked a request, and where its answer goes.
+enum Asker {
+    Peer(Asked<TaskCodec>),
+    Own { from: WorkerId, task: OwnTask },
+}
+
+/// An unanswered `/kabudachi/task/1` request, returned by
+/// [`Net::poll_task_requests`]: a peer's, or one this worker made of itself
+/// while it leads. Answer it with [`Net::respond_task`]; dropping it
+/// unanswered lets a peer's substream fail with `OutboundFailure` on their
+/// side, and this worker's own ask end `Unanswered`.
+pub struct TaskRequestHandle(Asker);
 
 impl TaskRequestHandle {
     /// The `WorkerId` of whoever sent this request.
     pub fn from(&self) -> WorkerId {
-        worker_id_of(&self.0.from)
+        match &self.0 {
+            Asker::Peer(asked) => worker_id_of(&asked.from),
+            Asker::Own { from, .. } => from.clone(),
+        }
     }
 
     /// What this request asks for.
     pub fn request(&self) -> &task_request::Request {
-        self.0
-            .request
+        let request = match &self.0 {
+            Asker::Peer(asked) => &asked.request,
+            Asker::Own { task, .. } => &task.request,
+        };
+        request
             .request
             .as_ref()
-            .expect("the task codec only accepts a request that asks for something")
+            .expect("every task request this worker reads asks for something")
     }
 }
 
@@ -278,20 +300,34 @@ impl Net {
         self.ask_task(leader, request).await
     }
 
-    /// Drains every inbound `/kabudachi/task/1` request not yet answered.
-    /// Answer each with [`Self::respond_task`].
+    /// Drains every `/kabudachi/task/1` request not yet answered: peers', and
+    /// this worker's own. Answer each with [`Self::respond_task`].
     pub fn poll_task_requests(&self) -> Vec<TaskRequestHandle> {
-        self.take_asked::<TaskCodec>()
+        let me = self.local_worker_id();
+        let mut handles: Vec<TaskRequestHandle> = self
+            .take_asked::<TaskCodec>()
             .into_iter()
-            .map(TaskRequestHandle)
-            .collect()
+            .map(|asked| TaskRequestHandle(Asker::Peer(asked)))
+            .collect();
+        handles.extend(self.inbound.take_own_tasks().into_iter().map(|task| {
+            TaskRequestHandle(Asker::Own {
+                from: me.clone(),
+                task,
+            })
+        }));
+        handles
     }
 
     /// Answers a request obtained from [`Self::poll_task_requests`].
-    /// Fire-and-forget like `respond_claim`: if the driver task has already
-    /// stopped, there's nowhere for the answer to go, and that's fine to drop.
+    /// Fire-and-forget: an asker that stopped waiting, or a swarm task that
+    /// stopped, drops the answer, and that is fine.
     pub fn respond_task(&self, handle: TaskRequestHandle, response: TaskResponse) {
-        self.answer::<TaskCodec>(handle.0.channel, response);
+        match handle.0 {
+            Asker::Peer(asked) => self.answer::<TaskCodec>(asked.channel, response),
+            Asker::Own { task, .. } => {
+                let _ = task.reply.send(response);
+            }
+        }
     }
 
     /// The runs this worker claimed and has not heard the end of.
@@ -305,7 +341,17 @@ impl Net {
         request: task_request::Request,
     ) -> Result<TaskResponse, TaskFailure> {
         if leader == self.local_worker_id() {
-            return Err(TaskFailure::ThisWorkerLeads);
+            // This worker leads: its own driver decides, from its own
+            // scheduler, and answers once the writes it made are stored,
+            // as it answers a peer.
+            let (reply, answer) = oneshot::channel();
+            self.inbound.queue_own_task(OwnTask {
+                request: TaskRequest {
+                    request: Some(request),
+                },
+                reply,
+            });
+            return answer.await.map_err(|_| TaskFailure::Unanswered);
         }
         let to = PeerId::from_str(leader.as_str()).map_err(|_| TaskFailure::Unanswered)?;
         self.ask::<TaskCodec>(
@@ -346,6 +392,114 @@ impl Net {
             },
             _ => {}
         }
+    }
+}
+
+/// How [`Net::submit_to_leader`] and [`Net::cancel_at_leader`] keep asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaderRetry {
+    /// How long a leader may take to answer before it is asked again.
+    pub answer_within: Duration,
+    /// How long to wait before asking again, after an answer that came too
+    /// late, no answer, or a refusal that says to ask again.
+    pub ask_again_after: Duration,
+}
+
+/// The leader this worker's node last named, and whether the worker has left
+/// its shard, for the requests [`Net`] routes to its leader.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NamedLeader {
+    leader: Option<WorkerId>,
+    left: bool,
+}
+
+impl Net {
+    /// Asks the shard's leader to record `submitted` until a leader decides
+    /// it, and returns that decision: stored, or refused for good. The
+    /// leader asked is the one this worker's node names; while it names none
+    /// the ask waits for one. An ask that is not answered within
+    /// `retry.answer_within`, fails, or is refused for now
+    /// (`TASK_REJECT_NOT_LEADER` or `TASK_REJECT_NOT_READY`, which the
+    /// executor's reports are asked again on too, or
+    /// `TASK_REJECT_NOT_MEMBER`: the leader is not yet sure of this worker)
+    /// is asked again, of whichever leader the
+    /// node names then, `retry.ask_again_after` later, with the same
+    /// `submitted`, so the task id holds. `None` once the worker has left
+    /// its shard (see [`Self::has_left_shard`]): no leader will answer.
+    ///
+    /// Any driver (`run_driver` included) names a leader here, but only
+    /// [`crate::worker::Worker::run`] marks the worker out of its shard when
+    /// it ends, however it does. A `Net` driven by `run_driver` alone waits
+    /// for ever in this call and `cancel_at_leader` once its driver stops.
+    pub async fn submit_to_leader(&self, submitted: Submitted, retry: LeaderRetry) -> Option<TaskResponse> {
+        self.ask_until_decided(task_request::Request::Submit(wire::submit_task(&submitted)), retry)
+            .await
+    }
+
+    /// Asks the shard's leader to cancel `task` until a leader decides it,
+    /// and returns that decision (cancelled, already finished, unknown, or
+    /// refused for good), asking again as [`Self::submit_to_leader`] does;
+    /// `None` once the worker has left its shard.
+    pub async fn cancel_at_leader(&self, task: TaskId, retry: LeaderRetry) -> Option<TaskResponse> {
+        let request = task_request::Request::Cancel(CancelTask {
+            task_id: Some(task.into()),
+        });
+        self.ask_until_decided(request, retry).await
+    }
+
+    /// Whether this worker has left its shard: [`crate::worker::Worker::run`]
+    /// ended, however it did. No request routed to the leader is answered
+    /// from then on.
+    pub fn has_left_shard(&self) -> bool {
+        self.named_leader.borrow().left
+    }
+
+    /// Records the leader the node driving this `Net` names now, if any.
+    pub(crate) fn name_leader(&self, leader: Option<WorkerId>) {
+        self.named_leader.send_if_modified(|named| {
+            let changed = named.leader != leader;
+            if changed {
+                named.leader = leader;
+            }
+            changed
+        });
+    }
+
+    /// Records that this worker has left its shard, for good.
+    pub(crate) fn leave_shard(&self) {
+        self.named_leader.send_modify(|named| named.left = true);
+    }
+
+    /// Sends `request` to the leader the node names until one decides it
+    /// (see [`Self::submit_to_leader`]); `None` once the worker has left
+    /// its shard.
+    async fn ask_until_decided(&self, request: task_request::Request, retry: LeaderRetry) -> Option<TaskResponse> {
+        loop {
+            let leader = self.routed_leader().await?;
+            let asked = self.ask_task(leader, request.clone());
+            if let Ok(Ok(response)) = tokio::time::timeout(retry.answer_within, asked).await {
+                let ask_again = rejection(&response)
+                    .is_some_and(|reason| refused_for_now(reason) || reason == TaskRejectReason::TaskRejectNotMember);
+                if !ask_again {
+                    return Some(response);
+                }
+            }
+            tokio::time::sleep(retry.ask_again_after).await;
+        }
+    }
+
+    /// The leader the node names, once it names one; `None` once the worker
+    /// has left its shard.
+    async fn routed_leader(&self) -> Option<WorkerId> {
+        let mut named = self.named_leader.subscribe();
+        let named = named
+            .wait_for(|named| named.left || named.leader.is_some())
+            .await
+            .ok()?;
+        if named.left {
+            return None;
+        }
+        named.leader.clone()
     }
 }
 
@@ -494,4 +648,23 @@ pub(crate) fn not_member() -> TaskResponse {
 /// were not acknowledged while it still led: a retryable `NotLeader`.
 pub(crate) fn not_leader() -> TaskResponse {
     wire::reject(TaskRejectReason::TaskRejectNotLeader)
+}
+
+/// The reason `response` refuses its request, if it does and the reason can
+/// be read.
+pub(crate) fn rejection(response: &TaskResponse) -> Option<TaskRejectReason> {
+    match &response.result {
+        Some(task_response::Result::Reject(reject)) => TaskRejectReason::try_from(reject.reason).ok(),
+        _ => None,
+    }
+}
+
+/// Whether `reason` refuses a request only for now: the worker asked does
+/// not lead, or leads but cannot decide yet. The same request may be taken
+/// when asked again, of whichever leader the asker's node names then.
+pub(crate) fn refused_for_now(reason: TaskRejectReason) -> bool {
+    matches!(
+        reason,
+        TaskRejectReason::TaskRejectNotLeader | TaskRejectReason::TaskRejectNotReady
+    )
 }

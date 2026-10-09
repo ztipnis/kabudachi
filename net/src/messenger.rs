@@ -217,6 +217,7 @@ use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, w
 use crate::reconcile::codec::ReconcileCodec;
 use crate::steal::codec::StealCodec;
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm, hide_listen_addresses};
+use crate::task_exchange::{NamedLeader, OwnTask};
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_store::{HeldRecords, record_key};
 
@@ -253,6 +254,10 @@ enum Command {
     RefreshPeerRouting,
     /// See `Net::block_peer`.
     Block {
+        peer: PeerId,
+    },
+    /// See `Net::unblock_peer`.
+    Unblock {
         peer: PeerId,
     },
     /// Like `Dial`, but the caller wants to know *which* connection this
@@ -414,7 +419,8 @@ pub const DEFAULT_INPUT_LIMIT: usize = 1024;
 
 /// What `drive` hands over for the driver of this `Net`'s node, each queue
 /// in arrival order: the node's inputs, the join, claim, task, reconcile and steal requests the
-/// driver answers, and the outcomes of the record writes it asked for.
+/// driver answers, this worker's own task requests, and the outcomes of the record writes it
+/// asked for.
 /// `arrived` is signalled whenever any of them grows.
 pub(crate) struct Inbound {
     inputs: Mutex<VecDeque<Input>>,
@@ -425,6 +431,9 @@ pub(crate) struct Inbound {
     tasks: Mutex<VecDeque<Asked<TaskCodec>>>,
     reconciles: Mutex<VecDeque<Asked<ReconcileCodec>>>,
     steals: Mutex<VecDeque<Asked<StealCodec>>>,
+    /// `None` once the driver has stopped: nothing will answer a request
+    /// made then, so it is dropped (and its asker told) at once.
+    own_tasks: Mutex<Option<VecDeque<OwnTask>>>,
     writes: Mutex<VecDeque<WriteOutcome>>,
     arrived: Notify,
 }
@@ -439,6 +448,7 @@ impl Default for Inbound {
             tasks: Mutex::default(),
             reconciles: Mutex::default(),
             steals: Mutex::default(),
+            own_tasks: Mutex::new(Some(VecDeque::new())),
             writes: Mutex::default(),
             arrived: Notify::new(),
         }
@@ -501,6 +511,40 @@ impl Inbound {
         push(queue, asked);
         self.arrived.notify_one();
     }
+
+    /// Queues a task-exchange request this worker made of itself. Once the
+    /// own-task queue is closed the request is dropped, which its asker hears
+    /// as unanswered.
+    pub(crate) fn queue_own_task(&self, task: OwnTask) {
+        let mut own_tasks = self.own_tasks.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(queue) = own_tasks.as_mut() else {
+            return;
+        };
+        queue.push_back(task);
+        drop(own_tasks);
+        self.arrived.notify_one();
+    }
+
+    pub(crate) fn take_own_tasks(&self) -> Vec<OwnTask> {
+        self.own_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .map(|queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Closes the own-task queue for good, once no driver will answer it:
+    /// each request queued and each made later is dropped, so its asker hears
+    /// it unanswered instead of waiting forever.
+    pub(crate) fn close_own_tasks(&self) {
+        let queued = self
+            .own_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(queued);
+    }
 }
 
 /// The peer a connection event is about; `None` for any other input.
@@ -532,7 +576,7 @@ fn drain<T>(queue: &Mutex<VecDeque<T>>) -> Vec<T> {
 pub struct Net {
     local_worker_id: WorkerId,
     commands: mpsc::UnboundedSender<Command>,
-    inbound: Arc<Inbound>,
+    pub(crate) inbound: Arc<Inbound>,
     /// The address this `Net` gives other nodes for itself (see
     /// `Self::local_multiaddr`), as the swarm task last published it.
     local_addr: watch::Receiver<Option<Multiaddr>>,
@@ -545,6 +589,9 @@ pub struct Net {
     held: HeldRecords,
     /// The runs this worker claimed (see [`Self::claimed_runs`]).
     pub(crate) claimed: ClaimedRuns,
+    /// The leader this worker's node last named, and whether the worker has
+    /// left its shard (see [`Self::submit_to_leader`]).
+    pub(crate) named_leader: watch::Sender<NamedLeader>,
     driver: JoinHandle<()>,
 }
 
@@ -609,6 +656,7 @@ impl Net {
             records_shard,
             held,
             claimed: ClaimedRuns::default(),
+            named_leader: watch::Sender::new(NamedLeader::default()),
             driver,
         }
     }
@@ -698,8 +746,7 @@ impl Net {
     /// refuses: `peer` may see its own dial connect for an instant before
     /// the refusal closes it. So a partition is blocked on both sides, or
     /// the unblocked side would see each of its dials connect for an
-    /// instant. There is no way back: a test that needs the peer again
-    /// starts a new node.
+    /// instant. [`Net::unblock_peer`] heals the partition.
     /// Gossip still reaches `peer` through any other peer both are
     /// connected to, as it would across a partial partition: a test that
     /// cuts one group off from another blocks every pair across the cut.
@@ -715,6 +762,18 @@ impl Net {
             return;
         };
         let _ = self.commands.send(Command::Block { peer });
+    }
+
+    /// Lets `peer` through again after [`Net::block_peer`], as a healed
+    /// partition would: connections either way are allowed from now on, and
+    /// the next send or redial to `peer` connects. Heal both sides, as both
+    /// were blocked. Fire-and-forget, like `block_peer`; a no-op for a peer
+    /// never blocked, or one this mapping never produced.
+    pub fn unblock_peer(&self, peer: WorkerId) {
+        let Ok(peer) = PeerId::from_str(peer.as_str()) else {
+            return;
+        };
+        let _ = self.commands.send(Command::Unblock { peer });
     }
 
     /// Makes the dial `target` describes and resolves to the `PeerId` of the
@@ -1338,6 +1397,9 @@ fn handle_command(
         }
         Command::Block { peer } => {
             swarm.behaviour_mut().blocked.block_peer(peer);
+        }
+        Command::Unblock { peer } => {
+            swarm.behaviour_mut().blocked.unblock_peer(peer);
         }
         Command::DialForConnection { target, respond_to } => {
             let (opts, asked_at) = match target {

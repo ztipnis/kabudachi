@@ -226,8 +226,8 @@ Until the claiming worker folds them, superseded payloads are retained as an ord
 | Situation | `@task` retriable | `@task` non-retriable | `@ephemeral_task` | `@coalescing_task` |
 |---|---|---|---|---|
 | Worker lost while running (after the reconnect timeout, §8.3) | new TaskRun (at-least-once) | `ORPHANED` | `LOST`, not replayed | replayed if newest, else `LOST` and not replayed |
-| Task subprocess dies, worker alive | as worker lost, within one heartbeat interval | `ORPHANED` | `LOST`, not replayed | as worker lost |
-| Timeout | `FAILED`, retried per retry policy (in-process mode: retry deferred until the abandoned body exits, §6.2) | `FAILED`; hard-kill state is open (§28.13) | `FAILED` | `FAILED`, no special requeue |
+| Task subprocess dies, worker alive | as worker lost, as soon as the worker sees the subprocess exit | `ORPHANED` | `LOST`, not replayed | as worker lost |
+| Timeout | `FAILED`, retried per retry policy (in-process mode: retry deferred until the abandoned body exits, §6.2) | `FAILED`, killed at the hard limit or not (§28.13) | `FAILED` | `FAILED`, no special requeue |
 | Leader change | run continues, adopted at reconciliation | adopted | adopted | adopted |
 | Catastrophic shard loss | `ShardLostError`, may `resubmit()` | `ORPHANED` | lost | not replayed; next submission creates the newest (§16.3) |
 
@@ -663,11 +663,19 @@ For a task subprocess:
 - synchronous functions execute in a worker thread through `asgiref.sync_to_async(..., thread_sensitive=False)`, which propagates `contextvars`; the default `thread_sensitive=True` would serialize every sync task on one thread and is never used;
 - both consume from the same bounded concurrency budget.
 
-If configured process count is `0`, the main Python runtime may execute task functions itself. In that mode only cooperative (soft) cancellation is enforceable: a synchronous body that ignores cancellation cannot be killed in-process, so at the hard limit the TaskRun is marked `FAILED` and the runtime stops waiting for it. Nothing is killed, so in this mode the outcome is `FAILED`, as in the delivery table (§3.2.2); that is a provisional choice for the in-process mode, and the state after a hard-timeout kill in the subprocess pool stays open (§28.13). An abandoned body of a non-retriable task may still complete irreversible effects, which is the ambiguity `ORPHANED` names in §4.4. The abandoned body may still be running, so a retry, if the retry policy calls for one, is not started until that body has actually exited; a lineage never has two bodies executing at once. The failed TaskRun itself is terminal. When a retry is due, the lineage stays pending until the body exits and the handle does not resolve meanwhile; when none is due (no retries configured, or the last attempt), the lineage is terminal `FAILED` at once. A coalescing generation's key stays occupied until its abandoned body exits, so no second generation of that key starts while a body for it is still running (§25.4.1). Whatever the abandoned body later returns or raises is discarded and can never certify (§25.1.5, §25.1.6). It keeps its concurrency slot until it exits. A body that never exits therefore blocks that lineage's retry and holds its slot indefinitely, and enough of them exhaust the bounded pool: this is a documented limitation of the in-process mode, removed by the subprocess pool's hard kill (Phase 5). The rule limits duplicate side effects from retries but does not fence writes the abandoned body still makes (§2.3).
+If configured process count is `0`, the main Python runtime may execute task functions itself. In that mode only cooperative (soft) cancellation is enforceable: a synchronous body that ignores cancellation cannot be killed in-process, so at the hard limit the TaskRun is marked `FAILED` and the runtime stops waiting for it. Nothing is killed, so in this mode the outcome is `FAILED`, as in the delivery table (§3.2.2): the same outcome as a hard-timeout kill in the subprocess pool (§28.13). An abandoned body of a non-retriable task may still complete irreversible effects, which is the ambiguity `ORPHANED` names in §4.4. The abandoned body may still be running, so a retry, if the retry policy calls for one, is not started until that body has actually exited; a lineage never has two bodies executing at once. The failed TaskRun itself is terminal. When a retry is due, the lineage stays pending until the body exits and the handle does not resolve meanwhile; when none is due (no retries configured, or the last attempt), the lineage is terminal `FAILED` at once. A coalescing generation's key stays occupied until its abandoned body exits, so no second generation of that key starts while a body for it is still running (§25.4.1). Whatever the abandoned body later returns or raises is discarded and can never certify (§25.1.5, §25.1.6). It keeps its concurrency slot until it exits. A body that never exits therefore blocks that lineage's retry and holds its slot indefinitely, and enough of them exhaust the bounded pool: this is a documented limitation of the in-process mode, removed by the subprocess pool's hard kill. In this mode a body that raises `SystemExit` or `KeyboardInterrupt` fails its run with `TaskBodyError`, except an async body that raises `KeyboardInterrupt` on the main thread: that can be a real Ctrl-C, so it interrupts the whole worker. The rule limits duplicate side effects from retries but does not fence writes the abandoned body still makes (§2.3).
 
 `kabudachi.run(main=None)` is the synchronous entry point, in the style of `asyncio.run`. It constructs and owns the event loop on the main thread, initializes the native runtime on it, runs `main()` if given (returning its result) and then drains and stops. Draining waits for every task that was called to finish, queued tasks and tasks started by other tasks included; if `main` raised or was interrupted, tasks already running are let finish, tasks that have not started fail with `RunStoppedError`, and the error propagates. A task that waits for another task does not occupy one of the `concurrency` places while it waits, so a task that waits for tasks it called cannot starve them. Before `main` starts, every registered task is checked against the serializers of the process, so a task that cannot work is reported at once; with no `main` it serves as a worker (on the main thread) until SIGINT/SIGTERM, then drains as above and returns; a second signal stops the waiting and raises `KeyboardInterrupt`, abandoning unfinished tasks (a synchronous task still in its thread keeps the interpreter from exiting until it returns). Submitting a task outside `run()` raises `RuntimeNotStartedError`; `.local()` (§3.3) needs no runtime.
 
-Hard timeouts (§3.8) kill the task subprocess. Whether a subprocess is recycled after a configured number of runs, for tasks that hold native memory, is deferred to the Phase 5 design (§28.12).
+By default the process count is the number of CPUs the worker may use (its CPU affinity, not the host's count). Task subprocesses start with the `spawn` method, never `fork`, because the worker holds a Tokio runtime and native threads. A spawned subprocess imports the main script again, so a script that calls `kabudachi.run()` must guard it with `if __name__ == "__main__":`. Each subprocess imports every module that declared a task or lifecycle hook in the worker (or the modules an explicit `imports` setting names instead), checks that it has every task at the same version, and reports ready within `process_start_timeout` (60 s by default); otherwise the worker's start fails. A task or hook declared in `__main__` is refused at start while the process count is above 0, since a subprocess cannot import it.
+
+At the hard limit (§3.8) the run settles at once: a non-retriable run is `FAILED` with a timeout error, and a retriable one queues its retry, which starts once the body has exited. The subprocess hosting the body takes no new runs and is stopped (SIGTERM, then SIGKILL after a short grace) once its other runs have settled; a replacement starts at once, and neighbouring runs are never killed as collateral. A body that raises `SystemExit` or `KeyboardInterrupt` is contained the same way: its run fails with `TaskBodyError` naming the type, and its subprocess is stopped once its other runs settle.
+
+A subprocess that dies (a crash, running out of memory, an external SIGKILL or SIGTERM) loses its runs, which are reported as soon as the worker sees it exit, and is replaced, after a wait that doubles while replacements keep dying quickly. A lost run follows the delivery table (§3.2.2) as if its worker had been lost: it is replayed without using up a retry, except an ephemeral task's or a coalescing generation's that a newer one waits behind (whose handles raise `TaskLostError`), and a non-retriable run that was running, which is `ORPHANED`. A compaction run lost with its subprocess is reported `FAILED`, not lost, so a merge that crashes its process is not run again on that key until its waiting generation changes.
+
+A subprocess is recycled after `max_runs_per_process` runs (off by default), after a run of a task declared `recycle_process=True`, or after an `after_run` hook raises (§19.6): it takes no new runs, finishes the ones it has and exits, and its replacement starts then. Until it exits it still counts against the process count, so recycling never raises the number of processes (§28.12).
+
+Task subprocesses ignore SIGINT, since a terminal's Ctrl-C reaches the whole process group and only the worker decides what it means, and they exit when the worker's end of their pipe closes, so none outlives its worker. The worker's first SIGINT or SIGTERM drains as described above; a running body past its timeout still escalates through its cancel grace to the hard limit. A second signal stops the task subprocesses at once (SIGTERM, then SIGKILL), and their unfinished runs are lost. A SIGTERM sent to a task subprocess itself cancels its bodies and ends it, and its runs are lost and replayed as for any subprocess that dies. Deployments should therefore signal only the worker process, not its whole process group. With systemd, set `KillMode=mixed`: systemd then sends SIGTERM to the worker process only, which drains and stops its task subprocesses itself, and SIGKILLs whatever remains only after the worker exits or `TimeoutStopSec` passes. The default, `KillMode=control-group`, sends SIGTERM to every process, which cancels the task-subprocess bodies during the drain (their runs are replayed).
 
 The design does not encourage thousands of coroutines per worker process simply because asyncio technically permits it. Predictable bounded concurrency is more important.
 
@@ -867,8 +875,10 @@ reconnect_timeout     grace period after which a lost TaskRun is considered dead
 - The leader marks a TaskRun `LOST` when heartbeats stop, but creates a replacement TaskRun only after `reconnect_timeout` elapses.
 - Workers monitor their connection to the leader (and client, where relevant) and abort the TaskRun, by cooperative cancellation and then subprocess kill, at or before `reconnect_timeout` if communication is not re-established. The worker's abort deadline is shorter than the leader's replacement deadline by a clock-skew margin, and both use monotonic time.
 - If the worker reconnects in time, a non-retriable TaskRun's result is adopted and certified (§8.5); a competing replacement cannot supersede it.
+- A worker starts no TaskRun until a leader has heard from it, so every run it holds has an abort deadline. Before the deadline it cancels each run cooperatively, the run's cancel grace ahead of it. At the deadline it kills the task subprocess of any body still running, which also ends the other runs that subprocess hosts; they share the same lost contact, so the same deadline. A run stopped this way is reported lost once its body has exited. If a leader hears the worker again before the deadline, the pending aborts are withdrawn. A leader runs its own claims under the same rule.
+- The leader's replacement deadline is per TaskRun: the run's own `reconnect_timeout` after the leader suspects the silent worker. A worker heard again keeps every run whose deadline has not passed.
 
-The worst-case time from an abrupt kill (SIGKILL) to the replacement TaskRun starting is `heartbeat_timeout + reconnect_timeout`, plus an election if the leader was lost and the claim round trip. Defaults are on the order of tens of seconds and are configurable per queue and task. Heartbeats run in the native core, independent of the GIL and of any CPU-bound task subprocess, so a long native call cannot make a healthy worker look dead. If a task subprocess dies while its worker lives, the TaskRun is reported `LOST` within one heartbeat interval.
+The worst-case time from an abrupt kill (SIGKILL) to the replacement TaskRun starting is `heartbeat_timeout + reconnect_timeout`, plus an election if the leader was lost and the claim round trip. Defaults are on the order of tens of seconds (`heartbeat_timeout` 10 s, `reconnect_timeout` 30 s). `reconnect_timeout` is configurable per shard, per queue and per task: a task's own value wins, then its queue's, then the shard's. It is resolved when the task is submitted and stored in the Task record, so the leader's replacement deadline and the worker's abort deadline use the same value, and a successor leader reads it from the record. Heartbeats run in the native core, independent of the GIL and of any CPU-bound task subprocess, so a long native call cannot make a healthy worker look dead. If a task subprocess dies while its worker lives, the TaskRun is reported `LOST` as soon as the worker sees the subprocess exit, after waiting up to a second for the frames it sent last.
 
 This bounds overlap; it does not fence external writes (§2.3).
 
@@ -1823,7 +1833,7 @@ STOPPED
 
 The drained worker asks the leader it followed where each of its records goes now, writes each copy to the holders it names (as the record is held, naming the worker as its publisher, so the holder keeps it whatever holders the record names), waits for the acknowledgements, and writes again what was refused, until the drain wait limit. A copy a holder refuses because it holds a newer revision needs no handing over.
 
-Termination is soft and then hard, similar to a warm/cold shutdown in Celery. A soft terminate starts the drain above and lets running TaskRuns finish within a configured grace period; when the grace period elapses, running task subprocesses are cancelled cooperatively and then killed, and their TaskRuns follow the worker-loss semantics of §3.2.2.
+Termination is soft and then hard, similar to a warm/cold shutdown in Celery. A soft terminate starts the drain above and lets running TaskRuns finish within a configured grace period; when the grace period elapses, running task subprocesses are cancelled cooperatively and then killed, and their TaskRuns follow the worker-loss semantics of §3.2.2. The Python runtime has no drain grace setting: a second SIGINT or SIGTERM to the worker is its hard terminate (§6.2).
 
 ### 18.2 Leader shutdown
 
@@ -2033,7 +2043,13 @@ Hooks receive immutable event DTOs.
 
 Hook failures never affect Task success or cluster correctness.
 
-Separately from these observer hooks, the runtime offers execution lifecycle hooks that run inside the task subprocess: worker-process initialization, and per-run before/after. They exist so applications can prepare and clean up per-process state (for example returning database connections after each run). They are registered where tasks are registered, at package scope, so every subprocess that imports the task modules also has them; they are scoped to the queues the worker subscribes to. Framework-specific recipes, such as connection handling for a particular web framework, belong in documentation and cookbooks, not in the architecture.
+Separately from these observer hooks, the runtime offers execution lifecycle hooks that run where task bodies run, in the task subprocess (or in the worker's own process when the process count is 0): `@kabudachi.process_init` once when a subprocess starts, before it takes a run, and `@kabudachi.before_run(context)` and `@kabudachi.after_run(context, outcome)` around each run. The context (`kabudachi.RunContext`) names the task, the run and its attempt; the outcome is what the body returned or the exception it raised. Each hook may be sync or async. The two run hooks take an optional `queues=` that scopes them (by default, every queue), and run on the thread the body runs on, so per-thread state such as a database connection is the body's. They exist so applications can prepare and clean up per-process state, for example returning database connections after each run. They are declared at package scope, where tasks are, so every subprocess that imports the task modules has them.
+
+- A `process_init` that raises fails the worker's start with `StartupError`, or delays a later replacement subprocess with the same growing wait as a crash.
+- A `before_run` that raises fails the run under its retry policy; the body does not run, and the `after_run` hooks see the error.
+- An `after_run` that raises is logged, the other `after_run` hooks still run, and the result stands; the subprocess is recycled (§6.2), since what the hook did not clean up may be left in it.
+
+Framework-specific recipes, such as connection handling for a particular web framework, belong in documentation and cookbooks, not in the architecture.
 
 ### 19.7 Plugin architecture
 
@@ -2956,7 +2972,7 @@ Implement:
 - worker discovery of pending Tasks: own records, then shard peers outward by distance, then the leader's oldest pending tasks;
 - compaction of retained coalescing chains.
 
-The leader does not execute compaction, and a networked worker does not yet run a claimed compaction by itself: that needs the worker-side executor of Phase 5. The one-node runtime executes compaction on a free worker place.
+Compaction runs on a worker, never in the leader's scheduler: a networked worker with an executor claims a compaction run and folds the chain it is handed (Phase 5), and the one-node runtime executes compaction on a free worker place.
 
 ### Phase 4: Redis CoordinationAuthority
 
@@ -2972,26 +2988,28 @@ Implemented:
 - recovery fence timing (§28.4);
 - the shared-instance provider constraints (§9.1).
 
-A Python-hosted networked worker is Phase 5; the task-to-shard cache, the client shard map and `ShardLostError` are Phase 8.
+The Python-hosted networked worker came in Phase 5; the task-to-shard cache, the client shard map and `ShardLostError` are Phase 8.
 
 Open: two Redis test flakes were seen once each and never reproduced or explained. `//redis_authority:redis_authority_integration_test` hung after its tests had passed, before the port-ownership fixes; and a cluster test's first call once answered `Unavailable`. The port-ownership fixes may have removed both. If either recurs, find the cause before rerunning.
 
 ### Phase 5: Python subprocess execution
 
-Implement:
+Implemented:
 
-- configured process limit;
-- bounded asyncio concurrency;
-- sync bodies via the §6.2 `asgiref` mechanism, now inside the task subprocess;
-- cooperative cancellation and soft-to-hard timeout escalation;
-- execution lifecycle hooks in the task subprocess;
-- SIGTERM/SIGKILL behavior;
-- networked workers run the tasks they claim, compaction runs included;
-- a TaskRun executor that honors `Output::AbortDeadline` and starts a TaskRun only once the node has a contact floor (a leader has heard from it), so its abort deadline is defined;
-- a leader's own claims (today the leader's own node answers a claim as `ThisWorkerLeads`);
-- a multi-process SIGKILL harness;
-- a test for a sync body raising `BaseException`, under subprocess isolation;
-- per-queue and per-task `reconnect_timeout`.
+- a configured process count (`processes`, by default the CPUs the worker may use; `0` runs bodies in the worker's process) and bounded concurrency per subprocess (`concurrency`, at most 32 unless overridden), shared by async bodies on the subprocess's event loop and sync bodies through `asgiref.sync_to_async(thread_sensitive=False)` (§6.2);
+- task discovery in `spawn`ed subprocesses: each imports the modules that declared tasks and hooks (or `imports`), checks it has every task at the same version and reports ready within `process_start_timeout`; a task or hook declared in `__main__` is refused at start;
+- cooperative cancellation and soft-to-hard escalation through the cancel grace: a hard limit settles the run at once and stops its subprocess once its other runs settle, with no neighbour killed as collateral (§28.13); a body raising `SystemExit` or `KeyboardInterrupt` is contained the same way, with `TaskBodyError`;
+- a dead subprocess's runs reported lost, one run at a time while the worker lives, and replayed by the delivery table (§3.2.2); a lost compaction reported failed; the subprocess replaced with backoff;
+- nested task, flow and group calls from a subprocess, proxied through the worker, and compaction's fold in a subprocess;
+- execution lifecycle hooks (`process_init`, `before_run`, `after_run`, with `kabudachi.RunContext`) and recycling (`max_runs_per_process`, `recycle_process`, a failed `after_run`; §28.12);
+- SIGTERM/SIGKILL behaviour: subprocesses ignore SIGINT and exit on SIGTERM or when their worker's pipe closes; the worker's first signal drains, a second stops its subprocesses at once (§6.2);
+- the executor seam in `kabudachi_net` (`Work`, `Report`, `WorkerConfig::with_executor`, `ExecutorHandle::split`): a networked worker claims only once a leader has heard from it (`WorkerNode::has_contact_floor`), forwards each run's abort deadline (`Work::Abort`, withdrawn by `Work::AbortWithdrawn`), and runs the compaction runs it claims; a leader claims for itself from its own scheduler, submits and cancels through its own driver, and decides its own reports, each held like a remote worker's until a quorum of the task's placement has stored it;
+- remote cancellation: a worker holding a run of a cancelled task learns it in its leader's next heartbeat ack, derived from the cancelled state stored in the Task record, so a successor leader tells holders an earlier one could not;
+- per-run `reconnect_timeout` (§8.3): the task option, then the queue's (`reconnect_timeouts`), then the shard's, fixed at submission and used by the leader's per-run replay after a worker falls silent and by the worker's abort deadline;
+- the networked Python worker: `kabudachi.run()` with `listen` set (and `seeds`, `external_address`, `authority` as a `redis://` or `rediss://` URL with `?key_prefix=` and `?ttl=`, `shard`, and the shard's heartbeat and reconnect timings) hosts `kabudachi_net::worker::Worker`, starts once it has joined and knows its leader, runs whatever that leader hands it, submits through the leader, and on stopping lets its held runs finish and waits until the leader has taken their reports; it needs `processes` of at least 1, so it can kill a body at its abort deadline;
+- the multi-process SIGKILL harness (`//runtime/tests:test_networked`): a killed task subprocess, worker and leader, each run certified once, a CPU-bound body that leaves heartbeats and leadership alone, a networked compaction, a remote cancel, and a partitioned worker that stops its run by its abort deadline; and a Python worker cold-bootstrapped against valkey (`//runtime/tests:test_networked_valkey`).
+
+Awaiting a result on a networked worker raises `RemoteResultUnavailableError`, inside task bodies too; the handle's `cancel()` still reaches the leader. Delivering a result from the worker that ran a task back to the one that submitted it is networked client result delivery (§8.5, Phase 8).
 
 ### Phase 6: flow/group/map/reduce
 
@@ -3002,6 +3020,8 @@ Phase 1 already delivers `flow`, `group`, implicit flows and `.map` in a one-nod
 - `.reduce` (a sequential chain of certified steps; a reduction tree only for a seedless reducer declared associative);
 - group ordered result collection across workers and leader changes;
 - durable flow continuations: ending a continuation over the network, so that an implicit flow's lifetime holds across a leader change (§8.2).
+
+Open (from Phase 5): on a networked worker, a task that returns a flow, group or bound task fails with `RemoteResultUnavailableError`. Its continuation starts stages that run on other workers and awaits their results, then ends over the network: it needs the durable flow continuations and the result collection across workers above.
 
 ### Phase 7: observability
 
@@ -3047,7 +3067,7 @@ The coalescing, flow, and failure-detection invariants (§25.1 item 9 and §25.4
 | 2 | 25.4.5 under worker loss, and abort-before-replacement under a simulated (connection-loss) partition. The bound on the time from worker unreachable to replacement claim stays tested (`core/tests/scenario/scenario_partition.rs`); its measured value is a §27.2 gate item |
 | 3 | 25.4.5 under leader loss (a new leader can replay only what reconciliation rebuilds), retained-payload chain across DHT replicas and compaction (the one-node soft/hard-limit backpressure contract is a Phase 1 exit criterion) |
 | 4 | Cold bootstrap, flush with a live leader, restart, and quorum loss plus flush, each against a real Redis-compatible server, with one ShardId per incarnation |
-| 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess; the multi-process SIGKILL harness |
+| 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess; the multi-process SIGKILL harness (a killed task subprocess, worker and leader, each run certified once); a partitioned worker stopping its runs by their abort deadline |
 
 ### 27.2 Production-readiness gate
 
@@ -3152,11 +3172,11 @@ No latency target is committed. The path is DHT dissemination, worker pull, and 
 
 ### 28.12 Subprocess recycling
 
-Whether task subprocesses can be recycled after a number of runs (for tasks that accumulate native memory), and whether that is per task or per queue, is deferred to the Phase 5 execution-pool design.
+Closed. Recycling is per worker and per task. `max_runs_per_process` recycles a subprocess after that many runs (off by default). A task declared `recycle_process=True` recycles the subprocess that ran it once the run ends. An `after_run` hook that raises recycles its subprocess too (§19.6). A recycled subprocess takes no new runs, finishes the ones it has and exits; it counts against the process count until it exits, and its replacement starts then. No per-queue knob exists: a queue's tasks share their worker's subprocesses.
 
 ### 28.13 State after a hard-timeout kill of a non-retriable task
 
-A non-retriable TaskRun killed at its hard timeout may or may not have performed irreversible work. Whether it becomes `FAILED` or `ORPHANED` needs a decision consistent with §4.4.
+Closed. A non-retriable TaskRun killed at its hard limit is `FAILED` with a timeout error. It did not certify, and a body that raises midway is `FAILED` too, partial effects or not. `ORPHANED` stays the state for an unknown outcome: a run whose worker or subprocess was lost while it ran (§4.4). This matches the common practice of task queues and workflow engines, Celery and Temporal among them, of treating a timeout as a failure.
 
 ### 28.14 Thresholds and margins
 

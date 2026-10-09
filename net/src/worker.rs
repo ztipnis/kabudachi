@@ -27,10 +27,10 @@ use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, ShardName, Uuid7Ids, WorkerId};
-use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::scheduler::{MemoryLimits, Scheduler};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::RealClock;
-use libp2p::Multiaddr;
+pub use libp2p::Multiaddr;
 
 use crate::authority::{AuthorityClient, SharedAuthority};
 use crate::bootstrap::{DEFAULT_RETRY_INTERVAL, DEFAULT_SEED_ROUNDS, bootstrap};
@@ -103,6 +103,10 @@ pub struct WorkerConfig {
     /// scheduler and by every worker's record store; `None` keeps finished
     /// tasks.
     pub result_ttl: Option<StdDuration>,
+    /// The memory limits the worker's scheduler holds pending task input to
+    /// while it leads (see `kabudachi_core::scheduler::MemoryLimits`); `None`
+    /// for none.
+    pub memory_limits: Option<MemoryLimits>,
     /// The executor that runs the tasks this worker claims; `None` for none.
     /// With one, the driver claims work while the executor has room and
     /// hands it over, and the worker says it runs compaction. With none it
@@ -138,6 +142,7 @@ impl WorkerConfig {
             input_limit: None,
             replication_factor: ReplicationFactor::DEFAULT,
             result_ttl: None,
+            memory_limits: None,
             executor: None,
         }
     }
@@ -208,6 +213,13 @@ impl WorkerConfig {
         self
     }
 
+    /// Holds pending task input to `limits` while this worker leads.
+    #[must_use]
+    pub fn with_memory_limits(mut self, limits: MemoryLimits) -> Self {
+        self.memory_limits = Some(limits);
+        self
+    }
+
     /// Bounds the inputs the worker's network holds while its driver is not taking them.
     #[must_use]
     pub fn with_input_limit(mut self, limit: usize) -> Self {
@@ -258,17 +270,18 @@ impl Worker {
     }
 
     /// This worker's network, for what its node does not do itself, such as
-    /// submitting tasks to the leader its node names (`Net::submit`, given
-    /// the leader `observe` last saw in [`Self::run`]). Only
-    /// [`Self::run`] drives a node on it.
+    /// submitting tasks to the leader its node names
+    /// (`Net::submit_to_leader`). Only [`Self::run`] drives a node on it.
     pub fn net(&self) -> Arc<Net> {
         Arc::clone(&self.net)
     }
 
     /// Bootstraps this worker into its shard, then drives its node for good.
     /// `observe` is called after every step the driver carries out (see
-    /// `run_driver`). Stop the worker by dropping the returned future; a
-    /// worker stopped this way is gone, and a new one must be started.
+    /// `run_driver`), and is dropped only once the worker shows out of its
+    /// shard (see `Net::has_left_shard`). Stop the worker by dropping the
+    /// returned future; a worker stopped this way is gone, and a new one must
+    /// be started.
     ///
     /// A worker asked to drain (see `Net::request_drain`) leaves its shard,
     /// hands the records it holds to the voters its leader chooses, and then
@@ -284,9 +297,13 @@ impl Worker {
     /// anything: the epoch it rejoins shows the shard exists.
     pub async fn run(
         self,
-        observe: impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
+        mut observe: impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
     ) -> HandedOff {
         let Worker { net, mut config } = self;
+        // However this ends (returns, is dropped, aborted or panics), the
+        // worker has left its shard: no request routed to its leader waits
+        // for one any more.
+        let _leave_shard = LeaveShard(&net);
         let mut executor = config.executor.take();
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
@@ -329,6 +346,11 @@ impl Worker {
         let (mut node, first) = WorkerNode::start(identity, entry, clock, authority_timings);
         let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         scheduler.set_result_ttl(retention_of(&config));
+        scheduler.set_memory_limits(config.memory_limits);
+        // However the driver ends (returns, is dropped, aborted or panics),
+        // no driver answers this worker's own requests any more: tell each
+        // asker so, now and from here on.
+        let _close_own_tasks = CloseOwnTasks(&net);
         run_driver(
             &mut node,
             first,
@@ -344,8 +366,30 @@ impl Worker {
                 retry_interval: config.retry_interval,
                 replication_factor: config.replication_factor,
             },
-            observe,
+            // Borrowed, so `observe` outlives the guards above: once it is
+            // dropped, the worker shows out of its shard.
+            &mut observe,
         )
         .await
+    }
+}
+
+/// Marks the worker out of its shard when dropped (see
+/// `Net::has_left_shard`).
+struct LeaveShard<'a>(&'a Net);
+
+impl Drop for LeaveShard<'_> {
+    fn drop(&mut self) {
+        self.0.leave_shard();
+    }
+}
+
+/// Closes the worker's own-task queue when dropped, so a future that ends
+/// early still tells every asker that nobody will answer.
+struct CloseOwnTasks<'a>(&'a Net);
+
+impl Drop for CloseOwnTasks<'_> {
+    fn drop(&mut self) {
+        self.0.inbound.close_own_tasks();
     }
 }

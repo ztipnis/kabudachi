@@ -60,11 +60,12 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             }))
             .await;
 
-        // A task of the leader's own run is cancelled: its executor is told
-        // to stop the body.
+        // A task the leader submits and cancels through its own network,
+        // which its own driver answers like any other request, is one its
+        // own executor runs: the executor is told to stop the body.
         executors[leader].grant(1);
         let cancelled = shard
-            .drive_until(submitted_through(&client, &leader_id, plain_with(b"cancelled")))
+            .drive_until(submitted_through(&leader_net, &leader_id, plain_with(b"cancelled")))
             .await;
         let (run, _) = shard.drive_until(executors[leader].next_claim()).await;
         executors[leader].report(Report::Started(run.clone()));
@@ -74,9 +75,9 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             }))
             .await;
         shard
-            .drive_until(client.cancel(leader_id.clone(), cancelled))
+            .drive_until(leader_net.cancel(leader_id.clone(), cancelled))
             .await
-            .expect("the leader answered");
+            .expect("the leader's own driver answered");
         assert_eq!(shard.drive_until(executors[leader].next_work()).await, Work::Cancel(run));
 
         // A run a follower runs is cancelled: the leader's next ack to the
@@ -132,6 +133,26 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
         shard
             .drive_until(poll_until("the leader replays the run its executor abandoned", || {
                 holding(&nets, &lost, &[TaskRunState::Lost, TaskRunState::Lost, TaskRunState::Queued]) >= QUORUM
+            }))
+            .await;
+
+        // The leader's executor claims that replay, then stops reading work
+        // though it could still report: no run it was handed will be run, so
+        // the run is reported lost and replayed once more.
+        let own_executor = if follower < leader { leader - 1 } else { leader };
+        executors[own_executor].grant(1);
+        let (run, _) = shard.drive_until(executors[own_executor].next_claim()).await;
+        executors[own_executor].report(Report::Started(run.clone()));
+        executors[own_executor].stop_taking_work();
+        shard
+            .drive_until(poll_until("the leader replays the run its executor no longer reads", || {
+                holding(&nets, &lost, &[
+                    TaskRunState::Lost,
+                    TaskRunState::Lost,
+                    TaskRunState::Lost,
+                    TaskRunState::Queued,
+                ]) >= QUORUM
+                    && leader_net.claimed_runs().get(&run).is_none()
             }))
             .await;
     })

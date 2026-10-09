@@ -9,5 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 kabudachi-core = { path = "../core" }
+kabudachi-net = { path = "../net" }
+kabudachi-redis-authority = { path = "../redis_authority" }
 pyo3 = { version = "0.29.2", features = ["abi3-py312"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

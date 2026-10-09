@@ -37,6 +37,9 @@ bazel test //runtime/tests:test_session
 bazel test //runtime/tests:test_run
 bazel test //runtime/tests:test_runner
 bazel test //runtime/tests:test_signals
+bazel test //runtime/tests:test_pool
+bazel test //runtime/tests:test_networked
+bazel test //runtime/tests:test_networked_valkey
 
 cargo check --workspace --all-targets
 

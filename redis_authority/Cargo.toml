@@ -10,7 +10,8 @@ name = "kabudachi_redis_authority"
 [dependencies]
 crc16 = "0.4"
 kabudachi-core = { path = "../core" }
-redis = { version = "1.7", default-features = false }
+redis = { version = "1.7", default-features = false, features = ["tls-rustls", "tls-rustls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 thiserror = "2"
 tracing = "0.1"
 url = "2"

@@ -1,11 +1,15 @@
-//! What Python sees of the scheduler: claims, certifications and events.
+//! What Python sees of the scheduler: claims, certifications and events, and
+//! the Task records a networked shard holds.
 
+use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::protocol::messages::{TaskRecord, TaskRun, chain_entry};
+use kabudachi_core::protocol::task::TaskRunState as DomainRunState;
 use kabudachi_core::scheduler::{Certification, Claim, Event};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use crate::outcomes::PyEventKind;
+use crate::outcomes::{PyEventKind, PyRunState};
 
 /// A task handed to a worker to run, and the run that now belongs to it.
 #[pyclass(name = "Claim", frozen)]
@@ -120,6 +124,47 @@ pub struct PyEvent {
     /// For `SLOW_DOWN`: whether the slow-down was raised (`True`) or cleared.
     #[pyo3(get)]
     active: bool,
+    /// For `REFUSED`: why the leader refused the submission.
+    #[pyo3(get)]
+    reason: Option<String>,
+    /// For `ABORT`: seconds until the run may be run again elsewhere, as of
+    /// when the event was made.
+    #[pyo3(get)]
+    seconds_left: f64,
+}
+
+impl PyEvent {
+    /// An event a networked worker raises itself: about `task_id`'s run
+    /// `task_run_id` (empty for a submission).
+    pub fn networked(kind: PyEventKind, task_id: &str, task_run_id: &str) -> Self {
+        PyEvent {
+            kind,
+            task_id: task_id.to_owned(),
+            task_run_id: task_run_id.to_owned(),
+            was_running: matches!(kind, PyEventKind::Cancelled),
+            superseded_by: None,
+            active: false,
+            reason: None,
+            seconds_left: 0.0,
+        }
+    }
+
+    /// The leader refused `task_id`'s submission for good, for `reason`.
+    pub fn refused(task_id: &str, reason: &str) -> Self {
+        PyEvent {
+            reason: Some(reason.to_owned()),
+            ..PyEvent::networked(PyEventKind::Refused, task_id, "")
+        }
+    }
+
+    /// The run `task_run_id` of `task_id` may be run again elsewhere in
+    /// `seconds_left` seconds.
+    pub fn abort(task_id: &str, task_run_id: &str, seconds_left: f64) -> Self {
+        PyEvent {
+            seconds_left,
+            ..PyEvent::networked(PyEventKind::Abort, task_id, task_run_id)
+        }
+    }
 }
 
 impl From<Event> for PyEvent {
@@ -132,6 +177,8 @@ impl From<Event> for PyEvent {
             was_running: false,
             superseded_by: None,
             active: false,
+            reason: None,
+            seconds_left: 0.0,
         };
         match event {
             Event::Expired {
@@ -176,5 +223,88 @@ impl From<Event> for PyEvent {
                 ..nothing
             },
         }
+    }
+}
+
+/// A Task record as the shard holds it: what a networked worker's tests
+/// read the outcome of a run from.
+#[pyclass(name = "TaskRecord", frozen)]
+pub struct PyTaskRecord {
+    /// No run of the task will change again.
+    #[pyo3(get)]
+    finished: bool,
+    /// Every run, oldest attempt first.
+    #[pyo3(get)]
+    runs: Vec<PyRunRecord>,
+    /// Whether the payloads the task retained from superseded generations
+    /// start with a fold a compaction run made.
+    #[pyo3(get)]
+    folded: bool,
+}
+
+/// One run in a Task record.
+#[pyclass(name = "RunRecord", frozen, skip_from_py_object)]
+#[derive(Clone)]
+pub struct PyRunRecord {
+    #[pyo3(get)]
+    task_run_id: String,
+    #[pyo3(get)]
+    state: PyRunState,
+    /// The worker that claimed it; `None` while it is pending.
+    #[pyo3(get)]
+    worker: Option<String>,
+    /// The type name of the error that failed it; empty unless it failed.
+    #[pyo3(get)]
+    failure_kind: String,
+    result_digest: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl PyRunRecord {
+    /// The digest of the certified result; `None` unless the run succeeded.
+    #[getter]
+    fn result_digest<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.result_digest
+            .as_deref()
+            .map(|digest| PyBytes::new(py, digest))
+    }
+}
+
+impl From<TaskRecord> for PyTaskRecord {
+    fn from(record: TaskRecord) -> Self {
+        PyTaskRecord {
+            finished: record.finished,
+            runs: record.runs.iter().filter_map(PyRunRecord::read).collect(),
+            folded: record
+                .retained_chain
+                .iter()
+                .any(|entry| matches!(entry.entry, Some(chain_entry::Entry::Folded(_)))),
+        }
+    }
+}
+
+impl PyRunRecord {
+    /// `run` as Python sees it; `None` for a run whose state this build
+    /// cannot read.
+    fn read(run: &TaskRun) -> Option<Self> {
+        let state = DomainRunState::try_from(run.state()).ok()?;
+        Some(PyRunRecord {
+            task_run_id: run
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.task_run_id.clone())
+                .map(|id| TaskRunId::from(id).as_str().to_owned())
+                .unwrap_or_default(),
+            state: state.into(),
+            worker: run
+                .selected_worker
+                .clone()
+                .map(|worker| WorkerId::from(worker).as_str().to_owned()),
+            failure_kind: run.failure_kind.clone(),
+            result_digest: run
+                .result_digest
+                .as_ref()
+                .map(|digest| digest.value.clone()),
+        })
     }
 }

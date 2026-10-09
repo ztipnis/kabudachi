@@ -21,7 +21,7 @@ from kabudachi import coalescing_task, ephemeral_task, task
 from kabudachi import config as config_module
 from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
-from kabudachi.config import UNSET, Configuration
+from kabudachi.config import UNSET, Configuration, authority_parts
 from kabudachi.errors import (
     ConfigurationError,
     DuplicateTaskError,
@@ -700,6 +700,28 @@ def test_an_unknown_setting_is_refused():
         ({"reconnect_timeouts": {"slow": 1e300}}, "reconnect_timeouts"),
         ({"reconnect_timeouts": {"": 5}}, "reconnect_timeouts"),
         ({"reconnect_timeouts": [("slow", 5)]}, "reconnect_timeouts"),
+        # A networked worker must be able to kill a body at its abort deadline.
+        ({"listen": "/ip4/127.0.0.1/tcp/0", "processes": 0}, "processes"),
+        ({"seeds": "/ip4/127.0.0.1/tcp/4001"}, "seeds"),
+        ({"shard": "a/b"}, "shard"),
+        ({"shard": " "}, "shard"),
+        ({"authority": "http://127.0.0.1:6379/"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/x"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/70000"}, "authority"),
+        ({"authority": "redis://127.0.0.1:abc/"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/\u0663"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?timeout=3"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=0"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=-1"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=abc"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=inf"}, "authority"),
+        # The authority bounds each call by a tenth of its TTL.
+        ({"authority": "redis://127.0.0.1:6379/?ttl=0.0001"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/?ttl=2&ttl=3"}, "authority"),
+        ({"heartbeat_interval": timedelta(0)}, "heartbeat_interval"),
+        # Three intervals must fit in the timeout (10 s by default).
+        ({"heartbeat_interval": timedelta(seconds=4)}, "heartbeat_timeout"),
+        ({"reconnect_timeout": timedelta(0)}, "reconnect_timeout"),
     ],
 )
 def test_an_invalid_value_is_refused_and_changes_nothing(settings, refused):
@@ -824,6 +846,10 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_PROCESS_START_TIMEOUT", "2.5")
     monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "50")
     monkeypatch.setenv("KABUDACHI_RECONNECT_TIMEOUTS", "slow=90, gpu=2.5")
+    monkeypatch.setenv("KABUDACHI_LISTEN", "/ip4/0.0.0.0/tcp/4001")
+    monkeypatch.setenv("KABUDACHI_SEEDS", "/ip4/10.0.0.1/tcp/4001, /dns4/seed.example/tcp/4001")
+    monkeypatch.setenv("KABUDACHI_AUTHORITY", "rediss://user:secret@cache.example:6380/3?key_prefix=app:&ttl=2.5")
+    monkeypatch.setenv("KABUDACHI_HEARTBEAT_TIMEOUT", "3.5")
     configuration = Configuration()
 
     names = (
@@ -833,6 +859,11 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         "process_start_timeout",
         "max_runs_per_process",
         "reconnect_timeouts",
+        "listen",
+        "seeds",
+        "shard",
+        "heartbeat_timeout",
+        "reconnect_timeout",
     )
     assert [configuration.resolve(name) for name in names] == [
         2,
@@ -841,12 +872,33 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         timedelta(seconds=2.5),
         50,
         {"slow": 90.0, "gpu": 2.5},
+        "/ip4/0.0.0.0/tcp/4001",
+        ("/ip4/10.0.0.1/tcp/4001", "/dns4/seed.example/tcp/4001"),
+        "default",
+        timedelta(seconds=3.5),
+        timedelta(seconds=30),
     ]
+    assert authority_parts(configuration.resolve("authority")) == (
+        "rediss://user:secret@cache.example:6380/",
+        "app:",
+        3,
+        2.5,
+    )
+    assert authority_parts("redis://127.0.0.1:6379") == (
+        "redis://127.0.0.1:6379/",
+        "kabudachi:",
+        0,
+        None,
+    )
 
     monkeypatch.setenv("KABUDACHI_IMPORTS", "")
     assert Configuration().resolve("imports") is None
     monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "")
     assert Configuration().resolve("max_runs_per_process") is None
+    monkeypatch.setenv("KABUDACHI_LISTEN", "")
+    monkeypatch.setenv("KABUDACHI_SEEDS", "")
+    assert Configuration().resolve("listen") is None
+    assert Configuration().resolve("seeds") == ()
 
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(

@@ -832,7 +832,15 @@ def test_an_abandoned_body_keeps_its_place_until_it_exits():
     assert seen_before_exit == ["first"]
 
 
-def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit():
+@pytest.mark.parametrize(
+    "delivers_results",
+    [
+        pytest.param(True, id="its own handle"),
+        # Runs a shard's leader hands a worker, which settle no handle here.
+        pytest.param(False, id="a run handed over by a shard"),
+    ],
+)
+def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit(delivers_results):
     release = threading.Event()
     calls = []
 
@@ -846,18 +854,66 @@ def test_a_retry_after_a_hard_timeout_waits_for_the_abandoned_body_to_exit():
         return request
 
     world = World(stubborn_then_fine, retries=1, timeout=SOFT, cancel_grace=GRACE)
+    world.runtime.delivers_results = delivers_results
 
     async def body():
         handle = world.call("stubborn_then_fine", Greeting(text="x"))
         await until(lambda: any(event[0] == "fail" for event in world.runtime.events), "a fail event")
         await asyncio.sleep(0.2)
-        assert not handle.done(), "the lineage stays pending while its retry waits"
+        if delivers_results:
+            assert not handle.done(), "the lineage stays pending while its retry waits"
         assert len(calls) == 1, "no second body while the abandoned one runs"
         release.set()
-        return await handle
+        if delivers_results:
+            assert (await handle).text == "x"
+        else:
+            await until(lambda: len(calls) == 3, "the retry to run")
 
-    assert run(world.working(body)).text == "x"
+    run(world.working(body))
     assert calls == ["first body started", "first body exited", "second body ran"]
+
+
+@pytest.mark.parametrize(
+    ("early", "reported"),
+    [
+        pytest.param("abort", ["lost"], id="an abort deadline, then reported lost"),
+        pytest.param("cancel", [], id="a cancellation, then nothing reported"),
+    ],
+)
+def test_what_the_leader_says_before_its_held_run_starts_still_stops_the_run(early, reported):
+    async def sleeps(request: Greeting) -> Greeting:
+        await asyncio.sleep(30)
+        return request
+
+    world = World(sleeps, cancel_grace=timedelta(milliseconds=50))
+    # Runs a shard's leader hands a worker, which settle no handle here.
+    world.runtime.delivers_results = False
+    claim_pending = world.runtime.claim_pending
+
+    async def word_before_start(limit):
+        claims = await claim_pending(limit)
+        for claim in claims:
+            if early == "abort":
+                world.runtime.inject_abort(claim.task_run_id, 0.2)
+            else:
+                world.runtime.inject_cancel(claim.task_id, claim.task_run_id)
+        # The event watcher takes the word before the claim loop starts the run.
+        await asyncio.sleep(0.05)
+        return claims
+
+    world.runtime.claim_pending = word_before_start
+
+    async def body():
+        world.call("sleeps", Greeting())
+        await until(lambda: world.runtime.events, "the run to start")
+        # Its body would sleep on for 30 s.
+        await asyncio.wait_for(world.session.wait_until_running_finish(), WAIT)
+
+    run(with_events(world, body))
+
+    assert [
+        event[0] for event in world.runtime.events if event[0] in ("complete", "fail", "lost")
+    ] == reported
 
 
 def test_what_an_abandoned_body_later_returns_or_raises_is_discarded(caplog):

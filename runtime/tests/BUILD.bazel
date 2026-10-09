@@ -1,6 +1,8 @@
 load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
 
 # gazelle:python_generation_mode file
+# The networked worker program is run as a file, never imported.
+# gazelle:exclude networked_worker.py
 
 # Shared test helper: protobuf message classes built at runtime. Tests import it
 # as a top-level module, which Gazelle cannot infer.
@@ -187,8 +189,78 @@ py_test(
     deps = [
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
+        "//runtime/tests:faulting_runtime",
         "//runtime/tests:pool_slow_import",  # keep
         "//runtime/tests:pool_tasks",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+# Tasks the networked worker program declares, importable by its task processes.
+# gazelle:resolve py networked_tasks //runtime/tests:networked_tasks
+py_library(
+    name = "networked_tasks",
+    testonly = True,
+    srcs = ["networked_tasks.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+    ],
+)
+
+# Starts and drives networked worker processes for the multi-process tests.
+# gazelle:resolve py cluster //runtime/tests:cluster
+py_library(
+    name = "cluster",
+    testonly = True,
+    srcs = ["cluster.py"],
+    # The program each worker process runs, as a file.
+    data = ["networked_worker.py"],  # keep
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        ":networked_tasks",  # keep
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",  # keep
+    ],
+)
+
+# Three real worker processes on loopback: kills a task process, a follower
+# and the leader with SIGKILL, SIGSTOPs workers to cut one off, compacts and
+# cancels. About 28 s on a laptop.
+py_test(
+    name = "test_networked",
+    size = "medium",
+    srcs = ["test_networked.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/tests:cluster",
+        "//runtime/tests:networked_tasks",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+# One worker against a real valkey server built from the BCR module; the
+# server binary comes in as data. About 8 s on a laptop, 3 s of it the
+# authority's TTL (set short by the URL's `ttl`), which a cold worker waits out
+# before it founds its shard.
+py_test(
+    name = "test_networked_valkey",
+    size = "medium",
+    timeout = "short",
+    srcs = ["test_networked_valkey.py"],
+    data = ["@valkey//:valkey-server"],  # keep
+    env = {"VALKEY_SERVER": "$(rlocationpath @valkey//:valkey-server)"},  # keep
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/tests:cluster",
+        "//runtime/tests:networked_tasks",
         "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
     ],

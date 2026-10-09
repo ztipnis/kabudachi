@@ -13,6 +13,7 @@ from pathlib import Path
 
 import kabudachi
 from kabudachi.errors import TaskCancelledError, UnknownTaskError
+from kabudachi.session import current_session
 from proto_messages import Greeting
 
 MARKERS = "KABUDACHI_TEST_MARKERS"
@@ -80,6 +81,33 @@ async def refresh(request: Greeting) -> Greeting:
         for _ in range(500):  # holds the key until a compaction has folded
             if marker("folded-in").exists():
                 return Greeting(text="held until folded")
+            await asyncio.sleep(0.01)
+    return request
+
+
+def fold_once_released(older: Greeting, newer: Greeting) -> Greeting:
+    """Leaves its process id in `merging`, then blocks its whole task process
+    until `release merge` exists (at most 30 s), and leaves `merged` once it has."""
+    marker("merging").write_text(str(os.getpid()))
+    end = time.monotonic() + 30
+    while time.monotonic() < end and not marker("release merge").exists():
+        time.sleep(0.01)
+    marker("merged").touch()
+    return Greeting(text=f"({older.text}>{newer.text})")
+
+
+@kabudachi.coalescing_task(
+    name="pool.compacted_slowly", merge=fold_once_released, cancel_grace=timedelta(seconds=3)
+)
+async def compacted_slowly(request: Greeting) -> Greeting:
+    """The `holder` generation holds the key until a fold has begun, so the
+    payloads queued behind it are compacted. The cancel grace is longer than
+    the abort deadline a test gives the compaction."""
+    if request.text == "holder":
+        marker("holding").touch()
+        for _ in range(3000):
+            if marker("merging").exists():
+                break
             await asyncio.sleep(0.01)
     return request
 
@@ -178,6 +206,31 @@ async def ignores_cancel(request: Greeting) -> Greeting:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             continue
+
+
+@kabudachi.ephemeral_task(name="pool.outlives_its_deadline", cancel_grace=timedelta(seconds=3))
+async def outlives_its_deadline(request: Greeting) -> Greeting:
+    """Leaves its process id in `outliving`, and runs on for 30 s whatever
+    it is asked: only its process's end stops it. Its cancel grace is longer
+    than the abort deadline a test gives it, so a cancel that it ignores
+    costs its process only after that deadline.
+
+    First it calls two tasks that will not start for 30 s, on a worker whose
+    results never come back, and cancels one: `nested` says whether the
+    cancel took, and how many handles this process still keeps for them."""
+    later = leaf.options(delay=timedelta(seconds=30))
+    later(request)
+    cancelled = later(request).cancel()
+    kept = len(current_session()._process._handles)
+    marker("nested").write_text(f"{cancelled} {kept}")
+    marker("outliving").write_text(str(os.getpid()))
+    end = time.monotonic() + 30
+    while time.monotonic() < end:
+        try:
+            await asyncio.sleep(end - time.monotonic())
+        except asyncio.CancelledError:
+            marker("asked to stop").touch()
+    return request
 
 
 @kabudachi.task(name="pool.recycles", recycle_process=True)

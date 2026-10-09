@@ -68,6 +68,11 @@ class NestedCalls(Protocol):
 
     def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle: ...
 
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancels a task such a body called whose handle is no longer kept,
+        by its id, and says whether it was cancelled."""
+        ...
+
 
 class Executor(Protocol):
     @property
@@ -100,6 +105,12 @@ class Executor(Protocol):
 
     def condemn_host_of(self, run_id: str) -> None:
         """The run passed its hard limit: whatever hosts its body is given up on."""
+
+    def kill_host_of(self, run_id: str) -> None:
+        """The run's abort deadline passed with its body still running: what
+        hosts the body is killed now, with every body it hosts, and each of
+        their runs is lost. Runs sharing a host share its lost contact, so
+        they share the deadline too."""
 
     async def drain(self) -> None:
         """Waits until every body handed over so far has exited."""
@@ -203,6 +214,10 @@ class InProcessExecutor:
 
     def condemn_host_of(self, run_id: str) -> None:
         """Nothing here can be killed: the body is left to finish on its own."""
+
+    def kill_host_of(self, run_id: str) -> None:
+        """Nothing here can be killed. A networked worker, whose runs have
+        abort deadlines, always runs bodies in task processes."""
 
     async def drain(self) -> None:
         await self._places.wait_until_running_finish()

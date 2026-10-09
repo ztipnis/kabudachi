@@ -1,7 +1,8 @@
 //! A worker's driver and its executor over real sockets: the driver claims
 //! nothing for its executor until a leader has vouched for hearing the
 //! worker, and tells the executor to abort its runs before any other leader
-//! can replay them, including a leader that loses its quorum mid-run.
+//! can replay them, including a leader that loses its quorum mid-run, and to
+//! drop the abort if contact comes back before its deadline.
 
 use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
@@ -200,6 +201,81 @@ async fn a_leader_that_loses_its_quorum_mid_run_aborts_each_run_by_its_own_deadl
         assert!(
             StdInstant::now() >= deadline,
             "the run was replayed before the deadline by which its first worker had to abort it"
+        );
+    })
+    .await
+}
+
+// A follower cut off from every other voter mid-run cannot show that its
+// leader still hears it: its executor is told to abort the run, and the
+// driver claims nothing more. Contact restored before the deadline, the
+// abort is withdrawn and the follower claims again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_that_regains_its_leader_before_the_abort_deadline_keeps_its_run_and_claims_again() {
+    within_deadline(async {
+        let (mut shard, client) = ThreeVoters::start().await;
+        let mut executors: Vec<FakeExecutor> = (0..3)
+            .map(|voter| {
+                let (executor, endpoint) = FakeExecutor::new();
+                shard.set_executor(voter, endpoint);
+                executor
+            })
+            .collect();
+        let leader = shard.drive_until_a_leader().await;
+        let leader_id = shard.id(leader);
+        let follower = shard.others(leader)[0];
+        let follower_id = shard.id(follower);
+        // Only the follower's executor offers places.
+        let executor = &mut executors[follower];
+        shard.join_as_pending(&client, leader).await;
+        let nets = shard.nets.clone();
+        executor.grant(1);
+        // Its deadline is far enough off that contact comes back in time.
+        let task = shard
+            .drive_until(submitted_through(
+                &client,
+                &leader_id,
+                plain_with(b"kept").with_reconnect_timeout(Duration::from_millis(OWN_RECONNECT_MS)),
+            ))
+            .await;
+        let (run, _) = shard.drive_until(executor.next_claim()).await;
+        executor.report(Report::Started(run.clone()));
+        shard
+            .drive_until(poll_until("a majority stored the run running", || {
+                holding(&nets, &task, &[TaskRunState::Running]) >= 2
+            }))
+            .await;
+        let next = shard
+            .drive_until(submitted_through(&client, &leader_id, plain_with(b"next")))
+            .await;
+
+        let others = shard.others(follower);
+        for &other in &others {
+            nets[follower].block_peer(shard.id(other));
+            nets[other].block_peer(follower_id.clone());
+        }
+        let deadline = match shard.drive_until(executor.next_work()).await {
+            Work::Abort { run: aborted, deadline } if aborted == run => deadline,
+            other => panic!("expected the run aborted, got {other:?}"),
+        };
+        // A place, which the driver must not fill while the deadline stands.
+        executor.grant(1);
+
+        for &other in &others {
+            nets[follower].unblock_peer(shard.id(other));
+            nets[other].unblock_peer(follower_id.clone());
+        }
+        assert_eq!(
+            shard.drive_until(executor.next_work()).await,
+            Work::AbortWithdrawn(run),
+            "the abort was withdrawn before anything else reached the executor"
+        );
+        assert!(StdInstant::now() < deadline, "the abort was withdrawn only after its deadline");
+        let (_, claim) = shard.drive_until(executor.next_claim()).await;
+        assert_eq!(
+            claim.task.as_ref().and_then(|task| task.task_id.clone()).map(TaskId::from),
+            Some(next),
+            "the follower claimed the waiting task once the abort was withdrawn"
         );
     })
     .await

@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 
 /// What a scheduler event is about. `SLOW_DOWN` says memory use crossed the
 /// soft limit; the event's `active` says whether it was raised or cleared.
+/// The last four come only from a networked worker.
 #[pyclass(name = "EventKind", eq, eq_int, frozen, hash, skip_from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyEventKind {
@@ -24,6 +25,19 @@ pub enum PyEventKind {
     RecordFull,
     #[pyo3(name = "COALESCED_PAYLOAD_TOO_LARGE")]
     CoalescedPayloadTooLarge,
+    /// A networked worker's submission was stored by its shard's leader.
+    #[pyo3(name = "ACCEPTED")]
+    Accepted,
+    /// A networked worker's submission was refused for good; `reason` says why.
+    #[pyo3(name = "REFUSED")]
+    Refused,
+    /// A run this worker holds may be run again elsewhere once
+    /// `seconds_left` has passed: its leader cannot be shown to hear it.
+    #[pyo3(name = "ABORT")]
+    Abort,
+    /// The leader hears this worker again: a run's pending abort is lifted.
+    #[pyo3(name = "ABORT_WITHDRAWN")]
+    AbortWithdrawn,
 }
 
 impl From<&Event> for PyEventKind {

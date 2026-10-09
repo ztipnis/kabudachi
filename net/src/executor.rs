@@ -55,7 +55,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     Claim, ClaimResponse, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, TaskRejectReason,
-    TaskResponse, claim_response, task_request, task_response,
+    TaskResponse, claim_response, task_request,
 };
 use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::{Clock, Duration as CoreDuration, Instant as NodeInstant, WallTime};
@@ -67,7 +67,7 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::discovery::{Found, IdleBackoff};
 use crate::messenger::Net;
-use crate::task_exchange::{self, TaskFailure, reported_run};
+use crate::task_exchange::{self, TaskFailure, refused_for_now, rejection, reported_run};
 
 /// What the driver hands the executor (see the module doc).
 #[derive(Debug, Clone, PartialEq)]
@@ -138,6 +138,47 @@ impl ExecutorHandle {
     pub fn report(&self, report: Report) -> Result<(), DriverGone> {
         self.reports.send(report).map_err(|_| DriverGone)
     }
+
+    /// The handle as two halves, for an executor that waits for work in one
+    /// place and reports from others. Dropping either half tells the driver
+    /// the executor is gone, as dropping the whole handle does.
+    pub fn split(self) -> (WorkSource, ReportSink) {
+        (
+            WorkSource { work: self.work },
+            ReportSink {
+                reports: self.reports,
+            },
+        )
+    }
+}
+
+/// The half of an [`ExecutorHandle`] that receives the work the driver hands
+/// over.
+pub struct WorkSource {
+    work: mpsc::UnboundedReceiver<Work>,
+}
+
+/// The half of an [`ExecutorHandle`] that reports to the driver; cheap to
+/// clone, for an executor that reports from more than one place. The driver
+/// hears the executor is gone once every clone is dropped, or once the
+/// [`WorkSource`] is dropped; from then on a report fails with [`DriverGone`].
+#[derive(Clone)]
+pub struct ReportSink {
+    reports: mpsc::UnboundedSender<Report>,
+}
+
+impl WorkSource {
+    /// As [`ExecutorHandle::next_work`].
+    pub async fn next_work(&mut self) -> Option<Work> {
+        self.work.recv().await
+    }
+}
+
+impl ReportSink {
+    /// As [`ExecutorHandle::report`].
+    pub fn report(&self, report: Report) -> Result<(), DriverGone> {
+        self.reports.send(report).map_err(|_| DriverGone)
+    }
 }
 
 /// A report on one of this worker's runs, as the leader is asked to take it.
@@ -155,7 +196,8 @@ pub(crate) struct Held {
     pub(crate) cancelled: BTreeSet<TaskRunId>,
     /// Per run, the reports no leader has taken yet, oldest first.
     pub(crate) waiting: BTreeMap<TaskRunId, VecDeque<RunReport>>,
-    /// The executor dropped its handle: nothing more is claimed for it.
+    /// The executor dropped its handle, or either half of it: nothing more
+    /// is claimed for it.
     pub(crate) gone: bool,
     /// The abort deadline the node last reported, while one stands.
     pub(crate) abort_by: Option<HostAbort>,
@@ -280,6 +322,9 @@ impl<'n> Executing<'n> {
                 Some(report) => self.arrived.push(report),
                 None => self.endpoint.held.gone = true,
             },
+            // The executor stopped taking work: the batch that follows reads
+            // what it reported first, then finds it gone.
+            () = self.endpoint.work.closed(), if !gone => {}
             found = next_found(&mut self.discovering) => self.found = Some(found),
             Some(reply) = self.in_flight.next(), if !self.in_flight.is_empty() => self.replies.push(reply),
             () = sleep_until(due) => {}
@@ -439,13 +484,25 @@ impl<'n> Executing<'n> {
     }
 
     /// Keeps every report the executor has sent, until none is left or the
-    /// executor is gone.
+    /// executor is gone. An executor that dropped the half it takes work
+    /// with is gone once what it reported before is kept.
     fn drain_reports(&mut self) {
         while !self.endpoint.held.gone {
             match self.endpoint.reports.try_recv() {
                 Ok(report) => self.arrived.push(report),
                 Err(mpsc::error::TryRecvError::Disconnected) => self.endpoint.held.gone = true,
                 Err(mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+        if self.endpoint.work.is_closed() {
+            self.endpoint.held.gone = true;
+            // Nothing reads reports any more: a report sent now fails with
+            // `DriverGone` rather than vanishing.
+            self.endpoint.reports.close();
+            // A report sent between the drain above and the close is still
+            // buffered: keep it too.
+            while let Ok(report) = self.endpoint.reports.try_recv() {
+                self.arrived.push(report);
             }
         }
     }
@@ -501,7 +558,7 @@ impl<'n> Executing<'n> {
         let retry = match &reply {
             Err(_) => true,
             Ok(response) => match rejection(response) {
-                Some(TaskRejectReason::TaskRejectNotLeader | TaskRejectReason::TaskRejectNotReady) => true,
+                Some(reason) if refused_for_now(reason) => true,
                 Some(TaskRejectReason::TaskRejectUnknownRun | TaskRejectReason::TaskRejectNotAuthoritative) => {
                     if matches!(request, task_request::Request::Started(_)) {
                         self.cancel(&run);
@@ -618,14 +675,6 @@ pub(crate) fn granted(response: &ClaimResponse) -> Vec<Claim> {
     match &response.result {
         Some(claim_response::Result::Batch(batch)) => batch.claims.clone(),
         _ => Vec::new(),
-    }
-}
-
-/// The reason `response` refuses its report, if it does.
-fn rejection(response: &TaskResponse) -> Option<TaskRejectReason> {
-    match &response.result {
-        Some(task_response::Result::Reject(reject)) => TaskRejectReason::try_from(reject.reason).ok(),
-        _ => None,
     }
 }
 

@@ -38,6 +38,10 @@ class Event(Protocol):
     superseded_by: str | None
     active: bool
     """For `EventKind.SLOW_DOWN`: whether it was raised (`True`) or cleared."""
+    reason: str | None
+    """For `EventKind.REFUSED`: why the leader refused the submission."""
+    seconds_left: float
+    """For `EventKind.ABORT`: seconds until the run may be run again elsewhere."""
 
 
 class Certification(Protocol):
@@ -51,6 +55,12 @@ class Certification(Protocol):
 @runtime_checkable
 class Runtime(Protocol):
     """What a session needs of the native runtime."""
+
+    delivers_results: bool
+    """Whether certifications come back to this process, so a handle can be
+    settled with its run's result. `False` for a worker of a networked shard,
+    whose reports go to a leader that may be another process: the reports
+    below then return `None`, and its runs settle no handle here."""
 
     def shard_id(self) -> str:
         """The incarnation of the shard this runtime founded at start."""
@@ -87,25 +97,28 @@ class Runtime(Protocol):
     def report_started(self, task_run_id: str) -> None:
         ...
 
-    def cancel(self, task_id: str) -> CancelOutcome:
-        """Cancels a task, and says how that ended."""
+    def cancel(self, task_id: str) -> CancelOutcome | None:
+        """Cancels a task, and says how that ended. `None`: the cancel was
+        sent, and the leader decides."""
 
-    def report_failure(self, task_run_id: str, failure_kind: str) -> bool:
+    def report_failure(self, task_run_id: str, failure_kind: str) -> bool | None:
         """Reports that a claimed run failed, started or not; whether a retry
-        is now queued."""
+        is now queued. `None` when the leader decides elsewhere."""
 
-    def report_lost(self, task_run_id: str) -> bool:
+    def report_lost(self, task_run_id: str) -> bool | None:
         """Reports that a claimed run was lost with the process that ran it;
         whether a new attempt now waits. Raises `RuntimeError` if the run is
-        not this worker's to lose."""
+        not this worker's to lose. `None` when the leader decides elsewhere."""
 
     def complete(
         self, task_run_id: str, result_digest: bytes, continues: bool = False
-    ) -> Certification:
-        ...
+    ) -> Certification | None:
+        """Reports that a running run succeeded; its certification. `None`
+        when the leader decides elsewhere."""
 
-    def complete_compaction(self, task_run_id: str, folded: bytes) -> bool:
-        """Reports the fold of a compaction run; whether the leader applied it."""
+    def complete_compaction(self, task_run_id: str, folded: bytes) -> bool | None:
+        """Reports the fold of a compaction run; whether the leader applied
+        it. `None` when the leader decides elsewhere."""
 
     def end_continuation(self, task_id: str) -> bool:
         """Ends the continuation of a task that returned a step; whether there was one."""

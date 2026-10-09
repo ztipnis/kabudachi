@@ -957,6 +957,7 @@ where
         let mut performer = Calls(self.calls.as_deref_mut());
         let observe = &mut *self.observe;
         let collected = &mut *self.collected;
+        let net = self.net;
         let next_deadline = carry_out(
             &mut *self.node,
             stepped,
@@ -978,6 +979,7 @@ where
                         _ => {}
                     }
                 }
+                net.name_leader(node.known_leader().map(|(leader, _)| leader));
                 // Only the first step has no reply for its input.
                 observe(node, reply.or(input), step);
             },

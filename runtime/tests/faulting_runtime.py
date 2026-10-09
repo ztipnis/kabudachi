@@ -9,6 +9,11 @@ from types import SimpleNamespace
 from kabudachi import _native
 
 
+def _read_failure(future):
+    if not future.cancelled():
+        future.exception()
+
+
 class FaultingRuntime:
     """Wraps a `_native.NativeRuntime`: records what the session asks of it, and
     can make chosen calls fail, be refused or be held back. `before_started`,
@@ -78,6 +83,30 @@ class FaultingRuntime:
             )
         )
 
+    def inject_abort(self, task_run_id, seconds_left):
+        """Makes `next_events()` also return the abort deadline a shard's
+        leader would send a worker that lost contact with it."""
+        self._injected.put_nowait(
+            SimpleNamespace(
+                kind=_native.EventKind.ABORT,
+                task_id="",
+                task_run_id=task_run_id,
+                seconds_left=seconds_left,
+            )
+        )
+
+    def inject_cancel(self, task_id, task_run_id):
+        """Makes `next_events()` also return the cancellation a shard's leader
+        would send the worker holding the task's run."""
+        self._injected.put_nowait(
+            SimpleNamespace(
+                kind=_native.EventKind.CANCELLED,
+                task_id=task_id,
+                task_run_id=task_run_id,
+                was_running=True,
+            )
+        )
+
     async def next_events(self):
         if self.event_error is not None:
             raise self.event_error
@@ -85,6 +114,10 @@ class FaultingRuntime:
         # is kept running across calls and never cancelled here.
         if self._native_events is None:
             self._native_events = asyncio.ensure_future(self.native.next_events())
+            # A runtime shut down while this waits fails it, and no call may
+            # come to read the failure: read it as it lands, so it is not
+            # reported as never retrieved. A later call still raises it.
+            self._native_events.add_done_callback(_read_failure)
         injected = asyncio.ensure_future(self._injected.get())
         try:
             await asyncio.wait({self._native_events, injected}, return_when=asyncio.FIRST_COMPLETED)

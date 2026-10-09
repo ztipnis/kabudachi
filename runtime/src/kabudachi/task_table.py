@@ -92,10 +92,35 @@ class Run:
     """One run of a task in this process, from its claim until
     `TaskTable.run_ended`. Used on the run's event loop only."""
 
-    def __init__(self, task_id: str, record: _Record, generation: int) -> None:
+    def __init__(
+        self, task_id: str, record: _Record, generation: int, *, holds_handle: bool = True
+    ) -> None:
         self.task_id = task_id
         self._record = record
         self._generation = generation
+        self._holds_handle = holds_handle
+        self._aborted = False
+
+    @property
+    def holds_handle(self) -> bool:
+        """Whether this run settles a handle of this process. A run a shard's
+        leader handed a networked worker settles none, whoever submitted its
+        task: its result is never certified back here."""
+        return self._holds_handle
+
+    def abort(self) -> None:
+        """The run's abort deadline is near: it is being stopped, and is
+        reported lost once its body has exited."""
+        self._aborted = True
+
+    @property
+    def aborted(self) -> bool:
+        """Whether the run is being stopped before its abort deadline."""
+        return self._aborted
+
+    def cancel_by_leader(self) -> None:
+        """The leader cancelled this run: nothing it ends with counts."""
+        self._record.cancelled = True
 
     @property
     def previous_body_exited(self) -> "asyncio.Future[None] | None":
@@ -141,6 +166,10 @@ class TaskTable:
         self._lock = threading.Lock()
         self._records: dict[str, _Record] = {}
         self._stopping = False
+        # The bodies of runs a shard's leader handed this worker that outlived
+        # their hard limit, by task id, until each exits: a retry of the task
+        # handed back here waits for it.
+        self._held_abandoned: dict[str, asyncio.Future[None]] = {}
 
     # submitted
 
@@ -174,7 +203,11 @@ class TaskTable:
                 reconnect_timeout_ms=reconnect_timeout_ms,
             )
             handle = TaskHandle(
-                task_id, self.cancel, self._run_callback, shard_id=self._runtime.shard_id()
+                task_id,
+                self.cancel,
+                self._run_callback,
+                shard_id=self._runtime.shard_id(),
+                results_delivered=self._runtime.delivers_results,
             )
             self._records[task_id] = _Record(handle, definition.name)
         return handle
@@ -201,7 +234,9 @@ class TaskTable:
                 # Under the lock, so a completion that carries a continuation
                 # is either not accepted yet (this cancels the run) or already
                 # has its continuation registered (found above).
-                cancelled = self._cancelled(self._runtime.cancel(task_id))
+                outcome = self._runtime.cancel(task_id)
+                # `None`: sent to a leader elsewhere, which decides.
+                cancelled = outcome is None or self._cancelled(outcome)
                 if cancelled and record is not None:
                     record.cancel_requested = True
                 return cancelled
@@ -212,6 +247,40 @@ class TaskTable:
         # The run is certified and over; what can still be cancelled is its
         # continuation, outside the lock because cancelling it takes the lock.
         return continuation.cancel()
+
+    # stored, detached
+
+    def stored(self, task_id: str) -> None:
+        """The shard's leader stored a task submitted here whose result will
+        not come back: nothing more settles its handle, so the table forgets
+        it, and waiting for the run's tasks no longer waits for it."""
+        with self._lock:
+            record = self._records.get(task_id)
+            if record is not None and not record.settled and not record.active:
+                self._records.pop(task_id)
+
+    def detached(self, task_id: str) -> Run:
+        """A run of `task_id` that a shard's leader handed this worker, which
+        settles no handle and is not kept in the table: its record's handle
+        is one nobody holds. It starts no body before an abandoned one of an
+        earlier run of the task here has exited."""
+        record = _Record(TaskHandle(task_id), "")
+        with self._lock:
+            record.abandoned = self._held_abandoned.get(task_id)
+        return Run(task_id, record, 1, holds_handle=False)
+
+    def held_body_abandoned(self, task_id: str, exited: "asyncio.Future[None]") -> None:
+        """The body of a run handed this worker outlived its hard limit: a
+        later run of the task here waits for `exited`."""
+        with self._lock:
+            self._held_abandoned[task_id] = exited
+
+        def forget(_: object) -> None:
+            with self._lock:
+                if self._held_abandoned.get(task_id) is exited:
+                    del self._held_abandoned[task_id]
+
+        exited.add_done_callback(forget)
 
     # claimed, run ended
 

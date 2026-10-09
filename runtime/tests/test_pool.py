@@ -8,14 +8,15 @@ import functools
 import multiprocessing
 import os
 import struct
+import time
 from datetime import timedelta
 
 import pytest
 
 import kabudachi
 import pool_tasks
+from kabudachi import _native, ipc
 from kabudachi import config as config_module
-from kabudachi import ipc
 from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi.config import Configuration
@@ -28,7 +29,11 @@ from kabudachi.errors import (
     TaskTimeoutError,
 )
 from kabudachi.lifecycle import HookRegistry
+from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import TaskRegistry
+from kabudachi.serializers import process_serializers
+from kabudachi.session import Session
+from faulting_runtime import FaultingRuntime
 from proto_messages import Greeting
 
 
@@ -281,6 +286,143 @@ def test_a_cancelled_body_stops_when_asked_and_one_that_will_not_costs_its_proce
     # A cancel racing a result in flight: each handle ends once, either way.
     assert all(isinstance(outcome, (Greeting, TaskCancelledError)) for outcome in outcomes), outcomes
     assert replaced != kept, "a body that ignored the cancel past its grace cost its process"
+
+
+def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_killed_with_its_process_and_lost(
+    markers,
+):
+    kabudachi.configure(processes=1, concurrency=1)
+    configuration = config_module.process_configuration()
+    settings = configuration.settings()
+    registry = registry_module.default_registry()
+    hooks = lifecycle_module.default_hooks()
+    seconds_left = 0.5
+
+    async def main():
+        pool = ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
+        native = _native.NativeRuntime("worker", "incarnation")
+        runtime = FaultingRuntime(native)
+        # Runs a shard's leader hands this worker, which settle no handle here.
+        runtime.delivers_results = False
+        serving = None
+        await pool.start()
+        try:
+            async with asyncio.timeout(30):
+                await native.wait_until_leader()
+                session = Session(runtime, registry, process_serializers(), configuration, executor=pool)
+                serving = asyncio.ensure_future(session.serve())
+                session.submit(pool_tasks.outlives_its_deadline.definition, Greeting())
+                while not (markers / "outliving").exists():
+                    await asyncio.sleep(0.01)
+                # The calls it made settle nothing here, so nothing keeps them.
+                kept = [dict(child.handles) for child in pool._children]
+                [run_id] = [event[1] for event in runtime.events if event[0] == "started"]
+                # As the leader would once this worker lost contact with it.
+                runtime.inject_abort(run_id, seconds_left)
+                aborted = time.monotonic()
+                while ("lost", run_id) not in runtime.events:
+                    await asyncio.sleep(0.01)
+                return time.monotonic() - aborted, list(runtime.events), kept
+        finally:
+            if serving is not None:
+                serving.cancel()
+                await asyncio.gather(serving, return_exceptions=True)
+            await pool.stop(kill=True)
+            native.shutdown()
+
+    lost, events, kept = asyncio.run(main())
+
+    # Killed at the deadline, not when its 3 s cancel grace ran out.
+    assert seconds_left <= lost < seconds_left + 2.0, lost
+    assert [event[0] for event in events] == ["started", "lost"], events
+    assert (markers / "asked to stop").exists(), "the body was asked to stop first"
+    assert (markers / "nested").read_text() == "True 0", "a nested cancel took, and no handle was kept"
+    assert kept == [{}], kept
+    with pytest.raises(ProcessLookupError):
+        os.kill(int((markers / "outliving").read_text()), 0)
+
+
+@pytest.mark.parametrize(
+    "ended_by",
+    [
+        pytest.param("abort", id="still folding at its abort deadline: killed with its process and failed"),
+        pytest.param("cancel", id="cancelled by the leader: reports nothing once its fold ends"),
+    ],
+)
+def test_a_compaction_handed_over_by_a_shard_ends_as_the_leader_says(markers, ended_by):
+    kabudachi.configure(processes=1, concurrency=2)
+    configuration = config_module.process_configuration()
+    settings = configuration.settings()
+    registry = registry_module.default_registry()
+    hooks = lifecycle_module.default_hooks()
+    seconds_left = 0.5
+
+    async def main():
+        pool = ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
+        native = _native.NativeRuntime(
+            "worker", "incarnation", memory_soft_limit=400, memory_hard_limit=100_000
+        )
+        runtime = FaultingRuntime(native)
+        # Runs a shard's leader hands this worker, which settle no handle here.
+        runtime.delivers_results = False
+        compactions = []
+        claim_pending = runtime.claim_pending
+
+        async def noting_compactions(limit):
+            claims = await claim_pending(limit)
+            compactions.extend(claim for claim in claims if claim.compaction)
+            return claims
+
+        runtime.claim_pending = noting_compactions
+        serving = None
+        await pool.start()
+        try:
+            async with asyncio.timeout(30):
+                await native.wait_until_leader()
+                session = Session(runtime, registry, process_serializers(), configuration, executor=pool)
+                serving = asyncio.ensure_future(session.serve())
+                definition = pool_tasks.compacted_slowly.definition
+                session.submit(definition, Greeting(text="holder"))
+                while not (markers / "holding").exists():
+                    await asyncio.sleep(0.01)
+                for letter in "abcdefgh":
+                    session.submit(definition, Greeting(text=letter * 60))
+                while not (compactions and (markers / "merging").exists()):
+                    await asyncio.sleep(0.01)
+                run_id = compactions[0].task_run_id
+                since = time.monotonic()
+                if ended_by == "abort":
+                    # As the leader would once this worker lost contact with it.
+                    runtime.inject_abort(run_id, seconds_left)
+                    while not any(event[:2] == ("fail", run_id) for event in runtime.events):
+                        await asyncio.sleep(0.01)
+                else:
+                    runtime.inject_cancel(compactions[0].task_id, run_id)
+                    await asyncio.sleep(0.1)
+                    (markers / "release merge").touch()
+                    while not (markers / "merged").exists():
+                        await asyncio.sleep(0.01)
+                    # What the fold sent back has reached the session once the
+                    # run it was part of has finished.
+                    await session.wait_until_running_finish()
+                return time.monotonic() - since, [event for event in runtime.events if event[1] == run_id]
+        finally:
+            if serving is not None:
+                serving.cancel()
+                await asyncio.gather(serving, return_exceptions=True)
+            await pool.stop(kill=True)
+            native.shutdown()
+
+    ended, reported = asyncio.run(main())
+
+    if ended_by == "abort":
+        # Its fold blocks its process for 30 s: it failed because the process
+        # was killed at the deadline.
+        assert seconds_left <= ended < seconds_left + 2.0, ended
+        assert [event[0] for event in reported] == ["fail"], reported
+        assert not (markers / "merged").exists()
+    else:
+        assert reported == [], reported
 
 
 def test_a_task_process_is_replaced_after_its_run_limit_and_after_a_recycling_task_once_its_run_finishes():

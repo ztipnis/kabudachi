@@ -125,6 +125,21 @@ class TaskBodyError(KabudachiError, RuntimeError):
         return (TaskBodyError, (str(self), self.kind))
 
 
+class RemoteResultUnavailableError(KabudachiError, RuntimeError):
+    """A task submitted on a networked worker is stored in its shard and will
+    run, but its result cannot be awaited here: results are not yet delivered
+    from the worker that runs a task back to the one that submitted it. The
+    task's record says how it ended."""
+
+    def __init__(self, message: str, task_id: str) -> None:
+        super().__init__(message)
+        self.task_id = task_id
+
+    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
+        # Crosses the pipe from a task process with its task id.
+        return type(self), (str(self), self.task_id)
+
+
 def interrupted(subject: str, error: BaseException) -> TaskInterruptedError:
     """The error that settles a task, flow or group which something other than
     its own failure ended: a cancellation, an interrupt, anything worse than
