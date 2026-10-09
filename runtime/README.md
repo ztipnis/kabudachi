@@ -86,8 +86,11 @@ imports your script again, which is why the call to `kabudachi.run(...)` needs i
 - Task processes ignore Ctrl-C: the worker decides what a signal means. The first SIGINT or SIGTERM
   to the worker drains, and the second stops the task processes at once. A SIGTERM sent to a task
   process itself ends it, and its runs are lost and tried again as above. So signal only the worker
-  process, not its whole process group (with systemd, `KillMode=mixed`): a SIGTERM to the group also
-  cancels the bodies the worker is draining.
+  process, not its whole process group. With systemd, set `KillMode=mixed`: systemd then sends
+  SIGTERM to the worker process only, which drains and stops its task processes itself, and SIGKILLs
+  whatever remains only after the worker exits or `TimeoutStopSec` passes. The default,
+  `KillMode=control-group`, sends SIGTERM to every process, which cancels task-process bodies during
+  the drain (their runs are tried again).
 
 ## Lifecycle hooks
 

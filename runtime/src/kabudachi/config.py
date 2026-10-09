@@ -49,6 +49,10 @@ DEFAULT_KEY_PREFIX = "kabudachi:"
 # The highest database number an `authority` URL may name.
 MAX_DATABASE = 65535
 
+# The shortest authority TTL, in milliseconds, whose call timeout (a tenth
+# of it) is a whole millisecond.
+MIN_AUTHORITY_TTL_MS = 10
+
 # Above this many places per process, `concurrency_override=True` is needed:
 # every place may hold a thread for a synchronous body.
 MAX_CONCURRENCY = 32
@@ -359,6 +363,13 @@ def authority_parts(url: str) -> tuple[str, str, int, float | None]:
             raise ValueError(
                 f"the authority's ttl must be a positive number of seconds, not {raw!r}"
             )
+        # The authority bounds each call by a tenth of its TTL in whole
+        # milliseconds, and refuses a TTL whose tenth rounds to nothing.
+        if round(ttl * 1000) < MIN_AUTHORITY_TTL_MS:
+            raise ValueError(
+                f"the authority's ttl must be at least {MIN_AUTHORITY_TTL_MS / 1000} s, "
+                f"not {raw!r}"
+            )
     return f"{parts.scheme}://{parts.netloc}/", prefix, int(path or 0), ttl
 
 
@@ -500,10 +511,10 @@ def configure(**settings: Any) -> None:
     `external_address`, `authority` and `shard` make this a worker of a
     networked shard (see each setting; `authority` is a URL that may set
     `?key_prefix=` and `?ttl=`); `heartbeat_interval`,
-    `heartbeat_timeout` and `reconnect_timeout` are its shard's timings. All
-    of them are read when `run()` starts. `KABUDACHI_<NAME>` in the
-    environment sets each too, below what is configured here. A setting a
-    task makes for itself always wins over these. `concurrency`, `processes`,
+    `heartbeat_timeout` and `reconnect_timeout` are its shard's timings.
+    `KABUDACHI_<NAME>` in the environment sets each too, below what is
+    configured here. A setting a task makes for itself always wins over
+    these. The networked settings and timings, `concurrency`, `processes`,
     `imports`, `max_runs_per_process`, `process_start_timeout`, the memory
     limits and `result_ttl` are read when `run()` starts, so changing them
     during a run has no effect on that run.

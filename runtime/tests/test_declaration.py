@@ -708,11 +708,15 @@ def test_an_unknown_setting_is_refused():
         ({"authority": "http://127.0.0.1:6379/"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/x"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/70000"}, "authority"),
+        ({"authority": "redis://127.0.0.1:abc/"}, "authority"),
+        ({"authority": "redis://127.0.0.1:6379/\u0663"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/?timeout=3"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/?ttl=0"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/?ttl=-1"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/?ttl=abc"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/?ttl=inf"}, "authority"),
+        # The authority bounds each call by a tenth of its TTL.
+        ({"authority": "redis://127.0.0.1:6379/?ttl=0.0001"}, "authority"),
         ({"authority": "redis://127.0.0.1:6379/?ttl=2&ttl=3"}, "authority"),
         ({"heartbeat_interval": timedelta(0)}, "heartbeat_interval"),
         # Three intervals must fit in the timeout (10 s by default).
