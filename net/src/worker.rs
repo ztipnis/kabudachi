@@ -278,7 +278,8 @@ impl Worker {
 
     /// Bootstraps this worker into its shard, then drives its node for good.
     /// `observe` is called after every step the driver carries out (see
-    /// `run_driver`). Stop the worker by dropping the returned future; a
+    /// `run_driver`), and is dropped only once the worker shows out of its
+    /// shard (see `Net::has_left_shard`). Stop the worker by dropping the returned future; a
     /// worker stopped this way is gone, and a new one must be started.
     ///
     /// A worker asked to drain (see `Net::request_drain`) leaves its shard,
@@ -295,7 +296,7 @@ impl Worker {
     /// anything: the epoch it rejoins shows the shard exists.
     pub async fn run(
         self,
-        observe: impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
+        mut observe: impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
     ) -> HandedOff {
         let Worker { net, mut config } = self;
         // However this ends (returns, is dropped, aborted or panics), the
@@ -364,7 +365,9 @@ impl Worker {
                 retry_interval: config.retry_interval,
                 replication_factor: config.replication_factor,
             },
-            observe,
+            // Borrowed, so `observe` outlives the guards above: once it is
+            // dropped, the worker shows out of its shard.
+            &mut observe,
         )
         .await
     }
