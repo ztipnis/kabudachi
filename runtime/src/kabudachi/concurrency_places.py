@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from typing import Any
 
 from kabudachi.handle import WaitObserver
 
@@ -36,7 +37,7 @@ class ConcurrencyPlaces:
         self._concurrency = concurrency
         self._lock = threading.Lock()  # guards _blocked, which any thread changes
         self._blocked = 0
-        self._running: set[asyncio.Task[None]] = set()  # the loop's thread only
+        self._running: set[asyncio.Future[Any]] = set()  # the loop's thread only
         self._freed = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -45,13 +46,13 @@ class ConcurrencyPlaces:
             blocked = self._blocked
         return self._concurrency - (len(self._running) - blocked)
 
-    def occupy(self, running: "asyncio.Task[None]") -> None:
-        """`running` holds a place until it ends. Call on the run's loop."""
+    def occupy(self, running: "asyncio.Future[Any]") -> None:
+        """`running` holds a place until it is done. Call on the run's loop."""
         self._loop = asyncio.get_running_loop()
         self._running.add(running)
         running.add_done_callback(self._left)
 
-    def _left(self, running: "asyncio.Task[None]") -> None:
+    def _left(self, running: "asyncio.Future[Any]") -> None:
         self._running.discard(running)
         # Whatever ended it already reached its handle; retrieving it keeps
         # asyncio from logging it as never retrieved.

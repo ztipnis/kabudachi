@@ -7,6 +7,7 @@ thread, on the awaiting loop."""
 
 import asyncio
 import inspect
+import os
 import sys
 import threading
 import types
@@ -658,34 +659,40 @@ def test_an_unknown_setting_is_refused():
 
 
 @pytest.mark.parametrize(
-    "settings",
+    "settings, refused",
     [
-        {"concurrency": 0},
-        {"concurrency": -1},
-        {"concurrency": 1.5},
-        {"concurrency": "many"},
-        {"concurrency": True},
-        {"concurrency": None},
-        {"queue": ""},
-        {"queue": "   "},
-        {"queue": 3},
-        {"queue": None},
-        {"result_ttl": 0},
-        {"result_ttl": -1},
-        {"result_ttl": 1.5},
-        {"result_ttl": True},
-        {"result_ttl": "1h"},
-        {"cancel_grace": timedelta(seconds=-1)},
-        {"cancel_grace": 5},
-        {"cancel_grace": "5"},
-        {"cancel_grace": True},
+        ({"concurrency": 0}, "concurrency"),
+        ({"concurrency": -1}, "concurrency"),
+        ({"concurrency": 1.5}, "concurrency"),
+        ({"concurrency": "many"}, "concurrency"),
+        ({"concurrency": True}, "concurrency"),
+        ({"concurrency": None}, "concurrency"),
+        ({"queue": ""}, "queue"),
+        ({"queue": "   "}, "queue"),
+        ({"queue": 3}, "queue"),
+        ({"queue": None}, "queue"),
+        ({"result_ttl": 0}, "result_ttl"),
+        ({"result_ttl": -1}, "result_ttl"),
+        ({"result_ttl": 1.5}, "result_ttl"),
+        ({"result_ttl": True}, "result_ttl"),
+        ({"result_ttl": "1h"}, "result_ttl"),
+        ({"cancel_grace": timedelta(seconds=-1)}, "cancel_grace"),
+        ({"cancel_grace": 5}, "cancel_grace"),
+        ({"cancel_grace": "5"}, "cancel_grace"),
+        ({"cancel_grace": True}, "cancel_grace"),
+        ({"processes": -1}, "processes"),
+        ({"processes": True}, "processes"),
+        # Above the cap without `concurrency_override`.
+        ({"concurrency": 33}, "concurrency_override"),
+        ({"imports": "app.tasks"}, "imports"),
+        ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
     ],
 )
-def test_an_invalid_value_is_refused_and_changes_nothing(settings):
+def test_an_invalid_value_is_refused_and_changes_nothing(settings, refused):
     configuration = Configuration()
     configuration.configure(queue="emails")
 
-    with pytest.raises(ConfigurationError):
+    with pytest.raises(ConfigurationError, match=refused):
         configuration.configure(**settings)
 
     assert configuration.resolve("queue") == "emails"
@@ -775,6 +782,33 @@ def test_the_soft_limit_may_not_be_above_the_hard_limit():
     with pytest.raises(ConfigurationError, match="soft"):
         Configuration().configure(memory_soft_limit=2000, memory_hard_limit=1000)
     Configuration().configure(memory_soft_limit=1000, memory_hard_limit=1000)
+
+
+def test_task_processes_default_to_one_per_cpu():
+    if hasattr(os, "process_cpu_count"):
+        expected = os.process_cpu_count() or 1
+    elif hasattr(os, "sched_getaffinity"):
+        expected = len(os.sched_getaffinity(0)) or 1
+    else:
+        expected = os.cpu_count() or 1
+    assert Configuration().resolve("processes") == expected
+
+
+def test_worker_settings_are_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("KABUDACHI_PROCESSES", "2")
+    monkeypatch.setenv("KABUDACHI_CONCURRENCY", "40")
+    monkeypatch.setenv("KABUDACHI_CONCURRENCY_OVERRIDE", "true")
+    monkeypatch.setenv("KABUDACHI_IMPORTS", "app.tasks, app.more_tasks")
+    monkeypatch.setenv("KABUDACHI_PROCESS_START_TIMEOUT", "2.5")
+    configuration = Configuration()
+
+    assert [
+        configuration.resolve(name)
+        for name in ("processes", "concurrency", "imports", "process_start_timeout")
+    ] == [2, 40, ("app.tasks", "app.more_tasks"), timedelta(seconds=2.5)]
+
+    monkeypatch.setenv("KABUDACHI_IMPORTS", "")
+    assert Configuration().resolve("imports") is None
 
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(

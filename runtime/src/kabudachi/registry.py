@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from kabudachi.config import UNSET, Unset
-from kabudachi.errors import DuplicateTaskError
+from kabudachi.errors import DuplicateTaskError, UnknownTaskError
 from kabudachi.serializers import Serializer
 
 
@@ -33,6 +33,9 @@ class TaskDefinition:
     input_type: Any
     output_type: Any
     is_async: bool
+    module: str
+    """The module that declared the task, which a task process imports to
+    find it; empty if the callable names none."""
     retries: int = 0
     """How many times a failed run is replaced by a new attempt."""
     timeout: timedelta | None = None
@@ -49,6 +52,11 @@ class TaskDefinition:
     """For a coalescing task: whether a submission that would pass the hard
     memory limit drops this key's oldest retained payloads to fit, instead of
     being refused."""
+
+    def __reduce__(self) -> tuple[Any, tuple[str]]:
+        # Sent between a worker and its task processes by name: both imported
+        # the same task, and its function is code, not data.
+        return (registered_definition, (self.name,))
 
     def types_unsupported_by(self, serializer: Serializer) -> list[tuple[str, Any]]:
         """The ("input" | "return", type) pairs `serializer` cannot encode. A
@@ -93,3 +101,12 @@ _default_registry = TaskRegistry()
 def default_registry() -> TaskRegistry:
     """The registry the task decorators add to."""
     return _default_registry
+
+
+def registered_definition(name: str) -> TaskDefinition:
+    """The task this process registered as `name`. Raises `UnknownTaskError`
+    if there is none."""
+    definition = default_registry().get(name)
+    if definition is None:
+        raise UnknownTaskError(f"this process has no task named {name!r}")
+    return definition

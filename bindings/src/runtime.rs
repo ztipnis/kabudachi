@@ -416,6 +416,22 @@ impl NativeRuntime {
         Ok(failure.retry.is_some())
     }
 
+    /// Reports that a claimed run was lost with the process that ran its
+    /// body (it died or was killed), not failed. Returns whether a new
+    /// attempt is now waiting to be claimed; `False` means the task is over
+    /// (an ephemeral task's run is not replayed, and a non-retriable task's
+    /// running run is orphaned).
+    ///
+    /// Raises `RuntimeError` if the run is unknown, is not this worker's, or
+    /// has already ended; the loss is then not recorded.
+    fn report_lost(&self, task_run_id: &str) -> PyResult<bool> {
+        let lost = self
+            .door
+            .lose_run(&TaskRunId::new(task_run_id))
+            .map_err(|refusal| refused(refusal, rejected))?;
+        Ok(lost.replayed.is_some())
+    }
+
     /// Cancels a task, whatever it is doing: `CancelOutcome.CANCELLED` if it
     /// was, and the worker running it (if any) is told through `next_events()`
     /// to stop; `ALREADY_FINISHED` if it had already finished; `UNKNOWN_TASK`

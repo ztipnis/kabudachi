@@ -34,7 +34,11 @@ from proto_messages import Greeting, make_message_class
 def faulting_native(monkeypatch):
     FaultingNative.instances = []
     monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
-    monkeypatch.setattr(config_module, "_process_configuration", Configuration())
+    # Bodies here share state with the test through closures, which only a
+    # body running in this process can see.
+    configuration = Configuration()
+    configuration.configure(processes=0)
+    monkeypatch.setattr(config_module, "_process_configuration", configuration)
     monkeypatch.setattr(runner_module, "_native", SimpleNamespace(NativeRuntime=FaultingNative))
     return FaultingNative
 

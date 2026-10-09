@@ -26,8 +26,8 @@ use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{
     Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
-    Completion, ContinuationRejection, Event, Failure, ReportRejection, Scheduler, Submission,
-    SubmitRejection,
+    Completion, ContinuationRejection, Event, Failure, LostRun, ReportRejection, Scheduler,
+    Submission, SubmitRejection,
 };
 use kabudachi_core::task_record::{LocalRecords, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};
@@ -250,6 +250,14 @@ impl<C: Clock> SchedulerDoor<C> {
                 }
                 scheduler.fail(&self.worker, run, failure_kind)
             })
+        }))
+    }
+
+    /// Reports that one run this worker holds was lost with the process
+    /// that ran its body.
+    pub fn lose_run(&self, run: &TaskRunId) -> Result<LostRun, Refusal<ReportRejection>> {
+        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
+            settled_change(scheduler, |scheduler| scheduler.report_lost(&self.worker, run))
         }))
     }
 

@@ -14,7 +14,9 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar, overload
 
 from kabudachi import _native
-from kabudachi.config import process_configuration
+from kabudachi.config import Configuration, process_configuration
+from kabudachi.execution import Executor, InProcessExecutor
+from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
 from kabudachi.session import (
@@ -38,11 +40,14 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
 
     This owns the event loop: like `asyncio.run` it cannot be called from a
     running loop, and Ctrl-C cancels `main`. While `main` runs, calling a task
-    queues it for the worker and gives back a handle to await. A task that
+    queues it for the worker and gives back a handle to await. Task bodies
+    run in `processes` task processes (one per CPU by default), each with
+    `concurrency` places, or, with `processes=0`, in this process. A task that
     waits for another task does not occupy one of the `concurrency` places
     while it waits, and takes its place back as soon as it resumes, even if
     that briefly puts more than `concurrency` bodies in progress. The
-    `concurrency` setting is read when `run` starts.
+    `processes`, `concurrency` and `imports` settings are read when `run`
+    starts.
 
     When `main` returns, `run` waits for every task that was called to finish
     before it stops the worker. If `main` raises, or is cancelled, tasks
@@ -53,12 +58,15 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     Without `main`, `run` serves as a worker (on the main thread) until it
     receives SIGINT or SIGTERM, then drains like the end of `main`: it waits
     for every task that was called and returns `None`. A second signal stops
-    the waiting: tasks not finished are abandoned, `run` raises
+    the waiting: task processes are stopped at once, tasks not finished are
+    abandoned, `run` raises
     `KeyboardInterrupt`, and a synchronous task still in its thread keeps the
     interpreter from exiting until it returns.
 
     Raises `TaskDefinitionError`, before `main` starts, if a registered task
-    cannot work with the serializers of this process.
+    cannot work with the serializers of this process, and if `processes` is
+    above 0 and a task is declared in the script being run. Raises
+    `StartupError` if the task processes cannot start.
     """
     if main is None and threading.current_thread() is not threading.main_thread():
         raise RuntimeError(
@@ -73,6 +81,7 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     if active_session() is not None:
         raise RuntimeError("kabudachi.run() is already running in this process")
     validate_definitions(default_registry(), process_serializers())
+    executor = _executor_for(process_configuration())
 
     with asyncio.Runner() as runner:
         if main is None:
@@ -81,8 +90,18 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
                 async def serve() -> None:
                     await signals.stop.wait()
 
-                return runner.run(_run_with_worker(serve))
-        return runner.run(_run_with_worker(main))
+                return runner.run(_run_with_worker(serve, executor, serving=True))
+        return runner.run(_run_with_worker(main, executor))
+
+
+def _executor_for(configuration: Configuration) -> Executor:
+    """Task processes as configured, or this process with `processes=0`.
+    Raises `TaskDefinitionError` for a task task processes could not import."""
+    settings = configuration.settings()
+    registry = default_registry()
+    if settings.processes == 0:
+        return InProcessExecutor(registry, process_serializers(), settings.concurrency)
+    return ProcessPool(settings, task_modules(registry, settings.imports), registry)
 
 
 async def _cancel(task: "asyncio.Future[object] | None") -> None:
@@ -553,39 +572,63 @@ async def _until_done_or_worker_stops(work: Awaitable[T], worker: "asyncio.Task[
         await _cancel(task)
 
 
-async def _run_with_worker(main: Callable[[], Awaitable[T]]) -> T:
+async def _run_with_worker(
+    main: Callable[[], Awaitable[T]], executor: Executor, *, serving: bool = False
+) -> T:
+    """With `serving`, `main` only waits for the first signal, so a cancel is
+    the second one: task processes are then stopped at once, not after their
+    running bodies, which a body that ignores the cancel would hold up for its
+    cancel grace. In this process nothing can be killed, so running bodies are
+    still waited for."""
     configuration = process_configuration()
-    native = _native.NativeRuntime(
-        uuid.uuid4().hex,
-        uuid.uuid4().hex,
-        result_ttl_ms=configuration.resolve("result_ttl") * 1000,
-        memory_soft_limit=configuration.resolve("memory_soft_limit"),
-        memory_hard_limit=configuration.resolve("memory_hard_limit"),
-    )
-    session = None
-    worker = None
+    # Set once every body has finished: the task processes are then let go
+    # idle. Otherwise (a second signal, or a run cancelled while it waited
+    # for its bodies) they are stopped at once.
+    graceful = False
+    await executor.start()
     try:
-        await native.wait_until_leader()
-        session = Session(
-            native, default_registry(), process_serializers(), configuration
+        native = _native.NativeRuntime(
+            uuid.uuid4().hex,
+            uuid.uuid4().hex,
+            result_ttl_ms=configuration.resolve("result_ttl") * 1000,
+            memory_soft_limit=configuration.resolve("memory_soft_limit"),
+            memory_hard_limit=configuration.resolve("memory_hard_limit"),
         )
-        activate(session)
-        worker = asyncio.create_task(session.serve())
-        result = await _until_done_or_worker_stops(main(), worker)
-        await _until_done_or_worker_stops(session.wait_until_idle(), worker)
-        return result
-    except BaseException:
-        if session is not None:
-            session.stop_claiming()
+        session = None
+        worker = None
+        try:
+            await native.wait_until_leader()
+            session = Session(
+                native, default_registry(), process_serializers(), configuration, executor=executor
+            )
+            activate(session)
+            worker = asyncio.create_task(session.serve())
+            result = await _until_done_or_worker_stops(main(), worker)
+            await _until_done_or_worker_stops(session.wait_until_idle(), worker)
+            graceful = True
+            return result
+        except BaseException as error:
+            if session is not None:
+                session.stop_claiming()
+                await _cancel(worker)
+                forced = serving and isinstance(error, (asyncio.CancelledError, KeyboardInterrupt))
+                if forced and executor.stops_bodies_at_once:
+                    # Their runs settle as lost once their processes are gone.
+                    await executor.stop(kill=True)
+                await session.wait_until_running_finish()
+                graceful = True
+            raise
+        finally:
+            if session is not None:
+                # Also on the normal path: between the run going idle and being
+                # deactivated a thread can still submit, and would never be served.
+                session.stop_claiming()
+                deactivate(session)
             await _cancel(worker)
-            await session.wait_until_running_finish()
-        raise
+            native.shutdown()
     finally:
-        if session is not None:
-            # Also on the normal path: between the run going idle and being
-            # deactivated a thread can still submit, and would never be served.
-            session.stop_claiming()
-            deactivate(session)
-            session.close()
-        await _cancel(worker)
-        native.shutdown()
+        try:
+            await executor.stop(kill=not graceful)
+        except BaseException:
+            await executor.stop(kill=True)  # a second cancel must not leave children
+            raise

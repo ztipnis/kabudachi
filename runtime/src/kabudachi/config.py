@@ -6,7 +6,7 @@ the environment), then the task's own explicit setting. A task setting of
 """
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from typing import Any, get_type_hints
 
@@ -40,6 +40,20 @@ ENVIRONMENT_PREFIX = "KABUDACHI_"
 DEFAULT_MEMORY_SOFT_LIMIT = 256 * 1024 * 1024
 DEFAULT_MEMORY_HARD_LIMIT = 512 * 1024 * 1024
 
+# Above this many places per process, `concurrency_override=True` is needed:
+# every place may hold a thread for a synchronous body.
+MAX_CONCURRENCY = 32
+
+
+def _one_per_cpu() -> int:
+    # The CPUs this process may use, not the host's: a container or `taskset`
+    # can allow fewer.
+    if hasattr(os, "process_cpu_count"):
+        return os.process_cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0)) or 1
+    return os.cpu_count() or 1
+
 
 @dataclass(frozen=True, kw_only=True)
 class Settings:
@@ -47,12 +61,31 @@ class Settings:
 
     To add one, add a field with its default, and refuse invalid values in
     `__post_init__`. `KABUDACHI_<NAME>` in the environment can set it; a field
-    of type `int` is read from the environment as a number, and one of type
-    `timedelta` as a number of seconds.
+    of type `int` is read from the environment as a number, one of type
+    `timedelta` as a number of seconds, a `bool` as true/false, yes/no, on/off
+    or 1/0, and `imports` as a comma-separated list.
     """
 
+    processes: int = field(default_factory=_one_per_cpu)
+    """How many task processes run task bodies: one per CPU unless set. `0`
+    runs bodies in this process instead, where a body that will not stop
+    cannot be killed."""
+
     concurrency: int = 16
-    """How many tasks a worker runs at once."""
+    """How many task bodies one process runs at once (in this process, with
+    `processes=0`). Above 32 only with `concurrency_override=True`."""
+
+    concurrency_override: bool = False
+    """Allows `concurrency` above 32."""
+
+    imports: tuple[str, ...] | None = None
+    """The modules a task process imports to find its tasks. `None` imports
+    every module that declared a task in this process."""
+
+    process_start_timeout: timedelta = timedelta(seconds=60)
+    """How long a task process has, from its start, to import its modules
+    and say it is ready, before it is killed. `KABUDACHI_PROCESS_START_TIMEOUT`
+    gives it in seconds."""
 
     queue: str = "default"
     """The queue tasks are sent to unless they name their own."""
@@ -80,6 +113,42 @@ class Settings:
             or self.concurrency <= 0
         ):
             raise ValueError(f"concurrency must be a positive integer, not {self.concurrency!r}")
+        if (
+            not isinstance(self.processes, int)
+            or isinstance(self.processes, bool)
+            or self.processes < 0
+        ):
+            raise ValueError(f"processes must be a non-negative integer, not {self.processes!r}")
+        if not isinstance(self.concurrency_override, bool):
+            raise ValueError(
+                f"concurrency_override must be True or False, not {self.concurrency_override!r}"
+            )
+        if self.concurrency > MAX_CONCURRENCY and not self.concurrency_override:
+            raise ValueError(
+                f"concurrency {self.concurrency} is above {MAX_CONCURRENCY}, which needs "
+                "concurrency_override=True: each place may hold a thread"
+            )
+        if (
+            not isinstance(self.process_start_timeout, timedelta)
+            or self.process_start_timeout <= timedelta(0)
+        ):
+            raise ValueError(
+                "process_start_timeout must be a positive timedelta, "
+                f"not {self.process_start_timeout!r}"
+            )
+        if self.imports is not None:
+            complaint = f"imports must be a list of module names, not {self.imports!r}"
+            if isinstance(self.imports, str):
+                raise ValueError(complaint)
+            try:
+                # Once: a generator would be used up by checking it.
+                modules = tuple(self.imports)
+            except TypeError:
+                raise ValueError(complaint) from None
+            if not all(isinstance(module, str) and module.strip() for module in modules):
+                raise ValueError(complaint)
+            # Frozen: a list given by the caller is kept as a tuple.
+            object.__setattr__(self, "imports", modules)
         if (
             not isinstance(self.result_ttl, int)
             or isinstance(self.result_ttl, bool)
@@ -122,15 +191,29 @@ class Settings:
             if raw is None:
                 continue
             try:
-                if hints[field.name] is int:
-                    found[field.name] = int(raw)
-                elif hints[field.name] is timedelta:
-                    found[field.name] = timedelta(seconds=float(raw))
-                else:
-                    found[field.name] = raw
+                found[field.name] = _parse(hints[field.name], raw)
             except ValueError:
-                raise ValueError(f"{field.name} must be a number, not {raw!r}") from None
+                raise ValueError(f"{field.name} cannot be {raw!r} from the environment") from None
         return found
+
+
+def _parse(value_type: Any, raw: str) -> Any:
+    """An environment variable's text as a setting of `value_type`."""
+    if value_type is int:
+        return int(raw)
+    if value_type is timedelta:
+        return timedelta(seconds=float(raw))
+    if value_type is bool:
+        lowered = raw.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+        raise ValueError(raw)
+    if value_type == tuple[str, ...] | None:
+        modules = tuple(part.strip() for part in raw.split(",") if part.strip())
+        return modules or None  # an empty value is "not set", not "no modules"
+    return raw
 
 
 class Configuration:
@@ -163,9 +246,14 @@ class Configuration:
             raise ConfigurationError(f"unknown setting {name!r}; the settings are: {known}")
         if task_value is not UNSET:
             return task_value
+        return getattr(self.settings(), name)
+
+    def settings(self) -> Settings:
+        """Every setting's effective value. The environment is read the first
+        time any setting is needed."""
         if self._settings is None:
             self._settings = self._validate(self._configured)
-        return getattr(self._settings, name)
+        return self._settings
 
     @staticmethod
     def _validate(configured: dict[str, Any]) -> Settings:
@@ -190,16 +278,22 @@ def process_configuration() -> Configuration:
 def configure(**settings: Any) -> None:
     """Sets settings for this whole process, keeping any set by earlier calls.
 
-    The settings are `concurrency`, the number of tasks a worker runs at
-    once, `queue`, the queue tasks are sent to unless they name their own,
+    The settings are `processes`, how many task processes run task bodies
+    (one per CPU by default; `0` runs them in this process), `concurrency`,
+    the number of tasks one process runs at once, `concurrency_override` to
+    allow `concurrency` above 32, `imports`, the modules task processes import
+    to find tasks (by default every module that declared one),
+    `process_start_timeout`, the timedelta a task process has to become
+    ready, `queue`, the queue tasks are sent to unless they name their own,
     `result_ttl`, the seconds a finished task is kept, `cancel_grace`, the
     timedelta a task past its timeout has to stop, and `memory_soft_limit` and
     `memory_hard_limit`, in bytes of pending task input (past the soft one
     `group` and `map` pause, past the hard one a submission raises
     `BackpressureError`); `KABUDACHI_<NAME>`
     in the environment sets each too, below what is configured here. A
-    setting a task makes for itself always wins over these. `concurrency`, the
-    memory limits and `result_ttl` are read when `run()` starts, so changing them during a run
+    setting a task makes for itself always wins over these. `concurrency`,
+    `processes`, `imports`, `process_start_timeout`, the memory limits and
+    `result_ttl` are read when `run()` starts, so changing them during a run
     has no effect on that run.
 
     Raises `ConfigurationError` for an unknown setting or an invalid value,

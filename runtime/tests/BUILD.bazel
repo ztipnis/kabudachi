@@ -134,6 +134,7 @@ py_test(
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",  # keep
         "//runtime/tests:faulting_runtime",  # keep
+        "//runtime/tests:pool_tasks",  # keep
         "@pypi//pytest",  # keep
     ],
 )
@@ -149,6 +150,45 @@ py_test(
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
         "//runtime/tests:faulting_runtime",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+# Tasks at module scope, which task processes import by name.
+# gazelle:resolve py pool_tasks //runtime/tests:pool_tasks
+py_library(
+    name = "pool_tasks",
+    testonly = True,
+    srcs = ["pool_tasks.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+    ],
+)
+
+# A module only task processes import, through `imports`.
+# gazelle:resolve py pool_slow_import //runtime/tests:pool_slow_import
+py_library(
+    name = "pool_slow_import",
+    testonly = True,
+    srcs = ["pool_slow_import.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+)
+
+py_test(
+    name = "test_pool",
+    srcs = ["test_pool.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",
+        "//runtime/tests:pool_slow_import",  # keep
+        "//runtime/tests:pool_tasks",
         "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
     ],

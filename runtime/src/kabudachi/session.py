@@ -9,7 +9,7 @@ delivered.
 
 A coalescing key whose waiting payloads pile up past the soft memory limit
 while one generation runs is compacted on a free worker place: the claim names
-the payloads to fold, `_compact` folds them with the task's merge and hands the
+the payloads to fold, the executor folds them with the task's merge and hands the
 folded payload to the leader, and no handle waits for it.
 """
 
@@ -21,27 +21,35 @@ import json
 import logging
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from kabudachi._native import EventKind
-from kabudachi.body import RunningBody, run_within, start_body
+from kabudachi.body import RunningBody
 from kabudachi.composites import Composites
-from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration
 from kabudachi.errors import (
     CoalescedPayloadTooLargeError,
     RuntimeNotStartedError,
+    TaskBodyError,
     TaskDefinitionError,
     TaskExpiredError,
+    TaskLostError,
     TaskRecordFullError,
     TaskSupersededError,
     UnknownTaskError,
     interrupted,
 )
 from kabudachi.config import UNSET
+from kabudachi.execution import (
+    CompactJob,
+    Executor,
+    InProcessExecutor,
+    RunJob,
+    TaskProcessLost,
+    run_within,
+)
 from kabudachi.hosted_work import LoopHostedWork
-from kabudachi.handle import TaskHandle, current_body, run_callback_inline
+from kabudachi.handle import TaskHandle, run_callback_inline
 from kabudachi.native_protocol import Runtime
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskDefinition, TaskRegistry
@@ -63,6 +71,7 @@ class Session:
         registry: TaskRegistry,
         serializers: SerializerRegistry,
         configuration: Configuration,
+        executor: Executor | None = None,
     ) -> None:
         self._runtime = runtime
         self._registry = registry
@@ -71,7 +80,16 @@ class Session:
         self.concurrency: int = configuration.resolve("concurrency")
         self._tasks = TaskTable(runtime, self._run_callback, self._decode_result)
         self._hosted = LoopHostedWork()
-        self._places = ConcurrencyPlaces(self.concurrency)
+        # Where bodies run, and the places they take: this process, unless
+        # the caller hands over task processes.
+        self._executor = (
+            executor
+            if executor is not None
+            else InProcessExecutor(registry, serializers, self.concurrency)
+        )
+        self._executor.accept_nested_calls(self)
+        # Every run and compaction this session sees through to its end.
+        self._running: set[asyncio.Task[None]] = set()
         try:
             # Built inside the run's loop, as `run()` does.
             self._hosted.attach(asyncio.get_running_loop())
@@ -82,11 +100,6 @@ class Session:
         self._below_soft_limit.set()
         # Every flow and group started here, and what runs them.
         self._composites = Composites(self, self._hosted)
-        # As many threads as tasks may run at once, or synchronous tasks
-        # would queue behind the event loop's small default pool.
-        self._threads = ThreadPoolExecutor(
-            max_workers=self.concurrency, thread_name_prefix="kabudachi-task"
-        )
 
     def submit(
         self,
@@ -105,6 +118,24 @@ class Session:
         queue = self._configuration.resolve("queue", definition.queue)
         return self._tasks.submit(definition, payload, queue, options or SubmissionOptions())
 
+    def submit_serialized(
+        self, definition_id: str, payload: bytes, options: SubmissionOptions
+    ) -> TaskHandle:
+        """Submits a task a body in a task process called, its input already
+        encoded there. Raises as `submit` does, and `UnknownTaskError` for a
+        task this process does not have."""
+        definition = self._registry.get(definition_id)
+        if definition is None:
+            raise UnknownTaskError(f"this process has no task named {definition_id!r}")
+        queue = self._configuration.resolve("queue", definition.queue)
+        return self._tasks.submit(definition, payload, queue, options)
+
+    def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle:
+        """Starts a flow (`kind` "flow") or group a body in a task process called."""
+        if kind == "flow":
+            return self._composites.submit_flow(composite, previous)
+        return self._composites.submit_group(composite, previous)
+
     async def work(self) -> None:
         """Claims pending tasks and runs them, up to the concurrency limit,
         until the runtime shuts down or the caller cancels it.
@@ -119,9 +150,9 @@ class Session:
         """
         self._hosted.attach(asyncio.get_running_loop())
         while not self._tasks.stopping:
-            free = self._places.free()
+            free = self._executor.free()
             if free <= 0:
-                await self._places.wait_for_free()
+                await self._executor.wait_for_free()
                 continue
             for claim in await self._runtime.claim_pending(free):
                 self._start(claim)
@@ -230,15 +261,12 @@ class Session:
         any running task that was waiting for one of them. Tasks already
         running are not interrupted."""
         self._tasks.stop_unstarted()
-        self._places.wake()
-
-    def close(self) -> None:
-        """Releases the threads that ran synchronous tasks."""
-        self._threads.shutdown(wait=False, cancel_futures=True)
+        self._executor.wake()
 
     async def wait_until_running_finish(self) -> None:
         """Waits for every task that is running now to finish."""
-        await self._places.wait_until_running_finish()
+        while self._running:
+            await asyncio.wait(set(self._running))
 
     async def wait_until_idle(self) -> None:
         """Waits until every task submitted so far, including any submitted by
@@ -252,13 +280,14 @@ class Session:
     def _run_callback(self, function: Any, value: Any) -> None:
         """Runs a task callback on the event loop, from whichever thread the
         task was settled on; inline if there is no loop left to run it."""
-        if not self._hosted.spawn(_invoke_callback(function, value)):
+        if not self._hosted.spawn(invoke_callback(function, value)):
             run_callback_inline(function, value)
 
     def _start(self, claim: Any) -> None:
         if claim.compaction:
             # Internal: no handle waits for it, so it is not in the task table.
-            self._places.occupy(asyncio.get_running_loop().create_task(self._compact(claim)))
+            job = CompactJob(claim.task_run_id, claim.definition_id, tuple(claim.chain))
+            self._track(self._compact(claim, self._executor.compact(job)))
             return
         run = self._tasks.claimed(claim.task_id)
         if run is None:
@@ -266,33 +295,70 @@ class Session:
             # route): its handle is settled, so running the body now would
             # contradict that.
             return
-        self._places.occupy(asyncio.get_running_loop().create_task(self._run(claim, run)))
+        self._track(self._run(claim, run, self._hand_over(claim, run)))
 
-    async def _run(self, claim: Any, run: Run) -> None:
-        """Runs one claimed task and settles its handle, whatever happens.
+    def _hand_over(
+        self, claim: Any, run: Run
+    ) -> "tuple[TaskDefinition, RunningBody, asyncio.Future[Any] | None] | BaseException":
+        """Tells the leader the run started and hands it to the executor. Done
+        here rather than in `_run`, which starts later, so the place the run
+        takes is counted before the next claim asks for more. What went wrong
+        instead is returned, for `_run` to settle. The future is the abandoned
+        body this one waits for, if any."""
+        after = run.previous_body_exited
+        try:
+            definition = self._registry.get(claim.definition_id)
+            if definition is None:
+                raise UnknownTaskError(f"this process has no task named {claim.definition_id!r}")
+            self._runtime.report_started(claim.task_run_id)
+            body = self._executor.run(
+                RunJob(
+                    run_id=claim.task_run_id,
+                    definition_id=claim.definition_id,
+                    source_version=claim.source_version,
+                    serialized_input=claim.serialized_input,
+                    chain=tuple(claim.chain),
+                    cancel_grace=self._cancel_grace(definition),
+                    # A retry does not run beside the abandoned body it replaces.
+                    after=after,
+                )
+            )
+        except BaseException as error:
+            return error
+        run.body_started(body)
+        return definition, body, after
+
+    def _track(self, coroutine: Any) -> None:
+        task = asyncio.get_running_loop().create_task(coroutine)
+        self._running.add(task)
+        task.add_done_callback(self._running.discard)
+
+    def _cancel_grace(self, definition: TaskDefinition) -> Any:
+        return self._configuration.resolve("cancel_grace", definition.cancel_grace)
+
+    async def _run(
+        self, claim: Any, run: Run, handed: "tuple[TaskDefinition, RunningBody, asyncio.Future[Any] | None] | BaseException"
+    ) -> None:
+        """Sees one handed-over run to its end and settles its handle,
+        whatever happens.
 
         A task that fails is reported to the leader, by its error's type,
         before its handle is failed with the error itself.
         """
-        current_body.set(self._places.watch_body())
         body: RunningBody | None = None
         try:
-            # A retry does not run beside the abandoned body it replaces.
-            previous = run.previous_body_exited
+            if isinstance(handed, BaseException):
+                raise handed
+            definition, body, previous = handed
+            # The body waits for an abandoned one of this task to exit before
+            # it starts; its timeout counts from when it does.
             if previous is not None:
                 await asyncio.wait({previous})
-            definition = self._registry.get(claim.definition_id)
-            if definition is None:
-                raise UnknownTaskError(f"this process has no task named {claim.definition_id!r}")
-            serializer = self._serializers.get(definition.serializer)
-            self._runtime.report_started(claim.task_run_id)
-            argument = self._fold(definition, serializer, claim)
-            body = start_body(definition, argument, self._threads)
-            run.body_started(body)
-            value = await run_within(
+            outcome = await run_within(
                 body,
                 definition.timeout,
-                self._configuration.resolve("cancel_grace", definition.cancel_grace),
+                self._cancel_grace(definition),
+                functools.partial(self._executor.condemn_host_of, claim.task_run_id),
             )
             if not run.outcome_counts:
                 # Cancelled, though the body carried on and returned anyway.
@@ -301,12 +367,16 @@ class Session:
                 # answers "cancelled".
                 return
             if definition.continues:
-                self._continue(claim, run, value)
+                self._continue(claim, run, outcome)
                 return
-            result = serializer.encode(value, definition.output_type)
-            self._tasks.result_held(claim.task_id, result)
-            certification = self._runtime.complete(claim.task_run_id, result_digest(result))
+            self._tasks.result_held(claim.task_id, outcome)
+            certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
             self._tasks.certified(certification)
+        except TaskProcessLost:
+            # Cancelled first, the leader's `cancelled` event settles the
+            # handle, as for a cancelled body that failed.
+            if run.outcome_counts:
+                self._lost(claim)
         except asyncio.CancelledError as error:
             current = asyncio.current_task()
             if run.cancelled_by_leader and current is not None and not current.cancelling():
@@ -322,14 +392,15 @@ class Session:
                 # event settles it, pushed in the same call that answers
                 # "cancelled".
                 return
-            _logger.warning("task %s failed with %s", claim.task_id, type(error).__name__)
+            kind = _kind_of(error)
+            _logger.warning("task %s failed with %s", claim.task_id, kind)
             # Only here, at DEBUG, does the error's own message (which can hold
             # task input) reach the log; the warning above names its type only.
             _logger.debug("task %s failed", claim.task_id, exc_info=error)
             abandoned = body is not None and not body.exited.done()
             if abandoned:
                 run.body_abandoned(body)
-            if self._report_failure(claim, error):
+            if self._report_failure(claim, kind):
                 self._tasks.retry_queued(claim.task_id)
             else:
                 self._tasks.failed(claim.task_id, error)
@@ -389,22 +460,18 @@ class Session:
 
         handle._outcome.add_done_callback(settled)
 
-    async def _compact(self, claim: Any) -> None:
-        """Folds a compaction run's payloads with the task's merge and hands
-        the result back. A failure is reported by the error's type only, and
-        the leader then leaves the chain as it was."""
+    async def _compact(self, claim: Any, body: RunningBody) -> None:
+        """Waits for a compaction run's fold and hands the folded payload to the
+        leader. A failure is reported by the error's type only, and the leader
+        then leaves the chain as it was."""
         try:
-            definition = self._registry.get(claim.definition_id)
-            if definition is None:
-                raise UnknownTaskError(f"this process has no task named {claim.definition_id!r}")
-            serializer = self._serializers.get(definition.serializer)
-            folded = self._fold_payloads(definition, serializer, list(claim.chain))
-            encoded = serializer.encode(folded, definition.input_type)
+            folded = await body.outcome
         except Exception as error:
-            _logger.warning("compaction of %s failed with %s", claim.definition_id, type(error).__name__)
+            kind = _kind_of(error)
+            _logger.warning("compaction of %s failed with %s", claim.definition_id, kind)
             _logger.debug("compaction of %s failed", claim.definition_id, exc_info=error)
             try:
-                self._runtime.report_failure(claim.task_run_id, type(error).__name__)
+                self._runtime.report_failure(claim.task_run_id, kind)
             except Exception as refusal:
                 _logger.warning(
                     "the leader did not record the failed compaction of %s: %s",
@@ -413,7 +480,7 @@ class Session:
                 )
             return
         try:
-            self._runtime.complete_compaction(claim.task_run_id, encoded)
+            self._runtime.complete_compaction(claim.task_run_id, folded)
         except Exception as refusal:
             # The merge was fine: the leader refused to take its result (the
             # run is no longer this worker's), which is no failure to report.
@@ -423,32 +490,37 @@ class Session:
                 type(refusal).__name__,
             )
 
-    @staticmethod
-    def _fold_payloads(definition: TaskDefinition, serializer: Any, payloads: list[bytes]) -> Any:
-        """Decodes `payloads` and folds them, oldest first, with the task's
-        merge (the newest wins without one). Runs here, on the worker, because
-        the leader never runs user code."""
-        values = [serializer.decode(payload, definition.input_type) for payload in payloads]
-        if len(values) == 1:
-            return values[0]
-        merge = definition.merge or (lambda older, newer: newer)
-        return functools.reduce(merge, values)
+    def _lost(self, claim: Any) -> None:
+        """The process running the body died. The leader decides, as for a
+        lost worker: a new attempt (the handle waits for it), or the task is
+        over (an ephemeral one, or a non-retriable one that may have had its
+        effects). A refused report ends the task here too; failing a handle
+        the leader already settled changes nothing."""
+        _logger.warning("task %s was lost with the process that ran it", claim.task_id)
+        try:
+            replayed = self._runtime.report_lost(claim.task_run_id)
+        except Exception as refusal:
+            _logger.warning(
+                "the leader did not record the loss of task %s: %s",
+                claim.task_id,
+                type(refusal).__name__,
+            )
+            replayed = False
+        if replayed:
+            self._tasks.retry_queued(claim.task_id)
+        else:
+            self._tasks.failed(
+                claim.task_id,
+                TaskLostError(f"task {claim.task_id} was lost with the process that ran it"),
+            )
 
-    @staticmethod
-    def _fold(definition: TaskDefinition, serializer: Any, claim: Any) -> Any:
-        """The input of the task: its own payload, folded onto the payloads of
-        the generations it superseded, oldest first."""
-        return Session._fold_payloads(
-            definition, serializer, [*claim.chain, claim.serialized_input]
-        )
-
-    def _report_failure(self, claim: Any, error: Exception) -> bool:
+    def _report_failure(self, claim: Any, kind: str) -> bool:
         """Tells the leader the run failed and says whether it will be retried.
-        Only the error's type name goes, never its message. A refusal is
-        logged, counts as no retry, and does not replace `error`, which is
+        Only the failure's kind goes, never the error's message. A refusal is
+        logged, counts as no retry, and does not replace the error, which is
         what the handle's awaiter needs to see."""
         try:
-            return self._runtime.report_failure(claim.task_run_id, type(error).__name__)
+            return self._runtime.report_failure(claim.task_run_id, kind)
         except Exception as refusal:
             _logger.warning(
                 "the leader did not record the failure of task %s: %s",
@@ -465,7 +537,15 @@ class Session:
         return serializer.decode(payload, definition.output_type)
 
 
-async def _invoke_callback(function: Any, value: Any) -> None:
+def _kind_of(error: BaseException) -> str:
+    """The type name a failure is reported and logged by: the original type
+    for an error a task process could only describe."""
+    return error.kind if isinstance(error, TaskBodyError) else type(error).__name__
+
+
+async def invoke_callback(function: Any, value: Any) -> None:
+    """Calls a task callback with `value`: an async one on the running loop, a
+    synchronous one off it. A failure is logged, by type only."""
     try:
         if inspect.iscoroutinefunction(function):
             await function(value)

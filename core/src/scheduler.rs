@@ -2331,6 +2331,40 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         Ok(lost)
     }
 
+    /// One run `worker` holds is gone while the worker is not: the process
+    /// that ran its body died. The run becomes lost or orphaned, and is
+    /// replayed or not, exactly as if its whole worker had been lost.
+    /// Refused, as a failure report is, when this node does not lead, the
+    /// run is unknown, or it is not a claimed or running run of `worker`
+    /// (it already ended, or a retry or replay replaced it).
+    pub fn report_lost(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+    ) -> Result<LostRun, ReportRejection> {
+        let outcome = self.lose_held_run(worker, run_id);
+        self.end_call();
+        outcome
+    }
+
+    fn lose_held_run(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+    ) -> Result<LostRun, ReportRejection> {
+        self.require_leader()?;
+        let expected = match self.runs.get(run_id).map(TaskRun::current_state) {
+            Some(TaskRunState::Claimed) => TaskRunState::Claimed,
+            _ => TaskRunState::Running,
+        };
+        // A replaced run is `Failed` or `Lost`, so a run still held in one of
+        // these states is its task's current run.
+        let task_id = self.owned_run(worker, run_id, expected)?.task_id();
+        let now = self.clock.now();
+        let stamped_at = WallTime::now(&self.clock);
+        Ok(self.lose_run(&task_id, now, stamped_at))
+    }
+
     /// The workers a claimed or running current run of one of `tasks` is
     /// selected for.
     fn holders_of<'t>(&self, tasks: impl Iterator<Item = &'t TaskId>) -> BTreeSet<WorkerId> {

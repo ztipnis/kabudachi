@@ -115,6 +115,10 @@ class FaultingRuntime:
             raise RuntimeError("the run does not belong to this worker")
         return self.native.report_failure(task_run_id, failure_kind)
 
+    def report_lost(self, task_run_id):
+        self.events.append(("lost", task_run_id))
+        return self.native.report_lost(task_run_id)
+
     def complete(self, task_run_id, result_digest, continues=False):
         self.events.append(("complete", task_run_id))
         if self.on_complete is not None:

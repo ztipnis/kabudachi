@@ -120,6 +120,7 @@ class Task(wrapt.ObjectProxy):
             input_type=input_type,
             output_type=output_type,
             is_async=inspect.iscoroutinefunction(self._annotated_callable(func)),
+            module=getattr(func, "__module__", None) or "",
             retries=retries,
             timeout=timeout,
             cancel_grace=cancel_grace,
