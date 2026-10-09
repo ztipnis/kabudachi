@@ -36,6 +36,7 @@ use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
 use kabudachi_net::executor::{Report, ReportSink, Work, WorkSource, executor_channel};
 use kabudachi_net::messenger::Net;
+use kabudachi_net::task_exchange::LeaderRetry;
 use kabudachi_net::worker::{AuthorityConfig, Multiaddr, Worker, WorkerConfig};
 use kabudachi_redis_authority::{RedisAuthority, RedisAuthorityConfig};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -105,10 +106,8 @@ struct Shared {
     reports: ReportSink,
     net: Arc<Net>,
     observed: watch::Receiver<Observed>,
-    /// How long to wait before asking a leader again.
-    retry_after: StdDuration,
-    /// How long a leader may take to answer.
-    answer_within: StdDuration,
+    /// How submissions and cancels keep asking the leader.
+    retry: LeaderRetry,
 }
 
 impl Shared {
@@ -288,20 +287,6 @@ impl Shared {
             }
         }
     }
-
-    /// The leader the node names, once it names one; `None` once the
-    /// worker is out of its shard.
-    async fn leader(&self) -> Option<WorkerId> {
-        let mut observed = self.observed.clone();
-        let seen = observed
-            .wait_for(|seen| seen.gone || seen.leader.is_some())
-            .await
-            .ok()?;
-        if seen.gone {
-            return None;
-        }
-        seen.leader.as_ref().map(|(leader, _)| leader.clone())
-    }
 }
 
 /// Removes `run` from the runs not taken yet; whether it was there.
@@ -315,52 +300,25 @@ fn take_handed(handed: &mut VecDeque<Claim>, run: &TaskRunId) -> bool {
 /// good, and says which.
 async fn deliver(shared: Arc<Shared>, submitted: Submitted) {
     let task = submitted.task_id.clone();
-    let event = loop {
-        let Some(leader) = shared.leader().await else {
-            // Out of its shard: no leader will answer, and a cancel waiting
-            // for this submission must not wait for ever.
-            shared.seam().delivering.remove(&task);
-            return;
-        };
-        let asked = shared.net.submit(leader, submitted.clone());
-        if let Ok(Ok(response)) = tokio::time::timeout(shared.answer_within, asked).await {
-            match &response.result {
-                Some(task_response::Result::Submitted(_)) => {
-                    break PyEvent::networked(PyEventKind::Accepted, task.as_str(), "");
-                }
-                Some(task_response::Result::Reject(reject)) => {
-                    match TaskRejectReason::try_from(reject.reason) {
-                        Ok(reason) if asks_again(reason) => {}
-                        Ok(reason) => break PyEvent::refused(task.as_str(), reason.as_str_name()),
-                        Err(_) => {
-                            break PyEvent::refused(task.as_str(), "a reason this worker cannot read");
-                        }
-                    }
-                }
-                _ => {
-                    break PyEvent::refused(task.as_str(), "an answer that is not about a submission");
-                }
-            }
+    let answer = shared.net.submit_to_leader(submitted, shared.retry).await;
+    let event = answer.map(|response| match response.result {
+        Some(task_response::Result::Submitted(_)) => {
+            PyEvent::networked(PyEventKind::Accepted, task.as_str(), "")
         }
-        tokio::time::sleep(shared.retry_after).await;
-    };
+        Some(task_response::Result::Reject(reject)) => match TaskRejectReason::try_from(reject.reason) {
+            Ok(reason) => PyEvent::refused(task.as_str(), reason.as_str_name()),
+            Err(_) => PyEvent::refused(task.as_str(), "a reason this worker cannot read"),
+        },
+        _ => PyEvent::refused(task.as_str(), "an answer that is not about a submission"),
+    });
     {
+        // Out of its shard, no leader will answer: nothing is said, but a
+        // cancel waiting for this submission must not wait for ever.
         let mut seam = shared.seam();
         seam.delivering.remove(&task);
-        seam.events.push_back(event);
+        seam.events.extend(event);
     }
     shared.wake();
-}
-
-/// Whether a refusal says to ask again: the node asked is not leading, not
-/// ready, or not yet sure of this worker.
-fn asks_again(reason: TaskRejectReason) -> bool {
-    matches!(
-        reason,
-        TaskRejectReason::TaskRejectNotLeader
-            | TaskRejectReason::TaskRejectNotReady
-            | TaskRejectReason::TaskRejectNotMember
-    )
 }
 
 /// Asks leaders to cancel `task` until one answers, once its own submission
@@ -369,27 +327,12 @@ fn asks_again(reason: TaskRejectReason) -> bool {
 /// it runs, and a task it found finished or unknown needs nothing.
 async fn cancel_at_leader(shared: Arc<Shared>, task: TaskId) {
     while shared.seam().delivering.contains(&task) {
-        if shared.observed.borrow().gone {
+        if shared.net.has_left_shard() {
             return;
         }
-        tokio::time::sleep(shared.retry_after).await;
+        tokio::time::sleep(shared.retry.ask_again_after).await;
     }
-    loop {
-        let Some(leader) = shared.leader().await else {
-            return;
-        };
-        let asked = shared.net.cancel(leader, task.clone());
-        if let Ok(Ok(response)) = tokio::time::timeout(shared.answer_within, asked).await {
-            match response.result {
-                Some(task_response::Result::Reject(reject))
-                    if TaskRejectReason::try_from(reject.reason).is_ok_and(asks_again) => {}
-                // Cancelled, already finished, unknown, or refused for good:
-                // the leader decided.
-                _ => return,
-            }
-        }
-        tokio::time::sleep(shared.retry_after).await;
-    }
+    let _ = shared.net.cancel_at_leader(task, shared.retry).await;
 }
 
 fn publish(sender: &watch::Sender<Observed>, node: &WorkerNode<RealClock>) {
@@ -574,8 +517,10 @@ impl NetworkedRuntime {
             reports,
             net: worker.net(),
             observed,
-            retry_after: StdDuration::from_millis(heartbeat_interval_ms),
-            answer_within: StdDuration::from_millis(heartbeat_timeout_ms),
+            retry: LeaderRetry {
+                answer_within: StdDuration::from_millis(heartbeat_timeout_ms),
+                ask_again_after: StdDuration::from_millis(heartbeat_interval_ms),
+            },
         });
 
         let seen = Arc::clone(&sender);

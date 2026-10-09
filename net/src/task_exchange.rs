@@ -5,7 +5,10 @@
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
 //! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
 //! [`Net::report_lost`] and [`Net::cancel`], each sent to the leader the
-//! caller names: the transport keeps no leader of its own. A call addressed
+//! caller names. [`Net::submit_to_leader`] and [`Net::cancel_at_leader`]
+//! instead find the leader themselves, the one the worker's node names, and
+//! ask again until a leader decides, as the executor's reports are asked
+//! again (see `crate::executor`). A call addressed
 //! to this worker itself, while it leads, is answered by its own driver the
 //! same way. The calls about a
 //! run also keep this worker's
@@ -28,6 +31,7 @@
 //! applied.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
@@ -392,6 +396,112 @@ impl Net {
     }
 }
 
+/// How [`Net::submit_to_leader`] and [`Net::cancel_at_leader`] keep asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaderRetry {
+    /// How long a leader may take to answer before it is asked again.
+    pub answer_within: Duration,
+    /// How long to wait before asking again, after an answer that came too
+    /// late, no answer, or a refusal that says to ask again.
+    pub ask_again_after: Duration,
+}
+
+/// The leader this worker's node last named, and whether the worker has left
+/// its shard, for the requests [`Net`] routes to its leader.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct NamedLeader {
+    leader: Option<WorkerId>,
+    left: bool,
+}
+
+impl Net {
+    /// Asks the shard's leader to record `submitted` until a leader decides
+    /// it, and returns that decision: stored, or refused for good. The
+    /// leader asked is the one this worker's node names; while it names none
+    /// the ask waits for one. An ask that is not answered within
+    /// `retry.answer_within`, fails, or is refused for now
+    /// (`TASK_REJECT_NOT_LEADER` or `TASK_REJECT_NOT_READY`, which the
+    /// executor's reports are asked again on too, or
+    /// `TASK_REJECT_NOT_MEMBER`: the leader is not yet sure of this worker)
+    /// is asked again, of whichever leader the
+    /// node names then, `retry.ask_again_after` later, with the same
+    /// `submitted`, so the task id holds. `None` once the worker has left
+    /// its shard (see [`Self::has_left_shard`]): no leader will answer.
+    ///
+    /// Only a worker driven by [`crate::worker::Worker::run`] names a leader
+    /// here, and leaves its shard when that ends however it does.
+    pub async fn submit_to_leader(&self, submitted: Submitted, retry: LeaderRetry) -> Option<TaskResponse> {
+        self.ask_until_decided(task_request::Request::Submit(wire::submit_task(&submitted)), retry)
+            .await
+    }
+
+    /// Asks the shard's leader to cancel `task` until a leader decides it,
+    /// and returns that decision (cancelled, already finished, unknown, or
+    /// refused for good), asking again as [`Self::submit_to_leader`] does;
+    /// `None` once the worker has left its shard.
+    pub async fn cancel_at_leader(&self, task: TaskId, retry: LeaderRetry) -> Option<TaskResponse> {
+        let request = task_request::Request::Cancel(CancelTask {
+            task_id: Some(task.into()),
+        });
+        self.ask_until_decided(request, retry).await
+    }
+
+    /// Whether this worker has left its shard: [`crate::worker::Worker::run`]
+    /// ended, however it did. No request routed to the leader is answered
+    /// from then on.
+    pub fn has_left_shard(&self) -> bool {
+        self.named_leader.borrow().left
+    }
+
+    /// Records the leader the node driving this `Net` names now, if any.
+    pub(crate) fn name_leader(&self, leader: Option<WorkerId>) {
+        self.named_leader.send_if_modified(|named| {
+            let changed = named.leader != leader;
+            if changed {
+                named.leader = leader;
+            }
+            changed
+        });
+    }
+
+    /// Records that this worker has left its shard, for good.
+    pub(crate) fn leave_shard(&self) {
+        self.named_leader.send_modify(|named| named.left = true);
+    }
+
+    /// Sends `request` to the leader the node names until one decides it
+    /// (see [`Self::submit_to_leader`]); `None` once the worker has left
+    /// its shard.
+    async fn ask_until_decided(&self, request: task_request::Request, retry: LeaderRetry) -> Option<TaskResponse> {
+        loop {
+            let leader = self.routed_leader().await?;
+            let asked = self.ask_task(leader, request.clone());
+            if let Ok(Ok(response)) = tokio::time::timeout(retry.answer_within, asked).await {
+                let ask_again = rejection(&response)
+                    .is_some_and(|reason| refused_for_now(reason) || reason == TaskRejectReason::TaskRejectNotMember);
+                if !ask_again {
+                    return Some(response);
+                }
+            }
+            tokio::time::sleep(retry.ask_again_after).await;
+        }
+    }
+
+    /// The leader the node names, once it names one; `None` once the worker
+    /// has left its shard.
+    async fn routed_leader(&self) -> Option<WorkerId> {
+        let mut named = self.named_leader.subscribe();
+        let named = named
+            .wait_for(|named| named.left || named.leader.is_some())
+            .await
+            .ok()?;
+        if named.left {
+            return None;
+        }
+        named.leader.clone()
+    }
+}
+
 /// The leader's answer to `request` from `from`, as `scheduler` decides it.
 /// The caller holds it until the writes the decision made are stored, and
 /// answers [`not_leader`] instead if they are not, or the lease ends first.
@@ -537,4 +647,23 @@ pub(crate) fn not_member() -> TaskResponse {
 /// were not acknowledged while it still led: a retryable `NotLeader`.
 pub(crate) fn not_leader() -> TaskResponse {
     wire::reject(TaskRejectReason::TaskRejectNotLeader)
+}
+
+/// The reason `response` refuses its request, if it does and the reason can
+/// be read.
+pub(crate) fn rejection(response: &TaskResponse) -> Option<TaskRejectReason> {
+    match &response.result {
+        Some(task_response::Result::Reject(reject)) => TaskRejectReason::try_from(reject.reason).ok(),
+        _ => None,
+    }
+}
+
+/// Whether `reason` refuses a request only for now: the worker asked does
+/// not lead, or leads but cannot decide yet. The same request may be taken
+/// when asked again, of whichever leader the asker's node names then.
+pub(crate) fn refused_for_now(reason: TaskRejectReason) -> bool {
+    matches!(
+        reason,
+        TaskRejectReason::TaskRejectNotLeader | TaskRejectReason::TaskRejectNotReady
+    )
 }

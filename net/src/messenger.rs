@@ -217,7 +217,7 @@ use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, w
 use crate::reconcile::codec::ReconcileCodec;
 use crate::steal::codec::StealCodec;
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm, hide_listen_addresses};
-use crate::task_exchange::OwnTask;
+use crate::task_exchange::{NamedLeader, OwnTask};
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_store::{HeldRecords, record_key};
 
@@ -589,6 +589,9 @@ pub struct Net {
     held: HeldRecords,
     /// The runs this worker claimed (see [`Self::claimed_runs`]).
     pub(crate) claimed: ClaimedRuns,
+    /// The leader this worker's node last named, and whether the worker has
+    /// left its shard (see [`Self::submit_to_leader`]).
+    pub(crate) named_leader: watch::Sender<NamedLeader>,
     driver: JoinHandle<()>,
 }
 
@@ -653,6 +656,7 @@ impl Net {
             records_shard,
             held,
             claimed: ClaimedRuns::default(),
+            named_leader: watch::Sender::new(NamedLeader::default()),
             driver,
         }
     }

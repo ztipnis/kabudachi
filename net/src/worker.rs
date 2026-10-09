@@ -270,9 +270,8 @@ impl Worker {
     }
 
     /// This worker's network, for what its node does not do itself, such as
-    /// submitting tasks to the leader its node names (`Net::submit`, given
-    /// the leader `observe` last saw in [`Self::run`]). Only
-    /// [`Self::run`] drives a node on it.
+    /// submitting tasks to the leader its node names
+    /// (`Net::submit_to_leader`). Only [`Self::run`] drives a node on it.
     pub fn net(&self) -> Arc<Net> {
         Arc::clone(&self.net)
     }
@@ -299,6 +298,10 @@ impl Worker {
         observe: impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step),
     ) -> HandedOff {
         let Worker { net, mut config } = self;
+        // However this ends (returns, is dropped, aborted or panics), the
+        // worker has left its shard: no request routed to its leader waits
+        // for one any more.
+        let _leave_shard = LeaveShard(&net);
         let mut executor = config.executor.take();
         let clock = RealClock::new();
         let my_id = net.local_worker_id();
@@ -364,6 +367,16 @@ impl Worker {
             observe,
         )
         .await
+    }
+}
+
+/// Marks the worker out of its shard when dropped (see
+/// `Net::has_left_shard`).
+struct LeaveShard<'a>(&'a Net);
+
+impl Drop for LeaveShard<'_> {
+    fn drop(&mut self) {
+        self.0.leave_shard();
     }
 }
 

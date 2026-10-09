@@ -55,7 +55,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     Claim, ClaimResponse, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, TaskRejectReason,
-    TaskResponse, claim_response, task_request, task_response,
+    TaskResponse, claim_response, task_request,
 };
 use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::{Clock, Duration as CoreDuration, Instant as NodeInstant, WallTime};
@@ -67,7 +67,7 @@ use tokio::time::Instant as TokioInstant;
 
 use crate::discovery::{Found, IdleBackoff};
 use crate::messenger::Net;
-use crate::task_exchange::{self, TaskFailure, reported_run};
+use crate::task_exchange::{self, TaskFailure, refused_for_now, rejection, reported_run};
 
 /// What the driver hands the executor (see the module doc).
 #[derive(Debug, Clone, PartialEq)]
@@ -558,7 +558,7 @@ impl<'n> Executing<'n> {
         let retry = match &reply {
             Err(_) => true,
             Ok(response) => match rejection(response) {
-                Some(TaskRejectReason::TaskRejectNotLeader | TaskRejectReason::TaskRejectNotReady) => true,
+                Some(reason) if refused_for_now(reason) => true,
                 Some(TaskRejectReason::TaskRejectUnknownRun | TaskRejectReason::TaskRejectNotAuthoritative) => {
                     if matches!(request, task_request::Request::Started(_)) {
                         self.cancel(&run);
@@ -675,14 +675,6 @@ pub(crate) fn granted(response: &ClaimResponse) -> Vec<Claim> {
     match &response.result {
         Some(claim_response::Result::Batch(batch)) => batch.claims.clone(),
         _ => Vec::new(),
-    }
-}
-
-/// The reason `response` refuses its report, if it does.
-fn rejection(response: &TaskResponse) -> Option<TaskRejectReason> {
-    match &response.result {
-        Some(task_response::Result::Reject(reject)) => TaskRejectReason::try_from(reject.reason).ok(),
-        _ => None,
     }
 }
 
