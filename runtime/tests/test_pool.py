@@ -397,13 +397,14 @@ def test_a_compaction_handed_over_by_a_shard_ends_as_the_leader_says(markers, en
                     while not any(event[:2] == ("fail", run_id) for event in runtime.events):
                         await asyncio.sleep(0.01)
                 else:
-                    runtime.inject_cancel("", run_id)
+                    runtime.inject_cancel(compactions[0].task_id, run_id)
                     await asyncio.sleep(0.1)
                     (markers / "release merge").touch()
                     while not (markers / "merged").exists():
                         await asyncio.sleep(0.01)
-                    # Time for what the fold sent back to reach the session.
-                    await asyncio.sleep(0.3)
+                    # What the fold sent back has reached the session once the
+                    # run it was part of has finished.
+                    await session.wait_until_running_finish()
                 return time.monotonic() - since, [event for event in runtime.events if event[1] == run_id]
         finally:
             if serving is not None:

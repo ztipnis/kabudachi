@@ -1,7 +1,9 @@
-//! A worker started through its entry point that leads asks its own driver,
-//! through its own `Net`, as any worker asks its leader: its own scheduler
-//! decides, held to the memory limits the worker's config gives; once that
-//! driver stops, what it asks itself is heard unanswered.
+//! A worker started through its entry point routes its requests to the leader
+//! its node names, which, while it leads alone, is its own driver: a routed
+//! request waits for a leader, is asked again while refused for now, and gets
+//! the scheduler's decision, held to the memory limits the worker's config
+//! gives. Once the worker has left its shard, a routed request ends
+//! unanswered and what it asks itself is heard unanswered.
 
 use std::time::Duration as StdDuration;
 
@@ -17,7 +19,7 @@ use crate::support::records::plain_with;
 use crate::support::worker::{spawn_worker, worker_config};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_request_routed_to_the_leader_waits_for_one_is_asked_again_until_decided_and_ends_once_the_worker_leaves() {
+async fn a_request_routed_to_the_leader_gets_its_decision_and_ends_once_the_worker_leaves() {
     within_deadline(async {
         let timings = ElectionTimings::new(Duration::from_millis(2_000), Duration::from_millis(100))
             .with_roll_call_deadline(Duration::from_millis(100));

@@ -8,10 +8,9 @@
 //! caller names. [`Net::submit_to_leader`] and [`Net::cancel_at_leader`]
 //! instead find the leader themselves, the one the worker's node names, and
 //! ask again until a leader decides, as the executor's reports are asked
-//! again (see `crate::executor`). A call addressed
-//! to this worker itself, while it leads, is answered by its own driver the
-//! same way. The calls about a
-//! run also keep this worker's
+//! again (see `crate::executor`). A call addressed to this worker itself,
+//! while it leads, is answered by its own driver the same way. The calls
+//! about a run also keep this worker's
 //! [`ClaimedRuns`](crate::claimed_runs::ClaimedRuns) ledger, from the answers
 //! they get.
 //!
@@ -428,8 +427,10 @@ impl Net {
     /// `submitted`, so the task id holds. `None` once the worker has left
     /// its shard (see [`Self::has_left_shard`]): no leader will answer.
     ///
-    /// Only a worker driven by [`crate::worker::Worker::run`] names a leader
-    /// here, and leaves its shard when that ends however it does.
+    /// Any driver (`run_driver` included) names a leader here, but only
+    /// [`crate::worker::Worker::run`] marks the worker out of its shard when
+    /// it ends, however it does. A `Net` driven by `run_driver` alone waits
+    /// for ever in this call and `cancel_at_leader` once its driver stops.
     pub async fn submit_to_leader(&self, submitted: Submitted, retry: LeaderRetry) -> Option<TaskResponse> {
         self.ask_until_decided(task_request::Request::Submit(wire::submit_task(&submitted)), retry)
             .await

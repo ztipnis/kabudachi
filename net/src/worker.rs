@@ -279,8 +279,9 @@ impl Worker {
     /// Bootstraps this worker into its shard, then drives its node for good.
     /// `observe` is called after every step the driver carries out (see
     /// `run_driver`), and is dropped only once the worker shows out of its
-    /// shard (see `Net::has_left_shard`). Stop the worker by dropping the returned future; a
-    /// worker stopped this way is gone, and a new one must be started.
+    /// shard (see `Net::has_left_shard`). Stop the worker by dropping the
+    /// returned future; a worker stopped this way is gone, and a new one must
+    /// be started.
     ///
     /// A worker asked to drain (see `Net::request_drain`) leaves its shard,
     /// hands the records it holds to the voters its leader chooses, and then
