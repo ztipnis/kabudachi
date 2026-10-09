@@ -160,7 +160,8 @@ pub struct WorkSource {
 
 /// The half of an [`ExecutorHandle`] that reports to the driver; cheap to
 /// clone, for an executor that reports from more than one place. The driver
-/// hears the executor is gone once every clone is dropped.
+/// hears the executor is gone once every clone is dropped, or once the
+/// [`WorkSource`] is dropped; from then on a report fails with [`DriverGone`].
 #[derive(Clone)]
 pub struct ReportSink {
     reports: mpsc::UnboundedSender<Report>,
@@ -495,6 +496,9 @@ impl<'n> Executing<'n> {
         }
         if self.endpoint.work.is_closed() {
             self.endpoint.held.gone = true;
+            // Nothing reads reports any more: a report sent now fails with
+            // `DriverGone` rather than vanishing.
+            self.endpoint.reports.close();
         }
     }
 

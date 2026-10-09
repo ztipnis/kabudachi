@@ -342,7 +342,7 @@ impl Worker {
         let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         scheduler.set_result_ttl(retention_of(&config));
         scheduler.set_memory_limits(config.memory_limits);
-        run_driver(
+        let stopped = run_driver(
             &mut node,
             first,
             &net,
@@ -359,6 +359,10 @@ impl Worker {
             },
             observe,
         )
-        .await
+        .await;
+        // No driver answers this worker's own requests any more: tell each
+        // asker so, now and from here on.
+        net.inbound.close_own_tasks();
+        stopped
     }
 }

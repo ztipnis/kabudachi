@@ -427,7 +427,9 @@ pub(crate) struct Inbound {
     tasks: Mutex<VecDeque<Asked<TaskCodec>>>,
     reconciles: Mutex<VecDeque<Asked<ReconcileCodec>>>,
     steals: Mutex<VecDeque<Asked<StealCodec>>>,
-    own_tasks: Mutex<VecDeque<OwnTask>>,
+    /// `None` once the driver has stopped: nothing will answer a request
+    /// made then, so it is dropped (and its asker told) at once.
+    own_tasks: Mutex<Option<VecDeque<OwnTask>>>,
     writes: Mutex<VecDeque<WriteOutcome>>,
     arrived: Notify,
 }
@@ -442,7 +444,7 @@ impl Default for Inbound {
             tasks: Mutex::default(),
             reconciles: Mutex::default(),
             steals: Mutex::default(),
-            own_tasks: Mutex::default(),
+            own_tasks: Mutex::new(Some(VecDeque::new())),
             writes: Mutex::default(),
             arrived: Notify::new(),
         }
@@ -506,13 +508,38 @@ impl Inbound {
         self.arrived.notify_one();
     }
 
-    /// Queues a task-exchange request this worker made of itself.
+    /// Queues a task-exchange request this worker made of itself. Once the
+    /// own-task queue is closed the request is dropped, which its asker hears
+    /// as unanswered.
     pub(crate) fn queue_own_task(&self, task: OwnTask) {
-        self.queue_asked(&self.own_tasks, task);
+        let mut own_tasks = self.own_tasks.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(queue) = own_tasks.as_mut() else {
+            return;
+        };
+        queue.push_back(task);
+        drop(own_tasks);
+        self.arrived.notify_one();
     }
 
     pub(crate) fn take_own_tasks(&self) -> Vec<OwnTask> {
-        drain(&self.own_tasks)
+        self.own_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .map(|queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Closes the own-task queue for good, once no driver will answer it:
+    /// each request queued and each made later is dropped, so its asker hears
+    /// it unanswered instead of waiting forever.
+    pub(crate) fn close_own_tasks(&self) {
+        let queued = self
+            .own_tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(queued);
     }
 }
 
