@@ -87,7 +87,6 @@ class _HeldHere:
     cancel_grace: timedelta
     abort: list[asyncio.TimerHandle] = field(default_factory=list)
     aborted: bool = False
-    cancelled: bool = False
 
 
 @dataclass
@@ -363,7 +362,6 @@ class Session:
             self._abort_at(run_id, early.deadline - asyncio.get_running_loop().time())
 
     def _cancel_held(self, here: _HeldHere, run_id: str) -> None:
-        here.cancelled = True
         if here.run is not None:
             here.run.cancel_by_leader()
         self._executor.cancel(run_id)
