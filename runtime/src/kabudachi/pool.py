@@ -23,9 +23,10 @@ from typing import Any
 from kabudachi import _child, ipc
 from kabudachi.body import RunningBody
 from kabudachi.config import Settings
-from kabudachi.errors import StartupError, TaskBodyError, TaskDefinitionError
+from kabudachi.errors import StartupError, TaskDefinitionError, body_error
 from kabudachi.execution import CompactJob, NestedCalls, RunJob, TaskProcessLost
 from kabudachi.handle import TaskHandle
+from kabudachi.lifecycle import HookRegistry
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskRegistry
 
@@ -44,28 +45,32 @@ _FIRST_RESPAWN_DELAY_SECONDS = 0.1
 _MAX_RESPAWN_DELAY_SECONDS = 10.0
 
 
-def task_modules(registry: TaskRegistry, imports: tuple[str, ...] | None) -> tuple[str, ...]:
-    """The modules a task process imports to find every task: `imports` if
-    given, else every module that declared one here.
+def task_modules(
+    registry: TaskRegistry, hooks: HookRegistry, imports: tuple[str, ...] | None
+) -> tuple[str, ...]:
+    """The modules a task process imports to find every task and lifecycle
+    hook: `imports` if given, else every module that declared one here.
 
-    Raises `TaskDefinitionError` naming every task declared in the script
-    being run, which a task process cannot import, whether or not `imports`
-    is given.
+    Raises `TaskDefinitionError` naming every task or hook declared in the
+    script being run, which a task process cannot import, whether or not
+    `imports` is given.
     """
     unreachable = [
         definition.name
         for definition in registry.definitions()
         if definition.module in ("", "__main__")
-    ]
+    ] + [hook.described for hook in hooks.all() if hook.module in ("", "__main__")]
     if unreachable:
         raise TaskDefinitionError(
-            "tasks declared in the script being run cannot run in task processes, "
+            "tasks and hooks declared in the script being run cannot run in task processes, "
             f"which cannot import it: {', '.join(unreachable)}; declare them in a module, "
             "or set processes=0 to run task bodies in this process"
         )
     if imports is not None:
         return imports
-    return tuple(dict.fromkeys(definition.module for definition in registry.definitions()))
+    modules = [definition.module for definition in registry.definitions()]
+    modules += [hook.module for hook in hooks.all()]
+    return tuple(dict.fromkeys(modules))
 
 
 @dataclass(eq=False)
@@ -90,6 +95,8 @@ class _Child:
     ) -> None:
         self.number = number
         self.process = process
+        # Runs sent to it, compactions not counted.
+        self.runs = 0
         self.connection = connection
         self.slots: dict[str, _Slot] = {}
         # Tasks bodies here called, until their outcome is sent here.
@@ -126,13 +133,21 @@ class _Child:
 class ProcessPool:
     """`processes` task processes with `concurrency` places each."""
 
-    def __init__(self, settings: Settings, modules: tuple[str, ...], registry: TaskRegistry) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        modules: tuple[str, ...],
+        registry: TaskRegistry,
+        hooks: HookRegistry,
+    ) -> None:
         self._settings = settings
         self._modules = modules
         self._registry = registry
+        self._hooks = hooks
         self._context = multiprocessing.get_context("spawn")
         self._loop: asyncio.AbstractEventLoop | None = None
-        # The children counted against `processes`; condemned ones are not.
+        # The children counted against `processes`, draining ones included;
+        # condemned ones are not.
         self._children: list[_Child] = []
         self._condemned: set[_Child] = set()
         self._slots: dict[str, _Slot] = {}
@@ -282,15 +297,7 @@ class ProcessPool:
             slot.outcome.cancel()  # never sent: nothing runs, nothing to stop
             return
         slot.abandoned = True
-        child = slot.child
-        if not child.condemned:
-            child.condemned = True
-            if child in self._children:
-                self._children.remove(child)
-            self._condemned.add(child)
-            if self._serving:
-                self._replace(None)
-        self._end_if_condemned(child)
+        self._condemn(slot.child)
 
     def _hand_over(self, job: RunJob | CompactJob) -> _Slot:
         loop = self._started_loop()
@@ -318,6 +325,20 @@ class ProcessPool:
             slot.child = child
             child.slots[slot.job.run_id] = slot
             child.send(_frame_for(slot.job))
+            if isinstance(slot.job, RunJob):
+                child.runs += 1
+                if self._recycles_after(child, slot.job):
+                    self._retire(child)
+
+    def _recycles_after(self, child: _Child, job: RunJob) -> bool:
+        """Whether `child` takes no run after `job`: it has reached
+        `max_runs_per_process`, or `job`'s task asks for a fresh process
+        after each run."""
+        limit = self._settings.max_runs_per_process
+        if limit is not None and child.runs >= limit:
+            return True
+        definition = self._registry.get(job.definition_id)
+        return definition is not None and definition.recycle_process
 
     def _least_busy(self) -> _Child | None:
         open_children = [
@@ -448,12 +469,15 @@ class ProcessPool:
                 problems.append(
                     f"{definition.name}'s serializer {definition.serializer!r} is not registered"
                 )
+        for described in (hook.described for hook in self._hooks.all()):
+            if described not in ready.hooks:
+                problems.append(f"{described} is missing")
         if problems:
             raise StartupError(
-                "a task process does not have the tasks this process has ("
+                "a task process does not have the tasks and hooks this process has ("
                 + "; ".join(problems)
-                + "); declare every task, and register its serializer, in a module the task "
-                "processes import, or list those modules in `imports`"
+                + "); declare every task and hook, and register every serializer, in a module the "
+                "task processes import, or list those modules in `imports`"
             )
         child.ready = True
         child.ready_at = time.monotonic()
@@ -496,6 +520,10 @@ class ProcessPool:
                     slot.waiting = isinstance(frame, ipc.Waiting)
                     self._wake()
                     self._dispatch()
+            case ipc.Recycle():
+                self._retire(child)
+            case ipc.Condemn():
+                self._condemn(child)
             case ipc.Submit():
                 self._submit_for(child, frame)
             case ipc.CancelTask():
@@ -536,6 +564,36 @@ class ProcessPool:
                 child.send(ipc.outcome_of(handle.task_id, outcome))
 
         handle._outcome.add_done_callback(settled)
+
+    def _retire(self, child: _Child) -> None:
+        """`child` takes no new runs, finishes the ones it has and exits on
+        its own; nothing it runs is cut short. It still counts against
+        `processes` until it has drained and exited, and its replacement
+        starts then, so long runs never raise the number of processes."""
+        if child.condemned or child.draining:
+            return
+        child.draining = True
+        child.send(ipc.Drain())
+
+    def _condemn(self, child: _Child) -> None:
+        """`child` takes no new runs, and is stopped (SIGTERM, then SIGKILL)
+        once every body on it has exited or been given up on; its other runs
+        are never killed for it. A replacement starts at once."""
+        if not child.condemned:
+            child.condemned = True
+            self._set_aside(child)
+        self._end_if_condemned(child)
+
+    def _set_aside(self, child: _Child) -> None:
+        """Moves `child` out of the processes counted against `processes`,
+        into the condemned, and starts its replacement at once if it was
+        counted. The replacement starts without the wait after a quick death:
+        the child did not die."""
+        self._condemned.add(child)
+        if child in self._children:
+            self._children.remove(child)
+            if self._serving:
+                self._replace(None)
 
     def _end_if_condemned(self, child: _Child) -> None:
         if child.condemned and all(slot.abandoned for slot in child.slots.values()):
@@ -584,15 +642,16 @@ class ProcessPool:
         self._condemned.discard(child)
         _set_done(child.buried)
         if replace:
-            self._replace(child)
+            self._replace(child, drained=child.draining and code == 0)
         self._dispatch()
 
-    def _replace(self, dead: _Child | None) -> None:
-        """Starts a child in place of `dead`, or of a condemned child (`None`)
-        at once. After a child that died quickly the start waits, longer for
-        each quick death in a row."""
+    def _replace(self, dead: _Child | None, *, drained: bool = False) -> None:
+        """Starts a child in place of `dead`, or of a child set aside (`None`)
+        at once. A child that `drained`, exiting cleanly as asked, is replaced
+        at once too; one that died while draining did not. After a child that
+        died quickly the start waits, longer for each quick death in a row."""
         delay = 0.0
-        if dead is not None:
+        if dead is not None and not drained:
             lived = time.monotonic() - dead.ready_at if dead.ready else 0.0
             self._quick_deaths = self._quick_deaths + 1 if lived < _STABLE_SECONDS else 0
             delay = self._respawn_delay()
@@ -633,13 +692,13 @@ class ProcessPool:
 
 def _raisable(frame: ipc.Failed) -> BaseException:
     """The error a failed body raised, with the child's traceback as a note.
-    One that is not an `Exception` (a body raising `CancelledError` though
-    nobody asked it to stop) would end whoever awaits the outcome instead of
-    failing the run, so it arrives as a `TaskBodyError` of its kind."""
+    One that is not an `Exception` (a task's merge or serializer raising
+    `CancelledError` though nobody asked the run to stop) would end whoever
+    awaits the outcome instead of failing the run, so it arrives as a
+    `TaskBodyError` of its kind."""
     error = frame.error
     if not isinstance(error, Exception):
-        kind = type(error).__name__
-        error = TaskBodyError(f"{kind}: {error}" if str(error) else kind, kind)
+        error = body_error(error)
     error.add_note(f"raised in a task process:\n{frame.traceback}")
     return error
 
@@ -647,7 +706,15 @@ def _raisable(frame: ipc.Failed) -> BaseException:
 def _frame_for(job: RunJob | CompactJob) -> ipc.Run | ipc.Compact:
     if isinstance(job, CompactJob):
         return ipc.Compact(job.run_id, job.definition_id, job.payloads)
-    return ipc.Run(job.run_id, job.definition_id, job.source_version, job.serialized_input, job.chain)
+    return ipc.Run(
+        job.run_id,
+        job.definition_id,
+        job.source_version,
+        job.serialized_input,
+        job.chain,
+        job.queue,
+        job.attempt,
+    )
 
 
 def _set_done(future: "asyncio.Future[None]") -> None:

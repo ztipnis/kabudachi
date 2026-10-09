@@ -8,11 +8,16 @@ place. The worker decides how many run at once; this process runs what it is
 sent. A task, flow or group a body calls is submitted by the worker, which
 answers at once and later sends its outcome; while a body waits for one, the
 worker counts its place free.
+
+It runs its `process_init` hooks before it says it is ready, and every body
+between its run hooks.
 """
 
 import asyncio
 import concurrent.futures
 import contextvars
+import dataclasses
+import functools
 import importlib
 import itertools
 import os
@@ -28,8 +33,10 @@ from typing import Any
 from kabudachi import ipc
 from kabudachi.body import fold_compaction, run_serialized
 from kabudachi.config import Settings
+from kabudachi.errors import StartupError
 from kabudachi.handle import TaskHandle, current_body, run_callback_inline
 from kabudachi.hosted_work import LoopHostedWork
+from kabudachi.lifecycle import RunContext, default_hooks, hooks_for_run, initialize_process
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
@@ -83,6 +90,7 @@ def _import(process: "_TaskProcess", modules: tuple[str, ...]) -> ipc.Ready:
     return ipc.Ready(
         {definition.name: definition.version for definition in default_registry().definitions()},
         tuple(process_serializers().names()),
+        hooks=tuple(hook.described for hook in default_hooks().all()),
     )
 
 
@@ -93,6 +101,7 @@ class _TaskProcess:
         self._connection = connection
         self._send_lock = threading.Lock()
         self._registry = default_registry()
+        self._hooks = default_hooks()
         self.serializers = process_serializers()
         self._threads = ThreadPoolExecutor(
             max_workers=settings.concurrency, thread_name_prefix="kabudachi-task"
@@ -141,6 +150,13 @@ class _TaskProcess:
             for frame in self._early:
                 loop.call_soon(self._received, frame)
             self._early.clear()
+        try:
+            await initialize_process(self._hooks)
+        except StartupError as error:
+            # Nothing here may run until the process is prepared; the worker
+            # gives up on, or replaces, a process that cannot be.
+            self.send(dataclasses.replace(ready, error=f"could not initialize: {error}"))
+            return
         self.send(ready)
         await self._finished.wait()
 
@@ -250,6 +266,13 @@ class _TaskProcess:
         # A body that waits for a task it called gives its place back meanwhile.
         context = contextvars.copy_context()
         context.run(current_body.set, _BodyWaits(self, frame.run_id))
+        hooks = hooks_for_run(
+            self._hooks,
+            RunContext(frame.definition_id, frame.run_id, frame.attempt),
+            frame.queue,
+            recycle=functools.partial(self.send, ipc.Recycle()),
+            condemn=functools.partial(self.send, ipc.Condemn()),
+        )
         body = context.run(
             run_serialized,
             self._registry,
@@ -259,6 +282,7 @@ class _TaskProcess:
             frame.source_version,
             frame.chain,
             frame.serialized_input,
+            hooks,
         )
         self._track(frame.run_id, body.outcome, body.exited, self._report_result)
 
@@ -320,7 +344,8 @@ class _TaskProcess:
 
     def _report_cancelled(self, run_id: str, asked: bool) -> None:
         """A cancelled run is silent when the worker asked for it, and has
-        stopped waiting for it; a body that raised CancelledError itself failed."""
+        stopped waiting for it. One nobody asked to stop failed: its task's
+        merge or serializer raised CancelledError itself."""
         if not asked:
             self.send(ipc.failed(run_id, asyncio.CancelledError()))
 

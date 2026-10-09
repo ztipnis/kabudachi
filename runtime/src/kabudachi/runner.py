@@ -16,6 +16,7 @@ from typing import TypeVar, overload
 from kabudachi import _native
 from kabudachi.config import Configuration, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
+from kabudachi.lifecycle import default_hooks
 from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
@@ -96,12 +97,13 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
 
 def _executor_for(configuration: Configuration) -> Executor:
     """Task processes as configured, or this process with `processes=0`.
-    Raises `TaskDefinitionError` for a task task processes could not import."""
+    Raises `TaskDefinitionError` for a task or hook task processes could not import."""
     settings = configuration.settings()
     registry = default_registry()
+    hooks = default_hooks()
     if settings.processes == 0:
-        return InProcessExecutor(registry, process_serializers(), settings.concurrency)
-    return ProcessPool(settings, task_modules(registry, settings.imports), registry)
+        return InProcessExecutor(registry, process_serializers(), settings.concurrency, hooks)
+    return ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
 
 
 async def _cancel(task: "asyncio.Future[object] | None") -> None:

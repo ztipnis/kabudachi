@@ -15,9 +15,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import kabudachi
 import proto_messages
 from kabudachi import ephemeral_task, task
 from kabudachi import config as config_module
+from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi.config import UNSET, Configuration
 from kabudachi.errors import (
@@ -27,6 +29,7 @@ from kabudachi.errors import (
     TaskDefinitionError,
 )
 from kabudachi.handle import TaskHandle
+from kabudachi.lifecycle import HookRegistry
 from kabudachi.options import SubmissionOptions, submission_options
 from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
@@ -188,6 +191,7 @@ BAD_OPTIONS = (
     + [("retries", bad, "retries") for bad in [-1, True, 1.5, "2", None]]
     + [("timeout", bad, "timeout") for bad in [timedelta(0), timedelta(seconds=-1), 5, "5s", True]]
     + [("cancel_grace", bad, "cancel_grace") for bad in [timedelta(seconds=-1), 5, "5s", None, True]]
+    + [("recycle_process", bad, "recycle_process") for bad in ["yes", 1, None]]
 )
 
 
@@ -686,6 +690,8 @@ def test_an_unknown_setting_is_refused():
         ({"concurrency": 33}, "concurrency_override"),
         ({"imports": "app.tasks"}, "imports"),
         ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
+        ({"max_runs_per_process": 0}, "max_runs_per_process"),
+        ({"max_runs_per_process": True}, "max_runs_per_process"),
     ],
 )
 def test_an_invalid_value_is_refused_and_changes_nothing(settings, refused):
@@ -800,15 +806,22 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_CONCURRENCY_OVERRIDE", "true")
     monkeypatch.setenv("KABUDACHI_IMPORTS", "app.tasks, app.more_tasks")
     monkeypatch.setenv("KABUDACHI_PROCESS_START_TIMEOUT", "2.5")
+    monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "50")
     configuration = Configuration()
 
-    assert [
-        configuration.resolve(name)
-        for name in ("processes", "concurrency", "imports", "process_start_timeout")
-    ] == [2, 40, ("app.tasks", "app.more_tasks"), timedelta(seconds=2.5)]
+    names = ("processes", "concurrency", "imports", "process_start_timeout", "max_runs_per_process")
+    assert [configuration.resolve(name) for name in names] == [
+        2,
+        40,
+        ("app.tasks", "app.more_tasks"),
+        timedelta(seconds=2.5),
+        50,
+    ]
 
     monkeypatch.setenv("KABUDACHI_IMPORTS", "")
     assert Configuration().resolve("imports") is None
+    monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "")
+    assert Configuration().resolve("max_runs_per_process") is None
 
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(
@@ -945,3 +958,52 @@ def test_cancelling_a_flow_after_a_stage_that_failed_does_not_claim_to_have_canc
     # has a stage still to start, which the cancel stops.
     assert flow_after_failure.cancel() is False
     assert flow_after_success.cancel() is True
+
+
+@pytest.mark.parametrize(
+    ("declare_hook", "match"),
+    [
+        pytest.param(lambda: kabudachi.process_init(42), "callable", id="not callable"),
+        pytest.param(
+            lambda: kabudachi.before_run(lambda: None),
+            r"must take \(context\)",
+            id="before_run without the context",
+        ),
+        pytest.param(
+            lambda: kabudachi.after_run(lambda context: None),
+            r"must take \(context, outcome\)",
+            id="after_run without the outcome",
+        ),
+        pytest.param(
+            lambda: kabudachi.before_run(queues="gpu")(lambda context: None),
+            "queues",
+            id="one queue as a string",
+        ),
+        pytest.param(
+            lambda: kabudachi.after_run(queues=[" "])(lambda context, outcome: None),
+            "queues",
+            id="blank queue",
+        ),
+    ],
+)
+def test_a_lifecycle_hook_that_could_never_be_called_is_refused_where_declared(
+    monkeypatch, declare_hook, match
+):
+    monkeypatch.setattr(lifecycle_module, "_default_hooks", HookRegistry())
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        declare_hook()
+
+    assert lifecycle_module.default_hooks().all() == ()
+
+
+def test_a_second_hook_with_the_same_name_is_refused_with_how_to_tell_them_apart(monkeypatch):
+    monkeypatch.setattr(lifecycle_module, "_default_hooks", HookRegistry())
+    # Two lambdas in one scope share a qualified name.
+    first, second = (lambda context: None), (lambda context: None)
+    kabudachi.before_run(first)
+
+    with pytest.raises(ValueError, match="already declared.*its own named function"):
+        kabudachi.before_run(second)
+
+    assert [hook.func for hook in lifecycle_module.default_hooks().all()] == [first]

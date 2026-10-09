@@ -19,6 +19,7 @@ from kabudachi.body import RunningBody, fold_compaction, run_serialized
 from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.errors import TaskTimeoutError
 from kabudachi.handle import TaskHandle, current_body
+from kabudachi.lifecycle import HookRegistry, RunContext, hooks_for_run, initialize_process
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import SerializerRegistry
@@ -38,6 +39,10 @@ class RunJob:
     serialized_input: bytes
     chain: tuple[bytes, ...]
     """Payloads of the generations it superseded, folded in first, oldest first."""
+    queue: str
+    """The queue the task was sent to, which picks the run hooks."""
+    attempt: int
+    """1 for the task's first run, then one more for each retry."""
     cancel_grace: timedelta
     """How long its body has to stop once asked."""
     after: "asyncio.Future[None] | None" = None
@@ -110,10 +115,15 @@ class InProcessExecutor:
     finish on its own, and keeps its place until it does."""
 
     def __init__(
-        self, registry: TaskRegistry, serializers: SerializerRegistry, concurrency: int
+        self,
+        registry: TaskRegistry,
+        serializers: SerializerRegistry,
+        concurrency: int,
+        hooks: HookRegistry,
     ) -> None:
         self._registry = registry
         self._serializers = serializers
+        self._hooks = hooks
         self._places = ConcurrencyPlaces(concurrency)
         # As many threads as places, or synchronous bodies would queue behind
         # the event loop's small default pool.
@@ -136,7 +146,9 @@ class InProcessExecutor:
         self._places.wake()
 
     async def start(self) -> None:
-        """Nothing to start: bodies run on the caller's loop."""
+        """Runs the `process_init` hooks here, where the bodies run. Raises
+        `StartupError` if one raises."""
+        await initialize_process(self._hooks)
 
     def accept_nested_calls(self, calls: NestedCalls) -> None:
         """Bodies here call the session directly."""
@@ -145,6 +157,13 @@ class InProcessExecutor:
         # A body that waits for a task it called gives its place back meanwhile.
         context = contextvars.copy_context()
         context.run(current_body.set, self._places.watch_body())
+        hooks = hooks_for_run(
+            self._hooks,
+            RunContext(job.definition_id, job.run_id, job.attempt),
+            job.queue,
+            recycle=_no_process_to_replace,
+            condemn=_no_process_to_replace,
+        )
         body = context.run(
             run_serialized,
             self._registry,
@@ -154,6 +173,7 @@ class InProcessExecutor:
             job.source_version,
             job.chain,
             job.serialized_input,
+            hooks,
             job.after,
         )
         self._hold(job.run_id, body)
@@ -189,6 +209,13 @@ class InProcessExecutor:
 
     async def stop(self, *, kill: bool) -> None:
         self._threads.shutdown(wait=False, cancel_futures=True)
+
+
+def _no_process_to_replace() -> None:
+    """Bodies here run in the worker itself, which is never replaced: a
+    failed hook is only logged, and a body that raised `SystemExit`, or a
+    `KeyboardInterrupt` that cannot be a Ctrl-C (one raised off the main
+    thread), only fails its run."""
 
 
 async def run_within(

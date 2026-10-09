@@ -16,6 +16,7 @@ import kabudachi
 import pool_tasks
 from kabudachi import config as config_module
 from kabudachi import ipc
+from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi.config import Configuration
 from kabudachi.errors import (
@@ -26,18 +27,23 @@ from kabudachi.errors import (
     TaskLostError,
     TaskTimeoutError,
 )
+from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting
 
 
 @pytest.fixture(autouse=True)
 def markers(monkeypatch, tmp_path):
-    """Fresh settings, the pool tasks alone in the registry, and a directory
-    the test shares with its task processes."""
+    """Fresh settings, the pool tasks and hooks alone in their registries,
+    and a directory the test shares with its task processes."""
     registry = TaskRegistry()
     for definition in registry_module.default_registry().definitions():
         registry.register(definition)
     monkeypatch.setattr(registry_module, "_default_registry", registry)
+    hooks = HookRegistry()
+    for hook in lifecycle_module.default_hooks().all():
+        hooks.register(hook)
+    monkeypatch.setattr(lifecycle_module, "_default_hooks", hooks)
     monkeypatch.setattr(config_module, "_process_configuration", Configuration())
     monkeypatch.setenv(pool_tasks.MARKERS, str(tmp_path))
     return tmp_path
@@ -73,28 +79,43 @@ def test_bodies_run_in_task_processes_spread_over_the_pool_and_send_back_results
         large = await pool_tasks.sized(Greeting(times=4 * 1024 * 1024))
         with pytest.raises(ValueError, match="refused this"):
             await pool_tasks.refuses(Greeting(text="this"))
-        # Not a cancel anyone asked for, so the run fails like any other error.
-        with pytest.raises(TaskBodyError, match="CancelledError") as raised:
-            await pool_tasks.cancels_itself(Greeting())
-        return first.times, second.times, len(large.text), raised.value.kind
+        return first.times, second.times, len(large.text)
 
-    first, second, size, kind = kabudachi.run(main)
+    first, second, size = kabudachi.run(main)
 
     assert os.getpid() not in (first, second)
     assert first != second, "with one place per process, the second body went to the other one"
     assert size == 4 * 1024 * 1024
-    assert kind == "CancelledError"
 
 
-def test_a_task_declared_in_the_script_being_run_is_refused_before_anything_starts():
+def declare_in_script_a_task():
     def scripted(request: Greeting) -> Greeting:
         return request
 
     scripted.__module__ = "__main__"
     kabudachi.task(name="tests.scripted")(scripted)
+
+
+def declare_in_script_a_hook():
+    def scripted_hook(context):
+        pass
+
+    scripted_hook.__module__ = "__main__"
+    kabudachi.before_run(scripted_hook)
+
+
+@pytest.mark.parametrize(
+    "declare, named",
+    [(declare_in_script_a_task, "tests.scripted"), (declare_in_script_a_hook, "scripted_hook")],
+    ids=["task", "hook"],
+)
+def test_a_task_or_hook_declared_in_the_script_being_run_is_refused_before_anything_starts(
+    declare, named
+):
+    declare()
     kabudachi.configure(processes=1)
 
-    with pytest.raises(TaskDefinitionError, match="tests.scripted"):
+    with pytest.raises(TaskDefinitionError, match=named):
         kabudachi.run(nothing)
 
 
@@ -102,6 +123,14 @@ def declare_only_here():
     @kabudachi.task(name="tests.only_here")
     def only_here(request: Greeting) -> Greeting:
         return request
+
+
+def declare_hook_only_here():
+    kabudachi.configure(imports=["pool_tasks"])
+
+    @kabudachi.before_run
+    def noted(context):
+        pass
 
 
 @pytest.mark.parametrize(
@@ -120,8 +149,19 @@ def declare_only_here():
             ),
             r"kabudachi-task-0 was not ready within 3 s while importing pool_slow_import",
         ),
+        (declare_hook_only_here, "before_run hook test_pool.declare_hook_only_here.<locals>.noted is missing"),
+        (
+            lambda: pool_tasks.marker("process-init-fails").touch(),
+            "process_init hook pool_tasks.open_resources raised RuntimeError: resources unavailable",
+        ),
     ],
-    ids=["module_fails_to_import", "task_only_in_the_worker", "import_never_finishes"],
+    ids=[
+        "module_fails_to_import",
+        "task_only_in_the_worker",
+        "import_never_finishes",
+        "hook_only_in_the_worker",
+        "process_init_raises",
+    ],
 )
 def test_task_processes_that_cannot_find_every_task_stop_the_start_with_the_reason(arrange, reason):
     kabudachi.configure(processes=1)
@@ -241,3 +281,110 @@ def test_a_cancelled_body_stops_when_asked_and_one_that_will_not_costs_its_proce
     # A cancel racing a result in flight: each handle ends once, either way.
     assert all(isinstance(outcome, (Greeting, TaskCancelledError)) for outcome in outcomes), outcomes
     assert replaced != kept, "a body that ignored the cancel past its grace cost its process"
+
+
+def test_a_task_process_is_replaced_after_its_run_limit_and_after_a_recycling_task_once_its_run_finishes():
+    kabudachi.configure(processes=1, concurrency=1, max_runs_per_process=3)
+    most_alive = 0
+
+    async def count_task_processes():
+        nonlocal most_alive
+        while True:
+            most_alive = max(most_alive, len(multiprocessing.active_children()))
+            await asyncio.sleep(0.005)
+
+    async def main():
+        async with asyncio.timeout(30):
+            counting = asyncio.create_task(count_task_processes())
+            pids = [(await pool_tasks.where_async(Greeting())).times for _ in range(4)]
+            pids.append((await pool_tasks.recycles(Greeting())).times)
+            pids.append((await pool_tasks.where_async(Greeting())).times)
+            counting.cancel()
+            return pids
+
+    pids = kabudachi.run(main)
+
+    # The recycling run returning the second process's id shows the drain was
+    # graceful: a killed process would have lost it, and its replay would
+    # have reported the third.
+    first, second, third = pids[0], pids[3], pids[5]
+    assert pids == [first] * 3 + [second] * 2 + [third], pids
+    assert len({first, second, third, os.getpid()}) == 4
+    # A draining process still counts: its replacement starts only once it
+    # has exited, so there was never more than one task process.
+    assert most_alive == 1
+
+
+def test_lifecycle_hooks_prepare_each_run_in_its_task_process_and_a_failed_cleanup_replaces_it(markers):
+    kabudachi.configure(processes=1, concurrency=1)
+
+    async def main():
+        async with asyncio.timeout(30):
+            sync = await pool_tasks.hooked(Greeting())
+            in_loop = await pool_tasks.hooked_async(Greeting())
+            retried = await pool_tasks.refused_once(Greeting())
+            with pytest.raises(LookupError, match="pool.refused is not ready"):
+                await pool_tasks.refused(Greeting())
+            await pool_tasks.where_async(Greeting())  # not on the hooks' queue
+            (markers / "process-init-fails").touch()
+            spoiled = await pool_tasks.hooked(Greeting(text="spoil"))
+            while not (markers / "process-init-failures").exists():
+                await asyncio.sleep(0.05)
+            (markers / "process-init-fails").unlink()
+            after = await pool_tasks.hooked(Greeting())
+            return sync, in_loop, retried, spoiled, after
+
+    sync, in_loop, retried, spoiled, after = kabudachi.run(main)
+
+    assert sync.times != os.getpid()
+    assert (sync.text, in_loop.text) == ("pool.hooked 1 True", "pool.hooked_async 1 True")
+    assert retried.text == "2", "the failing before_run hook failed the first attempt, which was retried"
+    assert (spoiled.text, spoiled.times) == ("spoil", sync.times), "the result stood"
+    assert after.times not in (sync.times, os.getpid()), "the failed cleanup replaced the process"
+    assert after.text == "pool.hooked 1 True", "a later start whose process_init failed was tried again"
+    assert (markers / "hooks.log").read_text().splitlines() == [
+        "before pool.hooked 1",
+        "after pool.hooked 1 Greeting",
+        "before pool.hooked_async 1",
+        "after pool.hooked_async 1 Greeting",
+        "before pool.refused_once 1",
+        "after pool.refused_once 1 LookupError",
+        "before pool.refused_once 2",
+        "after pool.refused_once 2 Greeting",
+        "before pool.refused 1",
+        "after pool.refused 1 LookupError",
+        "before pool.hooked 1",
+        "after pool.hooked 1 Greeting",
+        "before pool.hooked 1",
+        "after pool.hooked 1 Greeting",
+    ]
+
+
+def test_a_body_raising_system_exit_or_keyboard_interrupt_fails_its_run_and_costs_its_process_after_its_neighbour(
+    markers,
+):
+    kabudachi.configure(processes=1, concurrency=4)
+
+    async def main():
+        async with asyncio.timeout(30):
+            neighbour = pool_tasks.steady(Greeting(text="n"))
+            while not (markers / "steady-n").exists():
+                await asyncio.sleep(0.01)
+            outcomes = await asyncio.gather(
+                pool_tasks.leaves(Greeting(text="SystemExit")),
+                # On the loop of a process that ignores SIGINT: no Ctrl-C.
+                pool_tasks.leaves_async(Greeting(text="KeyboardInterrupt")),
+                return_exceptions=True,
+            )
+            finished = (await neighbour).times
+            after = (await pool_tasks.where_async(Greeting())).times
+            return outcomes, finished, after
+
+    outcomes, neighbour, after = kabudachi.run(main)
+
+    assert [(type(outcome), getattr(outcome, "kind", None)) for outcome in outcomes] == [
+        (TaskBodyError, "SystemExit"),
+        (TaskBodyError, "KeyboardInterrupt"),
+    ], outcomes
+    assert neighbour != os.getpid(), "the neighbour finished where it started"
+    assert after not in (neighbour, os.getpid()), "the process was condemned and replaced"

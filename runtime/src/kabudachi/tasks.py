@@ -64,6 +64,10 @@ class Task(wrapt.ObjectProxy):
         drop_oldest: For a coalescing task, whether a submission that would
             pass the hard memory limit drops this key's oldest retained
             payloads to fit, instead of being refused.
+        recycle_process: Whether the task process that runs it is replaced
+            by a fresh one after the run: it takes no new runs, and is
+            replaced once its other runs have finished and it has exited.
+            Ignored with `processes=0`.
         serializers: Where the serializer is looked up to check the task's
             types. Defaults to the registry of this process.
 
@@ -88,6 +92,7 @@ class Task(wrapt.ObjectProxy):
         cancel_grace: timedelta | Unset = UNSET,
         merge: Callable[[Any, Any], Any] | None = None,
         drop_oldest: bool = False,
+        recycle_process: bool = False,
         serializers: SerializerRegistry | None = None,
     ) -> None:
         if not callable(func):
@@ -107,6 +112,10 @@ class Task(wrapt.ObjectProxy):
         self._check_timing(timeout, cancel_grace)
         self._check_merge(merge, kind)
         self._check_drop_oldest(drop_oldest, kind)
+        if not isinstance(recycle_process, bool):
+            raise TaskDefinitionError(
+                f"the task recycle_process must be True or False, not {recycle_process!r}"
+            )
 
         task_name = self._task_name(func, name)
         input_type, output_type = self._read_types(task_name, func)
@@ -126,6 +135,7 @@ class Task(wrapt.ObjectProxy):
             cancel_grace=cancel_grace,
             merge=merge,
             drop_oldest=drop_oldest,
+            recycle_process=recycle_process,
             continues=is_step_type(output_type),
         )
         self._check_serializer_supports(
@@ -381,6 +391,7 @@ def task(
     retries: int = ...,
     timeout: timedelta | None = ...,
     cancel_grace: timedelta | Unset = ...,
+    recycle_process: bool = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def task(
     func: Any = None,
@@ -393,6 +404,7 @@ def task(
     retries: int = 0,
     timeout: timedelta | None = None,
     cancel_grace: timedelta | Unset = UNSET,
+    recycle_process: bool = False,
 ) -> Any:
     """Declares a durable task: work that survives the loss of the worker
     running it. Use it bare (`@task`) or with options (`@task(queue="gpu")`).
@@ -403,10 +415,13 @@ def task(
     because a task is sent to a worker by name.
 
     The options are those of `Task`; `retries` is how many more times a run
-    that raises, or times out, is tried again. `name` defaults to the function's module
-    and name, which must then be defined at package scope. `serializer` must
-    be registered under the same name on every worker; it is checked here if
-    it is already registered, and otherwise before the task first runs.
+    that raises, or times out, is tried again. `recycle_process=True`
+    replaces the task process after each run of this task, once it has
+    drained: its other runs finish and it exits, and only then is the fresh
+    one started. `name` defaults to the function's module and name, which
+    must then be defined at package scope. `serializer` must be registered
+    under the same name on every worker; it is checked here if it is already
+    registered, and otherwise before the task first runs.
 
     Raises `TaskDefinitionError` or `DuplicateTaskError` as `Task` does, and
     `TypeError` if given something other than a function or keyword options.
@@ -419,6 +434,7 @@ def task(
         "retries": retries,
         "timeout": timeout,
         "cancel_grace": cancel_grace,
+        "recycle_process": recycle_process,
     }
     return Task.declare(func, TaskKind.TASK, options)
 
@@ -434,6 +450,7 @@ def ephemeral_task(
     serializer: str = ...,
     timeout: timedelta | None = ...,
     cancel_grace: timedelta | Unset = ...,
+    recycle_process: bool = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def ephemeral_task(
     func: Any = None,
@@ -445,6 +462,7 @@ def ephemeral_task(
     serializer: str = DEFAULT_SERIALIZER,
     timeout: timedelta | None = None,
     cancel_grace: timedelta | Unset = UNSET,
+    recycle_process: bool = False,
 ) -> Any:
     """Declares a best-effort task: it is never replayed after the loss of the
     worker running it, and losing every worker may lose it.
@@ -459,6 +477,7 @@ def ephemeral_task(
         "serializer": serializer,
         "timeout": timeout,
         "cancel_grace": cancel_grace,
+        "recycle_process": recycle_process,
     }
     return Task.declare(func, TaskKind.EPHEMERAL, options)
 
@@ -477,6 +496,7 @@ def coalescing_task(
     cancel_grace: timedelta | Unset = ...,
     merge: Callable[[Any, Any], Any] | None = ...,
     drop_oldest: bool = ...,
+    recycle_process: bool = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def coalescing_task(
     func: Any = None,
@@ -491,6 +511,7 @@ def coalescing_task(
     cancel_grace: timedelta | Unset = UNSET,
     merge: Callable[[Any, Any], Any] | None = None,
     drop_oldest: bool = False,
+    recycle_process: bool = False,
 ) -> Any:
     """Declares continuously replaced work: a newer pending submission with
     the same key supersedes an older one, but never a running one, and only
@@ -521,5 +542,6 @@ def coalescing_task(
         "cancel_grace": cancel_grace,
         "merge": merge,
         "drop_oldest": drop_oldest,
+        "recycle_process": recycle_process,
     }
     return Task.declare(func, TaskKind.COALESCING, options)

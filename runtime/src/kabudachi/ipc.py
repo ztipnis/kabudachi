@@ -33,6 +33,10 @@ class Run:
     source_version: int
     serialized_input: bytes
     chain: tuple[bytes, ...]
+    queue: str
+    """The queue the task was sent to, which picks the run hooks."""
+    attempt: int
+    """1 for the task's first run, then one more for each retry."""
 
 
 @dataclass(frozen=True)
@@ -86,6 +90,8 @@ class Ready:
     definitions: dict[str, int]
     serializers: tuple[str, ...]
     error: str | None = None
+    hooks: tuple[str, ...] = ()
+    """The lifecycle hooks this process found, each as `<kind> hook <name>`."""
 
 
 @dataclass(frozen=True)
@@ -126,6 +132,18 @@ class Waiting:
     """A run's body is waiting for tasks it called, and gives its place back meanwhile."""
 
     run_id: str
+
+
+@dataclass(frozen=True)
+class Condemn:
+    """A body or one of its hooks raised `SystemExit` or `KeyboardInterrupt`: send this
+    process no new runs, and stop it once its other runs have finished."""
+
+
+@dataclass(frozen=True)
+class Recycle:
+    """An `after_run` hook raised, so this process may hold what it failed
+    to clean up: send it no new runs; it exits once its runs finish."""
 
 
 @dataclass(frozen=True)

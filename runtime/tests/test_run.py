@@ -2,7 +2,9 @@
 loop, tasks called from `main` and their results awaited."""
 
 import asyncio
+import concurrent.futures
 import functools
+import logging
 import threading
 import time
 from datetime import timedelta
@@ -11,18 +13,22 @@ import pytest
 
 import kabudachi
 from kabudachi import config as config_module
+from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
 from kabudachi.config import Configuration
-from kabudachi.errors import RuntimeNotStartedError, TaskDefinitionError
+from kabudachi.errors import RuntimeNotStartedError, StartupError, TaskBodyError, TaskDefinitionError
+from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting, Receipt
 
 
 @pytest.fixture(autouse=True)
 def fresh_process_state(monkeypatch):
-    """Each test declares its own tasks and settings, and starts with none left over."""
+    """Each test declares its own tasks, hooks and settings, and starts with
+    none left over."""
     monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
+    monkeypatch.setattr(lifecycle_module, "_default_hooks", HookRegistry())
     # Bodies here share state with the test through closures, which only a
     # body running in this process can see.
     configuration = Configuration()
@@ -583,3 +589,157 @@ def test_a_merge_that_fails_ends_its_compaction_and_fails_the_newest_generation_
     kabudachi.run(main)
 
     assert merge_failed_while_held.is_set(), "the compaction ran the merge while the key was busy"
+
+
+def test_lifecycle_hooks_run_in_this_process_around_the_runs_of_their_queues(caplog):
+    seen = []
+    per_thread = threading.local()
+
+    @kabudachi.process_init
+    async def opened():
+        seen.append("init")
+
+    @kabudachi.before_run(queues=["hooked"])
+    async def started(context):
+        seen.append(f"before {context.task_name} {context.attempt}")
+
+    @kabudachi.before_run(queues=["hooked"])
+    def checked_out(context):
+        per_thread.context = context
+
+    @kabudachi.after_run(queues=["hooked"])
+    def checked_in(context, outcome):
+        seen.append(f"after {context.task_name} {type(outcome).__name__}")
+        raise ValueError("could not return the connection")
+
+    @kabudachi.after_run(queues=["hooked"])
+    async def closed(context, outcome):
+        seen.append(f"closed {context.task_name}")
+
+    def hooked(request: Greeting) -> Greeting:
+        context = per_thread.context  # left by the before_run hook, on this body's thread
+        return Greeting(text=context.run_id, times=context.attempt)
+
+    def plain(request: Greeting) -> Greeting:
+        return request
+
+    hooked = declare(hooked, queue="hooked")
+    plain = declare(plain)
+
+    async def main():
+        return await hooked(Greeting()), await plain(Greeting(text="untouched"))
+
+    with caplog.at_level(logging.WARNING, logger="kabudachi"):
+        hooked_result, plain_result = kabudachi.run(main)
+
+    assert seen == [
+        "init",
+        "before tests.hooked 1",
+        "after tests.hooked Greeting",
+        "closed tests.hooked",
+    ], "the after_run hooks all ran, the second after the first raised"
+    assert hooked_result.times == 1 and hooked_result.text, "the body saw its run's context"
+    assert plain_result.text == "untouched", "hooks of another queue left it alone"
+    assert "ValueError" in caplog.text, "the failed after_run hook was logged; the result stood"
+
+
+def test_a_body_or_hook_that_raises_system_exit_or_keyboard_interrupt_or_cancels_itself_fails_only_its_run_here():
+    leaving = {"SystemExit": SystemExit, "KeyboardInterrupt": KeyboardInterrupt}
+
+    @kabudachi.after_run(queues=["leaving"])
+    def interrupts_cleanup(context, outcome):
+        raise leaving[outcome.text]("leaving")
+
+    def leaves(request: Greeting) -> Greeting:
+        raise leaving[request.text]("leaving")
+
+    async def leaves_async(request: Greeting) -> Greeting:
+        raise SystemExit("leaving")
+
+    async def cancels_itself(request: Greeting) -> Greeting:
+        raise asyncio.CancelledError
+
+    def cleaned_up(request: Greeting) -> Greeting:
+        return request
+
+    async def cleaned_up_async(request: Greeting) -> Greeting:
+        return request
+
+    async def steady(request: Greeting) -> Greeting:
+        await asyncio.sleep(0.2)
+        return Greeting(text="finished")
+
+    leaves, leaves_async, cancels_itself, steady = map(
+        declare, (leaves, leaves_async, cancels_itself, steady)
+    )
+    cleaned_up = declare(cleaned_up, queue="leaving")
+    cleaned_up_async = declare(cleaned_up_async, queue="leaving")
+
+    async def main():
+        async with asyncio.timeout(10):
+            neighbour = steady(Greeting())
+            outcomes = await asyncio.gather(
+                leaves(Greeting(text="SystemExit")),
+                leaves(Greeting(text="KeyboardInterrupt")),
+                leaves_async(Greeting()),
+                cancels_itself(Greeting()),
+                cleaned_up(Greeting(text="KeyboardInterrupt")),
+                cleaned_up_async(Greeting(text="SystemExit")),
+                return_exceptions=True,
+            )
+            return outcomes, (await neighbour).text
+
+    outcomes, neighbour = kabudachi.run(main)
+
+    assert [(type(outcome), getattr(outcome, "kind", None)) for outcome in outcomes] == [
+        (TaskBodyError, "SystemExit"),
+        (TaskBodyError, "KeyboardInterrupt"),
+        (TaskBodyError, "SystemExit"),
+        (TaskBodyError, "CancelledError"),
+        (TaskBodyError, "KeyboardInterrupt"),
+        (TaskBodyError, "SystemExit"),
+    ], outcomes
+    assert neighbour == "finished", "a body beside them ran to its end"
+
+
+def test_off_the_main_thread_what_is_not_an_exception_fails_only_what_raised_it():
+    """No signal reaches a loop off the main thread, so a `KeyboardInterrupt`
+    there is never a Ctrl-C, nor a `CancelledError` nobody asked for a stop:
+    each fails the start or the run that raised it."""
+    raising = [
+        SystemExit("no resources"),
+        KeyboardInterrupt("no resources"),
+        asyncio.CancelledError("no resources"),
+    ]
+
+    @kabudachi.process_init
+    def gives_up():
+        if raising:
+            raise raising.pop(0)
+
+    @declare
+    async def leaves_async(request: Greeting) -> Greeting:
+        raise KeyboardInterrupt("leaving")
+
+    async def main():
+        (outcome,) = await asyncio.gather(leaves_async(Greeting()), return_exceptions=True)
+        return outcome
+
+    def run_three_failed_starts_then_one_run():
+        failed = []
+        for _ in range(3):
+            try:
+                kabudachi.run(main)
+            except StartupError as error:
+                failed.append(str(error))
+        return failed, kabudachi.run(main)
+
+    with concurrent.futures.ThreadPoolExecutor(1) as thread:
+        failed, outcome = thread.submit(run_three_failed_starts_then_one_run).result(timeout=30)
+
+    assert [message.partition("gives_up raised ")[2] for message in failed] == [
+        "SystemExit: no resources",
+        "KeyboardInterrupt: no resources",
+        "CancelledError: no resources",
+    ], failed
+    assert (type(outcome), getattr(outcome, "kind", None)) == (TaskBodyError, "KeyboardInterrupt")

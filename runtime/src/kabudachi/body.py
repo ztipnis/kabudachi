@@ -15,7 +15,8 @@ from typing import Any
 
 from asgiref.sync import sync_to_async
 
-from kabudachi.errors import UnknownTaskError
+from kabudachi.errors import TaskBodyError, UnknownTaskError, body_error, may_be_ctrl_c
+from kabudachi.lifecycle import RunHooks
 from kabudachi.registry import TaskDefinition, TaskRegistry
 from kabudachi.serializers import Serializer, SerializerRegistry
 
@@ -34,9 +35,20 @@ class RunningBody:
     thread has returned, which cancelling `outcome` does not wait for."""
 
 
-def start_body(definition: TaskDefinition, argument: Any, threads: Executor) -> RunningBody:
-    """Starts running `definition` on `argument`, as a task for an async
-    body and in `threads` for a synchronous one."""
+def start_body(
+    definition: TaskDefinition, argument: Any, threads: Executor, hooks: RunHooks
+) -> RunningBody:
+    """Starts running `definition` on `argument` between its run hooks: as a
+    task for an async body, and in `threads` for a synchronous one, whose
+    hooks run in its thread.
+
+    A body or hook that raises `SystemExit` or `KeyboardInterrupt` fails
+    with `TaskBodyError` naming the type, and `hooks.condemn` is called. One
+    that raises `CancelledError` though nobody asked it to stop fails the
+    same way, without `hooks.condemn`. A `KeyboardInterrupt` from an async
+    body or its hooks is let through when the loop runs on the main thread
+    and this process does not ignore SIGINT: there it can be a real Ctrl-C,
+    which stops the whole run."""
     loop = asyncio.get_running_loop()
     exited: asyncio.Future[None] = loop.create_future()
 
@@ -45,14 +57,39 @@ def start_body(definition: TaskDefinition, argument: Any, threads: Executor) -> 
             exited.set_result(None)
 
     if definition.is_async:
-        outcome = loop.create_task(definition.func(argument))
+
+        async def contained() -> Any:
+            try:
+                return await hooks.around_async(lambda: definition.func(argument))
+            except Exception:
+                raise
+            except asyncio.CancelledError as error:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise  # asked to stop
+                raise body_error(error) from error
+            except KeyboardInterrupt as error:
+                if may_be_ctrl_c():
+                    raise  # perhaps Ctrl-C, raised into whatever the loop was running
+                raise _contained(error, hooks) from error
+            except BaseException as error:
+                raise _contained(error, hooks) from error
+
+        outcome = loop.create_task(contained())
         outcome.add_done_callback(lambda _: mark_exited())
     else:
         func = definition.func
 
         def in_thread(value: Any) -> Any:
             try:
-                return func(value)
+                return hooks.around_sync(lambda: func(value))
+            except Exception:
+                raise
+            except asyncio.CancelledError as error:
+                # Nothing can ask a thread to stop, so the body raised it itself.
+                raise body_error(error) from error
+            except BaseException as error:
+                raise _contained(error, hooks) from error
             finally:
                 try:
                     loop.call_soon_threadsafe(mark_exited)
@@ -68,6 +105,15 @@ def start_body(definition: TaskDefinition, argument: Any, threads: Executor) -> 
     # logged as never retrieved.
     outcome.add_done_callback(lambda done: done.cancelled() or done.exception())
     return RunningBody(outcome, exited)
+
+
+def _contained(error: BaseException, hooks: RunHooks) -> TaskBodyError:
+    """`SystemExit` or `KeyboardInterrupt` from a body or its hooks, as the
+    error its run fails with. Left to propagate, it would end the event loop of the whole
+    process, and every run in it with the loop; the process is condemned
+    instead, so its other runs finish first."""
+    hooks.condemn()
+    return body_error(error)
 
 
 def task_named(
@@ -108,13 +154,15 @@ def run_serialized(
     source_version: int,
     chain: Sequence[bytes],
     serialized_input: bytes,
+    hooks: RunHooks,
     after: "asyncio.Future[None] | None" = None,
 ) -> RunningBody:
     """Starts the task `definition_id` on its serialized input, folded onto
     the payloads of the generations it superseded (`chain`, oldest first),
-    once `after`, if given, is done. The outcome is the encoded result, or,
-    for a task that returns a step, the step itself. Started in the
-    caller's context, so the body sees the caller's context variables."""
+    between the run hooks in `hooks`, once `after`, if given, is done. The
+    outcome is the encoded result, or, for a task that returns a step, the
+    step itself. Started in the caller's context, so the body sees the
+    caller's context variables."""
     loop = asyncio.get_running_loop()
     exited: asyncio.Future[None] = loop.create_future()
 
@@ -125,7 +173,7 @@ def run_serialized(
             definition = task_named(registry, definition_id, source_version)
             serializer = serializers.get(definition.serializer)
             argument = fold_payloads(definition, serializer, [*chain, serialized_input])
-            body = start_body(definition, argument, threads)
+            body = start_body(definition, argument, threads, hooks)
         except BaseException:
             # Nothing started, so nothing is left running.
             _mark_done(exited)

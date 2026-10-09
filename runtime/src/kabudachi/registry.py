@@ -52,6 +52,10 @@ class TaskDefinition:
     """For a coalescing task: whether a submission that would pass the hard
     memory limit drops this key's oldest retained payloads to fit, instead of
     being refused."""
+    recycle_process: bool = False
+    """Whether a task process that runs this task takes no more runs after
+    it and is replaced by a fresh one once its runs finish: for a body that
+    leaves its process unfit for more work."""
 
     def __reduce__(self) -> tuple[Any, tuple[str]]:
         # Sent between a worker and its task processes by name: both imported
