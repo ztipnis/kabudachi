@@ -8,6 +8,8 @@ import logging
 from collections.abc import Awaitable, Callable, Generator
 from typing import Any, Protocol
 
+from kabudachi.errors import RemoteResultUnavailableError
+
 _logger = logging.getLogger("kabudachi")
 
 
@@ -73,6 +75,11 @@ class TaskHandle:
 
     `shard_id` names the incarnation of the shard that holds the task; `None`
     for a handle made outside a run.
+
+    On a networked worker (`results_delivered` false) the result is never
+    delivered: awaiting raises `RemoteResultUnavailableError`, unless the
+    leader refused the task, and `done()` stays false. `cancel()` still asks
+    the leader.
     """
 
     def __init__(
@@ -82,9 +89,11 @@ class TaskHandle:
         callback_runner: Callable[[Callable[[Any], Any], Any], None] = run_callback_inline,
         *,
         shard_id: str | None = None,
+        results_delivered: bool = True,
     ) -> None:
         self.task_id = task_id
         self.shard_id = shard_id
+        self._results_delivered = results_delivered
         self._canceller = canceller
         self._callback_runner = callback_runner
         # Thread-safe, because the result can arrive from any thread.
@@ -136,6 +145,12 @@ class TaskHandle:
         return self._wait().__await__()
 
     async def _wait(self) -> Any:
+        if not self._results_delivered and not self._outcome.done():
+            raise RemoteResultUnavailableError(
+                f"task {self.task_id} runs in its shard, but its result cannot be awaited here: "
+                "results are not yet sent back across workers",
+                self.task_id,
+            )
         body = current_body.get()
         if body is None or self._outcome.done():
             return await self._outcome_future()

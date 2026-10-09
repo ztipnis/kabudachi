@@ -1,6 +1,8 @@
 load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
 
 # gazelle:python_generation_mode file
+# The networked worker program is run as a file, never imported.
+# gazelle:exclude networked_worker.py
 
 # Shared test helper: protobuf message classes built at runtime. Tests import it
 # as a top-level module, which Gazelle cannot infer.
@@ -189,6 +191,53 @@ py_test(
         "//runtime/src/kabudachi",
         "//runtime/tests:pool_slow_import",  # keep
         "//runtime/tests:pool_tasks",
+        "//runtime/tests:proto_messages",
+        "@pypi//pytest",  # keep
+    ],
+)
+
+# Tasks the networked worker program declares, importable by its task processes.
+# gazelle:resolve py networked_tasks //runtime/tests:networked_tasks
+py_library(
+    name = "networked_tasks",
+    testonly = True,
+    srcs = ["networked_tasks.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
+    ],
+)
+
+# Starts and drives networked worker processes for the multi-process tests.
+# gazelle:resolve py cluster //runtime/tests:cluster
+py_library(
+    name = "cluster",
+    testonly = True,
+    srcs = ["cluster.py"],
+    # The program each worker process runs, as a file.
+    data = ["networked_worker.py"],  # keep
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        ":networked_tasks",  # keep
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",  # keep
+    ],
+)
+
+# Three real worker processes on loopback: a task process and a
+# worker killed with SIGKILL. About 13 s on a laptop.
+py_test(
+    name = "test_networked",
+    size = "medium",
+    srcs = ["test_networked.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//runtime/tests:cluster",
+        "//runtime/tests:networked_tasks",
         "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
     ],

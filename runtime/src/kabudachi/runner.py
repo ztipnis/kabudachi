@@ -11,10 +11,11 @@ import threading
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import TypeVar, overload
+from datetime import timedelta
+from typing import Any, TypeVar, overload
 
 from kabudachi import _native
-from kabudachi.config import Configuration, process_configuration
+from kabudachi.config import Configuration, Settings, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
 from kabudachi.pool import ProcessPool, task_modules
@@ -64,6 +65,15 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     `KeyboardInterrupt`, and a synchronous task still in its thread keeps the
     interpreter from exiting until it returns.
 
+    With `listen` set, the process is a worker of the networked shard
+    `shard`. It bootstraps from `seeds` or `authority`, `run` waits until it
+    has joined and knows its leader, and it runs the tasks the shard's leader
+    hands it, whoever submitted them. Awaiting a task's result there raises
+    `RemoteResultUnavailableError`, and cancelling one asks the leader. When
+    `main` returns, `run` waits until the leader has stored every task
+    called; then, as at the first signal, the worker also lets the runs it
+    holds finish and waits until its leader has taken their reports.
+
     Raises `TaskDefinitionError`, before `main` starts, if a registered task
     cannot work with the serializers of this process, and if `processes` is
     above 0 and a task is declared in the script being run. Raises
@@ -104,6 +114,32 @@ def _executor_for(configuration: Configuration) -> Executor:
     if settings.processes == 0:
         return InProcessExecutor(registry, process_serializers(), settings.concurrency, hooks)
     return ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
+
+
+def _millis(duration: timedelta) -> int:
+    return round(duration.total_seconds() * 1000)
+
+
+def _native_runtime(settings: Settings) -> Any:
+    """A one-node shard of this process's own, or, with `listen` set, a
+    worker of the networked shard `settings.shard`."""
+    limits = {
+        "result_ttl_ms": settings.result_ttl * 1000,
+        "memory_soft_limit": settings.memory_soft_limit,
+        "memory_hard_limit": settings.memory_hard_limit,
+    }
+    if settings.listen is None:
+        return _native.NativeRuntime(uuid.uuid4().hex, uuid.uuid4().hex, **limits)
+    return _native.NetworkedRuntime(
+        settings.shard,
+        settings.listen,
+        seeds=list(settings.seeds),
+        external_address=settings.external_address,
+        heartbeat_interval_ms=_millis(settings.heartbeat_interval),
+        heartbeat_timeout_ms=_millis(settings.heartbeat_timeout),
+        reconnect_timeout_ms=_millis(settings.reconnect_timeout),
+        **limits,
+    )
 
 
 async def _cancel(task: "asyncio.Future[object] | None") -> None:
@@ -574,6 +610,19 @@ async def _until_done_or_worker_stops(work: Awaitable[T], worker: "asyncio.Task[
         await _cancel(task)
 
 
+async def _drain_held_runs(session: Session, native: Any) -> None:
+    """Lets the runs a networked worker holds finish, then waits until its
+    leader has taken their reports, or its reconnect timeout has passed.
+    The claim loop has stopped; events are still acted on meanwhile, so a
+    run the leader cancels stops. A runtime that fails ends the wait."""
+    events = asyncio.create_task(session.watch_events())
+    try:
+        await _until_done_or_worker_stops(session.wait_until_running_finish(), events)
+        await _until_done_or_worker_stops(native.wait_until_reported(), events)
+    finally:
+        await _cancel(events)
+
+
 async def _run_with_worker(
     main: Callable[[], Awaitable[T]], executor: Executor, *, serving: bool = False
 ) -> T:
@@ -583,23 +632,23 @@ async def _run_with_worker(
     cancel grace. In this process nothing can be killed, so running bodies are
     still waited for."""
     configuration = process_configuration()
+    settings = configuration.settings()
+    networked = settings.listen is not None
     # Set once every body has finished: the task processes are then let go
     # idle. Otherwise (a second signal, or a run cancelled while it waited
     # for its bodies) they are stopped at once.
     graceful = False
     await executor.start()
     try:
-        native = _native.NativeRuntime(
-            uuid.uuid4().hex,
-            uuid.uuid4().hex,
-            result_ttl_ms=configuration.resolve("result_ttl") * 1000,
-            memory_soft_limit=configuration.resolve("memory_soft_limit"),
-            memory_hard_limit=configuration.resolve("memory_hard_limit"),
-        )
+        native = _native_runtime(settings)
         session = None
         worker = None
         try:
-            await native.wait_until_leader()
+            if networked:
+                # Joined, with a leader it knows, which may be another process.
+                await native.wait_until_ready()
+            else:
+                await native.wait_until_leader()
             session = Session(
                 native, default_registry(), process_serializers(), configuration, executor=executor
             )
@@ -607,17 +656,29 @@ async def _run_with_worker(
             worker = asyncio.create_task(session.serve())
             result = await _until_done_or_worker_stops(main(), worker)
             await _until_done_or_worker_stops(session.wait_until_idle(), worker)
+            if networked:
+                # It also holds runs no handle here waits for: they finish,
+                # and the leader takes their reports, before the worker goes.
+                session.stop_claiming()
+                native.stop_taking()
+                await _cancel(worker)
+                await _drain_held_runs(session, native)
             graceful = True
             return result
         except BaseException as error:
             if session is not None:
                 session.stop_claiming()
+                if networked:
+                    # Ends a waiting claim, which must not be cancelled.
+                    native.stop_taking()
                 await _cancel(worker)
                 forced = serving and isinstance(error, (asyncio.CancelledError, KeyboardInterrupt))
                 if forced and executor.stops_bodies_at_once:
                     # Their runs settle as lost once their processes are gone.
                     await executor.stop(kill=True)
                 await session.wait_until_running_finish()
+                if networked and not forced:
+                    await native.wait_until_reported()
                 graceful = True
             raise
         finally:

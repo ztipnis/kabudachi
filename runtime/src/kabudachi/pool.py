@@ -555,7 +555,9 @@ class ProcessPool:
             child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
             return
         child.handles[handle.task_id] = handle
-        child.send(ipc.Reply(frame.request, (handle.task_id, handle.shard_id)))
+        child.send(
+            ipc.Reply(frame.request, (handle.task_id, handle.shard_id, handle._results_delivered))
+        )
 
         def settled(outcome: Any) -> None:
             # A dead child's handles are dropped with it: the tasks it called

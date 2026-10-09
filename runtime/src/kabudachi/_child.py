@@ -206,8 +206,14 @@ class _TaskProcess:
         if reply.error is not None:
             answer.set_exception(reply.error)
         elif submission:
-            task_id, shard_id = reply.value
-            handle = TaskHandle(task_id, self._cancel, self._run_callback, shard_id=shard_id)
+            task_id, shard_id, results_delivered = reply.value
+            handle = TaskHandle(
+                task_id,
+                self._cancel,
+                self._run_callback,
+                shard_id=shard_id,
+                results_delivered=results_delivered,
+            )
             # Kept before the asker gets it: the outcome can follow at once.
             self._handles[task_id] = handle
             answer.set_result(handle)
