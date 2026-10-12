@@ -218,6 +218,7 @@ use crate::claimed_runs::ClaimedRuns;
 use crate::exchange::{Asked, Exchange};
 use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
+use crate::payload_memory::PayloadMemory;
 use crate::peers::{Carried, Peers, worker_id_of};
 use crate::reconcile::codec::ReconcileCodec;
 use crate::result_transport::ResultEvent;
@@ -718,6 +719,9 @@ pub struct Net {
     records_shard: Option<ShardName>,
     /// The Task records this `Net` holds (see [`Self::held_records`]).
     held: HeldRecords,
+    /// The blob payloads this worker holds whole in flight (see
+    /// [`Self::payload_memory`]).
+    payload_memory: Arc<PayloadMemory>,
     /// The runs this worker claimed (see [`Self::claimed_runs`]).
     pub(crate) claimed: ClaimedRuns,
     /// The leader this worker's node last named, and whether the worker has
@@ -786,6 +790,7 @@ impl Net {
             shard: Mutex::new(None),
             records_shard,
             held,
+            payload_memory: PayloadMemory::new(None),
             claimed: ClaimedRuns::default(),
             named_leader: watch::Sender::new(NamedLeader::default()),
             driver,
@@ -796,6 +801,13 @@ impl Net {
     /// [`Self::new`]).
     pub fn held_records(&self) -> HeldRecords {
         self.held.clone()
+    }
+
+    /// The ledger of blob payloads this worker holds whole while they cross
+    /// the network. Unlimited until [`crate::worker::Worker::run`] gives it
+    /// its share of the worker's memory limits.
+    pub fn payload_memory(&self) -> &Arc<PayloadMemory> {
+        &self.payload_memory
     }
 
     /// Holds at most `limit` inputs for this `Net`'s node (default

@@ -39,6 +39,7 @@ use crate::executor::ExecutorEndpoint;
 use crate::handoff::HandedOff;
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::{ListenRejected, Net};
+use crate::payload_memory::payload_shares;
 use crate::task_store::placement::ReplicationFactor;
 
 /// A coordination authority and the timings a worker's node keeps its
@@ -105,7 +106,9 @@ pub struct WorkerConfig {
     pub result_ttl: Option<StdDuration>,
     /// The memory limits the worker's scheduler holds pending task input to
     /// while it leads (see `kabudachi_core::scheduler::MemoryLimits`); `None`
-    /// for none.
+    /// for none. The worker's own memory for blob payloads is half of them
+    /// for payloads in flight (see `crate::payload_memory`) and the rest of
+    /// the hard limit for the blobs it stores for its shard.
     pub memory_limits: Option<MemoryLimits>,
     /// The executor that runs the tasks this worker claims; `None` for none.
     /// With one, the driver claims work while the executor has room and
@@ -347,6 +350,12 @@ impl Worker {
         let mut scheduler = Scheduler::with_observer(clock, Uuid7Ids, RecordOutbox::default());
         scheduler.set_result_ttl(retention_of(&config));
         scheduler.set_memory_limits(config.memory_limits);
+        // The scheduler counts the shard's admitted input against the whole
+        // limits; this process's own memory is split between the payloads it
+        // holds in flight and the blobs it stores for its shard.
+        let (in_flight, store) = payload_shares(config.memory_limits);
+        net.payload_memory().set_limits(in_flight);
+        net.held_records().set_blob_store_limit(store);
         // However the driver ends (returns, is dropped, aborted or panics),
         // no driver answers this worker's own requests any more: tell each
         // asker so, now and from here on.

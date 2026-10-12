@@ -20,6 +20,7 @@ pub mod join;
 pub mod join_codec;
 mod leader_search;
 pub mod messenger;
+pub mod payload_memory;
 mod peers;
 pub mod reconcile;
 pub mod result_transport;
