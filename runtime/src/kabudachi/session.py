@@ -740,35 +740,44 @@ class Session:
 
     async def _fold(self, claim: Any, body: RunningBody) -> None:
         try:
-            try:
-                folded = await body.outcome
-            except asyncio.CancelledError:
-                here = self._here.get(claim.task_run_id)
-                current = asyncio.current_task()
-                if here is None or (current is not None and current.cancelling()):
-                    raise
-                if not here.aborted:
-                    # The leader cancelled it: there is nothing to report.
-                    return
-                # Stopped at its abort deadline: failed, as a compaction lost
-                # with its process is, once its body has really stopped.
-                await asyncio.wait({body.exited})
-                raise TaskProcessLost(
-                    "the compaction was stopped at its abort deadline"
-                ) from None
+            folded = await self._folded(claim, body)
         except Exception as error:
-            kind = _kind_of(error)
-            _logger.warning("compaction of %s failed with %s", claim.definition_id, kind)
-            _logger.debug("compaction of %s failed", claim.definition_id, exc_info=error)
-            try:
-                self._runtime.report_failure(claim.task_run_id, kind)
-            except Exception as refusal:
-                _logger.warning(
-                    "the leader did not record the failed compaction of %s: %s",
-                    claim.definition_id,
-                    type(refusal).__name__,
-                )
+            self._compaction_failed(claim, error)
             return
+        if folded is not None:
+            self._hand_fold_to_leader(claim, folded)
+
+    async def _folded(self, claim: Any, body: RunningBody) -> bytes | None:
+        """The folded payload, or `None` if the leader cancelled the
+        compaction, which leaves nothing to report. A compaction stopped at
+        its abort deadline raises `TaskProcessLost` once its body has really
+        stopped, as one lost with its process does."""
+        try:
+            return await body.outcome
+        except asyncio.CancelledError:
+            here = self._here.get(claim.task_run_id)
+            current = asyncio.current_task()
+            if here is None or (current is not None and current.cancelling()):
+                raise
+            if not here.aborted:
+                return None
+            await asyncio.wait({body.exited})
+            raise TaskProcessLost("the compaction was stopped at its abort deadline") from None
+
+    def _compaction_failed(self, claim: Any, error: Exception) -> None:
+        kind = _kind_of(error)
+        _logger.warning("compaction of %s failed with %s", claim.definition_id, kind)
+        _logger.debug("compaction of %s failed", claim.definition_id, exc_info=error)
+        try:
+            self._runtime.report_failure(claim.task_run_id, kind)
+        except Exception as refusal:
+            _logger.warning(
+                "the leader did not record the failed compaction of %s: %s",
+                claim.definition_id,
+                type(refusal).__name__,
+            )
+
+    def _hand_fold_to_leader(self, claim: Any, folded: bytes) -> None:
         try:
             self._runtime.complete_compaction(claim.task_run_id, folded)
         except Exception as refusal:
