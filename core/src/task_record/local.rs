@@ -58,6 +58,7 @@ impl<C: Clock> LocalRecords<C> {
                 value: chunk,
                 owner: BlobOwner::Task(owner.clone()),
                 placement: vec![self.worker.clone()],
+                result: false,
             };
             self.records
                 .put_blob(&key, record, now)

@@ -83,6 +83,8 @@ pub struct BlobRecord {
     pub owner: BlobOwner,
     /// The holders its writer stored it with.
     pub placement: Vec<WorkerId>,
+    /// Stored as a run's result rather than as an input.
+    pub result: bool,
 }
 
 /// A blob record arrived naming no owner.
@@ -100,6 +102,7 @@ impl From<BlobRecord> for generated::BlobRecord {
             value: record.value,
             owner: Some(owner),
             placement: record.placement.into_iter().map(Into::into).collect(),
+            result: record.result,
         }
     }
 }
@@ -116,6 +119,7 @@ impl TryFrom<generated::BlobRecord> for BlobRecord {
             value: wire.value,
             owner,
             placement: wire.placement.into_iter().map(WorkerId::from).collect(),
+            result: wire.result,
         })
     }
 }

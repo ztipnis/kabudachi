@@ -53,6 +53,8 @@ pub enum BlobRefusal {
     WrongKey,
     #[error("the blob is larger than a holder keeps")]
     TooLarge,
+    #[error("this store's share of memory is full")]
+    StoreFull,
 }
 
 /// What a look-up across the shard found of a blob owner this store has
@@ -89,7 +91,10 @@ pub enum OwnerState {
 /// can follow it. An owner whose record it never held keeps its blobs until a
 /// look-up across the shard finds the record finished, a grace later, or gone
 /// ([`Self::owners_to_check`], [`Self::owner_checked`]). A blob goes when its
-/// last owner lets go.
+/// last owner lets go. A store may be given a share of memory for its blobs
+/// ([`Self::with_blob_store_limit`]): a blob it does not hold yet is refused
+/// once the blobs held would pass the share, and blobs stored as inputs may
+/// fill only half of it, so results always have room left.
 #[derive(Debug, Clone, Default)]
 pub struct VersionedRecords {
     records: BTreeMap<TaskId, Held>,
@@ -103,6 +108,12 @@ pub struct VersionedRecords {
     /// How long a blob is kept for an owner never seen here before the shard
     /// is asked about it; `None` never asks and waits for every owner.
     orphan_grace: Option<Duration>,
+    /// The bytes of every distinct blob held.
+    blob_bytes: u64,
+    /// The bytes of the blobs held that no owner stored as a result.
+    input_bytes: u64,
+    /// The most bytes of blobs held, or `None` for no limit.
+    blob_store_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +121,8 @@ struct HeldBlob {
     value: Vec<u8>,
     placement: Vec<WorkerId>,
     owners: BTreeSet<BlobOwner>,
+    /// Some owner stored it as a result.
+    result: bool,
 }
 
 /// What a store knows of one owner of the blobs it holds.
@@ -405,9 +418,29 @@ impl VersionedRecords {
         self
     }
 
+    /// A store that holds at most `limit` bytes of blobs, or any number with
+    /// `None`. See [`Self::set_blob_store_limit`].
+    #[must_use]
+    pub fn with_blob_store_limit(mut self, limit: Option<u64>) -> Self {
+        self.blob_store_limit = limit;
+        self
+    }
+
+    /// Sets the most bytes of blobs held, as [`Self::with_blob_store_limit`]
+    /// does. Blobs already held stay, whatever the new limit.
+    pub fn set_blob_store_limit(&mut self, limit: Option<u64>) {
+        self.blob_store_limit = limit;
+    }
+
+    /// The bytes of every blob held, each counted once.
+    pub fn blob_bytes(&self) -> u64 {
+        self.blob_bytes
+    }
+
     /// Keeps `record`'s bytes under `key`, for `record`'s owner, after
-    /// sweeping. A blob already held gains the owner. Refused if the bytes
-    /// are not those `key` names or are larger than one chunk.
+    /// sweeping. A blob already held gains the owner, at no cost in space.
+    /// Refused if the bytes are not those `key` names, are larger than one
+    /// chunk, or are a new blob that does not fit the store's share.
     pub fn put_blob(&mut self, key: &BlobKey, record: BlobRecord, now: Instant) -> Result<(), BlobRefusal> {
         self.sweep(now);
         if record.value.len() > MAX_BLOB_BYTES {
@@ -416,20 +449,51 @@ impl VersionedRecords {
         if !key.holds(&record.value) {
             return Err(BlobRefusal::WrongKey);
         }
+        self.admits(key, &record)?;
         let seen = owner_held(&self.records, &record.owner);
         self.blob_owners
             .entry(record.owner.clone())
             .or_insert_with(|| BlobsOf { keys: BTreeSet::new(), seen, since: now, finished: false })
             .keys
             .insert(key.clone());
-        let held = self.blobs.entry(key.clone()).or_insert_with(|| HeldBlob {
-            value: record.value,
-            placement: Vec::new(),
-            owners: BTreeSet::new(),
+        self.hold_blob(key, record);
+        Ok(())
+    }
+
+    /// Whether the store has room for `record`, which it holds under `key`
+    /// already or must find space for.
+    fn admits(&self, key: &BlobKey, record: &BlobRecord) -> Result<(), BlobRefusal> {
+        let Some(limit) = self.blob_store_limit else {
+            return Ok(());
+        };
+        if self.blobs.contains_key(key) {
+            return Ok(());
+        }
+        let len = record.value.len() as u64;
+        let fits_share = self.blob_bytes + len <= limit;
+        let fits_inputs = record.result || self.input_bytes + len <= limit / 2;
+        if fits_share && fits_inputs { Ok(()) } else { Err(BlobRefusal::StoreFull) }
+    }
+
+    /// Holds `record`'s bytes under `key` for its owner, counting them once.
+    fn hold_blob(&mut self, key: &BlobKey, record: BlobRecord) {
+        let len = record.value.len() as u64;
+        let held = self.blobs.entry(key.clone()).or_insert_with(|| {
+            self.blob_bytes += len;
+            self.input_bytes += len;
+            HeldBlob {
+                value: record.value,
+                placement: Vec::new(),
+                owners: BTreeSet::new(),
+                result: false,
+            }
         });
         held.placement = record.placement;
         held.owners.insert(record.owner);
-        Ok(())
+        if record.result && !held.result {
+            held.result = true;
+            self.input_bytes -= len;
+        }
     }
 
     /// The blob held under `key`, as a record naming its first owner.
@@ -439,6 +503,7 @@ impl VersionedRecords {
             value: held.value.clone(),
             owner: held.owners.first()?.clone(),
             placement: held.placement.clone(),
+            result: held.result,
         })
     }
 
@@ -469,10 +534,17 @@ impl VersionedRecords {
             return;
         };
         for key in of.keys {
-            if let Some(held) = self.blobs.get_mut(&key) {
-                held.owners.remove(owner);
-                if held.owners.is_empty() {
-                    self.blobs.remove(&key);
+            let Some(held) = self.blobs.get_mut(&key) else {
+                continue;
+            };
+            held.owners.remove(owner);
+            if held.owners.is_empty()
+                && let Some(gone) = self.blobs.remove(&key)
+            {
+                let len = gone.value.len() as u64;
+                self.blob_bytes -= len;
+                if !gone.result {
+                    self.input_bytes -= len;
                 }
             }
         }

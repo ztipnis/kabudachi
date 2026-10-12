@@ -51,4 +51,7 @@ message BlobRecord {
     CompositeId composite = 3;
   }
   repeated WorkerId placement = 4;
+  // Stored as a run's result rather than as an input: a holder keeps part of
+  // its share of memory for results, which inputs cannot fill.
+  bool result = 5;
 }

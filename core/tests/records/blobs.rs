@@ -99,6 +99,7 @@ fn a_payload_past_the_inline_bound_is_cut_into_chunks_that_join_back_only_whole_
         value: b"chunk".to_vec(),
         owner: BlobOwner::Task(TaskId::new("t1")),
         placement: Vec::new(),
+        result: false,
     };
     assert_eq!(BlobRecord::try_from(generated::BlobRecord::from(record.clone())), Ok(record));
 }
@@ -123,7 +124,12 @@ fn task_record(task: &str, revision: u64, holders: &[&str], finished: bool) -> T
 }
 
 fn owned_by(task: &str, value: &[u8]) -> BlobRecord {
-    BlobRecord { value: value.to_vec(), owner: BlobOwner::Task(TaskId::new(task)), placement: Vec::new() }
+    BlobRecord {
+        value: value.to_vec(),
+        owner: BlobOwner::Task(TaskId::new(task)),
+        placement: Vec::new(),
+        result: false,
+    }
 }
 
 fn task(task: &str) -> BlobOwner {
