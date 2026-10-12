@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::coalescing::{self, ChainItem, Key};
 use crate::protocol::generated::{CoalescingLink, TaskRecord, chain_entry};
 use crate::protocol::ids::{IdGenerator, TaskId};
-use crate::protocol::messages::Task;
+use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
@@ -119,16 +119,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         records: &[TaskRecord],
         index: &BTreeMap<TaskId, usize>,
     ) -> Supersession {
-        let Some(link) = newer.link.as_ref().filter(|link| !link.absorbed.is_empty()) else {
+        let Some((newer_id, predecessor)) = absorbing_generation(newer) else {
             return Supersession::Holds;
         };
-        if newer.finished {
-            return Supersession::Holds;
-        }
-        let Some(newer_id) = newer.task.as_ref().map(Task::task_id) else {
-            return Supersession::Holds;
-        };
-        let predecessor = TaskId::from(link.absorbed.last().expect("not empty").clone());
         // The generations a compaction folded were released with it, and their
         // records may be forgotten by now.
         let folded = folded_ids(newer);
@@ -137,73 +130,107 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let known = |task_id: &TaskId| {
             index.contains_key(task_id) || self.tasks.contains_key(task_id) || folded.contains(task_id)
         };
-        if !retained_ids(newer)
-            .iter()
-            .chain([&predecessor])
-            .all(known)
-        {
+        if !retained_ids(newer).iter().chain([&predecessor]).all(known) {
             return Supersession::Broken;
         }
-        let names_newer = |link: Option<&CoalescingLink>| {
-            link.and_then(|link| link.superseded_by.clone()).map(TaskId::from)
-                == Some(newer_id.clone())
-        };
-        let Some(&at) = index.get(&predecessor) else {
-            if names_newer(self.links.get(&predecessor)) {
-                return Supersession::Holds;
-            }
-            if folded.contains(&predecessor) && !self.tasks.contains_key(&predecessor) {
-                return Supersession::Holds;
-            }
-            // The predecessor was installed before this generation's record
-            // was known: if nothing claimed it, the supersession is finished
-            // live; a claimed one cannot have been absorbed.
-            let unclaimed = self.current_run.get(&predecessor).is_some_and(|run_id| {
-                matches!(
-                    self.runs[run_id].current_state(),
-                    TaskRunState::Scheduled | TaskRunState::Queued
-                ) && self.runs[run_id].selected_worker.is_none()
-            });
-            let named_other = self
-                .links
-                .get(&predecessor)
-                .is_some_and(|link| link.superseded_by.is_some());
-            if unclaimed && !named_other && !self.retention.holds(&predecessor) {
-                return Supersession::UnfinishedInstalled(predecessor);
-            }
-            tracing::error!(
-                newer = newer_id.as_str(),
-                older = predecessor.as_str(),
-                "a generation absorbed an installed one that is claimed or finished"
-            );
-            return Supersession::Broken;
-        };
-        let older = &records[at];
-        if names_newer(older.link.as_ref()) {
+        match index.get(&predecessor) {
+            Some(&at) => against_record(&newer_id, &predecessor, at, &records[at]),
+            None => self.against_installed(&newer_id, predecessor, &folded),
+        }
+    }
+
+    /// The supersession when the predecessor's record is not in the batch: it
+    /// was installed before this generation's record was known. If nothing
+    /// claimed it, the supersession is finished live; a claimed one cannot have
+    /// been absorbed.
+    fn against_installed(
+        &self,
+        newer: &TaskId,
+        predecessor: TaskId,
+        folded: &BTreeSet<TaskId>,
+    ) -> Supersession {
+        if names(self.links.get(&predecessor), newer) {
             return Supersession::Holds;
         }
-        let pending = older.runs.last().is_some_and(|run| {
-            matches!(
-                run.current_state(),
-                TaskRunState::Scheduled | TaskRunState::Queued
-            ) && run.selected_worker.is_none()
-        });
-        let named_other = older
-            .link
-            .as_ref()
-            .is_some_and(|link| link.superseded_by.is_some());
-        if pending && !named_other && !older.finished {
-            return Supersession::Unfinished(at);
+        if folded.contains(&predecessor) && !self.tasks.contains_key(&predecessor) {
+            return Supersession::Holds;
         }
-        // A supersession only ever absorbs a generation that had not been
-        // claimed, and writes its revision 0 before touching the older one.
+        let unclaimed = self
+            .current_run
+            .get(&predecessor)
+            .is_some_and(|run_id| is_unclaimed_pending(&self.runs[run_id]));
+        if unclaimed
+            && !names_any(self.links.get(&predecessor))
+            && !self.retention.holds(&predecessor)
+        {
+            return Supersession::UnfinishedInstalled(predecessor);
+        }
         tracing::error!(
-            newer = newer_id.as_str(),
+            newer = newer.as_str(),
             older = predecessor.as_str(),
-            "a generation absorbed one whose record shows it claimed or finished"
+            "a generation absorbed an installed one that is claimed or finished"
         );
         Supersession::Broken
     }
+}
+
+/// The generation `record` is and the last one it absorbed, when it
+/// absorbed any and is not finished.
+fn absorbing_generation(record: &TaskRecord) -> Option<(TaskId, TaskId)> {
+    let link = record.link.as_ref().filter(|link| !link.absorbed.is_empty())?;
+    if record.finished {
+        return None;
+    }
+    let newer = record.task.as_ref().map(Task::task_id)?;
+    let predecessor = TaskId::from(link.absorbed.last().expect("not empty").clone());
+    Some((newer, predecessor))
+}
+
+/// The supersession when the predecessor's record, `older`, is in the
+/// batch at `at`. A supersession only ever absorbs a generation that had
+/// not been claimed, and writes its revision 0 before touching the older
+/// one, so an older record that is neither superseded by `newer` nor still
+/// pending is broken.
+fn against_record(
+    newer: &TaskId,
+    predecessor: &TaskId,
+    at: usize,
+    older: &TaskRecord,
+) -> Supersession {
+    if names(older.link.as_ref(), newer) {
+        return Supersession::Holds;
+    }
+    let pending = older.runs.last().is_some_and(is_unclaimed_pending);
+    if pending && !names_any(older.link.as_ref()) && !older.finished {
+        return Supersession::Unfinished(at);
+    }
+    tracing::error!(
+        newer = newer.as_str(),
+        older = predecessor.as_str(),
+        "a generation absorbed one whose record shows it claimed or finished"
+    );
+    Supersession::Broken
+}
+
+/// Whether `link` names `newer` as the generation that superseded it.
+fn names(link: Option<&CoalescingLink>, newer: &TaskId) -> bool {
+    link.and_then(|link| link.superseded_by.clone())
+        .map(TaskId::from)
+        .as_ref()
+        == Some(newer)
+}
+
+/// Whether `link` names any generation as the one that superseded it.
+fn names_any(link: Option<&CoalescingLink>) -> bool {
+    link.is_some_and(|link| link.superseded_by.is_some())
+}
+
+/// Whether `run` waits to start and no worker was ever selected for it.
+fn is_unclaimed_pending(run: &TaskRun) -> bool {
+    matches!(
+        run.current_state(),
+        TaskRunState::Scheduled | TaskRunState::Queued
+    ) && run.selected_worker.is_none()
 }
 
 /// The generations a compaction folded into the chain `record` carries.
