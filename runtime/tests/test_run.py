@@ -91,6 +91,38 @@ def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_rec
     assert copied == after and copied.run_state is after.run_state
 
 
+def test_a_flow_and_a_group_report_their_stages_and_members():
+    @declare
+    def shout(request: Greeting) -> Greeting:
+        return Greeting(text=request.text.upper())
+
+    @declare
+    def explode(request: Greeting) -> Greeting:
+        raise ValueError("no")
+
+    async def main():
+        flowed = kabudachi.flow(shout.bind(Greeting(text="a")), shout)()
+        await flowed
+        grouped = kabudachi.group(shout, explode, on_error="collect_all")(Greeting(text="g"))
+        await grouped
+        return await flowed.status(), await grouped.status()
+
+    flowed, grouped = kabudachi.run(main)
+
+    assert (flowed.kind, flowed.state, flowed.stage, dict(flowed.counts)) == (
+        "flow",
+        "succeeded",
+        1,
+        {"succeeded": 2},
+    )
+    assert (grouped.kind, grouped.state, grouped.stage, dict(grouped.counts)) == (
+        "group",
+        "succeeded",
+        None,
+        {"succeeded": 1, "failed": 1},
+    )
+
+
 def test_a_task_that_returns_nothing_gives_none():
     seen = []
 

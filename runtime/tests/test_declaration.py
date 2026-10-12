@@ -1039,7 +1039,7 @@ def test_cancelling_a_flow_after_a_stage_that_failed_does_not_claim_to_have_canc
     failed._fail(ValueError("stage failed"))
     succeeded._resolve("done")
 
-    flow_after_failure, flow_after_success = FlowHandle("flow-1"), FlowHandle("flow-2")
+    flow_after_failure, flow_after_success = FlowHandle("flow-1", 2), FlowHandle("flow-2", 2)
     flow_after_failure._current = (failed, False)
     flow_after_success._current = (succeeded, False)
 
