@@ -535,6 +535,7 @@ impl<'n> Executing<'n> {
                 task_request::Request::Completed(ReportCompleted {
                     task_run_id: Some(run.into()),
                     result_digest: Some(digest.into()),
+                    delivered: false,
                 })
             }
             Report::Failed { run, reason } => {

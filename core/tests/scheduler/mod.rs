@@ -8,6 +8,7 @@ mod scheduler_compaction;
 mod scheduler_continuation;
 mod scheduler_lifecycle;
 mod scheduler_loss;
+mod scheduler_outcome;
 mod scheduler_reconcile;
 mod scheduler_records;
 mod scheduler_retention;

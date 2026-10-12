@@ -153,6 +153,7 @@ impl Net {
         self.report(leader, task_request::Request::Completed(ReportCompleted {
             task_run_id: Some(run.into()),
             result_digest: Some(result_digest.into()),
+            delivered: false,
         }))
         .await
     }
@@ -269,7 +270,10 @@ impl Net {
             Request::Lost(_) => {
                 self.note_report(&run, response, |answer| matches!(answer, Answer::Lost(_)), None)
             }
-            Request::Submit(_) | Request::Cancel(_) | Request::Place(_) => {}
+            Request::Submit(_)
+            | Request::Cancel(_)
+            | Request::Place(_)
+            | Request::QueryOutcome(_) => {}
         }
     }
 
@@ -526,6 +530,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Cancel(request) => cancel(scheduler, request),
         // Where records go is the driver's to say: it alone knows the voters.
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
+        _ => Err(TaskRejectReason::TaskRejectMalformed),
     };
     match result {
         Ok(result) => TaskResponse {
@@ -652,7 +657,9 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
         Request::Failed(report) => &report.task_run_id,
         Request::Compacted(report) => &report.task_run_id,
         Request::Lost(report) => &report.task_run_id,
-        Request::Submit(_) | Request::Cancel(_) | Request::Place(_) => return None,
+        Request::Submit(_) | Request::Cancel(_) | Request::Place(_) | Request::QueryOutcome(_) => {
+            return None;
+        }
     };
     run.clone().map(TaskRunId::from)
 }

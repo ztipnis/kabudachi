@@ -3,6 +3,7 @@ package kabudachi;
 
 import "ids.proto";
 import "task.proto";
+import "result.proto";
 
 // A worker asks its shard's leader to record a task, or tells it what
 // became of a run it claimed. Only the leader decides; a worker that is not
@@ -31,17 +32,21 @@ message SubmitTask {
   // The task's own reconnect timeout (see `Task.reconnect_timeout_ms`); zero
   // for the shard's.
   uint64 reconnect_timeout_ms = 14;
+  // The submitting worker, which awaits the result (see Task.client).
+  WorkerId client = 15;
 }
 
 message ReportStarted {
   TaskRunId task_run_id = 1;
 }
 
-// The run succeeded. Only the digest of its result travels: the result
-// itself stays with the worker that produced it.
+// The run succeeded. Only the digest of its result travels. The result
+// itself goes to the task's client, not to the leader.
 message ReportCompleted {
   TaskRunId task_run_id = 1;
   Digest result_digest = 2;
+  // The result reached its task's client first.
+  bool delivered = 3;
 }
 
 message ReportFailed {
@@ -85,6 +90,7 @@ message TaskRequest {
     PlaceRecords place = 6;
     ReportCompacted compacted = 7;
     ReportLost lost = 8;
+    QueryOutcome query_outcome = 9;
   }
 }
 
@@ -189,5 +195,6 @@ message TaskResponse {
     RecordPlacements placements = 7;
     CompactionApplied compaction = 8;
     RunLost lost = 9;
+    OutcomeAnswer outcome = 10;
   }
 }

@@ -42,6 +42,7 @@ fn a_report_with_a_succeeded_run_but_no_usable_result_digest_is_refused() {
             claim: claim("r1"),
             state: ReportedState::Succeeded {
                 result_digest: Digest::blake3(b"out"),
+                delivered: false,
             },
         }],
         keys: vec![],

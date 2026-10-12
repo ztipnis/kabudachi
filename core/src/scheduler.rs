@@ -91,6 +91,7 @@ mod loss;
 mod memory;
 mod memory_budget;
 mod observer;
+mod outcome;
 mod publication;
 mod rebuild;
 mod reconciliation;
@@ -112,6 +113,7 @@ pub use loss::LostRun;
 pub use memory::MemoryLimits;
 use memory_budget::MemoryBudget;
 pub use observer::{NoObserver, Observer};
+pub use outcome::{Conclusion, Outcome, OutcomeRejection};
 pub use rebuild::{Adopted, ReconcileRefused, ReconcileRejection, Reconciled};
 use reconciliation::Reconciliation;
 pub use reports::{Certification, Completion, ContinuationRejection, ReportRejection};
@@ -261,6 +263,8 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     /// merge that failed once would fail again on the same chain, so no new
     /// compaction is made for that generation.
     failed_compactions: BTreeMap<Key, TaskId>,
+    /// Conclusions not yet taken, oldest first.
+    conclusions: Vec<Conclusion>,
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
@@ -301,6 +305,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             compaction_runners: BTreeSet::new(),
             silent: BTreeMap::new(),
             failed_compactions: BTreeMap::new(),
+            conclusions: Vec::new(),
         }
     }
 
@@ -379,6 +384,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Its observer, for a driver that takes what the scheduler published.
     pub fn observer_mut(&mut self) -> &mut O {
         &mut self.observer
+    }
+
+    /// The observer every revision is published to.
+    pub fn observer(&self) -> &O {
+        &self.observer
     }
 
     /// Records that `run_id` was decided now, and that its task has a change

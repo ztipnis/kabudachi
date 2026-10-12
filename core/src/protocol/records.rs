@@ -40,6 +40,8 @@ pub struct NewTask {
     pub ephemeral: bool,
     pub non_retriable: bool,
     pub reconnect_timeout: Option<Duration>,
+    /// The worker that awaits the result, if one does across workers.
+    pub client: Option<WorkerId>,
 }
 
 impl NewTask {
@@ -66,6 +68,7 @@ impl NewTask {
             ephemeral: false,
             non_retriable: false,
             reconnect_timeout: None,
+            client: None,
         }
     }
 }
@@ -88,6 +91,7 @@ pub fn new_task(new: NewTask) -> Task {
         expiry_millis: new.expiry.map(|expiry| expiry.as_ticks()),
         compacts: None,
         reconnect_timeout_ms: new.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
+        client: new.client.map(Into::into),
     }
 }
 
@@ -124,6 +128,7 @@ pub fn first_attempt(
         selected_worker: None,
         result_digest: None,
         failure_kind: String::new(),
+        delivered: false,
     }
 }
 
@@ -145,6 +150,7 @@ pub fn retry_of(failed: &TaskRun, ids: &impl IdGenerator, at: WallTime) -> TaskR
         selected_worker: None,
         result_digest: None,
         failure_kind: String::new(),
+        delivered: false,
     }
 }
 

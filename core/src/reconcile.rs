@@ -49,9 +49,11 @@ pub struct ReconcileTerm {
 pub enum ReportedState {
     Claimed,
     Running,
-    /// Succeeded with this digest; no leader has certified it.
+    /// Succeeded with this digest; no leader has certified it. `delivered`:
+    /// the result reached its task's client before the run was reported.
     Succeeded {
         result_digest: Digest,
+        delivered: bool,
     },
     /// Failed; no leader has recorded the failure.
     Failed {

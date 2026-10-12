@@ -142,9 +142,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     ) {
         match state {
             ReportedState::Claimed | ReportedState::Running => {}
-            ReportedState::Succeeded { result_digest } => {
+            ReportedState::Succeeded {
+                result_digest,
+                delivered,
+            } => {
                 if let Ok(certified) =
-                    self.certify_owned(worker, run_id, result_digest, Completion::Final)
+                    self.certify_owned(worker, run_id, result_digest, Completion::Final, delivered)
                 {
                     out.certified.push(certified);
                 }
@@ -239,6 +242,7 @@ fn claimed_run(worker: &WorkerId, claim: &Claim, stamped_at: WallTime) -> TaskRu
         selected_worker: None,
         result_digest: None,
         failure_kind: String::new(),
+        delivered: false,
     };
     run.transition_to(TaskRunState::Claimed, stamped_at)
         .expect("a queued run can be claimed");

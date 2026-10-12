@@ -1058,6 +1058,7 @@ fn a_worker_is_believed_to_hold_the_runs_it_reported_until_a_newer_answer_leaves
                         &done,
                         ReportedState::Succeeded {
                             result_digest: Digest::blake3(b"out"),
+                            delivered: false,
                         },
                     ),
                 ],

@@ -82,6 +82,7 @@ impl ClaimedRuns {
                 HeldRun::Running => ReportedState::Running,
                 HeldRun::Completed { result_digest } => ReportedState::Succeeded {
                     result_digest: result_digest.clone(),
+                    delivered: false,
                 },
                 HeldRun::Failed { failure_kind } => ReportedState::Failed {
                     failure_kind: truncated(failure_kind, MAX_FAILURE_KIND_BYTES),

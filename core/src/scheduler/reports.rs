@@ -95,10 +95,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         Ok(())
     }
 
-    /// The worker running `run_id` reports success with the digest of its
-    /// result. Only a `Running` run owned by that worker can complete, so a
-    /// stale or repeated report is refused and certifies nothing. `completion`
-    /// says whether that ends the task.
+    /// As [`Self::complete_delivered`], for a run whose result went to no
+    /// client: a task with none, as in the one-node runtime.
     pub fn complete(
         &mut self,
         worker: &WorkerId,
@@ -106,7 +104,23 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         result_digest: Digest,
         completion: Completion,
     ) -> Result<Certification, ReportRejection> {
-        let outcome = self.certify(worker, run_id, result_digest, completion);
+        self.complete_delivered(worker, run_id, result_digest, completion, false)
+    }
+
+    /// The worker running `run_id` reports success with the digest of its
+    /// result, and whether it delivered the result to the task's client
+    /// first, which the run records. Only a `Running` run owned by that
+    /// worker can complete, so a stale or repeated report is refused and
+    /// certifies nothing. `completion` says whether that ends the task.
+    pub fn complete_delivered(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        result_digest: Digest,
+        completion: Completion,
+        delivered: bool,
+    ) -> Result<Certification, ReportRejection> {
+        let outcome = self.certify(worker, run_id, result_digest, completion, delivered);
         self.end_call();
         outcome
     }
@@ -118,6 +132,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run_id: &TaskRunId,
         result_digest: Digest,
         completion: Completion,
+        delivered: bool,
     ) -> Result<Certification, ReportRejection> {
         self.require_leader()?;
         // A compaction run's result is its fold, reported by `complete_compaction`.
@@ -128,7 +143,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         {
             return Err(ReportRejection::NotAuthoritative);
         }
-        self.certify_owned(worker, run_id, result_digest, completion)
+        self.certify_owned(worker, run_id, result_digest, completion, delivered)
     }
 
     pub(super) fn certify_owned(
@@ -137,6 +152,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run_id: &TaskRunId,
         result_digest: Digest,
         completion: Completion,
+        delivered: bool,
     ) -> Result<Certification, ReportRejection> {
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);
@@ -144,6 +160,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run.transition_to(TaskRunState::Succeeded, stamped_at)
             .expect("a Running run can always succeed");
         run.result_digest = Some(result_digest.clone().into());
+        run.delivered = delivered;
         let task_id = run.task_id();
         self.mark_decided(run_id);
         match completion {

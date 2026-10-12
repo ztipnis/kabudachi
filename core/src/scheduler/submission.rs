@@ -3,7 +3,7 @@
 
 use crate::coalescing;
 use crate::protocol::digest::Digest;
-use crate::protocol::ids::{IdGenerator, TaskDefinitionId, TaskId, mint_task_id};
+use crate::protocol::ids::{IdGenerator, TaskDefinitionId, TaskId, WorkerId, mint_task_id};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task};
@@ -117,6 +117,11 @@ pub struct Submission {
     /// leader has to abort it. `None`, or zero, leaves it to the shard's
     /// default (`ElectionTimings::reconnect_timeout`).
     pub reconnect_timeout: Option<Duration>,
+    /// The worker that submitted the task and awaits its result: the
+    /// worker that runs it delivers the result there, and the leader
+    /// tells it how the task ended. `None` for a task nobody awaits
+    /// across workers, as in the one-node runtime.
+    pub client: Option<WorkerId>,
 }
 
 impl Submission {
@@ -140,6 +145,7 @@ impl Submission {
             ephemeral: false,
             non_retriable: false,
             reconnect_timeout: None,
+            client: None,
         }
     }
 
@@ -192,6 +198,12 @@ impl Submission {
     /// silent, instead of after the shard's reconnect timeout.
     pub fn with_reconnect_timeout(mut self, timeout: Duration) -> Self {
         self.reconnect_timeout = Some(timeout);
+        self
+    }
+
+    /// The task is awaited by `client`, which hears how it ends.
+    pub fn with_client(mut self, client: WorkerId) -> Self {
+        self.client = Some(client);
         self
     }
 }
@@ -416,5 +428,6 @@ fn task_of(task_id: TaskId, submitted_at: WallTime, submission: Submission) -> T
         ephemeral: submission.ephemeral,
         non_retriable: submission.non_retriable,
         reconnect_timeout: submission.reconnect_timeout,
+        client: submission.client,
     })
 }

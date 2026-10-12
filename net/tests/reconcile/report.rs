@@ -129,7 +129,10 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
             } else if run.claim.task_run_id == succeeded_run {
                 assert_eq!(
                     run.state,
-                    ReportedState::Succeeded { result_digest: Digest::blake3(RESULT) }
+                    ReportedState::Succeeded {
+                        result_digest: Digest::blake3(RESULT),
+                        delivered: false,
+                    }
                 );
             } else {
                 assert_eq!(run.state, ReportedState::Claimed);
