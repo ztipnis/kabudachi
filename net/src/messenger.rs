@@ -180,8 +180,9 @@
 //! membership"). So a peer this node never itself connected to can still be
 //! reached, once some other peer's Identify has given `kad` a route to it.
 
+mod record_queries;
+
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -192,11 +193,10 @@ use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{ShardId, ShardName, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 pub use kabudachi_core::task_record::{PlacedWrite, WriteOutcome};
-use kabudachi_core::task_record::{RecordVersion, VersionOrder, Write, identify};
+use kabudachi_core::task_record::Write;
 use libp2p::core::ConnectedPoint;
 use libp2p::core::transport::ListenerId;
 use libp2p::futures::StreamExt;
-use libp2p::kad::store::RecordStore as _;
 use libp2p::request_response::{self, ResponseChannel};
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
@@ -219,7 +219,8 @@ use crate::steal::codec::StealCodec;
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm, hide_listen_addresses};
 use crate::task_exchange::{NamedLeader, OwnTask};
 use crate::task_exchange::codec::TaskCodec;
-use crate::task_store::{HeldRecords, record_key};
+use crate::task_store::HeldRecords;
+use record_queries::RecordQueries;
 
 /// What [`Net::dial_for_connection`] dials.
 pub(crate) enum DialTarget {
@@ -1196,53 +1197,10 @@ struct Pending {
     listens: HashMap<ListenerId, oneshot::Sender<Multiaddr>>,
     exchanges: Exchanges,
     dials: HashMap<ConnectionId, PendingDial>,
-    /// The `kad` queries of record writes in flight to other workers, each
-    /// to the write it is part of.
-    writes: HashMap<kad::QueryId, u64>,
-    /// The record writes with a query still in flight, by the number each is
-    /// known by here.
-    unfinished: HashMap<u64, UnfinishedWrite>,
-    /// The number the next record write is known by.
-    next_write: u64,
-    /// Hand-offs in flight to other workers, by their `kad` query, each to
-    /// say whether it reached its quorum.
-    hand_offs: HashMap<kad::QueryId, oneshot::Sender<bool>>,
-    /// Record lookups in flight, by their `kad` query.
-    reads: HashMap<kad::QueryId, Read>,
+    /// The shard's record writes, hand-offs and lookups in flight.
+    records: RecordQueries,
     /// Bootstrap queries that have had a failed step, until their last step.
     crawls: CrawlTracker,
-}
-
-/// A record lookup collecting the answers of its `kad` query.
-struct Read {
-    /// The newest answer so far, with its version.
-    best: Option<(RecordVersion, TaskRecord)>,
-    respond_to: oneshot::Sender<Option<TaskRecord>>,
-}
-
-impl Read {
-    /// Keeps `value` if it decodes to a record newer than the best so far.
-    fn offer(&mut self, value: &[u8]) {
-        let Ok(record) = TaskRecord::decode(value) else {
-            return;
-        };
-        let Ok((_, version)) = identify(&record) else {
-            return;
-        };
-        let newer = self
-            .best
-            .as_ref()
-            .is_none_or(|(best, _)| best.order(&version) == VersionOrder::Newer);
-        if newer {
-            self.best = Some((version, record));
-        }
-    }
-
-    /// Ends the lookup with the best answer, to a caller who may have
-    /// stopped waiting.
-    fn finish(self) {
-        let _ = self.respond_to.send(self.best.map(|(_, record)| record));
-    }
 }
 
 /// A `Command::DialForConnection` in flight.
@@ -1446,162 +1404,10 @@ fn handle_command(
         }
         Command::Exchange(run) => run(swarm, &mut pending.exchanges),
         Command::WithPeers(read) => read(peers),
-        Command::WriteRecords(writes) => {
-            for placed in writes {
-                write_record(swarm, placed, pending, inbound);
-            }
-        }
-        Command::HandOff { write, respond_to } => hand_off_record(swarm, write, respond_to, pending),
-        Command::GetRecord { task, respond_to } => {
-            match swarm.behaviour_mut().records.as_mut() {
-                Some(records) => {
-                    let query = records.get_record(record_key(&task));
-                    pending.reads.insert(
-                        query,
-                        Read {
-                            best: None,
-                            respond_to,
-                        },
-                    );
-                }
-                None => {
-                    let _ = respond_to.send(None);
-                }
-            }
-        }
+        Command::WriteRecords(writes) => pending.records.start_writes(swarm, writes, inbound),
+        Command::HandOff { write, respond_to } => pending.records.start_hand_off(swarm, write, respond_to),
+        Command::GetRecord { task, respond_to } => pending.records.start_read(swarm, task, respond_to),
     }
-}
-
-/// Starts one record write (see [`Net::write_records`]): puts the copy of a
-/// holder that is this worker into its own store, and writes the others'
-/// over the records protocol, to each placement the write must reach at the
-/// quorum of it still missing. A holder of two placements is written twice,
-/// once for each quorum that counts it. The write is stored once every
-/// placement's quorum has stored it, and refused as soon as one cannot.
-fn write_record(
-    swarm: &mut Swarm<Behaviour>,
-    placed: PlacedWrite,
-    pending: &mut Pending,
-    inbound: &Inbound,
-) {
-    let write = Write::of(&placed.record);
-    let local = *swarm.local_peer_id();
-    let Some(records) = swarm.behaviour_mut().records.as_mut() else {
-        inbound.queue_write(WriteOutcome {
-            write,
-            stored: false,
-        });
-        return;
-    };
-    let value = placed.record.encode_to_vec();
-    let key = record_key(&write.task_id);
-    // Every holder the write goes to: this worker's own copy first, so its
-    // acknowledgement counts for each placement it belongs to.
-    let goes_here = placed
-        .recipients()
-        .iter()
-        .any(|holder| PeerId::from_str(holder.as_str()).is_ok_and(|peer| peer == local));
-    let stored_here = goes_here
-        && records
-            .store_mut()
-            .put(kad::Record::new(key.clone(), value.clone()))
-            .is_ok();
-    let mut queries = Vec::new();
-    let placements = std::iter::once((placed.holders(), placed.quorum))
-        .chain(placed.prior.iter().map(|prior| (prior.holders.clone(), prior.quorum)));
-    for (holders, quorum) in placements {
-        let mut acked = 0;
-        let mut remote = Vec::new();
-        for holder in holders {
-            let Ok(peer) = PeerId::from_str(holder.as_str()) else {
-                continue;
-            };
-            if peer == local {
-                acked += usize::from(stored_here);
-            } else {
-                remote.push(peer);
-            }
-        }
-        let needed = quorum.saturating_sub(acked);
-        if needed == 0 {
-            continue;
-        }
-        if remote.len() < needed {
-            inbound.queue_write(WriteOutcome {
-                write,
-                stored: false,
-            });
-            return;
-        }
-        queries.push((remote, needed));
-    }
-    if queries.is_empty() {
-        inbound.queue_write(WriteOutcome {
-            write,
-            stored: true,
-        });
-        return;
-    }
-    let number = pending.next_write;
-    pending.next_write += 1;
-    pending.unfinished.insert(
-        number,
-        UnfinishedWrite {
-            write,
-            outstanding: queries.len(),
-        },
-    );
-    for (remote, needed) in queries {
-        let quorum = kad::Quorum::N(NonZeroUsize::new(needed).expect("needed is not zero here"));
-        let query = records.put_record_to(
-            kad::Record::new(key.clone(), value.clone()),
-            remote.into_iter(),
-            quorum,
-        );
-        pending.writes.insert(query, number);
-    }
-}
-
-/// Starts one hand-off (see [`Net::hand_off`]): the copy goes to each holder
-/// but this worker, under this worker's name as its publisher, at the quorum
-/// the hand-off asks.
-fn hand_off_record(
-    swarm: &mut Swarm<Behaviour>,
-    write: HandOffWrite,
-    respond_to: oneshot::Sender<bool>,
-    pending: &mut Pending,
-) {
-    let local = *swarm.local_peer_id();
-    let Some(records) = swarm.behaviour_mut().records.as_mut() else {
-        let _ = respond_to.send(false);
-        return;
-    };
-    let Ok((task, _)) = identify(&write.record) else {
-        let _ = respond_to.send(false);
-        return;
-    };
-    let remote: Vec<PeerId> = write
-        .holders
-        .iter()
-        .filter_map(|holder| PeerId::from_str(holder.as_str()).ok())
-        .filter(|peer| *peer != local)
-        .collect();
-    let Some(needed) = NonZeroUsize::new(write.quorum.max(1)).filter(|needed| needed.get() <= remote.len()) else {
-        let _ = respond_to.send(false);
-        return;
-    };
-    let mut record = kad::Record::new(record_key(&task), write.record.encode_to_vec());
-    record.publisher = Some(local);
-    let query = records.put_record_to(record, remote.into_iter(), kad::Quorum::N(needed));
-    pending.hand_offs.insert(query, respond_to);
-}
-
-/// A record write that waits for the queries it started: one for each
-/// placement it must reach, each to a quorum of that placement.
-struct UnfinishedWrite {
-    write: Write,
-    /// The queries not answered yet.
-    outstanding: usize,
 }
 
 /// The bootstrap queries that have had a failed step so far.
@@ -1819,64 +1625,7 @@ fn handle_event(
                 inbound.queue_input(input);
             }
         }
-        SwarmEvent::Behaviour(BehaviourEvent::Records(kad::Event::OutboundQueryProgressed {
-            id,
-            result: kad::QueryResult::PutRecord(result),
-            ..
-        })) => {
-            if let Some(number) = pending.writes.remove(&id) {
-                // A write already refused has no entry left: its other queries
-                // end unheard.
-                if let Some(mut unfinished) = pending.unfinished.remove(&number) {
-                    unfinished.outstanding -= 1;
-                    match &result {
-                        Err(error) => {
-                            tracing::debug!(
-                                task = unfinished.write.task_id.as_str(),
-                                %error,
-                                "a record write did not reach its quorum"
-                            );
-                            inbound.queue_write(WriteOutcome {
-                                write: unfinished.write,
-                                stored: false,
-                            });
-                        }
-                        Ok(_) if unfinished.outstanding == 0 => {
-                            inbound.queue_write(WriteOutcome {
-                                write: unfinished.write,
-                                stored: true,
-                            });
-                        }
-                        Ok(_) => {
-                            pending.unfinished.insert(number, unfinished);
-                        }
-                    }
-                }
-            } else if let Some(respond_to) = pending.hand_offs.remove(&id) {
-                if let Err(error) = &result {
-                    tracing::debug!(%error, "a record hand-off did not reach its quorum");
-                }
-                let _ = respond_to.send(result.is_ok());
-            }
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::Records(kad::Event::OutboundQueryProgressed {
-            id,
-            result: kad::QueryResult::GetRecord(result),
-            step,
-            ..
-        })) => {
-            if let Some(read) = pending.reads.get_mut(&id) {
-                if let Ok(kad::GetRecordOk::FoundRecord(found)) = &result {
-                    read.offer(&found.record.value);
-                }
-            }
-            // The lookup's last step, whether it found records or not.
-            if step.last {
-                if let Some(read) = pending.reads.remove(&id) {
-                    read.finish();
-                }
-            }
-        }
+        SwarmEvent::Behaviour(BehaviourEvent::Records(event)) => pending.records.on_event(event, inbound),
         SwarmEvent::Behaviour(BehaviourEvent::Join(event)) => {
             settle::<JoinCodec>(&mut pending.exchanges, event, inbound, peers, now);
         }
