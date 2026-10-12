@@ -23,6 +23,7 @@ use kabudachi_core::scheduler::{
 use kabudachi_core::task_record::RecordVersion;
 use kabudachi_core::time::{Clock, WallTime};
 
+use crate::support::grant::unbounded_grant;
 use crate::support::scheduler::{
     Fixture, OFFICE, grant_of, newest_records, reconciling, reconciling_after, ticks,
 };
@@ -1247,4 +1248,92 @@ fn a_successor_learns_a_worker_still_holds_a_run_stored_cancelled_and_names_it_o
         })
         .unwrap();
     assert_eq!(new.scheduler.take_held_cancels(), [told]);
+}
+
+#[test]
+fn a_claim_whose_key_another_installed_generation_holds_is_not_rebuilt() {
+    let mut old = Fixture::leading();
+    let holder = old
+        .scheduler
+        .submit(plain(b"h").with_coalescing_key("k"))
+        .unwrap();
+    let held = old.scheduler.request_claim(&worker("w1"), &holder).unwrap();
+    let holder_claimed = old.spy.revisions_of(&holder).last().cloned().unwrap();
+    old.scheduler
+        .report_started(&worker("w1"), &held.task_run_id)
+        .unwrap();
+    old.scheduler
+        .complete(&worker("w1"), &held.task_run_id, Digest::blake3(b"out"), Completion::Final)
+        .unwrap();
+    let later = old
+        .scheduler
+        .submit(plain(b"l").with_coalescing_key("k"))
+        .unwrap();
+    let later_claim = old.scheduler.request_claim(&worker("w2"), &later).unwrap();
+    let mut new = reconciling_after(&old);
+
+    new.scheduler
+        .reconcile(Rebuild {
+            records: vec![holder_claimed],
+            reports: report("w2", vec![reported(&later_claim, ReportedState::Claimed)]),
+            ..Rebuild::default()
+        })
+        .unwrap();
+
+    assert!(new.scheduler.holds(&holder));
+    assert!(
+        !new.scheduler.holds(&later),
+        "a generation claimed while the key's records say another holds it is not rebuilt"
+    );
+}
+
+#[test]
+fn a_compaction_claim_is_not_rebuilt_over_the_compaction_its_key_records_name() {
+    let limits = Some(MemoryLimits { soft: 300, hard: 10_000 });
+    let compaction_claimed_by = |fixture: &mut Fixture, runner: &WorkerId| {
+        fixture.scheduler.set_memory_limits(limits);
+        fixture
+            .scheduler
+            .set_compaction_runners(BTreeSet::from([runner.clone()]));
+        let holder = fixture
+            .scheduler
+            .submit(plain(b"h").with_coalescing_key("k"))
+            .unwrap();
+        fixture.scheduler.request_claim(&worker("w1"), &holder).unwrap();
+        for letter in b'a'..b'g' {
+            fixture
+                .scheduler
+                .submit(plain(&[letter; 80]).with_coalescing_key("k"))
+                .unwrap();
+        }
+        fixture
+            .scheduler
+            .claim_oldest(runner, 10)
+            .unwrap()
+            .into_iter()
+            .find(|claim| claim.task.compacts.is_some())
+            .expect("a compaction was made")
+    };
+    let mut first = Fixture::leading();
+    let stranger = compaction_claimed_by(&mut first, &worker("r1"));
+    let mut second = Fixture::successor_of(&first);
+    second.scheduler.set_leadership_grant(Some(unbounded_grant()));
+    compaction_claimed_by(&mut second, &worker("r2"));
+    let mut new = reconciling_after(&second);
+    new.scheduler.set_memory_limits(limits);
+    new.scheduler
+        .set_compaction_runners(BTreeSet::from([worker("r1"), worker("r2")]));
+
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&second),
+            reports: report("r1", vec![reported(&stranger, ReportedState::Claimed)]),
+            ..Rebuild::default()
+        })
+        .unwrap();
+
+    assert!(
+        !new.scheduler.holds(&stranger.task.task_id()),
+        "the key's compaction is the one its records name"
+    );
 }
