@@ -12,6 +12,9 @@ use tokio::sync::watch;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct Observed {
     pub(super) leader: Option<(WorkerId, u64)>,
+    /// How many times `leader` has changed, to or from none included, so a
+    /// reader that missed a spell with no leader named still sees it passed.
+    pub(super) leader_changes: u64,
     pub(super) voters: usize,
     pub(super) shard_id: String,
     /// The worker is out of its shard: `Worker::run` ended, however it did.
@@ -29,16 +32,18 @@ impl Drop for LeftOnDrop {
 }
 
 pub(super) fn publish(sender: &watch::Sender<Observed>, node: &WorkerNode<RealClock>) {
-    let now = Observed {
-        leader: node.known_leader(),
-        voters: node.voters().len(),
-        shard_id: node.shard_id().as_str().to_owned(),
-        gone: false,
-    };
+    let leader = node.known_leader();
     sender.send_if_modified(|seen| {
+        let now = Observed {
+            leader_changes: seen.leader_changes + u64::from(seen.leader != leader),
+            leader,
+            voters: node.voters().len(),
+            shard_id: node.shard_id().as_str().to_owned(),
+            gone: false,
+        };
         let changed = *seen != now;
         if changed {
-            *seen = now.clone();
+            *seen = now;
         }
         changed
     });

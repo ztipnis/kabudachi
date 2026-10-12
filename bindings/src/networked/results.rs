@@ -141,21 +141,26 @@ pub(super) async fn read_results(shared: Arc<Shared>) {
 /// stored and still awaited, stands: a certification or an ending the old
 /// leader decided may never have been told. A spell with no leader named
 /// counts as a change, even when the same leader is named after it, since
-/// what it told meanwhile may not have arrived. The answers come in as any
-/// conclusion does.
+/// what it told meanwhile may not have arrived; so does one that started
+/// and ended while asking. The answers come in as any conclusion does.
 pub(super) async fn ask_after_leader_change(shared: Arc<Shared>) {
     let mut observed = shared.observed.clone();
-    let mut named: Option<(WorkerId, u64)> = observed.borrow().leader.clone();
-    let mut unnamed_since = false;
+    let (mut named, mut seen_changes) = {
+        let now = observed.borrow();
+        (now.leader.clone(), now.leader_changes)
+    };
     while observed.changed().await.is_ok() {
-        let Some(now) = observed.borrow_and_update().leader.clone() else {
-            unnamed_since = true;
+        let (leader, changes) = {
+            let now = observed.borrow_and_update();
+            (now.leader.clone(), now.leader_changes)
+        };
+        let Some(now) = leader else {
             continue;
         };
-        if !unnamed_since && named.as_ref() == Some(&now) {
+        if changes == seen_changes {
             continue;
         }
-        unnamed_since = false;
+        seen_changes = changes;
         if named.replace(now).is_some() {
             ask_about_awaited(&shared).await;
         }
