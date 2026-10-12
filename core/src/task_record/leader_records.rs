@@ -323,6 +323,51 @@ impl<E> LeaderRecords<E> {
         }
     }
 
+    /// When the driver must next wake for the record path: a refused write
+    /// due again, or, while answers are held, one tick past `lease_end`, so
+    /// they are answered `NotLeader` even if nothing else arrives.
+    pub fn wake_at(&self, lease_end: Option<Instant>) -> Option<Instant> {
+        // A held answer is released `NotLeader` when the scheduler's lease
+        // ends, and nothing else guarantees a wake then: the election's own
+        // deadlines are not shown to coincide with the grant's end (the
+        // earlier of its quorum and fence ends), and no write outcome or
+        // arrival need come. One tick past the end, so a sleep that counts
+        // whole ticks never fires before the lease has ended.
+        let lease_wake = if self.held.is_empty() {
+            None
+        } else {
+            lease_end.map(|end| end + Duration::from_ticks(1))
+        };
+        [lease_wake, self.repair.wake_at()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Places `records` on the node's voters and writes them; each write's
+    /// outcome comes back through the ports' owner.
+    fn place_and_write<C: Clock>(
+        &mut self,
+        node: &WorkerNode<C>,
+        records: Vec<TaskRecord>,
+        ports: &mut impl RecordPorts,
+    ) {
+        let (mut placed, unplaced) = place(node, records, &*ports);
+        for write in &mut placed {
+            self.repair.written(write, |holder| node.is_member(holder));
+        }
+        // No placement means either the leader has just stopped leading (a
+        // scheduler publishes only while it leads, so its own roster no longer
+        // holds it), or a voter id is not a peer id, so it cannot be placed:
+        // either way the write counts as refused.
+        for record in unplaced {
+            ports.refuse(Write::of(&record));
+        }
+        ports.write(placed);
+    }
+}
+
+impl<E> LeaderRecords<E> {
     /// Takes `reconciliation` one turn on: rebuilds the scheduler when the
     /// round may stop, places and republishes its records, retries stuck
     /// work, and once the node leads hands the scheduler what late answers
@@ -488,27 +533,6 @@ impl<E> LeaderRecords<E> {
         );
     }
 
-    /// When the driver must next wake for the record path: a refused write
-    /// due again, or, while answers are held, one tick past `lease_end`, so
-    /// they are answered `NotLeader` even if nothing else arrives.
-    pub fn wake_at(&self, lease_end: Option<Instant>) -> Option<Instant> {
-        // A held answer is released `NotLeader` when the scheduler's lease
-        // ends, and nothing else guarantees a wake then: the election's own
-        // deadlines are not shown to coincide with the grant's end (the
-        // earlier of its quorum and fence ends), and no write outcome or
-        // arrival need come. One tick past the end, so a sleep that counts
-        // whole ticks never fires before the lease has ended.
-        let lease_wake = if self.held.is_empty() {
-            None
-        } else {
-            lease_end.map(|end| end + Duration::from_ticks(1))
-        };
-        [lease_wake, self.repair.wake_at()]
-            .into_iter()
-            .flatten()
-            .min()
-    }
-
     /// Places the republished `records` on the voters and starts writing them. If
     /// any cannot be placed none is written, and all are kept to be placed again
     /// when the voters change or after a suspicion timeout: leading without every
@@ -542,28 +566,6 @@ impl<E> LeaderRecords<E> {
                 .collect();
             reconciliation.stuck(Stuck::Place(all), node.placeable_voters(), node.now());
         }
-    }
-
-    /// Places `records` on the node's voters and writes them; each write's
-    /// outcome comes back through the ports' owner.
-    fn place_and_write<C: Clock>(
-        &mut self,
-        node: &WorkerNode<C>,
-        records: Vec<TaskRecord>,
-        ports: &mut impl RecordPorts,
-    ) {
-        let (mut placed, unplaced) = place(node, records, &*ports);
-        for write in &mut placed {
-            self.repair.written(write, |holder| node.is_member(holder));
-        }
-        // No placement means either the leader has just stopped leading (a
-        // scheduler publishes only while it leads, so its own roster no longer
-        // holds it), or a voter id is not a peer id, so it cannot be placed:
-        // either way the write counts as refused.
-        for record in unplaced {
-            ports.refuse(Write::of(&record));
-        }
-        ports.write(placed);
     }
 }
 
