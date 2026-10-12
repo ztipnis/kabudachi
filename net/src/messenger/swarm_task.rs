@@ -60,8 +60,9 @@ fn gossip_input(message: gossipsub::Message) -> Option<Input> {
 
 /// Writes `own` into `message` as its sender's address, if `message` is a
 /// roll call or a roll call reply: the two messages whose recipient may hold
-/// no connection to the sender and still has to answer it directly (see the
-/// "Where a peer's address comes from" in the `crate::messenger` module doc).
+/// no connection to the sender and still has to answer it directly (see
+/// "Reconnect/backoff and where a peer's address comes from" in the
+/// `crate::messenger` module doc).
 /// Every other message is left as it is.
 fn stamp_own_address(message: &mut ElectionMessage, own: &Multiaddr) {
     match &mut message.payload {

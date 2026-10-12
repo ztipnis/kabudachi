@@ -13,7 +13,8 @@ use crate::authority::AuthorityClient;
 use crate::messenger::{Net, PlacedWrite};
 use crate::task_store::placement::{Placement, ReplicationFactor, placement};
 
-/// What one batch of [`super::run_driver`] steps its node with.
+/// The driver run's stepper: what it steps its node with in each batch,
+/// kept between batches.
 pub(super) struct Stepper<'a, C: Clock, I: IdGenerator, O> {
     pub(super) node: &'a mut WorkerNode<C>,
     pub(super) scheduler: &'a mut Scheduler<C, I, RecordOutbox>,
