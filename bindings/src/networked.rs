@@ -23,19 +23,19 @@
 //! Python (`ABORT`) for a run it holds, and a run not yet taken is reported
 //! lost at once.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+mod delivery;
+mod observed;
+mod seam;
+
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use kabudachi_core::election::{ElectionTimings, Input, Step, WorkerNode};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
-use kabudachi_core::protocol::ids::{ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId};
-use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::messages::{TaskRejectReason, task_response};
-use kabudachi_core::scheduler::{Claim, Submitted, mint};
+use kabudachi_core::protocol::ids::{ShardName, TaskId, TaskRunId, Uuid7Ids};
+use kabudachi_core::scheduler::{Claim, mint};
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
-use kabudachi_net::executor::{Report, ReportSink, Work, WorkSource, executor_channel};
-use kabudachi_net::messenger::Net;
+use kabudachi_net::executor::{Report, Work, WorkSource, executor_channel};
 use kabudachi_net::task_exchange::LeaderRetry;
 use kabudachi_net::worker::{AuthorityConfig, Multiaddr, Worker, WorkerConfig};
 use kabudachi_redis_authority::{RedisAuthority, RedisAuthorityConfig};
@@ -48,7 +48,11 @@ use tokio::task::JoinHandle;
 use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::outcomes::PyEventKind;
-use crate::work::{PyClaim, PyEvent, PyTaskRecord};
+use crate::work::{PyEvent, PyTaskRecord};
+
+use self::delivery::{cancel_at_leader, deliver};
+use self::observed::{LeftOnDrop, Observed, publish};
+use self::seam::{GONE_MESSAGE, Shared, take_handed};
 
 const DEFAULT_WORKER_THREADS: usize = 2;
 const DEFAULT_RESULT_TTL_MS: u64 = 60 * 60 * 1000;
@@ -60,91 +64,9 @@ const ROLL_CALL_DEADLINE_MS: u64 = 250;
 /// and nothing it ends with counts.
 const CANCELLED_KIND: &str = "TaskCancelledError";
 const MALFORMED_KIND: &str = "MalformedClaim";
-const GONE_MESSAGE: &str = "the worker left its shard";
 const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
 
-/// What the worker's node last showed.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct Observed {
-    leader: Option<(WorkerId, u64)>,
-    voters: usize,
-    shard_id: String,
-    /// The worker is out of its shard: `Worker::run` ended, however it did.
-    gone: bool,
-}
-
-/// Marks the worker out of its shard when dropped: when `Worker::run`
-/// returns, and also when it panics or is aborted, so no wait outlives it.
-struct LeftOnDrop(Arc<watch::Sender<Observed>>);
-
-impl Drop for LeftOnDrop {
-    fn drop(&mut self) {
-        self.0.send_modify(|seen| seen.gone = true);
-    }
-}
-
-/// What passes between the driver and Python.
-#[derive(Default)]
-struct Seam {
-    /// Places offered to the driver that no run has used yet.
-    offered: u32,
-    /// Runs handed over that Python has not taken, oldest first.
-    handed: VecDeque<Claim>,
-    /// The task of every run Python took and has not ended.
-    held: BTreeMap<TaskRunId, TaskId>,
-    events: VecDeque<PyEvent>,
-    /// Tasks submitted here whose submission no leader has answered yet: a
-    /// cancel of one waits, so it never reaches a leader before the task.
-    delivering: BTreeSet<TaskId>,
-    /// Nothing more is taken: a run handed over is reported lost at once.
-    closed: bool,
-}
-
-struct Shared {
-    seam: Mutex<Seam>,
-    /// Woken whenever a claim or an event may be waiting.
-    changed: Notify,
-    reports: ReportSink,
-    net: Arc<Net>,
-    observed: watch::Receiver<Observed>,
-    /// How submissions and cancels keep asking the leader.
-    retry: LeaderRetry,
-}
-
 impl Shared {
-    fn seam(&self) -> MutexGuard<'_, Seam> {
-        self.seam.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Hands `report` to the driver. A driver that has stopped shows as the
-    /// worker leaving its shard, which every wait reports.
-    fn report(&self, report: Report) {
-        let _ = self.reports.report(report);
-    }
-
-    fn wake(&self) {
-        self.changed.notify_waiters();
-    }
-
-    /// Offers the driver the places `free` has that are neither offered nor
-    /// held by a run Python has not taken.
-    fn offer(&self, free: usize) {
-        let more = {
-            let mut seam = self.seam();
-            if seam.closed {
-                return;
-            }
-            let free = u32::try_from(free).unwrap_or(u32::MAX);
-            let waiting = u32::try_from(seam.handed.len()).unwrap_or(u32::MAX);
-            let more = free.saturating_sub(seam.offered.saturating_add(waiting));
-            seam.offered += more;
-            more
-        };
-        if more > 0 {
-            self.report(Report::Capacity(more));
-        }
-    }
-
     fn on_work(&self, work: Work) {
         let (report, wake) = {
             let mut guard = self.seam();
@@ -230,126 +152,6 @@ impl Shared {
             self.wake();
         }
     }
-
-    /// Up to `limit` runs handed over, now held by Python; `None` while
-    /// there are none, and none at all once nothing more is taken.
-    fn take_claims(&self, limit: usize) -> Option<Vec<PyClaim>> {
-        let mut seam = self.seam();
-        if seam.closed {
-            return Some(Vec::new());
-        }
-        if seam.handed.is_empty() {
-            return None;
-        }
-        let count = limit.min(seam.handed.len());
-        let claims: Vec<Claim> = seam.handed.drain(..count).collect();
-        for claim in &claims {
-            seam.held
-                .insert(claim.task_run_id.clone(), claim.task.task_id());
-        }
-        Some(claims.into_iter().map(PyClaim::from).collect())
-    }
-
-    fn take_events(&self) -> Option<Vec<PyEvent>> {
-        let mut seam = self.seam();
-        (!seam.events.is_empty()).then(|| seam.events.drain(..).collect())
-    }
-
-    fn holds(&self, run: &TaskRunId) -> bool {
-        self.seam().held.contains_key(run)
-    }
-
-    /// Ends a run Python held; `false` if it held none (the driver took it
-    /// back), and the report is then dropped.
-    fn end(&self, run: &TaskRunId) -> bool {
-        self.seam().held.remove(run).is_some()
-    }
-
-    /// Waits until `take` finds something, or the worker leaves its shard.
-    async fn until<T>(&self, take: impl Fn(&Shared) -> Option<T>) -> PyResult<T> {
-        let mut observed = self.observed.clone();
-        loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(found) = take(self) {
-                return Ok(found);
-            }
-            if observed.borrow_and_update().gone {
-                return Err(PyRuntimeError::new_err(GONE_MESSAGE));
-            }
-            tokio::select! {
-                () = &mut notified => {}
-                changed = observed.changed() => {
-                    if changed.is_err() {
-                        return Err(PyRuntimeError::new_err(GONE_MESSAGE));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Removes `run` from the runs not taken yet; whether it was there.
-fn take_handed(handed: &mut VecDeque<Claim>, run: &TaskRunId) -> bool {
-    let before = handed.len();
-    handed.retain(|claim| &claim.task_run_id != run);
-    handed.len() != before
-}
-
-/// Asks leaders to store `submitted` until one does or refuses it for
-/// good, and says which.
-async fn deliver(shared: Arc<Shared>, submitted: Submitted) {
-    let task = submitted.task_id.clone();
-    let answer = shared.net.submit_to_leader(submitted, shared.retry).await;
-    let event = answer.map(|response| match response.result {
-        Some(task_response::Result::Submitted(_)) => {
-            PyEvent::networked(PyEventKind::Accepted, task.as_str(), "")
-        }
-        Some(task_response::Result::Reject(reject)) => match TaskRejectReason::try_from(reject.reason) {
-            Ok(reason) => PyEvent::refused(task.as_str(), reason.as_str_name()),
-            Err(_) => PyEvent::refused(task.as_str(), "a reason this worker cannot read"),
-        },
-        _ => PyEvent::refused(task.as_str(), "an answer that is not about a submission"),
-    });
-    {
-        // Out of its shard, no leader will answer: nothing is said, but a
-        // cancel waiting for this submission must not wait for ever.
-        let mut seam = shared.seam();
-        seam.delivering.remove(&task);
-        seam.events.extend(event);
-    }
-    shared.wake();
-}
-
-/// Asks leaders to cancel `task` until one answers, once its own submission
-/// from here (if any) has been answered. How the cancel ended is not
-/// reported: a run it stopped is ended by the driver's `Cancel`, wherever
-/// it runs, and a task it found finished or unknown needs nothing.
-async fn cancel_at_leader(shared: Arc<Shared>, task: TaskId) {
-    while shared.seam().delivering.contains(&task) {
-        if shared.net.has_left_shard() {
-            return;
-        }
-        tokio::time::sleep(shared.retry.ask_again_after).await;
-    }
-    let _ = shared.net.cancel_at_leader(task, shared.retry).await;
-}
-
-fn publish(sender: &watch::Sender<Observed>, node: &WorkerNode<RealClock>) {
-    let now = Observed {
-        leader: node.known_leader(),
-        voters: node.voters().len(),
-        shard_id: node.shard_id().as_str().to_owned(),
-        gone: false,
-    };
-    sender.send_if_modified(|seen| {
-        let changed = *seen != now;
-        if changed {
-            *seen = now.clone();
-        }
-        changed
-    });
 }
 
 fn address(text: &str) -> PyResult<Multiaddr> {
