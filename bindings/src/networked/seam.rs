@@ -3,8 +3,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration as StdDuration;
 
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId};
+use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::Claim;
 use kabudachi_net::executor::{Report, ReportSink};
@@ -26,14 +27,25 @@ pub(super) struct Seam {
     pub(super) offered: u32,
     /// Runs handed over that Python has not taken, oldest first.
     pub(super) handed: VecDeque<Claim>,
-    /// The task of every run Python took and has not ended.
-    pub(super) held: BTreeMap<TaskRunId, TaskId>,
+    /// Every run Python took and has not ended.
+    pub(super) held: BTreeMap<TaskRunId, HeldRun>,
     pub(super) events: VecDeque<PyEvent>,
     /// Tasks submitted here whose submission no leader has answered yet: a
     /// cancel of one waits, so it never reaches a leader before the task.
     pub(super) delivering: BTreeSet<TaskId>,
+    /// Tasks submitted here whose outcome has not come back.
+    pub(super) awaiting: BTreeSet<TaskId>,
     /// Nothing more is taken: a run handed over is reported lost at once.
     pub(super) closed: bool,
+}
+
+/// A run Python took and has not ended: its task, and where its result goes.
+pub(super) struct HeldRun {
+    pub(super) task: TaskId,
+    /// The worker awaiting the result; `None` for a task nobody awaits.
+    pub(super) client: Option<WorkerId>,
+    /// How long the result may take to reach the client: the run's reconnect timeout.
+    pub(super) reconnect_timeout: StdDuration,
 }
 
 pub(super) struct Shared {
@@ -110,8 +122,12 @@ impl Shared {
         let count = limit.min(seam.handed.len());
         let claims: Vec<Claim> = seam.handed.drain(..count).collect();
         for claim in &claims {
-            seam.held
-                .insert(claim.task_run_id.clone(), claim.task.task_id());
+            let held = HeldRun {
+                task: claim.task.task_id(),
+                client: claim.task.client(),
+                reconnect_timeout: StdDuration::from_millis(claim.reconnect_timeout.as_ticks()),
+            };
+            seam.held.insert(claim.task_run_id.clone(), held);
         }
         Some(claims.into_iter().map(PyClaim::from).collect())
     }
@@ -125,16 +141,16 @@ impl Shared {
         self.seam().held.contains_key(run)
     }
 
-    /// Ends a run Python held; `false` if it held none (the driver took it
-    /// back), and the report is then dropped.
-    pub(super) fn end(&self, run: &TaskRunId) -> bool {
-        self.seam().held.remove(run).is_some()
+    /// Ends a run Python held, and returns it; `None` if it held none (the
+    /// driver took it back), and the report is then dropped.
+    pub(super) fn end(&self, run: &TaskRunId) -> Option<HeldRun> {
+        self.seam().held.remove(run)
     }
 
     /// Ends a run Python held and hands the driver `report` on it; nothing
     /// if Python held none (the driver took it back).
     pub(super) fn finish(&self, run: TaskRunId, report: impl FnOnce(TaskRunId) -> Report) {
-        if self.end(&run) {
+        if self.end(&run).is_some() {
             self.report(report(run));
         }
     }

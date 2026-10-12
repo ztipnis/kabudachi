@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 
 /// What a scheduler event is about. `SLOW_DOWN` says memory use crossed the
 /// soft limit; the event's `active` says whether it was raised or cleared.
-/// The last four come only from a networked worker.
+/// The last seven come only from a networked worker.
 #[pyclass(name = "EventKind", eq, eq_int, frozen, hash, skip_from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyEventKind {
@@ -38,6 +38,16 @@ pub enum PyEventKind {
     /// The leader hears this worker again: a run's pending abort is lifted.
     #[pyo3(name = "ABORT_WITHDRAWN")]
     AbortWithdrawn,
+    /// A task this worker submitted has a result delivered, not certified yet.
+    #[pyo3(name = "RESULT")]
+    Result,
+    /// The leader certified a run of a task this worker submitted.
+    #[pyo3(name = "CERTIFIED")]
+    Certified,
+    /// A task this worker submitted ended without a result, or its shard
+    /// no longer knows it (`state` is `None`).
+    #[pyo3(name = "OUTCOME")]
+    Outcome,
 }
 
 impl From<&Event> for PyEventKind {

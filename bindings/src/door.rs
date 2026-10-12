@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kabudachi_core::election::{DropMessages, Input, NoAuthority, Step, WorkerNode, carry_out};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::messages::TaskRecord;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
@@ -293,6 +294,11 @@ impl<C: Clock> SchedulerDoor<C> {
 
     pub fn run_ids(&self, task: &TaskId) -> Result<Vec<TaskRunId>, Closed> {
         self.read(|scheduler| scheduler.runs_of(task))
+    }
+
+    /// The newest record of `task` the scheduler's store holds, if any.
+    pub fn task_record(&self, task: &TaskId) -> Result<Option<TaskRecord>, Closed> {
+        self.read(|scheduler| scheduler.observer().records().get(task).cloned())
     }
 
     /// The timer loop's tick: `catch_up`, wake claims (never the timer loop

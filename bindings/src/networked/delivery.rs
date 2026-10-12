@@ -20,7 +20,11 @@ pub(super) fn send_submission(
     submitted: Submitted,
 ) -> String {
     let task_id = submitted.task_id.as_str().to_owned();
-    shared.seam().delivering.insert(submitted.task_id.clone());
+    {
+        let mut seam = shared.seam();
+        seam.delivering.insert(submitted.task_id.clone());
+        seam.awaiting.insert(submitted.task_id.clone());
+    }
     handle.spawn(deliver(Arc::clone(shared), submitted));
     task_id
 }
@@ -40,11 +44,17 @@ pub(super) async fn deliver(shared: Arc<Shared>, submitted: Submitted) {
         },
         _ => PyEvent::refused(task.as_str(), "an answer that is not about a submission"),
     });
+    let refused = event
+        .as_ref()
+        .is_some_and(|event| event.kind() == PyEventKind::Refused);
     {
         // Out of its shard, no leader will answer: nothing is said, but a
         // cancel waiting for this submission must not wait for ever.
         let mut seam = shared.seam();
         seam.delivering.remove(&task);
+        if refused {
+            seam.awaiting.remove(&task);
+        }
         seam.events.extend(event);
     }
     shared.wake();

@@ -1,7 +1,7 @@
 //! What Python sees of the scheduler: claims, certifications and events, and
-//! the Task records a networked shard holds.
+//! the Task records a shard holds.
 
-use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{TaskRecord, TaskRun, chain_entry};
 use kabudachi_core::protocol::task::TaskRunState as DomainRunState;
@@ -38,6 +38,9 @@ pub struct PyClaim {
     /// own, or the shard's.
     #[pyo3(get)]
     reconnect_timeout_ms: u64,
+    /// The worker awaiting the result; None for a task nobody awaits across workers.
+    #[pyo3(get)]
+    client: Option<String>,
 }
 
 #[pymethods]
@@ -62,7 +65,9 @@ impl PyClaim {
 
 impl From<Claim> for PyClaim {
     fn from(claim: Claim) -> Self {
+        let client = claim.task.client().map(|client| client.as_str().to_owned());
         PyClaim {
+            client,
             task_id: claim.task.task_id().as_str().to_owned(),
             task_run_id: claim.task_run_id.as_str().to_owned(),
             definition_id: claim.task.task_definition_id().as_str().to_owned(),
@@ -131,6 +136,32 @@ pub struct PyEvent {
     /// when the event was made.
     #[pyo3(get)]
     seconds_left: f64,
+    /// For `RESULT`: the run's result, not certified yet.
+    payload: Vec<u8>,
+    /// For `CERTIFIED`: the digest the leader certified.
+    result_digest: Vec<u8>,
+    /// For `OUTCOME`: the state the task's run ended in; `None` when the
+    /// shard does not know the task.
+    #[pyo3(get)]
+    state: Option<PyRunState>,
+    /// For `OUTCOME`: the error's type name, when the run failed.
+    #[pyo3(get)]
+    failure_kind: String,
+}
+
+#[pymethods]
+impl PyEvent {
+    /// For `RESULT`: the run's result, not certified yet.
+    #[getter]
+    fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.payload)
+    }
+
+    /// For `CERTIFIED`: the digest the leader certified.
+    #[getter]
+    fn result_digest<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.result_digest)
+    }
 }
 
 impl PyEvent {
@@ -146,6 +177,47 @@ impl PyEvent {
             active: false,
             reason: None,
             seconds_left: 0.0,
+            payload: Vec::new(),
+            result_digest: Vec::new(),
+            state: None,
+            failure_kind: String::new(),
+        }
+    }
+
+    /// What the event is about.
+    pub fn kind(&self) -> PyEventKind {
+        self.kind
+    }
+
+    /// A result of a run of `task_id`, delivered here, not certified yet.
+    pub fn result(task_id: &str, task_run_id: &str, payload: Vec<u8>) -> Self {
+        PyEvent {
+            payload,
+            ..PyEvent::networked(PyEventKind::Result, task_id, task_run_id)
+        }
+    }
+
+    /// The leader certified the result of `task_id`'s run `task_run_id`.
+    pub fn certified(task_id: &str, task_run_id: &str, result_digest: Vec<u8>) -> Self {
+        PyEvent {
+            result_digest,
+            ..PyEvent::networked(PyEventKind::Certified, task_id, task_run_id)
+        }
+    }
+
+    /// `task_id` ended in `state` without a result, or is unknown (`None`).
+    pub fn outcome(
+        task_id: &str,
+        task_run_id: &str,
+        state: Option<PyRunState>,
+        failure_kind: String,
+        superseded_by: Option<String>,
+    ) -> Self {
+        PyEvent {
+            state,
+            failure_kind,
+            superseded_by,
+            ..PyEvent::networked(PyEventKind::Outcome, task_id, task_run_id)
         }
     }
 
@@ -179,6 +251,10 @@ impl From<Event> for PyEvent {
             active: false,
             reason: None,
             seconds_left: 0.0,
+            payload: Vec::new(),
+            result_digest: Vec::new(),
+            state: None,
+            failure_kind: String::new(),
         };
         match event {
             Event::Expired {
@@ -226,10 +302,16 @@ impl From<Event> for PyEvent {
     }
 }
 
-/// A Task record as the shard holds it: what a networked worker's tests
-/// read the outcome of a run from.
+/// A Task record as the shard holds it: what a task's status and the
+/// outcome of its runs are read from.
 #[pyclass(name = "TaskRecord", frozen)]
 pub struct PyTaskRecord {
+    #[pyo3(get)]
+    task_id: String,
+    /// When the client submitted the task, in milliseconds since the Unix
+    /// epoch by the submitting worker's wall clock; 0 when unset.
+    #[pyo3(get)]
+    submitted_at_ms: u64,
     /// No run of the task will change again.
     #[pyo3(get)]
     finished: bool,
@@ -257,6 +339,20 @@ pub struct PyRunRecord {
     #[pyo3(get)]
     failure_kind: String,
     result_digest: Option<Vec<u8>>,
+    /// Which attempt this is: 1 for the first, then one more per retry.
+    #[pyo3(get)]
+    attempt_number: u32,
+    /// When the leader created the run, in milliseconds since the Unix
+    /// epoch by its wall clock; 0 when unset.
+    #[pyo3(get)]
+    created_at_ms: u64,
+    /// When the leader last changed the run, as `created_at_ms`.
+    #[pyo3(get)]
+    updated_at_ms: u64,
+    /// Whether the run's result reached its task's client before the run
+    /// was reported completed.
+    #[pyo3(get)]
+    delivered: bool,
 }
 
 #[pymethods]
@@ -272,7 +368,15 @@ impl PyRunRecord {
 
 impl From<TaskRecord> for PyTaskRecord {
     fn from(record: TaskRecord) -> Self {
+        let task = record.task.as_ref();
         PyTaskRecord {
+            task_id: task
+                .and_then(|task| task.task_id.clone())
+                .map(|id| TaskId::from(id).as_str().to_owned())
+                .unwrap_or_default(),
+            submitted_at_ms: task
+                .and_then(|task| task.submitted_at.as_ref())
+                .map_or(0, |time| time.unix_millis),
             finished: record.finished,
             runs: record.runs.iter().filter_map(PyRunRecord::read).collect(),
             folded: record
@@ -305,6 +409,13 @@ impl PyRunRecord {
                 .result_digest
                 .as_ref()
                 .map(|digest| digest.value.clone()),
+            attempt_number: run
+                .identity
+                .as_ref()
+                .map_or(0, |identity| identity.attempt_number),
+            created_at_ms: run.created_at.as_ref().map_or(0, |time| time.unix_millis),
+            updated_at_ms: run.updated_at.as_ref().map_or(0, |time| time.unix_millis),
+            delivered: run.delivered,
         })
     }
 }

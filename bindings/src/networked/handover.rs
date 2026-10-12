@@ -92,10 +92,10 @@ impl Seam {
     fn take_back(&mut self, run: TaskRunId) -> Handled {
         let unstarted = self.take_handed(&run);
         match self.held.remove(&run) {
-            Some(task) => {
+            Some(held) => {
                 self.events.push_back(PyEvent::networked(
                     PyEventKind::Cancelled,
-                    task.as_str(),
+                    held.task.as_str(),
                     run.as_str(),
                 ));
                 Handled {
@@ -115,26 +115,26 @@ impl Seam {
         if self.take_handed(&run) {
             return Handled::report(Report::Lost(run));
         }
-        let Some(task) = self.held.get(&run) else {
+        let Some(held) = self.held.get(&run) else {
             return Handled::default();
         };
         let left = deadline
             .saturating_duration_since(StdInstant::now())
             .as_secs_f64();
         self.events
-            .push_back(PyEvent::abort(task.as_str(), run.as_str(), left));
+            .push_back(PyEvent::abort(held.task.as_str(), run.as_str(), left));
         Handled::wake()
     }
 
     /// The leader hears this worker again: Python is told, for a run it
     /// holds, that the run's abort is lifted.
     fn withdraw_abort(&mut self, run: &TaskRunId) -> Handled {
-        let Some(task) = self.held.get(run) else {
+        let Some(held) = self.held.get(run) else {
             return Handled::default();
         };
         self.events.push_back(PyEvent::networked(
             PyEventKind::AbortWithdrawn,
-            task.as_str(),
+            held.task.as_str(),
             run.as_str(),
         ));
         Handled::wake()

@@ -1,6 +1,8 @@
-//! The Tokio runtime a networked worker runs on, with the two tasks it
-//! keeps there: the worker itself, and the pump that hands the driver's
-//! work to the seam.
+//! The Tokio runtime a networked worker runs on, with the tasks it keeps
+//! there: the worker itself, the pump that hands the driver's work to the
+//! seam, the reader that hands Python the result messages arriving for the
+//! tasks submitted here, and the task that asks a new leader about those
+//! still awaited.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
@@ -16,6 +18,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::observed::{LeftOnDrop, Observed, publish};
+use super::results::ask_after_leader_change;
 use super::seam::Shared;
 use crate::bridge::Bridge;
 
@@ -30,6 +33,8 @@ pub(super) struct Host {
     observed: Arc<watch::Sender<Observed>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     pump: Mutex<Option<JoinHandle<()>>>,
+    /// The tasks that read result messages and ask a new leader.
+    background: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Host {
@@ -59,6 +64,16 @@ impl Host {
                 .await;
             *drained.lock().unwrap_or_else(PoisonError::into_inner) = Some(handed);
         });
+        let reading = Arc::clone(&shared);
+        let results = tokio.spawn(async move {
+            loop {
+                reading.net.result_arrived().await;
+                for event in reading.net.take_result_events() {
+                    reading.on_result(event);
+                }
+            }
+        });
+        let outcomes = tokio.spawn(ask_after_leader_change(Arc::clone(&shared)));
         let pump = tokio.spawn(async move {
             let mut source = source;
             while let Some(work) = source.next_work().await {
@@ -72,6 +87,7 @@ impl Host {
             observed,
             worker: Mutex::new(Some(running)),
             pump: Mutex::new(Some(pump)),
+            background: Mutex::new(vec![results, outcomes]),
         }
     }
 
@@ -102,6 +118,14 @@ impl Host {
                     task.abort();
                 }
             }
+            let mut background = self
+                .background
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for task in background.drain(..) {
+                task.abort();
+            }
+            drop(background);
             runtime.block_on(async {
                 let _ = tokio::time::timeout(SHUTDOWN_GRACE, self.bridge.drained()).await;
             });
