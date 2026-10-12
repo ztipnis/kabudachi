@@ -754,12 +754,6 @@ pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator, O: Observer>(
     }
 }
 
-impl<C> WorkerNode<C>
-where
-    C: Clock,
-{
-}
-
 /// The configuration a node leads through its `office`, if it holds one, and
 /// otherwise the one its `standing` follows. Takes the two fields, not the
 /// node, so a caller can hold it while borrowing another field of the node.
