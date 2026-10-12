@@ -208,7 +208,7 @@ def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_pla
     result = kabudachi.run(main)
 
     assert result.times == 1 + 2 + 11 + 21
-    assert result.text == "True cancelled ValueError UnknownTaskError IN_MEMORY:succeeded:1"
+    assert result.text == "True cancelled ValueError UnknownTaskError IN_MEMORY:succeeded:1:succeeded:2"
     assert (markers / "called-back").read_text() == "101", "the task process ran the callback out"
 
 

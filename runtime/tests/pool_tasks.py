@@ -153,7 +153,12 @@ async def calls_others(request: Greeting) -> Greeting:
         late(request)
     except UnknownTaskError as error:
         refused = type(error).__name__
-    stages = await kabudachi.flow(leaf, leaf)(request)
+    staged = kabudachi.flow(leaf, leaf)(request)
+    stages = await staged
+    # A flow's status crosses the pipe back to this process.
+    composite = await staged.status()
+    assert isinstance(composite, kabudachi.CompositeStatus)
+    seen += f":{composite.state}:{composite.counts['succeeded']}"
     mapped = await leaf.map([Greeting(times=10), Greeting(times=20)])
     later = leaf.options(delay=timedelta(seconds=30))(request)
     cancelled = later.cancel()

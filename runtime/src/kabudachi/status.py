@@ -4,6 +4,7 @@ import enum
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any
 
 from kabudachi._native import RunState
@@ -102,3 +103,19 @@ class CompositeStatus:
     state: str
     counts: Mapping[str, int]
     stage: int | None = None
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        # Crosses the pipe to a task process; a mappingproxy does not pickle.
+        return _composite_status, (
+            self.composite_id,
+            self.kind,
+            self.state,
+            dict(self.counts),
+            self.stage,
+        )
+
+
+def _composite_status(
+    composite_id: str, kind: str, state: str, counts: dict[str, int], stage: int | None
+) -> CompositeStatus:
+    return CompositeStatus(composite_id, kind, state, MappingProxyType(counts), stage)
