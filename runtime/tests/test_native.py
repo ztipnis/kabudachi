@@ -310,6 +310,51 @@ async def claim(native, limit=10):
     return await asyncio.wait_for(native.claim_pending(limit), WAIT_LIMIT_SECONDS)
 
 
+@pytest.mark.parametrize(
+    ("kind", "key", "options", "refusal"),
+    [
+        ("coalescing", None, {}, "needs a key"),
+        ("task", "a-key", {}, "takes no key"),
+        ("ephemeral", None, {"drop_oldest": True}, "only a coalescing task"),
+        ("batch", None, {}, "is not a task kind"),
+        ("task", None, {"reconnect_timeout_ms": 0}, "must be positive"),
+    ],
+)
+def test_a_submission_whose_kind_key_and_options_disagree_is_refused_before_it_is_recorded(
+    runtime, kind, key, options, refusal
+):
+    with pytest.raises(ValueError, match=refusal):
+        runtime.submit("billing.charge", 3, b"input-bytes", "default", kind, key, **options)
+
+
+NETWORKED = {
+    "heartbeat_interval_ms": 100,
+    "heartbeat_timeout_ms": 1000,
+    "reconnect_timeout_ms": 2000,
+}
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: new_runtime(worker_threads=0),
+        lambda: new_runtime(memory_soft_limit=1),
+        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, worker_threads=0),
+        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **{**NETWORKED, "heartbeat_interval_ms": 0}),
+        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **{**NETWORKED, "reconnect_timeout_ms": 0}),
+        lambda: _native.NetworkedRuntime(
+            "s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, authority_url="redis://127.0.0.1:1", authority_ttl_ms=0
+        ),
+        lambda: _native.NetworkedRuntime("s", "not an address", **NETWORKED),
+        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, seeds=["nor this"]),
+        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, memory_hard_limit=1),
+    ],
+)
+def test_scaffold_runtime_arguments_the_bindings_cannot_use_are_refused_before_anything_starts(build):
+    with pytest.raises(ValueError):
+        build()
+
+
 def test_a_submitted_task_can_be_claimed(runtime):
     task_id = submit(runtime)
 
