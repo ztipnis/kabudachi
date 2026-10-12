@@ -69,8 +69,8 @@ impl Roster {
     }
 
     /// Forgets `worker` as one taken out (as departed when `depart`): every
-    /// record of it goes, and a promise round naming it is void. Its admission
-    /// generations if it was a member.
+    /// record of it goes, and a promise round naming it is void. Returns its
+    /// admission generations if it was a member.
     fn forget_departing(&mut self, worker: &WorkerId, depart: bool) -> Option<Admission> {
         if depart {
             self.departed.insert(worker.clone());
