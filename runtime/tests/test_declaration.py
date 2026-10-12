@@ -689,6 +689,11 @@ def test_an_unknown_setting_is_refused():
         # Above the cap without `concurrency_override`.
         ({"concurrency": 33}, "concurrency_override"),
         ({"imports": "app.tasks"}, "imports"),
+        ({"imports": ["app.tasks", " "]}, "imports"),
+        ({"imports": 3}, "imports"),
+        ({"concurrency_override": "yes"}, "concurrency_override"),
+        ({"process_start_timeout": 60}, "process_start_timeout"),
+        ({"max_runs_per_process": 1.5}, "max_runs_per_process"),
         ({"process_start_timeout": timedelta(0)}, "process_start_timeout"),
         ({"max_runs_per_process": 0}, "max_runs_per_process"),
         ({"max_runs_per_process": True}, "max_runs_per_process"),
@@ -703,6 +708,11 @@ def test_an_unknown_setting_is_refused():
         # A networked worker must be able to kill a body at its abort deadline.
         ({"listen": "/ip4/127.0.0.1/tcp/0", "processes": 0}, "processes"),
         ({"seeds": "/ip4/127.0.0.1/tcp/4001"}, "seeds"),
+        ({"seeds": ["/ip4/127.0.0.1/tcp/4001", ""]}, "seeds"),
+        ({"listen": " "}, "listen"),
+        ({"external_address": 3}, "external_address"),
+        ({"heartbeat_timeout": 10}, "heartbeat_timeout"),
+        ({"reconnect_timeout": 30}, "reconnect_timeout"),
         ({"shard": "a/b"}, "shard"),
         ({"shard": " "}, "shard"),
         ({"authority": "http://127.0.0.1:6379/"}, "authority"),
