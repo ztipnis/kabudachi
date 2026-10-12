@@ -1,9 +1,11 @@
 use kabudachi_core::election::WorkerNode;
 use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
-use kabudachi_core::protocol::messages::{ClaimResponse, TaskResponse, claim_request, task_request};
+use kabudachi_core::protocol::messages::{
+    ClaimResponse, PlaceRecords, TaskResponse, claim_request, task_request,
+};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::Scheduler;
-use kabudachi_core::task_record::{LeaderRecords, RecordOutbox, Settled};
+use kabudachi_core::task_record::{LeaderRecords, RecordOutbox, Settled, Write};
 use kabudachi_core::time::{Clock, WallTime};
 
 use super::stepper::NetRecords;
@@ -63,6 +65,54 @@ pub(super) struct Local {
     pub(super) cancelled: Vec<(WorkerId, TaskRunId)>,
 }
 
+/// What deciding a request needs this batch: the node and its scheduler,
+/// the transport, and the office's record path, which writes what a
+/// decision changed and holds its answer until those writes are stored
+/// (see [`LeaderRecords::hold`]).
+pub(super) struct Deciding<'b, C: Clock, I: IdGenerator> {
+    pub(super) node: &'b WorkerNode<C>,
+    pub(super) scheduler: &'b mut Scheduler<C, I, RecordOutbox>,
+    pub(super) net: &'b Net,
+    pub(super) records: &'b mut LeaderRecords<HeldAnswer>,
+    pub(super) factor: ReplicationFactor,
+}
+
+impl<C: Clock, I: IdGenerator> Deciding<'_, C, I> {
+    /// Places and writes every revision the scheduler published since the
+    /// last write; returns the writes made.
+    pub(super) fn write(&mut self) -> Vec<Write> {
+        self.records.write(
+            self.node,
+            self.scheduler,
+            &mut NetRecords { net: self.net, factor: self.factor },
+        )
+    }
+
+    /// Writes what the decision just made changed, then holds `held` until
+    /// those writes settle, and sends it at once if nothing holds it. One
+    /// that made no write of its own waits for the writes of `named`'s task
+    /// still unsettled instead (see [`LeaderRecords::hold`]).
+    pub(super) fn hold(&mut self, held: HeldAnswer, named: Option<&TaskId>, local: &mut Local) {
+        let made = self.write();
+        if let Some(settled) = self.records.hold(held, made, named) {
+            send_answer(self.net, settled, local);
+        }
+    }
+
+    /// Holds `held`, which made no write of its own, until the writes of
+    /// `named`'s task still unsettled are stored.
+    pub(super) fn hold_unwritten(
+        &mut self,
+        held: HeldAnswer,
+        named: Option<&TaskId>,
+        local: &mut Local,
+    ) {
+        if let Some(settled) = self.records.hold(held, Vec::new(), named) {
+            send_answer(self.net, settled, local);
+        }
+    }
+}
+
 /// Decides every inbound `/kabudachi/claim/1` request queued on `net` with
 /// `scheduler`'s decision (see `claim::answer`) and writes the revisions that
 /// decision made. The answer goes out once those writes are acknowledged,
@@ -73,29 +123,25 @@ pub(super) struct Local {
 /// what an earlier answer decided, which a leader elected next may never
 /// see until those writes land.
 pub(super) fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
-    node: &WorkerNode<C>,
-    scheduler: &mut Scheduler<C, I, RecordOutbox>,
-    net: &Net,
-    records: &mut LeaderRecords<HeldAnswer>,
-    factor: ReplicationFactor,
+    deciding: &mut Deciding<'_, C, I>,
     local: &mut Local,
 ) {
-    for handle in net.poll_claim_requests() {
-        if scheduler.is_leader() && !node.is_voter_or_pending(&handle.from()) {
-            net.respond_claim(handle, claim::not_member());
+    for handle in deciding.net.poll_claim_requests() {
+        if deciding.scheduler.is_leader() && !deciding.node.is_voter_or_pending(&handle.from()) {
+            deciding.net.respond_claim(handle, claim::not_member());
             continue;
         }
-        let response = claim::answer(scheduler, &handle.from(), handle.request());
-        let made = records.write(node, scheduler, &mut NetRecords { net, factor });
-        let task = match handle.request() {
-            claim_request::Request::TaskId(named) => Some(TaskId::from(named.clone())),
-            _ => None,
-        };
-        if let Some(settled) =
-            records.hold(HeldAnswer::Claim { handle, response }, made, task.as_ref())
-        {
-            send_answer(net, settled, local);
-        }
+        let response = claim::answer(deciding.scheduler, &handle.from(), handle.request());
+        let task = claimed_task(handle.request());
+        deciding.hold(HeldAnswer::Claim { handle, response }, task.as_ref(), local);
+    }
+}
+
+/// The task a claim request names, if it names one.
+fn claimed_task(request: &claim_request::Request) -> Option<TaskId> {
+    match request {
+        claim_request::Request::TaskId(named) => Some(TaskId::from(named.clone())),
+        _ => None,
     }
 }
 
@@ -110,46 +156,55 @@ pub(super) fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
 /// repeats one) waits for that task's writes still unsettled, for the same
 /// reason.
 pub(super) fn respond_to_task_requests<C: Clock, I: IdGenerator>(
-    node: &WorkerNode<C>,
-    scheduler: &mut Scheduler<C, I, RecordOutbox>,
-    net: &Net,
+    deciding: &mut Deciding<'_, C, I>,
     clock: &C,
-    records: &mut LeaderRecords<HeldAnswer>,
-    factor: ReplicationFactor,
     local: &mut Local,
 ) {
-    for handle in net.poll_task_requests() {
-        // A worker that drained has been taken out of the roster by the time
-        // it asks where its records go, so this answers any asker; it
-        // decides nothing and names only voters.
-        if let task_request::Request::Place(place) = handle.request() {
-            let response = if scheduler.is_leader() {
-                let asker = handle.from();
-                let voters: Vec<WorkerId> = node
-                    .placeable_voters()
-                    .into_iter()
-                    .filter(|voter| *voter != asker)
-                    .collect();
-                task_exchange::placements(place, &voters, factor)
-            } else {
-                task_exchange::not_leader()
-            };
-            net.respond_task(handle, response);
+    for handle in deciding.net.poll_task_requests() {
+        if let Some(response) = ungated_answer(deciding, &handle) {
+            deciding.net.respond_task(handle, response);
             continue;
         }
-        if scheduler.is_leader() && !node.is_voter_or_pending(&handle.from()) {
-            net.respond_task(handle, task_exchange::not_member());
+        if deciding.scheduler.is_leader() && !deciding.node.is_voter_or_pending(&handle.from()) {
+            deciding.net.respond_task(handle, task_exchange::not_member());
             continue;
         }
-        let named = task_named(scheduler, handle.request());
-        let response = task_exchange::answer(scheduler, &handle.from(), handle.request(), clock);
-        let made = records.write(node, scheduler, &mut NetRecords { net, factor });
-        if let Some(settled) =
-            records.hold(HeldAnswer::Task { handle, response }, made, named.as_ref())
-        {
-            send_answer(net, settled, local);
-        }
+        let named = task_named(deciding.scheduler, handle.request());
+        let response = task_exchange::answer(deciding.scheduler, &handle.from(), handle.request(), clock);
+        deciding.hold(HeldAnswer::Task { handle, response }, named.as_ref(), local);
     }
+}
+
+/// The answer to a request any asker gets at once, gated on no write and
+/// no membership; `None` for every request the leader decides. Where
+/// records go is one: a worker that drained has been taken out of the
+/// roster by the time it asks, and the answer decides nothing and names
+/// only voters.
+fn ungated_answer<C: Clock, I: IdGenerator>(
+    deciding: &Deciding<'_, C, I>,
+    handle: &TaskRequestHandle,
+) -> Option<TaskResponse> {
+    match handle.request() {
+        task_request::Request::Place(place) => Some(place_answer(deciding, &handle.from(), place)),
+        _ => None,
+    }
+}
+
+fn place_answer<C: Clock, I: IdGenerator>(
+    deciding: &Deciding<'_, C, I>,
+    asker: &WorkerId,
+    place: &PlaceRecords,
+) -> TaskResponse {
+    if !deciding.scheduler.is_leader() {
+        return task_exchange::not_leader();
+    }
+    let voters: Vec<WorkerId> = deciding
+        .node
+        .placeable_voters()
+        .into_iter()
+        .filter(|voter| voter != asker)
+        .collect();
+    task_exchange::placements(place, &voters, deciding.factor)
 }
 
 /// Answers every inbound `/kabudachi/reconcile/1` request queued on `net`

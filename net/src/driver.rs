@@ -174,7 +174,7 @@ use crate::routing_refresh::{RoutingRefresh, ShardView};
 use crate::task_store::placement::ReplicationFactor;
 
 use self::answers::{
-    Local, respond_to_claim_requests, respond_to_join_requests, respond_to_reconcile_requests,
+    Deciding, Local, respond_to_claim_requests, respond_to_join_requests, respond_to_reconcile_requests,
     respond_to_steal_requests, respond_to_task_requests, send_answer,
 };
 use self::events::{catch_up_if_due, drain_events};
@@ -430,20 +430,24 @@ where
         }
         respond_to_join_requests(stepper.node, net).await;
         respond_to_claim_requests(
-            stepper.node,
-            stepper.scheduler,
-            net,
-            stepper.records,
-            config.replication_factor,
+            &mut Deciding {
+                node: &*stepper.node,
+                scheduler: &mut *stepper.scheduler,
+                net,
+                records: &mut *stepper.records,
+                factor: config.replication_factor,
+            },
             &mut local,
         );
         respond_to_task_requests(
-            stepper.node,
-            stepper.scheduler,
-            net,
+            &mut Deciding {
+                node: &*stepper.node,
+                scheduler: &mut *stepper.scheduler,
+                net,
+                records: &mut *stepper.records,
+                factor: config.replication_factor,
+            },
             &clock,
-            stepper.records,
-            config.replication_factor,
             &mut local,
         );
         respond_to_reconcile_requests(stepper.node, net);
@@ -475,34 +479,29 @@ where
             }
             drive_executor(
                 executing,
-                stepper.node,
-                stepper.scheduler,
-                net,
+                &mut Deciding {
+                    node: &*stepper.node,
+                    scheduler: &mut *stepper.scheduler,
+                    net,
+                    records: &mut *stepper.records,
+                    factor: config.replication_factor,
+                },
                 &clock,
-                stepper.records,
-                config.replication_factor,
                 std::mem::take(&mut local.own),
             );
         }
         let heard = std::mem::take(&mut stepper.collected.runs_heard);
         forget_told_cancels(stepper.node, stepper.scheduler, &heard);
         compare_run_digests(&mut reconciliation, stepper.scheduler, &clock, heard);
-        let mut ports = stepper.ports();
-        let scheduler_deadline = catch_up_if_due(
-            stepper.node,
-            stepper.scheduler,
-            stepper.records,
-            &mut ports,
-            clock.now(),
-        );
-        drain_events(
-            stepper.node,
-            stepper.scheduler,
-            stepper.records,
-            &mut ports,
+        let mut deciding = Deciding {
+            node: &*stepper.node,
+            scheduler: &mut *stepper.scheduler,
             net,
-            &mut local,
-        );
+            records: &mut *stepper.records,
+            factor: config.replication_factor,
+        };
+        let scheduler_deadline = catch_up_if_due(&mut deciding, clock.now());
+        drain_events(&mut deciding, &mut local);
         let my_id = net.local_worker_id();
         for (worker, run) in std::mem::take(&mut local.cancelled) {
             if worker == my_id {
