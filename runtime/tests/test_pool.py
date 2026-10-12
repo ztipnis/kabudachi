@@ -207,7 +207,7 @@ def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_pla
     result = kabudachi.run(main)
 
     assert result.times == 1 + 2 + 11 + 21
-    assert result.text == "True cancelled ValueError UnknownTaskError"
+    assert result.text == "True cancelled ValueError UnknownTaskError IN_MEMORY:succeeded:1"
     assert (markers / "called-back").read_text() == "101", "the task process ran the callback out"
 
 
@@ -315,8 +315,8 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
                 session.submit(pool_tasks.outlives_its_deadline.definition, Greeting())
                 while not (markers / "outliving").exists():
                     await asyncio.sleep(0.01)
-                # The calls it made settle nothing here, so nothing keeps them.
-                kept = [dict(child.handles) for child in pool._children]
+                # The calls it made are kept on both sides until their outcomes come.
+                kept = [set(child.handles) for child in pool._children]
                 [run_id] = [event[1] for event in runtime.events if event[0] == "started"]
                 # As the leader would once this worker lost contact with it.
                 runtime.inject_abort(run_id, seconds_left)
@@ -337,8 +337,9 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
     assert seconds_left <= lost < seconds_left + 2.0, lost
     assert [event[0] for event in events] == ["started", "lost"], events
     assert (markers / "asked to stop").exists(), "the body was asked to stop first"
-    assert (markers / "nested").read_text() == "True 0", "a nested cancel took, and no handle was kept"
-    assert kept == [{}], kept
+    cancelled, kept_there, waiting = (markers / "nested").read_text().split()
+    assert (cancelled, kept_there) == ("True", "True"), "a nested cancel took, and the other handle was kept"
+    assert [waiting in handles for handles in kept] == [True], kept
     with pytest.raises(ProcessLookupError):
         os.kill(int((markers / "outliving").read_text()), 0)
 

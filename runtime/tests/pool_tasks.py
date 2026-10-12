@@ -130,7 +130,11 @@ def declared_late(request: Greeting) -> Greeting:
 async def calls_others(request: Greeting) -> Greeting:
     # Still running when this body has returned: the process waits for it.
     leaf(Greeting(times=100)).callback(note_slowly)
-    one = await leaf(request)
+    leafed = leaf(request)
+    one = await leafed
+    # How a body in a task process sees a task it called: read through the worker.
+    inspected = await leafed.status()
+    seen = f"{leafed.durability.name}:{inspected.state}:{inspected.attempt}"
     try:
         await refuses(Greeting(text="nested"))
     except ValueError as error:
@@ -151,7 +155,7 @@ async def calls_others(request: Greeting) -> Greeting:
     except TaskCancelledError:
         ended = "cancelled"
     total = one.times + stages[-1].times + sum(result.times for result in mapped)
-    return Greeting(times=total, text=f"{cancelled} {ended} {failed} {refused}")
+    return Greeting(times=total, text=f"{cancelled} {ended} {failed} {refused} {seen}")
 
 
 LIMIT = {"timeout": timedelta(milliseconds=300), "cancel_grace": timedelta(milliseconds=200)}
@@ -215,14 +219,14 @@ async def outlives_its_deadline(request: Greeting) -> Greeting:
     than the abort deadline a test gives it, so a cancel that it ignores
     costs its process only after that deadline.
 
-    First it calls two tasks that will not start for 30 s, on a worker whose
-    results never come back, and cancels one: `nested` says whether the
-    cancel took, and how many handles this process still keeps for them."""
+    First it calls two tasks that will not start for 30 s and cancels one:
+    `nested` says whether the cancel took, whether this process keeps the
+    other's handle until its outcome comes, and that task's id."""
     later = leaf.options(delay=timedelta(seconds=30))
-    later(request)
+    waiting = later(request)
     cancelled = later(request).cancel()
-    kept = len(current_session()._process._handles)
-    marker("nested").write_text(f"{cancelled} {kept}")
+    kept = waiting.task_id in current_session()._process._handles
+    marker("nested").write_text(f"{cancelled} {kept} {waiting.task_id}")
     marker("outliving").write_text(str(os.getpid()))
     end = time.monotonic() + 30
     while time.monotonic() < end:

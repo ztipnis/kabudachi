@@ -26,7 +26,6 @@ import signal
 import sys
 import threading
 import traceback
-import weakref
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -125,12 +124,6 @@ class _TaskProcess:
         self._asked: dict[int, tuple[concurrent.futures.Future[Any], bool]] = {}
         # Handles of tasks bodies here submitted, until the worker sends their outcome.
         self._handles: dict[str, TaskHandle] = {}
-        # Handles whose result never comes back (a networked worker's), which
-        # may never settle: held only while a body holds them, so a refusal
-        # still reaches one that is awaited.
-        self._unsettled: weakref.WeakValueDictionary[str, TaskHandle] = (
-            weakref.WeakValueDictionary()
-        )
         self._hosted = LoopHostedWork()
 
     def send(self, frame: Any) -> None:
@@ -185,10 +178,13 @@ class _TaskProcess:
             case ipc.Reply():
                 self._answered(frame)
                 return
+            case ipc.Stored():
+                handle = self._handles.get(frame.task_id)
+                if handle is not None:
+                    handle._mark_stored(frame.error)
+                return
             case ipc.WaitDone():
                 handle = self._handles.pop(frame.task_id, None)
-                if handle is None:
-                    handle = self._unsettled.pop(frame.task_id, None)
                 if handle is not None and frame.error is not None:
                     handle._fail(frame.error)
                 elif handle is not None:
@@ -215,25 +211,30 @@ class _TaskProcess:
         if reply.error is not None:
             answer.set_exception(reply.error)
         elif submission:
-            task_id, shard_id, results_delivered = reply.value
+            task_id, shard_id, replicable = reply.value
             handle = TaskHandle(
                 task_id,
                 self._cancel,
                 self._run_callback,
                 shard_id=shard_id,
-                results_delivered=results_delivered,
+                replicable=replicable,
+                status_reader=self._status,
             )
             # Kept before the asker gets it: the outcome can follow at once.
-            if results_delivered:
-                self._handles[task_id] = handle
-            else:
-                self._unsettled[task_id] = handle
+            self._handles[task_id] = handle
             answer.set_result(handle)
         else:
             answer.set_result(reply.value)
 
     def _cancel(self, task_id: str) -> bool:
         return self.ask(lambda request: ipc.CancelTask(request, task_id), submission=False)
+
+    async def _status(self, task_id: str) -> Any:
+        """How a task a body here called stands, read by the worker. Waits
+        off the loop: the worker's answer may take a record lookup."""
+        return await asyncio.to_thread(
+            self.ask, lambda request: ipc.Inspect(request, task_id), submission=False
+        )
 
     def _run_callback(self, function: Any, value: Any) -> None:
         # A drain waits for it too; checked again once it no longer counts.

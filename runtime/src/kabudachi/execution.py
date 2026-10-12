@@ -73,6 +73,10 @@ class NestedCalls(Protocol):
         by its id, and says whether it was cancelled."""
         ...
 
+    async def task_status(self, task_id: str) -> Any:
+        """How a task, flow or group such a body called stands."""
+        ...
+
 
 class Executor(Protocol):
     @property

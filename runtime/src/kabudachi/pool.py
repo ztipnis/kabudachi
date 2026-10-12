@@ -11,6 +11,7 @@ another is started in its place.
 """
 
 import asyncio
+import concurrent.futures
 import itertools
 import logging
 import multiprocessing
@@ -166,6 +167,8 @@ class ProcessPool:
         self._nested: NestedCalls | None = None
         self._numbers = itertools.count()
         self._background: set[asyncio.Task[None]] = set()
+        # Status reads bodies asked for, until the worker's session answers.
+        self._inspecting: set[asyncio.Task[None]] = set()
         # Replacement starts under way, stopped with the pool.
         self._replacing: set[asyncio.Task[None]] = set()
         # Dead children are replaced only between a successful start and stop.
@@ -533,38 +536,59 @@ class ProcessPool:
                     if handle is not None:
                         cancelled = handle.cancel()
                     else:
-                        # A task whose result never comes back keeps no handle
-                        # here: the cancel goes by its id.
                         cancelled = self._nested is not None and self._nested.cancel_task(frame.task_id)
                 except Exception as error:
                     child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
                 else:
                     child.send(ipc.Reply(frame.request, cancelled))
+            case ipc.Inspect():
+                self._inspect_for(child, frame)
 
     def _submit_for(self, child: _Child, frame: ipc.Submit) -> None:
         """Submits what a body in `child` called, answers at once with the
-        new task's id or the error, and sends the outcome once it settles."""
+        new task's id or the error, tells it once a networked leader stored
+        the task, and sends the outcome once it settles."""
         try:
             handle = self._nested_handle(frame)
         except Exception as error:
             child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
             return
-        delivered = handle._results_delivered
-        if delivered:
-            # Kept until it settles, which a handle whose result never comes
-            # back may never do: such a handle is not kept, so nested calls on
-            # a networked worker cost nothing once their tasks are stored.
-            child.handles[handle.task_id] = handle
-        child.send(ipc.Reply(frame.request, (handle.task_id, handle.shard_id, delivered)))
+        child.handles[handle.task_id] = handle
+        child.send(ipc.Reply(frame.request, (handle.task_id, handle.shard_id, handle._replicable)))
+
+        def stored(outcome: "concurrent.futures.Future[None]") -> None:
+            if handle.task_id in child.handles:
+                child.send(ipc.Stored(handle.task_id, outcome.exception()))
 
         def settled(outcome: Any) -> None:
             # A dead child's handles are dropped with it: the tasks it called
             # run on, but nobody there waits for them any more.
-            kept = child.handles.pop(handle.task_id, None) is not None
-            if kept or (not delivered and not child.buried.done()):
+            if child.handles.pop(handle.task_id, None) is not None:
                 child.send(ipc.outcome_of(handle.task_id, outcome))
 
+        if handle._replicable:
+            handle._stored.add_done_callback(stored)
         handle._outcome.add_done_callback(settled)
+
+    def _inspect_for(self, child: _Child, frame: ipc.Inspect) -> None:
+        """Answers a body's status read once the worker's session has it."""
+        nested = self._nested
+
+        async def answer() -> None:
+            try:
+                if nested is None:
+                    raise RuntimeError("the process pool takes no nested calls before a session")
+                status = await nested.task_status(frame.task_id)
+            except Exception as error:
+                child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
+            else:
+                # A status that would not arrive whole fails the read, so
+                # the body never waits for an answer that cannot come.
+                child.send(ipc.answer_of(frame.request, status))
+
+        reading = asyncio.get_running_loop().create_task(answer())
+        self._inspecting.add(reading)
+        reading.add_done_callback(self._inspecting.discard)
 
     def _nested_handle(self, frame: ipc.Submit) -> TaskHandle:
         """The handle of the task, flow or group a body in a task process
