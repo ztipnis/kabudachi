@@ -8,7 +8,7 @@ use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::task_record::{LeaderRecords, RecordOutbox, RecordPorts, Write};
 use kabudachi_core::time::{Clock, Instant};
 
-use super::answers::HeldAnswer;
+use super::answers::{Deciding, HeldAnswer};
 use crate::authority::AuthorityClient;
 use crate::messenger::{Net, PlacedWrite};
 use crate::task_store::placement::{Placement, ReplicationFactor, placement};
@@ -19,16 +19,16 @@ pub(super) struct Stepper<'a, C: Clock, I: IdGenerator, O> {
     pub(super) scheduler: &'a mut Scheduler<C, I, RecordOutbox>,
     pub(super) net: &'a Net,
     pub(super) replication_factor: ReplicationFactor,
-    /// [`super::run_driver`]'s `records`: the office's record path.
-    pub(super) records: &'a mut LeaderRecords<HeldAnswer>,
+    /// The office's record path.
+    pub(super) records: LeaderRecords<HeldAnswer>,
     /// The client to perform the node's calls with; `None` answers each at
     /// once as `Unavailable`.
-    pub(super) calls: Option<&'a mut AuthorityClient>,
+    pub(super) authority: Option<AuthorityClient>,
     /// [`super::run_driver`]'s `observe`.
-    pub(super) observe: &'a mut O,
+    pub(super) observe: O,
     /// What the node's steps reported that the batch acts on once they are
     /// all taken.
-    pub(super) collected: &'a mut Collected,
+    pub(super) collected: Collected,
 }
 
 /// What steps of the node reported that [`super::run_driver`] acts on after them.
@@ -67,9 +67,9 @@ where
     /// alerts (see [`log_alerts`]), hands every step to `observe`, and
     /// returns the node's next deadline.
     pub(super) fn carry(&mut self, stepped: Step, input: Option<&Input>) -> Option<Instant> {
-        let mut performer = Calls(self.calls.as_deref_mut());
-        let observe = &mut *self.observe;
-        let collected = &mut *self.collected;
+        let mut performer = Calls(self.authority.as_mut());
+        let observe = &mut self.observe;
+        let collected = &mut self.collected;
         let net = self.net;
         let next_deadline = carry_out(
             &mut *self.node,
@@ -110,6 +110,18 @@ where
 }
 
 impl<'a, C: Clock, I: IdGenerator, O> Stepper<'a, C, I, O> {
+    /// The leader-side view of this batch for deciding requests (see
+    /// [`Deciding`]).
+    pub(super) fn deciding(&mut self) -> Deciding<'_, C, I> {
+        Deciding {
+            node: &*self.node,
+            scheduler: &mut *self.scheduler,
+            net: self.net,
+            records: &mut self.records,
+            factor: self.replication_factor,
+        }
+    }
+
     /// The record path's ports over this batch's `Net`.
     pub(super) fn ports(&self) -> NetRecords<'a> {
         NetRecords {
