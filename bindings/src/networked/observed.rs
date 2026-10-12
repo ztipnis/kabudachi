@@ -1,3 +1,6 @@
+//! What the worker's node last showed, published for waits to read, and the
+//! guard that marks the worker gone when it ends.
+
 use std::sync::Arc;
 
 use kabudachi_core::election::WorkerNode;

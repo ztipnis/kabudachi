@@ -1,3 +1,6 @@
+//! Handing a submitted task to the shard leader in the background, and the
+//! event that tells Python how the leader answered.
+
 use std::sync::Arc;
 
 use kabudachi_core::protocol::ids::TaskId;

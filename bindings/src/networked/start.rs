@@ -24,10 +24,10 @@ const ROLL_CALL_DEADLINE_MS: u64 = 250;
 
 #[derive(FromPyObject)]
 pub(super) struct NetworkedArguments {
-    pub(super) shard: String,
+    shard: String,
     pub(super) listen: String,
-    pub(super) heartbeat_interval_ms: u64,
-    pub(super) heartbeat_timeout_ms: u64,
+    heartbeat_interval_ms: u64,
+    heartbeat_timeout_ms: u64,
     pub(super) reconnect_timeout_ms: u64,
     seeds: Vec<String>,
     external_address: Option<String>,

@@ -1,3 +1,6 @@
+//! The seam between the driver and Python: the runs, events and waits that
+//! pass between them, behind one lock and one wake-up.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -34,10 +37,10 @@ pub(super) struct Seam {
 }
 
 pub(super) struct Shared {
-    pub(super) seam: Mutex<Seam>,
+    seam: Mutex<Seam>,
     /// Woken whenever a claim or an event may be waiting.
-    pub(super) changed: Notify,
-    pub(super) reports: ReportSink,
+    changed: Notify,
+    reports: ReportSink,
     pub(super) net: Arc<Net>,
     pub(super) observed: watch::Receiver<Observed>,
     /// How submissions and cancels keep asking the leader.
