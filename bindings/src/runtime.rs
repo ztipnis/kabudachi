@@ -79,7 +79,11 @@ impl NativeRuntime {
     /// Raises `ValueError` if `worker_threads` is zero or only one of the two
     /// memory limits is given.
     #[new]
-    fn new(worker_id: String, incarnation_id: String, arguments: OneNodeArguments) -> PyResult<Self> {
+    fn new(
+        worker_id: String,
+        incarnation_id: String,
+        arguments: OneNodeArguments,
+    ) -> PyResult<Self> {
         if arguments.worker_threads == 0 {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));
         }

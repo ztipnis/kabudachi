@@ -18,8 +18,8 @@ from kabudachi import _native
 from kabudachi.config import Configuration, Settings, authority_parts, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
-from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.native_protocol import OneNodeArguments
+from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
 from kabudachi.session import (

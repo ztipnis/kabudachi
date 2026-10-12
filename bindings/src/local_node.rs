@@ -4,8 +4,8 @@
 //!
 //! This is `bindings`'s own replacement for the deleted `core::single_node`
 //! module. The suspicion timeout comes from the caller:
-//! `_native.NativeRuntime`'s `suspect_timeout_ms`, which is 0 by default. An
-//! instant suspicion timeout is a legitimate, deliberate product choice for
+//! `kabudachi.native_protocol.OneNodeArguments.suspect_timeout_ms`, which is 0
+//! by default. An instant suspicion timeout is a legitimate, deliberate product choice for
 //! this specific single-process runtime (prompt self-election, no network to
 //! wait on) — but it is *not* the generic behavior of a one-voter
 //! configuration. `kabudachi_net::bootstrap::bootstrap` (the `net`-side
