@@ -12,10 +12,11 @@
 //! never make the driver claim more than the executor can hold.
 //!
 //! Per run, in order: `Started` once the body runs (a compaction run sends
-//! none), then exactly one of `Completed` (with the digest of its result),
-//! `Failed` (with the error's type name), `Lost` (the process running it died
-//! or was killed at an abort deadline, so no outcome is known), or, for a
-//! compaction run, `Compacted` (the fold). The driver takes each report to
+//! none), then exactly one of `Completed` (with the digest of its result, and
+//! whether the result reached the task's client first), `Failed` (with the
+//! error's type name), `Lost` (the process running it died or was killed at
+//! an abort deadline, so no outcome is known), or, for a compaction run,
+//! `Compacted` (the fold). The driver takes each report to
 //! the leader in that order, asking again as leaders change, until one takes
 //! it.
 //!
@@ -84,7 +85,7 @@ pub enum Work {
 pub enum Report {
     Capacity(u32),
     Started(TaskRunId),
-    Completed { run: TaskRunId, digest: Digest },
+    Completed { run: TaskRunId, digest: Digest, delivered: bool },
     Failed { run: TaskRunId, reason: String },
     Lost(TaskRunId),
     Compacted { run: TaskRunId, payload: Vec<u8> },
@@ -530,12 +531,12 @@ impl<'n> Executing<'n> {
             Report::Started(run) => task_request::Request::Started(ReportStarted {
                 task_run_id: Some(run.into()),
             }),
-            Report::Completed { run, digest } => {
+            Report::Completed { run, digest, delivered } => {
                 self.ended(&run);
                 task_request::Request::Completed(ReportCompleted {
                     task_run_id: Some(run.into()),
                     result_digest: Some(digest.into()),
-                    delivered: false,
+                    delivered,
                 })
             }
             Report::Failed { run, reason } => {

@@ -254,6 +254,7 @@ impl NetworkedRuntime {
             .finish(TaskRunId::new(task_run_id), |run| Report::Completed {
                 run,
                 digest,
+                delivered: false,
             });
         Ok(())
     }

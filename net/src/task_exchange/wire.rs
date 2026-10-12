@@ -5,14 +5,14 @@
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId};
+use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelAnswer, CancelOutcome, RunCertified, RunFailed, RunLost, SubmitTask, TaskReject, TaskRejectReason,
-    TaskResponse, task_response,
+    CancelAnswer, CancelOutcome, OutcomeAnswer, RunCertified, RunFailed, RunLost, SubmitTask, TaskReject,
+    TaskRejectReason, TaskResponse, task_response,
 };
 use kabudachi_core::scheduler::{
-    CancelRejection, Cancellation, Certification, Failure, LostRun, ReportRejection, Submission, Submitted,
-    SubmitRejection,
+    CancelRejection, Cancellation, Certification, Failure, LostRun, Outcome, OutcomeRejection, ReportRejection,
+    Submission, Submitted, SubmitRejection,
 };
 use kabudachi_core::time::{Clock, Duration, WallTime};
 
@@ -39,7 +39,7 @@ pub(crate) fn submit_task(submitted: &Submitted) -> SubmitTask {
         ephemeral: submission.ephemeral,
         non_retriable: submission.non_retriable,
         reconnect_timeout_ms: submission.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
-        client: None,
+        client: submission.client.clone().map(Into::into),
     }
 }
 
@@ -66,7 +66,7 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
             non_retriable: task.non_retriable,
             reconnect_timeout: (task.reconnect_timeout_ms > 0)
                 .then(|| Duration::from_millis(task.reconnect_timeout_ms)),
-            client: None,
+            client: task.client.clone().map(WorkerId::from),
         },
         clock,
     ))
@@ -140,6 +140,34 @@ pub(crate) fn cancel_answer(cancellation: Cancellation) -> CancelAnswer {
     CancelAnswer {
         outcome: outcome as i32,
         was_running,
+    }
+}
+
+/// How `task` stands, as a client is told: `known` false and nothing else
+/// set when the leader does not hold it.
+pub(crate) fn outcome_answer(task: &TaskId, outcome: Option<Outcome>) -> OutcomeAnswer {
+    let Some(outcome) = outcome else {
+        return OutcomeAnswer {
+            task_id: Some(task.clone().into()),
+            ..OutcomeAnswer::default()
+        };
+    };
+    OutcomeAnswer {
+        task_id: Some(outcome.task_id.into()),
+        known: true,
+        task_run_id: Some(outcome.task_run_id.into()),
+        state: generated::TaskRunState::from(outcome.state) as i32,
+        finished: outcome.finished,
+        result_digest: outcome.result_digest.map(Into::into),
+        failure_kind: outcome.failure_kind,
+        superseded_by: outcome.superseded_by.map(Into::into),
+    }
+}
+
+pub(crate) fn outcome_reject(rejection: OutcomeRejection) -> TaskRejectReason {
+    match rejection {
+        OutcomeRejection::NotLeader => TaskRejectReason::TaskRejectNotLeader,
+        OutcomeRejection::NotReady => TaskRejectReason::TaskRejectNotReady,
     }
 }
 

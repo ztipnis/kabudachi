@@ -23,8 +23,9 @@ const MAX_FAILURE_KIND_BYTES: usize = 256;
 pub enum HeldRun {
     Claimed,
     Running,
-    /// It succeeded with this digest, and no leader has certified it yet.
-    Completed { result_digest: Digest },
+    /// It succeeded with this digest, its result reached the task's client
+    /// first if `delivered`, and no leader has certified it yet.
+    Completed { result_digest: Digest, delivered: bool },
     /// It failed, and no leader has recorded the failure yet.
     Failed { failure_kind: String },
 }
@@ -80,9 +81,12 @@ impl ClaimedRuns {
             let state = match &held.state {
                 HeldRun::Claimed => ReportedState::Claimed,
                 HeldRun::Running => ReportedState::Running,
-                HeldRun::Completed { result_digest } => ReportedState::Succeeded {
+                HeldRun::Completed {
+                    result_digest,
+                    delivered,
+                } => ReportedState::Succeeded {
                     result_digest: result_digest.clone(),
-                    delivered: false,
+                    delivered: *delivered,
                 },
                 HeldRun::Failed { failure_kind } => ReportedState::Failed {
                     failure_kind: truncated(failure_kind, MAX_FAILURE_KIND_BYTES),

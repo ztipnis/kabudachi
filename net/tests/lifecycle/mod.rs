@@ -1,5 +1,7 @@
-//! A worker's calls to the leader about tasks and runs, over real sockets.
+//! A worker's calls to the leader about tasks and runs, and results that
+//! reach their client, over real sockets.
 
 mod compaction;
 mod lifecycle;
 mod own_requests;
+mod results;

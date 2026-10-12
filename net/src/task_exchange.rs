@@ -4,9 +4,10 @@
 //! [`codec`] frames the `/kabudachi/task/1` messages; `wire` maps them to and
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
 //! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
-//! [`Net::report_lost`] and [`Net::cancel`], each sent to the leader the
-//! caller names. [`Net::submit_to_leader`] and [`Net::cancel_at_leader`]
-//! instead find the leader themselves, the one the worker's node names, and
+//! [`Net::report_lost`], [`Net::cancel`] and [`Net::query_outcome`], each
+//! sent to the leader the caller names. [`Net::submit_to_leader`],
+//! [`Net::cancel_at_leader`] and [`Net::query_outcome_at_leader`] instead
+//! find the leader themselves, the one the worker's node names, and
 //! ask again until a leader decides, as the executor's reports are asked
 //! again (see `crate::executor`). A call addressed to this worker itself,
 //! while it leads, is answered by its own driver the same way. The calls
@@ -18,7 +19,8 @@
 //! request from a voter or pending member of the leader's shard (as with
 //! claims, any other worker is answered [`not_member`] without asking the
 //! scheduler): whether to record a submission, a started, completed or failed
-//! report, or a cancel is `core::scheduler::Scheduler`'s decision alone, and
+//! report, or a cancel is `core::scheduler::Scheduler`'s decision alone, as is
+//! how a task stands, which decides nothing and is answered for any asker, and
 //! a request that lacks an id or digest it needs is refused as malformed
 //! without asking it. As with claims, the decision is made at once, but the
 //! driver sends the answer only once the revisions it wrote are acknowledged
@@ -36,10 +38,10 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, RecordPlacements, ReportCompacted,
-    ReportCompleted, ReportFailed, ReportLost, ReportStarted, StartAccepted, SubmitAccepted,
-    SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse, task_request,
-    task_response,
+    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, QueryOutcome, RecordPlacements,
+    ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, StartAccepted,
+    SubmitAccepted, SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse,
+    task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
@@ -57,6 +59,8 @@ use crate::task_store::placement::{Placement, ReplicationFactor, placement};
 
 pub mod codec;
 mod wire;
+
+pub(crate) use wire::outcome_answer;
 
 /// The most task ids one placement request carries (see
 /// [`Net::place_records`]): a worker with more asks in pages, so that an
@@ -143,7 +147,8 @@ impl Net {
     }
 
     /// Tells `leader` `run` succeeded with a result of digest
-    /// `result_digest`. The result itself is not sent.
+    /// `result_digest`, for a run whose result went to no client. The
+    /// result itself is not sent.
     pub async fn complete(
         &self,
         leader: WorkerId,
@@ -230,7 +235,13 @@ impl Net {
         match request {
             task_request::Request::Completed(report) => {
                 if let Ok(result_digest) = wire::digest(report.result_digest.as_ref()) {
-                    self.claimed.set(&run, HeldRun::Completed { result_digest });
+                    self.claimed.set(
+                        &run,
+                        HeldRun::Completed {
+                            result_digest,
+                            delivered: report.delivered,
+                        },
+                    );
                 }
             }
             task_request::Request::Failed(report) => self.claimed.set(
@@ -284,6 +295,18 @@ impl Net {
         task: TaskId,
     ) -> Result<TaskResponse, TaskFailure> {
         let request = task_request::Request::Cancel(CancelTask {
+            task_id: Some(task.into()),
+        });
+        self.ask_task(leader, request).await
+    }
+
+    /// Asks `leader` how `task` stands. Decides nothing, so any worker may ask.
+    pub async fn query_outcome(
+        &self,
+        leader: WorkerId,
+        task: TaskId,
+    ) -> Result<TaskResponse, TaskFailure> {
+        let request = task_request::Request::QueryOutcome(QueryOutcome {
             task_id: Some(task.into()),
         });
         self.ask_task(leader, request).await
@@ -452,6 +475,16 @@ impl Net {
         self.ask_until_decided(request, retry).await
     }
 
+    /// Asks the shard's leader how `task` stands until a leader answers,
+    /// asking again as [`Self::submit_to_leader`] does; `None` once the
+    /// worker has left its shard.
+    pub async fn query_outcome_at_leader(&self, task: TaskId, retry: LeaderRetry) -> Option<TaskResponse> {
+        let request = task_request::Request::QueryOutcome(QueryOutcome {
+            task_id: Some(task.into()),
+        });
+        self.ask_until_decided(request, retry).await
+    }
+
     /// Whether this worker has left its shard: [`crate::worker::Worker::run`]
     /// ended, however it did. No request routed to the leader is answered
     /// from then on.
@@ -530,7 +563,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Cancel(request) => cancel(scheduler, request),
         // Where records go is the driver's to say: it alone knows the voters.
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
-        _ => Err(TaskRejectReason::TaskRejectMalformed),
+        Request::QueryOutcome(query) => query_outcome(scheduler, query),
     };
     match result {
         Ok(result) => TaskResponse {
@@ -582,7 +615,7 @@ fn completed<C: Clock, I: IdGenerator, O: Observer>(
     let digest = wire::digest(report.result_digest.as_ref())
         .map_err(|Malformed| TaskRejectReason::TaskRejectMalformed)?;
     scheduler
-        .complete(from, &run, digest, Completion::Final)
+        .complete_delivered(from, &run, digest, Completion::Final, report.delivered)
         .map(|certification| task_response::Result::Certified(wire::certified(certification)))
         .map_err(wire::report_reject)
 }
@@ -636,6 +669,19 @@ fn cancel<C: Clock, I: IdGenerator, O: Observer>(
             .cancel(&TaskId::from(task))
             .map(|cancellation| task_response::Result::Cancelled(wire::cancel_answer(cancellation)))
             .map_err(wire::cancel_reject),
+        None => Err(TaskRejectReason::TaskRejectMalformed),
+    }
+}
+
+fn query_outcome<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    query: &QueryOutcome,
+) -> Answered {
+    match query.task_id.clone().map(TaskId::from) {
+        Some(task) => scheduler
+            .outcome(&task)
+            .map(|outcome| task_response::Result::Outcome(wire::outcome_answer(&task, outcome)))
+            .map_err(wire::outcome_reject),
         None => Err(TaskRejectReason::TaskRejectMalformed),
     }
 }

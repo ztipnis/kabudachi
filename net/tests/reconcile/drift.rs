@@ -71,7 +71,10 @@ async fn misdirected_completion(
     );
     assert_eq!(
         nets[worker].claimed_runs().get(&run).map(|held| held.state),
-        Some(HeldRun::Completed { result_digest: Digest::blake3(b"out") }),
+        Some(HeldRun::Completed {
+            result_digest: Digest::blake3(b"out"),
+            delivered: false
+        }),
         "the worker's ledger holds the run completed, not running"
     );
     task

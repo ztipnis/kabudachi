@@ -1,10 +1,11 @@
 use kabudachi_core::election::WorkerNode;
 use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    ClaimResponse, PlaceRecords, TaskResponse, claim_request, task_request,
+    ClaimResponse, PlaceRecords, ResultCertified, TaskResponse, claim_request, task_request,
 };
+use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::Scheduler;
+use kabudachi_core::scheduler::{Conclusion, Scheduler};
 use kabudachi_core::task_record::{LeaderRecords, RecordOutbox, Settled, Write};
 use kabudachi_core::time::{Clock, WallTime};
 
@@ -54,6 +55,9 @@ pub(super) enum HeldAnswer {
     Own(OwnAnswer),
     /// A cancel of a run `worker` holds, told to it once the cancel is stored.
     CancelledRun { worker: WorkerId, run: TaskRunId },
+    /// How a task with a client ended, told to the client once the
+    /// revision that ended it is stored.
+    Concluded(Conclusion),
 }
 
 /// What settled answers leave this worker itself to act on.
@@ -154,10 +158,11 @@ fn claimed_task(request: &claim_request::Request) -> Option<TaskId> {
 /// [`respond_to_claim_requests`] does. As claims are, task requests are
 /// answered only for the voters and pending members of the shard the leader
 /// leads: any other worker is answered `NotMember` at once, and its request
-/// never reaches the scheduler. A submission, a cancel or a report
-/// that made no write of its own (its task was already decided, or the report
-/// repeats one) waits for that task's writes still unsettled, for the same
-/// reason.
+/// never reaches the scheduler, unless it asks how a task stands, which
+/// decides nothing and is answered for any asker. A submission, a cancel, a
+/// report that made no write of its own (its task was already decided, or the
+/// report repeats one) or a question of how a task stands waits for that
+/// task's writes still unsettled, for the same reason.
 pub(super) fn respond_to_task_requests<C: Clock, I: IdGenerator>(
     deciding: &mut Deciding<'_, C, I>,
     clock: &C,
@@ -168,7 +173,7 @@ pub(super) fn respond_to_task_requests<C: Clock, I: IdGenerator>(
             deciding.net.respond_task(handle, response);
             continue;
         }
-        if deciding.scheduler.is_leader() && !deciding.node.is_voter_or_pending(&handle.from()) {
+        if refused_as_no_member(deciding, &handle) {
             deciding
                 .net
                 .respond_task(handle, task_exchange::not_member());
@@ -179,6 +184,20 @@ pub(super) fn respond_to_task_requests<C: Clock, I: IdGenerator>(
             task_exchange::answer(deciding.scheduler, &handle.from(), handle.request(), clock);
         deciding.hold(HeldAnswer::Task { handle, response }, named.as_ref(), local);
     }
+}
+
+/// Whether the leader refuses `handle` because its sender is neither a voter
+/// nor a pending member. How a task stands decides nothing, so it is
+/// answered for any asker, member or not, once that task's writes have
+/// settled.
+fn refused_as_no_member<C: Clock, I: IdGenerator>(
+    deciding: &Deciding<'_, C, I>,
+    handle: &TaskRequestHandle,
+) -> bool {
+    if matches!(handle.request(), task_request::Request::QueryOutcome(_)) {
+        return false;
+    }
+    deciding.scheduler.is_leader() && !deciding.node.is_voter_or_pending(&handle.from())
 }
 
 /// The answer to a request any asker gets at once, gated on no write and
@@ -282,8 +301,8 @@ pub(super) fn task_named<C: Clock, I: IdGenerator>(
         task_request::Request::Failed(report) => of_run(&report.task_run_id),
         task_request::Request::Compacted(report) => of_run(&report.task_run_id),
         task_request::Request::Lost(report) => of_run(&report.task_run_id),
+        task_request::Request::QueryOutcome(query) => query.task_id.clone().map(TaskId::from),
         task_request::Request::Place(_) => None,
-        _ => None,
     }
 }
 
@@ -309,5 +328,35 @@ pub(super) fn send_answer(net: &Net, settled: Settled<HeldAnswer>, local: &mut L
         // The cancel may not have been stored: the worker learns what the
         // next leader decided when it next reports on the run.
         Settled::NotLeader(HeldAnswer::CancelledRun { .. }) => {}
+        Settled::Released(HeldAnswer::Concluded(conclusion)) => tell_client(net, conclusion),
+        // The ending may not have been stored: the client asks the next
+        // leader how the task stands.
+        Settled::NotLeader(HeldAnswer::Concluded(_)) => {}
+    }
+}
+
+/// Tells a task's client how its task ended, in the background: its run
+/// certified, or the task over without a result. A client that never
+/// takes it asks the next leader.
+fn tell_client(net: &Net, conclusion: Conclusion) {
+    let Conclusion { client, outcome } = conclusion;
+    match (outcome.state, outcome.result_digest.clone()) {
+        (TaskRunState::Succeeded, Some(digest)) => {
+            tokio::spawn(net.send_certified(
+                client,
+                ResultCertified {
+                    task_id: Some(outcome.task_id.into()),
+                    task_run_id: Some(outcome.task_run_id.into()),
+                    result_digest: Some(digest.into()),
+                },
+            ));
+        }
+        _ => {
+            let task = outcome.task_id.clone();
+            tokio::spawn(net.send_concluded(
+                client,
+                task_exchange::outcome_answer(&task, Some(outcome)),
+            ));
+        }
     }
 }
