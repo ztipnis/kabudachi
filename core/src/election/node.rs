@@ -5,6 +5,7 @@
 //! with the coordination authority, and how it departs.
 
 mod authority_path;
+mod departure;
 mod follower;
 mod joining;
 mod leader;
