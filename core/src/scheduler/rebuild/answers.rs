@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::coalescing;
 use crate::protocol::digest::Digest;
 use crate::protocol::generated;
-use crate::protocol::ids::{IdGenerator, TaskRunId, WorkerId};
+use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{TaskRun, TaskRunIdentity};
 use crate::protocol::records::TaskRunRecord;
@@ -62,41 +62,84 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if !self.tasks.contains_key(&task_id) && !self.rebuild_from_claim(worker, &reported.claim) {
             return;
         }
-        if self.current_run.get(&task_id) != Some(&run_id) {
-            return;
+        match self.recorded_state_of(worker, &task_id, &run_id) {
+            Some(TaskRunState::Cancelled) => self.hold_cancel(worker, task_id, run_id, &reported.state),
+            Some(recorded @ (TaskRunState::Claimed | TaskRunState::Running)) => {
+                self.adopt_reported(worker, &run_id, recorded, reported.state, out);
+            }
+            _ => {}
         }
-        let recorded = self.runs[&run_id].current_state();
-        if self.runs[&run_id].selected_worker().as_ref() != Some(worker) {
-            return;
+    }
+
+    /// The state this leader records for `run_id`, if it is `task_id`'s
+    /// current run and selected for `worker`.
+    fn recorded_state_of(
+        &self,
+        worker: &WorkerId,
+        task_id: &TaskId,
+        run_id: &TaskRunId,
+    ) -> Option<TaskRunState> {
+        if self.current_run.get(task_id) != Some(run_id) {
+            return None;
         }
-        if recorded == TaskRunState::Cancelled
-            && matches!(reported.state, ReportedState::Claimed | ReportedState::Running)
-        {
+        let run = &self.runs[run_id];
+        (run.selected_worker().as_ref() == Some(worker)).then(|| run.current_state())
+    }
+
+    /// A run stored as cancelled that `worker` reports it still holds: whichever
+    /// leader stored the cancel, the worker must still be told to stop the body.
+    fn hold_cancel(
+        &mut self,
+        worker: &WorkerId,
+        task_id: TaskId,
+        run_id: TaskRunId,
+        state: &ReportedState,
+    ) {
+        if matches!(state, ReportedState::Claimed | ReportedState::Running) {
             self.held_cancels.push(HeldCancel {
                 task_id,
                 task_run_id: run_id,
                 worker: worker.clone(),
             });
-            return;
         }
-        if !matches!(recorded, TaskRunState::Claimed | TaskRunState::Running) {
-            return;
+    }
+
+    /// Takes what `worker` reports of its claimed or running run: a claimed run
+    /// it reports beyond its claim is started first.
+    fn adopt_reported(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        recorded: TaskRunState,
+        state: ReportedState,
+        out: &mut Adopted,
+    ) {
+        if recorded == TaskRunState::Claimed && !matches!(state, ReportedState::Claimed) {
+            let _ = self.start_owned(worker, run_id);
         }
-        let beyond_claimed = !matches!(reported.state, ReportedState::Claimed);
-        if recorded == TaskRunState::Claimed && beyond_claimed {
-            let _ = self.start_owned(worker, &run_id);
-        }
-        match reported.state {
+        self.apply_reported_outcome(worker, run_id, state, out);
+    }
+
+    /// A success `worker` reports of its running run is certified, and a
+    /// failure applied; a claimed or running one changes nothing more.
+    fn apply_reported_outcome(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        state: ReportedState,
+        out: &mut Adopted,
+    ) {
+        match state {
             ReportedState::Claimed | ReportedState::Running => {}
             ReportedState::Succeeded { result_digest } => {
                 if let Ok(certified) =
-                    self.certify_owned(worker, &run_id, result_digest, Completion::Final)
+                    self.certify_owned(worker, run_id, result_digest, Completion::Final)
                 {
                     out.certified.push(certified);
                 }
             }
             ReportedState::Failed { failure_kind } => {
-                if let Ok(failed) = self.fail_owned(worker, &run_id, failure_kind) {
+                if let Ok(failed) = self.fail_owned(worker, run_id, failure_kind) {
                     out.failed.push(failed);
                 }
             }
