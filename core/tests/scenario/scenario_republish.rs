@@ -193,7 +193,13 @@ fn records_a_new_leader_could_not_place_are_placed_again_after_the_delay() {
 
     // The voters are unchanged, so only the retry after the delay places the
     // record again.
+    let placeable = cluster.node(&leader).placeable_voters();
     cluster.set_replication_factor(REPLICATION_FACTOR);
+    assert_eq!(
+        cluster.node(&leader).placeable_voters(),
+        placeable,
+        "restoring the placement does not change who the record can be placed on"
+    );
     advance_until(&mut cluster, |cluster| cluster.states()[&leader] == WorkerState::Leader);
 }
 
