@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable, Generator
 from typing import Any, Protocol
 
 from kabudachi.errors import DurabilityUnavailableError, RuntimeNotStartedError
-from kabudachi.status import Durability, TaskStatus
+from kabudachi.status import CompositeStatus, Durability, TaskStatus
 
 _logger = logging.getLogger("kabudachi")
 
@@ -144,10 +144,12 @@ class TaskHandle:
         stored.add_done_callback(_read_error)
         await asyncio.shield(stored)
 
-    async def status(self) -> TaskStatus:
+    async def status(self) -> TaskStatus | CompositeStatus:
         """How the task stands, read from the record its shard holds. Not
         authoritative: a change its leader has just made may not show yet.
-        Raises `RuntimeNotStartedError` for a handle made outside a run."""
+        A task's handle answers a `TaskStatus`; a flow's or group's a
+        `CompositeStatus`. Raises `RuntimeNotStartedError` for a handle made
+        outside a run."""
         if self._status_reader is None:
             raise RuntimeNotStartedError(f"task {self.task_id} has no run to read its status from")
         return await self._status_reader(self.task_id)

@@ -141,6 +141,7 @@ async def calls_others(request: Greeting) -> Greeting:
     one = await leafed
     # How a body in a task process sees a task it called: read through the worker.
     inspected = await leafed.status()
+    assert isinstance(inspected, kabudachi.TaskStatus)
     seen = f"{leafed.durability.name}:{inspected.state}:{inspected.attempt}"
     try:
         await refuses(Greeting(text="nested"))

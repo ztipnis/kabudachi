@@ -37,7 +37,7 @@ from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session, validate_definitions
-from kabudachi.status import Durability
+from kabudachi.status import Durability, TaskStatus
 from kabudachi.tasks import Task
 from proto_messages import Greeting, Receipt
 from session_world import WAIT, World, run, until, with_events
@@ -303,6 +303,7 @@ def test_a_task_no_record_holds_reads_as_unknown():
 
     status = run(world.working(body))
 
+    assert isinstance(status, TaskStatus)
     assert (status.state, status.run_state, status.attempt, status.delivered) == ("unknown", None, 0, False)
 
 

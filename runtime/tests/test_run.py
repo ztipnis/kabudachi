@@ -104,15 +104,52 @@ def test_a_flow_and_a_group_report_their_stages_and_members():
     def explode(request: Greeting) -> Greeting:
         raise ValueError("no")
 
+    started = threading.Semaphore(0)
+    gate = threading.Event()
+
+    @declare
+    def held(request: Greeting) -> Greeting:
+        started.release()
+        gate.wait(10)
+        return request
+
+    async def group_counts_reach(grouped, counts):
+        status = await grouped.status()
+        for _ in range(500):
+            if dict(status.counts) == counts:
+                break
+            await asyncio.sleep(0.01)
+            status = await grouped.status()
+        return status
+
     async def main():
-        flowed = kabudachi.flow(shout.bind(Greeting(text="a")), shout)()
+        flowed = kabudachi.flow(held.bind(Greeting(text="a")), shout)()
+        grouped = kabudachi.group(shout, explode, held, on_error="collect_all")(Greeting(text="g"))
+        for _ in range(2):
+            assert await asyncio.to_thread(started.acquire, timeout=10)
+        # Both held bodies are running: the flow is at its first stage, the
+        # group waits on one member while the others have ended.
+        in_flight = await flowed.status(), await group_counts_reach(
+            grouped, {"succeeded": 1, "failed": 1, "running": 1}
+        )
+        gate.set()
         await flowed
-        grouped = kabudachi.group(shout, explode, on_error="collect_all")(Greeting(text="g"))
         await grouped
-        return await flowed.status(), await grouped.status()
+        return in_flight, (await flowed.status(), await grouped.status())
 
-    flowed, grouped = kabudachi.run(main)
+    (flowing, grouping), (flowed, grouped) = kabudachi.run(main)
 
+    assert (flowing.kind, flowing.state, flowing.stage, dict(flowing.counts)) == (
+        "flow",
+        "running",
+        0,
+        {"running": 1, "pending": 1},
+    )
+    assert (grouping.kind, grouping.state, dict(grouping.counts)) == (
+        "group",
+        "running",
+        {"succeeded": 1, "failed": 1, "running": 1},
+    )
     assert (flowed.kind, flowed.state, flowed.stage, dict(flowed.counts)) == (
         "flow",
         "succeeded",
@@ -123,7 +160,7 @@ def test_a_flow_and_a_group_report_their_stages_and_members():
         "group",
         "succeeded",
         None,
-        {"succeeded": 1, "failed": 1},
+        {"succeeded": 2, "failed": 1},
     )
 
 

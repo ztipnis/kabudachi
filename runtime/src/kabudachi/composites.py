@@ -88,7 +88,7 @@ class FlowHandle(TaskHandle):
         self._current = (stage, is_last)
         self._stages.append(stage)
 
-    async def status(self) -> CompositeStatus:  # pyright: ignore[reportIncompatibleMethodOverride]
+    async def status(self) -> CompositeStatus:
         """How the flow stands: its state, its stages by state, and the index
         of the stage it is at or ended on."""
         stages = list(self._stages)
@@ -147,7 +147,7 @@ class GroupHandle(TaskHandle):
         """One more member is running, so a cancel reaches it too."""
         self._members.append(member)
 
-    async def status(self) -> CompositeStatus:  # pyright: ignore[reportIncompatibleMethodOverride]
+    async def status(self) -> CompositeStatus:
         """How the group stands: its state and its members by state."""
         return CompositeStatus(
             self.task_id,
@@ -200,7 +200,9 @@ class Composites:
         self._session = session
         self._hosted = hosted
         self._numbers = itertools.count(1)
-        self._live: weakref.WeakValueDictionary[str, TaskHandle] = weakref.WeakValueDictionary()
+        self._live: weakref.WeakValueDictionary[str, FlowHandle | GroupHandle] = (
+            weakref.WeakValueDictionary()
+        )
 
     def submit_flow(self, flow: Any, previous: Any) -> FlowHandle:
         """Starts `flow`, whose stages run one after another, and returns its

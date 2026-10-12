@@ -106,6 +106,7 @@ async def answer(native, command: dict) -> dict:
         return {"durability": handle.durability.name}
     if "status" in command:
         status = await HANDLES[command["status"]].status()
+        assert isinstance(status, kabudachi.TaskStatus)
         return {"status": {"state": status.state, "attempt": status.attempt, "delivered": status.delivered}}
     if "claimed" in command:
         return {"client": CLIENTS.get(command["claimed"])}
