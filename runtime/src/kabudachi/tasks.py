@@ -51,6 +51,9 @@ class Task(wrapt.ObjectProxy):
         kind: The delivery semantics of the task.
         retries: How many more times a run that raises is replaced by a new
             attempt, at once. The handle only sees the last attempt's outcome.
+        retriable: `False` for a plain task that is not safe to run twice: a
+            run that was running when its worker or task process was lost is
+            orphaned instead of run again. Such a task takes no `retries`.
         timeout: How long a run may take before its body is asked to stop
             (cancelled, for an async body). A run that hits it fails with
             `TaskTimeoutError` and is retried per `retries`. `None` is no
@@ -94,6 +97,7 @@ class Task(wrapt.ObjectProxy):
         serializer: str = DEFAULT_SERIALIZER,
         kind: TaskKind = TaskKind.TASK,
         retries: int = 0,
+        retriable: bool = True,
         timeout: timedelta | None = None,
         cancel_grace: timedelta | Unset = UNSET,
         merge: Callable[[Any, Any], Any] | None = None,
@@ -109,6 +113,7 @@ class Task(wrapt.ObjectProxy):
             self._require_string("queue", queue)
         self._require_string("serializer", serializer)
         self._require_non_negative_count("retries", retries)
+        self._check_retriable(retriable, retries, kind)
 
         self._check_timing(timeout, cancel_grace, reconnect_timeout)
         self._check_merge(merge, kind)
@@ -129,6 +134,7 @@ class Task(wrapt.ObjectProxy):
             is_async=inspect.iscoroutinefunction(self._annotated_callable(func)),
             module=getattr(func, "__module__", None) or "",
             retries=retries,
+            retriable=retriable,
             timeout=timeout,
             cancel_grace=cancel_grace,
             merge=merge,
@@ -252,6 +258,21 @@ class Task(wrapt.ObjectProxy):
         Task._require_bool("drop_oldest", drop_oldest)
         if drop_oldest and kind is not TaskKind.COALESCING:
             raise TypeError("only a coalescing task takes drop_oldest")
+
+    @staticmethod
+    def _check_retriable(retriable: Any, retries: int, kind: TaskKind) -> None:
+        Task._require_bool("retriable", retriable)
+        if retriable:
+            return
+        if retries > 0:
+            raise TaskDefinitionError(
+                "a task that is not retriable takes no retries: running it again is what it must not do"
+            )
+        if kind is not TaskKind.TASK:
+            raise TaskDefinitionError(
+                "only a plain task can be declared not retriable: an ephemeral task is never run again "
+                "anyway, and a coalescing task's generations replace one another"
+            )
 
     @staticmethod
     def _check_timing(timeout: Any, cancel_grace: Any, reconnect_timeout: Any) -> None:
@@ -393,6 +414,7 @@ def task(
     queue: str | Unset = ...,
     serializer: str = ...,
     retries: int = ...,
+    retriable: bool = ...,
     timeout: timedelta | None = ...,
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
@@ -407,6 +429,7 @@ def task(
     queue: str | Unset = UNSET,
     serializer: str = DEFAULT_SERIALIZER,
     retries: int = 0,
+    retriable: bool = True,
     timeout: timedelta | None = None,
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
@@ -429,6 +452,11 @@ def task(
     under the same name on every worker; it is checked here if it is already
     registered, and otherwise before the task first runs.
 
+    `retriable=False` declares a task that is not safe to run twice. A run
+    that was running when its worker or task process was lost is then
+    orphaned instead of run again, and awaiting it raises
+    `TaskOrphanedError`. Such a task takes no `retries`.
+
     Raises `TaskDefinitionError` or `DuplicateTaskError` as `Task` does, and
     `TypeError` if given something other than a function or keyword options.
     """
@@ -438,6 +466,7 @@ def task(
         "queue": queue,
         "serializer": serializer,
         "retries": retries,
+        "retriable": retriable,
         "timeout": timeout,
         "cancel_grace": cancel_grace,
         "recycle_process": recycle_process,

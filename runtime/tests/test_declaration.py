@@ -192,6 +192,7 @@ BAD_OPTIONS = (
     + [("timeout", bad, "timeout") for bad in [timedelta(0), timedelta(seconds=-1), 5, "5s", True]]
     + [("cancel_grace", bad, "cancel_grace") for bad in [timedelta(seconds=-1), 5, "5s", None, True]]
     + [("recycle_process", bad, "recycle_process") for bad in ["yes", 1, None]]
+    + [("retriable", bad, "retriable") for bad in ["no", 0, None]]
     + [
         ("reconnect_timeout", bad, "reconnect_timeout")
         for bad in [timedelta(0), timedelta(seconds=-1), 5, "5s", True]
@@ -405,6 +406,19 @@ def fresh_registry(monkeypatch):
 def test_an_ephemeral_task_is_never_retried_so_it_takes_no_retries(fresh_registry):
     with pytest.raises(TypeError):
         ephemeral_task(name="retry.ephemeral", retries=1)(charge)
+
+
+def test_a_task_that_is_not_retriable_takes_no_retries_and_only_a_plain_task_is_one(fresh_registry):
+    with pytest.raises(TaskDefinitionError, match="retriable"):
+        task(name="orphan.retried", retriable=False, retries=1)(charge)
+    for kind in (TaskKind.EPHEMERAL, TaskKind.COALESCING):
+        with pytest.raises(TaskDefinitionError, match="retriable"):
+            Task(charge, registry=TaskRegistry(), name=f"orphan.{kind.value}", kind=kind, retriable=False)
+    with pytest.raises(TypeError):
+        ephemeral_task(name="orphan.ephemeral", retriable=False)(charge)
+    with pytest.raises(TypeError):
+        coalescing_task(name="orphan.coalescing", retriable=False)(charge)
+    assert task(name="orphan.plain", retriable=False)(charge).definition.retriable is False
 
 
 def test_a_zero_cancel_grace_and_an_ephemeral_timeout_are_allowed(fresh_registry):

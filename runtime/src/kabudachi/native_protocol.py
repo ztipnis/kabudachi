@@ -75,7 +75,9 @@ class SubmitArguments:
     or "" by default), and no other kind has one. A run that fails is
     replaced by a new attempt up to `retries` times. With `drop_oldest`, a
     coalescing task that would pass the hard memory limit loses its key's
-    oldest retained payloads to fit instead of being refused.
+    oldest retained payloads to fit instead of being refused. With
+    `non_retriable`, the task is not safe to run twice: a run lost while
+    running is orphaned.
 
     `options` is what the caller asked: with `delay_ms` the task is not
     claimed before that long has passed, and with `expires_in_ms` it
@@ -96,6 +98,7 @@ class SubmitArguments:
     settings: SubmissionSettings
     retries: int = 0
     drop_oldest: bool = False
+    non_retriable: bool = False
 
 
 _DEFAULT_WORKER_THREADS = 2
@@ -218,6 +221,9 @@ class Runtime(Protocol):
         """Reports that a running run succeeded; its certification. `None`
         when the leader decides elsewhere. `result`, on a networked worker, is
         delivered to the task's client before the report."""
+
+    def task_run_state(self, task_run_id: str) -> Any:
+        """The state of a run this runtime decides, or None."""
 
     async def task_record(self, task_id: str) -> Any:
         """The newest record of the task the runtime reaches, or None."""

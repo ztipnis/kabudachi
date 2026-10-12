@@ -848,10 +848,22 @@ class Session:
         if replayed:
             self._tasks.retry_queued(claim.task_id)
         else:
-            self._tasks.failed(
-                claim.task_id,
-                TaskLostError(f"task {claim.task_id} was lost with the process that ran it"),
+            self._tasks.failed(claim.task_id, self._loss_error(claim))
+
+    def _loss_error(self, claim: Any) -> BaseException:
+        """How a run lost here with no new attempt ended for its handle:
+        orphaned if the leader orphaned it (a task not safe to run twice),
+        lost otherwise, or if the leader's word cannot be read."""
+        try:
+            state = self._runtime.task_run_state(claim.task_run_id)
+        except Exception:
+            state = None
+        if state == RunState.ORPHANED:
+            return TaskOrphanedError(
+                f"task {claim.task_id} was running when the process that ran it died; whether it "
+                "took effect is unknown"
             )
+        return TaskLostError(f"task {claim.task_id} was lost with the process that ran it")
 
     def _report_lost_quietly(self, claim: Any) -> None:
         try:

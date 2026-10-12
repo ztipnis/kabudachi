@@ -26,6 +26,7 @@ from kabudachi.errors import (
     TaskCancelledError,
     TaskDefinitionError,
     TaskLostError,
+    TaskOrphanedError,
     TaskTimeoutError,
 )
 from kabudachi.lifecycle import HookRegistry
@@ -211,7 +212,7 @@ def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_pla
     assert (markers / "called-back").read_text() == "101", "the task process ran the callback out"
 
 
-def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_is_ephemeral():
+def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_is_ephemeral_or_not_retriable():
     kabudachi.configure(processes=1)
 
     async def main():
@@ -219,6 +220,10 @@ def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_
             replayed = await pool_tasks.dies_once(Greeting(text="a"))
             with pytest.raises(TaskLostError):
                 await pool_tasks.ephemeral_dies(Greeting())
+            # Running when its process died, and not safe to run twice: its
+            # outcome is unknown, so it is orphaned, not lost.
+            with pytest.raises(TaskOrphanedError):
+                await pool_tasks.not_retriable_dies(Greeting())
             after = await pool_tasks.where_async(Greeting())
             return replayed.times, after.times
 

@@ -59,6 +59,13 @@ def ephemeral_dies(request: Greeting) -> Greeting:
     return request
 
 
+@kabudachi.task(name="pool.not_retriable_dies", retriable=False)
+def not_retriable_dies(request: Greeting) -> Greeting:
+    """Kills its own process while running: a task not safe to run twice."""
+    os.kill(os.getpid(), signal.SIGKILL)
+    return request
+
+
 @kabudachi.task(name="pool.sized")
 def sized(request: Greeting) -> Greeting:
     return Greeting(text="x" * request.times)

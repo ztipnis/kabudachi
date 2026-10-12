@@ -202,6 +202,7 @@ class TaskTable:
                     settings,
                     retries=definition.retries,
                     drop_oldest=definition.drop_oldest,
+                    non_retriable=not definition.retriable,
                 )
             )
             handle = TaskHandle(

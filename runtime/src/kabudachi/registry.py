@@ -38,6 +38,10 @@ class TaskDefinition:
     find it; empty if the callable names none."""
     retries: int = 0
     """How many times a failed run is replaced by a new attempt."""
+    retriable: bool = True
+    """Whether a run that was running when its worker or task process was
+    lost may be run again. `False` for a task not safe to run twice: such a
+    run is orphaned instead, and the task is over."""
     timeout: timedelta | None = None
     """How long a run may take before it is asked to stop. `None` is no limit."""
     cancel_grace: timedelta | Unset = UNSET
