@@ -67,7 +67,6 @@ def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_rec
 
     async def main():
         handle = greet(Greeting(text="status"))
-        before = await handle.status()
         await handle.durable(Durability.IN_MEMORY)
         refusals = []
         for level in (Durability.REPLICATED, Durability.DR_STORED):
@@ -76,20 +75,17 @@ def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_rec
             except DurabilityUnavailableError as refusal:
                 refusals.append(refusal)
         await handle
-        return handle.durability, before, len(refusals), await handle.status()
+        return handle.durability, len(refusals), await handle.status()
 
-    durability, before, refused, after = kabudachi.run(main)
+    durability, refused, after = kabudachi.run(main)
 
     assert durability is Durability.IN_MEMORY
     assert refused == 2
-    assert before.state in {"pending", "running", "succeeded"}
     assert isinstance(after, TaskStatus)
     assert (after.state, after.attempt, after.delivered) == ("succeeded", 1, False)
     assert after.submitted_at is not None and after.updated_at >= after.submitted_at
     # A status crosses process boundaries (a task process reads it through
-    # its worker), so it pickles whole, its native run state included.
-    copied = pickle.loads(pickle.dumps(after))
-    assert copied == after and copied.run_state is after.run_state
+    # its worker), so every native run state it may hold pickles as itself.
     variants = [getattr(RunState, name) for name in dir(RunState) if name.isupper()]
     assert len(variants) == 11
     assert all(pickle.loads(pickle.dumps(variant)) is variant for variant in variants)

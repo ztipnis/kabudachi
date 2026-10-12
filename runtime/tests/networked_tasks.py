@@ -71,10 +71,14 @@ async def nests(request: Greeting) -> Greeting:
 
 @kabudachi.task(name="cluster.awaits")
 async def awaits(request: Greeting) -> Greeting:
-    """Calls `hold`, waits for its leader to store it, and awaits its result;
-    what that raises fails the run. Says how durably the call is kept."""
-    called = hold(Greeting(text=request.text))
+    """Calls `hold`, held until its leader has stored it, then lets it go and
+    awaits its result; what that raises fails the run, as does a call never
+    heard stored. Says how durably the call is kept."""
+    called = hold(Greeting(text=request.text, times=-1))
+    # Before the call can settle: only the worker's word that its leader
+    # stored the task can answer this.
     await asyncio.wait_for(called.durable(kabudachi.Durability.REPLICATED), 20)
+    (_markers() / f"{request.text}.go").touch()
     await called
     return Greeting(text=called.durability.name)
 

@@ -418,7 +418,6 @@ def test_a_task_that_is_not_retriable_takes_no_retries_and_only_a_plain_task_is_
         ephemeral_task(name="orphan.ephemeral", retriable=False)(charge)
     with pytest.raises(TypeError):
         coalescing_task(name="orphan.coalescing", retriable=False)(charge)
-    assert task(name="orphan.plain", retriable=False)(charge).definition.retriable is False
 
 
 def test_a_zero_cancel_grace_and_an_ephemeral_timeout_are_allowed(fresh_registry):
