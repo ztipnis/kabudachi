@@ -24,7 +24,7 @@ pub use local::LocalRecords;
 pub use order::{Settlement, WriteOrder};
 pub use outbox::RecordOutbox;
 pub use repair::Repair;
-pub use store::{Origin, Put, PutRefusal, VersionedRecords, identify};
+pub use store::{BlobRefusal, ORPHAN_BLOB_GRACE, Origin, OwnerState, Put, PutRefusal, VersionedRecords, identify};
 pub use version::{RecordVersion, VersionOrder};
 
 use crate::scheduler::MAX_CLAIM_FRAME_BYTES;

@@ -1,5 +1,6 @@
+use crate::blob::{BlobKey, BlobOwner, BlobRecord};
 use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::WorkerId;
+use crate::protocol::ids::{TaskId, WorkerId};
 use crate::scheduler::Observer;
 use crate::task_record::gate::Write;
 use crate::task_record::store::VersionedRecords;
@@ -42,6 +43,35 @@ impl<C: Clock> LocalRecords<C> {
     /// written to.
     pub fn sweep(&mut self) -> usize {
         self.records.sweep(self.clock.now())
+    }
+
+    /// Keeps each of `chunks` as a blob owned by the task `owner`. A one-node
+    /// store has no grace and asks no one: the owner's record always arrives,
+    /// unless its submission is refused or dropped, and then
+    /// [`Self::forget_blobs_of`] is called.
+    pub fn put_blobs(&mut self, owner: &TaskId, chunks: Vec<Vec<u8>>) {
+        let now = self.clock.now();
+        for chunk in chunks {
+            let key = BlobKey::of(&chunk);
+            let record = BlobRecord {
+                value: chunk,
+                owner: BlobOwner::Task(owner.clone()),
+                placement: vec![self.worker.clone()],
+            };
+            self.records
+                .put_blob(&key, record, now)
+                .expect("a chunk of a payload is no larger than a blob and is stored under its own key");
+        }
+    }
+
+    /// The bytes held under `key`.
+    pub fn blob(&self, key: &BlobKey) -> Option<Vec<u8>> {
+        self.records.blob(key).map(|record| record.value)
+    }
+
+    /// The task `owner` will never run: its blobs are dropped.
+    pub fn forget_blobs_of(&mut self, owner: &TaskId) {
+        self.records.forget_blobs_of(&BlobOwner::Task(owner.clone()));
     }
 
     /// Each write since the last call, and whether the store kept it.

@@ -9,7 +9,11 @@ use kabudachi_core::manifest::{
 };
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::generated::{self, manifest_entry};
-use kabudachi_core::protocol::ids::TaskId;
+use kabudachi_core::coordination_authority::RecoveryEpoch;
+use kabudachi_core::protocol::generated::{Task, TaskRecord};
+use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::task_record::{BlobRefusal, OwnerState, RecordVersion, VersionedRecords};
+use kabudachi_core::time::{Duration, Instant};
 
 /// `len` bytes that differ from chunk to chunk, so a reordering shows.
 fn varied(len: usize) -> Vec<u8> {
@@ -98,4 +102,112 @@ fn a_payload_past_the_inline_bound_is_cut_into_chunks_that_join_back_only_whole_
         placement: Vec::new(),
     };
     assert_eq!(BlobRecord::try_from(generated::BlobRecord::from(record.clone())), Ok(record));
+}
+
+fn at(ticks: u64) -> Instant {
+    Instant::at(ticks)
+}
+
+/// Revision `revision` of `task`'s record, placed on `holders`, finished or not.
+fn task_record(task: &str, revision: u64, holders: &[&str], finished: bool) -> TaskRecord {
+    TaskRecord {
+        version: Some(RecordVersion { recovery_epoch: RecoveryEpoch::new(0, 0), leader_term: 1, revision }.into()),
+        task: Some(Task {
+            task_id: Some(TaskId::new(task).into()),
+            task_definition_id: Some(TaskDefinitionId::new("definition").into()),
+            ..Task::default()
+        }),
+        placement: holders.iter().map(|holder| WorkerId::new(*holder).into()).collect(),
+        finished,
+        ..TaskRecord::default()
+    }
+}
+
+fn owned_by(task: &str, value: &[u8]) -> BlobRecord {
+    BlobRecord { value: value.to_vec(), owner: BlobOwner::Task(TaskId::new(task)), placement: Vec::new() }
+}
+
+fn task(task: &str) -> BlobOwner {
+    BlobOwner::Task(TaskId::new(task))
+}
+
+#[test]
+fn a_holder_keeps_a_blob_under_its_own_digest_while_its_owner_is_unfinished_and_notes_where_it_must_move() {
+    const RETENTION: u64 = 100;
+    const GRACE: u64 = 1000;
+    let store = || {
+        VersionedRecords::with_retention(Some(Duration::from_ticks(RETENTION)))
+            .with_orphan_blob_grace(Duration::from_ticks(GRACE))
+            .held_by(WorkerId::new("a"))
+    };
+    let chunk = b"chunk";
+    let key = BlobKey::of(chunk);
+
+    // Only under its own digest, and no larger than a chunk.
+    let mut held = store();
+    assert_eq!(held.put_blob(&BlobKey::of(b"other"), owned_by("t1", chunk), at(0)), Err(BlobRefusal::WrongKey));
+    let oversized = vec![0; kabudachi_core::blob::MAX_BLOB_BYTES + 1];
+    assert_eq!(
+        held.put_blob(&BlobKey::of(&oversized), owned_by("t1", &oversized), at(0)),
+        Err(BlobRefusal::TooLarge)
+    );
+
+    // The same bytes for two tasks: one blob, two owners.
+    assert_eq!(held.put_blob(&key, owned_by("t1", chunk), at(0)), Ok(()));
+    assert_eq!(held.put_blob(&key, owned_by("t2", chunk), at(0)), Ok(()));
+    assert_eq!(held.blobs(), vec![(key.clone(), vec![task("t1"), task("t2")])]);
+    assert_eq!(held.blobs_of(&task("t1")), vec![(key.clone(), chunk.to_vec())]);
+
+    // t1's record is held unfinished: kept past any grace, and never asked about.
+    held.put(task_record("t1", 1, &["a", "b"], false), at(10)).unwrap();
+    held.sweep(at(10 * GRACE));
+    assert!(held.blob(&key).is_some());
+    assert_eq!(held.owners_to_check(at(10 * GRACE)), vec![task("t2")], "only the never-seen owner");
+
+    // t2 is still unfinished somewhere in the shard: kept, and asked about
+    // again a grace later. Once found gone, it lets go at once.
+    held.owner_checked(&task("t2"), OwnerState::Unfinished, at(10 * GRACE));
+    assert!(held.owners_to_check(at(10 * GRACE + GRACE - 1)).is_empty());
+    held.owner_checked(&task("t2"), OwnerState::Gone, at(11 * GRACE));
+    assert_eq!(held.blobs(), vec![(key.clone(), vec![task("t1")])]);
+
+    // The leader moves t1's record from [a, b] to [a, c]: the move is noted,
+    // once; the same placement again notes nothing.
+    held.put(task_record("t1", 2, &["a", "c"], false), at(11 * GRACE)).unwrap();
+    assert_eq!(held.take_blob_moves(), vec![(task("t1"), vec![WorkerId::new("a"), WorkerId::new("c")])]);
+    assert!(held.take_blob_moves().is_empty());
+    held.put(task_record("t1", 3, &["a", "c"], false), at(11 * GRACE)).unwrap();
+    assert!(held.take_blob_moves().is_empty());
+
+    // Moved off this holder entirely, it keeps a stub, and so the blob,
+    // while the record is unfinished; the move is noted for it to push.
+    held.put(task_record("t1", 4, &["b", "c"], false), at(11 * GRACE)).unwrap();
+    assert_eq!(held.take_blob_moves(), vec![(task("t1"), vec![WorkerId::new("b"), WorkerId::new("c")])]);
+    held.sweep(at(20 * GRACE));
+    assert!(held.blob(&key).is_some(), "a stub of an unfinished owner keeps its blobs");
+
+    // Finished, the record (here, its stub) goes after its retention, and
+    // the blob with it.
+    held.put(task_record("t1", 5, &["b", "c"], true), at(20 * GRACE)).unwrap();
+    held.sweep(at(20 * GRACE + RETENTION));
+    assert!(held.blob(&key).is_none());
+
+    // An owner never seen here but found finished elsewhere lets go a grace
+    // after the answer.
+    let mut held = store();
+    held.put_blob(&key, owned_by("t3", chunk), at(0)).unwrap();
+    held.owner_checked(&task("t3"), OwnerState::Finished, at(GRACE));
+    assert_eq!(held.next_due(), Some(at(2 * GRACE)));
+    held.sweep(at(2 * GRACE - 1));
+    assert!(held.blob(&key).is_some());
+    held.sweep(at(2 * GRACE));
+    assert!(held.blob(&key).is_none());
+
+    // With no grace, nothing is asked about; forgetting an owner drops what
+    // only it owned.
+    let mut held = VersionedRecords::with_retention(None);
+    held.put_blob(&key, owned_by("t4", chunk), at(0)).unwrap();
+    assert!(held.owners_to_check(at(u64::MAX / 2)).is_empty());
+    held.forget_blobs_of(&task("t4"));
+    assert!(held.blob(&key).is_none());
 }
