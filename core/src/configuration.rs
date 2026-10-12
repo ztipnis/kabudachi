@@ -112,6 +112,12 @@ impl Generation {
         self.term
     }
 
+    /// Whether this generation and `other` were minted in the same recovery
+    /// epoch and term.
+    fn is_in_term_of(&self, other: Generation) -> bool {
+        self.recovery_epoch == other.recovery_epoch && self.term == other.term
+    }
+
     /// The generation of the next change a leader elected in `leader_term`
     /// announces after this one: the same recovery epoch, the announcing
     /// leader's term, and the counter one higher (every
@@ -282,6 +288,62 @@ pub struct Joint {
     pub new_voter_count: usize,
 }
 
+/// The old side of a joint configuration: the configuration it moves from,
+/// by base, generation and voter count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OldSide {
+    base: Generation,
+    generation: Generation,
+    voter_count: usize,
+}
+
+impl OldSide {
+    /// Whether this side is exactly `single`'s electorate: the same base,
+    /// generation and voter count.
+    fn is(&self, base: Generation, generation: Generation, voter_count: usize) -> bool {
+        self.voter_count == voter_count && self.base == base && self.generation == generation
+    }
+}
+
+impl Joint {
+    /// The first rule of [`Configuration::joint`] this breaks, in the order
+    /// that constructor documents; `None` when it breaks none.
+    fn first_broken_rule(&self) -> Option<InvalidConfiguration> {
+        [
+            (
+                self.base > self.generation,
+                InvalidConfiguration::BaseAfterGeneration,
+            ),
+            (
+                self.base > self.batch_generation,
+                InvalidConfiguration::BaseAfterBatchGeneration,
+            ),
+            (
+                self.batch_generation > self.generation,
+                InvalidConfiguration::BatchGenerationAfterGeneration,
+            ),
+            (
+                self.old_base > self.old_generation,
+                InvalidConfiguration::OldBaseAfterOldGeneration,
+            ),
+            (
+                self.old_generation >= self.batch_generation,
+                InvalidConfiguration::OldGenerationNotBeforeBatchGeneration,
+            ),
+            (
+                self.old_base > self.base,
+                InvalidConfiguration::OldBaseAfterBase,
+            ),
+            (
+                self.old_voter_count == 0 || self.new_voter_count == 0,
+                InvalidConfiguration::ZeroVoterCount,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(broken, rule)| broken.then_some(rule))
+    }
+}
+
 impl Configuration {
     /// A new shard's first configuration: its creator alone, at the genesis
     /// generation, which is also the base generation.
@@ -325,26 +387,8 @@ impl Configuration {
     /// `OldGenerationNotBeforeBatchGeneration`, `OldBaseAfterBase`, and
     /// `ZeroVoterCount` (old side, then new).
     pub fn joint(joint: Joint) -> Result<Self, InvalidConfiguration> {
-        if joint.base > joint.generation {
-            return Err(InvalidConfiguration::BaseAfterGeneration);
-        }
-        if joint.base > joint.batch_generation {
-            return Err(InvalidConfiguration::BaseAfterBatchGeneration);
-        }
-        if joint.batch_generation > joint.generation {
-            return Err(InvalidConfiguration::BatchGenerationAfterGeneration);
-        }
-        if joint.old_base > joint.old_generation {
-            return Err(InvalidConfiguration::OldBaseAfterOldGeneration);
-        }
-        if joint.old_generation >= joint.batch_generation {
-            return Err(InvalidConfiguration::OldGenerationNotBeforeBatchGeneration);
-        }
-        if joint.old_base > joint.base {
-            return Err(InvalidConfiguration::OldBaseAfterBase);
-        }
-        if joint.old_voter_count == 0 || joint.new_voter_count == 0 {
-            return Err(InvalidConfiguration::ZeroVoterCount);
+        if let Some(broken) = joint.first_broken_rule() {
+            return Err(broken);
         }
         Ok(Configuration {
             generation: joint.generation,
@@ -452,29 +496,53 @@ impl Configuration {
         batch: &Configuration,
         admission: Option<Generation>,
     ) -> Option<Generation> {
-        let Electorate::Joint {
-            batch_generation,
-            old_base,
-            old_generation,
-            old_voter_count,
-            ..
-        } = batch.electorate
-        else {
-            return None;
+        (self.is_batch_started_on_this(batch) && self.voters().counts(admission.into()))
+            .then_some(batch.generation)
+    }
+
+    /// Whether `batch` is the joint configuration this single one's own leader
+    /// started directly on it (see [`Self::admission_after_batch_start`]).
+    fn is_batch_started_on_this(&self, batch: &Configuration) -> bool {
+        let Some(old) = batch.old_electorate() else {
+            return false;
         };
         let Electorate::Single { voter_count } = self.electorate else {
-            return None;
+            return false;
         };
-        (old_voter_count == voter_count
-            && old_base == self.base
-            && old_generation == self.generation
-            && batch.generation > self.generation
-            && batch.generation.recovery_epoch == self.generation.recovery_epoch
-            && batch.generation.term == self.generation.term
-            && batch.base == batch.generation
-            && batch_generation == batch.generation
-            && self.voters().counts(admission.into()))
-        .then_some(batch.generation)
+        old.is(self.base, self.generation, voter_count)
+            && batch.is_fresh_batch_after(self.generation)
+    }
+
+    /// Whether this is a joint configuration based and batched at its own
+    /// generation, minted after `earlier` in `earlier`'s epoch and term: the
+    /// shape a leader's batch takes, started on a configuration at `earlier`.
+    fn is_fresh_batch_after(&self, earlier: Generation) -> bool {
+        let Electorate::Joint {
+            batch_generation, ..
+        } = self.electorate
+        else {
+            return false;
+        };
+        let based_at_its_batch =
+            self.base == self.generation && batch_generation == self.generation;
+        self.generation > earlier && self.generation.is_in_term_of(earlier) && based_at_its_batch
+    }
+
+    /// A joint configuration's old side; `None` for a single one.
+    fn old_electorate(&self) -> Option<OldSide> {
+        match self.electorate {
+            Electorate::Single { .. } => None,
+            Electorate::Joint {
+                old_base,
+                old_generation,
+                old_voter_count,
+                ..
+            } => Some(OldSide {
+                base: old_base,
+                generation: old_generation,
+                voter_count: old_voter_count,
+            }),
+        }
     }
 
     /// Whether a worker holding this configuration, and the promise of
