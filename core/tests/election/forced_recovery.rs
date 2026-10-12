@@ -682,27 +682,31 @@ fn awaiting_its_swap() -> (Driven, AuthorityCall) {
 // empty its slot so the real answer is ignored.
 #[test]
 fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
-    type Stray = fn(&Driven, &AuthorityCall) -> AuthorityReply;
+    type Stray = fn(&Driven, &AuthorityCall) -> Input;
     let strays: [Stray; 2] = [
-        |_, read| AuthorityReply::RecoveryEpoch {
-            token: ReplyToken {
-                kind: CallKind::ReadRecoveryEpoch,
-                ..read.token
-            },
-            sent_at: read.sent_at,
-            result: Ok(Some(record_at(epoch(0)))),
+        |_, read| {
+            Input::Authority(AuthorityReply::RecoveryEpoch {
+                token: ReplyToken {
+                    kind: CallKind::ReadRecoveryEpoch,
+                    ..read.token
+                },
+                sent_at: read.sent_at,
+                result: Ok(Some(record_at(epoch(0)))),
+            })
         },
         // A real live set, of the awaited kind and number, which would move
         // the recovery on if it were taken.
         |driven, read| {
-            AuthorityCall {
-                token: ReplyToken {
-                    issuer: Issuer::Cascade,
-                    ..read.token
+            performed(
+                driven,
+                AuthorityCall {
+                    token: ReplyToken {
+                        issuer: Issuer::Cascade,
+                        ..read.token
+                    },
+                    ..*read
                 },
-                ..*read
-            }
-            .perform(&driven.authority, &name_of(&shard(SHARD)), &shard(SHARD), &worker("w1"), "w1")
+            )
         },
     ];
 
@@ -710,18 +714,11 @@ fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
         let (mut driven, read) = awaiting_its_live_set_read();
         assert_eq!(read.token.issuer, Issuer::Node, "setup invariant");
 
-        let reply = stray(&driven, &read);
-        let ignored = driven.node.step(Input::Authority(reply));
+        let ignored = driven.node.step(stray(&driven, &read));
         assert!(authority_calls(&ignored.outputs).is_empty(), "{:?}", ignored.outputs);
         assert_eq!(driven.node.state(), WorkerState::NoQuorum);
 
-        let answered = driven.node.step(Input::Authority(read.perform(
-            &driven.authority,
-            &name_of(&shard(SHARD)),
-            &shard(SHARD),
-            &worker("w1"),
-            "w1",
-        )));
+        let answered = driven.node.step(performed(&driven, read));
         assert!(
             authority_calls(&answered.outputs).contains(&AuthorityRequest::ReadRecoveryEpoch),
             "the recovery is still going: {:?}",

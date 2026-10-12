@@ -64,7 +64,8 @@ pub(crate) struct MemberReport {
     pub(crate) routing_crawled: bool,
     /// The admission generation it holds, a promise included.
     pub(crate) admission: Option<Generation>,
-    /// Whether it runs compaction.
+    /// Whether it runs compaction, which the leader reads to know which
+    /// workers can run the compaction it assigns.
     pub(crate) runs_compaction: bool,
 }
 
@@ -146,8 +147,9 @@ impl LeaderOffice {
             reports: MemberReports::default(),
         };
         office.commit_when_due(duties.me);
-        // Seeded only now: `commit_when_due` notes the voters before the roll
-        // call's generation is known to the guard, as it always has.
+        // Seeded only now: `commit_when_due` notes the voters before the guard
+        // knows the roll call's generation, so the first note keeps only the
+        // current generation.
         if let Some((generation, sides)) = office.roster.called_under() {
             office.removal.seed(generation, sides);
         }

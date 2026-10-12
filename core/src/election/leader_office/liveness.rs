@@ -16,13 +16,15 @@ pub(super) struct Liveness {
     /// a member not in it counts from when it was first heard.
     confirmed_at: BTreeMap<WorkerId, Instant>,
     /// The counted members reported lost for confirming no ack while their
-    /// heartbeats kept arriving, to take out one at a time.
+    /// heartbeats kept arriving, to take out one at a time (see
+    /// [`super::LeaderOffice::remove_one_unconfirming`]).
     unconfirming: BTreeSet<WorkerId>,
     /// The workers reported lost and not heard since: one that confirmed no
     /// ack stays here until it confirms one, its heartbeats notwithstanding.
     lost: BTreeSet<WorkerId>,
     /// The workers reported silent and not heard since, each with the
-    /// instant from which the reconnect timeouts of the runs it holds count.
+    /// instant from which the reconnect timeouts of the runs it holds count
+    /// (see [`Self::silence_changes`]).
     reported_silence: BTreeMap<WorkerId, Instant>,
 }
 

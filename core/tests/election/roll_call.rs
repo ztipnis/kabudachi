@@ -217,18 +217,7 @@ const SLOW_CALL_SUSPECT: u64 = 100;
 fn slow_call_node(clock: &FakeClock, me: &WorkerId) -> TestNode {
     let timings = timings(Duration::from_ticks(SLOW_CALL_SUSPECT))
         .with_roll_call_deadline(Duration::from_ticks(SLOW_CALL_DEADLINE));
-    WorkerNode::start(
-        Identity {
-            id: me.clone(),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard("shard-1"),
-            timings,
-        },
-        Entry::Known(voter_of(3)),
-        clock.clone(),
-        None,
-    )
-    .0
+    known_node(clock, me, voter_of(3), timings)
 }
 
 /// How long an answer holds a node of [`slow_call_node`] back from its own
