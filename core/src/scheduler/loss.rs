@@ -158,34 +158,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// newer generation of its coalescing key waits behind it.
     pub(super) fn lose_run(&mut self, task_id: &TaskId, now: Instant, stamped_at: WallTime) -> LostRun {
         let run_id = self.current_run[task_id].clone();
-        let was_running = self.runs[&run_id].current_state() == TaskRunState::Running;
-        let task = &self.tasks[task_id];
-        let orphaned = task.non_retriable && !task.ephemeral && was_running;
-        let state = if orphaned {
-            TaskRunState::Orphaned
-        } else {
-            TaskRunState::Lost
-        };
+        let state = self.loss_state(task_id, &run_id);
         self.runs
             .get_mut(&run_id)
             .expect("every current run is stored")
             .transition_to(state, stamped_at)
             .expect("a claimed run can be lost, and a running one lost or orphaned");
         self.mark_decided(&run_id);
-        let newer_waits = self
-            .coalescing_key_of(task_id)
-            .is_some_and(|key| self.occupancy.has_waiting(&key));
-        let replayed = if orphaned || self.tasks[task_id].ephemeral || newer_waits {
-            self.record_finished(task_id, now);
-            None
-        } else {
-            *self.losses.entry(task_id.clone()).or_default() += 1;
-            let next = self.queue_next_attempt(task_id, &run_id);
-            if next.is_none() {
-                self.record_finished(task_id, now);
-            }
-            next
-        };
+        let replayed = self.replay_after_loss(task_id, &run_id, state, now);
         if let Some(key) = self.compaction_key_of(task_id) {
             self.compact_if_due(&key);
         }
@@ -195,5 +175,43 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             state,
             replayed,
         }
+    }
+
+    /// What a run lost with its worker becomes: `Orphaned` if it was running
+    /// and its task is non-retriable and not ephemeral, `Lost` otherwise.
+    fn loss_state(&self, task_id: &TaskId, run_id: &TaskRunId) -> TaskRunState {
+        let was_running = self.runs[run_id].current_state() == TaskRunState::Running;
+        let task = &self.tasks[task_id];
+        if task.non_retriable && !task.ephemeral && was_running {
+            TaskRunState::Orphaned
+        } else {
+            TaskRunState::Lost
+        }
+    }
+
+    /// Queues the replay of `run_id`, lost as `state`, and returns it; or
+    /// finishes the task when it is not replayed: the run is orphaned, the task
+    /// is ephemeral, a newer generation of its key waits, or its record has no
+    /// room for another attempt. A replay is a loss, not a retry.
+    fn replay_after_loss(
+        &mut self,
+        task_id: &TaskId,
+        run_id: &TaskRunId,
+        state: TaskRunState,
+        now: Instant,
+    ) -> Option<TaskRunId> {
+        let newer_waits = self
+            .coalescing_key_of(task_id)
+            .is_some_and(|key| self.occupancy.has_waiting(&key));
+        if state == TaskRunState::Orphaned || self.tasks[task_id].ephemeral || newer_waits {
+            self.record_finished(task_id, now);
+            return None;
+        }
+        *self.losses.entry(task_id.clone()).or_default() += 1;
+        let next = self.queue_next_attempt(task_id, run_id);
+        if next.is_none() {
+            self.record_finished(task_id, now);
+        }
+        next
     }
 }
