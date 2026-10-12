@@ -27,45 +27,35 @@ mod delivery;
 mod handover;
 mod observed;
 mod seam;
+mod start;
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::election::{ElectionTimings, Input, Step, WorkerNode};
+use kabudachi_core::election::{Input, Step, WorkerNode};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
-use kabudachi_core::protocol::ids::{ShardName, TaskId, TaskRunId, Uuid7Ids};
+use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids};
 use kabudachi_core::scheduler::mint;
-use kabudachi_core::time::{Duration as CoreDuration, RealClock};
+use kabudachi_core::time::RealClock;
 use kabudachi_net::executor::{Report, WorkSource, executor_channel};
-use kabudachi_net::task_exchange::LeaderRetry;
-use kabudachi_net::worker::{AuthorityConfig, Multiaddr, Worker, WorkerConfig};
-use kabudachi_redis_authority::{RedisAuthority, RedisAuthorityConfig};
+use kabudachi_net::worker::Worker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use tokio::runtime::{Builder, Handle, Runtime};
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
-use crate::arguments::{SubmitArguments, memory_limits};
+use crate::arguments::SubmitArguments;
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::work::PyTaskRecord;
 
 use self::delivery::{cancel_at_leader, deliver};
 use self::observed::{LeftOnDrop, Observed, publish};
 use self::seam::{GONE_MESSAGE, Shared};
+use self::start::NetworkedArguments;
 
-const DEFAULT_WORKER_THREADS: usize = 2;
-const DEFAULT_RESULT_TTL_MS: u64 = 60 * 60 * 1000;
 const SHUTDOWN_GRACE: StdDuration = StdDuration::from_secs(1);
-/// The default roll-call deadline, unless a quarter of the suspicion timeout
-/// is shorter: a roll call must close well inside it.
-const ROLL_CALL_DEADLINE_MS: u64 = 250;
 const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
-
-fn address(text: &str) -> PyResult<Multiaddr> {
-    text.parse()
-        .map_err(|error| PyValueError::new_err(format!("{text:?} is not an address: {error}")))
-}
 
 /// A worker of a networked shard, and the Tokio runtime it runs on.
 ///
@@ -88,125 +78,28 @@ pub struct NetworkedRuntime {
 
 #[pymethods]
 impl NetworkedRuntime {
-    /// Starts a worker of the shard `shard` listening on `listen`, and
-    /// bootstraps it into the shard through `seeds`: with none, it founds
-    /// the shard alone. The heartbeat interval, heartbeat timeout and
-    /// reconnect timeout are the shard's election timings, the same on every
-    /// worker of it. `memory_soft_limit` and `memory_hard_limit` bound
-    /// pending task input while this worker leads, as for `NativeRuntime`.
-    /// `authority_url`, a `redis://` or `rediss://` server URL, with
-    /// `authority_key_prefix`, `authority_database` and `authority_ttl_ms`
-    /// (the authority's own default unless given), is the shard's
-    /// coordination authority: the worker then bootstraps through it, and its
-    /// timings come from the authority's TTL.
+    /// Starts a worker of a networked shard as `arguments` say (see
+    /// `kabudachi.native_protocol.NetworkedArguments`), and bootstraps it into
+    /// the shard: through its seeds, through its authority, or, with neither,
+    /// by founding the shard alone.
     ///
     /// Raises `ValueError` for an address that cannot be read, a timing or
     /// authority TTL of zero, only one memory limit, no worker threads or an
-    /// authority that cannot be used, and `RuntimeError` if it cannot listen on `listen`.
+    /// authority that cannot be used, and `RuntimeError` if it cannot listen
+    /// on its listen address.
     #[new]
-    #[pyo3(signature = (
-        shard,
-        listen,
-        *,
-        heartbeat_interval_ms,
-        heartbeat_timeout_ms,
-        reconnect_timeout_ms,
-        seeds = Vec::new(),
-        external_address = None,
-        authority_url = None,
-        authority_key_prefix = None,
-        authority_database = 0,
-        authority_ttl_ms = None,
-        result_ttl_ms = DEFAULT_RESULT_TTL_MS,
-        memory_soft_limit = None,
-        memory_hard_limit = None,
-        worker_threads = DEFAULT_WORKER_THREADS,
-    ))]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "each argument is a Python parameter"
-    )]
-    fn new(
-        py: Python<'_>,
-        shard: &str,
-        listen: &str,
-        heartbeat_interval_ms: u64,
-        heartbeat_timeout_ms: u64,
-        reconnect_timeout_ms: u64,
-        seeds: Vec<String>,
-        external_address: Option<String>,
-        authority_url: Option<String>,
-        authority_key_prefix: Option<String>,
-        authority_database: u16,
-        authority_ttl_ms: Option<u64>,
-        result_ttl_ms: u64,
-        memory_soft_limit: Option<u64>,
-        memory_hard_limit: Option<u64>,
-        worker_threads: usize,
-    ) -> PyResult<Self> {
-        if worker_threads == 0 {
-            return Err(PyValueError::new_err("worker_threads must be at least 1"));
-        }
-        for (name, value) in [
-            ("heartbeat_interval_ms", heartbeat_interval_ms),
-            ("heartbeat_timeout_ms", heartbeat_timeout_ms),
-            ("reconnect_timeout_ms", reconnect_timeout_ms),
-            ("authority_ttl_ms", authority_ttl_ms.unwrap_or(1)),
-        ] {
-            if value == 0 {
-                return Err(PyValueError::new_err(format!("{name} must be positive")));
-            }
-        }
-        let timings = ElectionTimings::new(
-            CoreDuration::from_millis(heartbeat_timeout_ms),
-            CoreDuration::from_millis(heartbeat_interval_ms),
-        )
-        .with_roll_call_deadline(CoreDuration::from_millis(
-            ROLL_CALL_DEADLINE_MS.min(heartbeat_timeout_ms / 4).max(1),
-        ))
-        .with_reconnect_timeout(CoreDuration::from_millis(reconnect_timeout_ms));
+    fn new(py: Python<'_>, arguments: NetworkedArguments) -> PyResult<Self> {
+        arguments.check()?;
         let (endpoint, executor) = executor_channel();
         let (source, reports) = executor.split();
-        let mut config = WorkerConfig::new(ShardName::new(shard), address(listen)?, timings)
-            .with_seeds(
-                seeds
-                    .iter()
-                    .map(|seed| address(seed))
-                    .collect::<PyResult<_>>()?,
-            )
-            .with_result_ttl(StdDuration::from_millis(result_ttl_ms))
-            .with_executor(endpoint);
-        if let Some(external) = external_address {
-            config = config.with_external_address(address(&external)?);
-        }
-        if let Some(limits) = memory_limits(memory_soft_limit, memory_hard_limit)? {
-            config = config.with_memory_limits(limits);
-        }
-        if let Some(url) = authority_url {
-            let mut redis = RedisAuthorityConfig::new(vec![url]);
-            if let Some(prefix) = authority_key_prefix {
-                redis.key_prefix = prefix;
-            }
-            redis.database = authority_database;
-            if let Some(ttl) = authority_ttl_ms {
-                redis = redis.with_ttl(CoreDuration::from_millis(ttl));
-            }
-            let authority = RedisAuthority::connect(redis).map_err(|error| {
-                PyValueError::new_err(format!("the authority cannot be used: {error}"))
-            })?;
-            config = config.with_authority(AuthorityConfig::new(Arc::new(authority)));
-        }
-
-        let tokio = Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name("kabudachi-native")
-            .enable_all()
-            .build()
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let config = arguments.worker_config(endpoint)?;
+        let tokio = arguments.tokio()?;
         let handle = tokio.handle().clone();
         let worker = py
             .detach(|| tokio.block_on(Worker::start(config)))
-            .map_err(|_| PyRuntimeError::new_err(format!("cannot listen on {listen:?}")))?;
+            .map_err(|_| {
+                PyRuntimeError::new_err(format!("cannot listen on {:?}", arguments.listen))
+            })?;
         let worker_id = worker.id().as_str().to_owned();
         let address = worker
             .address()
@@ -220,10 +113,7 @@ impl NetworkedRuntime {
             reports,
             net: worker.net(),
             observed,
-            retry: LeaderRetry {
-                answer_within: StdDuration::from_millis(heartbeat_timeout_ms),
-                ask_again_after: StdDuration::from_millis(heartbeat_interval_ms),
-            },
+            retry: arguments.retry(),
         });
 
         let seen = Arc::clone(&sender);
@@ -255,7 +145,7 @@ impl NetworkedRuntime {
             worker_id,
             address,
             clock: RealClock::new(),
-            reconnect_timeout: StdDuration::from_millis(reconnect_timeout_ms),
+            reconnect_timeout: StdDuration::from_millis(arguments.reconnect_timeout_ms),
         })
     }
 

@@ -114,6 +114,46 @@ class OneNodeArguments:
     memory_hard_limit: int | None = None
 
 
+@dataclass(frozen=True)
+class AuthorityArguments:
+    """The shard's coordination authority: a `redis://` or `rediss://`
+    server `url`, with its key prefix, database and TTL (the authority's
+    own default unless given)."""
+
+    url: str
+    key_prefix: str | None = None
+    database: int = 0
+    ttl_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class NetworkedArguments:
+    """How a worker of the networked shard `shard` runs.
+
+    It listens on `listen` and bootstraps into the shard through `seeds`,
+    or, with none, founds the shard alone. The heartbeat interval,
+    heartbeat timeout and reconnect timeout are the shard's election
+    timings, the same on every worker of it. With an `authority`, the
+    worker bootstraps through it instead, and its timings come from the
+    authority's TTL. `memory_soft_limit` and `memory_hard_limit` bound
+    pending task input while this worker leads, as for
+    `OneNodeArguments`.
+    """
+
+    shard: str
+    listen: str
+    heartbeat_interval_ms: int
+    heartbeat_timeout_ms: int
+    reconnect_timeout_ms: int
+    seeds: tuple[str, ...] = ()
+    external_address: str | None = None
+    authority: AuthorityArguments | None = None
+    result_ttl_ms: int = _DEFAULT_RESULT_TTL_MS
+    memory_soft_limit: int | None = None
+    memory_hard_limit: int | None = None
+    worker_threads: int = _DEFAULT_WORKER_THREADS
+
+
 @runtime_checkable
 class Runtime(Protocol):
     """What a session needs of the native runtime."""

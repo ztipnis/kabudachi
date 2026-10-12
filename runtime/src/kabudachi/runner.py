@@ -18,7 +18,7 @@ from kabudachi import _native
 from kabudachi.config import Configuration, Settings, authority_parts, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
-from kabudachi.native_protocol import OneNodeArguments
+from kabudachi.native_protocol import AuthorityArguments, NetworkedArguments, OneNodeArguments
 from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
@@ -124,11 +124,6 @@ def _millis(duration: timedelta) -> int:
 def _native_runtime(settings: Settings) -> Any:
     """A one-node shard of this process's own, or, with `listen` set, a
     worker of the networked shard `settings.shard`."""
-    limits = {
-        "result_ttl_ms": settings.result_ttl * 1000,
-        "memory_soft_limit": settings.memory_soft_limit,
-        "memory_hard_limit": settings.memory_hard_limit,
-    }
     if settings.listen is None:
         return _native.NativeRuntime(
             uuid.uuid4().hex,
@@ -139,26 +134,26 @@ def _native_runtime(settings: Settings) -> Any:
                 memory_hard_limit=settings.memory_hard_limit,
             ),
         )
-    authority = {}
+    authority = None
     if settings.authority is not None:
         url, prefix, database, ttl = authority_parts(settings.authority)
-        authority = {
-            "authority_url": url,
-            "authority_key_prefix": prefix,
-            "authority_database": database,
-        }
-        if ttl is not None:
-            authority["authority_ttl_ms"] = _millis(timedelta(seconds=ttl))
+        authority = AuthorityArguments(
+            url, prefix, database, None if ttl is None else _millis(timedelta(seconds=ttl))
+        )
     return _native.NetworkedRuntime(
-        settings.shard,
-        settings.listen,
-        seeds=list(settings.seeds),
-        external_address=settings.external_address,
-        heartbeat_interval_ms=_millis(settings.heartbeat_interval),
-        heartbeat_timeout_ms=_millis(settings.heartbeat_timeout),
-        reconnect_timeout_ms=_millis(settings.reconnect_timeout),
-        **authority,
-        **limits,
+        NetworkedArguments(
+            settings.shard,
+            settings.listen,
+            heartbeat_interval_ms=_millis(settings.heartbeat_interval),
+            heartbeat_timeout_ms=_millis(settings.heartbeat_timeout),
+            reconnect_timeout_ms=_millis(settings.reconnect_timeout),
+            seeds=tuple(settings.seeds),
+            external_address=settings.external_address,
+            authority=authority,
+            result_ttl_ms=settings.result_ttl * 1000,
+            memory_soft_limit=settings.memory_soft_limit,
+            memory_hard_limit=settings.memory_hard_limit,
+        )
     )
 
 

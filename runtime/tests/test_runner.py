@@ -56,12 +56,12 @@ class StandInNetworked(FaultingNative):
     """Stands in for the `NetworkedRuntime` class: a shard of one that records
     the calls a networked run makes on its way out."""
 
-    def __init__(self, shard, listen, **options):
+    def __init__(self, arguments):
         super().__init__(
             arguments=OneNodeArguments(
-                result_ttl_ms=options["result_ttl_ms"],
-                memory_soft_limit=options["memory_soft_limit"],
-                memory_hard_limit=options["memory_hard_limit"],
+                result_ttl_ms=arguments.result_ttl_ms,
+                memory_soft_limit=arguments.memory_soft_limit,
+                memory_hard_limit=arguments.memory_hard_limit,
             )
         )
         self.calls = []
