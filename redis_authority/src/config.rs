@@ -62,18 +62,37 @@ pub enum ConfigError {
 impl RedisAuthorityConfig {
     /// Checks the config and returns each URL with its database path set.
     pub(crate) fn validated_urls(&self) -> Result<Vec<String>, ConfigError> {
+        self.check_url_count()?;
+        let urls = self
+            .urls
+            .iter()
+            .map(|text| self.database_url(text))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.check_bounds()?;
+        Ok(urls)
+    }
+
+    /// One URL for a standalone server; at least one seed for a cluster.
+    fn check_url_count(&self) -> Result<(), ConfigError> {
         if self.urls.is_empty() || (!self.cluster && self.urls.len() != 1) {
             return Err(ConfigError::Urls);
         }
-        let mut urls = Vec::with_capacity(self.urls.len());
-        for text in &self.urls {
-            let mut url = url::Url::parse(text)
-                .ok()
-                .filter(|url| matches!(url.scheme(), "redis" | "rediss") && url.has_host())
-                .ok_or_else(|| ConfigError::BadUrl(text.clone()))?;
-            url.set_path(&format!("/{}", self.database));
-            urls.push(url.into());
-        }
+        Ok(())
+    }
+
+    /// `text` as a `redis://` or `rediss://` URL with a host, its path set
+    /// to the database.
+    fn database_url(&self, text: &str) -> Result<String, ConfigError> {
+        let mut url = url::Url::parse(text)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "redis" | "rediss") && url.has_host())
+            .ok_or_else(|| ConfigError::BadUrl(text.to_owned()))?;
+        url.set_path(&format!("/{}", self.database));
+        Ok(url.into())
+    }
+
+    /// The prefix, database and timeout rules that hold whatever the URLs.
+    fn check_bounds(&self) -> Result<(), ConfigError> {
         if self.key_prefix.contains(['{', '}']) {
             return Err(ConfigError::PrefixBraces);
         }
@@ -84,6 +103,6 @@ impl RedisAuthorityConfig {
         if timeout == 0 || timeout * 3 >= self.ttl.as_ticks() {
             return Err(ConfigError::CallTimeout);
         }
-        Ok(urls)
+        Ok(())
     }
 }
