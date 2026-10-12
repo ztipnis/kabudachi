@@ -77,7 +77,8 @@ imports your script again, which is why the call to `kabudachi.run(...)` needs i
   replaced, after a growing wait while replacements keep dying quickly. Each run it held is tried
   again without using up a retry, except an `@ephemeral_task`'s, and a `@coalescing_task`
   generation's that a newer generation of its key is waiting to supersede; their handles raise
-  `TaskLostError`. A compaction it was folding counts as failed, and that key is not compacted again
+  `TaskLostError`. A run of a `retriable=False` task is not tried again either: its handle raises
+  `TaskOrphanedError`. A compaction it was folding counts as failed, and that key is not compacted again
   until its waiting generation changes.
 - A task process is replaced by a fresh one after `max_runs_per_process` runs, after a run of a task
   declared `recycle_process=True`, or after an `after_run` hook raises. It takes no new runs,
@@ -142,10 +143,11 @@ Set `listen` and the worker joins a networked shard instead of running one of it
 - A networked worker needs `processes` of at least 1: a run it can no longer show its leader it holds
   must stop before another worker may run it again. It asks the body to stop `cancel_grace` before
   that deadline, and kills its task process at the deadline.
-- Awaiting a task's result raises `RemoteResultUnavailableError`, inside task bodies too, and a task
-  that returns a flow, group or bound task fails with it. `handle.done()` stays false and callbacks
-  do not run, unless the leader refused the task (`BackpressureError`). The task's record says how it
-  ended.
+- Awaiting a task's result works as on one worker, inside task bodies too: the worker that runs the task
+  delivers its result to the one that submitted it, and the handle settles once the leader certifies it.
+  If the result cannot reach the submitter, the await raises `ResultUnavailableError`. A task that
+  returns a flow, group or bound task fails with `TaskDefinitionError`. A result too large to send in
+  one message fails the run with `ResultTooLargeError`.
 - `handle.cancel()` sends the cancel to the leader without waiting and returns `True`; the worker
   running the task hears of it from the leader and stops it.
 - When `main` returns, or at the first signal, the worker waits until the leader has stored every task
@@ -161,6 +163,7 @@ Set `listen` and the worker joins a networked shard instead of running one of it
 | `name` | how workers find the task; defaults to its module and name, which then must be at package scope |
 | `version`, `queue`, `serializer` | the data format version, the queue, and the registered serializer name |
 | `retries` | how many more times a run that raises or times out is tried again (not for `@ephemeral_task`) |
+| `retriable` | `False` for a `@task` that is not safe to run twice: a run that was running when its worker or task process was lost ends with `TaskOrphanedError` instead of being run again. Takes no `retries` |
 | `timeout`, `cancel_grace` | ask the body to stop after `timeout`; fail the run if it has not stopped `cancel_grace` later |
 | `reconnect_timeout` | on a networked shard, how long a run may go unheard, once its worker is suspected, before the leader runs it again elsewhere; by default its queue's, else the shard's |
 | `recycle_process` | replace the task process that ran it once the run ends |
@@ -184,6 +187,21 @@ certified it, or raises what the task raised.
   best-effort reaction: a callback that raises is logged and changes nothing.
 - `task.options(delay=, eta=, expires=, key=)(x)` delays the start, or makes the task fail with
   `TaskExpiredError` if it has not started by `expires`. `key` is a coalescing task's key.
+- `handle.durability` says where the task is kept, a `Durability`: `IN_MEMORY` (only this process holds
+  it: always so on one worker, and on a networked one until the leader has stored it), `REPLICATED` (a
+  networked leader stored it on a quorum of its shard) or `DR_STORED` (a disaster-recovery copy, which
+  no runtime offers yet).
+- `await handle.durable(Durability.REPLICATED)` returns once the task is kept at least that durably. It
+  raises `DurabilityUnavailableError` on one worker and for `DR_STORED`, `BackpressureError` if the
+  leader refused the task, and the handle's own error if the task ended before this process heard it
+  was stored. Cancelling the wait does not affect the task.
+- `await handle.status()` gives a `TaskStatus`: `state` (`"unknown"`, `"pending"`, `"running"`, or how
+  the newest run ended: `"succeeded"`, `"failed"`, `"expired"`, `"superseded"`, `"cancelled"`,
+  `"lost"` or `"orphaned"`), `run_state`, `attempt`, `submitted_at`, `updated_at` and `delivered`
+  (whether the result reached the worker awaiting it). It is read from the record the shard holds, not
+  from the leader, so a change the leader has just made may not show yet. The handle of a flow or group
+  gives a `CompositeStatus` instead: `kind`, `state` (`"running"`, `"succeeded"`, `"failed"` or
+  `"cancelled"`), `counts` of its stages or members by state, and, for a flow, `stage`.
 - A task whose run ended and whose record had no room for another attempt raises
   `TaskRecordFullError`.
 
@@ -232,17 +250,20 @@ errors, which `except KabudachiError` does not catch.
 
 The native module reports what happened as typed values rather than strings, all in
 `kabudachi._native`: `EventKind` (`EXPIRED`, `SUPERSEDED`, `SLOW_DOWN`, `CANCELLED`, `RECORD_FULL`, `COALESCED_PAYLOAD_TOO_LARGE`, and from a
-networked worker `ACCEPTED`, `REFUSED`, `ABORT`, `ABORT_WITHDRAWN`) for scheduler
+networked worker `ACCEPTED`, `REFUSED`, `ABORT`, `ABORT_WITHDRAWN`, `RESULT`, `CERTIFIED`, `OUTCOME`) for scheduler
 events, `CancelOutcome` (`CANCELLED`, `ALREADY_FINISHED`, `UNKNOWN_TASK`) for how a cancel ended, and
 `RunState` (`SCHEDULED` through `ORPHANED`) for where a run is. The runtime turns these into the
 handle behaviour described above; you meet them only if you call the native module directly.
 `COALESCED_PAYLOAD_TOO_LARGE` surfaces as `CoalescedPayloadTooLargeError` on the handle.
 
 Task processes and networked workers add `StartupError` (task processes could not start),
-`TaskLostError` (a task's process died and the task is not run again), `TaskBodyError` (a body raised
-what could not be sent back as it was, such as `SystemExit`; `kind` names its type) and
-`RemoteResultUnavailableError` (a networked worker cannot deliver the result; `task_id` names the
-task), all in `kabudachi.errors`.
+`TaskBodyError` (a body raised what could not be sent back as it was, such as `SystemExit`; `kind`
+names its type), `TaskOutcomeError` (a task ended without a result for a reason outside its body; the
+base of the next two), `TaskLostError` (a task's process died and the task is not run again),
+`TaskOrphanedError` (a run of a task not safe to run twice was running when its worker was lost),
+`ResultUnavailableError` (the outcome is known but the result cannot be had here; `task_id` names the
+task), `ResultTooLargeError` (a result too large to send to its awaiter) and
+`DurabilityUnavailableError` (the durability asked for cannot be reached), all in `kabudachi.errors`.
 
 ## Configuration
 
