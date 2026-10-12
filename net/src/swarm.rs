@@ -374,7 +374,7 @@ pub(crate) fn build_swarm(
             // ProtocolSupport::Full on every node: any worker may ask a holder
             // of a blob's owner's record for the blob, and every worker answers
             // from its own store (see `answer_blob_request` in
-            // `crate::messenger`).
+            // `crate::messenger::swarm_task`).
             blob: asked_and_answered(BLOB_PROTOCOL),
             blocked: allow_block_list::Behaviour::default(),
         })

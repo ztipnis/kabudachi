@@ -1402,12 +1402,6 @@ impl Net {
     }
 }
 
-/// The gossip topic the workers of the shard `name` publish election messages on. Every
-/// worker in the shard must name it the same way, or they cannot hear each
-/// other. It carries the same `ElectionMessage` schema as the direct
-/// protocol ([`crate::codec::PROTOCOL`]), so its version moves in step with
-/// that protocol's: a peer of another schema version never hears a message
-/// it would misread.
 /// Sends one blob write to the swarm task (see [`Net::put_blob`]). `result`
 /// says the blob is stored as a run's result, not as an input.
 async fn put_blob_through(
@@ -1430,6 +1424,12 @@ async fn put_blob_through(
     Ok(key.digest())
 }
 
+/// The gossip topic the workers of the shard `name` publish election messages on. Every
+/// worker in the shard must name it the same way, or they cannot hear each
+/// other. It carries the same `ElectionMessage` schema as the direct
+/// protocol ([`crate::codec::PROTOCOL`]), so its version moves in step with
+/// that protocol's: a peer of another schema version never hears a message
+/// it would misread.
 fn shard_topic(name: &ShardName) -> gossipsub::IdentTopic {
     gossipsub::IdentTopic::new(format!("/kabudachi/{name}/election/2"))
 }

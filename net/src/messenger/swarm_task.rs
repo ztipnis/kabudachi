@@ -573,11 +573,7 @@ fn handle_behaviour_event(
                 arrived(inbound, peers, input, now);
             }
         }
-        BehaviourEvent::Records(event) => {
-            if let Some(query) = pending.records.on_event(event, inbound) {
-                finish_query(swarm, query);
-            }
-        }
+        BehaviourEvent::Records(event) => records_event(swarm, pending, event, inbound),
         BehaviourEvent::Blob(request_response::Event::Message {
             message: request_response::Message::Request { request, channel, .. },
             ..
@@ -586,10 +582,14 @@ fn handle_behaviour_event(
     }
 }
 
-/// Ends the records `kad` query `query`, whose answer has arrived: the rest
-/// of its lookup is wasted.
-fn finish_query(swarm: &mut Swarm<Behaviour>, query: kad::QueryId) {
-    if let Some(mut running) = swarm.behaviour_mut().records.as_mut().and_then(|records| records.query_mut(&query)) {
+/// Takes one event of the shard's records `kad`, and ends the query it says
+/// has done its work: the rest of a blob lookup that found its copy is wasted.
+fn records_event(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, event: kad::Event, inbound: &Inbound) {
+    let Some(done) = pending.records.on_event(event, inbound) else {
+        return;
+    };
+    let records = swarm.behaviour_mut().records.as_mut();
+    if let Some(mut running) = records.and_then(|records| records.query_mut(&done)) {
         running.finish();
     }
 }
