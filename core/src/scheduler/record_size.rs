@@ -97,8 +97,21 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 /// What a claim of `task` weighs before its chain: its input, queue,
 /// definition id and coalescing key.
 pub(super) fn claim_weight_of(task: &Task) -> u64 {
-    (task.serialized_input.len()
-        + task.queue.len()
-        + task.task_definition_id().as_str().len()
-        + task.coalescing_key.as_deref().map_or(0, str::len)) as u64
+    claim_weight_sum(
+        task.serialized_input.len(),
+        &task.queue,
+        task.task_definition_id().as_str(),
+        task.coalescing_key.as_deref(),
+    )
+}
+
+/// The one sum of the parts a claim weighs before its chain, shared by a
+/// recorded task and a submission not yet recorded.
+pub(super) fn claim_weight_sum(
+    input_len: usize,
+    queue: &str,
+    definition_id: &str,
+    coalescing_key: Option<&str>,
+) -> u64 {
+    (input_len + queue.len() + definition_id.len() + coalescing_key.map_or(0, str::len)) as u64
 }

@@ -176,10 +176,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return false;
         }
         let stamped_at = WallTime::now(&self.clock);
-        let compaction_key = task
-            .compacts
-            .as_ref()
-            .map(|prefix| coalescing::key(&task.task_definition_id(), &prefix.coalescing_key));
+        let compaction_key = claimed_compaction_key(task);
         if self.compacted_by_another(&task_id, compaction_key.as_ref()) {
             return false;
         }
@@ -247,4 +244,11 @@ fn claimed_run(worker: &WorkerId, claim: &Claim, stamped_at: WallTime) -> TaskRu
         .expect("a queued run can be claimed");
     run.selected_worker = Some(worker.clone().into());
     run
+}
+
+/// The key of the compaction `task` makes, if it makes one.
+fn claimed_compaction_key(task: &Task) -> Option<Key> {
+    task.compacts
+        .as_ref()
+        .map(|prefix| coalescing::key(&task.task_definition_id(), &prefix.coalescing_key))
 }

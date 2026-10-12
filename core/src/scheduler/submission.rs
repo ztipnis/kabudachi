@@ -10,6 +10,7 @@ use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task};
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Duration, Instant, WallTime};
 
+use super::record_size::claim_weight_sum;
 use super::{MAX_SUBMISSION_BYTES, Observer, Scheduler};
 
 /// Why a submission was refused.
@@ -199,10 +200,12 @@ impl Submission {
     /// What a claim of the submitted task weighs before its chain: its
     /// input, queue, definition id and coalescing key.
     pub(super) fn claim_weight(&self) -> u64 {
-        (self.serialized_input.len()
-            + self.queue.len()
-            + self.definition_id.as_str().len()
-            + self.coalescing_key.as_deref().map_or(0, str::len)) as u64
+        claim_weight_sum(
+            self.serialized_input.len(),
+            &self.queue,
+            self.definition_id.as_str(),
+            self.coalescing_key.as_deref(),
+        )
     }
 }
 
@@ -234,10 +237,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             // The submission would wait with the key's retained payloads as
             // its chain, and a claim carries all of it.
             let key = coalescing::key(&submission.definition_id, key);
-            let claim_size = self.claim_bytes(
-                submission.claim_weight(),
-                self.occupancy.retained(&key).iter(),
-            );
+            let claim_size = self.claim_bytes(size, self.occupancy.retained(&key).iter());
             if claim_size > MAX_SUBMISSION_BYTES {
                 return Err(SubmitRejection::KeyBackpressure {
                     size: claim_size,
