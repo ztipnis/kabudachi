@@ -249,10 +249,13 @@ async def outlives_its_deadline(request: Greeting) -> Greeting:
 async def reads_a_status(request: Greeting) -> Greeting:
     """Reads the status of a task it called once that task has ended,
     leaving `reading` first and the type of the error the read ended with
-    in `read ended`."""
+    in `read ended`. With `request.text` set, it reads only once that mark
+    has been left."""
     called = leaf(request)
     await called
     marker("reading").touch()
+    while request.text and not marker(request.text).exists():
+        await asyncio.sleep(0.01)
     try:
         await called.status()
     except Exception as error:

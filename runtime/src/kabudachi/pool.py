@@ -580,7 +580,9 @@ class ProcessPool:
         handle._outcome.add_done_callback(settled)
 
     def _inspect_for(self, child: _Child, frame: ipc.Inspect) -> None:
-        """Answers a body's status read once the worker's session has it."""
+        """Answers a body's status read once the worker's session has it, or
+        as a stopped run once the pool is stopping, so a body let finish
+        never waits for an answer that will never come."""
         nested = self._nested
 
         async def answer() -> None:
@@ -588,11 +590,6 @@ class ProcessPool:
                 if nested is None:
                     raise RuntimeError("the process pool takes no nested calls before a session")
                 status = await nested.task_status(frame.task_id)
-            except asyncio.CancelledError:
-                # The pool is stopping: a body let finish must not wait
-                # for an answer that will never come.
-                child.send(ipc.Reply(frame.request, error=RunStoppedError("the run is stopping")))
-                raise
             except Exception as error:
                 child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
             else:
@@ -602,9 +599,18 @@ class ProcessPool:
                     ipc.answer_of(frame.request, status, f"the status of task {frame.task_id}")
                 )
 
+        def stopped(reading: "asyncio.Task[None]") -> None:
+            # Told here, so a read cancelled even before its first step is
+            # answered, and answered once.
+            if reading.cancelled():
+                child.send(ipc.Reply(frame.request, error=RunStoppedError("the run is stopping")))
+
         reading = asyncio.get_running_loop().create_task(answer())
         self._inspecting.add(reading)
         reading.add_done_callback(self._inspecting.discard)
+        reading.add_done_callback(stopped)
+        if not self._serving:
+            reading.cancel()
 
     def _nested_handle(self, frame: ipc.Submit) -> TaskHandle:
         """The handle of the task, flow or group a body in a task process

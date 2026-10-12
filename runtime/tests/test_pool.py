@@ -349,17 +349,35 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
         os.kill(int((markers / "outliving").read_text()), 0)
 
 
+@pytest.mark.parametrize("asked", ["before the pool stops", "once the pool is stopping"])
 def test_a_body_whose_status_read_is_still_unanswered_when_the_pool_stops_gently_ends_with_a_stopped_run(
-    markers,
+    markers, asked
 ):
     kabudachi.configure(processes=1, concurrency=1)
     configuration = config_module.process_configuration()
     settings = configuration.settings()
     registry = registry_module.default_registry()
     hooks = lifecycle_module.default_hooks()
+    reading = asyncio.Event()
 
     async def never_read(task_id):
+        reading.set()
         await asyncio.Event().wait()
+
+    async def stop_gently(pool, session):
+        if asked == "before the pool stops":
+            session.submit(pool_tasks.reads_a_status.definition, Greeting())
+            await reading.wait()
+            await pool.stop(kill=False)
+            return
+        session.submit(pool_tasks.reads_a_status.definition, Greeting(text="stopping"))
+        while not (markers / "reading").exists():
+            await asyncio.sleep(0.01)
+        stopping = asyncio.ensure_future(pool.stop(kill=False))
+        # The pool has begun stopping before the body asks.
+        await asyncio.sleep(0)
+        (markers / "stopping").touch()
+        await stopping
 
     async def main():
         pool = ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
@@ -373,11 +391,8 @@ def test_a_body_whose_status_read_is_still_unanswered_when_the_pool_stops_gently
         try:
             async with asyncio.timeout(30):
                 await native.wait_until_leader()
-                session.submit(pool_tasks.reads_a_status.definition, Greeting())
-                while not (markers / "reading").exists():
-                    await asyncio.sleep(0.01)
                 started = time.monotonic()
-                await pool.stop(kill=False)
+                await stop_gently(pool, session)
                 return time.monotonic() - started
         finally:
             serving.cancel()
