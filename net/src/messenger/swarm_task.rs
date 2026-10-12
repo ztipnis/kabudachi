@@ -34,9 +34,9 @@ use crate::swarm::{Behaviour, BehaviourEvent, hide_listen_addresses};
 use crate::task_exchange::codec::TaskCodec;
 
 /// The input an arriving gossip `message` is for this worker's node: a
-/// message from its author (see the module doc's "Gossip"). `None`, and the
-/// message dropped, when it names no author or its body is not a well-formed
-/// `ElectionMessage`.
+/// message from its author (see "Gossip" in the `crate::messenger` module
+/// doc). `None`, and the message dropped, when it names no author or its body
+/// is not a well-formed `ElectionMessage`.
 fn gossip_input(message: gossipsub::Message) -> Option<Input> {
     let Some(author) = message.source else {
         tracing::debug!(topic = %message.topic, "dropping a gossip message with no author");
@@ -61,8 +61,8 @@ fn gossip_input(message: gossipsub::Message) -> Option<Input> {
 /// Writes `own` into `message` as its sender's address, if `message` is a
 /// roll call or a roll call reply: the two messages whose recipient may hold
 /// no connection to the sender and still has to answer it directly (see the
-/// module doc's "Where a peer's address comes from"). Every other message is
-/// left as it is.
+/// "Where a peer's address comes from" in the `crate::messenger` module doc).
+/// Every other message is left as it is.
 fn stamp_own_address(message: &mut ElectionMessage, own: &Multiaddr) {
     match &mut message.payload {
         Some(election_message::Payload::RollCall(call)) => {
