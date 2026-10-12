@@ -169,10 +169,20 @@ impl PyEvent {
     /// `task_run_id` (empty for a submission).
     pub fn networked(kind: PyEventKind, task_id: &str, task_run_id: &str) -> Self {
         PyEvent {
-            kind,
             task_id: task_id.to_owned(),
             task_run_id: task_run_id.to_owned(),
             was_running: matches!(kind, PyEventKind::Cancelled),
+            ..PyEvent::blank(kind)
+        }
+    }
+
+    /// An event of `kind` about nothing yet: every other field empty.
+    fn blank(kind: PyEventKind) -> Self {
+        PyEvent {
+            kind,
+            task_id: String::new(),
+            task_run_id: String::new(),
+            was_running: false,
             superseded_by: None,
             active: false,
             reason: None,
@@ -241,21 +251,7 @@ impl PyEvent {
 
 impl From<Event> for PyEvent {
     fn from(event: Event) -> Self {
-        let kind = PyEventKind::from(&event);
-        let nothing = PyEvent {
-            kind,
-            task_id: String::new(),
-            task_run_id: String::new(),
-            was_running: false,
-            superseded_by: None,
-            active: false,
-            reason: None,
-            seconds_left: 0.0,
-            payload: Vec::new(),
-            result_digest: Vec::new(),
-            state: None,
-            failure_kind: String::new(),
-        };
+        let nothing = PyEvent::blank(PyEventKind::from(&event));
         match event {
             Event::Expired {
                 task_id,
