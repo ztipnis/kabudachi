@@ -223,7 +223,10 @@ class Runtime(Protocol):
         delivered to the task's client before the report."""
 
     def task_run_state(self, task_run_id: str) -> Any:
-        """The state of a run this runtime decides, or None."""
+        """The state of a run this runtime decides, or None. Only a runtime
+        that certifies locally (`certifies_locally`) has it, and a session
+        calls it only on such a runtime. Raises `RuntimeError` once the
+        runtime has shut down."""
 
     async def task_record(self, task_id: str) -> Any:
         """The newest record of the task the runtime reaches, or None."""

@@ -854,10 +854,18 @@ class Session:
     def _loss_error(self, claim: Any) -> BaseException:
         """How a run lost here with no new attempt ended for its handle:
         orphaned if the leader orphaned it (a task not safe to run twice),
-        lost otherwise, or if the leader's word cannot be read."""
+        lost otherwise, or if the runtime has shut down. Only a run that
+        holds a handle gets here, and only a runtime that certifies locally
+        hands out such runs, so the runtime has `task_run_state`."""
         try:
             state = self._runtime.task_run_state(claim.task_run_id)
-        except Exception:
+        except RuntimeError as closed:
+            # The runtime shut down: the leader's word is gone with it.
+            _logger.debug(
+                "the state of task %s's lost run could not be read: %s",
+                claim.task_id,
+                type(closed).__name__,
+            )
             state = None
         if state == RunState.ORPHANED:
             return TaskOrphanedError(
