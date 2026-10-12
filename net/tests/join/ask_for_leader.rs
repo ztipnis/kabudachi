@@ -137,6 +137,45 @@ async fn a_leader_that_cannot_be_reached_is_passed_over_for_one_that_can() {
     .await
 }
 
+/// Real time, not paused time: the asks run over real sockets, and paused
+/// time would jump past their timeouts before the sockets answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_waits_out_its_grace_for_a_silent_seed_and_no_longer() {
+    within_deadline(async {
+        let grace = Duration::from_secs(1);
+        // Far past the test's own bound, so only the grace can end the pass.
+        let per_peer_timeout = Duration::from_secs(60);
+        let (net_a, addr_a) = listening_net().await;
+        // Seed B receives the join request and never answers it.
+        let (_net_b, addr_b) = listening_net().await;
+        let joiner = Net::new();
+        let response = pointer_to(&net_a.local_worker_id(), &addr_a);
+        let _responder = JoinResponder::start(Arc::new(net_a), Some(response.clone()));
+        let started = tokio::time::Instant::now();
+
+        let found = timeout(
+            Duration::from_secs(10),
+            ask_for_leader(
+                &joiner,
+                &[addr_a, addr_b],
+                JoinFloor::none(),
+                per_peer_timeout,
+                grace,
+            ),
+        )
+        .await
+        .expect("the grace ended the pass long before the silent seed's timeout");
+
+        assert_eq!(found, LeaderSearch::Found(response));
+        assert!(
+            started.elapsed() >= grace,
+            "the pass ended after {:?}, before the grace for the silent seed ran out",
+            started.elapsed()
+        );
+    })
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seed_that_never_answers_does_not_stop_the_next_seed_being_heard() {
     within_deadline(async {
