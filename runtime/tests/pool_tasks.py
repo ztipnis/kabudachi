@@ -245,6 +245,22 @@ async def outlives_its_deadline(request: Greeting) -> Greeting:
     return request
 
 
+@kabudachi.task(name="pool.reads_a_status")
+async def reads_a_status(request: Greeting) -> Greeting:
+    """Reads the status of a task it called once that task has ended,
+    leaving `reading` first and the type of the error the read ended with
+    in `read ended`."""
+    called = leaf(request)
+    await called
+    marker("reading").touch()
+    try:
+        await called.status()
+    except Exception as error:
+        marker("read ended").write_text(type(error).__name__)
+        raise
+    return request
+
+
 @kabudachi.task(name="pool.recycles", recycle_process=True)
 async def recycles(request: Greeting) -> Greeting:
     """Still running when its process stops taking runs, so it shows the

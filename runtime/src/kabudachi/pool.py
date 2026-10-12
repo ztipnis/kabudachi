@@ -24,7 +24,7 @@ from typing import Any
 from kabudachi import _child, ipc
 from kabudachi.body import RunningBody
 from kabudachi.config import Settings
-from kabudachi.errors import StartupError, TaskDefinitionError, body_error
+from kabudachi.errors import RunStoppedError, StartupError, TaskDefinitionError, body_error
 from kabudachi.execution import CompactJob, NestedCalls, RunJob, TaskProcessLost
 from kabudachi.handle import TaskHandle
 from kabudachi.lifecycle import HookRegistry
@@ -243,7 +243,7 @@ class ProcessPool:
             # A child it already spawned is among the children below.
             replacing.cancel()
         for reading in self._inspecting:
-            # The body that asked is stopped with its child below.
+            # The body that asked is told the run is stopping.
             reading.cancel()
         children = [*self._children, *self._condemned]
         if not kill:
@@ -588,6 +588,11 @@ class ProcessPool:
                 if nested is None:
                     raise RuntimeError("the process pool takes no nested calls before a session")
                 status = await nested.task_status(frame.task_id)
+            except asyncio.CancelledError:
+                # The pool is stopping: a body let finish must not wait
+                # for an answer that will never come.
+                child.send(ipc.Reply(frame.request, error=RunStoppedError("the run is stopping")))
+                raise
             except Exception as error:
                 child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
             else:
