@@ -141,6 +141,19 @@ class Session:
         self._below_soft_limit.set()
         # Every flow and group started here, and what runs them.
         self._composites = Composites(self, self._hosted)
+        # What this does with each kind of event the runtime decides on its own.
+        self._event_handlers: dict[EventKind, Callable[[Any], None]] = {
+            EventKind.EXPIRED: self._on_expired,
+            EventKind.CANCELLED: self._on_cancelled,
+            EventKind.RECORD_FULL: self._on_record_full,
+            EventKind.COALESCED_PAYLOAD_TOO_LARGE: self._on_coalesced_payload_too_large,
+            EventKind.SLOW_DOWN: self._on_slow_down,
+            EventKind.SUPERSEDED: self._on_superseded,
+            EventKind.ACCEPTED: self._on_accepted,
+            EventKind.REFUSED: self._on_refused,
+            EventKind.ABORT: self._on_abort,
+            EventKind.ABORT_WITHDRAWN: self._on_abort_withdrawn,
+        }
 
     def submit(
         self,
@@ -274,66 +287,74 @@ class Session:
         self._hosted.attach(asyncio.get_running_loop())
         while True:
             for event in await self._runtime.next_events():
-                match event.kind:
-                    case EventKind.EXPIRED:
-                        self._tasks.failed(
-                            event.task_id,
-                            TaskExpiredError(
-                                f"task {event.task_id} expired before it could start"
-                            ),
-                        )
-                    case EventKind.CANCELLED:
-                        here = self._here.get(event.task_run_id)
-                        if here is None:
-                            self._tasks.cancelled_by_leader(event.task_id)
-                            self._hold_early(event.task_run_id).cancelled = True
-                        else:
-                            self._cancel_held(here, event.task_run_id)
-                    case EventKind.RECORD_FULL:
-                        self._tasks.failed(
-                            event.task_id,
-                            TaskRecordFullError(
-                                f"task {event.task_id} ended: its record had no room for another attempt"
-                            ),
-                        )
-                    case EventKind.COALESCED_PAYLOAD_TOO_LARGE:
-                        self._tasks.failed(
-                            event.task_id,
-                            CoalescedPayloadTooLargeError(
-                                f"task {event.task_id}'s folded payloads grew too large to run"
-                            ),
-                        )
-                    case EventKind.SLOW_DOWN if event.active:
-                        self._below_soft_limit.clear()
-                    case EventKind.SLOW_DOWN:
-                        self._below_soft_limit.set()
-                    case EventKind.SUPERSEDED:
-                        self._tasks.failed(
-                            event.task_id,
-                            TaskSupersededError(
-                                f"task {event.task_id} was superseded by {event.superseded_by}",
-                                event.superseded_by,
-                            ),
-                        )
-                    case EventKind.ACCEPTED:
-                        # Stored, and its result never comes back here: its
-                        # handle stays open for `cancel`, and nothing waits for it.
-                        self._tasks.stored(event.task_id)
-                    case EventKind.REFUSED:
-                        self._tasks.failed(
-                            event.task_id,
-                            BackpressureError(
-                                f"the leader refused task {event.task_id}: {event.reason}"
-                            ),
-                        )
-                    case EventKind.ABORT:
-                        self._abort_at(event.task_run_id, event.seconds_left)
-                    case EventKind.ABORT_WITHDRAWN:
-                        self._clear_abort(event.task_run_id)
-                    case unknown:
-                        raise RuntimeError(
-                            f"the native runtime reported an event of unknown kind {unknown!r}"
-                        )
+                handler = self._event_handlers.get(event.kind)
+                if handler is None:
+                    raise RuntimeError(
+                        f"the native runtime reported an event of unknown kind {event.kind!r}"
+                    )
+                handler(event)
+
+    def _on_expired(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            TaskExpiredError(f"task {event.task_id} expired before it could start"),
+        )
+
+    def _on_cancelled(self, event: Any) -> None:
+        here = self._here.get(event.task_run_id)
+        if here is None:
+            self._tasks.cancelled_by_leader(event.task_id)
+            self._hold_early(event.task_run_id).cancelled = True
+        else:
+            self._cancel_held(here, event.task_run_id)
+
+    def _on_record_full(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            TaskRecordFullError(
+                f"task {event.task_id} ended: its record had no room for another attempt"
+            ),
+        )
+
+    def _on_coalesced_payload_too_large(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            CoalescedPayloadTooLargeError(
+                f"task {event.task_id}'s folded payloads grew too large to run"
+            ),
+        )
+
+    def _on_slow_down(self, event: Any) -> None:
+        if event.active:
+            self._below_soft_limit.clear()
+        else:
+            self._below_soft_limit.set()
+
+    def _on_superseded(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            TaskSupersededError(
+                f"task {event.task_id} was superseded by {event.superseded_by}",
+                event.superseded_by,
+            ),
+        )
+
+    def _on_accepted(self, event: Any) -> None:
+        # Stored, and its result never comes back here: its handle stays
+        # open for `cancel`, and nothing waits for it.
+        self._tasks.stored(event.task_id)
+
+    def _on_refused(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            BackpressureError(f"the leader refused task {event.task_id}: {event.reason}"),
+        )
+
+    def _on_abort(self, event: Any) -> None:
+        self._abort_at(event.task_run_id, event.seconds_left)
+
+    def _on_abort_withdrawn(self, event: Any) -> None:
+        self._clear_abort(event.task_run_id)
 
     def _hold_early(self, run_id: str) -> _Early:
         """What came for `run_id` before it started here, kept for `_start`
