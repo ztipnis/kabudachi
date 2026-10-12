@@ -247,7 +247,7 @@ fn drop_oldest_outcomes() {
             folded: Some(0),
         },
         Row {
-            what: "drop_oldest never lets usage exceed the hard limit",
+            what: "a payload alone past the hard limit is refused, even with drop_oldest",
             existing: vec![(40, "k"), (40, "k"), (40, "k")],
             running: false,
             submission: generation(201, "k").with_drop_oldest(),
