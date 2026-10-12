@@ -187,21 +187,31 @@ async fn gather_answers(
         .map(|(index, ask)| async move { (index, ask.await) })
         .collect();
     let mut grace_ends = None;
-    loop {
-        let next = match grace_ends {
-            Some(end) => match tokio::time::timeout_at(end, in_flight.next()).await {
-                Ok(next) => next,
-                Err(_) => break,
-            },
-            None => in_flight.next().await,
-        };
-        let Some((index, answer)) = next else { break };
+    while let Some((index, answer)) = next_answer(&mut in_flight, grace_ends).await {
         if grace_ends.is_none() && answer.as_ref().is_some_and(&starts_grace) {
             grace_ends = Some(Instant::now() + grace);
         }
         answers[index] = answer;
     }
     answers
+}
+
+/// The next ask to finish; `None` once none is left in flight, or once
+/// `grace_ends` passes first.
+async fn next_answer<F>(
+    in_flight: &mut FuturesUnordered<F>,
+    grace_ends: Option<Instant>,
+) -> Option<(usize, Option<JoinResponse>)>
+where
+    F: Future<Output = (usize, Option<JoinResponse>)>,
+{
+    match grace_ends {
+        Some(end) => tokio::time::timeout_at(end, in_flight.next())
+            .await
+            .ok()
+            .flatten(),
+        None => in_flight.next().await,
+    }
 }
 
 /// The `JOIN_RESPONSE` `node`, running over `net`, gives a joiner right
