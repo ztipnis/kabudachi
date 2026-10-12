@@ -45,6 +45,22 @@ pub(super) struct Shared {
 }
 
 impl Shared {
+    pub(super) fn new(
+        reports: ReportSink,
+        net: Arc<Net>,
+        observed: watch::Receiver<Observed>,
+        retry: LeaderRetry,
+    ) -> Self {
+        Shared {
+            seam: Mutex::default(),
+            changed: Notify::new(),
+            reports,
+            net,
+            observed,
+            retry,
+        }
+    }
+
     pub(super) fn seam(&self) -> MutexGuard<'_, Seam> {
         self.seam.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -110,6 +126,31 @@ impl Shared {
     /// back), and the report is then dropped.
     pub(super) fn end(&self, run: &TaskRunId) -> bool {
         self.seam().held.remove(run).is_some()
+    }
+
+    /// Ends a run Python held and hands the driver `report` on it; nothing
+    /// if Python held none (the driver took it back).
+    pub(super) fn finish(&self, run: TaskRunId, report: impl FnOnce(TaskRunId) -> Report) {
+        if self.end(&run) {
+            self.report(report(run));
+        }
+    }
+
+    /// Takes no more runs: those handed over and not taken are reported
+    /// lost, later ones too, and a claim waiting resolves empty.
+    pub(super) fn stop_taking(&self) {
+        let unstarted: Vec<TaskRunId> = {
+            let mut seam = self.seam();
+            seam.closed = true;
+            seam.handed
+                .drain(..)
+                .map(|claim| claim.task_run_id)
+                .collect()
+        };
+        for run in unstarted {
+            self.report(Report::Lost(run));
+        }
+        self.wake();
     }
 
     /// Waits until `take` finds something, or the worker leaves its shard.

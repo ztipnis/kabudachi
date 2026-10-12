@@ -3,10 +3,24 @@ use std::sync::Arc;
 use kabudachi_core::protocol::ids::TaskId;
 use kabudachi_core::protocol::messages::{TaskRejectReason, task_response};
 use kabudachi_core::scheduler::Submitted;
+use tokio::runtime::Handle;
 
 use super::seam::Shared;
 use crate::outcomes::PyEventKind;
 use crate::work::PyEvent;
+
+/// Asks leaders, in the background on `handle`, to store `submitted`, and
+/// returns its task id. Until a leader answers, a cancel of the task waits.
+pub(super) fn send_submission(
+    shared: &Arc<Shared>,
+    handle: &Handle,
+    submitted: Submitted,
+) -> String {
+    let task_id = submitted.task_id.as_str().to_owned();
+    shared.seam().delivering.insert(submitted.task_id.clone());
+    handle.spawn(deliver(Arc::clone(shared), submitted));
+    task_id
+}
 
 /// Asks leaders to store `submitted` until one does or refuses it for
 /// good, and says which.

@@ -25,36 +25,34 @@
 
 mod delivery;
 mod handover;
+mod host;
 mod observed;
 mod seam;
 mod start;
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::election::{Input, Step, WorkerNode};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids};
 use kabudachi_core::scheduler::mint;
 use kabudachi_core::time::RealClock;
-use kabudachi_net::executor::{Report, WorkSource, executor_channel};
+use kabudachi_net::executor::{Report, executor_channel};
 use kabudachi_net::worker::Worker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{Notify, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::watch;
 
 use crate::arguments::SubmitArguments;
-use crate::bridge::{Bridge, CLOSED_MESSAGE};
+use crate::bridge::CLOSED_MESSAGE;
 use crate::work::PyTaskRecord;
 
-use self::delivery::{cancel_at_leader, deliver};
-use self::observed::{LeftOnDrop, Observed, publish};
+use self::delivery::{cancel_at_leader, send_submission};
+use self::host::Host;
+use self::observed::Observed;
 use self::seam::{GONE_MESSAGE, Shared};
 use self::start::NetworkedArguments;
 
-const SHUTDOWN_GRACE: StdDuration = StdDuration::from_secs(1);
 const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
 
 /// A worker of a networked shard, and the Tokio runtime it runs on.
@@ -63,13 +61,8 @@ const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
 /// leaving its shard, and every awaitable still pending fails.
 #[pyclass(name = "NetworkedRuntime", frozen)]
 pub struct NetworkedRuntime {
-    tokio: Mutex<Option<Runtime>>,
-    handle: Handle,
-    bridge: Bridge,
+    host: Host,
     shared: Arc<Shared>,
-    observed: Arc<watch::Sender<Observed>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
-    pump: Mutex<Option<JoinHandle<()>>>,
     worker_id: String,
     address: String,
     clock: RealClock,
@@ -94,7 +87,6 @@ impl NetworkedRuntime {
         let (source, reports) = executor.split();
         let config = arguments.worker_config(endpoint)?;
         let tokio = arguments.tokio()?;
-        let handle = tokio.handle().clone();
         let worker = py
             .detach(|| tokio.block_on(Worker::start(config)))
             .map_err(|_| {
@@ -106,42 +98,23 @@ impl NetworkedRuntime {
             .map(|address| address.to_string())
             .unwrap_or_default();
         let (sender, observed) = watch::channel(Observed::default());
-        let sender = Arc::new(sender);
-        let shared = Arc::new(Shared {
-            seam: Mutex::default(),
-            changed: Notify::new(),
+        let shared = Arc::new(Shared::new(
             reports,
-            net: worker.net(),
+            worker.net(),
             observed,
-            retry: arguments.retry(),
-        });
-
-        let seen = Arc::clone(&sender);
-        let left = LeftOnDrop(Arc::clone(&sender));
-        let running = tokio.spawn(async move {
-            // Dropped however this ends, a panic or an abort included.
-            let _left = left;
-            let _ = worker
-                .run(move |node: &WorkerNode<RealClock>, _: Option<&Input>, _: &Step| {
-                    publish(&seen, node);
-                })
-                .await;
-        });
-        let pumped = Arc::clone(&shared);
-        let pump = tokio.spawn(async move {
-            let mut source: WorkSource = source;
-            while let Some(work) = source.next_work().await {
-                pumped.on_work(work);
-            }
-        });
+            arguments.retry(),
+        ));
+        let host = Host::start(
+            tokio,
+            worker,
+            source,
+            Arc::clone(&shared),
+            Arc::new(sender),
+            Arc::default(),
+        );
         Ok(NetworkedRuntime {
-            tokio: Mutex::new(Some(tokio)),
-            bridge: Bridge::new(handle.clone()),
-            handle,
+            host,
             shared,
-            observed: sender,
-            worker: Mutex::new(Some(running)),
-            pump: Mutex::new(Some(pump)),
             worker_id,
             address,
             clock: RealClock::new(),
@@ -189,7 +162,7 @@ impl NetworkedRuntime {
     /// first.
     fn wait_until_ready<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut observed = self.shared.observed.clone();
-        self.bridge.spawn_into_py(py, async move {
+        self.host.bridge().spawn_into_py(py, async move {
             let gone = observed
                 .wait_for(|seen| seen.gone || seen.leader.is_some())
                 .await
@@ -213,18 +186,14 @@ impl NetworkedRuntime {
     /// if the submission's `kind`, `key` and `drop_oldest` disagree or its
     /// `reconnect_timeout_ms` is zero.
     fn submit(&self, py: Python<'_>, submission: SubmitArguments) -> PyResult<String> {
-        if !self.bridge.is_open() {
+        if !self.host.bridge().is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
-        let submitted = mint(submission.into_submission(py)?, &Uuid7Ids, &self.clock);
-        let task_id = submitted.task_id.as_str().to_owned();
-        self.shared
-            .seam()
-            .delivering
-            .insert(submitted.task_id.clone());
-        self.handle
-            .spawn(deliver(Arc::clone(&self.shared), submitted));
-        Ok(task_id)
+        Ok(send_submission(
+            &self.shared,
+            self.host.handle(),
+            mint(submission.into_submission(py)?, &Uuid7Ids, &self.clock),
+        ))
     }
 
     /// Offers the driver up to `limit` free places, and returns an
@@ -242,7 +211,7 @@ impl NetworkedRuntime {
         }
         self.shared.offer(limit);
         let shared = Arc::clone(&self.shared);
-        self.bridge.spawn_into_py(py, async move {
+        self.host.bridge().spawn_into_py(py, async move {
             shared.until(|shared| shared.take_claims(limit)).await
         })
     }
@@ -255,7 +224,8 @@ impl NetworkedRuntime {
     /// shutdown: events it took before the cancel are lost.
     fn next_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let shared = Arc::clone(&self.shared);
-        self.bridge
+        self.host
+            .bridge()
             .spawn_into_py(py, async move { shared.until(Shared::take_events).await })
     }
 
@@ -280,42 +250,37 @@ impl NetworkedRuntime {
         }
         let digest = Digest::new(DigestAlgorithm::Blake3, result_digest.to_vec())
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let run = TaskRunId::new(task_run_id);
-        if self.shared.end(&run) {
-            self.shared.report(Report::Completed { run, digest });
-        }
+        self.shared
+            .finish(TaskRunId::new(task_run_id), |run| Report::Completed {
+                run,
+                digest,
+            });
         Ok(())
     }
 
     /// Hands the leader a run's failure, by its error's type name.
     fn report_failure(&self, task_run_id: &str, failure_kind: &str) {
-        let run = TaskRunId::new(task_run_id);
-        if self.shared.end(&run) {
-            self.shared.report(Report::Failed {
+        self.shared
+            .finish(TaskRunId::new(task_run_id), |run| Report::Failed {
                 run,
                 reason: failure_kind.to_owned(),
             });
-        }
     }
 
     /// Hands the leader a run lost with the process that ran it, or stopped
     /// at its abort deadline.
     fn report_lost(&self, task_run_id: &str) {
-        let run = TaskRunId::new(task_run_id);
-        if self.shared.end(&run) {
-            self.shared.report(Report::Lost(run));
-        }
+        self.shared
+            .finish(TaskRunId::new(task_run_id), Report::Lost);
     }
 
     /// Hands the leader a compaction run's fold.
     fn complete_compaction(&self, task_run_id: &str, folded: &[u8]) {
-        let run = TaskRunId::new(task_run_id);
-        if self.shared.end(&run) {
-            self.shared.report(Report::Compacted {
+        self.shared
+            .finish(TaskRunId::new(task_run_id), |run| Report::Compacted {
                 run,
                 payload: folded.to_vec(),
             });
-        }
     }
 
     /// No continuation is ever certified here, so there is none to end.
@@ -328,10 +293,10 @@ impl NetworkedRuntime {
     /// and the task's record shows it. Raises `RuntimeError` once the
     /// runtime has shut down.
     fn cancel(&self, task_id: &str) -> PyResult<()> {
-        if !self.bridge.is_open() {
+        if !self.host.bridge().is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
-        self.handle.spawn(cancel_at_leader(
+        self.host.handle().spawn(cancel_at_leader(
             Arc::clone(&self.shared),
             TaskId::new(task_id),
         ));
@@ -342,7 +307,7 @@ impl NetworkedRuntime {
     /// shard holds, or `None` if no worker this one reaches holds it.
     fn task_record<'py>(&self, py: Python<'py>, task_id: String) -> PyResult<Bound<'py, PyAny>> {
         let net = Arc::clone(&self.shared.net);
-        self.bridge.spawn_into_py(py, async move {
+        self.host.bridge().spawn_into_py(py, async move {
             Ok(net
                 .get_record(TaskId::new(task_id))
                 .await
@@ -355,18 +320,7 @@ impl NetworkedRuntime {
     /// may still hand over up to the places already offered; each is
     /// reported lost as it arrives.
     fn stop_taking(&self) {
-        let unstarted: Vec<TaskRunId> = {
-            let mut seam = self.shared.seam();
-            seam.closed = true;
-            seam.handed
-                .drain(..)
-                .map(|claim| claim.task_run_id)
-                .collect()
-        };
-        for run in unstarted {
-            self.shared.report(Report::Lost(run));
-        }
-        self.shared.wake();
+        self.shared.stop_taking();
     }
 
     /// Returns an awaitable that resolves once the leader has taken the
@@ -376,7 +330,7 @@ impl NetworkedRuntime {
         let net = Arc::clone(&self.shared.net);
         let observed = self.shared.observed.clone();
         let within = self.reconnect_timeout;
-        self.bridge.spawn_into_py(py, async move {
+        self.host.bridge().spawn_into_py(py, async move {
             let deadline = tokio::time::Instant::now() + within;
             while !net.claimed_runs().snapshot().is_empty() {
                 if observed.borrow().gone || tokio::time::Instant::now() >= deadline {
@@ -391,41 +345,6 @@ impl NetworkedRuntime {
     /// Stops the worker at once and shuts the runtime down; awaitables
     /// still pending fail. Does nothing if already shut down.
     fn shutdown(&self, py: Python<'_>) {
-        // As for `NativeRuntime`: everything here blocks on Tokio work, and
-        // the tasks handing results to Python need the GIL.
-        py.detach(|| {
-            let mut slot = self.tokio.lock().unwrap_or_else(PoisonError::into_inner);
-            let Some(runtime) = slot.take() else {
-                return;
-            };
-            self.bridge.close();
-            // Every wait gives up, as it does when the worker leaves.
-            self.observed.send_modify(|seen| seen.gone = true);
-            self.shared.wake();
-            for task in [&self.worker, &self.pump] {
-                if let Some(task) = task.lock().unwrap_or_else(PoisonError::into_inner).take() {
-                    task.abort();
-                }
-            }
-            runtime.block_on(async {
-                let _ = tokio::time::timeout(SHUTDOWN_GRACE, self.bridge.drained()).await;
-            });
-            runtime.shutdown_timeout(SHUTDOWN_GRACE);
-        });
-    }
-}
-
-impl Drop for NetworkedRuntime {
-    /// As for `NativeRuntime`: a runtime never shut down abandons its tasks
-    /// rather than block its owner's thread.
-    fn drop(&mut self) {
-        let runtime = self
-            .tokio
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(runtime) = runtime {
-            runtime.shutdown_background();
-        }
+        self.host.shutdown(py, &self.shared);
     }
 }
