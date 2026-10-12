@@ -49,6 +49,18 @@ def result_digest(result: bytes) -> bytes:
     return _native.result_digest(result)
 
 
+def _run_stopped(handle: TaskHandle, unstarted: str) -> RunStoppedError:
+    """Why stopping the run failed `handle` before its task's result arrived:
+    a networked handle's task may be stored and running on another worker, so
+    it is not said not to have started."""
+    if handle._replicable:
+        return RunStoppedError(
+            "the run stopped before this task's result arrived here; the task may still run "
+            "elsewhere"
+        )
+    return RunStoppedError(f"the run stopped before {unstarted}")
+
+
 class _StartingContinuation:
     """Stands for a continuation between its run being certified and its first
     stage being started, so a cancel in that window is not lost."""
@@ -447,7 +459,7 @@ class TaskTable:
             # nothing will claim this retry.
             record.settled = True
             self._retire(task_id, record)
-        record.handle._fail(RunStoppedError("the run stopped before this task's retry could start"))
+        record.handle._fail(_run_stopped(record.handle, "this task's retry could start"))
 
     def failed(self, task_id: str, error: BaseException) -> None:
         """Settles the task, once, by failing its handle with `error`."""
@@ -483,15 +495,7 @@ class TaskTable:
                     dropped.append(record.handle)
                     self._retire(task_id, record)
         for handle in dropped:
-            if handle._replicable:
-                # Its leader may have stored it, and another worker may be running it.
-                stopped = RunStoppedError(
-                    "the run stopped before this task's result reached it; the task may still run "
-                    "elsewhere"
-                )
-            else:
-                stopped = RunStoppedError("the run stopped before this task could start")
-            handle._fail(stopped)
+            handle._fail(_run_stopped(handle, "this task could start"))
 
     @property
     def stopping(self) -> bool:
