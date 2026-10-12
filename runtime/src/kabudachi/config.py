@@ -247,7 +247,9 @@ class Settings:
                 minimum=1,
                 what="a positive integer or None",
             )
-        _require_count("result_ttl", self.result_ttl, minimum=1, what="a positive number of seconds")
+        _require_count(
+            "result_ttl", self.result_ttl, minimum=1, what="a positive number of seconds"
+        )
 
     def _check_memory(self) -> None:
         for name in ("memory_soft_limit", "memory_hard_limit"):
