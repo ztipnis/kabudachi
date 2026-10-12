@@ -5,6 +5,7 @@ use crate::coalescing;
 use crate::protocol::digest::Digest;
 use crate::protocol::ids::{IdGenerator, TaskDefinitionId, TaskId, mint_task_id};
 use crate::protocol::messages::prelude::*;
+use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task};
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Duration, Instant, WallTime};
@@ -270,6 +271,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.submit_minted(submitted)
     }
 
+    /// Records `submitted` as a new task with its first run, unless it is
+    /// already held (a retry after a refusal) or is refused.
     fn record_submission(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
         if !self.check_leader() {
             return Err(SubmitRejection::NotLeader);
@@ -278,83 +281,21 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return Ok(submitted.task_id);
         }
         self.check_submission(&submitted.submission, 0)?;
-        if let Some(key) = submitted.submission.coalescing_key.as_deref() {
-            let key = coalescing::key(&submitted.submission.definition_id, key);
-            if self.reconciliation.holds_key_back(&key) {
-                return Err(SubmitRejection::KeyNotReady);
-            }
-        }
+        self.check_key_ready(&submitted.submission)?;
+        let now = self.clock.now();
         let Submitted {
             task_id,
             submitted_at,
             submission,
             minted_at,
         } = submitted;
-        let needed = submission.serialized_input.len() as u64;
-        let now = self.clock.now();
-        let stamped_at = WallTime::now(&self.clock);
-        let not_before = submission
-            .delay
-            .filter(|delay| delay.as_ticks() > 0)
-            .map(|delay| minted_at + delay)
-            .filter(|at| *at > now);
-        let expires_at = submission
-            .expiry
-            .map(|expiry| minted_at + expiry);
+        let (not_before, expires_at) = wait_bounds(&submission, minted_at, now);
         let input_digest = Digest::blake3(&submission.serialized_input);
-        let task = new_task(NewTask {
-            task_id,
-            submitted_at,
-            definition_id: submission.definition_id,
-            source_version: submission.source_version,
-            serialized_input: submission.serialized_input,
-            queue: submission.queue,
-            max_retries: submission.retries,
-            delay: submission.delay,
-            expiry: submission.expiry,
-            coalescing_key: submission.coalescing_key,
-            ephemeral: submission.ephemeral,
-            non_retriable: submission.non_retriable,
-            reconnect_timeout: submission.reconnect_timeout,
-        });
-        let first_state = if not_before.is_some() {
-            TaskRunState::Scheduled
-        } else {
-            TaskRunState::Queued
-        };
-        let run = first_attempt(&task, &self.ids, stamped_at, first_state);
-        let size = self.submitted_record_len(&task, &run, &input_digest);
-        if size > Self::record_limit() {
-            return Err(SubmitRejection::RecordTooLarge {
-                size,
-                limit: Self::record_limit(),
-            });
-        }
-
-        let task_id = task.task_id();
-        self.current_run.insert(task_id.clone(), run.task_run_id());
-        self.runs_of_task
-            .insert(task_id.clone(), vec![run.task_run_id()]);
-        self.runs.insert(run.task_run_id(), run);
-        self.tasks.insert(task_id.clone(), task);
-        self.input_digests.insert(task_id.clone(), input_digest);
-        self.unpublished.insert(task_id.clone());
+        let task = task_of(task_id, submitted_at, submission);
+        let run = self.first_run_within_limit(&task, not_before.is_some(), &input_digest)?;
+        let task_id = self.hold_submitted(task, run, input_digest);
         self.waiting.admit(&task_id, not_before, expires_at);
-        self.mark_current_decided(&task_id);
-        self.budget.take(needed);
-        let older = self
-            .coalescing_key_of(&task_id)
-            .and_then(|key| self.occupancy.submit(&key, &task_id));
-        if let Some(older) = older {
-            self.supersede(&older, &task_id);
-            let mut absorbed = self
-                .links
-                .get(&older)
-                .map(|link| link.absorbed.clone())
-                .unwrap_or_default();
-            absorbed.push(older.into());
-            self.links.entry(task_id.clone()).or_default().absorbed = absorbed;
-        }
+        self.absorb_waiting_generation(&task_id);
         self.drop_oldest_until_it_fits(&task_id, now);
         self.update_pressure();
         if let Some(key) = self.coalescing_key_of(&task_id) {
@@ -362,4 +303,118 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         Ok(task_id)
     }
+
+    /// Refuses a submission to a coalescing key one of whose generations is
+    /// held back: no generation of a key may run while one might already be.
+    fn check_key_ready(&self, submission: &Submission) -> Result<(), SubmitRejection> {
+        let Some(key) = submission.coalescing_key.as_deref() else {
+            return Ok(());
+        };
+        if self
+            .reconciliation
+            .holds_key_back(&coalescing::key(&submission.definition_id, key))
+        {
+            return Err(SubmitRejection::KeyNotReady);
+        }
+        Ok(())
+    }
+
+    /// The first run of `task`, scheduled if it waits out a delay and queued
+    /// otherwise, unless the task's record would then be larger than a record
+    /// may be.
+    fn first_run_within_limit(
+        &self,
+        task: &Task,
+        delayed: bool,
+        input_digest: &Digest,
+    ) -> Result<TaskRun, SubmitRejection> {
+        let stamped_at = WallTime::now(&self.clock);
+        let first_state = if delayed {
+            TaskRunState::Scheduled
+        } else {
+            TaskRunState::Queued
+        };
+        let run = first_attempt(task, &self.ids, stamped_at, first_state);
+        let size = self.submitted_record_len(task, &run, input_digest);
+        if size > Self::record_limit() {
+            return Err(SubmitRejection::RecordTooLarge {
+                size,
+                limit: Self::record_limit(),
+            });
+        }
+        Ok(run)
+    }
+
+    /// Holds a newly submitted `task` with `run`, its first, and counts its
+    /// input against memory. Returns its id.
+    fn hold_submitted(&mut self, task: Task, run: TaskRun, input_digest: Digest) -> TaskId {
+        let task_id = task.task_id();
+        let needed = task.serialized_input.len() as u64;
+        self.current_run.insert(task_id.clone(), run.task_run_id());
+        self.runs_of_task
+            .insert(task_id.clone(), vec![run.task_run_id()]);
+        self.runs.insert(run.task_run_id(), run);
+        self.tasks.insert(task_id.clone(), task);
+        self.input_digests.insert(task_id.clone(), input_digest);
+        self.unpublished.insert(task_id.clone());
+        self.mark_current_decided(&task_id);
+        self.budget.take(needed);
+        task_id
+    }
+
+    /// The generation `task_id` supersedes the one of its coalescing key that
+    /// was waiting, if any, and absorbs it with everything it had absorbed.
+    fn absorb_waiting_generation(&mut self, task_id: &TaskId) {
+        let Some(older) = self
+            .coalescing_key_of(task_id)
+            .and_then(|key| self.occupancy.submit(&key, task_id))
+        else {
+            return;
+        };
+        self.supersede(&older, task_id);
+        let mut absorbed = self
+            .links
+            .get(&older)
+            .map(|link| link.absorbed.clone())
+            .unwrap_or_default();
+        absorbed.push(older.into());
+        self.links.entry(task_id.clone()).or_default().absorbed = absorbed;
+    }
+}
+
+/// When a task minted at `minted_at` may first start, if not at once, and
+/// when it expires, both by the monotonic clock. Time spent waiting for a
+/// leader since it was minted is taken off both.
+fn wait_bounds(
+    submission: &Submission,
+    minted_at: Instant,
+    now: Instant,
+) -> (Option<Instant>, Option<Instant>) {
+    let not_before = submission
+        .delay
+        .filter(|delay| delay.as_ticks() > 0)
+        .map(|delay| minted_at + delay)
+        .filter(|at| *at > now);
+    let expires_at = submission.expiry.map(|expiry| minted_at + expiry);
+    (not_before, expires_at)
+}
+
+/// The task `submission` makes, under `task_id` and submitted at
+/// `submitted_at`.
+fn task_of(task_id: TaskId, submitted_at: WallTime, submission: Submission) -> Task {
+    new_task(NewTask {
+        task_id,
+        submitted_at,
+        definition_id: submission.definition_id,
+        source_version: submission.source_version,
+        serialized_input: submission.serialized_input,
+        queue: submission.queue,
+        max_retries: submission.retries,
+        delay: submission.delay,
+        expiry: submission.expiry,
+        coalescing_key: submission.coalescing_key,
+        ephemeral: submission.ephemeral,
+        non_retriable: submission.non_retriable,
+        reconnect_timeout: submission.reconnect_timeout,
+    })
 }
