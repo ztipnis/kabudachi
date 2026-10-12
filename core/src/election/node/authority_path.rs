@@ -9,7 +9,7 @@ where
     C: Clock,
 {
     /// Asks the authority for what this node's standing has come due for
-    /// (see [`AuthorityStanding::calls_due`]).
+    /// (see [`AuthorityStanding::calls_due`](crate::election::authority_standing::AuthorityStanding::calls_due)).
     pub(super) fn ask_authority_if_due(&mut self) {
         let now = self.clock.now();
         let Some(authority) = self.authority.as_mut() else {

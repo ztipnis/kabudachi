@@ -16,7 +16,7 @@ where
     ///   [`Self::can_start_roll_call`]). Each transition takes its own
     ///   `Tick`, so a single one never goes from `Active` to `RollCall`.
     /// - `RollCall`: at its roll call's deadline, stands as the candidate or
-    ///   goes `NoQuorum` (see [`ElectionRound::on_deadline`]).
+    ///   goes `NoQuorum` (see [`ElectionRound::on_deadline`](crate::election::election_round::ElectionRound::on_deadline)).
     /// - `Candidate`: at its vote's deadline, not having won, suspects its
     ///   leader again (see [`Self::suspect_again`]).
     /// - `Leader`: reports every worker it has not heard from for too long
@@ -27,7 +27,7 @@ where
     /// Every other state is a no-op — deliberately so for `Bootstrapping` and
     /// `Joining`: nothing times out a
     /// stalled join here, since the transition out of those states happens
-    /// once via [`Input::JoinAnswer`], driven by something outside `core`
+    /// once via [`Input::JoinAnswer`](crate::election::Input::JoinAnswer), driven by something outside `core`
     /// that learns who leads the shard, not by a timer.
     pub(super) fn tick(&mut self) {
         match self.state {
@@ -66,7 +66,7 @@ where
     }
 
     /// When a `LeaderSuspect` or `NoQuorum` node may start a roll call (see
-    /// [`ElectionRound::roll_call_due`]).
+    /// [`ElectionRound::roll_call_due`](crate::election::election_round::ElectionRound::roll_call_due)).
     ///
     /// `None` for a node with no configuration: it has nothing to count a
     /// quorum against. It stays `LeaderSuspect`, still heartbeating its

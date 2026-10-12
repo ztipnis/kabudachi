@@ -14,7 +14,7 @@
 //! configuration only as a generation and a voter count (two, for a joint
 //! configuration), plus its own admission generation and, while a founding
 //! is uncommitted, the one it held before (see [`crate::configuration`]);
-//! only the leader holds a [`Roster`] of the members.
+//! only the leader holds a [`Roster`](crate::configuration::Roster) of the members.
 //!
 //! Liveness comes from heartbeats alone,
 //! never from the connections the driver reports. Every follower heartbeats

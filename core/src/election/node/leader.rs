@@ -221,7 +221,7 @@ where
     /// (see [`Self::announce_leadership`]), unless a drain kept from before
     /// stops it first. With an authority it needs a fence to act; one it
     /// already holds is kept. Every election duty runs from here; only the
-    /// scheduler's grant waits for [`Input::Reconciled`].
+    /// scheduler's grant waits for [`Input::Reconciled`](crate::election::Input::Reconciled).
     pub(super) fn take_office(&mut self, roster: Roster) {
         let now = self.clock.now();
         // A leader never acks itself, so nothing else raises its own

@@ -196,7 +196,7 @@ where
 
     /// Hands the office back to the standing, if this node holds one: the
     /// standing then follows the configuration the roster led, as it stands
-    /// (see [`LeaderOffice::hand_back`]). Call it before anything that writes
+    /// (see [`LeaderOffice::hand_back`](crate::election::leader_office::LeaderOffice::hand_back)). Call it before anything that writes
     /// the standing while this node still leads, so what it writes is not
     /// overwritten by the configuration this node led.
     pub(super) fn leave_office(&mut self) {

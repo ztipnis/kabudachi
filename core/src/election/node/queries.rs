@@ -29,7 +29,7 @@ where
         self.timings
     }
 
-    /// The id this node was started under (see [`Identity::id`]).
+    /// The id this node was started under (see [`Identity::id`](crate::election::Identity::id)).
     pub fn id(&self) -> &WorkerId {
         &self.my_id
     }
@@ -50,7 +50,7 @@ where
 
     /// This node's recovery epoch: its configuration's when built with one
     /// ([`Self::start`]), taken from the leader a JOIN pointed it at
-    /// ([`Input::JoinAnswer`]), moved on by an authority-path recovery of
+    /// ([`Input::JoinAnswer`](crate::election::Input::JoinAnswer)), moved on by an authority-path recovery of
     /// its own, and adopted from the ack of a leader of a later epoch.
     pub fn recovery_epoch(&self) -> u64 {
         self.standing.epoch_number()
@@ -64,7 +64,7 @@ where
         self.standing.join_floor()
     }
 
-    /// The lineage of this node's recovery epoch (see [`RecoveryEpoch`]),
+    /// The lineage of this node's recovery epoch (see [`RecoveryEpoch`](crate::coordination_authority::RecoveryEpoch)),
     /// learned with the epoch; `None` until the node has joined a shard.
     pub fn recovery_lineage(&self) -> Option<u64> {
         self.standing.epoch().map(|epoch| epoch.lineage)
@@ -87,7 +87,7 @@ where
     /// have vouched for hearing it (an ack echoing one of its heartbeats), or
     /// a grant of its own that ends, or a grant no rival can outlast. Before
     /// then no abort deadline could be named for the run (see
-    /// [`Output::AbortDeadline`]).
+    /// [`Output::AbortDeadline`](crate::election::Output::AbortDeadline)).
     pub fn has_contact_floor(&self) -> bool {
         self.lease.has_contact_floor()
     }

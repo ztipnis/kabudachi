@@ -29,7 +29,7 @@ where
     ///
     /// An ack from a later recovery epoch means the shard was recovered
     /// through the authority: the node adopts that epoch (see
-    /// [`ShardStanding::accept_ack`]) and steps down from any term it holds
+    /// [`ShardStanding::accept_ack`](crate::election::standing::ShardStanding::accept_ack)) and steps down from any term it holds
     /// or contests, whatever the terms, which two epochs do not order. A
     /// pending joiner that a stale JOIN pointer left on the old epoch finds
     /// its way the same way. A leader of the authority's epoch (see
@@ -45,7 +45,7 @@ where
     ///
     /// It also carries the leader's configuration and this node's admission
     /// generations in the leader's roster, which this node adopts as
-    /// [`ShardStanding::accept_ack`] says. An ack that names no admission
+    /// [`ShardStanding::accept_ack`](crate::election::standing::ShardStanding::accept_ack) says. An ack that names no admission
     /// generation (the leader holds this node as pending, or not at all)
     /// leaves this node's own as they were. A node that adopts a newer
     /// configuration heartbeats its leader at once, so its echo of it

@@ -12,7 +12,7 @@ where
     C: Clock,
 {
     /// Takes the leader `pointer` names and drives `Bootstrapping ->
-    /// Joining -> Active` (see [`Input::JoinAnswer`]).
+    /// Joining -> Active` (see [`Input::JoinAnswer`](crate::election::Input::JoinAnswer)).
     pub(super) fn join(&mut self, pointer: &JoinResponse) {
         if !self.state.can_transition_to(WorkerState::Joining) {
             return;
@@ -67,7 +67,7 @@ where
     }
 
     /// Records `token` as the read of the authority's epoch that the next
-    /// answer must name (see [`Input::AuthorityEpochAsked`]).
+    /// answer must name (see [`Input::AuthorityEpochAsked`](crate::election::Input::AuthorityEpochAsked)).
     pub(super) fn note_epoch_read_asked(&mut self, token: ReplyToken) {
         if matches!(
             self.state,
@@ -78,7 +78,7 @@ where
     }
 
     /// Applies the answer `held` to the read `token` when it is the latest
-    /// asked (see [`Input::AuthorityEpochRead`]): a bootstrapping node
+    /// asked (see [`Input::AuthorityEpochRead`](crate::election::Input::AuthorityEpochRead)): a bootstrapping node
     /// refreshes its floor, and one validating a pointer becomes a member or
     /// drops the pointer.
     pub(super) fn on_epoch_read(&mut self, token: ReplyToken, held: ShardRecord) {
@@ -125,7 +125,7 @@ where
     /// it knew of its own and goes back to `Bootstrapping`, for its driver to
     /// join it again. The epoch it rejoins is a
     /// floor: a JOIN pointer to a leader left on an older one (see
-    /// [`EpochOrder::Stale`]) must not take it back there.
+    /// [`EpochOrder::Stale`](crate::election::EpochOrder::Stale)) must not take it back there.
     pub(super) fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
         self.forget_election_state();
         self.standing.rejoin_at(epoch);
@@ -148,8 +148,8 @@ where
 
     /// Forgets the election state this node held under its recovery epoch,
     /// as it leaves that epoch behind. What its standing forgets goes with
-    /// the transition that moves it (see [`ShardStanding::accept_ack`] and
-    /// [`ShardStanding::rejoin_at`]).
+    /// the transition that moves it (see [`ShardStanding::accept_ack`](crate::election::standing::ShardStanding::accept_ack) and
+    /// [`ShardStanding::rejoin_at`](crate::election::standing::ShardStanding::rejoin_at)).
     pub(super) fn forget_election_state(&mut self) {
         if let Some(authority) = self.authority.as_mut() {
             authority.epoch_left();

@@ -58,7 +58,7 @@ where
     /// configuration without it, together with every removal it has
     /// accepted and not yet applied, so the survivors elect under the
     /// shrunk one. A leader whose removal, with those, would leave no voter
-    /// announces nothing (see [`Roster::remove_all`]).
+    /// announces nothing (see [`Roster::remove_all`](crate::configuration::Roster::remove_all)).
     fn drain(&mut self) {
         // Leaving `Leader` withdraws the grant first, so no departure
         // message goes out while this node still holds one.
@@ -135,7 +135,7 @@ where
 
     /// Accepts a departing worker's SELF_REMOVE, to take it out of this leader's roster with every
     /// other one accepted since the last change, in one next generation and
-    /// with no commit round (see [`LeaderOffice::take_removal`]).
+    /// with no commit round (see [`LeaderOffice::take_removal`](crate::election::leader_office::LeaderOffice::take_removal)).
     ///
     /// It accepts only a removal addressed to this leadership: to this
     /// node, as the leader of this term. And the term guard: it accepts the removal only if the

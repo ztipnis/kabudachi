@@ -137,7 +137,7 @@ where
     /// the batch it was promised admission in, which it is no voter of in what
     /// it holds, only in the batch itself: the ack that carried it never reached this node, say because its
     /// leader stopped soon after (see
-    /// [`ShardStanding::adopt_relayed_configuration`]). Without this, a
+    /// [`ShardStanding::adopt_relayed_configuration`](crate::election::standing::ShardStanding::adopt_relayed_configuration)). Without this, a
     /// survivor holding the older configuration and one holding the newer
     /// refuse each other's roll calls term after term. Only a node that takes
     /// part in elections without standing or leading adopts it.
@@ -150,7 +150,7 @@ where
     /// Accepts `leader`'s certificate of what its election's winner leads,
     /// sent to every respondent of its winning roll
     /// call: this node adopts that configuration and its admission
-    /// generations there, as [`ShardStanding::adopt_certificate`] allows, and the
+    /// generations there, as [`ShardStanding::adopt_certificate`](crate::election::standing::ShardStanding::adopt_certificate) allows, and the
     /// certificate's term raises its highest term seen, which makes a node
     /// holding or contesting an earlier one step down (see
     /// [`Self::step_down_if_outpaced`]).

@@ -17,7 +17,7 @@ where
     /// suspicion timeout it tries a roll call again; meanwhile it answers
     /// the roll calls and grants the votes of others, and an ack from a
     /// leader returns it to `Active`. With an authority, the authority path
-    /// can take it out too (see [`AuthorityStanding::begin_recovery`]).
+    /// can take it out too (see [`AuthorityStanding::begin_recovery`](crate::election::authority_standing::AuthorityStanding::begin_recovery)).
     /// A leader that has not heard from a quorum within its quorum-contact
     /// lease gives up leading, to `NoQuorum`.
     pub(super) fn lose_quorum_if_its_lease_ended(&mut self) {
@@ -40,7 +40,7 @@ where
     }
 
     /// The driver names the workers that hold runs and fell silent, and those
-    /// that answered this office's rebuild (see [`Input::WatchWorkers`]).
+    /// that answered this office's rebuild (see [`Input::WatchWorkers`](crate::election::Input::WatchWorkers)).
     pub(super) fn on_watch_workers(
         &mut self,
         silent_holders: BTreeSet<WorkerId>,
