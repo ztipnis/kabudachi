@@ -289,7 +289,9 @@ impl ReconcileRound {
                 .keys()
                 .all(|task| self.is_certain(task, &is_member))
     }
+}
 
+impl ReconcileRound {
     /// The newest version reported for `task` that is not lost: one whose
     /// holders have all left the configuration and whose record the round
     /// does not hold is skipped, for the next newest. If every version is
