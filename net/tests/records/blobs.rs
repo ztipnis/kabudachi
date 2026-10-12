@@ -3,6 +3,7 @@
 //! by their digest from any peer of the shard only if those miss.
 
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 use std::time::Duration;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, MAX_BLOB_BYTES};
@@ -15,7 +16,12 @@ use kabudachi_core::protocol::messages::{TaskRejectReason, claim_response, task_
 use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint};
 use kabudachi_core::task_record::{Placement, RecordVersion};
 use kabudachi_core::time::RealClock;
-use kabudachi_net::messenger::{Net, PlacedWrite, PutBlobError};
+use kabudachi_net::messenger::{Net, PutBlobError};
+use kabudachi_net::task_store::{TaskRecordStore, record_key};
+use libp2p::kad::Record;
+use libp2p::kad::store::RecordStore as _;
+use libp2p::PeerId;
+use prost::Message as _;
 use kabudachi_net::task_exchange::{LeaderRetry, NotStored, placement_of};
 use kabudachi_net::task_store::placement::ReplicationFactor;
 use tokio::time::timeout;
@@ -92,18 +98,23 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
             );
         }
 
-        // The owner's record names the holders: the reader, which holds
-        // nothing, asks them directly.
-        writer.write_records(vec![PlacedWrite::new(record_on("task-1", &holders), 2)]);
-        let task = TaskId::new("task-1");
-        timeout(TEST_TIMEOUT, wait_until(|| first.held_records().get(&task).is_some()))
-            .await
-            .expect("the record reached a holder");
+        // The owner's record names the holders. The outsider belongs to another
+        // shard, so its kad lookup reaches no holder of this one: only the
+        // holders' direct answers can give it the blob. It holds the owner's
+        // record itself, handed to it as a draining holder would.
+        let outsider = Net::for_shard(ShardId::new("shard-2").name(), None);
+        let outsider_address = outsider.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+        for holder in [&first, &second] {
+            connect_to(&outsider, &outsider_address, holder).await;
+        }
+        let mut handed = Record::new(record_key(&TaskId::new("task-1")), record_on("task-1", &holders).encode_to_vec());
+        handed.publisher = PeerId::from_str(first.local_worker_id().as_str()).ok();
+        TaskRecordStore::new(outsider.held_records()).put(handed).expect("the outsider keeps the record");
         let asked_before = blob_requests(&first).await + blob_requests(&second).await;
-        let found = timeout(TEST_TIMEOUT, reader.get_blob(owned_by("task-1"), &key.digest()))
+        let found = timeout(TEST_TIMEOUT, outsider.get_blob(owned_by("task-1"), &key.digest()))
             .await
             .expect("ended");
-        assert_eq!(found, Some(chunk.clone()));
+        assert_eq!(found, Some(chunk.clone()), "the holders' direct answer is the only way to the bytes");
         assert!(
             blob_requests(&first).await + blob_requests(&second).await > asked_before,
             "the holders were asked directly"
@@ -143,7 +154,8 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
             Err(PutBlobError::NotStored)
         );
 
-        // A writer whose own store has no room keeps nothing and sends nothing.
+        // A writer whose own store has no room is told so, and no holder had
+        // stored the blob by then.
         let held_by_writer = writer.held_records();
         held_by_writer.set_blob_store_limit(Some(held_by_writer.blob_bytes()));
         let refused = b"no room for this one".to_vec();
