@@ -172,7 +172,7 @@ use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice, MemberRe
 use lease::{Lease, LeaseChange, Office};
 use self_report::SelfReport;
 pub use standing::JoinFloor;
-use standing::ShardStanding;
+use standing::{AckChange, ShardStanding};
 pub(crate) use standing::EpochOrder;
 
 pub struct WorkerNode<C>
@@ -249,6 +249,13 @@ struct RejoinCheck {
     awaited_read: Option<ReplyToken>,
     /// The JOIN pointer taken, held while the node is `Joining`.
     held: Option<JoinResponse>,
+}
+
+/// The recovery epoch an accepted ack comes from, and whether it is later
+/// than this node's own.
+struct AckedEpoch {
+    heard: RecoveryEpoch,
+    later: bool,
 }
 
 /// The timers a [`WorkerNode`] runs its election on.
@@ -1602,38 +1609,12 @@ where
     /// suspicion they rested on, and that includes a node still `Active` whose
     /// stale contact no tick had yet acted on.
     fn on_leader_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>) {
-        // A node back in `Bootstrapping` rejoins through JOIN alone: an ack
-        // from a leader of the epoch it left would take it back past the
-        // floor it rejoins at, and one validating the pointer it took is no
-        // member yet.
-        if matches!(
-            self.state,
-            WorkerState::Bootstrapping | WorkerState::Joining
-        ) || ack.shard_id() != self.shard_id
-        {
-            return;
-        }
-        let heard = RecoveryEpoch::new(ack.recovery_epoch, ack.recovery_epoch_lineage);
-        // Never having joined a shard is `Bootstrapping`, returned above.
-        let Some(order) = self.standing.order(heard) else {
+        let Some(AckedEpoch { heard, later }) = self.acked_epoch(ack) else {
             return;
         };
-        let later_epoch = match order {
-            EpochOrder::Stale => return,
-            EpochOrder::Later => true,
-            EpochOrder::Mine => false,
-        };
-        // A leader with an authority leads the epoch it took office at, which
-        // no other lineage's epoch displaces, a higher number or lineage included.
-        if later_epoch && self.leads_its_office_epoch(heard.lineage) {
-            return;
-        }
-        if !later_epoch && ack.term < self.ack_floor() {
-            return;
-        }
         let outpaced = self
             .term_in_play()
-            .is_some_and(|term| later_epoch || ack.term > term);
+            .is_some_and(|term| later || ack.term > term);
         if outpaced {
             self.leave_office();
         }
@@ -1647,10 +1628,75 @@ where
         if change.epoch_moved {
             self.forget_election_state();
         }
+        self.follow_ack(ack, change, outpaced);
+    }
 
+    /// The epoch of `ack` when this node accepts acks of it at all: none for
+    /// another shard, an older epoch, another lineage's epoch while this node
+    /// leads the authority's, or a term of its own epoch below its ack floor.
+    fn acked_epoch(&self, ack: &Checked<LeaderHeartbeatAck>) -> Option<AckedEpoch> {
+        // A node back in `Bootstrapping` rejoins through JOIN alone: an ack
+        // from a leader of the epoch it left would take it back past the
+        // floor it rejoins at, and one validating the pointer it took is no
+        // member yet.
+        if !self.is_joined_to(&ack.shard_id()) {
+            return None;
+        }
+        let heard = RecoveryEpoch::new(ack.recovery_epoch, ack.recovery_epoch_lineage);
+        // Never having joined a shard is `Bootstrapping`, returned above.
+        let later = match self.standing.order(heard)? {
+            EpochOrder::Stale => return None,
+            EpochOrder::Later => true,
+            EpochOrder::Mine => false,
+        };
+        // A leader with an authority leads the epoch it took office at, which
+        // no other lineage's epoch displaces, a higher number or lineage included.
+        let refused = if later {
+            self.leads_its_office_epoch(heard.lineage)
+        } else {
+            ack.term < self.ack_floor()
+        };
+        (!refused).then_some(AckedEpoch { heard, later })
+    }
+
+    /// Whether this node is a member of `shard`: it has joined (it is neither
+    /// `Bootstrapping` nor `Joining`) and `shard` is its own.
+    fn is_joined_to(&self, shard: &ShardId) -> bool {
+        !matches!(
+            self.state,
+            WorkerState::Bootstrapping | WorkerState::Joining
+        ) && *shard == self.shard_id
+    }
+
+    /// Follows the leader whose `ack` this node accepted, the ack having
+    /// changed its standing as `change` says; `outpaced` when the ack outran
+    /// a term it held or contested.
+    fn follow_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>, change: AckChange, outpaced: bool) {
         let now = self.clock.now();
         self.last_leader_contact = now;
         self.round.end_no_quorum_streak();
+        self.record_ack(ack, now);
+        if change.generation_changed || change.admission_changed {
+            // Heartbeat at once: the echo of the new generation is what
+            // commits it (see `Roster::commit_if_confirmed`), and the
+            // admission held is what confirms a promise (see
+            // `Roster::promise_admission`).
+            self.next_heartbeat = None;
+        }
+        if outpaced || self.seeks_a_leader() {
+            self.round.stop();
+            self.drop_recovery();
+            self.transition_to(WorkerState::Active);
+        }
+        // Whatever this node's state: see the forgetting described at
+        // `on_leader_ack`.
+        self.round.follow_leader_of(ack.term);
+    }
+
+    /// Records `ack`, accepted at `now`: its vouching token for the lease, its
+    /// leader, the runs it says were cancelled and the echo the next heartbeat
+    /// carries.
+    fn record_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>, now: Instant) {
         // A token from a later instant than this node's own clock reads was
         // never sent by this node, and proves nothing.
         self.lease.acked(
@@ -1672,26 +1718,14 @@ where
             term: ack.term,
             send_token: ack.send_token,
         });
-        if change.generation_changed || change.admission_changed {
-            // Heartbeat at once: the echo of the new generation is what
-            // commits it (see `Roster::commit_if_confirmed`), and the
-            // admission held is what confirms a promise (see
-            // `Roster::promise_admission`).
-            self.next_heartbeat = None;
-        }
+    }
 
-        if outpaced
-            || matches!(
-                self.state,
-                WorkerState::LeaderSuspect | WorkerState::RollCall | WorkerState::NoQuorum
-            )
-        {
-            self.round.stop();
-            self.drop_recovery();
-            self.transition_to(WorkerState::Active);
-        }
-        // Whatever this node's state: see the forgetting described above.
-        self.round.follow_leader_of(ack.term);
+    /// Whether this node seeks a leader: `LeaderSuspect`, `RollCall` or `NoQuorum`.
+    fn seeks_a_leader(&self) -> bool {
+        matches!(
+            self.state,
+            WorkerState::LeaderSuspect | WorkerState::RollCall | WorkerState::NoQuorum
+        )
     }
 
     /// Whether this node leads an epoch of a lineage other than `lineage`.
@@ -1729,7 +1763,17 @@ where
             return;
         }
 
-        let heartbeat = WorkerHeartbeat {
+        let heartbeat = self.heartbeat(now);
+        self.send(
+            leader.clone(),
+            election_message::Payload::Heartbeat(heartbeat),
+        );
+        self.next_heartbeat = Some((leader, now + self.timings.heartbeat_interval));
+    }
+
+    /// The heartbeat this node sends its leader at `now`.
+    fn heartbeat(&self, now: Instant) -> WorkerHeartbeat {
+        WorkerHeartbeat {
             worker_id: Some(self.my_id.clone().into()),
             incarnation_id: Some(self.incarnation_id.clone().into()),
             recovery_epoch_seen: self.standing.epoch_number(),
@@ -1748,12 +1792,7 @@ where
             routing_crawled: self.routing_crawled(),
             admission_generation: self.standing.admission().map(Into::into),
             runs_compaction: self.report.runs_compaction,
-        };
-        self.send(
-            leader.clone(),
-            election_message::Payload::Heartbeat(heartbeat),
-        );
-        self.next_heartbeat = Some((leader, now + self.timings.heartbeat_interval));
+        }
     }
 
     /// The leader this node heartbeats: the one it records, while it is
@@ -2761,10 +2800,7 @@ where
         leader: &WorkerId,
         certificate: &Checked<ElectionCertificate>,
     ) {
-        if matches!(
-            self.state,
-            WorkerState::Bootstrapping | WorkerState::Joining
-        ) || certificate.shard_id() != self.shard_id
+        if !self.is_joined_to(&certificate.shard_id())
             || self.standing.order(RecoveryEpoch::new(
                 certificate.recovery_epoch,
                 certificate.recovery_epoch_lineage,
