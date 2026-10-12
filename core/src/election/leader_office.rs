@@ -268,10 +268,9 @@ impl LeaderOffice {
 
     /// The members whose latest heartbeat said they run compaction.
     pub(crate) fn compaction_runners(&self) -> BTreeSet<WorkerId> {
-        let members = self.roster.members();
         self.compaction_runners
             .iter()
-            .filter(|worker| members.contains_key(*worker) || self.roster.pending().contains(*worker))
+            .filter(|worker| self.roster.holds(worker))
             .cloned()
             .collect()
     }
@@ -358,7 +357,7 @@ impl LeaderOffice {
     /// Whether the roster holds `worker`, admitted or pending. Removals
     /// pending are not applied first, as for [`Self::is_voter_or_pending`].
     pub(crate) fn is_member(&self, worker: &WorkerId) -> bool {
-        self.roster.members().contains_key(worker) || self.roster.pending().contains(worker)
+        self.roster.holds(worker)
     }
 
     /// A SELF_REMOVE the node accepted (its term guard stays with the
