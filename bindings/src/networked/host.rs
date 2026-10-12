@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::observed::{LeftOnDrop, Observed, publish};
-use super::results::ask_after_leader_change;
+use super::results::{ask_after_leader_change, read_results};
 use super::seam::Shared;
 use crate::bridge::Bridge;
 
@@ -64,15 +64,7 @@ impl Host {
                 .await;
             *drained.lock().unwrap_or_else(PoisonError::into_inner) = Some(handed);
         });
-        let reading = Arc::clone(&shared);
-        let results = tokio.spawn(async move {
-            loop {
-                reading.net.result_arrived().await;
-                for event in reading.net.take_result_events() {
-                    reading.on_result(event);
-                }
-            }
-        });
+        let results = tokio.spawn(read_results(Arc::clone(&shared)));
         let outcomes = tokio.spawn(ask_after_leader_change(Arc::clone(&shared)));
         let pump = tokio.spawn(async move {
             let mut source = source;

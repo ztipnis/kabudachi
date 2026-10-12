@@ -125,19 +125,27 @@ fn outcome_event(task: &TaskId, answer: &OutcomeAnswer) -> Option<PyEvent> {
     ))
 }
 
-/// Whenever the leader this worker's node names changes to another, asks it
-/// how each task submitted here, stored and still awaited, stands: a
-/// certification or an ending the old leader decided may never have been
-/// told. The answers come in as any conclusion does.
+/// Reads the result messages arriving for the tasks submitted here and
+/// hands each to Python.
+pub(super) async fn read_results(shared: Arc<Shared>) {
+    loop {
+        shared.net.result_arrived().await;
+        for event in shared.net.take_result_events() {
+            shared.on_result(event);
+        }
+    }
+}
+
+/// Whenever the leader this worker's node names changes to another, or the
+/// same worker leads in a later term, asks it how each task submitted here,
+/// stored and still awaited, stands: a certification or an ending the old
+/// leader decided may never have been told. The answers come in as any
+/// conclusion does.
 pub(super) async fn ask_after_leader_change(shared: Arc<Shared>) {
     let mut observed = shared.observed.clone();
-    let mut named = observed.borrow().leader.clone().map(|(leader, _)| leader);
+    let mut named: Option<(WorkerId, u64)> = observed.borrow().leader.clone();
     while observed.changed().await.is_ok() {
-        let now = observed
-            .borrow_and_update()
-            .leader
-            .clone()
-            .map(|(leader, _)| leader);
+        let now = observed.borrow_and_update().leader.clone();
         if now.is_none() || now == named {
             continue;
         }
