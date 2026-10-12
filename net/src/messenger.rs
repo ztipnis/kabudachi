@@ -461,46 +461,34 @@ impl Inbound {
     /// driver takes from it (see the module doc's "Inputs for the node").
     fn queue_input(&self, input: Input) {
         let mut inputs = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(peer) = connection_event_peer(&input) {
-            let latest = inputs
-                .iter()
-                .rposition(|queued| connection_event_peer(queued) == Some(peer));
-            match latest.map(|index| (index, &inputs[index])) {
-                // The node would ignore a repeat of the peer's last event.
-                Some((_, queued)) if *queued == input => return,
-                // The peer connected and disconnected again before the node
-                // heard either: together they change nothing the node
-                // needs to know.
-                Some((index, Input::PeerConnected(_))) => {
-                    inputs.remove(index);
-                    return;
-                }
-                _ => {}
-            }
-        } else if input == Input::RoutingCrawled {
-            // The node handles one the same as two, and it is never dropped
-            // for the limit, so at most one is ever queued.
-            if inputs.contains(&input) {
-                return;
-            }
-        } else if inputs.len() >= self.input_limit.load(Ordering::Relaxed) {
-            // Connection events are never dropped: at most two per peer are
-            // ever queued, so only messages can fill the queue.
-            if let Some(oldest) = inputs
-                .iter()
-                .position(|queued| matches!(queued, Input::Message { .. }))
-            {
-                inputs.remove(oldest);
-                tracing::debug!(
-                    limit = self.input_limit.load(Ordering::Relaxed),
-                    "dropping the oldest queued election message: no driver has taken this \
-                     node's inputs"
-                );
-            }
+        if !self.admit(&mut inputs, &input) {
+            return;
         }
         inputs.push_back(input);
         drop(inputs);
         self.arrived.notify_one();
+    }
+
+    /// Whether `input` joins the queue, after making room for it if the
+    /// queue is at its limit. A connection event joins unless the node
+    /// would learn nothing from it (see [`admit_connection_event`]). A
+    /// routing crawl joins unless one is queued already: the node handles
+    /// one the same as two, and it is never dropped for the limit. Any
+    /// other input joins, and at the limit the oldest queued message is
+    /// dropped for it: connection events are never dropped, since at most
+    /// two per peer are ever queued, so only messages can fill the queue.
+    fn admit(&self, inputs: &mut VecDeque<Input>, input: &Input) -> bool {
+        if let Some(peer) = connection_event_peer(input) {
+            return admit_connection_event(inputs, peer, input);
+        }
+        if *input == Input::RoutingCrawled {
+            return !inputs.contains(input);
+        }
+        let limit = self.input_limit.load(Ordering::Relaxed);
+        if inputs.len() >= limit {
+            drop_oldest_message(inputs, limit);
+        }
+        true
     }
 
     fn queue_write(&self, outcome: WriteOutcome) {
@@ -545,6 +533,41 @@ impl Inbound {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         drop(queued);
+    }
+}
+
+/// Whether `input`, a connection event of `peer`'s, joins the queue. A
+/// repeat of the peer's last queued event does not: the node would ignore
+/// it. Nor does a disconnect while the peer's connect is still queued: it
+/// removes that connect instead, since together they change nothing the
+/// node needs to know.
+fn admit_connection_event(inputs: &mut VecDeque<Input>, peer: &WorkerId, input: &Input) -> bool {
+    let latest = inputs
+        .iter()
+        .rposition(|queued| connection_event_peer(queued) == Some(peer));
+    match latest.map(|index| (index, &inputs[index])) {
+        Some((_, queued)) if queued == input => false,
+        Some((index, Input::PeerConnected(_))) => {
+            inputs.remove(index);
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Drops the oldest queued election message, if there is one, to make room
+/// at `limit`.
+fn drop_oldest_message(inputs: &mut VecDeque<Input>, limit: usize) {
+    if let Some(oldest) = inputs
+        .iter()
+        .position(|queued| matches!(queued, Input::Message { .. }))
+    {
+        inputs.remove(oldest);
+        tracing::debug!(
+            limit,
+            "dropping the oldest queued election message: no driver has taken this \
+             node's inputs"
+        );
     }
 }
 
