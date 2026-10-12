@@ -12,7 +12,7 @@ use crate::protocol::messages::{Task, TaskRun};
 use crate::task_record::MAX_RECORD_BYTES;
 use crate::time::Clock;
 
-use super::{CHAIN_ENTRY_FRAMING_BYTES, Observer, RECORD_RESERVE_BYTES, Scheduler, Submission};
+use super::{CHAIN_ENTRY_FRAMING_BYTES, Observer, RECORD_RESERVE_BYTES, Scheduler};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// The payload one entry of a chain carries.
@@ -101,15 +101,4 @@ pub(super) fn claim_weight_of(task: &Task) -> u64 {
         + task.queue.len()
         + task.task_definition_id().as_str().len()
         + task.coalescing_key.as_deref().map_or(0, str::len)) as u64
-}
-
-impl Submission {
-    /// What a claim of the submitted task weighs before its chain: its
-    /// input, queue, definition id and coalescing key.
-    pub(super) fn claim_weight(&self) -> u64 {
-        (self.serialized_input.len()
-            + self.queue.len()
-            + self.definition_id.as_str().len()
-            + self.coalescing_key.as_deref().map_or(0, str::len)) as u64
-    }
 }
