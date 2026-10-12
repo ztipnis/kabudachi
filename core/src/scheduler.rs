@@ -88,13 +88,12 @@ use crate::reconcile::{
     ANSWER_IN_FLIGHT, RECONCILE_SKEW_MARGIN, Rebuild, ReconcileTerm, ReportedRun, ReportedState,
     WorkerRuns,
 };
-use crate::task_record::{
-    HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion, VersionOrder,
-};
+use crate::task_record::{HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion};
 use crate::time::{Clock, Duration, Instant, WallTime};
 
 mod backlog;
 mod compaction;
+mod leadership;
 mod memory_budget;
 mod observer;
 mod reconciliation;
@@ -102,8 +101,10 @@ mod retention;
 mod waiting_room;
 
 pub use backlog::Backlog;
-pub use observer::{NoObserver, Observer};
+use leadership::Leadership;
+pub use leadership::{LeadershipGrant, LeaseEnd};
 use memory_budget::MemoryBudget;
+pub use observer::{NoObserver, Observer};
 use reconciliation::Reconciliation;
 use retention::Retention;
 use waiting_room::WaitingRoom;
@@ -597,45 +598,11 @@ pub enum ReportRejection {
     NotReady,
 }
 
-/// What lets a scheduler act as its shard's leader: its worker's election
-/// says the worker leads `term` at `recovery_epoch`, and may act until
-/// `valid_until`.
-///
-/// The election hands it over (see `election::carry_out`), and the
-/// scheduler holds it until the election reports a change. The scheduler
-/// checks `valid_until` against its own clock on every leader-only call, so
-/// a grant that has run out stops it acting even before the election says
-/// anything more.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LeadershipGrant {
-    pub term: u64,
-    /// The recovery epoch the worker leads in, lineage included: what a Task
-    /// record this leader writes is versioned by.
-    pub recovery_epoch: RecoveryEpoch,
-    pub valid_until: LeaseEnd,
-    /// The shard's default reconnect timeout (`ElectionTimings::reconnect_timeout`),
-    /// for runs of tasks submitted without their own: what their claims tell
-    /// their workers, and how long after a worker falls silent they may be
-    /// replayed.
-    pub reconnect_timeout: Duration,
-}
-
 /// Why ending a continuation was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ContinuationRejection {
     #[error("this node is not the leader")]
     NotLeader,
-}
-
-/// When a leader's lease ends, and with it the time it may act as leader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LeaseEnd {
-    /// Nothing ends it, as for a leader that alone is a majority of its
-    /// electorate.
-    Unbounded,
-    /// It ends at this instant of the election's clock, which the scheduler
-    /// must read too: the lease is over from this instant on.
-    At(Instant),
 }
 
 /// Owns all Tasks and TaskRuns and decides every claim and report. Drive it
@@ -645,11 +612,8 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     ids: I,
     /// Handed every revision the scheduler publishes.
     observer: O,
-    /// Whether the scheduler led at the last call that checked, which
-    /// `next_deadline` reads for the lease end.
-    noticed_leading: bool,
-    /// The leadership grant its worker's election last gave it, if any.
-    grant: Option<LeadershipGrant>,
+    /// Its grant, lease and publishing versions.
+    leadership: Leadership,
     tasks: BTreeMap<TaskId, Task>,
     runs: BTreeMap<TaskRunId, TaskRun>,
     /// The run that is currently authoritative for each task.
@@ -677,12 +641,6 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     losses: BTreeMap<TaskId, u32>,
     /// Tasks changed since their last published revision.
     unpublished: BTreeSet<TaskId>,
-    /// The epoch and term this scheduler last published in, and the revision
-    /// it publishes next there. A grant of a newer epoch or term starts it at
-    /// 0, and one of an older epoch or term publishes nothing; a grant of the
-    /// same term handed back after a lapse continues it, so no version is ever
-    /// published twice with different contents.
-    revisions: Option<(RecoveryEpoch, u64, u64)>,
     /// Each task's input digest, computed once at submission.
     input_digests: BTreeMap<TaskId, Digest>,
     /// Each coalescing generation's links: who superseded it, whom it absorbed.
@@ -747,8 +705,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             clock,
             ids,
             observer,
-            noticed_leading: false,
-            grant: None,
+            leadership: Leadership::default(),
             tasks: BTreeMap::new(),
             runs: BTreeMap::new(),
             current_run: BTreeMap::new(),
@@ -762,7 +719,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             continuing: BTreeSet::new(),
             losses: BTreeMap::new(),
             unpublished: BTreeSet::new(),
-            revisions: None,
             input_digests: BTreeMap::new(),
             links: BTreeMap::new(),
             reconciliation: Reconciliation::default(),
@@ -782,7 +738,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     fn publish_changed(&mut self) {
-        let Some(grant) = self.grant.filter(|_| self.is_leader()) else {
+        let Some(grant) = self.leadership.grant().filter(|_| self.is_leader()) else {
             return;
         };
         self.publish_unpublished(grant.recovery_epoch, grant.term);
@@ -808,55 +764,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             if !self.tasks.contains_key(&task_id) {
                 continue;
             }
-            let version = self.next_version(recovery_epoch, term);
+            let version = self.leadership.next_version(recovery_epoch, term);
             let record = self.record_of(&task_id, version, published_at);
             self.observer.revision(record);
             published += 1;
         }
         published
-    }
-
-    /// Whether the epoch and term are not older than the ones already
-    /// published in: under an older one, a count restarted at 0 would publish
-    /// versions that were already published with other contents, so a
-    /// scheduler holding such a grant does not lead.
-    fn may_publish_under(&self, recovery_epoch: RecoveryEpoch, grant_term: u64) -> bool {
-        let Some((epoch, term, next)) = self.revisions else {
-            return true;
-        };
-        if epoch == recovery_epoch && term == grant_term {
-            return true;
-        }
-        let published = RecordVersion {
-            recovery_epoch: epoch,
-            leader_term: term,
-            revision: next.saturating_sub(1),
-        };
-        let offered = RecordVersion {
-            recovery_epoch,
-            leader_term: grant_term,
-            revision: 0,
-        };
-        published.order(&offered) == VersionOrder::Newer
-    }
-
-    fn next_version(&mut self, recovery_epoch: RecoveryEpoch, term: u64) -> RecordVersion {
-        let revision = match &mut self.revisions {
-            Some((epoch, current, next)) if *epoch == recovery_epoch && *current == term => {
-                let revision = *next;
-                *next += 1;
-                revision
-            }
-            slot => {
-                *slot = Some((recovery_epoch, term, 1));
-                0
-            }
-        };
-        RecordVersion {
-            recovery_epoch,
-            leader_term: term,
-            revision,
-        }
     }
 
     /// The whole record of `task_id` as the scheduler holds it now.
@@ -1031,26 +944,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.budget.set_limits(limits);
     }
 
-    /// Takes the leadership grant its worker's election reports, or `None`
-    /// once the worker does not lead. The scheduler keeps it until the next
-    /// call, but acts on it only until its lease ends.
-    ///
-    /// While its node reconciles, a grant takes effect only once
-    /// [`Self::reconcile`] has rebuilt for the same office; any other is not
-    /// held, since leading before the rebuild would decide on nothing. The
-    /// grant that ends the reconciliation loses the runs of every worker
-    /// reported silent meanwhile whose reconnect timeouts have passed (see
-    /// [`Self::note_silence`]).
-    pub fn set_leadership_grant(&mut self, grant: Option<LeadershipGrant>) {
-        let takes_effect = self.reconciliation.takes_grant(grant.as_ref());
-        self.grant = grant.filter(|_| takes_effect);
-        if self.check_leader() {
-            self.lose_overdue();
-        }
-        self.compact_every_due_key();
-        self.end_call();
-    }
-
     /// Its node took office for `term` and reconciles before it leads.
     /// Until the grant of that office arrives, the silences its node reports
     /// are kept, not acted on, and the scheduler,
@@ -1061,7 +954,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// leader since, and the new office counts every worker afresh.
     pub fn begin_reconcile(&mut self, term: ReconcileTerm) {
         self.silent.clear();
-        self.grant = None;
+        self.leadership.hold(None);
         self.check_leader();
         self.reconciliation.begin(term);
     }
@@ -1105,7 +998,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         // scheduler publishes and from the events it queues.
         let mut applied = Adopted::default();
         self.apply_reports(reports, &mut applied);
-        let republished = if self.may_publish_under(office.recovery_epoch, office.term) {
+        let republished = if self
+            .leadership
+            .may_publish_under(office.recovery_epoch, office.term)
+        {
             self.publish_unpublished(office.recovery_epoch, office.term)
         } else {
             0
@@ -1959,11 +1855,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// worker's run, only while this scheduler leads.
     pub fn next_deadline(&self) -> Option<Instant> {
         let forgetting = self.retention.next_due();
-        // A lapse is found by a call that reads the clock, so the lease end
-        // stays in the answer until one has: the caller that asks "is it due
-        // yet?" must still get to `catch_up`. That is why it reads what was
-        // noticed, not `is_leader`, which is false from the end's instant on.
-        let lease_end = self.lease_end().filter(|_| self.noticed_leading);
+        let lease_end = self.leadership.noticed_lease_end();
         let waiting = if self.is_leader() {
             self.waiting.next_deadline()
         } else {
@@ -2150,11 +2042,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// the grant. Asked only while leading, so a grant is held.
     fn reconnect_timeout_of(&self, task_id: &TaskId) -> Duration {
         match self.tasks[task_id].reconnect_timeout_ms {
-            0 => {
-                self.grant
-                    .expect("only a leader resolves a run's reconnect timeout, and a leader holds a grant")
-                    .reconnect_timeout
-            }
+            0 => self.leadership.shard_reconnect_timeout(),
             own => Duration::from_millis(own),
         }
     }
@@ -2846,20 +2734,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.tasks.contains_key(task)
     }
 
-    /// Whether this scheduler leads, the only one that decides anything: it
-    /// holds a grant whose lease has not ended by its own clock and that is
-    /// not older than the epoch and term it already published in.
-    pub fn is_leader(&self) -> bool {
-        let Some(grant) = self.grant else {
-            return false;
-        };
-        let leased = match grant.valid_until {
-            LeaseEnd::Unbounded => true,
-            LeaseEnd::At(end) => self.clock.now() < end,
-        };
-        leased && self.may_publish_under(grant.recovery_epoch, grant.term)
-    }
-
     /// How many tasks are queued to be claimed, including generations their
     /// coalescing key holds back. A delayed task counts once it is due.
     pub fn pending_len(&self) -> usize {
@@ -2872,26 +2746,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.budget.in_use()
     }
 
-    /// The instant the lease of the grant this scheduler holds ends, or
-    /// `None` for no grant or an unbounded lease. It is still the lease's
-    /// end after that instant has passed.
-    pub fn lease_end(&self) -> Option<Instant> {
-        match self.grant?.valid_until {
-            LeaseEnd::Unbounded => None,
-            LeaseEnd::At(end) => Some(end),
-        }
-    }
-
     /// Its observer, for a driver that takes what the scheduler published.
     pub fn observer_mut(&mut self) -> &mut O {
         &mut self.observer
-    }
-
-    /// Like `is_leader`, and remembers the answer as the one last noticed.
-    fn check_leader(&mut self) -> bool {
-        let leading = self.is_leader();
-        self.noticed_leading = leading;
-        leading
     }
 
     /// Records that `run_id` was decided now, and that its task has a change
@@ -2905,14 +2762,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     fn mark_current_decided(&mut self, task_id: &TaskId) {
         let run_id = self.current_run[task_id].clone();
         self.mark_decided(&run_id);
-    }
-
-    fn require_leader(&mut self) -> Result<(), ReportRejection> {
-        if self.check_leader() {
-            Ok(())
-        } else {
-            Err(ReportRejection::NotLeader)
-        }
     }
 
     /// `run_id`'s run, if the run exists, `worker` claimed it and it is in
