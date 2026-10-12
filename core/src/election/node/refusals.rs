@@ -22,7 +22,7 @@ where
     /// call for any reason learns who leads, or one cut off from its leader's
     /// acks while another is elected never finds it again. A candidate refused
     /// a vote ignores the name.
-    pub(in crate::election) fn send_reject(
+    pub(super) fn send_reject(
         &mut self,
         initiator: WorkerId,
         term: u64,
@@ -76,7 +76,7 @@ where
     /// epoch and lineage itself; one that names no epoch (its refuser has
     /// joined no shard) is read as this node's own epoch's. The refusal
     /// itself is not counted.
-    pub(in crate::election) fn on_election_reject(&mut self, reject: &Checked<ElectionReject>) {
+    pub(super) fn on_election_reject(&mut self, reject: &Checked<ElectionReject>) {
         if reject.shard_id() != self.shard_id || reject.initiator_id() != self.my_id {
             return;
         }
@@ -116,7 +116,7 @@ where
     /// `RollCall`: never itself, and, unless `any_term`, only one named at a
     /// term no older than the highest this node has seen, or named as still
     /// valid.
-    pub(in crate::election) fn leader_named_by(
+    fn leader_named_by(
         &self,
         reject: &Checked<ElectionReject>,
         any_term: bool,
@@ -141,7 +141,7 @@ where
     /// survivor holding the older configuration and one holding the newer
     /// refuse each other's roll calls term after term. Only a node that takes
     /// part in elections without standing or leading adopts it.
-    pub(in crate::election) fn adopt_relayed_configuration(&mut self, offered: Configuration) {
+    fn adopt_relayed_configuration(&mut self, offered: Configuration) {
         if self.takes_part_in_elections() {
             self.standing.adopt_relayed_configuration(offered);
         }
@@ -161,7 +161,7 @@ where
     /// never came granted nothing but is admitted too. A certificate for an
     /// earlier term from a leader it did not vote for is ignored, as is one
     /// reaching a node still joining, which answered no roll call.
-    pub(in crate::election) fn on_election_certificate(
+    pub(super) fn on_election_certificate(
         &mut self,
         leader: &WorkerId,
         certificate: &Checked<ElectionCertificate>,

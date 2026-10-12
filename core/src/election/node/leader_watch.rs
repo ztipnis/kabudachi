@@ -20,7 +20,7 @@ where
     /// can take it out too (see [`AuthorityStanding::begin_recovery`]).
     /// A leader that has not heard from a quorum within its quorum-contact
     /// lease gives up leading, to `NoQuorum`.
-    pub(in crate::election) fn lose_quorum_if_its_lease_ended(&mut self) {
+    pub(super) fn lose_quorum_if_its_lease_ended(&mut self) {
         if !self.holds_office() {
             return;
         }
@@ -41,7 +41,7 @@ where
 
     /// The driver names the workers that hold runs and fell silent, and those
     /// that answered this office's rebuild (see [`Input::WatchWorkers`]).
-    pub(in crate::election) fn on_watch_workers(
+    pub(super) fn on_watch_workers(
         &mut self,
         silent_holders: BTreeSet<WorkerId>,
         answered: BTreeSet<WorkerId>,
@@ -55,7 +55,7 @@ where
 
     /// Reports this node's grant and abort deadline where they differ from
     /// the ones last reported.
-    pub(in crate::election) fn report_lease_changes(&mut self) {
+    pub(super) fn report_lease_changes(&mut self) {
         // The lease runs from the win, exactly as a leader's, but the
         // scheduler is handed a grant only once the node leads.
         let grant = self.lease.grant(self.office().as_ref(), &self.timings);
@@ -77,7 +77,7 @@ where
     /// reports that worker lost: a suspicion timeout and then a reconnect
     /// timeout. Membership only: a run's replay is timed by its own
     /// reconnect timeout (see [`Output::WorkerSilence`]).
-    pub(in crate::election) fn lost_after(&self) -> Duration {
+    pub(super) fn lost_after(&self) -> Duration {
         Duration::from_ticks(
             self.timings
                 .suspect_timeout
@@ -90,7 +90,7 @@ where
     /// timeout and a reconnect timeout as lost, once each. Silences go
     /// first, so a worker lost at the instant it falls silent (a reconnect
     /// timeout of zero) still has its silence reported.
-    pub(in crate::election) fn report_lost_workers(&mut self) {
+    pub(super) fn report_lost_workers(&mut self) {
         self.report_silences();
         let now = self.clock.now();
         let lost_after = self.lost_after();
@@ -112,7 +112,7 @@ where
 
     /// Reports each change in which workers this leader counts silent (see
     /// [`Output::WorkerSilence`]).
-    pub(in crate::election) fn report_silences(&mut self) {
+    pub(super) fn report_silences(&mut self) {
         if !self.holds_office() {
             return;
         }

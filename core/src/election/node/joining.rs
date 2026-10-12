@@ -13,7 +13,7 @@ where
 {
     /// Takes the leader `pointer` names and drives `Bootstrapping ->
     /// Joining -> Active` (see [`Input::JoinAnswer`]).
-    pub(in crate::election) fn join(&mut self, pointer: &JoinResponse) {
+    pub(super) fn join(&mut self, pointer: &JoinResponse) {
         if !self.state.can_transition_to(WorkerState::Joining) {
             return;
         }
@@ -49,7 +49,7 @@ where
 
     /// Becomes the pending member of `leader`, elected in `term` at
     /// `epoch`, that a validated JOIN pointer named: `Joining -> Active`.
-    pub(in crate::election) fn become_member_of(&mut self, leader: WorkerId, term: u64, epoch: RecoveryEpoch) {
+    fn become_member_of(&mut self, leader: WorkerId, term: u64, epoch: RecoveryEpoch) {
         self.standing.joined(epoch, term);
         self.leader = Some((leader, term));
         // A freshly joined node hasn't heard from its leader yet; start the
@@ -68,7 +68,7 @@ where
 
     /// Records `token` as the read of the authority's epoch that the next
     /// answer must name (see [`Input::AuthorityEpochAsked`]).
-    pub(in crate::election) fn note_epoch_read_asked(&mut self, token: ReplyToken) {
+    pub(super) fn note_epoch_read_asked(&mut self, token: ReplyToken) {
         if matches!(
             self.state,
             WorkerState::Bootstrapping | WorkerState::Joining
@@ -81,7 +81,7 @@ where
     /// asked (see [`Input::AuthorityEpochRead`]): a bootstrapping node
     /// refreshes its floor, and one validating a pointer becomes a member or
     /// drops the pointer.
-    pub(in crate::election) fn on_epoch_read(&mut self, token: ReplyToken, held: ShardRecord) {
+    pub(super) fn on_epoch_read(&mut self, token: ReplyToken, held: ShardRecord) {
         if self.rejoin.awaited_read != Some(token) {
             return;
         }
@@ -126,7 +126,7 @@ where
     /// join it again. The epoch it rejoins is a
     /// floor: a JOIN pointer to a leader left on an older one (see
     /// [`EpochOrder::Stale`]) must not take it back there.
-    pub(in crate::election) fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
+    pub(super) fn rejoin_at(&mut self, epoch: RecoveryEpoch) {
         self.forget_election_state();
         self.standing.rejoin_at(epoch);
         if let Some(authority) = self.authority.as_mut() {
@@ -140,7 +140,7 @@ where
     /// of another incarnation of it. The shard is abandoned, and this node
     /// stops for good,
     /// raising an alert. A restart re-enters the bootstrap cascade.
-    pub(in crate::election) fn abandon_shard(&mut self) {
+    pub(super) fn abandon_shard(&mut self) {
         self.stop_reason = Some(StopReason::Abandoned);
         self.transition_to(WorkerState::Stopped);
         self.outputs.push(Output::ShardAbandoned);
@@ -150,7 +150,7 @@ where
     /// as it leaves that epoch behind. What its standing forgets goes with
     /// the transition that moves it (see [`ShardStanding::accept_ack`] and
     /// [`ShardStanding::rejoin_at`]).
-    pub(in crate::election) fn forget_election_state(&mut self) {
+    pub(super) fn forget_election_state(&mut self) {
         if let Some(authority) = self.authority.as_mut() {
             authority.epoch_left();
         }

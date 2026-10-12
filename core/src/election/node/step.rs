@@ -56,7 +56,7 @@ where
     /// [`Self::ask_authority_if_due`]), a follower heartbeats its leader if
     /// that has come due (see [`Self::heartbeat_leader_if_due`]), and a
     /// leader reports its grant if the step changed it.
-    pub(in crate::election) fn finish_step(&mut self) -> Step {
+    fn finish_step(&mut self) -> Step {
         self.ask_authority_if_due();
         self.heartbeat_leader_if_due();
         self.report_silences();
@@ -98,7 +98,7 @@ where
     /// state in which it keeps a registration. In every state, also when its
     /// contact floor goes stale, while that is still ahead (see
     /// [`Output::AbortDeadline`]): a `Tick` then reports the deadline.
-    pub(in crate::election) fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&self) -> Option<Instant> {
         let lease_deadline = self
             .authority
             .as_ref()
@@ -111,7 +111,7 @@ where
 
     /// What [`Self::next_deadline`] reports, leaving the authority lease
     /// aside.
-    pub(in crate::election) fn election_deadline(&self) -> Option<Instant> {
+    fn election_deadline(&self) -> Option<Instant> {
         let next_heartbeat = self.next_heartbeat.as_ref().map(|(_, at)| *at);
         match self.state {
             WorkerState::Active => {
@@ -133,7 +133,7 @@ where
     /// What a node in office waits for: going `NoQuorum` unless more
     /// confirmations arrive, its next worker to report lost or silent, and a
     /// kept drain's wake-up, whichever comes first.
-    pub(in crate::election) fn office_deadline(&self) -> Option<Instant> {
+    fn office_deadline(&self) -> Option<Instant> {
         let office = self.office.as_ref();
         let no_quorum = office.and_then(|office| {
             self.lease
@@ -160,7 +160,7 @@ where
     /// states that lead or stand to lead gives up any fence. Reaching
     /// `Active`, `LeaderReconciling` or `Leader` applies a drain kept from an
     /// earlier request at once (see [`Input::Drain`]).
-    pub(in crate::election) fn transition_to(&mut self, next: WorkerState) {
+    pub(super) fn transition_to(&mut self, next: WorkerState) {
         // Every caller moves along an edge of the transition table, checked
         // by the state it guards on first; no input can reach an illegal
         // edge, so one here is a bug in this module.
@@ -199,7 +199,7 @@ where
     /// (see [`LeaderOffice::hand_back`]). Call it before anything that writes
     /// the standing while this node still leads, so what it writes is not
     /// overwritten by the configuration this node led.
-    pub(in crate::election) fn leave_office(&mut self) {
+    pub(super) fn leave_office(&mut self) {
         if let Some(office) = self.office.take() {
             office.hand_back(&mut self.standing, &self.my_id);
         }
@@ -207,7 +207,7 @@ where
         self.cancelled_runs.clear();
     }
 
-    pub(in crate::election) fn send(&mut self, to: WorkerId, payload: election_message::Payload) {
+    pub(super) fn send(&mut self, to: WorkerId, payload: election_message::Payload) {
         self.outputs.push(Output::Send {
             to,
             message: ElectionMessage {
@@ -216,7 +216,7 @@ where
         });
     }
 
-    pub(in crate::election) fn publish(&mut self, payload: election_message::Payload) {
+    pub(super) fn publish(&mut self, payload: election_message::Payload) {
         self.outputs.push(Output::Publish {
             message: ElectionMessage {
                 payload: Some(payload),
@@ -234,7 +234,7 @@ where
     /// voter of a vote grant, the rejecter of a refusal, the departing
     /// worker of a self-remove and the leader of an election certificate.
     /// Anything else is dropped.
-    pub(in crate::election) fn on_message(&mut self, from: WorkerId, message: CheckedMessage) {
+    fn on_message(&mut self, from: WorkerId, message: CheckedMessage) {
         if matches!(
             self.state,
             WorkerState::Draining | WorkerState::Stopped | WorkerState::Fenced
@@ -282,7 +282,7 @@ where
     /// [`Self::announce_leadership`]): one that missed that announcement,
     /// cut off at the win or joining since (a restarted process joins under
     /// a new `WorkerId`), would otherwise never learn whom to heartbeat.
-    pub(in crate::election) fn on_peer_connected(&mut self, peer: WorkerId) {
+    fn on_peer_connected(&mut self, peer: WorkerId) {
         let newly_connected = self.connected.insert(peer.clone());
         if newly_connected && self.holds_office() {
             self.send_ack(peer, None);

@@ -18,7 +18,7 @@ where
     /// state that will reach one of them later it keeps the request for
     /// [`Self::transition_to`] to apply; a node already draining, or one
     /// that can never drain again, ignores it.
-    pub(in crate::election) fn request_drain(&mut self) {
+    pub(super) fn request_drain(&mut self) {
         let asked =
             self.drain_request
                 .ask(self.state, &self.clock, self.timings.drain_wait_limit);
@@ -33,7 +33,7 @@ where
     /// routing crawl since its admission, so no worker is left knowing only
     /// this leader, or once its drain wait has run out. Until then it keeps
     /// leading.
-    pub(in crate::election) fn drain_once_free(&mut self) {
+    pub(super) fn drain_once_free(&mut self) {
         let leaves = self.drain_request.leave_if_free(&self.clock, || {
             self.office
                 .as_mut()
@@ -59,7 +59,7 @@ where
     /// accepted and not yet applied, so the survivors elect under the
     /// shrunk one. A leader whose removal, with those, would leave no voter
     /// announces nothing (see [`Roster::remove_all`]).
-    pub(in crate::election) fn drain(&mut self) {
+    fn drain(&mut self) {
         // Leaving `Leader` withdraws the grant first, so no departure
         // message goes out while this node still holds one.
         let was_leader = self.holds_office();
@@ -97,7 +97,7 @@ where
 
     /// The draining follower's half of [`Self::drain`]: one `SelfRemove`
     /// to the leader it follows, if it knows one other than itself.
-    pub(in crate::election) fn tell_leader_of_departure(&mut self) {
+    fn tell_leader_of_departure(&mut self) {
         let Some((leader, leader_term)) = self.leader.clone() else {
             return;
         };
@@ -121,7 +121,7 @@ where
     /// The draining leader's half of [`Self::drain`]: if taking itself out
     /// of its roster announced a change (`departure`), acks every connected
     /// peer with it.
-    pub(in crate::election) fn announce_own_departure(&mut self, departure: Option<Departure>) {
+    fn announce_own_departure(&mut self, departure: Option<Departure>) {
         let Some(departure) = departure else {
             return;
         };
@@ -152,7 +152,7 @@ where
     ///
     /// Only a `Leader` honours it: every other node ignores it, and a
     /// candidate keeps counting against its roll call's configuration.
-    pub(in crate::election) fn on_self_remove(&mut self, departing: &WorkerId, msg: &Checked<SelfRemove>) {
+    pub(super) fn on_self_remove(&mut self, departing: &WorkerId, msg: &Checked<SelfRemove>) {
         if !self.accepts_removal(msg) {
             return;
         }
@@ -166,7 +166,7 @@ where
     /// Whether this leader accepts `msg`: it holds office, `msg` is for its
     /// shard, and it is addressed to this leadership by a worker that has seen
     /// no later term (the term guard; see [`Self::on_self_remove`]).
-    pub(in crate::election) fn accepts_removal(&self, msg: &Checked<SelfRemove>) -> bool {
+    fn accepts_removal(&self, msg: &Checked<SelfRemove>) -> bool {
         let to_this_leadership = msg.term_seen <= self.term && msg.leader_term == self.term;
         self.holds_office() && msg.shard_id() == self.shard_id && to_this_leadership
     }

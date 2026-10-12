@@ -174,13 +174,13 @@ where
 
     /// The configuration this node leads while it leads, and the one it
     /// follows otherwise.
-    pub(in crate::election) fn led_or_followed_configuration(&self) -> Option<&Configuration> {
+    pub(super) fn led_or_followed_configuration(&self) -> Option<&Configuration> {
         led_or_followed(&self.office, &self.standing)
     }
 
     /// The admission generations a quorum counts this node by: those of the
     /// roster it leads while it leads, and those it follows otherwise.
-    pub(in crate::election) fn counted_admission(&self) -> Admission {
+    pub(super) fn counted_admission(&self) -> Admission {
         match &self.office {
             Some(office) => Admission {
                 current: office.admission_of(&self.my_id),

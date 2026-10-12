@@ -17,7 +17,7 @@ where
     /// Whether this node's state takes part in elections: only `Active`,
     /// `LeaderSuspect`, `RollCall` and `NoQuorum` answer roll calls and
     /// grant votes, a pending member among them.
-    pub(in crate::election) fn takes_part_in_elections(&self) -> bool {
+    pub(super) fn takes_part_in_elections(&self) -> bool {
         matches!(
             self.state,
             WorkerState::Active
@@ -30,7 +30,7 @@ where
     /// Has this node's election round decide, through `decide`, with a view
     /// of this node as it is now, and carries out what it decided (see
     /// [`Self::apply`]).
-    pub(in crate::election) fn decide(&mut self, decide: impl FnOnce(&mut ElectionRound, &View<'_>) -> Vec<Verdict>) {
+    pub(super) fn decide(&mut self, decide: impl FnOnce(&mut ElectionRound, &View<'_>) -> Vec<Verdict>) {
         let admission = self.counted_admission();
         let takes_part = self.takes_part_in_elections();
         let leader_contact_is_fresh = self.current_leader_still_valid();
@@ -57,7 +57,7 @@ where
     /// Carries out, in order, what this node's election round decided:
     /// sends and publishes its messages, and moves this node's state, term
     /// and highest term seen as each verdict says.
-    pub(in crate::election) fn apply(&mut self, verdicts: Vec<Verdict>) {
+    fn apply(&mut self, verdicts: Vec<Verdict>) {
         use election_message::Payload;
         for verdict in verdicts {
             match verdict {
@@ -102,7 +102,7 @@ where
 
     /// Starts this node's roll call `call`: drops any recovery, moves to
     /// `RollCall` and publishes it.
-    pub(in crate::election) fn publish_roll_call(&mut self, call: RollCall) {
+    fn publish_roll_call(&mut self, call: RollCall) {
         self.drop_recovery();
         self.transition_to(WorkerState::RollCall);
         self.publish(election_message::Payload::RollCall(call));
@@ -110,7 +110,7 @@ where
 
     /// Grants `candidate` this vote, having raised the highest term seen to
     /// its term, which makes an initiator contesting an earlier term step down.
-    pub(in crate::election) fn grant_vote(&mut self, candidate: WorkerId, grant: VoteGrant) {
+    fn grant_vote(&mut self, candidate: WorkerId, grant: VoteGrant) {
         self.standing.saw_term(grant.term);
         self.step_down_if_outpaced();
         self.send(candidate, election_message::Payload::VoteGrant(grant));
@@ -120,7 +120,7 @@ where
     /// with `respondents`: it goes `NoQuorum` and, with an authority, takes
     /// the authority path from that census, which ends where the roll call's
     /// retry would have come.
-    pub(in crate::election) fn close_short(
+    fn close_short(
         &mut self,
         term: u64,
         configuration: Configuration,
@@ -137,7 +137,7 @@ where
 
     /// The round's roll call and vote stand in for the `RollCall` and
     /// `Candidate` states' checks (see `ElectionRound`), so they move together.
-    pub(in crate::election) fn debug_assert_round_matches_state(&self) {
+    fn debug_assert_round_matches_state(&self) {
         debug_assert_eq!(
             self.round.roll_call_term().is_some(),
             self.state == WorkerState::RollCall,
@@ -152,7 +152,7 @@ where
     /// The term this node holds or contests: its roll call's while
     /// `RollCall`, its candidacy's while `Candidate` and its leadership's
     /// while `Leader`. `None` in every other state.
-    pub(in crate::election) fn term_in_play(&self) -> Option<u64> {
+    pub(super) fn term_in_play(&self) -> Option<u64> {
         match self.state {
             WorkerState::RollCall => self.round.roll_call_term(),
             WorkerState::Candidate | WorkerState::LeaderReconciling | WorkerState::Leader => {
@@ -168,7 +168,7 @@ where
     /// returns the node to `Active` (see [`Self::on_leader_ack`]); anything
     /// else leaves it suspecting its leader again (see
     /// [`Self::suspect_again`]).
-    pub(in crate::election) fn step_down_if_outpaced(&mut self) {
+    pub(super) fn step_down_if_outpaced(&mut self) {
         if self
             .term_in_play()
             .is_some_and(|term| self.standing.highest_term_seen() > term)
@@ -182,19 +182,19 @@ where
     /// suspicion timeout, jittered for the latest term it knows of: the
     /// wait gives the election that outpaced it time to finish, and the
     /// jitter keeps rivals that failed together from retrying together.
-    pub(in crate::election) fn suspect_again(&mut self) {
+    pub(super) fn suspect_again(&mut self) {
         self.retry_after_a_fresh_suspicion_timeout();
         self.transition_to(WorkerState::LeaderSuspect);
     }
 
-    pub(in crate::election) fn lose_quorum(&mut self) {
+    pub(super) fn lose_quorum(&mut self) {
         self.retry_after_a_fresh_suspicion_timeout();
         self.transition_to(WorkerState::NoQuorum);
     }
 
     /// Gives up the roll call, candidacy or recovery this node runs, if any,
     /// and puts its next roll call a fresh suspicion timeout away.
-    pub(in crate::election) fn retry_after_a_fresh_suspicion_timeout(&mut self) {
+    fn retry_after_a_fresh_suspicion_timeout(&mut self) {
         let retry_at = self.clock.now() + self.jittered_suspect_timeout();
         self.round.retry_at(retry_at);
         self.drop_recovery();

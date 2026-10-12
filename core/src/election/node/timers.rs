@@ -29,7 +29,7 @@ where
     /// stalled join here, since the transition out of those states happens
     /// once via [`Input::JoinAnswer`], driven by something outside `core`
     /// that learns who leads the shard, not by a timer.
-    pub(in crate::election) fn tick(&mut self) {
+    pub(super) fn tick(&mut self) {
         match self.state {
             WorkerState::Active => {
                 if self.clock.now() - self.last_leader_contact > self.jittered_suspect_timeout() {
@@ -60,7 +60,7 @@ where
 
     /// Whether a `LeaderSuspect` or `NoQuorum` node starts a roll call on
     /// its next `Tick`: once [`Self::next_roll_call_due`] has come.
-    pub(in crate::election) fn can_start_roll_call(&self) -> bool {
+    fn can_start_roll_call(&self) -> bool {
         self.next_roll_call_due()
             .is_some_and(|due| self.clock.now() >= due)
     }
@@ -76,7 +76,7 @@ where
     /// stands only once its latest read of the authority's epoch confirms its
     /// own (see [`Self::may_stand`]). Its deadline is then its next read, so
     /// a `Tick` is never due that moves nothing.
-    pub(in crate::election) fn next_roll_call_due(&self) -> Option<Instant> {
+    pub(super) fn next_roll_call_due(&self) -> Option<Instant> {
         self.standing
             .configuration()
             .filter(|_| self.may_stand())
@@ -88,7 +88,7 @@ where
     /// confirms this node's own epoch, or found the authority holding none:
     /// a node at an epoch the authority does not hold must rejoin, not elect
     /// a leader there that would pull the others off the authority's epoch.
-    pub(in crate::election) fn may_stand(&self) -> bool {
+    fn may_stand(&self) -> bool {
         match (self.authority.as_ref(), self.standing.epoch()) {
             (Some(authority), Some(own)) => authority.permits_standing(own),
             _ => true,
@@ -103,7 +103,7 @@ where
     /// time once the term has moved on. Leader stickiness and a leader's
     /// lease keep the unjittered `suspect_timeout`, the shortest this can
     /// be.
-    pub(in crate::election) fn jittered_suspect_timeout(&self) -> Duration {
+    pub(super) fn jittered_suspect_timeout(&self) -> Duration {
         let share = self.hash_function.hash_to_u64(&[
             Field::Text(self.my_id.as_str()),
             Field::Number(self.latest_term()),
@@ -111,13 +111,13 @@ where
         lengthen_by_less_than_half(self.timings.suspect_timeout, share)
     }
 
-    pub(in crate::election) fn current_leader_still_valid(&self) -> bool {
+    pub(super) fn current_leader_still_valid(&self) -> bool {
         self.clock.now() - self.last_leader_contact <= self.timings.suspect_timeout
     }
 
     /// The latest term this node knows of: the highest it has seen, or that
     /// of the latest roll call it accepted, its own included, if later.
-    pub(in crate::election) fn latest_term(&self) -> u64 {
+    fn latest_term(&self) -> u64 {
         self.round.latest_term(self.standing.highest_term_seen())
     }
 }

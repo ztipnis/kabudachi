@@ -55,7 +55,7 @@ where
     /// `ElectionRound::follow_leader_of`): the live leader disproved the
     /// suspicion they rested on, and that includes a node still `Active` whose
     /// stale contact no tick had yet acted on.
-    pub(in crate::election) fn on_leader_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>) {
+    pub(super) fn on_leader_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>) {
         let Some(AckedEpoch { heard, later }) = self.acked_epoch(ack) else {
             return;
         };
@@ -108,7 +108,7 @@ where
 
     /// Whether this node is a member of `shard`: it has joined (it is neither
     /// `Bootstrapping` nor `Joining`) and `shard` is its own.
-    pub(in crate::election) fn is_joined_to(&self, shard: &ShardId) -> bool {
+    pub(super) fn is_joined_to(&self, shard: &ShardId) -> bool {
         !matches!(
             self.state,
             WorkerState::Bootstrapping | WorkerState::Joining
@@ -118,7 +118,7 @@ where
     /// Follows the leader whose `ack` this node accepted, the ack having
     /// changed its standing as `change` says; `outpaced` when the ack outran
     /// a term it held or contested.
-    pub(in crate::election) fn follow_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>, change: AckChange, outpaced: bool) {
+    fn follow_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>, change: AckChange, outpaced: bool) {
         let now = self.clock.now();
         self.last_leader_contact = now;
         self.round.end_no_quorum_streak();
@@ -143,7 +143,7 @@ where
     /// Records `ack`, accepted at `now`: its vouching token for the lease, its
     /// leader, the runs it says were cancelled and the echo the next heartbeat
     /// carries.
-    pub(in crate::election) fn record_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>, now: Instant) {
+    fn record_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>, now: Instant) {
         // A token from a later instant than this node's own clock reads was
         // never sent by this node, and proves nothing.
         self.lease.acked(
@@ -168,7 +168,7 @@ where
     }
 
     /// Whether this node seeks a leader: `LeaderSuspect`, `RollCall` or `NoQuorum`.
-    pub(in crate::election) fn seeks_a_leader(&self) -> bool {
+    fn seeks_a_leader(&self) -> bool {
         matches!(
             self.state,
             WorkerState::LeaderSuspect | WorkerState::RollCall | WorkerState::NoQuorum
@@ -183,7 +183,7 @@ where
     /// authority, until it leaves leadership. An ack of a later epoch of its
     /// own lineage ends it too, by taking the node out of office. A node with
     /// no authority has none.
-    pub(in crate::election) fn leads_its_office_epoch(&self, lineage: u64) -> bool {
+    fn leads_its_office_epoch(&self, lineage: u64) -> bool {
         self.holds_office()
             && self
                 .authority
@@ -196,7 +196,7 @@ where
     /// term it has seen, or, while it stands or leads, its own term if
     /// later. A candidate never follows an earlier term's leader while its
     /// candidacy can still win; once that lapses unwon, it can.
-    pub(in crate::election) fn ack_floor(&self) -> u64 {
+    pub(super) fn ack_floor(&self) -> u64 {
         // A leader's own term is already its term seen (see
         // `Self::take_office`); the arm only keeps that from resting on it.
         match self.state {
@@ -211,7 +211,7 @@ where
     /// interval has passed since the last one. A leader this node was not
     /// already heartbeating hears from it at once, so a leader it has just
     /// learned of does not wait a whole interval for its first heartbeat.
-    pub(in crate::election) fn heartbeat_leader_if_due(&mut self) {
+    pub(super) fn heartbeat_leader_if_due(&mut self) {
         let Some(leader) = self.leader_to_heartbeat() else {
             self.next_heartbeat = None;
             return;
@@ -234,7 +234,7 @@ where
     }
 
     /// The heartbeat this node sends its leader at `now`.
-    pub(in crate::election) fn heartbeat(&self, now: Instant) -> WorkerHeartbeat {
+    fn heartbeat(&self, now: Instant) -> WorkerHeartbeat {
         WorkerHeartbeat {
             worker_id: Some(self.my_id.clone().into()),
             incarnation_id: Some(self.incarnation_id.clone().into()),
@@ -260,7 +260,7 @@ where
     /// The leader this node heartbeats: the one it records, while it is
     /// `Active`, `LeaderSuspect`, `RollCall` or `NoQuorum`, unless that is
     /// itself.
-    pub(in crate::election) fn leader_to_heartbeat(&self) -> Option<WorkerId> {
+    fn leader_to_heartbeat(&self) -> Option<WorkerId> {
         if !matches!(
             self.state,
             WorkerState::Active

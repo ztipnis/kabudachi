@@ -17,7 +17,7 @@ where
     C: Clock,
 {
     /// Whether it holds office: reconciling or leading.
-    pub(in crate::election) fn holds_office(&self) -> bool {
+    pub(super) fn holds_office(&self) -> bool {
         matches!(
             self.state,
             WorkerState::LeaderReconciling | WorkerState::Leader
@@ -189,7 +189,7 @@ where
     /// What the lease reads of this node while it leads: `None` unless it
     /// is `Leader`, and, with an authority, holds the recovery fence (design
     /// 4.5), whose end also ends its grant.
-    pub(in crate::election) fn office(&self) -> Option<Office<'_>> {
+    pub(super) fn office(&self) -> Option<Office<'_>> {
         if !self.holds_office() {
             return None;
         }

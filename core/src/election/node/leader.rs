@@ -13,7 +13,7 @@ use super::super::leader_office::{AckContent, Duties, Heard, LeaderOffice, Membe
 use super::super::{Output, WorkerNode};
 
 /// What `heartbeat` says of its sender beyond its liveness.
-pub(in crate::election) fn member_report(heartbeat: &Checked<WorkerHeartbeat>) -> MemberReport {
+fn member_report(heartbeat: &Checked<WorkerHeartbeat>) -> MemberReport {
     MemberReport {
         routing_crawled: heartbeat.routing_crawled,
         admission: heartbeat.admission_generation(),
@@ -52,7 +52,7 @@ where
     /// and help commit its configuration; safety rests on the exact-
     /// generation rule, not on that worker's vote. The term fence above only
     /// keeps echoes of other leaderships' acks from counting here.
-    pub(in crate::election) fn on_heartbeat(&mut self, from: WorkerId, heartbeat: &Checked<WorkerHeartbeat>) {
+    pub(super) fn on_heartbeat(&mut self, from: WorkerId, heartbeat: &Checked<WorkerHeartbeat>) {
         let Some(same_epoch) = self.heartbeat_epoch(heartbeat) else {
             return;
         };
@@ -89,7 +89,7 @@ where
     /// Whether this node, in office, takes `heartbeat`: one from its own
     /// shard, at its own recovery epoch or an earlier one. `Some(true)` at its
     /// own epoch.
-    pub(in crate::election) fn heartbeat_epoch(&self, heartbeat: &Checked<WorkerHeartbeat>) -> Option<bool> {
+    fn heartbeat_epoch(&self, heartbeat: &Checked<WorkerHeartbeat>) -> Option<bool> {
         let seen =
             RecoveryEpoch::new(heartbeat.recovery_epoch_seen, heartbeat.recovery_epoch_lineage);
         let epoch = self.standing.order(seen);
@@ -106,7 +106,7 @@ where
     /// of one of its acks of its own term, sent no later than now, which it
     /// records with its lease, when `same_epoch`; that its sender is alive
     /// otherwise.
-    pub(in crate::election) fn take_confirmation(
+    fn take_confirmation(
         &mut self,
         from: &WorkerId,
         heartbeat: &Checked<WorkerHeartbeat>,
@@ -130,7 +130,7 @@ where
 
     /// Reports the runs `from` holds and acks its heartbeat, vouching for it
     /// while this leader holds a grant.
-    pub(in crate::election) fn answer_heartbeat(
+    fn answer_heartbeat(
         &mut self,
         from: WorkerId,
         heartbeat: &Checked<WorkerHeartbeat>,
@@ -159,7 +159,7 @@ where
     /// pending take effect first (see [`LeaderOffice::ack_for`]); a
     /// caller that vouches with `heartbeat_token` applies them before it
     /// decides whether it still holds a grant.
-    pub(in crate::election) fn send_ack(&mut self, to: WorkerId, heartbeat_token: Option<u64>) {
+    pub(super) fn send_ack(&mut self, to: WorkerId, heartbeat_token: Option<u64>) {
         let Some(office) = self.office.as_mut() else {
             return;
         };
@@ -168,7 +168,7 @@ where
     }
 
     /// Sends `to` an ack carrying `content` from this leader.
-    pub(in crate::election) fn send_ack_with(&mut self, to: WorkerId, content: AckContent, heartbeat_token: Option<u64>) {
+    pub(super) fn send_ack_with(&mut self, to: WorkerId, content: AckContent, heartbeat_token: Option<u64>) {
         let cancelled_runs = self
             .cancelled_runs
             .next_batch_for(&to)
@@ -202,7 +202,7 @@ where
     /// under the founded joint configuration, until the commit). A worker
     /// this misses hears from the leader once a
     /// connection to it opens (see [`Self::on_peer_connected`]).
-    pub(in crate::election) fn announce_leadership(&mut self) {
+    fn announce_leadership(&mut self) {
         let Some(office) = self.office.as_mut() else {
             return;
         };
@@ -222,7 +222,7 @@ where
     /// stops it first. With an authority it needs a fence to act; one it
     /// already holds is kept. Every election duty runs from here; only the
     /// scheduler's grant waits for [`Input::Reconciled`].
-    pub(in crate::election) fn take_office(&mut self, roster: Roster) {
+    pub(super) fn take_office(&mut self, roster: Roster) {
         let now = self.clock.now();
         // A leader never acks itself, so nothing else raises its own
         // `highest_term_seen` to the term it won.
@@ -256,7 +256,7 @@ where
     }
 
     /// Its scheduler reconciled for `office`: the node leads.
-    pub(in crate::election) fn on_reconciled(&mut self, office: ReconcileTerm) {
+    pub(super) fn on_reconciled(&mut self, office: ReconcileTerm) {
         if self.state == WorkerState::LeaderReconciling && self.office_term() == Some(office) {
             self.transition_to(WorkerState::Leader);
         }

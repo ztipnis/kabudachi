@@ -10,7 +10,7 @@ where
 {
     /// Asks the authority for what this node's standing has come due for
     /// (see [`AuthorityStanding::calls_due`]).
-    pub(in crate::election) fn ask_authority_if_due(&mut self) {
+    pub(super) fn ask_authority_if_due(&mut self) {
         let now = self.clock.now();
         let Some(authority) = self.authority.as_mut() else {
             return;
@@ -27,7 +27,7 @@ where
     }
 
     /// Handles what the authority answered to a call this node asked for.
-    pub(in crate::election) fn on_authority_reply(&mut self, reply: AuthorityReply) {
+    pub(super) fn on_authority_reply(&mut self, reply: AuthorityReply) {
         let now = self.clock.now();
         let Some(authority) = self.authority.as_mut() else {
             return;
@@ -44,7 +44,7 @@ where
     }
 
     /// Carries out, in order, what this node's authority standing decided.
-    pub(in crate::election) fn apply_authority(&mut self, verdicts: Vec<AuthorityVerdict>) {
+    fn apply_authority(&mut self, verdicts: Vec<AuthorityVerdict>) {
         for verdict in verdicts {
             match verdict {
                 AuthorityVerdict::Ask(call) => self.outputs.push(Output::Authority(call)),
@@ -77,7 +77,7 @@ where
     }
 
     /// Gives up the authority path this node runs, if any.
-    pub(in crate::election) fn drop_recovery(&mut self) {
+    pub(super) fn drop_recovery(&mut self) {
         if let Some(authority) = self.authority.as_mut() {
             authority.drop_recovery();
         }
@@ -89,7 +89,7 @@ where
     /// holds, and asks its executor to abort its TaskRuns within the
     /// reconnect timeout, less drift. It keeps its configuration and
     /// admission generation. Returns whether it did.
-    pub(in crate::election) fn orphan_if_unregistered(&mut self) -> bool {
+    pub(super) fn orphan_if_unregistered(&mut self) -> bool {
         let now = self.clock.now();
         let lapsed = self
             .authority
