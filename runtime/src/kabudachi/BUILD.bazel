@@ -6,6 +6,7 @@ py_library(
     # rule names in srcs, so with a glob no `kabudachi.*` import resolves.
     srcs = [
         "__init__.py",
+        "_checks.py",
         "_child.py",
         "body.py",
         "composites.py",

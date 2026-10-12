@@ -5,7 +5,6 @@ the environment), then the task's own explicit setting. A task setting of
 `None` is a choice like any other; only `UNSET` means the task chose nothing.
 """
 
-import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -13,6 +12,14 @@ from datetime import timedelta
 from typing import Any, get_type_hints
 from urllib.parse import parse_qs, urlsplit
 
+from kabudachi._checks import (
+    is_count,
+    is_non_negative_timedelta,
+    is_nonblank_string,
+    is_positive_seconds,
+    is_positive_timedelta,
+    name_list,
+)
 from kabudachi.errors import ConfigurationError
 
 
@@ -73,7 +80,8 @@ class Settings:
     """Every process-wide setting.
 
     To add one, add a field with its default, and refuse invalid values in
-    `__post_init__`. `KABUDACHI_<NAME>` in the environment can set it; a field
+    the `_check_*` validator for its concern (or a new one, called from
+    `__post_init__`). `KABUDACHI_<NAME>` in the environment can set it; a field
     of type `int` is read from the environment as a number, one of type
     `timedelta` as a number of seconds, a `bool` as true/false, yes/no, on/off
     or 1/0, `seeds` and `imports` as a comma-separated list, an `int | None`
@@ -176,19 +184,19 @@ class Settings:
     `queue=seconds` pairs separated by commas."""
 
     def __post_init__(self) -> None:
-        # `True` is an int to Python, but never what someone meant by a count.
-        if (
-            not isinstance(self.concurrency, int)
-            or isinstance(self.concurrency, bool)
-            or self.concurrency <= 0
-        ):
-            raise ValueError(f"concurrency must be a positive integer, not {self.concurrency!r}")
-        if (
-            not isinstance(self.processes, int)
-            or isinstance(self.processes, bool)
-            or self.processes < 0
-        ):
-            raise ValueError(f"processes must be a non-negative integer, not {self.processes!r}")
+        # In this order, so a value with several bad settings names the same
+        # one first as it always has.
+        self._check_task_processes()
+        self._check_network()
+        self._check_shard_timings()
+        self._check_run_limits()
+        self._check_memory()
+        self._check_stopping()
+        self._check_queues()
+
+    def _check_task_processes(self) -> None:
+        _require_count("concurrency", self.concurrency, minimum=1, what="a positive integer")
+        _require_count("processes", self.processes, minimum=0, what="a non-negative integer")
         if self.listen is not None and self.processes == 0:
             raise ValueError(
                 "a networked worker (listen set) needs processes of at least 1: it must be "
@@ -203,92 +211,64 @@ class Settings:
                 f"concurrency {self.concurrency} is above {MAX_CONCURRENCY}, which needs "
                 "concurrency_override=True: each place may hold a thread"
             )
-        if (
-            not isinstance(self.process_start_timeout, timedelta)
-            or self.process_start_timeout <= timedelta(0)
-        ):
-            raise ValueError(
-                "process_start_timeout must be a positive timedelta, "
-                f"not {self.process_start_timeout!r}"
-            )
+        _require_positive_timedelta("process_start_timeout", self.process_start_timeout)
         if self.imports is not None:
             complaint = f"imports must be a list of module names, not {self.imports!r}"
-            if isinstance(self.imports, str):
-                raise ValueError(complaint)
-            try:
-                # Once: a generator would be used up by checking it.
-                modules = tuple(self.imports)
-            except TypeError:
-                raise ValueError(complaint) from None
-            if not all(isinstance(module, str) and module.strip() for module in modules):
-                raise ValueError(complaint)
             # Frozen: a list given by the caller is kept as a tuple.
-            object.__setattr__(self, "imports", modules)
+            object.__setattr__(self, "imports", _name_tuple(self.imports, complaint))
+
+    def _check_network(self) -> None:
         complaint = f"seeds must be a list of addresses, not {self.seeds!r}"
-        if isinstance(self.seeds, str):
-            raise ValueError(complaint)
-        try:
-            seeds = tuple(self.seeds)
-        except TypeError:
-            raise ValueError(complaint) from None
-        if not all(isinstance(seed, str) and seed.strip() for seed in seeds):
-            raise ValueError(complaint)
-        object.__setattr__(self, "seeds", seeds)
+        object.__setattr__(self, "seeds", _name_tuple(self.seeds, complaint))
         for name in ("listen", "external_address"):
             value = getattr(self, name)
-            if value is not None and (not isinstance(value, str) or not value.strip()):
+            if value is not None and not is_nonblank_string(value):
                 raise ValueError(f"{name} must be an address, not {value!r}")
-        if not isinstance(self.shard, str) or not self.shard.strip() or "/" in self.shard:
+        if not is_nonblank_string(self.shard) or "/" in self.shard:
             raise ValueError(f"shard must be a name without '/', not {self.shard!r}")
         if self.authority is not None:
             authority_parts(self.authority)
+
+    def _check_shard_timings(self) -> None:
         for name in ("heartbeat_interval", "heartbeat_timeout", "reconnect_timeout"):
-            value = getattr(self, name)
-            if not isinstance(value, timedelta) or value <= timedelta(0):
-                raise ValueError(f"{name} must be a positive timedelta, not {value!r}")
+            _require_positive_timedelta(name, getattr(self, name))
         if self.heartbeat_interval * 3 > self.heartbeat_timeout:
             raise ValueError(
                 f"heartbeat_timeout ({self.heartbeat_timeout}) must be at least three "
                 f"heartbeat_interval ({self.heartbeat_interval}): a leader whose followers are "
                 "all alive would otherwise run out of lease"
             )
-        if self.max_runs_per_process is not None and (
-            not isinstance(self.max_runs_per_process, int)
-            or isinstance(self.max_runs_per_process, bool)
-            or self.max_runs_per_process <= 0
-        ):
-            raise ValueError(
-                "max_runs_per_process must be a positive integer or None, "
-                f"not {self.max_runs_per_process!r}"
+
+    def _check_run_limits(self) -> None:
+        if self.max_runs_per_process is not None:
+            _require_count(
+                "max_runs_per_process",
+                self.max_runs_per_process,
+                minimum=1,
+                what="a positive integer or None",
             )
-        if (
-            not isinstance(self.result_ttl, int)
-            or isinstance(self.result_ttl, bool)
-            or self.result_ttl <= 0
-        ):
-            raise ValueError(
-                f"result_ttl must be a positive number of seconds, not {self.result_ttl!r}"
-            )
+        _require_count("result_ttl", self.result_ttl, minimum=1, what="a positive number of seconds")
+
+    def _check_memory(self) -> None:
         for name in ("memory_soft_limit", "memory_hard_limit"):
-            limit = getattr(self, name)
-            if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-                raise ValueError(f"{name} must be a positive number of bytes, not {limit!r}")
+            _require_count(name, getattr(self, name), minimum=1, what="a positive number of bytes")
         if self.memory_soft_limit > self.memory_hard_limit:
             raise ValueError(
                 f"memory_soft_limit ({self.memory_soft_limit}) must not be above "
                 f"memory_hard_limit ({self.memory_hard_limit})"
             )
-        if (
-            not isinstance(self.cancel_grace, timedelta)
-            or self.cancel_grace < timedelta(0)
-        ):
+
+    def _check_stopping(self) -> None:
+        if not is_non_negative_timedelta(self.cancel_grace):
             raise ValueError(
                 f"cancel_grace must be a non-negative timedelta, not {self.cancel_grace!r}"
             )
-        if not isinstance(self.queue, str) or not self.queue.strip():
+
+    def _check_queues(self) -> None:
+        if not is_nonblank_string(self.queue):
             raise ValueError(f"queue must be a non-empty string, not {self.queue!r}")
         if not isinstance(self.reconnect_timeouts, Mapping) or not all(
-            isinstance(queue, str) and queue.strip() and _positive_seconds(seconds)
+            is_nonblank_string(queue) and is_positive_seconds(seconds)
             for queue, seconds in self.reconnect_timeouts.items()
         ):
             raise ValueError(
@@ -359,7 +339,7 @@ def authority_parts(url: str) -> tuple[str, str, int, float | None]:
             ttl = float(raw)
         except ValueError:
             ttl = None
-        if ttl is None or not _positive_seconds(ttl):
+        if ttl is None or not is_positive_seconds(ttl):
             raise ValueError(
                 f"the authority's ttl must be a positive number of seconds, not {raw!r}"
             )
@@ -373,13 +353,21 @@ def authority_parts(url: str) -> tuple[str, str, int, float | None]:
     return f"{parts.scheme}://{parts.netloc}/", prefix, int(path or 0), ttl
 
 
-def _positive_seconds(value: Any) -> bool:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return False
-    try:
-        return math.isfinite(value) and 0 < value <= timedelta.max.total_seconds()
-    except OverflowError:
-        return False
+def _require_count(name: str, value: Any, *, minimum: int, what: str) -> None:
+    if not is_count(value) or value < minimum:
+        raise ValueError(f"{name} must be {what}, not {value!r}")
+
+
+def _require_positive_timedelta(name: str, value: Any) -> None:
+    if not is_positive_timedelta(value):
+        raise ValueError(f"{name} must be a positive timedelta, not {value!r}")
+
+
+def _name_tuple(value: Any, complaint: str) -> tuple[str, ...]:
+    names = name_list(value)
+    if names is None:
+        raise ValueError(complaint)
+    return names
 
 
 def _queue_seconds(raw: str) -> dict[str, float]:
