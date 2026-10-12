@@ -352,44 +352,30 @@ impl ElectionRound {
             CallRank::of(call),
         );
         match verdict {
-            RollCallVerdict::Answer => {
-                self.hold
-                    .answered_at(now, view.roll_call_deadline, view.suspect_timeout);
-                if let Some(own) = self.roll_call.as_mut()
-                    && own.term() == call.term
-                {
-                    own.abandon();
-                }
-                let reply = RollCallReply {
-                    shard_id: Some(view.shard.clone().into()),
-                    term: call.term,
-                    initiator_id: Some(initiator.clone().into()),
-                    responder_id: Some(view.me.clone().into()),
-                    responder_address: String::new(),
-                    admission: view.admission.current.map(Into::into),
-                    prior_admission: view.admission.prior.map(Into::into),
-                    configuration_generation: view
-                        .configuration
-                        .map(|configuration| configuration.generation().into()),
-                };
-                vec![Verdict::Answer { initiator, reply }]
-            }
-            RollCallVerdict::Reject(reason) => {
-                // A caller left on an earlier recovery epoch learns who leads
-                // the current one, whose ack then moves it on.
-                let name_leader = reason == ElectionRejectReason::LeaderStillValid
-                    || view.recovery_epoch.map(|own| {
-                        order(own, call.configuration().generation().recovery_epoch())
-                    }) == Some(EpochOrder::Stale);
-                vec![Verdict::Reject {
-                    to: initiator,
-                    term: call.term,
-                    reason,
-                    name_leader,
-                }]
-            }
+            RollCallVerdict::Answer => self.answer_roll_call(view, initiator, call, now),
+            RollCallVerdict::Reject(reason) => vec![refusal_of(view, initiator, call, reason)],
             RollCallVerdict::Pass | RollCallVerdict::Drop => Vec::new(),
         }
+    }
+
+    /// Answers `initiator`'s roll call: the answer holds this node's own roll
+    /// calls back, and an own call for the same term is abandoned to it.
+    fn answer_roll_call(
+        &mut self,
+        view: &View,
+        initiator: WorkerId,
+        call: &Checked<RollCall>,
+        now: Instant,
+    ) -> Vec<Verdict> {
+        self.hold
+            .answered_at(now, view.roll_call_deadline, view.suspect_timeout);
+        if let Some(own) = self.roll_call.as_mut()
+            && own.term() == call.term
+        {
+            own.abandon();
+        }
+        let reply = reply_to(view, &initiator, call.term);
+        vec![Verdict::Answer { initiator, reply }]
     }
 
     /// Records a reply to this node's roll call from `responder`. Ignored
@@ -488,14 +474,7 @@ impl ElectionRound {
         );
         match verdict {
             VoteVerdict::Grant => {
-                let grant = VoteGrant {
-                    shard_id: Some(view.shard.clone().into()),
-                    recovery_epoch: view.epoch_number(),
-                    recovery_epoch_lineage: view.epoch().lineage,
-                    term: req.term,
-                    candidate_id: Some(candidate.clone().into()),
-                    voter_id: Some(view.me.clone().into()),
-                };
+                let grant = grant_to(view, &candidate, req.term);
                 vec![Verdict::Grant { candidate, grant }]
             }
             VoteVerdict::Reject(reason) => vec![Verdict::Reject {
@@ -520,16 +499,7 @@ impl ElectionRound {
         let Some(vote) = self.vote.as_mut() else {
             return Vec::new();
         };
-        if grant.term != vote.term()
-            || grant.shard_id() != *view.shard
-            || view.recovery_epoch.map(|own| {
-                order(
-                    own,
-                    RecoveryEpoch::new(grant.recovery_epoch, grant.recovery_epoch_lineage),
-                )
-            }) != Some(EpochOrder::Mine)
-            || grant.candidate_id() != *view.me
-        {
+        if !is_grant_for(view, vote.term(), grant) {
             return Vec::new();
         }
         vote.record_grant(voter);
@@ -642,18 +612,7 @@ impl ElectionRound {
             .filter(|respondent| *respondent != view.me)
             .map(|respondent| Verdict::Certify {
                 respondent: respondent.clone(),
-                certificate: ElectionCertificate {
-                    shard_id: Some(view.shard.clone().into()),
-                    recovery_epoch: view.epoch_number(),
-                    recovery_epoch_lineage: view.epoch().lineage,
-                    term: vote.term(),
-                    leader_id: Some(view.me.clone().into()),
-                    configuration: Some(roster.configuration().into()),
-                    recipient_admission: roster.admission_of(respondent).map(Into::into),
-                    recipient_prior_admission: roster
-                        .prior_admission_of(respondent)
-                        .map(Into::into),
-                },
+                certificate: certificate_for(view, vote.term(), &roster, respondent),
             })
             .collect();
         self.end_no_quorum_streak();
@@ -670,5 +629,82 @@ fn answered_admission(reply: &Checked<RollCallReply>) -> Admission {
     Admission {
         current: reply.admission(),
         prior: reply.prior_admission(),
+    }
+}
+
+/// What this node answers `initiator`'s roll call for `term` with.
+fn reply_to(view: &View, initiator: &WorkerId, term: u64) -> RollCallReply {
+    RollCallReply {
+        shard_id: Some(view.shard.clone().into()),
+        term,
+        initiator_id: Some(initiator.clone().into()),
+        responder_id: Some(view.me.clone().into()),
+        responder_address: String::new(),
+        admission: view.admission.current.map(Into::into),
+        prior_admission: view.admission.prior.map(Into::into),
+        configuration_generation: view
+            .configuration
+            .map(|configuration| configuration.generation().into()),
+    }
+}
+
+/// This node's refusal of `initiator`'s roll call, for `reason`.
+fn refusal_of(
+    view: &View,
+    initiator: WorkerId,
+    call: &Checked<RollCall>,
+    reason: ElectionRejectReason,
+) -> Verdict {
+    // A caller left on an earlier recovery epoch learns who leads
+    // the current one, whose ack then moves it on.
+    let name_leader = reason == ElectionRejectReason::LeaderStillValid
+        || view.recovery_epoch.map(|own| {
+            order(own, call.configuration().generation().recovery_epoch())
+        }) == Some(EpochOrder::Stale);
+    Verdict::Reject {
+        to: initiator,
+        term: call.term,
+        reason,
+        name_leader,
+    }
+}
+
+/// The vote this node grants `candidate` for `term`.
+fn grant_to(view: &View, candidate: &WorkerId, term: u64) -> VoteGrant {
+    VoteGrant {
+        shard_id: Some(view.shard.clone().into()),
+        recovery_epoch: view.epoch_number(),
+        recovery_epoch_lineage: view.epoch().lineage,
+        term,
+        candidate_id: Some(candidate.clone().into()),
+        voter_id: Some(view.me.clone().into()),
+    }
+}
+
+/// Whether `grant` is a vote for this node's candidacy for `term`: for that
+/// term, this node's shard and recovery epoch, and addressed to this node.
+fn is_grant_for(view: &View, term: u64, grant: &Checked<VoteGrant>) -> bool {
+    let epoch = RecoveryEpoch::new(grant.recovery_epoch, grant.recovery_epoch_lineage);
+    let own_epoch = view.recovery_epoch.map(|own| order(own, epoch)) == Some(EpochOrder::Mine);
+    let addressed = grant.shard_id() == *view.shard && grant.candidate_id() == *view.me;
+    grant.term == term && own_epoch && addressed
+}
+
+/// The certificate of what this node's win in `term` founded, for `respondent`.
+fn certificate_for(
+    view: &View,
+    term: u64,
+    roster: &Roster,
+    respondent: &WorkerId,
+) -> ElectionCertificate {
+    ElectionCertificate {
+        shard_id: Some(view.shard.clone().into()),
+        recovery_epoch: view.epoch_number(),
+        recovery_epoch_lineage: view.epoch().lineage,
+        term,
+        leader_id: Some(view.me.clone().into()),
+        configuration: Some(roster.configuration().into()),
+        recipient_admission: roster.admission_of(respondent).map(Into::into),
+        recipient_prior_admission: roster.prior_admission_of(respondent).map(Into::into),
     }
 }
