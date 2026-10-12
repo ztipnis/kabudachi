@@ -40,6 +40,7 @@ pub(crate) fn submit_task(submitted: &Submitted) -> SubmitTask {
         non_retriable: submission.non_retriable,
         reconnect_timeout_ms: submission.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
         client: submission.client.clone().map(Into::into),
+        input_manifest: None,
     }
 }
 

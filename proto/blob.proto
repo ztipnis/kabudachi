@@ -1,0 +1,54 @@
+syntax = "proto3";
+package kabudachi;
+
+import "digest.proto";
+import "ids.proto";
+
+// A failed member's outcome where a list of outcomes stands in for values:
+// the error's type name and its message.
+message Failure {
+  string kind = 1;
+  string message = 2;
+}
+
+// One page of a composite's member outcomes, stored as its own record.
+message PageRef {
+  CompositeId composite_id = 1;
+  uint32 page = 2;
+}
+
+message ManifestEntry {
+  oneof entry {
+    // A blob, named by the BLAKE3 digest of its bytes.
+    Digest blob = 1;
+    Failure failure = 2;
+    // Bytes small enough to travel in the manifest itself.
+    bytes inline = 3;
+    PageRef page = 4;
+  }
+}
+
+// An ordered list that stands in for a payload too large for one message,
+// or for a list of outcomes. A payload's bytes are its entries' bytes in
+// order.
+message Manifest {
+  repeated ManifestEntry entries = 1;
+  // How many bytes the entries' payloads add up to: what a payload weighs
+  // without fetching it. Zero for a manifest that is not one payload.
+  uint64 total_bytes = 2;
+}
+
+// A blob as a holder stores it, under the key `blob/<hex of its BLAKE3
+// digest>` in the shard's records store, which refuses a value stored under
+// any other key. It is also the answer to a `/kabudachi/blob/1` request
+// (whose request is the blob's Digest): empty, with no owner, from a peer
+// that holds no such blob. The owner bounds how long it is kept; the
+// placement is where its writer stored it.
+message BlobRecord {
+  bytes value = 1;
+  oneof owner {
+    TaskId task = 2;
+    CompositeId composite = 3;
+  }
+  repeated WorkerId placement = 4;
+}

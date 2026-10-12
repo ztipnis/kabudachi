@@ -1,8 +1,8 @@
 syntax = "proto3";
 package kabudachi;
 
+import "digest.proto";
 import "ids.proto";
-import "task.proto";
 import "claim.proto";
 import "task_record.proto";
 import "election.proto";

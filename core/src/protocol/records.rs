@@ -92,6 +92,7 @@ pub fn new_task(new: NewTask) -> Task {
         compacts: None,
         reconnect_timeout_ms: new.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
         client: new.client.map(Into::into),
+        input_manifest: None,
     }
 }
 
