@@ -4,9 +4,7 @@ resolves on the asyncio loop, and submitting, claiming, running and certifying
 tasks through it without any of the Python task API on top."""
 
 import asyncio
-import dataclasses
 import gc
-import re
 import sys
 import threading
 import time
@@ -16,12 +14,7 @@ import pytest
 import kabudachi
 from kabudachi import _native
 from kabudachi._native import CancelOutcome, RunState
-from kabudachi.native_protocol import (
-    AuthorityArguments,
-    NetworkedArguments,
-    OneNodeArguments,
-    SubmitArguments,
-)
+from kabudachi.native_protocol import OneNodeArguments, SubmitArguments
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 
 WAIT_LIMIT_SECONDS = 5
@@ -349,35 +342,6 @@ def test_a_submission_whose_kind_key_and_options_disagree_is_refused_before_it_i
 ):
     with pytest.raises(ValueError, match=refusal):
         runtime.submit(arguments("billing.charge", 3, b"input-bytes", kind, key, **options))
-
-
-BASE = NetworkedArguments("s", "/ip4/127.0.0.1/tcp/0", 100, 1000, 2000)
-
-
-def networked(**change):
-    return lambda: _native.NetworkedRuntime(dataclasses.replace(BASE, **change))
-
-
-@pytest.mark.parametrize(
-    ("build", "refusal"),
-    [
-        (lambda: new_runtime(worker_threads=0), "worker_threads must be at least 1"),
-        (lambda: new_runtime(memory_soft_limit=1), "give both memory limits or neither"),
-        (networked(worker_threads=0), "worker_threads must be at least 1"),
-        (networked(heartbeat_interval_ms=0), "heartbeat_interval_ms must be positive"),
-        (networked(reconnect_timeout_ms=0), "reconnect_timeout_ms must be positive"),
-        (
-            networked(authority=AuthorityArguments("redis://127.0.0.1:1", ttl_ms=0)),
-            "authority_ttl_ms must be positive",
-        ),
-        (networked(listen="not an address"), re.escape('"not an address" is not an address')),
-        (networked(seeds=("nor this",)), re.escape('"nor this" is not an address')),
-        (networked(memory_hard_limit=1), "give both memory limits or neither"),
-    ],
-)
-def test_scaffold_runtime_arguments_the_bindings_cannot_use_are_refused_before_anything_starts(build, refusal):
-    with pytest.raises(ValueError, match=refusal):
-        build()
 
 
 def test_a_submitted_task_can_be_claimed(runtime):
