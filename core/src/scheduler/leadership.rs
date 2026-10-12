@@ -72,7 +72,7 @@ impl Leadership {
     /// Whether it leads by `clock`: it holds a grant whose lease has not
     /// ended and that is not older than the epoch and term it already
     /// published in. The clock is read only for a bounded lease.
-    pub(super) fn leads(&self, clock: &impl Clock) -> bool {
+    fn leads(&self, clock: &impl Clock) -> bool {
         let Some(grant) = self.grant else {
             return false;
         };
@@ -84,7 +84,7 @@ impl Leadership {
     }
 
     /// Like [`Self::leads`], and remembers the answer as the one last noticed.
-    pub(super) fn check(&mut self, clock: &impl Clock) -> bool {
+    fn check(&mut self, clock: &impl Clock) -> bool {
         let leading = self.leads(clock);
         self.noticed_leading = leading;
         leading
@@ -92,7 +92,7 @@ impl Leadership {
 
     /// The instant the held grant's lease ends, or `None` for no grant or an
     /// unbounded lease. It is still the lease's end after that instant.
-    pub(super) fn lease_end(&self) -> Option<Instant> {
+    fn lease_end(&self) -> Option<Instant> {
         match self.grant?.valid_until {
             LeaseEnd::Unbounded => None,
             LeaseEnd::At(end) => Some(end),
