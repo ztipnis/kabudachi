@@ -128,16 +128,17 @@
 
 mod authority;
 mod authority_standing;
+mod cancelled_runs;
 mod carry_out;
 mod drain;
 mod election_round;
 mod entry;
 mod leader_office;
 mod lease;
+mod self_report;
 mod standing;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
+use std::collections::BTreeSet;
 
 pub use authority::{
     AuthorityCall, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind, Issuer,
@@ -164,48 +165,15 @@ use crate::scheduler::{LeadershipGrant, LeaseEnd, Observer, Scheduler};
 use crate::time::{Clock, Duration, Instant};
 
 use authority_standing::{AuthorityStanding, AuthorityVerdict, AuthorityView};
+use cancelled_runs::CancelledRunsLedger;
 use drain::{Asked, DrainRequest};
 use election_round::{ElectionRound, Verdict, View};
 use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice, MemberReport};
 use lease::{Lease, LeaseChange, Office};
+use self_report::SelfReport;
 pub use standing::JoinFloor;
 use standing::ShardStanding;
 pub(crate) use standing::EpochOrder;
-
-/// The most cancelled runs one ack lists; the rest follow in later acks.
-const MAX_CANCELLED_RUNS_PER_ACK: usize = 64;
-
-/// The runs a leader cancelled on one worker, and how far its acks have
-/// listed them: each ack lists the next batch after the last run listed,
-/// wrapping round, so every run goes out within a few acks however many there
-/// are.
-#[derive(Default)]
-struct CancelledRuns {
-    runs: BTreeSet<TaskRunId>,
-    last_listed: Option<TaskRunId>,
-}
-
-impl CancelledRuns {
-    /// The next batch for an ack, advancing the cursor past it.
-    fn next_batch(&mut self) -> Vec<TaskRunId> {
-        let after = match &self.last_listed {
-            Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
-            None => (Bound::Unbounded, Bound::Unbounded),
-        };
-        let wrapped = self.last_listed.iter().flat_map(|last| self.runs.range(..=last));
-        let batch: Vec<TaskRunId> = self
-            .runs
-            .range(after)
-            .chain(wrapped)
-            .take(MAX_CANCELLED_RUNS_PER_ACK)
-            .cloned()
-            .collect();
-        if let Some(last) = batch.last() {
-            self.last_listed = Some(last.clone());
-        }
-        batch
-    }
-}
 
 pub struct WorkerNode<C>
 where
@@ -260,14 +228,11 @@ where
     /// The admission generation this node held when its last routing crawl
     /// completed.
     crawled_at_admission: Option<Generation>,
-    /// What this node's heartbeats say of the runs it holds (see
-    /// [`Self::set_active_runs_digest`]); empty until set.
-    active_runs_digest: Vec<u8>,
-    /// Whether this worker runs compaction, which its heartbeats say.
-    runs_compaction: bool,
+    /// What this worker's heartbeats say of it.
+    report: SelfReport,
     /// While it holds office: per worker, the runs that worker holds which
     /// this leader cancelled and stored, to list in its acks to it.
-    cancelled_runs: BTreeMap<WorkerId, CancelledRuns>,
+    cancelled_runs: CancelledRunsLedger,
     /// What a node bootstrapping again holds while it checks a JOIN pointer
     /// against the authority.
     rejoin: RejoinCheck,
@@ -974,9 +939,8 @@ where
             lease: Lease::new(now),
             drain_request: DrainRequest::default(),
             crawled_at_admission: None,
-            active_runs_digest: Vec::new(),
-            runs_compaction: false,
-            cancelled_runs: BTreeMap::new(),
+            report: SelfReport::default(),
+            cancelled_runs: CancelledRunsLedger::default(),
             rejoin: RejoinCheck::default(),
             outputs: Vec::new(),
         }
@@ -1241,13 +1205,13 @@ where
     /// The digest of the runs this worker holds, which every heartbeat it
     /// sends from now on carries (see `reconcile::active_runs_digest`).
     pub fn set_active_runs_digest(&mut self, digest: Digest) {
-        self.active_runs_digest = digest.value().to_vec();
+        self.report.active_runs_digest = digest.value().to_vec();
     }
 
     /// Whether this worker runs compaction, which every heartbeat it sends
     /// from now on says.
     pub fn set_runs_compaction(&mut self, runs: bool) {
-        self.runs_compaction = runs;
+        self.report.runs_compaction = runs;
     }
 
     /// Whether this worker may start a TaskRun now: only once it could abort
@@ -1265,14 +1229,14 @@ where
     /// lists it until [`Self::forget_cancelled`].
     pub fn tell_cancelled(&mut self, worker: WorkerId, run: TaskRunId) {
         if self.holds_office() {
-            self.cancelled_runs.entry(worker).or_default().runs.insert(run);
+            self.cancelled_runs.tell(worker, run);
         }
     }
 
     /// `worker`'s heartbeats show it holds no run this leader told it was
     /// cancelled: its acks stop listing them.
     pub fn forget_cancelled(&mut self, worker: &WorkerId) {
-        self.cancelled_runs.remove(worker);
+        self.cancelled_runs.forget(worker);
     }
 
     /// The members that said in their latest heartbeat that they run
@@ -1282,7 +1246,7 @@ where
         match (&self.office, self.holds_office()) {
             (Some(office), true) => {
                 let mut runners = office.compaction_runners();
-                if self.runs_compaction {
+                if self.report.runs_compaction {
                     runners.insert(self.my_id.clone());
                 }
                 runners
@@ -1773,7 +1737,7 @@ where
             term_seen: self.standing.highest_term_seen(),
             // Nothing reports this node's capacity yet.
             available_capacity: 0,
-            active_task_runs_digest: self.active_runs_digest.clone(),
+            active_task_runs_digest: self.report.active_runs_digest.clone(),
             shard_id: Some(self.shard_id.clone().into()),
             newest_accepted_ack: self.newest_accepted_ack,
             configuration_generation: self
@@ -1783,7 +1747,7 @@ where
             send_token: now.as_ticks(),
             routing_crawled: self.routing_crawled(),
             admission_generation: self.standing.admission().map(Into::into),
-            runs_compaction: self.runs_compaction,
+            runs_compaction: self.report.runs_compaction,
         };
         self.send(
             leader.clone(),
@@ -1983,9 +1947,7 @@ where
     fn send_ack_with(&mut self, to: WorkerId, content: AckContent, heartbeat_token: Option<u64>) {
         let cancelled_runs = self
             .cancelled_runs
-            .get_mut(&to)
-            .map(CancelledRuns::next_batch)
-            .unwrap_or_default()
+            .next_batch_for(&to)
             .into_iter()
             .map(Into::into)
             .collect();
@@ -2512,7 +2474,7 @@ where
         }
         if let Some(office) = self.office.as_mut() {
             office.take_removal(departing.clone());
-            self.cancelled_runs.remove(departing);
+            self.cancelled_runs.forget(departing);
         }
         self.drain_once_free();
     }
