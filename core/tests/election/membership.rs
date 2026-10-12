@@ -353,6 +353,31 @@ fn a_draining_leader_ignores_a_crawl_report_from_an_earlier_admission() {
     assert_eq!(leader.state(), WorkerState::Stopped);
 }
 
+// A crawl report naming an admission the roster does not yet count the voter
+// by is dropped, not kept for when the voter is given that admission: a
+// removal re-admits the voters left at the next generation, and a crawl made
+// at an admission nobody held when it was reported proves nothing about it.
+#[test]
+fn a_draining_leader_ignores_a_crawl_reported_ahead_of_the_admission_a_removal_then_gives() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let _ = leader.step(Input::Drain);
+    let next = two_voters_at_the_next_generation().generation();
+    let _ = crawled_at(&clock, &mut leader, &p2, next);
+    remove_having_seen(&mut leader, &p1, 1);
+
+    let _ = leader.step(Input::Tick);
+    assert_eq!(
+        leader.state(),
+        WorkerState::Leader,
+        "p2 reported its crawl before it held that admission"
+    );
+
+    let _ = crawled(&clock, &mut leader, &p2);
+    assert_eq!(leader.state(), WorkerState::Stopped);
+}
+
 // A crawl reported while the founding configuration was still joint counted
 // at the admission the roster held then; the commit re-admits every voter,
 // so that crawl does not free the leader to leave.
