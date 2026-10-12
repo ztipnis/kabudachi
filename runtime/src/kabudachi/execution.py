@@ -16,7 +16,7 @@ from datetime import timedelta
 from typing import Any, Protocol
 
 from kabudachi.body import RunningBody, fold_compaction, run_serialized
-from kabudachi.concurrency_places import ConcurrencyPlaces
+from kabudachi.concurrency_places import BodyWaits, ConcurrencyPlaces
 from kabudachi.errors import TaskTimeoutError
 from kabudachi.handle import TaskHandle, current_body
 from kabudachi.lifecycle import HookRegistry, RunContext, hooks_for_run, initialize_process
@@ -143,9 +143,9 @@ class InProcessExecutor:
         )
         self._bodies: dict[str, RunningBody] = {}
 
-    @property
-    def stops_bodies_at_once(self) -> bool:
-        return False
+    # Nothing here can be killed: stopping with `kill` still leaves running
+    # bodies to finish on their own.
+    stops_bodies_at_once = False
 
     def free(self) -> int:
         return self._places.free()
@@ -167,7 +167,7 @@ class InProcessExecutor:
     def run(self, job: RunJob) -> RunningBody:
         # A body that waits for a task it called gives its place back meanwhile.
         context = contextvars.copy_context()
-        context.run(current_body.set, self._places.watch_body())
+        context.run(current_body.set, BodyWaits(self._places))
         hooks = hooks_for_run(
             self._hooks,
             RunContext(job.definition_id, job.run_id, job.attempt),
