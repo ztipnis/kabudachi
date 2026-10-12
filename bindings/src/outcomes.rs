@@ -6,6 +6,7 @@
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{Cancellation, Event};
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 
 /// What a scheduler event is about. `SLOW_DOWN` says memory use crossed the
 /// soft limit; the event's `active` says whether it was raised or cleared.
@@ -85,8 +86,18 @@ impl From<Cancellation> for PyCancelOutcome {
     }
 }
 
-/// Where a task run is in its life.
-#[pyclass(name = "RunState", eq, eq_int, frozen, hash, skip_from_py_object)]
+/// Where a task run is in its life. It pickles as its variant's name, so it
+/// crosses to another process (a task process reading a task's status) as
+/// the same variant.
+#[pyclass(
+    name = "RunState",
+    module = "kabudachi._native",
+    eq,
+    eq_int,
+    frozen,
+    hash,
+    skip_from_py_object
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyRunState {
     #[pyo3(name = "SCHEDULED")]
@@ -111,6 +122,38 @@ pub enum PyRunState {
     Lost,
     #[pyo3(name = "ORPHANED")]
     Orphaned,
+}
+
+/// What `__reduce__` gives pickle: a callable and the arguments that rebuild
+/// the value.
+type Reduced<'py> = (Bound<'py, PyAny>, (Bound<'py, PyType>, &'static str));
+
+#[pymethods]
+impl PyRunState {
+    /// `getattr(RunState, name)`: unpickling looks the variant up by name.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<Reduced<'py>> {
+        let getattr = py.import("builtins")?.getattr("getattr")?;
+        Ok((getattr, (py.get_type::<Self>(), self.python_name())))
+    }
+}
+
+impl PyRunState {
+    /// The variant's name in Python.
+    fn python_name(self) -> &'static str {
+        match self {
+            PyRunState::Scheduled => "SCHEDULED",
+            PyRunState::Queued => "QUEUED",
+            PyRunState::Claimed => "CLAIMED",
+            PyRunState::Running => "RUNNING",
+            PyRunState::Succeeded => "SUCCEEDED",
+            PyRunState::Failed => "FAILED",
+            PyRunState::Expired => "EXPIRED",
+            PyRunState::Superseded => "SUPERSEDED",
+            PyRunState::Cancelled => "CANCELLED",
+            PyRunState::Lost => "LOST",
+            PyRunState::Orphaned => "ORPHANED",
+        }
+    }
 }
 
 impl From<TaskRunState> for PyRunState {
