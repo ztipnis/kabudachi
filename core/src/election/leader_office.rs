@@ -146,6 +146,8 @@ impl LeaderOffice {
             reports: MemberReports::default(),
         };
         office.commit_when_due(duties.me);
+        // Seeded only now: `commit_when_due` notes the voters before the roll
+        // call's generation is known to the guard, as it always has.
         if let Some((generation, sides)) = office.roster.called_under() {
             office.removal.seed(generation, sides);
         }
@@ -170,10 +172,10 @@ impl LeaderOffice {
     }
 
     /// A worker's heartbeat: heard now. A confirmation records the
-    /// generation it holds and commits when due. `admission` is the one the
-    /// sender holds, which confirms a promise made to it. The sender joins as
-    /// pending if unknown, admission advances when due, and removals apply. A
-    /// crawl report (`report.routing_crawled`) counts only when
+    /// generation it holds and commits when due. `report.admission` is the
+    /// one the sender holds, which confirms a promise made to it. The sender
+    /// joins as pending if unknown, admission advances when due, and removals
+    /// apply. A crawl report (`report.routing_crawled`) counts only when
     /// `report.admission` is the one the roster counts the sender by now, so a
     /// delayed heartbeat from before a re-admission does not count.
     pub(crate) fn take_heartbeat(

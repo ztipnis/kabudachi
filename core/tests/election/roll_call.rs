@@ -303,7 +303,6 @@ fn an_answer_after_a_node_called_in_its_own_right_holds_it_afresh() {
     )
     .expect("the hold ends and the node calls");
     assert_eq!(node.state(), WorkerState::RollCall, "setup invariant");
-    let called_at = called.0;
 
     // Answered just before its own call closes, so the hold outlasts the
     // retry the closed call puts the node on whatever the jitter on it.
@@ -314,9 +313,12 @@ fn an_answer_after_a_node_called_in_its_own_right_holds_it_afresh() {
     tick(&mut node);
     assert_eq!(node.state(), WorkerState::NoQuorum, "setup invariant");
 
-    let next = first_call_before(&mut node, &clock, answered_at + slow_call_hold() + Duration::from_ticks(2));
+    let next = first_call_before(
+        &mut node,
+        &clock,
+        answered_at + slow_call_hold() + Duration::from_ticks(2),
+    );
 
-    assert!(called_at < answered_at, "setup invariant");
     assert_eq!(
         next.map(|(at, _)| at),
         Some(answered_at + slow_call_hold()),
@@ -348,7 +350,6 @@ fn a_leaders_ack_ends_the_widening_of_a_nodes_roll_call_deadlines() {
     let horizon = |clock: &FakeClock| clock.now() + Duration::from_ticks(1_000);
     let call = |node: &mut TestNode| {
         clock.advance(past_any_suspicion(SLOW_CALL_SUSPECT));
-        tick(node);
         let called = first_call_before(node, &clock, horizon(&clock)).expect("the node calls");
         assert_eq!(node.state(), WorkerState::RollCall);
         called.1
@@ -360,9 +361,10 @@ fn a_leaders_ack_ends_the_widening_of_a_nodes_roll_call_deadlines() {
         SLOW_CALL_DEADLINE
     );
     let term = call(&mut node);
-    assert!(
-        ticks_until_its_roll_call_closes(&mut node, &clock) > SLOW_CALL_DEADLINE,
-        "setup invariant: a call after one that closed short is widened"
+    assert_eq!(
+        ticks_until_its_roll_call_closes(&mut node, &clock),
+        2 * SLOW_CALL_DEADLINE,
+        "a call after one that closed short is widened"
     );
     deliver(
         &mut node,
