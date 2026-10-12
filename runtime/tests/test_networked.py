@@ -259,10 +259,7 @@ def unreached_while_the_leader_is_killed(cluster, tmp_path):
     # certifies once.
     leader = cluster.leader()
     client, other = [worker for worker in cluster.workers if worker is not leader]
-    texts = {client.submit("hold", text=f"unreached-{n}", times=GATED): f"unreached-{n}" for n in range(3)}
-    holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()))
-    [own] = [task for task, text in texts.items() if holders[text] is client]
-    unreached, interrupted = [task for task in texts if task != own]
+    texts, holders, own, unreached, interrupted = one_on_each_worker(cluster, tmp_path, client)
     client.ask(cancel=own)
     eventually("its own body to stop", lambda: (tmp_path / f"{texts[own]}.stopped").exists())
 
@@ -278,6 +275,24 @@ def unreached_while_the_leader_is_killed(cluster, tmp_path):
         killed_while_running(cluster, tmp_path, leader, other, tasks.values())
     let_go(tmp_path, tasks.values())
 
+    unreached_and_interrupted_heard(cluster, tmp_path, client, unreached, interrupted, texts)
+    certified_once_and_settled(cluster, other, tasks)
+
+
+def one_on_each_worker(cluster, tmp_path, client):
+    """Three gated holds `client` submits, once one runs on each worker:
+    each task's text, each text's worker, the task `client` runs itself, and
+    the other two."""
+    texts = {client.submit("hold", text=f"unreached-{n}", times=GATED): f"unreached-{n}" for n in range(3)}
+    holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()))
+    [own] = [task for task, text in texts.items() if holders[text] is client]
+    unreached, interrupted = [task for task in texts if task != own]
+    return texts, holders, own, unreached, interrupted
+
+
+def unreached_and_interrupted_heard(cluster, tmp_path, client, unreached, interrupted, texts):
+    """`client`, resumed, hears its undelivered task's result is unavailable
+    and its other task was cancelled before its body ended."""
     assert eventually("the unreached task's handle", lambda: settled(client, unreached), timeout=30)["error"] == (
         "ResultUnavailableError"
     )
@@ -286,11 +301,16 @@ def unreached_while_the_leader_is_killed(cluster, tmp_path):
     )
     assert states(cluster.record(interrupted)) == ["CANCELLED"]
     assert not (tmp_path / f"{texts[interrupted]}.stopped").exists(), "cancelled before its body ended"
+
+
+def certified_once_and_settled(cluster, follower, tasks):
+    """Each of `tasks` certifies once, and `follower`, which submitted them,
+    hears each end with its result."""
     for task, text in tasks.items():
         certified_once(cluster, task, digest_of(hold, Greeting(text=text)))
         # The follower that submitted them awaits all three: each settles
         # with its result, told by the new leader or asked of it.
-        assert eventually("the follower's handle", lambda: settled(other, task), timeout=30)["error"] is None
+        assert eventually("the follower's handle", lambda: settled(follower, task), timeout=30)["error"] is None
 
 
 def reported(holder):
