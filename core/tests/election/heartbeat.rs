@@ -8,7 +8,7 @@ use crate::support::builders::{
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    TestNode, close_roll_call, commit_founding, deliver, elect, finish_reconciling,
+    TestNode, close_roll_call, deliver, elect, finish_reconciling, leader_of_three,
     published_roll_calls, sent_to, tick, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Single};
@@ -67,12 +67,11 @@ fn ack_admitting(generation: Generation, send_token: u64) -> LeaderHeartbeatAck 
     }
 }
 
-/// Whether the heartbeat `node` sends its leader one interval from now says
-/// it has crawled its routing.
-fn next_heartbeat_reports_a_crawl(node: &mut TestNode, clock: &FakeClock) -> bool {
+/// The heartbeat `node` sends its leader one interval from now.
+fn next_heartbeat(node: &mut TestNode, clock: &FakeClock) -> WorkerHeartbeat {
     clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT)).heartbeat_interval);
     let outputs = tick(node);
-    let heartbeats: Vec<_> = sent_to(&outputs, &worker("leader-1"))
+    let mut heartbeats: Vec<_> = sent_to(&outputs, &worker("leader-1"))
         .into_iter()
         .map(|message| match message.payload {
             Some(election_message::Payload::Heartbeat(heartbeat)) => heartbeat,
@@ -80,7 +79,7 @@ fn next_heartbeat_reports_a_crawl(node: &mut TestNode, clock: &FakeClock) -> boo
         })
         .collect();
     assert_eq!(heartbeats.len(), 1, "{outputs:?}");
-    heartbeats[0].routing_crawled
+    heartbeats.remove(0)
 }
 
 fn receive_ack(node: &mut TestNode, ack: LeaderHeartbeatAck) {
@@ -98,22 +97,22 @@ fn a_heartbeat_reports_a_routing_crawl_only_since_the_current_admission() {
 
     let _ = node.step(Input::RoutingCrawled);
     assert!(
-        !next_heartbeat_reports_a_crawl(&mut node, &clock),
+        !next_heartbeat(&mut node, &clock).routing_crawled,
         "a pending member has nothing to report"
     );
 
     receive_ack(&mut node, ack_admitting(Generation::new(epoch(0), 1, 2), 1));
     assert!(
-        !next_heartbeat_reports_a_crawl(&mut node, &clock),
+        !next_heartbeat(&mut node, &clock).routing_crawled,
         "the crawl predates the admission"
     );
 
     let _ = node.step(Input::RoutingCrawled);
-    assert!(next_heartbeat_reports_a_crawl(&mut node, &clock));
+    assert!(next_heartbeat(&mut node, &clock).routing_crawled);
 
     receive_ack(&mut node, ack_admitting(Generation::new(epoch(0), 1, 3), 2));
     assert!(
-        !next_heartbeat_reports_a_crawl(&mut node, &clock),
+        !next_heartbeat(&mut node, &clock).routing_crawled,
         "re-admitted: crawl again"
     );
 }
@@ -142,26 +141,6 @@ fn an_ack_for_another_shard_or_from_other_than_the_leader_it_names_is_ignored() 
         tick(&mut node);
         assert_eq!(node.state(), WorkerState::LeaderSuspect, "{sender:?}");
     }
-}
-
-// A worker that runs compaction says so in every heartbeat it sends, from the
-// moment it is told to, so its leader can hand it compaction runs.
-#[test]
-fn a_heartbeat_says_whether_its_sender_runs_compaction() {
-    let clock = FakeClock::new();
-    let mut node = joined_node(&clock);
-    let says = |node: &mut TestNode| {
-        clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT)).heartbeat_interval);
-        let outputs = tick(node);
-        match sent_to(&outputs, &worker("leader-1")).remove(0).payload {
-            Some(election_message::Payload::Heartbeat(heartbeat)) => heartbeat.runs_compaction,
-            other => panic!("expected a heartbeat to the leader, got {other:?}"),
-        }
-    };
-
-    assert!(!says(&mut node), "off unless the worker says it runs compaction");
-    node.set_runs_compaction(true);
-    assert!(says(&mut node));
 }
 
 // A worker may start a TaskRun only once it can name the instant by which it
@@ -220,6 +199,12 @@ fn an_ack_echoing_a_heartbeat_from_the_future_gives_a_worker_no_contact_floor() 
     assert!(!node.has_contact_floor());
 }
 
+fn run_ids(count: usize) -> Vec<TaskRunId> {
+    (0..count)
+        .map(|n| TaskRunId::new(format!("run-{n:03}")))
+        .collect()
+}
+
 /// The ack `leader` sends `follower` in answer to a heartbeat from it.
 fn ack_to(leader: &mut TestNode, follower: &WorkerId) -> LeaderHeartbeatAck {
     let outputs = deliver(leader, follower, heartbeat_message(heartbeat(follower, None)));
@@ -240,7 +225,10 @@ fn cancelled_in(ack: &LeaderHeartbeatAck) -> Vec<TaskRunId> {
 
 // A leader tells a worker which of its runs it cancelled in its acks, at most
 // 64 at a time, rotating through them so none is starved by the others, until
-// told to stop, and holds none for a node that does not lead.
+// told to stop, and holds none for a node that does not lead. Past the end of
+// a worker's runs the rotation wraps to the start, so every ack lists a full
+// batch whenever the worker has that many runs: with 150, the third lists the
+// last 22 and then the first 42.
 #[test]
 fn a_leader_lists_the_runs_it_cancelled_in_its_acks_in_rotation_until_told_to_stop() {
     const SUSPECT: u64 = 10;
@@ -248,7 +236,7 @@ fn a_leader_lists_the_runs_it_cancelled_in_its_acks_in_rotation_until_told_to_st
     let (p1, p2) = (worker("p1"), worker("p2"));
     let mut leader = voter_node(&clock, &worker("w1"), 3, SUSPECT);
     elect(&mut leader, &clock, SUSPECT, &[p1.clone(), p2.clone()]);
-    let runs: Vec<TaskRunId> = (0..150).map(|n| TaskRunId::new(format!("run-{n:03}"))).collect();
+    let runs = run_ids(150);
     for run in &runs {
         leader.tell_cancelled(p1.clone(), run.clone());
     }
@@ -258,7 +246,7 @@ fn a_leader_lists_the_runs_it_cancelled_in_its_acks_in_rotation_until_told_to_st
     for _ in 0..3 {
         let ack = ack_to(&mut leader, &p1);
         let listed = cancelled_in(&ack);
-        assert!(listed.len() <= 64, "{} runs in one ack", listed.len());
+        assert_eq!(listed.len(), 64, "a full batch in every ack");
         let raised: Vec<_> = deliver(&mut follower, &worker("w1"), ack_message(ack))
             .into_iter()
             .filter_map(|output| match output {
@@ -286,76 +274,32 @@ fn a_leader_lists_the_runs_it_cancelled_in_its_acks_in_rotation_until_told_to_st
     assert!(cancelled_in(&ack_to(&mut fresh, &p1)).is_empty());
 }
 
-/// The heartbeat `node` sends its leader one interval from now.
-fn next_heartbeat(node: &mut TestNode, clock: &FakeClock) -> WorkerHeartbeat {
-    clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT)).heartbeat_interval);
-    let outputs = tick(node);
-    match sent_to(&outputs, &worker("leader-1")).remove(0).payload {
-        Some(election_message::Payload::Heartbeat(heartbeat)) => heartbeat,
-        other => panic!("expected a heartbeat to the leader, got {other:?}"),
-    }
-}
-
-// A worker's heartbeats carry the digest of the runs it holds from the moment
-// it is told, so its leader can see which runs it still holds.
+// A worker's heartbeats say what it runs and which runs it holds from the
+// moment it is told: that it runs compaction, so its leader can hand it
+// compaction runs, and the digest of its runs, so its leader can see which it
+// still holds.
 #[test]
-fn a_heartbeat_carries_the_digest_of_the_runs_its_sender_holds() {
+fn a_heartbeat_reports_what_its_sender_runs_and_holds_from_the_moment_it_is_told() {
     let clock = FakeClock::new();
     let mut node = joined_node(&clock);
     let held = Digest::blake3(b"the runs this worker holds");
 
-    assert!(
-        next_heartbeat(&mut node, &clock)
-            .active_task_runs_digest
-            .is_empty()
-    );
+    let before = next_heartbeat(&mut node, &clock);
+    assert!(!before.runs_compaction, "off unless the worker says it runs compaction");
+    assert!(before.active_task_runs_digest.is_empty());
+
+    node.set_runs_compaction(true);
     node.set_active_runs_digest(held.clone());
-    assert_eq!(
-        next_heartbeat(&mut node, &clock).active_task_runs_digest,
-        held.value()
-    );
-}
-
-/// `leader-1`'s election in term 1 over `p1` and `p2`, and the founding it
-/// committed.
-fn leader_of_three(clock: &FakeClock) -> TestNode {
-    let mut leader = voter_node(clock, &worker("w1"), 3, SUSPECT_TIMEOUT);
-    let peers = [worker("p1"), worker("p2")];
-    elect(&mut leader, clock, SUSPECT_TIMEOUT, &peers);
-    commit_founding(&mut leader, clock, &peers);
-    leader
-}
-
-fn run_ids(count: usize) -> Vec<TaskRunId> {
-    (0..count)
-        .map(|n| TaskRunId::new(format!("run-{n:03}")))
-        .collect()
-}
-
-// Past the end of a worker's runs the rotation wraps to the start, so one ack
-// lists a full batch whenever the worker has that many runs.
-#[test]
-fn a_leaders_acks_wrap_round_to_the_first_cancelled_run_after_the_last() {
-    let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
-    let p1 = worker("p1");
-    let runs = run_ids(70);
-    for run in &runs {
-        leader.tell_cancelled(p1.clone(), run.clone());
-    }
-
-    assert_eq!(cancelled_in(&ack_to(&mut leader, &p1)), runs[..64]);
-    assert_eq!(
-        cancelled_in(&ack_to(&mut leader, &p1)),
-        [&runs[64..], &runs[..58]].concat()
-    );
+    let after = next_heartbeat(&mut node, &clock);
+    assert!(after.runs_compaction);
+    assert_eq!(after.active_task_runs_digest, held.value());
 }
 
 // A worker that leaves the roster is told nothing more of its runs.
 #[test]
 fn a_leader_stops_listing_cancelled_runs_to_a_worker_that_left() {
     let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
+    let mut leader = leader_of_three(&clock, SUSPECT_TIMEOUT);
     let p1 = worker("p1");
     let runs = run_ids(1);
     leader.tell_cancelled(p1.clone(), runs[0].clone());
@@ -379,7 +323,7 @@ fn a_leader_stops_listing_cancelled_runs_to_a_worker_that_left() {
 #[test]
 fn a_leader_that_wins_office_back_lists_none_of_the_runs_its_old_office_was_told() {
     let clock = FakeClock::new();
-    let mut leader = leader_of_three(&clock);
+    let mut leader = leader_of_three(&clock, SUSPECT_TIMEOUT);
     let (p1, p2) = (worker("p1"), worker("p2"));
     let runs = run_ids(1);
     leader.tell_cancelled(p1.clone(), runs[0].clone());
