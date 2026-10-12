@@ -905,7 +905,10 @@ impl Net {
             .await
             .flatten()
     }
+}
 
+/// The correlated protocols' requests and answers, through [`Exchanges`].
+impl Net {
     /// Sends `request` to `to` over protocol `C` and awaits its answer. `None`
     /// if the swarm task is gone, the request fails outright
     /// (`OutboundFailure`), or the peer disconnects before answering.
