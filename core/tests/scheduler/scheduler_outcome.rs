@@ -58,11 +58,16 @@ fn concluded(fixture: &mut Fixture) -> Vec<(TaskId, TaskRunState)> {
 #[test]
 fn a_task_with_a_client_concludes_to_it_once_however_it_ends() {
     let mut fixture = Fixture::leading();
+    a_certified_task_concludes_with_its_delivered_result(&mut fixture);
+    every_other_ending_concludes_once_in_its_runs_state(&mut fixture);
+    a_retry_and_an_unawaited_task_conclude_nothing(&mut fixture);
+}
 
-    // Certified, its result delivered first: the run, its newest revision
-    // and the conclusion all say so.
+/// Certified, its result delivered first: the run, its newest revision and
+/// the conclusion all say so.
+fn a_certified_task_concludes_with_its_delivered_result(fixture: &mut Fixture) {
     let certified = fixture.scheduler.submit(awaited("certified")).unwrap();
-    let run = running(&mut fixture, &certified);
+    let run = running(fixture, &certified);
     let digest = Digest::blake3(b"result");
     fixture
         .scheduler
@@ -78,16 +83,18 @@ fn a_task_with_a_client_concludes_to_it_once_however_it_ends() {
         (conclusion.outcome.state, conclusion.outcome.result_digest, conclusion.outcome.delivered),
         (TaskRunState::Succeeded, Some(digest), true)
     );
-    let record = newest_records(&fixture)
+    let record = newest_records(fixture)
         .into_iter()
         .find(|record| record.task.as_ref().unwrap().task_id() == certified)
         .unwrap();
     assert_eq!(record.task.as_ref().unwrap().client(), Some(client()));
     assert!(record.runs.last().unwrap().delivered);
+}
 
-    // Every other way a task ends: each concludes once, in its run's state.
+/// Every other way a task ends: each concludes once, in its run's state.
+fn every_other_ending_concludes_once_in_its_runs_state(fixture: &mut Fixture) {
     let failed = fixture.scheduler.submit(awaited("failed")).unwrap();
-    let run = running(&mut fixture, &failed);
+    let run = running(fixture, &failed);
     fixture.scheduler.fail(&runner(), &run, "ValueError").unwrap();
     let expired = fixture
         .scheduler
@@ -106,12 +113,12 @@ fn a_task_with_a_client_concludes_to_it_once_however_it_ends() {
         .submit(awaited("newer").with_coalescing_key("k"))
         .unwrap();
     let lost = fixture.scheduler.submit(awaited("lost").ephemeral()).unwrap();
-    running(&mut fixture, &lost);
+    running(fixture, &lost);
     let orphaned = fixture
         .scheduler
         .submit(awaited("orphaned").non_retriable())
         .unwrap();
-    running(&mut fixture, &orphaned);
+    running(fixture, &orphaned);
     fixture.lose_silent(&runner());
 
     let mut expected = vec![
@@ -123,25 +130,27 @@ fn a_task_with_a_client_concludes_to_it_once_however_it_ends() {
         (orphaned, TaskRunState::Orphaned),
     ];
     expected.sort_by(|(left, _), (right, _)| left.cmp(right));
-    assert_eq!(concluded(&mut fixture), expected);
+    assert_eq!(concluded(fixture), expected);
+}
 
-    // A failure with a retry left, and a task nobody awaits, conclude nothing.
+/// A failure with a retry left, and a task nobody awaits, conclude nothing.
+fn a_retry_and_an_unawaited_task_conclude_nothing(fixture: &mut Fixture) {
     let retried = fixture
         .scheduler
         .submit(awaited("retried").with_retries(1))
         .unwrap();
-    let run = running(&mut fixture, &retried);
+    let run = running(fixture, &retried);
     fixture.scheduler.fail(&runner(), &run, "ValueError").unwrap();
     let unawaited = fixture
         .scheduler
         .submit(Submission::new(TaskDefinitionId::new("billing.charge"), 0, b"x".to_vec(), "default"))
         .unwrap();
-    let run = running(&mut fixture, &unawaited);
+    let run = running(fixture, &unawaited);
     fixture
         .scheduler
         .complete(&runner(), &run, Digest::blake3(b"x"), Completion::Final)
         .unwrap();
-    assert_eq!(concluded(&mut fixture), vec![]);
+    assert_eq!(concluded(fixture), vec![]);
 }
 
 #[test]
