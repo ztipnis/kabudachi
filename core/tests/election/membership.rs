@@ -625,6 +625,59 @@ fn a_promised_joiner_that_heartbeats_but_confirms_nothing_new_does_not_hold_back
     assert!(promised_late, "the joiner heard from every tick is never promised");
 }
 
+/// A joiner that holds its promise but whose confirmed ack has aged past the
+/// two heartbeat intervals a batch wants, while still within a suspicion
+/// timeout, keeps its round standing: the next heartbeat brings it back. Once
+/// that confirmation is a suspicion timeout old the round is replaced.
+#[test]
+fn a_round_whose_promise_is_held_stands_while_its_joiner_confirmed_within_a_suspicion_timeout() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let joiner = worker("joiner");
+    let peers = [worker("p1"), worker("p2")];
+    connect(&mut leader, &[joiner.clone()]);
+    let committed = leader.configuration().map(Configuration::generation);
+    let confirm_voters = |clock: &FakeClock, leader: &mut TestNode| {
+        for peer in &peers {
+            let beat = confirming_heartbeat(clock, leader, peer, committed);
+            deliver(leader, peer, heartbeat_message(beat));
+        }
+    };
+    confirm_voters(&clock, &mut leader);
+    let beat = confirming_heartbeat(&clock, &leader, &joiner, None);
+    let promise = ack_to(&deliver(&mut leader, &joiner, heartbeat_message(beat)), &joiner)
+        .recipient_admission()
+        .expect("setup: the joiner is promised");
+    let holding = |leader: &mut TestNode| {
+        let mut beat = heartbeat(&joiner, None);
+        beat.admission_generation = Some(promise.into());
+        ack_to(&deliver(leader, &joiner, heartbeat_message(beat)), &joiner)
+    };
+
+    // Past two heartbeat intervals and inside the suspicion timeout.
+    clock.advance(Duration::from_ticks(SUSPECT / 2));
+    confirm_voters(&clock, &mut leader);
+    let ack = holding(&mut leader);
+    assert_eq!(
+        ack.recipient_admission(),
+        Some(promise),
+        "the round stands while the joiner still confirms"
+    );
+    assert!(
+        !ack.configuration().is_joint(),
+        "no batch starts on a confirmation too old for one"
+    );
+
+    // The voters confirmed within a lease length of this, so the leader still leads.
+    clock.advance(Duration::from_ticks(SUSPECT / 2 + 1));
+    confirm_voters(&clock, &mut leader);
+    assert_eq!(
+        holding(&mut leader).recipient_admission(),
+        None,
+        "a joiner whose confirmation is a suspicion timeout old loses its promise"
+    );
+}
+
 /// Runs `leader` of three for `ticks` in heartbeat-sized steps: `p2` confirms
 /// each ack and holds the leader's latest configuration; `p1` heartbeats too,
 /// echoing an ack `p1_echo_age` old (`None`: it echoes none). Returns every
