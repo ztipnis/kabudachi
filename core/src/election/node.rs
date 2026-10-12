@@ -5,6 +5,7 @@
 //! with the coordination authority, and how it departs.
 
 mod follower;
+mod joining;
 mod leader;
 mod leader_watch;
 mod office_reads;
