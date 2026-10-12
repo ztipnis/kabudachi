@@ -4,6 +4,7 @@
 //! part in elections and refusals, how it joins and rejoins, its standing
 //! with the coordination authority, and how it departs.
 
+mod follower;
 mod office_reads;
 mod queries;
 mod step;
