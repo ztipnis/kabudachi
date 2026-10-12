@@ -68,8 +68,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use prost::Message;
-
 use crate::coalescing::{self, ChainItem, Folded, Key, Occupancy};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::digest::Digest;
@@ -80,21 +78,25 @@ use crate::protocol::ids::{
 use crate::protocol::messages::prelude::*;
 use crate::protocol::generated;
 use crate::protocol::messages::{Task, TaskRun, TaskRunIdentity};
-use crate::protocol::records::{TaskRunRecord, retry_of};
+use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
 use crate::reconcile::{
     ANSWER_IN_FLIGHT, RECONCILE_SKEW_MARGIN, Rebuild, ReconcileTerm, ReportedRun, ReportedState,
     WorkerRuns,
 };
-use crate::task_record::{HISTORY_TOO_LARGE_FAILURE_KIND, RecordVersion};
+use crate::task_record::RecordVersion;
 use crate::time::{Clock, Duration, Instant, WallTime};
 
 mod backlog;
 mod cancel;
 mod claims;
 mod compaction;
+mod deadlines;
 mod failures;
+mod finish;
 mod leadership;
+mod loss;
+mod memory;
 mod memory_budget;
 mod observer;
 mod publication;
@@ -109,9 +111,12 @@ pub use backlog::Backlog;
 pub use cancel::{CancelRejection, Cancellation, HeldCancel};
 pub use claims::{Claim, ClaimRejection};
 pub use compaction::Compacted;
+pub use deadlines::CaughtUp;
 pub use failures::Failure;
 use leadership::Leadership;
 pub use leadership::{LeadershipGrant, LeaseEnd};
+pub use loss::LostRun;
+pub use memory::MemoryLimits;
 use memory_budget::MemoryBudget;
 pub use observer::{NoObserver, Observer};
 use reconciliation::Reconciliation;
@@ -119,16 +124,6 @@ pub use reports::{Certification, Completion, ContinuationRejection, ReportReject
 use retention::Retention;
 pub use submission::{Submission, SubmitRejection, Submitted, mint};
 use waiting_room::WaitingRoom;
-
-/// When the scheduler asks for less work, and when it refuses it, counted in
-/// the serialized bytes of every task that has not finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryLimits {
-    /// Past this, `SlowDown` is raised: whoever submits in bulk should pause.
-    pub soft: u64,
-    /// A submission that would take usage past this is refused.
-    pub hard: u64,
-}
 
 /// The largest message a worker accepts, which bounds what one claim can
 /// carry. `net`'s framing limit is this size, and it checks that at compile
@@ -217,20 +212,6 @@ pub enum Event {
     },
 }
 
-/// A run that was lost with its worker, and the run that replaces it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LostRun {
-    pub task_id: TaskId,
-    pub task_run_id: TaskRunId,
-    /// What the run became: `Lost`, or `Orphaned` for a running run of a
-    /// non-retriable task.
-    pub state: TaskRunState,
-    /// The queued next attempt, or `None` when the run is not replayed: an
-    /// ephemeral task's, an orphaned one, and a coalescing generation that a
-    /// newer one had superseded in the meantime.
-    pub replayed: Option<TaskRunId>,
-}
-
 /// Why `Scheduler::reconcile` refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ReconcileRejection {
@@ -280,17 +261,6 @@ pub struct Reconciled {
     /// node reported for any of them is over (its node must count them heard
     /// now, see `Input::WatchWorkers`).
     pub answered: BTreeSet<WorkerId>,
-}
-
-/// What one call to [`Scheduler::catch_up`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CaughtUp {
-    /// Delayed tasks that became due and are now pending (only while leading).
-    pub queued: usize,
-    /// Pending tasks that expired (only while leading).
-    pub expired: usize,
-    /// Finished tasks forgotten because their result TTL had passed.
-    pub forgotten: usize,
 }
 
 /// Owns all Tasks and TaskRuns and decides every claim and report. Drive it
@@ -423,17 +393,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     fn end_call(&mut self) -> usize {
         self.publish_changed();
         self.forget_due()
-    }
-
-    /// Sets the memory limits, or removes them with `None`. Set them before
-    /// anything is recorded: they are not checked against what is already in
-    /// use, and no `SlowDown` event is raised for them.
-    ///
-    /// # Panics
-    ///
-    /// If the soft limit is above the hard one.
-    pub fn set_memory_limits(&mut self, limits: Option<MemoryLimits>) {
-        self.budget.set_limits(limits);
     }
 
     /// Its node took office for `term` and reconciles before it leads.
@@ -1131,73 +1090,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
     }
 
-    /// Lets time take effect, and is the only call a runtime makes for time's
-    /// sake: it forgets every task that finished at least `result_ttl` ago,
-    /// and, only while this scheduler leads, makes due delayed tasks pending
-    /// and expires pending tasks past their expiry (reported through
-    /// [`Self::take_events`]), and loses the runs of silent workers whose
-    /// reconnect timeouts have passed (see [`Self::note_silence`]). Call it
-    /// when [`Self::next_deadline`] comes.
-    pub fn catch_up(&mut self) -> CaughtUp {
-        let mut caught_up = if self.check_leader() {
-            let released = self.release_due();
-            self.lose_overdue();
-            released
-        } else {
-            CaughtUp::default()
-        };
-        caught_up.forgotten = self.end_call();
-        caught_up
-    }
-
-    /// Delayed tasks that are due become pending, and pending tasks past
-    /// their expiry expire. Only a leader decides this, so its callers check.
-    /// Claims do this themselves first, so a task that ran out of time is
-    /// never handed out.
-    fn release_due(&mut self) -> CaughtUp {
-        let mut advanced = CaughtUp::default();
-        let now = self.clock.now();
-        let stamped_at = WallTime::now(&self.clock);
-        for task_id in self.waiting.take_expired(now) {
-            self.expire(&task_id, now);
-            advanced.expired += 1;
-        }
-        for task_id in self.waiting.release_due(now) {
-            let run_id = self.current_run[&task_id].clone();
-            self.runs
-                .get_mut(&run_id)
-                .expect("every current run is stored")
-                .transition_to(TaskRunState::Queued, stamped_at)
-                .expect("a Scheduled run can always be queued");
-            self.mark_decided(&run_id);
-            advanced.queued += 1;
-        }
-        advanced
-    }
-
-    /// When [`Self::catch_up`] next has something to do, or `None`: the next
-    /// forgetting time always, and the next delay or expiry only while this
-    /// scheduler leads. Also the end of a bounded lease while this scheduler
-    /// has found itself leading: that end stays in the answer until a call
-    /// finds it passed, since finding the lapse is then `catch_up`'s to do.
-    /// An unbounded lease adds nothing. Also the next replay of a silent
-    /// worker's run, only while this scheduler leads.
-    pub fn next_deadline(&self) -> Option<Instant> {
-        let forgetting = self.retention.next_due();
-        let lease_end = self.leadership.noticed_lease_end();
-        let waiting = if self.is_leader() {
-            self.waiting.next_deadline()
-        } else {
-            None
-        };
-        let replays = if self.is_leader() {
-            self.replays_due().into_iter().map(|(at, _)| at).min()
-        } else {
-            None
-        };
-        [waiting, forgetting, lease_end, replays].into_iter().flatten().min()
-    }
-
     /// Whether [`Self::take_events`] has anything to return.
     pub fn has_events(&self) -> bool {
         !self.events.is_empty()
@@ -1215,370 +1107,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.runs.get(run_id)
     }
 
-    /// Its node's office counts `worker` silent from `reconnect_from` on:
-    /// each claimed or running run the worker holds is lost once that run's
-    /// own reconnect timeout has passed since then (a run of a task
-    /// submitted without one at the shard's, which the grant carries). A
-    /// lost run is replayed at once and uses up no retry, except that an
-    /// ephemeral task's stays `Lost`, a running run of a non-retriable task
-    /// is `Orphaned`, and a coalescing generation with a newer one waiting
-    /// stays lost. `None`: the worker was heard again, and the runs it holds
-    /// are kept. Kept while this scheduler does not lead, and acted on while
-    /// it does, here and by [`Self::catch_up`] at [`Self::next_deadline`].
-    pub fn note_silence(&mut self, worker: &WorkerId, reconnect_from: Option<Instant>) {
-        match reconnect_from {
-            Some(from) => {
-                self.silent.insert(worker.clone(), from);
-            }
-            None => {
-                self.silent.remove(worker);
-            }
-        }
-        if self.check_leader() {
-            self.lose_overdue();
-        }
-        self.end_call();
-    }
-
-    /// Each claimed or running current run of a silent worker, by its task,
-    /// with the instant from which it may be replayed. One pass over the
-    /// current runs, and none while no worker is silent.
-    fn replays_due(&self) -> Vec<(Instant, TaskId)> {
-        if self.silent.is_empty() {
-            return Vec::new();
-        }
-        self.current_run
-            .iter()
-            .filter_map(|(task_id, run_id)| {
-                let run = &self.runs[run_id];
-                if !matches!(
-                    run.current_state(),
-                    TaskRunState::Claimed | TaskRunState::Running
-                ) {
-                    return None;
-                }
-                let from = self.silent.get(run.selected_worker().as_ref()?)?;
-                Some((*from + self.reconnect_timeout_of(task_id), task_id.clone()))
-            })
-            .collect()
-    }
-
-    /// Loses every run of a silent worker whose reconnect timeout has
-    /// passed (see [`Self::note_silence`]). Only a leader decides this, so
-    /// its callers check.
-    fn lose_overdue(&mut self) {
-        let now = self.clock.now();
-        let stamped_at = WallTime::now(&self.clock);
-        for (at, task_id) in self.replays_due() {
-            if at <= now {
-                self.lose_run(&task_id, now, stamped_at);
-            }
-        }
-    }
-
-    /// One run `worker` holds is gone while the worker is not: the process
-    /// that ran its body died. The run becomes lost or orphaned, and is
-    /// replayed or not, exactly as if its whole worker had been lost.
-    /// Refused, as a failure report is, when this node does not lead, the
-    /// run is unknown, or it is not a claimed or running run of `worker`
-    /// (it already ended, or a retry or replay replaced it).
-    pub fn report_lost(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-    ) -> Result<LostRun, ReportRejection> {
-        let outcome = self.lose_held_run(worker, run_id);
-        self.end_call();
-        outcome
-    }
-
-    fn lose_held_run(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-    ) -> Result<LostRun, ReportRejection> {
-        self.require_leader()?;
-        let expected = match self.runs.get(run_id).map(TaskRun::current_state) {
-            Some(TaskRunState::Claimed) => TaskRunState::Claimed,
-            _ => TaskRunState::Running,
-        };
-        // A replaced run is `Failed` or `Lost`, so a run still held in one of
-        // these states is its task's current run.
-        let task_id = self.owned_run(worker, run_id, expected)?.task_id();
-        let now = self.clock.now();
-        let stamped_at = WallTime::now(&self.clock);
-        Ok(self.lose_run(&task_id, now, stamped_at))
-    }
-
-    /// The workers a claimed or running current run of one of `tasks` is
-    /// selected for.
-    fn holders_of<'t>(&self, tasks: impl Iterator<Item = &'t TaskId>) -> BTreeSet<WorkerId> {
-        tasks
-            .filter_map(|task_id| {
-                let run = &self.runs[self.current_run.get(task_id)?];
-                matches!(
-                    run.current_state(),
-                    TaskRunState::Claimed | TaskRunState::Running
-                )
-                .then(|| run.selected_worker())
-                .flatten()
-            })
-            .collect()
-    }
-
-    /// The tasks whose current run is claimed or running for `worker`.
-    fn held_by(&self, worker: &WorkerId) -> Vec<TaskId> {
-        self.current_run
-            .iter()
-            .filter(|(_, run_id)| {
-                let run = &self.runs[*run_id];
-                matches!(
-                    run.current_state(),
-                    TaskRunState::Claimed | TaskRunState::Running
-                ) && run.selected_worker().as_ref() == Some(worker)
-            })
-            .map(|(task_id, _)| task_id.clone())
-            .collect()
-    }
-
-    /// `task_id`'s current run, claimed or running, is gone with its worker:
-    /// it becomes lost, or orphaned if it was a running run of a non-retriable
-    /// task, and is replayed unless the task is ephemeral, orphaned, or a
-    /// newer generation of its coalescing key waits behind it.
-    fn lose_run(&mut self, task_id: &TaskId, now: Instant, stamped_at: WallTime) -> LostRun {
-        let run_id = self.current_run[task_id].clone();
-        let was_running = self.runs[&run_id].current_state() == TaskRunState::Running;
-        let task = &self.tasks[task_id];
-        let orphaned = task.non_retriable && !task.ephemeral && was_running;
-        let state = if orphaned {
-            TaskRunState::Orphaned
-        } else {
-            TaskRunState::Lost
-        };
-        self.runs
-            .get_mut(&run_id)
-            .expect("every current run is stored")
-            .transition_to(state, stamped_at)
-            .expect("a claimed run can be lost, and a running one lost or orphaned");
-        self.mark_decided(&run_id);
-        let newer_waits = self
-            .coalescing_key_of(task_id)
-            .is_some_and(|key| self.occupancy.has_waiting(&key));
-        let replayed = if orphaned || self.tasks[task_id].ephemeral || newer_waits {
-            self.record_finished(task_id, now);
-            None
-        } else {
-            *self.losses.entry(task_id.clone()).or_default() += 1;
-            let next = self.queue_next_attempt(task_id, &run_id);
-            if next.is_none() {
-                self.record_finished(task_id, now);
-            }
-            next
-        };
-        if let Some(key) = self.compaction_key_of(task_id) {
-            self.compact_if_due(&key);
-        }
-        LostRun {
-            task_id: task_id.clone(),
-            task_run_id: run_id,
-            state,
-            replayed,
-        }
-    }
-
     /// Every run of `task_id`, oldest attempt first; empty if the task is
     /// unknown or has been forgotten.
     pub fn runs_of(&self, task_id: &TaskId) -> Vec<TaskRunId> {
         self.runs_of_task.get(task_id).cloned().unwrap_or_default()
-    }
-
-    /// Queues the attempt that follows `previous`, a terminal run of
-    /// `task_id`, and makes it the one authoritative run. If the record would
-    /// then be past the limit, no attempt is created: the task is over (the
-    /// caller finishes it), a `RecordFull` event is raised, and a run that
-    /// has no failure kind of its own gets one saying why.
-    fn queue_next_attempt(
-        &mut self,
-        task_id: &TaskId,
-        previous: &TaskRunId,
-    ) -> Option<TaskRunId> {
-        let stamped_at = WallTime::now(&self.clock);
-        let next = retry_of(&self.runs[previous], &self.ids, stamped_at);
-        let record = self.record_of(task_id, UNVERSIONED, stamped_at);
-        // Adding the run to the record also adds its field tag and length prefix.
-        let next_len = next.encoded_len();
-        let run_framing = 1 + prost::encoding::encoded_len_varint(next_len as u64);
-        let grown = (record.encoded_len() + run_framing + next_len) as u64;
-        if grown > Self::record_limit() {
-            let run = self
-                .runs
-                .get_mut(previous)
-                .expect("a previous run is stored");
-            if run.failure_kind.is_empty() {
-                run.failure_kind = HISTORY_TOO_LARGE_FAILURE_KIND.to_owned();
-                self.mark_decided(previous);
-            }
-            self.events.push(Event::RecordFull {
-                task_id: task_id.clone(),
-            });
-            return None;
-        }
-        let next_id = next.task_run_id();
-        self.current_run.insert(task_id.clone(), next_id.clone());
-        self.runs_of_task
-            .entry(task_id.clone())
-            .or_default()
-            .push(next_id.clone());
-        self.runs.insert(next_id.clone(), next);
-        self.waiting.requeue(task_id);
-        self.mark_decided(&next_id);
-        Some(next_id)
-    }
-
-    /// Expires `task_id`, which `take_expired` found still waiting, so its
-    /// current run is pending.
-    fn expire(&mut self, task_id: &TaskId, now: Instant) {
-        let stamped_at = WallTime::now(&self.clock);
-        let run_id = self.current_run[task_id].clone();
-        let run = self
-            .runs
-            .get_mut(&run_id)
-            .expect("every current run is stored");
-        // The waiting room drops a task's expiry when the task is claimed or
-        // leaves, so a task it reports as expired has not started: its run is
-        // still `Scheduled` or `Queued`. Without this, a broken invariant
-        // would expire a claimed run, which the transition table allows.
-        assert!(
-            matches!(
-                run.current_state(),
-                TaskRunState::Scheduled | TaskRunState::Queued
-            ),
-            "a waiting task's run is pending"
-        );
-        run.transition_to(TaskRunState::Expired, stamped_at)
-            .expect("a pending run can always expire");
-        self.record_finished(task_id, now);
-        self.mark_decided(&run_id);
-        self.events.push(Event::Expired {
-            task_id: task_id.clone(),
-            task_run_id: run_id,
-        });
-    }
-
-    /// Takes a task that is over out of every place it was waiting in.
-    fn record_finished(&mut self, task_id: &TaskId, now: Instant) {
-        self.release(task_id, now);
-        if let Some(key) = self.compaction_key_of(task_id) {
-            self.occupancy.end_compaction(&key, task_id);
-        }
-        if let Some(key) = self.coalescing_key_of(task_id) {
-            // Whatever it absorbed is no longer needed, so it can be forgotten
-            // in its turn.
-            for item in self.occupancy.finish(&key, task_id) {
-                self.release_item(&item, now);
-            }
-        }
-        self.update_pressure();
-    }
-
-    /// `task_id`'s payload is no longer needed: it stops counting against
-    /// memory, and the task is forgotten `result_ttl` from now.
-    fn release(&mut self, task_id: &TaskId, now: Instant) {
-        let payload = self.payload_len(task_id);
-        self.budget.give_back(payload);
-        self.forget_later(task_id, now);
-    }
-
-    /// `task_id` is over and holds no payload any more: the task is forgotten
-    /// `result_ttl` from now.
-    pub(super) fn forget_later(&mut self, task_id: &TaskId, now: Instant) {
-        self.retention.record(task_id, now);
-        self.unpublished.insert(task_id.clone());
-    }
-
-    /// An entry of a chain is no longer needed. An absorbed generation is
-    /// released; a folded payload stops counting against memory (the
-    /// generations it replaced were released when it replaced them).
-    fn release_item(&mut self, item: &ChainItem, now: Instant) {
-        match item {
-            ChainItem::Absorbed(task_id) => self.release(task_id, now),
-            ChainItem::Folded(folded) => self.budget.give_back(folded.payload.len() as u64),
-        }
-    }
-
-    /// The serialized bytes of the task's input, which is what memory use counts.
-    fn payload_len(&self, task_id: &TaskId) -> u64 {
-        self.tasks[task_id].serialized_input.len() as u64
-    }
-
-    /// Refuses `submission` if it would take memory past the hard limit and
-    /// cannot be made to fit by dropping what it is allowed to drop.
-    fn check_room(&self, submission: &Submission, needed: u64) -> Result<(), SubmitRejection> {
-        self.budget.check_room(needed, || {
-            match (&submission.coalescing_key, submission.drop_oldest) {
-                (Some(key), true) => {
-                    let key = coalescing::key(&submission.definition_id, key);
-                    self.occupancy
-                        .retained(&key)
-                        .iter()
-                        .map(|item| self.item_len(item))
-                        .sum()
-                }
-                _ => 0,
-            }
-        })
-    }
-
-    /// If `task_id` took memory past the hard limit, which `check_room` only
-    /// allows for a task that may drop its key's retained payloads, drops
-    /// them oldest first until it fits.
-    fn drop_oldest_until_it_fits(&mut self, task_id: &TaskId, now: Instant) {
-        while self.budget.over_hard_limit() {
-            let Some(dropped) = self.occupancy.drop_oldest(task_id) else {
-                break;
-            };
-            self.release_item(&dropped, now);
-        }
-    }
-
-    /// Raises or clears `SlowDown` if memory use has crossed the relevant
-    /// limit.
-    fn update_pressure(&mut self) {
-        let event = self.budget.update_pressure();
-        let crossed_soft_limit = matches!(event, Some(Event::SlowDown { active: true }));
-        self.announce(event);
-        if crossed_soft_limit {
-            self.compact_every_due_key();
-        }
-    }
-
-    /// Records for the caller the event the budget returned, if
-    /// any.
-    fn announce(&mut self, event: Option<Event>) {
-        let Some(event) = event else {
-            return;
-        };
-        self.events.push(event);
-    }
-
-    /// `older`, a pending generation, is replaced by `newer`, which has
-    /// absorbed its payload: it is over, but not forgotten until `newer` is.
-    fn supersede(&mut self, older: &TaskId, newer: &TaskId) {
-        let stamped_at = WallTime::now(&self.clock);
-        let run_id = self.current_run[older].clone();
-        self.runs
-            .get_mut(&run_id)
-            .expect("every current run is stored")
-            .transition_to(TaskRunState::Superseded, stamped_at)
-            .expect("a pending run can always be superseded");
-        self.waiting.leave(older);
-        self.links.entry(older.clone()).or_default().superseded_by = Some(newer.clone().into());
-        self.mark_decided(&run_id);
-        self.events.push(Event::Superseded {
-            task_id: older.clone(),
-            task_run_id: run_id,
-            by: newer.clone(),
-        });
     }
 
     fn coalescing_key_of(&self, task_id: &TaskId) -> Option<Key> {
@@ -1620,12 +1152,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// coalescing key holds back. A delayed task counts once it is due.
     pub fn pending_len(&self) -> usize {
         self.waiting.queued_len()
-    }
-
-    /// Serialized bytes of every task that has not finished, and of every
-    /// superseded one still needed by the generation that absorbed it.
-    pub fn memory_in_use(&self) -> u64 {
-        self.budget.in_use()
     }
 
     /// Its observer, for a driver that takes what the scheduler published.
