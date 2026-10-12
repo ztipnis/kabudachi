@@ -110,17 +110,22 @@ impl Net {
     /// (`CLAIM_OLDEST`), and awaits its answer: a batch of claims, oldest
     /// task first, or a `ClaimReject`. The batch may hold fewer than
     /// `limit`, or none: the leader hands out only as many as fit in one
-    /// message. The caller names the leader, as for
-    /// [`Self::request_claim`]. See [`ClaimFailure`] for why there may be no
+    /// message, and, when `input_room` is given, only tasks whose inputs,
+    /// carried as blobs, add up to no more than it. The caller names the
+    /// leader, as for [`Self::request_claim`]. See [`ClaimFailure`] for why there may be no
     /// answer. It is the last stage of [`Self::discover`], after the tasks
     /// this worker's own records and its peers' show.
     pub async fn claim_oldest(
         &self,
         leader: WorkerId,
         limit: u32,
+        input_room: Option<u64>,
     ) -> Result<ClaimResponse, ClaimFailure> {
         let response = self
-            .ask_leader(leader, claim_request::Request::Oldest(ClaimOldest { limit }))
+            .ask_leader(
+                leader,
+                claim_request::Request::Oldest(ClaimOldest { limit, input_room }),
+            )
             .await?;
         self.keep_granted(&response);
         Ok(response)
@@ -182,7 +187,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, R: Observer>(
         claim_request::Request::Oldest(oldest) => {
             // A limit past what this platform can count is no limit.
             let limit = usize::try_from(oldest.limit).unwrap_or(usize::MAX);
-            let mut batch = Batch::default();
+            let mut batch = Batch::within(oldest.input_room);
             // Every claim the scheduler makes is one `batch` accepted,
             // in the same order, so `batch` already holds the answer.
             scheduler
@@ -229,17 +234,37 @@ pub(crate) fn not_member() -> ClaimResponse {
 /// claimant could not decode would stay claimed by a worker that never
 /// received it, so the leader claims only what fits in one message
 /// (`MAX_MESSAGE_BYTES`); the tasks left over stay pending for the next ask.
+/// The claimant may also bound the input bytes its claims carry as blobs;
+/// an inline input weighs nothing against that, since one message bounds it.
 #[derive(Default)]
 struct Batch {
     claims: Vec<Claim>,
     /// The encoded length of `ClaimBatch { claims }`.
     encoded_len: usize,
+    /// The blob input bytes the claimant can still take; `None` for no bound.
+    room: Option<u64>,
 }
 
 impl Batch {
-    /// Adds `claim` if the answer holding it still fits in one message, and
-    /// says whether it did.
+    /// An empty answer that may carry no more than `room` bytes of blob input.
+    fn within(room: Option<u64>) -> Self {
+        Batch { room, ..Batch::default() }
+    }
+
+    /// Adds `claim` if its blob input is within the room left and the answer
+    /// holding it still fits in one message, and says whether it did.
     fn try_add(&mut self, claim: &scheduler::Claim) -> bool {
+        let input = claim.task.input_manifest.as_ref().map_or(0, |manifest| manifest.total_bytes);
+        // The frame check adds the claim, so it runs only for one in the room.
+        let fits = self.room.is_none_or(|left| input <= left) && self.try_add_to_frame(claim);
+        if fits {
+            self.room = self.room.map(|left| left - input);
+        }
+        fits
+    }
+
+    /// Adds `claim` if the answer holding it still fits in one message.
+    fn try_add_to_frame(&mut self, claim: &scheduler::Claim) -> bool {
         use prost::encoding::{encoded_len_varint, key_len, message};
 
         const CLAIMS_TAG: u32 = 1; // ClaimBatch.claims

@@ -421,10 +421,12 @@ impl<'n> Executing<'n> {
 
     /// Claims `places` from `leader`, a remote leader, through discovery
     /// (see `Net::discover`); `now` judges which of this worker's own
-    /// records are due.
+    /// records are due. What it claims carries no more blob input than this
+    /// worker has room for (see `PayloadMemory::room`).
     pub(crate) fn discover(&mut self, leader: WorkerId, places: u32, now: WallTime) {
         let limit = usize::try_from(places).unwrap_or(usize::MAX);
-        let discovery = self.net.discover(leader, limit, now, true);
+        let room = self.net.payload_memory().room();
+        let discovery = self.net.discover(leader, limit, now, true, room);
         self.discovering = Some((places, Box::pin(discovery)));
     }
 

@@ -215,9 +215,10 @@ async fn pending_members_claim_from_the_leader_their_nodes_name() {
                     let (b_names, c_names) = (named[0].clone(), named[1].clone());
                     let claimed = until_a_member(|| net_b.request_claim(b_names.clone(), taken.clone())).await;
                     let refused = until_a_member(|| net_c.request_claim(c_names.clone(), taken.clone())).await;
-                    let batch = until_a_member(|| net_c.claim_oldest(c_names.clone(), 2)).await;
-                    let first_huge = until_a_member(|| net_c.claim_oldest(c_names.clone(), 2)).await;
-                    let second_huge = until_a_member(|| net_c.claim_oldest(c_names.clone(), 2)).await;
+                    let oldest = || net_c.claim_oldest(c_names.clone(), 2, None);
+                    let batch = until_a_member(oldest).await;
+                    let first_huge = until_a_member(oldest).await;
+                    let second_huge = until_a_member(oldest).await;
                     (claimed, refused, batch, [first_huge, second_huge])
                 } => claims,
             }

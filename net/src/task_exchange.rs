@@ -30,10 +30,15 @@
 //! for a compaction run, whose result is the folded payload itself
 //! ([`Net::complete_compaction`]): the leader's answer says whether it was
 //! applied.
+//!
+//! [`Net::store_payload_at_leader`] stores a payload too large for one
+//! message where the leader would place its task's record, asking again as
+//! `submit_to_leader` does.
 
 use std::str::FromStr;
 use std::time::Duration;
 
+use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
@@ -317,7 +322,7 @@ impl Net {
     /// hands its copies over. No more than [`MAX_PLACE_IDS`] ids at once;
     /// the answer names the holders and the quorum of each task the leader
     /// could place.
-    pub(crate) async fn place_records(
+    pub async fn place_records(
         &self,
         leader: WorkerId,
         tasks: Vec<TaskId>,
@@ -434,6 +439,23 @@ pub struct LeaderRetry {
     pub ask_again_after: Duration,
 }
 
+/// The placements [`Net::store_payload_at_leader`] writes to before it gives
+/// up, each asked of the leader afresh.
+pub const STORE_ATTEMPTS: u32 = 3;
+
+/// Why [`Net::store_payload_at_leader`] gave up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum NotStored {
+    /// This worker left its shard: no leader will answer.
+    #[error("this worker left its shard")]
+    LeftShard,
+    /// The shard did not store it in [`STORE_ATTEMPTS`] placements in a row
+    /// (holders' stores full or unreachable): refused for now, as
+    /// backpressure.
+    #[error("the shard could not store the payload now")]
+    Refused,
+}
+
 /// The leader this worker's node last named, and whether the worker has left
 /// its shard, for the requests [`Net`] routes to its leader.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -484,6 +506,57 @@ impl Net {
             task_id: Some(task.into()),
         });
         self.ask_until_decided(request, retry).await
+    }
+
+    /// Stores `payload` as blobs owned by the task `owner`, where the shard's
+    /// leader would place the task's record, and returns their manifest. The
+    /// leader is asked as [`Self::submit_to_leader`] asks it. A placement
+    /// leaves this worker out (see `PlaceRecords`), and [`Self::put_blob`]
+    /// keeps a copy here besides, so the blobs reach a quorum of the
+    /// record's placement whether or not this worker is in it. A write that
+    /// fails is made again, to a placement asked afresh, after
+    /// `retry.ask_again_after`. `LeftShard` once the worker has left its
+    /// shard; `Refused` once [`STORE_ATTEMPTS`] placements in a row answered
+    /// but the write failed (a store full, or holders unreachable), which
+    /// its caller treats as backpressure.
+    pub async fn store_payload_at_leader(
+        &self,
+        owner: &TaskId,
+        payload: &[u8],
+        retry: LeaderRetry,
+    ) -> Result<Manifest, NotStored> {
+        let mut failed = 0;
+        loop {
+            if let Some(placement) = self.placement_from_leader(owner, retry).await? {
+                if let Ok(manifest) = self.store_payload(owner, payload, placement).await {
+                    return Ok(manifest);
+                }
+                failed += 1;
+                if failed >= STORE_ATTEMPTS {
+                    return Err(NotStored::Refused);
+                }
+            }
+            tokio::time::sleep(retry.ask_again_after).await;
+        }
+    }
+
+    /// Where the leader the node names would place `task`'s record, if it
+    /// answered in time.
+    async fn placement_from_leader(
+        &self,
+        task: &TaskId,
+        retry: LeaderRetry,
+    ) -> Result<Option<Placement>, NotStored> {
+        let leader = self.routed_leader().await.ok_or(NotStored::LeftShard)?;
+        let asked = tokio::time::timeout(
+            retry.answer_within,
+            self.place_records(leader, vec![task.clone()]),
+        )
+        .await;
+        Ok(match asked {
+            Ok(Ok(response)) => placement_of(&response, task),
+            _ => None,
+        })
     }
 
     /// Whether this worker has left its shard: [`crate::worker::Worker::run`]
@@ -540,6 +613,21 @@ impl Net {
         }
         named.leader.clone()
     }
+}
+
+/// Where `response`, a leader's answer to `PlaceRecords`, places `task`.
+pub fn placement_of(response: &TaskResponse, task: &TaskId) -> Option<Placement> {
+    let Some(task_response::Result::Placements(answer)) = &response.result else {
+        return None;
+    };
+    answer
+        .placements
+        .iter()
+        .find(|placed| placed.task_id.as_ref().is_some_and(|id| id.value == task.as_str()))
+        .map(|placed| Placement {
+            holders: placed.holders.iter().cloned().map(WorkerId::from).collect(),
+            quorum: usize::try_from(placed.quorum).unwrap_or(usize::MAX),
+        })
 }
 
 /// The leader's answer to `request` from `from`, as `scheduler` decides it.

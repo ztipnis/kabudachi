@@ -143,7 +143,10 @@ fn decide_own_claim<C: Clock, I: IdGenerator>(
     deciding: &mut Deciding<'_, C, I>,
     local: &mut Local,
 ) {
-    let request = claim_request::Request::Oldest(ClaimOldest { limit: places });
+    let request = claim_request::Request::Oldest(ClaimOldest {
+        limit: places,
+        input_room: deciding.net.payload_memory().room(),
+    });
     let response = claim::answer(
         deciding.scheduler,
         &deciding.net.local_worker_id(),

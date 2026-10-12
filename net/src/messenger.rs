@@ -1221,6 +1221,17 @@ impl Net {
         put_blob_through(&self.commands, owner, bytes, placement, false).await
     }
 
+    /// Stores a blob this worker holds, `held`, as [`Self::put_blob`] stores
+    /// bytes, and as the kind it is held as: an input's or a result's.
+    pub(crate) async fn put_blob_as_held(
+        &self,
+        owner: BlobOwner,
+        held: BlobRecord,
+        placement: Placement,
+    ) -> Result<Digest, PutBlobError> {
+        put_blob_through(&self.commands, owner, held.value, placement, held.result).await
+    }
+
     /// The bytes of the blob `digest` names, which `owner` stored. Looked
     /// for, in turn, in this worker's own store; at the holders of `owner`'s
     /// record, asked directly and all at once; and, if they all miss, by the

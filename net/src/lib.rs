@@ -6,6 +6,7 @@
 
 pub mod authority;
 pub mod blob_exchange;
+mod blobs;
 pub mod bootstrap;
 pub mod claim;
 pub mod claimed_runs;

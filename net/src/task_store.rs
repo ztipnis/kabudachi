@@ -134,6 +134,17 @@ impl HeldRecords {
             .collect()
     }
 
+    /// The bytes of `task`'s input, carried as blobs, that this worker's copy
+    /// of its record shows; 0 for an input that travels inline or a task not
+    /// held.
+    pub(crate) fn blob_input_bytes(&self, task: &TaskId) -> u64 {
+        self.lock()
+            .get(task)
+            .and_then(|record| record.task.as_ref())
+            .and_then(|task| task.input_manifest.as_ref())
+            .map_or(0, |manifest| manifest.total_bytes)
+    }
+
     /// Feeds `take` a summary of each record held after `after` (every one
     /// for `None`), and of each stub of a revision held elsewhere (see
     /// [`VersionedRecords::reported`]), in task id order, until it refuses one. Says whether it
