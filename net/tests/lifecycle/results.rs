@@ -2,8 +2,10 @@
 //! The worker that ran it delivers it, then reports the run delivered, and
 //! the leader certifies the run to the client once the report is stored.
 //! A client cut off from the runner still hears the run certified, with no
-//! result. A task that ends without a result is told to its client, and a
-//! new leader certifies a run it adopted and answers how a task stands.
+//! result. An event the client queues itself comes after the results that
+//! arrived before it. A task that ends without a result is told to its
+//! client, and a new leader certifies a run it adopted and answers how a
+//! task stands.
 
 use std::time::Duration as StdDuration;
 
@@ -230,6 +232,44 @@ async fn a_result_for_this_worker_is_delivered_to_itself(at: &mut Delivering) {
     assert_eq!(leader.take_result_events(), delivered_event(&task, &run));
 }
 
+/// An event a client queues itself, such as a leader's answer about a task,
+/// comes after the result messages that arrived before it and are not yet
+/// taken, so whoever takes them hands every event on in one order.
+async fn an_event_queued_here_comes_after_the_results_already_arrived(at: &mut Delivering) {
+    let (task, run) = (TaskId::new("queued"), TaskRunId::new("queued-run"));
+    let concluded = ResultEvent::Concluded {
+        task: task.clone(),
+        outcome: OutcomeAnswer {
+            task_id: Some(task.clone().into()),
+            ..OutcomeAnswer::default()
+        },
+    };
+    // Spends any arrival already signalled, so the wait below is for the
+    // delivery.
+    at.client.queue_result_event(concluded.clone());
+    at.client.result_arrived().await;
+    at.client.take_result_events();
+    let runner = at.shard.nets[at.runner].clone();
+    let (me, client) = (at.me(), &at.client);
+    let (sent, taken) = at
+        .shard
+        .drive_until(async {
+            tokio::join!(
+                runner.deliver_result(me, delivery(&task, &run), StdDuration::from_secs(5)),
+                async {
+                    client.result_arrived().await;
+                    client.queue_result_event(concluded.clone());
+                    client.take_result_events()
+                }
+            )
+        })
+        .await;
+    assert_eq!(sent, Ok(()));
+    let mut expected = delivered_event(&task, &run);
+    expected.push(concluded);
+    assert_eq!(taken, expected);
+}
+
 /// A client cut off from the runner, not from the leader: the delivery is
 /// never acknowledged, the run is reported undelivered, and the client still
 /// hears it certified, with no result.
@@ -320,6 +360,7 @@ async fn results_reach_their_client_and_the_leader_tells_it_how_each_task_ended(
         let mut at = Delivering::start().await;
         a_delivered_result_is_certified(&mut at).await;
         a_result_for_this_worker_is_delivered_to_itself(&mut at).await;
+        an_event_queued_here_comes_after_the_results_already_arrived(&mut at).await;
         a_client_cut_off_from_the_runner_hears_the_run_certified(&mut at).await;
         a_task_that_ends_without_a_result_is_concluded(&mut at).await;
         a_run_is_not_certified_before_a_majority_stores_it(&mut at).await;

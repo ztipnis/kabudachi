@@ -168,8 +168,8 @@ pub(super) async fn ask_after_leader_change(shared: Arc<Shared>) {
 }
 
 /// Asks the leader how each task submitted here, stored and still awaited,
-/// stands, and queues each answer behind the result messages already
-/// arrived, so the result reader hands Python every event in one order.
+/// stands, and queues each answer behind the result messages that arrived
+/// before it, so the result reader hands Python every event in one order.
 async fn ask_about_awaited(shared: &Shared) {
     let tasks: Vec<TaskId> = {
         let seam = shared.seam();

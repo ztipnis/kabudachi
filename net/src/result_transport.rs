@@ -179,6 +179,24 @@ impl Net {
     /// call, each acknowledged now; a malformed one is dropped unanswered.
     pub fn take_result_events(&self) -> Vec<ResultEvent> {
         let mut events = self.inbound.take_own_results();
+        events.extend(self.take_arrived_results());
+        events
+    }
+
+    /// Queues `event` as if it had arrived for this worker, behind every
+    /// result message that arrived before it, so whoever takes the result
+    /// events hands on every one of them in a single order.
+    pub fn queue_result_event(&self, event: ResultEvent) {
+        for arrived in self.take_arrived_results() {
+            self.inbound.queue_own_result(arrived);
+        }
+        self.inbound.queue_own_result(event);
+    }
+
+    /// The result messages other workers sent here since the last take, each
+    /// acknowledged now; a malformed one is dropped unanswered.
+    fn take_arrived_results(&self) -> Vec<ResultEvent> {
+        let mut events = Vec::new();
         for asked in self.take_asked::<ResultCodec>() {
             if let Some((event, ack)) = ResultEvent::arrived(asked.request) {
                 self.answer::<ResultCodec>(asked.channel, ack);
@@ -186,12 +204,6 @@ impl Net {
             }
         }
         events
-    }
-
-    /// Queues `event` as if it had arrived for this worker, so whoever takes
-    /// the result events hands on every one of them in a single order.
-    pub fn queue_result_event(&self, event: ResultEvent) {
-        self.inbound.queue_own_result(event);
     }
 
     /// Waits until a result message has arrived since this last returned.
