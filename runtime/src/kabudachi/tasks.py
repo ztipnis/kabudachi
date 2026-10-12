@@ -106,12 +106,7 @@ class Task(wrapt.ObjectProxy):
         reconnect_timeout: timedelta | None = None,
         serializers: SerializerRegistry | None = None,
     ) -> None:
-        if not callable(func):
-            raise TaskDefinitionError(f"a task must be a callable, not {func!r}")
-        self._require_non_negative_count("version", version)
-        if queue is not UNSET:
-            self._require_string("queue", queue)
-        self._require_string("serializer", serializer)
+        self._check_identity(func, version, queue, serializer)
         self._require_non_negative_count("retries", retries)
         self._check_retriable(retriable, retries, kind)
 
@@ -239,6 +234,16 @@ class Task(wrapt.ObjectProxy):
 
             return finish()
         return checked(outcome)
+
+    @staticmethod
+    def _check_identity(func: Any, version: Any, queue: Any, serializer: Any) -> None:
+        """Checks what names the task: its function, version, queue and serializer."""
+        if not callable(func):
+            raise TaskDefinitionError(f"a task must be a callable, not {func!r}")
+        Task._require_non_negative_count("version", version)
+        if queue is not UNSET:
+            Task._require_string("queue", queue)
+        Task._require_string("serializer", serializer)
 
     @staticmethod
     def _check_merge(merge: Any, kind: TaskKind) -> None:
