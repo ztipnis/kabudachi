@@ -635,7 +635,7 @@ fn a_round_whose_promise_is_held_stands_while_its_joiner_confirmed_within_a_susp
     let mut leader = leader_of_three(&clock);
     let joiner = worker("joiner");
     let peers = [worker("p1"), worker("p2")];
-    connect(&mut leader, &[joiner.clone()]);
+    connect(&mut leader, std::slice::from_ref(&joiner));
     let committed = leader.configuration().map(Configuration::generation);
     let confirm_voters = |clock: &FakeClock, leader: &mut TestNode| {
         for peer in &peers {

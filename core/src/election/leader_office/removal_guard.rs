@@ -116,9 +116,9 @@ impl RemovalGuard {
     /// generations nothing points at any more.
     pub(super) fn note_voters(&mut self, roster: &Roster) {
         let current = roster.configuration().generation();
-        if !self.voters_at.contains_key(&current) {
-            self.voters_at.insert(current, roster.sides());
-        }
+        self.voters_at
+            .entry(current)
+            .or_insert_with(|| roster.sides());
         let removed = &self.removed;
         self.voters_at.retain(|generation, _| {
             *generation == current
