@@ -90,24 +90,32 @@ use crate::task_record::{HISTORY_TOO_LARGE_FAILURE_KIND, RecordVersion};
 use crate::time::{Clock, Duration, Instant, WallTime};
 
 mod backlog;
+mod cancel;
+mod claims;
 mod compaction;
+mod failures;
 mod leadership;
 mod memory_budget;
 mod observer;
 mod publication;
 mod reconciliation;
 mod record_size;
+mod reports;
 mod retention;
 mod submission;
 mod waiting_room;
 
 pub use backlog::Backlog;
+pub use cancel::{CancelRejection, Cancellation, HeldCancel};
+pub use claims::{Claim, ClaimRejection};
 pub use compaction::Compacted;
+pub use failures::Failure;
 use leadership::Leadership;
 pub use leadership::{LeadershipGrant, LeaseEnd};
 use memory_budget::MemoryBudget;
 pub use observer::{NoObserver, Observer};
 use reconciliation::Reconciliation;
+pub use reports::{Certification, Completion, ContinuationRejection, ReportRejection};
 use retention::Retention;
 pub use submission::{Submission, SubmitRejection, Submitted, mint};
 use waiting_room::WaitingRoom;
@@ -154,12 +162,6 @@ pub const COMPACTION_SOFT_BYTES: u64 = MAX_SUBMISSION_BYTES / 2;
 /// the placement.
 const RECORD_RESERVE_BYTES: u64 = 1024;
 
-/// The longest failure kind a record keeps, in bytes. A kind is an error
-/// type's name, so any real one fits; a longer one is cut rather than refused
-/// (the failure is reported either way), so that what a worker supplies can
-/// never push a record past the limit the network refuses to store.
-const MAX_FAILURE_KIND_BYTES: usize = 128;
-
 /// What a claim spends on each payload of a chain besides its bytes: the
 /// field's tag and its length.
 const CHAIN_ENTRY_FRAMING_BYTES: u64 = 6;
@@ -174,42 +176,6 @@ const UNVERSIONED: RecordVersion = RecordVersion {
     leader_term: 0,
     revision: 0,
 };
-
-/// A worker's permission to run a task: the Task itself and the run it now
-/// owns.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Claim {
-    pub task: Task,
-    pub task_run_id: TaskRunId,
-    /// Which attempt this run is: 1 for the first, then one more per retry.
-    pub attempt_number: u32,
-    /// The run's reconnect timeout: its task's own, or else the shard's
-    /// default from this leader's grant.
-    pub reconnect_timeout: Duration,
-    /// The serialized inputs of the generations this one superseded, oldest
-    /// first, for the worker to fold before running the task.
-    /// Empty unless the task is a coalescing one that absorbed others.
-    pub chain: Vec<Vec<u8>>,
-}
-
-/// The leader's word that a run's result is the authoritative one. Until a
-/// client holds this, result bytes it received are only provisional.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Certification {
-    pub task_id: TaskId,
-    pub task_run_id: TaskRunId,
-    pub result_digest: Digest,
-}
-
-/// The leader's record that a run failed, so its client can be told.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Failure {
-    pub task_id: TaskId,
-    pub task_run_id: TaskRunId,
-    /// The run that replaces the failed one, queued, if the task has retries
-    /// left. `None` means the task has failed for good.
-    pub retry: Option<TaskRunId>,
-}
 
 /// Something the scheduler decided on its own, because time passed, that
 /// whoever drives it has to act on. Drained with [`Scheduler::take_events`].
@@ -251,15 +217,6 @@ pub enum Event {
     },
 }
 
-/// A run stored as cancelled that its worker reported it still holds: the
-/// worker has to be told to stop the body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeldCancel {
-    pub task_id: TaskId,
-    pub task_run_id: TaskRunId,
-    pub worker: WorkerId,
-}
-
 /// A run that was lost with its worker, and the run that replaces it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LostRun {
@@ -272,28 +229,6 @@ pub struct LostRun {
     /// ephemeral task's, an orphaned one, and a coalescing generation that a
     /// newer one had superseded in the meantime.
     pub replayed: Option<TaskRunId>,
-}
-
-/// What cancelling a task did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cancellation {
-    /// The task's current run is now `Cancelled`.
-    Cancelled {
-        was_running: bool,
-    },
-    /// The task had already finished, so there was nothing to cancel.
-    AlreadyFinished,
-    UnknownTask,
-}
-
-/// Why a cancellation was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum CancelRejection {
-    #[error("this node is not the leader")]
-    NotLeader,
-    /// The task's newest record cannot be known yet: ask again.
-    #[error("the task's newest record is not known yet")]
-    NotReady,
 }
 
 /// Why `Scheduler::reconcile` refused.
@@ -356,62 +291,6 @@ pub struct CaughtUp {
     pub expired: usize,
     /// Finished tasks forgotten because their result TTL had passed.
     pub forgotten: usize,
-}
-
-/// Whether a certified run ends its task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Completion {
-    /// The task is over: its coalescing key is freed, its payload stops
-    /// counting, and it is forgotten `result_ttl` later.
-    Final,
-    /// The result is a continuation (an implicit flow): the run
-    /// is certified, but the task holds its key and its memory until
-    /// [`Scheduler::end_continuation`].
-    Continues,
-}
-
-/// Why a claim request was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ClaimRejection {
-    #[error("this node is not the leader")]
-    NotLeader,
-    #[error("no such task")]
-    TaskUnknown,
-    #[error("the task is not due yet")]
-    NotReady,
-    #[error("the task's run was already claimed")]
-    AlreadySelected,
-    #[error("the task's run has finished")]
-    Finished,
-    #[error("a newer generation of the task's coalescing key replaced it")]
-    Superseded,
-    #[error("another generation of the task's coalescing key is running")]
-    KeyBusy,
-    /// The task is a compaction run and the asking worker has not said it
-    /// runs them.
-    #[error("the worker does not run compaction")]
-    CannotRun,
-}
-
-/// Why a worker's report about a run was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ReportRejection {
-    #[error("this node is not the leader")]
-    NotLeader,
-    #[error("no such run")]
-    UnknownRun,
-    #[error("the run does not belong to this worker or is not in the expected state")]
-    NotAuthoritative,
-    /// The run's task has a newest record this leader cannot know yet: ask again.
-    #[error("the run's task is not known for certain yet")]
-    NotReady,
-}
-
-/// Why ending a continuation was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ContinuationRejection {
-    #[error("this node is not the leader")]
-    NotLeader,
 }
 
 /// Owns all Tasks and TaskRuns and decides every claim and report. Drive it
@@ -1332,418 +1211,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         events
     }
 
-    /// The runs stored as cancelled that their workers reported they still
-    /// hold, each time one reported it: whichever leader stored the cancel,
-    /// the worker must still be told to stop the body. Nothing while the
-    /// scheduler does not lead: what a rebuild installed is told of only once
-    /// it is stored again at this leader's term. Kept until then.
-    pub fn take_held_cancels(&mut self) -> Vec<HeldCancel> {
-        if !self.is_leader() {
-            return Vec::new();
-        }
-        std::mem::take(&mut self.held_cancels)
-    }
-
-    /// A worker asks for up to `limit` of the oldest pending tasks at once.
-    /// Fewer, or none, are returned if fewer are pending.
-    pub fn claim_oldest(
-        &mut self,
-        worker: &WorkerId,
-        limit: usize,
-    ) -> Result<Vec<Claim>, ClaimRejection> {
-        self.claim_oldest_fitting(worker, limit, |_| true)
-    }
-
-    /// Like [`Self::claim_oldest`], but each candidate, oldest first, is
-    /// shown to `fits` before it is claimed. The first one `fits` refuses
-    /// ends the batch and stays pending, first in line for the next call;
-    /// except that one refused while nothing is claimed yet, which would
-    /// never fit, is passed over so the tasks behind it still go out. No
-    /// claim outgrows a frame, so that last rule only guards a caller whose
-    /// limit is smaller. It is how a caller that must deliver the claims
-    /// keeps them within what it can deliver.
-    pub fn claim_oldest_fitting(
-        &mut self,
-        worker: &WorkerId,
-        limit: usize,
-        fits: impl FnMut(&Claim) -> bool,
-    ) -> Result<Vec<Claim>, ClaimRejection> {
-        let outcome = self.claim_while_fitting(worker, limit, fits);
-        self.end_call();
-        outcome
-    }
-
-    fn claim_while_fitting(
-        &mut self,
-        worker: &WorkerId,
-        limit: usize,
-        mut fits: impl FnMut(&Claim) -> bool,
-    ) -> Result<Vec<Claim>, ClaimRejection> {
-        if !self.check_leader() {
-            return Err(ClaimRejection::NotLeader);
-        }
-        self.release_due();
-        let mut claims = Vec::new();
-        let mut after = None;
-        // Time is only allowed to take effect once per call: each candidate
-        // is claimed as it is, whatever the clock has done since.
-        while claims.len() < limit {
-            let Some((position, task_id)) = self.next_unblocked_after(after) else {
-                break;
-            };
-            after = Some(position);
-            if self.is_compaction(&task_id) && !self.may_claim_compaction(worker, &task_id) {
-                continue;
-            }
-            let claim = self.claim_to_be(&task_id);
-            if fits(&claim) {
-                self.mark_claimed(worker, &task_id);
-                claims.push(claim);
-            } else if !claims.is_empty() {
-                break;
-            }
-        }
-        Ok(claims)
-    }
-
-    /// The oldest queued task, past queue position `after` if given, that
-    /// no other generation of its coalescing key holds back, and whose key is
-    /// not held back for want of knowing one of its generations.
-    fn next_unblocked_after(&self, after: Option<u64>) -> Option<(u64, TaskId)> {
-        self.waiting
-            .queued_after(after)
-            .find(|(_, task_id)| !self.is_blocked(task_id) && !self.is_held_back(task_id))
-            .map(|(position, task_id)| (position, task_id.clone()))
-    }
-
-    /// A worker asks for `task_id`. Of several workers asking for the same
-    /// task, the first is accepted and the rest are refused.
-    pub fn request_claim(
-        &mut self,
-        worker: &WorkerId,
-        task_id: &TaskId,
-    ) -> Result<Claim, ClaimRejection> {
-        let outcome = self.claim_task(worker, task_id);
-        self.end_call();
-        outcome
-    }
-
-    fn claim_task(&mut self, worker: &WorkerId, task_id: &TaskId) -> Result<Claim, ClaimRejection> {
-        if !self.check_leader() {
-            return Err(ClaimRejection::NotLeader);
-        }
-        self.release_due();
-        if self.reconciliation.is_uncertain(task_id) {
-            return Err(ClaimRejection::NotReady);
-        }
-        let run_id = self
-            .current_run
-            .get(task_id)
-            .ok_or(ClaimRejection::TaskUnknown)?
-            .clone();
-        match self.runs[&run_id].current_state() {
-            TaskRunState::Queued if self.is_held_back(task_id) => Err(ClaimRejection::NotReady),
-            TaskRunState::Queued if self.is_blocked(task_id) => Err(ClaimRejection::KeyBusy),
-            TaskRunState::Queued if self.is_compaction(task_id) => {
-                self.claim_compaction(worker, task_id)
-            }
-            TaskRunState::Queued => Ok(self.claim_queued(worker, task_id)),
-            TaskRunState::Scheduled => Err(ClaimRejection::NotReady),
-            TaskRunState::Claimed | TaskRunState::Running => Err(ClaimRejection::AlreadySelected),
-            TaskRunState::Superseded => Err(ClaimRejection::Superseded),
-            _ => Err(ClaimRejection::Finished),
-        }
-    }
-
-    /// Claims `task_id`, whose current run must be `Queued`, for `worker`.
-    fn claim_queued(&mut self, worker: &WorkerId, task_id: &TaskId) -> Claim {
-        let claim = self.claim_to_be(task_id);
-        self.mark_claimed(worker, task_id);
-        claim
-    }
-
-    /// The claim that claiming `task_id`, whose current run must be
-    /// `Queued`, would hand out. Changes nothing.
-    fn claim_to_be(&self, task_id: &TaskId) -> Claim {
-        let run_id = self.current_run[task_id].clone();
-        let chain = match self.coalescing_key_of(task_id) {
-            None if self.is_compaction(task_id) => {
-                self.compaction_claim_chain(task_id).unwrap_or_default()
-            }
-            Some(_) => self
-                .occupancy
-                .chain(task_id)
-                .iter()
-                .map(|item| self.item_payload(item).to_vec())
-                .collect(),
-            None => Vec::new(),
-        };
-        Claim {
-            task: self.tasks[task_id].clone(),
-            attempt_number: self.runs[&run_id].attempt_number(),
-            reconnect_timeout: self.reconnect_timeout_of(task_id),
-            task_run_id: run_id,
-            chain,
-        }
-    }
-
-    /// How long after its worker falls silent `task_id`'s current run may be
-    /// replayed: the task's own reconnect timeout, or else the shard's, from
-    /// the grant. Asked only while leading, so a grant is held.
-    fn reconnect_timeout_of(&self, task_id: &TaskId) -> Duration {
-        match self.tasks[task_id].reconnect_timeout_ms {
-            0 => self.leadership.shard_reconnect_timeout(),
-            own => Duration::from_millis(own),
-        }
-    }
-
-    /// Records that `worker` claimed `task_id`, whose current run must be
-    /// `Queued`. Starting is what expiry is about, so the task's expiry is
-    /// dropped.
-    fn mark_claimed(&mut self, worker: &WorkerId, task_id: &TaskId) {
-        let stamped_at = WallTime::now(&self.clock);
-        let run_id = self.current_run[task_id].clone();
-        let run = self
-            .runs
-            .get_mut(&run_id)
-            .expect("every current run is stored");
-        run.transition_to(TaskRunState::Claimed, stamped_at)
-            .expect("a Queued run can always be claimed");
-        run.selected_worker = Some(worker.clone().into());
-        self.waiting.claimed(task_id);
-        if let Some(key) = self.coalescing_key_of(task_id) {
-            self.occupancy.start(&key, task_id);
-        } else if let Some(key) = self.compaction_key_of(task_id) {
-            self.occupancy.compaction_claimed(&key, task_id);
-        }
-        self.mark_decided(&run_id);
-    }
-
-    /// The worker that claimed `run_id` reports that it began executing. The
-    /// same report again, while the run still runs, is taken and changes
-    /// nothing.
-    pub fn report_started(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-    ) -> Result<(), ReportRejection> {
-        let outcome = self.start_run(worker, run_id);
-        self.end_call();
-        outcome
-    }
-
-    fn start_run(&mut self, worker: &WorkerId, run_id: &TaskRunId) -> Result<(), ReportRejection> {
-        self.require_leader()?;
-        self.start_owned(worker, run_id)
-    }
-
-    /// Starts `worker`'s claimed run. A start repeated by the worker of a run
-    /// already running (its first went unanswered, or a new leader rebuilt the
-    /// run as running) is taken again and changes nothing, so a report sent
-    /// again never stops a healthy run.
-    fn start_owned(&mut self, worker: &WorkerId, run_id: &TaskRunId) -> Result<(), ReportRejection> {
-        let already_running = self.runs.get(run_id).is_some_and(|run| {
-            run.current_state() == TaskRunState::Running && run.selected_worker().as_ref() == Some(worker)
-        });
-        if already_running {
-            return Ok(());
-        }
-        let stamped_at = WallTime::now(&self.clock);
-        let run = self.owned_run(worker, run_id, TaskRunState::Claimed)?;
-        run.transition_to(TaskRunState::Running, stamped_at)
-            .expect("a Claimed run can always start");
-        self.mark_decided(run_id);
-        Ok(())
-    }
-
-    /// The worker running `run_id` reports success with the digest of its
-    /// result. Only a `Running` run owned by that worker can complete, so a
-    /// stale or repeated report is refused and certifies nothing. `completion`
-    /// says whether that ends the task.
-    pub fn complete(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-        result_digest: Digest,
-        completion: Completion,
-    ) -> Result<Certification, ReportRejection> {
-        let outcome = self.certify(worker, run_id, result_digest, completion);
-        self.end_call();
-        outcome
-    }
-
-    /// Certifies the result of a running run, and finishes its task unless it continues.
-    fn certify(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-        result_digest: Digest,
-        completion: Completion,
-    ) -> Result<Certification, ReportRejection> {
-        self.require_leader()?;
-        // A compaction run's result is its fold, reported by `complete_compaction`.
-        if self
-            .runs
-            .get(run_id)
-            .is_some_and(|run| self.is_compaction(&run.task_id()))
-        {
-            return Err(ReportRejection::NotAuthoritative);
-        }
-        self.certify_owned(worker, run_id, result_digest, completion)
-    }
-
-    fn certify_owned(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-        result_digest: Digest,
-        completion: Completion,
-    ) -> Result<Certification, ReportRejection> {
-        let now = self.clock.now();
-        let stamped_at = WallTime::now(&self.clock);
-        let run = self.owned_run(worker, run_id, TaskRunState::Running)?;
-        run.transition_to(TaskRunState::Succeeded, stamped_at)
-            .expect("a Running run can always succeed");
-        run.result_digest = Some(result_digest.clone().into());
-        let task_id = run.task_id();
-        self.mark_decided(run_id);
-        match completion {
-            Completion::Continues => {
-                self.continuing.insert(task_id.clone());
-            }
-            Completion::Final => self.record_finished(&task_id, now),
-        }
-        Ok(Certification {
-            task_id,
-            task_run_id: run_id.clone(),
-            result_digest,
-        })
-    }
-
-    /// The continuation of `task_id` is over, however it ended: the task is
-    /// finished after all. Says whether it had a continuation to end, so
-    /// ending twice, or a task with none, changes nothing.
-    pub fn end_continuation(&mut self, task_id: &TaskId) -> Result<bool, ContinuationRejection> {
-        if !self.check_leader() {
-            return Err(ContinuationRejection::NotLeader);
-        }
-        let had_one = self.finish_continuation(task_id);
-        self.end_call();
-        Ok(had_one)
-    }
-
-    fn finish_continuation(&mut self, task_id: &TaskId) -> bool {
-        if !self.continuing.remove(task_id) {
-            return false;
-        }
-        let now = self.clock.now();
-        self.record_finished(task_id, now);
-        true
-    }
-
-    /// The worker running `run_id` reports that it failed with an error of
-    /// type `failure_kind` (its name, never its message; one longer than
-    /// `MAX_FAILURE_KIND_BYTES` is cut). Like completing,
-    /// only a `Running` run owned by that worker can fail.
-    pub fn fail(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-        failure_kind: impl Into<String>,
-    ) -> Result<Failure, ReportRejection> {
-        let outcome = self.fail_run(worker, run_id, failure_kind.into());
-        self.end_call();
-        outcome
-    }
-
-    fn fail_run(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-        failure_kind: String,
-    ) -> Result<Failure, ReportRejection> {
-        self.require_leader()?;
-        self.fail_owned(worker, run_id, failure_kind)
-    }
-
-    fn fail_owned(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-        failure_kind: String,
-    ) -> Result<Failure, ReportRejection> {
-        self.start_if_claimed_compaction(worker, run_id);
-        let now = self.clock.now();
-        let stamped_at = WallTime::now(&self.clock);
-        let run = self.owned_run(worker, run_id, TaskRunState::Running)?;
-        run.transition_to(TaskRunState::Failed, stamped_at)
-            .expect("a Running run can always fail");
-        run.failure_kind = cut_to_fit(failure_kind, MAX_FAILURE_KIND_BYTES);
-        let task_id = run.task_id();
-        let attempt = run.attempt_number();
-        self.mark_decided(run_id);
-        self.note_failed_compaction(&task_id);
-        let retry = self.replace_failed_run(&task_id, run_id, attempt);
-        if retry.is_none() {
-            self.record_finished(&task_id, now);
-        }
-        Ok(Failure {
-            task_id,
-            task_run_id: run_id.clone(),
-            retry,
-        })
-    }
-
     pub fn task_run(&self, run_id: &TaskRunId) -> Option<&TaskRun> {
         self.runs.get(run_id)
-    }
-
-    /// Cancels `task_id` whatever state its current run is in: a pending or
-    /// scheduled run never starts, and a claimed or running one is taken from
-    /// its worker, whose later reports are refused. Only a leader decides.
-    /// A cancelled task is not retried, and does not expire.
-    pub fn cancel(&mut self, task_id: &TaskId) -> Result<Cancellation, CancelRejection> {
-        let outcome = self.cancel_task(task_id);
-        self.end_call();
-        outcome
-    }
-
-    fn cancel_task(&mut self, task_id: &TaskId) -> Result<Cancellation, CancelRejection> {
-        if !self.check_leader() {
-            return Err(CancelRejection::NotLeader);
-        }
-        if self.reconciliation.is_uncertain(task_id) {
-            return Err(CancelRejection::NotReady);
-        }
-        let Some(run_id) = self.current_run.get(task_id).cloned() else {
-            return Ok(Cancellation::UnknownTask);
-        };
-        // Compaction runs are internal: no client holds their ids.
-        if self.is_compaction(task_id) {
-            return Ok(Cancellation::UnknownTask);
-        }
-        let now = self.clock.now();
-        let stamped_at = WallTime::now(&self.clock);
-        let run = self
-            .runs
-            .get_mut(&run_id)
-            .expect("every current run is stored");
-        let was_running = match run.current_state() {
-            TaskRunState::Scheduled | TaskRunState::Queued => false,
-            TaskRunState::Claimed | TaskRunState::Running => true,
-            _ => return Ok(Cancellation::AlreadyFinished),
-        };
-        run.transition_to(TaskRunState::Cancelled, stamped_at)
-            .expect("an unfinished run can always be cancelled");
-        self.waiting.leave(task_id);
-        self.record_finished(task_id, now);
-        self.mark_decided(&run_id);
-        self.events.push(Event::Cancelled {
-            task_id: task_id.clone(),
-            task_run_id: run_id,
-            was_running,
-        });
-        Ok(Cancellation::Cancelled { was_running })
     }
 
     /// Its node's office counts `worker` silent from `reconnect_from` on:
@@ -1921,24 +1390,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// unknown or has been forgotten.
     pub fn runs_of(&self, task_id: &TaskId) -> Vec<TaskRunId> {
         self.runs_of_task.get(task_id).cloned().unwrap_or_default()
-    }
-
-    /// Queues the next attempt of `task_id` if it has retries left, and makes
-    /// it the one authoritative run.
-    fn replace_failed_run(
-        &mut self,
-        task_id: &TaskId,
-        failed: &TaskRunId,
-        attempt: u32,
-    ) -> Option<TaskRunId> {
-        let retries = self.tasks.get(task_id)?.max_retries;
-        // Attempt 1 is the first try, so retries left = retries - (attempt - 1),
-        // not counting the attempts that were lost rather than failed.
-        let lost = self.losses.get(task_id).copied().unwrap_or(0);
-        if attempt - lost > retries {
-            return None;
-        }
-        self.queue_next_attempt(task_id, failed)
     }
 
     /// Queues the attempt that follows `previous`, a terminal run of
@@ -2195,35 +1646,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.mark_decided(&run_id);
     }
 
-    /// `run_id`'s run, if the run exists, `worker` claimed it and it is in
-    /// `expected` state. Does not ask whether this node leads: a rebuild
-    /// applies what workers report before it holds a grant.
-    fn owned_run(
-        &mut self,
-        worker: &WorkerId,
-        run_id: &TaskRunId,
-        expected: TaskRunState,
-    ) -> Result<&mut TaskRun, ReportRejection> {
-        if !self.runs.contains_key(run_id) {
-            let uncertain = self.reconciliation.holds_uncertain_run(run_id);
-            return Err(if uncertain {
-                ReportRejection::NotReady
-            } else {
-                ReportRejection::UnknownRun
-            });
-        }
-        let run = self
-            .runs
-            .get_mut(run_id)
-            .expect("just seen");
-        let owned = run.selected_worker().as_ref() == Some(worker);
-        // A run replaced by a retry or a replay is `Failed` or `Lost`, which no
-        // report expects, so ownership and state are enough.
-        if !owned || run.current_state() != expected {
-            return Err(ReportRejection::NotAuthoritative);
-        }
-        Ok(run)
-    }
 }
 
 /// The order records are installed in, oldest submission first, so the
@@ -2287,16 +1709,4 @@ fn retained_ids(record: &TaskRecord) -> BTreeSet<TaskId> {
             chain_entry::Entry::Folded(_) => None,
         })
         .collect()
-}
-
-/// `text` cut to at most `max` bytes, at a character boundary.
-fn cut_to_fit(mut text: String, max: usize) -> String {
-    if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
-    text
 }
