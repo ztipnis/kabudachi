@@ -16,6 +16,7 @@
 //! confirmation until the lease runs past it). The same holds of a removal
 //! the leader simply announces late.
 
+mod liveness;
 mod reports;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,11 +24,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::configuration::{Configuration, Generation, Roster, Side, Tally};
 use crate::protocol::ids::WorkerId;
 use crate::reconcile::Answered;
-use crate::time::{Duration, Instant};
+use crate::time::Instant;
 
 use super::ElectionTimings;
 use super::lease::Lease;
 use super::standing::ShardStanding;
+use liveness::Liveness;
 use reports::MemberReports;
 
 /// What the leader's node lends the office for one operation.
@@ -102,22 +104,9 @@ impl Departure {
 pub(crate) struct LeaderOffice {
     roster: Roster,
     term: u64,
-    /// When it last heard from each worker it has not yet reported lost.
-    last_heard: BTreeMap<WorkerId, Instant>,
-    /// When each counted member last confirmed a recent ack of this leader;
-    /// a member not in it counts from when it was first heard.
-    confirmed_at: BTreeMap<WorkerId, Instant>,
-    /// The counted members reported lost for confirming no ack while their
-    /// heartbeats kept arriving, to take out one at a time (see
-    /// [`Self::remove_one_unconfirming`]).
-    unconfirming: BTreeSet<WorkerId>,
-    /// The workers reported lost and not heard since: one that confirmed no
-    /// ack stays here until it confirms one, its heartbeats notwithstanding.
-    lost: BTreeSet<WorkerId>,
-    /// The workers reported silent and not heard since, each with the
-    /// instant from which the reconnect timeouts of the runs it holds count
-    /// (see [`Self::silence_changes`]).
-    reported_silence: BTreeMap<WorkerId, Instant>,
+    /// When it last heard from, and last had an ack confirmed by, each
+    /// worker, and which it has reported silent or lost.
+    liveness: Liveness,
     /// The voters taken out for confirming no ack, each with the generation
     /// it last echoed before (see [`Self::may_remove_one_unconfirming`]).
     removed: Vec<(WorkerId, Option<Generation>)>,
@@ -140,21 +129,19 @@ impl LeaderOffice {
     /// are admitted from the first heartbeat on: the node does not lead yet,
     /// so nothing admits at the win.
     pub(crate) fn take(roster: Roster, term: u64, duties: &Duties) -> Self {
-        let last_heard = roster
-            .members()
-            .keys()
-            .chain(roster.pending())
-            .filter(|worker| *worker != duties.me)
-            .map(|worker| (worker.clone(), duties.now))
-            .collect();
+        let liveness = Liveness::hearing(
+            roster
+                .members()
+                .keys()
+                .chain(roster.pending())
+                .filter(|worker| *worker != duties.me)
+                .cloned(),
+            duties.now,
+        );
         let mut office = LeaderOffice {
             roster,
             term,
-            last_heard,
-            confirmed_at: BTreeMap::new(),
-            unconfirming: BTreeSet::new(),
-            lost: BTreeSet::new(),
-            reported_silence: BTreeMap::new(),
+            liveness,
             removed: Vec::new(),
             voters_at: BTreeMap::new(),
             pending_removals: BTreeSet::new(),
@@ -200,25 +187,8 @@ impl LeaderOffice {
     ) {
         // Removals first, so what follows sees who is a member now.
         self.apply_pending_removals();
-        self.last_heard.insert(from.clone(), duties.now);
-        // A counted member confirms when its heartbeat echoes an ack sent
-        // within a suspicion timeout, as `confirming_lately` reads a promised
-        // joiner's. One that keeps heartbeating but confirms none, a one-way
-        // link say, is removed once it has gone a loss timeout without (see
-        // [`Self::lost_by`]).
-        if self.roster.members().contains_key(&from) {
-            self.confirmed_at.entry(from.clone()).or_insert(duties.now);
-            if let Heard::Confirmed { sent_at, .. } = heard
-                && sent_at.as_ticks() + duties.timings.suspect_timeout.as_ticks()
-                    >= duties.now.as_ticks()
-            {
-                self.confirmed_at.insert(from.clone(), duties.now);
-                self.unconfirming.remove(&from);
-            }
-        }
-        if !self.unconfirming.contains(&from) {
-            self.lost.remove(&from);
-        }
+        let is_member = self.roster.members().contains_key(&from);
+        self.liveness.heard(&from, &heard, is_member, duties);
         let counted_by = self.roster.admission_of(&from);
         self.reports.record(&from, &report, counted_by);
         if let Some(admission) = report.admission {
@@ -289,7 +259,7 @@ impl LeaderOffice {
     pub(crate) fn placeable_voter_ids(&self, me: &WorkerId) -> Vec<WorkerId> {
         self.voter_ids(me)
             .into_iter()
-            .filter(|voter| voter == me || !self.lost.contains(voter))
+            .filter(|voter| voter == me || !self.liveness.is_lost(voter))
             .collect()
     }
 
@@ -393,184 +363,6 @@ impl LeaderOffice {
             .is_some_and(|at| duties.now >= at)
     }
 
-    /// Starts counting from `now` toward reporting each of `workers` but `me`
-    /// lost, unless it already counts one: a worker heard from keeps its own
-    /// time.
-    pub(crate) fn watch(&mut self, workers: BTreeSet<WorkerId>, me: &WorkerId, now: Instant) {
-        for worker in workers.into_iter().filter(|worker| worker != me) {
-            self.last_heard.entry(worker).or_insert(now);
-        }
-    }
-
-    /// `workers` answered this office's rebuild at `now`: each is heard, as
-    /// by a heartbeat, so it counts as silent again only from now, and a
-    /// silence reported for it is forgotten. A counted member that still
-    /// confirms no ack stays lost, and is silent again a suspicion timeout
-    /// after the first heartbeat heard from it since it was reported lost,
-    /// or after this answer if none has been heard since (see
-    /// [`Self::silent_from`]); it is reported silent at once if that has
-    /// passed.
-    pub(crate) fn heard_answers(&mut self, workers: BTreeSet<WorkerId>, me: &WorkerId, now: Instant) {
-        for worker in workers.into_iter().filter(|worker| worker != me) {
-            self.last_heard.insert(worker.clone(), now);
-            if !self.unconfirming.contains(&worker) {
-                self.lost.remove(&worker);
-            }
-            self.reported_silence.remove(&worker);
-        }
-    }
-
-    /// When the office next has a worker to report lost: `lost_after`
-    /// after it last heard from each, or, for a counted member whose
-    /// heartbeats still arrive (heard within `still_heard` of `now`), after
-    /// it last confirmed an ack if that comes first.
-    pub(crate) fn next_lost_at(
-        &self,
-        now: Instant,
-        lost_after: Duration,
-        still_heard: Duration,
-    ) -> Option<Instant> {
-        self.last_heard
-            .iter()
-            .map(|(worker, heard)| {
-                let silent = *heard + lost_after;
-                match self.confirmed_at.get(worker) {
-                    Some(confirmed)
-                        if self.roster.members().contains_key(worker)
-                            && now < *heard + still_heard =>
-                    {
-                        silent.min(*confirmed + lost_after)
-                    }
-                    _ => silent,
-                }
-            })
-            .min()
-    }
-
-    /// When `worker`'s runs' reconnect timeouts start to count: a suspicion
-    /// timeout after it was last heard or, for a counted member whose
-    /// heartbeats still arrive (one heard within `suspect_timeout` of `now`)
-    /// but which confirms no ack, after it last confirmed one, if that is
-    /// earlier, as [`Self::lost_by`] counts. `None` for a worker not tracked.
-    fn silent_from(&self, worker: &WorkerId, now: Instant, suspect_timeout: Duration) -> Option<Instant> {
-        let heard = *self.last_heard.get(worker)?;
-        let since = match self.confirmed_at.get(worker) {
-            Some(confirmed)
-                if self.roster.members().contains_key(worker) && now < heard + suspect_timeout =>
-            {
-                heard.min(*confirmed)
-            }
-            _ => heard,
-        };
-        Some(since + suspect_timeout)
-    }
-
-    /// The silences to report at `now`, each once: a worker newly silent,
-    /// with the instant its runs' reconnect timeouts count from (see
-    /// [`Self::silent_from`]), and `None` for one reported silent and heard
-    /// since. A worker reported lost and not heard since keeps its silence,
-    /// as does a lost member that still confirms no ack: nothing has ended
-    /// either silence. Such a member whose answer to a rebuild ended its
-    /// silence (see [`Self::heard_answers`]) is reported silent again. A
-    /// silence once reported keeps its instant until it ends, so a replay it
-    /// times never moves earlier.
-    pub(crate) fn silence_changes(
-        &mut self,
-        now: Instant,
-        suspect_timeout: Duration,
-    ) -> Vec<(WorkerId, Option<Instant>)> {
-        let mut changes = Vec::new();
-        for worker in self.last_heard.keys().filter(|worker| self.may_fall_silent(worker)) {
-            let silent = self
-                .silent_from(worker, now, suspect_timeout)
-                .filter(|from| *from <= now);
-            // A lost member's heartbeats do not end its silence: only a
-            // confirmation, which takes it out of `lost`, or an answer does.
-            let ends = !self.lost.contains(worker);
-            match (silent, self.reported_silence.contains_key(worker)) {
-                (Some(from), false) => changes.push((worker.clone(), Some(from))),
-                (None, true) if ends => changes.push((worker.clone(), None)),
-                _ => {}
-            }
-        }
-        for (worker, from) in &changes {
-            match from {
-                Some(from) => {
-                    self.reported_silence.insert(worker.clone(), *from);
-                }
-                None => {
-                    self.reported_silence.remove(worker);
-                }
-            }
-        }
-        changes
-    }
-
-    /// When the next worker not yet reported silent falls silent, while
-    /// that is ahead of `now`.
-    pub(crate) fn next_silent_at(&self, now: Instant, suspect_timeout: Duration) -> Option<Instant> {
-        self.last_heard
-            .keys()
-            .filter(|worker| {
-                self.may_fall_silent(worker) && !self.reported_silence.contains_key(*worker)
-            })
-            .filter_map(|worker| self.silent_from(worker, now, suspect_timeout))
-            .filter(|from| *from > now)
-            .min()
-    }
-
-    /// Whether `worker` can be reported silent: it is not lost, or it is a
-    /// lost member still heard but confirming no ack, whose silence its
-    /// answer to a rebuild can end while it stays lost.
-    fn may_fall_silent(&self, worker: &WorkerId) -> bool {
-        !self.lost.contains(worker) || self.unconfirming.contains(worker)
-    }
-
-    /// The workers not heard from for `lost_after` by `now`, each reported
-    /// once. A counted member whose heartbeats still arrive (one heard
-    /// within `still_heard`) but which confirmed no recent ack for
-    /// `lost_after` is reported lost too, and queued for removal (see
-    /// [`Self::remove_one_unconfirming`]) so admissions stop waiting on it.
-    /// A silent member is only reported.
-    pub(crate) fn lost_by(
-        &mut self,
-        now: Instant,
-        lost_after: Duration,
-        still_heard: Duration,
-    ) -> Vec<WorkerId> {
-        let mut lost: Vec<WorkerId> = self
-            .last_heard
-            .iter()
-            .filter(|(_, heard)| now >= **heard + lost_after)
-            .map(|(worker, _)| worker.clone())
-            .collect();
-        let queued_before = self.unconfirming.clone();
-        let unconfirming: Vec<WorkerId> = self
-            .last_heard
-            .iter()
-            .filter(|(worker, heard)| {
-                self.roster.members().contains_key(*worker)
-                    && now < **heard + still_heard
-                    && self
-                        .confirmed_at
-                        .get(*worker)
-                        .is_some_and(|confirmed| now >= *confirmed + lost_after)
-            })
-            .map(|(worker, _)| worker.clone())
-            .collect();
-        self.unconfirming.extend(unconfirming.iter().cloned());
-        lost.extend(unconfirming);
-        for worker in &lost {
-            self.last_heard.remove(worker);
-            self.confirmed_at.remove(worker);
-            self.lost.insert(worker.clone());
-        }
-        // A voter already reported for confirming no ack is reported again
-        // only after it confirmed one in between, which unqueues it.
-        lost.retain(|worker| !queued_before.contains(worker));
-        lost
-    }
-
     /// Takes one queued unconfirming member out of the configuration if it
     /// may (see [`Self::may_remove_one_unconfirming`]). One voter per
     /// change, so each moves from n voters to n - 1 and the majorities of the
@@ -582,7 +374,7 @@ impl LeaderOffice {
         if !self.may_remove_one_unconfirming(duties.me) {
             return false;
         }
-        while let Some(worker) = self.unconfirming.pop_first() {
+        while let Some(worker) = self.liveness.pop_unconfirming() {
             if self.roster.members().contains_key(&worker) {
                 let last_echoed = self.roster.held_generation_of(&worker);
                 self.roster.remove_lost(&worker, self.term);
@@ -606,12 +398,12 @@ impl LeaderOffice {
     /// leader. A voter whose echoed generation is unknown, as any is until it
     /// echoes in this office, blocks removal.
     fn may_remove_one_unconfirming(&self, me: &WorkerId) -> bool {
-        if self.unconfirming.is_empty() || self.roster.configuration().is_joint() {
+        let unconfirming = self.liveness.unconfirming();
+        if unconfirming.is_empty() || self.roster.configuration().is_joint() {
             return false;
         }
         let counted = self.roster.counted_voters();
-        let mut anchors: BTreeSet<Option<Generation>> = self
-            .unconfirming
+        let mut anchors: BTreeSet<Option<Generation>> = unconfirming
             .iter()
             .filter(|worker| counted.contains(*worker))
             .map(|worker| self.roster.held_generation_of(worker))
@@ -629,7 +421,7 @@ impl LeaderOffice {
                 *worker == me
                     || self.roster.held_generation_of(worker) == Some(current)
             })
-            .filter(|worker| !self.unconfirming.contains(*worker))
+            .filter(|worker| !unconfirming.contains(*worker))
             .collect();
         anchors.into_iter().all(|anchor| {
             let Some(voters) = anchor.and_then(|generation| self.voters_at.get(&generation))
@@ -701,10 +493,7 @@ impl LeaderOffice {
 
     /// Drops what is kept about workers that are no longer members.
     fn forget_non_members(&mut self) {
-        let members = self.roster.members();
-        self.confirmed_at.retain(|worker, _| members.contains_key(worker));
-        self.unconfirming.retain(|worker| members.contains_key(worker));
-        self.lost.retain(|worker| members.contains_key(worker));
+        self.liveness.forget_non_members(self.roster.members());
     }
 
     /// Leadership ended: `standing` takes on the configuration the roster
