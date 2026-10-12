@@ -63,7 +63,7 @@ from kabudachi.hosted_work import LoopHostedWork
 from kabudachi.handle import TaskHandle, run_callback_inline
 from kabudachi.lifecycle import default_hooks
 from kabudachi.native_protocol import Runtime
-from kabudachi.options import SubmissionOptions
+from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskDefinition, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.task_table import Run, TaskTable, result_digest
@@ -175,13 +175,8 @@ class Session:
         self, definition: TaskDefinition, payload: bytes, options: SubmissionOptions
     ) -> TaskHandle:
         queue = self._configuration.resolve("queue", definition.queue)
-        return self._tasks.submit(
-            definition,
-            payload,
-            queue,
-            options,
-            reconnect_timeout_ms=self._reconnect_timeout_ms(definition, queue),
-        )
+        settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
+        return self._tasks.submit(definition, payload, options, settings)
 
     def _reconnect_timeout_ms(self, definition: TaskDefinition, queue: str) -> int | None:
         """The reconnect timeout a run of `definition` sent to `queue`

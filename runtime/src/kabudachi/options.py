@@ -17,6 +17,17 @@ class SubmissionOptions:
     """A coalescing task's key for this submission; `None` is the default key."""
 
 
+@dataclass(frozen=True)
+class SubmissionSettings:
+    """What a submission carries that the submitting process resolved from
+    the task's own settings and its own, as opposed to what the caller asked
+    for in `SubmissionOptions`."""
+
+    queue: str
+    reconnect_timeout_ms: int | None = None
+    """The reconnect timeout its runs carry; `None` leaves it to the shard."""
+
+
 def submission_options(
     *,
     delay: timedelta | None = None,
