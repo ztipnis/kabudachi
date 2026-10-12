@@ -907,10 +907,13 @@ class Session:
         return serializer.decode(payload, definition.output_type)
 
 
-# Failure kinds a leader reports that name kabudachi's own errors.
+# Failure kinds a leader reports that name kabudachi's own errors, including
+# the kinds the leader itself gives a task it ended.
 _KNOWN_FAILURES: dict[str, type[Exception]] = {
     "ResultTooLargeError": ResultTooLargeError,
     "TaskTimeoutError": TaskTimeoutError,
+    "HistoryTooLarge": TaskRecordFullError,
+    "CoalescedPayloadTooLarge": CoalescedPayloadTooLargeError,
 }
 
 # How a task ended without a result, for the endings that carry nothing more

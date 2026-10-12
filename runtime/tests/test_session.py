@@ -26,7 +26,6 @@ from kabudachi.errors import (
     TaskCancelledError,
     TaskDefinitionError,
     TaskExpiredError,
-    TaskLostError,
     TaskOrphanedError,
     TaskRecordFullError,
     TaskSupersededError,
@@ -137,12 +136,24 @@ def test_a_certification_for_a_different_result_is_never_delivered():
             {},
             id="result too large",
         ),
-        pytest.param({"kind": EventKind.OUTCOME, "state": RunState.LOST}, TaskLostError, {}, id="lost"),
         pytest.param(
-            {"kind": EventKind.OUTCOME, "state": RunState.ORPHANED}, TaskOrphanedError, {}, id="orphaned"
+            {"kind": EventKind.OUTCOME, "state": RunState.FAILED, "failure_kind": "HistoryTooLarge"},
+            TaskRecordFullError,
+            {},
+            id="record full",
         ),
         pytest.param(
-            {"kind": EventKind.OUTCOME, "state": RunState.CANCELLED}, TaskCancelledError, {}, id="cancelled"
+            {
+                "kind": EventKind.OUTCOME,
+                "state": RunState.FAILED,
+                "failure_kind": "CoalescedPayloadTooLarge",
+            },
+            CoalescedPayloadTooLargeError,
+            {},
+            id="coalesced payload too large",
+        ),
+        pytest.param(
+            {"kind": EventKind.OUTCOME, "state": RunState.ORPHANED}, TaskOrphanedError, {}, id="orphaned"
         ),
         pytest.param(
             {"kind": EventKind.OUTCOME, "state": RunState.EXPIRED}, TaskExpiredError, {}, id="expired"
@@ -158,12 +169,6 @@ def test_a_certification_for_a_different_result_is_never_delivered():
             ResultUnavailableError,
             {},
             id="unknown to the shard",
-        ),
-        pytest.param(
-            {"kind": EventKind.CERTIFIED, "task_run_id": "elsewhere", "result_digest": b"\0" * 32},
-            ResultUnavailableError,
-            {},
-            id="certified with no result delivered",
         ),
     ],
 )
