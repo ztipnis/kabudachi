@@ -19,6 +19,7 @@ from kabudachi.config import Configuration, Settings, authority_parts, process_c
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
 from kabudachi.pool import ProcessPool, task_modules
+from kabudachi.native_protocol import OneNodeArguments
 from kabudachi.registry import default_registry
 from kabudachi.serializers import process_serializers
 from kabudachi.session import (
@@ -129,7 +130,15 @@ def _native_runtime(settings: Settings) -> Any:
         "memory_hard_limit": settings.memory_hard_limit,
     }
     if settings.listen is None:
-        return _native.NativeRuntime(uuid.uuid4().hex, uuid.uuid4().hex, **limits)
+        return _native.NativeRuntime(
+            uuid.uuid4().hex,
+            uuid.uuid4().hex,
+            OneNodeArguments(
+                result_ttl_ms=settings.result_ttl * 1000,
+                memory_soft_limit=settings.memory_soft_limit,
+                memory_hard_limit=settings.memory_hard_limit,
+            ),
+        )
     authority = {}
     if settings.authority is not None:
         url, prefix, database, ttl = authority_parts(settings.authority)

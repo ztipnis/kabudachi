@@ -28,6 +28,7 @@ from kabudachi.config import Configuration
 from kabudachi.errors import RunStoppedError
 from kabudachi.execution import InProcessExecutor
 from kabudachi.lifecycle import HookRegistry
+from kabudachi.native_protocol import OneNodeArguments
 from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import process_serializers
 from proto_messages import Greeting, make_message_class
@@ -56,8 +57,13 @@ class StandInNetworked(FaultingNative):
     the calls a networked run makes on its way out."""
 
     def __init__(self, shard, listen, **options):
-        limits = ("result_ttl_ms", "memory_soft_limit", "memory_hard_limit")
-        super().__init__(**{name: options[name] for name in limits})
+        super().__init__(
+            arguments=OneNodeArguments(
+                result_ttl_ms=options["result_ttl_ms"],
+                memory_soft_limit=options["memory_soft_limit"],
+                memory_hard_limit=options["memory_hard_limit"],
+            )
+        )
         self.calls = []
         self._taking_stopped = asyncio.Event()
 
@@ -241,7 +247,7 @@ def test_the_configured_result_ttl_is_given_to_the_native_runtime_in_millisecond
 
     kabudachi.run(main)
 
-    assert only_native().options["result_ttl_ms"] == 5000
+    assert only_native().arguments.result_ttl_ms == 5000
 
 
 def test_a_worker_that_ended_is_reported_even_if_the_work_finished_at_the_same_moment():

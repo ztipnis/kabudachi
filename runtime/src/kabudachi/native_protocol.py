@@ -86,6 +86,34 @@ class SubmitArguments:
     drop_oldest: bool = False
 
 
+_DEFAULT_WORKER_THREADS = 2
+_DEFAULT_RESULT_TTL_MS = 60 * 60 * 1000
+
+
+@dataclass(frozen=True)
+class OneNodeArguments:
+    """How a one-node runtime runs.
+
+    `worker_threads` sizes the native thread pool. `suspect_timeout_ms` is
+    how long the worker waits, with no leader to hear from, before it
+    elects itself. A lone worker has no peer to wait for, so with the
+    default of 0 it leads a millisecond after it starts, when its
+    one-voter roll call closes. `result_ttl_ms` is how long a finished
+    task is kept before it is forgotten. `memory_soft_limit` and
+    `memory_hard_limit` are in bytes of serialized task input: past the
+    soft one `next_events()` reports an `EventKind.SLOW_DOWN` event with
+    `active` set, and past the hard one `submit` raises
+    `BackpressureError`. Both or neither must be given, and the soft one
+    must not be above the hard one, which `kabudachi.configure` checks.
+    """
+
+    worker_threads: int = _DEFAULT_WORKER_THREADS
+    suspect_timeout_ms: int = 0
+    result_ttl_ms: int = _DEFAULT_RESULT_TTL_MS
+    memory_soft_limit: int | None = None
+    memory_hard_limit: int | None = None
+
+
 @runtime_checkable
 class Runtime(Protocol):
     """What a session needs of the native runtime."""

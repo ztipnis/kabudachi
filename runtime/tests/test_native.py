@@ -15,14 +15,14 @@ import pytest
 import kabudachi
 from kabudachi import _native
 from kabudachi._native import CancelOutcome, RunState
-from kabudachi.native_protocol import SubmitArguments
+from kabudachi.native_protocol import OneNodeArguments, SubmitArguments
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 
 WAIT_LIMIT_SECONDS = 5
 
 
 def new_runtime(**options):
-    return _native.NativeRuntime("worker-1", "incarnation-1", **options)
+    return _native.NativeRuntime("worker-1", "incarnation-1", OneNodeArguments(**options))
 
 
 @pytest.fixture

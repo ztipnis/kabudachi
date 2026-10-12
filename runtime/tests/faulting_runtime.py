@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 from kabudachi import _native
+from kabudachi.native_protocol import OneNodeArguments
 
 
 def _read_failure(future):
@@ -202,9 +203,10 @@ class FaultingNative(FaultingRuntime):
 
     instances = []
 
-    def __init__(self, worker_id="worker", incarnation_id="incarnation", **options):
-        super().__init__(_native.NativeRuntime(worker_id, incarnation_id, **options))
-        self.options = options
+    def __init__(self, worker_id="worker", incarnation_id="incarnation", arguments=None):
+        arguments = arguments or OneNodeArguments()
+        super().__init__(_native.NativeRuntime(worker_id, incarnation_id, arguments))
+        self.arguments = arguments
         self.leader_error = None
         self.shutdowns = 0
         FaultingNative.instances.append(self)
