@@ -77,6 +77,56 @@ fn only_placed_elsewhere(held: &TaskRecord, record: &TaskRecord) -> bool {
     replaced == *held
 }
 
+/// What a store does with a revision of a task it already holds.
+enum Admission {
+    /// It keeps the revision, or its stub.
+    Keep,
+    /// What it holds already says everything the revision does.
+    Unchanged,
+}
+
+/// Whether a store holding `held` keeps `record`, a revision of `version`
+/// sent by `origin`, leaves what it holds unchanged, or refuses it.
+fn admission(
+    held: &Held,
+    record: &TaskRecord,
+    version: RecordVersion,
+    origin: Origin,
+) -> Result<Admission, PutRefusal> {
+    let (_, held_version) = identify(&held.record)?;
+    match held_version.order(&version) {
+        VersionOrder::Newer => Ok(Admission::Keep),
+        VersionOrder::Same => same_version(held, record, origin),
+        VersionOrder::Older => Err(PutRefusal::Older),
+    }
+}
+
+/// What a store does with `record` when it holds the same version, `held`.
+fn same_version(held: &Held, record: &TaskRecord, origin: Origin) -> Result<Admission, PutRefusal> {
+    // Only the key of this revision is held: a record that names this
+    // holder now is the revision itself, and one that does not is the
+    // same stub, perhaps placed elsewhere again.
+    if held.stub {
+        return Ok(Admission::Keep);
+    }
+    if held.record == *record {
+        return Ok(Admission::Unchanged);
+    }
+    if !only_placed_elsewhere(&held.record, record) {
+        return Err(PutRefusal::Conflicting);
+    }
+    if origin == Origin::HandOff {
+        // The same revision, as another holder placed it: nothing
+        // to learn, and its placement is stale where this is not.
+        return Ok(Admission::Unchanged);
+    }
+    // A leader that placed the record anew after its voters
+    // changed writes it again to a holder that kept the first
+    // write: the holder takes the new placement, or keeps only a
+    // stub of it if the new placement leaves it out.
+    Ok(Admission::Keep)
+}
+
 impl VersionedRecords {
     /// A store that drops a finished record `retention` after it first held
     /// a finished revision of it, or keeps finished records with `None`.
@@ -117,38 +167,25 @@ impl VersionedRecords {
     ) -> Result<Put, PutRefusal> {
         self.sweep(now);
         let (task, version) = identify(&record)?;
-        let leaves_me_out = origin == Origin::Leader
-            && self.holder.as_ref().is_some_and(|me| {
-                !record.placement.is_empty()
-                    && !record.placement.iter().any(|holder| WorkerId::from(holder.clone()) == *me)
-            });
+        let leaves_me_out = self.leaves_me_out(&record, origin);
         let Some(held) = self.records.get(&task) else {
             return Ok(self.keep(task, record, leaves_me_out, None, now));
         };
-        let (_, held_version) = identify(&held.record)?;
         let since = held.finished_since;
-        match held_version.order(&version) {
-            VersionOrder::Newer => Ok(self.keep(task, record, leaves_me_out, since, now)),
-            // Only the key of this revision is held: a record that names this
-            // holder now is the revision itself, and one that does not is the
-            // same stub, perhaps placed elsewhere again.
-            VersionOrder::Same if held.stub => Ok(self.keep(task, record, leaves_me_out, since, now)),
-            VersionOrder::Same if held.record == record => Ok(Put::Unchanged),
-            VersionOrder::Same if only_placed_elsewhere(&held.record, &record) => {
-                if origin == Origin::HandOff {
-                    // The same revision, as another holder placed it: nothing
-                    // to learn, and its placement is stale where this is not.
-                    return Ok(Put::Unchanged);
-                }
-                // A leader that placed the record anew after its voters
-                // changed writes it again to a holder that kept the first
-                // write: the holder takes the new placement, or keeps only a
-                // stub of it if the new placement leaves it out.
-                Ok(self.keep(task, record, leaves_me_out, since, now))
-            }
-            VersionOrder::Same => Err(PutRefusal::Conflicting),
-            VersionOrder::Older => Err(PutRefusal::Older),
+        match admission(held, &record, version, origin)? {
+            Admission::Keep => Ok(self.keep(task, record, leaves_me_out, since, now)),
+            Admission::Unchanged => Ok(Put::Unchanged),
         }
+    }
+
+    /// Whether `record`, a leader's revision whose placement names holders,
+    /// leaves this store's own holder out.
+    fn leaves_me_out(&self, record: &TaskRecord, origin: Origin) -> bool {
+        origin == Origin::Leader
+            && self.holder.as_ref().is_some_and(|me| {
+                !record.placement.is_empty()
+                    && !record.placement.iter().any(|holder| WorkerId::from(holder.clone()) == *me)
+            })
     }
 
     /// Holds `record`, or only its stub if it leaves this holder out.
