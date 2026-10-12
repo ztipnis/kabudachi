@@ -12,7 +12,7 @@ use crate::protocol::messages::{Task, TaskRun};
 use crate::task_record::MAX_RECORD_BYTES;
 use crate::time::Clock;
 
-use super::{CHAIN_ENTRY_FRAMING_BYTES, Observer, RECORD_RESERVE_BYTES, Scheduler};
+use super::{CHAIN_ENTRY_FRAMING_BYTES, Observer, RECORD_RESERVE_BYTES, Scheduler, Submission};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// The payload one entry of a chain carries.
@@ -28,19 +28,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.item_payload(item).len() as u64
     }
 
-    /// What a claim of a task with `input_len` bytes of input, `queue`,
-    /// `definition` and `key` weighs once it carries `chain`: the task's own
-    /// size, then each payload and its framing.
+    /// What a claim weighs once it carries `chain`: `weight`, what the task
+    /// itself weighs in a claim, then each payload and its framing.
     pub(super) fn claim_bytes<'a>(
         &self,
-        input_len: usize,
-        queue: &str,
-        definition: &str,
-        key: Option<&str>,
+        weight: u64,
         chain: impl Iterator<Item = &'a ChainItem>,
     ) -> u64 {
-        let own = input_len + queue.len() + definition.len() + key.map_or(0, str::len);
-        own as u64
+        weight
             + chain
                 .map(|item| self.item_len(item) + CHAIN_ENTRY_FRAMING_BYTES)
                 .sum::<u64>()
@@ -96,5 +91,25 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             finished: false,
         };
         record.encoded_len() as u64
+    }
+}
+
+/// What a claim of `task` weighs before its chain: its input, queue,
+/// definition id and coalescing key.
+pub(super) fn claim_weight_of(task: &Task) -> u64 {
+    (task.serialized_input.len()
+        + task.queue.len()
+        + task.task_definition_id().as_str().len()
+        + task.coalescing_key.as_deref().map_or(0, str::len)) as u64
+}
+
+impl Submission {
+    /// What a claim of the submitted task weighs before its chain: its
+    /// input, queue, definition id and coalescing key.
+    pub(super) fn claim_weight(&self) -> u64 {
+        (self.serialized_input.len()
+            + self.queue.len()
+            + self.definition_id.as_str().len()
+            + self.coalescing_key.as_deref().map_or(0, str::len)) as u64
     }
 }

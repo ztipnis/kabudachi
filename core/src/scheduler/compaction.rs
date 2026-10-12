@@ -31,6 +31,7 @@ use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task};
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Instant, WallTime};
 
+use super::record_size::claim_weight_of;
 use super::{
     COALESCED_PAYLOAD_TOO_LARGE, COMPACTION_SOFT_BYTES, Claim, ClaimRejection, Event,
     MAX_SUBMISSION_BYTES, Observer, ReportRejection, Scheduler,
@@ -161,13 +162,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return;
         };
         let task = &self.tasks[&waiting];
-        let claim_size = self.claim_bytes(
-            task.serialized_input.len(),
-            &task.queue,
-            task.task_definition_id().as_str(),
-            task.coalescing_key.as_deref(),
-            self.occupancy.chain(&waiting).iter(),
-        );
+        let claim_size =
+            self.claim_bytes(claim_weight_of(task), self.occupancy.chain(&waiting).iter());
         if claim_size <= MAX_SUBMISSION_BYTES {
             return;
         }

@@ -73,9 +73,7 @@ use prost::Message;
 use crate::coalescing::{self, ChainItem, Folded, Key, Occupancy};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::digest::Digest;
-use crate::protocol::generated::{
-    ChainEntry, CoalescingLink, TaskRecord, chain_entry,
-};
+use crate::protocol::generated::{ChainEntry, CoalescingLink, TaskRecord, chain_entry};
 use crate::protocol::ids::{
     IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId, mint_task_id,
 };
@@ -1451,10 +1449,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         queued_bytes: u64,
     ) -> Result<(), SubmitRejection> {
         let needed = submission.serialized_input.len() as u64;
-        let size = needed
-            + (submission.queue.len()
-                + submission.definition_id.as_str().len()
-                + submission.coalescing_key.as_deref().map_or(0, str::len)) as u64;
+        let size = submission.claim_weight();
         if size > MAX_SUBMISSION_BYTES {
             return Err(SubmitRejection::TooLarge {
                 size,
@@ -1466,10 +1461,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             // its chain, and a claim carries all of it.
             let key = coalescing::key(&submission.definition_id, key);
             let claim_size = self.claim_bytes(
-                submission.serialized_input.len(),
-                &submission.queue,
-                submission.definition_id.as_str(),
-                submission.coalescing_key.as_deref(),
+                submission.claim_weight(),
                 self.occupancy.retained(&key).iter(),
             );
             if claim_size > MAX_SUBMISSION_BYTES {
