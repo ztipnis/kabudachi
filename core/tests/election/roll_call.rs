@@ -5,8 +5,9 @@
 
 use crate::support::builders::checked;
 use crate::support::builders::{
-    ack_message, configuration_at_epoch, configuration_of, epoch, g0, leader_ack, message, past_any_suspicion, roll_call,
-    roll_call_message, roll_call_reply, shard, timings, voter_at_epoch, voter_of, worker,
+    ack_message, configuration_at_epoch, configuration_of, epoch, g0, leader_ack, message,
+    past_any_suspicion, roll_call, roll_call_message, roll_call_reply, shard, timings,
+    voter_at_epoch, voter_of, worker,
 };
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};

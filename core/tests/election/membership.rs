@@ -49,7 +49,6 @@ fn leader_of_three_losing_quickly(clock: &FakeClock) -> TestNode {
     leader_of_three_reconnecting(clock, SUSPECT, Some(RECONNECT))
 }
 
-
 /// What `leader_of_three` leads: its founding of three, committed and
 /// re-based at (0, 1, 2).
 fn three_voters_founded_in_term_1() -> Configuration {

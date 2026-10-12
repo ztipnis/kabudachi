@@ -21,8 +21,7 @@ use std::collections::BTreeSet;
 use crate::support::clock::FakeClock;
 use crate::support::node::{
     acks_to, close_roll_call, connect, deliver, finish_reconciling, grants, known_node,
-    published_roll_calls,
-    stand_as_candidate, start_roll_call,
+    published_roll_calls, stand_as_candidate, start_roll_call,
 };
 use crate::support::scenarios::{
     abort_deadline_at, assert_aborts_by, bootstrap_5_and_elect_leader, reported_lost_at,
@@ -119,7 +118,8 @@ fn connected_node(
 fn leader_at_epoch_1(clock: &FakeClock, size: usize) -> Won {
     let epoch_1 = Generation::new(epoch(1), 0, 0);
     let timings = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS));
-    let (mut node, me, others) = connected_node(clock, voter_at_epoch(epoch(1), size), size, timings);
+    let (mut node, me, others) =
+        connected_node(clock, voter_at_epoch(epoch(1), size), size, timings);
 
     let started = start_roll_call(&mut node, clock, SUSPECT_TIMEOUT_TICKS);
     let call = published_roll_calls(&started).remove(0);

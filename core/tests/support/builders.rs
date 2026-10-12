@@ -1,7 +1,7 @@
 //! Message, ID and configuration builders shared by the election tests.
 
-use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::configuration::{Admission, Configuration, Generation, Joint, Single};
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{ElectionTimings, Input, KnownConfiguration};
 use kabudachi_core::protocol::checked::{self, CheckedMessage};
 use kabudachi_core::protocol::ids::IncarnationId;

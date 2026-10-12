@@ -1,7 +1,9 @@
 //! Helpers for driving `WorkerNode`s by hand and reading back what they
 //! asked their driver to do.
 
-use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input, KnownConfiguration, Output, WorkerNode};
+use kabudachi_core::election::{
+    ElectionTimings, Entry, Identity, Input, KnownConfiguration, Output, WorkerNode,
+};
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
@@ -13,8 +15,8 @@ use kabudachi_core::scheduler::LeadershipGrant;
 use kabudachi_core::time::{Clock, Duration};
 
 use crate::support::builders::{
-    checked, g0, heartbeat, heartbeat_message, message_input, past_any_suspicion, roll_call_reply, shard, timings,
-    vote_grant, vote_grant_message, voter_of, worker,
+    checked, g0, heartbeat, heartbeat_message, message_input, past_any_suspicion, roll_call_reply,
+    shard, timings, vote_grant, vote_grant_message, voter_of, worker,
 };
 use crate::support::clock::FakeClock;
 
