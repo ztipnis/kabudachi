@@ -17,11 +17,12 @@
 //! the leader simply announces late.
 
 mod liveness;
+mod removal_guard;
 mod reports;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::configuration::{Configuration, Generation, Roster, Side, Tally};
+use crate::configuration::{Configuration, Generation, Roster, Tally};
 use crate::protocol::ids::WorkerId;
 use crate::reconcile::Answered;
 use crate::time::Instant;
@@ -30,6 +31,7 @@ use super::ElectionTimings;
 use super::lease::Lease;
 use super::standing::ShardStanding;
 use liveness::Liveness;
+use removal_guard::RemovalGuard;
 use reports::MemberReports;
 
 /// What the leader's node lends the office for one operation.
@@ -107,13 +109,9 @@ pub(crate) struct LeaderOffice {
     /// When it last heard from, and last had an ack confirmed by, each
     /// worker, and which it has reported silent or lost.
     liveness: Liveness,
-    /// The voters taken out for confirming no ack, each with the generation
-    /// it last echoed before (see [`Self::may_remove_one_unconfirming`]).
-    removed: Vec<(WorkerId, Option<Generation>)>,
-    /// The voters of each generation this office may still need to reason
-    /// about: the current one, those a member last echoed, and those a
-    /// record of `removed` points at.
-    voters_at: BTreeMap<Generation, Vec<Side>>,
+    /// What keeps the removal of voters that confirm no ack safe (see
+    /// [`Self::remove_one_unconfirming`]).
+    removal: RemovalGuard,
     /// The workers whose SELF_REMOVE it has accepted since it last changed
     /// its configuration, to take out together (see
     /// [`Self::apply_pending_removals`]).
@@ -142,14 +140,13 @@ impl LeaderOffice {
             roster,
             term,
             liveness,
-            removed: Vec::new(),
-            voters_at: BTreeMap::new(),
+            removal: RemovalGuard::default(),
             pending_removals: BTreeSet::new(),
             reports: MemberReports::default(),
         };
         office.commit_when_due(duties.me);
         if let Some((generation, sides)) = office.roster.called_under() {
-            office.voters_at.insert(generation, sides);
+            office.removal.seed(generation, sides);
         }
         office.note_voters();
         office
@@ -364,21 +361,24 @@ impl LeaderOffice {
     }
 
     /// Takes one queued unconfirming member out of the configuration if it
-    /// may (see [`Self::may_remove_one_unconfirming`]). One voter per
+    /// may (see [`RemovalGuard::may_remove_one`]). One voter per
     /// change, so each moves from n voters to n - 1 and the majorities of the
     /// two share a voter. Whether it removed one: the shrunk generation is
     /// then unheld, which holds the next removal and every admission back
     /// until the remaining voters echo it.
     fn remove_one_unconfirming(&mut self, duties: &Duties) -> bool {
-        self.drop_settled_records(duties.me);
-        if !self.may_remove_one_unconfirming(duties.me) {
+        self.removal.drop_settled(&self.roster, duties.me);
+        if !self
+            .removal
+            .may_remove_one(&self.roster, self.liveness.unconfirming(), duties.me)
+        {
             return false;
         }
         while let Some(worker) = self.liveness.pop_unconfirming() {
             if self.roster.members().contains_key(&worker) {
                 let last_echoed = self.roster.held_generation_of(&worker);
                 self.roster.remove_lost(&worker, self.term);
-                self.removed.push((worker, last_echoed));
+                self.removal.record(worker, last_echoed);
                 self.forget_non_members();
                 self.note_voters();
                 return true;
@@ -387,108 +387,10 @@ impl LeaderOffice {
         false
     }
 
-    /// Whether a queued unconfirming member may be taken out now: the
-    /// configuration is committed, and the voters that hold it, the leader
-    /// among them, outside the queue, are a majority of the voters of every
-    /// configuration a muted or removed voter may still stand at: the one
-    /// each queued voter last echoed, and the one each voter removed
-    /// before last echoed. Any majority of such a configuration then holds a
-    /// voter that, holding a later generation, refuses its call as stale, so
-    /// those voters, the removed ones among them, cannot elect a second
-    /// leader. A voter whose echoed generation is unknown, as any is until it
-    /// echoes in this office, blocks removal.
-    fn may_remove_one_unconfirming(&self, me: &WorkerId) -> bool {
-        let unconfirming = self.liveness.unconfirming();
-        if unconfirming.is_empty() || self.roster.configuration().is_joint() {
-            return false;
-        }
-        let counted = self.roster.counted_voters();
-        let mut anchors: BTreeSet<Option<Generation>> = unconfirming
-            .iter()
-            .filter(|worker| counted.contains(*worker))
-            .map(|worker| self.roster.held_generation_of(worker))
-            .collect();
-        anchors.extend(
-            self.removed
-                .iter()
-                .filter(|(worker, _)| !counted.contains(worker))
-                .map(|(_, anchor)| *anchor),
-        );
-        let current = self.roster.configuration().generation();
-        let holders: BTreeSet<&WorkerId> = counted
-            .iter()
-            .filter(|worker| {
-                *worker == me
-                    || self.roster.held_generation_of(worker) == Some(current)
-            })
-            .filter(|worker| !unconfirming.contains(*worker))
-            .collect();
-        anchors.into_iter().all(|anchor| {
-            let Some(voters) = anchor.and_then(|generation| self.voters_at.get(&generation))
-            else {
-                return false;
-            };
-            voters.iter().all(|(known, total)| {
-                let holding = known.iter().filter(|voter| holders.contains(voter)).count();
-                2 * holding > *total
-            })
-        })
-    }
-
-    /// Forgets the voters removed that can no longer elect behind the
-    /// leader's back: one readmitted, or one a majority of whose anchor
-    /// configuration now holds a later generation, which is permanent. The
-    /// leader holds the current generation, later than any anchor but it.
-    fn drop_settled_records(&mut self, me: &WorkerId) {
-        let counted = self.roster.counted_voters();
-        let current = self.roster.configuration().generation();
-        let roster = &self.roster;
-        let voters_at = &self.voters_at;
-        self.removed.retain(|(worker, anchor)| {
-            if counted.contains(worker) {
-                return false;
-            }
-            let Some(anchor) = anchor else { return true };
-            let Some(voters) = voters_at.get(anchor) else {
-                return true;
-            };
-            // Settled once a majority of every side holds a later generation.
-            !voters.iter().all(|(known, total)| {
-                let later = known
-                    .iter()
-                    .filter(|voter| {
-                        counted.contains(*voter)
-                            && if *voter == me {
-                                current > *anchor
-                            } else {
-                                roster
-                                    .held_generation_of(voter)
-                                    .is_some_and(|held| held > *anchor)
-                            }
-                    })
-                    .count();
-                2 * later > *total
-            })
-        });
-    }
-
     /// Notes the voters of the current generation, and forgets those of
     /// generations nothing points at any more.
     fn note_voters(&mut self) {
-        let current = self.roster.configuration().generation();
-        if !self.voters_at.contains_key(&current) {
-            self.voters_at.insert(current, self.roster.sides());
-        }
-        let roster = &self.roster;
-        let removed = &self.removed;
-        self.voters_at.retain(|generation, _| {
-            *generation == current
-                || removed.iter().any(|(_, anchor)| *anchor == Some(*generation))
-                || roster
-                    .members()
-                    .keys()
-                    .any(|member| roster.held_generation_of(member) == Some(*generation))
-        });
+        self.removal.note_voters(&self.roster);
     }
 
     /// Drops what is kept about workers that are no longer members.
