@@ -221,9 +221,9 @@ fn a_node_that_grants_a_vote_in_a_later_term_gives_up_the_roll_call_it_runs() {
     let clock = FakeClock::new();
     let mut node = voter_node(&clock, &worker("w2"), 3, SUSPECT);
     let own = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
-    assert_eq!(node.state(), WorkerState::RollCall, "setup invariant");
     let rival = worker("w1");
     answer(&mut node, &rival, own.term + 1, 0);
+    assert_eq!(node.state(), WorkerState::RollCall, "setup invariant");
 
     let outputs = request(&mut node, vote_request(rival.clone(), 0, own.term + 1));
 

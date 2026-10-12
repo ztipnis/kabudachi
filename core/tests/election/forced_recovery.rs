@@ -8,7 +8,7 @@
 
 use crate::support::builders::{
     message_input,
-    ack_message, configuration_of, g0, leader_ack, roll_call_reply, shard, timings, vote_grant,
+    ack_message, configuration_at_epoch, configuration_of, g0, leader_ack, roll_call_reply, shard, timings, vote_grant,
     vote_grant_message, voter_of, worker,
 };
 
@@ -1102,7 +1102,7 @@ fn nodes_at_one_epoch_number_of_two_lineages_agree_which_epoch_is_newer() {
         let authority = warmed_up_authority(&clock);
         swap_epoch(&authority, &shard(SHARD), None, own)
             .expect("the shard has no epoch yet");
-        let configuration = configuration_at_epoch(own);
+        let configuration = configuration_at_epoch(own, 3);
         let (mut driven, _) = Driven::with(
             &clock,
             &authority,
@@ -1134,17 +1134,6 @@ fn nodes_at_one_epoch_number_of_two_lineages_agree_which_epoch_is_newer() {
     }
 }
 
-/// A configuration of three voters founded at `recovery_epoch`.
-fn configuration_at_epoch(recovery_epoch: RecoveryEpoch) -> Configuration {
-    let generation = Generation::new(recovery_epoch, 0, 0);
-    Configuration::single(Single {
-        generation,
-        base: generation,
-        voter_count: 3,
-    })
-    .expect("valid")
-}
-
 /// An ack from `leader` of `recovery_epoch`, term 9.
 fn ack_of_epoch(leader: &WorkerId, recovery_epoch: RecoveryEpoch) -> Input {
     message_input(
@@ -1155,7 +1144,7 @@ fn ack_of_epoch(leader: &WorkerId, recovery_epoch: RecoveryEpoch) -> Input {
             ..leader_ack(
                 leader,
                 9,
-                &configuration_at_epoch(recovery_epoch),
+                &configuration_at_epoch(recovery_epoch, 3),
                 Some(Generation::new(recovery_epoch, 0, 0)),
             )
         }),

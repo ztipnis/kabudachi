@@ -8,16 +8,17 @@ use crate::support::builders::checked;
 use crate::support::builders::{
     ack_message, committed_from_g0, configuration_of, epoch, g0, heartbeat, heartbeat_message,
     leader_ack, past_any_suspicion, roll_call, roll_call_message, roll_call_reply, self_remove,
-    self_remove_message, vote_grant, vote_grant_message, vote_request, vote_request_message,
-    worker,
+    self_remove_message, single_at, vote_grant, vote_grant_message, vote_request,
+    vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, close_roll_call, commit_founding, connect, deliver, elect, finish_reconciling,
-    published_roll_calls, sent, sent_to, voter_node, voter_node_reconnecting,
+    TestNode, acks_to, close_roll_call, commit_founding, connect, deliver, elect,
+    finish_reconciling, leader_of_three_reconnecting, published_roll_calls, sent, voter_node,
+    voter_node_reconnecting,
 };
-use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::configuration::{Configuration, Generation};
 use kabudachi_core::election::{HandOffTo, Input, Output};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
@@ -39,23 +40,15 @@ const RECONNECT: u64 = 100;
 /// `w1`, elected in term 1 leader of a configuration of 3 by `p1` and `p2`,
 /// connected to both, having committed what its election founded.
 fn leader_of_three(clock: &FakeClock) -> TestNode {
-    leader_of_three_reconnecting(clock, None)
+    crate::support::node::leader_of_three(clock, SUSPECT)
 }
 
 /// `leader_of_three`, reporting a worker lost `RECONNECT` ticks past the
 /// suspicion timeout rather than the default.
 fn leader_of_three_losing_quickly(clock: &FakeClock) -> TestNode {
-    leader_of_three_reconnecting(clock, Some(RECONNECT))
+    leader_of_three_reconnecting(clock, SUSPECT, Some(RECONNECT))
 }
 
-fn leader_of_three_reconnecting(clock: &FakeClock, reconnect: Option<u64>) -> TestNode {
-    let mut node = voter_node_reconnecting(clock, &worker("w1"), 3, SUSPECT, reconnect);
-    let peers = [worker("p1"), worker("p2")];
-    connect(&mut node, &peers);
-    elect(&mut node, clock, SUSPECT, &peers);
-    commit_founding(&mut node, clock, &peers);
-    node
-}
 
 /// What `leader_of_three` leads: its founding of three, committed and
 /// re-based at (0, 1, 2).
@@ -67,25 +60,6 @@ fn three_voters_founded_in_term_1() -> Configuration {
 /// at and based at (0, 1, 3).
 fn two_voters_at_the_next_generation() -> Configuration {
     single_at(Generation::new(epoch(0), 1, 3), 2)
-}
-
-fn single_at(generation: Generation, voter_count: usize) -> Configuration {
-    Configuration::single(Single {
-        generation,
-        base: generation,
-        voter_count,
-    }).expect("valid")
-}
-
-/// The acks among `outputs` sent to `to`.
-fn acks_to(outputs: &[Output], to: &WorkerId) -> Vec<Checked<LeaderHeartbeatAck>> {
-    sent_to(outputs, to)
-        .into_iter()
-        .filter_map(|message| match checked(message).into_payload() {
-            Some(CheckedPayload::HeartbeatAck(ack)) => Some(ack),
-            _ => None,
-        })
-        .collect()
 }
 
 /// The one ack among `outputs` sent to `to`.

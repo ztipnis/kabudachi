@@ -5,17 +5,17 @@
 
 use crate::support::builders::checked;
 use crate::support::builders::{
-    ack_message, configuration_of, epoch, g0, leader_ack, message, past_any_suspicion, roll_call,
-    roll_call_message, roll_call_reply, shard, timings, voter_of, worker,
+    ack_message, configuration_at_epoch, configuration_of, epoch, g0, leader_ack, message, past_any_suspicion, roll_call,
+    roll_call_message, roll_call_reply, shard, timings, voter_at_epoch, voter_of, worker,
 };
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use crate::support::node::{
-    TestNode, close_roll_call, connect, deliver, elect, published_roll_calls,
+    TestNode, close_roll_call, connect, deliver, elect, known_node, published_roll_calls,
     rejects_sent_to, sent_to, start_roll_call, state_changes, tick, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::election::{Entry, Identity, Input, KnownConfiguration, Output, WorkerNode};
+use kabudachi_core::election::{Entry, Identity, Input, Output, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
@@ -444,38 +444,12 @@ fn reject_message(
 /// `me`, a voter of `voters` at recovery epoch 1, whose leader contact has
 /// not yet gone stale.
 fn voter_at_epoch_1(clock: &FakeClock, me: &WorkerId, voters: usize) -> TestNode {
-    let epoch_1 = Generation::new(epoch(1), 0, 0);
-    WorkerNode::start(
-        Identity {
-            id: me.clone(),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard("shard-1"),
-            timings: timings(Duration::from_ticks(SUSPECT)),
-        },
-        Entry::Known(KnownConfiguration {
-            configuration: Configuration::single(Single {
-                generation: epoch_1,
-                base: epoch_1,
-                voter_count: voters,
-            }).expect("valid"),
-            admission: Some(epoch_1),
-        }),
-        clock.clone(),
-        None,
+    known_node(
+        clock,
+        me,
+        voter_at_epoch(epoch(1), voters),
+        timings(Duration::from_ticks(SUSPECT)),
     )
-    .0
-}
-
-// A refusal from a lower recovery
-// epoch counts that epoch's terms, which order nothing here.
-fn epoch_1_configuration(voters: usize) -> Configuration {
-    let epoch_1 = Generation::new(epoch(1), 0, 0);
-    Configuration::single(Single {
-        generation: epoch_1,
-        base: epoch_1,
-        voter_count: voters,
-    })
-    .expect("valid")
 }
 
 /// `refusal` as `epoch` and `lineage` name the epoch its refuser stands in,
@@ -526,7 +500,7 @@ fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
             "a higher lineage at this epoch number",
             Some(1),
             Some(1),
-            Some(epoch_1_configuration(3)),
+            Some(configuration_at_epoch(epoch(1), 3)),
             ElectionRejectReason::LeaderStillValid,
             (0, WorkerState::RollCall, true),
         ),

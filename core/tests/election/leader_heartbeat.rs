@@ -11,15 +11,17 @@
 
 use crate::support::builders::{
     epoch, g0, heartbeat, heartbeat_message, message_input, roll_call_reply, self_remove,
-    self_remove_message, shard, timings, vote_grant, vote_grant_message, voter_of, worker,
+    self_remove_message, shard, timings, vote_grant, vote_grant_message, voter_at_epoch, voter_of,
+    worker,
 };
 
-use kabudachi_core::configuration::{Configuration, Generation, Single};
+use kabudachi_core::configuration::Generation;
 use std::collections::BTreeSet;
 
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    close_roll_call, connect, deliver, finish_reconciling, grants, published_roll_calls, sent_to,
+    acks_to, close_roll_call, connect, deliver, finish_reconciling, grants, known_node,
+    published_roll_calls,
     stand_as_candidate, start_roll_call,
 };
 use crate::support::scenarios::{
@@ -30,7 +32,7 @@ use kabudachi_core::election::{
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    AckEcho, LeaderHeartbeatAck, VoteGrant, WorkerHeartbeat, election_message,
+    AckEcho, VoteGrant, WorkerHeartbeat,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
@@ -66,26 +68,8 @@ fn leader_of(clock: &FakeClock, size: usize) -> Won {
 
 /// `leader_of` for a node that runs `timings`.
 fn leader_with_timings(clock: &FakeClock, size: usize, timings: ElectionTimings) -> Won {
-    assert!(size >= 3, "leader_of needs a configuration of at least 3");
     let quorum = size / 2 + 1;
-    let me = worker("leader");
-    let others: Vec<WorkerId> = (0..size - 1)
-        .map(|i| worker(&format!("peer-{i}")))
-        .collect();
-
-    let mut node = WorkerNode::start(
-        Identity {
-            id: me.clone(),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings,
-        },
-        Entry::Known(voter_of(size)),
-        clock.clone(),
-        None,
-    )
-    .0;
-    connect(&mut node, &others);
+    let (mut node, me, others) = connected_node(clock, voter_of(size), size, timings);
 
     stand_as_candidate(
         &mut node,
@@ -111,35 +95,31 @@ fn leader_with_timings(clock: &FakeClock, size: usize, timings: ElectionTimings)
     }
 }
 
-/// `leader_of` for a node whose configuration was founded at recovery epoch 1:
-/// every heartbeat the builders make is from the earlier epoch 0.
-fn leader_at_epoch_1(clock: &FakeClock, size: usize) -> Won {
-    let epoch_1 = Generation::new(epoch(1), 0, 0);
+/// A node that runs `timings` and starts in `known`, a configuration of
+/// `size` voters (at least 3), connected to the `size - 1` others: the node
+/// as `leader`, the others as `peer-0`, `peer-1` and so on.
+fn connected_node(
+    clock: &FakeClock,
+    known: KnownConfiguration,
+    size: usize,
+    timings: ElectionTimings,
+) -> (TestNode, WorkerId, Vec<WorkerId>) {
+    assert!(size >= 3, "a leader needs a configuration of at least 3");
     let me = worker("leader");
     let others: Vec<WorkerId> = (0..size - 1)
         .map(|i| worker(&format!("peer-{i}")))
         .collect();
-    let mut node = WorkerNode::start(
-        Identity {
-            id: me.clone(),
-            incarnation: IncarnationId::new("incarnation-1"),
-            shard: shard(SHARD),
-            timings: timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS)),
-        },
-        Entry::Known(KnownConfiguration {
-            configuration: Configuration::single(Single {
-                generation: epoch_1,
-                base: epoch_1,
-                voter_count: size,
-            })
-            .expect("valid"),
-            admission: Some(epoch_1),
-        }),
-        clock.clone(),
-        None,
-    )
-    .0;
+    let mut node = known_node(clock, &me, known, timings);
     connect(&mut node, &others);
+    (node, me, others)
+}
+
+/// `leader_of` for a node whose configuration was founded at recovery epoch 1:
+/// every heartbeat the builders make is from the earlier epoch 0.
+fn leader_at_epoch_1(clock: &FakeClock, size: usize) -> Won {
+    let epoch_1 = Generation::new(epoch(1), 0, 0);
+    let timings = timings(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS));
+    let (mut node, me, others) = connected_node(clock, voter_at_epoch(epoch(1), size), size, timings);
 
     let started = start_roll_call(&mut node, clock, SUSPECT_TIMEOUT_TICKS);
     let call = published_roll_calls(&started).remove(0);
@@ -166,17 +146,6 @@ fn leader_at_epoch_1(clock: &FakeClock, size: usize) -> Won {
         others,
         won_at: clock.now(),
     }
-}
-
-/// The acks `outputs` send `to`.
-fn acks_to(outputs: &[Output], to: &WorkerId) -> Vec<LeaderHeartbeatAck> {
-    sent_to(outputs, to)
-        .into_iter()
-        .filter_map(|message| match message.payload {
-            Some(election_message::Payload::HeartbeatAck(ack)) => Some(ack),
-            _ => None,
-        })
-        .collect()
 }
 
 /// Hands `node` `heartbeat` from `from` and returns the whole step.

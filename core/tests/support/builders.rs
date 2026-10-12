@@ -1,5 +1,6 @@
 //! Message, ID and configuration builders shared by the election tests.
 
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::configuration::{Admission, Configuration, Generation, Joint, Single};
 use kabudachi_core::election::{ElectionTimings, Input, KnownConfiguration};
 use kabudachi_core::protocol::checked::{self, CheckedMessage};
@@ -56,13 +57,34 @@ pub fn g0() -> Generation {
     Generation::genesis(epoch(0))
 }
 
+/// A configuration of `voter_count` voters at and based at `generation`.
+pub fn single_at(generation: Generation, voter_count: usize) -> Configuration {
+    Configuration::single(Single {
+        generation,
+        base: generation,
+        voter_count,
+    })
+    .expect("valid")
+}
+
 /// A configuration of `voter_count` voters admitted at [`g0`].
 pub fn configuration_of(voter_count: usize) -> Configuration {
-    Configuration::single(Single {
-        generation: g0(),
-        base: g0(),
-        voter_count,
-    }).expect("valid")
+    single_at(g0(), voter_count)
+}
+
+/// A configuration of `voter_count` voters founded at `recovery_epoch`, at
+/// its first generation.
+pub fn configuration_at_epoch(recovery_epoch: RecoveryEpoch, voter_count: usize) -> Configuration {
+    single_at(Generation::new(recovery_epoch, 0, 0), voter_count)
+}
+
+/// A voter of `configuration_at_epoch(recovery_epoch, voter_count)`, admitted
+/// at its first generation.
+pub fn voter_at_epoch(recovery_epoch: RecoveryEpoch, voter_count: usize) -> KnownConfiguration {
+    KnownConfiguration {
+        configuration: configuration_at_epoch(recovery_epoch, voter_count),
+        admission: Some(Generation::new(recovery_epoch, 0, 0)),
+    }
 }
 
 /// A voter of `configuration_of(voter_count)`, admitted at [`g0`].
