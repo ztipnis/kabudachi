@@ -30,6 +30,7 @@ use crate::framing::decode_election;
 use crate::join_codec::JoinCodec;
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
 use crate::reconcile::codec::ReconcileCodec;
+use crate::result_transport::codec::ResultCodec;
 use crate::steal::codec::StealCodec;
 use crate::swarm::{Behaviour, BehaviourEvent, hide_listen_addresses};
 use crate::task_exchange::codec::TaskCodec;
@@ -655,6 +656,10 @@ fn settle_exchange(
         BehaviourEvent::Task(event) => settle::<TaskCodec>(exchanges, event, inbound, peers, now),
         BehaviourEvent::Reconcile(event) => settle::<ReconcileCodec>(exchanges, event, inbound, peers, now),
         BehaviourEvent::Steal(event) => settle::<StealCodec>(exchanges, event, inbound, peers, now),
+        BehaviourEvent::Result(event) => {
+            settle::<ResultCodec>(exchanges, event, inbound, peers, now);
+            inbound.results_arrived.notify_one();
+        }
         _ => {}
     }
 }

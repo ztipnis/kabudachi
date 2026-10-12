@@ -3,15 +3,18 @@
 //! handshake over TCP+noise+yamux.
 //!
 //! `Behaviour` holds `identify`, `gossipsub`, two `kad` behaviours (one that
-//! routes, one that stores the shard's Task records) and six
+//! routes, one that stores the shard's Task records) and seven
 //! `request_response` behaviours: one carrying the election protocol (see
 //! `crate::codec`), one the bootstrap join protocol (see
 //! `crate::join_codec`), one the claim arbitration protocol (see
 //! `crate::claim::codec`), one the task exchange (see
 //! `crate::task_exchange::codec`), one the reconciliation of a new leader
-//! (see `crate::reconcile::codec`) and one the steal exchange, by which a
+//! (see `crate::reconcile::codec`), one the steal exchange, by which a
 //! worker asks a shard peer for the tasks it holds records of that look
-//! claimable (see `crate::steal::codec`) — each a deliberately separate wire protocol, not a
+//! claimable (see `crate::steal::codec`), and one the result transport, by
+//! which a worker that ran a task delivers its result to the task's client
+//! and a leader tells the client how the task ended (see
+//! `crate::result_transport::codec`) — each a deliberately separate wire protocol, not a
 //! variant folded into `ElectionMessage` (see `crate::join_codec`'s module
 //! doc). `gossipsub` carries the election messages a worker publishes to its
 //! whole shard rather than sends to one peer; every message is signed with
@@ -113,6 +116,7 @@ use crate::claim::codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
 use crate::codec::{ElectionCodec, PROTOCOL};
 use crate::join_codec::{JoinCodec, PROTOCOL as JOIN_PROTOCOL};
 use crate::reconcile::codec::{PROTOCOL as RECONCILE_PROTOCOL, ReconcileCodec};
+use crate::result_transport::codec::{PROTOCOL as RESULT_PROTOCOL, ResultCodec};
 use crate::steal::codec::{PROTOCOL as STEAL_PROTOCOL, StealCodec};
 use crate::task_exchange::codec::{PROTOCOL as TASK_PROTOCOL, TaskCodec};
 use crate::task_store::{
@@ -174,6 +178,7 @@ pub struct Behaviour {
     pub task: request_response::Behaviour<TaskCodec>,
     pub reconcile: request_response::Behaviour<ReconcileCodec>,
     pub steal: request_response::Behaviour<StealCodec>,
+    pub result: request_response::Behaviour<ResultCodec>,
 }
 
 /// libp2p's TCP transport, except that every dial it makes leaves from a
@@ -387,6 +392,13 @@ pub(crate) fn build_swarm(
             // `crate::messenger::Net::steal_targets`).
             steal: request_response::Behaviour::new(
                 [(STEAL_PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default(),
+            ),
+            // ProtocolSupport::Full on every node: any worker may run a task
+            // whose client is another worker, lead a shard whose tasks have
+            // clients, or await a result itself.
+            result: request_response::Behaviour::new(
+                [(RESULT_PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default(),
             ),
             blocked: allow_block_list::Behaviour::default(),

@@ -187,6 +187,7 @@ use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use kabudachi_core::election::Input;
 use kabudachi_core::protocol::generated::TaskRecord;
@@ -206,11 +207,18 @@ use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
 use crate::peers::{Carried, Peers, worker_id_of};
 use crate::reconcile::codec::ReconcileCodec;
+use crate::result_transport::ResultEvent;
+use crate::result_transport::codec::ResultCodec;
 use crate::steal::codec::StealCodec;
 use crate::swarm::{Behaviour, build_swarm};
 use crate::task_exchange::{NamedLeader, OwnTask};
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_store::HeldRecords;
+
+/// The first pause before [`Net::ask_until_accepted`] asks again.
+const ASK_AGAIN_FIRST: Duration = Duration::from_millis(100);
+/// The longest pause between its asks.
+const ASK_AGAIN_LONGEST: Duration = Duration::from_secs(1);
 
 /// What [`Net::dial_for_connection`] dials.
 pub(crate) enum DialTarget {
@@ -312,6 +320,7 @@ pub(crate) struct Exchanges {
     task: Exchange<TaskCodec>,
     reconcile: Exchange<ReconcileCodec>,
     steal: Exchange<StealCodec>,
+    result: Exchange<ResultCodec>,
 }
 
 /// A correlated protocol `Net` carries through an [`Exchange`]
@@ -392,6 +401,19 @@ impl Correlated for StealCodec {
     }
 }
 
+impl Correlated for ResultCodec {
+    const ARRIVAL: Carried = Carried::ResultMessage;
+    fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self> {
+        &mut behaviour.result
+    }
+    fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
+        &mut exchanges.result
+    }
+    fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
+        &inbound.results
+    }
+}
+
 /// [`Net::try_listen_on`] could not listen on this address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenRejected(pub Multiaddr);
@@ -410,9 +432,10 @@ pub const DEFAULT_INPUT_LIMIT: usize = 1024;
 
 /// What `drive` hands over for the driver of this `Net`'s node, each queue
 /// in arrival order: the node's inputs, the join, claim, task, reconcile and steal requests the
-/// driver answers, this worker's own task requests, and the outcomes of the record writes it
-/// asked for.
-/// `arrived` is signalled whenever any of them grows.
+/// driver answers, this worker's own task requests, the outcomes of the record writes it
+/// asked for, and the result messages for this worker as a client.
+/// `arrived` is signalled whenever any of the driver's queues grows; `results_arrived` whenever a
+/// result message arrives.
 pub(crate) struct Inbound {
     inputs: Mutex<VecDeque<Input>>,
     /// See [`Net::with_input_limit`].
@@ -427,6 +450,11 @@ pub(crate) struct Inbound {
     own_tasks: Mutex<Option<VecDeque<OwnTask>>>,
     writes: Mutex<VecDeque<WriteOutcome>>,
     arrived: Notify,
+    results: Mutex<VecDeque<Asked<ResultCodec>>>,
+    /// Result messages this worker sent itself, as a client of its own task.
+    own_results: Mutex<VecDeque<ResultEvent>>,
+    /// Signalled when a result message arrives, for whoever reads them.
+    pub(crate) results_arrived: Notify,
 }
 
 impl Default for Inbound {
@@ -442,6 +470,9 @@ impl Default for Inbound {
             own_tasks: Mutex::new(Some(VecDeque::new())),
             writes: Mutex::default(),
             arrived: Notify::new(),
+            results: Mutex::default(),
+            own_results: Mutex::default(),
+            results_arrived: Notify::new(),
         }
     }
 }
@@ -523,6 +554,15 @@ impl Inbound {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         drop(queued);
+    }
+
+    pub(crate) fn queue_own_result(&self, event: ResultEvent) {
+        push(&self.own_results, event);
+        self.results_arrived.notify_one();
+    }
+
+    pub(crate) fn take_own_results(&self) -> Vec<ResultEvent> {
+        drain(&self.own_results)
     }
 }
 
@@ -881,6 +921,50 @@ impl Net {
             })))
             .ok()?;
         response.await.ok()?
+    }
+
+    /// Asks `to` over protocol `C` until it answers with something
+    /// `accepted` takes, or `within` has passed; whether it did. A
+    /// failed or refused ask is asked again after a pause that starts at
+    /// [`ASK_AGAIN_FIRST`] and doubles up to [`ASK_AGAIN_LONGEST`]. The
+    /// future owns all it needs, so it can be spawned.
+    pub(crate) fn ask_until_accepted<C: Correlated>(
+        &self,
+        to: PeerId,
+        request: C::Request,
+        accepted: fn(&C::Response) -> bool,
+        within: Duration,
+    ) -> impl Future<Output = bool> + Send + use<C>
+    where
+        C::Request: Clone + Send + 'static,
+        C::Response: Send + 'static,
+    {
+        let commands = self.commands.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + within;
+            let mut pause = ASK_AGAIN_FIRST;
+            loop {
+                let (respond_to, response) = oneshot::channel();
+                let asked = request.clone();
+                let sent = commands.send(Command::Exchange(Box::new(move |swarm, exchanges| {
+                    C::exchange(exchanges).ask(C::behaviour(swarm.behaviour_mut()), &to, asked, respond_to);
+                })));
+                if sent.is_err() {
+                    return false;
+                }
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if let Ok(Ok(Some(answer))) = tokio::time::timeout(left, response).await
+                    && accepted(&answer)
+                {
+                    return true;
+                }
+                if tokio::time::Instant::now() + pause >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(ASK_AGAIN_LONGEST);
+            }
+        }
     }
 
     /// Drains every inbound request of protocol `C` not yet answered.
