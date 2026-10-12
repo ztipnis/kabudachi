@@ -6,6 +6,7 @@
 
 mod follower;
 mod leader;
+mod leader_watch;
 mod office_reads;
 mod queries;
 mod step;
