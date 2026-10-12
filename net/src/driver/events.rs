@@ -13,7 +13,11 @@ pub(super) fn catch_up_if_due<C: Clock, I: IdGenerator>(
     deciding: &mut Deciding<'_, C, I>,
     now: Instant,
 ) -> Option<Instant> {
-    if deciding.scheduler.next_deadline().is_some_and(|due| due <= now) {
+    if deciding
+        .scheduler
+        .next_deadline()
+        .is_some_and(|due| due <= now)
+    {
         deciding.scheduler.catch_up();
         deciding.write();
     }
@@ -39,7 +43,10 @@ pub(super) fn drain_events<C: Clock, I: IdGenerator>(
         tracing::debug!(?event, "scheduler event with no client to tell");
     }
     for held in deciding.scheduler.take_held_cancels() {
-        let answer = HeldAnswer::CancelledRun { worker: held.worker, run: held.task_run_id };
+        let answer = HeldAnswer::CancelledRun {
+            worker: held.worker,
+            run: held.task_run_id,
+        };
         deciding.hold_unwritten(answer, Some(&held.task_id), local);
     }
 }
@@ -57,7 +64,11 @@ fn hold_for_worker<C: Clock, I: IdGenerator>(
     local: &mut Local,
 ) {
     match event {
-        Event::Cancelled { task_id, task_run_id, was_running: true } => {
+        Event::Cancelled {
+            task_id,
+            task_run_id,
+            was_running: true,
+        } => {
             hold_cancelled_run(deciding, task_id, task_run_id, local);
         }
         _ => {}
@@ -70,8 +81,19 @@ fn hold_cancelled_run<C: Clock, I: IdGenerator>(
     run: &TaskRunId,
     local: &mut Local,
 ) {
-    let Some(worker) = deciding.scheduler.task_run(run).and_then(|held| held.selected_worker()) else {
+    let Some(worker) = deciding
+        .scheduler
+        .task_run(run)
+        .and_then(|held| held.selected_worker())
+    else {
         return;
     };
-    deciding.hold_unwritten(HeldAnswer::CancelledRun { worker, run: run.clone() }, Some(task), local);
+    deciding.hold_unwritten(
+        HeldAnswer::CancelledRun {
+            worker,
+            run: run.clone(),
+        },
+        Some(task),
+        local,
+    );
 }

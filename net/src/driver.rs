@@ -160,11 +160,11 @@ use libp2p::Multiaddr;
 
 use crate::authority::AuthorityClient;
 use crate::bootstrap::DEFAULT_RETRY_INTERVAL;
+use crate::executor::ExecutorEndpoint;
 use crate::handoff::HandedOff;
 use crate::join::DEFAULT_JOIN_PEER_TIMEOUT;
 use crate::messenger::Net;
 pub use crate::routing_refresh::{DEFAULT_ROUTING_REFRESH_SUSPICIONS, MIN_ROUTING_REFRESH_PERIOD};
-use crate::executor::ExecutorEndpoint;
 use crate::task_store::placement::ReplicationFactor;
 
 use self::run::DriverRun;
@@ -296,7 +296,9 @@ where
     C: Clock,
     I: IdGenerator,
 {
-    let mut run = DriverRun::start(node, first, net, scheduler, clock, authority, executor, config, observe);
+    let mut run = DriverRun::start(
+        node, first, net, scheduler, clock, authority, executor, config, observe,
+    );
     loop {
         run.batch().await;
         // A node that drained has nothing more to do but hand its records

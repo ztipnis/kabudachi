@@ -1,11 +1,13 @@
 use std::time::Duration;
 
-use kabudachi_core::election::{AuthorityReply, Input, Issuer, Step, WorkerNode};
+use kabudachi_core::election::{AuthorityReply, HandOffTo, Input, Issuer, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IdGenerator, TaskRunId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::reconcile::active_runs_digest;
 use kabudachi_core::scheduler::Scheduler;
-use kabudachi_core::task_record::{LeaderRecords, RecordOutbox, Settled, Turn, office_to_reconcile};
+use kabudachi_core::task_record::{
+    LeaderRecords, RecordOutbox, Settled, Turn, office_to_reconcile,
+};
 use kabudachi_core::time::{Clock, Instant};
 use tokio::time::Instant as TokioInstant;
 
@@ -24,7 +26,6 @@ use crate::leader_search::{DrivenSearch, JoinOverNet};
 use crate::messenger::Net;
 use crate::reconcile::leader::LeaderReconciliation;
 use crate::routing_refresh::{RoutingRefresh, ShardView};
-use kabudachi_core::election::HandOffTo;
 
 /// One run of [`super::run_driver`]: everything it keeps between batches.
 pub(super) struct DriverRun<'a, C: Clock, I: IdGenerator, O> {
@@ -74,12 +75,16 @@ where
         node.set_runs_compaction(executor.is_some());
         let timings = node.timings();
         let retry_after = Duration::from_millis(timings.heartbeat_interval.as_ticks());
-        let executing =
-            executor.map(|endpoint| Executing::new(endpoint, net, retry_after, timings.reconnect_timeout));
+        let executing = executor
+            .map(|endpoint| Executing::new(endpoint, net, retry_after, timings.reconnect_timeout));
         net.subscribe_to_shard(node.shard_id());
         let search = leader_search(node, net, &config, authority.is_some());
         let records = LeaderRecords::new(node.office_term(), timings.heartbeat_interval);
-        let routing = RoutingRefresh::new(timings.suspect_timeout, config.routing_refresh_period, clock.now());
+        let routing = RoutingRefresh::new(
+            timings.suspect_timeout,
+            config.routing_refresh_period,
+            clock.now(),
+        );
         DriverRun {
             stepper: Stepper {
                 node,
@@ -174,7 +179,11 @@ where
     /// last one's writes, and tells nothing the last one decided.
     fn settle_writes(&mut self, local: &mut Local) {
         let net = self.net;
-        for answer in self.stepper.records.follow_office(self.stepper.node.office_term()) {
+        for answer in self
+            .stepper
+            .records
+            .follow_office(self.stepper.node.office_term())
+        {
             send_answer(net, Settled::NotLeader(answer), local);
         }
         let now = self.clock.now();
@@ -209,7 +218,8 @@ where
         // there must not lose it.
         let deadline = self.stepper.collected.abort_deadline.take();
         if let (Some(executing), Some(deadline)) = (self.executing.as_mut(), deadline) {
-            executing.follow_abort_deadline(deadline.map(|by| HostAbort::reported_now(by, &self.clock)));
+            executing
+                .follow_abort_deadline(deadline.map(|by| HostAbort::reported_now(by, &self.clock)));
         }
     }
 
@@ -222,9 +232,12 @@ where
         respond_to_steal_requests(self.net, &self.clock);
         self.stepper.write_revisions();
         let mut ports = self.stepper.ports();
-        self.stepper
-            .records
-            .repair(self.stepper.node, self.stepper.scheduler, self.clock.now(), &mut ports);
+        self.stepper.records.repair(
+            self.stepper.node,
+            self.stepper.scheduler,
+            self.clock.now(),
+            &mut ports,
+        );
     }
 
     fn tick_and_reconcile(&mut self) {
@@ -232,12 +245,18 @@ where
         // begins suspecting its leader starts a roll call at its next
         // `Tick`, due at once. Every `Tick` that is due moves the node on or
         // puts its deadline later (see `Step::next_deadline`), so this ends.
-        while self.next_deadline.is_some_and(|deadline| deadline <= self.clock.now()) {
+        while self
+            .next_deadline
+            .is_some_and(|deadline| deadline <= self.clock.now())
+        {
             self.next_deadline = self.stepper.step(Input::Tick);
         }
-        if let Some(deadline) =
-            reconcile_office(&mut self.reconciliation, self.net, &mut self.stepper, &self.clock)
-        {
+        if let Some(deadline) = reconcile_office(
+            &mut self.reconciliation,
+            self.net,
+            &mut self.stepper,
+            &self.clock,
+        ) {
             self.next_deadline = Some(deadline);
         }
     }
@@ -250,19 +269,30 @@ where
             return;
         };
         if let Some(deadline) = abort_deadline {
-            executing.follow_abort_deadline(deadline.map(|by| HostAbort::reported_now(by, &self.clock)));
+            executing
+                .follow_abort_deadline(deadline.map(|by| HostAbort::reported_now(by, &self.clock)));
         }
         for run in &cancelled_runs {
             executing.cancel(run);
         }
         let settled = std::mem::take(&mut local.own);
-        drive_executor(executing, &mut self.stepper.deciding(), &self.clock, settled);
+        drive_executor(
+            executing,
+            &mut self.stepper.deciding(),
+            &self.clock,
+            settled,
+        );
     }
 
     fn compare_heard_runs(&mut self) {
         let heard = std::mem::take(&mut self.stepper.collected.runs_heard);
         forget_told_cancels(self.stepper.node, self.stepper.scheduler, &heard);
-        compare_run_digests(&mut self.reconciliation, self.stepper.scheduler, &self.clock, heard);
+        compare_run_digests(
+            &mut self.reconciliation,
+            self.stepper.scheduler,
+            &self.clock,
+            heard,
+        );
     }
 
     fn catch_up_and_drain(&mut self, local: &mut Local) {
@@ -321,8 +351,12 @@ where
         // A fenced node that found its shard recovered without it rejoins;
         // a stranded node searches for a leader to reconnect to.
         let state = self.stepper.node.state();
-        self.search
-            .follow(state, self.stepper.authority.as_mut(), self.clock.now(), TokioInstant::now());
+        self.search.follow(
+            state,
+            self.stepper.authority.as_mut(),
+            self.clock.now(),
+            TokioInstant::now(),
+        );
         let wakes = self.wakes();
         // A due routing crawl is made between batches, with no batch of its
         // own: the node is stepped only when something arrives or its
@@ -367,7 +401,10 @@ where
             // Held answers are answered `NotLeader` when the lease ends,
             // and a refused write is published again, with no other wake
             // guaranteed.
-            records: self.stepper.records.wake_at(self.stepper.scheduler.lease_end()),
+            records: self
+                .stepper
+                .records
+                .wake_at(self.stepper.scheduler.lease_end()),
         }
     }
 }

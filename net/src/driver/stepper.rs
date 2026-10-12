@@ -36,7 +36,7 @@ pub(super) struct Stepper<'a, C: Clock, I: IdGenerator, O> {
 pub(super) struct Collected {
     /// The run digests that heartbeats heard in office reported, with the
     /// workers that sent them, for the batch to compare (see
-    /// [`LeaderReconciliation::runs_heard`]).
+    /// [`crate::reconcile::leader::LeaderReconciliation::runs_heard`]).
     pub(super) runs_heard: Vec<(WorkerId, Vec<u8>)>,
     /// Where the node, once it drained, said to hand the records it holds.
     pub(super) hand_off: Option<HandOffTo>,

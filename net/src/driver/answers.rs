@@ -84,7 +84,10 @@ impl<C: Clock, I: IdGenerator> Deciding<'_, C, I> {
         self.records.write(
             self.node,
             self.scheduler,
-            &mut NetRecords { net: self.net, factor: self.factor },
+            &mut NetRecords {
+                net: self.net,
+                factor: self.factor,
+            },
         )
     }
 
@@ -166,11 +169,14 @@ pub(super) fn respond_to_task_requests<C: Clock, I: IdGenerator>(
             continue;
         }
         if deciding.scheduler.is_leader() && !deciding.node.is_voter_or_pending(&handle.from()) {
-            deciding.net.respond_task(handle, task_exchange::not_member());
+            deciding
+                .net
+                .respond_task(handle, task_exchange::not_member());
             continue;
         }
         let named = task_named(deciding.scheduler, handle.request());
-        let response = task_exchange::answer(deciding.scheduler, &handle.from(), handle.request(), clock);
+        let response =
+            task_exchange::answer(deciding.scheduler, &handle.from(), handle.request(), clock);
         deciding.hold(HeldAnswer::Task { handle, response }, named.as_ref(), local);
     }
 }
@@ -233,11 +239,7 @@ pub(super) fn respond_to_reconcile_requests<C: Clock>(node: &WorkerNode<C>, net:
             term = request.term,
             "answering a reconciliation request"
         );
-        let page = page_of(
-            handle.request(),
-            &net.claimed_runs(),
-            &net.held_records(),
-        );
+        let page = page_of(handle.request(), &net.claimed_runs(), &net.held_records());
         net.respond_reconcile(handle, page);
     }
 }

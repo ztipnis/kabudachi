@@ -89,7 +89,9 @@ fn claim_more<C: Clock, I: IdGenerator>(
             executing.claiming_own(places);
             decide_own_claim(places, deciding, local);
         }
-        OwnLeader::Remote(leader) => executing.discover(leader.clone(), places, WallTime::now(clock)),
+        OwnLeader::Remote(leader) => {
+            executing.discover(leader.clone(), places, WallTime::now(clock))
+        }
     }
 }
 
@@ -100,14 +102,16 @@ fn claim_more<C: Clock, I: IdGenerator>(
 /// would be refused, and back off as one that found nothing.
 fn may_claim<C: Clock, I: IdGenerator>(deciding: &Deciding<'_, C, I>, to: &OwnLeader) -> bool {
     let can_grant = match to {
-        OwnLeader::Itself => deciding.scheduler.is_leader() && deciding.scheduler.reconciling().is_none(),
+        OwnLeader::Itself => {
+            deciding.scheduler.is_leader() && deciding.scheduler.reconciling().is_none()
+        }
         OwnLeader::Remote(_) => true,
     };
     deciding.node.has_contact_floor() && can_grant
 }
 
 /// Decides `request`, a report on one of this worker's own runs, with its
-/// own scheduler, as [`respond_to_task_requests`] decides a remote worker's,
+/// own scheduler, as [`super::answers::respond_to_task_requests`] decides a remote worker's,
 /// and holds the answer until the writes it made are stored.
 fn decide_own_report<C: Clock, I: IdGenerator>(
     request: RunReport,
@@ -117,22 +121,46 @@ fn decide_own_report<C: Clock, I: IdGenerator>(
 ) {
     let named = task_named(deciding.scheduler, &request);
     deciding.net.note_sending(&request);
-    let response = task_exchange::answer(deciding.scheduler, &deciding.net.local_worker_id(), &request, clock);
-    deciding.hold(HeldAnswer::Own(OwnAnswer::Report { request, response }), named.as_ref(), local);
+    let response = task_exchange::answer(
+        deciding.scheduler,
+        &deciding.net.local_worker_id(),
+        &request,
+        clock,
+    );
+    deciding.hold(
+        HeldAnswer::Own(OwnAnswer::Report { request, response }),
+        named.as_ref(),
+        local,
+    );
 }
 
 /// Claims up to `places` of the oldest pending tasks for this worker's own
-/// executor from its own scheduler, as [`respond_to_claim_requests`] decides
+/// executor from its own scheduler, as [`super::answers::respond_to_claim_requests`] decides
 /// a remote worker's claim, and holds the answer until the writes it made
 /// are stored.
-fn decide_own_claim<C: Clock, I: IdGenerator>(places: u32, deciding: &mut Deciding<'_, C, I>, local: &mut Local) {
+fn decide_own_claim<C: Clock, I: IdGenerator>(
+    places: u32,
+    deciding: &mut Deciding<'_, C, I>,
+    local: &mut Local,
+) {
     let request = claim_request::Request::Oldest(ClaimOldest { limit: places });
-    let response = claim::answer(deciding.scheduler, &deciding.net.local_worker_id(), &request);
+    let response = claim::answer(
+        deciding.scheduler,
+        &deciding.net.local_worker_id(),
+        &request,
+    );
     // The ledger takes each grant now, as a remote claim's is entered inside
     // its discovery, so a driver dropped before the grant is stored or handed
     // over still finds the runs when the next one starts.
     for claim in granted(&response) {
         deciding.net.claimed_runs().claimed(claim);
     }
-    deciding.hold(HeldAnswer::Own(OwnAnswer::Claim { response, reserved: places }), None, local);
+    deciding.hold(
+        HeldAnswer::Own(OwnAnswer::Claim {
+            response,
+            reserved: places,
+        }),
+        None,
+        local,
+    );
 }
