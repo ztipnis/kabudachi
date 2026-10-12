@@ -60,11 +60,7 @@ jobs:
           steps:
             - run:
                 name: Test
-                # A hung test fails the job after 5 minutes instead of
-                # holding the executor until CircleCI's default limit. The
-                # timeout bounds the whole command, whether it keeps printing
-                # or goes silent.
-                command: timeout --signal=TERM 300 bazel test --config=ci //...
+                command: bazel test --config=ci //...
       - save_cache:
           key: bazel-repos-v3-{{ checksum "/tmp/repo-cache-key" }}
           # Unpacking the repositories inside Bazel took about 50 seconds per

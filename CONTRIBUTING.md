@@ -61,7 +61,7 @@ PROPTEST_CASES=5000 PROPTEST_RNG_SEED=7 bazel test //core:core_integration_test 
 
 `.circleci/config.yml` runs one CircleCI job on every push: `bazel test --config=ci //...`. The job is built to make the Free plan's 30,000 credits a month last.
 
-**Time guard.** The test step stops after 5 minutes (`timeout 300` around the Bazel command), so a hung test fails the job quickly instead of spending credits until CircleCI's own limit. A healthy run takes well under that. Each property test has its own budget, so on a starved host the budgets of the tests sharing the binary can add up.
+**Time target.** A warm-cache run should finish within 5 minutes. That is a target to watch, not a limit the job enforces: a run whose caches have expired rebuilds everything and takes longer. A hung test is still stopped by CircleCI's own no-output limit. Each property test has its own budget, so on a starved host the budgets of the tests sharing the binary can add up.
 
 **The Redis-backed tests run here unchanged.** The job builds valkey from the same module and runs the same three targets, with no service container.
 
