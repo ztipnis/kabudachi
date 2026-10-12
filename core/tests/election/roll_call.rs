@@ -16,8 +16,8 @@ use crate::support::node::{
     rejects_sent_to, sent_to, start_roll_call, state_changes, tick, voter_node,
 };
 use kabudachi_core::configuration::{Configuration, Generation, Single};
-use kabudachi_core::election::{Entry, Identity, Input, Output, WorkerNode};
-use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
+use kabudachi_core::election::{Input, Output};
+use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
     ElectionMessage, ElectionReject, ElectionRejectReason, KnownLeader,

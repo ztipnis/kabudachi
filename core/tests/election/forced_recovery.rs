@@ -1448,7 +1448,9 @@ fn a_leader_whose_record_is_gone_publishes_no_hint_until_its_republish_lands() {
 // publishes none for another reason. A registration that falls due at the step
 // the node wins does not consume the pending hint, so the node publishes the
 // same hint again at its next step and then stops. The repeat is redundant but
-// harmless; a change that drops it may change or delete this test.
+// harmless. The `next` assertion pins the order in which the due registration
+// and the owed hint are weighed: the registration, short-circuiting, leaves the
+// hint owed.
 #[test]
 fn a_hint_owed_for_taking_office_outlasts_a_registration_that_falls_due_with_it() {
     let clock = FakeClock::new();
