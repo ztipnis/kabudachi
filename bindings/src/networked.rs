@@ -24,18 +24,19 @@
 //! lost at once.
 
 mod delivery;
+mod handover;
 mod observed;
 mod seam;
 
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::{ElectionTimings, Input, Step, WorkerNode};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{ShardName, TaskId, TaskRunId, Uuid7Ids};
-use kabudachi_core::scheduler::{Claim, mint};
+use kabudachi_core::scheduler::mint;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
-use kabudachi_net::executor::{Report, Work, WorkSource, executor_channel};
+use kabudachi_net::executor::{Report, WorkSource, executor_channel};
 use kabudachi_net::task_exchange::LeaderRetry;
 use kabudachi_net::worker::{AuthorityConfig, Multiaddr, Worker, WorkerConfig};
 use kabudachi_redis_authority::{RedisAuthority, RedisAuthorityConfig};
@@ -47,12 +48,11 @@ use tokio::task::JoinHandle;
 
 use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
-use crate::outcomes::PyEventKind;
-use crate::work::{PyEvent, PyTaskRecord};
+use crate::work::PyTaskRecord;
 
 use self::delivery::{cancel_at_leader, deliver};
 use self::observed::{LeftOnDrop, Observed, publish};
-use self::seam::{GONE_MESSAGE, Shared, take_handed};
+use self::seam::{GONE_MESSAGE, Shared};
 
 const DEFAULT_WORKER_THREADS: usize = 2;
 const DEFAULT_RESULT_TTL_MS: u64 = 60 * 60 * 1000;
@@ -60,99 +60,7 @@ const SHUTDOWN_GRACE: StdDuration = StdDuration::from_secs(1);
 /// The default roll-call deadline, unless a quarter of the suspicion timeout
 /// is shorter: a roll call must close well inside it.
 const ROLL_CALL_DEADLINE_MS: u64 = 250;
-/// How a run the driver took back is reported: its body is being stopped,
-/// and nothing it ends with counts.
-const CANCELLED_KIND: &str = "TaskCancelledError";
-const MALFORMED_KIND: &str = "MalformedClaim";
 const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
-
-impl Shared {
-    fn on_work(&self, work: Work) {
-        let (report, wake) = {
-            let mut guard = self.seam();
-            // Through the guard once, so the arms borrow its fields apart.
-            let seam = &mut *guard;
-            match work {
-                Work::Run(wire) | Work::Compact(wire) => {
-                    seam.offered = seam.offered.saturating_sub(1);
-                    match Claim::try_from(&wire).ok() {
-                        Some(claim) if seam.closed => (Some(Report::Lost(claim.task_run_id)), false),
-                        Some(claim) => {
-                            seam.handed.push_back(claim);
-                            (None, true)
-                        }
-                        None => (
-                            wire.task_run_id.map(|run| Report::Failed {
-                                run: run.into(),
-                                reason: MALFORMED_KIND.into(),
-                            }),
-                            false,
-                        ),
-                    }
-                }
-                Work::Cancel(run) => {
-                    let unstarted = take_handed(&mut seam.handed, &run);
-                    match seam.held.remove(&run) {
-                        Some(task) => {
-                            seam.events.push_back(PyEvent::networked(
-                                PyEventKind::Cancelled,
-                                task.as_str(),
-                                run.as_str(),
-                            ));
-                            (
-                                Some(Report::Failed {
-                                    run,
-                                    reason: CANCELLED_KIND.into(),
-                                }),
-                                true,
-                            )
-                        }
-                        None if unstarted => (
-                            Some(Report::Failed {
-                                run,
-                                reason: CANCELLED_KIND.into(),
-                            }),
-                            false,
-                        ),
-                        None => (None, false),
-                    }
-                }
-                Work::Abort { run, deadline } => {
-                    if take_handed(&mut seam.handed, &run) {
-                        // Never started: nothing runs, so it is lost now.
-                        (Some(Report::Lost(run)), false)
-                    } else if let Some(task) = seam.held.get(&run) {
-                        let left = deadline
-                            .saturating_duration_since(StdInstant::now())
-                            .as_secs_f64();
-                        seam.events
-                            .push_back(PyEvent::abort(task.as_str(), run.as_str(), left));
-                        (None, true)
-                    } else {
-                        (None, false)
-                    }
-                }
-                Work::AbortWithdrawn(run) => match seam.held.get(&run) {
-                    Some(task) => {
-                        seam.events.push_back(PyEvent::networked(
-                            PyEventKind::AbortWithdrawn,
-                            task.as_str(),
-                            run.as_str(),
-                        ));
-                        (None, true)
-                    }
-                    None => (None, false),
-                },
-            }
-        };
-        if let Some(report) = report {
-            self.report(report);
-        }
-        if wake {
-            self.wake();
-        }
-    }
-}
 
 fn address(text: &str) -> PyResult<Multiaddr> {
     text.parse()

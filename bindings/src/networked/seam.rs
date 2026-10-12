@@ -136,10 +136,3 @@ impl Shared {
         }
     }
 }
-
-/// Removes `run` from the runs not taken yet; whether it was there.
-pub(super) fn take_handed(handed: &mut VecDeque<Claim>, run: &TaskRunId) -> bool {
-    let before = handed.len();
-    handed.retain(|claim| &claim.task_run_id != run);
-    handed.len() != before
-}
