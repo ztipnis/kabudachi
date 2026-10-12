@@ -423,7 +423,8 @@ impl Net {
     }
 }
 
-/// How [`Net::submit_to_leader`] and [`Net::cancel_at_leader`] keep asking.
+/// How [`Net::submit_to_leader`], [`Net::cancel_at_leader`] and
+/// [`Net::query_outcome_at_leader`] keep asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaderRetry {
     /// How long a leader may take to answer before it is asked again.

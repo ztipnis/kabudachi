@@ -3,11 +3,14 @@
 //! the task ends, leaves exactly one conclusion for the client, whatever
 //! ended it. A retry, a replay or a task nobody awaits concludes nothing.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::support::scheduler::{Fixture, newest_records, ticks};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
+use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{Completion, OutcomeRejection, Submission};
 
 fn client() -> WorkerId {
@@ -172,6 +175,20 @@ fn the_outcome_of_a_task_is_its_current_run_and_only_a_leader_answers() {
         (TaskRunState::Succeeded, true, false)
     );
     assert_eq!(fixture.scheduler.outcome(&TaskId::new("never-submitted")), Ok(None));
+    // A task whose newest record this leader does not know yet is held back,
+    // and asked about again later.
+    let uncertain = TaskId::new("uncertain");
+    fixture
+        .scheduler
+        .adopt(Rebuild {
+            uncertain: BTreeMap::from([(uncertain.clone(), BTreeSet::new())]),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    assert_eq!(
+        fixture.scheduler.outcome(&uncertain),
+        Err(OutcomeRejection::NotReady)
+    );
     assert_eq!(
         Fixture::not_leading().scheduler.outcome(&task),
         Err(OutcomeRejection::NotLeader)
