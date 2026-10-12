@@ -166,7 +166,7 @@ use crate::time::{Clock, Duration, Instant};
 use authority_standing::{AuthorityStanding, AuthorityVerdict, AuthorityView};
 use drain::{Asked, DrainRequest};
 use election_round::{ElectionRound, Verdict, View};
-use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice};
+use leader_office::{AckContent, Departure, Duties, Heard, LeaderOffice, MemberReport};
 use lease::{Lease, LeaseChange, Office};
 pub use standing::JoinFloor;
 use standing::ShardStanding;
@@ -1942,14 +1942,7 @@ where
                 timings: &self.timings,
                 now,
             };
-            office.take_heartbeat(
-                from.clone(),
-                heard,
-                heartbeat.routing_crawled,
-                heartbeat.admission_generation(),
-                heartbeat.runs_compaction,
-                &duties,
-            );
+            office.take_heartbeat(from.clone(), heard, member_report(heartbeat), &duties);
         }
         self.drain_once_free();
         if !self.holds_office() {
@@ -3118,6 +3111,15 @@ fn led_or_followed<'a>(
     match office {
         Some(office) => Some(office.configuration()),
         None => standing.configuration(),
+    }
+}
+
+/// What `heartbeat` says of its sender beyond its liveness.
+fn member_report(heartbeat: &Checked<WorkerHeartbeat>) -> MemberReport {
+    MemberReport {
+        routing_crawled: heartbeat.routing_crawled,
+        admission: heartbeat.admission_generation(),
+        runs_compaction: heartbeat.runs_compaction,
     }
 }
 

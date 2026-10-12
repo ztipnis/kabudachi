@@ -16,6 +16,8 @@
 //! confirmation until the lease runs past it). The same holds of a removal
 //! the leader simply announces late.
 
+mod reports;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::configuration::{Configuration, Generation, Roster, Side, Tally};
@@ -26,6 +28,7 @@ use crate::time::{Duration, Instant};
 use super::ElectionTimings;
 use super::lease::Lease;
 use super::standing::ShardStanding;
+use reports::MemberReports;
 
 /// What the leader's node lends the office for one operation.
 pub(crate) struct Duties<'a> {
@@ -47,6 +50,17 @@ pub(crate) enum Heard {
         held: Option<Generation>,
         sent_at: Instant,
     },
+}
+
+/// What a worker's heartbeat says of it, beyond its liveness and the ack it
+/// confirms.
+pub(crate) struct MemberReport {
+    /// Whether it has completed a routing crawl since its admission.
+    pub(crate) routing_crawled: bool,
+    /// The admission generation it holds, a promise included.
+    pub(crate) admission: Option<Generation>,
+    /// Whether it runs compaction.
+    pub(crate) runs_compaction: bool,
 }
 
 /// What one ack carries of the configuration the office leads. A joiner the
@@ -115,11 +129,8 @@ pub(crate) struct LeaderOffice {
     /// its configuration, to take out together (see
     /// [`Self::apply_pending_removals`]).
     pending_removals: BTreeSet<WorkerId>,
-    /// The workers whose latest heartbeat reported a routing crawl, with the
-    /// admission each crawled at.
-    crawled: BTreeMap<WorkerId, Generation>,
-    /// The workers whose latest heartbeat said they run compaction.
-    compaction_runners: BTreeSet<WorkerId>,
+    /// What each worker's latest heartbeat said of it.
+    reports: MemberReports,
 }
 
 impl LeaderOffice {
@@ -147,8 +158,7 @@ impl LeaderOffice {
             removed: Vec::new(),
             voters_at: BTreeMap::new(),
             pending_removals: BTreeSet::new(),
-            crawled: BTreeMap::new(),
-            compaction_runners: BTreeSet::new(),
+            reports: MemberReports::default(),
         };
         office.commit_when_due(duties.me);
         if let Some((generation, sides)) = office.roster.called_under() {
@@ -178,16 +188,14 @@ impl LeaderOffice {
     /// generation it holds and commits when due. `admission` is the one the
     /// sender holds, which confirms a promise made to it. The sender joins as
     /// pending if unknown, admission advances when due, and removals apply. A
-    /// crawl report (`routing_crawled`) counts only when `admission` is the
-    /// one the roster counts the sender by now, so a delayed heartbeat from
-    /// before a re-admission does not count.
+    /// crawl report (`report.routing_crawled`) counts only when
+    /// `report.admission` is the one the roster counts the sender by now, so a
+    /// delayed heartbeat from before a re-admission does not count.
     pub(crate) fn take_heartbeat(
         &mut self,
         from: WorkerId,
         heard: Heard,
-        routing_crawled: bool,
-        admission: Option<Generation>,
-        runs_compaction: bool,
+        report: MemberReport,
         duties: &Duties,
     ) {
         // Removals first, so what follows sees who is a member now.
@@ -211,20 +219,9 @@ impl LeaderOffice {
         if !self.unconfirming.contains(&from) {
             self.lost.remove(&from);
         }
-        if runs_compaction {
-            self.compaction_runners.insert(from.clone());
-        } else {
-            self.compaction_runners.remove(&from);
-        }
-        match admission.filter(|_| routing_crawled) {
-            Some(admission) if Some(admission) == self.roster.admission_of(&from) => {
-                self.crawled.insert(from.clone(), admission);
-            }
-            _ => {
-                self.crawled.remove(&from);
-            }
-        }
-        if let Some(admission) = admission {
+        let counted_by = self.roster.admission_of(&from);
+        self.reports.record(&from, &report, counted_by);
+        if let Some(admission) = report.admission {
             self.roster.record_held_admission(&from, admission);
         }
         if let Heard::Confirmed { held, .. } = heard {
@@ -260,19 +257,14 @@ impl LeaderOffice {
             usize::from(configuration.is_voter(self.roster.counted_admission_of(me)));
         others.len() + leader_votes == voter_count
             && others.iter().all(|worker| {
-                self.crawled
-                    .get(*worker)
-                    .is_some_and(|crawled_at| Some(*crawled_at) == self.roster.admission_of(worker))
+                self.reports
+                    .crawled_at(worker, self.roster.admission_of(worker))
             })
     }
 
     /// The members whose latest heartbeat said they run compaction.
     pub(crate) fn compaction_runners(&self) -> BTreeSet<WorkerId> {
-        self.compaction_runners
-            .iter()
-            .filter(|worker| self.roster.holds(worker))
-            .cloned()
-            .collect()
+        self.reports.compaction_runners(&self.roster)
     }
 
     /// The voters of the committed configuration this office knows by id,
