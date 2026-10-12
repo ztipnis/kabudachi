@@ -5,6 +5,7 @@
 //! swarm event; the record queries live in `record_queries`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use kabudachi_core::election::Input;
@@ -395,13 +396,16 @@ fn handle_event(
             endpoint,
             num_established,
             ..
-        } => {
-            if num_established.get() == 1 {
-                inbound.queue_input(Input::PeerConnected(worker_id_of(&peer_id)));
-            }
-            observe_connection(peers, peer_id, &endpoint, now);
-            finish_dial(pending, peers, connection_id, Some(peer_id), now);
-        }
+        } => connection_established(
+            pending,
+            inbound,
+            peers,
+            peer_id,
+            connection_id,
+            &endpoint,
+            num_established,
+            now,
+        ),
         SwarmEvent::ConnectionClosed {
             peer_id,
             num_established: 0,
@@ -414,18 +418,46 @@ fn handle_event(
             connection_id,
             peer_id,
             ..
-        } => {
-            finish_dial(pending, peers, connection_id, None, now);
-            // A dial that names its peer and fails while no other connection
-            // to that peer is open: the peer cannot be reached.
-            if let Some(peer) = peer_id
-                && !swarm.is_connected(&peer)
-            {
-                inbound.queue_input(Input::PeerDisconnected(worker_id_of(&peer)));
-            }
-        }
+        } => dial_failed(swarm, pending, inbound, peers, connection_id, peer_id, now),
         SwarmEvent::Behaviour(event) => handle_behaviour_event(swarm, event, pending, inbound, peers, now),
         _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connection_established(
+    pending: &mut Pending,
+    inbound: &Inbound,
+    peers: &mut Peers,
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    endpoint: &ConnectedPoint,
+    num_established: NonZeroU32,
+    now: Instant,
+) {
+    if num_established.get() == 1 {
+        inbound.queue_input(Input::PeerConnected(worker_id_of(&peer_id)));
+    }
+    observe_connection(peers, peer_id, endpoint, now);
+    finish_dial(pending, peers, connection_id, Some(peer_id), now);
+}
+
+fn dial_failed(
+    swarm: &Swarm<Behaviour>,
+    pending: &mut Pending,
+    inbound: &Inbound,
+    peers: &mut Peers,
+    connection_id: ConnectionId,
+    peer_id: Option<PeerId>,
+    now: Instant,
+) {
+    finish_dial(pending, peers, connection_id, None, now);
+    // A dial that names its peer and fails while no other connection
+    // to that peer is open: the peer cannot be reached.
+    if let Some(peer) = peer_id
+        && !swarm.is_connected(&peer)
+    {
+        inbound.queue_input(Input::PeerDisconnected(worker_id_of(&peer)));
     }
 }
 

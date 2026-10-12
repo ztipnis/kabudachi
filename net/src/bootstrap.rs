@@ -152,6 +152,7 @@
 //! of its own.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::coordination_authority::{
@@ -291,34 +292,70 @@ pub(crate) async fn cascade<C: Clock, P: AskWhoLeads>(
             return Entry::Joining(pointer);
         }
 
-        let mut pause = retry_interval;
-        match authority.as_deref_mut() {
-            None if !search.shard_exists() => match silence.one_more(&mut search, retry_interval) {
-                Some(longer) => pause = longer,
-                None => return founding_alone(&candidate, lineages),
-            },
-            None => {}
-            Some(calls) => {
-                let round = consult_authority(
-                    calls,
-                    port,
-                    lineages,
-                    &mut search,
-                    clock,
-                    my_id,
-                    &candidate,
-                    &mut record_seen,
-                    retry_interval,
-                )
-                .await;
-                if let Some(entry) = round.entry() {
-                    return entry;
-                }
-            }
-        }
+        let pause = match authority_round(
+            authority.as_deref_mut(),
+            port,
+            lineages,
+            &mut silence,
+            &mut search,
+            clock,
+            my_id,
+            &candidate,
+            &mut record_seen,
+            retry_interval,
+        )
+        .await
+        {
+            ControlFlow::Break(entry) => return entry,
+            ControlFlow::Continue(pause) => pause,
+        };
 
         search.end_round();
         tokio::time::sleep(pause).await;
+    }
+}
+
+/// What the cascade does after the seeds stayed silent: with no authority,
+/// found alone once the seeds have been silent long enough (`Break`) or wait
+/// out a longer pause (`Continue`); with one, consult it. `Continue` carries
+/// how long to pause before the next round.
+#[allow(clippy::too_many_arguments)]
+async fn authority_round<C: Clock, P: AskWhoLeads>(
+    authority: Option<&mut AuthorityClient>,
+    port: &mut P,
+    lineages: &mut impl LineageSource,
+    silence: &mut SeedSilence,
+    search: &mut SearchRounds,
+    clock: &C,
+    my_id: &WorkerId,
+    candidate: &ShardId,
+    record_seen: &mut Option<ShardId>,
+    retry_interval: StdDuration,
+) -> ControlFlow<Entry, StdDuration> {
+    match authority {
+        None if !search.shard_exists() => match silence.one_more(search, retry_interval) {
+            Some(longer) => ControlFlow::Continue(longer),
+            None => ControlFlow::Break(founding_alone(candidate, lineages)),
+        },
+        None => ControlFlow::Continue(retry_interval),
+        Some(calls) => {
+            let round = consult_authority(
+                calls,
+                port,
+                lineages,
+                search,
+                clock,
+                my_id,
+                candidate,
+                record_seen,
+                retry_interval,
+            )
+            .await;
+            match round.entry() {
+                Some(entry) => ControlFlow::Break(entry),
+                None => ControlFlow::Continue(retry_interval),
+            }
+        }
     }
 }
 
@@ -377,6 +414,15 @@ fn founding_alone(candidate: &ShardId, lineages: &mut impl LineageSource) -> Ent
 }
 
 impl AuthorityRound {
+    /// The round that won ownership of the shard `calls` serves.
+    fn won(calls: &AuthorityClient, recovery_epoch: RecoveryEpoch, registered_at: Instant) -> Self {
+        AuthorityRound::OwnershipWon {
+            shard_id: calls.shard_id().clone(),
+            recovery_epoch,
+            registered_at,
+        }
+    }
+
     /// How the worker enters its shard after this round, if the round
     /// decided it.
     fn entry(self) -> Option<Entry> {
@@ -477,8 +523,7 @@ async fn consult_authority<C: Clock, P: AskWhoLeads>(
     loop {
         let within = matches!(stage, Stage::ReadingShard).then_some(retry_interval);
         let Some(reply) = calls.next_reply(within).await else {
-            search.log(WaitReason::AuthorityNotAnswering);
-            return AuthorityRound::Wait;
+            return wait_round(search, Some(WaitReason::AuthorityNotAnswering));
         };
         note_record_read(&stage, &reply, record_seen);
         match decide_round(
@@ -503,13 +548,7 @@ async fn consult_authority<C: Clock, P: AskWhoLeads>(
             Decision::OwnershipWon {
                 recovery_epoch,
                 registered_at,
-            } => {
-                return AuthorityRound::OwnershipWon {
-                    shard_id: calls.shard_id().clone(),
-                    recovery_epoch,
-                    registered_at,
-                };
-            }
+            } => return AuthorityRound::won(calls, recovery_epoch, registered_at),
             Decision::Wait(reason) => return wait_round(search, reason),
             Decision::Ignore => {}
         }
@@ -530,8 +569,6 @@ fn note_record_read(stage: &Stage, reply: &AuthorityReply, record_seen: &mut Opt
     }
 }
 
-/// Makes `request` on the authority, serving the incarnation `serve` names
-/// first if it names one.
 fn ask_next<C: Clock>(
     calls: &mut AuthorityClient,
     request: AuthorityRequest,
@@ -564,7 +601,6 @@ async fn ask_peers<P: AskWhoLeads>(
     }
 }
 
-/// Ends the round waiting, logging `reason` if there is one.
 fn wait_round(search: &mut SearchRounds, reason: Option<WaitReason>) -> AuthorityRound {
     if let Some(reason) = reason {
         search.log(reason);
