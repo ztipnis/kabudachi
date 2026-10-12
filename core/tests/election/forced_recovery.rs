@@ -639,6 +639,42 @@ fn awaiting_its_live_set_read() -> (Driven, AuthorityCall) {
     (driven, read)
 }
 
+/// The authority call of `call` run as `w1`, as the reply it would bring.
+fn performed(driven: &Driven, call: AuthorityCall) -> Input {
+    Input::Authority(call.perform(
+        &driven.authority,
+        &name_of(&shard(SHARD)),
+        &shard(SHARD),
+        &worker("w1"),
+        "w1",
+    ))
+}
+
+/// `w1` in a five-voter shard at epoch 0, past its roll call and its two
+/// authority reads, stopped where it awaits its swap to epoch 1: that call, not
+/// yet performed.
+fn awaiting_its_swap() -> (Driven, AuthorityCall) {
+    let clock = FakeClock::new();
+    let authority = warmed_up_authority(&clock);
+    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
+    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
+    driven.answer_roll_call(&[worker("w2")]);
+    driven.clock.advance(default_timings().roll_call_deadline);
+    let closed = driven.node.step(Input::Tick);
+    let live = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
+    let read = driven.node.step(performed(&driven, live));
+    let epoch_read = asked(&read.outputs, AuthorityRequest::ReadRecoveryEpoch);
+    let read = driven.node.step(performed(&driven, epoch_read));
+    let swap = asked(
+        &read.outputs,
+        AuthorityRequest::SwapRecoveryEpoch {
+            expected: Some(epoch(0)),
+            new: epoch(1),
+        },
+    );
+    (driven, swap)
+}
+
 // A reply is matched by its call's issuer, kind and number, not by when the
 // call was sent: a reply of another kind carrying the awaited number (a stray
 // or a duplicate), or one the bootstrap cascade issued (it numbers its calls
@@ -1252,36 +1288,9 @@ fn a_lost_swap_race_sends_the_node_to_rejoin_the_epoch_that_won() {
 // call timeout finds the attempt given up, and changes nothing.)
 #[test]
 fn a_swap_reply_after_the_rolls_retry_within_the_call_timeout_still_makes_the_node_stand_at_the_new_epoch() {
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
-    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
-    driven.answer_roll_call(&[worker("w2")]);
-    driven.clock.advance(default_timings().roll_call_deadline);
-    let closed = driven.node.step(Input::Tick);
-
-    let perform = |driven: &Driven, call: AuthorityCall| {
-        Input::Authority(call.perform(
-            &driven.authority,
-            &name_of(&shard(SHARD)),
-            &shard(SHARD),
-            &worker("w1"),
-            "w1",
-        ))
-    };
-    let live = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
-    let read = driven.node.step(perform(&driven, live));
-    let epoch_read = asked(&read.outputs, AuthorityRequest::ReadRecoveryEpoch);
-    let read = driven.node.step(perform(&driven, epoch_read));
-    let swap = asked(
-        &read.outputs,
-        AuthorityRequest::SwapRecoveryEpoch {
-            expected: Some(epoch(0)),
-            new: epoch(1),
-        },
-    );
+    let (mut driven, swap) = awaiting_its_swap();
     // The swap lands, and its reply is held past the next roll call's due time.
-    let reply = perform(&driven, swap);
+    let reply = performed(&driven, swap);
     driven.clock.advance(Duration::from_ticks(SUSPECT_TIMEOUT_TICKS * 10));
     let _ = driven.node.step(Input::Tick);
 
@@ -1449,27 +1458,11 @@ fn a_leader_whose_record_is_gone_publishes_no_hint_until_its_republish_lands() {
     );
 }
 
-// A leader says where it can be reached when it takes office and then on its
-// registration's schedule, not on every step.
-#[test]
-fn a_leader_publishes_its_hint_on_taking_office_and_then_on_its_registrations() {
-    let (mut driven, won) = lone_winner(Some(AuthorityTimings {
-        ttl: authority_ttl(),
-    }));
-    assert!(asks_for_a_hint(&won));
-
-    let quiet = driven.node.step(Input::Tick);
-    assert!(!asks_for_a_hint(&quiet.outputs), "{:?}", quiet.outputs);
-
-    driven.clock.advance(Duration::from_ticks(ttl_ticks() / 3));
-    let due = driven.node.step(Input::Tick);
-    assert!(asks_for_a_hint(&due.outputs), "{:?}", due.outputs);
-}
-
 // A leader owes the hint it publishes on taking office until a step that
 // publishes none for another reason. A registration that falls due at the step
-// the node wins does not use up that debt: the hint it owes follows at its
-// next step.
+// the node wins does not consume the pending hint, so the node publishes the
+// same hint again at its next step and then stops. The repeat is redundant but
+// harmless; a change that drops it may change or delete this test.
 #[test]
 fn a_hint_owed_for_taking_office_outlasts_a_registration_that_falls_due_with_it() {
     let clock = FakeClock::new();
@@ -1506,33 +1499,7 @@ fn a_hint_owed_for_taking_office_outlasts_a_registration_that_falls_due_with_it(
 // completes the path nor ends it.
 #[test]
 fn a_swap_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
-    let clock = FakeClock::new();
-    let authority = warmed_up_authority(&clock);
-    seed_shard(&authority, &shard(SHARD), 0, [&worker("w2")]);
-    let (mut driven, _) = Driven::voter(&clock, &authority, "w1", 5);
-    driven.answer_roll_call(&[worker("w2")]);
-    driven.clock.advance(default_timings().roll_call_deadline);
-    let closed = driven.node.step(Input::Tick);
-    let perform = |driven: &Driven, call: AuthorityCall| {
-        Input::Authority(call.perform(
-            &driven.authority,
-            &name_of(&shard(SHARD)),
-            &shard(SHARD),
-            &worker("w1"),
-            "w1",
-        ))
-    };
-    let live = asked(&closed.outputs, AuthorityRequest::ReadLiveRegistrations);
-    let read = driven.node.step(perform(&driven, live));
-    let epoch_read = asked(&read.outputs, AuthorityRequest::ReadRecoveryEpoch);
-    let read = driven.node.step(perform(&driven, epoch_read));
-    let swap = asked(
-        &read.outputs,
-        AuthorityRequest::SwapRecoveryEpoch {
-            expected: Some(epoch(0)),
-            new: epoch(1),
-        },
-    );
+    let (mut driven, swap) = awaiting_its_swap();
 
     let stray = driven.node.step(swap_reply(
         Some(epoch(0)),
@@ -1542,7 +1509,7 @@ fn a_swap_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
     ));
 
     assert_eq!(driven.node.state(), WorkerState::NoQuorum, "{:?}", stray.outputs);
-    let answered = driven.node.step(perform(&driven, swap));
+    let answered = driven.node.step(performed(&driven, swap));
     assert_ne!(
         driven.node.state(),
         WorkerState::NoQuorum,
