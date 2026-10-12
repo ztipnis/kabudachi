@@ -60,13 +60,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .enumerate()
             .filter_map(|(at, record)| Some((record.task.as_ref()?.task_id(), at)))
             .collect();
-        let key_of = |record: &TaskRecord| {
-            let task = record.task.as_ref()?;
-            Some(coalescing::key(
-                &task.task_definition_id(),
-                task.coalescing_key.as_deref()?,
-            ))
-        };
         // A key with a generation whose record is unknown is held whole, like
         // one found broken: the generations decide each other's fate, and one
         // not yet known may have absorbed a generation known already.
@@ -88,20 +81,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 }
             }
         }
-        let stamped_at = WallTime::now(&self.clock);
-        let mut finished_in_batch = Vec::new();
-        for (older, newer) in unfinished {
-            if key_of(&records[older]).is_some_and(|key| broken.contains(&key)) {
-                continue;
-            }
-            let record = &mut records[older];
-            finished_in_batch.extend(record.task.as_ref().map(Task::task_id));
-            if let Some(run) = record.runs.last_mut() {
-                run.transition_to(TaskRunState::Superseded, stamped_at)
-                    .expect("a pending run can always be superseded");
-            }
-            record.link.get_or_insert_default().superseded_by = Some(newer.into());
-        }
+        let finished_in_batch = finish_superseded(
+            &mut records,
+            unfinished,
+            &broken,
+            WallTime::now(&self.clock),
+        );
         finish_live.retain(|(_, newer)| {
             index
                 .get(newer)
@@ -182,6 +167,41 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         );
         Supersession::Broken
     }
+}
+
+/// The coalescing key of `record`'s task, if it has one.
+fn key_of(record: &TaskRecord) -> Option<Key> {
+    let task = record.task.as_ref()?;
+    Some(coalescing::key(
+        &task.task_definition_id(),
+        task.coalescing_key.as_deref()?,
+    ))
+}
+
+/// Finishes each supersession in `unfinished` (the older record's index,
+/// the newer generation) whose key is not `broken`: the older record's run
+/// becomes superseded at `stamped_at` and its link names its successor.
+/// Returns the older generations finished.
+fn finish_superseded(
+    records: &mut [TaskRecord],
+    unfinished: Vec<(usize, TaskId)>,
+    broken: &BTreeSet<Key>,
+    stamped_at: WallTime,
+) -> Vec<TaskId> {
+    let mut finished = Vec::new();
+    for (older, newer) in unfinished {
+        if key_of(&records[older]).is_some_and(|key| broken.contains(&key)) {
+            continue;
+        }
+        let record = &mut records[older];
+        finished.extend(record.task.as_ref().map(Task::task_id));
+        if let Some(run) = record.runs.last_mut() {
+            run.transition_to(TaskRunState::Superseded, stamped_at)
+                .expect("a pending run can always be superseded");
+        }
+        record.link.get_or_insert_default().superseded_by = Some(newer.into());
+    }
+    finished
 }
 
 /// The generation `record` is and the last one it absorbed, when it
