@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use crate::protocol::ids::WorkerId;
 
-use crate::configuration::{Admission, Configuration, Joint, OldSide, Single};
 use super::Roster;
+use crate::configuration::{Admission, Configuration, Joint, OldSide, Single};
 
 impl Roster {
     /// Takes the departing `workers` out together (every pending

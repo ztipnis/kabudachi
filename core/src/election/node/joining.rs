@@ -1,7 +1,7 @@
 use crate::coordination_authority::{RecoveryEpoch, ShardRecord};
 use crate::protocol::ids::WorkerId;
-use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::JoinResponse;
+use crate::protocol::messages::prelude::*;
 use crate::protocol::worker_state::WorkerState;
 use crate::time::Clock;
 

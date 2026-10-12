@@ -50,10 +50,9 @@ impl AuthorityStanding {
         self.follow_recovery(next, now)
     }
 
-    /// A compare-and-swap of the recovery epoch came back: either this
-    /// node's authority path, or a leader republishing its epoch after the
-    /// authority lost it, which then asks for its fence
-    /// again at once.
+    /// A compare-and-swap of the recovery epoch came back: either this node's
+    /// authority path, or a leader republishing its epoch after the authority
+    /// lost it, which then asks for its fence again at once.
     pub(super) fn on_recovery_epoch_swapped(
         &mut self,
         expected: Option<RecoveryEpoch>,
@@ -94,10 +93,10 @@ impl AuthorityStanding {
         view: &AuthorityView,
         now: Instant,
     ) -> Vec<AuthorityVerdict> {
-        // The leader's republish: once the epoch is back, by
-        // this swap or another worker's, it asks for its fence at once.
-        // Otherwise it asks when the fence is next due, so an authority that
-        // keeps failing is not asked again within the same instant.
+        // The leader's republish: once the epoch is back, by this swap or
+        // another worker's, it asks for its fence at once. Otherwise it asks
+        // when the fence is next due, so an authority that keeps failing is not
+        // asked again within the same instant.
         if !(republished(new, result) && republishes_own_epoch(view, expected, new)) {
             return Vec::new();
         }
@@ -151,7 +150,11 @@ impl AuthorityStanding {
     /// adopts it, and the configuration its recovery founds there, stands as
     /// `Candidate` for its roll call's term, and asks for the fence, which
     /// it must hold before it leads.
-    fn stand_through_authority(&mut self, epoch: RecoveryEpoch, now: Instant) -> Vec<AuthorityVerdict> {
+    fn stand_through_authority(
+        &mut self,
+        epoch: RecoveryEpoch,
+        now: Instant,
+    ) -> Vec<AuthorityVerdict> {
         let Some(recovery) = self.recovery.as_ref() else {
             return Vec::new();
         };

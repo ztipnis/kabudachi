@@ -163,6 +163,11 @@ impl AuthorityStanding {
             .then(|| self.confirmation.next_read_at())
             .flatten();
         let give_up = self.recovery_gives_up_in(state);
-        Some([read, give_up].into_iter().flatten().fold(lease, Instant::min))
+        Some(
+            [read, give_up]
+                .into_iter()
+                .flatten()
+                .fold(lease, Instant::min),
+        )
     }
 }

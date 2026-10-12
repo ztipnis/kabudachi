@@ -51,8 +51,7 @@ impl AuthorityStanding {
                 .is_some_and(ForcedRecovery::is_awaiting_fence),
             _ => false,
         };
-        let own_epoch_is_it =
-            view.own_epoch.map(|own| order(own, epoch)) == Some(EpochOrder::Mine);
+        let own_epoch_is_it = view.own_epoch.map(|own| order(own, epoch)) == Some(EpochOrder::Mine);
         seeking && own_epoch_is_it
     }
 
@@ -116,7 +115,10 @@ impl AuthorityStanding {
                         ..
                     }),
             } if cannot_recover_from(view.own_epoch, held) => {
-                vec![AuthorityVerdict::LoseQuorum, AuthorityVerdict::RejoinAt(held)]
+                vec![
+                    AuthorityVerdict::LoseQuorum,
+                    AuthorityVerdict::RejoinAt(held),
+                ]
             }
             AuthorityError::ShardConflict { .. } => {
                 if view.in_office() {

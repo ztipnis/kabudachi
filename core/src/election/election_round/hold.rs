@@ -99,8 +99,7 @@ impl RollCallHold {
         // starts a new episode.
         let live = self.answered.as_ref().filter(|held| held.release_at > now);
         let episode_start = live.map_or(now, |held| held.episode_start);
-        let episode_end =
-            episode_start + Duration::from_ticks(window.as_ticks().saturating_mul(2));
+        let episode_end = episode_start + Duration::from_ticks(window.as_ticks().saturating_mul(2));
         let release_at = (now + window)
             .min(episode_end)
             .max(now + round_span)

@@ -142,7 +142,10 @@ impl AuthorityStanding {
             return Vec::new();
         };
         let interval = self.lease.renewal_interval();
-        match self.confirmation.answered(token, result, own, now, interval) {
+        match self
+            .confirmation
+            .answered(token, result, own, now, interval)
+        {
             Answer::RejoinAt(epoch) => vec![AuthorityVerdict::RejoinAt(epoch)],
             Answer::Confirmed | Answer::Ignored => Vec::new(),
         }

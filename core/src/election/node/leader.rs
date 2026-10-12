@@ -25,21 +25,20 @@ impl<C> WorkerNode<C>
 where
     C: Clock,
 {
-    /// Answers a follower's heartbeat with one ack to its
-    /// sender, and records which of this leader's acks the heartbeat
-    /// confirms. Only a `Leader` answers, and only a heartbeat from its own
-    /// shard at its own recovery epoch or an earlier one: a worker left on an
-    /// earlier epoch adopts this leader's from the ack, but what it echoes
-    /// confirms nothing here. Any heartbeat also tells the leader its sender
-    /// is alive (see [`Self::report_lost_workers`]). A sender its roster does not hold is
-    /// added as a pending joiner, so its acks name it pending, until the
-    /// leader promises it admission and then a batch admits it (see
+    /// Answers a follower's heartbeat with one ack to its sender, and records
+    /// which of this leader's acks the heartbeat confirms. Only a `Leader`
+    /// answers, and only a heartbeat from its own shard at its own recovery
+    /// epoch or an earlier one: a worker left on an earlier epoch adopts this
+    /// leader's from the ack, but what it echoes confirms nothing here. Any
+    /// heartbeat also tells the leader its sender is alive (see
+    /// [`Self::report_lost_workers`]). A sender its roster does not hold is
+    /// added as a pending joiner, so its acks name it pending, until the leader
+    /// promises it admission and then a batch admits it (see
     /// [`LeaderOffice::take_heartbeat`]); the ack answering this heartbeat
-    /// already carries either. Every sender gets an ack,
-    /// though only members' confirmations count towards the lease, except
-    /// one whose heartbeat names a later term of this leader's epoch: this
-    /// leader steps down instead, and neither acks
-    /// it nor records it as heard.
+    /// already carries either. Every sender gets an ack, though only members'
+    /// confirmations count towards the lease, except one whose heartbeat names
+    /// a later term of this leader's epoch: this leader steps down instead, and
+    /// neither acks it nor records it as heard.
     ///
     /// A confirmation counts only for an ack of this leader's own term, sent
     /// no later than now: anything else names no ack this leader has sent in
@@ -90,8 +89,10 @@ where
     /// shard, at its own recovery epoch or an earlier one. `Some(true)` at its
     /// own epoch.
     fn heartbeat_epoch(&self, heartbeat: &Checked<WorkerHeartbeat>) -> Option<bool> {
-        let seen =
-            RecoveryEpoch::new(heartbeat.recovery_epoch_seen, heartbeat.recovery_epoch_lineage);
+        let seen = RecoveryEpoch::new(
+            heartbeat.recovery_epoch_seen,
+            heartbeat.recovery_epoch_lineage,
+        );
         let epoch = self.standing.order(seen);
         if !self.holds_office() || heartbeat.shard_id() != self.shard_id {
             return None;
@@ -168,7 +169,12 @@ where
     }
 
     /// Sends `to` an ack carrying `content` from this leader.
-    pub(super) fn send_ack_with(&mut self, to: WorkerId, content: AckContent, heartbeat_token: Option<u64>) {
+    pub(super) fn send_ack_with(
+        &mut self,
+        to: WorkerId,
+        content: AckContent,
+        heartbeat_token: Option<u64>,
+    ) {
         let cancelled_runs = self
             .cancelled_runs
             .next_batch_for(&to)

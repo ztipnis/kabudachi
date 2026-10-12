@@ -30,7 +30,10 @@ where
     /// Has this node's election round decide, through `decide`, with a view
     /// of this node as it is now, and carries out what it decided (see
     /// [`Self::apply`]).
-    pub(super) fn decide(&mut self, decide: impl FnOnce(&mut ElectionRound, &View<'_>) -> Vec<Verdict>) {
+    pub(super) fn decide(
+        &mut self,
+        decide: impl FnOnce(&mut ElectionRound, &View<'_>) -> Vec<Verdict>,
+    ) {
         let admission = self.counted_admission();
         let takes_part = self.takes_part_in_elections();
         let leader_contact_is_fresh = self.current_leader_still_valid();

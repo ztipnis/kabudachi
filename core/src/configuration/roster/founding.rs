@@ -3,8 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::ids::WorkerId;
 
-use crate::configuration::{Admission, Configuration, Counted, Electorate, Generation, Joint, Single, Tally};
 use super::{Roster, Side};
+use crate::configuration::{
+    Admission, Configuration, Counted, Electorate, Generation, Joint, Single, Tally,
+};
 
 impl Roster {
     /// The roster of the winner of the election for `term`, at

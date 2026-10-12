@@ -19,9 +19,9 @@ where
     /// [`Self::transition_to`] to apply; a node already draining, or one
     /// that can never drain again, ignores it.
     pub(super) fn request_drain(&mut self) {
-        let asked =
-            self.drain_request
-                .ask(self.state, &self.clock, self.timings.drain_wait_limit);
+        let asked = self
+            .drain_request
+            .ask(self.state, &self.clock, self.timings.drain_wait_limit);
         match asked {
             Asked::DrainNow => self.drain(),
             Asked::WaitForCrawls => self.drain_once_free(),

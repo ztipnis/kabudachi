@@ -97,11 +97,7 @@ impl LeaderOffice {
     /// sides of a joint configuration), a quorum, or short of one. Pending
     /// members and workers the roster does not hold count for nothing; `me`
     /// counts as the lease counts it, whether or not the roster lists it.
-    pub(crate) fn voters_answered(
-        &self,
-        me: &WorkerId,
-        answered: &BTreeSet<WorkerId>,
-    ) -> Answered {
+    pub(crate) fn voters_answered(&self, me: &WorkerId, answered: &BTreeSet<WorkerId>) -> Answered {
         let mut tally = Tally::against(self.roster.configuration());
         for worker in answered
             .iter()

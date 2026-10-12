@@ -151,9 +151,10 @@ fn refusal_of(
     // A caller left on an earlier recovery epoch learns who leads
     // the current one, whose ack then moves it on.
     let name_leader = reason == ElectionRejectReason::LeaderStillValid
-        || view.recovery_epoch.map(|own| {
-            order(own, call.configuration().generation().recovery_epoch())
-        }) == Some(EpochOrder::Stale);
+        || view
+            .recovery_epoch
+            .map(|own| order(own, call.configuration().generation().recovery_epoch()))
+            == Some(EpochOrder::Stale);
     Verdict::Reject {
         to: initiator,
         term: call.term,

@@ -22,8 +22,12 @@ where
             term: self.term,
             own_epoch: self.standing.epoch(),
         };
-        self.outputs
-            .extend(authority.calls_due(&view, now).into_iter().map(Output::Authority));
+        self.outputs.extend(
+            authority
+                .calls_due(&view, now)
+                .into_iter()
+                .map(Output::Authority),
+        );
     }
 
     /// Handles what the authority answered to a call this node asked for.

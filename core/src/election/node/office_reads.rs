@@ -126,8 +126,10 @@ where
         if certificate.leader_id() != *from || certificate.shard_id() != self.shard_id {
             return false;
         }
-        let named =
-            RecoveryEpoch::new(certificate.recovery_epoch, certificate.recovery_epoch_lineage);
+        let named = RecoveryEpoch::new(
+            certificate.recovery_epoch,
+            certificate.recovery_epoch_lineage,
+        );
         match self.standing.order(named) {
             Some(EpochOrder::Later) => true,
             Some(EpochOrder::Stale) | None => false,

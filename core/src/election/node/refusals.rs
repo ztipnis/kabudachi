@@ -32,9 +32,7 @@ where
         let leader = self
             .leader
             .as_ref()
-            .filter(|_| {
-                name_leader || self.holds_office() || self.current_leader_still_valid()
-            })
+            .filter(|_| name_leader || self.holds_office() || self.current_leader_still_valid())
             .map(|(leader, term)| KnownLeader {
                 leader_id: Some(leader.clone().into()),
                 term: *term,

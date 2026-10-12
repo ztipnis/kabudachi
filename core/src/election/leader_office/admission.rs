@@ -42,25 +42,26 @@ impl LeaderOffice {
     }
 
     /// Advances the admission of workers waiting to join, which takes two
-    /// phases: the leader first promises each worker that has confirmed one
-    /// of its acks recently enough to leave it a lease worth having (see
-    /// [`super::Lease::admissible`]; sent within the last two heartbeat intervals,
-    /// or no earlier than the lease's quorum-contact time) its admission at a
-    /// generation of its term (see [`super::Roster::promise_admission`]); and once
-    /// every one has said it holds the promise, starts the batch (see
-    /// [`super::Roster::begin_batch`]) that admits exactly those workers there. So
-    /// each joiner holds its admission, which a quorum counts at the batch's
-    /// generation, before the batch exists, and a leader lost before any
-    /// joiner heard of the batch leaves survivors that can still count them.
-    /// A round with a worker that has yet to confirm its promise and has not
-    /// confirmed an ack for a suspicion timeout, or whose workers are no
-    /// longer all admissible when every one holds its promise, is replaced by
-    /// a new round, since a batch must admit exactly those promised. A worker that drained after its last
-    /// confirmation, its SELF_REMOVE not yet here, may be promised: the same
-    /// as one that is admitted and then drains, which the removal handles in
-    /// turn. The leader itself, if its configuration does not count it, joins
-    /// the batch too. Nothing starts while the configuration is joint:
-    /// joiners wait for the commit, which calls this again.
+    /// phases: the leader first promises each worker that has confirmed one of
+    /// its acks recently enough to leave it a lease worth having (see
+    /// [`super::Lease::admissible`]; sent within the last two heartbeat
+    /// intervals, or no earlier than the lease's quorum-contact time) its
+    /// admission at a generation of its term (see
+    /// [`super::Roster::promise_admission`]); and once every one has said it
+    /// holds the promise, starts the batch (see [`super::Roster::begin_batch`])
+    /// that admits exactly those workers there. So each joiner holds its
+    /// admission, which a quorum counts at the batch's generation, before the
+    /// batch exists, and a leader lost before any joiner heard of the batch
+    /// leaves survivors that can still count them. A round with a worker that
+    /// has yet to confirm its promise and has not confirmed an ack for a
+    /// suspicion timeout, or whose workers are no longer all admissible when
+    /// every one holds its promise, is replaced by a new round, since a batch
+    /// must admit exactly those promised. A worker that drained after its last
+    /// confirmation, its SELF_REMOVE not yet here, may be promised: the same as
+    /// one that is admitted and then drains, which the removal handles in turn.
+    /// The leader itself, if its configuration does not count it, joins the
+    /// batch too. Nothing starts while the configuration is joint: joiners wait
+    /// for the commit, which calls this again.
     ///
     /// Nor does anything start until every member the configuration counts
     /// has said it holds it. A member that missed the acks after a commit

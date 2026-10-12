@@ -98,11 +98,7 @@ where
         let Some(office) = self.office.as_mut() else {
             return;
         };
-        for worker in office.lost_by(
-            now,
-            lost_after,
-            suspect_timeout,
-        ) {
+        for worker in office.lost_by(now, lost_after, suspect_timeout) {
             // Its cancelled runs stay listed: its own runs are decided by its
             // silence, each at its own reconnect timeout, so a worker heard
             // again may still hold one and must still be told.
@@ -122,7 +118,10 @@ where
             return;
         };
         for (worker, reconnect_from) in office.silence_changes(now, suspect_timeout) {
-            self.outputs.push(Output::WorkerSilence { worker, reconnect_from });
+            self.outputs.push(Output::WorkerSilence {
+                worker,
+                reconnect_from,
+            });
         }
     }
 }

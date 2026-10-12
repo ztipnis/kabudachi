@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::protocol::ids::WorkerId;
 
-use crate::configuration::{Admission, Configuration, Electorate, Generation, Joint};
 use super::Roster;
+use crate::configuration::{Admission, Configuration, Electorate, Generation, Joint};
 
 /// The admissions a leader has promised joiners, ahead of the batch that
 /// admits them: a joiner told it will be admitted at a generation holds that
@@ -32,7 +32,9 @@ impl Promises {
     /// The generation the next change starts from: `current`, or the latest
     /// promise if that is later.
     fn floor(&self, current: Generation) -> Generation {
-        self.latest.filter(|latest| *latest > current).unwrap_or(current)
+        self.latest
+            .filter(|latest| *latest > current)
+            .unwrap_or(current)
     }
 
     /// `worker` said it holds an admission at `held`: confirms its promise if
@@ -202,7 +204,9 @@ impl Roster {
             old_voter_count: voter_count,
             new_voter_count,
         })
-        .expect("a batch's old generation is its base's, before the batch, and both sides have a voter");
+        .expect(
+            "a batch's old generation is its base's, before the batch, and both sides have a voter",
+        );
         true
     }
 }

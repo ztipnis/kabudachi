@@ -68,7 +68,11 @@ impl ElectionRound {
         }
         if let Some(vote) = self.vote.as_mut()
             && vote.term() == reply.term
-            && vote.record_respondent(responder.clone(), admission, reply.configuration_generation())
+            && vote.record_respondent(
+                responder.clone(),
+                admission,
+                reply.configuration_generation(),
+            )
         {
             return vec![Verdict::AskVotes {
                 voters: vec![responder],
