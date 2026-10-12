@@ -37,25 +37,31 @@ def submission_options(
     now = now if now is not None else datetime.now(timezone.utc)
     if key is not None and not isinstance(key, str):
         raise TypeError(f"key must be a string, not {key!r}")
-    if delay is not None and eta is not None:
-        raise ValueError("give a delay or an eta, not both")
-    delay_ms = None
-    if delay is not None:
-        delay_ms = _milliseconds(_duration("delay", delay))
-    elif eta is not None:
-        delay_ms = _milliseconds(max(_moment("eta", eta) - now, timedelta(0)))
-    expires_in_ms = None
-    if expires is not None:
-        if isinstance(expires, datetime):
-            span = max(_moment("expires", expires) - now, timedelta(0))
-        else:
-            span = _duration("expires", expires)
-        expires_in_ms = _milliseconds(span)
+    delay_ms = _delay_ms(delay, eta, now)
+    expires_in_ms = _expires_in_ms(expires, now)
     if delay_ms and expires_in_ms is not None and expires_in_ms <= delay_ms:
         raise ValueError(
             "the task would expire before it could start: expires must be later than the delay"
         )
     return SubmissionOptions(delay_ms=delay_ms, expires_in_ms=expires_in_ms, key=key)
+
+
+def _delay_ms(delay: timedelta | None, eta: datetime | None, now: datetime) -> int | None:
+    if delay is not None and eta is not None:
+        raise ValueError("give a delay or an eta, not both")
+    if delay is not None:
+        return _milliseconds(_duration("delay", delay))
+    if eta is not None:
+        return _milliseconds(max(_moment("eta", eta) - now, timedelta(0)))
+    return None
+
+
+def _expires_in_ms(expires: timedelta | datetime | None, now: datetime) -> int | None:
+    if expires is None:
+        return None
+    if isinstance(expires, datetime):
+        return _milliseconds(max(_moment("expires", expires) - now, timedelta(0)))
+    return _milliseconds(_duration("expires", expires))
 
 
 def _duration(name: str, value: object) -> timedelta:

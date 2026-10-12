@@ -9,6 +9,7 @@ from typing import Any, overload
 
 import wrapt
 
+from kabudachi._checks import is_count, is_non_negative_timedelta, is_positive_timedelta
 from kabudachi.config import UNSET, Unset
 from kabudachi.errors import TaskDefinitionError
 from kabudachi.flow import BoundTask, MapStep, bind_task, is_step_type
@@ -103,25 +104,16 @@ class Task(wrapt.ObjectProxy):
     ) -> None:
         if not callable(func):
             raise TaskDefinitionError(f"a task must be a callable, not {func!r}")
-        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
-            raise TaskDefinitionError(
-                f"the task version must be a non-negative integer, not {version!r}"
-            )
+        self._require_count("version", version)
         if queue is not UNSET:
             self._require_string("queue", queue)
         self._require_string("serializer", serializer)
-        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
-            raise TaskDefinitionError(
-                f"the task retries must be a non-negative integer, not {retries!r}"
-            )
+        self._require_count("retries", retries)
 
         self._check_timing(timeout, cancel_grace, reconnect_timeout)
         self._check_merge(merge, kind)
         self._check_drop_oldest(drop_oldest, kind)
-        if not isinstance(recycle_process, bool):
-            raise TaskDefinitionError(
-                f"the task recycle_process must be True or False, not {recycle_process!r}"
-            )
+        self._require_bool("recycle_process", recycle_process)
 
         task_name = self._task_name(func, name)
         input_type, output_type = self._read_types(task_name, func)
@@ -242,27 +234,6 @@ class Task(wrapt.ObjectProxy):
             return finish()
         return checked(outcome)
 
-    @classmethod
-    def declare(
-        cls,
-        func: Any,
-        kind: TaskKind,
-        options: dict[str, Any],
-    ) -> "Task | Callable[[Callable[..., Any]], Task]":
-        """What a task decorator returns: the task, if it was given a
-        function, or a decorator for one if it was given only options.
-
-        Tasks declared this way are registered in the registry of this
-        process. Raises `TypeError` if given something else.
-        """
-        if func is None:
-            return lambda target: cls(target, registry=default_registry(), kind=kind, **options)
-        if not callable(func):
-            raise TypeError(
-                "a task decorator takes a function, or its options as keyword arguments"
-            )
-        return cls(func, registry=default_registry(), kind=kind, **options)
-
     @staticmethod
     def _check_merge(merge: Any, kind: TaskKind) -> None:
         if merge is None:
@@ -278,34 +249,37 @@ class Task(wrapt.ObjectProxy):
 
     @staticmethod
     def _check_drop_oldest(drop_oldest: Any, kind: TaskKind) -> None:
-        if not isinstance(drop_oldest, bool):
-            raise TaskDefinitionError(
-                f"the task drop_oldest must be True or False, not {drop_oldest!r}"
-            )
+        Task._require_bool("drop_oldest", drop_oldest)
         if drop_oldest and kind is not TaskKind.COALESCING:
             raise TypeError("only a coalescing task takes drop_oldest")
 
     @staticmethod
     def _check_timing(timeout: Any, cancel_grace: Any, reconnect_timeout: Any) -> None:
-        if timeout is not None and (
-            not isinstance(timeout, timedelta) or timeout <= timedelta(0)
-        ):
+        if timeout is not None and not is_positive_timedelta(timeout):
             raise TaskDefinitionError(
                 f"the task timeout must be a positive timedelta or None, not {timeout!r}"
             )
-        if cancel_grace is not UNSET and (
-            not isinstance(cancel_grace, timedelta) or cancel_grace < timedelta(0)
-        ):
+        if cancel_grace is not UNSET and not is_non_negative_timedelta(cancel_grace):
             raise TaskDefinitionError(
                 f"the task cancel_grace must be a non-negative timedelta, not {cancel_grace!r}"
             )
-        if reconnect_timeout is not None and (
-            not isinstance(reconnect_timeout, timedelta) or reconnect_timeout <= timedelta(0)
-        ):
+        if reconnect_timeout is not None and not is_positive_timedelta(reconnect_timeout):
             raise TaskDefinitionError(
                 "the task reconnect_timeout must be a positive timedelta or None, "
                 f"not {reconnect_timeout!r}"
             )
+
+    @staticmethod
+    def _require_count(what: str, value: Any) -> None:
+        if not is_count(value) or value < 0:
+            raise TaskDefinitionError(
+                f"the task {what} must be a non-negative integer, not {value!r}"
+            )
+
+    @staticmethod
+    def _require_bool(what: str, value: Any) -> None:
+        if not isinstance(value, bool):
+            raise TaskDefinitionError(f"the task {what} must be True or False, not {value!r}")
 
     @staticmethod
     def _require_string(what: str, value: Any) -> None:
@@ -382,6 +356,22 @@ class Task(wrapt.ObjectProxy):
             )
 
 
+def declare_task(
+    func: Any, kind: TaskKind, options: dict[str, Any]
+) -> "Task | Callable[[Callable[..., Any]], Task]":
+    """What a task decorator returns: the task, if it was given a
+    function, or a decorator for one if it was given only options.
+
+    Tasks declared this way are registered in the registry of this
+    process. Raises `TypeError` if given something else.
+    """
+    if func is None:
+        return lambda target: Task(target, registry=default_registry(), kind=kind, **options)
+    if not callable(func):
+        raise TypeError("a task decorator takes a function, or its options as keyword arguments")
+    return Task(func, registry=default_registry(), kind=kind, **options)
+
+
 class _OptionedTask:
     """A task and the timing of one submission of it. Calling it submits."""
 
@@ -453,7 +443,7 @@ def task(
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
     }
-    return Task.declare(func, TaskKind.TASK, options)
+    return declare_task(func, TaskKind.TASK, options)
 
 
 @overload
@@ -499,7 +489,7 @@ def ephemeral_task(
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
     }
-    return Task.declare(func, TaskKind.EPHEMERAL, options)
+    return declare_task(func, TaskKind.EPHEMERAL, options)
 
 
 @overload
@@ -567,4 +557,4 @@ def coalescing_task(
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
     }
-    return Task.declare(func, TaskKind.COALESCING, options)
+    return declare_task(func, TaskKind.COALESCING, options)
