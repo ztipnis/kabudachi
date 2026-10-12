@@ -511,17 +511,31 @@ impl LeaderOffice {
         {
             return;
         }
+        let waiting = self.admissible_joiners(duties);
+        let leader = self.roster.is_admissible(duties.me).then_some(duties.me);
+        match self.next_admission(&waiting, duties) {
+            NextAdmission::BeginBatch => {
+                self.roster.begin_batch(leader, self.term);
+            }
+            NextAdmission::Wait => {}
+            NextAdmission::PromiseAgain => {
+                if !self.roster.promise_admission(&waiting, self.term) {
+                    self.roster.begin_batch(leader, self.term);
+                }
+            }
+        }
+    }
+
+    /// The workers waiting to join that have confirmed an ack recently enough
+    /// to leave the leader a lease worth having.
+    fn admissible_joiners(&self, duties: &Duties) -> BTreeSet<WorkerId> {
         // A joiner heartbeats every heartbeat interval, echoing the ack that
         // answered its previous heartbeat: two intervals cover that ack's
         // age, and network delays within one.
-        let recent_since = Instant::at(
-            duties
-                .now
-                .as_ticks()
-                .saturating_sub(2 * duties.timings.heartbeat_interval.as_ticks()),
-        );
+        let recent_since =
+            ticks_before(duties.now, 2 * duties.timings.heartbeat_interval.as_ticks());
         let roster = &self.roster;
-        let waiting: BTreeSet<WorkerId> = duties
+        duties
             .lease
             .admissible(
                 roster
@@ -536,8 +550,13 @@ impl LeaderOffice {
             )
             .into_iter()
             .cloned()
-            .collect();
-        let leader = roster.is_admissible(duties.me).then_some(duties.me);
+            .collect()
+    }
+
+    /// What the standing round of promises calls for, with `waiting` the
+    /// workers admissible now.
+    fn next_admission(&self, waiting: &BTreeSet<WorkerId>, duties: &Duties) -> NextAdmission {
+        let roster = &self.roster;
         // A round stands while every promised worker that has yet to confirm
         // its promise still confirms the leader's acks, if not recently
         // enough for a batch then within a suspicion timeout: a worker that
@@ -553,43 +572,50 @@ impl LeaderOffice {
                 duties.me,
                 roster,
                 duties.timings,
-                Instant::at(
-                    duties
-                        .now
-                        .as_ticks()
-                        .saturating_sub(duties.timings.suspect_timeout.as_ticks()),
-                ),
+                ticks_before(duties.now, duties.timings.suspect_timeout.as_ticks()),
             )
             .into_iter()
             .collect();
-        if !promised.is_empty() {
-            let confirming = |worker: &WorkerId| {
-                waiting.contains(worker) || confirming_lately.contains(worker)
-            };
-            if roster.is_every_promise_held() {
-                // The batch's new side must not cost the leader its lease, so
-                // each worker it takes, one that confirmed its promise before
-                // included, must still be one a lease is worth leaving it
-                // with. A promised worker not waiting at this moment but
-                // still confirming is between two confirmations: the next
-                // heartbeat brings it back, whereas a new round would make
-                // every joiner confirm again.
-                if promised.iter().all(|(worker, _)| waiting.contains(*worker)) {
-                    self.roster.begin_batch(leader, self.term);
-                    return;
-                }
-                if promised.iter().all(|(worker, _)| confirming(worker)) {
-                    return;
-                }
-            } else if promised
-                .iter()
-                .all(|(worker, held)| *held || confirming(worker))
-            {
-                return;
+        if promised.is_empty() {
+            return NextAdmission::PromiseAgain;
+        }
+        let confirming =
+            |worker: &WorkerId| waiting.contains(worker) || confirming_lately.contains(worker);
+        if roster.is_every_promise_held() {
+            // The batch's new side must not cost the leader its lease, so
+            // each worker it takes, one that confirmed its promise before
+            // included, must still be one a lease is worth leaving it
+            // with. A promised worker not waiting at this moment but
+            // still confirming is between two confirmations: the next
+            // heartbeat brings it back, whereas a new round would make
+            // every joiner confirm again.
+            if promised.iter().all(|(worker, _)| waiting.contains(*worker)) {
+                return NextAdmission::BeginBatch;
             }
+            if promised.iter().all(|(worker, _)| confirming(worker)) {
+                return NextAdmission::Wait;
+            }
+        } else if promised
+            .iter()
+            .all(|(worker, held)| *held || confirming(worker))
+        {
+            return NextAdmission::Wait;
         }
-        if !self.roster.promise_admission(&waiting, self.term) {
-            self.roster.begin_batch(leader, self.term);
-        }
+        NextAdmission::PromiseAgain
     }
+}
+
+/// What the round of promises standing calls for.
+enum NextAdmission {
+    /// Every worker promised is waiting: start the batch that admits them.
+    BeginBatch,
+    /// The round stands: wait for its workers.
+    Wait,
+    /// No round stands, or it must be replaced: promise afresh.
+    PromiseAgain,
+}
+
+/// The instant `ticks` before `now`, or the start of time.
+fn ticks_before(now: Instant, ticks: u64) -> Instant {
+    Instant::at(now.as_ticks().saturating_sub(ticks))
 }
