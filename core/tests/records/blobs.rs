@@ -4,15 +4,14 @@
 use std::collections::BTreeMap;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord};
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::manifest::{
     BLOB_CHUNK_BYTES, Failure, INLINE_PAYLOAD_BYTES, Manifest, ManifestEntry, Unresolved, fits_inline,
 };
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
-use kabudachi_core::protocol::generated::{self, manifest_entry};
-use kabudachi_core::coordination_authority::RecoveryEpoch;
-use kabudachi_core::protocol::generated::{Task, TaskRecord};
+use kabudachi_core::protocol::generated::{self, Task, TaskRecord, manifest_entry};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::task_record::{BlobRefusal, OwnerState, RecordVersion, VersionedRecords};
+use kabudachi_core::task_record::{BlobRefusal, Origin, OwnerState, RecordVersion, VersionedRecords};
 use kabudachi_core::time::{Duration, Instant};
 
 /// `len` bytes that differ from chunk to chunk, so a reordering shows.
@@ -202,6 +201,23 @@ fn a_holder_keeps_a_blob_under_its_own_digest_while_its_owner_is_unfinished_and_
     assert!(held.blob(&key).is_some());
     held.sweep(at(2 * GRACE));
     assert!(held.blob(&key).is_none());
+
+    // A copy handed off by a draining worker names that worker's old holders:
+    // it is no move.
+    let mut held = store();
+    held.put_blob(&key, owned_by("t6", chunk), at(0)).unwrap();
+    held.put_from(task_record("t6", 1, &["a", "b"], false), Origin::Leader, at(1)).unwrap();
+    held.put_from(task_record("t6", 2, &["a", "d"], false), Origin::HandOff, at(2)).unwrap();
+    assert!(held.take_blob_moves().is_empty());
+
+    // An answer that the owner was gone, from a look-up begun before its
+    // record arrived, does not drop the blobs of the record now held.
+    let mut held = store();
+    held.put_blob(&key, owned_by("t5", chunk), at(0)).unwrap();
+    assert_eq!(held.owners_to_check(at(GRACE)), vec![task("t5")]);
+    held.put(task_record("t5", 1, &["a", "b"], false), at(GRACE)).unwrap();
+    held.owner_checked(&task("t5"), OwnerState::Gone, at(GRACE));
+    assert!(held.blob(&key).is_some());
 
     // With no grace, nothing is asked about; forgetting an owner drops what
     // only it owned.

@@ -250,12 +250,11 @@ impl VersionedRecords {
         let (task, version) = identify(&record)?;
         let leaves_me_out = self.leaves_me_out(&record, origin);
         let Some(held) = self.records.get(&task) else {
-            return Ok(self.keep(task, record, leaves_me_out, origin, (None, None), now));
+            return Ok(self.keep(task, record, leaves_me_out, origin, None, now));
         };
-        let before: BTreeSet<WorkerId> = holders_of(&held.record).into_iter().collect();
         let since = held.finished_since;
         match admission(held, &record, version, origin)? {
-            Admission::Keep => Ok(self.keep(task, record, leaves_me_out, origin, (since, Some(before)), now)),
+            Admission::Keep => Ok(self.keep(task, record, leaves_me_out, origin, since, now)),
             Admission::Unchanged => Ok(Put::Unchanged),
         }
     }
@@ -280,10 +279,10 @@ impl VersionedRecords {
         record: TaskRecord,
         leaves_me_out: bool,
         origin: Origin,
-        (finished_since, before): (Option<Instant>, Option<BTreeSet<WorkerId>>),
+        finished_since: Option<Instant>,
         now: Instant,
     ) -> Put {
-        self.see_owner(&task, &record, origin, before);
+        self.see_owner(&task, &record, origin);
         if leaves_me_out {
             self.records.insert(task, Held::stub_of(&record, finished_since, now));
             Put::Retired
@@ -294,25 +293,20 @@ impl VersionedRecords {
     }
 
     /// Marks the owner `task` seen, once its record is held, and notes a move
-    /// if a leader's `record` placed it on other holders than `before`. Only
-    /// a leader's re-placement is a move: a handed-off copy names its old
-    /// holders.
-    fn see_owner(
-        &mut self,
-        task: &TaskId,
-        record: &TaskRecord,
-        origin: Origin,
-        before: Option<BTreeSet<WorkerId>>,
-    ) {
+    /// if a leader's `record` placed it on other holders than the revision
+    /// held so far. Only a leader's re-placement is a move: a handed-off copy
+    /// names its old holders.
+    fn see_owner(&mut self, task: &TaskId, record: &TaskRecord, origin: Origin) {
         let owner = BlobOwner::Task(task.clone());
         let Some(of) = self.blob_owners.get_mut(&owner) else {
             return;
         };
         of.seen = true;
         let after = holders_of(record);
+        let before = self.records.get(task).map(|held| holders_of(&held.record));
         let moved = origin == Origin::Leader
             && !after.is_empty()
-            && before.is_some_and(|before| before != after.iter().cloned().collect());
+            && before.is_some_and(|before| before.iter().collect::<BTreeSet<_>>() != after.iter().collect());
         if moved {
             self.blob_moves.insert(owner, after);
         }
@@ -338,20 +332,6 @@ impl VersionedRecords {
             self.forget_blobs_of(&owner);
         }
         dropped + blobs_before - self.blobs.len()
-    }
-
-    /// The owners whose blobs go by `now`: those seen here whose record has
-    /// gone, and those never seen found finished a grace ago.
-    fn owners_let_go(&self, now: Instant) -> Vec<BlobOwner> {
-        self.blob_owners
-            .iter()
-            .filter(|(owner, of)| !owner_held(&self.records, owner) && self.lets_go(of, now))
-            .map(|(owner, _)| owner.clone())
-            .collect()
-    }
-
-    fn lets_go(&self, of: &BlobsOf, now: Instant) -> bool {
-        of.seen || (of.finished && self.orphan_grace.is_some_and(|grace| of.since + grace <= now))
     }
 
     /// When the next finished record's retention, or finished-elsewhere
@@ -403,6 +383,20 @@ impl VersionedRecords {
 }
 
 impl VersionedRecords {
+    /// The owners whose blobs go by `now`: those seen here whose record has
+    /// gone, and those never seen found finished a grace ago.
+    fn owners_let_go(&self, now: Instant) -> Vec<BlobOwner> {
+        self.blob_owners
+            .iter()
+            .filter(|(owner, of)| !owner_held(&self.records, owner) && self.lets_go(of, now))
+            .map(|(owner, _)| owner.clone())
+            .collect()
+    }
+
+    fn lets_go(&self, of: &BlobsOf, now: Instant) -> bool {
+        of.seen || (of.finished && self.orphan_grace.is_some_and(|grace| of.since + grace <= now))
+    }
+
     /// A store that asks about an owner it has never held a record of once
     /// `grace` has passed since its first blob arrived.
     #[must_use]
@@ -507,6 +501,11 @@ impl VersionedRecords {
 
     /// What a look-up across the shard found of `owner` at `now`.
     pub fn owner_checked(&mut self, owner: &BlobOwner, state: OwnerState, now: Instant) {
+        // The record arrived since the look-up began: the answer is stale,
+        // and the blobs now follow the record.
+        if self.blob_owners.get(owner).is_none_or(|of| of.seen) || owner_held(&self.records, owner) {
+            return;
+        }
         match state {
             OwnerState::Gone => self.forget_blobs_of(owner),
             OwnerState::Unfinished | OwnerState::Finished => {

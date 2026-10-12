@@ -38,9 +38,10 @@ impl<C: Clock> LocalRecords<C> {
     }
 
     /// Drops every finished record whose retention has passed by this
-    /// store's clock, and says how many. The timer loop calls it at the
-    /// store's `next_due`, since nothing else sweeps a store that is not
-    /// written to.
+    /// store's clock, and the blobs of an owner that has gone with its
+    /// record, and says how many records and blobs it dropped. The timer
+    /// loop calls it at the store's `next_due`, since nothing else sweeps a
+    /// store that is not written to.
     pub fn sweep(&mut self) -> usize {
         self.records.sweep(self.clock.now())
     }

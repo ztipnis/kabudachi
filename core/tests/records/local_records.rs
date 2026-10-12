@@ -1,7 +1,7 @@
 //! A node that stores its own records names itself as their placement.
 
-use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::blob::BlobKey;
+use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, Uuid7Ids, WorkerId};
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd, Scheduler, Submission};
 use kabudachi_core::task_record::LocalRecords;
