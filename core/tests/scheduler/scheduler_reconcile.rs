@@ -37,6 +37,16 @@ fn plain(input: &[u8]) -> Submission {
     )
 }
 
+/// The compaction claim `runner` is given from `fixture`, if one was made.
+fn claimed_compaction(fixture: &mut Fixture, runner: &WorkerId) -> Option<Claim> {
+    fixture
+        .scheduler
+        .claim_oldest(runner, 10)
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.task.compacts.is_some())
+}
+
 fn worker(id: &str) -> WorkerId {
     WorkerId::new(id)
 }
@@ -219,7 +229,7 @@ fn a_worker_silent_while_reconciling_loses_its_runs_once_the_grant_arrives() {
 }
 
 #[test]
-fn occupancy_memory_use_and_losses_are_rebuilt_from_records() {
+fn occupancy_and_memory_use_are_rebuilt_from_records() {
     let limits = MemoryLimits {
         soft: 150,
         hard: 200,
@@ -1089,13 +1099,7 @@ fn a_claimed_compaction_still_holds_its_key_after_a_rebuild_and_its_fold_is_acce
     for letter in b'a'..b'g' {
         newest = old.scheduler.submit(generation(&[letter; 80])).unwrap();
     }
-    let compaction = old
-        .scheduler
-        .claim_oldest(&runner, 10)
-        .unwrap()
-        .into_iter()
-        .find(|claim| claim.task.compacts.is_some())
-        .expect("a compaction was made");
+    let compaction = claimed_compaction(&mut old, &runner).expect("a compaction was made");
     let mut new = reconciling_after(&old);
     new.scheduler.set_memory_limits(limits);
     new.scheduler.set_compaction_runners(BTreeSet::from([runner.clone()]));
@@ -1306,13 +1310,7 @@ fn a_compaction_claim_is_not_rebuilt_over_the_compaction_its_key_records_name() 
                 .submit(plain(&[letter; 80]).with_coalescing_key("k"))
                 .unwrap();
         }
-        fixture
-            .scheduler
-            .claim_oldest(runner, 10)
-            .unwrap()
-            .into_iter()
-            .find(|claim| claim.task.compacts.is_some())
-            .expect("a compaction was made")
+        claimed_compaction(fixture, runner).expect("a compaction was made")
     };
     let mut first = Fixture::leading();
     let stranger = compaction_claimed_by(&mut first, &worker("r1"));
@@ -1376,9 +1374,7 @@ fn a_finished_generation_is_installed_though_the_record_of_the_one_it_absorbed_i
 #[test]
 fn a_generation_whose_predecessor_a_compaction_folded_is_installed_without_that_record() {
     let runner = worker("runner");
-    let mut old = Fixture::leading();
-    old.scheduler
-        .set_memory_limits(Some(MemoryLimits { soft: 300, hard: 10_000 }));
+    let mut old = Fixture::leading_with_limits(MemoryLimits { soft: 300, hard: 10_000 });
     old.scheduler
         .set_compaction_runners(BTreeSet::from([runner.clone()]));
     let holder = old
@@ -1394,12 +1390,7 @@ fn a_generation_whose_predecessor_a_compaction_folded_is_installed_without_that_
                 .scheduler
                 .submit(plain(&[letter; 80]).with_coalescing_key("k"))
                 .unwrap();
-            let compaction = old
-                .scheduler
-                .claim_oldest(&runner, 10)
-                .unwrap()
-                .into_iter()
-                .find(|claim| claim.task.compacts.is_some())?;
+            let compaction = claimed_compaction(&mut old, &runner)?;
             Some((waiting, compaction))
         })
         .expect("a compaction was made");

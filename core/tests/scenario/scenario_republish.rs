@@ -41,6 +41,19 @@ fn advance_until(cluster: &mut Cluster, reached: impl Fn(&Cluster) -> bool) {
     assert!(reached(cluster), "the cluster never got there");
 }
 
+/// Advances until a node is a leader reconciling, and names it.
+fn reconciling_leader(cluster: &mut Cluster) -> WorkerId {
+    advance_until(cluster, |cluster| {
+        cluster.states().values().any(|state| *state == WorkerState::LeaderReconciling)
+    });
+    cluster
+        .states()
+        .into_iter()
+        .find(|(_, state)| *state == WorkerState::LeaderReconciling)
+        .map(|(id, _)| id)
+        .expect("a node reconciles")
+}
+
 fn held_term(cluster: &Cluster, holder: &WorkerId, task: &TaskId) -> Option<u64> {
     cluster
         .records()
@@ -103,15 +116,7 @@ fn stuck_republish(shrinking: bool, staying: bool) -> Stuck {
     }
     let rest: BTreeSet<WorkerId> = voters.iter().filter(|id| **id != deposed).cloned().collect();
     cluster.partition(BTreeSet::from([deposed.clone()]), rest);
-    advance_until(&mut cluster, |cluster| {
-        cluster.states().values().any(|state| *state == WorkerState::LeaderReconciling)
-    });
-    let leader = cluster
-        .states()
-        .into_iter()
-        .find(|(_, state)| *state == WorkerState::LeaderReconciling)
-        .map(|(id, _)| id)
-        .expect("a node reconciles");
+    let leader = reconciling_leader(&mut cluster);
 
     // The leader places the record on the voters it knows, which no longer
     // include the leader that was cut off.
@@ -175,15 +180,7 @@ fn records_a_new_leader_could_not_place_are_placed_again_after_the_delay() {
     cluster.set_replication_factor(0);
     let rest: BTreeSet<WorkerId> = cluster.node_ids().into_iter().filter(|id| *id != deposed).collect();
     cluster.partition(BTreeSet::from([deposed.clone()]), rest);
-    advance_until(&mut cluster, |cluster| {
-        cluster.states().values().any(|state| *state == WorkerState::LeaderReconciling)
-    });
-    let leader = cluster
-        .states()
-        .into_iter()
-        .find(|(_, state)| *state == WorkerState::LeaderReconciling)
-        .map(|(id, _)| id)
-        .expect("a node reconciles");
+    let leader = reconciling_leader(&mut cluster);
     advance_for(&mut cluster, Duration::from_ticks(SUSPECT.as_ticks() * 3));
     assert_eq!(
         cluster.states()[&leader],
