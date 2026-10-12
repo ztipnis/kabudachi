@@ -574,6 +574,82 @@ fn a_refusal_is_placed_by_the_epoch_and_lineage_it_names() {
     }
 }
 
+// A refusal is read only by the node whose call it refuses.
+#[test]
+fn a_refusal_of_another_nodes_call_teaches_a_node_nothing() {
+    let clock = FakeClock::new();
+    let mut node = voter_at_epoch_1(&clock, &worker("w1"), 3);
+    let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+    let (rejecter, their_leader) = (worker("w2"), worker("their-leader"));
+    let refusal = refusal_at(
+        reject_message(
+            &call,
+            &rejecter,
+            ElectionRejectReason::LeaderStillValid,
+            9,
+            Some((&their_leader, 9)),
+        ),
+        Some(1),
+        None,
+        None,
+    );
+    let mut for_another = refusal.clone();
+    let Some(election_message::Payload::ElectionReject(reject)) = for_another.payload.as_mut()
+    else {
+        panic!("reject_message builds a refusal");
+    };
+    reject.initiator_id = Some(worker("w3").into());
+
+    let ignored = deliver(&mut node, &rejecter, for_another);
+    assert_eq!(node.highest_term_seen(), 0);
+    assert!(sent_to(&ignored, &their_leader).is_empty(), "{ignored:?}");
+
+    let heeded = deliver(&mut node, &rejecter, refusal);
+    assert_eq!(node.highest_term_seen(), 9, "setup invariant");
+    assert!(!sent_to(&heeded, &their_leader).is_empty(), "{heeded:?}");
+}
+
+// A leader named for a node to follow is never the node itself: a refusal that
+// names it, whichever epoch the refuser stands in, leaves the node naming no
+// leader when it refuses a caller left on an earlier epoch in its turn.
+#[test]
+fn a_refusal_naming_a_node_itself_makes_it_follow_no_one() {
+    for (name, refuser_epoch) in [("this epoch", 1), ("a later epoch", 2)] {
+        let clock = FakeClock::new();
+        let me = worker("w1");
+        let mut node = voter_at_epoch_1(&clock, &me, 3);
+        let call = published_roll_calls(&start_roll_call(&mut node, &clock, SUSPECT)).remove(0);
+        let rejecter = worker("w2");
+        deliver(
+            &mut node,
+            &rejecter,
+            refusal_at(
+                reject_message(
+                    &call,
+                    &rejecter,
+                    ElectionRejectReason::LeaderStillValid,
+                    9,
+                    Some((&me, 9)),
+                ),
+                Some(refuser_epoch),
+                None,
+                None,
+            ),
+        );
+
+        let stranded = worker("stranded");
+        let outputs = deliver(
+            &mut node,
+            &stranded,
+            roll_call_message(roll_call(&stranded, 5, &configuration_of(3), 0)),
+        );
+
+        let refusals = rejects_sent_to(&outputs, &stranded);
+        assert_eq!(refusals.len(), 1, "{name}: {outputs:?}");
+        assert_eq!(refusals[0].named_leader(), None, "{name}");
+    }
+}
+
 /// A node cut off from its leader's acks while a new one is elected keeps
 /// heartbeating the old leader and rolling calls under a configuration older
 /// than everyone's. The followers refuse it for its stale generation and the
