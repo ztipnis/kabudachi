@@ -72,9 +72,7 @@ use crate::coalescing::{self, Key, Occupancy};
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::digest::Digest;
 use crate::protocol::generated::CoalescingLink;
-use crate::protocol::ids::{
-    IdGenerator, TaskId, TaskRunId, WorkerId,
-};
+use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::TaskRunRecord;
@@ -94,8 +92,8 @@ mod memory;
 mod memory_budget;
 mod observer;
 mod publication;
-mod reconciliation;
 mod rebuild;
+mod reconciliation;
 mod record_size;
 mod reports;
 mod retention;
@@ -114,8 +112,8 @@ pub use loss::LostRun;
 pub use memory::MemoryLimits;
 use memory_budget::MemoryBudget;
 pub use observer::{NoObserver, Observer};
-use reconciliation::Reconciliation;
 pub use rebuild::{Adopted, ReconcileRefused, ReconcileRejection, Reconciled};
+use reconciliation::Reconciliation;
 pub use reports::{Certification, Completion, ContinuationRejection, ReportRejection};
 use retention::Retention;
 pub use submission::{Submission, SubmitRejection, Submitted, mint};
@@ -395,5 +393,4 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let run_id = self.current_run[task_id].clone();
         self.mark_decided(&run_id);
     }
-
 }

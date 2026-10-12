@@ -75,9 +75,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// already running (its first went unanswered, or a new leader rebuilt the
     /// run as running) is taken again and changes nothing, so a report sent
     /// again never stops a healthy run.
-    pub(super) fn start_owned(&mut self, worker: &WorkerId, run_id: &TaskRunId) -> Result<(), ReportRejection> {
+    pub(super) fn start_owned(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+    ) -> Result<(), ReportRejection> {
         let already_running = self.runs.get(run_id).is_some_and(|run| {
-            run.current_state() == TaskRunState::Running && run.selected_worker().as_ref() == Some(worker)
+            run.current_state() == TaskRunState::Running
+                && run.selected_worker().as_ref() == Some(worker)
         });
         if already_running {
             return Ok(());
@@ -192,10 +197,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 ReportRejection::UnknownRun
             });
         }
-        let run = self
-            .runs
-            .get_mut(run_id)
-            .expect("just seen");
+        let run = self.runs.get_mut(run_id).expect("just seen");
         let owned = run.selected_worker().as_ref() == Some(worker);
         // A run replaced by a retry or a replay is `Failed` or `Lost`, which no
         // report expects, so ownership and state are enough.

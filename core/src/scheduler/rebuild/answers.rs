@@ -25,7 +25,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// asked may not have reached it, so it is not lost for being missing.
     /// What a worker's earlier answer left held for tasks still uncertain is
     /// dropped when its newer answer leaves those runs out.
-    pub(super) fn apply_reports(&mut self, reports: BTreeMap<WorkerId, WorkerRuns>, out: &mut Adopted) {
+    pub(super) fn apply_reports(
+        &mut self,
+        reports: BTreeMap<WorkerId, WorkerRuns>,
+        out: &mut Adopted,
+    ) {
         for (worker, answer) in reports {
             let now = self.clock.now();
             let stamped_at = WallTime::now(&self.clock);
@@ -53,7 +57,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Applies one run `worker` reported (see [`Self::apply_reports`]).
-    pub(super) fn apply_reported(&mut self, worker: &WorkerId, reported: ReportedRun, out: &mut Adopted) {
+    pub(super) fn apply_reported(
+        &mut self,
+        worker: &WorkerId,
+        reported: ReportedRun,
+        out: &mut Adopted,
+    ) {
         let Some(reported) = self.reconciliation.hold_report(worker, reported) else {
             return;
         };
@@ -63,7 +72,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return;
         }
         match self.recorded_state_of(worker, &task_id, &run_id) {
-            Some(TaskRunState::Cancelled) => self.hold_cancel(worker, task_id, run_id, &reported.state),
+            Some(TaskRunState::Cancelled) => {
+                self.hold_cancel(worker, task_id, run_id, &reported.state)
+            }
             Some(recorded @ (TaskRunState::Claimed | TaskRunState::Running)) => {
                 self.adopt_reported(worker, &run_id, recorded, reported.state, out);
             }
@@ -165,9 +176,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return false;
         }
         let stamped_at = WallTime::now(&self.clock);
-        let compaction_key = task.compacts.as_ref().map(|prefix| {
-            coalescing::key(&task.task_definition_id(), &prefix.coalescing_key)
-        });
+        let compaction_key = task
+            .compacts
+            .as_ref()
+            .map(|prefix| coalescing::key(&task.task_definition_id(), &prefix.coalescing_key));
         if self.compacted_by_another(&task_id, compaction_key.as_ref()) {
             return false;
         }
@@ -202,7 +214,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.input_digests
             .insert(task_id.clone(), Digest::blake3(&task.serialized_input));
         self.current_run.insert(task_id.clone(), run_id.clone());
-        self.runs_of_task.insert(task_id.clone(), vec![run_id.clone()]);
+        self.runs_of_task
+            .insert(task_id.clone(), vec![run_id.clone()]);
         self.runs.insert(run_id, run);
         self.tasks.insert(task_id.clone(), task);
         self.mark_current_decided(&task_id);

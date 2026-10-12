@@ -7,8 +7,8 @@ use crate::coalescing::{ChainItem, Folded, Key};
 use crate::protocol::digest::Digest;
 use crate::protocol::generated::{ChainEntry, CoalescingLink, TaskRecord, chain_entry};
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId};
-use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::messages::prelude::*;
+use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
 use crate::reconcile::RECONCILE_SKEW_MARGIN;
@@ -267,11 +267,17 @@ fn chain_items(entries: &[ChainEntry]) -> Vec<ChainItem> {
     entries
         .iter()
         .filter_map(|entry| match entry.entry.as_ref()? {
-            chain_entry::Entry::Absorbed(absorbed) => {
-                absorbed.task_id.clone().map(|id| ChainItem::Absorbed(TaskId::from(id)))
-            }
+            chain_entry::Entry::Absorbed(absorbed) => absorbed
+                .task_id
+                .clone()
+                .map(|id| ChainItem::Absorbed(TaskId::from(id))),
             chain_entry::Entry::Folded(folded) => Some(ChainItem::Folded(Folded {
-                generations: folded.generations.iter().cloned().map(TaskId::from).collect(),
+                generations: folded
+                    .generations
+                    .iter()
+                    .cloned()
+                    .map(TaskId::from)
+                    .collect(),
                 digest: folded
                     .input_digest
                     .as_ref()

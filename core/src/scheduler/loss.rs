@@ -123,7 +123,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// The workers a claimed or running current run of one of `tasks` is
     /// selected for.
-    pub(super) fn holders_of<'t>(&self, tasks: impl Iterator<Item = &'t TaskId>) -> BTreeSet<WorkerId> {
+    pub(super) fn holders_of<'t>(
+        &self,
+        tasks: impl Iterator<Item = &'t TaskId>,
+    ) -> BTreeSet<WorkerId> {
         tasks
             .filter_map(|task_id| {
                 let run = &self.runs[self.current_run.get(task_id)?];
@@ -156,7 +159,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// it becomes lost, or orphaned if it was a running run of a non-retriable
     /// task, and is replayed unless the task is ephemeral, orphaned, or a
     /// newer generation of its coalescing key waits behind it.
-    pub(super) fn lose_run(&mut self, task_id: &TaskId, now: Instant, stamped_at: WallTime) -> LostRun {
+    pub(super) fn lose_run(
+        &mut self,
+        task_id: &TaskId,
+        now: Instant,
+        stamped_at: WallTime,
+    ) -> LostRun {
         let run_id = self.current_run[task_id].clone();
         let state = self.loss_state(task_id, &run_id);
         self.runs

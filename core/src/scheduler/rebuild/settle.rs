@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::coalescing::{self, ChainItem, Key};
 use crate::protocol::generated::{CoalescingLink, TaskRecord, chain_entry};
 use crate::protocol::ids::{IdGenerator, TaskId};
-use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::messages::prelude::*;
+use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, WallTime};
@@ -128,7 +128,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         // A chain entry the leader would fold must have its record: the
         // chain's size, release and fold look it up as a held task.
         let known = |task_id: &TaskId| {
-            index.contains_key(task_id) || self.tasks.contains_key(task_id) || folded.contains(task_id)
+            index.contains_key(task_id)
+                || self.tasks.contains_key(task_id)
+                || folded.contains(task_id)
         };
         if !retained_ids(newer).iter().chain([&predecessor]).all(known) {
             return Supersession::Broken;
@@ -177,7 +179,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 /// The generation `record` is and the last one it absorbed, when it
 /// absorbed any and is not finished.
 fn absorbing_generation(record: &TaskRecord) -> Option<(TaskId, TaskId)> {
-    let link = record.link.as_ref().filter(|link| !link.absorbed.is_empty())?;
+    let link = record
+        .link
+        .as_ref()
+        .filter(|link| !link.absorbed.is_empty())?;
     if record.finished {
         return None;
     }
@@ -251,9 +256,7 @@ fn retained_ids(record: &TaskRecord) -> BTreeSet<TaskId> {
         .retained_chain
         .iter()
         .filter_map(|entry| match entry.entry.as_ref()? {
-            chain_entry::Entry::Absorbed(absorbed) => {
-                absorbed.task_id.clone().map(TaskId::from)
-            }
+            chain_entry::Entry::Absorbed(absorbed) => absorbed.task_id.clone().map(TaskId::from),
             chain_entry::Entry::Folded(_) => None,
         })
         .collect()

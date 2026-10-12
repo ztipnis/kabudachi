@@ -1,8 +1,7 @@
 //! The memory tasks hold: the limits, the check that refuses a submission past the hard one, what dropping
 //! and releasing payloads gives back, and the SlowDown signal.
 
-use crate::coalescing;
-use crate::coalescing::ChainItem;
+use crate::coalescing::{self, ChainItem};
 use crate::protocol::ids::{IdGenerator, TaskId};
 use crate::time::{Clock, Instant};
 
@@ -38,7 +37,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// Refuses `submission` if it would take memory past the hard limit and
     /// cannot be made to fit by dropping what it is allowed to drop.
-    pub(super) fn check_room(&self, submission: &Submission, needed: u64) -> Result<(), SubmitRejection> {
+    pub(super) fn check_room(
+        &self,
+        submission: &Submission,
+        needed: u64,
+    ) -> Result<(), SubmitRejection> {
         self.budget.check_room(needed, || {
             match (&submission.coalescing_key, submission.drop_oldest) {
                 (Some(key), true) => {

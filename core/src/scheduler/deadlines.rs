@@ -1,10 +1,10 @@
 //! What time does to tasks, and when it next will: delayed tasks become due, pending ones expire, and
 //! finished ones are forgotten.
 
+use crate::protocol::ids::IdGenerator;
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Instant, WallTime};
-use crate::protocol::ids::IdGenerator;
 
 use super::{Observer, Scheduler};
 
@@ -84,6 +84,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         } else {
             None
         };
-        [waiting, forgetting, lease_end, replays].into_iter().flatten().min()
+        [waiting, forgetting, lease_end, replays]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
