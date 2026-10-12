@@ -7,9 +7,8 @@
 //! straight back, as a driver does.
 
 use crate::support::builders::{
-    message_input,
-    ack_message, configuration_at_epoch, configuration_of, g0, leader_ack, roll_call_reply, shard, timings, vote_grant,
-    vote_grant_message, voter_of, worker,
+    ack_message, configuration_at_epoch, configuration_of, g0, leader_ack, message_input,
+    roll_call_reply, shard, timings, vote_grant, vote_grant_message, voter_of, worker,
 };
 
 use kabudachi_core::configuration::{Configuration, Generation, Single};
@@ -17,11 +16,9 @@ use kabudachi_core::coordination_authority::{
     AuthorityError, CoordinationAuthority, RecoveryEpoch, ShardRecord,
 };
 use kabudachi_core::election::{
-    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, AuthorityTimings, CallKind,
-    DropMessages,
-    ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration, Output, ReplyToken, Step,
-    StopReason, WorkerNode,
-    carry_out,
+    AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityRequest, AuthorityTimings,
+    CallKind, DropMessages, ElectionTimings, Entry, Identity, Input, Issuer, KnownConfiguration,
+    Output, ReplyToken, Step, StopReason, WorkerNode, carry_out,
 };
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::{
