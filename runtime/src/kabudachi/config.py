@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from typing import Any, get_type_hints
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from kabudachi._checks import (
     is_count,
@@ -311,46 +311,65 @@ def authority_parts(url: str) -> tuple[str, str, int, float | None]:
     if not isinstance(url, str):
         raise ValueError(f"authority must be a redis:// or rediss:// URL, not {url!r}")
     parts = urlsplit(url)
+    _check_authority_server(parts, url)
+    database = _authority_database(parts)
+    query = _authority_query(parts, url)
+    prefix = query.get("key_prefix", [DEFAULT_KEY_PREFIX])[0]
+    if "{" in prefix or "}" in prefix:
+        raise ValueError(f"the authority's key prefix may not contain braces: {prefix!r}")
+    return f"{parts.scheme}://{parts.netloc}/", prefix, database, _authority_ttl(query)
+
+
+def _check_authority_server(parts: SplitResult, url: str) -> None:
     try:
         parts.port  # a port that is not a number raises here
     except ValueError:
         raise ValueError(f"the authority URL's port must be a number: {url!r}") from None
     if parts.scheme not in ("redis", "rediss") or not parts.hostname:
         raise ValueError(f"authority must be a redis:// or rediss:// URL with a host, not {url!r}")
+
+
+def _authority_database(parts: SplitResult) -> int:
     path = parts.path.strip("/")
-    if path and not (path.isascii() and path.isdigit() and int(path) <= MAX_DATABASE):
+    if path and not _is_database_number(path):
         raise ValueError(
             f"the authority URL's path must be a database number up to {MAX_DATABASE}, "
             f"not {parts.path!r}"
         )
+    return int(path or 0)
+
+
+def _is_database_number(path: str) -> bool:
+    return path.isascii() and path.isdigit() and int(path) <= MAX_DATABASE
+
+
+def _authority_query(parts: SplitResult, url: str) -> dict[str, list[str]]:
     query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=bool(parts.query))
     unknown = sorted(set(query) - {"key_prefix", "ttl"})
     if unknown or any(len(values) != 1 for values in query.values()):
         raise ValueError(
             f"the authority URL may set key_prefix and ttl once each, and nothing else: {url!r}"
         )
-    prefix = query.get("key_prefix", [DEFAULT_KEY_PREFIX])[0]
-    if "{" in prefix or "}" in prefix:
-        raise ValueError(f"the authority's key prefix may not contain braces: {prefix!r}")
-    ttl = None
-    if "ttl" in query:
-        raw = query["ttl"][0]
-        try:
-            ttl = float(raw)
-        except ValueError:
-            ttl = None
-        if ttl is None or not is_positive_seconds(ttl):
-            raise ValueError(
-                f"the authority's ttl must be a positive number of seconds, not {raw!r}"
-            )
-        # The authority bounds each call by a tenth of its TTL in whole
-        # milliseconds, and refuses a TTL whose tenth rounds to nothing.
-        if round(ttl * 1000) < MIN_AUTHORITY_TTL_MS:
-            raise ValueError(
-                f"the authority's ttl must be at least {MIN_AUTHORITY_TTL_MS / 1000} s, "
-                f"not {raw!r}"
-            )
-    return f"{parts.scheme}://{parts.netloc}/", prefix, int(path or 0), ttl
+    return query
+
+
+def _authority_ttl(query: dict[str, list[str]]) -> float | None:
+    if "ttl" not in query:
+        return None
+    raw = query["ttl"][0]
+    try:
+        ttl = float(raw)
+    except ValueError:
+        ttl = None
+    if ttl is None or not is_positive_seconds(ttl):
+        raise ValueError(f"the authority's ttl must be a positive number of seconds, not {raw!r}")
+    # The authority bounds each call by a tenth of its TTL in whole
+    # milliseconds, and refuses a TTL whose tenth rounds to nothing.
+    if round(ttl * 1000) < MIN_AUTHORITY_TTL_MS:
+        raise ValueError(
+            f"the authority's ttl must be at least {MIN_AUTHORITY_TTL_MS / 1000} s, not {raw!r}"
+        )
+    return ttl
 
 
 def _require_count(name: str, value: Any, *, minimum: int, what: str) -> None:
