@@ -268,46 +268,76 @@ impl<'n> LeaderReconciliation<'n> {
     /// Reads every record the round lacks from this worker's own store, and
     /// looks up those that are not there, a bounded number at once.
     fn fetch_what_is_missing<C: Clock>(&mut self, node: &WorkerNode<C>, now: Instant) {
-        let cooled_down = self.scan_again_at.is_some_and(|at| at <= now);
-        if !(self.scan || cooled_down) {
+        if !self.scan_due(now) {
             return;
         }
         self.scan = false;
         self.scan_again_at = None;
         self.unlooked = 0;
+        self.read_held_records(node);
+        for task in self
+            .reconciling
+            .round()
+            .missing_records(|worker| node.is_member(worker))
+        {
+            self.look_up(task, now);
+        }
+    }
+
+    /// Whether the round is to be scanned for missing records: it was asked
+    /// to be, or a cooldown set to scan it again has ended.
+    fn scan_due(&self, now: Instant) -> bool {
+        self.scan || self.scan_again_at.is_some_and(|at| at <= now)
+    }
+
+    /// Takes every record the round lacks that this worker's own store holds.
+    fn read_held_records<C: Clock>(&mut self, node: &WorkerNode<C>) {
         let held = self.net.held_records();
-        for task in self.reconciling.round().missing_records(|worker| node.is_member(worker)) {
+        for task in self
+            .reconciling
+            .round()
+            .missing_records(|worker| node.is_member(worker))
+        {
             if let Some(record) = held.get(&task) {
                 self.reconciling.round_mut().fetched(record);
             }
         }
-        for task in self.reconciling.round().missing_records(|worker| node.is_member(worker)) {
-            if self.fetching.contains(&task) {
-                continue;
-            }
-            if let Some((at, times)) = self.looked_up.get(&task)
-                && now < *at + self.cooldown(*times)
-            {
-                let again = *at + self.cooldown(*times);
-                self.scan_again_at = Some(self.scan_again_at.map_or(again, |at| at.min(again)));
-                continue;
-            }
-            if self.fetching.len() >= FETCHES_IN_FLIGHT {
-                // Scanned again when a lookup ends.
-                if !self.looked_up.contains_key(&task) {
-                    self.unlooked += 1;
-                }
-                continue;
-            }
-            let times = self.looked_up.get(&task).map_or(0, |(_, times)| times + 1);
-            self.looked_up.insert(task.clone(), (now, times));
-            self.fetching.insert(task.clone());
-            let net = self.net;
-            self.fetches.push(Box::pin(async move {
-                let record = net.get_record(task.clone()).await;
-                (task, record)
-            }));
+    }
+
+    /// Looks `task` up, unless a lookup of it runs, it was looked up too
+    /// recently (the round is scanned again when that cools down), or the
+    /// most lookups run that may (scanned again when one ends).
+    fn look_up(&mut self, task: TaskId, now: Instant) {
+        if self.fetching.contains(&task) {
+            return;
         }
+        if let Some(again) = self.cooling_until(&task, now) {
+            self.scan_again_at = Some(self.scan_again_at.map_or(again, |at| at.min(again)));
+            return;
+        }
+        if self.fetching.len() >= FETCHES_IN_FLIGHT {
+            // Scanned again when a lookup ends.
+            if !self.looked_up.contains_key(&task) {
+                self.unlooked += 1;
+            }
+            return;
+        }
+        let times = self.looked_up.get(&task).map_or(0, |(_, times)| times + 1);
+        self.looked_up.insert(task.clone(), (now, times));
+        self.fetching.insert(task.clone());
+        let net = self.net;
+        self.fetches.push(Box::pin(async move {
+            let record = net.get_record(task.clone()).await;
+            (task, record)
+        }));
+    }
+
+    /// When `task`, looked up before, may be looked up again, while that is
+    /// still ahead of `now`.
+    fn cooling_until(&self, task: &TaskId, now: Instant) -> Option<Instant> {
+        let (at, times) = self.looked_up.get(task)?;
+        let again = *at + self.cooldown(*times);
+        (now < again).then_some(again)
     }
 
     /// How long a record looked up `times` before is left alone: it doubles
