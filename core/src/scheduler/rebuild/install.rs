@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coalescing::{ChainItem, Folded, Key};
 use crate::protocol::digest::Digest;
-use crate::protocol::generated::{ChainEntry, TaskRecord, chain_entry};
-use crate::protocol::ids::{IdGenerator, TaskId};
+use crate::protocol::generated::{ChainEntry, CoalescingLink, TaskRecord, chain_entry};
+use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId};
+use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
@@ -33,46 +34,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         };
         let task_id = task.task_id();
         let state = runs[runs.len() - 1].current_state();
-        // Only a task's first attempt waits out a delay or an expiry; a
-        // later one follows a run that was claimed.
-        let first_attempt = runs.len() == 1;
-        let submitted_at = task.submitted_at.map_or(wall_now, WallTime::from);
-        let deadline = |after_submission: u64| {
-            submitted_at.deadline(
-                Duration::from_millis(
-                    after_submission.saturating_add(RECONCILE_SKEW_MARGIN.as_ticks()),
-                ),
-                now,
-                wall_now,
-            )
-        };
         if matches!(state, TaskRunState::Scheduled | TaskRunState::Queued) {
-            let not_before = (state == TaskRunState::Scheduled && first_attempt)
-                .then_some(task.delay_millis)
-                .flatten()
-                .map(deadline);
-            let expires_at = first_attempt
-                .then_some(task.expiry_millis)
-                .flatten()
-                .map(deadline);
+            let (not_before, expires_at) =
+                installed_wait_bounds(&task, state, runs.len() == 1, now, wall_now);
             self.waiting.admit(&task_id, not_before, expires_at);
         }
         if finished {
             self.retention.record(&task_id, now);
         } else {
-            self.budget.take(task.serialized_input.len() as u64);
-            self.budget.take(
-                chain_items(&retained_chain)
-                    .iter()
-                    .map(|item| match item {
-                        ChainItem::Folded(folded) => folded.payload.len() as u64,
-                        ChainItem::Absorbed(_) => 0,
-                    })
-                    .sum(),
-            );
-            if state == TaskRunState::Succeeded {
-                self.continuing.insert(task_id.clone());
-            }
+            self.count_unfinished(&task_id, &task, &retained_chain, state);
         }
         let lost = runs
             .iter()
@@ -85,6 +55,44 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .as_ref()
             .and_then(|digest| Digest::try_from(digest).ok())
             .unwrap_or_else(|| Digest::blake3(&task.serialized_input));
+        self.hold_installed(task, runs, current, digest, link);
+    }
+
+    /// Counts an unfinished installed task's input, and the folded payloads its
+    /// chain carries, against memory, and a certified one as continuing.
+    fn count_unfinished(
+        &mut self,
+        task_id: &TaskId,
+        task: &Task,
+        retained_chain: &[ChainEntry],
+        state: TaskRunState,
+    ) {
+        self.budget.take(task.serialized_input.len() as u64);
+        self.budget.take(
+            chain_items(retained_chain)
+                .iter()
+                .map(|item| match item {
+                    ChainItem::Folded(folded) => folded.payload.len() as u64,
+                    ChainItem::Absorbed(_) => 0,
+                })
+                .sum(),
+        );
+        if state == TaskRunState::Succeeded {
+            self.continuing.insert(task_id.clone());
+        }
+    }
+
+    /// Holds `task` with `runs`, `current` the authoritative one. Installing a
+    /// record decides nothing: this leader did not make it.
+    fn hold_installed(
+        &mut self,
+        task: Task,
+        runs: Vec<TaskRun>,
+        current: TaskRunId,
+        digest: Digest,
+        link: Option<CoalescingLink>,
+    ) {
+        let task_id = task.task_id();
         self.input_digests.insert(task_id.clone(), digest);
         if let Some(link) = link {
             self.links.insert(task_id.clone(), link);
@@ -99,7 +107,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.current_run.insert(task_id.clone(), current);
         self.tasks.insert(task_id.clone(), task);
         self.mark_current_decided(&task_id);
-        // Installing a record decides nothing: this leader did not make it.
         for run_id in self.runs_of_task[&task_id].clone() {
             self.run_decided_at.remove(&run_id);
         }
@@ -185,6 +192,39 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.occupancy.restore(&key, waiting, holder, chains);
         }
     }
+}
+
+/// When an installed pending task may first start, if not at once, and when
+/// it expires. Only a task's first attempt waits out a delay (while still
+/// scheduled) or an expiry: a later one follows a run that was claimed. Both
+/// count from the submission by the wall clock, plus the reconcile skew
+/// margin, so they err late.
+fn installed_wait_bounds(
+    task: &Task,
+    state: TaskRunState,
+    first_attempt: bool,
+    now: Instant,
+    wall_now: WallTime,
+) -> (Option<Instant>, Option<Instant>) {
+    let submitted_at = task.submitted_at.map_or(wall_now, WallTime::from);
+    let deadline = |after_submission: u64| {
+        submitted_at.deadline(
+            Duration::from_millis(
+                after_submission.saturating_add(RECONCILE_SKEW_MARGIN.as_ticks()),
+            ),
+            now,
+            wall_now,
+        )
+    };
+    let not_before = (state == TaskRunState::Scheduled && first_attempt)
+        .then_some(task.delay_millis)
+        .flatten()
+        .map(deadline);
+    let expires_at = first_attempt
+        .then_some(task.expiry_millis)
+        .flatten()
+        .map(deadline);
+    (not_before, expires_at)
 }
 
 /// The order records are installed in, oldest submission first, so the
