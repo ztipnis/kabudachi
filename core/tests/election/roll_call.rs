@@ -6,7 +6,7 @@
 use crate::support::builders::checked;
 use crate::support::builders::{
     ack_message, configuration_of, epoch, g0, leader_ack, message, past_any_suspicion, roll_call,
-    roll_call_message, roll_call_reply, shard, timings, worker,
+    roll_call_message, roll_call_reply, shard, timings, voter_of, worker,
 };
 use crate::support::clock::FakeClock;
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
@@ -203,6 +203,125 @@ fn answers_in_turn_hold_a_node_back_no_longer_than_its_episode_and_one_minimum_m
             "the node calls once the hold ends, no sooner and no later"
         );
     }
+}
+
+/// A base roll-call deadline of this many ticks, in [`slow_call_node`].
+const SLOW_CALL_DEADLINE: u64 = 40;
+/// The suspicion timeout of [`slow_call_node`].
+const SLOW_CALL_SUSPECT: u64 = 100;
+
+/// `me`, a voter of three whose roll-call deadline is long next to its
+/// suspicion timeout, so that the hold an answer puts on it outlasts a
+/// suspicion that follows it whatever the jitter on that suspicion.
+fn slow_call_node(clock: &FakeClock, me: &WorkerId) -> TestNode {
+    let timings = timings(Duration::from_ticks(SLOW_CALL_SUSPECT))
+        .with_roll_call_deadline(Duration::from_ticks(SLOW_CALL_DEADLINE));
+    WorkerNode::start(
+        Identity {
+            id: me.clone(),
+            incarnation: IncarnationId::new("incarnation-1"),
+            shard: shard("shard-1"),
+            timings,
+        },
+        Entry::Known(voter_of(3)),
+        clock.clone(),
+        None,
+    )
+    .0
+}
+
+/// How long an answer holds a node of [`slow_call_node`] back from its own
+/// calls: two base deadlines and a suspicion timeout.
+fn slow_call_hold() -> Duration {
+    Duration::from_ticks(2 * SLOW_CALL_DEADLINE + SLOW_CALL_SUSPECT)
+}
+
+/// Delivers `caller`'s roll call for `term` to `node`, which must answer it.
+fn answer_call(node: &mut TestNode, caller: &WorkerId, term: u64) {
+    let answered = deliver(
+        node,
+        caller,
+        roll_call_message(roll_call(caller, term, &configuration_of(3), 0)),
+    );
+    assert_eq!(replies_to(&answered, caller).len(), 1, "setup invariant");
+}
+
+// An answered call holds the node's own calls back until a leader's ack
+// resolves it: the ack ends the hold, so a node that suspects the leader
+// again calls as soon as its suspicion allows, not when the hold would have
+// run out.
+#[test]
+fn a_leaders_ack_releases_the_hold_an_answered_call_put_on_a_node() {
+    let clock = FakeClock::new();
+    let (caller, me) = (worker("w1"), worker("w3"));
+    let mut node = slow_call_node(&clock, &me);
+    clock.advance(past_any_suspicion(SLOW_CALL_SUSPECT));
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::LeaderSuspect, "setup invariant");
+    let answered_at = clock.now();
+    answer_call(&mut node, &caller, 1);
+    clock.advance(Duration::from_ticks(1));
+    deliver(
+        &mut node,
+        &caller,
+        ack_message(leader_ack(&caller, 1, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::Active, "setup invariant");
+
+    let called = first_call_before(&mut node, &clock, answered_at + slow_call_hold());
+
+    assert!(
+        called.is_some(),
+        "the node calls before the hold the ack released would have run out"
+    );
+}
+
+// Starting a call of its own ends the hold an episode of answers ran to its
+// cap, which owed the node that call; an answer after it holds the node
+// afresh, so its next call waits out that answer's whole hold.
+#[test]
+fn an_answer_after_a_node_called_in_its_own_right_holds_it_afresh() {
+    let clock = FakeClock::new();
+    let (first, second, third) = (worker("w1"), worker("w2"), worker("w4"));
+    let mut node = slow_call_node(&clock, &worker("w3"));
+    clock.advance(past_any_suspicion(SLOW_CALL_SUSPECT));
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::LeaderSuspect, "setup invariant");
+    let start = clock.now();
+    let window = slow_call_hold().as_ticks();
+    let episode_end = 2 * window;
+    // Two answers within one episode, the second cut by the episode's end.
+    answer_call(&mut node, &first, 1);
+    clock.advance(start + Duration::from_ticks(window - 1) - clock.now());
+    answer_call(&mut node, &second, 2);
+    clock.advance(start + Duration::from_ticks(episode_end - 2) - clock.now());
+    answer_call(&mut node, &first, 3);
+    let called = first_call_before(
+        &mut node,
+        &clock,
+        start + Duration::from_ticks(episode_end + 2 * SLOW_CALL_DEADLINE + 2),
+    )
+    .expect("the hold ends and the node calls");
+    assert_eq!(node.state(), WorkerState::RollCall, "setup invariant");
+    let called_at = called.0;
+
+    // Answered just before its own call closes, so the hold outlasts the
+    // retry the closed call puts the node on whatever the jitter on it.
+    clock.advance(Duration::from_ticks(SLOW_CALL_DEADLINE - 1));
+    answer_call(&mut node, &third, called.1 + 1);
+    let answered_at = clock.now();
+    clock.advance(Duration::from_ticks(1));
+    tick(&mut node);
+    assert_eq!(node.state(), WorkerState::NoQuorum, "setup invariant");
+
+    let next = first_call_before(&mut node, &clock, answered_at + slow_call_hold() + Duration::from_ticks(2));
+
+    assert!(called_at < answered_at, "setup invariant");
+    assert_eq!(
+        next.map(|(at, _)| at),
+        Some(answered_at + slow_call_hold()),
+        "the node calls once the answer's hold ends, no sooner"
+    );
 }
 
 // ---- Roll calls a node drops ----
