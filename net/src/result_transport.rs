@@ -188,6 +188,12 @@ impl Net {
         events
     }
 
+    /// Queues `event` as if it had arrived for this worker, so whoever takes
+    /// the result events hands on every one of them in a single order.
+    pub fn queue_result_event(&self, event: ResultEvent) {
+        self.inbound.queue_own_result(event);
+    }
+
     /// Waits until a result message has arrived since this last returned.
     /// An arrival while no one waits is kept. Wait from one task at a time.
     pub async fn result_arrived(&self) {

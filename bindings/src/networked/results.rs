@@ -48,7 +48,7 @@ pub(super) async fn deliver_then_report(
 impl Shared {
     /// Hands Python what arrived for a task submitted here: a result, a
     /// certification, or how the task ended without one.
-    pub(super) fn on_result(&self, event: ResultEvent) {
+    fn on_result(&self, event: ResultEvent) {
         let told = {
             let mut seam = self.seam();
             let event = seam.told(event);
@@ -139,26 +139,32 @@ pub(super) async fn read_results(shared: Arc<Shared>) {
 /// Whenever the leader this worker's node names changes to another, or the
 /// same worker leads in a later term, asks it how each task submitted here,
 /// stored and still awaited, stands: a certification or an ending the old
-/// leader decided may never have been told. The answers come in as any
+/// leader decided may never have been told. A spell with no leader named
+/// counts as a change, even when the same leader is named after it, since
+/// what it told meanwhile may not have arrived. The answers come in as any
 /// conclusion does.
 pub(super) async fn ask_after_leader_change(shared: Arc<Shared>) {
     let mut observed = shared.observed.clone();
     let mut named: Option<(WorkerId, u64)> = observed.borrow().leader.clone();
+    let mut unnamed_since = false;
     while observed.changed().await.is_ok() {
-        let now = observed.borrow_and_update().leader.clone();
-        if now.is_none() || now == named {
+        let Some(now) = observed.borrow_and_update().leader.clone() else {
+            unnamed_since = true;
+            continue;
+        };
+        if !unnamed_since && named.as_ref() == Some(&now) {
             continue;
         }
-        let had_one = named.is_some();
-        named = now;
-        if had_one {
+        unnamed_since = false;
+        if named.replace(now).is_some() {
             ask_about_awaited(&shared).await;
         }
     }
 }
 
 /// Asks the leader how each task submitted here, stored and still awaited,
-/// stands, and hands Python each answer that settles one.
+/// stands, and queues each answer behind the result messages already
+/// arrived, so the result reader hands Python every event in one order.
 async fn ask_about_awaited(shared: &Shared) {
     let tasks: Vec<TaskId> = {
         let seam = shared.seam();
@@ -176,7 +182,9 @@ async fn ask_about_awaited(shared: &Shared) {
             result: Some(task_response::Result::Outcome(outcome)),
         }) = answer
         {
-            shared.on_result(ResultEvent::Concluded { task, outcome });
+            shared
+                .net
+                .queue_result_event(ResultEvent::Concluded { task, outcome });
         }
     }
 }
