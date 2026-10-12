@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 import kabudachi
-from kabudachi.errors import RemoteResultUnavailableError
+from kabudachi.errors import ResultUnavailableError
 from proto_messages import Greeting
 
 
@@ -47,16 +47,35 @@ async def nests(request: Greeting) -> Greeting:
     """Calls `hold` and awaits its result, and says what that did."""
     try:
         await hold(Greeting(text=request.text))
-    except RemoteResultUnavailableError as error:
+    except ResultUnavailableError as error:
         return Greeting(text=type(error).__name__)
     return Greeting(text="delivered")
 
 
 @kabudachi.task(name="cluster.awaits")
 async def awaits(request: Greeting) -> Greeting:
-    """Calls `hold` and awaits its result; what that raises fails the run."""
-    await hold(Greeting(text=request.text))
-    return Greeting(text="delivered")
+    """Calls `hold`, waits for its leader to store it, and awaits its result;
+    what that raises fails the run. Says how durably the call is kept."""
+    called = hold(Greeting(text=request.text))
+    await asyncio.wait_for(called.durable(kabudachi.Durability.REPLICATED), 20)
+    await called
+    return Greeting(text=called.durability.name)
+
+
+@kabudachi.ephemeral_task(name="cluster.fleeting")
+async def fleeting(request: Greeting) -> Greeting:
+    """As `hold`, for a task that is never replayed once its worker is lost."""
+    first = not any(_markers().glob(f"{request.text}.*"))
+    (_markers() / f"{request.text}.{os.getpid()}").touch()
+    if first:
+        await asyncio.sleep(request.times / 1000)
+    return Greeting(text=request.text)
+
+
+@kabudachi.task(name="cluster.big")
+def big(request: Greeting) -> Greeting:
+    """Returns a result larger than one frame can carry."""
+    return Greeting(text="x" * (2 * 1024 * 1024))
 
 
 def _join(older: Greeting, newer: Greeting) -> Greeting:
@@ -71,4 +90,12 @@ async def gather(request: Greeting) -> Greeting:
     return request
 
 
-TASKS = {"spin": spin, "hold": hold, "nests": nests, "awaits": awaits, "gather": gather}
+TASKS = {
+    "spin": spin,
+    "hold": hold,
+    "nests": nests,
+    "awaits": awaits,
+    "fleeting": fleeting,
+    "big": big,
+    "gather": gather,
+}

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from cluster import TIMINGS, Worker, certified_once, digest_of, eventually
+from cluster import TIMINGS, Worker, certified_once, digest_of, eventually, settled
 from networked_tasks import nests
 from proto_messages import Greeting
 
@@ -101,15 +101,8 @@ def test_a_worker_founds_its_shard_through_valkey_runs_a_task_that_calls_another
         assert command(valkey, "KEYS", f"{PREFIX}*") != b"*0\r\n", "the founding wrote nothing"
 
         task = worker.submit("nests", text="inner")
-        certified_once(worker, task, digest_of(nests, Greeting(text="RemoteResultUnavailableError")))
-
-        def settled():
-            worker.leader()  # an answer reads the lines printed before it
-            return next((n for n in worker.notices if n.get("settled") == task), None)
-
-        assert eventually("the caller's handle to settle", settled)["error"] == (
-            "RemoteResultUnavailableError"
-        )
+        certified_once(worker, task, digest_of(nests, Greeting(text="delivered")))
+        assert eventually("the caller's handle to settle", lambda: settled(worker, task))["error"] is None
 
         # A run still held when the program ends finishes before the worker exits.
         worker.submit("hold", text="held", times=1000)
