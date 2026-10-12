@@ -1,5 +1,6 @@
 //! Task records: the order between revisions and the store that keeps the newest.
 
+mod blobs;
 mod candidate;
 mod local_records;
 mod record_store;
