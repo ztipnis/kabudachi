@@ -2,15 +2,23 @@
 //! report, and the acks it ignores.
 
 use crate::support::builders::{
-    ack_message, configuration_of, epoch, g0, heartbeat, heartbeat_message, leader_ack, shard,
-    timings, worker,
+    ack_message, configuration_of, epoch, g0, heartbeat, heartbeat_message, leader_ack,
+    past_any_suspicion, roll_call_reply, self_remove, self_remove_message, shard, timings,
+    vote_grant, vote_grant_message, worker,
 };
 use crate::support::clock::FakeClock;
-use crate::support::node::{TestNode, deliver, elect, sent_to, tick, voter_node};
+use crate::support::node::{
+    TestNode, close_roll_call, commit_founding, deliver, elect, finish_reconciling,
+    published_roll_calls, sent_to, tick, voter_node,
+};
 use kabudachi_core::configuration::{Configuration, Generation, Single};
 use kabudachi_core::election::{Entry, Identity, Input, Output, WorkerNode};
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{IncarnationId, TaskRunId, WorkerId};
-use kabudachi_core::protocol::messages::{JoinResponse, LeaderHeartbeatAck, election_message};
+use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::protocol::messages::{
+    JoinResponse, LeaderHeartbeatAck, WorkerHeartbeat, election_message,
+};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Clock, Duration};
 use std::collections::BTreeSet;
@@ -257,4 +265,153 @@ fn a_leader_lists_the_runs_it_cancelled_in_its_acks_in_rotation_until_told_to_st
     fresh.tell_cancelled(p1.clone(), runs[0].clone());
     elect(&mut fresh, &clock, SUSPECT, &[p1.clone(), p2]);
     assert!(cancelled_in(&ack_to(&mut fresh, &p1)).is_empty());
+}
+
+/// The heartbeat `node` sends its leader one interval from now.
+fn next_heartbeat(node: &mut TestNode, clock: &FakeClock) -> WorkerHeartbeat {
+    clock.advance(timings(Duration::from_ticks(SUSPECT_TIMEOUT)).heartbeat_interval);
+    let outputs = tick(node);
+    match sent_to(&outputs, &worker("leader-1")).remove(0).payload {
+        Some(election_message::Payload::Heartbeat(heartbeat)) => heartbeat,
+        other => panic!("expected a heartbeat to the leader, got {other:?}"),
+    }
+}
+
+// A worker's heartbeats carry the digest of the runs it holds from the moment
+// it is told, so its leader can see which runs it still holds.
+#[test]
+fn a_heartbeat_carries_the_digest_of_the_runs_its_sender_holds() {
+    let clock = FakeClock::new();
+    let mut node = joined_node(&clock);
+    let held = Digest::blake3(b"the runs this worker holds");
+
+    assert!(
+        next_heartbeat(&mut node, &clock)
+            .active_task_runs_digest
+            .is_empty()
+    );
+    node.set_active_runs_digest(held.clone());
+    assert_eq!(
+        next_heartbeat(&mut node, &clock).active_task_runs_digest,
+        held.value()
+    );
+}
+
+/// `leader-1`'s election in term 1 over `p1` and `p2`, and the founding it
+/// committed.
+fn leader_of_three(clock: &FakeClock) -> TestNode {
+    let mut leader = voter_node(clock, &worker("w1"), 3, SUSPECT_TIMEOUT);
+    let peers = [worker("p1"), worker("p2")];
+    elect(&mut leader, clock, SUSPECT_TIMEOUT, &peers);
+    commit_founding(&mut leader, clock, &peers);
+    leader
+}
+
+fn run_ids(count: usize) -> Vec<TaskRunId> {
+    (0..count)
+        .map(|n| TaskRunId::new(format!("run-{n:03}")))
+        .collect()
+}
+
+// Past the end of a worker's runs the rotation wraps to the start, so one ack
+// lists a full batch whenever the worker has that many runs.
+#[test]
+fn a_leaders_acks_wrap_round_to_the_first_cancelled_run_after_the_last() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let p1 = worker("p1");
+    let runs = run_ids(70);
+    for run in &runs {
+        leader.tell_cancelled(p1.clone(), run.clone());
+    }
+
+    assert_eq!(cancelled_in(&ack_to(&mut leader, &p1)), runs[..64]);
+    assert_eq!(
+        cancelled_in(&ack_to(&mut leader, &p1)),
+        [&runs[64..], &runs[..58]].concat()
+    );
+}
+
+// A worker that leaves the roster is told nothing more of its runs.
+#[test]
+fn a_leader_stops_listing_cancelled_runs_to_a_worker_that_left() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let p1 = worker("p1");
+    let runs = run_ids(1);
+    leader.tell_cancelled(p1.clone(), runs[0].clone());
+    assert_eq!(
+        cancelled_in(&ack_to(&mut leader, &p1)),
+        runs,
+        "setup invariant"
+    );
+
+    deliver(
+        &mut leader,
+        &p1,
+        self_remove_message(self_remove(&p1, "shard-1")),
+    );
+
+    assert!(cancelled_in(&ack_to(&mut leader, &p1)).is_empty());
+}
+
+// A leader that loses its office and wins it back tells only the runs it
+// cancelled in the new one.
+#[test]
+fn a_leader_that_wins_office_back_lists_none_of_the_runs_its_old_office_was_told() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let runs = run_ids(1);
+    leader.tell_cancelled(p1.clone(), runs[0].clone());
+    assert_eq!(
+        cancelled_in(&ack_to(&mut leader, &p1)),
+        runs,
+        "setup invariant"
+    );
+
+    // A later term's heartbeat deposes it.
+    deliver(
+        &mut leader,
+        &p1,
+        heartbeat_message(WorkerHeartbeat {
+            term_seen: 2,
+            ..heartbeat(&p1, None)
+        }),
+    );
+    assert_eq!(
+        leader.state(),
+        WorkerState::LeaderSuspect,
+        "setup invariant"
+    );
+
+    let call = (0..3)
+        .find_map(|_| {
+            clock.advance(past_any_suspicion(SUSPECT_TIMEOUT));
+            published_roll_calls(&tick(&mut leader)).into_iter().next()
+        })
+        .expect("a roll call");
+    let me = call.initiator_id();
+    let admission = leader.admission();
+    for peer in [&p1, &p2] {
+        deliver(
+            &mut leader,
+            peer,
+            roll_call_reply(&me, call.term, peer, admission),
+        );
+    }
+    close_roll_call(&mut leader, &clock, SUSPECT_TIMEOUT);
+    for peer in [&p1, &p2] {
+        if leader.state() == WorkerState::Candidate {
+            deliver(
+                &mut leader,
+                peer,
+                vote_grant_message(vote_grant(me.clone(), peer.clone(), call.term)),
+            );
+        }
+    }
+    finish_reconciling(&mut leader);
+    assert_eq!(leader.state(), WorkerState::Leader, "setup invariant");
+
+    assert!(cancelled_in(&ack_to(&mut leader, &p1)).is_empty());
 }
