@@ -791,6 +791,7 @@ fn a_certain_predecessor_waits_for_a_silent_newer_generation_of_its_key_and_the_
         .unwrap();
 
     assert_eq!(adopted.installed, 2);
+    assert_told_superseded_once(&mut new, &older);
     assert_eq!(
         new.scheduler.request_claim(&worker("w1"), &older),
         Err(ClaimRejection::Superseded)
@@ -802,6 +803,77 @@ fn a_certain_predecessor_waits_for_a_silent_newer_generation_of_its_key_and_the_
             .chain,
         [b"o".to_vec()]
     );
+}
+
+/// An interrupted supersession whose older generation has a client, plus an
+/// awaited task whose running run its worker reports succeeded: a rebuild of
+/// these concludes both tasks.
+fn rebuild_that_concludes() -> (Fixture, Rebuild, Vec<(TaskId, TaskRunState)>) {
+    let (mut old, older, _, mut records) = interrupted_supersession();
+    let awaited = old
+        .scheduler
+        .submit(plain(b"a").with_client(worker("client")))
+        .unwrap();
+    let claim = old.scheduler.request_claim(&worker("w1"), &awaited).unwrap();
+    old.scheduler
+        .report_started(&worker("w1"), &claim.task_run_id)
+        .unwrap();
+    records.push(old.spy.revisions_of(&awaited).last().cloned().unwrap());
+    let succeeded = ReportedState::Succeeded {
+        result_digest: Digest::blake3(b"out"),
+        delivered: true,
+    };
+    let rebuild = Rebuild {
+        records,
+        reports: report("w1", vec![reported(&claim, succeeded)]),
+        ..Rebuild::default()
+    };
+    let mut concluded = vec![
+        (older, TaskRunState::Superseded),
+        (awaited, TaskRunState::Succeeded),
+    ];
+    concluded.sort_by(|(left, _), (right, _)| left.cmp(right));
+    (old, rebuild, concluded)
+}
+
+/// The tasks concluded since the last call, by task, and how each ended.
+fn conclusions(fixture: &mut Fixture) -> Vec<(TaskId, TaskRunState)> {
+    let mut told: Vec<_> = fixture
+        .scheduler
+        .take_conclusions()
+        .into_iter()
+        .map(|conclusion| (conclusion.outcome.task_id, conclusion.outcome.state))
+        .collect();
+    told.sort_by(|(left, _), (right, _)| left.cmp(right));
+    told
+}
+
+#[test]
+fn what_a_rebuild_concludes_is_told_only_once_the_scheduler_leads_and_a_later_rebuild_drops_it() {
+    let (old, rebuild, concluded) = rebuild_that_concludes();
+    let mut new = reconciling_after(&old);
+    new.scheduler.reconcile(rebuild.clone()).unwrap();
+    assert_eq!(
+        conclusions(&mut new),
+        [],
+        "the rebuild's revisions are not stored before the scheduler leads"
+    );
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+    assert_eq!(conclusions(&mut new), concluded);
+
+    // An office that never led: the next office's rebuild drops what it
+    // concluded, and its client asks again.
+    let mut abandoned = reconciling_after(&old);
+    abandoned.scheduler.reconcile(rebuild).unwrap();
+    let later = ReconcileTerm {
+        term: OFFICE.term + 1,
+        ..OFFICE
+    };
+    abandoned.scheduler.begin_reconcile(later);
+    abandoned.scheduler.reconcile(Rebuild::default()).unwrap();
+    abandoned.scheduler.set_leadership_grant(Some(grant_of(later)));
+    assert!(abandoned.scheduler.is_leader());
+    assert_eq!(conclusions(&mut abandoned), []);
 }
 
 #[test]

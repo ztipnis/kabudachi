@@ -29,7 +29,9 @@ pub(super) fn catch_up_if_due<C: Clock, I: IdGenerator>(
 /// then left in `local` for the run's worker to be told. So is a run stored
 /// as cancelled, perhaps by an earlier leader, that its worker reported it
 /// still holds. A task with a client that ended is told to the client the
-/// same way: once what ended it is stored. Taking the events ends the
+/// same way: once what ended it is stored. The scheduler hands those over
+/// only while it leads, so what a rebuild concluded waits until every
+/// revision the rebuild republished is stored. Taking the events ends the
 /// scheduler's call, which can publish the revisions the call made, so they
 /// are written first; nothing else waits on those writes.
 pub(super) fn drain_events<C: Clock, I: IdGenerator>(

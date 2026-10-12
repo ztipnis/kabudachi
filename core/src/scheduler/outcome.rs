@@ -64,8 +64,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         outcome
     }
 
-    /// Every conclusion since the last call, oldest first.
+    /// Every conclusion since the last call, oldest first; none while not
+    /// leading, when they are kept. A rebuild concludes before its node has
+    /// stored the revisions it republished, and the scheduler leads only once
+    /// they are stored, so a conclusion is never told ahead of its revision.
+    /// A later rebuild drops what an office that never led concluded: its
+    /// client asks how the task stands instead.
     pub fn take_conclusions(&mut self) -> Vec<Conclusion> {
+        if !self.is_leader() {
+            return Vec::new();
+        }
         std::mem::take(&mut self.conclusions)
     }
 
