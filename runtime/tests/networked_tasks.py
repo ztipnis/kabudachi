@@ -28,18 +28,35 @@ def spin(request: Greeting) -> Greeting:
 
 @kabudachi.task(name="cluster.hold")
 async def hold(request: Greeting) -> Greeting:
-    """Holds for `times` milliseconds the first time `text` runs; a later run
-    of the same text returns at once. A hold asked to stop leaves a
-    `<text>.stopped` marker."""
+    """Holds for `times` milliseconds the first time `text` runs, or, for a
+    negative `times`, until the test creates a `<text>.go` marker; a later
+    run of the same text returns at once. Its start marker holds the process
+    id of the worker running it. A hold asked to stop leaves a
+    `<text>.stopped` marker, and one that returns a `<text>.ended` marker."""
     first = not any(_markers().glob(f"{request.text}.*"))
-    (_markers() / f"{request.text}.{os.getpid()}").touch()
+    started = _markers() / f"{request.text}.{os.getpid()}"
+    # Written whole under a name nothing matches, then renamed: the test
+    # never reads a start marker without its worker.
+    written = _markers() / f"_{request.text}.{os.getpid()}"
+    written.write_text(str(os.getppid()))
+    written.rename(started)
     if first:
         try:
-            await asyncio.sleep(request.times / 1000)
+            await _held(request)
         except asyncio.CancelledError:
             (_markers() / f"{request.text}.stopped").touch()
             raise
+    (_markers() / f"{request.text}.ended").touch()
     return Greeting(text=request.text)
+
+
+async def _held(request: Greeting) -> None:
+    if request.times >= 0:
+        await asyncio.sleep(request.times / 1000)
+        return
+    go = _markers() / f"{request.text}.go"
+    while not go.exists():
+        await asyncio.sleep(0.01)
 
 
 @kabudachi.task(name="cluster.nests")

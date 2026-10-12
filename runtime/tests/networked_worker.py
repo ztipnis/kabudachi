@@ -48,7 +48,9 @@ CLIENTS = {}
 
 class NotingClaims:
     """The worker's runtime, noting the client named by each claim made
-    through it."""
+    through it. A private seam: the worker swaps it in for the runtime
+    `kabudachi.run` makes (`runner._native_runtime`), since no public API
+    shows which client a claim named."""
 
     def __init__(self, runtime) -> None:
         self._runtime = runtime
@@ -105,11 +107,16 @@ async def answer(native, command: dict) -> dict:
         await asyncio.wait_for(handle.durable(kabudachi.Durability.REPLICATED), 20)
         return {"durability": handle.durability.name}
     if "status" in command:
-        status = await HANDLES[command["status"]].status()
+        # A record read waits on a shard peer that is stopped but connected.
+        status = await asyncio.wait_for(HANDLES[command["status"]].status(), 20)
         assert isinstance(status, kabudachi.TaskStatus)
         return {"status": {"state": status.state, "attempt": status.attempt, "delivered": status.delivered}}
     if "claimed" in command:
         return {"client": CLIENTS.get(command["claimed"])}
+    if "reported" in command:
+        # Whether the leader took the last report on every run claimed here,
+        # waited for up to the reconnect timeout.
+        return {"reported": await native.wait_until_reported()}
     raise ValueError(f"unknown command {command!r}")
 
 

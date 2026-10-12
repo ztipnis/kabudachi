@@ -1,6 +1,7 @@
 """Three real networked workers on loopback, seeded from one, each with one
 task process of one place. Runs are found through the shard's Task records,
-and each handle's end through the `settled` notice of the worker that
+or, while a worker is stopped, through the start markers of the bodies that
+run them, and each handle's end through the `settled` notice of the worker that
 submitted it. The tests kill a task process, a worker and a leader with
 SIGKILL, and stop workers with SIGSTOP, and check each run certifies once,
 by its result's digest, and each handle hears how its task ended."""
@@ -8,7 +9,7 @@ by its result's digest, and each handle hears how its task ended."""
 import os
 import signal
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 import pytest
 
@@ -47,14 +48,16 @@ def all_running(cluster, tasks):
 
 @contextmanager
 def stopped(*workers):
-    """The workers stopped with SIGSTOP until the block ends."""
+    """The workers stopped with SIGSTOP until the block ends; one killed
+    meanwhile is left dead."""
     for worker in workers:
         os.kill(worker.pid, signal.SIGSTOP)
     try:
         yield
     finally:
         for worker in workers:
-            os.kill(worker.pid, signal.SIGCONT)
+            with suppress(ProcessLookupError):
+                os.kill(worker.pid, signal.SIGCONT)
 
 
 @pytest.fixture
@@ -189,9 +192,7 @@ def test_a_cut_off_worker_stops_its_run_by_its_deadline_an_unreached_client_stil
 ):
     cut_off_by_its_deadline(cluster, tmp_path)
     eventually("the shard to settle on one leader", cluster.led)
-    client_unreached(cluster, tmp_path)
-    eventually("the shard to settle on one leader again", cluster.led)
-    leader_killed(cluster)
+    unreached_while_the_leader_is_killed(cluster, tmp_path)
 
 
 def cut_off_by_its_deadline(cluster, tmp_path):
@@ -223,87 +224,97 @@ def cut_off_by_its_deadline(cluster, tmp_path):
     assert states(record)[0] == "LOST"
 
 
-# How long each run of the unreached client's tasks holds, in milliseconds.
-UNREACHED_HOLD = 2000
+# A hold's `times` that holds it until the test lets it go.
+GATED = -1
 
 
-def client_unreached(cluster, tmp_path):
-    # A follower submits three tasks, one running on each worker, and is
-    # stopped once its own is cancelled. The other two runs cannot deliver
-    # to it within their reconnect timeout: one certifies with its result
-    # undelivered, the other is cancelled while it delivers. The leader is
-    # then stopped too, so the client, resumed, can learn how both ended only
-    # by asking the leader the other two elect.
+def started_on(cluster, markers, texts):
+    """The worker running the first run of each text, by its start marker,
+    once each has started."""
+    holders = {}
+    for text in texts:
+        found = [marker for marker in markers.glob(f"{text}.*") if marker.suffix[1:].isdigit()]
+        if not found:
+            return None
+        worker_pid = int(found[0].read_text())
+        holders[text] = next(worker for worker in cluster.workers if worker.pid == worker_pid)
+    return holders
+
+
+def let_go(markers, texts):
+    """Lets each gated hold return, and waits until each has."""
+    for text in texts:
+        (markers / f"{text}.go").touch()
+    eventually("the bodies to end", lambda: all((markers / f"{text}.ended").exists() for text in texts))
+
+
+def unreached_while_the_leader_is_killed(cluster, tmp_path):
+    # A follower, the client, submits three tasks, one running on each
+    # worker, and is stopped once its own is cancelled. The other two runs
+    # cannot deliver to it within their reconnect timeout: one certifies
+    # with its result undelivered, the other is cancelled while it delivers.
+    # The leader is then killed while it and the other follower each run a
+    # task, so the client, resumed, learns how its tasks ended only by
+    # asking the leader the two survivors elect, under which every run
+    # certifies once.
     leader = cluster.leader()
-    client = next(worker for worker in cluster.workers if worker is not leader)
-    texts = {
-        client.submit("hold", text=f"unreached-{n}", times=UNREACHED_HOLD): f"unreached-{n}" for n in range(3)
-    }
-    holders = eventually("all three to run", lambda: all_running(cluster, texts))
-    running_at = time.monotonic()
-    [own] = [task for task, holder in holders.items() if holder is client]
+    client, other = [worker for worker in cluster.workers if worker is not leader]
+    texts = {client.submit("hold", text=f"unreached-{n}", times=GATED): f"unreached-{n}" for n in range(3)}
+    holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()))
+    [own] = [task for task, text in texts.items() if holders[text] is client]
     unreached, interrupted = [task for task in texts if task != own]
     client.ask(cancel=own)
-    eventually("its own run to be cancelled", lambda: states(leader.record(own)) == ["CANCELLED"])
+    eventually("its own body to stop", lambda: (tmp_path / f"{texts[own]}.stopped").exists())
 
-    try:
-        with stopped(client):
-            delivered_nowhere(leader, (unreached, interrupted), running_at)
-            os.kill(leader.pid, signal.SIGSTOP)
-        # Only the client and the other follower run now, and elect a leader.
-        assert eventually("the unreached task's handle", lambda: settled(client, unreached))["error"] == (
-            "ResultUnavailableError"
-        )
-        assert eventually("the cancelled task's handle", lambda: settled(client, interrupted))["error"] == (
-            "TaskCancelledError"
-        )
-    finally:
-        os.kill(leader.pid, signal.SIGCONT)
+    with stopped(client):
+        let_go(tmp_path, [texts[unreached], texts[interrupted]])
+        # Its body has ended and its result is on its way to the stopped client.
+        assert leader.ask(cancel_by_id=interrupted)["cancelled"]
+        reported(holders[texts[unreached]])
+        # Held until let go, so the leader is killed while it and the other
+        # follower each run one; started while the leader's record is read.
+        tasks = {other.submit("hold", text=f"leader-{n}", times=GATED): f"leader-{n}" for n in range(3)}
+        undelivered(leader, unreached)
+        killed_while_running(cluster, tmp_path, leader, other, tasks.values())
+    let_go(tmp_path, tasks.values())
 
-    record = cluster.record(unreached)
-    assert [(run["state"], run["delivered"]) for run in record["runs"]] == [("SUCCEEDED", False)]
+    assert eventually("the unreached task's handle", lambda: settled(client, unreached), timeout=30)["error"] == (
+        "ResultUnavailableError"
+    )
+    assert eventually("the cancelled task's handle", lambda: settled(client, interrupted))["error"] == (
+        "TaskCancelledError"
+    )
     assert states(cluster.record(interrupted)) == ["CANCELLED"]
     assert not (tmp_path / f"{texts[interrupted]}.stopped").exists(), "cancelled before its body ended"
+    for task, text in tasks.items():
+        certified_once(cluster, task, digest_of(hold, Greeting(text=text)))
+        # The follower that submitted them awaits all three: each settles
+        # with its result, told by the new leader or asked of it.
+        assert eventually("the follower's handle", lambda: settled(other, task), timeout=30)["error"] is None
 
 
-def delivered_nowhere(leader, tasks, running_at):
-    """While the client is stopped: one run gives up delivering and is
-    certified, and the other is cancelled once its body has ended, while it
-    is still trying to deliver. A record read waits on the stopped worker, so
-    the first is read once, when its report is due."""
-    unreached, interrupted = tasks
-    body_ended = running_at + UNREACHED_HOLD / 1000
-    time.sleep(max(0.0, body_ended + 0.8 - time.monotonic()))
-    assert leader.ask(cancel_by_id=interrupted)["cancelled"]
-    time.sleep(max(0.0, body_ended + RECONNECT_TIMEOUT + 0.5 - time.monotonic()))
-    finished(leader, unreached)
+def reported(holder):
+    """Once `holder` gave up delivering the run it holds and the leader took
+    its report."""
+    eventually("the unreached run's report to be taken", lambda: holder.ask(reported=None)["reported"])
 
 
-def leader_killed(cluster):
-    # The leader is killed while it and a follower each run a task: every
-    # run certifies once under the leader the other two elect.
-    leader = cluster.leader()
-    follower = next(worker for worker in cluster.workers if worker is not leader)
-    tasks = [follower.submit("hold", text=f"leader-{n}", times=3000) for n in range(3)]
+def undelivered(leader, unreached):
+    """The leader has the run it took the report on certified, undelivered.
+    A record read waits out a query timeout on the stopped client, so it is
+    read once."""
+    record = leader.record(unreached)
+    assert record is not None and record["finished"], record
+    assert [(run["state"], run["delivered"]) for run in record["runs"]] == [("SUCCEEDED", False)]
+
+
+def killed_while_running(cluster, tmp_path, leader, follower, texts):
+    """Kills the leader once it and `follower` each run a hold of one of
+    `texts`."""
 
     def spread():
-        holders = {running_on(cluster, task) for task in tasks}
-        return leader in holders and len(holders - {None, leader}) >= 1
+        running = [started_on(cluster, tmp_path, [text]) for text in texts]
+        return {leader, follower} <= {worker for holders in running if holders for worker in holders.values()}
 
-    eventually("the leader and a follower to each run one", spread)
+    eventually("the leader and the follower to each run one", spread)
     leader.kill()
-
-    def new_leader():
-        seen = {worker.leader() for worker in cluster.live()}
-        if len(seen) != 1 or None in seen:
-            return None
-        [(chosen, _)] = seen
-        return chosen if chosen != leader.id else None
-
-    eventually("the others to elect a new leader", new_leader, timeout=15)
-    for n, task in enumerate(tasks):
-        certified_once(cluster, task, digest_of(hold, Greeting(text=f"leader-{n}")))
-    # The follower awaits all three: each settles with its result, told by
-    # the new leader or asked of it after the change.
-    for task in tasks:
-        assert eventually("the follower's handle", lambda: settled(follower, task), timeout=30)["error"] is None
