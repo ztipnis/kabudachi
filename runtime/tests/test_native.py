@@ -5,6 +5,7 @@ tasks through it without any of the Python task API on top."""
 
 import asyncio
 import gc
+import re
 import sys
 import threading
 import time
@@ -352,23 +353,44 @@ NETWORKED = {
 
 
 @pytest.mark.parametrize(
-    "build",
+    ("build", "refusal"),
     [
-        lambda: new_runtime(worker_threads=0),
-        lambda: new_runtime(memory_soft_limit=1),
-        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, worker_threads=0),
-        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **{**NETWORKED, "heartbeat_interval_ms": 0}),
-        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **{**NETWORKED, "reconnect_timeout_ms": 0}),
-        lambda: _native.NetworkedRuntime(
-            "s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, authority_url="redis://127.0.0.1:1", authority_ttl_ms=0
+        (lambda: new_runtime(worker_threads=0), "worker_threads must be at least 1"),
+        (lambda: new_runtime(memory_soft_limit=1), "give both memory limits or neither"),
+        (
+            lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, worker_threads=0),
+            "worker_threads must be at least 1",
         ),
-        lambda: _native.NetworkedRuntime("s", "not an address", **NETWORKED),
-        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, seeds=["nor this"]),
-        lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, memory_hard_limit=1),
+        (
+            lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **{**NETWORKED, "heartbeat_interval_ms": 0}),
+            "heartbeat_interval_ms must be positive",
+        ),
+        (
+            lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **{**NETWORKED, "reconnect_timeout_ms": 0}),
+            "reconnect_timeout_ms must be positive",
+        ),
+        (
+            lambda: _native.NetworkedRuntime(
+                "s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, authority_url="redis://127.0.0.1:1", authority_ttl_ms=0
+            ),
+            "authority_ttl_ms must be positive",
+        ),
+        (
+            lambda: _native.NetworkedRuntime("s", "not an address", **NETWORKED),
+            re.escape('"not an address" is not an address'),
+        ),
+        (
+            lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, seeds=["nor this"]),
+            re.escape('"nor this" is not an address'),
+        ),
+        (
+            lambda: _native.NetworkedRuntime("s", "/ip4/127.0.0.1/tcp/0", **NETWORKED, memory_hard_limit=1),
+            "give both memory limits or neither",
+        ),
     ],
 )
-def test_scaffold_runtime_arguments_the_bindings_cannot_use_are_refused_before_anything_starts(build):
-    with pytest.raises(ValueError):
+def test_scaffold_runtime_arguments_the_bindings_cannot_use_are_refused_before_anything_starts(build, refusal):
+    with pytest.raises(ValueError, match=refusal):
         build()
 
 
