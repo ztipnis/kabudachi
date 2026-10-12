@@ -298,8 +298,7 @@ struct OldSide {
 }
 
 impl OldSide {
-    /// Whether this side is exactly `single`'s electorate: the same base,
-    /// generation and voter count.
+    /// Whether this side has exactly this base, generation and voter count.
     fn is(&self, base: Generation, generation: Generation, voter_count: usize) -> bool {
         self.voter_count == voter_count && self.base == base && self.generation == generation
     }
