@@ -119,11 +119,7 @@ class _TaskProcess:
         # Runs the worker asked to cancel; a body that raises CancelledError
         # of its own accord is a failure unless it is one of these.
         self._cancel_asked: set[str] = set()
-        self._requests = itertools.count()
-        # Requests waiting for the worker's answer: (answer, whether it is a submission).
-        self._asked: dict[int, tuple[concurrent.futures.Future[Any], bool]] = {}
-        # Handles of tasks bodies here submitted, until the worker sends their outcome.
-        self._handles: dict[str, TaskHandle] = {}
+        self.requests = _WorkerRequests(self.send, self._run_callback)
         self._hosted = LoopHostedWork()
 
     def send(self, frame: Any) -> None:
@@ -176,72 +172,16 @@ class _TaskProcess:
         # thread for one must not need the loop to get it.
         match frame:
             case ipc.Reply():
-                self._answered(frame)
+                self.requests.answered(frame)
                 return
             case ipc.Stored() | ipc.WaitDone():
-                self._settle_frame(frame)
+                self.requests.settle(frame)
                 return
         with self._buffer_lock:
             if self._loop is None:
                 self._early.append(frame)
                 return
         self._loop.call_soon_threadsafe(self._received, frame)
-
-    def _settle_frame(self, frame: ipc.Stored | ipc.WaitDone) -> None:
-        """Marks a called task's handle stored, or settles it with its
-        outcome, unless the handle is gone."""
-        if isinstance(frame, ipc.Stored):
-            handle = self._handles.get(frame.task_id)
-            if handle is not None:
-                handle._mark_stored(frame.error)
-            return
-        handle = self._handles.pop(frame.task_id, None)
-        if handle is None:
-            return
-        if frame.error is not None:
-            handle._fail(frame.error)
-        else:
-            handle._resolve(frame.value)
-
-    def ask(self, make: Callable[[int], Any], *, submission: bool) -> Any:
-        """Sends the request `make(request)` builds and waits for the worker's
-        answer on this thread (the loop's, for an async body: the worker
-        answers at once). A submission is answered with a handle."""
-        request = next(self._requests)
-        answer: concurrent.futures.Future[Any] = concurrent.futures.Future()
-        self._asked[request] = (answer, submission)
-        self.send(make(request))
-        return answer.result()
-
-    def _answered(self, reply: ipc.Reply) -> None:
-        answer, submission = self._asked.pop(reply.request)
-        if reply.error is not None:
-            answer.set_exception(reply.error)
-        elif submission:
-            task_id, shard_id, replicable = reply.value
-            handle = TaskHandle(
-                task_id,
-                self._cancel,
-                self._run_callback,
-                shard_id=shard_id,
-                replicable=replicable,
-                status_reader=self._status,
-            )
-            # Kept before the asker gets it: the outcome can follow at once.
-            self._handles[task_id] = handle
-            answer.set_result(handle)
-        else:
-            answer.set_result(reply.value)
-
-    def _cancel(self, task_id: str) -> bool:
-        return self.ask(lambda request: ipc.CancelTask(request, task_id), submission=False)
-
-    async def _status(self, task_id: str) -> Any:
-        """How a task a body here called stands, read by the worker. Waits
-        off the loop: the worker's answer may take a record lookup."""
-        return await asyncio.to_thread(
-            self.ask, lambda request: ipc.Inspect(request, task_id), submission=False
-        )
 
     def _run_callback(self, function: Any, value: Any) -> None:
         # A drain waits for it too; checked again once it no longer counts.
@@ -387,6 +327,78 @@ class _TaskProcess:
             self._finished.set()
 
 
+class _WorkerRequests:
+    """Requests bodies here send the worker and its answers, and the handles
+    of the tasks they called until the worker sends their outcome."""
+
+    def __init__(
+        self, send: Callable[[Any], None], run_callback: Callable[[Any, Any], None]
+    ) -> None:
+        self._send = send
+        self._run_callback = run_callback
+        self._requests = itertools.count()
+        # Requests waiting for the worker's answer: (answer, whether it is a submission).
+        self._asked: dict[int, tuple[concurrent.futures.Future[Any], bool]] = {}
+        # Handles of tasks bodies here submitted, until the worker sends their outcome.
+        self._handles: dict[str, TaskHandle] = {}
+
+    def ask(self, make: Callable[[int], Any], *, submission: bool) -> Any:
+        """Sends the request `make(request)` builds and waits for the worker's
+        answer on this thread (the loop's, for an async body: the worker
+        answers at once). A submission is answered with a handle."""
+        request = next(self._requests)
+        answer: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        self._asked[request] = (answer, submission)
+        self._send(make(request))
+        return answer.result()
+
+    def answered(self, reply: ipc.Reply) -> None:
+        answer, submission = self._asked.pop(reply.request)
+        if reply.error is not None:
+            answer.set_exception(reply.error)
+        elif submission:
+            task_id, shard_id, replicable = reply.value
+            handle = TaskHandle(
+                task_id,
+                self._cancel,
+                self._run_callback,
+                shard_id=shard_id,
+                replicable=replicable,
+                status_reader=self._status,
+            )
+            # Kept before the asker gets it: the outcome can follow at once.
+            self._handles[task_id] = handle
+            answer.set_result(handle)
+        else:
+            answer.set_result(reply.value)
+
+    def settle(self, frame: ipc.Stored | ipc.WaitDone) -> None:
+        """Marks a called task's handle stored, or settles it with its
+        outcome, unless the handle is gone."""
+        if isinstance(frame, ipc.Stored):
+            handle = self._handles.get(frame.task_id)
+            if handle is not None:
+                handle._mark_stored(frame.error)
+            return
+        handle = self._handles.pop(frame.task_id, None)
+        if handle is None:
+            return
+        if frame.error is not None:
+            handle._fail(frame.error)
+        else:
+            handle._resolve(frame.value)
+
+    def _cancel(self, task_id: str) -> bool:
+        return self.ask(lambda request: ipc.CancelTask(request, task_id), submission=False)
+
+    async def _status(self, task_id: str) -> Any:
+        """How a task a body here called stands, read by the worker. Waits
+        off the loop: the worker's answer may take a record lookup."""
+        return await asyncio.to_thread(
+            self.ask, lambda request: ipc.Inspect(request, task_id), submission=False
+        )
+
+
 class _BodyWaits:
     """Tells the worker when one run's body starts and stops waiting for
     tasks it called, so the worker counts its place free meanwhile."""
@@ -424,7 +436,7 @@ class _ChildSession:
         serializer = self._process.serializers.get(definition.serializer)
         payload = serializer.encode(argument, definition.input_type)
         chosen = options or SubmissionOptions()
-        return self._process.ask(
+        return self._process.requests.ask(
             lambda request: ipc.Submit(request, definition.name, payload, chosen), submission=True
         )
 
@@ -443,7 +455,7 @@ class _ChildComposites:
 
     def _submit(self, kind: str, step: Any, previous: Any) -> TaskHandle:
         sent, before = pickle.dumps(step), pickle.dumps(previous)
-        return self._process.ask(
+        return self._process.requests.ask(
             lambda request: ipc.Submit(request, composite=kind, step=sent, previous=before),
             submission=True,
         )

@@ -233,7 +233,7 @@ async def outlives_its_deadline(request: Greeting) -> Greeting:
     later = leaf.options(delay=timedelta(seconds=30))
     waiting = later(request)
     cancelled = later(request).cancel()
-    kept = waiting.task_id in current_session()._process._handles
+    kept = waiting.task_id in current_session()._process.requests._handles
     marker("nested").write_text(f"{cancelled} {kept} {waiting.task_id}")
     marker("outliving").write_text(str(os.getpid()))
     end = time.monotonic() + 30
