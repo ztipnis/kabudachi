@@ -104,6 +104,7 @@ use libp2p::core::transport::{
     DialOpts, ListenerId, PortUse, Transport, TransportError, TransportEvent,
 };
 use libp2p::core::upgrade::Version;
+use libp2p::identity::Keypair;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::swarm::behaviour::toggle::Toggle;
@@ -323,14 +324,7 @@ pub(crate) fn build_swarm(
                     )
                     .clone(),
             ),
-            gossipsub: gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub::ConfigBuilder::default()
-                    .validation_mode(gossipsub::ValidationMode::Strict)
-                    .build()
-                    .expect("gossipsub's default config with strict validation is valid"),
-            )
-            .expect("gossipsub accepts a signing keypair with a valid config"),
+            gossipsub: signed_gossipsub(key),
             // Mode::Server unconditionally: this node always answers other
             // peers' DHT queries rather than waiting for libp2p's own
             // external-address-confirmation heuristic (kad's default) to
@@ -338,75 +332,81 @@ pub(crate) fn build_swarm(
             // good routing hop for another. See this module's "kad: peer
             // routing, not membership" doc for why no put/get record ever
             // touches the MemoryStore below.
-            kad: {
-                let mut kad = kad::Behaviour::new(
-                    key.public().to_peer_id(),
-                    kad::store::MemoryStore::new(key.public().to_peer_id()),
-                );
-                kad.set_mode(Some(kad::Mode::Server));
-                kad
-            },
+            kad: routing_behaviour(key.public().to_peer_id()),
             records: shard
                 .map(|shard| records_behaviour(key.public().to_peer_id(), shard, held))
                 .into(),
-            request_response: request_response::Behaviour::new(
-                [(PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default(),
-            ),
+            request_response: asked_and_answered(PROTOCOL),
             // ProtocolSupport::Full on every node: any node may need to ask
             // (a fresh Bootstrapping node) or answer (an established Active
             // node) a join request — see net/src/driver.rs's
             // respond_to_join_requests for the answering side.
-            join: request_response::Behaviour::new(
-                [(JOIN_PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default(),
-            ),
+            join: asked_and_answered(JOIN_PROTOCOL),
             // ProtocolSupport::Full on every node, same reasoning as `join`
             // above: any node may need to ask (a follower with a task to
             // claim) or answer (whichever node currently holds leadership) a
             // claim request — see net/src/driver.rs's
             // respond_to_claim_requests for the answering side.
-            claim: request_response::Behaviour::new(
-                [(CLAIM_PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default(),
-            ),
+            claim: asked_and_answered(CLAIM_PROTOCOL),
             // ProtocolSupport::Full on every node, same reasoning as `claim`
             // above: any node may ask the leader about a task or a run, and
             // whichever holds leadership answers.
-            task: request_response::Behaviour::new(
-                [(TASK_PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default(),
-            ),
+            task: asked_and_answered(TASK_PROTOCOL),
             // ProtocolSupport::Full on every node: a worker keeps no view of
             // who leads, so any worker may ask (a new leader) or answer (every
             // worker it asks) — see net/src/driver.rs's
             // respond_to_reconcile_requests for the answering side.
-            reconcile: request_response::Behaviour::new(
-                [(RECONCILE_PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default(),
-            ),
+            reconcile: asked_and_answered(RECONCILE_PROTOCOL),
             // ProtocolSupport::Full on every node: any worker may ask a shard
             // peer for work or answer such a question — see
             // net/src/driver.rs's respond_to_steal_requests for the answering
             // side. Only a shard's workers are ever asked (see
             // `crate::messenger::Net::steal_targets`).
-            steal: request_response::Behaviour::new(
-                [(STEAL_PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default(),
-            ),
+            steal: asked_and_answered(STEAL_PROTOCOL),
             // ProtocolSupport::Full on every node: any worker may run a task
             // whose client is another worker, lead a shard whose tasks have
             // clients, or await a result itself.
-            result: request_response::Behaviour::new(
-                [(RESULT_PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default(),
-            ),
+            result: asked_and_answered(RESULT_PROTOCOL),
             blocked: allow_block_list::Behaviour::default(),
         })
         .expect("behaviour construction never fails")
         .with_swarm_config(|config| config.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build();
     (swarm, identify_config.expect("the behaviour was built"))
+}
+
+/// The `gossipsub` behaviour: every message signed with `key` and checked
+/// strictly.
+fn signed_gossipsub(key: &Keypair) -> gossipsub::Behaviour {
+    gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(key.clone()),
+        gossipsub::ConfigBuilder::default()
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .build()
+            .expect("gossipsub's default config with strict validation is valid"),
+    )
+    .expect("gossipsub accepts a signing keypair with a valid config")
+}
+
+/// The routing `kad` behaviour of `local`, in server mode, over a store no
+/// record is ever put in.
+fn routing_behaviour(local: PeerId) -> kad::Behaviour<kad::store::MemoryStore> {
+    let mut kad = kad::Behaviour::new(local, kad::store::MemoryStore::new(local));
+    kad.set_mode(Some(kad::Mode::Server));
+    kad
+}
+
+/// A request-response behaviour of codec `C` over `protocol`, with
+/// `ProtocolSupport::Full` (this node both asks and answers) and the default
+/// config.
+fn asked_and_answered<C>(protocol: C::Protocol) -> request_response::Behaviour<C>
+where
+    C: request_response::Codec + Default + Clone + Send + 'static,
+{
+    request_response::Behaviour::new(
+        [(protocol, ProtocolSupport::Full)],
+        request_response::Config::default(),
+    )
 }
 
 /// Makes `swarm`'s `identify` advertise the swarm's external addresses and
