@@ -40,6 +40,15 @@ fn delivery(task: &TaskId, run: &TaskRunId) -> DeliverResult {
     }
 }
 
+fn delivered_event(task: &TaskId, run: &TaskRunId) -> Vec<ResultEvent> {
+    vec![ResultEvent::Delivered {
+        task: task.clone(),
+        run: run.clone(),
+        digest: digest(),
+        payload: RESULT.to_vec(),
+    }]
+}
+
 fn certified(task: &TaskId, run: &TaskRunId) -> Vec<ResultEvent> {
     vec![ResultEvent::Certified {
         task: task.clone(),
@@ -130,7 +139,11 @@ impl Delivering {
         let leader = self.shard.id(self.leader);
         let task = self
             .shard
-            .drive_until(submitted_through(&self.client, &leader, submission.with_client(me.clone())))
+            .drive_until(submitted_through(
+                &self.client,
+                &leader,
+                submission.with_client(me.clone()),
+            ))
             .await;
         // Room offered once the task is queued is claimed at once; room
         // offered earlier finds nothing and waits for the next claim round.
@@ -188,12 +201,7 @@ async fn a_delivered_result_is_certified(at: &mut Delivering) {
     let (task, run) = at.started(plain_with(b"delivered")).await;
     assert_eq!(
         at.delivered(&task, &run).await,
-        vec![ResultEvent::Delivered {
-            task: task.clone(),
-            run: run.clone(),
-            digest: digest(),
-            payload: RESULT.to_vec()
-        }]
+        delivered_event(&task, &run)
     );
     at.completed(&run, true);
     assert_eq!(at.next_events(&task).await, certified(&task, &run));
@@ -212,18 +220,14 @@ async fn a_result_for_this_worker_is_delivered_to_itself(at: &mut Delivering) {
     let leader = at.shard.nets[at.leader].clone();
     let (task, run) = (TaskId::new("own"), TaskRunId::new("own-run"));
     let sent = leader
-        .deliver_result(at.shard.id(at.leader), delivery(&task, &run), StdDuration::from_secs(5))
+        .deliver_result(
+            at.shard.id(at.leader),
+            delivery(&task, &run),
+            StdDuration::from_secs(5),
+        )
         .await;
     assert_eq!(sent, Ok(()));
-    assert_eq!(
-        leader.take_result_events(),
-        vec![ResultEvent::Delivered {
-            task,
-            run,
-            digest: digest(),
-            payload: RESULT.to_vec()
-        }]
-    );
+    assert_eq!(leader.take_result_events(), delivered_event(&task, &run));
 }
 
 /// A client cut off from the runner, not from the leader: the delivery is
@@ -238,7 +242,11 @@ async fn a_client_cut_off_from_the_runner_hears_the_run_certified(at: &mut Deliv
     // is asked again once before it gives up.
     let sent = at
         .shard
-        .drive_until(runner.deliver_result(at.me(), delivery(&task, &run), StdDuration::from_millis(200)))
+        .drive_until(runner.deliver_result(
+            at.me(),
+            delivery(&task, &run),
+            StdDuration::from_millis(200),
+        ))
         .await;
     assert_eq!(sent, Err(DeliveryError::Unreached));
     at.completed(&run, false);
@@ -289,7 +297,10 @@ async fn a_running_run_whose_result_was_delivered(at: &mut Delivering) -> (TaskI
             holding(&nets, &stored, &[TaskRunState::Running]) >= 2
         }))
         .await;
-    assert_eq!(at.delivered(&task, &run).await.len(), 1);
+    assert_eq!(
+        at.delivered(&task, &run).await,
+        delivered_event(&task, &run)
+    );
     (task, run)
 }
 
@@ -312,7 +323,12 @@ async fn the_leader_dies_before_the_run_is_reported(at: &mut Delivering, run: &T
 /// The new leader adopts the run from the runner's reconcile page, with
 /// `delivered` as the runner's ledger holds it, and certifies it to the
 /// client.
-async fn the_new_leader_certifies_the_adopted_run(at: &mut Delivering, next: usize, task: &TaskId, run: &TaskRunId) {
+async fn the_new_leader_certifies_the_adopted_run(
+    at: &mut Delivering,
+    next: usize,
+    task: &TaskId,
+    run: &TaskRunId,
+) {
     assert_eq!(at.next_events(task).await, certified(task, run));
     let next_net = at.shard.nets[next].clone();
     let record = at
@@ -320,7 +336,10 @@ async fn the_new_leader_certifies_the_adopted_run(at: &mut Delivering, next: usi
         .drive_until(next_net.get_record(task.clone()))
         .await
         .expect("the new leader's shard holds the adopted record");
-    assert!(record.runs.last().unwrap().delivered, "adoption dropped `delivered`");
+    assert!(
+        record.runs.last().unwrap().delivered,
+        "adoption dropped `delivered`"
+    );
 }
 
 /// The new leader answers how a task stands, idempotently, and says it does
@@ -334,7 +353,12 @@ async fn the_new_leader_answers_how_tasks_stand(at: &mut Delivering, next: usize
             .drive_until(outcome_of(&at.client, &next_id, task))
             .await;
         assert_eq!(
-            (answer.known, answer.finished, answer.state(), answer.result_digest),
+            (
+                answer.known,
+                answer.finished,
+                answer.state(),
+                answer.result_digest
+            ),
             (true, true, TaskRunState::Succeeded, Some(digest().into()))
         );
     }
