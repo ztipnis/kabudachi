@@ -5,6 +5,7 @@
 //! on `tokio`, to bridge the native runtime to Python, but not on `libp2p`.
 
 pub mod authority;
+pub mod blob_exchange;
 pub mod bootstrap;
 pub mod claim;
 pub mod claimed_runs;

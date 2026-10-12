@@ -1,23 +1,24 @@
-//! The swarm task's `kad` queries of the shard's Task records: writes to a
-//! placement's quorum, a draining worker's hand-offs, and lookups. Each
-//! query's state lives here from the command that starts it to the event
-//! that ends it.
+//! The swarm task's `kad` queries of the shard's Task records and blobs:
+//! writes to a placement's quorum, a draining worker's hand-offs, and
+//! lookups. Each query's state lives here from the command that starts it to
+//! the event that ends it.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
-use kabudachi_core::protocol::generated::TaskRecord;
+use kabudachi_core::blob::{BlobKey, BlobRecord};
+use kabudachi_core::protocol::generated::{self, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::task_record::{
-    PlacedWrite, RecordVersion, VersionOrder, Write, WriteOutcome, identify,
+    PlacedWrite, Placement, RecordVersion, VersionOrder, Write, WriteOutcome, identify,
 };
 use libp2p::kad::store::RecordStore as _;
 use libp2p::{PeerId, Swarm, kad};
 use prost::Message as _;
 use tokio::sync::oneshot;
 
-use super::{HandOffWrite, Inbound};
+use super::{HandOffWrite, Inbound, PutBlobError};
 use crate::swarm::Behaviour;
 use crate::task_store::record_key;
 
@@ -38,6 +39,11 @@ pub(super) struct RecordQueries {
     hand_offs: HashMap<kad::QueryId, oneshot::Sender<bool>>,
     /// Record lookups in flight, by their `kad` query.
     reads: HashMap<kad::QueryId, Read>,
+    /// Blob writes in flight to other workers, by their `kad` query, each to
+    /// say whether it reached its quorum.
+    blob_puts: HashMap<kad::QueryId, oneshot::Sender<Result<(), PutBlobError>>>,
+    /// Blob lookups in flight, by their `kad` query.
+    blob_reads: HashMap<kad::QueryId, BlobRead>,
 }
 
 impl RecordQueries {
@@ -168,22 +174,85 @@ impl RecordQueries {
         }
     }
 
+    /// Starts one blob write (see `Net::put_blob`): this worker's own copy
+    /// first, then the other holders over the records protocol, at the quorum
+    /// still missing. A store with no room for this worker's own copy ends it
+    /// at once, with nothing sent.
+    pub(super) fn start_blob_put(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        key: BlobKey,
+        record: BlobRecord,
+        placement: &Placement,
+        respond_to: oneshot::Sender<Result<(), PutBlobError>>,
+    ) {
+        let local = *swarm.local_peer_id();
+        let Some(records) = swarm.behaviour_mut().records.as_mut() else {
+            let _ = respond_to.send(Err(PutBlobError::NotStored));
+            return;
+        };
+        let record_key = kad::RecordKey::new(&key.record_key());
+        let value = generated::BlobRecord::from(record).encode_to_vec();
+        let stored_here = records.store_mut().put(kad::Record::new(record_key.clone(), value.clone()));
+        if stored_here.is_err() {
+            let _ = respond_to.send(Err(PutBlobError::StoreFull));
+            return;
+        }
+        let (remote, acked) = split_holders(&placement.holders, local, true);
+        let needed = placement.quorum.saturating_sub(acked);
+        if needed == 0 {
+            let _ = respond_to.send(Ok(()));
+            return;
+        }
+        if remote.len() < needed {
+            let _ = respond_to.send(Err(PutBlobError::NotStored));
+            return;
+        }
+        let quorum = kad::Quorum::N(NonZeroUsize::new(needed).expect("needed is not zero here"));
+        let query = records.put_record_to(kad::Record::new(record_key, value), remote.into_iter(), quorum);
+        self.blob_puts.insert(query, respond_to);
+    }
+
+    /// Starts a kad lookup of the blob `key` names (see `Net::get_blob`'s
+    /// last resort); at once with none when this `Net` stores no shard's
+    /// records.
+    pub(super) fn start_blob_lookup(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        key: BlobKey,
+        respond_to: oneshot::Sender<Option<Vec<u8>>>,
+    ) {
+        match swarm.behaviour_mut().records.as_mut() {
+            Some(records) => {
+                let query = records.get_record(kad::RecordKey::new(&key.record_key()));
+                self.blob_reads.insert(query, BlobRead { key, respond_to });
+            }
+            None => {
+                let _ = respond_to.send(None);
+            }
+        }
+    }
+
     /// Takes one event of the records `kad`: the progress of a write, a
-    /// hand-off or a lookup this started. Any other event is ignored.
-    pub(super) fn on_event(&mut self, event: kad::Event, inbound: &Inbound) {
+    /// hand-off or a lookup this started. Any other event is ignored. Says
+    /// which query, if any, has done its work and should be finished.
+    pub(super) fn on_event(&mut self, event: kad::Event, inbound: &Inbound) -> Option<kad::QueryId> {
         match event {
             kad::Event::OutboundQueryProgressed {
                 id,
                 result: kad::QueryResult::PutRecord(result),
                 ..
-            } => self.on_put(id, &result, inbound),
+            } => {
+                self.on_put(id, &result, inbound);
+                None
+            }
             kad::Event::OutboundQueryProgressed {
                 id,
                 result: kad::QueryResult::GetRecord(result),
                 step,
                 ..
             } => self.on_get(id, &result, &step),
-            _ => {}
+            _ => None,
         }
     }
 
@@ -195,6 +264,11 @@ impl RecordQueries {
                 tracing::debug!(%error, "a record hand-off did not reach its quorum");
             }
             let _ = respond_to.send(result.is_ok());
+        } else if let Some(respond_to) = self.blob_puts.remove(&id) {
+            if let Err(error) = result {
+                tracing::debug!(%error, "a blob write did not reach its quorum");
+            }
+            let _ = respond_to.send(result.as_ref().map(|_| ()).map_err(|_| PutBlobError::NotStored));
         }
     }
 
@@ -229,18 +303,49 @@ impl RecordQueries {
         }
     }
 
-    fn on_get(&mut self, id: kad::QueryId, result: &kad::GetRecordResult, step: &kad::ProgressStep) {
+    /// One step of a lookup. A blob lookup that found a checked copy is
+    /// answered at once, and its query returned for the caller to finish: one
+    /// copy is enough, and the rest of the lookup is wasted.
+    fn on_get(
+        &mut self,
+        id: kad::QueryId,
+        result: &kad::GetRecordResult,
+        step: &kad::ProgressStep,
+    ) -> Option<kad::QueryId> {
         if let Some(read) = self.reads.get_mut(&id)
             && let Ok(kad::GetRecordOk::FoundRecord(found)) = result
         {
             read.offer(&found.record.value);
         }
+        let found_blob = self.answer_blob_lookup(id, result);
         // The lookup's last step, whether it found records or not.
         if step.last
             && let Some(read) = self.reads.remove(&id)
         {
             read.finish();
         }
+        if step.last
+            && let Some(read) = self.blob_reads.remove(&id)
+        {
+            let _ = read.respond_to.send(None);
+        }
+        found_blob.then_some(id)
+    }
+
+    /// Answers the blob lookup `id` if `result` carries the bytes its key
+    /// names; whether it did.
+    fn answer_blob_lookup(&mut self, id: kad::QueryId, result: &kad::GetRecordResult) -> bool {
+        let Ok(kad::GetRecordOk::FoundRecord(found)) = result else {
+            return false;
+        };
+        let Some(bytes) = self.blob_reads.get(&id).and_then(|read| blob_bytes(&read.key, &found.record.value))
+        else {
+            return false;
+        };
+        if let Some(read) = self.blob_reads.remove(&id) {
+            let _ = read.respond_to.send(Some(bytes));
+        }
+        true
     }
 }
 
@@ -295,6 +400,19 @@ struct UnfinishedWrite {
     write: Write,
     /// The queries not answered yet.
     outstanding: usize,
+}
+
+/// A blob lookup waiting for a holder's answer.
+struct BlobRead {
+    key: BlobKey,
+    respond_to: oneshot::Sender<Option<Vec<u8>>>,
+}
+
+/// The bytes `value`, an encoded blob record, holds, if they are the ones
+/// `key` names: a peer's answer is checked, not trusted.
+fn blob_bytes(key: &BlobKey, value: &[u8]) -> Option<Vec<u8>> {
+    let record = generated::BlobRecord::decode(value).ok()?;
+    key.holds(&record.value).then_some(record.value)
 }
 
 /// A record lookup collecting the answers of its `kad` query.

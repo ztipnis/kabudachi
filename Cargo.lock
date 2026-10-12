@@ -1595,6 +1595,7 @@ dependencies = [
  "kabudachi-valkey-test-support",
  "libp2p",
  "prost 0.13.5",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
