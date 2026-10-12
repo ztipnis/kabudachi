@@ -205,6 +205,8 @@ async fn a_delivered_result_is_certified(at: &mut Delivering) {
     );
     at.completed(&run, true);
     assert_eq!(at.next_events(&task).await, certified(&task, &run));
+    // Certified only once a majority stores the run succeeded.
+    assert!(holding(&at.shard.nets, &task, &[TaskRunState::Succeeded]) >= 2);
     let leader = at.shard.nets[at.leader].clone();
     let record = at
         .shard
