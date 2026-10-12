@@ -551,11 +551,16 @@ fn a_run_whose_task_has_no_known_record_is_rebuilt_from_its_claim() {
 
 /// The records a shard holds when the leader died between writing the newer
 /// generation's first revision and the older generation's superseded one.
+/// The older generation has a client awaiting it.
 fn interrupted_supersession() -> (Fixture, TaskId, TaskId, Vec<TaskRecord>) {
     let mut old = Fixture::leading();
     let older = old
         .scheduler
-        .submit(plain(b"o").with_coalescing_key("k"))
+        .submit(
+            plain(b"o")
+                .with_coalescing_key("k")
+                .with_client(worker("client")),
+        )
         .unwrap();
     let before_supersession = newest_records(&old);
     let newer = old
@@ -565,6 +570,26 @@ fn interrupted_supersession() -> (Fixture, TaskId, TaskId, Vec<TaskRecord>) {
     let mut records = before_supersession;
     records.push(old.spy.revisions_of(&newer).last().cloned().unwrap());
     (old, older, newer, records)
+}
+
+/// The client of the older generation is told once that it was superseded.
+fn assert_told_superseded_once(fixture: &mut Fixture, older: &TaskId) {
+    let told: Vec<_> = fixture
+        .scheduler
+        .take_conclusions()
+        .into_iter()
+        .map(|conclusion| {
+            (
+                conclusion.client,
+                conclusion.outcome.task_id,
+                conclusion.outcome.state,
+            )
+        })
+        .collect();
+    assert_eq!(
+        told,
+        [(worker("client"), older.clone(), TaskRunState::Superseded)]
+    );
 }
 
 #[test]
@@ -602,6 +627,7 @@ fn an_interrupted_supersession_is_finished_by_the_new_leader_older_generation_la
         .map(|record| record.task.as_ref().unwrap().task_id())
         .collect();
     assert_eq!(written, [newer.clone(), older.clone()], "successor first");
+    assert_told_superseded_once(&mut new, &older);
     assert_eq!(
         new.scheduler.request_claim(&worker("w1"), &older),
         Err(ClaimRejection::Superseded)
@@ -816,6 +842,7 @@ fn a_newer_generation_arriving_late_over_an_installed_pending_predecessor_finish
         TaskRunState::Superseded,
         "the finished supersession is published"
     );
+    assert_told_superseded_once(&mut new, &older);
 }
 
 #[test]

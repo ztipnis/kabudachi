@@ -23,6 +23,10 @@ pub(super) struct Settled {
     /// generation is already installed, pending, and its record does not name
     /// the newer one (older, newer).
     pub(super) finish_live: Vec<(TaskId, TaskId)>,
+    /// The older generations whose records were finished here: once installed,
+    /// their clients are told. These are in the batch, so none is also in
+    /// `finish_live`, which names only generations installed already.
+    pub(super) finished_in_batch: Vec<TaskId>,
 }
 
 /// Whether a generation that absorbed another agrees with that one's record.
@@ -85,11 +89,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             }
         }
         let stamped_at = WallTime::now(&self.clock);
+        let mut finished_in_batch = Vec::new();
         for (older, newer) in unfinished {
             if key_of(&records[older]).is_some_and(|key| broken.contains(&key)) {
                 continue;
             }
             let record = &mut records[older];
+            finished_in_batch.extend(record.task.as_ref().map(Task::task_id));
             if let Some(run) = record.runs.last_mut() {
                 run.transition_to(TaskRunState::Superseded, stamped_at)
                     .expect("a pending run can always be superseded");
@@ -109,6 +115,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             install,
             held_back,
             finish_live,
+            finished_in_batch,
         }
     }
 
