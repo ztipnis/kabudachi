@@ -54,6 +54,11 @@ impl MemoryBudget {
         })
     }
 
+    /// The limits, if any are set.
+    pub(super) fn limits(&self) -> Option<MemoryLimits> {
+        self.limits
+    }
+
     /// Forgets the bytes in use, keeping the limits.
     pub(super) fn reset_usage(&mut self) {
         self.in_use = 0;

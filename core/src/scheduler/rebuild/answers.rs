@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coalescing::{self, Key};
-use crate::protocol::digest::Digest;
+use crate::manifest;
 use crate::protocol::generated;
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
@@ -210,9 +210,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     fn hold_rebuilt(&mut self, task: Task, run: TaskRun) {
         let task_id = task.task_id();
         let run_id = run.task_run_id();
-        let needed = task.serialized_input.len() as u64;
+        let needed = manifest::payload_bytes(&task);
         self.input_digests
-            .insert(task_id.clone(), Digest::blake3(&task.serialized_input));
+            .insert(task_id.clone(), manifest::input_digest(&task));
         self.current_run.insert(task_id.clone(), run_id.clone());
         self.runs_of_task
             .insert(task_id.clone(), vec![run_id.clone()]);

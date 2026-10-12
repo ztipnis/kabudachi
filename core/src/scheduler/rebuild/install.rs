@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coalescing::{ChainItem, Folded, Key};
+use crate::manifest;
 use crate::protocol::digest::Digest;
 use crate::protocol::generated::{ChainEntry, CoalescingLink, TaskRecord, chain_entry};
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId};
@@ -54,7 +55,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let digest = input_digest
             .as_ref()
             .and_then(|digest| Digest::try_from(digest).ok())
-            .unwrap_or_else(|| Digest::blake3(&task.serialized_input));
+            .unwrap_or_else(|| manifest::input_digest(&task));
         self.hold_installed(task, runs, current, digest, link);
     }
 
@@ -67,7 +68,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         retained_chain: &[ChainEntry],
         state: TaskRunState,
     ) {
-        self.budget.take(task.serialized_input.len() as u64);
+        self.budget.take(manifest::payload_bytes(task));
         self.budget.take(
             chain_items(retained_chain)
                 .iter()

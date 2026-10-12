@@ -1,7 +1,11 @@
 //! How a task is submitted: the submission and its options, the checks that
 //! refuse one, and how the leader records a new task and its first run.
 
+use prost::Message as _;
+
 use crate::coalescing;
+use crate::manifest::{self, Manifest};
+use crate::protocol::generated;
 use crate::protocol::digest::Digest;
 use crate::protocol::ids::{IdGenerator, TaskDefinitionId, TaskId, WorkerId, mint_task_id};
 use crate::protocol::messages::prelude::*;
@@ -39,6 +43,11 @@ pub enum SubmitRejection {
     /// folded or claimed.
     #[error("the coalescing key's claim would be {size} bytes, past the {limit} one claim carries")]
     KeyBackpressure { size: u64, limit: u64 },
+    /// The whole input is larger than the hard memory limit, so it could
+    /// never fit (see [`Scheduler::set_memory_limits`]). Unlike
+    /// `Backpressure`, asking again is refused again.
+    #[error("a task input of {size} bytes is past the hard memory limit of {limit}")]
+    PayloadTooLarge { size: u64, limit: u64 },
 }
 
 /// A submission given its task id and its submission time: what its client
@@ -122,6 +131,10 @@ pub struct Submission {
     /// tells it how the task ended. `None` for a task nobody awaits
     /// across workers, as in the one-node runtime.
     pub client: Option<WorkerId>,
+    /// The input as blobs, for one too large to travel inline:
+    /// `serialized_input` is then empty. The blobs are stored before the
+    /// submission is made.
+    pub input_manifest: Option<Manifest>,
 }
 
 impl Submission {
@@ -146,6 +159,7 @@ impl Submission {
             non_retriable: false,
             reconnect_timeout: None,
             client: None,
+            input_manifest: None,
         }
     }
 
@@ -206,6 +220,20 @@ impl Submission {
         self.client = Some(client);
         self
     }
+
+    /// The input travels as the blobs `manifest` names, already stored.
+    pub fn with_input_manifest(mut self, manifest: Manifest) -> Self {
+        self.serialized_input = Vec::new();
+        self.input_manifest = Some(manifest);
+        self
+    }
+
+    /// What the input weighs: its whole length, inline or as blobs.
+    pub fn payload_bytes(&self) -> u64 {
+        self.input_manifest
+            .as_ref()
+            .map_or(self.serialized_input.len() as u64, Manifest::total_bytes)
+    }
 }
 
 impl Submission {
@@ -213,11 +241,20 @@ impl Submission {
     /// input, queue, definition id and coalescing key.
     pub(super) fn claim_weight(&self) -> u64 {
         claim_weight_sum(
-            self.serialized_input.len(),
+            self.carried_bytes(),
             &self.queue,
             self.definition_id.as_str(),
             self.coalescing_key.as_deref(),
         )
+    }
+
+    /// What a claim of this task carries for its input: the bytes, or the
+    /// encoded manifest.
+    fn carried_bytes(&self) -> u64 {
+        self.serialized_input.len() as u64
+            + self.input_manifest.as_ref().map_or(0, |manifest| {
+                generated::Manifest::from(manifest.clone()).encoded_len() as u64
+            })
     }
 }
 
@@ -237,7 +274,27 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         submission: &Submission,
         queued_bytes: u64,
     ) -> Result<(), SubmitRejection> {
-        let needed = submission.serialized_input.len() as u64;
+        let weight = submission.payload_bytes();
+        if let Some(limits) = self.budget.limits()
+            && weight > limits.hard
+        {
+            // It could never fit, however much is released: refused for good,
+            // where `check_room` below refuses one that does not fit now.
+            return Err(SubmitRejection::PayloadTooLarge {
+                size: weight,
+                limit: limits.hard,
+            });
+        }
+        if submission.input_manifest.is_some() && submission.coalescing_key.is_some() {
+            // A coalescing generation's payload travels in one claim with its
+            // chain, so it can never be carried as blobs.
+            return Err(SubmitRejection::TooLarge {
+                size: weight,
+                limit: MAX_SUBMISSION_BYTES,
+            });
+        }
+        // The carried input (bytes or encoded manifest), queue, definition id
+        // and key: the shared claim-weight sum.
         let size = submission.claim_weight();
         if size > MAX_SUBMISSION_BYTES {
             return Err(SubmitRejection::TooLarge {
@@ -257,7 +314,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 });
             }
         }
-        self.check_room(submission, needed + queued_bytes)
+        self.check_room(submission, weight + queued_bytes)
     }
 
     /// Records a new Task and queues its first run, under the id and
@@ -302,7 +359,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             minted_at,
         } = submitted;
         let (not_before, expires_at) = wait_bounds(&submission, minted_at, now);
-        let input_digest = Digest::blake3(&submission.serialized_input);
+        let input_digest = submission
+            .input_manifest
+            .as_ref()
+            .map_or_else(|| Digest::blake3(&submission.serialized_input), Manifest::digest);
         let task = task_of(task_id, submitted_at, submission);
         let run = self.first_run_within_limit(&task, not_before.is_some(), &input_digest)?;
         let task_id = self.hold_submitted(task, run, input_digest);
@@ -361,7 +421,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// input against memory. Returns its id.
     fn hold_submitted(&mut self, task: Task, run: TaskRun, input_digest: Digest) -> TaskId {
         let task_id = task.task_id();
-        let needed = task.serialized_input.len() as u64;
+        let needed = manifest::payload_bytes(&task);
         self.current_run.insert(task_id.clone(), run.task_run_id());
         self.runs_of_task
             .insert(task_id.clone(), vec![run.task_run_id()]);
@@ -429,5 +489,6 @@ fn task_of(task_id: TaskId, submitted_at: WallTime, submission: Submission) -> T
         non_retriable: submission.non_retriable,
         reconnect_timeout: submission.reconnect_timeout,
         client: submission.client,
+        input_manifest: submission.input_manifest,
     })
 }

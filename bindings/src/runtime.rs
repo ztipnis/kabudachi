@@ -212,7 +212,8 @@ impl NativeRuntime {
                     | SubmitRejection::RecordTooLarge { .. }
                     | SubmitRejection::Backpressure { .. }
                     | SubmitRejection::KeyNotReady
-                    | SubmitRejection::KeyBackpressure { .. } => {
+                    | SubmitRejection::KeyBackpressure { .. }
+                    | SubmitRejection::PayloadTooLarge { .. } => {
                         errors::backpressure_error(py, rejection.to_string())
                     }
                 })

@@ -3,6 +3,7 @@
 //! [`Malformed`], which the leader answers as a refusal instead of panicking
 //! on a peer's bad message.
 
+use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
@@ -40,7 +41,7 @@ pub(crate) fn submit_task(submitted: &Submitted) -> SubmitTask {
         non_retriable: submission.non_retriable,
         reconnect_timeout_ms: submission.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
         client: submission.client.clone().map(Into::into),
-        input_manifest: None,
+        input_manifest: submission.input_manifest.clone().map(Into::into),
     }
 }
 
@@ -50,6 +51,15 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
     let task_id = task.task_id.clone().ok_or(Malformed)?;
     let submitted_at = task.submitted_at.ok_or(Malformed)?;
     let definition_id = task.task_definition_id.clone().ok_or(Malformed)?;
+    let input_manifest = task
+        .input_manifest
+        .as_ref()
+        .map(Manifest::try_from)
+        .transpose()
+        .map_err(|_| Malformed)?;
+    if input_manifest.is_some() && !task.serialized_input.is_empty() {
+        return Err(Malformed);
+    }
     Ok(Submitted::received(
         TaskId::from(task_id),
         WallTime::from(submitted_at),
@@ -68,6 +78,7 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
             reconnect_timeout: (task.reconnect_timeout_ms > 0)
                 .then(|| Duration::from_millis(task.reconnect_timeout_ms)),
             client: task.client.clone().map(WorkerId::from),
+            input_manifest,
         },
         clock,
     ))
@@ -88,6 +99,7 @@ pub(crate) fn submit_reject(rejection: SubmitRejection) -> TaskRejectReason {
         SubmitRejection::RecordTooLarge { .. } => TaskRejectReason::TaskRejectRecordTooLarge,
         SubmitRejection::KeyNotReady => TaskRejectReason::TaskRejectNotReady,
         SubmitRejection::KeyBackpressure { .. } => TaskRejectReason::TaskRejectBackpressure,
+        SubmitRejection::PayloadTooLarge { .. } => TaskRejectReason::TaskRejectPayloadTooLarge,
     }
 }
 

@@ -24,10 +24,6 @@ const INLINE_HEADROOM_BYTES: u64 = 64 * 1024;
 /// message less its headroom. A larger one travels as blobs.
 pub const INLINE_PAYLOAD_BYTES: u64 = MAX_SUBMISSION_BYTES - INLINE_HEADROOM_BYTES;
 
-/// The largest payload, input or result, a shard takes unless configured
-/// otherwise. Every worker of a shard must use the same limit.
-pub const DEFAULT_MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
-
 /// The failure kind of a run whose input's blobs could not all be fetched
 /// and checked: its body never started.
 pub const PAYLOAD_UNAVAILABLE_KIND: &str = "PayloadUnavailable";

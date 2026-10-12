@@ -1,6 +1,8 @@
 //! How workers claim tasks: the oldest pending ones in a batch, or one by name,
 //! and what a claim carries.
 
+use crate::blob::BlobKey;
+use crate::manifest::{InvalidManifest, Manifest, Unresolved};
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::Task;
 use crate::protocol::records::TaskRunRecord;
@@ -24,6 +26,32 @@ pub struct Claim {
     /// first, for the worker to fold before running the task.
     /// Empty unless the task is a coalescing one that absorbed others.
     pub chain: Vec<Vec<u8>>,
+}
+
+impl Claim {
+    /// The manifest the task's input travels as, if it travels as blobs.
+    pub fn input_manifest(&self) -> Result<Option<Manifest>, InvalidManifest> {
+        self.task
+            .input_manifest
+            .as_ref()
+            .map(Manifest::try_from)
+            .transpose()
+    }
+
+    /// Puts the task's whole input in `task.serialized_input`, joined from the
+    /// blobs its manifest names, which `blob` looks up, and checked against
+    /// them. A task whose input is inline is left as it is.
+    pub fn resolve_input(
+        &mut self,
+        blob: impl FnMut(&BlobKey) -> Option<Vec<u8>>,
+    ) -> Result<(), Unresolved> {
+        let Some(manifest) = self.input_manifest().map_err(|_| Unresolved::Malformed)? else {
+            return Ok(());
+        };
+        self.task.serialized_input = manifest.join(blob)?;
+        self.task.input_manifest = None;
+        Ok(())
+    }
 }
 
 /// Why a claim request was refused.

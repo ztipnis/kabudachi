@@ -53,6 +53,16 @@ impl Backlog {
         submission: Submission,
     ) -> Result<TaskId, SubmitRejection> {
         let submitted = scheduler.mint(submission);
+        self.submit_minted(scheduler, submitted)
+    }
+
+    /// Records or queues `submitted`, which already has its task id, as
+    /// [`Self::submit`] does.
+    pub fn submit_minted<C: Clock, I: IdGenerator, O: Observer>(
+        &mut self,
+        scheduler: &mut Scheduler<C, I, O>,
+        submitted: Submitted,
+    ) -> Result<TaskId, SubmitRejection> {
         if scheduler.is_leader() {
             // A leader may have freed room since a refusal, so what waits is
             // recorded first.
@@ -65,7 +75,7 @@ impl Backlog {
             }
         }
         scheduler.check_submission(&submitted.submission, self.queued_bytes)?;
-        self.queued_bytes += submitted.submission.serialized_input.len() as u64;
+        self.queued_bytes += submitted.submission.payload_bytes();
         let task = submitted.task_id.clone();
         self.queued.push(submitted);
         Ok(task)
@@ -81,7 +91,7 @@ impl Backlog {
     ) -> Result<Cancellation, CancelRejection> {
         if let Some(at) = self.queued.iter().position(|queued| queued.task_id == *task) {
             let dropped = self.queued.remove(at);
-            self.queued_bytes -= dropped.submission.serialized_input.len() as u64;
+            self.queued_bytes -= dropped.submission.payload_bytes();
             return Ok(Cancellation::Cancelled { was_running: false });
         }
         scheduler.cancel(task)
@@ -162,7 +172,7 @@ impl Backlog {
         self.queued_bytes = self
             .queued
             .iter()
-            .map(|submitted| submitted.submission.serialized_input.len() as u64)
+            .map(|submitted| submitted.submission.payload_bytes())
             .sum();
     }
 }
