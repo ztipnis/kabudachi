@@ -1,5 +1,5 @@
-pub(crate) mod coalescing;
 pub mod blob;
+pub(crate) mod coalescing;
 pub mod configuration;
 pub mod coordination_authority;
 pub mod election;
