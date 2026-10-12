@@ -1,6 +1,7 @@
-//! How a new leader's scheduler rebuilds from what its shard holds: it installs every record known for
-//! certain, holds back the uncertain ones, applies what workers report about their runs, and takes what it
-//! learns late through the same rules.
+//! How a new leader's scheduler rebuilds from what its shard holds: it installs
+//! every record known for certain, holds back the uncertain ones, applies what
+//! workers report about their runs, and takes what it learns late through the
+//! same rules.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,4 +1,5 @@
-//! Which rebuilt records may be installed: a coalescing key whose generations disagree is held back whole.
+//! Which rebuilt records may be installed: a coalescing key whose generations
+//! disagree is held back whole.
 
 use std::collections::{BTreeMap, BTreeSet};
 

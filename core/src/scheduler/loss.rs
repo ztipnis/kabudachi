@@ -1,5 +1,6 @@
-//! Runs lost with their worker: a worker counted silent loses each run it holds once that run's reconnect
-//! timeout has passed, a worker can report one run lost, and a lost run is replayed unless the task forbids it.
+//! Runs lost with their worker: a worker counted silent loses each run it holds
+//! once that run's reconnect timeout has passed, a worker can report one run
+//! lost, and a lost run is replayed unless the task forbids it.
 
 use std::collections::BTreeSet;
 

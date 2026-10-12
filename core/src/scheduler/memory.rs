@@ -1,5 +1,6 @@
-//! The memory tasks hold: the limits, the check that refuses a submission past the hard one, what dropping
-//! and releasing payloads gives back, and the SlowDown signal.
+//! The memory tasks hold: the limits, the check that refuses a submission past
+//! the hard one, what dropping and releasing payloads gives back, and the
+//! SlowDown signal.
 
 use crate::coalescing::{self, ChainItem};
 use crate::protocol::ids::{IdGenerator, TaskId};

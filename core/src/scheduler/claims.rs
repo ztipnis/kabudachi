@@ -1,4 +1,5 @@
-//! How workers claim tasks: the oldest pending ones in a batch, or one by name, and what a claim carries.
+//! How workers claim tasks: the oldest pending ones in a batch, or one by name,
+//! and what a claim carries.
 
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::Task;

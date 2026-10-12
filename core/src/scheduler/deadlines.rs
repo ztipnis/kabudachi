@@ -1,5 +1,5 @@
-//! What time does to tasks, and when it next will: delayed tasks become due, pending ones expire, and
-//! finished ones are forgotten.
+//! What time does to tasks, and when it next will: delayed tasks become due,
+//! pending ones expire, and finished ones are forgotten.
 
 use crate::protocol::ids::IdGenerator;
 use crate::protocol::records::TaskRunRecord;

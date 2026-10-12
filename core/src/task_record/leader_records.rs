@@ -247,7 +247,10 @@ impl<E> LeaderRecords<E> {
         leading: bool,
         ports: &mut impl RecordPorts,
     ) -> Vec<Write> {
-        match self.order.settled(&outcome.write, outcome.stored && leading) {
+        match self
+            .order
+            .settled(&outcome.write, outcome.stored && leading)
+        {
             Settlement::Release(records) => {
                 self.place_and_write(node, records, ports);
                 Vec::new()
@@ -389,7 +392,8 @@ impl<E> LeaderRecords<E> {
         loop {
             let progress =
                 reconciliation.progress(node, scheduler.is_leader(), lookups_done, now, ports);
-            if let Some(turn) = self.act_on(progress, reconciliation, node, scheduler, now, &*ports) {
+            if let Some(turn) = self.act_on(progress, reconciliation, node, scheduler, now, &*ports)
+            {
                 return turn;
             }
         }

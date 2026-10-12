@@ -1,5 +1,5 @@
-//! Installing a record: the task, its runs, where it waits, its memory, and its coalescing key's
-//! occupancy.
+//! Installing a record: the task, its runs, where it waits, its memory, and its
+//! coalescing key's occupancy.
 
 use std::collections::{BTreeMap, BTreeSet};
 

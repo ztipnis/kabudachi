@@ -1,6 +1,7 @@
-//! How a task's current run ends: finishing frees its key and its memory and starts its time to live,
-//! expiry ends a run that waited too long, supersession ends one a newer generation replaced, and a retry or
-//! replay queues the next attempt.
+//! How a task's current run ends: finishing frees its key and its memory and
+//! starts its time to live, expiry ends a run that waited too long, supersession
+//! ends one a newer generation replaced, and a retry or replay queues the next
+//! attempt.
 
 use prost::Message;
 
