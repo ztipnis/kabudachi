@@ -12,7 +12,7 @@ impl Roster {
     ///
     /// If any of them is a voter here, on either side of a joint
     /// configuration, the configuration moves once, to the next generation
-    /// that leader announces (see [`Generation::next_change`]), re-based
+    /// that leader announces (see [`crate::configuration::Generation::next_change`]), re-based
     /// there: every member left on the new side is re-admitted at it, and
     /// the new side counts exactly those. A joint configuration keeps its
     /// old side, less the departing workers it counted: a batch or founding
@@ -35,7 +35,7 @@ impl Roster {
     /// # Panics
     ///
     /// If `leader_term` is below the term of the configuration's generation
-    /// (see [`Generation::next_change`]).
+    /// (see [`crate::configuration::Generation::next_change`]).
     pub fn remove_all(&mut self, workers: &BTreeSet<WorkerId>, leader_term: u64) {
         self.take_out(workers, leader_term, true);
     }
