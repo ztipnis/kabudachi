@@ -213,6 +213,8 @@ impl NativeRuntime {
                     | SubmitRejection::Backpressure { .. }
                     | SubmitRejection::KeyNotReady
                     | SubmitRejection::KeyBackpressure { .. }
+                    // The session's own pre-check runs first, so a payload past the
+                    // hard memory limit is normally refused before it reaches here.
                     | SubmitRejection::PayloadTooLarge { .. } => {
                         errors::backpressure_error(py, rejection.to_string())
                     }

@@ -17,13 +17,13 @@ use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint
 use kabudachi_core::task_record::{Placement, RecordVersion};
 use kabudachi_core::time::RealClock;
 use kabudachi_net::messenger::{Net, PutBlobError};
-use kabudachi_net::task_store::{TaskRecordStore, record_key};
-use libp2p::kad::Record;
-use libp2p::kad::store::RecordStore as _;
-use libp2p::PeerId;
-use prost::Message as _;
 use kabudachi_net::task_exchange::{LeaderRetry, NotStored, placement_of};
 use kabudachi_net::task_store::placement::ReplicationFactor;
+use kabudachi_net::task_store::{TaskRecordStore, record_key};
+use libp2p::PeerId;
+use libp2p::kad::Record;
+use libp2p::kad::store::RecordStore as _;
+use prost::Message as _;
 use tokio::time::timeout;
 
 use crate::support::deadline::within_deadline;
@@ -40,9 +40,13 @@ async fn writer_holders_reader() -> [Net; 4] {
     let shard = ShardId::new("shard-1");
     let [writer, first, second, reader] =
         std::array::from_fn(|_| Net::for_shard(shard.name(), None));
-    let reader_address = reader.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+    let reader_address = reader
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await;
     for holder in [&first, &second] {
-        let address = holder.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+        let address = holder
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await;
         connect_to(holder, &address, &writer).await;
         connect_to(&reader, &reader_address, holder).await;
     }
@@ -57,8 +61,12 @@ fn owned_by(task: &str) -> BlobOwner {
 fn record_on(task: &str, holders: &[WorkerId]) -> TaskRecord {
     TaskRecord {
         version: Some(
-            RecordVersion { recovery_epoch: RecoveryEpoch::new(0, 0), leader_term: 1, revision: 0 }
-                .into(),
+            RecordVersion {
+                recovery_epoch: RecoveryEpoch::new(0, 0),
+                leader_term: 1,
+                revision: 0,
+            }
+            .into(),
         ),
         task: Some(Task {
             task_id: Some(TaskId::new(task).into()),
@@ -81,7 +89,10 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
         let holders = vec![first.local_worker_id(), second.local_worker_id()];
         let chunk = b"a chunk of some payload".to_vec();
         let key = BlobKey::of(&chunk);
-        let placement = Placement { holders: holders.clone(), quorum: 2 };
+        let placement = Placement {
+            holders: holders.clone(),
+            quorum: 2,
+        };
 
         let stored = timeout(
             TEST_TIMEOUT,
@@ -103,18 +114,32 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
         // holders' direct answers can give it the blob. It holds the owner's
         // record itself, handed to it as a draining holder would.
         let outsider = Net::for_shard(ShardId::new("shard-2").name(), None);
-        let outsider_address = outsider.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).await;
+        let outsider_address = outsider
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await;
         for holder in [&first, &second] {
             connect_to(&outsider, &outsider_address, holder).await;
         }
-        let mut handed = Record::new(record_key(&TaskId::new("task-1")), record_on("task-1", &holders).encode_to_vec());
+        let mut handed = Record::new(
+            record_key(&TaskId::new("task-1")),
+            record_on("task-1", &holders).encode_to_vec(),
+        );
         handed.publisher = PeerId::from_str(first.local_worker_id().as_str()).ok();
-        TaskRecordStore::new(outsider.held_records()).put(handed).expect("the outsider keeps the record");
+        TaskRecordStore::new(outsider.held_records())
+            .put(handed)
+            .expect("the outsider keeps the record");
         let asked_before = blob_requests(&first).await + blob_requests(&second).await;
-        let found = timeout(TEST_TIMEOUT, outsider.get_blob(owned_by("task-1"), &key.digest()))
-            .await
-            .expect("ended");
-        assert_eq!(found, Some(chunk.clone()), "the holders' direct answer is the only way to the bytes");
+        let found = timeout(
+            TEST_TIMEOUT,
+            outsider.get_blob(owned_by("task-1"), &key.digest()),
+        )
+        .await
+        .expect("ended");
+        assert_eq!(
+            found,
+            Some(chunk.clone()),
+            "the holders' direct answer is the only way to the bytes"
+        );
         assert!(
             blob_requests(&first).await + blob_requests(&second).await > asked_before,
             "the holders were asked directly"
@@ -123,19 +148,30 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
         // An owner whose record no one holds: the kad lookup still finds the
         // blob, with no direct ask; a blob no one holds is not found.
         let other = b"held for an owner with no record".to_vec();
-        writer.put_blob(owned_by("task-2"), other.clone(), placement.clone()).await.expect("stored");
+        writer
+            .put_blob(owned_by("task-2"), other.clone(), placement.clone())
+            .await
+            .expect("stored");
         let asked_before = blob_requests(&first).await + blob_requests(&second).await;
-        let found =
-            timeout(TEST_TIMEOUT, reader.get_blob(owned_by("task-2"), &BlobKey::of(&other).digest()))
-                .await
-                .expect("ended");
+        let found = timeout(
+            TEST_TIMEOUT,
+            reader.get_blob(owned_by("task-2"), &BlobKey::of(&other).digest()),
+        )
+        .await
+        .expect("ended");
         assert_eq!(found, Some(other));
-        assert_eq!(blob_requests(&first).await + blob_requests(&second).await, asked_before);
+        assert_eq!(
+            blob_requests(&first).await + blob_requests(&second).await,
+            asked_before
+        );
         let unknown = BlobKey::of(b"no one holds this");
         assert_eq!(
-            timeout(TEST_TIMEOUT, reader.get_blob(owned_by("task-1"), &unknown.digest()))
-                .await
-                .expect("ended"),
+            timeout(
+                TEST_TIMEOUT,
+                reader.get_blob(owned_by("task-1"), &unknown.digest())
+            )
+            .await
+            .expect("ended"),
             None
         );
 
@@ -160,14 +196,21 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
         held_by_writer.set_blob_store_limit(Some(held_by_writer.blob_bytes()));
         let refused = b"no room for this one".to_vec();
         assert_eq!(
-            writer.put_blob(owned_by("task-1"), refused.clone(), placement.clone()).await,
+            writer
+                .put_blob(owned_by("task-1"), refused.clone(), placement.clone())
+                .await,
             Err(PutBlobError::StoreFull)
         );
         assert_eq!(first.held_records().blob(&BlobKey::of(&refused)), None);
 
         assert_eq!(
-            writer.put_blob(owned_by("task-1"), vec![0; MAX_BLOB_BYTES + 1], placement).await,
-            Err(PutBlobError::TooLarge { size: MAX_BLOB_BYTES + 1, limit: MAX_BLOB_BYTES })
+            writer
+                .put_blob(owned_by("task-1"), vec![0; MAX_BLOB_BYTES + 1], placement)
+                .await,
+            Err(PutBlobError::TooLarge {
+                size: MAX_BLOB_BYTES + 1,
+                limit: MAX_BLOB_BYTES
+            })
         );
     })
     .await
@@ -193,14 +236,23 @@ async fn submitted_as_blobs(
     input: &[u8],
 ) -> Manifest {
     let task = minted.task_id.clone();
-    let placed = client.place_records(leader.clone(), vec![task.clone()]).await.expect("answered");
+    let placed = client
+        .place_records(leader.clone(), vec![task.clone()])
+        .await
+        .expect("answered");
     let placement = placement_of(&placed, &task).expect("the leader places the task");
-    let manifest = client.store_payload(&task, input, placement).await.expect("stored");
+    let manifest = client
+        .store_payload(&task, input, placement)
+        .await
+        .expect("stored");
     submitted_with(
         client,
         leader,
         (task.as_str(), minted.submitted_at),
-        minted.submission.clone().with_input_manifest(manifest.clone()),
+        minted
+            .submission
+            .clone()
+            .with_input_manifest(manifest.clone()),
     )
     .await;
     manifest
@@ -209,7 +261,10 @@ async fn submitted_as_blobs(
 /// `claimant` claims `task` from `leader`, asking again until it is due.
 async fn claimed_when_due(claimant: &Net, leader: &WorkerId, task: &TaskId) -> Claim {
     loop {
-        let answer = claimant.request_claim(leader.clone(), task.clone()).await.expect("answered");
+        let answer = claimant
+            .request_claim(leader.clone(), task.clone())
+            .await
+            .expect("answered");
         if let Some(claim_response::Result::Accept(wire)) = answer.result {
             return Claim::try_from(&wire).expect("a well-formed claim");
         }
@@ -220,7 +275,10 @@ async fn claimed_when_due(claimant: &Net, leader: &WorkerId, task: &TaskId) -> C
 /// Why `leader` refused `submission` at once, as a submitter is told.
 async fn refusal_of(client: &Net, leader: &WorkerId, submission: Submission) -> i32 {
     let minted = mint(submission, &Uuid7Ids, &RealClock::new());
-    let answer = client.submit(leader.clone(), minted).await.expect("answered");
+    let answer = client
+        .submit(leader.clone(), minted)
+        .await
+        .expect("answered");
     let Some(task_response::Result::Reject(reject)) = answer.result else {
         panic!("expected a refusal, got {answer:?}");
     };
@@ -231,7 +289,8 @@ async fn refusal_of(client: &Net, leader: &WorkerId, submission: Submission) -> 
 /// now: `submitter` is told so, as backpressure, not as a failure.
 async fn a_new_input_is_refused_while_every_store_is_full(stores: &[&Net], submitter: &Net) {
     for net in stores {
-        net.held_records().set_blob_store_limit(Some(net.held_records().blob_bytes()));
+        net.held_records()
+            .set_blob_store_limit(Some(net.held_records().blob_bytes()));
     }
     let crowded = mint(plain_with(b""), &Uuid7Ids, &RealClock::new()).task_id;
     let quick = LeaderRetry {
@@ -239,7 +298,9 @@ async fn a_new_input_is_refused_while_every_store_is_full(stores: &[&Net], submi
         ask_again_after: Duration::from_millis(50),
     };
     assert_eq!(
-        submitter.store_payload_at_leader(&crowded, &varied(MIB), quick).await,
+        submitter
+            .store_payload_at_leader(&crowded, &varied(MIB), quick)
+            .await,
         Err(NotStored::Refused)
     );
     for net in stores {
@@ -254,8 +315,15 @@ async fn a_large_input_reaches_its_claimant_and_a_drained_holder_hands_its_blobs
         let leader = shard.drive_until_a_leader().await;
         let leader_id = shard.id(leader);
         // Small configured limits, never the machine's memory.
-        let limits = MemoryLimits { soft: 4 * MIB as u64, hard: 8 * MIB as u64 };
-        shard.with(leader, move |_, scheduler| scheduler.set_memory_limits(Some(limits))).await;
+        let limits = MemoryLimits {
+            soft: 4 * MIB as u64,
+            hard: 8 * MIB as u64,
+        };
+        shard
+            .with(leader, move |_, scheduler| {
+                scheduler.set_memory_limits(Some(limits))
+            })
+            .await;
         shard.join_as_pending(&client, leader).await;
         let nets = shard.nets.clone();
         let handed_off = shard.handed_off();
@@ -284,7 +352,9 @@ async fn a_large_input_reaches_its_claimant_and_a_drained_holder_hands_its_blobs
                 // A claimant without room for the input is passed over, and
                 // the task stays pending; one with room gets it.
                 let room = Some(MIB as u64);
-                let small = nets[claimant].claim_oldest(leader_id.clone(), 1, room).await;
+                let small = nets[claimant]
+                    .claim_oldest(leader_id.clone(), 1, room)
+                    .await;
                 let small = small.expect("answered");
                 assert!(
                     matches!(
@@ -296,7 +366,10 @@ async fn a_large_input_reaches_its_claimant_and_a_drained_holder_hands_its_blobs
 
                 // Whichever voter claims it fetches the input back whole.
                 let claim = claimed_when_due(&nets[claimant], &leader_id, &task).await;
-                let carried = claim.input_manifest().expect("readable").expect("a manifest input");
+                let carried = claim
+                    .input_manifest()
+                    .expect("readable")
+                    .expect("a manifest input");
                 assert_eq!(carried, manifest);
                 let resolved = nets[claimant].resolve_manifest(&owner, &carried).await;
                 assert_eq!(resolved, Ok(input.clone()));
@@ -318,8 +391,11 @@ async fn a_large_input_reaches_its_claimant_and_a_drained_holder_hands_its_blobs
                     TaskRejectReason::TaskRejectMalformed as i32
                 );
 
-                let stores: Vec<&Net> =
-                    nets.iter().map(|net| &**net).chain(std::iter::once(&client)).collect();
+                let stores: Vec<&Net> = nets
+                    .iter()
+                    .map(|net| &**net)
+                    .chain(std::iter::once(&client))
+                    .collect();
                 a_new_input_is_refused_while_every_store_is_full(&stores, &nets[claimant]).await;
 
                 // A voter holding the input's blobs drains: it hands each to

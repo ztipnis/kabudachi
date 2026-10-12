@@ -102,6 +102,8 @@ pub enum InvalidManifest {
     Digest(#[from] InvalidDigest),
     #[error("a manifest page names no composite")]
     PageWithoutComposite,
+    #[error("a manifest of {blobs} blobs names {total_bytes} bytes, which they cannot hold")]
+    TotalBytesOutOfRange { blobs: usize, total_bytes: u64 },
 }
 
 impl Manifest {
@@ -228,7 +230,22 @@ impl TryFrom<&generated::Manifest> for Manifest {
     type Error = InvalidManifest;
 
     fn try_from(wire: &generated::Manifest) -> Result<Self, InvalidManifest> {
-        let entries = wire.entries.iter().map(ManifestEntry::try_from).collect::<Result<_, _>>()?;
+        let entries: Vec<ManifestEntry> =
+            wire.entries.iter().map(ManifestEntry::try_from).collect::<Result<_, _>>()?;
+        // Cut blobs are all full but the last, so a manifest of only blobs
+        // pins its length to within one chunk; other entries have no such bound.
+        let blobs = entries.len() as u64;
+        let only_blobs = entries.iter().all(|entry| matches!(entry, ManifestEntry::Blob(_)));
+        let chunk = BLOB_CHUNK_BYTES as u64;
+        if only_blobs
+            && blobs > 0
+            && !(((blobs - 1) * chunk + 1)..=blobs * chunk).contains(&wire.total_bytes)
+        {
+            return Err(InvalidManifest::TotalBytesOutOfRange {
+                blobs: entries.len(),
+                total_bytes: wire.total_bytes,
+            });
+        }
         Ok(Manifest {
             entries,
             total_bytes: wire.total_bytes,

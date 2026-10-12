@@ -5,8 +5,8 @@ use prost::Message as _;
 
 use crate::coalescing;
 use crate::manifest::{self, Manifest};
-use crate::protocol::generated;
 use crate::protocol::digest::Digest;
+use crate::protocol::generated;
 use crate::protocol::ids::{IdGenerator, TaskDefinitionId, TaskId, WorkerId, mint_task_id};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};

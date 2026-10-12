@@ -274,7 +274,6 @@ impl RecordQueries {
         }
         found_blob.then_some(id)
     }
-
 }
 
 /// What each placement of `placed` still needs from other workers: its

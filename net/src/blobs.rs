@@ -19,6 +19,10 @@ impl Net {
     /// Cuts `payload` into blobs owned by the task `owner`, stores each at a
     /// quorum of `placement` (see [`Net::put_blob`]), and returns the manifest
     /// naming them. Fails if any blob was not stored.
+    ///
+    /// Known limit: the caller's `payload` and the chunk copies made here are
+    /// alive together, so peak memory is about twice the payload, while the
+    /// memory ledger counts the payload once.
     pub async fn store_payload(
         &self,
         owner: &TaskId,
@@ -26,10 +30,11 @@ impl Net {
         placement: Placement,
     ) -> Result<Manifest, PutBlobError> {
         let Chunked { manifest, chunks } = Manifest::chunk(payload);
-        let mut puts = stream::iter(chunks.into_iter().map(|chunk| {
-            self.put_blob(BlobOwner::Task(owner.clone()), chunk, placement.clone())
-        }))
-        .buffer_unordered(BLOBS_IN_FLIGHT);
+        let mut puts =
+            stream::iter(chunks.into_iter().map(|chunk| {
+                self.put_blob(BlobOwner::Task(owner.clone()), chunk, placement.clone())
+            }))
+            .buffer_unordered(BLOBS_IN_FLIGHT);
         while let Some(put) = puts.next().await {
             put?;
         }
@@ -37,7 +42,9 @@ impl Net {
     }
 
     /// Every blob `manifest` names, owned by `owner`, that some holder could
-    /// give, checked.
+    /// give, checked. A manifest that arrived has its length checked against
+    /// its blob count, and a holder stores no blob past a chunk, so this
+    /// fetches no more than the length it names plus one chunk.
     pub async fn fetch_blobs(
         &self,
         owner: &BlobOwner,
@@ -55,6 +62,10 @@ impl Net {
     }
 
     /// The payload `manifest` stands in for, fetched and checked.
+    ///
+    /// Known limit: the fetched blobs and the joined payload are alive
+    /// together, so peak memory is about twice the payload, while the memory
+    /// ledger counts the payload once.
     pub async fn resolve_manifest(
         &self,
         owner: &BlobOwner,
