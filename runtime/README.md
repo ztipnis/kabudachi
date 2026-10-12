@@ -150,8 +150,9 @@ Set `listen` and the worker joins a networked shard instead of running one of it
   one message fails the run with `ResultTooLargeError`.
 - `handle.cancel()` sends the cancel to the leader without waiting and returns `True`; the worker
   running the task hears of it from the leader and stops it.
-- When `main` returns, or at the first signal, `run()` waits until every task called here has settled;
-  then the worker lets the runs it holds finish and waits until the leader has taken their reports.
+- When `main` returns, or at the first signal when serving without `main`, `run()` waits until every
+  task called here has settled; then the worker lets the runs it holds finish and waits until the
+  leader has taken their reports.
 - The memory limits apply while this worker leads.
 
 ## Declaring tasks
