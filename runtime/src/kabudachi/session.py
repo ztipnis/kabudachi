@@ -375,6 +375,10 @@ class Session:
         self._tasks.certified(event)
 
     def _on_outcome(self, event: Any) -> None:
+        if event.state is None:
+            # The shard does not know the task: nothing says it was ever stored.
+            self._tasks.failed(event.task_id, _outcome_error(event))
+            return
         self._tasks.concluded(event.task_id, _outcome_error(event))
 
     def _hold_early(self, run_id: str) -> _Early:

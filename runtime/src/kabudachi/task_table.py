@@ -482,7 +482,15 @@ class TaskTable:
                     dropped.append(record.handle)
                     self._retire(task_id, record)
         for handle in dropped:
-            handle._fail(RunStoppedError("the run stopped before this task could start"))
+            if handle._replicable:
+                # Its leader may have stored it, and another worker may be running it.
+                stopped = RunStoppedError(
+                    "the run stopped before this task's result reached it; the task may still run "
+                    "elsewhere"
+                )
+            else:
+                stopped = RunStoppedError("the run stopped before this task could start")
+            handle._fail(stopped)
 
     @property
     def stopping(self) -> bool:

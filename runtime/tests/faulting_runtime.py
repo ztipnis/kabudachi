@@ -44,6 +44,8 @@ class FaultingRuntime:
         self.submit_lingers_for = 0
         self._claims_given = 0
         self._injected = asyncio.Queue()
+        # Injected events `next_events()` has not handed the session yet.
+        self._injected_untaken = 0
         self._native_events = None
 
     def __getattr__(self, name):
@@ -91,7 +93,7 @@ class FaultingRuntime:
         produce, for one it could never cause (such as one for another
         session's task, or what a networked leader tells a client). `fields`
         set or override the event's attributes."""
-        self._injected.put_nowait(
+        self._inject(
             SimpleNamespace(
                 **{
                     "kind": kind,
@@ -109,10 +111,20 @@ class FaultingRuntime:
             )
         )
 
+    def _inject(self, event):
+        self._injected_untaken += 1
+        self._injected.put_nowait(event)
+
+    def injected_taken(self):
+        """Whether `next_events()` has returned every injected event. The
+        session handles a batch in the step it is returned in, so by then
+        every one of them has been handled."""
+        return self._injected_untaken == 0
+
     def inject_abort(self, task_run_id, seconds_left):
         """Makes `next_events()` also return the abort deadline a shard's
         leader would send a worker that lost contact with it."""
-        self._injected.put_nowait(
+        self._inject(
             SimpleNamespace(
                 kind=_native.EventKind.ABORT,
                 task_id="",
@@ -124,7 +136,7 @@ class FaultingRuntime:
     def inject_cancel(self, task_id, task_run_id):
         """Makes `next_events()` also return the cancellation a shard's leader
         would send the worker holding the task's run."""
-        self._injected.put_nowait(
+        self._inject(
             SimpleNamespace(
                 kind=_native.EventKind.CANCELLED,
                 task_id=task_id,
@@ -155,6 +167,7 @@ class FaultingRuntime:
             events.append(injected.result())
             while not self._injected.empty():
                 events.append(self._injected.get_nowait())
+            self._injected_untaken -= len(events)
         if self._native_events.done():
             events.extend(self._native_events.result())
             self._native_events = None

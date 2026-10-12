@@ -11,6 +11,7 @@ from datetime import timedelta
 
 import pytest
 
+from kabudachi import _native
 from kabudachi._native import EventKind, RunState, result_digest
 from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration
@@ -36,6 +37,7 @@ from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session, validate_definitions
+from kabudachi.status import Durability
 from kabudachi.tasks import Task
 from proto_messages import Greeting, Receipt
 from session_world import WAIT, World, run, until, with_events
@@ -173,15 +175,21 @@ def test_what_the_leader_says_of_a_task_with_no_result_here_fails_its_handle(eve
         # The first task takes the only claim; the second is never claimed
         # here, so only what the leader says settles it.
         await world.call("echo", Greeting(text="claimed"))
+        # Submitted as a networked client would, so its handle is replicable.
+        world.runtime.certifies_locally = False
         handle = world.call("echo", Greeting(text="elsewhere"))
         world.runtime.inject_event(task_id=handle.task_id, **event)
         with pytest.raises(error) as raised:
             await asyncio.wait_for(handle, WAIT)
-        return raised.value
+        return raised.value, handle.durability
 
-    raised = run(with_events(world, body))
+    raised, durability = run(with_events(world, body))
 
     assert {name: getattr(raised, name) for name in detail} == detail
+    # Only a leader's decision says the task was stored; a shard that no
+    # longer knows the task decided nothing.
+    unknown = event["kind"] == EventKind.OUTCOME and event["state"] is None
+    assert durability == (Durability.IN_MEMORY if unknown else Durability.REPLICATED)
 
 
 def test_a_result_delivered_here_settles_its_handle_once_the_leader_certifies_its_run():
@@ -199,19 +207,92 @@ def test_a_result_delivered_here_settles_its_handle_once_the_leader_certifies_it
         # first: the other's arriving last must not stand in for it.
         inject(EventKind.RESULT, task_id, task_run_id="second", payload=certified)
         inject(EventKind.RESULT, task_id, task_run_id="first", payload=earlier)
-        await asyncio.sleep(0.05)
+        await until(world.runtime.injected_taken, "the results to be taken")
         delivered_but_uncertified = handle.done()
         inject(EventKind.CERTIFIED, task_id, task_run_id="second", result_digest=result_digest(certified))
         value = await asyncio.wait_for(handle, WAIT)
         # A repeated certification, even of the other run, changes nothing.
         inject(EventKind.CERTIFIED, task_id, task_run_id="first", result_digest=result_digest(earlier))
-        await asyncio.sleep(0.05)
+        await until(world.runtime.injected_taken, "the repeated certification to be taken")
         return delivered_but_uncertified, value, await handle
 
     delivered_but_uncertified, value, again = run(with_events(world, body))
 
     assert not delivered_but_uncertified
     assert value.text == again.text == "certified run"
+
+
+@pytest.mark.parametrize(
+    ("settle", "error", "message"),
+    [
+        pytest.param("cancelled", TaskCancelledError, "was cancelled", id="cancelled before stored"),
+        # The task may already be stored and running on another worker.
+        pytest.param("stopped", RunStoppedError, "may still run elsewhere", id="the run stopped first"),
+    ],
+)
+def test_a_networked_handle_settled_before_its_task_was_stored_still_answers_durable(
+    settle, error, message, caplog
+):
+    world = World(echo)
+    world.runtime.hold_claims = True
+
+    async def body():
+        await world.call("echo", Greeting(text="claimed"))
+        # Submitted as a networked client would, and never claimed here.
+        world.runtime.certifies_locally = False
+        handle = world.call("echo", Greeting(text="elsewhere"))
+        # A waiter that gives up before the task settles leaves nothing behind.
+        gave_up = asyncio.ensure_future(handle.durable())
+        await asyncio.sleep(0)
+        gave_up.cancel()
+        await asyncio.gather(gave_up, return_exceptions=True)
+        if settle == "cancelled":
+            world.runtime.inject_event(EventKind.CANCELLED, handle.task_id)
+        else:
+            world.session.stop_claiming()
+        with pytest.raises(error, match=message):
+            await asyncio.wait_for(handle, WAIT)
+        with pytest.raises(error, match=message):
+            await asyncio.wait_for(handle.durable(), 1)
+        return handle.durability
+
+    assert run(with_events(world, body)) == Durability.IN_MEMORY
+    gc.collect()
+    assert "never retrieved" not in caplog.text
+
+
+class ClaimForAClient:
+    """A claim whose result goes to the worker that submitted its task."""
+
+    client = "peer"
+
+    def __init__(self, claim):
+        self._claim = claim
+
+    def __getattr__(self, name):
+        return getattr(self._claim, name)
+
+
+def test_a_result_too_large_to_send_to_its_client_fails_the_run_before_it_completes():
+    def oversized(request: Greeting) -> Greeting:
+        return Greeting(text="x" * (_native.MAX_RESULT_PAYLOAD_BYTES + 1))
+
+    world = World(oversized)
+    claim_pending = world.runtime.claim_pending
+
+    async def claims_for_a_client(limit):
+        return [ClaimForAClient(claim) for claim in await claim_pending(limit)]
+
+    world.runtime.claim_pending = claims_for_a_client
+
+    async def body():
+        with pytest.raises(ResultTooLargeError):
+            await world.call("oversized", Greeting())
+
+    run(world.working(body))
+
+    assert [event[0] for event in world.runtime.events] == ["started", "fail"]
+    assert world.runtime.events[1][2] == "ResultTooLargeError"
 
 
 def test_a_task_no_record_holds_reads_as_unknown():

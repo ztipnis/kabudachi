@@ -26,6 +26,11 @@ async def _await_callback(outcome: Awaitable[Any]) -> None:
         _logger.warning("a task callback failed with %s", type(error).__name__)
 
 
+def _read_error(future: "asyncio.Future[Any]") -> None:
+    if not future.cancelled():
+        future.exception()
+
+
 def run_callback_inline(function: Callable[[Any], Any], value: Any) -> None:
     """Calls `function(value)` here and now, for a handle with no run to run it
     for it. An async `function` is scheduled on the running loop, or run to
@@ -117,8 +122,10 @@ class TaskHandle:
 
         Raises `DurabilityUnavailableError` for a level this runtime can
         never reach (`REPLICATED` in the one-node runtime, `DR_STORED`
-        anywhere), and the leader's refusal (`BackpressureError`) if it
-        refused the task. Cancelling the wait does not affect the task.
+        anywhere), the leader's refusal (`BackpressureError`) if it refused
+        the task, and the handle's own error if the task ended before this
+        process heard it was stored. Cancelling the wait does not affect the
+        task.
         """
         if level >= Durability.DR_STORED:
             raise DurabilityUnavailableError(
@@ -131,7 +138,11 @@ class TaskHandle:
                 f"task {self.task_id} is kept only in this process's memory: the one-node runtime "
                 "replicates nothing"
             )
-        await asyncio.shield(asyncio.wrap_future(self._stored))
+        stored = asyncio.wrap_future(self._stored)
+        # A waiter that gave up leaves the error to nobody: read it here, so
+        # it is not logged as never retrieved.
+        stored.add_done_callback(_read_error)
+        await asyncio.shield(stored)
 
     async def status(self) -> TaskStatus:
         """How the task stands, read from the record its shard holds. Not
@@ -142,8 +153,10 @@ class TaskHandle:
         return await self._status_reader(self.task_id)
 
     def _mark_stored(self, error: BaseException | None = None) -> None:
-        """A networked leader stored the task, or refused it with `error`;
-        nothing for a handle whose task is never replicated."""
+        """A networked leader stored the task, or refused it with `error`, or
+        the handle settled with `error` before this process heard either;
+        nothing for a handle whose task is never replicated. Only the first
+        word counts."""
         if not self._replicable:
             return
         try:
@@ -214,14 +227,19 @@ class TaskHandle:
         return asyncio.shield(asyncio.wrap_future(self._outcome))
 
     def _resolve(self, value: Any) -> None:
-        """Settles the handle with `value`, unless it is already settled."""
+        """Settles the handle with `value`, unless it is already settled. A
+        certified result was stored, so `durable()` answers too."""
+        self._mark_stored()
         try:
             self._outcome.set_result(value)
         except concurrent.futures.InvalidStateError:
             pass
 
     def _fail(self, error: BaseException) -> None:
-        """Settles the handle with `error`, unless it is already settled."""
+        """Settles the handle with `error`, unless it is already settled. A
+        `durable()` not answered yet raises `error` too: nothing more about
+        the task reaches this handle."""
+        self._mark_stored(error)
         try:
             self._outcome.set_exception(error)
         except concurrent.futures.InvalidStateError:
