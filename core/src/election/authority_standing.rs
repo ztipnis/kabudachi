@@ -157,20 +157,9 @@ impl AuthorityStanding {
     /// for at `now`, for a node in `view.state`: a registration, from every
     /// state that keeps one, and, while it needs one, its recovery fence.
     pub(crate) fn calls_due(&mut self, view: &AuthorityView, now: Instant) -> Vec<AuthorityCall> {
-        if self.recovery_overdue(view.state, now) {
-            self.recovery = None;
-            self.awaited = None;
-        }
-        let register = Self::registers_in(view.state) && self.lease.registration_due(now);
-        if register {
-            self.lease.registration_asked(now);
-        }
-        // A node that has joined no shard has no epoch to hold a fence at,
-        // and never needs one.
-        let fence = view.own_epoch.filter(|_| self.lease.fence_due(now));
-        if fence.is_some() {
-            self.lease.fence_asked(now);
-        }
+        self.give_up_overdue_recovery(view.state, now);
+        let register = self.ask_registration_if_due(view.state, now);
+        let fence = self.ask_fence_if_due(view.own_epoch, now);
         let mut calls = Vec::new();
         if register {
             calls.push(self.ask(AuthorityRequest::Register, now));
@@ -178,14 +167,7 @@ impl AuthorityStanding {
         if let Some(recovery_epoch) = fence {
             calls.push(self.ask(AuthorityRequest::AcquireFence { recovery_epoch }, now));
         }
-        // A leader says where it can be reached on the registration's schedule,
-        // so a hint lasts while the leader does, unless the record under the
-        // name is not yet its own again.
-        if view.in_office()
-            && !self.record_lost
-            && (register || std::mem::take(&mut self.hint_now))
-            && let Some(recovery_epoch) = view.own_epoch
-        {
+        if let Some(recovery_epoch) = self.hint_due(view, register) {
             calls.push(self.ask(
                 AuthorityRequest::PublishLeaderHint {
                     recovery_epoch,
@@ -194,16 +176,70 @@ impl AuthorityStanding {
                 now,
             ));
         }
-        if view.own_epoch.is_some()
-            && self.may_ask_for_confirmation(view.state)
-            && self.confirmation.read_due(now)
-        {
-            let call = self.ask(AuthorityRequest::ReadRecoveryEpoch, now);
-            self.confirmation
-                .read_asked(call.token, now, self.lease.call_timeout());
-            calls.push(call);
-        }
+        calls.extend(self.confirmation_read_due(view, now));
         calls
+    }
+
+    /// Drops the authority path, and the reply it awaits, once it has run past
+    /// its give-up instant.
+    fn give_up_overdue_recovery(&mut self, state: WorkerState, now: Instant) {
+        if self.recovery_overdue(state, now) {
+            self.recovery = None;
+            self.awaited = None;
+        }
+    }
+
+    /// Whether a registration has come due for a node in `state`; marks it
+    /// asked.
+    fn ask_registration_if_due(&mut self, state: WorkerState, now: Instant) -> bool {
+        let register = Self::registers_in(state) && self.lease.registration_due(now);
+        if register {
+            self.lease.registration_asked(now);
+        }
+        register
+    }
+
+    /// The epoch to ask a fence at, if one has come due; marks it asked.
+    fn ask_fence_if_due(
+        &mut self,
+        own_epoch: Option<RecoveryEpoch>,
+        now: Instant,
+    ) -> Option<RecoveryEpoch> {
+        // A node that has joined no shard has no epoch to hold a fence at,
+        // and never needs one.
+        let fence = own_epoch.filter(|_| self.lease.fence_due(now));
+        if fence.is_some() {
+            self.lease.fence_asked(now);
+        }
+        fence
+    }
+
+    /// The epoch to publish a leader hint at, if one is due.
+    fn hint_due(&mut self, view: &AuthorityView, register: bool) -> Option<RecoveryEpoch> {
+        // A leader says where it can be reached on the registration's schedule,
+        // so a hint lasts while the leader does, unless the record under the
+        // name is not yet its own again.
+        let may_hint = view.in_office() && !self.record_lost;
+        let due = may_hint && (register || std::mem::take(&mut self.hint_now));
+        view.own_epoch.filter(|_| due)
+    }
+
+    /// The read confirming this member's epoch, if one has come due.
+    fn confirmation_read_due(
+        &mut self,
+        view: &AuthorityView,
+        now: Instant,
+    ) -> Option<AuthorityCall> {
+        let due = view.own_epoch.is_some()
+            && self.may_ask_for_confirmation(view.state)
+            && self.confirmation.read_due(now);
+        if !due {
+            return None;
+        }
+        let call = self.ask(AuthorityRequest::ReadRecoveryEpoch, now);
+        self.confirmation
+            .read_asked(call.token, now, self.lease.call_timeout());
+        Some(call)
     }
 
     /// When the authority path of a node in `state` is given up, if it is
@@ -371,11 +407,7 @@ impl AuthorityStanding {
         view: &AuthorityView,
         now: Instant,
     ) -> Vec<AuthorityVerdict> {
-        if Self::reads_records_in(view.state)
-            && reply
-                .held_record()
-                .is_some_and(|held| held.shard_id != *view.shard)
-        {
+        if Self::finds_another_incarnation(&reply, view) {
             // The authority holds another incarnation of the shard under its
             // name: this one is gone, whatever epoch either is at.
             self.recovery = None;
@@ -385,21 +417,7 @@ impl AuthorityStanding {
         match reply {
             AuthorityReply::Registered {
                 sent_at, result, ..
-            } => {
-                let Ok(granted) = result else {
-                    return Vec::new();
-                };
-                self.lease.registered(sent_at, granted);
-                // A fenced node that can register again reads the epoch to
-                // learn whether it may resume.
-                if view.state == WorkerState::Fenced {
-                    vec![AuthorityVerdict::Ask(
-                        self.ask_awaited(AuthorityRequest::ReadRecoveryEpoch, now),
-                    )]
-                } else {
-                    Vec::new()
-                }
-            }
+            } => self.on_registered(sent_at, result, view, now),
             AuthorityReply::LiveRegistrations { token, result, .. } => {
                 if self.take_awaited(token) {
                     self.on_live_registrations(result, view, now)
@@ -408,19 +426,7 @@ impl AuthorityStanding {
                 }
             }
             AuthorityReply::RecoveryEpoch { token, result, .. } => {
-                let result = result.map(|held| held.map(|held| held.recovery_epoch));
-                if self.confirmation.is_awaiting(token) {
-                    self.on_member_read(token, result, view, now)
-                } else if !self.take_awaited(token) {
-                    Vec::new()
-                } else if view.state == WorkerState::Fenced {
-                    match result {
-                        Ok(epoch) => self.reconnect(epoch, view, now),
-                        Err(_) => Vec::new(),
-                    }
-                } else {
-                    self.on_recovery_epoch(result, view, now)
-                }
+                self.on_epoch_reply(token, result, view, now)
             }
             AuthorityReply::RecoveryEpochSwapped {
                 token,
@@ -441,6 +447,60 @@ impl AuthorityStanding {
             AuthorityReply::LeaderHint { .. } | AuthorityReply::LeaderHintPublished { .. } => {
                 Vec::new()
             }
+        }
+    }
+
+    /// Whether `reply` shows another incarnation of the shard under its name,
+    /// to a node that reads records.
+    fn finds_another_incarnation(reply: &AuthorityReply, view: &AuthorityView) -> bool {
+        Self::reads_records_in(view.state)
+            && reply
+                .held_record()
+                .is_some_and(|held| held.shard_id != *view.shard)
+    }
+
+    fn on_registered(
+        &mut self,
+        sent_at: Instant,
+        result: Result<Duration, AuthorityError>,
+        view: &AuthorityView,
+        now: Instant,
+    ) -> Vec<AuthorityVerdict> {
+        let Ok(granted) = result else {
+            return Vec::new();
+        };
+        self.lease.registered(sent_at, granted);
+        // A fenced node that can register again reads the epoch to
+        // learn whether it may resume.
+        if view.state == WorkerState::Fenced {
+            vec![AuthorityVerdict::Ask(
+                self.ask_awaited(AuthorityRequest::ReadRecoveryEpoch, now),
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn on_epoch_reply(
+        &mut self,
+        token: ReplyToken,
+        result: Result<Option<ShardRecord>, AuthorityError>,
+        view: &AuthorityView,
+        now: Instant,
+    ) -> Vec<AuthorityVerdict> {
+        let result = result.map(|held| held.map(|held| held.recovery_epoch));
+        if self.confirmation.is_awaiting(token) {
+            return self.on_member_read(token, result, view, now);
+        }
+        if !self.take_awaited(token) {
+            return Vec::new();
+        }
+        if view.state != WorkerState::Fenced {
+            return self.on_recovery_epoch(result, view, now);
+        }
+        match result {
+            Ok(epoch) => self.reconnect(epoch, view, now),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -574,43 +634,54 @@ impl AuthorityStanding {
         view: &AuthorityView,
         now: Instant,
     ) -> Vec<AuthorityVerdict> {
-        if view.state == WorkerState::NoQuorum
-            && let Some(recovery) = self.recovery.as_mut()
-        {
-            if !awaited {
-                return Vec::new();
-            }
-            let next = recovery.on_swapped(expected, new, &result);
-            return self.follow_recovery(next, now);
+        if view.state == WorkerState::NoQuorum && self.recovery.is_some() {
+            return self.on_recovery_swap(expected, new, awaited, &result, now);
         }
+        self.on_republish(expected, new, &result, view, now)
+    }
+
+    /// The reply to the swap of this node's authority path, if it is the one
+    /// awaited.
+    fn on_recovery_swap(
+        &mut self,
+        expected: Option<RecoveryEpoch>,
+        new: RecoveryEpoch,
+        awaited: bool,
+        result: &Result<(), AuthorityError>,
+        now: Instant,
+    ) -> Vec<AuthorityVerdict> {
+        let Some(recovery) = self.recovery.as_mut().filter(|_| awaited) else {
+            return Vec::new();
+        };
+        let next = recovery.on_swapped(expected, new, result);
+        self.follow_recovery(next, now)
+    }
+
+    fn on_republish(
+        &mut self,
+        expected: Option<RecoveryEpoch>,
+        new: RecoveryEpoch,
+        result: &Result<(), AuthorityError>,
+        view: &AuthorityView,
+        now: Instant,
+    ) -> Vec<AuthorityVerdict> {
         // The leader's republish: once the epoch is back, by
         // this swap or another worker's, it asks for its fence at once.
         // Otherwise it asks when the fence is next due, so an authority that
         // keeps failing is not asked again within the same instant.
-        let republished = match &result {
-            Ok(()) => true,
-            Err(AuthorityError::ShardConflict { current }) => current
-                .as_ref()
-                .is_some_and(|current| order(new, current.recovery_epoch) == EpochOrder::Mine),
-            Err(_) => false,
-        };
-        if view.in_office()
-            && expected.is_none()
-            && view.own_epoch.map(|own| order(own, new)) == Some(EpochOrder::Mine)
-            && republished
-        {
-            self.lease.retry_fence_at(now);
-            // The record is this node's again: its hint follows at once.
-            self.record_lost = false;
-            return vec![AuthorityVerdict::Ask(self.ask(
-                AuthorityRequest::PublishLeaderHint {
-                    recovery_epoch: new,
-                    term: view.term,
-                },
-                now,
-            ))];
+        if !(republished(new, result) && republishes_own_epoch(view, expected, new)) {
+            return Vec::new();
         }
-        Vec::new()
+        self.lease.retry_fence_at(now);
+        // The record is this node's again: its hint follows at once.
+        self.record_lost = false;
+        vec![AuthorityVerdict::Ask(self.ask(
+            AuthorityRequest::PublishLeaderHint {
+                recovery_epoch: new,
+                term: view.term,
+            },
+            now,
+        ))]
     }
 
     /// Carries a recovery on as `next` says.
@@ -690,6 +761,18 @@ impl AuthorityStanding {
         view: &AuthorityView,
         now: Instant,
     ) -> Vec<AuthorityVerdict> {
+        if !self.seeks_fence_at(epoch, view) {
+            return Vec::new();
+        }
+        match result {
+            Ok(granted) => self.on_fence_granted(epoch, sent_at, granted, view, now),
+            Err(refused) => self.on_fence_refused(epoch, refused, view, now),
+        }
+    }
+
+    /// Whether a node in `view.state` seeks the recovery fence at `epoch`, its
+    /// own.
+    fn seeks_fence_at(&self, epoch: RecoveryEpoch, view: &AuthorityView) -> bool {
         let seeking = match view.state {
             WorkerState::LeaderReconciling | WorkerState::Leader => true,
             WorkerState::Candidate => self
@@ -698,37 +781,52 @@ impl AuthorityStanding {
                 .is_some_and(ForcedRecovery::is_awaiting_fence),
             _ => false,
         };
-        let own_epoch_is_it = view.own_epoch.map(|own| order(own, epoch)) == Some(EpochOrder::Mine);
-        if !seeking || !own_epoch_is_it {
-            return Vec::new();
+        let own_epoch_is_it =
+            view.own_epoch.map(|own| order(own, epoch)) == Some(EpochOrder::Mine);
+        seeking && own_epoch_is_it
+    }
+
+    fn on_fence_granted(
+        &mut self,
+        epoch: RecoveryEpoch,
+        sent_at: Instant,
+        granted: Duration,
+        view: &AuthorityView,
+        now: Instant,
+    ) -> Vec<AuthorityVerdict> {
+        self.lease.fence_acquired(epoch, sent_at, granted);
+        if view.state == WorkerState::Candidate {
+            self.lead_recovered()
+        } else if std::mem::take(&mut self.record_lost) {
+            // A fence needs the record: it is this node's again, though
+            // the reply to its republish never said so. Its hint
+            // follows at once.
+            vec![AuthorityVerdict::Ask(self.ask(
+                AuthorityRequest::PublishLeaderHint {
+                    recovery_epoch: epoch,
+                    term: view.term,
+                },
+                now,
+            ))]
+        } else {
+            Vec::new()
         }
-        match result {
-            Ok(granted) => {
-                self.lease.fence_acquired(epoch, sent_at, granted);
-                if view.state == WorkerState::Candidate {
-                    self.lead_recovered()
-                } else if std::mem::take(&mut self.record_lost) {
-                    // A fence needs the record: it is this node's again, though
-                    // the reply to its republish never said so. Its hint
-                    // follows at once.
-                    vec![AuthorityVerdict::Ask(self.ask(
-                        AuthorityRequest::PublishLeaderHint {
-                            recovery_epoch: epoch,
-                            term: view.term,
-                        },
-                        now,
-                    ))]
-                } else {
-                    Vec::new()
-                }
-            }
-            Err(AuthorityError::FenceHeld { remaining }) => {
+    }
+
+    fn on_fence_refused(
+        &mut self,
+        epoch: RecoveryEpoch,
+        refused: AuthorityError,
+        view: &AuthorityView,
+        now: Instant,
+    ) -> Vec<AuthorityVerdict> {
+        match refused {
+            AuthorityError::FenceHeld { remaining } => {
                 self.lease
                     .retry_fence_at(now + remaining + Duration::from_ticks(1));
                 Vec::new()
             }
-            Err(AuthorityError::ShardConflict { current: None }) if view.in_office() =>
-            {
+            AuthorityError::ShardConflict { current: None } if view.in_office() => {
                 self.record_lost = true;
                 vec![AuthorityVerdict::Ask(self.ask(
                     AuthorityRequest::SwapRecoveryEpoch {
@@ -741,23 +839,23 @@ impl AuthorityStanding {
             // An epoch this node cannot recover from: it rejoins the shard
             // at it, as a reconnecting fenced node and a `NoQuorum` node's
             // recovery do, rather than win again and meet it again.
-            Err(AuthorityError::ShardConflict {
+            AuthorityError::ShardConflict {
                 current:
                     Some(ShardRecord {
                         recovery_epoch: held,
                         ..
                     }),
-            }) if cannot_recover_from(view.own_epoch, held) => {
+            } if cannot_recover_from(view.own_epoch, held) => {
                 vec![AuthorityVerdict::LoseQuorum, AuthorityVerdict::RejoinAt(held)]
             }
-            Err(AuthorityError::ShardConflict { .. }) => {
+            AuthorityError::ShardConflict { .. } => {
                 if view.in_office() {
                     vec![AuthorityVerdict::SuspectAgain]
                 } else {
                     vec![AuthorityVerdict::LoseQuorum]
                 }
             }
-            Err(AuthorityError::Unavailable) => Vec::new(),
+            AuthorityError::Unavailable => Vec::new(),
         }
     }
 
@@ -774,4 +872,26 @@ impl AuthorityStanding {
             None => Vec::new(),
         }
     }
+}
+
+/// Whether a swap that came back `result` left `new` as the authority's epoch.
+fn republished(new: RecoveryEpoch, result: &Result<(), AuthorityError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(AuthorityError::ShardConflict { current }) => current
+            .as_ref()
+            .is_some_and(|current| order(new, current.recovery_epoch) == EpochOrder::Mine),
+        Err(_) => false,
+    }
+}
+
+/// Whether a leader in office republished its own epoch `new` over a missing
+/// record.
+fn republishes_own_epoch(
+    view: &AuthorityView,
+    expected: Option<RecoveryEpoch>,
+    new: RecoveryEpoch,
+) -> bool {
+    let own = view.own_epoch.map(|own| order(own, new)) == Some(EpochOrder::Mine);
+    view.in_office() && expected.is_none() && own
 }
