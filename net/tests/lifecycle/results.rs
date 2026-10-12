@@ -205,8 +205,6 @@ async fn a_delivered_result_is_certified(at: &mut Delivering) {
     );
     at.completed(&run, true);
     assert_eq!(at.next_events(&task).await, certified(&task, &run));
-    // Certified only once a majority stores the run succeeded.
-    assert!(holding(&at.shard.nets, &task, &[TaskRunState::Succeeded]) >= 2);
     let leader = at.shard.nets[at.leader].clone();
     let record = at
         .shard
@@ -277,6 +275,45 @@ async fn a_task_that_ends_without_a_result_is_concluded(at: &mut Delivering) {
     );
 }
 
+/// The leader runs a task itself and is cut off from the other voters
+/// before its run is reported completed: it stores the run succeeded in its
+/// own copy at once, but tells the client nothing while no other voter can
+/// store it. Leaves the leader cut off.
+async fn a_run_is_not_certified_before_a_majority_stores_it(at: &mut Delivering) {
+    at.runner = at.leader;
+    let (task, run) = at.started(plain_with(b"unstored")).await;
+    let nets = at.shard.nets.clone();
+    let stored = task.clone();
+    at.shard
+        .drive_until(poll_until("a majority stored the run running", || {
+            holding(&nets, &stored, &[TaskRunState::Running]) >= 2
+        }))
+        .await;
+    let leader_id = at.shard.id(at.leader);
+    for follower in at.shard.others(at.leader) {
+        nets[at.leader].block_peer(at.shard.id(follower));
+        nets[follower].block_peer(leader_id.clone());
+    }
+    at.completed(&run, false);
+    let leader = [nets[at.leader].clone()];
+    at.shard
+        .drive_until(poll_until("the leader stored the run succeeded", || {
+            holding(&leader, &stored, &[TaskRunState::Succeeded]) == 1
+        }))
+        .await;
+    // Long past the moment a certification sent at once would arrive.
+    at.shard
+        .drive_until(tokio::time::sleep(StdDuration::from_millis(500)))
+        .await;
+    let told: Vec<_> = at
+        .client
+        .take_result_events()
+        .into_iter()
+        .filter(|event| matches!(event, ResultEvent::Certified { task: of, .. } if *of == task))
+        .collect();
+    assert_eq!(told, Vec::new(), "certified before a majority stored the run");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn results_reach_their_client_and_the_leader_tells_it_how_each_task_ended() {
     within_deadline(async {
@@ -285,6 +322,7 @@ async fn results_reach_their_client_and_the_leader_tells_it_how_each_task_ended(
         a_result_for_this_worker_is_delivered_to_itself(&mut at).await;
         a_client_cut_off_from_the_runner_hears_the_run_certified(&mut at).await;
         a_task_that_ends_without_a_result_is_concluded(&mut at).await;
+        a_run_is_not_certified_before_a_majority_stores_it(&mut at).await;
     })
     .await;
 }
