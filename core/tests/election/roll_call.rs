@@ -346,7 +346,7 @@ fn a_leaders_ack_ends_the_widening_of_a_nodes_roll_call_deadlines() {
     let (leader, me) = (worker("w1"), worker("w3"));
     let mut node = slow_call_node(&clock, &me);
     let horizon = |clock: &FakeClock| clock.now() + Duration::from_ticks(1_000);
-    let mut call = |node: &mut TestNode| {
+    let call = |node: &mut TestNode| {
         clock.advance(past_any_suspicion(SLOW_CALL_SUSPECT));
         tick(node);
         let called = first_call_before(node, &clock, horizon(&clock)).expect("the node calls");
