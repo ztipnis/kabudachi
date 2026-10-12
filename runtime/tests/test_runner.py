@@ -85,7 +85,9 @@ class StandInNetworked(FaultingNative):
 
 
 @pytest.mark.parametrize("fails", [False, True], ids=["returns", "raises"])
-def test_a_networked_run_stops_taking_and_waits_for_its_reports_however_main_ends(monkeypatch, fails):
+def test_a_networked_run_stops_taking_and_waits_for_its_reports_however_main_ends(
+    monkeypatch, fails
+):
     configuration = Configuration()
     configuration.configure(processes=1, listen="/ip4/127.0.0.1/tcp/0")
     monkeypatch.setattr(config_module, "_process_configuration", configuration)

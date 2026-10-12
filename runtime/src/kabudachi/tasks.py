@@ -104,11 +104,11 @@ class Task(wrapt.ObjectProxy):
     ) -> None:
         if not callable(func):
             raise TaskDefinitionError(f"a task must be a callable, not {func!r}")
-        self._require_count("version", version)
+        self._require_non_negative_count("version", version)
         if queue is not UNSET:
             self._require_string("queue", queue)
         self._require_string("serializer", serializer)
-        self._require_count("retries", retries)
+        self._require_non_negative_count("retries", retries)
 
         self._check_timing(timeout, cancel_grace, reconnect_timeout)
         self._check_merge(merge, kind)
@@ -270,7 +270,7 @@ class Task(wrapt.ObjectProxy):
             )
 
     @staticmethod
-    def _require_count(what: str, value: Any) -> None:
+    def _require_non_negative_count(what: str, value: Any) -> None:
         if not is_count(value) or value < 0:
             raise TaskDefinitionError(
                 f"the task {what} must be a non-negative integer, not {value!r}"
