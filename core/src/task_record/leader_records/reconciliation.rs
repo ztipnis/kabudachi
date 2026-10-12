@@ -35,6 +35,16 @@ pub(crate) enum Stuck {
     Place(Vec<TaskRecord>),
 }
 
+impl Stuck {
+    /// The progress that tries this work again.
+    fn retried(self) -> Progress {
+        match self {
+            Stuck::Rebuild(rebuild) => Progress::Rebuild(rebuild),
+            Stuck::Place(records) => Progress::Place(records),
+        }
+    }
+}
+
 /// Work that failed and is tried again when the voters change and, failing
 /// that, once per `every`.
 struct Retry<T> {
@@ -170,7 +180,28 @@ impl OfficeReconciliation {
         ports: &mut impl RecordPorts,
     ) -> Progress {
         self.progressed_at = now;
+        if let Some(progress) = self.write_republish(node, now, ports) {
+            return progress;
+        }
+        if let Some(stuck) = self.stuck.take_if_due(&node.placeable_voters(), now) {
+            return stuck.retried();
+        }
+        if !self.rebuilt {
+            return self.rebuild_once_answered(node, lookups_done, now);
+        }
+        self.learnt_while_leading(node, leading)
+            .unwrap_or(Progress::Waiting)
+    }
 
+    /// Writes the republished records that fell due through `ports`. `Some`
+    /// when every one is stored (the node may lead), or when the voters changed
+    /// while some are not (place them anew).
+    fn write_republish<C: Clock>(
+        &mut self,
+        node: &WorkerNode<C>,
+        now: Instant,
+        ports: &mut impl RecordPorts,
+    ) -> Option<Progress> {
         // A republish that cannot reach a quorum is not given up: this leader
         // keeps office, writes each record again, and places the writes anew
         // whenever the voters change. That is accepted because a node holds
@@ -179,45 +210,56 @@ impl OfficeReconciliation {
         // node leaves office (`NoQuorum`), the driver drops this
         // reconciliation. Writes that fell due before the node stepped may
         // still go out; a holder refuses them against a newer term.
-        if let Some(republish) = self.republish.as_mut() {
-            let due = republish.due(now);
-            if !due.is_empty() {
-                ports.write(due);
-            }
-            if republish.is_done() && !self.led {
-                self.led = true;
-                return Progress::Republished(self.round.term());
-            }
-            let mut voters = node.placeable_voters();
-            voters.sort();
-            if !republish.is_done() && voters != self.republish_voters {
-                self.republish_voters = voters;
-                return Progress::RePlace;
-            }
+        let republish = self.republish.as_mut()?;
+        let due = republish.due(now);
+        if !due.is_empty() {
+            ports.write(due);
         }
-        if let Some(stuck) = self.stuck.take_if_due(&node.placeable_voters(), now) {
-            return match stuck {
-                Stuck::Rebuild(rebuild) => Progress::Rebuild(rebuild),
-                Stuck::Place(records) => Progress::Place(records),
-            };
+        if republish.is_done() && !self.led {
+            self.led = true;
+            return Some(Progress::Republished(self.round.term()));
         }
-        if !self.rebuilt {
-            let answered = node.voters_answered(&self.round.answered());
-            if self.round.may_finish(answered, now) && lookups_done {
-                self.rebuilt = true;
-                self.news = false;
-                return Progress::Rebuild(self.round.take_settled(|worker| node.is_member(worker)));
-            }
+        let mut voters = node.placeable_voters();
+        voters.sort();
+        if !republish.is_done() && voters != self.republish_voters {
+            self.republish_voters = voters;
+            return Some(Progress::RePlace);
+        }
+        None
+    }
+
+    /// The rebuild, once the round may stop and no record lookup is in flight
+    /// or owed; until then, nothing.
+    fn rebuild_once_answered<C: Clock>(
+        &mut self,
+        node: &WorkerNode<C>,
+        lookups_done: bool,
+        now: Instant,
+    ) -> Progress {
+        let answered = node.voters_answered(&self.round.answered());
+        if !(self.round.may_finish(answered, now) && lookups_done) {
             return Progress::Waiting;
         }
-        if self.led && self.news && leading {
-            self.news = false;
-            let learnt = self.round.take_settled(|worker| node.is_member(worker));
-            if !learnt.records.is_empty() || !learnt.reports.is_empty() {
-                return Progress::Learnt(learnt);
-            }
+        self.rebuilt = true;
+        self.news = false;
+        Progress::Rebuild(self.round.take_settled(|worker| node.is_member(worker)))
+    }
+
+    /// What arrived since the last hand-over, once the node leads and the
+    /// scheduler does too, if it teaches anything.
+    fn learnt_while_leading<C: Clock>(
+        &mut self,
+        node: &WorkerNode<C>,
+        leading: bool,
+    ) -> Option<Progress> {
+        let due = self.led && self.news && leading;
+        if !due {
+            return None;
         }
-        Progress::Waiting
+        self.news = false;
+        let learnt = self.round.take_settled(|worker| node.is_member(worker));
+        let teaches = !learnt.records.is_empty() || !learnt.reports.is_empty();
+        teaches.then_some(Progress::Learnt(learnt))
     }
 
     /// Takes back what the scheduler could not adopt because it did not lead:

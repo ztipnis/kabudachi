@@ -4,11 +4,13 @@ mod reconciliation;
 
 pub use reconciliation::OfficeReconciliation;
 
+use std::collections::BTreeSet;
+
 use crate::election::{Input, WorkerNode};
 use crate::protocol::generated::TaskRecord;
 use crate::protocol::ids::{IdGenerator, TaskId, WorkerId};
 use crate::protocol::worker_state::WorkerState;
-use crate::reconcile::ReconcileTerm;
+use crate::reconcile::{Rebuild, ReconcileTerm};
 use crate::scheduler::{Observer, ReconcileRefused, Scheduler};
 use crate::time::{Clock, Duration, Instant};
 
@@ -204,42 +206,73 @@ impl<E> LeaderRecords<E> {
         let leading = scheduler.is_leader();
         let mut settled = Vec::new();
         for outcome in outcomes {
-            self.ledger.settled(&outcome.write, outcome.stored, leading);
-            // A superseded generation's revision is written only once its
-            // successor's is stored while the leader still leads.
-            let mut refused = Vec::new();
-            match self
-                .order
-                .settled(&outcome.write, outcome.stored && leading)
-            {
-                Settlement::Release(records) => self.place_and_write(node, records, ports),
-                Settlement::Refuse(writes) => {
-                    for write in writes {
-                        self.ledger.settled(&write, false, leading);
-                        refused.push(write);
-                    }
-                }
-            }
-            if outcome.stored {
-                settled.extend(self.held.acknowledged(&outcome.write, leading));
-            } else {
-                tracing::debug!(
-                    task = outcome.write.task_id.as_str(),
-                    "a record revision was not stored at its quorum"
-                );
-                refused.push(outcome.write);
-            }
-            for write in refused {
-                let newer = self.ledger.pending_newer_than(&write);
-                settled.extend(
-                    self.held
-                        .refused(&write, &newer)
-                        .into_iter()
-                        .map(Settled::NotLeader),
-                );
-            }
+            settled.extend(self.settle_outcome(node, outcome, leading, ports));
         }
         settled.extend(self.end_unless_leading(leading));
+        settled
+    }
+
+    /// Settles one write's outcome: acknowledges the answers it lets go, and
+    /// answers `NotLeader` those whose write was refused.
+    fn settle_outcome<C: Clock>(
+        &mut self,
+        node: &WorkerNode<C>,
+        outcome: WriteOutcome,
+        leading: bool,
+        ports: &mut impl RecordPorts,
+    ) -> Vec<Settled<E>> {
+        self.ledger.settled(&outcome.write, outcome.stored, leading);
+        let mut refused = self.release_held_back(node, &outcome, leading, ports);
+        let mut settled = Vec::new();
+        if outcome.stored {
+            settled.extend(self.held.acknowledged(&outcome.write, leading));
+        } else {
+            tracing::debug!(
+                task = outcome.write.task_id.as_str(),
+                "a record revision was not stored at its quorum"
+            );
+            refused.push(outcome.write);
+        }
+        settled.extend(self.answer_refused(refused));
+        settled
+    }
+
+    /// A superseded generation's revision is written only once its
+    /// successor's is stored while the leader still leads: writes the
+    /// revisions `outcome` releases, and returns those it refuses.
+    fn release_held_back<C: Clock>(
+        &mut self,
+        node: &WorkerNode<C>,
+        outcome: &WriteOutcome,
+        leading: bool,
+        ports: &mut impl RecordPorts,
+    ) -> Vec<Write> {
+        match self.order.settled(&outcome.write, outcome.stored && leading) {
+            Settlement::Release(records) => {
+                self.place_and_write(node, records, ports);
+                Vec::new()
+            }
+            Settlement::Refuse(writes) => {
+                for write in &writes {
+                    self.ledger.settled(write, false, leading);
+                }
+                writes
+            }
+        }
+    }
+
+    /// Every held answer that waited on one of `refused`, settled `NotLeader`.
+    fn answer_refused(&mut self, refused: Vec<Write>) -> Vec<Settled<E>> {
+        let mut settled = Vec::new();
+        for write in refused {
+            let newer = self.ledger.pending_newer_than(&write);
+            settled.extend(
+                self.held
+                    .refused(&write, &newer)
+                    .into_iter()
+                    .map(Settled::NotLeader),
+            );
+        }
         settled
     }
 
@@ -303,105 +336,156 @@ impl<E> LeaderRecords<E> {
         now: Instant,
         ports: &mut impl RecordPorts,
     ) -> Turn {
-        if let Some(learnt) = reconciliation.take_learnt() {
-            // The node was stepped with a `Tick` first, which checks its
-            // lease: one that ended took it out of office, and with it the
-            // reconciliation, before the scheduler is handed anything.
-            if node.office_term() != Some(reconciliation.office()) {
-                return Turn::Ended;
-            }
-            let found = learnt.records.clone();
-            match scheduler.adopt(learnt) {
-                Ok(adopted) => {
-                    self.repair.found(&found);
-                    if !(adopted.silent_holders.is_empty() && adopted.answered.is_empty()) {
-                        return Turn::Step(Input::WatchWorkers {
-                            silent_holders: adopted.silent_holders,
-                            answered: adopted.answered,
-                        });
-                    }
-                }
-                // Holding office does not mean leading: the grant also ends
-                // with the recovery fence, which the node can renew, and has
-                // not arrived before a quorum confirms the office. The round
-                // has given the knowledge up, so it takes it back and offers
-                // it again once the scheduler leads.
-                Err(learnt) => {
-                    tracing::debug!("late reconciliation answers were not adopted: not leading");
-                    reconciliation.give_back(learnt);
-                    return Turn::Wait;
-                }
-            }
-            self.write(node, scheduler, ports);
+        if let Some(learnt) = reconciliation.take_learnt()
+            && let Some(turn) = self.adopt_learnt(reconciliation, learnt, node, scheduler, ports)
+        {
+            return turn;
         }
         loop {
-            match reconciliation.progress(node, scheduler.is_leader(), lookups_done, now, ports) {
-                Progress::Waiting => return Turn::Wait,
-                Progress::Rebuild(rebuild) => {
-                    // Where the rebuild's records were held is noted first, so
-                    // a revision that moves one is written to the holders it
-                    // left too.
-                    self.repair.found(&rebuild.records);
-                    match scheduler.reconcile(rebuild) {
-                        Ok(rebuilt) => {
-                            tracing::info!(
-                                republished = rebuilt.republished,
-                                uncertain = rebuilt.uncertain,
-                                "a new leader rebuilt its scheduler from its shard"
-                            );
-                            let revisions = scheduler.observer_mut().take_published();
-                            self.place_republish(reconciliation, node, revisions, &*ports);
-                            if !(rebuilt.silent_holders.is_empty() && rebuilt.answered.is_empty()) {
-                                return Turn::Step(Input::WatchWorkers {
-                                    silent_holders: rebuilt.silent_holders,
-                                    answered: rebuilt.answered,
-                                });
-                            }
-                        }
-                        Err(ReconcileRefused { rejection, rebuild }) => {
-                            // Nothing was installed, so the same rebuild is
-                            // offered again; leading without it would serve an
-                            // empty shard.
-                            tracing::error!(%rejection, "the scheduler did not take the rebuild: not leading");
-                            reconciliation.stuck(
-                                Stuck::Rebuild(rebuild),
-                                node.placeable_voters(),
-                                now,
-                            );
-                        }
-                    }
-                }
-                Progress::Place(records) => {
-                    self.place_republish(reconciliation, node, records, &*ports);
-                }
-                Progress::RePlace => {
-                    let voters = node.placeable_voters();
-                    let (repair, ports) = (&mut self.repair, &*ports);
-                    reconciliation.re_place(
-                        |write| match ports.place(&Write::of(&write.record).task_id, &voters) {
-                            Some(Placement { holders, quorum }) => {
-                                write.record.placement =
-                                    holders.into_iter().map(Into::into).collect();
-                                write.quorum = quorum;
-                                repair.written(write, |holder| node.is_member(holder));
-                            }
-                            None => tracing::error!(
-                                task = Write::of(&write.record).task_id.as_str(),
-                                "a republished record could not be placed on the new voters"
-                            ),
-                        },
-                        now,
-                    );
-                }
-                // The node leads once stepped: answers that came while it was
-                // republishing are taken on the next turn.
-                Progress::Republished(office) => return Turn::Step(Input::Reconciled(office)),
-                Progress::Learnt(learnt) => {
-                    reconciliation.hold_learnt(learnt);
-                    return Turn::Step(Input::Tick);
-                }
+            let progress =
+                reconciliation.progress(node, scheduler.is_leader(), lookups_done, now, ports);
+            if let Some(turn) = self.act_on(progress, reconciliation, node, scheduler, now, &*ports) {
+                return turn;
             }
         }
+    }
+
+    /// Hands the leading scheduler what late answers taught, and writes what it
+    /// published. `Some` is the turn to return: the office has ended, the node
+    /// is to watch workers, or the scheduler did not lead and the round took the
+    /// answers back.
+    fn adopt_learnt<C: Clock, I: IdGenerator, O: Observer + PublishedRevisions>(
+        &mut self,
+        reconciliation: &mut OfficeReconciliation,
+        learnt: Rebuild,
+        node: &WorkerNode<C>,
+        scheduler: &mut Scheduler<C, I, O>,
+        ports: &mut impl RecordPorts,
+    ) -> Option<Turn> {
+        // The node was stepped with a `Tick` first, which checks its
+        // lease: one that ended took it out of office, and with it the
+        // reconciliation, before the scheduler is handed anything.
+        if node.office_term() != Some(reconciliation.office()) {
+            return Some(Turn::Ended);
+        }
+        let found = learnt.records.clone();
+        match scheduler.adopt(learnt) {
+            Ok(adopted) => {
+                self.repair.found(&found);
+                if let Some(turn) = watch_workers(adopted.silent_holders, adopted.answered) {
+                    return Some(turn);
+                }
+            }
+            // Holding office does not mean leading: the grant also ends
+            // with the recovery fence, which the node can renew, and has
+            // not arrived before a quorum confirms the office. The round
+            // has given the knowledge up, so it takes it back and offers
+            // it again once the scheduler leads.
+            Err(learnt) => {
+                tracing::debug!("late reconciliation answers were not adopted: not leading");
+                reconciliation.give_back(learnt);
+                return Some(Turn::Wait);
+            }
+        }
+        self.write(node, scheduler, ports);
+        None
+    }
+
+    /// Does what `progress` asks. `Some` is the turn to return; `None` asks the
+    /// reconciliation for its next step.
+    fn act_on<C: Clock, I: IdGenerator, O: Observer + PublishedRevisions>(
+        &mut self,
+        progress: Progress,
+        reconciliation: &mut OfficeReconciliation,
+        node: &WorkerNode<C>,
+        scheduler: &mut Scheduler<C, I, O>,
+        now: Instant,
+        ports: &impl RecordPorts,
+    ) -> Option<Turn> {
+        match progress {
+            Progress::Waiting => Some(Turn::Wait),
+            Progress::Rebuild(rebuild) => {
+                self.rebuild_scheduler(reconciliation, rebuild, node, scheduler, now, ports)
+            }
+            Progress::Place(records) => {
+                self.place_republish(reconciliation, node, records, ports);
+                None
+            }
+            Progress::RePlace => {
+                self.re_place(reconciliation, node, now, ports);
+                None
+            }
+            // The node leads once stepped: answers that came while it was
+            // republishing are taken on the next turn.
+            Progress::Republished(office) => Some(Turn::Step(Input::Reconciled(office))),
+            Progress::Learnt(learnt) => {
+                reconciliation.hold_learnt(learnt);
+                Some(Turn::Step(Input::Tick))
+            }
+        }
+    }
+
+    /// Rebuilds the scheduler from `rebuild` and starts writing its
+    /// republished records. `Some` is the turn to return when the node is to
+    /// watch workers. A rebuild the scheduler refuses is offered again.
+    fn rebuild_scheduler<C: Clock, I: IdGenerator, O: Observer + PublishedRevisions>(
+        &mut self,
+        reconciliation: &mut OfficeReconciliation,
+        rebuild: Rebuild,
+        node: &WorkerNode<C>,
+        scheduler: &mut Scheduler<C, I, O>,
+        now: Instant,
+        ports: &impl RecordPorts,
+    ) -> Option<Turn> {
+        // Where the rebuild's records were held is noted first, so a revision
+        // that moves one is written to the holders it left too.
+        self.repair.found(&rebuild.records);
+        match scheduler.reconcile(rebuild) {
+            Ok(rebuilt) => {
+                tracing::info!(
+                    republished = rebuilt.republished,
+                    uncertain = rebuilt.uncertain,
+                    "a new leader rebuilt its scheduler from its shard"
+                );
+                let revisions = scheduler.observer_mut().take_published();
+                self.place_republish(reconciliation, node, revisions, ports);
+                watch_workers(rebuilt.silent_holders, rebuilt.answered)
+            }
+            Err(ReconcileRefused { rejection, rebuild }) => {
+                // Nothing was installed, so the same rebuild is offered again;
+                // leading without it would serve an empty shard.
+                tracing::error!(%rejection, "the scheduler did not take the rebuild: not leading");
+                reconciliation.stuck(Stuck::Rebuild(rebuild), node.placeable_voters(), now);
+                None
+            }
+        }
+    }
+
+    /// The voters changed: places every republished write not yet stored on
+    /// them, noting each for repair.
+    fn re_place<C: Clock>(
+        &mut self,
+        reconciliation: &mut OfficeReconciliation,
+        node: &WorkerNode<C>,
+        now: Instant,
+        ports: &impl RecordPorts,
+    ) {
+        let voters = node.placeable_voters();
+        let repair = &mut self.repair;
+        reconciliation.re_place(
+            |write| match ports.place(&Write::of(&write.record).task_id, &voters) {
+                Some(Placement { holders, quorum }) => {
+                    write.record.placement = holders.into_iter().map(Into::into).collect();
+                    write.quorum = quorum;
+                    repair.written(write, |holder| node.is_member(holder));
+                }
+                None => tracing::error!(
+                    task = Write::of(&write.record).task_id.as_str(),
+                    "a republished record could not be placed on the new voters"
+                ),
+            },
+            now,
+        );
     }
 
     /// When the driver must next wake for the record path: a refused write
@@ -501,4 +585,14 @@ fn place<C: Clock>(
         }
     }
     (placed, unplaced)
+}
+
+/// The step that has the node watch `silent_holders` and count `answered`
+/// heard, unless there is neither.
+fn watch_workers(silent_holders: BTreeSet<WorkerId>, answered: BTreeSet<WorkerId>) -> Option<Turn> {
+    let none = silent_holders.is_empty() && answered.is_empty();
+    (!none).then_some(Turn::Step(Input::WatchWorkers {
+        silent_holders,
+        answered,
+    }))
 }
