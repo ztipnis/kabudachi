@@ -324,6 +324,60 @@ fn an_answer_after_a_node_called_in_its_own_right_holds_it_afresh() {
     );
 }
 
+/// Ticks `node` until its roll call closes; how many ticks that took.
+fn ticks_until_its_roll_call_closes(node: &mut TestNode, clock: &FakeClock) -> u64 {
+    let mut ticks = 0;
+    while node.state() == WorkerState::RollCall {
+        assert!(ticks < 1_000, "the roll call never closed");
+        clock.advance(Duration::from_ticks(1));
+        tick(node);
+        ticks += 1;
+    }
+    ticks
+}
+
+// Each roll call of a node's own that closes without a quorum doubles the next
+// one's deadline, up to the suspicion timeout; a leader's ack ends the
+// widening, so a node that suspects its leader again calls at the base
+// deadline.
+#[test]
+fn a_leaders_ack_ends_the_widening_of_a_nodes_roll_call_deadlines() {
+    let clock = FakeClock::new();
+    let (leader, me) = (worker("w1"), worker("w3"));
+    let mut node = slow_call_node(&clock, &me);
+    let horizon = |clock: &FakeClock| clock.now() + Duration::from_ticks(1_000);
+    let mut call = |node: &mut TestNode| {
+        clock.advance(past_any_suspicion(SLOW_CALL_SUSPECT));
+        tick(node);
+        let called = first_call_before(node, &clock, horizon(&clock)).expect("the node calls");
+        assert_eq!(node.state(), WorkerState::RollCall);
+        called.1
+    };
+
+    call(&mut node);
+    assert_eq!(
+        ticks_until_its_roll_call_closes(&mut node, &clock),
+        SLOW_CALL_DEADLINE
+    );
+    let term = call(&mut node);
+    assert!(
+        ticks_until_its_roll_call_closes(&mut node, &clock) > SLOW_CALL_DEADLINE,
+        "setup invariant: a call after one that closed short is widened"
+    );
+    deliver(
+        &mut node,
+        &leader,
+        ack_message(leader_ack(&leader, term, &configuration_of(3), Some(g0()))),
+    );
+    assert_eq!(node.state(), WorkerState::Active, "setup invariant");
+
+    call(&mut node);
+    assert_eq!(
+        ticks_until_its_roll_call_closes(&mut node, &clock),
+        SLOW_CALL_DEADLINE
+    );
+}
+
 // ---- Roll calls a node drops ----
 
 #[test]

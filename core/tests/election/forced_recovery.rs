@@ -694,6 +694,31 @@ fn a_reply_that_is_not_the_awaited_calls_does_not_answer_it() {
     }
 }
 
+// A leader's ack takes a node off the authority path. Had the path stood, the
+// node would take it for the read of the epoch it runs, never ask for a
+// confirmation of its own, and so never call again when it suspects its leader
+// anew.
+#[test]
+fn a_node_a_leaders_ack_took_off_the_authority_path_calls_again_when_it_suspects_anew() {
+    let (mut driven, _awaited) = awaiting_its_live_set_read();
+    let leader = worker("w2");
+    driven.step(message_input(
+        &leader,
+        ack_message(leader_ack(&leader, 1, &configuration_of(5), Some(g0()))),
+    ));
+    assert_eq!(driven.node.state(), WorkerState::Active, "setup invariant");
+    driven.advance(SUSPECT_TIMEOUT_TICKS * 2);
+    assert_eq!(
+        driven.node.state(),
+        WorkerState::LeaderSuspect,
+        "setup invariant"
+    );
+
+    let started = driven.tick();
+
+    assert_eq!(published_roll_calls(&started).len(), 1, "{started:?}");
+}
+
 /// `w1`, a voter of 5, its roll call answered by `w2` alone, with `live`
 /// registered (and warm) and the epoch at `epoch`: the returning quorum is
 /// short (2 of 5), so the call closes into the authority path.

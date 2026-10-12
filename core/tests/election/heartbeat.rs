@@ -201,6 +201,25 @@ fn a_worker_has_a_contact_floor_once_a_leader_vouches_for_hearing_it() {
     assert!(alone.has_contact_floor(), "no other leader can replay a lone leader's runs");
 }
 
+// A leader echoes the instant of the heartbeat it heard. An instant later than
+// the worker's clock reads was never sent by it, so such an ack vouches for
+// nothing.
+#[test]
+fn an_ack_echoing_a_heartbeat_from_the_future_gives_a_worker_no_contact_floor() {
+    let clock = FakeClock::new();
+    let mut node = joined_node(&clock);
+
+    receive_ack(
+        &mut node,
+        LeaderHeartbeatAck {
+            heartbeat_token: Some(clock.now().as_ticks() + 1),
+            ..ack_admitting(g0(), 1)
+        },
+    );
+
+    assert!(!node.has_contact_floor());
+}
+
 /// The ack `leader` sends `follower` in answer to a heartbeat from it.
 fn ack_to(leader: &mut TestNode, follower: &WorkerId) -> LeaderHeartbeatAck {
     let outputs = deliver(leader, follower, heartbeat_message(heartbeat(follower, None)));
