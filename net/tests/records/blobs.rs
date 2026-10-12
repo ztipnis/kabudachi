@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, MAX_BLOB_BYTES};
 use kabudachi_core::coordination_authority::RecoveryEpoch;
-use kabudachi_core::manifest::{Manifest, ManifestEntry};
+use kabudachi_core::manifest::{BLOB_CHUNK_BYTES, Manifest, ManifestEntry};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, Uuid7Ids, WorkerId};
@@ -377,8 +377,11 @@ async fn a_large_input_reaches_its_claimant_and_a_drained_holder_hands_its_blobs
                 // The leader refuses for good an input that alone is past its
                 // hard memory limit, whatever the blobs, and one that sends
                 // bytes beside its manifest.
-                let unfetched = ManifestEntry::Blob(BlobKey::of(b"never fetched"));
-                let oversized = Manifest::new(vec![unfetched], 8 * MIB as u64 + 1);
+                let oversized_bytes = 8 * MIB as u64 + 1;
+                let unfetched: Vec<ManifestEntry> = (0..oversized_bytes.div_ceil(BLOB_CHUNK_BYTES as u64))
+                    .map(|index| ManifestEntry::Blob(BlobKey::of(format!("never fetched {index}").as_bytes())))
+                    .collect();
+                let oversized = Manifest::new(unfetched, oversized_bytes);
                 let too_large = plain_with(b"").with_input_manifest(oversized);
                 assert_eq!(
                     refusal_of(&client, &leader_id, too_large).await,
