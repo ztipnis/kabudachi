@@ -29,10 +29,10 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use kabudachi_core::election::{ElectionTimings, Input, Step, WorkerNode};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
-use kabudachi_core::protocol::ids::{ShardName, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::ids::{ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{TaskRejectReason, task_response};
-use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint};
+use kabudachi_core::scheduler::{Claim, Submitted, mint};
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
 use kabudachi_net::executor::{Report, ReportSink, Work, WorkSource, executor_channel};
 use kabudachi_net::messenger::Net;
@@ -45,8 +45,9 @@ use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
+use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
-use crate::outcomes::{PyEventKind, coalescing};
+use crate::outcomes::PyEventKind;
 use crate::work::{PyClaim, PyEvent, PyTaskRecord};
 
 const DEFAULT_WORKER_THREADS: usize = 2;
@@ -356,14 +357,6 @@ fn address(text: &str) -> PyResult<Multiaddr> {
         .map_err(|error| PyValueError::new_err(format!("{text:?} is not an address: {error}")))
 }
 
-fn memory_limits(soft: Option<u64>, hard: Option<u64>) -> PyResult<Option<MemoryLimits>> {
-    match (soft, hard) {
-        (None, None) => Ok(None),
-        (Some(soft), Some(hard)) => Ok(Some(MemoryLimits { soft, hard })),
-        _ => Err(PyValueError::new_err("give both memory limits or neither")),
-    }
-}
-
 /// A worker of a networked shard, and the Tokio runtime it runs on.
 ///
 /// Call `shutdown()` when finished: the worker stops at once, without
@@ -613,77 +606,17 @@ impl NetworkedRuntime {
 
     /// Mints a task and returns its id at once; the task is then delivered
     /// to the shard's leader, which `ACCEPTED` or `REFUSED` in
-    /// `next_events()` says the end of. Arguments as for `NativeRuntime.submit`.
+    /// `next_events()` says the end of. `submission` as for
+    /// `NativeRuntime.submit`.
     ///
-    /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree or
-    /// `reconnect_timeout_ms` is zero, and `RuntimeError` once the runtime
-    /// has shut down.
-    #[pyo3(signature = (
-        definition_id,
-        source_version,
-        serialized_input,
-        queue,
-        kind,
-        key,
-        *,
-        retries = 0,
-        delay_ms = None,
-        expires_in_ms = None,
-        drop_oldest = false,
-        reconnect_timeout_ms = None,
-    ))]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "each argument is a Python parameter"
-    )]
-    fn submit(
-        &self,
-        definition_id: &str,
-        source_version: u32,
-        serialized_input: &[u8],
-        queue: &str,
-        kind: &str,
-        key: Option<String>,
-        retries: u32,
-        delay_ms: Option<u64>,
-        expires_in_ms: Option<u64>,
-        drop_oldest: bool,
-        reconnect_timeout_ms: Option<u64>,
-    ) -> PyResult<String> {
+    /// Raises `RuntimeError` once the runtime has shut down, and `ValueError`
+    /// if the submission's `kind`, `key` and `drop_oldest` disagree or its
+    /// `reconnect_timeout_ms` is zero.
+    fn submit(&self, py: Python<'_>, submission: SubmitArguments) -> PyResult<String> {
         if !self.bridge.is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
-        let coalescing = coalescing(kind, key, drop_oldest).map_err(PyValueError::new_err)?;
-        let mut submission = Submission::new(
-            TaskDefinitionId::new(definition_id),
-            source_version,
-            serialized_input.to_vec(),
-            queue,
-        )
-        .with_retries(retries);
-        if kind == "ephemeral" {
-            submission = submission.ephemeral();
-        }
-        if let Some(delay_ms) = delay_ms {
-            submission = submission.with_delay(CoreDuration::from_millis(delay_ms));
-        }
-        if let Some(expires_in_ms) = expires_in_ms {
-            submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
-        }
-        if let Some(reconnect_timeout_ms) = reconnect_timeout_ms {
-            if reconnect_timeout_ms == 0 {
-                return Err(PyValueError::new_err("reconnect_timeout_ms must be positive"));
-            }
-            submission =
-                submission.with_reconnect_timeout(CoreDuration::from_millis(reconnect_timeout_ms));
-        }
-        if let Some((key, drop_oldest)) = coalescing {
-            submission = submission.with_coalescing_key(key);
-            if drop_oldest {
-                submission = submission.with_drop_oldest();
-            }
-        }
-        let submitted = mint(submission, &Uuid7Ids, &self.clock);
+        let submitted = mint(submission.into_submission(py)?, &Uuid7Ids, &self.clock);
         let task_id = submitted.task_id.as_str().to_owned();
         self.shared
             .seam()

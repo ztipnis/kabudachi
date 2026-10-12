@@ -48,12 +48,28 @@ class FaultingRuntime:
     def __getattr__(self, name):
         return getattr(self.native, name)
 
-    def submit(self, definition_id, source_version, serialized_input, queue, kind, key, **options):
-        task_id = self.native.submit(
-            definition_id, source_version, serialized_input, queue, kind, key, **options
+    def submit(self, submission):
+        task_id = self.native.submit(submission)
+        self.submitted.append(
+            (
+                task_id,
+                submission.definition_id,
+                submission.source_version,
+                submission.serialized_input,
+                submission.settings.queue,
+            )
         )
-        self.submitted.append((task_id, definition_id, source_version, serialized_input, queue))
-        self.submit_options.append({"kind": kind, "key": key, **options})
+        self.submit_options.append(
+            {
+                "kind": submission.kind,
+                "key": submission.key,
+                "retries": submission.retries,
+                "delay_ms": submission.options.delay_ms,
+                "expires_in_ms": submission.options.expires_in_ms,
+                "drop_oldest": submission.drop_oldest,
+                "reconnect_timeout_ms": submission.settings.reconnect_timeout_ms,
+            }
+        )
         # Holds this call open after the task exists. `time.sleep` blocks the
         # event loop, so no worker on it can claim meanwhile: this only widens
         # the window for a cancel arriving from another thread.

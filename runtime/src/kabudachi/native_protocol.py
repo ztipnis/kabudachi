@@ -5,9 +5,11 @@ satisfy them. They live apart from `session` so that `task_table` can name them
 without importing `session`, which imports `task_table`.
 """
 
+from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
 from kabudachi._native import CancelOutcome, EventKind
+from kabudachi.options import SubmissionOptions, SubmissionSettings
 
 
 class Claim(Protocol):
@@ -52,6 +54,38 @@ class Certification(Protocol):
     result_digest: bytes
 
 
+@dataclass(frozen=True)
+class SubmitArguments:
+    """One task for `Runtime.submit` to record.
+
+    `kind` is the task's `TaskKind` value. `key` is the coalescing key
+    resolved for that kind: a coalescing task always has one (`options.key`,
+    or "" by default), and no other kind has one. A run that fails is
+    replaced by a new attempt up to `retries` times. With `drop_oldest`, a
+    coalescing task that would pass the hard memory limit loses its key's
+    oldest retained payloads to fit instead of being refused.
+
+    `options` is what the caller asked: with `delay_ms` the task is not
+    claimed before that long has passed, and with `expires_in_ms` it
+    expires instead of running if it is still unclaimed after that long.
+    Its `key` is not read here; `key` above is. `settings` is what this
+    process resolved: the task's queue, and, with `reconnect_timeout_ms`
+    (which must be positive), how long after its worker goes a suspicion
+    timeout unheard a run of the task may be replayed, instead of after the
+    shard's reconnect timeout.
+    """
+
+    definition_id: str
+    source_version: int
+    serialized_input: bytes
+    kind: Literal["task", "ephemeral", "coalescing"]
+    key: str | None
+    options: SubmissionOptions
+    settings: SubmissionSettings
+    retries: int = 0
+    drop_oldest: bool = False
+
+
 @runtime_checkable
 class Runtime(Protocol):
     """What a session needs of the native runtime."""
@@ -66,27 +100,10 @@ class Runtime(Protocol):
         """The incarnation of the shard this runtime founded at start."""
         ...
 
-    def submit(
-        self,
-        definition_id: str,
-        source_version: int,
-        serialized_input: bytes,
-        queue: str,
-        kind: Literal["task", "ephemeral", "coalescing"],
-        key: str | None,
-        *,
-        retries: int = 0,
-        delay_ms: int | None = None,
-        expires_in_ms: int | None = None,
-        drop_oldest: bool = False,
-        reconnect_timeout_ms: int | None = None,
-    ) -> str:
-        """Records a new task. `kind` is its `TaskKind` value; a coalescing
-        task always has a `key` (its default is ""), and no other kind has
-        one. Raises `ValueError` if `kind` and `key` disagree, or
-        `reconnect_timeout_ms` is 0, and `BackpressureError` past the hard
-        memory limit. `reconnect_timeout_ms`, when given, is the run's own
-        reconnect timeout."""
+    def submit(self, submission: SubmitArguments) -> str:
+        """Records a new task. Raises `ValueError` if the submission's kind
+        and key disagree, or its `reconnect_timeout_ms` is 0, and
+        `BackpressureError` past the hard memory limit."""
 
     async def claim_pending(self, limit: int) -> list[Claim]:
         ...

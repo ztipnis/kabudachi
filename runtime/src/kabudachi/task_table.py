@@ -30,7 +30,7 @@ from kabudachi.errors import (
     TaskCancelledError,
 )
 from kabudachi.handle import TaskHandle
-from kabudachi.native_protocol import Certification, Runtime
+from kabudachi.native_protocol import Certification, Runtime, SubmitArguments
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskDefinition, TaskKind
 
@@ -187,18 +187,18 @@ class TaskTable:
             if self._stopping:
                 raise RunStoppedError("the run is stopping, so no more tasks are accepted")
             task_id = self._runtime.submit(
-                definition.name,
-                definition.version,
-                payload,
-                settings.queue,
-                definition.kind.value,
-                # A coalescing task always has a key: the default is "".
-                (options.key or "") if definition.kind is TaskKind.COALESCING else None,
-                retries=definition.retries,
-                delay_ms=options.delay_ms,
-                expires_in_ms=options.expires_in_ms,
-                drop_oldest=definition.drop_oldest,
-                reconnect_timeout_ms=settings.reconnect_timeout_ms,
+                SubmitArguments(
+                    definition.name,
+                    definition.version,
+                    payload,
+                    definition.kind.value,
+                    # A coalescing task always has a key: the default is "".
+                    (options.key or "") if definition.kind is TaskKind.COALESCING else None,
+                    options,
+                    settings,
+                    retries=definition.retries,
+                    drop_oldest=definition.drop_oldest,
+                )
             )
             handle = TaskHandle(
                 task_id,

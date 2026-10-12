@@ -3,11 +3,11 @@ use std::time::Duration;
 
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{
-    IncarnationId, ShardName, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
+    IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::{
-    Completion, MemoryLimits, ReportRejection, Scheduler, Submission, SubmitRejection,
+    Completion, MemoryLimits, ReportRejection, Scheduler, SubmitRejection,
 };
 use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
@@ -17,12 +17,13 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
+use crate::arguments::SubmitArguments;
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::door::{Closed, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
 use crate::errors;
 use crate::local_node::local_node;
-use crate::outcomes::{PyCancelOutcome, PyRunState, coalescing};
+use crate::outcomes::{PyCancelOutcome, PyRunState};
 use crate::timers::run_timers;
 use crate::work::{PyCertification, PyClaim, PyEvent};
 
@@ -208,95 +209,23 @@ impl NativeRuntime {
         })
     }
 
-    /// Records a new task and returns its ID. The task waits until a worker
-    /// claims it. Every call is a new task. `kind` is the task's `TaskKind`
-    /// value (`"task"`, `"ephemeral"` or `"coalescing"`); a coalescing task
-    /// always has a `key` (its default is `""`), and no other kind has one. A
-    /// run that fails is replaced by a new attempt up to `retries` times. With
-    /// `delay_ms` the task is not claimed before that long has passed; with
-    /// `expires_in_ms` it expires instead of running if it is still unclaimed
-    /// after that long. With `drop_oldest`, a coalescing task that would pass
-    /// the hard memory limit loses its key's oldest retained payloads to fit
-    /// instead of being refused. With `reconnect_timeout_ms`, a run of the
-    /// task may be replayed that long after its worker goes a suspicion
-    /// timeout unheard, instead of after the shard's reconnect timeout; it
-    /// must be positive.
+    /// Records a new task and returns its ID; `submission` says what it is
+    /// (see `kabudachi.native_protocol.SubmitArguments`). The task waits until
+    /// a worker claims it. Every call is a new task.
     ///
-    /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree or
-    /// `reconnect_timeout_ms` is zero,
-    /// `BackpressureError` if the task does not fit under the hard memory
-    /// limit, is too large to be claimed (about 1 MiB with its queue and
-    /// key), or, transiently, its coalescing key's newest generation is not
-    /// yet known to the scheduler (submit again shortly), and
-    /// `RuntimeError` if the runtime has shut down. Before this worker leads
-    /// the task is queued and its id returned at once; it is recorded, in
-    /// order, when the worker comes to lead. A task whose record cannot yet
-    /// fit stays queued, with everything behind it, until the generation it
-    /// supersedes ends, and no error is raised for it.
-    #[pyo3(signature = (
-        definition_id,
-        source_version,
-        serialized_input,
-        queue,
-        kind,
-        key,
-        *,
-        retries = 0,
-        delay_ms = None,
-        expires_in_ms = None,
-        drop_oldest = false,
-        reconnect_timeout_ms = None,
-    ))]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "each argument is a Python parameter"
-    )]
-    fn submit(
-        &self,
-        definition_id: &str,
-        source_version: u32,
-        serialized_input: &[u8],
-        queue: &str,
-        kind: &str,
-        key: Option<String>,
-        retries: u32,
-        delay_ms: Option<u64>,
-        expires_in_ms: Option<u64>,
-        drop_oldest: bool,
-        reconnect_timeout_ms: Option<u64>,
-        py: Python<'_>,
-    ) -> PyResult<String> {
-        let coalescing =
-            coalescing(kind, key, drop_oldest).map_err(PyValueError::new_err)?;
-        let mut submission = Submission::new(
-            TaskDefinitionId::new(definition_id),
-            source_version,
-            serialized_input.to_vec(),
-            queue,
-        )
-        .with_retries(retries);
-        if kind == "ephemeral" {
-            submission = submission.ephemeral();
-        }
-        if let Some(delay_ms) = delay_ms {
-            submission = submission.with_delay(CoreDuration::from_millis(delay_ms));
-        }
-        if let Some(expires_in_ms) = expires_in_ms {
-            submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
-        }
-        if let Some(reconnect_timeout_ms) = reconnect_timeout_ms {
-            if reconnect_timeout_ms == 0 {
-                return Err(PyValueError::new_err("reconnect_timeout_ms must be positive"));
-            }
-            submission =
-                submission.with_reconnect_timeout(CoreDuration::from_millis(reconnect_timeout_ms));
-        }
-        if let Some((key, drop_oldest)) = coalescing {
-            submission = submission.with_coalescing_key(key);
-            if drop_oldest {
-                submission = submission.with_drop_oldest();
-            }
-        }
+    /// Raises `ValueError` if the submission's `kind`, `key` and `drop_oldest`
+    /// disagree or its `reconnect_timeout_ms` is zero, `BackpressureError` if
+    /// the task does not fit under the hard memory limit, is too large to be
+    /// claimed (about 1 MiB with its queue and key), or, transiently, its
+    /// coalescing key's newest generation is not yet known to the scheduler
+    /// (submit again shortly), and `RuntimeError` if the runtime has shut
+    /// down. Before this worker leads the task is queued and its id returned
+    /// at once; it is recorded, in order, when the worker comes to lead. A
+    /// task whose record cannot yet fit stays queued, with everything behind
+    /// it, until the generation it supersedes ends, and no error is raised
+    /// for it.
+    fn submit(&self, py: Python<'_>, submission: SubmitArguments) -> PyResult<String> {
+        let submission = submission.into_submission(py)?;
         let task_id = self
             .door
             .submit(submission)
