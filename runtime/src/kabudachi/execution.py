@@ -69,8 +69,10 @@ class NestedCalls(Protocol):
     def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle: ...
 
     def cancel_task(self, task_id: str) -> bool:
-        """Cancels a task such a body called whose handle is no longer kept,
-        by its id, and says whether it was cancelled."""
+        """Cancels a task such a body called, by its id, and says whether it
+        was cancelled. The pool asks this only when the handle it kept is
+        gone, which happens once the task's outcome settled, so it serves
+        only a cancel that raced that settling."""
         ...
 
     async def task_status(self, task_id: str) -> Any:

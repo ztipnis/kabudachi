@@ -220,7 +220,8 @@ class Session:
 
     def cancel_task(self, task_id: str) -> bool:
         """Cancels a task a body in a task process called, by its id, as its
-        handle's `cancel` does."""
+        handle's `cancel` does. The pool asks this only for a cancel that
+        raced the task's outcome settling, after it dropped the handle."""
         return self._tasks.cancel(task_id)
 
     async def work(self) -> None:

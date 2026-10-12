@@ -242,6 +242,9 @@ class ProcessPool:
         for replacing in self._replacing:
             # A child it already spawned is among the children below.
             replacing.cancel()
+        for reading in self._inspecting:
+            # The body that asked is stopped with its child below.
+            reading.cancel()
         children = [*self._children, *self._condemned]
         if not kill:
             await self._let_children_finish(children)
@@ -531,18 +534,24 @@ class ProcessPool:
             case ipc.Submit():
                 self._submit_for(child, frame)
             case ipc.CancelTask():
-                handle = child.handles.get(frame.task_id)
-                try:
-                    if handle is not None:
-                        cancelled = handle.cancel()
-                    else:
-                        cancelled = self._nested is not None and self._nested.cancel_task(frame.task_id)
-                except Exception as error:
-                    child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
-                else:
-                    child.send(ipc.Reply(frame.request, cancelled))
+                self._cancel_for(child, frame)
             case ipc.Inspect():
                 self._inspect_for(child, frame)
+
+    def _cancel_for(self, child: _Child, frame: ipc.CancelTask) -> None:
+        """Cancels what a body in `child` asked to cancel and answers whether
+        it was. A task the child no longer holds a handle for (its outcome
+        already settled) is cancelled by id."""
+        handle = child.handles.get(frame.task_id)
+        try:
+            if handle is not None:
+                cancelled = handle.cancel()
+            else:
+                cancelled = self._nested is not None and self._nested.cancel_task(frame.task_id)
+        except Exception as error:
+            child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
+        else:
+            child.send(ipc.Reply(frame.request, cancelled))
 
     def _submit_for(self, child: _Child, frame: ipc.Submit) -> None:
         """Submits what a body in `child` called, answers at once with the
@@ -584,7 +593,9 @@ class ProcessPool:
             else:
                 # A status that would not arrive whole fails the read, so
                 # the body never waits for an answer that cannot come.
-                child.send(ipc.answer_of(frame.request, status))
+                child.send(
+                    ipc.answer_of(frame.request, status, f"the status of task {frame.task_id}")
+                )
 
         reading = asyncio.get_running_loop().create_task(answer())
         self._inspecting.add(reading)

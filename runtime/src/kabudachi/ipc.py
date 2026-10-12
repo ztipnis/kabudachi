@@ -247,10 +247,10 @@ def outcome_of(task_id: str, outcome: "Future[Any]") -> WaitDone:
     return WaitDone(task_id, value)
 
 
-def answer_of(request: int, value: Any) -> Reply:
+def answer_of(request: int, value: Any, what: str) -> Reply:
     """The `Reply` carrying `value`, or a `TaskBodyError` the asking body
-    raises if `value` would not arrive whole."""
-    unsendable = _unsendable(value, f"the answer to request {request}")
+    raises if `value` (described as `what`) would not arrive whole."""
+    unsendable = _unsendable(value, what)
     if unsendable is not None:
         return Reply(request, error=unsendable)
     return Reply(request, value)

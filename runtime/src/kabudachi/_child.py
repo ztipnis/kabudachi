@@ -178,23 +178,30 @@ class _TaskProcess:
             case ipc.Reply():
                 self._answered(frame)
                 return
-            case ipc.Stored():
-                handle = self._handles.get(frame.task_id)
-                if handle is not None:
-                    handle._mark_stored(frame.error)
-                return
-            case ipc.WaitDone():
-                handle = self._handles.pop(frame.task_id, None)
-                if handle is not None and frame.error is not None:
-                    handle._fail(frame.error)
-                elif handle is not None:
-                    handle._resolve(frame.value)
+            case ipc.Stored() | ipc.WaitDone():
+                self._settle_frame(frame)
                 return
         with self._buffer_lock:
             if self._loop is None:
                 self._early.append(frame)
                 return
         self._loop.call_soon_threadsafe(self._received, frame)
+
+    def _settle_frame(self, frame: ipc.Stored | ipc.WaitDone) -> None:
+        """Marks a called task's handle stored, or settles it with its
+        outcome, unless the handle is gone."""
+        if isinstance(frame, ipc.Stored):
+            handle = self._handles.get(frame.task_id)
+            if handle is not None:
+                handle._mark_stored(frame.error)
+            return
+        handle = self._handles.pop(frame.task_id, None)
+        if handle is None:
+            return
+        if frame.error is not None:
+            handle._fail(frame.error)
+        else:
+            handle._resolve(frame.value)
 
     def ask(self, make: Callable[[int], Any], *, submission: bool) -> Any:
         """Sends the request `make(request)` builds and waits for the worker's

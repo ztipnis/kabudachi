@@ -19,6 +19,7 @@ from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
 from kabudachi.config import Configuration
 from kabudachi import Durability, TaskStatus
+from kabudachi._native import RunState
 from kabudachi.errors import (
     DurabilityUnavailableError,
     RuntimeNotStartedError,
@@ -89,6 +90,9 @@ def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_rec
     # its worker), so it pickles whole, its native run state included.
     copied = pickle.loads(pickle.dumps(after))
     assert copied == after and copied.run_state is after.run_state
+    variants = [getattr(RunState, name) for name in dir(RunState) if name.isupper()]
+    assert len(variants) == 11
+    assert all(pickle.loads(pickle.dumps(variant)) is variant for variant in variants)
 
 
 def test_a_flow_and_a_group_report_their_stages_and_members():
