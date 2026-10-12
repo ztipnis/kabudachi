@@ -545,8 +545,6 @@ fn admit_connection_event(inputs: &mut VecDeque<Input>, peer: &WorkerId, input: 
     }
 }
 
-/// Drops the oldest queued election message, if there is one, to make room
-/// at `limit`.
 fn drop_oldest_message(inputs: &mut VecDeque<Input>, limit: usize) {
     if let Some(oldest) = inputs
         .iter()

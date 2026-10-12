@@ -466,7 +466,6 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         self.read_listing(client, sent_at, now);
     }
 
-    /// Whether the next round is due at `now`.
     fn round_due(&self, now: Instant) -> bool {
         self.next_round_at.is_some_and(|due| now >= due)
     }
