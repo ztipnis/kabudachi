@@ -128,69 +128,88 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         kept_chains: &BTreeMap<TaskId, Vec<ChainItem>>,
         only: Option<&BTreeSet<Key>>,
     ) {
+        for (key, tasks) in self.generations_by_key() {
+            if only.is_some_and(|only| !only.contains(&key)) {
+                continue;
+            }
+            let (waiting, holder) = self.waiting_and_holder(tasks);
+            let chains = [waiting.as_ref(), holder.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|task_id| (task_id.clone(), self.kept_chain(task_id, kept_chains)))
+                .collect();
+            self.occupancy.restore(&key, waiting, holder, chains);
+        }
+    }
+
+    /// Every task held that has a coalescing key, by key.
+    fn generations_by_key(&self) -> BTreeMap<Key, Vec<TaskId>> {
         let mut generations: BTreeMap<Key, Vec<TaskId>> = BTreeMap::new();
         for task_id in self.tasks.keys() {
             if let Some(key) = self.coalescing_key_of(task_id) {
                 generations.entry(key).or_default().push(task_id.clone());
             }
         }
-        for (key, mut tasks) in generations {
-            if only.is_some_and(|only| !only.contains(&key)) {
-                continue;
-            }
-            tasks.retain(|task_id| !self.retention.holds(task_id));
-            tasks.sort_by_cached_key(|task_id| {
-                let task = &self.tasks[task_id];
-                (
-                    task.submitted_at.as_ref().map(|at| at.unix_millis),
-                    task_id.clone(),
-                )
-            });
-            let claimed = |scheduler: &Self, task_id: &TaskId| {
-                scheduler.runs_of_task[task_id]
-                    .iter()
-                    .any(|run| scheduler.runs[run].selected_worker.is_some())
-            };
-            let waiting = tasks
-                .iter()
-                .rev()
-                .find(|task_id| {
-                    !claimed(self, task_id)
-                        && matches!(
-                            self.runs[&self.current_run[*task_id]].current_state(),
-                            TaskRunState::Scheduled | TaskRunState::Queued
-                        )
-                })
-                .cloned();
-            let holder = tasks
-                .iter()
-                .rev()
-                .find(|task_id| claimed(self, task_id))
-                .cloned();
-            let chains = [waiting.as_ref(), holder.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(|task_id| {
-                    // An absorbed generation whose record is not installed
-                    // cannot be folded either, so it is not chained. A task
-                    // not installed in this batch was held before: what its
-                    // chain kept stays kept.
-                    let chain = match kept_chains.get(task_id) {
-                        Some(chain) => chain.clone(),
-                        None => self.occupancy.chain(task_id).to_vec(),
-                    };
-                    let chain = chain
-                        .into_iter()
-                        .filter(|item| match item {
-                            ChainItem::Absorbed(absorbed) => self.tasks.contains_key(absorbed),
-                            ChainItem::Folded(_) => true,
-                        })
-                        .collect();
-                    (task_id.clone(), chain)
-                })
-                .collect();
-            self.occupancy.restore(&key, waiting, holder, chains);
-        }
+        generations
+    }
+
+    /// Of `tasks`, the generations of one key: the newest unfinished one that
+    /// was never claimed and still waits, and the newest one ever claimed,
+    /// which holds the key.
+    fn waiting_and_holder(&self, mut tasks: Vec<TaskId>) -> (Option<TaskId>, Option<TaskId>) {
+        tasks.retain(|task_id| !self.retention.holds(task_id));
+        tasks.sort_by_cached_key(|task_id| {
+            let task = &self.tasks[task_id];
+            (
+                task.submitted_at.as_ref().map(|at| at.unix_millis),
+                task_id.clone(),
+            )
+        });
+        let waiting = tasks
+            .iter()
+            .rev()
+            .find(|task_id| {
+                !self.was_claimed(task_id)
+                    && matches!(
+                        self.runs[&self.current_run[*task_id]].current_state(),
+                        TaskRunState::Scheduled | TaskRunState::Queued
+                    )
+            })
+            .cloned();
+        let holder = tasks
+            .iter()
+            .rev()
+            .find(|task_id| self.was_claimed(task_id))
+            .cloned();
+        (waiting, holder)
+    }
+
+    /// Whether any run of `task_id` was ever selected for a worker.
+    fn was_claimed(&self, task_id: &TaskId) -> bool {
+        self.runs_of_task[task_id]
+            .iter()
+            .any(|run| self.runs[run].selected_worker.is_some())
+    }
+
+    /// The chain `task_id` keeps: the one its record carries, or, for a task
+    /// held before this batch, the one it had. An absorbed generation whose
+    /// record is not installed cannot be folded either, so it is left out.
+    fn kept_chain(
+        &self,
+        task_id: &TaskId,
+        kept_chains: &BTreeMap<TaskId, Vec<ChainItem>>,
+    ) -> Vec<ChainItem> {
+        let chain = match kept_chains.get(task_id) {
+            Some(chain) => chain.clone(),
+            None => self.occupancy.chain(task_id).to_vec(),
+        };
+        chain
+            .into_iter()
+            .filter(|item| match item {
+                ChainItem::Absorbed(absorbed) => self.tasks.contains_key(absorbed),
+                ChainItem::Folded(_) => true,
+            })
+            .collect()
     }
 }
 
