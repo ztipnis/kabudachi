@@ -17,7 +17,14 @@ from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
 from kabudachi.config import Configuration
-from kabudachi.errors import RuntimeNotStartedError, StartupError, TaskBodyError, TaskDefinitionError
+from kabudachi import Durability, TaskStatus
+from kabudachi.errors import (
+    DurabilityUnavailableError,
+    RuntimeNotStartedError,
+    StartupError,
+    TaskBodyError,
+    TaskDefinitionError,
+)
 from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting, Receipt
@@ -49,6 +56,34 @@ def test_a_synchronous_task_is_run_and_its_result_awaited():
         return await greet(Greeting(text="world", times=1))
 
     assert kabudachi.run(main) == Greeting(text="hello world", times=2)
+
+
+def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_record():
+    @declare
+    def greet(request: Greeting) -> Greeting:
+        return request
+
+    async def main():
+        handle = greet(Greeting(text="status"))
+        before = await handle.status()
+        await handle.durable(Durability.IN_MEMORY)
+        refusals = []
+        for level in (Durability.REPLICATED, Durability.DR_STORED):
+            try:
+                await handle.durable(level)
+            except DurabilityUnavailableError as refusal:
+                refusals.append(refusal)
+        await handle
+        return handle.durability, before, len(refusals), await handle.status()
+
+    durability, before, refused, after = kabudachi.run(main)
+
+    assert durability is Durability.IN_MEMORY
+    assert refused == 2
+    assert before.state in {"pending", "running", "succeeded"}
+    assert isinstance(after, TaskStatus)
+    assert (after.state, after.attempt, after.delivered) == ("succeeded", 1, False)
+    assert after.submitted_at is not None and after.updated_at >= after.submitted_at
 
 
 def test_a_task_that_returns_nothing_gives_none():

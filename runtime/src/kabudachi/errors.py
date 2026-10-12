@@ -106,10 +106,20 @@ class StartupError(KabudachiError, RuntimeError):
     task modules, did not find the same tasks as the worker, or exited first."""
 
 
-class TaskLostError(KabudachiError, RuntimeError):
+class TaskOutcomeError(KabudachiError, RuntimeError):
+    """A task ended without a result for a reason outside its own body: its
+    run was lost, or its outcome is unknown."""
+
+
+class TaskLostError(TaskOutcomeError):
     """The process running a task died before it finished, and the task is
-    not run again: an ephemeral task is never replayed, and a non-retriable
-    one may already have had its effects."""
+    not run again: an ephemeral task is never replayed."""
+
+
+class TaskOrphanedError(TaskOutcomeError):
+    """A task that is not safe to run twice was running when its worker was
+    lost, so whether its effects happened is unknown, and it is not run
+    again."""
 
 
 class TaskBodyError(KabudachiError, RuntimeError):
@@ -125,11 +135,10 @@ class TaskBodyError(KabudachiError, RuntimeError):
         return (TaskBodyError, (str(self), self.kind))
 
 
-class RemoteResultUnavailableError(KabudachiError, RuntimeError):
-    """A task submitted on a networked worker is stored in its shard and will
-    run, but its result cannot be awaited here: results are not yet delivered
-    from the worker that runs a task back to the one that submitted it. The
-    task's record says how it ended."""
+class ResultUnavailableError(KabudachiError, RuntimeError):
+    """A task's outcome is known to its shard but its result cannot be had
+    here: it never reached this process (its worker could not reach this
+    one), or the shard no longer knows the task. `task_id` names it."""
 
     def __init__(self, message: str, task_id: str) -> None:
         super().__init__(message)
@@ -138,6 +147,17 @@ class RemoteResultUnavailableError(KabudachiError, RuntimeError):
     def __reduce__(self) -> tuple[Any, tuple[str, str]]:
         # Crosses the pipe from a task process with its task id.
         return type(self), (str(self), self.task_id)
+
+
+class ResultTooLargeError(KabudachiError, RuntimeError):
+    """A task returned a result too large to send to the worker awaiting it,
+    so its run failed."""
+
+
+class DurabilityUnavailableError(KabudachiError, RuntimeError):
+    """A task cannot reach the durability asked for here: the one-node
+    runtime keeps tasks only in memory, and no disaster-recovery store
+    exists."""
 
 
 def interrupted(subject: str, error: BaseException) -> TaskInterruptedError:

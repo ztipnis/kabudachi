@@ -13,10 +13,11 @@ the payloads to fold, the executor folds them with the task's merge and hands th
 folded payload to the leader, and no handle waits for it.
 
 A worker of a networked shard runs whatever the shard's leader hands it,
-whoever submitted the task, and its reports go to that leader: no
-certification comes back, so its runs settle no handle. A task it submits is
-forgotten once the leader has stored it; awaiting its handle raises
-`RemoteResultUnavailableError`, and cancelling it asks the leader.
+whoever submitted the task. It delivers each result to the task's client
+before reporting the run to that leader, which certifies it to the client. A
+task it submits names it as client: the result arrives as `RESULT`, the
+certification as `CERTIFIED`, and an end without a result as `OUTCOME`, and
+its handle settles as a one-node handle does.
 """
 
 import asyncio
@@ -32,21 +33,26 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from kabudachi._native import EventKind
+from kabudachi import _native
+from kabudachi._native import EventKind, RunState
 from kabudachi.body import RunningBody
 from kabudachi.composites import Composites
 from kabudachi.config import Configuration
 from kabudachi.errors import (
     BackpressureError,
     CoalescedPayloadTooLargeError,
-    RemoteResultUnavailableError,
+    ResultTooLargeError,
+    ResultUnavailableError,
     RuntimeNotStartedError,
     TaskBodyError,
+    TaskCancelledError,
     TaskDefinitionError,
     TaskExpiredError,
     TaskLostError,
+    TaskOrphanedError,
     TaskRecordFullError,
     TaskSupersededError,
+    TaskTimeoutError,
     UnknownTaskError,
     interrupted,
 )
@@ -66,6 +72,7 @@ from kabudachi.native_protocol import Runtime
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskDefinition, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
+from kabudachi.status import CompositeStatus, TaskStatus
 from kabudachi.task_table import Run, TaskTable, result_digest
 
 WAIT_POLL_SECONDS = 0.005
@@ -153,6 +160,9 @@ class Session:
             EventKind.REFUSED: self._on_refused,
             EventKind.ABORT: self._on_abort,
             EventKind.ABORT_WITHDRAWN: self._on_abort_withdrawn,
+            EventKind.RESULT: self._on_result,
+            EventKind.CERTIFIED: self._on_certified,
+            EventKind.OUTCOME: self._on_outcome,
         }
 
     def submit(
@@ -259,6 +269,14 @@ class Session:
         """What a handle made by this session runs its callbacks with."""
         return self._run_callback
 
+    async def task_status(self, task_id: str) -> TaskStatus | CompositeStatus:
+        """How a task, flow or group submitted here stands: a flow or group
+        from its handle, a task from its shard's record."""
+        composite = self._composites.status_of(task_id)
+        if composite is not None:
+            return await composite
+        return await self._tasks.status(task_id)
+
     def has_room(self) -> bool:
         """Whether there is room to submit in bulk now: the scheduler has not
         said memory use is past its soft limit."""
@@ -335,12 +353,11 @@ class Session:
         )
 
     def _on_accepted(self, event: Any) -> None:
-        # Stored, and its result never comes back here: its handle stays
-        # open for `cancel`, and nothing waits for it.
-        self._tasks.stored(event.task_id)
+        # Stored on a quorum: its handle is `REPLICATED`.
+        self._tasks.replicated(event.task_id)
 
     def _on_refused(self, event: Any) -> None:
-        self._tasks.failed(
+        self._tasks.refused(
             event.task_id,
             BackpressureError(f"the leader refused task {event.task_id}: {event.reason}"),
         )
@@ -351,6 +368,15 @@ class Session:
     def _on_abort_withdrawn(self, event: Any) -> None:
         self._clear_abort(event.task_run_id)
 
+    def _on_result(self, event: Any) -> None:
+        self._tasks.result_held(event.task_id, event.task_run_id, event.payload)
+
+    def _on_certified(self, event: Any) -> None:
+        self._tasks.certified(event)
+
+    def _on_outcome(self, event: Any) -> None:
+        self._tasks.concluded(event.task_id, _outcome_error(event))
+
     def _hold_early(self, run_id: str) -> _Early:
         """What came for `run_id` before it started here, kept for `_start`
         on a networked worker, which may have claimed it already. The oldest
@@ -359,7 +385,7 @@ class Session:
         if early is not None:
             return early
         early = _Early()
-        if self._runtime.delivers_results or not run_id:
+        if self._runtime.certifies_locally or not run_id:
             return early
         if len(self._early) >= _EARLY_LIMIT:
             del self._early[next(iter(self._early))]
@@ -464,7 +490,7 @@ class Session:
         if claim.compaction:
             # Internal: no handle waits for it, so it is not in the task table.
             # Held for the shard, it is under an abort deadline like any run.
-            if not self._runtime.delivers_results:
+            if not self._runtime.certifies_locally:
                 definition = self._registry.get(claim.definition_id)
                 grace = (
                     self._cancel_grace(definition)
@@ -476,7 +502,7 @@ class Session:
             self._track(self._compact(claim, self._executor.compact(job)))
             self._apply_early(claim.task_run_id)
             return
-        if self._runtime.delivers_results:
+        if self._runtime.certifies_locally:
             run = self._tasks.claimed(claim.task_id)
             if run is None:
                 # Already settled and forgotten (by `stop_claiming`, or any other
@@ -595,9 +621,19 @@ class Session:
         self._complete(claim, run, outcome)
 
     def _complete(self, claim: Any, run: Run, outcome: Any) -> None:
+        if claim.client is not None and len(outcome) > _native.MAX_RESULT_PAYLOAD_BYTES:
+            raise ResultTooLargeError(
+                f"task {claim.definition_id} returned {len(outcome)} bytes, more than the "
+                f"{_native.MAX_RESULT_PAYLOAD_BYTES} that can be sent to the worker awaiting it"
+            )
         if run.holds_handle:
-            self._tasks.result_held(claim.task_id, outcome)
-        certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
+            self._tasks.result_held(claim.task_id, claim.task_run_id, outcome)
+            certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
+        else:
+            # Held for the shard: the result goes to the task's client first.
+            certification = self._runtime.complete(
+                claim.task_run_id, result_digest(outcome), result=outcome
+            )
         if certification is not None:
             self._tasks.certified(certification)
 
@@ -679,12 +715,11 @@ class Session:
         and only then start the step as the task's continuation, so a run the
         leader does not certify leaves no continuation behind.
         The task is over, and its handle settled, when the continuation is."""
-        if not self._runtime.delivers_results:
-            raise RemoteResultUnavailableError(
-                f"task {claim.definition_id} returned a flow, group or bound task, whose stages "
-                "need results this worker cannot deliver: results are not yet sent back across "
-                "workers",
-                claim.task_id,
+        if not self._runtime.certifies_locally:
+            raise TaskDefinitionError(
+                f"task {claim.definition_id} returned a flow, group or bound task, which a "
+                "networked worker cannot run as a continuation: its stages would be orchestrated "
+                "in this process"
             )
         if not getattr(step, "is_step", False):
             raise TaskDefinitionError(
@@ -845,6 +880,57 @@ class Session:
         definition = self._registry.get(definition_name)
         serializer = self._serializers.get(definition.serializer)
         return serializer.decode(payload, definition.output_type)
+
+
+# Failure kinds a leader reports that name kabudachi's own errors.
+_KNOWN_FAILURES: dict[str, type[Exception]] = {
+    "ResultTooLargeError": ResultTooLargeError,
+    "TaskTimeoutError": TaskTimeoutError,
+}
+
+# How a task ended without a result, for the endings that carry nothing more
+# than their state: the error it raises and what its message says.
+_PLAIN_ENDINGS: dict[Any, tuple[type[Exception], str]] = {
+    RunState.LOST: (TaskLostError, "was lost with its worker and is not run again"),
+    RunState.ORPHANED: (
+        TaskOrphanedError,
+        "was running when its worker was lost; whether it took effect is unknown",
+    ),
+    RunState.CANCELLED: (TaskCancelledError, "was cancelled"),
+    RunState.EXPIRED: (TaskExpiredError, "expired before it could start"),
+}
+
+
+def _outcome_error(event: Any) -> BaseException:
+    """The error a handle fails with when its task ended without a result
+    here, by what its leader said."""
+    task_id = event.task_id
+    if event.state is None:
+        return ResultUnavailableError(
+            f"the shard no longer knows task {task_id}: it never stored it, or forgot it after "
+            "its result's time to live",
+            task_id,
+        )
+    if event.state == RunState.FAILED:
+        return _failure_error(task_id, event.failure_kind)
+    if event.state == RunState.SUPERSEDED:
+        return TaskSupersededError(
+            f"task {task_id} was superseded by {event.superseded_by}", event.superseded_by
+        )
+    plain = _PLAIN_ENDINGS.get(event.state)
+    if plain is None:
+        return ResultUnavailableError(f"task {task_id} ended as {event.state!r} with no result", task_id)
+    error_type, ending = plain
+    return error_type(f"task {task_id} {ending}")
+
+
+def _failure_error(task_id: str, kind: str) -> BaseException:
+    """The error of a run that failed elsewhere, of which only the kind
+    arrives: kabudachi's own kinds as their classes."""
+    known = _KNOWN_FAILURES.get(kind)
+    if known is not None:
+        return known(f"task {task_id} failed with {kind}")
+    return TaskBodyError(f"task {task_id} failed with {kind}", kind)
 
 
 def _kind_of(error: BaseException) -> str:

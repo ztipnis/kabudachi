@@ -8,11 +8,19 @@ __path__ = extend_path(__path__, __name__)
 
 from kabudachi.composites import FlowHandle, GroupHandle
 from kabudachi.config import configure
+from kabudachi.errors import (
+    DurabilityUnavailableError,
+    ResultTooLargeError,
+    ResultUnavailableError,
+    TaskOrphanedError,
+    TaskOutcomeError,
+)
 from kabudachi.flow import BoundTask, Flow, Group, flow, group
 from kabudachi.handle import TaskHandle
 from kabudachi.lifecycle import RunContext, after_run, before_run, process_init
 from kabudachi.runner import run
 from kabudachi.serializers import register_serializer
+from kabudachi.status import CompositeStatus, Durability, TaskStatus
 from kabudachi.tasks import coalescing_task, ephemeral_task, task
 
 __version__ = "0.1.0"
@@ -22,8 +30,11 @@ __all__ = [
     "after_run",
     "before_run",
     "coalescing_task",
+    "CompositeStatus",
     "configure",
     "BoundTask",
+    "Durability",
+    "DurabilityUnavailableError",
     "ephemeral_task",
     "Flow",
     "flow",
@@ -33,8 +44,13 @@ __all__ = [
     "GroupHandle",
     "process_init",
     "register_serializer",
+    "ResultTooLargeError",
+    "ResultUnavailableError",
     "run",
     "RunContext",
     "task",
     "TaskHandle",
+    "TaskOrphanedError",
+    "TaskOutcomeError",
+    "TaskStatus",
 ]

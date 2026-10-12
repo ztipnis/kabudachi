@@ -69,11 +69,12 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     With `listen` set, the process is a worker of the networked shard
     `shard`. It bootstraps from `seeds` or `authority`, `run` waits until it
     has joined and knows its leader, and it runs the tasks the shard's leader
-    hands it, whoever submitted them. Awaiting a task's result there raises
-    `RemoteResultUnavailableError`, and cancelling one asks the leader. When
-    `main` returns, `run` waits until the leader has stored every task
-    called; then, as at the first signal, the worker also lets the runs it
-    holds finish and waits until its leader has taken their reports.
+    hands it, whoever submitted them. Awaiting a task's result there gets it
+    from the worker that ran it, once the leader has certified it, and
+    cancelling one asks the leader. When `main` returns, `run` waits until
+    every task called has settled; then, as at the first signal, the worker
+    also lets the runs it holds finish and waits until its leader has taken
+    their reports.
 
     Raises `TaskDefinitionError`, before `main` starts, if a registered task
     cannot work with the serializers of this process, and if `processes` is

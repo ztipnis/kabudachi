@@ -13,7 +13,7 @@ import contextlib
 import contextvars
 import functools
 import itertools
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from kabudachi.errors import (
@@ -27,6 +27,7 @@ from kabudachi.errors import (
 from kabudachi.handle import TaskHandle, run_callback_inline
 
 from kabudachi.hosted_work import LoopHostedWork
+from kabudachi.status import CompositeStatus
 
 if TYPE_CHECKING:
     from kabudachi.session import Session
@@ -165,6 +166,10 @@ class Composites:
         handle = GroupHandle(self._identifier("group"), self._session.callback_runner)
         self._host(self._run_group(group, previous, handle), handle)
         return handle
+
+    def status_of(self, task_id: str) -> Awaitable[CompositeStatus] | None:
+        """How the flow or group `task_id` stands; `None` if it is neither."""
+        return None
 
     def _identifier(self, kind: str) -> str:
         return f"{kind}-{next(self._numbers)}"

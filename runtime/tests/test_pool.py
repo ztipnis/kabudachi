@@ -304,7 +304,7 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
         native = _native.NativeRuntime("worker", "incarnation", OneNodeArguments())
         runtime = FaultingRuntime(native)
         # Runs a shard's leader hands this worker, which settle no handle here.
-        runtime.delivers_results = False
+        runtime.certifies_locally = False
         serving = None
         await pool.start()
         try:
@@ -367,7 +367,7 @@ def test_a_compaction_handed_over_by_a_shard_ends_as_the_leader_says(markers, en
         )
         runtime = FaultingRuntime(native)
         # Runs a shard's leader hands this worker, which settle no handle here.
-        runtime.delivers_results = False
+        runtime.certifies_locally = False
         compactions = []
         claim_pending = runtime.claim_pending
 

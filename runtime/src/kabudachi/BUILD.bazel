@@ -27,6 +27,7 @@ py_library(
         "runner.py",
         "serializers.py",
         "session.py",
+        "status.py",
         "task_table.py",
         "tasks.py",
     ],

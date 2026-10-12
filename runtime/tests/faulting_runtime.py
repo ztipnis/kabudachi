@@ -86,17 +86,26 @@ class FaultingRuntime:
         self._claims_given += len(claims)
         return claims
 
-    def inject_event(self, kind, task_id=""):
+    def inject_event(self, kind, task_id="", **fields):
         """Makes `next_events()` also return an event the real runtime did not
-        produce, for one it could never cause (such as one for another session's task)."""
+        produce, for one it could never cause (such as one for another
+        session's task, or what a networked leader tells a client). `fields`
+        set or override the event's attributes."""
         self._injected.put_nowait(
             SimpleNamespace(
-                kind=kind,
-                task_id=task_id,
-                task_run_id="",
-                was_running=False,
-                superseded_by=None,
-                active=False,
+                **{
+                    "kind": kind,
+                    "task_id": task_id,
+                    "task_run_id": "",
+                    "was_running": False,
+                    "superseded_by": None,
+                    "active": False,
+                    "payload": b"",
+                    "result_digest": b"",
+                    "state": None,
+                    "failure_kind": "",
+                    **fields,
+                }
             )
         )
 
@@ -169,7 +178,8 @@ class FaultingRuntime:
         self.events.append(("lost", task_run_id))
         return self.native.report_lost(task_run_id)
 
-    def complete(self, task_run_id, result_digest, continues=False):
+    def complete(self, task_run_id, result_digest, continues=False, *, result=None):
+        # `result` goes to a networked task's client; one-node, nowhere.
         self.events.append(("complete", task_run_id))
         if self.on_complete is not None:
             self.on_complete(task_run_id)
