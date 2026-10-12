@@ -379,6 +379,17 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> Rejoin<'a, P> {
         self
     }
 
+    /// Takes over the hint, and the hint read still out, of the search this
+    /// one replaces, so a restart neither forgets the hinted leader nor
+    /// orphans the read that would name it.
+    pub(crate) fn carrying_hint_of(mut self, replaced: Option<Rejoin<'a, P>>) -> Self {
+        if let Some(replaced) = replaced {
+            self.hint = replaced.hint;
+            self.hint_read = replaced.hint_read;
+        }
+        self
+    }
+
     /// When the driver must next wake for this rejoin: a round due, or a
     /// read's bound; while validating, the epoch read's bound, or when the
     /// next is due.
@@ -869,11 +880,14 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> DrivenSearch<'a, P> {
         // to `Bootstrapping` to join again. Only a node with an authority
         // fences itself, and that authority lists whom to ask. A stranded node
         // searches too, for a leader to reconnect to, and a stranded search
-        // restarts each time the watch fires, once per suspicion timeout.
+        // restarts each time the watch fires, once per suspicion timeout. The
+        // authority's leader hint survives a restart, along with the read that
+        // would name it, so a short timeout cannot keep discarding it.
+        let mut replaced = None;
         if self.stranded.observe(state, sent_at) {
             self.stranded_search = true;
             if matches!(self.running, Some((SearchFor::Leader, _))) {
-                self.running = None;
+                replaced = self.running.take().map(|(_, search)| search);
             }
         }
         if !matches!(state, WorkerState::RollCall | WorkerState::NoQuorum) {
@@ -899,7 +913,7 @@ impl<'a, P: AskWhoLeads + Clone + Send + 'a> DrivenSearch<'a, P> {
                     self.running = Some((
                         purpose,
                         if purpose == SearchFor::Leader {
-                            rejoin.for_leader_search()
+                            rejoin.for_leader_search().carrying_hint_of(replaced)
                         } else {
                             rejoin
                         },
