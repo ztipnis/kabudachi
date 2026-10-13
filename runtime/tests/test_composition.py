@@ -1810,3 +1810,72 @@ def test_a_reduce_reads_items_from_every_item_page_whether_they_are_inline_or_st
         assert run(with_events(world, body)) == "".join(items)
     levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "tree_concat"))
     assert levels == [0, 0, 0, 1, 2], "three chunks, each reading across a page boundary"
+
+
+def split_words(text: str) -> list[str]:
+    return text.split()
+
+
+def upper(word: str) -> str:
+    return word.upper()
+
+
+def join_words(item: str, previous: str) -> str:
+    return f"{previous} {item}".strip()
+
+
+def _numbered(count: int) -> list[str]:
+    """`count` items of about 1 KB, each starting with its own index."""
+    return [f"{index:06d}" + "x" * 994 for index in range(count)]
+
+
+def numbered(count: int) -> list[str]:
+    return _numbered(count)
+
+
+def take_tag(item: str, previous: str) -> str:
+    return previous + item[:6]
+
+
+def test_a_reduce_stage_folds_a_maps_results_from_its_pages_and_a_returned_list_streamed_by_its_expansion():
+    world = reducing_world(split_words, upper, join_words, join_words={"associative": True})
+    join = world.tasks["join_words"]
+
+    async def body():
+        mapped = await flow(world.tasks["split_words"], world.tasks["upper"].map, join.reduce.options(chunk_size=2)).start(
+            world.session, "a b c d e"
+        )
+        expanded = await flow(world.tasks["split_words"], join.reduce.options(initial="")).start(world.session, "x y")
+        return mapped[-1], expanded[-1]
+
+    with activated(world):
+        assert run(with_events(world, body)) == ("A B C D E", "x y")
+    expansions = [claim for claim in world.runtime.claimed if claim.expansion]
+    assert len(expansions) == 2, "the map's list and the second flow's list were streamed; the map's results were not"
+
+
+def test_a_list_larger_than_one_record_reduces_in_order_whether_it_is_given_or_returned():
+    count = _native.MAX_RECORD_BYTES // 1000 + 64  # more item bytes than one record holds
+    world = reducing_world(numbered, take_tag, take_tag={"tree": True, "merge": concatenated})
+    tag = world.tasks["take_tag"].reduce.options(initial="", chunk_size=64)
+
+    async def body():
+        given = await world.tasks["take_tag"].reduce(_numbered(count), initial="", chunk_size=64)
+        returned = await flow(world.tasks["numbered"], tag).start(world.session, count)
+        return given, returned[-1]
+
+    expected = "".join(f"{index:06d}" for index in range(count))
+    with activated(world):
+        assert run(with_events(world, body)) == (expected, expected)
+    reduces = {composite for composite, _, _ in world.runtime.members_sent}
+    assert len(reduces) == 2 and len(world.runtime.members_sent) >= 4, "each list went in more than one batch"
+
+
+def test_a_reduce_stage_must_follow_a_stage_that_returns_a_list_of_its_items_and_names_its_requirement_with_its_serializer():
+    world = reducing_world(split_words, chain_concat, upper)
+    concat = world.tasks["chain_concat"].reduce
+
+    assert concat.input_requirements() == [("tests.chain_concat", list[str], "pickle")]
+    flow(world.tasks["split_words"], concat)
+    with pytest.raises(TaskDefinitionError, match="upper"):
+        flow(world.tasks["upper"], concat)

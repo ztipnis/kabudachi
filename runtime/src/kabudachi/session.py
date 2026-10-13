@@ -40,6 +40,7 @@ from kabudachi import _native
 from kabudachi._native import MAX_FAILURE_MESSAGE_BYTES, EventKind, RunState
 from kabudachi.body import Given, RunningBody, decode_resolved
 from kabudachi.composites import (
+    INLINE_VALUE_BYTES,
     MEMBER_BATCH_BYTES,
     Composites,
     _batches,
@@ -1003,10 +1004,12 @@ class Session:
             self._tasks.continuing(claim.task_id, _native.continuation_of(claim.task_run_id))
 
     async def _expand(self, claim: Any) -> None:
-        """Splits the list an expansion run names into the map it feeds: each
-        item encoded as the map's task takes it and sent in batches, waiting
-        out SlowDown, then the run completes, which seals the map. The leader
-        never decodes the list."""
+        """Splits the list an expansion run names into the map or reduce it
+        feeds: each item encoded as the map's task or the reducer takes it and
+        sent in batches, waiting out SlowDown, then the run completes, which
+        seals the composite. A reduce's items sit in its item pages, so those
+        longer than `INLINE_VALUE_BYTES` are stored as blobs it owns. The
+        leader never decodes the list."""
         try:
             request = _native.read_expansion(claim.serialized_input)
             items = self.decode_resolved(await self._runtime.resolve_expansion(claim.task_run_id))
@@ -1016,13 +1019,17 @@ class Session:
             serializer = self._serializers.get(template.serializer)
             self._runtime.report_started(claim.task_run_id)
             encoded = (serializer.encode(item, template.input_type) for item in items)
+            inline_bytes = INLINE_VALUE_BYTES if request.reduces else MEMBER_BATCH_BYTES
             start = 0
             for batch in _batches(encoded, self._composites.batch_items, MEMBER_BATCH_BYTES):
                 while not self.has_room():
                     if self.stopping:
                         raise RunStoppedError("the run stopped while this was being sent")
                     await self.wait_for_room()
-                if await self._runtime.submit_members(claim.composite_id, start, batch, False) != "accepted":
+                sent = await self._runtime.submit_members(
+                    claim.composite_id, start, batch, False, inline_bytes=inline_bytes
+                )
+                if sent != "accepted":
                     # The map ended without all its items (a member failed, or
                     # it was cancelled), which cancels this run: nothing is left
                     # to complete or report.

@@ -61,10 +61,18 @@ pub struct PyExpansion(ExpansionRequest);
 
 #[pymethods]
 impl PyExpansion {
-    /// The task the map runs on every item.
+    /// The task the map runs on every item, or the reducer each item is
+    /// encoded for.
     #[getter]
     fn definition_id(&self) -> &str {
         self.0.task.definition.as_str()
+    }
+
+    /// Whether the items stream into a reduce, as that reducer's items,
+    /// rather than into a map of the task.
+    #[getter]
+    fn reduces(&self) -> bool {
+        self.0.reduces
     }
 
     #[getter]

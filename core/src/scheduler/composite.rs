@@ -681,26 +681,32 @@ impl Step {
 }
 
 /// What an expansion run is asked: the task to run on every item of the list
-/// it splits, and how the map over the items treats a failure.
+/// it splits, or, for a reduce, the reducer whose item each one is, and how
+/// the map over the items treats a failure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpansionRequest {
     pub task: BoundStep,
     pub on_error: OnError,
+    /// Whether `task` is the reducer of the reduce the items stream into,
+    /// rather than the template of the map they become members of.
+    pub reduces: bool,
 }
 
 impl ExpansionRequest {
     /// The request an expansion run carries as its input.
     pub fn decode(bytes: &[u8]) -> Result<ExpansionRequest, MalformedStep> {
         let request = generated::Expansion::decode(bytes).map_err(|_| MalformedStep::Undecodable)?;
-        let Some(generated::expansion::Then::Map(template)) = request.then else {
-            return Err(MalformedStep::UnsupportedKind);
+        let (template, reduces) = match request.then {
+            Some(generated::expansion::Then::Map(template)) => (template, false),
+            Some(generated::expansion::Then::Reduce(reducer)) => (reducer, true),
+            None => return Err(MalformedStep::UnsupportedKind),
         };
         let on_error = match generated::OnError::try_from(request.on_error) {
             Ok(generated::OnError::FailFast) => OnError::FailFast,
             Ok(generated::OnError::CollectAll) => OnError::CollectAll,
             _ => return Err(MalformedStep::UnknownKind),
         };
-        Ok(ExpansionRequest { task: BoundStep::try_from(&template)?, on_error })
+        Ok(ExpansionRequest { task: BoundStep::try_from(&template)?, on_error, reduces })
     }
 }
 

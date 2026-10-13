@@ -91,9 +91,11 @@ class BoundTask:
         step, whose handle resolves to the continuation's list of results."""
         return None if self.definition.continues else self.definition.output_type
 
-    def input_requirements(self) -> list[tuple[str, Any]]:
-        """The (name, type) of each task that takes the input of this step."""
-        return [(self.definition.name, self.definition.input_type)] if self.needs_input else []
+    def input_requirements(self) -> list[tuple[str, Any, str]]:
+        """The (name, type, serializer name) of each task that takes the input of this step."""
+        if not self.needs_input:
+            return []
+        return [(self.definition.name, self.definition.input_type, self.definition.serializer)]
 
     def definitions(self) -> list[TaskDefinition]:
         """Every task this step runs."""
@@ -201,8 +203,8 @@ class Flow:
     def needs_input(self) -> bool:
         return self.stages[0].needs_input
 
-    def input_requirements(self) -> list[tuple[str, Any]]:
-        """The (name, type) of each task the flow's input goes to.
+    def input_requirements(self) -> list[tuple[str, Any, str]]:
+        """The (name, type, serializer name) of each task the flow's input goes to.
 
         Used to type-check the step before it.
         """
@@ -260,8 +262,8 @@ class Group:
     def needs_input(self) -> bool:
         return any(member.needs_input for member in self.members)
 
-    def input_requirements(self) -> list[tuple[str, Any]]:
-        """The (name, type) of each member task that takes the group's input."""
+    def input_requirements(self) -> list[tuple[str, Any, str]]:
+        """The (name, type, serializer name) of each member task that takes the group's input."""
         return [need for member in self.members for need in member.input_requirements()]
 
     def definitions(self) -> list[TaskDefinition]:
@@ -322,9 +324,9 @@ class MapStep:
         self._serializers = serializers
         self._on_error = on_error
 
-    def input_requirements(self) -> list[tuple[str, Any]]:
-        """The (name, type) of the task, whose input must be a list of what it takes."""
-        return [(self.definition.name, list[self.definition.input_type])]
+    def input_requirements(self) -> list[tuple[str, Any, str]]:
+        """The (name, type, serializer name) of the task, whose input must be a list of what it takes."""
+        return [(self.definition.name, list[self.definition.input_type], self.definition.serializer)]
 
     def definitions(self) -> list[TaskDefinition]:
         return [self.definition]
@@ -408,9 +410,9 @@ class ReduceStep:
         """The reducer's result type, which is what the reduce gives."""
         return self.definition.output_type
 
-    def input_requirements(self) -> list[tuple[str, Any]]:
-        """The (name, type) of the reducer, whose input must be a list of its items."""
-        return [(self.definition.name, list[self.definition.input_type])]
+    def input_requirements(self) -> list[tuple[str, Any, str]]:
+        """The (name, type, serializer name) of the reducer, whose input must be a list of its items."""
+        return [(self.definition.name, list[self.definition.input_type], self.definition.serializer)]
 
     def definitions(self) -> list[TaskDefinition]:
         return [self.definition]
@@ -506,7 +508,7 @@ def flow(*stages: Any) -> Flow:
         produced = before.output_type
         if produced is None:
             continue  # a group or flow gives a list whose members are not checked
-        for name, wanted in after.input_requirements():
+        for name, wanted, _ in after.input_requirements():
             if not _fits(produced, wanted):
                 raise TaskDefinitionError(
                     f"{before.definition.name} returns {produced!r}, "
