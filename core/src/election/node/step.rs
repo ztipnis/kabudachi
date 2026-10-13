@@ -119,7 +119,8 @@ where
                 let suspicion = self.last_leader_contact
                     + self.jittered_suspect_timeout()
                     + Duration::from_ticks(1);
-                Some(next_heartbeat.map_or(suspicion, |at| at.min(suspicion)))
+                let waking = earliest(next_heartbeat, self.drain_request.wakes_at());
+                Some(waking.map_or(suspicion, |at| at.min(suspicion)))
             }
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
                 earliest(next_heartbeat, self.next_roll_call_due())
@@ -177,7 +178,8 @@ where
         if self.holds_office() && next != WorkerState::Leader {
             // Losing office mid-wait keeps the request: the node drains
             // when it next reaches `Active`, `LeaderReconciling` or `Leader`.
-            self.drain_request.office_lost();
+            self.drain_request
+                .office_lost(self.clock.now(), self.timings.drain_wait_limit);
             self.lease.withdraw_grant(self.clock.now());
             self.outputs.push(Output::Grant(None));
             self.leave_office();

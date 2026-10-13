@@ -9,6 +9,7 @@ use crate::queues::Subscription;
 use crate::time::{Clock, Instant};
 
 use super::super::EpochOrder;
+use super::super::drain::DrainRequest;
 use super::super::authority_standing::AuthorityStanding;
 use super::super::standing::AckChange;
 use super::super::{Output, WorkerNode};
@@ -152,6 +153,17 @@ where
         // `on_leader_ack`.
         if !ack.leader_draining {
             self.round.follow_leader_of(ack.term);
+        }
+        // A node that handed its leadership over leaves once the leader that
+        // took over vouches for hearing it: that leader holds a grant, so it
+        // has reconciled with this node's runs and can place its records.
+        if self.drain_request.hands_over()
+            && self.state == WorkerState::Active
+            && ack.heartbeat_token.is_some()
+            && ack.leader_id() != self.my_id
+        {
+            self.drain_request = DrainRequest::NotAsked;
+            self.drain();
         }
     }
 

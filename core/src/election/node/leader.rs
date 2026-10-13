@@ -81,7 +81,7 @@ where
             };
             office.take_heartbeat(from.clone(), heard, member_report(heartbeat), &duties);
         }
-        self.drain_once_free();
+        self.hand_over_once_free();
         if !self.holds_office() {
             return;
         }

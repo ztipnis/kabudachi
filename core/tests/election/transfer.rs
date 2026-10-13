@@ -13,7 +13,8 @@ use kabudachi_core::time::{Clock, Duration};
 
 use crate::support::builders::{
     ack_message, checked, configuration_of, g0, heartbeat, heartbeat_message, leader_ack,
-    roll_call, roll_call_message, transfer_message, worker,
+    past_any_suspicion, roll_call, roll_call_message, transfer_message, vote_request,
+    vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
@@ -149,4 +150,66 @@ fn the_voter_asked_to_stand_does_so_at_once_and_a_voter_that_heard_the_leader_ha
         "no LEADER_STILL_VALID"
     );
     assert_eq!(sent_to(&answered, &b).len(), 1, "it answers the call");
+}
+
+#[test]
+fn a_leader_handing_over_answers_and_grants_like_a_follower_and_steps_down_for_a_later_term() {
+    let clock = FakeClock::new();
+    let (a, b, c) = (worker("a"), worker("b"), worker("c"));
+    let mut leader = voter_node(&clock, &a, 3, SUSPECT);
+    connect(&mut leader, &[b.clone(), c.clone()]);
+    elect(&mut leader, &clock, SUSPECT, &[b.clone(), c.clone()]);
+    commit_founding(&mut leader, &clock, &[b.clone(), c.clone()]);
+    clock.advance(Duration::from_ticks(1));
+    confirm(&mut leader, &clock, &c);
+    let _ = leader.step(Input::TransferLeadership);
+    assert_eq!(leader.state(), WorkerState::Leader);
+    let later = leader.term() + 1;
+    let held = leader.configuration().cloned().expect("a configuration");
+
+    let answered = deliver(
+        &mut leader,
+        &b,
+        roll_call_message(roll_call(&b, later, &held, 0)),
+    );
+    assert!(
+        rejects_sent_to(&answered, &b).is_empty(),
+        "it does not defend a leadership it is handing over"
+    );
+    assert_eq!(sent_to(&answered, &b).len(), 1, "it answers the call");
+    let mut request = vote_request(b.clone(), 0, later);
+    request.roll_call_generation = Some(held.generation().into());
+    let voted = deliver(&mut leader, &b, vote_request_message(request));
+
+    assert_eq!(sent_to(&voted, &b).len(), 1, "it grants the vote");
+    assert!(
+        rejects_sent_to(&voted, &b).is_empty(),
+        "the vote is granted, not refused"
+    );
+    assert_eq!(
+        leader.state(),
+        WorkerState::LeaderSuspect,
+        "granting a later term deposes it"
+    );
+}
+
+#[test]
+fn a_draining_ack_leaves_the_leader_contact_stale_so_the_voter_still_suspects_in_time() {
+    let clock = FakeClock::new();
+    let (a, c) = (worker("a"), worker("c"));
+    let configuration = configuration_of(3);
+    let mut voter = voter_node(&clock, &c, 3, SUSPECT);
+    deliver(&mut voter, &a, ack_message(leader_ack(&a, 1, &configuration, Some(g0()))));
+
+    clock.advance(Duration::from_ticks(SUSPECT - 2));
+    let mut draining = leader_ack(&a, 1, &configuration, Some(g0()));
+    draining.leader_draining = true;
+    deliver(&mut voter, &a, ack_message(draining));
+
+    // Counted from the draining ack this would not have lapsed yet.
+    clock.advance(Duration::from_ticks(
+        past_any_suspicion(SUSPECT).as_ticks() - (SUSPECT - 2) + 1,
+    ));
+    tick(&mut voter);
+    assert_eq!(voter.state(), WorkerState::LeaderSuspect);
 }

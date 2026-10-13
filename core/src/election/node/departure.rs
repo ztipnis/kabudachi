@@ -5,7 +5,7 @@ use crate::protocol::messages::{SelfRemove, election_message};
 use crate::protocol::worker_state::WorkerState;
 use crate::time::Clock;
 
-use super::super::drain::Asked;
+use super::super::drain::{Asked, DrainRequest};
 use super::super::leader_office::Departure;
 use super::super::{HandOffTo, Output, StopReason, WorkerNode};
 
@@ -13,34 +13,55 @@ impl<C> WorkerNode<C>
 where
     C: Clock,
 {
-    /// Drains at once from `Active`, and from `LeaderReconciling` or `Leader`
-    /// once every other voter has crawled or the wait limit has passed. From a
-    /// state that will reach one of them later it keeps the request for
-    /// [`Self::transition_to`] to apply; a node already draining, or one
-    /// that can never drain again, ignores it.
+    /// Drains at once from `Active`. A `LeaderReconciling` or `Leader` node
+    /// hands its leadership over once every other voter has crawled or the
+    /// wait limit has passed, and leaves through its successor (see
+    /// [`Self::hand_over_once_free`]). From a state that will reach one of
+    /// them later it keeps the request for [`Self::transition_to`] to apply; a
+    /// node already draining, or one that can never drain again, ignores it.
     pub(super) fn request_drain(&mut self) {
-        let asked = self
+        let now = self.clock.now();
+        match self
             .drain_request
-            .ask(self.state, &self.clock, self.timings.drain_wait_limit);
-        match asked {
+            .ask(self.state, now, self.timings.drain_wait_limit)
+        {
             Asked::DrainNow => self.drain(),
-            Asked::WaitForCrawls => self.drain_once_free(),
-            Asked::Nothing => {}
+            Asked::WaitToHandOver => self.hand_over_once_free(),
+            Asked::WaitForALeader | Asked::Nothing => {}
         }
     }
 
-    /// A leader asked to drain leaves once every other voter has reported a
-    /// routing crawl since its admission, so no worker is left knowing only
-    /// this leader, or once its drain wait has run out. Until then it keeps
-    /// leading.
-    pub(super) fn drain_once_free(&mut self) {
-        let leaves = self.drain_request.leave_if_free(&self.clock, || {
-            self.office
-                .as_mut()
-                .is_some_and(|office| office.remaining_voters_have_crawled(&self.my_id))
-        });
-        if leaves {
-            self.drain();
+    /// A leader asked to drain hands its leadership over once every other
+    /// voter has reported a routing crawl since its admission (so no worker
+    /// is left knowing only this leader), or once its drain wait has run out,
+    /// to its successor (see [`LeaderOffice::successor`](crate::election::leader_office::LeaderOffice::successor)). With no successor
+    /// it keeps leading, so a pending member can be admitted and become one,
+    /// until its wait runs out; then it departs alone.
+    pub(super) fn hand_over_once_free(&mut self) {
+        let now = self.clock.now();
+        let DrainRequest::Waiting { until } = self.drain_request else {
+            return;
+        };
+        if self.transfer.is_some() {
+            return;
+        }
+        let Some(office) = self.office.as_mut() else {
+            return;
+        };
+        let crawled = office.remaining_voters_have_crawled(&self.my_id);
+        let successor = office.successor(&self.my_id);
+        match successor {
+            Some(to) if crawled || now >= until => {
+                self.drain_request = DrainRequest::HandingOver {
+                    until: now + self.timings.drain_wait_limit,
+                };
+                self.begin_transfer(to);
+            }
+            None if now >= until => {
+                self.drain_request = DrainRequest::NotAsked;
+                self.drain();
+            }
+            _ => {}
         }
     }
 
@@ -59,7 +80,7 @@ where
     /// accepted and not yet applied, so the survivors elect under the
     /// shrunk one. A leader whose removal, with those, would leave no voter
     /// announces nothing (see [`Roster::remove_all`](crate::configuration::Roster::remove_all)).
-    fn drain(&mut self) {
+    pub(super) fn drain(&mut self) {
         // Leaving `Leader` withdraws the grant first, so no departure
         // message goes out while this node still holds one.
         let was_leader = self.holds_office();
@@ -160,7 +181,7 @@ where
             office.take_removal(departing.clone());
             self.cancelled_runs.forget(departing);
         }
-        self.drain_once_free();
+        self.hand_over_once_free();
     }
 
     /// Whether this leader accepts `msg`: it holds office, `msg` is for its

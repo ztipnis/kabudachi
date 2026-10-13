@@ -90,8 +90,10 @@ fn grant_is_applied_before_any_message_leaves() {
     // The grant a lease of this leader's gave its scheduler.
     scheduler.set_leadership_grant(Some(unbounded_grant()));
 
-    // A leader drains by withdrawing its grant and then acking every
-    // connected peer a last time, in one step.
+    // A leader drains by handing its leadership over: it withdraws its grant,
+    // then acks every connected peer saying so, then asks its successor (the
+    // lowest id among voters that confirmed at one instant) to stand, in one
+    // step.
     let drained = node.step(Input::Drain);
     assert!(
         drained.outputs.contains(&Output::Grant(None)),
@@ -116,6 +118,7 @@ fn grant_is_applied_before_any_message_leaves() {
             "scheduler leading: false".to_string(),
             "send to peer-a".to_string(),
             "send to peer-b".to_string(),
+            "send to peer-a".to_string(),
         ]
     );
 }

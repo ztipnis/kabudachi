@@ -5,6 +5,7 @@ use crate::protocol::messages::{TransferLeadership, election_message};
 use crate::protocol::worker_state::WorkerState;
 use crate::time::Clock;
 
+use super::super::drain::DrainRequest;
 use super::super::standing::EpochOrder;
 use super::super::transfer::Transfer;
 use super::super::{Output, WorkerNode};
@@ -34,10 +35,9 @@ where
     /// so the grant is withdrawn (reported in this step, and carried out
     /// before any message it sends) and no ack vouches for a heartbeat. Every
     /// connected peer is acked saying so, then `to` is asked to stand.
-    fn begin_transfer(&mut self, to: WorkerId) {
+    pub(super) fn begin_transfer(&mut self, to: WorkerId) {
         let now = self.clock.now();
         self.transfer = Some(Transfer {
-            to: to.clone(),
             until: now + self.timings.suspect_timeout,
         });
         for peer in self.connected.clone() {
@@ -55,15 +55,21 @@ where
         self.outputs.push(Output::TransferLeadership { to });
     }
 
-    /// Ends a hand-over no successor took up in time: the node leads again.
+    /// Ends a hand-over no successor took up in time: a draining node
+    /// departs as it would alone; any other leads again.
     pub(super) fn end_transfer_if_due(&mut self) {
         let now = self.clock.now();
-        if self
+        if !self
             .transfer
             .as_ref()
             .is_some_and(|transfer| now >= transfer.until)
         {
-            self.transfer = None;
+            return;
+        }
+        self.transfer = None;
+        if self.drain_request.hands_over() {
+            self.drain_request = DrainRequest::NotAsked;
+            self.drain();
         }
     }
 

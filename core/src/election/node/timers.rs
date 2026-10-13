@@ -2,6 +2,7 @@ use crate::hashing::Field;
 use crate::protocol::worker_state::WorkerState;
 use crate::time::{Clock, Duration, Instant};
 
+use super::super::drain::DrainRequest;
 use super::super::{WorkerNode, lengthen_by_less_than_half};
 
 impl<C> WorkerNode<C>
@@ -32,6 +33,13 @@ where
     pub(super) fn tick(&mut self) {
         match self.state {
             WorkerState::Active => {
+                if self.drain_request.hands_over()
+                    && self.drain_request.gave_up_waiting(self.clock.now())
+                {
+                    self.drain_request = DrainRequest::NotAsked;
+                    self.drain();
+                    return;
+                }
                 if self.clock.now() - self.last_leader_contact > self.jittered_suspect_timeout() {
                     self.round.may_call_from(self.clock.now());
                     self.transition_to(WorkerState::LeaderSuspect);
@@ -50,7 +58,7 @@ where
             }
             WorkerState::LeaderReconciling | WorkerState::Leader => {
                 self.end_transfer_if_due();
-                self.drain_once_free();
+                self.hand_over_once_free();
                 if self.holds_office() {
                     self.report_lost_workers();
                 }

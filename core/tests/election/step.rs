@@ -12,8 +12,8 @@ use crate::support::builders::{
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    connect, deliver, finish_reconciling, stand_as_candidate, start_roll_call,
-    state_changes, tick,
+    connect, deliver, finish_reconciling, leader_of_three as committed_leader, stand_as_candidate,
+    start_roll_call, state_changes, tick,
 };
 use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input, Output, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
@@ -337,6 +337,52 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
     let ticked_in = tick_at_every_deadline(&mut confirmed, &clock, first, 50);
     assert_eq!(ticked_in[..2], [WorkerState::Leader, WorkerState::NoQuorum]);
 
+    // A leader handing its leadership to a voter that never stands, its
+    // voters confirming every deadline: a tick at the hand-over's end moves
+    // it on, so it grants again exactly a suspicion timeout after it began.
+    let mut handing_over = committed_leader(&clock, SUSPECT_TIMEOUT);
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let handed_at = clock.now();
+    let handed = handing_over.step(Input::TransferLeadership);
+    assert!(
+        handed
+            .outputs
+            .iter()
+            .any(|output| matches!(output, Output::TransferLeadership { .. })),
+        "setup invariant"
+    );
+    let mut deadline = handed.next_deadline;
+    let mut led_again_at = None;
+    for _ in 0..50 {
+        let Some(due) = deadline else { break };
+        // The voters heartbeat every few ticks, keeping the leader's lease
+        // while it hands over; the tick comes at its deadline.
+        let at = due.min(clock.now() + Duration::from_ticks(SUSPECT_TIMEOUT / 4));
+        clock.advance(at - clock.now());
+        for voter in [&p1, &p2] {
+            deadline = confirm(&mut handing_over, &clock, voter);
+        }
+        if deadline.is_some_and(|due| due > clock.now()) {
+            continue;
+        }
+        let ticked = handing_over.step(Input::Tick);
+        if ticked
+            .outputs
+            .iter()
+            .any(|output| matches!(output, Output::Grant(Some(_))))
+        {
+            led_again_at = Some(clock.now());
+            break;
+        }
+        deadline = ticked.next_deadline;
+    }
+    assert_eq!(
+        led_again_at,
+        Some(handed_at + Duration::from_ticks(SUSPECT_TIMEOUT)),
+        "it leads again when the hand-over lapses"
+    );
+    assert_eq!(handing_over.state(), WorkerState::Leader);
+
     // A lone voter elects itself at its roll call's deadline, and a lone
     // leader's lease never ends.
     let mut lone = node(&clock, &w1, std::slice::from_ref(&w1));
@@ -353,6 +399,21 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
     let led = finish_reconciling(&mut lone);
     assert_eq!(state_changes(&led), vec![WorkerState::Leader]);
     assert_eq!(lone.step(Input::Tick).next_deadline, None);
+}
+
+/// `voter`'s heartbeat confirming the ack `leader` sent it at this instant.
+fn confirm(leader: &mut TestNode, clock: &FakeClock, voter: &WorkerId) -> Option<Instant> {
+    let mut beat = heartbeat(
+        voter,
+        Some(AckEcho {
+            term: leader.term(),
+            send_token: clock.now().as_ticks(),
+        }),
+    );
+    beat.configuration_generation = leader
+        .configuration()
+        .map(|configuration| configuration.generation().into());
+    deliver_step(leader, voter, heartbeat_message(beat))
 }
 
 /// Hands `node` `message` from `from` and returns the deadline it reports.

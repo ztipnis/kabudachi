@@ -498,8 +498,14 @@ pub enum Input {
     /// to every connected peer, and end `Stopped`. From `Active` this happens
     /// at once. A `Leader` keeps leading until every other voter has reported
     /// a routing crawl since its admission, or `drain_wait_limit` has passed
-    /// (see [`ElectionTimings::drain_wait_limit`]), and then leaves; a leader
-    /// with no other voter leaves at once. From `Draining` or `Stopped` the request does
+    /// (see [`ElectionTimings::drain_wait_limit`]), and then hands its
+    /// leadership over to the voter that confirmed its acks last (see
+    /// [`Input::TransferLeadership`]). It leaves through the leader that
+    /// takes over once that leader vouches for hearing it, or, if none does
+    /// within a suspicion timeout of the hand-over, as it would alone. A
+    /// leader with no other voter to hand over to keeps leading, so a pending
+    /// member can be admitted and become one, until `drain_wait_limit` has
+    /// passed, and then leaves alone. From `Draining` or `Stopped` the request does
     /// nothing; from any other state, `Fenced` among them, the node keeps it and
     /// drains as soon as it reaches `Active`, `LeaderReconciling` or `Leader`,
     /// in the same step. A leader that loses office while it waits keeps the
