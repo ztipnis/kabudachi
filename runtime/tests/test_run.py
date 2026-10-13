@@ -22,7 +22,9 @@ from kabudachi import Durability, TaskStatus
 from kabudachi._native import RunState
 from kabudachi.errors import (
     DurabilityUnavailableError,
+    PayloadTooLargeError,
     RuntimeNotStartedError,
+    SerializationError,
     StartupError,
     TaskBodyError,
     TaskDefinitionError,
@@ -620,8 +622,6 @@ def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
 
 
 def test_an_input_larger_than_one_message_reaches_its_task_and_one_alone_past_the_hard_limit_is_refused():
-    from kabudachi.errors import PayloadTooLargeError, SerializationError
-
     @declare
     def measure(request: Greeting) -> Greeting:
         return Greeting(text=request.text[-5:], times=len(request.text))

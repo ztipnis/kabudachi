@@ -877,6 +877,8 @@ def test_memory_limits_default_to_a_quarter_and_a_half_of_available_memory_and_e
     assert Settings(memory_hard_limit=GIB).memory_soft_limit == GIB, "a lower hard limit lowers the default soft one"
     with pytest.raises(ValueError, match="soft"):
         Settings(memory_soft_limit=4 * GIB + 1)
+    with pytest.raises(ConfigurationError, match="soft"):
+        Configuration().configure(memory_soft_limit=4 * GIB + 1)
 
 
 @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "big"])

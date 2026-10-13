@@ -203,8 +203,11 @@ impl NativeRuntime {
     /// the task does not fit under the hard memory limit, is too large to be
     /// claimed (about 1 MiB with its queue and key), or, transiently, its
     /// coalescing key's newest generation is not yet known to the scheduler
-    /// (submit again shortly), and `RuntimeError` if the runtime has shut
-    /// down. Before this worker leads the task is queued and its id returned
+    /// (submit again shortly), `BackpressureError` as well, though submitting
+    /// again will not help, if the task's input alone is past the hard memory
+    /// limit (the session refuses that first with `PayloadTooLargeError`, so
+    /// only a caller of this method directly reaches it), and `RuntimeError`
+    /// if the runtime has shut down. Before this worker leads the task is queued and its id returned
     /// at once; it is recorded, in order, when the worker comes to lead. A
     /// task whose record cannot yet fit stays queued, with everything behind
     /// it, until the generation it supersedes ends, and no error is raised
@@ -224,8 +227,11 @@ impl NativeRuntime {
                     | SubmitRejection::Backpressure { .. }
                     | SubmitRejection::KeyNotReady
                     | SubmitRejection::KeyBackpressure { .. }
-                    // The session's own pre-check runs first, so a payload past the
-                    // hard memory limit is normally refused before it reaches here.
+                    // The session checks a payload against the hard memory limit
+                    // first and raises `PayloadTooLargeError`, so this arm is
+                    // reached only by a caller that submits to the runtime
+                    // directly. It is not transient, but the native layer has no
+                    // such error of its own to raise.
                     | SubmitRejection::PayloadTooLarge { .. } => {
                         errors::backpressure_error(py, rejection.to_string())
                     }
