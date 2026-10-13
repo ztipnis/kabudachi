@@ -570,6 +570,7 @@ impl<'n> Executing<'n> {
                     task_run_id: Some(run.into()),
                     result_digest: Some(digest.into()),
                     delivered,
+                    continuation: None,
                 })
             }
             Report::Failed { run, reason, message } => {

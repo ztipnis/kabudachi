@@ -301,7 +301,7 @@ pub(super) fn task_named<C: Clock, I: IdGenerator>(
         task_request::Request::Compacted(report) => of_run(&report.task_run_id),
         task_request::Request::Lost(report) => of_run(&report.task_run_id),
         task_request::Request::QueryOutcome(query) => query.task_id.clone().map(TaskId::from),
-        task_request::Request::Place(_) => None,
+        task_request::Request::Place(_) | task_request::Request::SubmitComposite(_) => None,
     }
 }
 

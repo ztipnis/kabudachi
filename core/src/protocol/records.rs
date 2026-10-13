@@ -105,6 +105,8 @@ pub fn new_task(new: NewTask) -> Task {
         trace_parent: new.trace.trace_parent,
         trace_state: new.trace.trace_state,
         baggage: new.trace.baggage,
+        composite_id: None,
+        composite_index: 0,
     }
 }
 
@@ -145,6 +147,7 @@ pub fn first_attempt(
         claimed_at: None,
         started_at: None,
         failure_message: String::new(),
+        continuation: None,
     }
 }
 
@@ -170,6 +173,7 @@ pub fn retry_of(failed: &TaskRun, ids: &impl IdGenerator, at: WallTime) -> TaskR
         claimed_at: None,
         started_at: None,
         failure_message: String::new(),
+        continuation: None,
     }
 }
 

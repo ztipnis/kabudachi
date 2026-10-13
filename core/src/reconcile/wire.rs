@@ -91,6 +91,7 @@ impl From<&ReportedRun> for generated::ReportedRun {
                 }
             ),
             failure_message,
+            continuation: None,
         }
     }
 }
@@ -132,6 +133,8 @@ impl From<&HeldKey> for generated::HeldKey {
                 .as_ref()
                 .map(|coalescing| coalescing.definition.clone().into()),
             coalescing_key: key.coalescing.as_ref().map(|coalescing| coalescing.key.clone()),
+            composite_id: None,
+            page: None,
         }
     }
 }

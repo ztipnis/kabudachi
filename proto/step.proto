@@ -1,0 +1,96 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+import "blob.proto";
+
+// What a composite does with its members.
+enum CompositeKind {
+  COMPOSITE_KIND_UNSPECIFIED = 0;
+  // Stages run one after another, each on the result of the one before.
+  COMPOSITE_KIND_FLOW = 1;
+  // Members run side by side, each on the composite's input.
+  COMPOSITE_KIND_GROUP = 2;
+  // One task per item of a list, run as a group whose results keep the
+  // items' order. Its members are bound to the items, or it has one member
+  // that takes its input, a list another stage returned, which an expansion
+  // run splits into one member per item.
+  COMPOSITE_KIND_MAP = 3;
+  COMPOSITE_KIND_REDUCE = 4;
+}
+
+enum OnError {
+  ON_ERROR_UNSPECIFIED = 0;
+  // The first member that fails for good fails the composite. Members still
+  // running are left to finish, and what they end with is ignored.
+  ON_ERROR_FAIL_FAST = 1;
+  // Every member runs to its end, and a failed member's entry of the
+  // results is its failure.
+  ON_ERROR_COLLECT_ALL = 2;
+}
+
+// A composite as its submitter described it. It is encoded the same way
+// every time it is built the same way, so the BLAKE3 digest of its encoding
+// names it. Field 5 is left for reduce options.
+message StepDescription {
+  CompositeKind kind = 1;
+  OnError on_error = 2;
+  // A flow's stages, or a group's or map's members, in order.
+  repeated StageDescription stages = 3;
+}
+
+message StageDescription {
+  oneof step {
+    BoundTaskStep task = 1;
+    // A stage or member that is itself a composite: a child composite.
+    StepDescription composite = 2;
+  }
+}
+
+// One task to run, with as much of its input as the submitter fixed.
+message BoundTaskStep {
+  TaskDefinitionId definition = 1;
+  uint32 version = 2;
+  TaskOptions options = 3;
+  // Neither set: the step takes the input it is given (the composite's
+  // input, or the previous stage's result) as it is.
+  oneof input {
+    // The whole input, encoded by the task's own serializer.
+    bytes value = 4;
+    // The whole input, too large for one frame, as chunks.
+    Manifest value_manifest = 5;
+  }
+  // Fields set on a copy of the input the step is given; only for an input
+  // that is a protobuf message, never with `input` set. Sorted by name.
+  repeated BoundField fields = 6;
+}
+
+// What a member Task is submitted with, besides its input.
+message TaskOptions {
+  string queue = 1;
+  uint32 max_retries = 2;
+  bool ephemeral = 3;
+  bool non_retriable = 4;
+  // Zero: the shard's default.
+  uint64 reconnect_timeout_ms = 5;
+}
+
+// One scalar field of a protobuf message input, as its submitter bound it.
+message BoundField {
+  string name = 1;
+  oneof value {
+    sint64 int_value = 2;
+    uint64 uint_value = 3;
+    double double_value = 4;
+    bool bool_value = 5;
+    string string_value = 6;
+    bytes bytes_value = 7;
+  }
+}
+
+// Where one step of a reduce sits. Level 0 folds items (a chain's step, or
+// a tree's chunk); a higher level combines two results of the level below.
+message ReduceNode {
+  uint32 level = 1;
+  uint64 position = 2;
+}

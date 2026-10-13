@@ -4,6 +4,7 @@ package kabudachi;
 import "blob.proto";
 import "digest.proto";
 import "ids.proto";
+import "step.proto";
 
 enum TaskRunState {
   TASK_RUN_STATE_UNSPECIFIED = 0;
@@ -83,6 +84,10 @@ message Task {
   string trace_parent = 22;
   string trace_state = 23;
   string baggage = 24;
+  // Set on a stage or member of a composite: which composite, and which of
+  // its stages or members this task is.
+  CompositeId composite_id = 19;
+  uint64 composite_index = 20;
 }
 
 // The front of a coalescing key's waiting chain a compaction run folds: each
@@ -129,4 +134,8 @@ message TaskRun {
   // The error's message, cut to at most 1 KiB, never its traceback. Empty
   // unless the run is FAILED.
   string failure_message = 15;
+  // Set on a SUCCEEDED run that returned a step: the step, which runs as
+  // the task's continuation. Written in the revision that certifies the
+  // run, so storing that revision commits the continuation with it.
+  StepDescription continuation = 18;
 }

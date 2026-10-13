@@ -5,6 +5,7 @@ import "digest.proto";
 import "blob.proto";
 import "ids.proto";
 import "task.proto";
+import "composite.proto";
 
 // `/kabudachi/result/1`: how a task's result reaches its client, the worker
 // that submitted the task and awaits it. The worker that ran the task
@@ -70,5 +71,6 @@ message ResultMessage {
     ResultCertified certified = 3;
     CertifiedAck certified_ack = 4;
     OutcomeAnswer concluded = 5;
+    CompositeFinished composite_finished = 10;
   }
 }

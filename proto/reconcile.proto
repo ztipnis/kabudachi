@@ -6,6 +6,7 @@ import "ids.proto";
 import "claim.proto";
 import "task_record.proto";
 import "election.proto";
+import "step.proto";
 
 // A new leader asks each worker of its shard what it holds before it
 // schedules anything. A worker answers in pages, each within one message:
@@ -20,6 +21,9 @@ message ReconcileRequest {
   oneof after {
     TaskRunId after_run = 4;
     TaskId after_key = 5;
+    // The kad key of the last record of the previous page, for a page that
+    // ended on a composite record or page.
+    bytes after_record = 8;
   }
   // Only the runs, no records: the leader asks this when the runs it
   // believes a worker holds differ from what the worker's heartbeats say.
@@ -46,6 +50,9 @@ message HeldKey {
   // leader that cannot read this record can still tell which key it belongs to.
   TaskDefinitionId task_definition_id = 7;
   optional string coalescing_key = 8;
+  // A composite record, or with `page` one page of it (`task_id` unset).
+  CompositeId composite_id = 9;
+  optional uint32 page = 10;
 }
 
 enum ReportedRunState {
@@ -72,6 +79,8 @@ message ReportedRun {
   bool delivered = 7;
   // For a failed run: the error's message (see `ReportFailed.failure_message`).
   string failure_message = 6;
+  // With REPORTED_RUN_SUCCEEDED: the step the run returned.
+  StepDescription continuation = 5;
 }
 
 message ReconcileReport {

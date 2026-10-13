@@ -112,6 +112,42 @@ id_newtype!(
     CompositeId
 );
 
+impl CompositeId {
+    /// The id of the Task that is member (or stage) `index` of this
+    /// composite. It is derived rather than minted, so a leader that takes
+    /// over and drives the composite again makes the same Task, which it
+    /// finds already recorded, and never a second one.
+    pub fn member_task(&self, index: u64) -> TaskId {
+        TaskId::new(derived_id("member", self.as_str(), index))
+    }
+
+    /// The id of the composite that member `index` of this one is, when the
+    /// member is itself a composite. Derived for the same reason.
+    pub fn child(&self, index: u64) -> CompositeId {
+        CompositeId::new(derived_id("child", self.as_str(), index))
+    }
+
+    /// The id of the composite that the step `run` returned becomes. The
+    /// worker's report and a later leader's reconciliation both name it
+    /// without asking anyone.
+    pub fn continuation_of(run: &TaskRunId) -> CompositeId {
+        CompositeId::new(derived_id("continuation", run.as_str(), 0))
+    }
+}
+
+/// The first 32 hex digits of BLAKE3 over `tag`, `parent` and `index`, each
+/// length-prefixed so no two inputs run together: short, the same on every
+/// worker, and free of `/`, which composite record keys use.
+fn derived_id(tag: &str, parent: &str, index: u64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in [tag.as_bytes(), parent.as_bytes()] {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    hasher.update(&index.to_be_bytes());
+    hasher.finalize().to_hex()[..32].to_owned()
+}
+
 /// Mints the IDs of new Tasks and TaskRuns. Clients and workers mint IDs
 /// independently, so an implementation must never hand out the same ID twice,
 /// even across processes.
@@ -120,9 +156,18 @@ id_newtype!(
 /// overhead reserve counts on it, so that a task admitted within
 /// `MAX_SUBMISSION_BYTES` always fits one claim message. The scheduler checks
 /// every ID it mints and panics on a longer one.
+///
+/// A task ID must not contain `/`: record keys use it to tell composite
+/// records from Task records.
 pub trait IdGenerator {
     fn next_task_id(&self) -> TaskId;
     fn next_task_run_id(&self) -> TaskRunId;
+
+    /// A new composite ID; by default a fresh task ID's text, which no task
+    /// ever gets.
+    fn next_composite_id(&self) -> CompositeId {
+        CompositeId::new(self.next_task_id().as_str())
+    }
 }
 
 /// The longest a generated task or run ID may be, in bytes. A UUID is 36.

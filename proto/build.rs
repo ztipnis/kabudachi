@@ -1,6 +1,7 @@
-const PROTO_FILES: [&str; 12] = [
+const PROTO_FILES: [&str; 14] = [
     "blob.proto",
     "claim.proto",
+    "composite.proto",
     "digest.proto",
     "election.proto",
     "ids.proto",
@@ -8,6 +9,7 @@ const PROTO_FILES: [&str; 12] = [
     "reconcile.proto",
     "result.proto",
     "steal.proto",
+    "step.proto",
     "task.proto",
     "task_exchange.proto",
     "task_record.proto",

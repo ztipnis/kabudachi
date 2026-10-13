@@ -84,6 +84,7 @@ mod backlog;
 mod cancel;
 mod claims;
 mod compaction;
+pub mod composite;
 mod deadlines;
 mod failures;
 mod fairness;

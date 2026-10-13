@@ -6,6 +6,8 @@ import "digest.proto";
 import "ids.proto";
 import "task.proto";
 import "result.proto";
+import "step.proto";
+import "composite.proto";
 
 // A worker asks its shard's leader to record a task, or tells it what
 // became of a run it claimed. Only the leader decides; a worker that is not
@@ -57,6 +59,9 @@ message ReportCompleted {
   Digest result_digest = 2;
   // The result reached its task's client first.
   bool delivered = 3;
+  // Set when the run returned a step: the step to run as its continuation,
+  // committed with this certification. `result_digest` is its digest.
+  StepDescription continuation = 4;
 }
 
 message ReportFailed {
@@ -81,8 +86,10 @@ message ReportLost {
   TaskRunId task_run_id = 1;
 }
 
+// Cancels a task, or with `composite_id` a composite; exactly one is set.
 message CancelTask {
   TaskId task_id = 1;
+  CompositeId composite_id = 2;
 }
 
 // Where the leader would place each of these records now, the asker left out:
@@ -90,6 +97,8 @@ message CancelTask {
 // over. Decides nothing, so a leader answers it without gating.
 message PlaceRecords {
   repeated TaskId task_ids = 1;
+  // Composite records and pages, by their record keys (the kad key bytes).
+  repeated bytes record_keys = 2;
 }
 
 message TaskRequest {
@@ -103,6 +112,7 @@ message TaskRequest {
     ReportCompacted compacted = 7;
     ReportLost lost = 8;
     QueryOutcome query_outcome = 9;
+    SubmitComposite submit_composite = 10;
   }
 }
 
@@ -133,6 +143,8 @@ enum TaskRejectReason {
   // The task's whole input is larger than the shard takes. Nothing of the
   // request took effect; asking again is refused again.
   TASK_REJECT_PAYLOAD_TOO_LARGE = 12;
+  // The composite a request names is over.
+  TASK_REJECT_COMPOSITE_FINISHED = 11;
 }
 
 message TaskReject {
@@ -199,6 +211,8 @@ message PlacedKey {
   // among the holders, where `holders` is the real placement. A writer of
   // blobs stores them there, and keeps its own copy only then.
   PlacedWithAsker with_asker = 4;
+  // Set instead of `task_id` for a composite record or page: its record key.
+  bytes record_key = 5;
 }
 
 message PlacedWithAsker {
@@ -222,5 +236,6 @@ message TaskResponse {
     CompactionApplied compaction = 8;
     RunLost lost = 9;
     OutcomeAnswer outcome = 10;
+    CompositeAccepted composite = 11;
   }
 }

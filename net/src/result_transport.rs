@@ -91,7 +91,7 @@ impl ResultEvent {
                 },
                 wrapped(Message::CertifiedAck(CertifiedAck {})),
             )),
-            Message::Delivered(_) | Message::CertifiedAck(_) => None,
+            Message::Delivered(_) | Message::CertifiedAck(_) | Message::CompositeFinished(_) => None,
         }
     }
 }

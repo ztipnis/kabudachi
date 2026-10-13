@@ -168,6 +168,7 @@ impl Net {
             task_run_id: Some(run.into()),
             result_digest: Some(result_digest.into()),
             delivered: false,
+            continuation: None,
         }))
         .await
     }
@@ -297,7 +298,8 @@ impl Net {
             Request::Submit(_)
             | Request::Cancel(_)
             | Request::Place(_)
-            | Request::QueryOutcome(_) => {}
+            | Request::QueryOutcome(_)
+            | Request::SubmitComposite(_) => {}
         }
     }
 
@@ -309,6 +311,7 @@ impl Net {
     ) -> Result<TaskResponse, TaskFailure> {
         let request = task_request::Request::Cancel(CancelTask {
             task_id: Some(task.into()),
+            composite_id: None,
         });
         self.ask_task(leader, request).await
     }
@@ -337,6 +340,7 @@ impl Net {
     ) -> Result<TaskResponse, TaskFailure> {
         let request = task_request::Request::Place(PlaceRecords {
             task_ids: tasks.into_iter().map(Into::into).collect(),
+            record_keys: Vec::new(),
         });
         self.ask_task(leader, request).await
     }
@@ -509,6 +513,7 @@ impl Net {
     pub async fn cancel_at_leader(&self, task: TaskId, retry: LeaderRetry) -> Option<TaskResponse> {
         let request = task_request::Request::Cancel(CancelTask {
             task_id: Some(task.into()),
+            composite_id: None,
         });
         self.ask_until_decided(request, retry).await
     }
@@ -689,6 +694,8 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Cancel(request) => cancel(scheduler, request),
         // Where records go is the driver's to say: it alone knows the voters.
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
+        // Composites are not driven by this leader yet.
+        Request::SubmitComposite(_) => Err(TaskRejectReason::TaskRejectMalformed),
         Request::QueryOutcome(query) => query_outcome(scheduler, query),
     };
     match result {
@@ -834,7 +841,11 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
         Request::Failed(report) => &report.task_run_id,
         Request::Compacted(report) => &report.task_run_id,
         Request::Lost(report) => &report.task_run_id,
-        Request::Submit(_) | Request::Cancel(_) | Request::Place(_) | Request::QueryOutcome(_) => {
+        Request::Submit(_)
+        | Request::Cancel(_)
+        | Request::Place(_)
+        | Request::QueryOutcome(_)
+        | Request::SubmitComposite(_) => {
             return None;
         }
     };
@@ -886,6 +897,7 @@ pub(crate) fn placements(
                 holders: holders.into_iter().map(Into::into).collect(),
                 quorum: u32::try_from(quorum).unwrap_or(u32::MAX),
                 with_asker,
+                record_key: Vec::new(),
             })
         })
         .collect();
