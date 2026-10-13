@@ -351,3 +351,18 @@ py_test(
         "@pypi//pytest",  # keep
     ],
 )
+
+# The result backend contract runs against a Python object through a
+# test-only extension (//bindings/contract), which Gazelle cannot see.
+# gazelle:resolve py _kabudachi_contract //bindings/contract
+py_test(
+    name = "test_result_backend",
+    srcs = ["test_result_backend.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//bindings/contract",  # keep
+        "@pypi//pytest",  # keep
+    ],
+)

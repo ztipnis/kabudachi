@@ -1634,6 +1634,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kabudachi-contract-extension"
+version = "0.1.0"
+dependencies = [
+ "kabudachi-core",
+ "kabudachi-py-result-backend",
+ "kabudachi-testkit",
+ "pyo3",
+]
+
+[[package]]
 name = "kabudachi-core"
 version = "0.1.0"
 dependencies = [
@@ -1674,6 +1684,14 @@ dependencies = [
  "prost-build",
  "prost-types",
  "protox",
+]
+
+[[package]]
+name = "kabudachi-py-result-backend"
+version = "0.1.0"
+dependencies = [
+ "kabudachi-core",
+ "pyo3",
 ]
 
 [[package]]
