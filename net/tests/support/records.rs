@@ -1002,8 +1002,8 @@ pub fn finished_count_heard_by(client: &Net) -> FinishesHeard<'_> {
 }
 
 impl<'n> FinishesHeard<'n> {
-    /// Keeps listening until `count` finishes were heard, then waits out a
-    /// moment more for a repeated one.
+    /// Keeps listening until `count` finishes were heard, then waits a
+    /// bounded moment more for a repeated one.
     pub async fn until(mut self, count: usize) -> FinishesHeard<'n> {
         loop {
             self.take();
@@ -1012,7 +1012,7 @@ impl<'n> FinishesHeard<'n> {
             }
             self.client.result_arrived().await;
         }
-        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        tokio::time::sleep(StdDuration::from_millis(150)).await;
         self.take();
         self
     }

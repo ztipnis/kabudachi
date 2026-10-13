@@ -1,7 +1,7 @@
 //! What a leader may tell of a task while its record writes are in flight.
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
-use kabudachi_core::protocol::ids::TaskId;
+use kabudachi_core::protocol::ids::{CompositeId, TaskId};
 use kabudachi_core::task_record::{EffectGate, RecordKey, RecordVersion, Waits, Write, WriteLedger};
 
 fn write(task: &str, revision: u64) -> Write {
@@ -29,6 +29,44 @@ fn a_task_waits_on_its_own_pending_writes_until_they_settle() {
     ledger.settled(&write("a", 0), true, true);
     assert_eq!(waits_on(&ledger, "a"), Waits::Writes(vec![]));
     assert_eq!(waits_on(&ledger, "b"), Waits::Writes(vec![write("b", 0)]));
+}
+
+fn page_write(composite: &str, page: u32, revision: u64) -> Write {
+    Write {
+        key: RecordKey::Page(CompositeId::new(composite), page),
+        version: RecordVersion {
+            recovery_epoch: RecoveryEpoch::new(0, 0),
+            leader_term: 1,
+            revision,
+        },
+    }
+}
+
+fn composite_write(composite: &str, revision: u64) -> Write {
+    Write { key: RecordKey::Composite(CompositeId::new(composite)), ..page_write(composite, 0, revision) }
+}
+
+#[test]
+fn a_composite_waits_on_its_pages_writes_as_well_as_its_own_but_not_another_composites() {
+    let mut ledger = WriteLedger::default();
+    ledger.made(&[composite_write("c", 0), page_write("c", 0, 0), page_write("other", 0, 0)]);
+    let composite = RecordKey::Composite(CompositeId::new("c"));
+
+    ledger.settled(&composite_write("c", 0), true, true);
+    assert_eq!(ledger.waits_on(&composite), Waits::Writes(vec![page_write("c", 0, 0)]));
+
+    ledger.settled(&page_write("c", 0, 0), true, true);
+    assert_eq!(ledger.waits_on(&composite), Waits::Writes(vec![]));
+}
+
+#[test]
+fn a_composite_whose_page_write_was_refused_is_gated() {
+    let mut ledger = WriteLedger::default();
+    ledger.made(&[composite_write("c", 0), page_write("c", 0, 0)]);
+    ledger.settled(&composite_write("c", 0), true, true);
+    ledger.settled(&page_write("c", 0, 0), false, true);
+
+    assert_eq!(ledger.waits_on(&RecordKey::Composite(CompositeId::new("c"))), Waits::Refused);
 }
 
 #[test]

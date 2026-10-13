@@ -100,16 +100,27 @@ impl WriteLedger {
     }
 
     /// What an answer about `record` that made no write of its own waits on.
+    /// A composite's answer also waits on its pages: they are the same
+    /// call's terminal records, so what it tells must not outrun them.
     pub fn waits_on(&self, record: &RecordKey) -> Waits {
-        if self.refused.iter().any(|write| write.key == *record) {
+        if self.refused.iter().any(|write| covered_by(&write.key, record)) {
             return Waits::Refused;
         }
         Waits::Writes(
             self.pending
                 .iter()
-                .filter(|write| write.key == *record)
+                .filter(|write| covered_by(&write.key, record))
                 .cloned()
                 .collect(),
         )
+    }
+}
+
+/// Whether a write of `written` is part of what an answer about `record`
+/// tells: the record itself, or, for a composite, one of its pages.
+fn covered_by(written: &RecordKey, record: &RecordKey) -> bool {
+    match (written, record) {
+        (RecordKey::Page(page_of, _), RecordKey::Composite(composite)) => page_of == composite,
+        _ => written == record,
     }
 }
