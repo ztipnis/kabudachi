@@ -105,6 +105,7 @@ py_test(
         "//runtime/tests:proto_messages",
         "//runtime/tests:session_world",
         "@pypi//hypothesis",  # keep
+        "@pypi//pydantic",
         "@pypi//pytest",  # keep
     ],
 )

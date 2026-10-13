@@ -13,13 +13,14 @@ import inspect
 import json
 import re
 import threading
+import types
 import typing
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, Final, TypeVar
 
 from kabudachi.config import UNSET, Unset
-from kabudachi.errors import SerializationError
+from kabudachi.errors import SerializationError, TaskFailure
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -339,6 +340,101 @@ def default_compatibility(
         return family is None and wanted is None
     planned = schemas.plan(family, schemas.version_of(produced), schemas.version_of(consumed))
     return isinstance(planned, Runnable)
+
+
+# --- what a step in a composition gives the next one -------------------------
+
+
+@dataclass(frozen=True)
+class Value:
+    """One task's output, of `value_type` encoded by the serializer named `serializer`."""
+
+    value_type: Any
+    serializer: str
+
+
+@dataclass(frozen=True)
+class Items:
+    """A list of results of different steps, one entry each, in order: a
+    flow's or group's output."""
+
+    entries: tuple["OutputShape", ...]
+
+
+@dataclass(frozen=True)
+class Each:
+    """A list whose every item has the shape `item`: a map's output."""
+
+    item: "OutputShape"
+
+
+@dataclass(frozen=True)
+class Either:
+    """An entry that is one of `options`: a result, or the failure that took
+    its place under `collect_all`."""
+
+    options: tuple["OutputShape", ...]
+
+
+class _Unknown:
+    def __repr__(self) -> str:
+        return "UNKNOWN"
+
+
+UNKNOWN: Final = _Unknown()
+"""A shape nothing is checked against, such as what a task that returns a step gives."""
+
+OutputShape = Value | Items | Each | Either | _Unknown
+
+_ANYTHING = (Any, object, list)
+
+
+def fits(
+    shape: OutputShape, wanted: Any, wanted_serializer: str, serializers: Any
+) -> bool | None:
+    """Whether a step whose output is `shape` can feed a task that takes
+    `wanted`, which `wanted_serializer` carries. `serializers` is the registry
+    its backends are found in. `None` when it cannot be told, which callers
+    treat as a fit."""
+    if shape is UNKNOWN or wanted is None or any(wanted is anything for anything in _ANYTHING):
+        return None
+    if isinstance(shape, Either):
+        answers = [fits(option, wanted, wanted_serializer, serializers) for option in shape.options]
+        return False if False in answers else (None if None in answers else True)
+    if typing.get_origin(wanted) in (typing.Union, types.UnionType):
+        answers = [fits(shape, arm, wanted_serializer, serializers) for arm in typing.get_args(wanted)]
+        return True if True in answers else (None if None in answers else False)
+    if isinstance(shape, (Items, Each)):
+        if typing.get_origin(wanted) is not list:
+            return False
+        (item,) = typing.get_args(wanted) or (Any,)
+        entries = shape.entries if isinstance(shape, Items) else (shape.item,)
+        answers = [fits(entry, item, wanted_serializer, serializers) for entry in entries]
+        return False if False in answers else (None if None in answers else True)
+    return _value_fits(shape, wanted, wanted_serializer, serializers)
+
+
+def _value_fits(produced: Value, wanted: Any, wanted_serializer: str, serializers: Any) -> bool | None:
+    value_type = produced.value_type
+    if value_type is TaskFailure:
+        return isinstance(wanted, type) and issubclass(TaskFailure, wanted)
+    if value_type is wanted:
+        return True
+    if value_type in _ANYTHING:
+        return None
+    if isinstance(value_type, type) and isinstance(wanted, type) and issubclass(value_type, wanted):
+        return True
+    backends = [serializers.find(wanted_serializer), serializers.find(produced.serializer)]
+    for backend in backends:
+        if backend is not None:
+            answer = type_compatibility(backend, value_type, wanted)
+            if answer is not None:
+                return answer
+    consumer = backends[0]
+    if consumer is not None and produced.serializer != wanted_serializer and not consumer.supports(value_type):
+        # Bytes in the producer's format, which the consumer's backend cannot even hold.
+        return False
+    return None
 
 
 def can_migrate(serializer: Any) -> bool:

@@ -11,11 +11,12 @@ import pickle
 import threading
 from types import SimpleNamespace
 
+import pydantic
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from kabudachi import _native
+from kabudachi import _native, schemas
 from kabudachi._native import KabudachiError
 from kabudachi.body import fold_payloads
 from kabudachi.composites import INLINE_VALUE_BYTES, _batches
@@ -34,6 +35,7 @@ from kabudachi.errors import (
 )
 from kabudachi.flow import BoundTask, Flow, Group, flow, group
 from kabudachi.registry import TaskKind, TaskRegistry
+from kabudachi.schemas import SchemaRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session
 from kabudachi.tasks import Task
@@ -196,9 +198,145 @@ def test_a_flow_needs_at_least_one_stage_and_only_takes_tasks():
         flow("not a task")
 
 
-def test_stages_must_fit_together_by_type():
-    with pytest.raises(TaskDefinitionError, match="to_receipt"):
-        flow(declare(to_receipt), declare(shout))
+class OrderV1(pydantic.BaseModel):
+    text: str
+
+
+class OrderV2(pydantic.BaseModel):
+    text: str
+    priority: int = 0
+
+
+class OrderV3(pydantic.BaseModel):
+    text: str
+
+
+class RenamedV4(pydantic.BaseModel):
+    title: str
+
+
+def order_schemas() -> SchemaRegistry:
+    """Four classes as versions of one family, with an incompatible bump into the last."""
+    registry = SchemaRegistry()
+    registry.declare(OrderV1, version=1, family="shop.Order")
+    registry.declare(OrderV2, version=2, family="shop.Order")
+    registry.declare(OrderV3, version=3, family="shop.Order")
+    registry.declare(RenamedV4, version=4, family="shop.Order", migration=None)
+    return registry
+
+
+def greetings_of(request: Greeting) -> list[Greeting]:
+    return [request]
+
+
+def count(request: list[Greeting]) -> Receipt:
+    return Receipt(ok=bool(request))
+
+
+def tally(request: list[Receipt]) -> Receipt:
+    return Receipt(ok=bool(request))
+
+
+def anything(request: list) -> Receipt:
+    return Receipt(ok=bool(request))
+
+
+def outcomes(request: list[Greeting | TaskFailure]) -> Receipt:
+    return Receipt(ok=bool(request))
+
+
+def numbers_of(request: Greeting) -> list[Receipt]:
+    return [Receipt(ok=True)]
+
+
+def make_v1(request: OrderV1) -> OrderV1:
+    return request
+
+
+def take_v2(request: OrderV2) -> OrderV2:
+    return request
+
+
+def take_v3(request: OrderV3) -> OrderV3:
+    return request
+
+
+def take_v4(request: RenamedV4) -> RenamedV4:
+    return request
+
+
+# Backends other than protobuf: a union of a message and a failure is not a protobuf type.
+SERIALIZER_OF = {
+    make_v1: "pydantic",
+    take_v2: "pydantic",
+    take_v3: "pydantic",
+    take_v4: "pydantic",
+    anything: "pickle",
+    outcomes: "pickle",
+}
+
+
+def declare_with_serializer(function):
+    serializers = SerializerRegistry.with_defaults()
+    serializers.register(Pickle())
+    return Task(
+        function,
+        registry=TaskRegistry(),
+        serializers=serializers,
+        name=f"tests.{function.__name__}",
+        serializer=SERIALIZER_OF.get(function, "protobuf"),
+    )
+
+
+FIT_CASES = [
+    # (stages, a name the TypeError mentions, or None when the stages fit)
+    pytest.param(lambda d: (d(to_receipt), d(shout)), "to_receipt", id="a message of another family"),
+    pytest.param(lambda d: (d(shout), d(wrap)), None, id="the same type"),
+    pytest.param(lambda d: (d(to_receipt), group(d(shout))), "to_receipt", id="every group member is checked"),
+    pytest.param(lambda d: (group(d(shout), d(wrap)), d(count)), None, id="a group gives a list"),
+    pytest.param(
+        lambda d: (group(d(shout), d(to_receipt)), d(count)),
+        "to_receipt",
+        id="one member of another type",
+    ),
+    pytest.param(
+        lambda d: (group(d(shout), on_error="collect_all"), d(count)),
+        "TaskFailure",
+        id="collect_all may hold a failure",
+    ),
+    pytest.param(
+        lambda d: (group(d(shout), on_error="collect_all"), d(outcomes)), None, id="a consumer that takes failures"
+    ),
+    pytest.param(
+        lambda d: (group(d(shout), on_error="collect_all"), d(anything)), None, id="a bare list takes anything"
+    ),
+    pytest.param(lambda d: (d(greetings_of), d(shout).map), None, id="a map after a list of what it takes"),
+    pytest.param(
+        lambda d: (d(numbers_of), d(shout).map), "numbers_of", id="a map after a list of another type"
+    ),
+    pytest.param(lambda d: (d(greetings_of), d(shout).map, d(count)), None, id="a map gives a list"),
+    pytest.param(
+        lambda d: (d(greetings_of), d(shout).map, d(tally)), "shout", id="a map's items of another type"
+    ),
+    pytest.param(
+        lambda d: (flow(d(shout), d(to_receipt)), d(tally)), "shout", id="a nested flow's list of mixed types"
+    ),
+    pytest.param(lambda d: (d(make_v1), d(take_v3)), None, id="later versions of a family"),
+    pytest.param(lambda d: (d(take_v3), d(take_v2)), "take_v3", id="a downgrade"),
+    pytest.param(lambda d: (d(make_v1), d(take_v4)), "make_v1", id="across an incompatible bump"),
+    pytest.param(lambda d: (d(make_v1), d(shout)), "make_v1", id="another family and serializer"),
+]
+
+
+@pytest.mark.parametrize(("stages", "naming"), FIT_CASES)
+def test_a_composition_refuses_an_output_the_next_step_cannot_take(stages, naming, monkeypatch):
+    monkeypatch.setattr(schemas, "_process_schemas", order_schemas())
+
+    if naming is None:
+        flow(*stages(declare_with_serializer))
+    else:
+        with pytest.raises(TypeError, match=naming):
+            flow(*stages(declare_with_serializer))
 
 
 @pytest.mark.parametrize(
@@ -397,11 +535,6 @@ def test_a_group_needs_members_a_known_policy_and_only_takes_steps():
         group(declare(shout), on_error="ignore")
     with pytest.raises(TypeError):
         group(shout)
-
-
-def test_every_member_that_takes_the_prior_output_is_checked_against_it():
-    with pytest.raises(TaskDefinitionError, match="shout"):
-        flow(declare(to_receipt), group(declare(shout)))
 
 
 def test_fail_fast_leaves_the_other_members_running_like_asyncio_gather():
@@ -804,23 +937,6 @@ def test_groups_whose_members_fail_alike_are_each_given_their_own_member_error()
     assert (error_early.who, error_late.who) == ("early", "late")
 
 
-@pytest.mark.parametrize(("stage", "consumer"), [("map", "upper"), ("reduce", "chain_concat")])
-def test_a_map_or_reduce_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_takes(stage, consumer):
-    def numbers_of(text: str) -> list[int]:
-        return [1]
-
-    def not_a_list(text: str) -> str:
-        return text
-
-    world = reducing_world(numbers_of, not_a_list, upper, chain_concat)
-    step = getattr(world.tasks[consumer], stage)
-
-    with pytest.raises(TaskDefinitionError, match=consumer):
-        flow(world.tasks["numbers_of"], step)
-    with pytest.raises(TaskDefinitionError, match=consumer):
-        flow(world.tasks["not_a_list"], step)
-
-
 # --- backpressure -------------------------------------------------------
 
 # Bytes of serialized input. Past the soft limit the runtime raises SlowDown;
@@ -1208,6 +1324,25 @@ def test_a_returned_step_that_needs_an_input_is_refused_and_fails_the_run():
 
     run(with_events(world, body))
 
+    assert [e[0] for e in world.runtime.events][-1] == "fail"
+
+
+def test_a_returned_step_whose_stages_do_not_fit_fails_its_run_and_starts_nothing():
+    world = continuing_world(to_receipt)
+
+    def plan(request: Greeting) -> Flow:
+        # Built without flow(), so only the check at the continuation's commit can catch it.
+        return Flow([world.tasks["to_receipt"].bind(Greeting()), BoundTask(world.tasks["shout"].definition)])
+
+    planner = declare_planner(world, plan)
+
+    async def body():
+        with pytest.raises(TypeError, match="to_receipt"):
+            await world.session.submit(planner.definition, Greeting())
+
+    run(with_events(world, body))
+
+    assert started_runs(world) == 1, "no stage of the step started"
     assert [e[0] for e in world.runtime.events][-1] == "fail"
 
 

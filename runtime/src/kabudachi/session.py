@@ -989,6 +989,7 @@ class Session:
         for definition in step.definitions():
             if self._registry.get(definition.name) is None:
                 raise UnknownTaskError(f"this process has no task named {definition.name!r}")
+        step.check_types()
         tree = step.describe(self)
         if step.is_task:
             tree = ("flow", "fail_fast", [tree])
