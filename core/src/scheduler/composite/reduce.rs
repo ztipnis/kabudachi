@@ -13,7 +13,7 @@ use crate::time::{Clock, WallTime};
 use super::held::Composite;
 use super::{
     BoundInput, BoundStep, CompositeState, INLINE_VALUE_BYTES, ItemInput, MalformedStep, MemberOutcome, PAGE_ENTRIES,
-    StreamedMember,
+    SpilledValue, StreamedMember, spill_value,
 };
 
 /// The first page of a reduce's items; item `k` is on page
@@ -32,6 +32,19 @@ pub struct ReduceShape {
     /// The result before any item is folded: `Value` or `Chunked` (blobs the reduce owns). `None`: the
     /// first item is.
     pub initial: Option<BoundInput>,
+}
+
+impl ReduceShape {
+    /// The shape with a long inline initial value moved to `values`, after
+    /// the stages of the step that holds it.
+    pub(super) fn spill(self, values: &mut Vec<SpilledValue>) -> ReduceShape {
+        match self.initial {
+            Some(BoundInput::Value(bytes)) if bytes.len() > INLINE_VALUE_BYTES => {
+                ReduceShape { initial: Some(spill_value(bytes, values)), ..self }
+            }
+            _ => self,
+        }
+    }
 }
 
 /// Where one reduce step sits: level 0 folds items, a higher level combines two results below it.

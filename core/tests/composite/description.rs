@@ -294,6 +294,17 @@ fn a_large_step_spills_its_long_values_to_blobs_the_same_way_every_time_and_a_sm
         reduce: None,
     };
     assert_eq!(nested.spill().values, spilled.values);
+
+    // A large seeded reduce spills its initial value too, the same way every time.
+    let (mut seeded, _) = reduces();
+    seeded.reduce.as_mut().expect("a reduce has a shape").initial = Some(BoundInput::Value(long.clone()));
+    let spilled_reduce = seeded.clone().spill();
+    assert_eq!(spilled_reduce, seeded.spill(), "deterministic");
+    assert_eq!(spilled_reduce.values, [SpilledValue { bytes: long.clone() }]);
+    assert_eq!(
+        spilled_reduce.step.reduce.expect("still a reduce").initial,
+        Some(BoundInput::Chunked(Manifest::chunk(&long).manifest))
+    );
 }
 
 #[test]

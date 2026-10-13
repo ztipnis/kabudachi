@@ -613,7 +613,8 @@ impl Step {
 
     fn spill_into(self, values: &mut Vec<SpilledValue>) -> Step {
         let stages = self.stages.into_iter().map(|stage| stage.spill(values)).collect();
-        Step { stages, ..self }
+        let reduce = self.reduce.map(|shape| shape.spill(values));
+        Step { stages, reduce, ..self }
     }
 
     /// The BLAKE3 digest of the step's encoding: what a returning run's
