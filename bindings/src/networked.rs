@@ -395,8 +395,8 @@ impl NetworkedRuntime {
         })
     }
 
-    /// Takes no more runs: those handed over and not taken are reported
-    /// lost, later ones too, and a claim waiting resolves empty. The driver
+    /// Takes no more runs: those handed over and not taken, or still
+    /// being fetched, are reported lost, later ones too, and a claim waiting resolves empty. The driver
     /// may still hand over up to the places already offered; each is
     /// reported lost as it arrives.
     fn stop_taking(&self) {

@@ -108,8 +108,11 @@ def carried_as_blobs(cluster, leader):
     # worker runs it reads them back whole.
     follower = next(worker for worker in cluster.workers if worker is not leader)
     big = ("0123456789" * (3 * 1024 * 1024 // 10 + 1))[: 3 * 1024 * 1024]
-    measured = follower.submit("measure", text=big)
-    certified_once(cluster, measured, digest_of(measure, Greeting(text=big[-5:], times=len(big))))
+    # Three in a row: the in-flight share of a worker is 8 MiB, so a run that
+    # leaves its input counted on any path makes the third be refused.
+    for _ in range(3):
+        measured = follower.submit("measure", text=big)
+        certified_once(cluster, measured, digest_of(measure, Greeting(text=big[-5:], times=len(big))))
 
 
 def awaited_across_workers(cluster, leader):

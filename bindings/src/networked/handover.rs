@@ -95,17 +95,21 @@ impl Shared {
                 drop(seam);
                 return self.report(Report::Lost(claim.task_run_id));
             }
-            seam.resolving.insert(claim.task_run_id.clone());
+            let run = claim.task_run_id.clone();
+            let shared = Arc::clone(&self);
+            // Spawned under the lock, so the fetch cannot end before its
+            // handle is kept.
+            let fetch = tokio::spawn(async move {
+                let outcome = shared.fetch_input(&mut claim).await;
+                shared.finish_resolving(claim, outcome);
+            });
+            seam.resolving.insert(run, fetch.abort_handle());
         }
-        tokio::spawn(async move {
-            let outcome = self.fetch_input(&mut claim).await;
-            self.finish_resolving(claim, outcome);
-        });
     }
 
     /// Waits, still resolving, while other inputs fill this process's room:
-    /// a cancel or abort deadline meanwhile ends the run as before, and
-    /// `finish_resolving` then drops it. Puts the whole input in `claim`
+    /// a cancel or abort deadline meanwhile ends the run as before and
+    /// stops this, dropping the room it holds. Puts the whole input in `claim`
     /// and returns the room it takes, if its input travelled as blobs.
     async fn fetch_input(&self, claim: &mut Claim) -> Result<Option<Taken>, Resolving> {
         let manifest = match claim.input_manifest() {
@@ -133,8 +137,9 @@ impl Shared {
         let run = claim.task_run_id.clone();
         let report = {
             let mut seam = self.seam();
-            if !seam.resolving.remove(&run) {
-                // Cancelled, aborted or stopped meanwhile: already reported.
+            if seam.resolving.remove(&run).is_none() {
+                // Cancelled, aborted or stopped meanwhile: already reported
+                // (the fetch was stopped, unless it was already here).
                 return;
             }
             match outcome {
@@ -189,7 +194,7 @@ impl Seam {
     /// are still being fetched, is reported failed; one already ended needs
     /// nothing.
     fn take_back(&mut self, run: TaskRunId) -> Handled {
-        let unstarted = self.take_handed(&run) || self.resolving.remove(&run);
+        let unstarted = self.take_handed(&run) || self.stop_resolving(&run);
         match self.held.remove(&run) {
             Some(held) => {
                 self.events.push_back(PyEvent::networked(
@@ -211,7 +216,7 @@ impl Seam {
     /// yet taken, or still having its blobs fetched, never starts, so it is
     /// lost now; Python is told of one it holds.
     fn abort(&mut self, run: TaskRunId, deadline: StdInstant) -> Handled {
-        if self.take_handed(&run) || self.resolving.remove(&run) {
+        if self.take_handed(&run) || self.stop_resolving(&run) {
             return Handled::report(Report::Lost(run));
         }
         let Some(held) = self.held.get(&run) else {
@@ -237,6 +242,15 @@ impl Seam {
             run.as_str(),
         ));
         Handled::wake()
+    }
+
+    /// Stops the fetch of `run`'s blobs, which drops the room it holds;
+    /// whether it was being fetched.
+    fn stop_resolving(&mut self, run: &TaskRunId) -> bool {
+        self.resolving.remove(run).is_some_and(|fetch| {
+            fetch.abort();
+            true
+        })
     }
 
     /// Removes `run` from the runs not taken yet; whether it was there.

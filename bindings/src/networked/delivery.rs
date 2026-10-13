@@ -86,30 +86,29 @@ pub(super) async fn deliver(
         }
     }
     let answer = shared.net.submit_to_leader(submitted, shared.retry).await;
-    let event = answer.map(|response| match response.result {
+    // Out of its shard, no leader will answer: nothing is said, but a
+    // cancel waiting for this submission must not wait for ever.
+    let Some(response) = answer else {
+        shared.seam().delivering.remove(&task);
+        shared.wake();
+        return;
+    };
+    match response.result {
         Some(task_response::Result::Submitted(_)) => {
-            PyEvent::networked(PyEventKind::Accepted, task.as_str(), "")
+            {
+                let mut seam = shared.seam();
+                seam.delivering.remove(&task);
+                seam.events
+                    .push_back(PyEvent::networked(PyEventKind::Accepted, task.as_str(), ""));
+            }
+            shared.wake();
         }
         Some(task_response::Result::Reject(reject)) => match TaskRejectReason::try_from(reject.reason) {
-            Ok(reason) => PyEvent::refused(task.as_str(), reason.as_str_name()),
-            Err(_) => PyEvent::refused(task.as_str(), "a reason this worker cannot read"),
+            Ok(reason) => shared.refuse(&task, reason.as_str_name()),
+            Err(_) => shared.refuse(&task, "a reason this worker cannot read"),
         },
-        _ => PyEvent::refused(task.as_str(), "an answer that is not about a submission"),
-    });
-    let refused = event
-        .as_ref()
-        .is_some_and(|event| event.kind() == PyEventKind::Refused);
-    {
-        // Out of its shard, no leader will answer: nothing is said, but a
-        // cancel waiting for this submission must not wait for ever.
-        let mut seam = shared.seam();
-        seam.delivering.remove(&task);
-        if refused {
-            seam.awaiting.remove(&task);
-        }
-        seam.events.extend(event);
+        _ => shared.refuse(&task, "an answer that is not about a submission"),
     }
-    shared.wake();
 }
 
 /// Asks leaders to cancel `task` until one answers, once its own submission

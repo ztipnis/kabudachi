@@ -15,6 +15,7 @@ use kabudachi_net::task_exchange::LeaderRetry;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokio::sync::{Notify, watch};
+use tokio::task::AbortHandle;
 
 use super::observed::Observed;
 use crate::work::{PyClaim, PyEvent};
@@ -30,8 +31,8 @@ pub(super) struct Seam {
     pub(super) handed: VecDeque<Claim>,
     /// Runs handed over whose input's blobs are still being fetched: handed
     /// over as far as a cancel or an abort deadline is concerned, but not
-    /// yet takeable.
-    pub(super) resolving: BTreeSet<TaskRunId>,
+    /// yet takeable. Each holds the handle that stops its fetch.
+    pub(super) resolving: BTreeMap<TaskRunId, AbortHandle>,
     /// The inputs of runs handed over that travelled as blobs, counted in
     /// flight until each run ends.
     pub(super) inputs_in_flight: BTreeMap<TaskRunId, Taken>,
@@ -118,7 +119,7 @@ impl Shared {
                 return;
             }
             let free = u32::try_from(free).unwrap_or(u32::MAX);
-            let waiting = u32::try_from(seam.handed.len()).unwrap_or(u32::MAX);
+            let waiting = u32::try_from(seam.handed.len() + seam.resolving.len()).unwrap_or(u32::MAX);
             let more = free.saturating_sub(seam.offered.saturating_add(waiting));
             seam.offered += more;
             more
@@ -186,7 +187,10 @@ impl Shared {
                 .drain(..)
                 .map(|claim| claim.task_run_id)
                 .collect();
-            unstarted.extend(std::mem::take(&mut seam.resolving));
+            for (run, fetch) in std::mem::take(&mut seam.resolving) {
+                fetch.abort();
+                unstarted.push(run);
+            }
             unstarted
         };
         for run in unstarted {
