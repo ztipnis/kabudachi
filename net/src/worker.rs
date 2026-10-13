@@ -316,9 +316,10 @@ impl Worker {
     /// leadership over first and leaves through its successor; with no other
     /// voter it waits up to the drain wait limit for one. A worker with no
     /// leader leaves once that limit has passed, handing nothing over. A
-    /// leader that drains may spend the limit up to three times: once waiting
+    /// leader that drains may spend the limit up to four times: once waiting
     /// for its voters to crawl, once for its successor to vouch for hearing
-    /// it, and once handing its records over.
+    /// it, once handing its records over, and once flushing its last election
+    /// messages until they are answered.
     ///
     /// A node that fences itself and then finds its shard recovered without
     /// it goes back to `Bootstrapping`; the driver rejoins it through the

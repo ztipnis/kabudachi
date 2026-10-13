@@ -93,6 +93,7 @@ where
         }
         let now = self.clock.now();
         self.leader_draining = true;
+        self.handed_over_by = Some((from.clone(), asked.term));
         self.round.may_call_from(now);
         self.transition_to(WorkerState::LeaderSuspect);
         let timestamp_millis = self.clock.wall_clock_millis();

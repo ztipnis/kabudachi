@@ -94,7 +94,7 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
             }))
             .await;
         // The successor drops the old leader from its roster.
-        while shard.with(successor,|node, _| node.voters().len()).await != 2 {
+        while shard.with(successor, |node, _| node.voters().len()).await != 2 {
             shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
         }
     })

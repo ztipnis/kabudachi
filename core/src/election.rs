@@ -240,6 +240,11 @@ where
     /// Whether the newest ack this node accepted said its leader is handing
     /// over: that leader no longer counts as valid against a roll call.
     leader_draining: bool,
+    /// The leader and term that asked this node to take over, while the roll
+    /// call it started for that stays open: that leader's ordinary acks of
+    /// that term are ignored, so one it sent before it handed over and that
+    /// arrives after (on another stream) cannot end the call.
+    handed_over_by: Option<(WorkerId, u64)>,
     /// The admission generation this node held when its last routing crawl
     /// completed.
     crawled_at_admission: Option<Generation>,
@@ -354,12 +359,18 @@ pub struct ElectionTimings {
     /// while its worker still runs it. Usually
     /// [`Self::DEFAULT_RECONNECT_TIMEOUT`].
     pub reconnect_timeout: Duration,
-    /// The longest a leader asked to drain keeps leading while it waits for
-    /// every other voter to report a routing crawl since its admission (see
-    /// `WorkerHeartbeat::routing_crawled`). Leaving earlier can strand
-    /// workers that know no one but this leader; past this it leaves anyway,
-    /// so a voter that never reports cannot hold a shutdown up for ever.
-    /// Usually [`Self::DEFAULT_DRAIN_WAIT_SUSPICIONS`] suspicion timeouts.
+    /// The longest a draining worker waits at each step of leaving, so no
+    /// one that never answers can hold a shutdown up for ever. It bounds:
+    /// a leader's wait for every other voter to report a routing crawl since
+    /// its admission (see `WorkerHeartbeat::routing_crawled`; leaving earlier
+    /// can strand workers that know no one but this leader); its wait, once
+    /// it handed its leadership over, for the successor to vouch for hearing
+    /// it; a worker's wait for a leader when it has none; a leader's wait for
+    /// a voter to hand over to when it is the sole voter; the wait for the
+    /// records it holds to be stored or passed on; and the wait for its last
+    /// election messages to be answered (the flush). Each wait past this
+    /// gives way to the next step, so a leader that drains may spend it
+    /// several times over. Usually [`Self::DEFAULT_DRAIN_WAIT_SUSPICIONS`] suspicion timeouts.
     pub drain_wait_limit: Duration,
 }
 
@@ -501,12 +512,22 @@ pub enum Input {
     /// `drain_wait_limit` has passed (see
     /// [`ElectionTimings::drain_wait_limit`]), and then hands its leadership
     /// over to the voter that confirmed its acks last (see
-    /// [`Input::TransferLeadership`]). It leaves through the leader that
-    /// takes over once that leader vouches for hearing it, or, if none does
-    /// within a suspicion timeout of the hand-over, as it would alone. A
-    /// leader with no other voter to hand over to keeps leading, so a pending
-    /// member can be admitted and become one, until `drain_wait_limit` has
-    /// passed, and then leaves alone.
+    /// [`Input::TransferLeadership`]). Where it leaves from then depends on
+    /// what becomes of the hand-over:
+    ///
+    /// - It stays in office, no successor taking up the hand-over: it departs
+    ///   alone when the hand-over ends, a suspicion timeout after it began,
+    ///   whatever `drain_wait_limit` is.
+    /// - A successor takes office and the node, deposed, follows it: it
+    ///   leaves through that leader once the leader vouches for hearing it,
+    ///   or, if none does, `drain_wait_limit` after the hand-over began.
+    /// - The node ends up in `LeaderSuspect`, `RollCall` or `NoQuorum`
+    ///   without a leader: it leaves without one, at `drain_wait_limit` after
+    ///   the hand-over began.
+    ///
+    /// A leader with no other voter to hand over to keeps leading, so a
+    /// pending member can be admitted and become one, until `drain_wait_limit`
+    /// has passed, and then leaves alone.
     ///
     /// From `LeaderSuspect`, `RollCall` or `NoQuorum` the node keeps the
     /// request and drains as soon as it reaches `Active`, `LeaderReconciling`

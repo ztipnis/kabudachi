@@ -8,9 +8,20 @@
 //! admission, so no worker is left knowing only this leader, or until its
 //! drain wait limit passes, and then hands its leadership over. It leaves
 //! through the leader that takes over once that leader vouches for hearing
-//! it, or, if none does within the drain wait limit, without one. A leader
-//! that loses office while it waits keeps the request, and waits afresh once
-//! it leads again.
+//! it. What happens when the hand-over does not go through depends on where
+//! the node stands:
+//!
+//! - In office, with no successor having taken up the hand-over, it departs
+//!   alone when the hand-over ends, a suspicion timeout after it began,
+//!   whatever the drain wait limit is.
+//! - Deposed, following the successor, it leaves through it at the drain wait
+//!   limit after the hand-over began, if the successor has not vouched for
+//!   hearing it by then.
+//! - In `LeaderSuspect`, `RollCall` or `NoQuorum`, with no leader, it leaves
+//!   without one at that limit.
+//!
+//! A leader that loses office while it waits keeps the request, and waits
+//! afresh once it leads again.
 //!
 //! This part decides only when the node drains; the node carries the
 //! departure out.

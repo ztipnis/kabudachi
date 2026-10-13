@@ -391,7 +391,8 @@ pub mod prelude {
         ElectionRejectConfigurations, ElectionRejectIds, JoinResponseIds,
         LeaderHeartbeatAckConfigurations, LeaderHeartbeatAckIds, RollCallConfigurations,
         RollCallIds, RollCallReplyConfigurations, RollCallReplyIds, SelfRemoveConfigurations,
-        SelfRemoveIds, TaskIds, TaskRunIdentityIds, TransferLeadershipIds, VoteGrantIds, VoteRequestConfigurations,
-        VoteRequestIds, WorkerHeartbeatConfigurations, WorkerHeartbeatIds,
+        SelfRemoveIds, TaskIds, TaskRunIdentityIds, TransferLeadershipIds, VoteGrantIds,
+        VoteRequestConfigurations, VoteRequestIds, WorkerHeartbeatConfigurations,
+        WorkerHeartbeatIds,
     };
 }

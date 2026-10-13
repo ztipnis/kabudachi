@@ -63,7 +63,17 @@ where
     /// `ElectionRound::follow_leader_of`): the live leader disproved the
     /// suspicion they rested on, and that includes a node still `Active` whose
     /// stale contact no tick had yet acted on.
+    ///
+    /// A node that this ack's leader asked to take over its leadership
+    /// ignores that leader's other acks of that term for as long as the roll
+    /// call it started stays open: one sent before the hand-over, arriving
+    /// after it on another stream, would otherwise end the call.
     pub(super) fn on_leader_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>) {
+        if !ack.leader_draining
+            && self.handed_over_by.as_ref() == Some(&(ack.leader_id(), ack.term))
+        {
+            return;
+        }
         let Some(AckedEpoch { heard, later }) = self.acked_epoch(ack) else {
             return;
         };

@@ -150,6 +150,27 @@ fn the_voter_asked_to_stand_does_so_at_once_and_a_voter_that_heard_the_leader_ha
 }
 
 #[test]
+fn an_ordinary_ack_the_old_leader_sent_before_handing_over_does_not_end_the_roll_call_it_asked_for()
+ {
+    let clock = FakeClock::new();
+    let (a, b) = (worker("a"), worker("b"));
+    let configuration = configuration_of(3);
+    let mut target = voter_node(&clock, &b, 3, SUSPECT);
+    deliver(&mut target, &a, ack_message(leader_ack(&a, 1, &configuration, Some(g0()))));
+    deliver(&mut target, &a, transfer_message(&a, &b, 1));
+    assert_eq!(target.state(), WorkerState::RollCall, "setup invariant");
+
+    // On another stream, an ack sent before the hand-over arrives after it.
+    deliver(&mut target, &a, ack_message(leader_ack(&a, 1, &configuration, Some(g0()))));
+
+    assert_eq!(
+        target.state(),
+        WorkerState::RollCall,
+        "the old leader's earlier ack does not call the roll call off"
+    );
+}
+
+#[test]
 fn a_leader_handing_over_answers_and_grants_like_a_follower_and_steps_down_for_a_later_term() {
     let clock = FakeClock::new();
     let (a, b, c) = (worker("a"), worker("b"), worker("c"));

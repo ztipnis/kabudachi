@@ -344,6 +344,7 @@ impl<C: Clock> WorkerNode<C> {
             drain_request: DrainRequest::default(),
             transfer: None,
             leader_draining: false,
+            handed_over_by: None,
             crawled_at_admission: None,
             report: SelfReport::default(),
             cancelled_runs: CancelledRunsLedger::default(),
