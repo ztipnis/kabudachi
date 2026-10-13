@@ -685,3 +685,156 @@ def test_a_coalescing_submission_that_would_outgrow_one_claim_is_refused_and_the
 
     assert claimed.task_id == newest
     assert [len(payload) for payload in claimed.chain] == [chunk]
+
+
+# --- streamed composites and the step spill rule ---------------------------------------
+
+
+def streamed_map(native):
+    template = ("task", "tests.echo", 0, {"queue": "default"}, None, [])
+    return native.submit_composite(("map", "fail_fast", [template], "streamed"))
+
+
+def streamed_group(native):
+    return native.submit_composite(("group", "fail_fast", [], "streamed"))
+
+
+def test_a_streamed_map_makes_one_member_per_item_whatever_batches_name_an_item_again(runtime):
+    async def main():
+        await leader_within_limit(runtime)
+        composite = streamed_map(runtime)
+        assert await runtime.submit_members(composite, 0, [b"a", b"b"], False) == "accepted"
+        # Asked again after a lost answer, and overlapping the members held.
+        assert await runtime.submit_members(composite, 0, [b"a", b"b"], False) == "accepted"
+        assert await runtime.submit_members(composite, 1, [b"b", b"c"], True) == "accepted"
+        return await claim(runtime), await runtime.composite_status(composite)
+
+    claims, status = asyncio.run(main())
+
+    assert {claimed.composite_index: claimed.serialized_input for claimed in claims} == {
+        0: b"a",
+        1: b"b",
+        2: b"c",
+    }
+    assert len(claims) == 3
+    assert status[0] == "running"
+    assert sum(status[2:]) == 3
+
+
+def test_a_batch_for_a_cancelled_streamed_composite_answers_finished(runtime):
+    async def main():
+        await leader_within_limit(runtime)
+        composite = streamed_map(runtime)
+        assert await runtime.submit_members(composite, 0, [b"a"], False) == "accepted"
+        assert runtime.cancel_composite(composite) == CancelOutcome.CANCELLED
+        return await runtime.submit_members(composite, 1, [b"b"], True)
+
+    assert asyncio.run(main()) == "finished"
+
+
+@pytest.mark.parametrize(
+    ("make", "start", "members"),
+    [
+        pytest.param(streamed_map, 3, [b"a"], id="a gap"),
+        pytest.param(streamed_group, 0, [b"an item"], id="an item sent to a group"),
+        pytest.param(lambda native: native.submit_composite(one_stage_flow("tests.flow")), 0, [b"a"], id="a flow"),
+    ],
+)
+def test_a_batch_the_composite_cannot_take_is_refused_as_malformed(runtime, make, start, members):
+    async def main():
+        await leader_within_limit(runtime)
+        await runtime.submit_members(make(runtime), start, members, False)
+
+    with pytest.raises(ValueError):
+        asyncio.run(main())
+
+
+def test_a_batch_past_the_hard_limit_is_refused_whole_and_slow_down_follows_the_soft_limit():
+    # The composite's own description weighs a few tens of bytes.
+    native = new_runtime(memory_soft_limit=80, memory_hard_limit=150)
+    try:
+
+        async def main():
+            await leader_within_limit(native)
+            composite = streamed_map(native)
+            before = native.slow_down()
+            assert await native.submit_members(composite, 0, [b"a" * 60], False) == "accepted"
+            raised = native.slow_down()
+            with pytest.raises(_native.BackpressureError):
+                await native.submit_members(composite, 1, [b"b" * 30, b"c" * 30], False)
+            assert await native.submit_members(composite, 1, [b"d" * 20], True) == "accepted"
+            return before, raised, await claim(native)
+
+        before, raised, claims = asyncio.run(main())
+
+        assert (before, raised) == (False, True)
+        assert [claimed.serialized_input for claimed in claims] == [b"a" * 60, b"d" * 20]
+    finally:
+        native.shutdown()
+
+
+def test_a_streamed_member_that_cannot_fit_one_frame_is_refused_before_anything_is_sent(runtime):
+    # A bound field is structure: only the values a member binds whole are spilled.
+    first = ("task", "tests.first", 0, {"queue": "default"}, b"x", [])
+    second = ("task", "tests.second", 0, {"queue": "default"}, None, [("blob", "bytes", b"\0" * (2 * 1024 * 1024))])
+    member = ("flow", "fail_fast", [first, second])
+
+    async def main():
+        await leader_within_limit(runtime)
+        composite = streamed_group(runtime)
+        with pytest.raises(ValueError, match="one message"):
+            await runtime.submit_members(composite, 0, [member], True)
+        return await runtime.composite_status(composite)
+
+    status = asyncio.run(main())
+
+    assert sum(status[2:]) == 0
+
+
+@pytest.mark.parametrize(
+    ("size", "options", "own_blobs"),
+    [
+        pytest.param(1000, {}, False, id="under the batch bound"),
+        pytest.param(1000, {"inline_bytes": 500}, True, id="over the caller's bound"),
+        pytest.param(600 * 1024, {"inline_bytes": 10**9}, True, id="over the batch bound whatever the caller says"),
+    ],
+)
+def test_a_streamed_item_over_the_inline_bound_is_stored_as_blobs_its_member_reads_whole(
+    runtime, size, options, own_blobs
+):
+    item = b"i" * size
+
+    async def main():
+        await leader_within_limit(runtime)
+        composite = streamed_map(runtime)
+        assert await runtime.submit_members(composite, 0, [item], True, **options) == "accepted"
+        [claimed] = await claim(runtime)
+        return claimed, await runtime.resolve_input(claimed.task_run_id)
+
+    claimed, resolved = asyncio.run(main())
+
+    assert resolved == ([], ("input", item) if own_blobs else None)
+    assert (claimed.serialized_input == item) is (not own_blobs)
+
+
+@pytest.mark.parametrize(
+    ("members", "own_blobs"),
+    [
+        pytest.param(1, False, id="a step under the inline bound"),
+        pytest.param(3, True, id="a step over the inline bound"),
+    ],
+)
+def test_a_step_over_the_inline_bound_has_its_values_stored_as_blobs_and_a_small_one_keeps_them(
+    runtime, members, own_blobs
+):
+    value = b"v" * (100 * 1024)
+    stage = ("task", "tests.big", 0, {"queue": "default"}, value, [])
+
+    async def main():
+        await leader_within_limit(runtime)
+        runtime.submit_composite(("group", "fail_fast", [stage] * members))
+        return [await runtime.resolve_input(claimed.task_run_id) for claimed in await claim(runtime)]
+
+    resolved = asyncio.run(main())
+
+    assert resolved == [([], ("input", value) if own_blobs else None)] * members

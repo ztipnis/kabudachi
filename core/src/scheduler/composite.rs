@@ -397,6 +397,14 @@ pub struct MemberBatch {
     pub last: bool,
 }
 
+impl MemberBatch {
+    /// The length of the batch as it goes on the wire, which one message
+    /// must hold.
+    pub fn encoded_len(&self) -> u64 {
+        generated::SubmitMembers::from(self).encoded_len() as u64
+    }
+}
+
 /// What a leader answers a batch it took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MembersAccepted {

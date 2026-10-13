@@ -8,6 +8,7 @@ without importing `session`, which imports `task_table`.
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from kabudachi import _native
 from kabudachi._native import CancelOutcome, EventKind
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 
@@ -321,6 +322,34 @@ class Runtime(Protocol):
         `EventKind.COMPOSITE_FINISHED` event. Raises `ValueError` for a step
         the leader would not accept or one that takes an input, and
         `BackpressureError` past the hard memory limit."""
+
+    async def submit_members(
+        self,
+        composite_id: str,
+        start_index: int,
+        members: list[Any],
+        last: bool,
+        inline_bytes: int = _native.MEMBER_BATCH_BYTES,
+    ) -> Literal["accepted", "finished"]:
+        """Sends the members from `start_index` on of a streamed composite
+        (its head tree is `("group", on_error, [], "streamed")` or `("map",
+        on_error, [template], "streamed")`): a map's items, each its template's
+        whole input as `bytes`, or a group's members, each a stage tree as
+        `_native.describe_step` takes one. `last` says no member follows.
+        `"accepted"`: the composite holds them (a batch asked again changes
+        nothing). `"finished"`: the composite is over, send no more. A member
+        whose inline bytes pass `inline_bytes` (at most
+        `_native.MEMBER_BATCH_BYTES`) has its bound values stored as blobs.
+        Raises `BackpressureError` past the hard memory limit, with nothing
+        of the batch taken, and `ValueError` for a batch the composite cannot
+        take."""
+        ...
+
+    def slow_down(self) -> bool:
+        """Whether the runtime asks submitters to wait: memory in use is past
+        the soft limit and has not yet fallen back. A networked worker reads
+        what its leader last said."""
+        ...
 
     def cancel_composite(self, composite_id: str) -> CancelOutcome | None:
         """Cancels a composite and every member it has started; one still

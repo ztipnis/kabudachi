@@ -31,6 +31,10 @@ class FaultingRuntime:
         self.events = []
         self.submitted = []
         self.claimed = []
+        # (composite id, start index, member count) of each batch answered "accepted".
+        self.members_sent = []
+        # The `active` of each SLOW_DOWN event, as `next_events` hands it on.
+        self.slow_downs = []
         self.submit_options = []
         self.refuse_completion = False
         self.altered_digest = None
@@ -179,6 +183,7 @@ class FaultingRuntime:
         if self._native_events.done():
             events.extend(self._native_events.result())
             self._native_events = None
+        self.slow_downs.extend(event.active for event in events if event.kind == _native.EventKind.SLOW_DOWN)
         return events
 
     def report_started(self, task_run_id):
@@ -229,6 +234,17 @@ class FaultingRuntime:
 
     async def composite_status(self, composite_id):
         return await self.native.composite_status(composite_id)
+
+    async def submit_members(self, composite_id, start_index, members, last, inline_bytes=_native.MEMBER_BATCH_BYTES):
+        answer = await self.native.submit_members(
+            composite_id, start_index, members, last, inline_bytes=inline_bytes
+        )
+        if answer == "accepted":
+            self.members_sent.append((composite_id, start_index, len(members)))
+        return answer
+
+    def slow_down(self):
+        return self.native.slow_down()
 
     async def store_result(self, task_id, data):
         if self.store_gives_up > 0:

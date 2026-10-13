@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, MAX_BLOB_BYTES};
-use kabudachi_core::manifest::{INLINE_PAYLOAD_BYTES, Manifest, fits_inline};
+use kabudachi_core::manifest::{Manifest, fits_inline};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, Uuid7Ids};
 use kabudachi_core::protocol::messages::Task;
@@ -80,7 +80,7 @@ use crate::arguments::SubmitArguments;
 use crate::bridge::CLOSED_MESSAGE;
 use crate::composite::{
     CompositeStatusTuple, PyBytesValue, PyManifest, PyMemberInput, PyResolved, record_status,
-    refuse_values_past_limit, step_from_tree, take_large_values,
+    refuse_values_past_limit, spill_step, step_from_tree,
 };
 use crate::errors::backpressure_error;
 use crate::health;
@@ -501,11 +501,11 @@ impl NetworkedRuntime {
         if !self.host.bridge().is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
-        let mut step = step_from_tree(tree)?;
+        let step = step_from_tree(tree)?;
         if step.takes_input() {
             return Err(PyValueError::new_err(SubmitRejection::StepTakesInput.to_string()));
         }
-        let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+        let (step, values) = spill_step(step);
         refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), &values)?;
         let mut stored = Vec::with_capacity(values.len());
         for value in values {
@@ -798,11 +798,11 @@ impl NetworkedRuntime {
     /// values too large to inline are stored first, under the composite the
     /// step runs as, so the report finds them held.
     fn complete_with_step(&self, py: Python<'_>, run: TaskRunId, tree: &Bound<'_, PyAny>) -> PyResult<()> {
-        let mut step = step_from_tree(tree)?;
+        let step = step_from_tree(tree)?;
         if step.takes_input() {
             return Err(PyValueError::new_err("a returned step cannot take an input"));
         }
-        let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+        let (step, values) = spill_step(step);
         refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), &values)?;
         let Some(held) = self.shared.end(&run) else {
             return Ok(());

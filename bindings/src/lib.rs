@@ -58,6 +58,9 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "MAX_FAILURE_MESSAGE_BYTES",
         kabudachi_core::scheduler::MAX_FAILURE_MESSAGE_BYTES,
     )?;
+    m.add("MEMBER_BATCH_ITEMS", kabudachi_core::scheduler::composite::MEMBER_BATCH_ITEMS)?;
+    m.add("MEMBER_BATCH_BYTES", kabudachi_core::scheduler::composite::MEMBER_BATCH_BYTES)?;
+    m.add("MAX_RECORD_BYTES", kabudachi_core::task_record::MAX_RECORD_BYTES)?;
     m.add("KabudachiError", m.py().get_type::<errors::KabudachiError>())?;
     m.add("BackpressureError", errors::backpressure_error_type(m.py())?)?;
     Ok(())

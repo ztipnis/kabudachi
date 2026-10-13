@@ -30,7 +30,8 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::composite::{
-    CompositeSource, CompositeStatus, Step as CompositeStep, Unresolved,
+    CompositeSource, CompositeState, CompositeStatus, MemberBatch, MembersAccepted, Step as CompositeStep,
+    Unresolved,
 };
 use kabudachi_core::scheduler::{
     Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
@@ -214,7 +215,7 @@ impl<C: Clock> SchedulerDoor<C> {
     /// Mints a composite for `step` with this door's worker as its client and
     /// submits it: the backlog records it now, or holds it until the node
     /// leads. `values` are the bound inputs too large to inline that `step`
-    /// names by manifest (see `take_large_values`): they are kept in this
+    /// names by manifest (see `spill_step`): they are kept in this
     /// node's own store, as blobs the composite owns, before it is submitted,
     /// and dropped again if it is refused. Wakes claims and timers.
     pub fn submit_composite(
@@ -234,6 +235,39 @@ impl<C: Clock> SchedulerDoor<C> {
                     .inspect_err(|_| scheduler.observer_mut().forget_blobs_of(&owner))
             })
         }))
+    }
+
+    /// Adds the next members of a streamed composite, or refuses the batch
+    /// whole. `values` are the bound inputs too large to inline that `batch`
+    /// names by manifest (see `member_batch`): they are kept in this node's
+    /// own store, as blobs the composite owns, before the batch is taken, so
+    /// no member can be claimed ahead of them. A composite that is no longer
+    /// running owns none, so it stores none. Wakes claims and timers.
+    pub fn submit_members(
+        &self,
+        batch: MemberBatch,
+        values: Vec<Vec<u8>>,
+    ) -> Result<MembersAccepted, Refusal<SubmitRejection>> {
+        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            settled_backlog(inside, |_, scheduler| {
+                let running = scheduler
+                    .composite_status(&batch.composite_id)
+                    .is_some_and(|status| status.state == CompositeState::Running);
+                if running {
+                    let owner = BlobOwner::Composite(batch.composite_id.clone());
+                    for value in values {
+                        scheduler.observer_mut().put_blobs(&owner, Manifest::chunk(&value).chunks);
+                    }
+                }
+                scheduler.submit_members(batch)
+            })
+        }))
+    }
+
+    /// Whether the scheduler asks submitters to wait: memory in use passed its
+    /// soft limit and has not yet fallen back.
+    pub fn slow_down(&self) -> Result<bool, Closed> {
+        self.read(|scheduler| scheduler.slow_down())
     }
 
     /// Cancels the composite `id`, with every member it has started. One
@@ -299,7 +333,7 @@ impl<C: Clock> SchedulerDoor<C> {
 
     /// Reports that a running run succeeded and returned `step`, which runs as
     /// a composite: the run is certified under the step's digest. `values` are
-    /// the step's bound inputs too large to inline (see `take_large_values`),
+    /// the step's bound inputs too large to inline (see `spill_step`),
     /// kept as blobs the composite owns before the report, and dropped again if
     /// the report is refused.
     pub fn complete_with_step(

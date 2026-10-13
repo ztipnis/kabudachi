@@ -7,7 +7,9 @@
 //!
 //! - a composite is `(kind, on_error, stages)`, with `kind` one of `"flow"`,
 //!   `"group"` or `"map"` and `on_error` one of `"fail_fast"` or
-//!   `"collect_all"`;
+//!   `"collect_all"`. A group or map whose members are sent afterwards, in
+//!   batches, has `"streamed"` as a fourth element, and `stages` empty for a
+//!   group or holding the one template (a task with no value) for a map;
 //! - a task is `("task", definition_id, version, options, value, fields)`,
 //!   where `options` is a dict with the key `queue` and, each optional,
 //!   `retries`, `ephemeral`, `non_retriable` and `reconnect_timeout_ms`, and
@@ -23,9 +25,10 @@ use kabudachi_core::protocol::generated::{
     bound_task_step, stage_description,
 };
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
+use kabudachi_core::scheduler::MAX_SUBMISSION_BYTES;
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeState, ExpansionRequest, FieldValue, MemberInput, OnError, Resolved, Stage,
-    Step,
+    BoundInput, BoundStep, CompositeState, ExpansionRequest, FieldValue, MemberBatch, MemberInput, OnError,
+    Resolved, Spilled, Stage, Step, StreamedMember,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -33,6 +36,10 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3::IntoPyObjectExt;
 
 use crate::errors;
+
+/// The fourth element of a composite's tree that says its members are sent in
+/// batches.
+const STREAMED_MARKER: &str = "streamed";
 
 /// The manifest of a payload stored for a composite, which goes into a tree
 /// as `("manifest", manifest)`. Opaque to Python.
@@ -116,7 +123,17 @@ pub(crate) fn step_from_tree(tree: &Bound<'_, PyAny>) -> PyResult<Step> {
 }
 
 fn composite_description(tree: &Bound<'_, PyAny>) -> PyResult<StepDescription> {
-    let (kind, on_error, stages): (String, String, Vec<Bound<'_, PyAny>>) = tree.extract()?;
+    let streamed = match tree.len()? {
+        3 => false,
+        4 if tree.get_item(3)?.extract::<&str>().is_ok_and(|marker| marker == STREAMED_MARKER) => true,
+        _ => {
+            return Err(PyTypeError::new_err(format!(
+                "a composite is (kind, on_error, stages), with \"{STREAMED_MARKER}\" after them for one whose members are sent in batches"
+            )));
+        }
+    };
+    let (kind, on_error, stages): (String, String, Vec<Bound<'_, PyAny>>) =
+        (tree.get_item(0)?.extract()?, tree.get_item(1)?.extract()?, tree.get_item(2)?.extract()?);
     let kind = match kind.as_str() {
         "flow" => generated::CompositeKind::Flow,
         "group" => generated::CompositeKind::Group,
@@ -129,7 +146,7 @@ fn composite_description(tree: &Bound<'_, PyAny>) -> PyResult<StepDescription> {
         other => return Err(PyValueError::new_err(format!("{other:?} is not an error policy"))),
     };
     let stages = stages.iter().map(stage_description).collect::<PyResult<Vec<_>>>()?;
-    Ok(StepDescription { kind: kind as i32, on_error: on_error as i32, stages, streamed: false })
+    Ok(StepDescription { kind: kind as i32, on_error: on_error as i32, stages, streamed })
 }
 
 fn stage_description(stage: &Bound<'_, PyAny>) -> PyResult<StageDescription> {
@@ -210,29 +227,58 @@ fn field_description(name: String, kind: &str, value: &Bound<'_, PyAny>) -> PyRe
     Ok(BoundField { name, value: Some(value) })
 }
 
-/// Replaces every bound value of `step` above `inline_bound`, nested
-/// composites' included, with the manifest of its chunks, and returns the
-/// values to store, depth first in stage order. The caller stores them all
+/// `step` with its bound values moved out by the step rule (`Step::spill`),
+/// and those values, depth first in stage order. The caller stores them all
 /// under the root of the tree (the composite it submits, or the continuation
 /// it certifies), whose record is held unfinished until the whole tree is
 /// over.
-pub(crate) fn take_large_values(step: &mut Step, inline_bound: usize) -> Vec<Vec<u8>> {
-    let mut taken = Vec::new();
-    for stage in &mut step.stages {
-        match stage {
-            Stage::Task(bound) => {
-                if let BoundInput::Value(value) = &mut bound.input
-                    && value.len() > inline_bound
-                {
-                    let bytes = std::mem::take(value);
-                    bound.input = BoundInput::Chunked(Manifest::chunk(&bytes).manifest);
-                    taken.push(bytes);
-                }
-            }
-            Stage::Composite(nested) => taken.extend(take_large_values(nested, inline_bound)),
-        }
+pub(crate) fn spill_step(step: Step) -> (Step, Vec<Vec<u8>>) {
+    let Spilled { step, values } = step.spill();
+    (step, values.into_iter().map(|value| value.bytes).collect())
+}
+
+/// A streamed member as the tree `member` describes it: `bytes` for a map's
+/// item, the tree of a stage for a group's member.
+fn streamed_member(member: &Bound<'_, PyAny>) -> PyResult<StreamedMember> {
+    if let Ok(item) = member.cast::<PyBytes>() {
+        return Ok(StreamedMember::Item(BoundInput::Value(item.as_bytes().to_vec())));
     }
-    taken
+    let stage = stage_description(member)?;
+    Stage::try_from(&stage)
+        .map(StreamedMember::Stage)
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+/// The batch of `members` that starts at `start_index` in the streamed
+/// composite `composite_id`, each member spilled when its inline bytes pass
+/// `inline_bytes`, and the values to store under that composite before the
+/// batch is sent. Raises `ValueError` for a member that is no item or stage,
+/// and for a batch that cannot go in one message even so (a bound field is
+/// structure, so it is never spilled).
+pub(crate) fn member_batch(
+    composite_id: &str,
+    start_index: u64,
+    members: &[Bound<'_, PyAny>],
+    last: bool,
+    inline_bytes: u64,
+) -> PyResult<(MemberBatch, Vec<Vec<u8>>)> {
+    let mut values = Vec::new();
+    let mut spilled = Vec::with_capacity(members.len());
+    for member in members {
+        let (member, member_values) = streamed_member(member)?.spill(inline_bytes);
+        spilled.push(member);
+        values.extend(member_values.into_iter().map(|value| value.bytes));
+    }
+    let batch = MemberBatch { composite_id: CompositeId::new(composite_id), start_index, members: spilled, last };
+    let size = batch.encoded_len();
+    if size > MAX_SUBMISSION_BYTES {
+        return Err(PyValueError::new_err(format!(
+            "the {} members from {start_index} take {size} bytes with their bound values stored as blobs, more than \
+             the {MAX_SUBMISSION_BYTES} one message holds: send fewer, or bind less in each",
+            members.len(),
+        )));
+    }
+    Ok((batch, values))
 }
 
 /// Bytes an awaitable resolves to, as a Python `bytes`.
