@@ -22,8 +22,9 @@ pub enum Waits {
 /// may arrive out of order: a refusal of a revision at or below one already
 /// stored gates nothing, because the stored one supersedes it.
 ///
-/// Nothing re-publishes a refused task, so a refused task of a still-leading
-/// scheduler stays gated for as long as it leads. The ledger is dropped with
+/// A refused task is published again by `Repair`, and a stored outcome
+/// clears its refusal; one whose retry is dropped stays gated for as long as
+/// the scheduler leads. The ledger is dropped with
 /// [`clear`](WriteLedger::clear) when the scheduler stops leading.
 #[derive(Debug, Default)]
 pub struct WriteLedger {
