@@ -967,6 +967,75 @@ async fn started(net: &Net, leader: &WorkerId, claim: &Claim) {
     );
 }
 
+/// Has `net` report `run`, a plain task's run, succeeded by returning `step`,
+/// asking again until a leader certifies it.
+pub async fn completed_with_continuation(net: &Net, leader: &WorkerId, run: &TaskRunId, step: CompositeStep) {
+    loop {
+        let answer = net
+            .complete_continuing(leader.clone(), run.clone(), &step)
+            .await
+            .expect("the leader answered");
+        match answer.result {
+            Some(task_response::Result::Certified(_)) => return,
+            Some(task_response::Result::Reject(reject))
+                if matches!(
+                    TaskRejectReason::try_from(reject.reason),
+                    Ok(TaskRejectReason::TaskRejectNotLeader | TaskRejectReason::TaskRejectNotReady)
+                ) =>
+            {
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+            other => panic!("expected the run certified, got {other:?}"),
+        }
+    }
+}
+
+/// Every composite finish `client` is told of, as it reads them.
+pub struct FinishesHeard<'n> {
+    client: &'n Net,
+    heard: Vec<CompositeFinished>,
+}
+
+/// Starts listening for the finishes `client` is told of.
+pub fn finished_count_heard_by(client: &Net) -> FinishesHeard<'_> {
+    FinishesHeard { client, heard: Vec::new() }
+}
+
+impl<'n> FinishesHeard<'n> {
+    /// Keeps listening until `count` finishes were heard, then waits out a
+    /// moment more for a repeated one.
+    pub async fn until(mut self, count: usize) -> FinishesHeard<'n> {
+        loop {
+            self.take();
+            if self.heard.len() >= count {
+                break;
+            }
+            self.client.result_arrived().await;
+        }
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        self.take();
+        self
+    }
+
+    fn take(&mut self) {
+        for event in self.client.take_result_events() {
+            if let ResultEvent::CompositeFinished(wire) = event {
+                self.heard.push(CompositeFinished::try_from(&wire).expect("the finish message reads"));
+            }
+        }
+    }
+
+    /// How many times `composite` was heard finished.
+    pub fn count(&self, composite: &CompositeId) -> usize {
+        self.heard.iter().filter(|finished| finished.composite_id == *composite).count()
+    }
+
+    /// How many times the continuation of `task` was heard finished.
+    pub fn parent_task_count(&self, task: &TaskId) -> usize {
+        self.heard.iter().filter(|finished| finished.parent_task.as_ref() == Some(task)).count()
+    }
+}
+
 /// The first composite `client` is told is over, as it reads it.
 pub async fn finished_heard_by(client: &Net) -> CompositeFinished {
     loop {

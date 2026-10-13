@@ -41,7 +41,7 @@ use std::time::Duration;
 use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated;
+use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome,
@@ -194,6 +194,23 @@ impl Net {
             result_digest: Some(result_digest.into()),
             delivered: false,
             continuation: None,
+        }))
+        .await
+    }
+
+    /// Tells `leader` `run` succeeded by returning `step`, which runs in its
+    /// place. The result is the step's digest.
+    pub async fn complete_continuing(
+        &self,
+        leader: WorkerId,
+        run: TaskRunId,
+        step: &Step,
+    ) -> Result<TaskResponse, TaskFailure> {
+        self.report(leader, task_request::Request::Completed(ReportCompleted {
+            task_run_id: Some(run.into()),
+            result_digest: Some(step.digest().into()),
+            delivered: false,
+            continuation: Some(StepDescription::from(step)),
         }))
         .await
     }
