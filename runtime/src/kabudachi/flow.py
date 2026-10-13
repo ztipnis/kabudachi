@@ -450,8 +450,14 @@ class ReduceStep:
         """A reduce joins nothing to check."""
 
     def input_requirements(self) -> list[tuple[str, Any, str]]:
-        """The (name, type, serializer name) of the reducer, whose input must be a list of its items."""
-        return [(self.definition.name, list[self.definition.input_type], self.definition.serializer)]
+        """The (name, type, serializer name) of the reducer, whose input must be
+        a list of its items. Without an `initial` the first item starts the
+        fold as the previous result, so the items must also fit that."""
+        name, serializer = self.definition.name, self.definition.serializer
+        required = [(name, list[self.definition.input_type], serializer)]
+        if self._initial is UNSET:
+            required.append((name, list[self.definition.reducer.previous_type], serializer))
+        return required
 
     def definitions(self) -> list[TaskDefinition]:
         return [self.definition]

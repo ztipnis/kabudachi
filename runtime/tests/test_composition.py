@@ -318,6 +318,14 @@ SERIALIZER_OF = {
 }
 
 
+def merge_greetings(item: Greeting, previous: Greeting) -> Greeting:
+    return Greeting(text=previous.text + item.text, times=previous.times + item.times)
+
+
+def count_into(item: Greeting, previous: Receipt) -> Receipt:
+    return Receipt(ok=previous.ok or item.times > 0)
+
+
 def collecting_map(bound):
     return MapStep(bound.definition, SerializerRegistry.with_defaults(), "collect_all")
 
@@ -393,6 +401,41 @@ FIT_CASES = [
         lambda d: (group(group(d(shout), d(wrap)), d(wrap)), d(count)),
         "count",
         id="a nested group gives a list inside the list",
+    ),
+    pytest.param(
+        lambda d: (d(greetings_of), d(shout).map, d(merge_greetings).reduce),
+        None,
+        id="a reduce after a map of its items",
+    ),
+    pytest.param(
+        lambda d: (d(numbers_of), d(merge_greetings).reduce),
+        "numbers_of",
+        id="a reduce after a list of another type",
+    ),
+    pytest.param(
+        lambda d: (d(shout), d(merge_greetings).reduce),
+        "shout",
+        id="a reduce after one value, not a list",
+    ),
+    pytest.param(
+        lambda d: (d(greetings_of), d(count_into).reduce),
+        "count_into",
+        id="a seedless reduce whose items cannot start the fold",
+    ),
+    pytest.param(
+        lambda d: (d(greetings_of), d(count_into).reduce.options(initial=Receipt())),
+        None,
+        id="a seeded reduce whose items cannot start the fold",
+    ),
+    pytest.param(
+        lambda d: (d(greetings_of), d(merge_greetings).reduce, d(shout)),
+        None,
+        id="a reduce gives one value",
+    ),
+    pytest.param(
+        lambda d: (d(greetings_of), d(merge_greetings).reduce, d(count)),
+        "merge_greetings",
+        id="a reduce gives one value, not a list",
     ),
 ]
 
@@ -2076,10 +2119,3 @@ def test_a_reduce_cannot_be_the_first_stage_of_a_flow_and_says_how_to_give_it_it
     with pytest.raises(TypeError, match=r"chain_concat.*first stage.*reduce\(items\)"):
         flow(world.tasks["chain_concat"].reduce)
 
-
-def test_a_reduce_stage_names_its_requirement_with_its_serializer_and_follows_a_stage_that_returns_a_list_of_its_items():
-    world = reducing_world(split_words, chain_concat)
-    concat = world.tasks["chain_concat"].reduce
-
-    assert concat.input_requirements() == [("tests.chain_concat", list[str], "pickle")]
-    flow(world.tasks["split_words"], concat)
