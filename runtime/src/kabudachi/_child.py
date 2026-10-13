@@ -468,6 +468,10 @@ class _ChildComposites:
             submission=True,
         )
 
+    def stream_reduce(self, step: Any, items: Any) -> TaskHandle:
+        """A reduce of `items`, started by the worker, which streams them on."""
+        return self.submit(step, list(items))
+
 
 def _after(outcome: "asyncio.Future[Any]", then: Callable[[], None]) -> None:
     """Calls `then` once `outcome` is done, at once if it is."""

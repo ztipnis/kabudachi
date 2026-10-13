@@ -193,8 +193,11 @@ class Composites:
         under way), `PayloadTooLargeError` for a value bound in a flow that is
         past the hard limit alone, and `RunStoppedError` once the run is
         stopping."""
-        from kabudachi.flow import Group, MappedList
+        from kabudachi.flow import Group, MappedList, ReduceStep
 
+        if isinstance(step, ReduceStep) and isinstance(previous, list):
+            # A reduce a body in a task process called: its items stream on.
+            return self.stream_reduce(step, previous)
         if not self._hosted.has_loop():
             raise RuntimeNotStartedError(
                 "flows and groups can only be started while kabudachi.run() is serving"
