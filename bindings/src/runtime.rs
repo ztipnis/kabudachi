@@ -23,7 +23,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
-use crate::arguments::{SubmitArguments, memory_limits};
+use crate::arguments::{SubmitArguments, memory_limits, version_block_ttl_ms};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::composite::{
     PyBytesValue, PyManifest, PyMemberInput, PyReduceOperands, PyResolved, member_batch, refuse_values_past_limit,
@@ -57,6 +57,7 @@ pub(crate) struct OneNodeArguments {
     health_listen: Option<String>,
     queues: Option<Vec<String>>,
     queue_options: Vec<QueueOptionsArgument>,
+    version_block_ttl_ms: Option<u64>,
 }
 
 /// Counts the runtime's native loops still running; each loop holds one and
@@ -113,8 +114,8 @@ impl NativeRuntime {
     /// Raises `ValueError` if `worker_threads` is zero, only one of the two
     /// memory limits is given, `queues` is empty or names an empty queue,
     /// `queue_options` gives a weight, running limit or starvation age of
-    /// zero, or a queue twice, or if `health_listen` is not an `ip:port`
-    /// address; `RuntimeError` if `health_listen` cannot be bound.
+    /// zero, or a queue twice, `version_block_ttl_ms` is zero, or if
+    /// `health_listen` is not an `ip:port` address; `RuntimeError` if `health_listen` cannot be bound.
     #[new]
     fn new(
         worker_id: String,
@@ -127,6 +128,7 @@ impl NativeRuntime {
         let limits = memory_limits(arguments.memory_soft_limit, arguments.memory_hard_limit)?;
         let subscription = subscription(arguments.queues)?;
         let policy = queue_policy(arguments.queue_options)?;
+        let block_ttl = version_block_ttl_ms(arguments.version_block_ttl_ms)?;
 
         let tokio = Builder::new_multi_thread()
             .worker_threads(arguments.worker_threads)
@@ -160,6 +162,9 @@ impl NativeRuntime {
         new_scheduler.set_result_ttl(Some(retention));
         new_scheduler.set_memory_limits(limits);
         new_scheduler.set_queue_policy(policy);
+        if let Some(ttl_ms) = block_ttl {
+            new_scheduler.set_version_block_ttl(CoreDuration::from_millis(ttl_ms));
+        }
         new_scheduler.set_subscriptions(BTreeMap::from([(worker_id.clone(), subscription)]));
         let door = Arc::new(SchedulerDoor::new(new_scheduler, worker_id));
         let shard_id = node.shard_id().as_str().to_owned();
@@ -392,14 +397,34 @@ impl NativeRuntime {
         })
     }
 
-    /// Reports that the worker began executing a claimed run.
+    /// Reports that the worker began executing a claimed run, at
+    /// `execution_version` of its input if it migrated the input; `None`
+    /// leaves the run's own version.
     ///
     /// Raises `RuntimeError` if the run is unknown or is not a claimed run of
     /// this worker.
-    fn report_started(&self, task_run_id: &str) -> PyResult<()> {
+    #[pyo3(signature = (task_run_id, execution_version = None))]
+    fn report_started(&self, task_run_id: &str, execution_version: Option<u32>) -> PyResult<()> {
         self.door
-            .report_started(&TaskRunId::new(task_run_id))
+            .report_started(&TaskRunId::new(task_run_id), execution_version)
             .map_err(|refusal| refused(refusal, rejected))
+    }
+
+    /// Reports that this worker cannot run the input of `task_id` at its
+    /// version, for `reason`: a run it claimed goes back to the queue and the
+    /// task is not handed to this worker again. With `incompatible`, the input
+    /// can never be migrated and the task ends, which `next_events()` reports
+    /// as `MIGRATION_FAILED`. A task left blocked past the version block time
+    /// to live ends the same way.
+    ///
+    /// Raises `RuntimeError` if the task is unknown or this worker does not
+    /// lead.
+    #[pyo3(signature = (task_id, reason, incompatible = false))]
+    fn report_blocked(&self, task_id: &str, reason: String, incompatible: bool) -> PyResult<()> {
+        self.door
+            .report_blocked(&TaskId::new(task_id), reason, incompatible)
+            .map(drop)
+            .map_err(|refusal| refused(refusal, |rejection| PyRuntimeError::new_err(rejection.to_string())))
     }
 
     /// Reports that a running run succeeded, and returns the certification of

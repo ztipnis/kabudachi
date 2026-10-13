@@ -34,7 +34,7 @@ use kabudachi_core::scheduler::composite::{
     Step as CompositeStep, Unresolved,
 };
 use kabudachi_core::scheduler::{
-    Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
+    Backlog, BlockRejection, Blocked, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
     Completion, Event, Failure, LostRun, ReportRejection, Scheduler, Submission, SubmitRejection,
     Submitted,
 };
@@ -307,10 +307,36 @@ impl<C: Clock> SchedulerDoor<C> {
         self.change(Concerned::Nobody, |scheduler| scheduler.hold_member_input(run, bytes))
     }
 
-    pub fn report_started(&self, run: &TaskRunId) -> Result<(), Refusal<ReportRejection>> {
+    /// Reports that this worker began executing `run`, at `execution_version`
+    /// of its input if it migrated the input, `None` for a run as submitted.
+    pub fn report_started(
+        &self,
+        run: &TaskRunId,
+        execution_version: Option<u32>,
+    ) -> Result<(), Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
             settled_change(scheduler, |scheduler| {
-                scheduler.report_started(&self.worker, run, None)
+                scheduler.report_started(&self.worker, run, execution_version)
+            })
+        }))
+    }
+
+    /// Reports that this worker cannot run `task`'s input at its version, for
+    /// `reason`: a run it claimed goes back to the queue, and, if
+    /// `incompatible`, the task ends. Wakes claims and timers.
+    pub fn report_blocked(
+        &self,
+        task: &TaskId,
+        reason: String,
+        incompatible: bool,
+    ) -> Result<Blocked, Refusal<BlockRejection>> {
+        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
+            settled_change(scheduler, |scheduler| {
+                let blocked = scheduler.report_blocked(&self.worker, task, reason, incompatible)?;
+                if blocked.ended {
+                    forget_blobs_if_finished(scheduler, task);
+                }
+                Ok(blocked)
             })
         }))
     }

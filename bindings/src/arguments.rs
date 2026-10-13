@@ -110,6 +110,16 @@ fn coalesced(submission: Submission, coalescing: Option<(String, bool)>) -> Subm
     }
 }
 
+/// How long, in milliseconds, a task may wait blocked by workers that cannot
+/// run its input version before it fails: the one given, or `None` for the
+/// scheduler's default. Raises `ValueError` for zero.
+pub(crate) fn version_block_ttl_ms(ttl_ms: Option<u64>) -> PyResult<Option<u64>> {
+    match ttl_ms {
+        Some(0) => Err(PyValueError::new_err("version_block_ttl_ms must be positive")),
+        other => Ok(other),
+    }
+}
+
 /// Both memory limits, or neither. Raises `ValueError` for only one.
 pub(crate) fn memory_limits(soft: Option<u64>, hard: Option<u64>) -> PyResult<Option<MemoryLimits>> {
     match (soft, hard) {

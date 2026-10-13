@@ -186,13 +186,17 @@ class FaultingRuntime:
         self.slow_downs.extend(event.active for event in events if event.kind == _native.EventKind.SLOW_DOWN)
         return events
 
-    def report_started(self, task_run_id):
+    def report_started(self, task_run_id, execution_version=None):
         self.events.append(("started", task_run_id))
         if self.before_started is not None:
             self.before_started(task_run_id)
         if self.fail_start:
             raise RuntimeError("not the leader")
-        return self.native.report_started(task_run_id)
+        return self.native.report_started(task_run_id, execution_version)
+
+    def report_blocked(self, task_id, reason, incompatible=False):
+        self.events.append(("blocked", task_id, reason, incompatible))
+        return self.native.report_blocked(task_id, reason, incompatible)
 
     def report_failure(self, task_run_id, failure_kind, failure_message=""):
         self.events.append(("fail", task_run_id, failure_kind))

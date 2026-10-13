@@ -2,13 +2,15 @@
 //! `kabudachi.native_protocol.NetworkedArguments`, and the checks and the
 //! worker config made from it.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::ElectionTimings;
-use kabudachi_core::protocol::ids::ShardName;
+use kabudachi_core::protocol::ids::{ShardName, TaskDefinitionId};
 use kabudachi_core::time::Duration as CoreDuration;
+use kabudachi_core::versions::RunnableVersions;
 use kabudachi_net::executor::ExecutorEndpoint;
 use kabudachi_net::task_exchange::LeaderRetry;
 use kabudachi_net::task_store::placement::ReplicationFactor;
@@ -18,7 +20,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::runtime::{Builder, Runtime};
 
-use crate::arguments::memory_limits;
+use crate::arguments::{memory_limits, version_block_ttl_ms};
 use crate::queues::{QueueOptionsArgument, queue_policy, subscription};
 
 /// The default roll-call deadline, unless a quarter of the suspicion
@@ -47,6 +49,8 @@ pub(super) struct NetworkedArguments {
     queues: Option<Vec<String>>,
     queue_options: Vec<QueueOptionsArgument>,
     drain_wait_limit_ms: Option<u64>,
+    version_block_ttl_ms: Option<u64>,
+    runnable_versions: Option<BTreeMap<String, u32>>,
 }
 
 /// The shard's coordination authority: a `redis://` or `rediss://` server.
@@ -60,7 +64,8 @@ pub(super) struct AuthorityArguments {
 
 impl NetworkedArguments {
     /// Raises `ValueError` for no worker threads, a replication factor or
-    /// seed rounds of zero, a timing or authority TTL of zero, or a roll-call
+    /// seed rounds of zero, a timing, authority TTL or version block TTL of
+    /// zero, or a roll-call
     /// deadline that is not less than the heartbeat timeout.
     pub(super) fn check(&self) -> PyResult<()> {
         if self.worker_threads == 0 {
@@ -89,6 +94,7 @@ impl NetworkedArguments {
                 return Err(PyValueError::new_err(format!("{name} must be positive")));
             }
         }
+        version_block_ttl_ms(self.version_block_ttl_ms)?;
         if self.roll_call_deadline() >= self.heartbeat_timeout_ms {
             return Err(PyValueError::new_err(
                 "roll_call_deadline_ms must be less than heartbeat_timeout_ms",
@@ -130,6 +136,17 @@ impl NetworkedArguments {
         .with_executor(executor)
         .with_queues(subscription(self.queues.clone())?)
         .with_queue_policy(queue_policy(self.queue_options.clone())?);
+        if let Some(ttl_ms) = self.version_block_ttl_ms {
+            config = config.with_version_block_ttl(StdDuration::from_millis(ttl_ms));
+        }
+        if let Some(versions) = &self.runnable_versions {
+            config = config.with_runnable_versions(versions.iter().fold(
+                RunnableVersions::default(),
+                |runnable, (definition, current)| {
+                    runnable.with(TaskDefinitionId::new(definition.as_str()), *current)
+                },
+            ));
+        }
         if let Some(period) = self.routing_refresh_ms {
             config = config.with_routing_refresh_period(StdDuration::from_millis(period));
         }

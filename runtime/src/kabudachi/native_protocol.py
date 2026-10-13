@@ -55,7 +55,9 @@ class Event(Protocol):
     active: bool
     """For `EventKind.SLOW_DOWN`: whether it was raised (`True`) or cleared."""
     reason: str | None
-    """For `EventKind.REFUSED`: why the leader refused the submission."""
+    """For `EventKind.REFUSED`: why the leader refused the submission. For
+    `EventKind.MIGRATION_FAILED`: why no worker could run the task's input
+    version, as the worker that gave it up wrote it."""
     seconds_left: float
     """For `EventKind.ABORT`: seconds until the run may be run again elsewhere."""
     payload: bytes
@@ -155,7 +157,9 @@ class OneNodeArguments:
     port 0 picks one), the runtime serves `/healthz` and `/readyz` there.
     `queues` names the queues this worker takes, every queue for `None`
     (an empty tuple is refused); `queue_options` gives queues their own
-    priority, weight, running limit and starvation age.
+    priority, weight, running limit and starvation age. `version_block_ttl_ms`
+    (positive) is how long a task may wait blocked by workers that cannot run
+    its input version before it fails; `None` for the default of an hour.
     """
 
     worker_threads: int = _DEFAULT_WORKER_THREADS
@@ -166,6 +170,7 @@ class OneNodeArguments:
     health_listen: str | None = None
     queues: tuple[str, ...] | None = None
     queue_options: tuple[QueueOptionsArgument, ...] = ()
+    version_block_ttl_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -199,7 +204,12 @@ class NetworkedArguments:
     nothing prompted. With `health_listen`, the worker serves `/healthz` and
     `/readyz` there, as for `OneNodeArguments`. `drain_wait_limit_ms` bounds
     each wait of a worker that is leaving its shard (ten heartbeat timeouts
-    unless given).
+    unless given). `version_block_ttl_ms` is as for `OneNodeArguments`, and
+    the same on every worker of the shard: its leader's decides.
+    `runnable_versions` maps each task definition to the input version this
+    worker runs; it claims no task of its own records whose input is newer,
+    and tells the leader it cannot run it. A definition not listed is not
+    judged.
     """
 
     shard: str
@@ -222,6 +232,8 @@ class NetworkedArguments:
     queues: tuple[str, ...] | None = None
     queue_options: tuple[QueueOptionsArgument, ...] = ()
     drain_wait_limit_ms: int | None = None
+    version_block_ttl_ms: int | None = None
+    runnable_versions: dict[str, int] | None = None
 
 
 @runtime_checkable
@@ -271,8 +283,19 @@ class Runtime(Protocol):
     async def next_events(self) -> list[Event]:
         ...
 
-    def report_started(self, task_run_id: str) -> None:
-        ...
+    def report_started(self, task_run_id: str, execution_version: int | None = None) -> None:
+        """Reports that a claimed run began executing. `execution_version` is
+        the version of its input it runs, when it migrated the input; `None`
+        for a run as submitted."""
+
+    def report_blocked(self, task_id: str, reason: str, incompatible: bool = False) -> None:
+        """Reports that this worker cannot run the input of a claimed task at
+        its version, for `reason`: the claim goes back to the leader, which
+        queues the task for another worker and hands this one the task no more.
+        With `incompatible`, the input can never be migrated and the task ends.
+        A task left blocked past the version block time to live ends too. On a
+        networked worker it is sent in the background and never blocks. Raises
+        `RuntimeError` on a one-node runtime that does not lead."""
 
     def cancel(self, task_id: str) -> CancelOutcome | None:
         """Cancels a task, and says how that ended. `None`: the cancel was

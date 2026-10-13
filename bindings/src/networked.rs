@@ -132,9 +132,9 @@ impl NetworkedRuntime {
     /// the shard: through its seeds, through its authority, or, with neither,
     /// by founding the shard alone.
     ///
-    /// Raises `ValueError` for an address that cannot be read, a timing or
-    /// authority TTL of zero (`drain_wait_limit_ms`, which bounds each wait of
-    /// a leaving worker, included), a replication factor or seed rounds of
+    /// Raises `ValueError` for an address that cannot be read, a timing,
+    /// authority TTL or `version_block_ttl_ms` of zero (`drain_wait_limit_ms`,
+    /// which bounds each wait of a leaving worker, included), a replication factor or seed rounds of
     /// zero, only one memory limit, no worker threads, an authority that
     /// cannot be used, no queues, a blank queue name or queue options that are
     /// refused (a zero weight, running limit or starvation age, or a queue
@@ -390,12 +390,24 @@ impl NetworkedRuntime {
             .spawn_into_py(py, async move { shared.until(Shared::take_events).await })
     }
 
-    /// Hands the leader a started report for a run this worker holds.
-    fn report_started(&self, task_run_id: &str) {
+    /// Hands the leader a started report for a run this worker holds, at
+    /// `execution_version` of its input if it migrated the input.
+    #[pyo3(signature = (task_run_id, execution_version = None))]
+    fn report_started(&self, task_run_id: &str, execution_version: Option<u32>) {
         let run = TaskRunId::new(task_run_id);
         if self.shared.holds(&run) {
-            self.shared.report(Report::Started { run, execution_version: None });
+            self.shared.report(Report::Started { run, execution_version });
         }
+    }
+
+    /// Tells the leader, in the background, that this worker cannot run the
+    /// input of `task_id` at its version, for `reason`; it returns at once. The
+    /// leader gives the claim back and hands this worker the task no more.
+    /// With `incompatible` the input can never be migrated and the task ends.
+    /// A run Python held for the task is over.
+    #[pyo3(signature = (task_id, reason, incompatible = false))]
+    fn report_blocked(&self, task_id: &str, reason: String, incompatible: bool) {
+        self.shared.report_blocked(TaskId::new(task_id), reason, incompatible);
     }
 
     /// Hands the leader a run's success. Give either `result_digest`, the
