@@ -450,7 +450,8 @@ fn a_step_too_large_for_the_task_record_fails_its_run_for_good() {
 
 #[test]
 fn the_largest_step_a_record_can_carry_is_taken_and_one_byte_more_fails_its_run() {
-    // Whether a step of this many payload bytes was taken, and the largest record then published.
+    // Whether a step of this many payload bytes was taken, and the size of the record then published
+    // with the empty version the limit is measured at.
     let returns_step_of = |payload: usize| {
         let mut fixture = Fixture::leading();
         let task = fixture
@@ -459,13 +460,16 @@ fn the_largest_step_a_record_can_carry_is_taken_and_one_byte_more_fails_its_run(
             .unwrap();
         let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
         fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
-        let step = flow_of(vec![task_stage("big", Some(&vec![0; payload]))]);
+        // The first stage keeps the step's task running, so the revision that
+        // certifies the run is the newest the task has.
+        let step = flow_of(vec![task_stage("first", Some(b"f")), task_stage("big", Some(&vec![0; payload]))]);
         let taken = fixture
             .scheduler
             .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step))
             .is_ok();
-        let published = fixture.spy.newest_revision_of(&task).unwrap().encoded_len();
-        (taken, published as u64)
+        let mut published = fixture.spy.newest_revision_of(&task).unwrap();
+        published.version = Some(Default::default());
+        (taken, published.encoded_len() as u64)
     };
     let (mut taken, mut refused) = (0, MAX_RECORD_BYTES as usize);
     assert!(returns_step_of(taken).0 && !returns_step_of(refused).0);
@@ -477,11 +481,12 @@ fn the_largest_step_a_record_can_carry_is_taken_and_one_byte_more_fails_its_run(
             refused = middle;
         }
     }
-    let (_, published) = returns_step_of(taken);
-    assert!(published <= MAX_RECORD_BYTES, "the largest step taken still fits its record");
-    assert!(
-        published + 2048 > MAX_RECORD_BYTES,
-        "and the limit is tight: {published} bytes published against {MAX_RECORD_BYTES}"
+    let (_, measured) = returns_step_of(taken);
+    // A record keeps this much free for what a measurement leaves out.
+    let limit = MAX_RECORD_BYTES - 1024;
+    assert_eq!(
+        measured, limit,
+        "the largest step taken fills the limit to the byte, so nothing of the record goes unmeasured"
     );
 }
 
