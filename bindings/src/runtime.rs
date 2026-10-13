@@ -115,7 +115,8 @@ impl NativeRuntime {
     /// memory limits is given, `queues` is empty or names an empty queue,
     /// `queue_options` gives a weight, running limit or starvation age of
     /// zero, or a queue twice, `version_block_ttl_ms` is zero, or if
-    /// `health_listen` is not an `ip:port` address; `RuntimeError` if `health_listen` cannot be bound.
+    /// `health_listen` is not an `ip:port` address; `RuntimeError` if
+    /// `health_listen` cannot be bound.
     #[new]
     fn new(
         worker_id: String,

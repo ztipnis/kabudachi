@@ -34,9 +34,9 @@ use kabudachi_core::scheduler::composite::{
     Step as CompositeStep, Unresolved,
 };
 use kabudachi_core::scheduler::{
-    Backlog, BlockRejection, Blocked, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
-    Completion, Event, Failure, LostRun, ReportRejection, Scheduler, Submission, SubmitRejection,
-    Submitted,
+    Backlog, BlockRejection, Blocked, CancelRejection, Cancellation, Certification, Claim,
+    ClaimRejection, Compacted, Completion, Event, Failure, LostRun, ReportRejection, Scheduler,
+    Submission, SubmitRejection, Submitted,
 };
 use kabudachi_core::task_record::{LocalRecords, RecordKey, ShardRecord, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};

@@ -130,6 +130,8 @@ impl Shared {
     pub(super) fn report_blocked(&self, task: TaskId, reason: String, incompatible: bool) {
         let freed = {
             let mut seam = self.seam();
+            // The leader has one current run of a task, and this worker holds
+            // at most that one, so the first match is the only one.
             let run = seam
                 .held
                 .iter()

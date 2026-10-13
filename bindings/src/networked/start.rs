@@ -65,8 +65,8 @@ pub(super) struct AuthorityArguments {
 impl NetworkedArguments {
     /// Raises `ValueError` for no worker threads, a replication factor or
     /// seed rounds of zero, a timing, authority TTL or version block TTL of
-    /// zero, or a roll-call
-    /// deadline that is not less than the heartbeat timeout.
+    /// zero, or a roll-call deadline that is not less than the heartbeat
+    /// timeout.
     pub(super) fn check(&self) -> PyResult<()> {
         if self.worker_threads == 0 {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));

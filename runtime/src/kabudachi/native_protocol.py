@@ -209,7 +209,8 @@ class NetworkedArguments:
     `runnable_versions` maps each task definition to the input version this
     worker runs; it claims no task of its own records whose input is newer,
     and tells the leader it cannot run it. A definition not listed is not
-    judged.
+    judged. A version is an unsigned 32-bit number: a negative one, or one
+    past 32 bits, raises `OverflowError` when the runtime is built.
     """
 
     shard: str
@@ -286,7 +287,8 @@ class Runtime(Protocol):
     def report_started(self, task_run_id: str, execution_version: int | None = None) -> None:
         """Reports that a claimed run began executing. `execution_version` is
         the version of its input it runs, when it migrated the input; `None`
-        for a run as submitted."""
+        for a run as submitted. It is an unsigned 32-bit number: a negative
+        one, or one past 32 bits, raises `OverflowError`."""
 
     def report_blocked(self, task_id: str, reason: str, incompatible: bool = False) -> None:
         """Reports that this worker cannot run the input of a claimed task at

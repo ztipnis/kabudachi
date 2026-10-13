@@ -302,6 +302,8 @@ async def _start_a_wait(native):
 # --- scheduling ----------------------------------------
 
 DIGEST = _native.result_digest(b"the-result")
+# The version of its input that `submit` gives the task it submits.
+SOURCE_VERSION = 3
 
 
 def arguments(
@@ -320,7 +322,7 @@ def arguments(
 
 
 def submit(native, payload=b"input-bytes", queue="default"):
-    return native.submit(arguments("billing.charge", 3, payload, "task", queue=queue))
+    return native.submit(arguments("billing.charge", SOURCE_VERSION, payload, "task", queue=queue))
 
 
 async def claim(native, limit=10):
@@ -353,7 +355,7 @@ def test_a_submitted_task_can_be_claimed(runtime):
     [only] = claims
     assert only.task_id == task_id
     assert only.definition_id == "billing.charge"
-    assert only.source_version == 3
+    assert only.source_version == SOURCE_VERSION
     assert only.serialized_input == b"input-bytes"
     assert only.queue == "default"
     assert only.task_run_id
@@ -365,12 +367,12 @@ def test_a_run_reported_started_at_an_execution_version_keeps_it_in_the_task_rec
 
     async def main():
         [claimed] = await claim(runtime)
-        runtime.report_started(claimed.task_run_id, execution_version=4)
+        runtime.report_started(claimed.task_run_id, execution_version=SOURCE_VERSION + 1)
         return await runtime.task_record(task_id)
 
     [run] = asyncio.run(main()).runs
 
-    assert (run.source_version, run.execution_version) == (3, 4)
+    assert (run.source_version, run.execution_version) == (SOURCE_VERSION, SOURCE_VERSION + 1)
 
 
 def test_a_task_a_worker_reports_blocked_goes_back_to_the_queue_with_the_reason_in_its_record(runtime):
