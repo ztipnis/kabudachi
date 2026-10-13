@@ -100,6 +100,8 @@ pub struct Voters {
     _hosts: Vec<Hosting>,
     states: Vec<watch::Receiver<WorkerState>>,
     senders: Vec<watch::Sender<WorkerState>>,
+    crawled: Vec<watch::Receiver<bool>>,
+    crawled_senders: Vec<watch::Sender<bool>>,
     killed: Vec<bool>,
     /// What each voter's driver returned once it had drained and handed its
     /// records over; such a voter is driven no more.
@@ -149,12 +151,20 @@ impl ThreeVoters {
 /// What a test can read of the voters' states while the shard is driven.
 pub struct Watch {
     states: Vec<watch::Receiver<WorkerState>>,
+    crawled: Vec<watch::Receiver<bool>>,
     killed: Vec<bool>,
 }
 
 impl Watch {
     pub fn state(&self, voter: usize) -> WorkerState {
         *self.states[voter].borrow()
+    }
+
+    /// Whether `voter`'s node has crawled its routing, as of its last step.
+    /// Read this rather than asking the node through [`Voters::with`], which
+    /// restarts the voter's driver and with it the settling of its routing.
+    pub fn routing_crawled(&self, voter: usize) -> bool {
+        *self.crawled[voter].borrow()
     }
 
     /// The voter that leads, among those not killed when this was taken.
@@ -206,6 +216,10 @@ impl Voters {
         let channels: Vec<_> = nodes.iter().map(|node| watch::channel(node.state())).collect();
         let senders = channels.iter().map(|(sender, _)| sender.clone()).collect();
         let states = channels.into_iter().map(|(_, receiver)| receiver).collect();
+        let (crawled_senders, crawled): (Vec<_>, Vec<_>) = nodes
+            .iter()
+            .map(|node| watch::channel(node.routing_crawled()))
+            .unzip();
         let killed = vec![false; count];
         let handed_off = HandedOffBy::new(count);
         let voters = nodes
@@ -229,6 +243,8 @@ impl Voters {
             _hosts: hosts,
             states,
             senders,
+            crawled,
+            crawled_senders,
             killed,
             handed_off,
         }
@@ -338,6 +354,7 @@ impl Voters {
                 self.clock,
                 config,
                 self.senders[voter].clone(),
+                self.crawled_senders[voter].clone(),
                 receiver,
                 self.handed_off.clone(),
             ));
@@ -350,6 +367,7 @@ impl Voters {
     pub fn watch(&self) -> Watch {
         Watch {
             states: self.states.clone(),
+            crawled: self.crawled.clone(),
             killed: self.killed.clone(),
         }
     }
@@ -522,13 +540,14 @@ async fn drive_in_background(
     clock: RealClock,
     config: DriverConfig,
     state: watch::Sender<WorkerState>,
+    crawled: watch::Sender<bool>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
     handed_off: HandedOffBy,
 ) {
     loop {
         let Driven { node, scheduler, executor } = &mut driven;
         let command = tokio::select! {
-            returned = run_driver(node, due_now(&clock), &net, scheduler, clock, None, executor.as_mut(), config.clone(), publish(state.clone())) => {
+            returned = run_driver(node, due_now(&clock), &net, scheduler, clock, None, executor.as_mut(), config.clone(), publish(state.clone(), crawled.clone())) => {
                 handed_off.record(voter, returned);
                 return;
             }
@@ -603,9 +622,11 @@ impl Drop for Hosting {
 
 fn publish(
     state: watch::Sender<WorkerState>,
+    crawled: watch::Sender<bool>,
 ) -> impl FnMut(&WorkerNode<RealClock>, Option<&Input>, &Step) {
     move |node, _, _| {
         let _ = state.send(node.state());
+        let _ = crawled.send(node.routing_crawled());
     }
 }
 

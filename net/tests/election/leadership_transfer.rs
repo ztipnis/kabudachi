@@ -53,15 +53,13 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
                 holding(&nets, &task, &[TaskRunState::Running]) >= QUORUM
             }))
             .await;
-        // Both followers have crawled their routing; the pause only gives
-        // their reports time to reach the leader, so it hands over as soon as
-        // it is asked.
-        for follower in &followers {
-            while !shard.with(*follower, |node, _| node.routing_crawled()).await {
-                shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
-            }
-        }
-        shard.drive_until(tokio::time::sleep(StdDuration::from_millis(300))).await;
+        // Both followers have crawled their routing, which their next
+        // heartbeats report to the leader, so it hands over as soon as it is
+        // asked. Read from the watch: asking a node through `with` restarts
+        // its driver, which would keep its routing from ever settling.
+        shard
+            .drive_until(wait_until(|| followers.iter().all(|follower| watch.routing_crawled(*follower))))
+            .await;
 
         let asked_at = StdInstant::now();
         nets[leader].request_drain();
@@ -76,9 +74,12 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
             .await;
         let took_over_in = asked_at.elapsed();
         // Without a hand-over no follower even suspects before a suspicion
-        // timeout has passed since the leader's last ack.
+        // timeout has passed since the leader's last ack, which is at most a
+        // heartbeat interval before the drain. The bound leaves an eighth of
+        // that timeout for the successor's roll call, which waits out its
+        // deadline when a reply comes late on a loaded host.
         assert!(
-            took_over_in < StdDuration::from_millis(SUSPECT_TIMEOUT_MS * 3 / 4),
+            took_over_in < StdDuration::from_millis(SUSPECT_TIMEOUT_MS * 7 / 8),
             "a follower took office {took_over_in:?} after the drain"
         );
 
