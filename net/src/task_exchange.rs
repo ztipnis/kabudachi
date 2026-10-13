@@ -182,6 +182,7 @@ impl Net {
         self.report(leader, task_request::Request::Failed(ReportFailed {
             task_run_id: Some(run.into()),
             failure_kind,
+            failure_message: String::new(),
         }))
         .await
     }

@@ -566,6 +566,7 @@ impl<'n> Executing<'n> {
                 task_request::Request::Failed(ReportFailed {
                     task_run_id: Some(run.into()),
                     failure_kind: reason,
+                    failure_message: String::new(),
                 })
             }
             Report::Lost(run) => {

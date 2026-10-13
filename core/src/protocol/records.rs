@@ -98,6 +98,9 @@ pub fn new_task(new: NewTask) -> Task {
         reconnect_timeout_ms: new.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
         client: new.client.map(Into::into),
         input_manifest: new.input_manifest.map(Into::into),
+        trace_parent: String::new(),
+        trace_state: String::new(),
+        baggage: String::new(),
     }
 }
 
@@ -135,6 +138,9 @@ pub fn first_attempt(
         result_digest: None,
         failure_kind: String::new(),
         delivered: false,
+        claimed_at: None,
+        started_at: None,
+        failure_message: String::new(),
     }
 }
 
@@ -157,6 +163,9 @@ pub fn retry_of(failed: &TaskRun, ids: &impl IdGenerator, at: WallTime) -> TaskR
         result_digest: None,
         failure_kind: String::new(),
         delivered: false,
+        claimed_at: None,
+        started_at: None,
+        failure_message: String::new(),
     }
 }
 

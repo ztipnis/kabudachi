@@ -243,6 +243,9 @@ fn claimed_run(worker: &WorkerId, claim: &Claim, stamped_at: WallTime) -> TaskRu
         result_digest: None,
         failure_kind: String::new(),
         delivered: false,
+        claimed_at: None,
+        started_at: None,
+        failure_message: String::new(),
     };
     run.transition_to(TaskRunState::Claimed, stamped_at)
         .expect("a queued run can be claimed");

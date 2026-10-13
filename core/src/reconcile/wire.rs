@@ -83,6 +83,7 @@ impl From<&ReportedRun> for generated::ReportedRun {
                     ..
                 }
             ),
+            failure_message: String::new(),
         }
     }
 }
