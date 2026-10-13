@@ -277,6 +277,74 @@ worker that splits the prior stage's list sends the items in batches.
   they count as part of the structure, as do names and settings. A single group member whose own
   structure passes one message to the leader raises `ValueError`.
 
+## Reducing
+
+`@reducer` declares a durable task of two parameters, `(item, previous) -> previous`: it folds one
+item into the result so far. A plain `@task` of two parameters is the same as a bare `@reducer`.
+Both parameters and the return value are annotated, and the return type must be the type of
+`previous`. It takes the options of `@task` except `version`, plus `associative`, `tree` and `merge`
+below. It must be durable, so it cannot be an `@ephemeral_task` or a `@coalescing_task`, and it cannot
+return a step. Calling it, or using `.bind`, `.map` or `task.options(...)` on it, raises `TypeError`;
+`reducer.local(item, previous)` runs the function here, like `task.local`.
+
+```python
+@kabudachi.reducer
+def total(item: int, previous: int) -> int:
+    return previous + item
+
+await total.reduce([1, 2, 3, 4], initial=0)   # 10
+```
+
+`await reducer.reduce(items, initial=..., chunk_size=...)` folds a list, left to right, and gives the
+folded value. Each step is a certified task of its own, so retries, timeouts and the queue apply per
+step, and a step that fails after its retries fails the reduce, with the step's error, and no later
+step runs. `initial` may be any value, `None` included. Without it, the first item starts the fold
+and is not passed to the reducer, so a list of `n` items runs `n - 1` steps. `reduce` also takes
+`items` as a tuple, and anything else raises `TypeError`.
+
+A reduce is a chain unless the reducer says otherwise: step `i` folds item `i` into step `i - 1`'s
+result. A tree folds chunks of `chunk_size` items (64 by default, a positive integer) side by side,
+each with the reducer, then combines neighbouring results, in order, until one is left. It keeps the
+chain's result while spreading the work across workers, if the combine of two results gives what
+folding them in order would. Declare that with exactly one of:
+
+- `@reducer(associative=True)`: the reducer is its own combine, so `(item, previous)` take and return
+  one type, and combining two results is `reducer(item=right, previous=left)`. A sum, a
+  concatenation or a maximum are of this kind.
+- `@reducer(tree=True, merge=combine)`: for a reducer whose items are not its result, such as one
+  that counts items into a dict. `combine(left, right)` is a synchronous function defined at module
+  level (or a lambda), so that every worker that imports the reducer has the same one. An
+  associative reducer takes no `merge`, and `merge` needs `tree=True`.
+
+`tree` defaults to `associative`, so `associative=True, tree=False` declares a reducer that is
+associative but always runs as a chain. A tree with an `initial` folds every chunk from `initial`,
+so `initial` must be the combine's identity (`0` for a sum, `[]` or `""` for a concatenation). This
+is not checked: a seed that is not an identity is counted once per chunk.
+
+`reducer.reduce` is also a `flow` stage that folds the list the stage before it returns, and so is
+`reducer.reduce.options(initial=..., chunk_size=...)`. The stage before it is a task that returns
+`list[X]` where the reducer's item is `X` (a different type raises `TaskDefinitionError` when the
+flow is built), or a `map`, in which case the reduce folds the map's results. A reduce cannot be the
+first stage of a flow, since it has no list to fold: call it with `reducer.reduce(items)` instead.
+The flow's results list holds the folded value for the reduce's stage.
+
+```python
+flow(split_words, upper.map, join.reduce.options(initial=""))
+```
+
+A reduce of no items with an `initial` gives `initial`, and a reduce of one item without one gives
+that item, each without running a step. A reduce of no items without an `initial` has no result: for
+a list that is empty when `reduce` is called it raises `ReduceEmptyError` at once, and for a list that
+a flow's earlier stage returns empty it fails the reduce, so awaiting it raises `ReduceEmptyError`.
+`ReduceEmptyError` is also a `TypeError`, as in `functools.reduce`.
+
+A list of any size is sent to the shard in batches, as a map's items are, so it may be larger than one
+record or one message: an item or an `initial` too long to be stored inline is stored as a blob that
+the reduce owns, and the reducer reads it back whole. As with `group` and `map`, the batches pause
+while memory use is past `memory_soft_limit`, and the reduce fails with `BackpressureError` if a batch
+would pass `memory_hard_limit`. A step must return a value: a reducer that returns a step fails the
+reduce with `ReducerContinuedError`.
+
 ## Coalescing and backpressure
 
 A newer pending submission of a `@coalescing_task` with the same key supersedes the older one, whose
