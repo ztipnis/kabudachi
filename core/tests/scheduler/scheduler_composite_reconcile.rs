@@ -14,7 +14,7 @@ use kabudachi_core::reconcile::{Rebuild, ReportedRun, ReportedState, WorkerRuns}
 use kabudachi_core::scheduler::composite::{
     BoundInput, CompositeKind, CompositeState, OnError, Stage, Step,
 };
-use kabudachi_core::scheduler::{ClaimRejection, Completion, Submission};
+use kabudachi_core::scheduler::{CancelRejection, ClaimRejection, Completion, Submission};
 use kabudachi_core::task_record::RecordKey;
 
 use crate::support::composites::*;
@@ -443,6 +443,11 @@ fn a_continuation_certified_while_its_composite_record_is_unknown_is_taken_from_
     )]);
     let mut new = took_over(&old, rebuild);
     assert!(new.scheduler.composite_status(&continuation).is_none(), "the record may exist: nothing is made over it");
+    assert_eq!(
+        new.scheduler.cancel(&task),
+        Err(CancelRejection::NotReady),
+        "a cancel cannot reach a step whose record is unknown, and says to ask again"
+    );
     new.scheduler
         .adopt(Rebuild { composites: known_later.composites, pages: known_later.pages, records: known_later.records, ..Rebuild::default() })
         .unwrap();
