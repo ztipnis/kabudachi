@@ -116,6 +116,11 @@ impl From<&ReduceShape> for generated::ReduceOptions {
 /// Python runtime raises it as `ReduceEmptyError`.
 pub const REDUCE_EMPTY_KIND: &str = "ReduceEmptyError";
 
+/// The failure kind of a reduce one of whose steps returned a continuation
+/// instead of a value: a reducer is a function of its operands, and a step
+/// still running has no value to fold.
+pub const REDUCER_CONTINUED_KIND: &str = "ReducerContinuedError";
+
 /// One operand of a reduce step, in the order the step takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
@@ -489,17 +494,22 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let plan = composite.reduce_plan().expect("a reduce step belongs to a planned reduce");
         let step = plan.step(index).expect("only a planned step is started");
-        let results: Vec<ManifestEntry> = step
-            .operands
-            .iter()
-            .filter_map(|operand| match operand {
-                Operand::Result(before) => match composite.outcomes.get(before) {
-                    Some(MemberOutcome::Value { digest, .. }) => Some(ManifestEntry::Blob(BlobKey::from(digest))),
-                    _ => unreachable!("a step starts only once the results it takes have values"),
-                },
-                Operand::Item(_) | Operand::Initial => None,
-            })
-            .collect();
+        let mut results: Vec<ManifestEntry> = Vec::new();
+        for operand in &step.operands {
+            let Operand::Result(before) = operand else {
+                continue;
+            };
+            match composite.outcomes.get(before) {
+                Some(MemberOutcome::Value { digest, .. }) => results.push(ManifestEntry::Blob(BlobKey::from(digest))),
+                // A step starts only once the results it takes have settled, and one
+                // that settled with a failure ended the reduce; what is left is a
+                // step that returned a continuation, which has no value to fold.
+                _ => {
+                    self.fail_continued_reducer(id, *before);
+                    return;
+                }
+            }
+        }
         let reducer = &composite.step.reduce.as_ref().expect("a planned reduce has a shape").reducer;
         let input = (!results.is_empty()).then(|| Manifest::new(results, 0));
         let submission = reducer.submission(input).as_member_of(id.clone(), index).with_reduce_node(step.node);
@@ -510,13 +520,28 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
     }
 
+    /// Fails the reduce `id` because step `index` returned a continuation: a
+    /// reducer must return its value, and the step that would take that
+    /// value as an operand has none to take.
+    fn fail_continued_reducer(&mut self, id: &CompositeId, index: u64) {
+        let message = format!("reduce step {index} returned a continuation instead of a value");
+        self.finish_composite(id, CompositeState::Failed, Some(Failure::new(REDUCER_CONTINUED_KIND, message)));
+    }
+
     /// Step `index` settled: a failure fails the reduce; the root's value
     /// finishes it; any other value starts the step that takes it, once that
     /// step's other operand has settled too.
     pub(super) fn advance_reduce(&mut self, id: &CompositeId, index: u64, outcome: MemberOutcome) {
-        if let MemberOutcome::Failed(failure) = outcome {
-            self.finish_composite(id, CompositeState::Failed, Some(failure));
-            return;
+        match outcome {
+            MemberOutcome::Failed(failure) => {
+                self.finish_composite(id, CompositeState::Failed, Some(failure));
+                return;
+            }
+            MemberOutcome::Child(_) => {
+                self.fail_continued_reducer(id, index);
+                return;
+            }
+            MemberOutcome::Value { .. } => {}
         }
         let composite = &self.composites.held[id];
         let plan = composite.reduce_plan().expect("only a planned reduce advances here");

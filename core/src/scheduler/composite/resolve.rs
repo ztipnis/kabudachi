@@ -115,7 +115,10 @@ pub async fn member_input<S: CompositeSource>(source: &S, task: &Task) -> Result
         .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
     let step = step_of(&record)?;
     let index = task.composite_index;
-    // A reduce's steps read their operands through their own call.
+    // A reduce step's operands are results of earlier steps and items on the
+    // reduce's item pages, which a reader fetches through its own call; this
+    // call, which reads a stage's template and input, has nothing to answer
+    // for it, so it is refused as malformed rather than guessed at.
     if step.kind == CompositeKind::Reduce {
         return Err(Unresolved::Malformed);
     }

@@ -12,7 +12,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
     CompositeKind, CompositeState, EXPANSION_DEFINITION, ITEM_PAGES, ItemInput, MemberBatch, OnError, PAGE_ENTRIES,
-    REDUCE_EMPTY_KIND, ReduceNode, Stage, Step, StreamedMember,
+    REDUCE_EMPTY_KIND, REDUCER_CONTINUED_KIND, ReduceNode, Stage, Step, StreamedMember,
 };
 use kabudachi_core::scheduler::{Claim, ClaimRejection, Completion, SubmitRejection};
 use kabudachi_core::task_record::{RecordKey, ShardRecord};
@@ -380,6 +380,17 @@ fn a_reduce_after_a_task_stage_folds_what_its_expansion_streamed_and_a_seedless_
     let failed = ended.iter().find(|end| end.composite_id == empty).unwrap();
     assert_eq!(failed.state, CompositeState::Failed);
     assert_eq!(failed.failure.as_ref().unwrap().kind, REDUCE_EMPTY_KIND);
+
+    // A reduce whose last batch sealed it runs on when its expansion completes.
+    let (_, sealed, expansion) = expanding(&mut fixture);
+    fixture.scheduler.submit_members(items_batch(&sealed, 0, &[b"a", b"b"], true)).unwrap();
+    fixture
+        .scheduler
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    run_member(&mut fixture, &sealed, 0, b"ab");
+    assert_eq!(fixture.scheduler.runs_of(&sealed.member_task(0)).len(), 1, "its step is made once");
+    assert_eq!(fixture.scheduler.composite_status(&sealed).unwrap().state, CompositeState::Succeeded);
 }
 
 #[test]
@@ -422,6 +433,90 @@ fn a_new_leader_drives_a_half_combined_tree_on_and_makes_each_step_once() {
         let runs = new.scheduler.runs_of(&reduce.member_task(step)).len();
         assert_eq!(runs, 1, "step {step} was made and run once");
     }
+}
+
+#[test]
+fn a_new_leader_fails_a_reduce_one_of_whose_steps_failed_in_the_old_one_once_and_starts_nothing() {
+    let mut old = Fixture::leading();
+    let reduce = reduce_fed(&mut old, streamed_reduce(None, Some(b"")), &[b"a", b"b", b"c"]);
+    let mark = old.spy.mark();
+    fail_member(&mut old, &reduce, 0, "ValueError");
+    // The failure reached the step's own record but not the reduce's.
+    let mut new = took_over(&old, rebuild_losing(&old, mark, is_composite_or_page));
+    let ended = finished(&mut new);
+    assert_eq!(ended.len(), 1, "the reduce failed once");
+    assert_eq!(ended[0].state, CompositeState::Failed);
+    assert_eq!(ended[0].failure.as_ref().unwrap().kind, "ValueError");
+    assert_eq!(new.scheduler.pending_len(), 0, "no later step starts");
+}
+
+/// A reduce of `PAGE_ENTRIES + extra` items in one chunk, so one step.
+fn one_chunk_reduce(extra: u64) -> Step {
+    streamed_reduce(Some((PAGE_ENTRIES + extra) as u32), None)
+}
+
+#[test]
+fn a_new_leader_finds_a_reduces_items_on_both_sides_of_a_page_boundary() {
+    for extra in [0, 1] {
+        let mut old = Fixture::leading();
+        let reduce = submitted(&mut old, one_chunk_reduce(extra + 2));
+        let held = page_of_items(0).into_iter().chain((0..extra).map(|more| item(PAGE_ENTRIES + more))).collect::<Vec<_>>();
+        let held: Vec<&[u8]> = held.iter().map(Vec::as_slice).collect();
+        let mark = old.spy.mark();
+        old.scheduler.submit_members(items_batch(&reduce, 0, &held, false)).unwrap();
+        let mut new = took_over(&old, rebuild_losing(&old, mark, |key| matches!(key, RecordKey::Composite(_))));
+        // The client asks again, with the items that are left.
+        let last = [item(PAGE_ENTRIES + extra), item(PAGE_ENTRIES + extra + 1)];
+        let last: Vec<&[u8]> = last.iter().map(Vec::as_slice).collect();
+        let taken = new.scheduler.submit_members(items_batch(&reduce, PAGE_ENTRIES + extra, &last, true)).unwrap();
+        assert_eq!(taken.members, PAGE_ENTRIES + extra + 2, "{extra} items past the first page");
+        let second: Vec<(u64, Vec<u8>)> =
+            (0..extra + 2).map(|more| (PAGE_ENTRIES + more, item(PAGE_ENTRIES + more))).collect();
+        assert_eq!(items_on_page(&new, &reduce, 1), second, "{extra} items past the first page");
+        assert_eq!(new.spy.page_revisions(&reduce, ITEM_PAGES), 0, "the full first page is not written again");
+        run_member(&mut new, &reduce, 0, b"folded");
+        assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+    }
+}
+
+#[test]
+fn a_new_leader_counts_a_reduces_items_only_up_to_a_gap_in_its_item_pages_and_does_not_trust_a_record_that_counts_more() {
+    let mut old = Fixture::leading();
+    let total = PAGE_ENTRIES + 3;
+    let reduce = submitted(&mut old, one_chunk_reduce(3));
+    old.scheduler.submit_members(items_batch(&reduce, 0, &[b"a", b"b"], false)).unwrap();
+    let mark = old.spy.mark();
+    let rest: Vec<Vec<u8>> = (2..total).map(item).collect();
+    let rest: Vec<&[u8]> = rest.iter().map(Vec::as_slice).collect();
+    old.scheduler.submit_members(items_batch(&reduce, 2, &rest, true)).unwrap();
+    assert_eq!(old.scheduler.pending_len(), 1, "the sealed reduce started its step");
+    // The first page's later writes, and the step, were lost: the second page
+    // is stored with items 2 to PAGE_ENTRIES - 1 missing before it, while the
+    // reduce's record says it is sealed with all the items.
+    let lost = |key: &RecordKey| matches!(key, RecordKey::Task(_)) || matches!(key, RecordKey::Page(_, page) if *page == ITEM_PAGES);
+    let mut new = took_over(&old, rebuild_losing(&old, mark, lost));
+    assert_eq!(new.scheduler.pending_len(), 0, "a reduce missing items is not sealed, so no step starts");
+    let all: Vec<Vec<u8>> = (0..total).map(item).collect();
+    let all: Vec<&[u8]> = all.iter().map(Vec::as_slice).collect();
+    let taken = new.scheduler.submit_members(items_batch(&reduce, 0, &all, true)).unwrap();
+    assert_eq!(taken.members, total, "the client's batch fills the gap");
+    assert_eq!(items_on_page(&new, &reduce, 0).len() as u64, PAGE_ENTRIES);
+    run_member(&mut new, &reduce, 0, b"folded");
+    assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn a_reducer_that_returns_a_continuation_fails_its_reduce_without_folding_the_continuations_result() {
+    let mut fixture = Fixture::leading();
+    let reduce = reduce_fed(&mut fixture, streamed_reduce(None, Some(b"")), &[b"a", b"b"]);
+    let claim = start_member(&mut fixture, &reduce, 0);
+    let continuation = continue_with_a_stage(&mut fixture, &claim.task_run_id);
+    end_continuation(&mut fixture, &continuation);
+    let ended = finished(&mut fixture);
+    let end = ended.iter().find(|end| end.composite_id == reduce).unwrap();
+    assert_eq!(end.state, CompositeState::Failed);
+    assert_eq!(end.failure.as_ref().unwrap().kind, REDUCER_CONTINUED_KIND);
+    assert_eq!(fixture.scheduler.pending_len(), 0, "the step after it does not start");
 }
 
 /// The old leader stored a batch's item page but not the reduce's record.
@@ -471,25 +566,6 @@ fn an_expansion_that_fails_fails_the_reduce_and_its_flow_and_one_that_is_cancell
     let (flow, _, expansion) = expanding(&mut fixture);
     fixture.scheduler.cancel_composite(&flow).unwrap();
     assert_eq!(fixture.run_state(&expansion.task_run_id), TaskRunState::Cancelled);
-}
-
-#[test]
-fn a_reduce_its_last_batch_sealed_is_not_sealed_again_when_its_expansion_completes() {
-    let mut fixture = Fixture::leading();
-    let (_, reduce, expansion) = expanding(&mut fixture);
-    fixture.scheduler.submit_members(items_batch(&reduce, 0, &[b"a", b"b"], true)).unwrap();
-    assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(0)).len(), 1);
-    let mark = fixture.spy.mark();
-    fixture
-        .scheduler
-        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
-        .unwrap();
-    assert!(
-        !fixture.spy.published_since(mark).iter().any(|record| matches!(record, ShardRecord::Composite(_))),
-        "the reduce's record is unchanged by the expansion's end"
-    );
-    run_member(&mut fixture, &reduce, 0, b"ab");
-    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
 }
 
 #[test]
