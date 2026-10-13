@@ -74,11 +74,12 @@ impl StealRequestHandle {
 
 impl Net {
     /// Asks `peer` which tasks it holds records of that look claimable, at
-    /// most `limit` of them, oldest submission first. `None` if no answer
-    /// came within [`STEAL_TIMEOUT`]: the peer could not be reached or did not
-    /// answer, or this `Net` is the peer. A compaction run is offered only if
-    /// `takes` says this worker runs them, and a task only if its queue is one
-    /// `takes` names.
+    /// most `limit` of them, most urgent first by the peer's queue policy,
+    /// then oldest submission. `None` if no answer came within
+    /// [`STEAL_TIMEOUT`]: the peer could not be reached or did not answer, or
+    /// this `Net` is the peer. A compaction run is offered only if `takes` says
+    /// this worker runs them, and a task only if its queue is one `takes`
+    /// names.
     pub async fn steal(&self, peer: WorkerId, limit: usize, takes: &Takes) -> Option<Vec<TaskId>> {
         if peer == self.local_worker_id() {
             return None;

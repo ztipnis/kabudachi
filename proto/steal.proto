@@ -16,7 +16,8 @@ message StealRequest {
   repeated string queues = 3;
 }
 
-// Task ids, oldest submission first.
+// Task ids, most urgent first by the answering peer's queue policy, then
+// oldest submission.
 message StealResponse {
   repeated TaskId task_ids = 1;
 }

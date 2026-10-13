@@ -304,8 +304,8 @@ kabudachi.configure(
   has any waiting.
 - `weight` (a positive integer, `1` by default): among queues of one priority, how many tasks this
   queue hands out for each one a queue of weight 1 does.
-- `max_running` (a positive integer, or `None` for no limit, the default): the most tasks of the queue
-  claimed or running at once across the shard.
+- `max_running` (a positive integer, or `None` for no limit, the default): the most tasks of the
+  queue claimed or running at once across the shard.
 - `reconnect_timeout` (a positive `timedelta`, or `None` for the shard's, the default): how long a run
   of a task sent here may go without its worker being heard, past the time it takes to suspect a
   silent worker, before the leader runs it again. A task's own `reconnect_timeout` wins.
@@ -314,8 +314,8 @@ kabudachi.configure(
 - `starvation_age` (a positive `timedelta`, or `None` for never, the default): how long a task may
   wait before it goes ahead of every priority.
 
-An invalid option raises `ValueError` when the `QueueOptions` is built. Every worker of a shard should give the same queue
-options; the leader's decide.
+An invalid option raises `ValueError` when the `QueueOptions` is built. Every worker of a shard
+should give the same queue options; the leader's decide.
 
 `router(name, value) -> str | None` picks the queue of a task that names none, when it is
 submitted: it is called with the task's name and its argument, and returns a queue name, or `None`
