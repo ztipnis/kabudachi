@@ -467,3 +467,41 @@ fn a_continuation_certified_while_its_composite_record_is_unknown_is_taken_from_
     assert_eq!(finished[0].parent_task, Some(task));
     assert_eq!(finished[0].state, CompositeState::Succeeded);
 }
+
+/// The old leader stored a batch's member records but not the map's record.
+/// Its successor counts the members it finds: the submitter, whether it carries
+/// on with the next batch or asks for the lost one again, is taken once, and
+/// the map ends when its last batch comes.
+#[test]
+fn a_streamed_maps_batch_whose_record_was_lost_with_its_leader_is_counted_from_its_members() {
+    let mut old = Fixture::leading();
+    let map = submitted(&mut old, streamed_map(OnError::FailFast));
+    old.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    let mark = old.spy.mark();
+    old.scheduler.submit_members(item_batch(&map, 2, 3, false)).unwrap();
+    let lose_the_record = |key: &RecordKey| matches!(key, RecordKey::Composite(_));
+
+    let mut carries_on = took_over(&old, rebuild_losing(&old, mark, lose_the_record));
+    assert_eq!(
+        carries_on.scheduler.submit_members(item_batch(&map, 5, 0, true)).unwrap().members,
+        5,
+        "the members found count, so the next batch is no gap"
+    );
+    let mut asks_again = took_over(&old, rebuild_losing(&old, mark, lose_the_record));
+    assert_eq!(
+        asks_again.scheduler.submit_members(item_batch(&map, 2, 3, false)).unwrap().members,
+        5,
+        "the batch asked again creates nothing"
+    );
+    asks_again.scheduler.submit_members(item_batch(&map, 5, 0, true)).unwrap();
+    for new in [&mut carries_on, &mut asks_again] {
+        for index in 0..5 {
+            let claim = run_member(new, &map, index, b"r");
+            assert_eq!(new.scheduler.runs_of(&map.member_task(index)).len(), 1);
+            assert_eq!(claim.task.serialized_input, item(index));
+        }
+        assert_eq!(finished(new)[0].state, CompositeState::Succeeded);
+        let record = new.spy.newest_composite(&map).unwrap();
+        assert_eq!((record.members, record.sealed), (5, true));
+    }
+}

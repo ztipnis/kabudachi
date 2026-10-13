@@ -6,12 +6,15 @@
 //! reach their holders in any order, so no field of one record is trusted to
 //! agree with another.
 
-use crate::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId};
+use std::collections::BTreeMap;
+
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskDefinitionId, TaskId, TaskRunId};
+use crate::protocol::messages::prelude::*;
 use crate::time::Clock;
 
 use crate::scheduler::{Observer, Scheduler};
 
-use super::{CompositeKind, CompositeState, MemberOutcome, Stage};
+use super::{CompositeKind, CompositeState, EXPANSION_DEFINITION, MemberOutcome, Stage};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Brings every composite rebuilt from records up to what its members'
@@ -21,6 +24,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     pub(in crate::scheduler) fn recover_composites(&mut self) {
         self.resolve_retainers();
         self.derive_continuations();
+        self.count_streamed_members();
         let ids: Vec<CompositeId> = self.composites.held.keys().cloned().collect();
         for id in ids {
             if !self.holds_composite_back(&id) {
@@ -41,6 +45,34 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .collect();
         for task in ended {
             self.finish_continuation(&task);
+        }
+    }
+
+    /// Raises the member count of every streamed composite to one past the
+    /// highest index any of its member Tasks or settled outcomes names. Its
+    /// record may lag what its old leader stored, so the larger count stands;
+    /// whether it is sealed only its record says, so a successor never seals
+    /// a composite on its own. An expansion run carries the map's id but is
+    /// not one of its members.
+    fn count_streamed_members(&mut self) {
+        let expansion = TaskDefinitionId::new(EXPANSION_DEFINITION);
+        let mut counts: BTreeMap<CompositeId, u64> = BTreeMap::new();
+        for task in self.tasks.values() {
+            let Some(id) = task.composite_id() else {
+                continue;
+            };
+            if task.task_definition_id() != expansion && self.composites.held.get(&id).is_some_and(|c| c.takes_batches()) {
+                let held = counts.entry(id).or_default();
+                *held = (*held).max(task.composite_index + 1);
+            }
+        }
+        for (id, composite) in &mut self.composites.held {
+            if !composite.takes_batches() {
+                continue;
+            }
+            let named = counts.get(id).copied().unwrap_or(0);
+            let settled = composite.outcomes.last_key_value().map_or(0, |(index, _)| index + 1);
+            composite.members = composite.members.max(named).max(settled);
         }
     }
 

@@ -172,9 +172,10 @@ impl Composites {
         let Some(composite) = self.held.get(id) else {
             return;
         };
+        let pages = composite.pages();
         self.unpublished.insert(id.clone());
-        for page in 0..composite.pages() {
-            self.unpublished_pages.insert((id.clone(), page));
+        for page in 0..pages {
+            self.page_changed(id, page);
         }
     }
 
