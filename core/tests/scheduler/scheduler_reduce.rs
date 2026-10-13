@@ -14,7 +14,7 @@ use kabudachi_core::scheduler::composite::{
     REDUCE_EMPTY_KIND, ReduceNode, Stage, Step, StreamedMember,
 };
 use kabudachi_core::scheduler::{Claim, ClaimRejection, Completion, SubmitRejection};
-use kabudachi_core::task_record::ShardRecord;
+use kabudachi_core::task_record::{RecordKey, ShardRecord};
 use kabudachi_core::time::Duration;
 
 use crate::support::composites::*;
@@ -389,4 +389,52 @@ fn a_reduce_after_a_map_is_forgotten_with_its_steps_when_its_flow_is() {
     for step in 0..3 {
         assert!(fixture.forgotten(&reduce.member_task(step)), "step {step} goes with its reduce");
     }
+}
+
+#[test]
+fn a_new_leader_drives_a_half_combined_tree_on_and_makes_each_step_once() {
+    let mut old = Fixture::leading();
+    // Chunks 0-3; combines 4 = (0, 1), 5 = (2, 3); root 6 = (4, 5).
+    let reduce = reduce_fed(&mut old, streamed_reduce(Some(1), None), &[b"a", b"b", b"c", b"d"]);
+    run_member(&mut old, &reduce, 0, b"a");
+    let mark = old.spy.mark();
+    run_member(&mut old, &reduce, 1, b"b"); // makes combine 4
+    run_member(&mut old, &reduce, 2, b"c");
+    // The old leader dies with its composite and page writes since `mark` lost:
+    // the new one knows step 0 from the reduce's record, steps 1 and 2 only
+    // from their own Task records.
+    let mut new = took_over(&old, rebuild_losing(&old, mark, is_composite_or_page));
+    run_member(&mut new, &reduce, 3, b"d");
+    run_member(&mut new, &reduce, 4, b"ab");
+    run_member(&mut new, &reduce, 5, b"cd");
+    let root = run_member(&mut new, &reduce, 6, b"abcd");
+    assert_eq!(operands_of(&root), Some(vec![result_blob(b"ab"), result_blob(b"cd")]));
+    assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+    for step in 0..7 {
+        let runs = new.scheduler.runs_of(&reduce.member_task(step)).len();
+        assert_eq!(runs, 1, "step {step} was made and run once");
+    }
+}
+
+/// The old leader stored a batch's item page but not the reduce's record.
+/// The client, unanswered, asks the successor again.
+#[test]
+fn a_new_leader_takes_a_reduces_items_from_its_item_pages_and_a_batch_asked_again_adds_none() {
+    let mut old = Fixture::leading();
+    let reduce = submitted(&mut old, streamed_reduce(Some(2), None));
+    old.scheduler.submit_members(items_batch(&reduce, 0, &[b"a", b"b"], false)).unwrap();
+    let mark = old.spy.mark();
+    old.scheduler.submit_members(items_batch(&reduce, 2, &[b"c"], false)).unwrap();
+    let mut new = took_over(&old, rebuild_losing(&old, mark, |key| matches!(key, RecordKey::Composite(_))));
+    let taken = new.scheduler.submit_members(items_batch(&reduce, 2, &[b"c", b"d"], true)).unwrap();
+    assert_eq!(taken.members, 4, "the items found on its page count, and none is taken twice");
+    // The partly filled page was rebuilt from the stored page, so its rewrite keeps a and b.
+    assert_eq!(
+        items_on_page(&new, &reduce, 0),
+        [(0, b"a".to_vec()), (1, b"b".to_vec()), (2, b"c".to_vec()), (3, b"d".to_vec())]
+    );
+    run_member(&mut new, &reduce, 0, b"ab");
+    run_member(&mut new, &reduce, 1, b"cd");
+    run_member(&mut new, &reduce, 2, b"abcd");
+    assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
 }

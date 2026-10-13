@@ -333,7 +333,7 @@ pub(super) fn item_page(index: u64) -> u32 {
 
 impl ReduceItem {
     /// What holding it costs the leader: its inline bytes, or its manifest's.
-    fn held_bytes(&self) -> u64 {
+    pub(super) fn held_bytes(&self) -> u64 {
         match self {
             ReduceItem::Value(bytes) => bytes.len() as u64,
             ReduceItem::Manifest(manifest) => manifest.encoded_len() as u64,
@@ -452,12 +452,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         composite.members = composite.reduce_plan().expect("a sealed reduce has a plan").steps();
         composite.outcomes.grow_to(composite.members);
         self.composites.unpublished.insert(id.clone());
-        self.start_reduce(id);
+        // As a successor drives it: settle the steps that already ran (a
+        // lost record may leave some), then start the rest.
+        self.reevaluate(id);
     }
 
     /// Starts a sealed reduce: its first steps, or, with nothing to fold, its
     /// end at once (its initial value or its one item is its result).
-    fn start_reduce(&mut self, id: &CompositeId) {
+    pub(super) fn start_reduce(&mut self, id: &CompositeId) {
         let plan = self.composites.held[id].reduce_plan().expect("only a sealed reduce starts");
         match plan.root() {
             ReduceRoot::Empty => {

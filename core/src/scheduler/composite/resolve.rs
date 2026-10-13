@@ -115,7 +115,11 @@ pub async fn member_input<S: CompositeSource>(source: &S, task: &Task) -> Result
         .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
     let step = step_of(&record)?;
     let index = task.composite_index;
-    if step.takes_batches() {
+    // A reduce's steps read their operands through their own call.
+    if step.kind == CompositeKind::Reduce {
+        return Err(Unresolved::Malformed);
+    }
+    if step.streamed || step.expands() {
         return streamed_member_input(source, &id, &step, task).await;
     }
     let Some(Stage::Task(bound)) = usize::try_from(index).ok().and_then(|index| step.stages.get(index)).cloned()

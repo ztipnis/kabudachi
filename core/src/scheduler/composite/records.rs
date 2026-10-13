@@ -19,7 +19,7 @@ use crate::scheduler::{Observer, Scheduler, UNVERSIONED};
 use super::held::{Composite, Outcomes};
 use super::{
     BoundInput, CompositeKind, CompositeParent, CompositeState, ITEM_PAGES, InputShape, MemberCounts, MemberOutcome,
-    PAGE_ENTRIES, Stage, Step,
+    PAGE_ENTRIES, ReduceItem, ReducePlan, Stage, Step,
 };
 
 impl From<CompositeState> for generated::CompositeState {
@@ -235,7 +235,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             (Some(manifest), Some(shape)) => Some((Manifest::try_from(manifest).ok()?, input_shape_of(shape))),
             (Some(_), None) => return None,
         };
-        if step.expands() && input.is_none() {
+        if step.expands_given(&input) && input.is_none() {
             return None;
         }
         let outcomes: BTreeMap<u64, MemberOutcome> = pages
@@ -244,17 +244,31 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .filter_map(outcome_of)
             .collect();
         let retained_by = self.retainer_of(parent.as_ref());
-        let (members, sealed) = if step.takes_batches() {
-            (record.members, record.sealed)
-        } else {
-            (step.stages.len() as u64, true)
+        let batches = step.takes_batches_given(&input);
+        let mut bytes = budget_len(id, &step);
+        let (members, sealed, items_taken, partial_items) = match &step.reduce {
+            Some(shape) => {
+                // A reduce given another composite's results has every item
+                // from the start; one fed in batches holds the items its
+                // item pages hold, from index 0 with no gap, whatever its
+                // record counts, and is sealed only if the record says so
+                // and the pages hold all it counts.
+                let (taken, partial) =
+                    if batches { items_on(pages) } else { (record.reduce_items, Vec::new()) };
+                bytes += partial.iter().map(ReduceItem::held_bytes).sum::<u64>();
+                let sealed = !batches || (record.sealed && record.reduce_items == taken);
+                let members = if sealed { ReducePlan::new(taken, shape).steps() } else { 0 };
+                (members, sealed, taken, partial)
+            }
+            None if batches => (record.members, record.sealed, 0, Vec::new()),
+            None => (step.stages.len() as u64, true, 0, Vec::new()),
         };
         Some(Composite {
-            bytes: budget_len(id, &step),
+            bytes,
             members,
             sealed,
-            items_taken: 0,
-            partial_items: Vec::new(),
+            items_taken,
+            partial_items,
             filled_item_pages: BTreeMap::new(),
             step,
             root: record.root.map_or_else(|| id.clone(), CompositeId::from),
@@ -298,6 +312,40 @@ fn entry_of(index: u64, outcome: &MemberOutcome) -> generated::CompositeEntry {
         MemberOutcome::Child(child) => (composite_entry::Outcome::Child(child.clone().into()), None),
     };
     generated::CompositeEntry { index, outcome: Some(outcome), producer }
+}
+
+/// How many items the item pages in `pages` hold from index 0 on without a
+/// gap, and the items of the last page when it is not full: all a leader
+/// keeps of the items it took.
+fn items_on(pages: &[CompositePage]) -> (u64, Vec<ReduceItem>) {
+    let entries: BTreeMap<u64, &generated::CompositeEntry> = pages
+        .iter()
+        .filter(|page| page.index >= ITEM_PAGES)
+        .flat_map(|page| &page.entries)
+        .map(|entry| (entry.index, entry))
+        .collect();
+    let mut taken = 0;
+    let mut partial = Vec::new();
+    while let Some(item) = entries.get(&taken).and_then(|entry| item_of(entry)) {
+        if partial.len() as u64 == PAGE_ENTRIES {
+            partial.clear();
+        }
+        partial.push(item);
+        taken += 1;
+    }
+    if partial.len() as u64 == PAGE_ENTRIES {
+        partial.clear();
+    }
+    (taken, partial)
+}
+
+/// The item an item page entry holds, if it holds a readable one.
+fn item_of(entry: &generated::CompositeEntry) -> Option<ReduceItem> {
+    match entry.outcome.as_ref()? {
+        composite_entry::Outcome::Item(bytes) => Some(ReduceItem::Value(bytes.clone())),
+        composite_entry::Outcome::ItemManifest(manifest) => Manifest::try_from(manifest).ok().map(ReduceItem::Manifest),
+        _ => None,
+    }
 }
 
 fn input_shape_of(shape: input_shape::Shape) -> InputShape {

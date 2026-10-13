@@ -664,13 +664,6 @@ impl Step {
         self.streamed || self.expands_given(input)
     }
 
-    /// Whether the step's members arrive in batches whatever its input is: it
-    /// is streamed, or it is a map whose expansion run sends the items it
-    /// splits a list into.
-    pub(in crate::scheduler) fn takes_batches(&self) -> bool {
-        self.streamed || self.expands()
-    }
-
     /// Whether the step expands a list and its template has fields set: each
     /// item is the template's whole input, so none could be given them.
     fn template_has_fields(&self) -> bool {
