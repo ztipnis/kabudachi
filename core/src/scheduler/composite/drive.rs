@@ -47,7 +47,7 @@ impl BoundStep {
     /// bytes when it is bound to a value; when it is bound to blobs, none, since
     /// those belong to the composite and its member's worker reads them through
     /// the composite's record; otherwise the manifest of what it is given.
-    fn submission(&self, input: Option<Manifest>) -> Submission {
+    pub(super) fn submission(&self, input: Option<Manifest>) -> Submission {
         let serialized_input = match &self.input {
             BoundInput::Value(bytes) => bytes.clone(),
             BoundInput::Chunked(_) | BoundInput::Previous => Vec::new(),
@@ -387,6 +387,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if composite.state != CompositeState::Running {
             return;
         }
+        if composite.step.kind == CompositeKind::Reduce {
+            self.submit_reduce_step(id, index);
+            return;
+        }
         let stage = composite.step.stages[index as usize].clone();
         if self.stage_started(id, index, &stage) {
             return;
@@ -598,6 +602,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     fn advance(&mut self, id: &CompositeId, index: u64, outcome: MemberOutcome) {
         let composite = &self.composites.held[id];
+        if composite.step.kind == CompositeKind::Reduce {
+            self.advance_reduce(id, index, outcome);
+            return;
+        }
         let stages = composite.step.stages.len() as u64;
         match (composite.step.kind, outcome) {
             (_, MemberOutcome::Failed(failure)) if composite.fails_on_first_failure() => {

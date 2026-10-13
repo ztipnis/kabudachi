@@ -2,14 +2,19 @@
 //! task. These are its description and the shape of its item pages; the
 //! leader reads them and never runs the reducer.
 
-use crate::manifest::Manifest;
+use crate::blob::BlobKey;
+use crate::manifest::{Failure, Manifest, ManifestEntry};
 use crate::protocol::generated::{self, composite_entry, reduce_options};
 use crate::protocol::ids::{CompositeId, IdGenerator};
 use crate::scheduler::{Observer, Scheduler, SubmitRejection};
-use crate::time::Clock;
+use crate::scheduler::Submitted;
+use crate::time::{Clock, WallTime};
 
 use super::held::Composite;
-use super::{BoundInput, BoundStep, INLINE_VALUE_BYTES, ItemInput, MalformedStep, PAGE_ENTRIES, StreamedMember};
+use super::{
+    BoundInput, BoundStep, CompositeState, INLINE_VALUE_BYTES, ItemInput, MalformedStep, MemberOutcome, PAGE_ENTRIES,
+    StreamedMember,
+};
 
 /// The first page of a reduce's items; item `k` is on page
 /// `ITEM_PAGES + k / PAGE_ENTRIES`.
@@ -447,5 +452,85 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         composite.members = composite.reduce_plan().expect("a sealed reduce has a plan").steps();
         composite.outcomes.grow_to(composite.members);
         self.composites.unpublished.insert(id.clone());
+        self.start_reduce(id);
+    }
+
+    /// Starts a sealed reduce: its first steps, or, with nothing to fold, its
+    /// end at once (its initial value or its one item is its result).
+    fn start_reduce(&mut self, id: &CompositeId) {
+        let plan = self.composites.held[id].reduce_plan().expect("only a sealed reduce starts");
+        match plan.root() {
+            ReduceRoot::Empty => {
+                let failure = Failure::new(REDUCE_EMPTY_KIND, "a reduce of no items needs an initial value");
+                self.finish_composite(id, CompositeState::Failed, Some(failure));
+            }
+            ReduceRoot::Initial | ReduceRoot::Item(_) => {
+                self.finish_composite(id, CompositeState::Succeeded, None);
+            }
+            ReduceRoot::Step(_) => {
+                for index in plan.startable(|_| false) {
+                    self.submit_reduce_step(id, index);
+                }
+            }
+        }
+    }
+
+    /// Records step `index`'s Task, unless it exists already (a takeover
+    /// driving the reduce again) or the reduce is over. Its input manifest
+    /// names the results it takes, in order; its items and initial value stay
+    /// in the reduce's pages and description.
+    pub(super) fn submit_reduce_step(&mut self, id: &CompositeId, index: u64) {
+        let task_id = id.member_task(index);
+        let composite = &self.composites.held[id];
+        if composite.state != CompositeState::Running || self.tasks.contains_key(&task_id) {
+            return;
+        }
+        let plan = composite.reduce_plan().expect("a reduce step belongs to a planned reduce");
+        let step = plan.step(index).expect("only a planned step is started");
+        let results: Vec<ManifestEntry> = step
+            .operands
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::Result(before) => match composite.outcomes.get(before) {
+                    Some(MemberOutcome::Value { digest, .. }) => Some(ManifestEntry::Blob(BlobKey::from(digest))),
+                    _ => unreachable!("a step starts only once the results it takes have values"),
+                },
+                Operand::Item(_) | Operand::Initial => None,
+            })
+            .collect();
+        let reducer = &composite.step.reduce.as_ref().expect("a planned reduce has a shape").reducer;
+        let input = (!results.is_empty()).then(|| Manifest::new(results, 0));
+        let submission = reducer.submission(input).as_member_of(id.clone(), index).with_reduce_node(step.node);
+        let submitted = Submitted::received(task_id, WallTime::now(&self.clock), submission, &self.clock);
+        if let Err(refused) = self.record_submission(submitted) {
+            let failure = Failure::new(refused.kind(), refused.to_string());
+            self.settle_member(id, index, MemberOutcome::Failed(failure));
+        }
+    }
+
+    /// Step `index` settled: a failure fails the reduce; the root's value
+    /// finishes it; any other value starts the step that takes it, once that
+    /// step's other operand has settled too.
+    pub(super) fn advance_reduce(&mut self, id: &CompositeId, index: u64, outcome: MemberOutcome) {
+        if let MemberOutcome::Failed(failure) = outcome {
+            self.finish_composite(id, CompositeState::Failed, Some(failure));
+            return;
+        }
+        let composite = &self.composites.held[id];
+        let plan = composite.reduce_plan().expect("only a planned reduce advances here");
+        if plan.root() == ReduceRoot::Step(index) {
+            self.finish_composite(id, CompositeState::Succeeded, None);
+            return;
+        }
+        let next = plan.consumer(index).filter(|&next| {
+            let step = plan.step(next).expect("a consumer is a planned step");
+            step.operands.iter().all(|operand| match operand {
+                Operand::Result(before) => composite.outcomes.contains_key(before),
+                Operand::Item(_) | Operand::Initial => true,
+            })
+        });
+        if let Some(next) = next {
+            self.submit_reduce_step(id, next);
+        }
     }
 }

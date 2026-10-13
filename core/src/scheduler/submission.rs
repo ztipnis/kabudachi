@@ -14,6 +14,7 @@ use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task};
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Duration, Instant, WallTime};
 
+use super::composite::ReduceNode;
 use super::record_size::claim_weight_sum;
 use super::{MAX_SUBMISSION_BYTES, Observer, Scheduler};
 
@@ -202,6 +203,8 @@ pub struct Submission {
     pub trace: TraceContext,
     /// The composite the task is a stage or member of, and its index there.
     pub member_of: Option<(CompositeId, u64)>,
+    /// Where the task sits in the reduce it is a step of.
+    pub reduce_node: Option<ReduceNode>,
 }
 
 impl Submission {
@@ -229,6 +232,7 @@ impl Submission {
             input_manifest: None,
             trace: TraceContext::default(),
             member_of: None,
+            reduce_node: None,
         }
     }
 
@@ -236,6 +240,13 @@ impl Submission {
     #[must_use]
     pub fn as_member_of(mut self, composite: CompositeId, index: u64) -> Self {
         self.member_of = Some((composite, index));
+        self
+    }
+
+    /// The task is the reduce step at `node`.
+    #[must_use]
+    pub fn with_reduce_node(mut self, node: ReduceNode) -> Self {
+        self.reduce_node = Some(node);
         self
     }
 
@@ -586,5 +597,6 @@ fn task_of(task_id: TaskId, submitted_at: WallTime, submission: Submission) -> T
         input_manifest: submission.input_manifest,
         trace: submission.trace,
         member_of: submission.member_of,
+        reduce_node: submission.reduce_node,
     })
 }

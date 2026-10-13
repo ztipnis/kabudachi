@@ -182,9 +182,10 @@ impl Composite {
     }
 
     /// Whether the first stage or member to fail for good ends the
-    /// composite: a flow's always does, a group's or map's by its policy.
+    /// composite: a flow's or a reduce's always does, a group's or map's by
+    /// its policy.
     pub(super) fn fails_on_first_failure(&self) -> bool {
-        self.step.kind == CompositeKind::Flow || self.step.on_error == OnError::FailFast
+        matches!(self.step.kind, CompositeKind::Flow | CompositeKind::Reduce) || self.step.on_error == OnError::FailFast
     }
 
     /// The failure that ended the composite, or the cancellation that did.

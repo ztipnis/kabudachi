@@ -171,6 +171,23 @@ pub fn items_batch(reduce: &CompositeId, start: u64, values: &[&[u8]], last: boo
     }
 }
 
+/// Submits `step` and streams it `values` as its one and last batch, which
+/// seals it and starts its steps.
+pub fn reduce_fed(fixture: &mut Fixture, step: Step, values: &[&[u8]]) -> CompositeId {
+    let reduce = submitted(fixture, step);
+    fixture.scheduler.submit_members(items_batch(&reduce, 0, values, true)).unwrap();
+    reduce
+}
+
+/// The result digest member `index` of `composite` settled with, as last
+/// published, if it settled with a value.
+pub fn value_of(fixture: &Fixture, composite: &CompositeId, index: u64) -> Option<Digest> {
+    match entry(fixture, composite, index)?.outcome {
+        Some(composite_entry::Outcome::Value(digest)) => Some(Digest::try_from(&digest).unwrap()),
+        _ => None,
+    }
+}
+
 /// The inline item entries of `reduce`'s item page `page`, as last published.
 pub fn items_on_page(fixture: &Fixture, reduce: &CompositeId, page: u32) -> Vec<(u64, Vec<u8>)> {
     let Some(page) = fixture.spy.newest_page(reduce, ITEM_PAGES + page) else {
