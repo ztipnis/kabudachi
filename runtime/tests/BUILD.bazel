@@ -3,6 +3,10 @@ load("@aspect_rules_py//py:defs.bzl", "py_library", "py_test")
 # gazelle:python_generation_mode file
 # The networked worker program is run as a file, never imported.
 # gazelle:exclude networked_worker.py
+# Run by the wheel test with the interpreter of the environment it installs
+# the wheel into, never imported from the source tree.
+# gazelle:exclude wheel_smoke.py
+# gazelle:exclude wheel_smoke_tasks.py
 
 # Shared test helper: protobuf message classes built at runtime. Tests import it
 # as a top-level module, which Gazelle cannot infer.
@@ -271,14 +275,17 @@ py_test(
     ],
 )
 
-# The wheel's metadata matches pyproject.toml, and its version is the one
-# pyproject.toml, the package and MODULE.bazel name. It does not depend on the
-# package's sources: everything it reads comes from the wheel. Under 1 s on a
-# laptop, plus the wheel's build.
+# The wheel, installed with pip into a fresh virtual environment, runs a flow
+# on a worker of its own; its metadata matches pyproject.toml, and its version
+# is the one pyproject.toml, the package and MODULE.bazel name. It does not
+# depend on the package's sources: everything it runs comes from the wheel.
 py_test(
     name = "test_wheel",
+    size = "medium",
     srcs = ["test_wheel.py"],
     data = [
+        "wheel_smoke.py",
+        "wheel_smoke_tasks.py",
         "//:MODULE.bazel",
         "//runtime:kabudachi_wheel",
         "//runtime:pyproject.toml",
@@ -291,6 +298,11 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
+        # The wheel's dependencies, linked into the environment it is
+        # installed in, since the test has no network to download them.
+        "@pypi//asgiref",  # keep
+        "@pypi//protobuf",  # keep
+        "@pypi//wrapt",  # keep
         "@pypi//packaging",  # keep
         "@pypi//pytest",  # keep
     ],
