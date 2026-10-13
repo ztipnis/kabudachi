@@ -92,26 +92,44 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if !self.check_leader() {
             return Err(SubmitRejection::NotLeader);
         }
+        if self.composites.held.contains_key(&submitted.composite_id) {
+            return Ok(submitted.composite_id);
+        }
+        self.check_composite(&submitted, 0)?;
         let SubmittedComposite { composite_id, submitted_at, step, client } = submitted;
-        if self.composites.held.contains_key(&composite_id) {
-            return Ok(composite_id);
-        }
-        if step.takes_input() {
-            return Err(SubmitRejection::StepTakesInput);
-        }
-        self.check_composite_room(&composite_id, &step)?;
         self.create_composite(composite_id.clone(), step, None, client, None, submitted_at);
         Ok(composite_id)
     }
 
-    /// Refuses a composite whose record would not fit one record, or whose
-    /// description would take memory past the hard limit.
-    fn check_composite_room(&self, id: &CompositeId, step: &Step) -> Result<(), SubmitRejection> {
-        let size = super::records::first_record_len(id, step);
+    /// Whether `submitted` could be recorded now with `queued_bytes` more
+    /// promised to composites and tasks not yet recorded: it needs no input,
+    /// its record fits one record, and its description fits under the hard
+    /// limit with them. Records nothing, so it needs no leadership.
+    pub fn check_composite(&self, submitted: &SubmittedComposite, queued_bytes: u64) -> Result<(), SubmitRejection> {
+        if submitted.step.takes_input() {
+            return Err(SubmitRejection::StepTakesInput);
+        }
+        let size = submitted.record_bytes();
         if size > Self::record_limit() {
             return Err(SubmitRejection::RecordTooLarge { size, limit: Self::record_limit() });
         }
-        self.budget.check_room(size, || 0)
+        self.budget.check_room(size + queued_bytes, || 0)
+    }
+
+    /// Tells the client of `dropped`, a composite cancelled before the
+    /// scheduler ever recorded it, that it is over, as it is told of one
+    /// cancelled while it runs.
+    pub(in crate::scheduler) fn announce_dropped(&mut self, dropped: &SubmittedComposite) {
+        if let Some(client) = dropped.client.clone() {
+            self.events.push(Event::CompositeFinished(CompositeFinished {
+                composite_id: dropped.composite_id.clone(),
+                state: CompositeState::Cancelled,
+                failure: None,
+                pages: 0,
+                client: Some(client),
+                parent_task: None,
+            }));
+        }
     }
 
     /// Holds a new composite, publishes it, and starts what it starts with.

@@ -11,7 +11,7 @@ use kabudachi_core::protocol::ids::{
     CompositeId, IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::composite::{member_input, results};
+use kabudachi_core::scheduler::composite::{expansion_source, member_input, results};
 use kabudachi_core::scheduler::{Completion, ReportRejection, Scheduler, SubmitRejection};
 use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
@@ -446,11 +446,15 @@ impl NativeRuntime {
     /// inline are stored as blobs the composite owns, nested stages'
     /// included. The worker is told when it is over (`COMPOSITE_FINISHED`).
     ///
+    /// Before this worker leads the composite is queued and its id returned
+    /// at once, as a task's is; it is recorded, in order, when the worker
+    /// comes to lead.
+    ///
     /// Raises `ValueError` if the tree describes a step the leader would not
     /// accept, or one that takes an input, `BackpressureError` if the
     /// composite does not fit under the hard memory limit or a value of the
-    /// tree alone is past it, and `RuntimeError` if this worker is not the
-    /// leader or the runtime has shut down.
+    /// tree alone is past it, and `RuntimeError` if the runtime has shut
+    /// down.
     fn submit_composite(&self, py: Python<'_>, tree: &Bound<'_, PyAny>) -> PyResult<String> {
         let mut step = step_from_tree(tree)?;
         let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
@@ -591,6 +595,26 @@ impl NativeRuntime {
             member_input(&DoorSource(&door), &task)
                 .await
                 .map(PyMemberInput)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    /// Returns an awaitable that resolves to the list the expansion run
+    /// `task_run_id` is to split, as `composite_results` has a list:
+    /// `("value", producer_definition_id, bytes)` or a nested list.
+    ///
+    /// Raises `RuntimeError` if the run is unknown or not an expansion, or the
+    /// list is no longer held.
+    fn resolve_expansion<'py>(&self, py: Python<'py>, task_run_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let task = self
+            .door
+            .task_of_run(&TaskRunId::new(task_run_id))?
+            .ok_or_else(|| PyRuntimeError::new_err("no such run"))?;
+        let door = Arc::clone(&self.door);
+        self.bridge.spawn_into_py(py, async move {
+            expansion_source(&DoorSource(&door), &task)
+                .await
+                .map(PyResolved)
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))
         })
     }

@@ -9,11 +9,13 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use prost::Message as _;
+
 use crate::blob::{BlobKey, BlobOwner};
 use crate::manifest::{Failure, Manifest, ManifestEntry};
 use crate::protocol::digest::Digest;
 use crate::protocol::generated::{
-    CompositeEntry, CompositePage, CompositeRecord, composite_entry, composite_record, input_shape,
+    CompositeEntry, CompositePage, CompositeRecord, Expansion, composite_entry, composite_record, input_shape,
 };
 use crate::protocol::ids::{CompositeId, TaskDefinitionId};
 use crate::protocol::messages::Task;
@@ -123,6 +125,26 @@ pub async fn member_input<S: CompositeSource>(source: &S, task: &Task) -> Result
     };
     let input = resolve_manifest(source, &manifest, producer.as_ref(), owner.as_ref()).await?;
     Ok(MemberInput { step: bound, input: Some(input), own_input: None })
+}
+
+/// The list an expansion run `task` is to split: the source its `Expansion`
+/// names, read from the stage before the map it belongs to, resolved as that
+/// stage's result is for a member that takes it.
+pub async fn expansion_source<S: CompositeSource>(source: &S, task: &Task) -> Result<Resolved, Unresolved> {
+    let id = task.composite_id().ok_or(Unresolved::Malformed)?;
+    let expansion = Expansion::decode(&task.serialized_input[..]).map_err(|_| Unresolved::Malformed)?;
+    let manifest = expansion
+        .source
+        .as_ref()
+        .ok_or(Unresolved::Malformed)
+        .and_then(|manifest| Manifest::try_from(manifest).map_err(|_| Unresolved::Malformed))?;
+    let record = source
+        .composite(&id)
+        .await
+        .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
+    let producer: Option<TaskDefinitionId> = expansion.producer.map(Into::into);
+    let owner = input_owner(source, &record).await?;
+    resolve_manifest(source, &manifest, producer.as_ref(), owner.as_ref()).await
 }
 
 /// `manifest` as one value or a list. A manifest of pages is a list: the

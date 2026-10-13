@@ -25,7 +25,9 @@ mod recover;
 mod resolve;
 
 pub(in crate::scheduler) use held::Composites;
-pub use resolve::{CompositeSource, MemberInput, Resolved, Unresolved, member_input, resolve_manifest, results};
+pub use resolve::{
+    CompositeSource, MemberInput, Resolved, Unresolved, expansion_source, member_input, resolve_manifest, results,
+};
 
 /// How many member outcomes one page of a composite holds.
 pub const PAGE_ENTRIES: u64 = 1024;
@@ -95,6 +97,13 @@ pub struct SubmittedComposite {
     /// The worker told when the composite finishes; `None` when nobody
     /// waits for it.
     pub client: Option<WorkerId>,
+}
+
+impl SubmittedComposite {
+    /// The bytes its record takes of a record and of the memory budget.
+    pub fn record_bytes(&self) -> u64 {
+        records::first_record_len(&self.composite_id, &self.step)
+    }
 }
 
 /// What a composite is a part of.
@@ -341,6 +350,30 @@ impl Step {
     /// that takes the list it is given.
     fn is_map_shaped(&self) -> bool {
         self.expands() || self.stages.iter().all(|stage| !stage.takes_input())
+    }
+}
+
+/// What an expansion run is asked: the task to run on every item of the list
+/// it splits, and how the map over the items treats a failure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpansionRequest {
+    pub task: BoundStep,
+    pub on_error: OnError,
+}
+
+impl ExpansionRequest {
+    /// The request an expansion run carries as its input.
+    pub fn decode(bytes: &[u8]) -> Result<ExpansionRequest, MalformedStep> {
+        let request = generated::Expansion::decode(bytes).map_err(|_| MalformedStep::Undecodable)?;
+        let Some(generated::expansion::Then::Map(template)) = request.then else {
+            return Err(MalformedStep::UnsupportedKind);
+        };
+        let on_error = match generated::OnError::try_from(request.on_error) {
+            Ok(generated::OnError::FailFast) => OnError::FailFast,
+            Ok(generated::OnError::CollectAll) => OnError::CollectAll,
+            _ => return Err(MalformedStep::UnknownKind),
+        };
+        Ok(ExpansionRequest { task: BoundStep::try_from(&template)?, on_error })
     }
 }
 

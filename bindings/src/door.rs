@@ -213,33 +213,44 @@ impl<C: Clock> SchedulerDoor<C> {
     }
 
     /// Mints a composite for `step` with this door's worker as its client and
-    /// submits it. `values` are the bound inputs too large to inline that
-    /// `step` names by manifest (see `take_large_values`): they are kept in
-    /// this node's own store, as blobs the composite owns, before it is
-    /// submitted, and dropped again if it is refused. Wakes claims and timers.
+    /// submits it: the backlog records it now, or holds it until the node
+    /// leads. `values` are the bound inputs too large to inline that `step`
+    /// names by manifest (see `take_large_values`): they are kept in this
+    /// node's own store, as blobs the composite owns, before it is submitted,
+    /// and dropped again if it is refused. Wakes claims and timers.
     pub fn submit_composite(
         &self,
         step: CompositeStep,
         values: Vec<Vec<u8>>,
     ) -> Result<CompositeId, Refusal<SubmitRejection>> {
-        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            settled_change(scheduler, |scheduler| {
+        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            settled_backlog(inside, |backlog, scheduler| {
                 let minted = scheduler.mint_composite(step, Some(self.worker.clone()));
                 let owner = BlobOwner::Composite(minted.composite_id.clone());
                 for value in values {
                     scheduler.observer_mut().put_blobs(&owner, Manifest::chunk(&value).chunks);
                 }
-                scheduler
-                    .submit_composite(minted)
+                backlog
+                    .submit_composite(scheduler, minted)
                     .inspect_err(|_| scheduler.observer_mut().forget_blobs_of(&owner))
             })
         }))
     }
 
-    /// Cancels the composite `id`, with every member it has started.
+    /// Cancels the composite `id`, with every member it has started. One
+    /// still waiting in the backlog is dropped, so it never runs, and its
+    /// blobs go with it.
     pub fn cancel_composite(&self, id: &CompositeId) -> Result<Cancellation, Refusal<CancelRejection>> {
-        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
-            settled_change(scheduler, |scheduler| scheduler.cancel_composite(id))
+        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
+            settled_backlog(inside, |backlog, scheduler| {
+                let cancelled = backlog.cancel_composite(scheduler, id);
+                if cancelled == Ok(Cancellation::Cancelled { was_running: false })
+                    && scheduler.composite_status(id).is_none()
+                {
+                    scheduler.observer_mut().forget_blobs_of(&BlobOwner::Composite(id.clone()));
+                }
+                cancelled
+            })
         }))
     }
 
@@ -577,7 +588,11 @@ impl<C: Clock> SchedulerDoor<C> {
 
     /// Where the composite `id` stands, if the scheduler holds it.
     pub fn composite_status(&self, id: &CompositeId) -> Result<Option<CompositeStatus>, Closed> {
-        self.read(|scheduler| scheduler.composite_status(id))
+        let inside = self.lock();
+        if inside.closed {
+            return Err(Closed);
+        }
+        Ok(inside.backlog.composite_status(&inside.scheduler, id))
     }
 
     /// Reads the scheduler under its lock, unless the door is closed.

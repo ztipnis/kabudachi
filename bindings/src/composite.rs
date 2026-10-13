@@ -22,9 +22,10 @@ use kabudachi_core::protocol::generated::{
     self, BoundField, BoundTaskStep, StageDescription, StepDescription, bound_field, bound_task_step,
     stage_description,
 };
-use kabudachi_core::protocol::ids::TaskDefinitionId;
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeState, FieldValue, MemberInput, Resolved, Stage, Step,
+    BoundInput, BoundStep, CompositeState, ExpansionRequest, FieldValue, MemberInput, OnError, Resolved, Stage,
+    Step,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -36,6 +37,66 @@ use pyo3::IntoPyObjectExt;
 #[pyclass(name = "Manifest", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyManifest(pub(crate) Manifest);
+
+/// What an expansion run is asked: the task to run on every item of a list
+/// another stage returned, and how the map over the items treats a failure.
+/// The list itself is read with `NativeRuntime.resolve_expansion`.
+#[pyclass(name = "Expansion", frozen, skip_from_py_object)]
+pub struct PyExpansion(ExpansionRequest);
+
+#[pymethods]
+impl PyExpansion {
+    /// The task the map runs on every item.
+    #[getter]
+    fn definition_id(&self) -> &str {
+        self.0.task.definition.as_str()
+    }
+
+    #[getter]
+    fn version(&self) -> u32 {
+        self.0.task.version
+    }
+
+    /// `"fail_fast"` or `"collect_all"`.
+    #[getter]
+    fn on_error(&self) -> &'static str {
+        match self.0.on_error {
+            OnError::FailFast => "fail_fast",
+            OnError::CollectAll => "collect_all",
+        }
+    }
+
+    /// The task's options as a tree names them (see `describe_step`).
+    #[getter]
+    fn settings<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let options = &self.0.task.options;
+        let settings = PyDict::new(py);
+        settings.set_item("queue", &options.queue)?;
+        settings.set_item("retries", options.retries)?;
+        settings.set_item("ephemeral", options.ephemeral)?;
+        settings.set_item("non_retriable", options.non_retriable)?;
+        settings.set_item(
+            "reconnect_timeout_ms",
+            options.reconnect_timeout.map(|timeout| timeout.as_millis() as u64),
+        )?;
+        Ok(settings)
+    }
+}
+
+/// The request an expansion run's claim carries as its input. Raises
+/// `ValueError` for bytes that are not one.
+#[pyfunction]
+pub fn read_expansion(serialized_input: &[u8]) -> PyResult<PyExpansion> {
+    ExpansionRequest::decode(serialized_input)
+        .map(PyExpansion)
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+/// The id of the composite a task's run returned as its continuation.
+#[pyfunction]
+pub fn continuation_of(task_run_id: &str) -> String {
+    CompositeId::continuation_of(&TaskRunId::new(task_run_id)).as_str().to_owned()
+}
 
 /// Encodes the step `tree` describes: the same tree always gives the same
 /// bytes. Raises `TypeError` for a tree of the wrong shape and `ValueError`
