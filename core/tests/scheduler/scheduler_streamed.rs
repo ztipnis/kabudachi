@@ -2,7 +2,8 @@
 //! whole or refused whole, and the composite ends once its last batch is in
 //! and every member has settled.
 
-use kabudachi_core::manifest::Manifest;
+use kabudachi_core::blob::BlobKey;
+use kabudachi_core::manifest::{Manifest, ManifestEntry};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::composite_entry;
 use kabudachi_core::protocol::ids::CompositeId;
@@ -230,4 +231,21 @@ fn a_page_is_written_once_it_is_whole_or_its_composite_is_over_and_never_in_betw
     let record = fixture.spy.newest_composite(&map).unwrap();
     assert_eq!((record.members, record.sealed, record.finished), (total, true, true));
     assert_eq!(record.counts.unwrap().failed, 1);
+}
+
+#[test]
+fn a_streamed_item_held_as_blobs_reaches_its_task_as_the_manifest_its_budget_counted() {
+    let mut fixture = Fixture::leading();
+    let map = submitted(&mut fixture, streamed_map(OnError::FailFast));
+    let manifest = Manifest::new(vec![ManifestEntry::Blob(BlobKey::of(b"a large item"))], 12);
+    let batch = MemberBatch {
+        composite_id: map.clone(),
+        start_index: 0,
+        members: vec![StreamedMember::Item(BoundInput::Chunked(manifest.clone()))],
+        last: true,
+    };
+    fixture.scheduler.submit_members(batch).unwrap();
+    let claim = start_member(&mut fixture, &map, 0);
+    assert_eq!(claim.input_manifest().unwrap(), Some(manifest), "the Task names the blobs the budget weighed");
+    assert!(claim.task.serialized_input.is_empty());
 }

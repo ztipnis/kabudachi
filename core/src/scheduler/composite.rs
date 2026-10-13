@@ -529,6 +529,12 @@ impl Step {
             && matches!(self.stages.as_slice(), [Stage::Task(template)] if matches!(template.input, BoundInput::Previous))
     }
 
+    /// Whether the step's members arrive in batches: it is streamed, or it is
+    /// a map whose expansion run sends the items it splits a list into.
+    pub(in crate::scheduler) fn takes_batches(&self) -> bool {
+        self.streamed || self.expands()
+    }
+
     /// A map's members are all bound to their items, or it has one member
     /// that takes the list it is given.
     fn is_map_shaped(&self) -> bool {

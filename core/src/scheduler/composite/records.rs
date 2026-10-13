@@ -239,7 +239,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .filter_map(outcome_of)
             .collect();
         let retained_by = self.retainer_of(parent.as_ref());
-        let (members, sealed) = if step.streamed {
+        let (members, sealed) = if step.takes_batches() {
             (record.members, record.sealed)
         } else {
             (step.stages.len() as u64, true)

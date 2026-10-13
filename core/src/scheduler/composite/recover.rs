@@ -72,7 +72,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             }
             let named = counts.get(id).copied().unwrap_or(0);
             let settled = composite.outcomes.last_key_value().map_or(0, |(index, _)| index + 1);
-            composite.members = composite.members.max(named).max(settled);
+            let counted = composite.members.max(named).max(settled);
+            if counted > composite.members {
+                composite.members = counted;
+                self.composites.unpublished.insert(id.clone());
+            }
         }
     }
 
@@ -117,6 +121,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let composite = &self.composites.held[id];
         let uncertain = &self.reconciliation;
         uncertain.is_uncertain_composite(id)
+            || (composite.step.expands() && uncertain.is_uncertain(&id.expansion_task()))
             || (0..composite.members).any(|index| {
                 let task = id.member_task(index);
                 uncertain.is_uncertain(&task)
@@ -144,6 +149,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let stages = self.composites.held[id].members;
         for index in 0..stages {
             self.settle_from_record(id, index);
+        }
+        if self.composites.held[id].step.expands() && !self.composites.held[id].sealed {
+            self.resume_expansion(id);
+            if self.composites.held[id].state != CompositeState::Running {
+                return;
+            }
         }
         let composite = &self.composites.held[id];
         if let Some(failure) = composite.first_failure_it_fails_on() {
@@ -203,17 +214,26 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Starts stage or member `index` of `id` unless its Task or child
-    /// composite exists. An expanding map's one member is the run that
-    /// splits its list.
+    /// composite exists. A composite fed in batches starts nothing: its
+    /// submitter or its expansion run sends the members again if they are
+    /// missing.
     fn ensure_stage(&mut self, id: &CompositeId, index: u64) {
-        if self.composites.held[id].step.expands() {
-            if !self.tasks.contains_key(&id.member_task(0)) {
-                self.submit_expansion(id);
-            }
-            return;
-        }
-        if !self.composites.held[id].step.streamed {
+        if !self.composites.held[id].step.takes_batches() {
             self.start_stage(id, index);
+        }
+    }
+
+    /// Takes up the expansion run of the expanding map `id` from its Task's
+    /// record: a run that ended seals the map, one that failed for good fails
+    /// it, and a map with no run yet gets one.
+    fn resume_expansion(&mut self, id: &CompositeId) {
+        let task = id.expansion_task();
+        if !self.tasks.contains_key(&task) {
+            self.submit_expansion(id);
+        } else if self.retention.holds(&task) {
+            if let Some(outcome) = self.member_outcome_of(&task) {
+                self.expansion_finished(id, outcome);
+            }
         }
     }
 }

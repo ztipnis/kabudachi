@@ -221,14 +221,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let retained_by = self.retainer_of(parent.as_ref());
         let starts: Vec<u64> = match step.kind {
             CompositeKind::Flow => vec![0],
-            _ if step.streamed => Vec::new(),
+            _ if step.takes_batches() => Vec::new(),
             _ => (0..step.stages.len() as u64).collect(),
         };
-        // A map over an empty list has no member to wait for; a streamed
-        // composite has none yet, and waits for its last batch.
-        let empty = step.stages.is_empty() && !step.streamed;
+        // A map over an empty list has no member to wait for; a composite
+        // fed in batches has none yet, and waits for its last batch.
+        let empty = step.stages.is_empty() && !step.takes_batches();
         let expands = step.expands();
-        let (members, sealed) = if step.streamed { (0, false) } else { (step.stages.len() as u64, true) };
+        let (members, sealed) = if step.takes_batches() { (0, false) } else { (step.stages.len() as u64, true) };
         self.composites.held.insert(
             id.clone(),
             Composite {
@@ -263,8 +263,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Records the expansion run that splits the list an expanding map is
-    /// given. The run is the map's member 0; the map's members proper come
-    /// from the step it returns.
+    /// given. The run is not a member: it sends the map its items in batches,
+    /// and its certification seals the map.
     pub(super) fn submit_expansion(&mut self, id: &CompositeId) {
         let composite = &self.composites.held[id];
         let Stage::Task(template) = &composite.step.stages[0] else {
@@ -290,10 +290,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             template.options.queue.clone(),
         )
         .as_member_of(id.clone(), 0);
-        let submitted = Submitted::received(id.member_task(0), WallTime::now(&self.clock), submission, &self.clock);
+        let submitted = Submitted::received(id.expansion_task(), WallTime::now(&self.clock), submission, &self.clock);
         if let Err(refused) = self.record_submission(submitted) {
             let failure = Failure::new(refused.kind(), refused.to_string());
-            self.settle_member(id, 0, MemberOutcome::Failed(failure));
+            self.finish_composite(id, CompositeState::Failed, Some(failure));
         }
     }
 
@@ -356,7 +356,19 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if self.composites.held[id].state != CompositeState::Running || self.stage_started(id, index, &stage) {
             return;
         }
-        self.launch_stage(id, index, stage, None);
+        match stage {
+            Stage::Task(bound) => {
+                // A streamed member's blobs belong to the composite it
+                // streams into, and no record holds its step, so its Task
+                // names them.
+                let mut submission = bound.submission(None);
+                if let BoundInput::Chunked(manifest) = &bound.input {
+                    submission = submission.with_input_manifest(manifest.clone());
+                }
+                self.submit_member(id, index, submission);
+            }
+            Stage::Composite(step) => self.launch_stage(id, index, Stage::Composite(step), None),
+        }
     }
 
     /// Whether the Task or child composite stage `index` of `id` makes exists.
@@ -369,7 +381,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     fn launch_stage(&mut self, id: &CompositeId, index: u64, stage: Stage, input: Option<(Manifest, InputShape)>) {
         match stage {
-            Stage::Task(bound) => self.submit_member(id, index, &bound, input.map(|(manifest, _)| manifest)),
+            Stage::Task(bound) => {
+                self.submit_member(id, index, bound.submission(input.map(|(manifest, _)| manifest)));
+            }
             Stage::Composite(step) => {
                 let child = id.child(index);
                 let submitted_at = WallTime::now(&self.clock);
@@ -407,25 +421,18 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// The manifest of a held composite's pages, if it is held.
-    /// An expanding map's results are those of the members its expansion run
-    /// returned.
     fn results_manifest(&self, id: &CompositeId) -> Option<Manifest> {
         let composite = self.composites.held.get(id)?;
-        if composite.step.expands() {
-            if let Some(MemberOutcome::Child(members)) = composite.outcomes.get(&0) {
-                return self.results_manifest(members);
-            }
-        }
         Some(pages_manifest(id, composite.pages()))
     }
 
     /// Records member `index`'s Task. A Task the scheduler refuses settles
     /// the member as failed with the refusal's kind.
-    fn submit_member(&mut self, id: &CompositeId, index: u64, bound: &BoundStep, input: Option<Manifest>) {
+    fn submit_member(&mut self, id: &CompositeId, index: u64, submission: Submission) {
         let submitted = Submitted::received(
             id.member_task(index),
             WallTime::now(&self.clock),
-            bound.submission(input).as_member_of(id.clone(), index),
+            submission.as_member_of(id.clone(), index),
             &self.clock,
         );
         if let Err(refused) = self.record_submission(submitted) {
@@ -441,11 +448,37 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return;
         };
         let index = self.tasks[task_id].composite_index;
+        let expansion = self.tasks[task_id].task_definition_id().as_str() == EXPANSION_DEFINITION;
         if let Some(outcome) = self.member_outcome_of(task_id) {
             let outer = self.composites.settling.len();
             self.composites.settling.push(task_id.clone());
-            self.settle_member(&composite, index, outcome);
+            if expansion {
+                self.expansion_finished(&composite, outcome);
+            } else {
+                self.settle_member(&composite, index, outcome);
+            }
             self.composites.settling.truncate(outer);
+        }
+    }
+
+    /// The expansion run of the map `id` ended as `outcome`. Success means
+    /// every item has been sent, so the map is sealed at the members it holds;
+    /// failure fails the map whatever its policy, since without the items it
+    /// has no results. Members already accepted run on and are ignored.
+    pub(super) fn expansion_finished(&mut self, id: &CompositeId, outcome: MemberOutcome) {
+        let Some(composite) = self.composites.held.get_mut(id) else {
+            return;
+        };
+        if composite.state != CompositeState::Running {
+            return;
+        }
+        match outcome {
+            MemberOutcome::Failed(failure) => self.finish_composite(id, CompositeState::Failed, Some(failure)),
+            MemberOutcome::Value { .. } | MemberOutcome::Child(_) => {
+                composite.sealed = true;
+                self.composites.unpublished.insert(id.clone());
+                self.finish_if_complete(id);
+            }
         }
     }
 
@@ -633,6 +666,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let mut was_running = false;
         for index in unsettled {
             was_running |= self.cancel_stage(id, index);
+        }
+        let expansion = id.expansion_task();
+        if self.tasks.contains_key(&expansion) {
+            was_running |= matches!(self.cancel_task(&expansion), Ok(Cancellation::Cancelled { was_running: true }));
         }
         self.finish_composite(id, CompositeState::Cancelled, None);
         Ok(Cancellation::Cancelled { was_running })

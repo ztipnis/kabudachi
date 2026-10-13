@@ -12,7 +12,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::{Rebuild, ReportedRun, ReportedState, WorkerRuns};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, CompositeKind, CompositeState, OnError, Stage, Step,
+    CompositeKind, CompositeState, OnError, Stage, Step,
 };
 use kabudachi_core::scheduler::{CancelRejection, ClaimRejection, Completion, Submission};
 use kabudachi_core::task_record::RecordKey;
@@ -319,15 +319,14 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
             flow_of(vec![task_stage("load", Some(b"x")), map, task_stage("report", Some(b"r"))]),
         );
         run_member(&mut fixture, &flow, 0, b"[1]");
-        let expansion = start_member(&mut fixture, &flow.child(1), 0);
-        let Stage::Task(mut item) = task_stage("each", None) else { unreachable!("a task stage") };
-        item.input = BoundInput::Value(b"1".to_vec());
-        let items = Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: vec![Stage::Task(item)], streamed: false };
+        let split = flow.child(1);
+        let expansion = fixture.scheduler.request_claim(&worker(), &split.expansion_task()).unwrap();
+        fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        fixture.scheduler.submit_members(item_batch(&split, 0, 1, false)).unwrap();
         fixture
             .scheduler
-            .complete(&worker(), &expansion.task_run_id, items.digest(), Completion::Continues(items))
+            .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
             .unwrap();
-        let split = CompositeId::continuation_of(&expansion.task_run_id);
         run_member(&mut fixture, &split, 0, b"1!");
         assert_eq!(
             fixture.scheduler.composite_status(&flow.child(1)).unwrap().state,
@@ -357,7 +356,10 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
             leading.scheduler.composite_record(&flow.child(1)).is_none(),
             "and the map it held (takeover: {takeover})"
         );
-        assert!(leading.scheduler.composite_record(&split).is_none(), "and the items (takeover: {takeover})");
+        assert!(
+            leading.scheduler.composite_page(&split, 0).is_none(),
+            "and the items' results (takeover: {takeover})"
+        );
     }
 }
 

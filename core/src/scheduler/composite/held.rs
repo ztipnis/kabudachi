@@ -49,7 +49,7 @@ pub(in crate::scheduler) struct Composite {
 impl Composite {
     /// Whether its members arrive in batches.
     pub(super) fn takes_batches(&self) -> bool {
-        self.step.streamed
+        self.step.takes_batches()
     }
 
     /// The stage a streamed member is to run as: a map's item is the input of
@@ -75,13 +75,9 @@ impl Composite {
     }
 
     /// Whether the first stage or member to fail for good ends the
-    /// composite: a flow's always does, a group's or map's by its policy, and
-    /// an expanding map's always, since its one member is the run that
-    /// splits its list and without the items it has no results.
+    /// composite: a flow's always does, a group's or map's by its policy.
     pub(super) fn fails_on_first_failure(&self) -> bool {
-        self.step.kind == CompositeKind::Flow
-            || self.step.on_error == OnError::FailFast
-            || self.step.expands()
+        self.step.kind == CompositeKind::Flow || self.step.on_error == OnError::FailFast
     }
 
     /// The failure that ended the composite, or the cancellation that did.
@@ -256,13 +252,14 @@ impl Composites {
 
     fn forget(&mut self, id: &CompositeId) -> Vec<TaskId> {
         let members = self.held.remove(id).map_or_else(Vec::new, |composite| {
-            // A streamed composite keeps no stage once it has started it: a
-            // child's index names no Task, which retention never holds.
+            // A composite fed in batches keeps no stage once it has started
+            // it: a child's index names no Task, which retention never holds.
+            let fed = composite.step.takes_batches();
+            let expansion = composite.step.expands().then(|| id.expansion_task());
             (0..composite.members)
-                .filter(|index| {
-                    composite.step.streamed || matches!(composite.step.stages[*index as usize], Stage::Task(_))
-                })
+                .filter(|index| fed || matches!(composite.step.stages[*index as usize], Stage::Task(_)))
                 .map(|index| id.member_task(index))
+                .chain(expansion)
                 .collect()
         });
         self.unpublished.remove(id);
