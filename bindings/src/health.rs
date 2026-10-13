@@ -21,28 +21,39 @@ pub(crate) struct Probe {
     pub(crate) ready: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
-/// Binds `listen` (`ip:port`; port 0 picks one) and serves the endpoints on
-/// `handle` until the runtime shuts down. Returns the address bound.
+/// Binds `listen` (`ip:port`; port 0 picks one), to be served by `serve`.
 ///
 /// Raises `ValueError` for an address that is not `ip:port`, and
 /// `RuntimeError` if it cannot be bound.
-pub(crate) fn serve(
-    py: Python<'_>,
-    handle: &Handle,
-    listen: &str,
-    probe: Probe,
-) -> PyResult<SocketAddr> {
+pub(crate) fn bind(listen: &str) -> PyResult<std::net::TcpListener> {
     let address: SocketAddr = listen.parse().map_err(|error| {
         PyValueError::new_err(format!("{listen:?} is not an ip:port address: {error}"))
     })?;
-    let listener = py
-        .detach(|| handle.block_on(TcpListener::bind(address)))
-        .map_err(|error| {
-            PyRuntimeError::new_err(format!("cannot serve health on {listen:?}: {error}"))
-        })?;
+    let cannot = |error: std::io::Error| {
+        PyRuntimeError::new_err(format!("cannot serve health on {listen:?}: {error}"))
+    };
+    let listener = std::net::TcpListener::bind(address).map_err(cannot)?;
+    listener.set_nonblocking(true).map_err(cannot)?;
+    Ok(listener)
+}
+
+/// Serves the endpoints on a listener `bind` made, on `handle`, until the
+/// runtime shuts down. Returns the address bound.
+///
+/// Raises `RuntimeError` if the listener cannot be used.
+pub(crate) fn serve(
+    handle: &Handle,
+    listener: std::net::TcpListener,
+    probe: Probe,
+) -> PyResult<SocketAddr> {
     let bound = listener
         .local_addr()
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let listener = {
+        let _entered = handle.enter();
+        TcpListener::from_std(listener)
+    }
+    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))

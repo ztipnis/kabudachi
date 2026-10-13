@@ -102,7 +102,6 @@ impl NativeRuntime {
     /// address; `RuntimeError` if `health_listen` cannot be bound.
     #[new]
     fn new(
-        py: Python<'_>,
         worker_id: String,
         incarnation_id: String,
         arguments: OneNodeArguments,
@@ -152,13 +151,13 @@ impl NativeRuntime {
         // Bound before the loops start, so a port in use leaves nothing running.
         let health = match arguments.health_listen {
             Some(listen) => {
+                let listener = health::bind(&listen)?;
                 let ready_state = state.clone();
                 let loaded = Arc::clone(&registry);
                 let alive = Arc::clone(&running);
                 Some(health::serve(
-                    py,
                     tokio.handle(),
-                    &listen,
+                    listener,
                     health::Probe {
                         alive: Box::new(move || alive.load(Ordering::Acquire) == 2),
                         ready: Box::new(move || {
@@ -428,7 +427,8 @@ impl NativeRuntime {
     /// Reports that a claimed run failed with an error of type `failure_kind`
     /// (the type's name) and the error's message `failure_message` (never its
     /// traceback; the leader keeps at most `MAX_FAILURE_MESSAGE_BYTES` of it),
-    /// whether or not its body started. Returns whether the task has retries
+    /// whether or not its body started. The message is stored in the task's
+    /// replicated record, so it can contain task data. Returns whether the task has retries
     /// left, so a new attempt is now waiting to be claimed; `False` means the
     /// task has failed for good.
     ///

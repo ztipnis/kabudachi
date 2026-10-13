@@ -110,6 +110,13 @@ impl NetworkedRuntime {
     #[new]
     fn new(py: Python<'_>, arguments: NetworkedArguments) -> PyResult<Self> {
         arguments.check()?;
+        // Bound before the worker bootstraps, so a port in use leaves nothing
+        // running.
+        let health_listener = arguments
+            .health_listen
+            .as_deref()
+            .map(health::bind)
+            .transpose()?;
         let (endpoint, executor) = executor_channel();
         let (source, reports) = executor.split();
         let config = arguments.worker_config(endpoint)?;
@@ -140,16 +147,15 @@ impl NetworkedRuntime {
             Arc::default(),
         );
         let registry = Arc::new(AtomicBool::new(false));
-        let health = match &arguments.health_listen {
-            Some(listen) => {
+        let health = match health_listener {
+            Some(listener) => {
                 let seen = shared.observed.clone();
                 let ready_seen = shared.observed.clone();
                 let pump_running = host.pumping();
                 let loaded = Arc::clone(&registry);
                 Some(health::serve(
-                    py,
                     host.handle(),
-                    listen,
+                    listener,
                     health::Probe {
                         alive: Box::new(move || {
                             !seen.borrow().gone && pump_running.load(Ordering::Acquire)
@@ -402,7 +408,8 @@ impl NetworkedRuntime {
     }
 
     /// Hands the leader a run's failure, by its error's type name and
-    /// message (never its traceback).
+    /// message (never its traceback). The message is stored in the task's
+    /// replicated record, so it can contain task data.
     #[pyo3(signature = (task_run_id, failure_kind, failure_message = ""))]
     fn report_failure(&self, task_run_id: &str, failure_kind: &str, failure_message: &str) {
         self.shared
