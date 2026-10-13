@@ -3071,6 +3071,8 @@ Open: while a takeover has records not known yet, every member that settles in a
 
 Open: a joiner whose leader dies before its first ack has no configuration yet, and with no other live member and an empty or flushed authority it stays `LeaderSuspect`: it neither abandons the shard nor runs a stranded search. An unconfigured node starts no roll call (`core/src/election/node/timers.rs`), and the empty authority read is not acted on for it (`core/src/election/authority_standing/replies.rs`); `StrandedWatch` (`net/src/leader_search.rs`) does not cover it. A restart recovers it. Exposure: rare, the join window plus loss of the leader plus a flushed authority. Impact: that node is stuck until restarted. Fix direction: let an unconfigured `LeaderSuspect` node act on an empty authority read, or extend `StrandedWatch` to cover it; either changes documented behaviour, so it needs a design ruling first.
 
+Open: a released page cannot be re-placed. After the acknowledgement of its stored write, the leader releases a full page (a reduce's item pages, and the full results pages of a large map or group), so `LeaderRecords::repair` (`core/src/task_record/leader_records.rs`) has nothing held to publish again when the voters change. Fix: a driver read-back path that reads a released page from its old holders and writes it to the new placement, through `RecordPorts`. Exposure: a voter change within `result_ttl` of the composite's completion; plausible but rare. Impact: the page is unavailable once its holders are lost, so the composite's results surface as unavailable; resubmitting the work recovers them.
+
 ### Phase 7: observability
 
 Prometheus and tracing should exist earlier for development, but this phase hardens:
