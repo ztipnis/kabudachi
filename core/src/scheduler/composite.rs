@@ -166,6 +166,12 @@ pub struct CompositeFinished {
     pub client: Option<WorkerId>,
     /// Set when the composite is a task's continuation.
     pub parent_task: Option<TaskId>,
+    /// The Tasks whose ends led to this one, innermost first: the member
+    /// whose outcome ended the composite, and, for a composite that ended a
+    /// member of another, the Task that member was. Their records were made
+    /// in the same call, and what is told of the end must not outrun them.
+    /// Known only to the leader that raised the event; empty otherwise.
+    pub settled_by: Vec<TaskId>,
 }
 
 impl CompositeFinished {
@@ -198,6 +204,7 @@ impl CompositeFinished {
             pages: record.pages,
             client: record.client.clone().map(WorkerId::from),
             parent_task,
+            settled_by: Vec::new(),
         })
     }
 }
@@ -255,6 +262,7 @@ impl TryFrom<&generated::CompositeFinished> for CompositeFinished {
             pages,
             client: None,
             parent_task: wire.parent_task.clone().map(TaskId::from),
+            settled_by: Vec::new(),
         })
     }
 }

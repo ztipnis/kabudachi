@@ -103,16 +103,19 @@ impl WriteLedger {
     /// A composite's answer also waits on its pages: they are the same
     /// call's terminal records, so what it tells must not outrun them.
     pub fn waits_on(&self, record: &RecordKey) -> Waits {
-        if self.refused.iter().any(|write| covered_by(&write.key, record)) {
+        self.waits_on_all(std::slice::from_ref(record))
+    }
+
+    /// What an answer about all of `records` that made no write of its own
+    /// waits on: the writes [`Self::waits_on`] names for each, once each. A
+    /// composite's end is told with the Task whose end settled it among them,
+    /// since the end must not outrun the certification it follows.
+    pub fn waits_on_all(&self, records: &[RecordKey]) -> Waits {
+        let named = |write: &Write| records.iter().any(|record| covered_by(&write.key, record));
+        if self.refused.iter().any(named) {
             return Waits::Refused;
         }
-        Waits::Writes(
-            self.pending
-                .iter()
-                .filter(|write| covered_by(&write.key, record))
-                .cloned()
-                .collect(),
-        )
+        Waits::Writes(self.pending.iter().filter(|write| named(write)).cloned().collect())
     }
 }
 

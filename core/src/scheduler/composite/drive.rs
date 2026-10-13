@@ -129,6 +129,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 pages: 0,
                 client: Some(client),
                 parent_task: None,
+                settled_by: Vec::new(),
             }));
         }
     }
@@ -351,7 +352,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         };
         let index = self.tasks[task_id].composite_index;
         if let Some(outcome) = self.member_outcome_of(task_id) {
+            let outer = self.composites.settling.len();
+            self.composites.settling.push(task_id.clone());
             self.settle_member(&composite, index, outcome);
+            self.composites.settling.truncate(outer);
         }
     }
 
@@ -480,6 +484,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 pages,
                 client,
                 parent_task,
+                settled_by: self.composites.settling.clone(),
             }));
         }
         match parent {

@@ -70,6 +70,25 @@ fn a_composite_whose_page_write_was_refused_is_gated() {
 }
 
 #[test]
+fn what_tells_of_a_composite_and_the_task_that_ended_it_waits_on_the_writes_of_both() {
+    let mut ledger = WriteLedger::default();
+    let keys = [RecordKey::Composite(CompositeId::new("c")), RecordKey::Task(TaskId::new("last"))];
+    ledger.made(&[write("last", 1), page_write("c", 0, 0), composite_write("c", 0), write("unrelated", 0)]);
+
+    ledger.settled(&page_write("c", 0, 0), true, true);
+    ledger.settled(&composite_write("c", 0), true, true);
+    assert_eq!(
+        ledger.waits_on_all(&keys),
+        Waits::Writes(vec![write("last", 1)]),
+        "the composite is stored, the certification that ended it is not"
+    );
+
+    ledger.settled(&write("last", 1), false, true);
+    assert_eq!(ledger.waits_on_all(&keys), Waits::Refused, "its certification may be lost, and with it the end");
+    assert_eq!(ledger.waits_on_all(&keys[..1]), Waits::Writes(vec![]));
+}
+
+#[test]
 fn a_refused_write_gates_its_task_until_a_newer_revision_is_stored() {
     let mut ledger = WriteLedger::default();
     ledger.made(&[write("a", 0), write("a", 1)]);

@@ -119,7 +119,18 @@ impl<C: Clock, I: IdGenerator> Deciding<'_, C, I> {
         named: Option<RecordKey>,
         local: &mut Local,
     ) {
-        if let Some(settled) = self.records.hold(held, Vec::new(), named.as_ref()) {
+        self.hold_unwritten_on(held, named.as_slice(), local);
+    }
+
+    /// Like [`Self::hold_unwritten`] for an answer about several records:
+    /// held until the writes of all of `named` still unsettled are stored.
+    pub(super) fn hold_unwritten_on(
+        &mut self,
+        held: HeldAnswer,
+        named: &[RecordKey],
+        local: &mut Local,
+    ) {
+        if let Some(settled) = self.records.hold_on(held, Vec::new(), named) {
             send_answer(self.net, settled, local);
         }
     }

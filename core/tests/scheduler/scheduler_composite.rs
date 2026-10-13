@@ -195,6 +195,30 @@ fn a_member_is_kept_with_its_results_until_its_group_is_forgotten_however_long_a
 }
 
 #[test]
+fn a_composites_end_names_the_tasks_whose_ends_led_to_it() {
+    let mut fixture = Fixture::leading();
+    let group = submitted(&mut fixture, group_of(OnError::CollectAll, vec![task_stage("plan", Some(b"a"))]));
+    let planner = start_member(&mut fixture, &group, 0);
+    let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
+    fixture
+        .scheduler
+        .complete(&worker(), &planner.task_run_id, step.digest(), Completion::Continues(step))
+        .unwrap();
+    let continuation = CompositeId::continuation_of(&planner.task_run_id);
+
+    run_member(&mut fixture, &continuation, 0, b"staged");
+
+    let ended = finished(&mut fixture);
+    let settled_by = |id: &CompositeId| ended.iter().find(|end| end.composite_id == *id).unwrap().settled_by.clone();
+    assert_eq!(settled_by(&continuation), [continuation.member_task(0)]);
+    assert_eq!(
+        settled_by(&group),
+        [continuation.member_task(0), group.member_task(0)],
+        "the stage that ended the continuation, then the planner whose end that was"
+    );
+}
+
+#[test]
 fn fail_fast_fails_the_group_at_its_first_failure_and_leaves_running_members_alone() {
     let mut fixture = Fixture::leading();
     let group = submitted(
@@ -732,7 +756,9 @@ fn a_finished_composites_record_gives_the_finish_its_client_was_told_and_a_runni
     fail_member(&mut fixture, &flow, 0, "ValueError");
     let told = finished(&mut fixture);
     let record = fixture.spy.newest_composite(&flow).unwrap();
-    assert_eq!(CompositeFinished::of_record(&record).as_ref(), Some(&told[0]));
+    // The record cannot say which Tasks' ends led to it.
+    let told_by_record = CompositeFinished { settled_by: Vec::new(), ..told[0].clone() };
+    assert_eq!(CompositeFinished::of_record(&record), Some(told_by_record));
 
     // A task's continuation is told with the task that returned it.
     let task = fixture
@@ -750,6 +776,7 @@ fn a_finished_composites_record_gives_the_finish_its_client_was_told_and_a_runni
     run_member(&mut fixture, &continuation, 0, b"staged");
     let told = finished(&mut fixture);
     let record = fixture.spy.newest_composite(&continuation).unwrap();
-    assert_eq!(CompositeFinished::of_record(&record).as_ref(), Some(&told[0]));
+    let told_by_record = CompositeFinished { settled_by: Vec::new(), ..told[0].clone() };
+    assert_eq!(CompositeFinished::of_record(&record), Some(told_by_record));
     assert_eq!(told[0].parent_task, Some(task));
 }

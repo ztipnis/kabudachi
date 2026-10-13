@@ -167,11 +167,22 @@ impl<E> LeaderRecords<E> {
         made: Vec<Write>,
         key: Option<&RecordKey>,
     ) -> Option<Settled<E>> {
+        self.hold_on(answer, made, key.map_or(&[], std::slice::from_ref))
+    }
+
+    /// Like [`Self::hold`] for an answer about several records at once: one
+    /// that made no write waits for the writes of all of `keys` still
+    /// unsettled, and is answered `NotLeader` at once if any was refused.
+    #[must_use]
+    pub fn hold_on(
+        &mut self,
+        answer: E,
+        made: Vec<Write>,
+        keys: &[RecordKey],
+    ) -> Option<Settled<E>> {
         let mut writes = made;
-        if writes.is_empty()
-            && let Some(key) = key
-        {
-            match self.ledger.waits_on(key) {
+        if writes.is_empty() && !keys.is_empty() {
+            match self.ledger.waits_on_all(keys) {
                 Waits::Refused => return Some(Settled::NotLeader(answer)),
                 Waits::Writes(pending) => writes.extend(pending),
             }

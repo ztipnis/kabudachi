@@ -47,15 +47,19 @@ pub(super) fn drain_events<C: Clock, I: IdGenerator>(
         if let Event::CompositeFinished(finished) = &event
             && let Some(client) = finished.client.clone()
         {
-            // Told only once the composite's terminal records are stored: a
-            // client that settles on this must never see a later leader
-            // undo it.
+            // Told only once the composite's terminal records are stored, and
+            // those of the Tasks whose ends led to it: a client that settles
+            // on this must never see a later leader undo it, as one that
+            // replays a member whose certification was lost could with a
+            // result the stored page does not name.
             let held = HeldAnswer::Finished {
                 client,
                 finished: finished.into(),
             };
-            let record = RecordKey::Composite(finished.composite_id.clone());
-            deciding.hold_unwritten(held, Some(record), local);
+            let named: Vec<RecordKey> = std::iter::once(RecordKey::Composite(finished.composite_id.clone()))
+                .chain(finished.settled_by.iter().cloned().map(RecordKey::Task))
+                .collect();
+            deciding.hold_unwritten_on(held, &named, local);
             continue;
         }
         hold_for_worker(deciding, &event, local);

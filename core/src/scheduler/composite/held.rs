@@ -100,6 +100,9 @@ pub(in crate::scheduler) struct Composites {
     pub(in crate::scheduler) held: BTreeMap<CompositeId, Composite>,
     pub(in crate::scheduler) unpublished: BTreeSet<CompositeId>,
     pub(in crate::scheduler) unpublished_pages: BTreeSet<(CompositeId, u32)>,
+    /// The Tasks whose ends are being settled into their composites right
+    /// now, outermost first: a composite that ends meanwhile says so.
+    pub(in crate::scheduler) settling: Vec<TaskId>,
     /// When each finished composite finished, for its retention.
     finished_at: BTreeMap<CompositeId, Instant>,
     /// The same, by time, so only the due ones are visited.
