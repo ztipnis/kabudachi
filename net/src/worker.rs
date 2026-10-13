@@ -312,9 +312,12 @@ impl Worker {
     /// hands the records it holds to the voters its leader chooses, and then
     /// returns, saying what became of them: the process may exit. It
     /// returns only once every record was stored or passed on, or once the
-    /// node's drain wait limit has passed. A leader that drains may spend
-    /// that limit twice, once waiting for its voters to crawl and once handing
-    /// its records over.
+    /// node's drain wait limit has passed. A leader that drains hands its
+    /// leadership over first and leaves through its successor; with no other
+    /// voter it waits up to the drain wait limit for one. A worker with no
+    /// leader leaves once that limit has passed, handing nothing over. A
+    /// leader that drains may spend the limit twice, once waiting for its
+    /// voters to crawl and once handing its records over.
     ///
     /// A node that fences itself and then finds its shard recovered without
     /// it goes back to `Bootstrapping`; the driver rejoins it through the
