@@ -111,7 +111,7 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
         // Asking for the oldest tasks of every queue, it is handed the oldest of
         // its own: the leader holds it to the queues it reported.
         let handed = shard
-            .drive_until(cpu_net.claim_oldest(leader_id.clone(), 1, &Subscription::Every))
+            .drive_until(cpu_net.claim_oldest(leader_id.clone(), 1, &Subscription::Every, None))
             .await
             .expect("the leader answered");
         let Some(claim_response::Result::Batch(batch)) = handed.result else {
