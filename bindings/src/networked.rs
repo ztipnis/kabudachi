@@ -93,8 +93,9 @@ impl NetworkedRuntime {
     /// by founding the shard alone.
     ///
     /// Raises `ValueError` for an address that cannot be read, a timing or
-    /// authority TTL of zero, only one memory limit, no worker threads or an
-    /// authority that cannot be used, and `RuntimeError` if it cannot listen
+    /// authority TTL of zero, a replication factor or seed rounds of zero,
+    /// only one memory limit, no worker threads or an authority that cannot
+    /// be used, and `RuntimeError` if it cannot listen
     /// on its listen address.
     #[new]
     fn new(py: Python<'_>, arguments: NetworkedArguments) -> PyResult<Self> {

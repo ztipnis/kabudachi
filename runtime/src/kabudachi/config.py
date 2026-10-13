@@ -6,6 +6,7 @@ the environment), then the task's own explicit setting. A task setting of
 """
 
 import functools
+import ipaddress
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -148,9 +149,10 @@ class Settings:
     of type `int` is read from the environment as a number, one of type
     `timedelta` as a number of seconds, a `bool` as true/false, yes/no, on/off
     or 1/0, `seeds` and `imports` as a comma-separated list, an `int | None`
-    field as a number, and `reconnect_timeouts` as `queue=seconds` pairs
-    separated by commas; an empty value leaves `seeds` empty and `imports`, an
-    `int | None` field or a `str | None` field unset.
+    field as a number, a `timedelta | None` field as a number of seconds, and
+    `reconnect_timeouts` as `queue=seconds` pairs separated by commas; an
+    empty value leaves `seeds` empty and `imports`, an `int | None` field, a
+    `timedelta | None` field or a `str | None` field unset.
     """
 
     processes: int = field(default_factory=_one_per_cpu)
@@ -195,6 +197,22 @@ class Settings:
     shard: str = "default"
     """The name of the shard a networked worker serves."""
 
+    replication_factor: int = 3
+    """How many voters of a networked shard store each task's record."""
+
+    seed_rounds: int = 3
+    """How many rounds a networked worker with seeds and no authority asks
+    its silent seeds before it founds its shard alone."""
+
+    routing_refresh: timedelta | None = None
+    """How often a networked worker re-crawls its peers' routing when nothing
+    else prompts it; `None` is ten heartbeat timeouts."""
+
+    health_listen: str | None = None
+    """`host:port` (an IP address, `[::]` for IPv6) on which the worker
+    answers `/healthz` (200 while it runs) and `/readyz` (200 once it can
+    take work); port 0 picks a free one. `None` serves neither."""
+
     heartbeat_interval: timedelta = timedelta(seconds=1)
     """How often a networked worker tells its leader it is alive."""
 
@@ -202,6 +220,11 @@ class Settings:
     """How long a networked worker goes without hearing its leader before it
     suspects it, and a leader without hearing a worker before it suspects
     that. Every worker of a shard must use the same value."""
+
+    roll_call_deadline: timedelta | None = None
+    """How long a networked worker's roll call runs before it decides on it;
+    below `heartbeat_timeout`. `None` is a quarter second, or a quarter of
+    `heartbeat_timeout` if that is shorter."""
 
     reconnect_timeout: timedelta = timedelta(seconds=30)
     """How long after a worker goes unheard its leader waits before it runs
@@ -256,6 +279,7 @@ class Settings:
         self._check_task_processes()
         self._check_network()
         self._check_shard_timings()
+        self._check_shard_tunables()
         self._check_run_limits()
         self._check_memory()
         self._check_stopping()
@@ -295,6 +319,8 @@ class Settings:
             raise ValueError(f"shard must be a name without '/', not {self.shard!r}")
         if self.authority is not None:
             authority_parts(self.authority)
+        if self.health_listen is not None:
+            health_address_parts(self.health_listen)
 
     def _check_shard_timings(self) -> None:
         for name in ("heartbeat_interval", "heartbeat_timeout", "reconnect_timeout"):
@@ -305,6 +331,22 @@ class Settings:
                 f"heartbeat_interval ({self.heartbeat_interval}): a leader whose followers are "
                 "all alive would otherwise run out of lease"
             )
+        if self.roll_call_deadline is not None and (
+            not is_positive_timedelta(self.roll_call_deadline)
+            or self.roll_call_deadline >= self.heartbeat_timeout
+        ):
+            raise ValueError(
+                "roll_call_deadline must be a positive timedelta below heartbeat_timeout "
+                f"({self.heartbeat_timeout}), not {self.roll_call_deadline!r}"
+            )
+
+    def _check_shard_tunables(self) -> None:
+        _require_count(
+            "replication_factor", self.replication_factor, minimum=1, what="a positive integer"
+        )
+        _require_count("seed_rounds", self.seed_rounds, minimum=1, what="a positive integer")
+        if self.routing_refresh is not None:
+            _require_positive_timedelta("routing_refresh", self.routing_refresh)
 
     def _check_run_limits(self) -> None:
         if self.max_runs_per_process is not None:
@@ -403,6 +445,25 @@ def authority_parts(url: str) -> tuple[str, str, int, float | None]:
     if "{" in prefix or "}" in prefix:
         raise ValueError(f"the authority's key prefix may not contain braces: {prefix!r}")
     return f"{parts.scheme}://{parts.netloc}/", prefix, database, _authority_ttl(query)
+
+
+def health_address_parts(address: str) -> tuple[str, int]:
+    """The IP address and port of a `health_listen` setting. Raises
+    `ValueError` for anything else, a host name included."""
+    complaint = (
+        f"health_listen must be an IP address and port such as 0.0.0.0:8081, not {address!r}"
+    )
+    if not isinstance(address, str):
+        raise ValueError(complaint)
+    parts = urlsplit("//" + address)
+    try:
+        port = parts.port
+        host = ipaddress.ip_address(parts.hostname or "")
+    except ValueError:
+        raise ValueError(complaint) from None
+    if port is None or parts.path or parts.query:
+        raise ValueError(complaint)
+    return str(host), port
 
 
 def _check_authority_server(parts: SplitResult, url: str) -> None:
@@ -512,6 +573,8 @@ def _parse(value_type: Any, raw: str) -> Any:
         return modules or None  # an empty value is "not set", not "no modules"
     if value_type == str | None:
         return raw if raw.strip() else None  # an empty value is "not set"
+    if value_type == timedelta | None:
+        return timedelta(seconds=float(raw)) if raw.strip() else None  # empty is "not set"
     if value_type == int | None:
         return int(raw) if raw.strip() else None  # an empty value is "not set"
     if value_type == Mapping[str, float]:
@@ -604,7 +667,10 @@ def configure(**settings: Any) -> None:
     `external_address`, `authority` and `shard` make this a worker of a
     networked shard (see each setting; `authority` is a URL that may set
     `?key_prefix=` and `?ttl=`); `heartbeat_interval`,
-    `heartbeat_timeout` and `reconnect_timeout` are its shard's timings.
+    `heartbeat_timeout` and `reconnect_timeout` are its shard's timings, and
+    it also reads `roll_call_deadline`, `replication_factor`, `seed_rounds`
+    and `routing_refresh` (see each setting). `health_listen` is the
+    `host:port` that answers `/healthz` and `/readyz`.
     `KABUDACHI_<NAME>` in the environment sets each too, below what is
     configured here. A setting a task makes for itself always wins over
     these. The networked settings and timings, `concurrency`, `processes`,

@@ -2,6 +2,7 @@
 //! `kabudachi.native_protocol.NetworkedArguments`, and the checks and the
 //! worker config made from it.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -10,6 +11,7 @@ use kabudachi_core::protocol::ids::ShardName;
 use kabudachi_core::time::Duration as CoreDuration;
 use kabudachi_net::executor::ExecutorEndpoint;
 use kabudachi_net::task_exchange::LeaderRetry;
+use kabudachi_net::task_store::placement::ReplicationFactor;
 use kabudachi_net::worker::{AuthorityConfig, Multiaddr, WorkerConfig};
 use kabudachi_redis_authority::{RedisAuthority, RedisAuthorityConfig};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -36,6 +38,10 @@ pub(super) struct NetworkedArguments {
     memory_soft_limit: Option<u64>,
     memory_hard_limit: Option<u64>,
     worker_threads: usize,
+    roll_call_deadline_ms: Option<u64>,
+    replication_factor: usize,
+    seed_rounds: u32,
+    routing_refresh_ms: Option<u64>,
 }
 
 /// The shard's coordination authority: a `redis://` or `rediss://` server.
@@ -48,11 +54,17 @@ pub(super) struct AuthorityArguments {
 }
 
 impl NetworkedArguments {
-    /// Raises `ValueError` for no worker threads, or a timing or authority
-    /// TTL of zero.
+    /// Raises `ValueError` for no worker threads, a replication factor or
+    /// seed rounds of zero, or a timing or authority TTL of zero.
     pub(super) fn check(&self) -> PyResult<()> {
         if self.worker_threads == 0 {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));
+        }
+        if self.replication_factor == 0 {
+            return Err(PyValueError::new_err("replication_factor must be at least 1"));
+        }
+        if self.seed_rounds == 0 {
+            return Err(PyValueError::new_err("seed_rounds must be at least 1"));
         }
         let authority_ttl_ms = self
             .authority
@@ -62,6 +74,8 @@ impl NetworkedArguments {
             ("heartbeat_interval_ms", self.heartbeat_interval_ms),
             ("heartbeat_timeout_ms", self.heartbeat_timeout_ms),
             ("reconnect_timeout_ms", self.reconnect_timeout_ms),
+            ("roll_call_deadline_ms", self.roll_call_deadline_ms.unwrap_or(1)),
+            ("routing_refresh_ms", self.routing_refresh_ms.unwrap_or(1)),
             ("authority_ttl_ms", authority_ttl_ms.unwrap_or(1)),
         ] {
             if value == 0 {
@@ -87,7 +101,14 @@ impl NetworkedArguments {
                 .collect::<PyResult<_>>()?,
         )
         .with_result_ttl(StdDuration::from_millis(self.result_ttl_ms))
+        .with_seed_rounds(self.seed_rounds)
+        .with_replication_factor(ReplicationFactor::new(
+            NonZeroUsize::new(self.replication_factor).expect("refused by check when zero"),
+        ))
         .with_executor(executor);
+        if let Some(period) = self.routing_refresh_ms {
+            config = config.with_routing_refresh_period(StdDuration::from_millis(period));
+        }
         if let Some(external) = &self.external_address {
             config = config.with_external_address(address(external)?);
         }
@@ -125,9 +146,11 @@ impl NetworkedArguments {
             CoreDuration::from_millis(self.heartbeat_interval_ms),
         )
         .with_roll_call_deadline(CoreDuration::from_millis(
-            ROLL_CALL_DEADLINE_MS
-                .min(self.heartbeat_timeout_ms / 4)
-                .max(1),
+            self.roll_call_deadline_ms.unwrap_or_else(|| {
+                ROLL_CALL_DEADLINE_MS
+                    .min(self.heartbeat_timeout_ms / 4)
+                    .max(1)
+            }),
         ))
         .with_reconnect_timeout(CoreDuration::from_millis(self.reconnect_timeout_ms))
     }

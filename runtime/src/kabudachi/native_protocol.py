@@ -155,7 +155,11 @@ class NetworkedArguments:
     worker bootstraps through it instead, and its timings come from the
     authority's TTL. `memory_soft_limit` and `memory_hard_limit` bound
     pending task input while this worker leads, as for
-    `OneNodeArguments`.
+    `OneNodeArguments`. `roll_call_deadline_ms` overrides the default
+    roll-call deadline; `replication_factor` voters store each record;
+    `seed_rounds` silent rounds pass before a worker with seeds founds the
+    shard alone; `routing_refresh_ms` is the period of the routing crawl
+    nothing prompted.
     """
 
     shard: str
@@ -170,6 +174,10 @@ class NetworkedArguments:
     memory_soft_limit: int | None = None
     memory_hard_limit: int | None = None
     worker_threads: int = _DEFAULT_WORKER_THREADS
+    roll_call_deadline_ms: int | None = None
+    replication_factor: int = 3
+    seed_rounds: int = 3
+    routing_refresh_ms: int | None = None
 
 
 @runtime_checkable

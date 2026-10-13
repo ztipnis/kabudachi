@@ -122,6 +122,10 @@ def _millis(duration: timedelta) -> int:
     return round(duration.total_seconds() * 1000)
 
 
+def _optional_millis(duration: timedelta | None) -> int | None:
+    return None if duration is None else _millis(duration)
+
+
 def _native_runtime(settings: Settings) -> Any:
     """A one-node shard of this process's own, or, with `listen` set, a
     worker of the networked shard `settings.shard`."""
@@ -154,6 +158,10 @@ def _native_runtime(settings: Settings) -> Any:
             result_ttl_ms=settings.result_ttl * 1000,
             memory_soft_limit=settings.memory_soft_limit,
             memory_hard_limit=settings.memory_hard_limit,
+            replication_factor=settings.replication_factor,
+            seed_rounds=settings.seed_rounds,
+            roll_call_deadline_ms=_optional_millis(settings.roll_call_deadline),
+            routing_refresh_ms=_optional_millis(settings.routing_refresh),
         )
     )
 

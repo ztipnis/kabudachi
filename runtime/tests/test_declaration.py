@@ -748,6 +748,16 @@ def test_an_unknown_setting_is_refused():
         # Three intervals must fit in the timeout (10 s by default).
         ({"heartbeat_interval": timedelta(seconds=4)}, "heartbeat_timeout"),
         ({"reconnect_timeout": timedelta(0)}, "reconnect_timeout"),
+        ({"health_listen": "8081"}, "health_listen"),
+        ({"health_listen": "localhost:8081"}, "health_listen"),
+        ({"health_listen": "127.0.0.1:99999"}, "health_listen"),
+        ({"roll_call_deadline": timedelta(0)}, "roll_call_deadline"),
+        # It must close well inside a suspicion (10 s by default).
+        ({"roll_call_deadline": timedelta(seconds=10)}, "roll_call_deadline"),
+        ({"replication_factor": 0}, "replication_factor"),
+        ({"replication_factor": True}, "replication_factor"),
+        ({"seed_rounds": 0}, "seed_rounds"),
+        ({"routing_refresh": timedelta(0)}, "routing_refresh"),
     ],
 )
 def test_an_invalid_value_is_refused_and_changes_nothing(settings, refused):
@@ -917,6 +927,11 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_SEEDS", "/ip4/10.0.0.1/tcp/4001, /dns4/seed.example/tcp/4001")
     monkeypatch.setenv("KABUDACHI_AUTHORITY", "rediss://user:secret@cache.example:6380/3?key_prefix=app:&ttl=2.5")
     monkeypatch.setenv("KABUDACHI_HEARTBEAT_TIMEOUT", "3.5")
+    monkeypatch.setenv("KABUDACHI_HEALTH_LISTEN", "0.0.0.0:8081")
+    monkeypatch.setenv("KABUDACHI_ROLL_CALL_DEADLINE", "0.25")
+    monkeypatch.setenv("KABUDACHI_REPLICATION_FACTOR", "5")
+    monkeypatch.setenv("KABUDACHI_SEED_ROUNDS", "7")
+    monkeypatch.setenv("KABUDACHI_ROUTING_REFRESH", "30")
     configuration = Configuration()
 
     names = (
@@ -931,6 +946,11 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         "shard",
         "heartbeat_timeout",
         "reconnect_timeout",
+        "health_listen",
+        "roll_call_deadline",
+        "replication_factor",
+        "seed_rounds",
+        "routing_refresh",
     )
     assert [configuration.resolve(name) for name in names] == [
         2,
@@ -943,6 +963,11 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         ("/ip4/10.0.0.1/tcp/4001", "/dns4/seed.example/tcp/4001"),
         "default",
         timedelta(seconds=3.5),
+        timedelta(seconds=30),
+        "0.0.0.0:8081",
+        timedelta(seconds=0.25),
+        5,
+        7,
         timedelta(seconds=30),
     ]
     assert authority_parts(configuration.resolve("authority")) == (
@@ -966,6 +991,8 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_SEEDS", "")
     assert Configuration().resolve("listen") is None
     assert Configuration().resolve("seeds") == ()
+    monkeypatch.setenv("KABUDACHI_ROUTING_REFRESH", "")
+    assert Configuration().resolve("routing_refresh") is None
 
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(
