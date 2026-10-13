@@ -23,6 +23,7 @@ from cluster import (
     digest_of,
     eventually,
     free_port,
+    outcome,
     probe,
     running_on,
     settled,
@@ -30,6 +31,11 @@ from cluster import (
 )
 from networked_tasks import BULK_BYTES, awaits, bulk, echo, fleeting, gather, hold, spin, varied_text
 from proto_messages import Greeting
+
+
+# What `pipeline` of "a" gives: a flow's last result, a group's results, and
+# a returned flow's results.
+PIPELINE_OF_A = ["LOADED A", "loaded a", "A", "loaded a", "LOADED A"]
 
 
 def finished(shard, task_id):
@@ -85,7 +91,7 @@ def test_a_cluster_delivers_results_compacts_and_keeps_its_runs_through_a_busy_t
     compacted(cluster, leader, tmp_path)
     task_process_killed(cluster, leader, tmp_path)
     cancelled_while_running(cluster, leader, tmp_path)
-    worker_killed(cluster, leader)
+    worker_killed(cluster, leader, tmp_path)
 
 
 def test_a_worker_that_has_not_joined_its_shard_is_alive_but_not_ready(tmp_path):
@@ -227,11 +233,17 @@ def cancelled_while_running(cluster, leader, tmp_path):
     eventually("the body to stop", lambda: (tmp_path / "cancelled.stopped").exists(), timeout=5)
 
 
-def worker_killed(cluster, leader):
-    # A worker holding a run of a task that is never replayed is killed: the
-    # run is lost only once the leader has stopped hearing it and its
-    # reconnect timeout has passed, and its handle hears so. One of the three
-    # runs on the leader's own worker, which delivers its result to itself.
+def worker_killed(cluster, leader, tmp_path):
+    # A body that awaits a flow, a group and a returned step, each a composite
+    # the leader runs, is under way when a worker is killed, and gets the
+    # results it would have had. A worker holding a run of a task that is
+    # never replayed is killed: the run is lost only once the leader has
+    # stopped hearing it and its reconnect timeout has passed, and its handle
+    # hears so. One of the three runs on the leader's own worker, which
+    # delivers its result to itself.
+    seen = set(tmp_path.glob("shout.*"))
+    piped = leader.submit("pipeline", text="a")
+    eventually("its first stage to run", lambda: set(tmp_path.glob("shout.*")) - seen)
     tasks = [leader.submit("fleeting", text=f"worker-{n}", times=8000) for n in range(3)]
     holders = eventually("all three to run", lambda: all_running(cluster, tasks))
     assert leader in holders.values()
@@ -248,6 +260,7 @@ def worker_killed(cluster, leader):
             record = certified_once(cluster, each, digest_of(fleeting, Greeting(text=f"worker-{n}")))
             assert [run["delivered"] for run in record["runs"]] == [True]
             assert eventually("its handle", lambda: settled(leader, each))["error"] is None
+    assert outcome(leader, piped) == PIPELINE_OF_A
 
 
 def test_a_client_too_small_to_hold_a_result_has_its_handle_fail_while_the_run_completes_elsewhere(tmp_path):
@@ -388,12 +401,18 @@ def unreached_while_the_leader_is_killed(cluster, tmp_path):
         # Held until let go, so the leader is killed while it and the other
         # follower each run one; started while the leader's record is read.
         tasks = {other.submit("hold", text=f"leader-{n}", times=GATED): f"leader-{n}" for n in range(3)}
+        # A pipeline `other` submits behind them: every place is held, so it
+        # starts only under the leader the survivors elect.
+        piped = other.submit("pipeline", text="a")
         undelivered(leader, unreached)
         killed_while_running(cluster, tmp_path, leader, other, tasks.values())
     let_go(tmp_path, tasks.values())
 
     unreached_and_interrupted_heard(cluster, tmp_path, client, unreached, interrupted, texts)
     certified_once_and_settled(cluster, other, tasks)
+    # The pipeline, stored under the leader that was killed, ends as it would
+    # have under it.
+    assert outcome(other, piped) == PIPELINE_OF_A
 
 
 def one_on_each_worker(cluster, tmp_path, client):
@@ -477,3 +496,4 @@ def test_a_stopped_leader_hands_over_and_leaves_and_the_two_left_keep_certifying
     eventually("the two left to follow a new leader of two voters", handed_over, timeout=10)
     task_id = others[0].submit("spin", times=0)
     certified_once(cluster, task_id, digest_of(spin, Greeting(text="spun")))
+

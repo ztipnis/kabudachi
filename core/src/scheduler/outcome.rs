@@ -101,11 +101,20 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Leaves a conclusion for `task_id`'s client, if it has one: its
-    /// current run has just ended the task.
+    /// current run has just ended the task. A task whose run returned a step
+    /// concludes nothing: its client takes its end from the step's, and a
+    /// certification of the step's digest would match no result it holds.
     pub(super) fn conclude(&mut self, task_id: &TaskId) {
         let Some(client) = self.tasks.get(task_id).and_then(|task| task.client()) else {
             return;
         };
+        let continued = self
+            .current_run
+            .get(task_id)
+            .is_some_and(|run| self.runs[run].continuation.is_some());
+        if continued {
+            return;
+        }
         if let Some(outcome) = self.outcome_of(task_id) {
             self.conclusions.push(Conclusion { client, outcome });
         }

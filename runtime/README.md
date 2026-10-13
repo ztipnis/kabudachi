@@ -239,6 +239,10 @@ certified it, or raises what the task raised.
   continuation: the run is certified first, and the task's handle resolves to the continuation's
   results.
 
+Flows, groups, `.map` and returned steps run on a networked worker as on one node. A `collect_all`
+failure is a `TaskFailure` with its `kind` and `message`. A coalescing task cannot be a stage, and
+`kabudachi.` is a reserved task-name prefix.
+
 A stage that consumes the array of a `collect_all` group receives failures in it, so it needs a
 serializer that can encode them; the protobuf serializer cannot.
 
@@ -352,4 +356,3 @@ matters.
   with task processes, and the body is abandoned to finish on its own, holding its concurrency place
   until it does. An async body that raises `KeyboardInterrupt` there is taken as a Ctrl-C and stops
   the whole run.
-- On a networked worker no result comes back to the process that submitted the task.

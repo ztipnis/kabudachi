@@ -33,8 +33,9 @@ def say(**message) -> None:
 
 async def settled(handle) -> None:
     try:
-        await handle
-        say(settled=handle.task_id, error=None)
+        result = await handle
+        results = result if isinstance(result, list) else [result]
+        say(settled=handle.task_id, error=None, texts=[item.text for item in results])
     except Exception as error:
         say(settled=handle.task_id, error=type(error).__name__)
 

@@ -423,6 +423,31 @@ fn a_returned_step_runs_as_a_composite_and_its_task_finishes_with_it() {
 }
 
 #[test]
+fn a_client_hears_that_its_task_that_returned_a_step_is_over_from_the_step_alone() {
+    let mut fixture = Fixture::leading();
+    let client = kabudachi_core::protocol::ids::WorkerId::new("client");
+    let task = fixture
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_client(client))
+        .unwrap();
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
+    fixture
+        .scheduler
+        .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step))
+        .unwrap();
+    assert!(fixture.scheduler.take_conclusions().is_empty(), "the task is not over");
+    run_member(&mut fixture, &CompositeId::continuation_of(&claim.task_run_id), 0, b"staged");
+    let told = finished(&mut fixture);
+    assert_eq!(told[0].parent_task, Some(task));
+    assert!(
+        fixture.scheduler.take_conclusions().is_empty(),
+        "the client takes its end from the step's: a certification of the step's digest would match no result it holds"
+    );
+}
+
+#[test]
 fn a_step_too_large_for_the_task_record_fails_its_run_for_good() {
     let mut fixture = Fixture::leading();
     let task = fixture

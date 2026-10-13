@@ -192,6 +192,8 @@ class Cluster:
             "KABUDACHI_MEMORY_SOFT_LIMIT": "300",
             "KABUDACHI_MEMORY_HARD_LIMIT": "16000000",
             "KABUDACHI_TEST_MARKERS": str(markers),
+            # A `shout` stage runs this long, so a kill can land inside one.
+            "KABUDACHI_TEST_STAGE_SECONDS": "1",
         }
         founder = Worker({**environment, **overrides.get(0, {})})
         workers = [founder]
@@ -265,6 +267,14 @@ def settled(worker: Worker, task_id: str) -> dict | None:
     it has: `{"settled": task_id, "error": <its type's name> or None}`."""
     worker.leader()  # an answer reads the lines printed before it
     return next((notice for notice in worker.notices if notice.get("settled") == task_id), None)
+
+
+def outcome(worker: Worker, task_id: str, timeout: float = 40.0) -> list[str]:
+    """The text of each result the worker's handle to the task settled with,
+    once it has; fails if the handle raised."""
+    notice = eventually(f"the handle of {task_id} to settle", lambda: settled(worker, task_id), timeout)
+    assert notice["error"] is None, notice
+    return notice["texts"]
 
 
 def running_on(cluster: Cluster, task_id: str) -> Worker | None:

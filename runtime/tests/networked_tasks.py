@@ -153,6 +153,41 @@ async def gather(request: Greeting) -> Greeting:
     return request
 
 
+@kabudachi.task(name="cluster.load")
+async def load(request: Greeting) -> Greeting:
+    """Says `loaded` before its input's text."""
+    return Greeting(text=f"loaded {request.text}")
+
+
+@kabudachi.task(name="cluster.shout")
+async def shout(request: Greeting) -> Greeting:
+    """Upper-cases its input's text after `KABUDACHI_TEST_STAGE_SECONDS`, and
+    leaves a `shout.<pid>.<n>` marker, holding the process id of the worker
+    running it, once it starts, so the test can find the worker."""
+    started = f"shout.{os.getpid()}.{time.monotonic_ns()}"
+    written = _markers() / f"_{started}"
+    written.write_text(str(os.getppid()))
+    written.rename(_markers() / started)
+    await asyncio.sleep(float(os.environ.get("KABUDACHI_TEST_STAGE_SECONDS", "0")))
+    return Greeting(text=request.text.upper())
+
+
+@kabudachi.task(name="cluster.plan")
+async def plan(request: Greeting) -> kabudachi.Flow:
+    """Returns a flow, which runs as this task's continuation."""
+    return kabudachi.flow(load.bind(request), shout)
+
+
+@kabudachi.task(name="cluster.pipeline")
+async def pipeline(request: Greeting) -> list[Greeting]:
+    """Awaits a flow, a group and a returned step from inside a body: on a
+    networked worker each is a composite the leader runs."""
+    flowed = await kabudachi.flow(load.bind(request), shout)()
+    grouped = await kabudachi.group(load.bind(request), shout.bind(request))()
+    planned = await plan(request)
+    return [flowed[-1], *grouped, *planned]
+
+
 TASKS = {
     "spin": spin,
     "hold": hold,
@@ -165,4 +200,6 @@ TASKS = {
     "weigh": weigh,
     "bulk": bulk,
     "gather": gather,
+    "pipeline": pipeline,
+    "plan": plan,
 }
