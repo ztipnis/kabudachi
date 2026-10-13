@@ -9,6 +9,7 @@ stored task never changes.
 """
 
 import inspect
+import json
 import re
 import threading
 import typing
@@ -17,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from kabudachi.config import UNSET, Unset
+from kabudachi.errors import SerializationError
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -340,3 +342,53 @@ def can_migrate(serializer: Any) -> bool:
     return _member(serializer, "load_plain") is not None and _member(
         serializer, "dump_plain"
     ) is not None
+
+
+# --- helpers for serializers whose payload is JSON ----------------------------
+
+
+def json_bytes(plain: Any) -> bytes:
+    """`plain` as canonical JSON: sorted keys, no whitespace, UTF-8, so
+    equal values always give equal bytes (results are certified by digest)."""
+    try:
+        return json.dumps(
+            plain, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode()
+    except (TypeError, ValueError) as error:
+        raise SerializationError(f"cannot encode as JSON: {error}") from error
+
+
+def get_path(plain: Any, path: tuple[str, ...]) -> Any:
+    """The value at `path` (the keys, outermost first) in the parsed JSON
+    `plain`, or `UNSET` if some key on the way is missing."""
+    for key in path:
+        if not isinstance(plain, dict) or key not in plain:
+            return UNSET
+        plain = plain[key]
+    return plain
+
+
+def set_path(plain: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+    """Sets `value` at `path` in `plain`, creating the objects on the way."""
+    for key in path[:-1]:
+        child = plain.setdefault(key, {})
+        if not isinstance(child, dict):
+            raise SerializationError(f"cannot write the version at {'.'.join(path)}: {key} is not an object")
+        plain = child
+    plain[path[-1]] = value
+
+
+def drop_path(plain: dict[str, Any], path: tuple[str, ...]) -> None:
+    """Removes the value at `path` from `plain`, and the objects on the way
+    that this leaves empty."""
+    trail = [plain]
+    for key in path[:-1]:
+        child = trail[-1].get(key)
+        if not isinstance(child, dict):
+            return
+        trail.append(child)
+    trail[-1].pop(path[-1], None)
+    for key, parent, child in zip(reversed(path[:-1]), reversed(trail[:-1]), reversed(trail[1:])):
+        if child:
+            break
+        del parent[key]

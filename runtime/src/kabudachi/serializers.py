@@ -8,7 +8,9 @@ from kabudachi.errors import (
     SerializerUnavailableError,
     UnknownSerializerError,
 )
+from kabudachi.dataclass_serializer import DataclassSerializer
 from kabudachi.protobuf_serializer import ProtobufSerializer
+from kabudachi.pydantic_serializer import PydanticSerializer
 
 DEFAULT_SERIALIZER = "protobuf"
 
@@ -87,6 +89,8 @@ class SerializerRegistry:
         """A registry holding the backends that ship with kabudachi."""
         registry = cls()
         registry.register(ProtobufSerializer())
+        registry.register(PydanticSerializer())
+        registry.register(DataclassSerializer())
         return registry
 
     def register(self, serializer: Serializer) -> None:

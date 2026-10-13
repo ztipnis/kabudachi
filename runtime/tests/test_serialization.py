@@ -4,6 +4,7 @@ what was asked for; backends are found by name in the registry, and one that
 cannot run here is reported when it is asked for, not when the package is
 imported."""
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -22,7 +23,9 @@ from kabudachi.errors import (
     SerializerUnavailableError,
     UnknownSerializerError,
 )
+from kabudachi.dataclass_serializer import DataclassSerializer
 from kabudachi.protobuf_serializer import ProtobufSerializer
+from kabudachi.pydantic_serializer import PydanticSerializer
 from kabudachi.schemas import Incompatible, Newer, Runnable, SchemaRegistry
 from kabudachi.serializers import SerializerRegistry
 from proto_messages import Greeting, Receipt, Strict
@@ -389,3 +392,80 @@ def test_a_backend_without_the_schema_members_still_works_with_defaults():
     schemas.validate(text, "x")
     assert schemas.type_compatibility(text, str, str) is None, "the backend does not say, so unknown"
     assert not schemas.can_migrate(text)
+
+
+# --- the pydantic and dataclass serializers --------------------------------
+
+@dataclasses.dataclass
+class Label:
+    text: str
+
+
+@dataclasses.dataclass
+class Parcel:
+    order: str
+    weights: list[float]
+    label: Label | None = None
+
+
+JSON_CASES = [
+    (PydanticSerializer(), Shipment(order="o1", items=["b", "a"], notes={"z": 1, "a": 2}), Shipment),
+    (PydanticSerializer(), [Shipment(order="o1", items=[])], list[Shipment]),
+    (PydanticSerializer(), None, type(None)),
+    (DataclassSerializer(), Parcel(order="o1", weights=[1.5], label=Label("x")), Parcel),
+    (DataclassSerializer(), [Parcel(order="o2", weights=[])], list[Parcel]),
+]
+
+
+@pytest.mark.parametrize("backend, value, value_type", JSON_CASES)
+def test_a_json_serializer_round_trips_and_encodes_equal_values_to_the_same_bytes(backend, value, value_type):
+    encoded = backend.encode(value, value_type)
+    assert backend.decode(encoded, value_type) == value
+    assert backend.encode(backend.decode(encoded, value_type), value_type) == encoded
+    assert b" " not in encoded and b"\n" not in encoded, "compact separators"
+    if isinstance(value, Shipment):
+        assert encoded.index(b'"a"') < encoded.index(b'"z"'), "keys are sorted"
+    backend.validate(backend.decode(encoded, value_type))
+
+
+@pytest.mark.parametrize("backend", [PydanticSerializer(), DataclassSerializer()])
+def test_a_json_serializer_refuses_what_it_cannot_carry(backend):
+    assert not backend.supports(Greeting)
+    assert not backend.supports(int)
+    with pytest.raises(SerializationError):
+        backend.decode(b"{not json", Shipment if isinstance(backend, PydanticSerializer) else Parcel)
+    assert backend.type_compatibility(Greeting, Greeting) is None
+
+
+@pytest.mark.parametrize(
+    "backend, target, old, expected",
+    [
+        (PydanticSerializer(), Shipment, {"order": "o", "items": [], "gone": 1}, Shipment(order="o", items=[])),
+        (
+            DataclassSerializer(),
+            Parcel,
+            {"order": "o", "weights": [], "label": {"text": "t", "gone": 1}, "gone": 2},
+            Parcel(order="o", weights=[], label=Label("t")),
+        ),
+    ],
+)
+def test_the_default_migration_drops_fields_the_new_version_lacks_and_defaults_new_ones(
+    backend, target, old, expected
+):
+    migrated = backend.dump_plain(old, target)
+    assert backend.decode(migrated, target) == expected
+
+
+def test_a_family_with_a_version_path_carries_its_version_in_the_payload(monkeypatch):
+    registry = SchemaRegistry()
+    monkeypatch.setattr(schemas, "_process_schemas", registry)
+    registry.declare(Shipment, version=3, version_path="$.meta.v")
+    backend = PydanticSerializer()
+    encoded = backend.encode(Shipment(order="o", items=[]), Shipment)
+    assert json.loads(encoded)["meta"] == {"v": 3}
+    assert backend.extract_version(encoded, Shipment) == 3
+    assert backend.decode(encoded, Shipment) == Shipment(order="o", items=[]), "the version key is not a field"
+    old = json.dumps({"order": "o", "items": [], "meta": {"v": 1}}).encode()
+    assert backend.extract_version(old, Shipment) == 1
+    listed = backend.encode([Shipment(order="o", items=[])], list[Shipment])
+    assert backend.extract_version(listed, list[Shipment]) is None
