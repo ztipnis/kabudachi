@@ -51,8 +51,6 @@ class Task(wrapt.ObjectProxy):
         registry: Where the task is registered.
         name: Identifies the task to every worker. Defaults to the
             function's module and name.
-        version: The version of the task's data format. Every worker must
-            agree on it.
         queue: The queue tasks are sent to, instead of the process default.
         serializer: The name of the serializer that encodes the task's input
             and output.
@@ -74,6 +72,13 @@ class Task(wrapt.ObjectProxy):
             the leader replays it on another; and so how long a worker cut
             off from its leader has to stop it. Defaults to the queue's
             `QueueOptions.reconnect_timeout`, else the shard's.
+        raise_on_failed_migration: Whether a task whose input this worker
+            cannot migrate to its schema version (a migration raised, or a
+            bump is declared incompatible) is left for another worker
+            instead of dropped. Left, it fails with `MigrationError` after
+            `version_block_ttl`; dropped, it fails with `MigrationError` at
+            once and the worker logs a warning. A task whose input is newer
+            than the worker's version is always left.
         merge: For a coalescing task, a pure reducer `(older, newer) -> merged`
             that combines the payloads of superseded generations, oldest
             first, on the worker that claims the newest one. Without it the
@@ -114,7 +119,6 @@ class Task(wrapt.ObjectProxy):
         *,
         registry: TaskRegistry,
         name: str | Unset = UNSET,
-        version: int = 0,
         queue: str | Unset = UNSET,
         serializer: str = DEFAULT_SERIALIZER,
         kind: TaskKind = TaskKind.TASK,
@@ -129,15 +133,17 @@ class Task(wrapt.ObjectProxy):
         associative: bool = False,
         tree: bool | None = None,
         reduces: bool = False,
+        raise_on_failed_migration: bool = False,
         serializers: SerializerRegistry | None = None,
     ) -> None:
-        self._check_identity(func, version, queue, serializer)
+        self._check_identity(func, queue, serializer)
         self._require_non_negative_count("retries", retries)
         self._check_retriable(retriable, retries, kind)
 
         self._check_timing(timeout, cancel_grace, reconnect_timeout)
         self._check_drop_oldest(drop_oldest, kind)
         self._require_bool("recycle_process", recycle_process)
+        self._require_bool("raise_on_failed_migration", raise_on_failed_migration)
 
         task_name = self._task_name(func, name)
         types = self._read_types(task_name, func)
@@ -151,7 +157,6 @@ class Task(wrapt.ObjectProxy):
             func=func,
             kind=kind,
             serializer=serializer,
-            version=version,
             queue=queue,
             input_type=input_type,
             output_type=output_type,
@@ -165,6 +170,7 @@ class Task(wrapt.ObjectProxy):
             drop_oldest=drop_oldest,
             recycle_process=recycle_process,
             reconnect_timeout=reconnect_timeout,
+            raise_on_failed_migration=raise_on_failed_migration,
             continues=is_step_type(output_type),
             reducer=reducing,
         )
@@ -296,11 +302,10 @@ class Task(wrapt.ObjectProxy):
         return checked(outcome)
 
     @staticmethod
-    def _check_identity(func: Any, version: Any, queue: Any, serializer: Any) -> None:
-        """Checks what names the task: its function, version, queue and serializer."""
+    def _check_identity(func: Any, queue: Any, serializer: Any) -> None:
+        """Checks what names the task: its function, queue and serializer."""
         if not callable(func):
             raise TaskDefinitionError(f"a task must be a callable, not {func!r}")
-        Task._require_non_negative_count("version", version)
         if queue is not UNSET:
             Task._require_string("queue", queue)
         Task._require_string("serializer", serializer)
@@ -569,7 +574,6 @@ def task(func: Callable[..., Any], /) -> Task: ...
 def task(
     *,
     name: str | Unset = ...,
-    version: int = ...,
     queue: str | Unset = ...,
     serializer: str = ...,
     retries: int = ...,
@@ -578,13 +582,13 @@ def task(
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
     reconnect_timeout: timedelta | None = ...,
+    raise_on_failed_migration: bool = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def task(
     func: Any = None,
     /,
     *,
     name: str | Unset = UNSET,
-    version: int = 0,
     queue: str | Unset = UNSET,
     serializer: str = DEFAULT_SERIALIZER,
     retries: int = 0,
@@ -593,6 +597,7 @@ def task(
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
     reconnect_timeout: timedelta | None = None,
+    raise_on_failed_migration: bool = False,
 ) -> Any:
     """Declares a durable task: work that survives the loss of the worker
     running it. Use it bare (`@task`) or with options (`@task(queue="gpu")`).
@@ -623,7 +628,6 @@ def task(
     """
     options = {
         "name": name,
-        "version": version,
         "queue": queue,
         "serializer": serializer,
         "retries": retries,
@@ -632,6 +636,7 @@ def task(
         "cancel_grace": cancel_grace,
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
+        "raise_on_failed_migration": raise_on_failed_migration,
     }
     return declare_task(func, TaskKind.TASK, options)
 
@@ -715,26 +720,26 @@ def ephemeral_task(func: Callable[..., Any], /) -> Task: ...
 def ephemeral_task(
     *,
     name: str | Unset = ...,
-    version: int = ...,
     queue: str | Unset = ...,
     serializer: str = ...,
     timeout: timedelta | None = ...,
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
     reconnect_timeout: timedelta | None = ...,
+    raise_on_failed_migration: bool = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def ephemeral_task(
     func: Any = None,
     /,
     *,
     name: str | Unset = UNSET,
-    version: int = 0,
     queue: str | Unset = UNSET,
     serializer: str = DEFAULT_SERIALIZER,
     timeout: timedelta | None = None,
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
     reconnect_timeout: timedelta | None = None,
+    raise_on_failed_migration: bool = False,
 ) -> Any:
     """Declares a best-effort task: it is never replayed after the loss of the
     worker running it, and losing every worker may lose it.
@@ -746,13 +751,13 @@ def ephemeral_task(
     """
     options = {
         "name": name,
-        "version": version,
         "queue": queue,
         "serializer": serializer,
         "timeout": timeout,
         "cancel_grace": cancel_grace,
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
+        "raise_on_failed_migration": raise_on_failed_migration,
     }
     return declare_task(func, TaskKind.EPHEMERAL, options)
 
@@ -763,7 +768,6 @@ def coalescing_task(func: Callable[..., Any], /) -> Task: ...
 def coalescing_task(
     *,
     name: str | Unset = ...,
-    version: int = ...,
     queue: str | Unset = ...,
     serializer: str = ...,
     retries: int = ...,
@@ -773,13 +777,13 @@ def coalescing_task(
     drop_oldest: bool = ...,
     recycle_process: bool = ...,
     reconnect_timeout: timedelta | None = ...,
+    raise_on_failed_migration: bool = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def coalescing_task(
     func: Any = None,
     /,
     *,
     name: str | Unset = UNSET,
-    version: int = 0,
     queue: str | Unset = UNSET,
     serializer: str = DEFAULT_SERIALIZER,
     retries: int = 0,
@@ -789,6 +793,7 @@ def coalescing_task(
     drop_oldest: bool = False,
     recycle_process: bool = False,
     reconnect_timeout: timedelta | None = None,
+    raise_on_failed_migration: bool = False,
 ) -> Any:
     """Declares continuously replaced work: a newer pending submission with
     the same key supersedes an older one, but never a running one, and only
@@ -813,7 +818,6 @@ def coalescing_task(
     """
     options = {
         "name": name,
-        "version": version,
         "queue": queue,
         "serializer": serializer,
         "retries": retries,
@@ -823,5 +827,6 @@ def coalescing_task(
         "drop_oldest": drop_oldest,
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
+        "raise_on_failed_migration": raise_on_failed_migration,
     }
     return declare_task(func, TaskKind.COALESCING, options)

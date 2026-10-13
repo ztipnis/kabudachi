@@ -131,6 +131,7 @@ py_test(
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
         "//runtime/tests:session_world",
+        "@pypi//pydantic",
         "@pypi//pytest",  # keep
     ],
 )

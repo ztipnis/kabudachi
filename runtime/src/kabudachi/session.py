@@ -52,6 +52,7 @@ from kabudachi.errors import (
     BackpressureError,
     CoalescedPayloadTooLargeError,
     ConfigurationError,
+    MigrationError,
     PayloadTooLargeError,
     ReduceEmptyError,
     ReduceItemsLostError,
@@ -88,6 +89,14 @@ from kabudachi.lifecycle import default_hooks
 from kabudachi.native_protocol import Runtime
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskDefinition, TaskKind, TaskRegistry
+from kabudachi.schemas import (
+    Admitted,
+    Incompatible,
+    Newer,
+    SchemaRegistry,
+    admit,
+    process_schemas,
+)
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.status import CompositeStatus, TaskStatus
 from kabudachi.task_table import Run, TaskTable, result_digest
@@ -125,6 +134,11 @@ class _Early:
     cancelled: bool = False
 
 
+class _GaveBack(Exception):
+    """A claimed run was handed back to the leader because this worker cannot
+    run its input version. It never ran, and settles nothing."""
+
+
 class Session:
     """The tasks of one running worker: what it submitted and what it runs."""
 
@@ -135,10 +149,12 @@ class Session:
         serializers: SerializerRegistry,
         configuration: Configuration,
         executor: Executor | None = None,
+        schemas: SchemaRegistry | None = None,
     ) -> None:
         self._runtime = runtime
         self._registry = registry
         self._serializers = serializers
+        self._schemas = process_schemas() if schemas is None else schemas
         self._configuration = configuration
         self.concurrency: int = configuration.resolve("concurrency")
         self._tasks = TaskTable(runtime, self._run_callback, self._decode_result)
@@ -179,6 +195,7 @@ class Session:
             EventKind.CANCELLED: self._on_cancelled,
             EventKind.RECORD_FULL: self._on_record_full,
             EventKind.COALESCED_PAYLOAD_TOO_LARGE: self._on_coalesced_payload_too_large,
+            EventKind.MIGRATION_FAILED: self._on_migration_failed,
             EventKind.SLOW_DOWN: self._on_slow_down,
             EventKind.SUPERSEDED: self._on_superseded,
             EventKind.ACCEPTED: self._on_accepted,
@@ -226,7 +243,13 @@ class Session:
             )
         queue = self._queue_of(definition, value)
         settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
-        return self._tasks.submit(definition, payload, options, settings)
+        return self._tasks.submit(
+            definition,
+            payload,
+            options,
+            settings,
+            self._schemas.version_of(definition.input_type),
+        )
 
     def _queue_of(self, definition: TaskDefinition, value: Callable[[], Any]) -> str:
         """The queue a task of `definition` goes to: its own, else the one
@@ -326,6 +349,12 @@ class Session:
         return self._runtime
 
     @property
+    def schemas(self) -> SchemaRegistry:
+        """The data schemas, and the migrations between their versions, that
+        this session submits and runs tasks by."""
+        return self._schemas
+
+    @property
     def serializers(self) -> SerializerRegistry:
         """The serializers this session encodes and decodes tasks' values with."""
         return self._serializers
@@ -417,6 +446,11 @@ class Session:
             CoalescedPayloadTooLargeError(
                 f"task {event.task_id}'s folded payloads grew too large to run"
             ),
+        )
+
+    def _on_migration_failed(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id, _failure_error(event.task_id, "MigrationError", event.reason)
         )
 
     def _on_slow_down(self, event: Any) -> None:
@@ -533,6 +567,8 @@ class Session:
         held = self._tasks.member_error(event.failure_task_id)
         if held is not None:
             return held
+        if kind == "MigrationError":
+            return _failure_error(event.failure_task_id or subject, kind, message or None)
         known = _KNOWN_FAILURES.get(kind)
         if known is not None:
             return known(message or f"{subject} failed with {kind}")
@@ -554,7 +590,23 @@ class Session:
             # The shard does not know the task: nothing says it was ever stored.
             self._tasks.failed(event.task_id, _outcome_error(event))
             return
+        if event.state == RunState.FAILED and event.failure_kind == "MigrationError":
+            # The outcome does not say why; the task's record does.
+            if self._hosted.spawn(self._conclude_migration_failure(event)):
+                return
         self._tasks.concluded(event.task_id, _outcome_error(event))
+
+    async def _conclude_migration_failure(self, event: Any) -> None:
+        """Settles the handle of a task no worker could run at its input
+        version, with the reason the worker that gave it up wrote."""
+        reason = None
+        try:
+            record = await self._runtime.task_record(event.task_id)
+            reason = getattr(record, "blocked_reason", None)
+        except Exception:
+            # The reason is only more detail: the task still ended.
+            pass
+        self._tasks.concluded(event.task_id, _outcome_error(event, reason))
 
     def _hold_early(self, run_id: str) -> _Early:
         """What came for `run_id` before it started here, kept for `_start`
@@ -689,15 +741,26 @@ class Session:
         if claim.compaction:
             # Internal: no handle waits for it, so it is not in the task table.
             # Held for the shard, it is under an abort deadline like any run.
+            definition = self._registry.get(claim.definition_id)
+            chain = tuple(claim.chain)
+            if definition is not None and chain:
+                # The payloads to fold are brought to this worker's version
+                # first. A compaction is the leader's own task, so one that
+                # cannot be is failed, and the leader leaves the chain as it was.
+                *older, newest = chain
+                admitted = self._admit(claim, definition, newest, tuple(older))
+                if not isinstance(admitted, Admitted):
+                    self._compaction_failed(claim, MigrationError(admitted.reason))
+                    return
+                chain = (*admitted.chain, admitted.serialized_input)
             if not self._runtime.certifies_locally:
-                definition = self._registry.get(claim.definition_id)
                 grace = (
                     self._cancel_grace(definition)
                     if definition is not None
                     else self._configuration.resolve("cancel_grace")
                 )
                 self._here[claim.task_run_id] = _HeldHere(None, grace)
-            job = CompactJob(claim.task_run_id, claim.definition_id, tuple(claim.chain))
+            job = CompactJob(claim.task_run_id, claim.definition_id, chain)
             self._track(self._compact(claim, self._executor.compact(job)))
             self._apply_early(claim.task_run_id)
             return
@@ -739,17 +802,28 @@ class Session:
             definition = self._registry.get(claim.definition_id)
             if definition is None:
                 raise UnknownTaskError(f"this process has no task named {claim.definition_id!r}")
-            self._runtime.report_started(claim.task_run_id)
+            serialized_input, chain = claim.serialized_input, tuple(claim.chain)
+            version = claim.source_version
+            if claim.composite_id is None:
+                # Migrated before the run is reported started, so a task this
+                # worker cannot run never ran.
+                admitted = self._admit(claim, definition, serialized_input, chain)
+                if not isinstance(admitted, Admitted):
+                    self._give_back(claim, definition, admitted)
+                    return _GaveBack()
+                serialized_input, chain = admitted.serialized_input, admitted.chain
+                version = admitted.execution_version
+                self._runtime.report_started(claim.task_run_id, execution_version=version)
             shard, worker_id = self._shard_and_worker()
-            given = self._read_out(claim)
+            given = self._read_out(claim, definition)
             body = self._executor.run(
                 RunJob(
                     run_id=claim.task_run_id,
                     task_id=claim.task_id,
                     definition_id=claim.definition_id,
-                    source_version=claim.source_version,
-                    serialized_input=claim.serialized_input,
-                    chain=tuple(claim.chain),
+                    source_version=version,
+                    serialized_input=serialized_input,
+                    chain=chain,
                     queue=claim.queue,
                     attempt=claim.attempt_number,
                     shard=shard,
@@ -765,25 +839,125 @@ class Session:
         run.body_started(body)
         return definition, body, after
 
-    def _read_out(self, claim: Any) -> "asyncio.Future[Given] | None":
+    def _read_out(
+        self, claim: Any, definition: TaskDefinition
+    ) -> "asyncio.Future[Given] | None":
         """Starts reading what the leader holds for the member `claim` is a run
         of, if it is one: its bound fields and the results it takes. The body
         starts once they are read, and fails if they cannot be."""
         if claim.composite_id is None:
             return None
-        reading = asyncio.get_running_loop().create_task(self._given(claim))
+        reading = asyncio.get_running_loop().create_task(self._given(claim, definition))
         # A run cancelled before it needed them leaves a failure nobody reads.
         reading.add_done_callback(lambda done: done.cancelled() or done.exception())
         return reading
 
-    async def _given(self, claim: Any) -> Given:
+    async def _given(self, claim: Any, definition: TaskDefinition) -> Given:
+        """What the member's run is given, migrated to this worker's version.
+        A member's input is read out of the leader rather than carried by its
+        claim, so it is migrated, and the run reported started, here: before
+        the body starts, and if this worker cannot run it, the claim is given
+        back and the body never does."""
         if claim.reduce_node is not None:
             # A reduce step works on items and earlier results, which the
             # leader reads out as `reduce_operands`, not on a stage's input.
             operands = await self._runtime.reduce_operands(claim.task_run_id)
+            self._runtime.report_started(claim.task_run_id)
             return Given((), ("reduce", operands, claim.reduce_node[0] > 0))
         fields, resolved = await self._runtime.resolve_input(claim.task_run_id)
-        return Given(tuple(fields), resolved)
+        given = self._admitted_given(claim, definition, tuple(fields), resolved)
+        if isinstance(given, (Newer, Incompatible)):
+            self._give_back(claim, definition, given)
+            raise _GaveBack()
+        self._runtime.report_started(claim.task_run_id, execution_version=given.execution_version)
+        return given
+
+    def _admitted_given(
+        self, claim: Any, definition: TaskDefinition, fields: tuple[Any, ...], resolved: Any
+    ) -> Given | Newer | Incompatible:
+        """The member's `resolved` input, each payload in it migrated to the
+        version of the type it is decoded as: its own input as the member's
+        input type, a result it takes as the type its producer returns. The
+        first payload that cannot be is the refusal."""
+        refused: Newer | Incompatible | None = None
+
+        def migrated(serializer_name: str, value_type: Any, payload: bytes) -> bytes:
+            nonlocal refused
+            if refused is not None:
+                return payload
+            admitted = admit(
+                self._schemas,
+                self._serializers.get(serializer_name),
+                value_type,
+                claim.source_version,
+                payload,
+                (),
+            )
+            if isinstance(admitted, Admitted):
+                return admitted.serialized_input
+            refused = admitted
+            return payload
+
+        def walk(entry: Any) -> Any:
+            match entry:
+                case ("value", producer, payload):
+                    maker = self._registry.get(producer)
+                    if maker is None:
+                        return entry  # decoding names the task this process lacks
+                    return ("value", producer, migrated(maker.serializer, maker.output_type, payload))
+                case ("list", entries):
+                    return ("list", [walk(item) for item in entries])
+            return entry
+
+        own: bytes | None = None
+        match resolved:
+            case None:
+                own = migrated(definition.serializer, definition.input_type, claim.serialized_input)
+            case ("input", payload):
+                resolved = ("input", migrated(definition.serializer, definition.input_type, payload))
+            case _:
+                resolved = walk(resolved)
+        if refused is not None:
+            return refused
+        return Given(
+            fields,
+            resolved,
+            serialized_input=own,
+            execution_version=self._schemas.version_of(definition.input_type),
+        )
+
+    def _admit(
+        self, claim: Any, definition: TaskDefinition, serialized_input: bytes, chain: tuple[bytes, ...]
+    ) -> Admitted | Newer | Incompatible:
+        """`serialized_input` and the coalescing payloads before it, as the
+        claim carries them, migrated to this worker's version of the task's
+        input."""
+        return admit(
+            self._schemas,
+            self._serializers.get(definition.serializer),
+            definition.input_type,
+            claim.source_version,
+            serialized_input,
+            chain,
+        )
+
+    def _give_back(
+        self, claim: Any, definition: TaskDefinition, refused: Newer | Incompatible
+    ) -> None:
+        """This worker cannot run the claim's input version. A newer input, or
+        any refusal for a task that asked to keep its tasks, waits for another
+        worker; otherwise the task is dropped as incompatible, and says so."""
+        keep = isinstance(refused, Newer) or definition.raise_on_failed_migration
+        if not keep:
+            _logger.warning(
+                "dropping task %s: its input (%s) cannot be migrated from version %d to %d: %s",
+                claim.task_id,
+                self._schemas.family(definition.input_type),
+                claim.source_version,
+                self._schemas.version_of(definition.input_type),
+                refused.reason,
+            )
+        self._runtime.report_blocked(claim.task_id, refused.reason, incompatible=not keep)
 
     def _shard_and_worker(self) -> tuple[str, str]:
         if self._identity is None:
@@ -815,6 +989,11 @@ class Session:
             await self._run_body(claim, run, definition, body, previous)
         except TaskProcessLost:
             self._lost(claim, run)
+        except _GaveBack:
+            # The leader decides what becomes of the task; its handle, if
+            # it is here, waits for that.
+            if run.holds_handle:
+                self._tasks.released(run)
         except asyncio.CancelledError as error:
             if not await self._cancellation_ends_here(claim, run, body, error):
                 raise
@@ -1195,7 +1374,9 @@ class Session:
 
 
 # Failure kinds a leader reports that name kabudachi's own errors, including
-# the kinds the leader itself gives a task it ended.
+# the kinds the leader itself gives a task it ended. `MigrationError`, which it
+# gives a task no worker could run at its input version, is built by
+# `_failure_error`: it carries the worker's reason.
 _KNOWN_FAILURES: dict[str, type[Exception]] = {
     "ResultTooLargeError": ResultTooLargeError,
     "TaskTimeoutError": TaskTimeoutError,
@@ -1221,9 +1402,10 @@ _PLAIN_ENDINGS: dict[Any, tuple[type[Exception], str]] = {
 }
 
 
-def _outcome_error(event: Any) -> BaseException:
+def _outcome_error(event: Any, reason: str | None = None) -> BaseException:
     """The error a handle fails with when its task ended without a result
-    here, by what its leader said."""
+    here, by what its leader said. `reason` is why no worker could run a task
+    that failed with `MigrationError`, when it is known."""
     task_id = event.task_id
     if event.state is None:
         return ResultUnavailableError(
@@ -1232,7 +1414,7 @@ def _outcome_error(event: Any) -> BaseException:
             task_id,
         )
     if event.state == RunState.FAILED:
-        return _failure_error(task_id, event.failure_kind)
+        return _failure_error(task_id, event.failure_kind, reason)
     if event.state == RunState.SUPERSEDED:
         return TaskSupersededError(
             f"task {task_id} was superseded by {event.superseded_by}", event.superseded_by
@@ -1244,9 +1426,13 @@ def _outcome_error(event: Any) -> BaseException:
     return error_type(f"task {task_id} {ending}")
 
 
-def _failure_error(task_id: str, kind: str) -> BaseException:
+def _failure_error(task_id: str, kind: str, reason: str | None = None) -> BaseException:
     """The error of a run that failed elsewhere, of which only the kind
-    arrives: kabudachi's own kinds as their classes."""
+    arrives: kabudachi's own kinds as their classes. A task no worker could run
+    at its input version also has the `reason` the worker gave, when known."""
+    if kind == "MigrationError":
+        detail = f": {reason}" if reason else ""
+        return MigrationError(f"task {task_id} could not be run at its input version{detail}")
     known = _KNOWN_FAILURES.get(kind)
     if known is not None:
         return known(f"task {task_id} failed with {kind}")

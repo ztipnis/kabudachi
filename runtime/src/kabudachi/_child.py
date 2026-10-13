@@ -40,6 +40,7 @@ from kabudachi.lifecycle import RunContext, default_hooks, hooks_for_run, initia
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import default_registry
 from kabudachi.run_info import RunInfo, run_context
+from kabudachi.schemas import process_schemas, runnable_versions
 from kabudachi.serializers import process_serializers
 from kabudachi.session import activate, invoke_callback
 
@@ -89,7 +90,7 @@ def _import(process: "_TaskProcess", modules: tuple[str, ...]) -> ipc.Ready:
         except BaseException as error:
             return ipc.Ready({}, (), error=f"could not import {module}: {type(error).__name__}: {error}")
     return ipc.Ready(
-        {definition.name: definition.version for definition in default_registry().definitions()},
+        runnable_versions(default_registry(), process_schemas()),
         tuple(process_serializers().names()),
         hooks=tuple(hook.described for hook in default_hooks().all()),
     )

@@ -130,7 +130,8 @@ class BoundTask:
                 for name, field_value in sorted(self._fields.items())
             ]
         settings = session.submission_settings(definition)
-        return ("task", definition.name, definition.version, settings, value, fields)
+        version = session.schemas.version_of(definition.input_type)
+        return ("task", definition.name, version, settings, value, fields)
 
     def __call__(self, *arguments: Any) -> TaskHandle:
         self.check_arguments(arguments)

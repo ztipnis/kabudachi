@@ -28,6 +28,8 @@ class World:
         memory_soft_limit=None,
         memory_hard_limit=None,
         member_batch_items=None,
+        schemas=None,
+        version_block_ttl_ms=None,
         **task_options,
     ):
         if (memory_soft_limit is None) != (memory_hard_limit is None):
@@ -38,7 +40,11 @@ class World:
                 "memory_soft_limit": memory_soft_limit,
                 "memory_hard_limit": memory_hard_limit,
             }
-        self.native = _native.NativeRuntime("worker-world", "incarnation-world", OneNodeArguments(**limits))
+        self.native = _native.NativeRuntime(
+            "worker-world",
+            "incarnation-world",
+            OneNodeArguments(version_block_ttl_ms=version_block_ttl_ms, **limits),
+        )
         weakref.finalize(self, self.native.shutdown)
         self.runtime = FaultingRuntime(self.native)
         self.registry = TaskRegistry()
@@ -59,7 +65,7 @@ class World:
             for function in functions
         }
         self.session = Session(
-            self.runtime, self.registry, self.serializers, self.configuration
+            self.runtime, self.registry, self.serializers, self.configuration, schemas=schemas
         )
         if member_batch_items is not None:
             self.session.composites.batch_items = member_batch_items

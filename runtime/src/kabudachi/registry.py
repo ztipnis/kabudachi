@@ -47,7 +47,6 @@ class TaskDefinition:
     func: Callable[..., Any]
     kind: TaskKind
     serializer: str
-    version: int
     queue: str | Unset
     input_type: Any
     output_type: Any
@@ -86,6 +85,12 @@ class TaskDefinition:
     reducer: ReducerShape | None = None
     """For a task of two parameters `(item, previous)`: how it folds a list.
     `None` for a task of one."""
+    raise_on_failed_migration: bool = False
+    """Whether a task whose input this worker cannot migrate (a migration
+    raised, or a bump is declared incompatible) is left for another worker
+    instead of dropped. Left, it fails with `MigrationError` after
+    `version_block_ttl`; dropped, it fails with `MigrationError` at once and
+    the worker logs a warning."""
 
     def __reduce__(self) -> tuple[Any, tuple[str]]:
         # Sent between a worker and its task processes by name: both imported

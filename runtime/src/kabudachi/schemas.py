@@ -15,12 +15,15 @@ import re
 import threading
 import types
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Final, TypeVar
+from typing import TYPE_CHECKING, Any, Final, TypeVar
 
 from kabudachi.config import UNSET, Unset
-from kabudachi.errors import SerializationError, TaskFailure
+from kabudachi.errors import MigrateRejectError, SerializationError, TaskFailure
+
+if TYPE_CHECKING:
+    from kabudachi.registry import TaskRegistry
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -443,6 +446,94 @@ def can_migrate(serializer: Any) -> bool:
     return _member(serializer, "load_plain") is not None and _member(
         serializer, "dump_plain"
     ) is not None
+
+
+# --- bringing a claimed payload to this worker's version ----------------------
+
+
+@dataclass(frozen=True)
+class Admitted:
+    """A claim's payloads at this worker's version: the input, the coalescing
+    payloads that came before it, and the version they are all at."""
+
+    serialized_input: bytes
+    chain: tuple[bytes, ...]
+    execution_version: int
+
+
+def admit(
+    schemas: SchemaRegistry,
+    serializer: Any,
+    value_type: Any,
+    source_version: int,
+    serialized_input: bytes,
+    chain: Sequence[bytes],
+) -> Admitted | Newer | Incompatible:
+    """The claimed input, and the coalescing payloads before it, brought to
+    this worker's version of `value_type`'s family: each payload at the
+    version it carries (or `source_version`), migrated one version at a
+    time (an explicit migration, or the default that keeps only what the
+    newer version has), then decoded and validated. Why it cannot be,
+    when it cannot."""
+    family = schemas.family(value_type)
+    target = schemas.version_of(value_type)
+    admitted: list[bytes] = []
+    for payload in [*chain, serialized_input]:
+        try:
+            version = extract_version(serializer, payload, value_type)
+        except SerializationError as error:
+            return Incompatible(_failed(family, source_version, target, error))
+        version = source_version if version is None else version
+        if family is None or version == target:
+            admitted.append(payload)
+            continue
+        planned = schemas.plan(family, version, target)
+        if not isinstance(planned, Runnable):
+            return planned
+        if not can_migrate(serializer):
+            return Incompatible(f"the serializer {serializer.name!r} cannot migrate {family}")
+        try:
+            admitted.append(_migrate(schemas, serializer, value_type, payload, planned))
+        except MigrateRejectError as error:
+            return Incompatible(
+                f"migrating {family} from version {version} to {target} was refused: {error}"
+            )
+        except Exception as error:
+            return Incompatible(_failed(family, version, target, error))
+    return Admitted(admitted[-1], tuple(admitted[:-1]), target)
+
+
+def _failed(family: str | None, version: int, target: int, error: Exception) -> str:
+    # Only the type: the message of an arbitrary error can hold the input.
+    return f"migrating {family} from version {version} to {target} failed with {type(error).__name__}"
+
+
+def _migrate(
+    schemas: SchemaRegistry, serializer: Any, value_type: Any, payload: bytes, planned: Runnable
+) -> bytes:
+    """`payload` through each step of `planned`, conformed to `value_type`,
+    decoded and validated; its bytes at the new version."""
+    plain = serializer.load_plain(payload, value_type)
+    for step in planned.steps:
+        if step is not None:
+            plain = step(plain)
+    declared = schemas.schema_of(value_type)
+    if declared is not None and declared.version_path is not None:
+        for item in plain if isinstance(plain, list) else [plain]:
+            if isinstance(item, dict):
+                set_path(item, declared.version_path, planned.version)
+    migrated = serializer.dump_plain(plain, value_type)
+    validate(serializer, serializer.decode(migrated, value_type))
+    return migrated
+
+
+def runnable_versions(registry: "TaskRegistry", schemas: SchemaRegistry) -> dict[str, int]:
+    """The input version this process runs each of `registry`'s tasks at, by
+    task name."""
+    return {
+        definition.name: schemas.version_of(definition.input_type)
+        for definition in registry.definitions()
+    }
 
 
 # --- helpers for serializers whose payload is JSON ----------------------------

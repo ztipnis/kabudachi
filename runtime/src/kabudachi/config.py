@@ -296,6 +296,13 @@ class Settings:
     worker of a shard must use the same value; tasks and queues may set their
     own."""
 
+    version_block_ttl: timedelta = timedelta(hours=1)
+    """How long a task left for another worker, because the first that claimed
+    it could not run its input version, may wait before it fails with
+    `MigrationError`. Only tasks newer than a worker's version, or declared
+    with `raise_on_failed_migration=True`, wait. Every worker of a shard must
+    use the same value. `KABUDACHI_VERSION_BLOCK_TTL` gives it in seconds."""
+
     max_runs_per_process: int | None = None
     """How many runs a task process takes before a fresh one replaces it,
     which bounds what bodies leak (memory, global state). The process takes
@@ -409,7 +416,12 @@ class Settings:
             health_address_parts(self.health_listen)
 
     def _check_shard_timings(self) -> None:
-        for name in ("heartbeat_interval", "heartbeat_timeout", "reconnect_timeout"):
+        for name in (
+            "heartbeat_interval",
+            "heartbeat_timeout",
+            "reconnect_timeout",
+            "version_block_ttl",
+        ):
             _require_positive_timedelta(name, getattr(self, name))
         if self.heartbeat_interval * 3 > self.heartbeat_timeout:
             raise ValueError(

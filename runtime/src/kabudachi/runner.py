@@ -29,6 +29,7 @@ from kabudachi.native_protocol import (
 )
 from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import default_registry
+from kabudachi.schemas import process_schemas, runnable_versions
 from kabudachi.serializers import process_serializers
 from kabudachi.session import (
     Session,
@@ -171,6 +172,7 @@ def _native_runtime(settings: Settings) -> Any:
                 health_listen=settings.health_listen,
                 queues=None if settings.queues is None else tuple(settings.queues),
                 queue_options=_queue_options(settings),
+                version_block_ttl_ms=max(1, _millis(settings.version_block_ttl)),
             ),
         )
     authority = None
@@ -204,6 +206,8 @@ def _native_runtime(settings: Settings) -> Any:
                 if settings.drain_wait_limit is None
                 else max(1, _millis(settings.drain_wait_limit))
             ),
+            version_block_ttl_ms=max(1, _millis(settings.version_block_ttl)),
+            runnable_versions=runnable_versions(default_registry(), process_schemas()),
         )
     )
 
