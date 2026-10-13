@@ -718,13 +718,14 @@ def configure(**settings: Any) -> None:
     timedelta a task process has to become ready, `queue`, the queue tasks
     are sent to unless they name their own, `result_ttl`, the seconds a
     finished task is kept, `cancel_grace`, the timedelta a task past its
-    timeout has to stop, `queues`, the queues this worker takes, `queue_options`, each queue's
-    `QueueOptions` (priority, weight, running limit, reconnect timeout, result
-    TTL, starvation age), `router`, which picks the queue of a task that names
-    none, and `memory_soft_limit` and `memory_hard_limit`, in bytes of pending task
-    payload (past the soft one `group` and `map` pause, past the hard one a
-    submission raises `BackpressureError`; a quarter and half of the memory
-    this process may use unless set). `listen`, `seeds`,
+    timeout has to stop, `queues`, the queues this worker takes,
+    `queue_options`, each queue's `QueueOptions` (priority, weight, running
+    limit, reconnect timeout, result TTL, starvation age), `router`, which
+    picks the queue of a task that names none, and `memory_soft_limit` and
+    `memory_hard_limit`, in bytes of pending task payload (past the soft one
+    `group` and `map` pause, past the hard one a submission raises
+    `BackpressureError`; a quarter and half of the memory this process may use
+    unless set). `listen`, `seeds`,
     `external_address`, `authority` and `shard` make this a worker of a
     networked shard (see each setting; `authority` is a URL that may set
     `?key_prefix=` and `?ttl=`); `heartbeat_interval`,
@@ -736,8 +737,8 @@ def configure(**settings: Any) -> None:
     configured here. A setting a task makes for itself always wins over
     these. The networked settings and timings, `concurrency`, `processes`,
     `imports`, `max_runs_per_process`, `process_start_timeout`, the memory
-    limits, `queues`, `queue_options` and `result_ttl` are read when `run()` starts, so changing them
-    during a run has no effect on that run.
+    limits, `queues`, `queue_options` and `result_ttl` are read when `run()`
+    starts, so changing them during a run has no effect on that run.
 
     Raises `ConfigurationError` for an unknown setting or an invalid value,
     and then applies none of the settings in this call.
