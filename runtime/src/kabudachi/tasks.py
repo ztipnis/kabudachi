@@ -65,7 +65,7 @@ class Task(wrapt.ObjectProxy):
             heard, past the time it takes to suspect a silent worker, before
             the leader replays it on another; and so how long a worker cut
             off from its leader has to stop it. Defaults to the queue's
-            `reconnect_timeouts` setting, else the shard's.
+            `QueueOptions.reconnect_timeout`, else the shard's.
         merge: For a coalescing task, a pure reducer `(older, newer) -> merged`
             that combines the payloads of superseded generations, oldest
             first, on the worker that claims the newest one. Without it the

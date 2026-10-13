@@ -13,7 +13,7 @@ import pytest
 
 from kabudachi._native import EventKind, RunState, result_digest
 from kabudachi.concurrency_places import ConcurrencyPlaces
-from kabudachi.config import Configuration
+from kabudachi.config import Configuration, QueueOptions
 from kabudachi.errors import (
     CertificationError,
     CoalescedPayloadTooLargeError,
@@ -1808,11 +1808,14 @@ def tiny_reconnect(request: Greeting) -> Greeting:
 
 def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
     world = World()
-    timeouts = {"slow": 90, "tiny": 1e-9}
-    world.configuration.configure(reconnect_timeouts=timeouts)
+    options = {
+        "slow": QueueOptions(reconnect_timeout=timedelta(seconds=90)),
+        "tiny": QueueOptions(reconnect_timeout=timedelta(microseconds=1)),
+    }
+    world.configuration.configure(queue_options=options)
     # Changing the mapping after configuring it changes nothing, even once
     # another setting is configured.
-    timeouts["slow"] = 1
+    options["slow"] = QueueOptions(reconnect_timeout=timedelta(seconds=1))
     world.configuration.configure(result_ttl=60)
     own = Task(
         quick_reconnect,

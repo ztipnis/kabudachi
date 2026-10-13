@@ -8,7 +8,7 @@ the environment), then the task's own explicit setting. A task setting of
 import functools
 import ipaddress
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from pathlib import Path
@@ -42,6 +42,69 @@ class Unset:
 
 
 UNSET = Unset()
+
+
+def _in_range(value: Any, low: int, high: int) -> bool:
+    return is_count(value) and low <= value <= high
+
+
+@dataclass(frozen=True, kw_only=True)
+class QueueOptions:
+    """How one queue's tasks are ordered, limited and kept.
+
+    The leader orders and limits by `priority`, `weight`, `max_running` and
+    `starvation_age`; every worker of a shard should give the same ones, and
+    the leader's decide. `reconnect_timeout` and `result_ttl` are stamped on
+    each task when it is submitted.
+    """
+
+    priority: int = 0
+    """Higher goes first: a worker asking for work gets the highest priority
+    that has any waiting."""
+
+    weight: int = 1
+    """Among queues of one priority, how many tasks this queue hands out for
+    each one a queue of weight 1 does."""
+
+    max_running: int | None = None
+    """The most tasks of this queue claimed or running at once across the
+    shard; `None` for no limit."""
+
+    reconnect_timeout: timedelta | None = None
+    """How long a run of a task sent here may go without its worker being
+    heard, past the time it takes to suspect a silent worker, before the
+    leader runs it again; a task's own `reconnect_timeout` wins. `None` uses
+    the shard's."""
+
+    result_ttl: timedelta | None | Unset = UNSET
+    """How long a finished task sent here is kept; `None` keeps nothing, and
+    `UNSET` uses the process's `result_ttl`. A task's own wins."""
+
+    starvation_age: timedelta | None = None
+    """How long a task may wait here before it goes ahead of every priority;
+    `None` never."""
+
+    def __post_init__(self) -> None:
+        if not _in_range(self.priority, -(2**31), 2**31 - 1):
+            raise ValueError(f"priority must be a 32-bit integer, not {self.priority!r}")
+        if not _in_range(self.weight, 1, 2**32 - 1):
+            raise ValueError(f"weight must be a positive 32-bit integer, not {self.weight!r}")
+        if self.max_running is not None and not _in_range(self.max_running, 1, 2**32 - 1):
+            raise ValueError(
+                f"max_running must be a positive 32-bit integer or None, not {self.max_running!r}"
+            )
+        for name in ("reconnect_timeout", "starvation_age"):
+            value = getattr(self, name)
+            if value is not None and not is_positive_timedelta(value):
+                raise ValueError(f"{name} must be a positive timedelta or None, not {value!r}")
+        if not (
+            self.result_ttl is None
+            or self.result_ttl is UNSET
+            or is_positive_timedelta(self.result_ttl)
+        ):
+            raise ValueError(
+                f"result_ttl must be a positive timedelta, None or UNSET, not {self.result_ttl!r}"
+            )
 
 
 ENVIRONMENT_PREFIX = "KABUDACHI_"
@@ -150,9 +213,10 @@ class Settings:
     `timedelta` as a number of seconds, a `bool` as true/false, yes/no, on/off
     or 1/0, `seeds` and `imports` as a comma-separated list, an `int | None`
     field as a number, a `timedelta | None` field as a number of seconds, and
-    `reconnect_timeouts` as `queue=seconds` pairs separated by commas; an
-    empty value leaves `seeds` empty and `imports`, an `int | None` field, a
-    `timedelta | None` field or a `str | None` field unset.
+    `queues` as a comma-separated list; an empty value leaves `seeds` empty and
+    `imports`, `queues`, an `int | None` field, a `timedelta | None` field or a
+    `str | None` field unset. `queue_options` and `router` cannot come from
+    the environment.
     """
 
     processes: int = field(default_factory=_one_per_cpu)
@@ -246,6 +310,20 @@ class Settings:
     queue: str = "default"
     """The queue tasks are sent to unless they name their own."""
 
+    queues: tuple[str, ...] | None = None
+    """The queues this worker takes tasks from. `None` takes `queue` alone on a
+    networked worker, and every queue in a shard of one, where nothing else
+    could run the rest. `KABUDACHI_QUEUES` gives them separated by commas."""
+
+    queue_options: Mapping[str, QueueOptions] = field(default_factory=dict)
+    """Per queue, its `QueueOptions`; a queue not named here has the defaults.
+    Every worker of a shard should give the same; the leader's decide."""
+
+    router: Callable[[str, Any], str | None] | None = None
+    """Picks the queue of a task that names none, when it is submitted:
+    called with the task's name and its argument, it returns a queue name, or
+    `None` for `queue`. It runs in the submitting process only."""
+
     result_ttl: int = 3600
     """How many seconds a finished task is kept, so its result and state can
     still be looked up, before it is forgotten."""
@@ -264,14 +342,6 @@ class Settings:
     """How long a task past its timeout has to stop once asked, before its
     run is failed and its body abandoned. `KABUDACHI_CANCEL_GRACE` gives it
     in seconds."""
-
-    reconnect_timeouts: Mapping[str, float] = field(default_factory=dict)
-    """Per queue, the seconds a run of a task sent there may go without its
-    worker being heard, past the time it takes to suspect a silent worker,
-    before the leader replays it, and so how long a worker cut off from its
-    leader has to stop it. A task's own `reconnect_timeout` wins; a queue not
-    named here uses the shard's. `KABUDACHI_RECONNECT_TIMEOUTS` gives it as
-    `queue=seconds` pairs separated by commas."""
 
     def __post_init__(self) -> None:
         # In this order, so a value with several bad settings names the same
@@ -396,21 +466,24 @@ class Settings:
     def _check_queues(self) -> None:
         if not is_nonblank_string(self.queue):
             raise ValueError(f"queue must be a non-empty string, not {self.queue!r}")
-        if not isinstance(self.reconnect_timeouts, Mapping) or not all(
-            is_nonblank_string(queue) and is_positive_seconds(seconds)
-            for queue, seconds in self.reconnect_timeouts.items()
+        if self.queues is not None:
+            complaint = f"queues must be a non-empty list of queue names, not {self.queues!r}"
+            queues = _name_tuple(self.queues, complaint)
+            if not queues:
+                raise ValueError(complaint)
+            object.__setattr__(self, "queues", queues)
+        if not isinstance(self.queue_options, Mapping) or not all(
+            is_nonblank_string(queue) and isinstance(options, QueueOptions)
+            for queue, options in self.queue_options.items()
         ):
             raise ValueError(
-                "reconnect_timeouts must map queue names to positive numbers of seconds, "
-                f"not {self.reconnect_timeouts!r}"
+                f"queue_options must map queue names to QueueOptions, not {self.queue_options!r}"
             )
         # A copy, as a plain dict: a mapping the caller changes later changes
         # nothing here, and the settings pickle into task processes.
-        object.__setattr__(
-            self,
-            "reconnect_timeouts",
-            {queue: float(seconds) for queue, seconds in self.reconnect_timeouts.items()},
-        )
+        object.__setattr__(self, "queue_options", dict(self.queue_options))
+        if self.router is not None and not callable(self.router):
+            raise ValueError(f"router must be callable or None, not {self.router!r}")
 
     @classmethod
     def names(cls) -> tuple[str, ...]:
@@ -537,24 +610,6 @@ def _name_tuple(value: Any, complaint: str) -> tuple[str, ...]:
     return names
 
 
-def _queue_seconds(raw: str) -> dict[str, float]:
-    """`queue=seconds` pairs separated by commas, as a mapping. Raises
-    `ValueError` for a pair without `=`, seconds that are not a number, or
-    a queue named twice."""
-    pairs: dict[str, float] = {}
-    for item in raw.split(","):
-        if not item.strip():
-            continue
-        queue, separator, seconds = item.partition("=")
-        if not separator:
-            raise ValueError(raw)
-        queue = queue.strip()
-        if queue in pairs:
-            raise ValueError(raw)
-        pairs[queue] = float(seconds)
-    return pairs
-
-
 def _parse(value_type: Any, raw: str) -> Any:
     """An environment variable's text as a setting of `value_type`."""
     if value_type is int:
@@ -579,8 +634,6 @@ def _parse(value_type: Any, raw: str) -> Any:
         return timedelta(seconds=float(raw)) if raw.strip() else None  # empty is "not set"
     if value_type == int | None:
         return int(raw) if raw.strip() else None  # an empty value is "not set"
-    if value_type == Mapping[str, float]:
-        return _queue_seconds(raw)
     return raw
 
 
@@ -606,9 +659,9 @@ class Configuration:
         """
         configured ={**self._configured, **settings}
         validated = self._validate(configured)
-        if "reconnect_timeouts" in settings:
+        if "queue_options" in settings:
             # A copy: a mapping the caller changes later changes nothing here.
-            configured["reconnect_timeouts"] = dict(validated.reconnect_timeouts)
+            configured["queue_options"] = dict(validated.queue_options)
         self._configured, self._settings = configured, validated
 
     def resolve(self, name: str, task_value: Any = UNSET) -> Any:
@@ -665,10 +718,10 @@ def configure(**settings: Any) -> None:
     timedelta a task process has to become ready, `queue`, the queue tasks
     are sent to unless they name their own, `result_ttl`, the seconds a
     finished task is kept, `cancel_grace`, the timedelta a task past its
-    timeout has to stop, `reconnect_timeouts`, the seconds a run of a task in
-    each named queue may go unheard past a suspicion before the leader
-    replays it (a task's own `reconnect_timeout` wins), and
-    `memory_soft_limit` and `memory_hard_limit`, in bytes of pending task
+    timeout has to stop, `queues`, the queues this worker takes, `queue_options`, each queue's
+    `QueueOptions` (priority, weight, running limit, reconnect timeout, result
+    TTL, starvation age), `router`, which picks the queue of a task that names
+    none, and `memory_soft_limit` and `memory_hard_limit`, in bytes of pending task
     payload (past the soft one `group` and `map` pause, past the hard one a
     submission raises `BackpressureError`; a quarter and half of the memory
     this process may use unless set). `listen`, `seeds`,
@@ -683,7 +736,7 @@ def configure(**settings: Any) -> None:
     configured here. A setting a task makes for itself always wins over
     these. The networked settings and timings, `concurrency`, `processes`,
     `imports`, `max_runs_per_process`, `process_start_timeout`, the memory
-    limits and `result_ttl` are read when `run()` starts, so changing them
+    limits, `queues`, `queue_options` and `result_ttl` are read when `run()` starts, so changing them
     during a run has no effect on that run.
 
     Raises `ConfigurationError` for an unknown setting or an invalid value,
