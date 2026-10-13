@@ -614,19 +614,6 @@ def test_map_runs_the_task_on_every_input_and_keeps_the_order_of_the_inputs():
     assert [g.text for g in run(with_events(world, body))] == ["A", "B", "C"]
 
 
-def test_a_map_longer_than_a_batch_is_sent_in_batches_that_continue_where_the_last_ended():
-    world = World(shout, concurrency=8, member_batch_items=3)
-
-    async def body():
-        with activated(world):
-            return await world.tasks["shout"].map(greetings(*"abcdefg"))
-
-    results = run(with_events(world, body))
-
-    assert [g.text for g in results] == list("ABCDEFG")
-    assert [(start, count) for _, start, count in world.runtime.members_sent] == [(0, 3), (3, 3), (6, 1)]
-
-
 def test_mapping_an_empty_list_gives_an_empty_list_and_submits_nothing():
     world = World(shout)
 
@@ -970,6 +957,9 @@ def test_a_stream_that_cannot_cancel_what_it_sent_still_fails_its_handle_and_say
     ]
 
 
+# A pure-logic edge-case exception to testing through the public seam: the
+# boundaries of a batch are many and cheap to reach here, and slow to reach by
+# running a map for each.
 @pytest.mark.parametrize(
     ("lengths", "max_items", "max_bytes", "expected"),
     [

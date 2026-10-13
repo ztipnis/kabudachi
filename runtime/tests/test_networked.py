@@ -229,11 +229,19 @@ def slow_down_followed_across_workers(cluster, leader, tmp_path):
     # the worker that sent them hears SlowDown and polls until it clears; the
     # results come back in order, and no worker is left asking submitters to
     # wait.
+    raised_before = [worker.ask(slow_down=None)["raises"] for worker in cluster.workers]
     mapped = follower.submit("maps", times=300)
     expected = Greeting(text=",".join(str(index) for index in range(300)))
     certified_once(cluster, mapped, digest_of(maps, expected))
     for worker in cluster.workers:
         eventually("SlowDown to clear", lambda: not worker.ask(slow_down=None)["slow_down"])
+    # The cleared state above is no proof SlowDown was ever raised: a worker
+    # heard it go up during the map, and the check above saw it come down.
+    heard = [
+        worker.ask(slow_down=None)["raises"] - before
+        for worker, before in zip(cluster.workers, raised_before)
+    ]
+    assert sum(heard) >= 1, f"no worker heard SlowDown raised during the map: {heard}"
 
 
 def task_process_killed(cluster, leader, tmp_path):
