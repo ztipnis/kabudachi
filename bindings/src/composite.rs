@@ -348,8 +348,8 @@ pub(crate) fn refuse_values_past_limit(py: Python<'_>, limit: Option<u64>, value
 }
 
 /// A composite's status as Python reads it: `(state, next_stage, pending,
-/// succeeded, failed, cancelled)`.
-pub(crate) type CompositeStatusTuple = (&'static str, u64, u64, u64, u64, u64);
+/// running, succeeded, failed, cancelled)`.
+pub(crate) type CompositeStatusTuple = (&'static str, u64, u64, u64, u64, u64, u64);
 
 /// How a composite's record says it stands.
 pub(crate) fn record_status(record: &CompositeRecord) -> CompositeStatusTuple {
@@ -364,6 +364,7 @@ pub(crate) fn record_status(record: &CompositeRecord) -> CompositeStatusTuple {
         state_name(state),
         record.next_stage,
         counts.pending,
+        counts.running,
         counts.succeeded,
         counts.failed,
         counts.cancelled,

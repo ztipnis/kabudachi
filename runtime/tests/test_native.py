@@ -498,7 +498,7 @@ def test_a_composite_submitted_before_the_node_leads_waits_for_the_grant_and_a_c
         async def status_of(composite_id):
             return await native.composite_status(composite_id)
 
-        assert asyncio.run(status_of(kept)) == ("running", 0, 1, 0, 0, 0)
+        assert asyncio.run(status_of(kept)) == ("running", 0, 1, 0, 0, 0, 0)
         assert native.cancel_composite(dropped) == CancelOutcome.CANCELLED
         assert asyncio.run(status_of(dropped)) is None
         assert native.worker_state() != "Leader"

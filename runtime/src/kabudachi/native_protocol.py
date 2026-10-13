@@ -327,9 +327,9 @@ class Runtime(Protocol):
 
     async def composite_status(
         self, composite_id: str
-    ) -> tuple[str, int, int, int, int, int] | None:
+    ) -> tuple[str, int, int, int, int, int, int] | None:
         """A composite's state, the stage it is on, and the number of its
-        members pending, succeeded, failed and cancelled; `None` when the
+        members pending, running, succeeded, failed and cancelled; `None` when the
         runtime holds no such composite. Awaited, since a networked runtime
         asks its shard."""
 

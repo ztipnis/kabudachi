@@ -541,7 +541,7 @@ impl NativeRuntime {
     }
 
     /// Returns an awaitable that resolves to where a composite stands, as
-    /// `(state, next_stage, pending, succeeded, failed, cancelled)`: `state`
+    /// `(state, next_stage, pending, running, succeeded, failed, cancelled)`: `state`
     /// is `"running"`, `"succeeded"`, `"failed"` or `"cancelled"`,
     /// `next_stage` the stage of a flow that runs or runs next, and the rest
     /// count its members. `None` if the runtime holds no such composite. It
@@ -556,6 +556,7 @@ impl NativeRuntime {
                     state_name(status.state),
                     status.next_stage,
                     counts.pending,
+                    counts.running,
                     counts.succeeded,
                     counts.failed,
                     counts.cancelled,

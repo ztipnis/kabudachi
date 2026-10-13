@@ -94,7 +94,7 @@ class TaskStatus:
 class CompositeStatus:
     """How a flow or group stood when it was asked. `state` is "running",
     "succeeded", "failed" or "cancelled"; `counts` its stages or members
-    by "pending" (not ended yet, running or not), "succeeded", "failed" and
+    by "pending" (not started), "running", "succeeded", "failed" and
     "cancelled", only those with any; `stage`, for a flow, the index of the
     stage it is at or ended on."""
 

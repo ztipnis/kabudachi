@@ -27,7 +27,7 @@ from kabudachi.status import CompositeStatus
 if TYPE_CHECKING:
     from kabudachi.session import Session
 
-_COUNTED = ("pending", "succeeded", "failed", "cancelled")
+_COUNTED = ("pending", "running", "succeeded", "failed", "cancelled")
 
 
 class CompositeHandle(TaskHandle):

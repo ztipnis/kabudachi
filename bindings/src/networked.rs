@@ -544,7 +544,7 @@ impl NetworkedRuntime {
     }
 
     /// Returns an awaitable that resolves to where a composite stands, as
-    /// `(state, next_stage, pending, succeeded, failed, cancelled)`, by the
+    /// `(state, next_stage, pending, running, succeeded, failed, cancelled)`, by the
     /// newest record of it the shard holds that this worker reaches: not
     /// authoritative, so a change the leader has just made may not show yet.
     /// `None` if no worker this one reaches holds it. Reading the record asks
