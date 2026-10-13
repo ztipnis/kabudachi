@@ -31,6 +31,9 @@ message MemberCounts {
   uint64 succeeded = 2;
   uint64 failed = 3;
   uint64 cancelled = 4;
+  // Members whose current run is claimed or started, which `pending` leaves
+  // out. Only as of the revision that carries it.
+  uint64 running = 5;
 }
 
 // The outcome of one stage or member.

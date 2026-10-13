@@ -406,14 +406,26 @@ fn a_composites_status_counts_its_members_by_state() {
         &mut fixture,
         group_of(
             OnError::CollectAll,
-            vec![task_stage("a", Some(b"a")), task_stage("b", Some(b"b")), task_stage("c", Some(b"c"))],
+            vec![
+                task_stage("a", Some(b"a")),
+                task_stage("b", Some(b"b")),
+                task_stage("c", Some(b"c")),
+                task_stage("d", Some(b"d")),
+                task_stage("e", Some(b"e")),
+            ],
         ),
     );
     run_member(&mut fixture, &group, 0, b"ok");
     fail_member(&mut fixture, &group, 1, "ValueError");
+    start_member(&mut fixture, &group, 2);
+    fixture.scheduler.request_claim(&worker(), &group.member_task(3)).unwrap();
     let status = fixture.scheduler.composite_status(&group).unwrap();
     assert_eq!(status.state, CompositeState::Running);
-    assert_eq!(status.counts, MemberCounts { pending: 1, succeeded: 1, failed: 1, cancelled: 0 });
+    assert_eq!(
+        status.counts,
+        MemberCounts { pending: 1, running: 2, succeeded: 1, failed: 1, cancelled: 0 },
+        "a member that is claimed or started is running, not pending"
+    );
 }
 
 #[test]
@@ -598,7 +610,7 @@ fn cancelling_a_group_member_that_already_returned_a_step_cancels_the_step_and_c
     assert_eq!(fixture.run_state(&slow.task_run_id), TaskRunState::Cancelled);
     let status = fixture.scheduler.composite_status(&group).unwrap();
     assert_eq!(status.state, CompositeState::Running, "collect_all waits for the other member");
-    assert_eq!(status.counts, MemberCounts { pending: 1, succeeded: 0, failed: 0, cancelled: 1 });
+    assert_eq!(status.counts, MemberCounts { pending: 1, running: 0, succeeded: 0, failed: 0, cancelled: 1 });
 }
 
 #[test]
@@ -615,7 +627,7 @@ fn stages_that_never_started_count_pending_after_their_flow_is_cancelled() {
     );
     let status = fixture.scheduler.composite_status(&flow).unwrap();
     assert_eq!(status.state, CompositeState::Cancelled);
-    assert_eq!(status.counts, MemberCounts { pending: 2, succeeded: 0, failed: 0, cancelled: 1 });
+    assert_eq!(status.counts, MemberCounts { pending: 2, running: 0, succeeded: 0, failed: 0, cancelled: 1 });
 }
 
 /// The map member a worker builds for one item it stored.

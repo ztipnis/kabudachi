@@ -76,8 +76,10 @@ impl Composite {
             .map_or(0, |(index, _)| (index / PAGE_ENTRIES) as u32 + 1)
     }
 
-    pub(super) fn counts(&self) -> MemberCounts {
-        let mut counts = MemberCounts::default();
+    /// The members by state, `running` of those not settled being claimed or
+    /// started.
+    pub(super) fn counts(&self, running: u64) -> MemberCounts {
+        let mut counts = MemberCounts { running, ..MemberCounts::default() };
         for outcome in self.outcomes.values() {
             match outcome {
                 MemberOutcome::Value { .. } | MemberOutcome::Child(_) => counts.succeeded += 1,
@@ -85,7 +87,9 @@ impl Composite {
                 MemberOutcome::Failed(_) => counts.failed += 1,
             }
         }
-        counts.pending = (self.step.stages.len() as u64).saturating_sub(self.outcomes.len() as u64);
+        counts.pending = (self.step.stages.len() as u64)
+            .saturating_sub(self.outcomes.len() as u64)
+            .saturating_sub(running);
         counts
     }
 }

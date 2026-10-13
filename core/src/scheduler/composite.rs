@@ -136,7 +136,10 @@ pub enum MemberOutcome {
 /// How many of a composite's members are in each state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemberCounts {
+    /// Members not settled and not running: waiting, or not yet started.
     pub pending: u64,
+    /// Members whose current run is claimed or started.
+    pub running: u64,
     pub succeeded: u64,
     pub failed: u64,
     pub cancelled: u64,

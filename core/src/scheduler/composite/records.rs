@@ -37,6 +37,7 @@ impl From<MemberCounts> for generated::MemberCounts {
     fn from(counts: MemberCounts) -> Self {
         generated::MemberCounts {
             pending: counts.pending,
+            running: counts.running,
             succeeded: counts.succeeded,
             failed: counts.failed,
             cancelled: counts.cancelled,
@@ -119,7 +120,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             input_shape: composite.input.as_ref().map(|(_, shape)| shape.into()),
             state: generated::CompositeState::from(composite.state) as i32,
             next_stage: composite.next_stage,
-            counts: Some(composite.counts().into()),
+            counts: Some(composite.counts(self.running_members(id)).into()),
             pages: composite.pages(),
             failure: composite.failure.clone().map(failure_message),
             submitted_at: Some(composite.submitted_at.into()),

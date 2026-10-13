@@ -558,7 +558,21 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         Some(CompositeStatus {
             state: composite.state,
             next_stage: composite.next_stage,
-            counts: composite.counts(),
+            counts: composite.counts(self.running_members(id)),
         })
+    }
+
+    /// How many members of the held composite `id` are Tasks that have not
+    /// settled and whose current run is claimed or started.
+    pub(in crate::scheduler) fn running_members(&self, id: &CompositeId) -> u64 {
+        let composite = &self.composites.held[id];
+        (0..composite.step.stages.len() as u64)
+            .filter(|index| !composite.outcomes.contains_key(index))
+            .filter(|index| {
+                self.current_run.get(&id.member_task(*index)).is_some_and(|run| {
+                    matches!(self.runs[run].current_state(), TaskRunState::Claimed | TaskRunState::Running)
+                })
+            })
+            .count() as u64
     }
 }
