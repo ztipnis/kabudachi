@@ -412,3 +412,53 @@ fn a_holder_keeps_a_blob_under_its_own_digest_while_its_owner_is_unfinished_and_
     held.forget_blobs_of(&task("t4"));
     assert!(held.blob(&key).is_none());
 }
+
+/// A store holding `held` finished tasks, the first finished at tick 0 and
+/// each next one tick later, every one with a result blob of its own, none of
+/// them yet due; then the time `extra` further unfinished tasks, each with a
+/// blob, take to be put.
+fn time_puts_into_a_store_holding(held: u64, extra: u64) -> (VersionedRecords, std::time::Duration) {
+    let mut store = VersionedRecords::with_retention(Some(Duration::from_ticks(RETENTION_TICKS)));
+    for n in 0..held {
+        let name = format!("held-{n}");
+        let value = name.clone().into_bytes();
+        let record = BlobRecord { result: true, ..owned_by(&name, &value) };
+        store.put_blob(&BlobKey::of(&value), record, at(n)).unwrap();
+        store.put(task_record(&name, 1, &[], true), at(n)).unwrap();
+    }
+    let started = std::time::Instant::now();
+    for n in 0..extra {
+        let name = format!("new-{n}");
+        let value = name.clone().into_bytes();
+        store.put_blob(&BlobKey::of(&value), owned_by(&name, &value), at(held)).unwrap();
+        store.put(task_record(&name, 1, &[], false), at(held)).unwrap();
+    }
+    (store, started.elapsed())
+}
+
+const RETENTION_TICKS: u64 = 1_000_000;
+
+#[test]
+fn putting_into_a_store_holding_many_unexpired_records_costs_no_more_than_into_a_small_one() {
+    let (_, small) = time_puts_into_a_store_holding(1_000, 500);
+    let (mut big, large) = time_puts_into_a_store_holding(64_000, 500);
+    // Work that rescanned every held record and blob on each put would cost
+    // sixty-four times as much here, seconds, where this allows a few times.
+    assert!(
+        large < small * 8 + std::time::Duration::from_millis(100),
+        "500 puts took {small:?} beside 1000 records and {large:?} beside 64000"
+    );
+
+    // Expiry still drops exactly the records that are due, with their blobs:
+    // the first ten were finished at ticks 0 to 9.
+    assert_eq!(big.len(), 64_000 + 500);
+    assert_eq!(big.blobs().len(), 64_000 + 500);
+    assert_eq!(big.sweep(at(RETENTION_TICKS + 9)), 10 + 10);
+    assert_eq!(big.len(), 64_000 + 500 - 10);
+    assert_eq!(big.blobs().len(), 64_000 + 500 - 10);
+    assert!(big.get(&TaskId::new("held-9")).is_none());
+    assert!(big.get(&TaskId::new("held-10")).is_some());
+    assert_eq!(big.next_due(), Some(at(RETENTION_TICKS + 10)));
+    assert!(big.blobs_of(&task("held-9")).is_empty());
+    assert_eq!(big.blobs_of(&task("held-10")).len(), 1);
+}

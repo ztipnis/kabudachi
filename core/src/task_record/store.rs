@@ -122,6 +122,16 @@ pub struct VersionedRecords {
     input_bytes: u64,
     /// The most bytes of blobs held, or `None` for no limit.
     blob_store_limit: Option<u64>,
+    /// The records held that have a finished revision, by when this store
+    /// first held one, kept only when there is a retention: a sweep reads
+    /// from the front instead of looking at every record.
+    finishing: BTreeMap<Instant, BTreeSet<RecordKey>>,
+    /// The owners with blobs whose record (or stub) left the store since the
+    /// last sweep, which lets their blobs go.
+    released: BTreeSet<BlobOwner>,
+    /// The owners never seen here whose last look-up found their record
+    /// finished, by when that grace started: a sweep reads from the front.
+    unseen_finished: BTreeMap<Instant, BTreeSet<BlobOwner>>,
 }
 
 #[derive(Debug, Clone)]
@@ -334,10 +344,10 @@ impl VersionedRecords {
             }
         }
         if leaves_me_out {
-            self.records.insert(key, Held::stub_of(&record, finished_since, now));
+            self.insert_held(key, Held::stub_of(&record, finished_since, now));
             Put::Retired
         } else {
-            self.records.insert(key, Held::new(record, finished_since, now));
+            self.insert_held(key, Held::new(record, finished_since, now));
             Put::Stored
         }
     }
@@ -350,7 +360,11 @@ impl VersionedRecords {
         let Some(of) = self.blob_owners.get_mut(&owner) else {
             return;
         };
+        let (was_seen, was_finished, since) = (of.seen, of.finished, of.since);
         of.seen = true;
+        if !was_seen && was_finished {
+            self.unindex_unseen_finished(&owner, since);
+        }
         let after = holders_of(record);
         let before = self.records.get(key).map(|held| holders_of(&held.record));
         let moved = origin == Origin::Leader
@@ -371,10 +385,17 @@ impl VersionedRecords {
     pub fn sweep(&mut self, now: Instant) -> usize {
         let mut dropped = 0;
         if let Some(retention) = self.retention {
-            let before = self.records.len();
-            self.records
-                .retain(|_, held| held.finished_since.is_none_or(|since| since + retention > now));
-            dropped += before - self.records.len();
+            while let Some(due) = self.finishing.first_entry() {
+                if *due.key() + retention > now {
+                    break;
+                }
+                for key in due.remove() {
+                    if self.records.remove(&key).is_some() {
+                        dropped += 1;
+                        self.release_owner_of(&key);
+                    }
+                }
+            }
         }
         let blobs_before = self.blobs.len();
         for owner in self.owners_let_go(now) {
@@ -387,12 +408,10 @@ impl VersionedRecords {
     /// owner's grace, passes, if any.
     pub fn next_due(&self) -> Option<Instant> {
         let records = self.retention.and_then(|retention| {
-            let finished = self.records.values().filter_map(|held| held.finished_since);
-            finished.min().map(|since| since + retention)
+            self.finishing.first_key_value().map(|(since, _)| *since + retention)
         });
         let blobs = self.orphan_grace.and_then(|grace| {
-            let finished_elsewhere = self.blob_owners.values().filter(|of| !of.seen && of.finished);
-            finished_elsewhere.map(|of| of.since + grace).min()
+            self.unseen_finished.first_key_value().map(|(since, _)| *since + grace)
         });
         records.into_iter().chain(blobs).min()
     }
@@ -418,7 +437,10 @@ impl VersionedRecords {
         if self.records.get(key).is_some_and(|held| held.stub) {
             return None;
         }
-        self.records.remove(key).map(|held| held.record)
+        let held = self.records.remove(key)?;
+        self.unindex_finish(key, held.finished_since);
+        self.release_owner_of(key);
+        Some(held.record)
     }
 
     /// The Task records held, the newest revision of each task: no stub.
@@ -451,13 +473,65 @@ impl VersionedRecords {
 }
 
 impl VersionedRecords {
+    /// Holds `held` under `key` in place of any record held there.
+    fn insert_held(&mut self, key: RecordKey, held: Held) {
+        let since = held.finished_since;
+        if let Some(replaced) = self.records.insert(key.clone(), held) {
+            self.unindex_finish(&key, replaced.finished_since);
+        }
+        if let (Some(_), Some(since)) = (self.retention, since) {
+            self.finishing.entry(since).or_default().insert(key);
+        }
+    }
+
+    fn unindex_finish(&mut self, key: &RecordKey, since: Option<Instant>) {
+        let Some(since) = since else {
+            return;
+        };
+        if let Some(keys) = self.finishing.get_mut(&since) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.finishing.remove(&since);
+            }
+        }
+    }
+
+    /// Notes that the record under `key` has left the store: its owner's
+    /// blobs, if it has any here, let go at the next sweep.
+    fn release_owner_of(&mut self, key: &RecordKey) {
+        if let Some(owner) = blob_owner_of(key).filter(|owner| self.blob_owners.contains_key(owner)) {
+            self.released.insert(owner);
+        }
+    }
+
+    fn unindex_unseen_finished(&mut self, owner: &BlobOwner, since: Instant) {
+        if let Some(owners) = self.unseen_finished.get_mut(&since) {
+            owners.remove(owner);
+            if owners.is_empty() {
+                self.unseen_finished.remove(&since);
+            }
+        }
+    }
+
     /// The owners whose blobs go by `now`: those seen here whose record has
-    /// gone, and those never seen found finished a grace ago.
-    fn owners_let_go(&self, now: Instant) -> Vec<BlobOwner> {
-        self.blob_owners
-            .iter()
-            .filter(|(owner, of)| !owner_held(&self.records, owner) && self.lets_go(of, now))
-            .map(|(owner, _)| owner.clone())
+    /// gone since the last sweep, and those never seen found finished a
+    /// grace ago.
+    fn owners_let_go(&mut self, now: Instant) -> Vec<BlobOwner> {
+        let mut candidates = std::mem::take(&mut self.released);
+        if let Some(grace) = self.orphan_grace {
+            while let Some(due) = self.unseen_finished.first_entry() {
+                if *due.key() + grace > now {
+                    break;
+                }
+                candidates.extend(due.remove());
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|owner| {
+                !owner_held(&self.records, owner)
+                    && self.blob_owners.get(owner).is_some_and(|of| self.lets_go(of, now))
+            })
             .collect()
     }
 
@@ -605,6 +679,9 @@ impl VersionedRecords {
         let Some(of) = self.blob_owners.remove(owner) else {
             return;
         };
+        if !of.seen && of.finished {
+            self.unindex_unseen_finished(owner, of.since);
+        }
         self.release(owner, of.keys);
     }
 
@@ -692,11 +769,16 @@ impl VersionedRecords {
             }
             OwnerState::Gone | OwnerState::Unfinished | OwnerState::Finished => {
                 if let Some(of) = self.blob_owners.get_mut(owner) {
+                    let (was_finished, since) = (of.finished, of.since);
                     of.since = now;
                     of.finished = state == OwnerState::Finished;
                     of.gone = state == OwnerState::Gone;
+                    if was_finished {
+                        self.unindex_unseen_finished(owner, since);
+                    }
                 }
                 if state == OwnerState::Finished {
+                    self.unseen_finished.entry(now).or_default().insert(owner.clone());
                     self.forget_inputs_of(owner);
                 }
             }
