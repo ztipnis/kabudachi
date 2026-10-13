@@ -140,11 +140,7 @@ where
     /// refuse each other's roll calls term after term. Only a node that takes
     /// part in elections without standing or leading adopts it.
     fn adopt_relayed_configuration(&mut self, offered: Configuration) {
-        // A leader handing its leadership over takes part in elections but
-        // still leads the configuration its office holds; the standing is
-        // written back from that office, so a relayed configuration adopted
-        // here would be overwritten or contradict it.
-        if self.takes_part_in_elections() && !self.holds_office() {
+        if self.takes_part_in_elections() {
             self.standing.adopt_relayed_configuration(offered);
         }
     }
