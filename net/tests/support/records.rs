@@ -18,8 +18,9 @@ use kabudachi_core::protocol::ids::{
     CompositeId, IdGenerator, IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::messages::{
-    CompositeAccepted, ElectionMessage, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
+    ClaimResponse, CompositeAccepted, ElectionMessage, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
 };
+use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::composite::{
@@ -107,6 +108,8 @@ pub struct Voters {
     queues: Vec<Subscription>,
     /// The queue policy every voter is given.
     queue_policy: QueuePolicy,
+    /// The input version each voter runs of each task definition.
+    runnable: Vec<RunnableVersions>,
     /// Keeps each net's hosting thread running for as long as the voters live.
     _hosts: Vec<Hosting>,
     states: Vec<watch::Receiver<WorkerState>>,
@@ -251,6 +254,7 @@ impl Voters {
             replication_factor,
             queues: vec![Subscription::Every; count],
             queue_policy: QueuePolicy::new(),
+            runnable: vec![RunnableVersions::default(); count],
             _hosts: hosts,
             states,
             senders,
@@ -280,6 +284,16 @@ impl Voters {
         );
         self.queues[voter] =
             Subscription::Only(queues.iter().map(|name| (*name).to_owned()).collect());
+    }
+
+    /// Makes `voter` run each task definition at the input version `runnable`
+    /// names. Only before the shard is first driven.
+    pub fn set_runnable_versions(&mut self, voter: usize, runnable: RunnableVersions) {
+        assert!(
+            matches!(self.voters[voter], Voter::Idle(_)),
+            "set before the shard is first driven"
+        );
+        self.runnable[voter] = runnable;
     }
 
     /// Gives every voter `policy`. Only before the shard is first driven.
@@ -355,6 +369,7 @@ impl Voters {
                 replication_factor: self.replication_factor,
                 queues: self.queues[voter].clone(),
                 queue_policy: self.queue_policy.clone(),
+                runnable: self.runnable[voter].clone(),
                 ..DriverConfig::default()
             };
             let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -688,6 +703,30 @@ pub fn plain_with(input: &[u8]) -> Submission {
         input.to_vec(),
         "default",
     )
+}
+
+/// Drives the shard until `leader` places records among every voter, and
+/// returns them: where a task's record goes is then `placement` over them.
+pub async fn placing_among_every_voter(shard: &mut Voters, leader: usize) -> Vec<WorkerId> {
+    loop {
+        let voters = shard.with(leader, |node, _| node.voters()).await;
+        if voters.len() == shard.nets.len() {
+            return voters;
+        }
+        shard.drive_until(tokio::time::sleep(StdDuration::from_millis(10))).await;
+    }
+}
+
+/// The tasks a batch of claims from the leader's oldest pending tasks holds.
+pub fn claims_in(response: &ClaimResponse) -> Vec<TaskId> {
+    match &response.result {
+        Some(claim_response::Result::Batch(batch)) => batch
+            .claims
+            .iter()
+            .map(|claim| claim.task.as_ref().expect("a claim carries its task").task_id())
+            .collect(),
+        other => panic!("expected a batch of claims, got {other:?}"),
+    }
 }
 
 /// Resolves once `net` holds a record of every task in `tasks`.
