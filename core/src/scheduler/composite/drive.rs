@@ -8,9 +8,12 @@
 
 use std::collections::BTreeMap;
 
+use prost::Message as _;
+
 use crate::manifest::{Failure, Manifest, ManifestEntry};
 use crate::protocol::digest::Digest;
-use crate::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, WorkerId};
+use crate::protocol::generated;
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
@@ -24,7 +27,7 @@ use crate::scheduler::{
 use super::held::Composite;
 use super::{
     BoundInput, BoundStep, CompositeFinished, CompositeKind, CompositeParent, CompositeState,
-    CompositeStatus, InputShape, LOST_KIND, MemberOutcome, PAGE_ENTRIES, Stage, Step, SubmittedComposite,
+    CompositeStatus, EXPANSION_DEFINITION, InputShape, LOST_KIND, MemberOutcome, PAGE_ENTRIES, Stage, Step, SubmittedComposite,
     failure_of, pages_manifest,
 };
 
@@ -129,6 +132,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             _ => (0..step.stages.len() as u64).collect(),
         };
         let empty = step.stages.is_empty();
+        let expands = step.expands();
         self.composites.held.insert(
             id.clone(),
             Composite {
@@ -150,10 +154,49 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             // A map over an empty list has no member to wait for.
             self.finish_composite(&id, CompositeState::Succeeded, None);
         }
-        for index in starts {
-            self.start_stage(&id, index);
+        if expands {
+            self.submit_expansion(&id);
+        } else {
+            for index in starts {
+                self.start_stage(&id, index);
+            }
         }
         self.update_pressure();
+    }
+
+    /// Records the expansion run that splits the list an expanding map is
+    /// given. The run is the map's member 0; the map's members proper come
+    /// from the step it returns.
+    fn submit_expansion(&mut self, id: &CompositeId) {
+        let composite = &self.composites.held[id];
+        let Stage::Task(template) = &composite.step.stages[0] else {
+            unreachable!("a map that expands has one task member");
+        };
+        let (source, shape) = composite
+            .input
+            .clone()
+            .expect("only a stage after another expands, and it is given that stage's result");
+        let expansion = generated::Expansion {
+            source: Some(source.into()),
+            then: Some(generated::expansion::Then::Map(template.into())),
+            producer: match shape {
+                InputShape::Value(producer) => Some(producer.into()),
+                InputShape::List => None,
+            },
+            on_error: generated::OnError::from(composite.step.on_error) as i32,
+        };
+        let submission = Submission::new(
+            TaskDefinitionId::new(EXPANSION_DEFINITION),
+            0,
+            expansion.encode_to_vec(),
+            template.options.queue.clone(),
+        )
+        .as_member_of(id.clone(), 0);
+        let submitted = Submitted::received(id.member_task(0), WallTime::now(&self.clock), submission, &self.clock);
+        if let Err(refused) = self.record_submission(submitted) {
+            let failure = Failure { kind: refused.kind().to_owned(), message: refused.to_string() };
+            self.settle_member(id, 0, MemberOutcome::Failed(failure));
+        }
     }
 
     /// Starts the composite `CompositeId::continuation_of(run)` from the step
@@ -224,8 +267,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// The manifest of a held composite's pages.
+    /// An expanding map's results are those of the members its expansion run
+    /// returned.
     fn results_manifest(&self, id: &CompositeId) -> Manifest {
-        pages_manifest(id, self.composites.held[id].pages())
+        let composite = &self.composites.held[id];
+        if composite.step.expands() {
+            if let Some(MemberOutcome::Child(members)) = composite.outcomes.get(&0) {
+                return self.results_manifest(members);
+            }
+        }
+        pages_manifest(id, composite.pages())
     }
 
     /// Records member `index`'s Task, unless the scheduler holds it already

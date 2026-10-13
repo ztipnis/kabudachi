@@ -37,9 +37,13 @@ pub(in crate::scheduler) struct Composite {
 
 impl Composite {
     /// Whether the first stage or member to fail for good ends the
-    /// composite: a flow's always does, a group's or map's by its policy.
+    /// composite: a flow's always does, a group's or map's by its policy, and
+    /// an expanding map's always, since its one member is the run that
+    /// splits its list and without the items it has no results.
     pub(super) fn fails_on_first_failure(&self) -> bool {
-        self.step.kind == CompositeKind::Flow || self.step.on_error == OnError::FailFast
+        self.step.kind == CompositeKind::Flow
+            || self.step.on_error == OnError::FailFast
+            || self.step.expands()
     }
 
     /// The failure that ended the composite, or the cancellation that did.

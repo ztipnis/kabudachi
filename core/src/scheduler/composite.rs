@@ -466,14 +466,19 @@ impl From<&Step> for generated::StepDescription {
             CompositeKind::Map => generated::CompositeKind::Map,
             CompositeKind::Reduce => generated::CompositeKind::Reduce,
         };
-        let on_error = match step.on_error {
-            OnError::FailFast => generated::OnError::FailFast,
-            OnError::CollectAll => generated::OnError::CollectAll,
-        };
         generated::StepDescription {
             kind: kind as i32,
-            on_error: on_error as i32,
+            on_error: generated::OnError::from(step.on_error) as i32,
             stages: step.stages.iter().map(generated::StageDescription::from).collect(),
+        }
+    }
+}
+
+impl From<OnError> for generated::OnError {
+    fn from(on_error: OnError) -> Self {
+        match on_error {
+            OnError::FailFast => generated::OnError::FailFast,
+            OnError::CollectAll => generated::OnError::CollectAll,
         }
     }
 }

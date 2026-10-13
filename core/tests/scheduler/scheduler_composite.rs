@@ -5,12 +5,15 @@
 use kabudachi_core::blob::BlobKey;
 use kabudachi_core::manifest::{Manifest, ManifestEntry};
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::composite_entry;
+use kabudachi_core::protocol::generated::{Expansion, composite_entry};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::composite::{CompositeState, MemberCounts, OnError, PAGE_ENTRIES, Stage, Step};
+use kabudachi_core::scheduler::composite::{
+    BoundInput, CompositeKind, CompositeState, EXPANSION_DEFINITION, MemberCounts, OnError, PAGE_ENTRIES,
+    Stage, Step,
+};
 use kabudachi_core::scheduler::{
     Cancellation, ClaimRejection, Completion, Event, ReportRejection, Submission, SubmitRejection,
 };
@@ -546,4 +549,102 @@ fn stages_that_never_started_count_pending_after_their_flow_is_cancelled() {
     let status = fixture.scheduler.composite_status(&flow).unwrap();
     assert_eq!(status.state, CompositeState::Cancelled);
     assert_eq!(status.counts, MemberCounts { pending: 2, succeeded: 0, failed: 0, cancelled: 1 });
+}
+
+/// The map member a worker builds for one item it stored.
+fn item_member(item: &[u8]) -> Stage {
+    let Stage::Task(mut member) = task_stage("each", None) else { unreachable!("a task stage") };
+    member.input = BoundInput::Chunked(Manifest::new(vec![ManifestEntry::Blob(BlobKey::of(item))], 0));
+    Stage::Task(member)
+}
+
+fn map_over_previous() -> Stage {
+    Stage::Composite(Step {
+        kind: CompositeKind::Map,
+        on_error: OnError::FailFast,
+        stages: vec![task_stage("each", None)],
+    })
+}
+
+#[test]
+fn a_map_after_a_stage_is_split_by_an_expansion_run_and_the_next_stage_takes_the_items_results() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(
+        &mut fixture,
+        flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(), task_stage("report", None)]),
+    );
+    run_member(&mut fixture, &flow, 0, b"[1, 2]");
+    let map = flow.child(1);
+    let expansion = start_member(&mut fixture, &map, 0);
+    assert_eq!(expansion.task.task_definition_id().as_str(), EXPANSION_DEFINITION);
+    let asked = Expansion::decode(&expansion.task.serialized_input[..]).unwrap();
+    assert_eq!(
+        Manifest::try_from(asked.source.as_ref().unwrap()).unwrap(),
+        Manifest::new(vec![ManifestEntry::Blob(BlobKey::of(b"[1, 2]"))], 0)
+    );
+    assert_eq!(asked.producer, Some(TaskDefinitionId::new("load").into()));
+    let items = Step {
+        kind: CompositeKind::Map,
+        on_error: OnError::FailFast,
+        stages: vec![item_member(b"1"), item_member(b"2")],
+    };
+    fixture
+        .scheduler
+        .complete(&worker(), &expansion.task_run_id, items.digest(), Completion::Continues(items))
+        .unwrap();
+    let members = CompositeId::continuation_of(&expansion.task_run_id);
+    for index in 0..2 {
+        run_member(&mut fixture, &members, index, &[index as u8]);
+    }
+    let report = run_member(&mut fixture, &flow, 2, b"reported");
+    assert_eq!(
+        report.input_manifest().unwrap(),
+        Some(Manifest::new(vec![ManifestEntry::Page { composite: members, page: 0 }], 0)),
+        "the stage after the map takes the items' results, not the expansion's"
+    );
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn a_list_that_splits_into_no_items_gives_the_next_stage_an_empty_list() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(
+        &mut fixture,
+        flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(), task_stage("report", None)]),
+    );
+    run_member(&mut fixture, &flow, 0, b"[]");
+    let expansion = start_member(&mut fixture, &flow.child(1), 0);
+    let items = Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: Vec::new() };
+    fixture
+        .scheduler
+        .complete(&worker(), &expansion.task_run_id, items.digest(), Completion::Continues(items))
+        .unwrap();
+    let report = run_member(&mut fixture, &flow, 2, b"reported");
+    assert_eq!(report.input_manifest().unwrap(), Some(Manifest::new(Vec::new(), 0)));
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn an_expansion_that_fails_fails_its_map_and_the_flow() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous()]));
+    run_member(&mut fixture, &flow, 0, b"not a list");
+    fail_member(&mut fixture, &flow.child(1), 0, "SerializationError");
+    let finished = finished(&mut fixture);
+    assert_eq!(finished[0].state, CompositeState::Failed);
+    assert_eq!(finished[0].failure.as_ref().unwrap().kind, "SerializationError");
+}
+
+#[test]
+fn an_expansion_that_fails_fails_a_collect_all_map_too() {
+    let mut fixture = Fixture::leading();
+    let collecting = Stage::Composite(Step {
+        kind: CompositeKind::Map,
+        on_error: OnError::CollectAll,
+        stages: vec![task_stage("each", None)],
+    });
+    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), collecting]));
+    run_member(&mut fixture, &flow, 0, b"not a list");
+    fail_member(&mut fixture, &flow.child(1), 0, "SerializationError");
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Failed);
 }
