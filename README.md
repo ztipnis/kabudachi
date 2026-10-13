@@ -3035,6 +3035,14 @@ Open: `//runtime/tests:test_networked` also failed intermittently under load wit
 
 Open: an idle worker's claim backoff grows to 5 s (`IdleBackoff::MAX`) with no wake-up on new queued work, so work queued on an idle cluster can wait up to 5 s for a claimant. The fix is to clear the idle backoff when the leader announces pending work. `//runtime/tests:test_networked` failed intermittently under load because of it (a compaction run not claimed while the generation holding the key ran); its tests now hold the key until released and do not depend on the backoff.
 
+Open: aging restarts at a leader change: a task's waiting time is counted from its installation in the new leader's waiting room.
+
+Open: workers whose `queue_options` differ from the leader's rank discovery differently, and the leader decides. This is unsupported and not detected.
+
+Open: a compaction run for a queue that no compaction runner takes waits until its key's newest generation is claimed whole.
+
+Open: `Subscription::Only` of an empty set maps to `Every` on the wire. Python refuses empty queues.
+
 Open: a record that is re-placed off a killed voter stalls. The re-placement is a joint write that needs a majority of the prior placement, and a killed voter stays a member of the configuration until it leaves, so with replication 2 and a dead holder in the prior placement, every later write for that task (a claim included) cannot be acknowledged. The blobs of such a task do follow the new placement; the claim does not go through until the dead voter leaves the configuration.
 
 Open: the failed-composite-member message. A composite page entry and `CompositeFinished.failure` should carry the run's `failure_message`, so a networked `TaskFailure.message` is non-empty for a failed composite member. It is pending the composite code, which is not in this branch yet. A failure message may hold task input, and it is stored in the replicated record.
