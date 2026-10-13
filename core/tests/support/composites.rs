@@ -74,6 +74,16 @@ pub fn flow_of(stages: Vec<Stage>) -> Step {
     Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages }
 }
 
+/// A group of `members` run side by side under `on_error`.
+pub fn group_of(on_error: OnError, members: Vec<Stage>) -> Step {
+    Step { kind: CompositeKind::Group, on_error, stages: members }
+}
+
+/// A map whose members are bound to their items, failing fast.
+pub fn map_of(members: Vec<Stage>) -> Step {
+    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members }
+}
+
 /// Settings of a task stage, which the builders above leave at their defaults.
 pub trait StageExt {
     fn options_mut(&mut self) -> &mut TaskOptions;

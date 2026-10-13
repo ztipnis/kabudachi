@@ -9,7 +9,7 @@ use kabudachi_core::protocol::generated::composite_entry;
 use kabudachi_core::protocol::ids::TaskDefinitionId;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::composite::CompositeState;
+use kabudachi_core::scheduler::composite::{CompositeState, OnError, PAGE_ENTRIES};
 use kabudachi_core::scheduler::{ClaimRejection, Completion, SubmitRejection};
 use kabudachi_core::task_record::{RecordKey, ShardRecord};
 
@@ -143,4 +143,113 @@ fn a_finished_composite_and_its_pages_are_forgotten_with_the_result_ttl_and_a_le
     assert!(!fixture.scheduler.holds(&page));
     assert!(fixture.scheduler.composite_status(&flow).is_none());
     assert!(fixture.forgotten(&flow.member_task(0)));
+}
+
+#[test]
+fn fail_fast_fails_the_group_at_its_first_failure_and_leaves_running_members_alone() {
+    let mut fixture = Fixture::leading();
+    let group = submitted(
+        &mut fixture,
+        group_of(
+            OnError::FailFast,
+            vec![task_stage("explode", Some(b"a")), task_stage("slow", Some(b"b"))],
+        ),
+    );
+    let slow = start_member(&mut fixture, &group, 1);
+    fail_member(&mut fixture, &group, 0, "ValueError");
+    let finished_events = finished(&mut fixture);
+    assert_eq!(finished_events.len(), 1);
+    assert_eq!(finished_events[0].state, CompositeState::Failed);
+    assert_eq!(
+        fixture.run_state(&slow.task_run_id),
+        TaskRunState::Running,
+        "like asyncio.gather, the other member is left to finish"
+    );
+    fixture
+        .scheduler
+        .complete(&worker(), &slow.task_run_id, Digest::blake3(b"late"), Completion::Final)
+        .unwrap();
+    assert!(finished(&mut fixture).is_empty(), "the group finished once");
+    assert!(entry(&fixture, &group, 1).is_some(), "the late result is still recorded");
+}
+
+#[test]
+fn collect_all_waits_for_every_member_and_records_each_failure_as_its_entry() {
+    let mut fixture = Fixture::leading();
+    let group = submitted(
+        &mut fixture,
+        group_of(
+            OnError::CollectAll,
+            vec![
+                task_stage("fine", Some(b"a")),
+                task_stage("explode", Some(b"b")),
+                task_stage("pending", Some(b"c")),
+            ],
+        ),
+    );
+    run_member(&mut fixture, &group, 0, b"ok");
+    fail_member(&mut fixture, &group, 1, "ValueError");
+    assert!(finished(&mut fixture).is_empty(), "one member is still pending");
+    fixture.scheduler.cancel(&group.member_task(2)).unwrap();
+    let finished_events = finished(&mut fixture);
+    assert_eq!(finished_events[0].state, CompositeState::Succeeded);
+    let kinds: Vec<Option<String>> = (0..3)
+        .map(|index| match entry(&fixture, &group, index).unwrap().outcome {
+            Some(composite_entry::Outcome::Failure(failure)) => Some(failure.kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, [None, Some("ValueError".into()), Some("TaskCancelledError".into())]);
+}
+
+#[test]
+fn a_member_lost_with_its_worker_is_replayed_and_settles_only_with_its_replay() {
+    let mut fixture = Fixture::leading();
+    let group = submitted(&mut fixture, group_of(OnError::FailFast, vec![task_stage("a", Some(b"a"))]));
+    start_member(&mut fixture, &group, 0);
+    let lost = fixture.lose_silent(&worker());
+    assert!(lost[0].replayed.is_some());
+    assert!(finished(&mut fixture).is_empty());
+    run_member(&mut fixture, &group, 0, b"replayed");
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn a_map_of_more_members_than_a_page_holds_spreads_its_outcomes_over_pages_each_published_before_the_record_naming_it() {
+    let mut fixture = Fixture::leading();
+    let members = (0..=PAGE_ENTRIES).map(|item| task_stage("each", Some(&item.to_be_bytes()))).collect();
+    let map = submitted(&mut fixture, map_of(members));
+    run_member(&mut fixture, &map, PAGE_ENTRIES, &PAGE_ENTRIES.to_be_bytes());
+    assert!(
+        fixture.spy.newest_page(&map, 0).is_some(),
+        "the record now names two pages, so the lower one is published too"
+    );
+    for index in 0..PAGE_ENTRIES {
+        run_member(&mut fixture, &map, index, &index.to_be_bytes());
+    }
+    let finished_events = finished(&mut fixture);
+    assert_eq!(finished_events[0].pages, 2);
+    assert_eq!(fixture.spy.newest_page(&map, 0).unwrap().entries.len() as u64, PAGE_ENTRIES);
+    assert_eq!(fixture.spy.newest_page(&map, 1).unwrap().entries[0].index, PAGE_ENTRIES);
+}
+
+#[test]
+fn a_map_of_no_members_finishes_at_once_with_no_pages() {
+    let mut fixture = Fixture::leading();
+    submitted(&mut fixture, map_of(Vec::new()));
+    let finished_events = finished(&mut fixture);
+    assert_eq!(finished_events.len(), 1);
+    assert_eq!(finished_events[0].state, CompositeState::Succeeded);
+    assert_eq!(finished_events[0].pages, 0);
+}
+
+#[test]
+fn republishing_a_key_named_twice_writes_it_once() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x"))]));
+    run_member(&mut fixture, &flow, 0, b"loaded");
+    let page = RecordKey::Page(flow.clone(), 0);
+    let mark = fixture.spy.mark();
+    assert_eq!(fixture.scheduler.republish(&[page.clone(), page]), 1);
+    assert_eq!(fixture.spy.mark() - mark, 1);
 }

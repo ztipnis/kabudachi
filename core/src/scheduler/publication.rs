@@ -141,8 +141,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return 0;
         }
         let mut republished = 0;
+        let mut seen = std::collections::BTreeSet::new();
         for key in keys {
-            if !self.holds(key) {
+            if !seen.insert(key) || !self.holds(key) {
                 continue;
             }
             match key {

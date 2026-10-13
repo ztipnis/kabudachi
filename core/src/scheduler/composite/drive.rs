@@ -16,14 +16,15 @@ use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Duration, WallTime};
 
+use crate::blob::BlobKey;
+use crate::scheduler::{Event, Observer, Scheduler, Submission, SubmitRejection, Submitted};
+
 use super::held::Composite;
 use super::{
     BoundInput, BoundStep, CompositeFinished, CompositeKind, CompositeParent, CompositeState,
-    CompositeStatus, InputShape, MemberOutcome, PAGE_ENTRIES, Stage, Step, SubmittedComposite, failure_of,
-    pages_manifest,
+    CompositeStatus, InputShape, LOST_KIND, MemberOutcome, PAGE_ENTRIES, Stage, Step, SubmittedComposite,
+    failure_of, pages_manifest,
 };
-use crate::blob::BlobKey;
-use crate::scheduler::{Event, Observer, Scheduler, Submission, SubmitRejection, Submitted};
 
 impl BoundStep {
     /// The submission of this step as a Task. The input is the step's own
@@ -247,13 +248,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 match self.composites.held.get(&continuation) {
                     Some(child) if child.state == CompositeState::Succeeded => MemberOutcome::Child(continuation),
                     Some(child) => MemberOutcome::Failed(child.failure_or_cancelled()),
-                    None => MemberOutcome::Value {
-                        digest: run
-                            .result_digest
-                            .as_ref()
-                            .and_then(|digest| Digest::try_from(digest).ok())
-                            .expect("a succeeded run has a digest"),
-                        producer: self.tasks[task_id].task_definition_id(),
+                    None => match run.result_digest.as_ref().and_then(|digest| Digest::try_from(digest).ok()) {
+                        Some(digest) => MemberOutcome::Value { digest, producer: self.tasks[task_id].task_definition_id() },
+                        None => MemberOutcome::Failed(Failure {
+                            kind: LOST_KIND.to_owned(),
+                            message: "the run succeeded without a readable result digest".to_owned(),
+                        }),
                     },
                 }
             }
@@ -273,10 +273,17 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if composite.outcomes.contains_key(&index) {
             return;
         }
+        let pages_before = composite.pages();
         composite.outcomes.insert(index, outcome.clone());
+        let pages_after = composite.pages();
         let running = composite.state == CompositeState::Running;
         self.composites.unpublished.insert(id.clone());
         self.composites.unpublished_pages.insert((id.clone(), (index / PAGE_ENTRIES) as u32));
+        // The record now names every page up to the newest, so the pages
+        // below the one that grew it are published, empty, with it.
+        for page in pages_before..pages_after {
+            self.composites.unpublished_pages.insert((id.clone(), page));
+        }
         if running {
             self.advance(id, index, outcome);
         }

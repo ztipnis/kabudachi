@@ -10,8 +10,9 @@ use crate::protocol::ids::{CompositeId, IdGenerator};
 use crate::task_record::RecordVersion;
 use crate::time::{Clock, WallTime};
 
-use super::{CompositeParent, CompositeState, InputShape, MemberCounts, MemberOutcome, PAGE_ENTRIES, Step};
 use crate::scheduler::{Observer, Scheduler, UNVERSIONED};
+
+use super::{CompositeParent, CompositeState, InputShape, MemberCounts, MemberOutcome, PAGE_ENTRIES, Step};
 
 impl From<CompositeState> for generated::CompositeState {
     fn from(state: CompositeState) -> Self {

@@ -3,8 +3,8 @@
 
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::TaskRunId;
-use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::protocol::messages::{ReconcileReport, ReconcileRequest, reconcile_request};
+use kabudachi_core::task_record::RecordKey;
 use prost::encoding::message;
 
 use crate::claimed_runs::ClaimedRuns;
@@ -36,7 +36,12 @@ pub(crate) fn page_of(
     };
     let keys_after = match &request.after {
         Some(reconcile_request::After::AfterKey(task)) => Some(RecordKey::Task(task.clone().into())),
-        Some(reconcile_request::After::AfterRecord(bytes)) => RecordKey::from_kad_bytes(bytes),
+        Some(reconcile_request::After::AfterRecord(bytes)) => match RecordKey::from_kad_bytes(bytes) {
+            Some(key) => Some(key),
+            // A cursor that names no key this node can read has no
+            // position: nothing is said to follow it.
+            None => return ReconcileReport { last: true, ..Default::default() },
+        },
         _ => None,
     };
     let runs_sent = matches!(
