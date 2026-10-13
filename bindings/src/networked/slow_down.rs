@@ -66,10 +66,14 @@ pub(super) fn heard_slow_down(shared: &Arc<Shared>, raised: bool) {
         let poll = !watch.polling;
         watch.raised = true;
         watch.polling = true;
+        // Pushed under the watch lock, so the events follow the flag's order.
+        // Lock order: watch, then seam; nothing takes the seam and then the watch.
+        if announce {
+            shared.seam().events.push_back(PyEvent::slow_down(true));
+        }
         (announce, poll)
     };
     if announce {
-        shared.seam().events.push_back(PyEvent::slow_down(true));
         shared.wake();
     }
     if poll {
@@ -95,7 +99,9 @@ async fn poll_slow_down(shared: Arc<Shared>) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         watch.raised = false;
         watch.polling = false;
+        // Pushed under the watch lock: a raise that lands after this sees the
+        // cleared flag and queues its event after this one.
+        shared.seam().events.push_back(PyEvent::slow_down(false));
     }
-    shared.seam().events.push_back(PyEvent::slow_down(false));
     shared.wake();
 }
