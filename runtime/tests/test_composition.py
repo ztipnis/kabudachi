@@ -25,6 +25,7 @@ from kabudachi.errors import (
     RunStoppedError,
     RuntimeNotStartedError,
     SerializationError,
+    TaskBodyError,
     TaskCancelledError,
     TaskDefinitionError,
     TaskFailure,
@@ -1249,19 +1250,22 @@ def test_a_returned_step_whose_bound_values_pass_a_record_runs_with_them_stored_
 
 def test_a_returned_step_too_large_by_its_structure_alone_fails_its_run_for_good_with_continuation_too_large():
     world = continuing_world()
-    members = 40_000
+    members = 32_000  # 35 bytes each: just past the 1,114,112 a record may hold
+
+    step = group(*([world.tasks["shout"].bind(Greeting(text="x"))] * members))
 
     def plan(request: Greeting) -> Group:
-        return group(*([world.tasks["shout"].bind(Greeting(text="x"))] * members))
+        return step
 
-    tree = plan(Greeting()).describe(world.session)
+    tree = step.describe(world.session)
     assert len(_native.describe_step(tree)) > _native.MAX_RECORD_BYTES, "the structure alone passes a record"
     planner = declare_planner(world, plan)
 
     async def body():
         handle = world.session.submit(planner.definition, Greeting())
-        with pytest.raises(RuntimeError, match="does not fit"):
+        with pytest.raises(TaskBodyError) as failure:
             await handle
+        assert failure.value.kind == "ContinuationTooLarge"
         return await world.native.task_record(handle.task_id)
 
     record = run(with_events(world, body))

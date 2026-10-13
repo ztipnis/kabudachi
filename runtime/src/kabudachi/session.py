@@ -984,7 +984,14 @@ class Session:
         if step.is_task:
             tree = ("flow", "fail_fast", [tree])
         refuse_oversized_values(self._runtime, tree)
-        self._runtime.complete(claim.task_run_id, continuation=tree)
+        try:
+            self._runtime.complete(claim.task_run_id, continuation=tree)
+        except _native.ContinuationTooLargeError as refusal:
+            # The leader has failed the run for good already, so nothing is
+            # reported; the handle fails as a follower's does, by the kind.
+            if run.holds_handle:
+                self._tasks.failed(claim.task_id, TaskBodyError(str(refusal), "ContinuationTooLarge"))
+            return
         if run.holds_handle:
             self._tasks.continuing(claim.task_id, _native.continuation_of(claim.task_run_id))
 

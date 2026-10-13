@@ -226,11 +226,14 @@ def slow_down_followed_across_workers(cluster, leader, tmp_path):
 
     # A body maps over 300 items from its task process: the members go to the
     # leader in one batch, which passes the cluster's 300-byte soft limit, so
-    # a worker besides the leader hears SlowDown and polls until it clears;
-    # the results come back in order.
+    # the worker that sent them hears SlowDown and polls until it clears; the
+    # results come back in order, and no worker is left asking submitters to
+    # wait.
     mapped = follower.submit("maps", times=300)
     expected = Greeting(text=",".join(str(index) for index in range(300)))
     certified_once(cluster, mapped, digest_of(maps, expected))
+    for worker in cluster.workers:
+        eventually("SlowDown to clear", lambda: not worker.ask(slow_down=None)["slow_down"])
 
 
 def task_process_killed(cluster, leader, tmp_path):

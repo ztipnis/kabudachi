@@ -413,7 +413,9 @@ impl NativeRuntime {
     /// Raises `ValueError` if neither or both are given, if `result_digest`
     /// is not a BLAKE3 digest's length, or if `continuation` is malformed or
     /// takes an input, `BackpressureError` if a value of the step alone is
-    /// past the hard memory limit, and `RuntimeError` if the run is unknown,
+    /// past the hard memory limit, `ContinuationTooLargeError` if the encoded
+    /// step is past the largest a task's record may be (the run is then
+    /// failed for good), and `RuntimeError` if the run is unknown,
     /// is not running, or is not this worker's; the result is then not
     /// certified.
     #[pyo3(signature = (task_run_id, result_digest = None, continuation = None))]
@@ -904,7 +906,12 @@ impl NativeRuntime {
 }
 
 fn rejected(rejection: ReportRejection) -> PyErr {
-    PyRuntimeError::new_err(rejection.to_string())
+    match rejection {
+        ReportRejection::ContinuationTooLarge => {
+            errors::ContinuationTooLargeError::new_err(rejection.to_string())
+        }
+        _ => PyRuntimeError::new_err(rejection.to_string()),
+    }
 }
 
 /// What a refused door operation raises: the closed error, or whatever
