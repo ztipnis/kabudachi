@@ -3029,6 +3029,10 @@ Open: large-input starvation. A claimant without room for a large blob input pas
 
 Open: a task whose input is larger than every worker's in-flight share waits until its expiry, or indefinitely with none, in a shard where every voter holds every record. In a larger shard, a non-holder can steal it and fail it with `PayloadTooLarge`, so it can fail after its retries. One explicit memory limit per networked shard avoids both.
 
+Open: blob retention edges. (1) A holder that never saw an owner's record drops the owner's blobs once the leader answers that it does not know the task, after the orphan grace; a submit that lands after a leaderless period longer than the grace, or a record the rebuild learns late, can lose its blobs. Requiring two such answers a grace apart is the known fix. (2) The tending task asks about due owners one at a time, each up to 5 s, so a dead named leader slows a tick and the blob re-puts in it; the asks should run concurrently. (3) An owner found finished is never asked about again, so its result blobs stay on a holder that never sees its record until the store drops them with the owner's retention elsewhere. (4) The store has no test seam for the orphan grace, so the leader-asked drop is unproven by a test.
+
+Open: `//runtime/tests:test_networked` fails intermittently under load (a run not reaching all three workers in time, a retained chain not compacted in time, a result reported unavailable); to be diagnosed before the phase closes.
+
 Open: a record that is re-placed off a killed voter stalls. The re-placement is a joint write that needs a majority of the prior placement, and a killed voter stays a member of the configuration until it leaves, so with replication 2 and a dead holder in the prior placement, every later write for that task (a claim included) cannot be acknowledged. The blobs of such a task do follow the new placement; the claim does not go through until the dead voter leaves the configuration.
 
 ### Phase 7: observability
