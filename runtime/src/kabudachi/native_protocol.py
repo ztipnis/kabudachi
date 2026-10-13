@@ -101,6 +101,10 @@ class SubmitArguments:
     non_retriable: bool = False
 
 
+QueueOptionsArgument = tuple[str, int, int, int | None, int | None]
+"""One queue's options: its name, priority, weight, running limit and
+starvation age in milliseconds. The last two are `None` for none."""
+
 _DEFAULT_WORKER_THREADS = 2
 _DEFAULT_RESULT_TTL_MS = 60 * 60 * 1000
 
@@ -124,6 +128,9 @@ class OneNodeArguments:
     blobs and handed back whole with its claim; it counts against the
     memory limits like any other input. With `health_listen` (`ip:port`;
     port 0 picks one), the runtime serves `/healthz` and `/readyz` there.
+    `queues` names the queues this worker takes, every queue for `None`
+    (an empty tuple is refused); `queue_options` gives queues their own
+    priority, weight, running limit and starvation age.
     """
 
     worker_threads: int = _DEFAULT_WORKER_THREADS
@@ -132,6 +139,8 @@ class OneNodeArguments:
     memory_soft_limit: int | None = None
     memory_hard_limit: int | None = None
     health_listen: str | None = None
+    queues: tuple[str, ...] | None = None
+    queue_options: tuple[QueueOptionsArgument, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,7 +166,7 @@ class NetworkedArguments:
     worker bootstraps through it instead, and its timings come from the
     authority's TTL. `memory_soft_limit` and `memory_hard_limit` bound
     pending task input while this worker leads, as for
-    `OneNodeArguments`. `roll_call_deadline_ms` overrides the default
+    `OneNodeArguments`, as are `queues` and `queue_options`. `roll_call_deadline_ms` overrides the default
     roll-call deadline; `replication_factor` voters store each record;
     `seed_rounds` silent rounds pass before a worker with seeds founds the
     shard alone; `routing_refresh_ms` is the period of the routing crawl
@@ -182,6 +191,8 @@ class NetworkedArguments:
     seed_rounds: int = 3
     routing_refresh_ms: int | None = None
     health_listen: str | None = None
+    queues: tuple[str, ...] | None = None
+    queue_options: tuple[QueueOptionsArgument, ...] = ()
 
 
 @runtime_checkable

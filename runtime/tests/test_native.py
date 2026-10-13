@@ -14,7 +14,7 @@ import pytest
 import kabudachi
 from kabudachi import _native
 from kabudachi._native import CancelOutcome, RunState
-from kabudachi.native_protocol import OneNodeArguments, SubmitArguments
+from kabudachi.native_protocol import NetworkedArguments, OneNodeArguments, SubmitArguments
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 
 WAIT_LIMIT_SECONDS = 5
@@ -358,6 +358,60 @@ def test_a_submitted_task_can_be_claimed(runtime):
     assert only.queue == "default"
     assert only.task_run_id
     assert only.attempt_number == 1
+
+
+def test_a_shard_of_one_claims_the_higher_priority_first_and_only_its_own_queues():
+    native = new_runtime(
+        queues=["high", "low"],
+        queue_options=[("high", 5, 1, None, None)],
+    )
+    try:
+        submit(native, b"elsewhere", queue="elsewhere")
+        low = submit(native, b"low", queue="low")
+        high = submit(native, b"high", queue="high")
+
+        claims = asyncio.run(claim(native))
+
+        assert [one.task_id for one in claims] == [high, low]
+    finally:
+        native.shutdown()
+    with pytest.raises(ValueError, match="weight"):
+        new_runtime(queue_options=[("high", 0, 0, None, None)])
+    with pytest.raises(ValueError, match="queues"):
+        new_runtime(queues=[])
+
+
+def test_a_networked_worker_claims_only_from_the_queues_it_takes():
+    native = _native.NetworkedRuntime(
+        NetworkedArguments(
+            "queues",
+            "/ip4/127.0.0.1/tcp/0",
+            heartbeat_interval_ms=100,
+            heartbeat_timeout_ms=1000,
+            reconnect_timeout_ms=2000,
+            queues=("gpu",),
+        )
+    )
+
+    async def main():
+        await asyncio.wait_for(native.wait_until_ready(), WAIT_LIMIT_SECONDS)
+        elsewhere = submit(native, b"cpu")
+        # Stored first, so a worker that ignored its queues would claim it.
+        deadline = time.monotonic() + WAIT_LIMIT_SECONDS
+        while await native.task_record(elsewhere) is None:
+            assert time.monotonic() < deadline, "the first task was stored"
+            await asyncio.sleep(0.05)
+        gpu = submit(native, b"gpu", queue="gpu")
+        claims = await claim(native)
+        record = await native.task_record(elsewhere)
+        return gpu, claims, record
+
+    try:
+        gpu, claims, record = asyncio.run(main())
+    finally:
+        native.shutdown()
+    assert [one.task_id for one in claims] == [gpu]
+    assert [run.state for run in record.runs] == [RunState.QUEUED]
 
 
 def test_submissions_made_before_the_node_leads_are_claimed_in_order_after_the_grant():

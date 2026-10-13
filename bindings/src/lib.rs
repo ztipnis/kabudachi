@@ -12,6 +12,7 @@ mod local_node;
 mod native_log;
 mod networked;
 mod outcomes;
+mod queues;
 mod runtime;
 mod timers;
 mod work;

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -25,6 +26,7 @@ use crate::errors;
 use crate::health;
 use crate::local_node::local_node;
 use crate::outcomes::{PyCancelOutcome, PyRunState};
+use crate::queues::{QueueOptionsArgument, queue_policy, subscription};
 use crate::timers::run_timers;
 use crate::work::{PyCertification, PyClaim, PyEvent, PyTaskRecord};
 
@@ -44,6 +46,8 @@ pub(crate) struct OneNodeArguments {
     memory_soft_limit: Option<u64>,
     memory_hard_limit: Option<u64>,
     health_listen: Option<String>,
+    queues: Option<Vec<String>>,
+    queue_options: Vec<QueueOptionsArgument>,
 }
 
 /// Counts the runtime's native loops still running; each loop holds one and
@@ -97,8 +101,10 @@ impl NativeRuntime {
     /// of it. `arguments` is a `kabudachi.native_protocol.OneNodeArguments`,
     /// which says how the runtime runs and what each of its fields means.
     ///
-    /// Raises `ValueError` if `worker_threads` is zero or only one of the two
-    /// memory limits is given, or if `health_listen` is not an `ip:port`
+    /// Raises `ValueError` if `worker_threads` is zero, only one of the two
+    /// memory limits is given, `queues` is empty or names an empty queue,
+    /// `queue_options` gives a weight, running limit or starvation age of
+    /// zero, or a queue twice, or if `health_listen` is not an `ip:port`
     /// address; `RuntimeError` if `health_listen` cannot be bound.
     #[new]
     fn new(
@@ -110,6 +116,8 @@ impl NativeRuntime {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));
         }
         let limits = memory_limits(arguments.memory_soft_limit, arguments.memory_hard_limit)?;
+        let subscription = subscription(arguments.queues)?;
+        let policy = queue_policy(arguments.queue_options)?;
 
         let tokio = Builder::new_multi_thread()
             .worker_threads(arguments.worker_threads)
@@ -138,6 +146,8 @@ impl NativeRuntime {
             Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::new(worker_id.clone(), clock, Some(retention)));
         new_scheduler.set_result_ttl(Some(retention));
         new_scheduler.set_memory_limits(limits);
+        new_scheduler.set_queue_policy(policy);
+        new_scheduler.set_subscriptions(BTreeMap::from([(worker_id.clone(), subscription)]));
         let door = Arc::new(SchedulerDoor::new(new_scheduler, worker_id));
         let shard_id = node.shard_id().as_str().to_owned();
         let (state_sender, state) = watch::channel(node.state());
