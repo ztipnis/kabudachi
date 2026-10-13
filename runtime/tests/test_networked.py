@@ -334,7 +334,9 @@ def test_a_stage_running_on_a_killed_worker_is_replayed_once_and_the_pipeline_en
         cluster.close()
 
 
-def test_a_leader_killed_between_a_pipelines_stages_hands_it_to_its_successor_which_runs_each_stage_once(tmp_path):
+def test_a_pipeline_whose_leader_is_killed_between_its_stages_ends_as_it_would_have_with_each_stage_run_at_least_once_and_committed_at_most_once(
+    tmp_path,
+):
     cluster = Cluster.start(tmp_path, overrides=LEADER_RUNS_NOTHING)
     try:
         leader, client, _ = cluster.workers
