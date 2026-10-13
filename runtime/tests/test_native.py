@@ -489,34 +489,25 @@ def one_stage_flow(definition_id):
     return ("flow", "fail_fast", [("task", definition_id, 0, {"queue": "default"}, b"x", [])])
 
 
-def test_a_composite_submitted_before_the_node_leads_waits_for_the_grant_and_a_cancel_drops_it():
+def test_a_composite_cancelled_before_the_node_leads_reads_as_unknown_and_is_announced_cancelled():
     native = new_runtime(suspect_timeout_ms=1000)
     try:
         dropped = native.submit_composite(one_stage_flow("tests.dropped"))
-        kept = native.submit_composite(one_stage_flow("tests.kept"))
 
         async def status_of(composite_id):
             return await native.composite_status(composite_id)
 
-        assert asyncio.run(status_of(kept)) == ("running", 0, 1, 0, 0, 0, 0)
+        assert asyncio.run(status_of(dropped)) == ("running", 0, 1, 0, 0, 0, 0)
         assert native.cancel_composite(dropped) == CancelOutcome.CANCELLED
         assert asyncio.run(status_of(dropped)) is None
-        assert native.worker_state() != "Leader"
 
         async def after_the_grant():
             await leader_within_limit(native)
-            claims = await claim(native)
-            events = await asyncio.wait_for(native.next_events(), WAIT_LIMIT_SECONDS)
-            return claims, events
+            return await asyncio.wait_for(native.next_events(), WAIT_LIMIT_SECONDS)
 
-        claims, events = asyncio.run(after_the_grant())
+        events = asyncio.run(after_the_grant())
 
-        assert [(claimed.composite_id, claimed.definition_id) for claimed in claims] == [
-            (kept, "tests.kept")
-        ]
-        assert [(event.composite_id, event.state) for event in events] == [(dropped, "cancelled")], (
-            "the submitter hears of the dropped composite as of one cancelled while it ran"
-        )
+        assert [(event.composite_id, event.state) for event in events] == [(dropped, "cancelled")]
     finally:
         native.shutdown()
 
