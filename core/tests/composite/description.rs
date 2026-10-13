@@ -239,21 +239,24 @@ fn bound_group(values: Vec<Vec<u8>>) -> Step {
     }
 }
 
-/// A seeded tree over the one reducer stage that takes the list it is given.
-fn tree_reduce() -> Step {
+/// A seeded tree whose items stream in, and the same reduce over the one
+/// reducer stage that takes the list it is given.
+fn reduces() -> (Step, Step) {
     let reducer = bound("fold", BoundInput::Previous);
-    Step {
+    let streamed = Step {
         kind: CompositeKind::Reduce,
         on_error: OnError::FailFast,
-        stages: vec![Stage::Task(reducer.clone())],
-        streamed: false,
+        stages: Vec::new(),
+        streamed: true,
         reduce: Some(ReduceShape {
-            reducer,
+            reducer: reducer.clone(),
             tree: true,
             chunk_size: 2,
             initial: Some(BoundInput::Value(Vec::new())),
         }),
-    }
+    };
+    let template = Step { stages: vec![Stage::Task(reducer)], streamed: false, ..streamed.clone() };
+    (streamed, template)
 }
 
 #[test]
@@ -323,38 +326,53 @@ fn a_streamed_member_spills_only_once_its_inline_bytes_pass_the_senders_bound() 
 
 #[test]
 fn a_reduce_description_reads_back_exactly_and_one_that_cannot_be_planned_is_refused() {
-    let reduce = tree_reduce();
-    let bytes = StepDescription::from(&reduce).encode_to_vec();
-    let read = Step::try_from(&StepDescription::decode(&bytes[..]).unwrap()).unwrap();
-    assert_eq!(read, reduce);
+    let (streamed, template) = reduces();
+    for step in [&streamed, &template] {
+        let bytes = StepDescription::from(step).encode_to_vec();
+        let read = Step::try_from(&StepDescription::decode(&bytes[..]).unwrap()).unwrap();
+        assert_eq!(&read, step);
+    }
     assert_eq!(
-        read.reduce.as_ref().unwrap().initial,
+        streamed.reduce.as_ref().unwrap().initial,
         Some(BoundInput::Value(Vec::new())),
         "an initial that encodes to no bytes is still given: the reduce is seeded"
     );
-    assert!(read.takes_input());
+    assert!(template.takes_input() && !streamed.takes_input());
 
     let refused = |step: Step| Step::try_from(&StepDescription::from(&step)).unwrap_err();
-    let shape = reduce.reduce.clone().unwrap();
-    let mut collect_all = reduce.clone();
+    let shape = streamed.reduce.clone().unwrap();
+    let mut collect_all = streamed.clone();
     collect_all.on_error = OnError::CollectAll;
-    let mut no_shape = reduce.clone();
+    let mut no_shape = streamed.clone();
     no_shape.reduce = None;
-    let mut zero_chunks = reduce.clone();
+    let mut zero_chunks = streamed.clone();
     zero_chunks.reduce.as_mut().unwrap().chunk_size = 0;
-    let mut bound_item = reduce.clone();
+    let mut streamed_with_a_stage = template.clone();
+    streamed_with_a_stage.streamed = true;
+    let mut unstreamed_without_one = streamed.clone();
+    unstreamed_without_one.streamed = false;
+    let mut bound_item = template.clone();
     bound_item.stages = vec![task("fold", BoundInput::Value(b"a".to_vec()))];
-    let mut other_reducer = reduce.clone();
+    let mut other_reducer = template.clone();
     other_reducer.stages[0] =
         Stage::Task(BoundStep { definition: TaskDefinitionId::new("other"), ..shape.reducer.clone() });
-    let mut fields_bound = reduce.clone();
+    let mut fields_bound = template.clone();
     let field = BoundField { name: "count".into(), value: FieldValue::Int(0) };
     fields_bound.reduce.as_mut().unwrap().reducer.fields = vec![field];
     fields_bound.stages = vec![Stage::Task(fields_bound.reduce.as_ref().unwrap().reducer.clone())];
-    for step in [collect_all, no_shape, zero_chunks, bound_item, other_reducer, fields_bound] {
+    for step in [
+        collect_all,
+        no_shape,
+        zero_chunks,
+        streamed_with_a_stage,
+        unstreamed_without_one,
+        bound_item,
+        other_reducer,
+        fields_bound,
+    ] {
         assert_eq!(refused(step), MalformedStep::ReduceShape);
     }
-    let mut shaped_flow = StepDescription::from(&reduce);
+    let mut shaped_flow = StepDescription::from(&template);
     shaped_flow.kind = generated::CompositeKind::Flow as i32;
     assert_eq!(
         Step::try_from(&shaped_flow).unwrap_err(),

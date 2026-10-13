@@ -571,7 +571,7 @@ pub enum MalformedStep {
     #[error("a member batch names no composite")]
     NoComposite,
     #[error(
-        "a reduce needs fail_fast, its reducer, the one reducer stage taking its list, \
+        "a reduce needs fail_fast, its reducer, either streamed items or the one reducer stage taking its list, \
          and a tree chunk of at least one item; only a reduce takes reduce options"
     )]
     ReduceShape,
@@ -752,7 +752,8 @@ impl TryFrom<&generated::StepDescription> for Step {
             _ => return Err(MalformedStep::UnknownKind),
         };
         // A map over an empty list is a map of no members, which finishes as
-        // it starts; a flow or group of nothing is a mistake.
+        // it starts; a flow or group of nothing is a mistake. A reduce with
+        // no stages is judged with the rest of its shape.
         if wire.streamed {
             if kind == CompositeKind::Flow {
                 return Err(MalformedStep::StreamedFlow);
@@ -760,7 +761,7 @@ impl TryFrom<&generated::StepDescription> for Step {
             if wire.stages.len() > 1 {
                 return Err(MalformedStep::StreamedWithStages);
             }
-        } else if wire.stages.is_empty() && kind != CompositeKind::Map {
+        } else if wire.stages.is_empty() && !matches!(kind, CompositeKind::Map | CompositeKind::Reduce) {
             return Err(MalformedStep::NoStages);
         }
         let stages = wire.stages.iter().map(Stage::try_from).collect::<Result<Vec<_>, _>>()?;
@@ -790,15 +791,16 @@ impl TryFrom<&generated::StepDescription> for Step {
 
 /// A reduce is driven only if it fails on its first failed step, its
 /// reducer takes its input and binds no fields, a tree has chunks of at
-/// least one item, and it has the one stage of that very reducer, taking the
-/// list it is given.
+/// least one item, and it either streams its items in (no stages) or has the
+/// one stage of that very reducer, taking the list it is given.
 fn check_reduce(step: &Step) -> Result<(), MalformedStep> {
     let Some(shape) = &step.reduce else {
         return Err(MalformedStep::ReduceShape);
     };
     let reducer = &shape.reducer;
     let takes_its_list = matches!(step.stages.as_slice(), [Stage::Task(bound)] if bound == reducer);
-    let well_formed = takes_its_list
+    let items = if step.streamed { step.stages.is_empty() } else { takes_its_list };
+    let well_formed = items
         && step.on_error == OnError::FailFast
         && matches!(reducer.input, BoundInput::Previous)
         && reducer.fields.is_empty()
