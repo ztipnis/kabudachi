@@ -9,6 +9,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{Expansion, composite_entry, expansion};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId};
 use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
     CompositeKind, CompositeState, EXPANSION_DEFINITION, ITEM_PAGES, ItemInput, MemberBatch, OnError, PAGE_ENTRIES,
     REDUCE_EMPTY_KIND, ReduceNode, Stage, Step, StreamedMember,
@@ -329,10 +330,10 @@ fn a_reduce_after_a_map_folds_the_maps_results_in_order_without_an_expansion() {
     }
 }
 
-/// A flow of a task stage returning a list and a seedless reduce of it;
-/// runs the stage and its expansion, which streams `items` into the reduce
-/// and then completes, sealing it. Returns the flow and the reduce.
-fn expanded(fixture: &mut Fixture, items: &[&[u8]]) -> (CompositeId, CompositeId) {
+/// A flow of a task stage returning a list and a seedless reduce of it; runs
+/// the stage and claims and starts the reduce's expansion. Returns the flow,
+/// the reduce and the expansion's claim.
+fn expanding(fixture: &mut Fixture) -> (CompositeId, CompositeId, Claim) {
     let flow = submitted(fixture, flow_of(vec![task_stage("load", Some(b"x")), reduce_template(None, None)]));
     run_member(fixture, &flow, 0, b"[...]");
     let reduce = flow.child(1);
@@ -343,6 +344,13 @@ fn expanded(fixture: &mut Fixture, items: &[&[u8]]) -> (CompositeId, CompositeId
         panic!("a reduce's expansion names its reducer");
     };
     assert_eq!(reducer.definition, Some(TaskDefinitionId::new("fold").into()));
+    (flow, reduce, expansion)
+}
+
+/// As [`expanding`], then streams `items` into the reduce and completes the
+/// expansion, which seals it.
+fn expanded(fixture: &mut Fixture, items: &[&[u8]]) -> (CompositeId, CompositeId) {
+    let (flow, reduce, expansion) = expanding(fixture);
     fixture.scheduler.submit_members(items_batch(&reduce, 0, items, false)).unwrap();
     assert_eq!(fixture.scheduler.pending_len(), 0, "no step starts before the expansion seals the reduce");
     fixture
@@ -437,4 +445,81 @@ fn a_new_leader_takes_a_reduces_items_from_its_item_pages_and_a_batch_asked_agai
     run_member(&mut new, &reduce, 1, b"cd");
     run_member(&mut new, &reduce, 2, b"abcd");
     assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn an_expansion_that_fails_fails_the_reduce_and_its_flow_and_one_that_is_cancelled_with_its_flow_stops_the_run() {
+    let mut fixture = Fixture::leading();
+    let (flow, reduce, expansion) = expanding(&mut fixture);
+    fixture.scheduler.submit_members(items_batch(&reduce, 0, &[b"a"], false)).unwrap();
+    fixture
+        .scheduler
+        .fail_with_message(&worker(), &expansion.task_run_id, "ListError", "the list could not be read")
+        .unwrap();
+    let ended = finished(&mut fixture);
+    // Only the flow has a client to tell.
+    let end = ended.iter().find(|end| end.composite_id == flow).unwrap();
+    assert_eq!(end.state, CompositeState::Failed);
+    assert_eq!(end.failure.as_ref().unwrap().kind, "ListError");
+    assert_eq!(fixture.scheduler.composite_status(&reduce).unwrap().state, CompositeState::Failed);
+    assert_eq!(fixture.scheduler.pending_len(), 0, "no step runs for the items it did send");
+    assert_eq!(
+        fixture.scheduler.submit_members(items_batch(&reduce, 1, &[b"b"], true)),
+        Err(SubmitRejection::CompositeFinished)
+    );
+
+    let (flow, _, expansion) = expanding(&mut fixture);
+    fixture.scheduler.cancel_composite(&flow).unwrap();
+    assert_eq!(fixture.run_state(&expansion.task_run_id), TaskRunState::Cancelled);
+}
+
+#[test]
+fn a_reduce_its_last_batch_sealed_is_not_sealed_again_when_its_expansion_completes() {
+    let mut fixture = Fixture::leading();
+    let (_, reduce, expansion) = expanding(&mut fixture);
+    fixture.scheduler.submit_members(items_batch(&reduce, 0, &[b"a", b"b"], true)).unwrap();
+    assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(0)).len(), 1);
+    let mark = fixture.spy.mark();
+    fixture
+        .scheduler
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    assert!(
+        !fixture.spy.published_since(mark).iter().any(|record| matches!(record, ShardRecord::Composite(_))),
+        "the reduce's record is unchanged by the expansion's end"
+    );
+    run_member(&mut fixture, &reduce, 0, b"ab");
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn a_reduce_after_a_map_that_expanded_folds_the_members_the_expansion_streamed() {
+    let mut fixture = Fixture::leading();
+    let map = Stage::Composite(Step {
+        kind: CompositeKind::Map,
+        on_error: OnError::FailFast,
+        stages: vec![task_stage("each", None)],
+        streamed: false,
+        reduce: None,
+    });
+    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map, reduce_template(Some(2), None)]));
+    run_member(&mut fixture, &flow, 0, b"[...]");
+    let map = flow.child(1);
+    let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    fixture
+        .scheduler
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    run_member(&mut fixture, &map, 0, b"x");
+    run_member(&mut fixture, &map, 1, b"y");
+    let reduce = flow.child(2);
+    assert_eq!(
+        fixture.spy.newest_composite(&reduce).unwrap().reduce_items,
+        2,
+        "the members the map's expansion streamed are the reduce's items"
+    );
+    run_member(&mut fixture, &reduce, 0, b"xy");
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
 }

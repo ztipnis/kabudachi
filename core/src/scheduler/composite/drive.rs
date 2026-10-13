@@ -282,6 +282,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let (members, sealed) = if batches || reduce { (0, false) } else { (step.stages.len() as u64, true) };
         // A reduce given the results of a composite folds them from that
         // composite's pages: they are its items.
+        debug_assert!(
+            !reduce || batches || input.is_some(),
+            "a reduce that streams no items is given the results to fold: nothing runs before a submitted one"
+        );
         let items = if reduce && !batches { self.items_in(input.as_ref()) } else { 0 };
         self.composites.held.insert(
             id.clone(),
@@ -699,9 +703,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let (bytes, parent, client) = (composite.bytes, composite.parent.clone(), composite.client.clone());
         let pages = composite.pages();
         let expands = composite.expands();
-        // A map or reduce that ends without all of its items, which a failing member or
-        // a cancel does, has no use for the rest of them: its expansion run
-        // is stopped, since its next batch would find the map over.
+        // A map or reduce that ends without all of its items, which a failing
+        // member or a cancel does, has no use for the rest of them: its
+        // expansion run is stopped, since its next batch would find the
+        // composite over.
         let expansion = id.expansion_task();
         if expands && state != CompositeState::Succeeded && self.tasks.contains_key(&expansion) {
             let _ = self.cancel_task(&expansion);
