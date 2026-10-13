@@ -23,7 +23,7 @@ use kabudachi_core::protocol::messages::{
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeFinished, CompositeKind, MemberBatch, OnError, Stage, Step as CompositeStep,
+    BoundInput, BoundStep, CompositeFinished, CompositeKind, ItemInput, MemberBatch, OnError, Stage, Step as CompositeStep,
     StreamedMember, SubmittedComposite, TaskOptions,
 };
 use kabudachi_core::scheduler::{Claim, Scheduler, Submission, Submitted, mint};
@@ -915,7 +915,7 @@ pub fn item_batch(map: &CompositeId, start: u64, count: u64, last: bool) -> Memb
         composite_id: map.clone(),
         start_index: start,
         members: (start..start + count)
-            .map(|index| StreamedMember::Item(BoundInput::Value(index.to_be_bytes().to_vec())))
+            .map(|index| StreamedMember::Item(ItemInput::Value(index.to_be_bytes().to_vec())))
             .collect(),
         last,
     }

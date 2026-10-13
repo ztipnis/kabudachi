@@ -6,7 +6,7 @@ use kabudachi_core::protocol::generated::{
 };
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId, WorkerId};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeFinished, CompositeKind, MemberBatch, OnError, PAGE_ENTRIES, Stage,
+    BoundInput, BoundStep, CompositeFinished, CompositeKind, ItemInput, MemberBatch, OnError, PAGE_ENTRIES, Stage,
     Step, StreamedMember, TaskOptions,
 };
 use kabudachi_core::reconcile::Rebuild;
@@ -123,7 +123,7 @@ pub fn item_batch(map: &CompositeId, start: u64, count: u64, last: bool) -> Memb
         composite_id: map.clone(),
         start_index: start,
         members: (0..count)
-            .map(|offset| StreamedMember::Item(BoundInput::Value(item(start.wrapping_add(offset)))))
+            .map(|offset| StreamedMember::Item(ItemInput::Value(item(start.wrapping_add(offset)))))
             .collect(),
         last,
     }

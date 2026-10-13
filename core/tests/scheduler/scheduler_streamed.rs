@@ -9,7 +9,7 @@ use kabudachi_core::protocol::generated::composite_entry;
 use kabudachi_core::protocol::ids::CompositeId;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
-    BoundField, BoundInput, CompositeState, FieldValue, MEMBER_BATCH_ITEMS, MemberBatch, MembersAccepted,
+    BoundField, CompositeState, FieldValue, ItemInput, MEMBER_BATCH_ITEMS, MemberBatch, MembersAccepted,
     OnError, PAGE_ENTRIES, Stage, StreamedMember,
 };
 use kabudachi_core::scheduler::{ClaimRejection, Event, MemoryLimits, SubmitRejection};
@@ -90,7 +90,7 @@ fn a_batch_is_refused_whole_past_the_hard_limit_and_after_the_composite_is_over(
 fn a_chunked_item_weighs_its_whole_input_so_a_batch_that_cannot_hold_it_is_refused_whole() {
     let (mut fixture, map) = leading_with_room_for(streamed_map(OnError::FailFast), 16, 40);
     let mut batch = item_batch(&map, 0, 1, false);
-    batch.members.push(StreamedMember::Item(BoundInput::Chunked(Manifest::chunk(&[7; 64]).manifest)));
+    batch.members.push(StreamedMember::Item(ItemInput::Chunked(Manifest::chunk(&[7; 64]).manifest)));
     assert!(matches!(fixture.scheduler.submit_members(batch), Err(SubmitRejection::Backpressure { .. })));
     assert_eq!(fixture.scheduler.pending_len(), 0, "the first item of the refused batch was not started");
     assert_eq!(fixture.scheduler.submit_members(item_batch(&map, 0, 1, false)).unwrap().members, 1);
@@ -257,7 +257,7 @@ fn a_streamed_item_held_as_blobs_reaches_its_task_as_the_manifest_its_budget_cou
     let batch = MemberBatch {
         composite_id: map.clone(),
         start_index: 0,
-        members: vec![StreamedMember::Item(BoundInput::Chunked(manifest.clone()))],
+        members: vec![StreamedMember::Item(ItemInput::Chunked(manifest.clone()))],
         last: true,
     };
     fixture.scheduler.submit_members(batch).unwrap();

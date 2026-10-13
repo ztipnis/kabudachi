@@ -27,8 +27,8 @@ use kabudachi_core::protocol::generated::{
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
 use kabudachi_core::scheduler::MAX_SUBMISSION_BYTES;
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeState, ExpansionRequest, FieldValue, MemberBatch, MemberInput, OnError,
-    Resolved, Spilled, Stage, Step, StreamedMember,
+    BoundStep, CompositeState, ExpansionRequest, FieldValue, ItemInput, MemberBatch, MemberInput,
+    OnError, Resolved, Spilled, Stage, Step, StreamedMember,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -241,7 +241,7 @@ pub(crate) fn spill_step(step: Step) -> (Step, Vec<Vec<u8>>) {
 /// item, the tree of a stage for a group's member.
 fn streamed_member(member: &Bound<'_, PyAny>) -> PyResult<StreamedMember> {
     if let Ok(item) = member.cast::<PyBytes>() {
-        return Ok(StreamedMember::Item(BoundInput::Value(item.as_bytes().to_vec())));
+        return Ok(StreamedMember::Item(ItemInput::Value(item.as_bytes().to_vec())));
     }
     let stage = stage_description(member)?;
     Stage::try_from(&stage)

@@ -10,7 +10,7 @@ use crate::scheduler::SubmitRejection;
 use crate::time::{Duration, Instant, WallTime};
 
 use super::{
-    BoundInput, BoundStep, CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape,
+    BoundStep, CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape,
     MemberCounts, MemberOutcome, OnError, PAGE_ENTRIES, Stage, Step, StreamedMember,
 };
 
@@ -145,9 +145,8 @@ impl Composite {
     pub(super) fn member_stage(&self, member: StreamedMember) -> Result<Stage, SubmitRejection> {
         match (self.step.kind, member) {
             (CompositeKind::Map, StreamedMember::Item(input)) => match (&self.step.stages[..], input) {
-                (_, BoundInput::Previous) => Err(SubmitRejection::MemberKind),
                 ([Stage::Task(template)], input) if template.fields.is_empty() => {
-                    Ok(Stage::Task(BoundStep { input, ..template.clone() }))
+                    Ok(Stage::Task(BoundStep { input: input.into(), ..template.clone() }))
                 }
                 _ => Err(SubmitRejection::MemberKind),
             },

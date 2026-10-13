@@ -326,10 +326,27 @@ pub struct Step {
 /// One member of a streamed composite, as its submitter sends it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamedMember {
-    /// A map's item: its template's whole input (`Value` or `Chunked`).
-    Item(BoundInput),
+    /// A map's item: its template's whole input.
+    Item(ItemInput),
     /// A group's member.
     Stage(Stage),
+}
+
+/// A map item's bytes, inline or as the blobs of a manifest: a
+/// [`BoundInput`] that is never open, since an item is the whole input.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemInput {
+    Value(Vec<u8>),
+    Chunked(Manifest),
+}
+
+impl From<ItemInput> for BoundInput {
+    fn from(input: ItemInput) -> Self {
+        match input {
+            ItemInput::Value(bytes) => BoundInput::Value(bytes),
+            ItemInput::Chunked(manifest) => BoundInput::Chunked(manifest),
+        }
+    }
 }
 
 impl StreamedMember {
@@ -338,8 +355,11 @@ impl StreamedMember {
     /// nothing for a chunked item or stage, whose bytes are blobs, or for a
     /// composite stage.
     pub fn input_bytes(&self) -> u64 {
-        match self.task_input() {
-            Some(BoundInput::Value(bytes)) => bytes.len() as u64,
+        match self {
+            StreamedMember::Item(ItemInput::Value(bytes))
+            | StreamedMember::Stage(Stage::Task(BoundStep { input: BoundInput::Value(bytes), .. })) => {
+                bytes.len() as u64
+            }
             _ => 0,
         }
     }
@@ -347,10 +367,16 @@ impl StreamedMember {
     /// What the member weighs against the memory budget once its Task is
     /// submitted: its whole input, inline or as the blobs of a manifest.
     pub fn budget_bytes(&self) -> u64 {
-        match self.task_input() {
-            Some(BoundInput::Value(bytes)) => bytes.len() as u64,
-            Some(BoundInput::Chunked(manifest)) => manifest.total_bytes(),
-            Some(BoundInput::Previous) | None => 0,
+        match self {
+            StreamedMember::Item(ItemInput::Value(bytes))
+            | StreamedMember::Stage(Stage::Task(BoundStep { input: BoundInput::Value(bytes), .. })) => {
+                bytes.len() as u64
+            }
+            StreamedMember::Item(ItemInput::Chunked(manifest))
+            | StreamedMember::Stage(Stage::Task(BoundStep { input: BoundInput::Chunked(manifest), .. })) => {
+                manifest.total_bytes()
+            }
+            StreamedMember::Stage(_) => 0,
         }
     }
 
@@ -364,10 +390,12 @@ impl StreamedMember {
         let inline_bytes = inline_bytes.min(MEMBER_BATCH_BYTES);
         let mut values = Vec::new();
         let member = match self {
-            StreamedMember::Item(BoundInput::Value(bytes))
+            StreamedMember::Item(ItemInput::Value(bytes))
                 if bytes.len() as u64 > inline_bytes && bytes.len() > INLINE_VALUE_BYTES =>
             {
-                StreamedMember::Item(spill_value(bytes, &mut values))
+                let manifest = Manifest::chunk(&bytes).manifest;
+                values.push(SpilledValue { bytes });
+                StreamedMember::Item(ItemInput::Chunked(manifest))
             }
             StreamedMember::Stage(stage) if stage.inline_bytes() > inline_bytes => {
                 StreamedMember::Stage(stage.spill(&mut values))
@@ -375,15 +403,6 @@ impl StreamedMember {
             unchanged => unchanged,
         };
         (member, values)
-    }
-
-    /// The input of the Task the member is, if it is one.
-    fn task_input(&self) -> Option<&BoundInput> {
-        match self {
-            StreamedMember::Item(input) => Some(input),
-            StreamedMember::Stage(Stage::Task(step)) => Some(&step.input),
-            StreamedMember::Stage(Stage::Composite(_)) => None,
-        }
     }
 }
 
@@ -537,6 +556,8 @@ pub enum MalformedStep {
     BadManifest,
     #[error("a flow cannot be streamed")]
     StreamedFlow,
+    #[error("only a root composite can be streamed, not a stage or member of one")]
+    StreamedBelowRoot,
     #[error("a streamed group has no stages and a streamed map has exactly one template that takes its input")]
     StreamedWithStages,
     #[error("a streamed member names neither an item nor a stage")]
@@ -759,9 +780,12 @@ impl TryFrom<&generated::StageDescription> for Stage {
         match wire.step.as_ref() {
             None => Err(MalformedStep::EmptyStage),
             Some(generated::stage_description::Step::Task(task)) => BoundStep::try_from(task).map(Stage::Task),
-            Some(generated::stage_description::Step::Composite(step)) => {
-                Step::try_from(step).map(Stage::Composite)
-            }
+            // Only a step submitted as a root is fed in batches: a stage is
+            // described whole.
+            Some(generated::stage_description::Step::Composite(step)) => match Step::try_from(step)? {
+                step if step.streamed => Err(MalformedStep::StreamedBelowRoot),
+                step => Ok(Stage::Composite(step)),
+            },
         }
     }
 }
@@ -849,8 +873,8 @@ impl TryFrom<&generated::StreamedMember> for StreamedMember {
     fn try_from(wire: &generated::StreamedMember) -> Result<Self, MalformedStep> {
         use generated::streamed_member::Member;
         match wire.member.as_ref().ok_or(MalformedStep::EmptyMember)? {
-            Member::Value(bytes) => Ok(StreamedMember::Item(BoundInput::Value(bytes.clone()))),
-            Member::ValueManifest(manifest) => Ok(StreamedMember::Item(BoundInput::Chunked(
+            Member::Value(bytes) => Ok(StreamedMember::Item(ItemInput::Value(bytes.clone()))),
+            Member::ValueManifest(manifest) => Ok(StreamedMember::Item(ItemInput::Chunked(
                 Manifest::try_from(manifest).map_err(|_| MalformedStep::BadManifest)?,
             ))),
             Member::Stage(stage) => Stage::try_from(stage).map(StreamedMember::Stage),
@@ -862,10 +886,8 @@ impl From<&StreamedMember> for generated::StreamedMember {
     fn from(member: &StreamedMember) -> Self {
         use generated::streamed_member::Member;
         let member = match member {
-            StreamedMember::Item(BoundInput::Value(bytes)) => Member::Value(bytes.clone()),
-            StreamedMember::Item(BoundInput::Chunked(manifest)) => Member::ValueManifest(manifest.clone().into()),
-            // An item always carries its input; an open one has no wire form.
-            StreamedMember::Item(BoundInput::Previous) => Member::Value(Vec::new()),
+            StreamedMember::Item(ItemInput::Value(bytes)) => Member::Value(bytes.clone()),
+            StreamedMember::Item(ItemInput::Chunked(manifest)) => Member::ValueManifest(manifest.clone().into()),
             StreamedMember::Stage(stage) => Member::Stage(stage.into()),
         };
         generated::StreamedMember { member: Some(member) }

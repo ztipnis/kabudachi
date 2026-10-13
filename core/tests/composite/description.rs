@@ -7,7 +7,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
 use kabudachi_core::scheduler::composite::{
-    BoundField, BoundInput, BoundStep, CompositeKind, EXPANSION_DEFINITION, FieldValue, INLINE_VALUE_BYTES,
+    BoundField, BoundInput, BoundStep, CompositeKind, EXPANSION_DEFINITION, FieldValue, INLINE_VALUE_BYTES, ItemInput,
     MalformedStep, MemberBatch, OnError, Spilled, SpilledValue, Stage, Step, StreamedMember, TaskOptions,
 };
 use prost::Message;
@@ -139,6 +139,14 @@ fn a_step_that_cannot_be_driven_is_refused() {
     };
     assert_eq!(refused(with_field(false)), MalformedStep::MapShape);
     assert_eq!(refused(with_field(true)), MalformedStep::StreamedWithStages);
+    // Only a root is fed in batches: a streamed map as a stage of a flow has
+    // nothing to feed it.
+    let mut nested = StepDescription::from(&every_kind());
+    let generated::stage_description::Step::Composite(map) = nested.stages[2].step.as_mut().unwrap() else {
+        panic!("a map stage")
+    };
+    map.streamed = true;
+    assert_eq!(refused(nested), MalformedStep::StreamedBelowRoot);
 }
 
 /// A streamed map: one template that takes each item, no members.
@@ -165,7 +173,7 @@ fn a_streamed_step_and_its_member_batches_read_back_exactly_and_a_streamed_flow_
         composite_id: id.clone(),
         start_index: 1024,
         members: vec![
-            StreamedMember::Item(BoundInput::Value(b"a".to_vec())),
+            StreamedMember::Item(ItemInput::Value(b"a".to_vec())),
             StreamedMember::Stage(task("other", BoundInput::Value(b"b".to_vec()))),
         ],
         last: true,
@@ -261,14 +269,14 @@ fn a_large_step_spills_its_long_values_to_blobs_the_same_way_every_time_and_a_sm
 #[test]
 fn a_streamed_member_spills_only_once_its_inline_bytes_pass_the_senders_bound() {
     let value = vec![5u8; 1000];
-    let item = StreamedMember::Item(BoundInput::Value(value.clone()));
+    let item = StreamedMember::Item(ItemInput::Value(value.clone()));
     assert_eq!(item.clone().spill(1000), (item.clone(), Vec::new()), "at the bound it stays inline");
     let (spilled, values) = item.spill(999);
-    assert_eq!(spilled, StreamedMember::Item(BoundInput::Chunked(Manifest::chunk(&value).manifest)));
+    assert_eq!(spilled, StreamedMember::Item(ItemInput::Chunked(Manifest::chunk(&value).manifest)));
     assert_eq!(values, [SpilledValue { bytes: value.clone() }], "an item's one value goes whole");
 
     // A value no longer than a one-chunk manifest costs is never worth spilling.
-    let short = StreamedMember::Item(BoundInput::Value(vec![5; INLINE_VALUE_BYTES]));
+    let short = StreamedMember::Item(ItemInput::Value(vec![5; INLINE_VALUE_BYTES]));
     assert_eq!(short.clone().spill(0), (short, Vec::new()), "a short item stays inline below any bound");
 
     let stage = StreamedMember::Stage(bound_group(vec![vec![1; INLINE_VALUE_BYTES], value.clone()]).stages.remove(1));
