@@ -4,6 +4,7 @@
 
 use prost::Message as _;
 
+use crate::protocol::digest::Digest;
 use crate::protocol::generated::{self, CompositePage, CompositeRecord, TaskRecord};
 use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
 use crate::task_record::store::{PutRefusal, identify};
@@ -163,6 +164,23 @@ impl ShardRecord {
         match self {
             ShardRecord::Task(record) => record.finished && !record.retained_by_composite,
             ShardRecord::Composite(_) | ShardRecord::Page(_) => self.is_finished(),
+        }
+    }
+
+    /// A digest of what this record's first revision fixed for good: a Task
+    /// record's task (its submission), a composite record's step
+    /// description. A page has none: its member outcomes fill in revision by
+    /// revision. Every holder compares digests made from records decoded by
+    /// the same protobuf schema, so every worker of a shard must run the same
+    /// version of it.
+    pub fn submission_digest(&self) -> Option<Digest> {
+        match self {
+            ShardRecord::Task(record) => record.task.as_ref().map(|task| Digest::blake3(&task.encode_to_vec())),
+            ShardRecord::Composite(record) => record
+                .description
+                .as_ref()
+                .map(|description| Digest::blake3(&description.encode_to_vec())),
+            ShardRecord::Page(_) => None,
         }
     }
 

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::protocol::digest::Digest;
 use crate::blob::{BlobKey, BlobOwner, BlobRecord, MAX_BLOB_BYTES};
 use crate::protocol::generated::TaskRecord;
 use crate::protocol::ids::{TaskId, WorkerId};
@@ -45,6 +46,8 @@ pub enum PutRefusal {
     Conflicting,
     #[error("the record lacks its version, its task or its task id")]
     Malformed,
+    #[error("the record changes what its first revision fixed")]
+    SubmissionChanged,
 }
 
 /// Why a blob was not kept.
@@ -76,7 +79,9 @@ pub enum OwnerState {
 /// The newest revision of each record a worker holds: Task records,
 /// composite records and composite pages, each under its [`RecordKey`]. A put never
 /// replaces a record with an older one, nor with a different one of the same
-/// version, unless it differs only in the voters it is placed on. A store
+/// version, unless it differs only in the voters it is placed on; and a
+/// newer revision must keep what the first fixed (a Task record's submission, a
+/// composite's step description), or it is refused. A store
 /// that knows its holder keeps only a stub of a revision the leader moves to
 /// other holders: the task, the version and the holders, no record. The stub
 /// is not a copy anyone reads (it is not served, handed off or claimed from),
@@ -169,6 +174,17 @@ struct Held {
     finished_since: Option<Instant>,
     /// Whether `record` is only the key of a revision held elsewhere.
     stub: bool,
+    /// The digest of what the first revision held here fixed (see
+    /// [`ShardRecord::submission_digest`]); a stub keeps the digest of the
+    /// record it replaced.
+    submission: Option<Digest>,
+}
+
+/// What the revision held before a new one already established.
+#[derive(Default)]
+struct Established {
+    finished_since: Option<Instant>,
+    submission: Option<Digest>,
 }
 
 /// Whether `record` is `held` placed on other holders (and so written to other
@@ -177,6 +193,14 @@ fn only_placed_elsewhere(held: &ShardRecord, record: &ShardRecord) -> bool {
     let mut replaced = record.clone();
     replaced.set_placement(held.placement().to_vec(), held.prior_placements().to_vec());
     replaced == *held
+}
+
+/// Refuses `record` if it changes what `held`'s first revision fixed.
+fn refuse_if_resubmitted(held: &Held, record: &ShardRecord) -> Result<(), PutRefusal> {
+    if held.submission.is_some() && record.submission_digest() != held.submission {
+        return Err(PutRefusal::SubmissionChanged);
+    }
+    Ok(())
 }
 
 /// The record key of the record that owns `owner`'s blobs.
@@ -229,7 +253,7 @@ fn admission(
 ) -> Result<Admission, PutRefusal> {
     let (_, held_version) = held.record.identify()?;
     match held_version.order(&version) {
-        VersionOrder::Newer => Ok(Admission::Keep),
+        VersionOrder::Newer => refuse_if_resubmitted(held, record).map(|()| Admission::Keep),
         VersionOrder::Same => same_version(held, record, origin),
         VersionOrder::Older => Err(PutRefusal::Older),
     }
@@ -241,7 +265,7 @@ fn same_version(held: &Held, record: &ShardRecord, origin: Origin) -> Result<Adm
     // holder now is the revision itself, and one that does not is the
     // same stub, perhaps placed elsewhere again.
     if held.stub {
-        return Ok(Admission::Keep);
+        return refuse_if_resubmitted(held, record).map(|()| Admission::Keep);
     }
     if held.record == *record {
         return Ok(Admission::Unchanged);
@@ -305,11 +329,14 @@ impl VersionedRecords {
         let (key, version) = record.identify()?;
         let leaves_me_out = self.leaves_me_out(&record, origin);
         let Some(held) = self.records.get(&key) else {
-            return Ok(self.keep(key, record, leaves_me_out, origin, None, now));
+            return Ok(self.keep(key, record, leaves_me_out, origin, Established::default(), now));
         };
-        let since = held.finished_since;
+        let established = Established {
+            finished_since: held.finished_since,
+            submission: held.submission.clone(),
+        };
         match admission(held, &record, version, origin)? {
-            Admission::Keep => Ok(self.keep(key, record, leaves_me_out, origin, since, now)),
+            Admission::Keep => Ok(self.keep(key, record, leaves_me_out, origin, established, now)),
             Admission::Unchanged => Ok(Put::Unchanged),
         }
     }
@@ -326,17 +353,19 @@ impl VersionedRecords {
 
     /// Holds `record`, or only its stub if it leaves this holder out.
     /// `leaves_me_out` says whether it does, and `origin` who sent it;
-    /// `finished_since` and the holders of the revision held before it
-    /// (`None` if none was) are what that revision already established.
+    /// `established` is what the revision held before it (none if there was
+    /// none) already settled.
     fn keep(
         &mut self,
         key: RecordKey,
         record: ShardRecord,
         leaves_me_out: bool,
         origin: Origin,
-        finished_since: Option<Instant>,
+        established: Established,
         now: Instant,
     ) -> Put {
+        let Established { finished_since, submission } = established;
+        let submission = submission.or_else(|| record.submission_digest());
         if let Some(owner) = blob_owner_of(&key) {
             self.see_owner(&key, owner.clone(), &record, origin);
             if record.is_finished() {
@@ -344,10 +373,10 @@ impl VersionedRecords {
             }
         }
         if leaves_me_out {
-            self.insert_held(key, Held::stub_of(&record, finished_since, now));
+            self.insert_held(key, Held::stub_of(&record, finished_since, submission, now));
             Put::Retired
         } else {
-            self.insert_held(key, Held::new(record, finished_since, now));
+            self.insert_held(key, Held::new(record, finished_since, submission, now));
             Put::Stored
         }
     }
@@ -789,21 +818,27 @@ impl VersionedRecords {
 impl Held {
     /// `finished_since` is kept once set; otherwise a finished `record`
     /// starts its retention at `now`.
-    fn new(record: ShardRecord, finished_since: Option<Instant>, now: Instant) -> Self {
+    fn new(record: ShardRecord, finished_since: Option<Instant>, submission: Option<Digest>, now: Instant) -> Self {
         let finished_since = finished_since.or(record.retention_may_begin().then_some(now));
         Held {
             record,
             finished_since,
             stub: false,
+            submission,
         }
     }
 
     /// The stub of `record`: its key fields, version, holders and whether it
     /// is finished, and nothing else.
-    fn stub_of(record: &ShardRecord, finished_since: Option<Instant>, now: Instant) -> Self {
+    fn stub_of(
+        record: &ShardRecord,
+        finished_since: Option<Instant>,
+        submission: Option<Digest>,
+        now: Instant,
+    ) -> Self {
         Held {
             stub: true,
-            ..Held::new(record.stub(), finished_since, now)
+            ..Held::new(record.stub(), finished_since, submission, now)
         }
     }
 }
