@@ -49,12 +49,9 @@ fn evaluate(plan: &ReducePlan) -> Option<Vec<u64>> {
     for (index, taker) in taken_by.iter().enumerate() {
         assert_eq!(plan.consumer(index as u64), *taker, "consumer of {index}");
     }
-    assert_eq!(
-        plan.startable(|_| false),
-        (0..plan.steps())
-            .filter(|&index| plan.step(index).unwrap().operands.iter().all(|o| !matches!(o, Operand::Result(_))))
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(plan.consumer(plan.steps()), None);
+    assert_eq!(plan.consumer(plan.steps() + 7), None);
+    assert_eq!(plan.step(plan.steps()), None);
     match plan.root() {
         ReduceRoot::Empty => None,
         ReduceRoot::Initial => Some(Vec::new()),
@@ -63,22 +60,57 @@ fn evaluate(plan: &ReducePlan) -> Option<Vec<u64>> {
     }
 }
 
+/// What a leader may start, worked out from the operands alone.
+fn startable_by_hand(plan: &ReducePlan, settled: impl Fn(u64) -> bool) -> Vec<u64> {
+    let mut ready = Vec::new();
+    for index in 0..plan.steps() {
+        let step = plan.step(index).unwrap();
+        let operands_settled = step.operands.iter().all(|operand| match *operand {
+            Operand::Result(before) => settled(before),
+            _ => true,
+        });
+        if !settled(index) && operands_settled {
+            ready.push(index);
+        }
+    }
+    ready
+}
+
+/// The seed enters a chain once, at its first step, and a tree at the head
+/// of every chunk; an unseeded plan never mentions it.
+fn assert_initial_placement(plan: &ReducePlan, tree: bool, seeded: bool) {
+    for index in 0..plan.steps() {
+        let step = plan.step(index).unwrap();
+        let wants_initial = seeded && if tree { !step.combines() } else { index == 0 };
+        assert_eq!(step.operands.first() == Some(&Operand::Initial), wants_initial, "step {index}");
+        assert_eq!(step.operands.iter().filter(|o| **o == Operand::Initial).count(), usize::from(wants_initial));
+    }
+}
+
 proptest! {
     #[test]
     fn every_plan_folds_every_item_once_in_order(
         items in 0u64..300,
-        chunk_size in 1u32..10,
+        chunk_size in 0u32..10,
         tree: bool,
         seeded: bool,
+        settled_mask in prop::collection::vec(any::<bool>(), 600),
+        settled_prefix in 0u64..600,
     ) {
         let plan = ReducePlan::new(items, &shape(tree, chunk_size, seeded));
+        assert_initial_placement(&plan, tree, seeded);
+        let by_mask = |index: u64| settled_mask[index as usize];
+        prop_assert_eq!(plan.startable(by_mask), startable_by_hand(&plan, by_mask));
+        let by_prefix = |index: u64| index < settled_prefix;
+        prop_assert_eq!(plan.startable(by_prefix), startable_by_hand(&plan, by_prefix));
+        prop_assert_eq!(plan.startable(|_| false), startable_by_hand(&plan, |_| false));
         let expected = (items > 0 || seeded).then(|| (0..items).collect::<Vec<_>>());
         prop_assert_eq!(evaluate(&plan), expected);
         let steps = match (tree, seeded, items) {
             (_, false, 0 | 1) | (_, true, 0) => 0,
             (false, true, n) => n,
             (false, false, n) => n - 1,
-            (true, _, n) => 2 * n.div_ceil(u64::from(chunk_size)) - 1,
+            (true, _, n) => 2 * n.div_ceil(u64::from(chunk_size.max(1))) - 1,
         };
         prop_assert_eq!(plan.steps(), steps);
     }

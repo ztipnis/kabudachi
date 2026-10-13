@@ -161,6 +161,7 @@ pub struct ReducePlan {
 }
 
 impl ReducePlan {
+    /// The plan for a reduce of `items` items; a tree's chunk size of 0 is read as 1.
     pub fn new(items: u64, shape: &ReduceShape) -> Self {
         let seeded = shape.initial.is_some();
         let chunk = shape.tree.then(|| u64::from(shape.chunk_size.max(1)));
@@ -190,6 +191,7 @@ impl ReducePlan {
         }
     }
 
+    /// What the reduce gives when its steps are done.
     pub fn root(&self) -> ReduceRoot {
         match (self.items, self.seeded) {
             (0, false) => ReduceRoot::Empty,
@@ -213,6 +215,9 @@ impl ReducePlan {
 
     /// The step that takes `index`'s result, or `None` for the last one.
     pub fn consumer(&self, index: u64) -> Option<u64> {
+        if index >= self.steps() {
+            return None;
+        }
         if self.chunk.is_none() {
             return (index + 1 < self.steps()).then_some(index + 1);
         }
