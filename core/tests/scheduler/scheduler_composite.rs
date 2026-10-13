@@ -219,10 +219,16 @@ fn a_map_of_more_members_than_a_page_holds_spreads_its_outcomes_over_pages_each_
     let mut fixture = Fixture::leading();
     let members = (0..=PAGE_ENTRIES).map(|item| task_stage("each", Some(&item.to_be_bytes()))).collect();
     let map = submitted(&mut fixture, map_of(members));
+    let mark = fixture.spy.mark();
     run_member(&mut fixture, &map, PAGE_ENTRIES, &PAGE_ENTRIES.to_be_bytes());
+    let published = fixture.spy.published_since(mark);
+    let position_of = |wanted: &dyn Fn(&ShardRecord) -> bool| published.iter().position(wanted).unwrap();
+    let page_zero = position_of(&|record| matches!(record, ShardRecord::Page(page) if page.index == 0));
+    let page_one = position_of(&|record| matches!(record, ShardRecord::Page(page) if page.index == 1));
+    let composite = position_of(&|record| matches!(record, ShardRecord::Composite(_)));
     assert!(
-        fixture.spy.newest_page(&map, 0).is_some(),
-        "the record now names two pages, so the lower one is published too"
+        page_zero < composite && page_one < composite,
+        "the record now names two pages, so the lower one is published too, before the record"
     );
     for index in 0..PAGE_ENTRIES {
         run_member(&mut fixture, &map, index, &index.to_be_bytes());

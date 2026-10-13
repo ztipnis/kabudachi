@@ -168,7 +168,10 @@ impl<'n> LeaderReconciliation<'n> {
                 after: after.map(request_after),
                 ..ReconcileRequest::default()
             };
-            let report = page_of(&request, &runs, &held);
+            let Some(report) = page_of(&request, &runs, &held) else {
+                tracing::warn!("this worker's own reconciliation cursor could not be read");
+                return;
+            };
             let page = match wire::page(&report) {
                 Ok(page) => page,
                 Err(malformed) => {

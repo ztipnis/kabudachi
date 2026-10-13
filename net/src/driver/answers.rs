@@ -256,7 +256,13 @@ pub(super) fn respond_to_reconcile_requests<C: Clock>(node: &WorkerNode<C>, net:
             term = request.term,
             "answering a reconciliation request"
         );
-        let page = page_of(handle.request(), &net.claimed_runs(), &net.held_records());
+        let Some(page) = page_of(handle.request(), &net.claimed_runs(), &net.held_records()) else {
+            tracing::warn!(
+                from = handle.from().as_str(),
+                "refusing a reconciliation request: its cursor names a record this worker cannot read"
+            );
+            continue;
+        };
         net.respond_reconcile(handle, page);
     }
 }

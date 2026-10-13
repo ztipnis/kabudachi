@@ -20,12 +20,14 @@ const LAST_BYTES: usize = 2;
 /// after the cursor, then the records it holds (from `held`) after it, as
 /// many as fit in one message. Whether `request` may be answered is not decided
 /// here (see `WorkerNode::may_answer_reconcile`); the answer decides nothing
-/// by itself.
+/// by itself. `None` for a request whose cursor names a record key this node
+/// cannot read: any page would say something false about what follows it
+/// (an empty last page reads as holding nothing more), so there is no answer.
 pub(crate) fn page_of(
     request: &ReconcileRequest,
     runs: &ClaimedRuns,
     held: &HeldRecords,
-) -> ReconcileReport {
+) -> Option<ReconcileReport> {
     let mut page = Page::default();
     let mut exhausted = true;
 
@@ -36,12 +38,7 @@ pub(crate) fn page_of(
     };
     let keys_after = match &request.after {
         Some(reconcile_request::After::AfterKey(task)) => Some(RecordKey::Task(task.clone().into())),
-        Some(reconcile_request::After::AfterRecord(bytes)) => match RecordKey::from_kad_bytes(bytes) {
-            Some(key) => Some(key),
-            // A cursor that names no key this node can read has no
-            // position: nothing is said to follow it.
-            None => return ReconcileReport { last: true, ..Default::default() },
-        },
+        Some(reconcile_request::After::AfterRecord(bytes)) => Some(RecordKey::from_kad_bytes(bytes)?),
         _ => None,
     };
     let runs_sent = matches!(
@@ -63,7 +60,7 @@ pub(crate) fn page_of(
     }
 
     page.report.last = exhausted;
-    page.report
+    Some(page.report)
 }
 
 /// A page as items are added to it, so that it never outgrows one message.

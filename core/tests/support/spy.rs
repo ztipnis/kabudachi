@@ -43,6 +43,11 @@ impl Spy {
         self.0.borrow().len()
     }
 
+    /// Every record published after `mark`, in order, left in the log.
+    pub fn published_since(&self, mark: usize) -> Vec<ShardRecord> {
+        self.0.borrow()[mark..].to_vec()
+    }
+
     /// The tasks revised after `mark`, in order of publication: what the
     /// calls since changed, while the scheduler led.
     pub fn revised_since(&self, mark: usize) -> Vec<TaskId> {
