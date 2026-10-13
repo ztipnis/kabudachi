@@ -231,7 +231,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// same composite and one already held is kept as it is.
     pub(in crate::scheduler) fn commit_continuation(&mut self, task_id: &TaskId, run: &TaskRunId) {
         let id = CompositeId::continuation_of(run);
-        if self.composites.held.contains_key(&id) {
+        // A record that may exist is not made over: recovery derives the
+        // composite if it turns out there is none.
+        if self.composites.held.contains_key(&id) || self.reconciliation.is_uncertain_composite(&id) {
             return;
         }
         let Some(step) = self.continuation_of_run(run) else {

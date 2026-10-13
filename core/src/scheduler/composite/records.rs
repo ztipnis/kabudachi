@@ -186,6 +186,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         true
     }
 
+    /// Takes the outcomes `pages` carry for the held composite `id` that it
+    /// has no outcome for yet: what it decided itself stands.
+    pub(in crate::scheduler) fn learn_pages(&mut self, id: &CompositeId, pages: &[CompositePage]) {
+        let outcomes: Vec<(u64, MemberOutcome)> =
+            pages.iter().flat_map(|page| &page.entries).filter_map(outcome_of).collect();
+        for (index, outcome) in outcomes {
+            self.record_member(id, index, outcome);
+        }
+    }
+
     fn composite_from(&self, id: &CompositeId, record: CompositeRecord, pages: &[CompositePage]) -> Option<Composite> {
         let step = Step::try_from(&record.description?).ok()?;
         let state = match generated::CompositeState::try_from(record.state).ok()? {

@@ -275,8 +275,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Holds the composites of `composites`, each with the outcomes of its
-    /// `pages`; when `late`, only those not held already, which this leader
-    /// decided itself. Returns the composites held.
+    /// `pages`; when `late`, a composite held already is kept as this leader
+    /// decided it, and takes only the outcomes of its pages it has none for.
+    /// Returns the composites whose records or pages are held now.
     fn install_composites(
         &mut self,
         composites: Vec<CompositeRecord>,
@@ -295,14 +296,21 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             let Some(id) = record.composite_id.clone().map(CompositeId::from) else {
                 continue;
             };
-            if late && self.composites.held.contains_key(&id) {
-                continue;
-            }
             let pages = pages_of.remove(&id).unwrap_or_default();
-            if self.install_composite(record, &pages, now) {
+            if late && self.composites.held.contains_key(&id) {
+                self.learn_pages(&id, &pages);
+                installed.push(id);
+            } else if self.install_composite(record, &pages, now) {
                 // Written again at the office's term, as every installed
                 // Task record is.
                 self.composites.mark_unpublished(&id);
+                installed.push(id);
+            }
+        }
+        // Pages that came without their composite's record.
+        for (id, pages) in pages_of {
+            if late && self.composites.held.contains_key(&id) {
+                self.learn_pages(&id, &pages);
                 installed.push(id);
             }
         }

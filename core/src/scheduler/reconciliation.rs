@@ -127,15 +127,17 @@ impl Reconciliation {
         self.deferred.insert(task_id, record);
     }
 
-    /// Takes late knowledge of composites: those of `installed` are known now,
-    /// and those of `uncertain` that `held` does not hold wait for a record.
+    /// Takes late knowledge of composites: those of `handed` had their
+    /// records or pages handed and are known now unless `uncertain` still
+    /// names them, and those of `uncertain` that `held` does not hold wait
+    /// for a record.
     pub(super) fn learn_composites(
         &mut self,
-        installed: &[CompositeId],
+        handed: &[CompositeId],
         uncertain: BTreeSet<CompositeId>,
         held: impl Fn(&CompositeId) -> bool,
     ) {
-        for id in installed {
+        for id in handed.iter().filter(|id| !uncertain.contains(*id)) {
             self.uncertain_composites.remove(id);
         }
         self.uncertain_composites

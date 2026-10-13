@@ -377,3 +377,78 @@ fn a_composite_record_learnt_after_the_rebuild_is_written_again_at_the_new_term(
     let version = written.version.unwrap();
     assert_eq!(version.leader_term, 2, "it is written at the new leader's term, fencing the old leader's writes");
 }
+
+/// A composite's record is certain at the rebuild but a page of its member
+/// outcomes is not. The composite waits, and once the page is learnt late it
+/// holds the outcome it names and moves on as if it had been known.
+#[test]
+fn a_composite_whose_page_is_learnt_after_the_rebuild_moves_on_once_it_is_learnt() {
+    let mut old = Fixture::leading();
+    let group = submitted(
+        &mut old,
+        group_of(OnError::CollectAll, vec![task_stage("a", Some(b"a")), task_stage("b", Some(b"b"))]),
+    );
+    run_member(&mut old, &group, 0, b"a");
+    let mut rebuild = rebuild_losing(&old, 0, |_| false);
+    let pages = std::mem::take(&mut rebuild.pages);
+    assert!(!pages.is_empty(), "the member's outcome was published on a page");
+    rebuild.uncertain_composites.insert(group.clone());
+    let mut new = took_over(&old, rebuild);
+    new.scheduler
+        .adopt(Rebuild { pages, ..Rebuild::default() })
+        .unwrap();
+    run_member(&mut new, &group, 1, b"b");
+    let finished = finished(&mut new);
+    assert_eq!(finished.len(), 1, "the group ends once the page is known");
+    assert_eq!(finished[0].state, CompositeState::Succeeded);
+    assert_eq!(
+        entry(&new, &group, 0).unwrap().outcome,
+        Some(composite_entry::Outcome::Value(Digest::blake3(b"a").into()))
+    );
+}
+
+/// A worker reports a run that returned a step while the record of the
+/// step's composite is not known yet. The composite is not made over the
+/// record that may exist: it is held when the record is learnt, and the
+/// step's stage then runs it to its end.
+#[test]
+fn a_continuation_certified_while_its_composite_record_is_unknown_is_taken_from_the_record_learnt_later() {
+    let mut old = Fixture::leading();
+    let task = old
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
+        .unwrap();
+    let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let step = flow_of(vec![task_stage("stage", Some(b"x"))]);
+    let mark = old.spy.mark();
+    old.scheduler
+        .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step.clone()))
+        .unwrap();
+    let continuation = CompositeId::continuation_of(&claim.task_run_id);
+    let known_later = rebuild_losing(&old, 0, |_| false);
+
+    let mut rebuild = rebuild_losing(&old, mark, |_| true);
+    rebuild.uncertain_composites.insert(continuation.clone());
+    rebuild.reports = BTreeMap::from([(
+        worker(),
+        WorkerRuns {
+            runs: vec![ReportedRun {
+                claim: claim.clone(),
+                state: ReportedState::Succeeded { result_digest: step.digest(), delivered: false },
+                continuation: Some(step),
+            }],
+            asked_at: None,
+        },
+    )]);
+    let mut new = took_over(&old, rebuild);
+    assert!(new.scheduler.composite_status(&continuation).is_none(), "the record may exist: nothing is made over it");
+    new.scheduler
+        .adopt(Rebuild { composites: known_later.composites, pages: known_later.pages, records: known_later.records, ..Rebuild::default() })
+        .unwrap();
+    run_member(&mut new, &continuation, 0, b"staged");
+    let finished = finished(&mut new);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].parent_task, Some(task));
+    assert_eq!(finished[0].state, CompositeState::Succeeded);
+}
