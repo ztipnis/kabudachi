@@ -90,6 +90,12 @@ impl PayloadMemory {
         self.lock().limits.map(|limits| limits.hard)
     }
 
+    /// The soft limit: past it, a process holding these payloads asks its
+    /// own bulk submission to wait. `None` with no limits.
+    pub fn soft_limit(&self) -> Option<u64> {
+        self.lock().limits.map(|limits| limits.soft)
+    }
+
     /// The hard limit less what is in use; `None` with no limits.
     pub fn room(&self) -> Option<u64> {
         let ledger = self.lock();

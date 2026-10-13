@@ -293,6 +293,14 @@ impl PyEvent {
         }
     }
 
+    /// Submitters are to wait (`active`), or may send again.
+    pub fn slow_down(active: bool) -> Self {
+        PyEvent {
+            active,
+            ..PyEvent::blank(PyEventKind::SlowDown)
+        }
+    }
+
     /// The run `task_run_id` of `task_id` may be run again elsewhere in
     /// `seconds_left` seconds.
     pub fn abort(task_id: &str, task_run_id: &str, seconds_left: f64) -> Self {

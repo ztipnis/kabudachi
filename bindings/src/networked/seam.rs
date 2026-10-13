@@ -19,6 +19,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
 use super::observed::Observed;
+use super::slow_down::SlowDownWatch;
 use crate::work::{PyClaim, PyEvent};
 
 pub(super) const GONE_MESSAGE: &str = "the worker left its shard";
@@ -51,6 +52,9 @@ pub(super) struct Seam {
     /// Composites submitted here, and continuations of tasks submitted here,
     /// that have not been told finished.
     pub(super) awaiting_composites: BTreeSet<CompositeId>,
+    /// Composites submitted here whose submission a leader refused for good:
+    /// members sent for one are answered as for a composite that is over.
+    pub(super) refused_composites: BTreeSet<CompositeId>,
     /// Nothing more is taken: a run handed over is reported lost at once.
     pub(super) closed: bool,
 }
@@ -76,6 +80,9 @@ pub(super) struct Shared {
     pub(super) observed: watch::Receiver<Observed>,
     /// How submissions and cancels keep asking the leader.
     pub(super) retry: LeaderRetry,
+    /// What the leader last said about SlowDown, and the poll that waits for
+    /// it to clear.
+    pub(super) slow_down: Mutex<SlowDownWatch>,
 }
 
 impl Shared {
@@ -92,6 +99,7 @@ impl Shared {
             net,
             observed,
             retry,
+            slow_down: Mutex::default(),
         }
     }
 
