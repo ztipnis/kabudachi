@@ -1275,11 +1275,11 @@ def test_a_returned_step_too_large_by_its_structure_alone_fails_its_run_for_good
     ], "failed once, with no retry"
 
 
-def test_a_thousand_item_map_toggles_slow_down_and_keeps_its_order():
-    # Every batch of 50 items (about 450 bytes) passes the soft limit on
+def test_a_two_thousand_item_map_toggles_slow_down_and_keeps_its_order():
+    # Every batch of 100 items (about 900 bytes) passes the soft limit on
     # its own, so each one raises SlowDown and the next waits for it to clear.
-    world = World(shout, memory_soft_limit=250, memory_hard_limit=1_000_000, concurrency=8, member_batch_items=50)
-    items = [Greeting(text=f"item {index}") for index in range(1_000)]
+    world = World(shout, memory_soft_limit=500, memory_hard_limit=1_000_000, concurrency=8, member_batch_items=100)
+    items = [Greeting(text=f"item {index}") for index in range(2_000)]
 
     async def body():
         with activated(world):
@@ -1289,7 +1289,7 @@ def test_a_thousand_item_map_toggles_slow_down_and_keeps_its_order():
 
     assert [result.text for result in results] == [item.text.upper() for item in items]
     starts = [start for _, start, _ in world.runtime.members_sent]
-    assert starts == list(range(0, 1_000, 50)), "every batch once, in order"
+    assert starts == list(range(0, 2_000, 100)), "every batch once, in order"
     assert world.runtime.slow_downs.count(True) >= 10 and world.runtime.slow_downs.count(False) >= 10
 
 
