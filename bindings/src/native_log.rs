@@ -95,13 +95,15 @@ pub(crate) fn install(py: Python<'_>) -> PyResult<()> {
         .name("kabudachi-log".into())
         .spawn(move || forward(queue, python, dropped))
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    // Registered before the logger is installed, so a failure here leaves
+    // nothing installed. It is harmless if installing then loses.
+    py.import("atexit")?
+        .call_method1("register", (wrap_pyfunction!(stop_forwarding, py)?,))?;
     if log::set_boxed_logger(Box::new(forwarding)).is_err() {
         return Ok(());
     }
     log::set_max_level(level);
     let _ = CACHE.set(cache);
-    py.import("atexit")?
-        .call_method1("register", (wrap_pyfunction!(stop_forwarding, py)?,))?;
     Ok(())
 }
 
@@ -164,7 +166,7 @@ fn effective_level(py: Python<'_>) -> PyResult<LevelFilter> {
         .call_method0("getEffectiveLevel")?
         .extract()?;
     Ok(match level {
-        i64::MIN..=5 =>LevelFilter::Trace,
+        i64::MIN..=5 => LevelFilter::Trace,
         6..=10 => LevelFilter::Debug,
         11..=20 => LevelFilter::Info,
         21..=30 => LevelFilter::Warn,
