@@ -44,6 +44,8 @@ SETTINGS = {
     "KABUDACHI_DRAIN_WAIT_LIMIT": "2",
 }
 RUN_SECONDS = 60
+# Pip and ensurepip unpack and compile; a child past this hung.
+INSTALL_SECONDS = 300
 
 
 def project() -> dict:
@@ -121,7 +123,9 @@ def installed(tmp_path_factory) -> dict:
     }
 
     def run(*command) -> str:
-        done = subprocess.run(command, env=environment, capture_output=True, text=True)
+        done = subprocess.run(
+            command, env=environment, capture_output=True, text=True, timeout=INSTALL_SECONDS
+        )
         assert done.returncode == 0, f"{command} exited with {done.returncode}: {done.stderr}"
         return done.stdout
 
@@ -178,7 +182,7 @@ def test_the_linux_wheel_claims_the_platform_its_symbols_allow():
     shown = subprocess.run(
         [sys.executable, "-c", "import sys; from auditwheel.main import main; sys.exit(main())",
          "show", "--json", WHEEL],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=RUN_SECONDS,
     )
     assert shown.returncode == 0, shown.stderr
     claimed = WHEEL.name.removesuffix(".whl").rsplit("-", 1)[1]
