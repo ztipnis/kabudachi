@@ -12,7 +12,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::{Rebuild, ReportedRun, ReportedState, WorkerRuns};
 use kabudachi_core::scheduler::composite::{
-    CompositeKind, CompositeState, OnError, Stage, Step,
+    CompositeKind, CompositeState, OnError, PAGE_ENTRIES, Stage, Step,
 };
 use kabudachi_core::scheduler::{CancelRejection, ClaimRejection, Completion, Submission};
 use kabudachi_core::task_record::RecordKey;
@@ -622,4 +622,44 @@ fn a_streamed_map_whose_held_members_all_settled_stays_open_after_a_takeover_unt
     assert_eq!(new.scheduler.composite_status(&map).unwrap().state, CompositeState::Running);
     assert_eq!(new.scheduler.submit_members(item_batch(&map, 5, 0, true)).unwrap().members, 5);
     assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+}
+
+/// A map of more members than a page holds ended under the old leader, which
+/// stored its record and every page as finished. Its successor, given only
+/// those records, holds the map as it ended: the same counts and outcomes on
+/// every page, the failed member's entry included, and publishes each record
+/// again as finished and in full.
+#[test]
+fn a_successor_takes_over_a_finished_multi_page_map_whole() {
+    let mut old = Fixture::leading();
+    let map = submitted(&mut old, streamed_map(OnError::CollectAll));
+    let total = PAGE_ENTRIES + 2;
+    old.scheduler.submit_members(item_batch(&map, 0, total, true)).unwrap();
+    fail_member(&mut old, &map, 0, "ValueError");
+    for index in 1..total {
+        run_member(&mut old, &map, index, b"r");
+    }
+    assert_eq!(finished(&mut old)[0].state, CompositeState::Succeeded, "collect_all ends the map with a member failed");
+    let pages = (0..2u32)
+        .map(|index| old.spy.newest_page(&map, index).unwrap())
+        .collect::<Vec<_>>();
+    assert!(pages.iter().all(|page| page.finished && !page.entries.is_empty()));
+    let record = old.spy.newest_composite(&map).unwrap();
+    assert!(record.finished);
+
+    let rebuild = Rebuild { composites: vec![record], pages: pages.clone(), ..Rebuild::default() };
+    let new = took_over(&old, rebuild);
+
+    let (was, now) = (old.scheduler.composite_status(&map).unwrap(), new.scheduler.composite_status(&map).unwrap());
+    assert_eq!((now.state, now.counts), (was.state, was.counts));
+    for (index, original) in pages.iter().enumerate() {
+        let held = new.scheduler.composite_page(&map, index as u32).unwrap();
+        assert_eq!(held.entries, original.entries, "page {index} as the old leader ended it");
+        let published = new.spy.newest_page(&map, index as u32).unwrap();
+        assert!(published.finished, "page {index} is republished as finished");
+        assert_eq!(published.entries, original.entries, "and in full");
+    }
+    assert!(new.spy.newest_composite(&map).unwrap().finished);
+    let failed = entry(&new, &map, 0).unwrap();
+    assert!(matches!(failed.outcome, Some(composite_entry::Outcome::Failure(_))));
 }
