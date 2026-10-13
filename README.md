@@ -3033,6 +3033,12 @@ Open: blob retention edges. (1) A holder that never saw an owner's record drops 
 
 Open: `//runtime/tests:test_networked` also failed intermittently under load with a result reported unavailable; that symptom is not shown fixed and is to be diagnosed before the phase closes.
 
+Open: a drained worker's record hand-off can wait about 5 s before it returns when its copy of a record was already superseded (the hand-off reports stored 0, superseded 1); about a third of runs of the networked leader hand-over test showed it. The hand-off should finish as soon as the superseding copy is confirmed rather than waiting out a timeout.
+
+Open: a node drained while fenced, bootstrapping or joining keeps the request until it leaves that state, so a networked run whose node is fenced at exit stops waiting after four drain waits plus a heartbeat timeout and shuts down with the records it held. A drain in those states should end after the drain wait limit like the other leaderless states.
+
+Open: `runtime/tests:test_networked` failed in 4 of 80 runs in one batch (a cut-off worker, a killed task-process worker, a compaction timeout) while the machine was loaded and passed 100 of 100 in baselines; the cause is not found. Rerun on a quiet machine and trace before relying on it.
+
 Open: an idle worker's claim backoff grows to 5 s (`IdleBackoff::MAX`) with no wake-up on new queued work, so work queued on an idle cluster can wait up to 5 s for a claimant. The fix is to clear the idle backoff when the leader announces pending work. `//runtime/tests:test_networked` failed intermittently under load because of it (a compaction run not claimed while the generation holding the key ran); its tests now hold the key until released and do not depend on the backoff.
 
 Open: aging restarts at a leader change: a task's waiting time is counted from its installation in the new leader's waiting room.
