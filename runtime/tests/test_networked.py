@@ -24,7 +24,7 @@ from cluster import (
     settled,
     states,
 )
-from networked_tasks import awaits, fleeting, gather, hold, spin
+from networked_tasks import awaits, fleeting, gather, hold, measure, spin
 from proto_messages import Greeting
 
 
@@ -72,6 +72,7 @@ def test_a_cluster_delivers_results_compacts_and_keeps_its_runs_through_a_busy_t
 ):
     leader = cluster.leader()
     delivered_to_its_submitter(cluster, leader)
+    carried_as_blobs(cluster, leader)
     awaited_across_workers(cluster, leader)
     compacted(cluster, leader)
     task_process_killed(cluster, leader, tmp_path)
@@ -99,6 +100,16 @@ def delivered_to_its_submitter(cluster, leader):
     # The worker that ran it was told whom to deliver to.
     runner = cluster.by_id(record["runs"][0]["worker"])
     assert runner.ask(claimed=spun)["client"] == follower.id
+
+
+def carried_as_blobs(cluster, leader):
+    # An input larger than one message travels as blobs: the follower stores
+    # its chunks where the leader will place the task's record, and whichever
+    # worker runs it reads them back whole.
+    follower = next(worker for worker in cluster.workers if worker is not leader)
+    big = ("0123456789" * (3 * 1024 * 1024 // 10 + 1))[: 3 * 1024 * 1024]
+    measured = follower.submit("measure", text=big)
+    certified_once(cluster, measured, digest_of(measure, Greeting(text=big[-5:], times=len(big))))
 
 
 def awaited_across_workers(cluster, leader):

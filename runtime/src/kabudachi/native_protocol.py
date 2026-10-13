@@ -184,7 +184,8 @@ class Runtime(Protocol):
 
     payload_limit: int | None
     """The largest payload this process holds whole: a one-node runtime's
-    hard memory limit. `None` when no limit is set."""
+    hard memory limit, a networked worker's half of it for payloads in
+    flight. `None` when no limit is set."""
 
     def shard_id(self) -> str:
         """The incarnation of the shard this runtime founded at start."""

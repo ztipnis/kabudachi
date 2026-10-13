@@ -18,6 +18,13 @@
 //! a change of leader, every task still awaited is asked about again. A run
 //! held here delivers its result to its own client before it is reported.
 //!
+//! An input too large for one message travels as blobs. A submission stores
+//! them before it is sent. A run whose input is a manifest is held back until
+//! this worker has room for it under its memory limits and its blobs are
+//! fetched and checked, and a cancel or abort deadline meanwhile ends it as
+//! it ends a run Python has not taken. The input counts against the limits
+//! until the run ends.
+//!
 //! Places are offered to the driver as credits. Each claim Python asks for
 //! offers the places it has free that are neither offered already nor held
 //! by a run it has not taken yet; each run the driver hands over uses one.
@@ -39,6 +46,7 @@ mod start;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
+use kabudachi_core::manifest::fits_inline;
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids};
 use kabudachi_core::scheduler::mint;
@@ -51,6 +59,7 @@ use tokio::sync::watch;
 
 use crate::arguments::SubmitArguments;
 use crate::bridge::CLOSED_MESSAGE;
+use crate::errors::backpressure_error;
 use crate::work::PyTaskRecord;
 
 use self::delivery::{cancel_at_leader, send_submission};
@@ -136,11 +145,11 @@ impl NetworkedRuntime {
         false
     }
 
-    /// The largest payload this worker holds whole: none is bounded here yet,
-    /// since an input never travels except inline.
+    /// The largest payload this worker holds whole: its share of the hard
+    /// memory limit for payloads in flight, or `None` when no limit is set.
     #[getter]
     fn payload_limit(&self) -> Option<u64> {
-        None
+        self.shared.net.payload_memory().hard_limit()
     }
 
     /// The incarnation of the shard this worker joined; empty before it has.
@@ -196,23 +205,50 @@ impl NetworkedRuntime {
     /// `next_events()` says the end of. `submission` as for
     /// `NativeRuntime.submit`.
     ///
-    /// Raises `RuntimeError` once the runtime has shut down, and `ValueError`
+    /// An input larger than one message is stored in the shard as blobs
+    /// before the submission is sent. While it is stored it counts against
+    /// this process's memory limits: past the hard limit with others in
+    /// flight, `BackpressureError`.
+    ///
+    /// Raises `RuntimeError` once the runtime has shut down, `ValueError`
     /// if the submission's `kind`, `key` and `drop_oldest` disagree or its
-    /// `reconnect_timeout_ms` is zero.
+    /// `reconnect_timeout_ms` is zero, and `BackpressureError` if the
+    /// input's blobs do not fit this process's room for payloads in flight
+    /// now.
     fn submit(&self, py: Python<'_>, submission: SubmitArguments) -> PyResult<String> {
         if !self.host.bridge().is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
+        let mut submission = submission
+            .into_submission(py)?
+            .with_client(self.shared.net.local_worker_id());
+        // Too large for one message: delivered as blobs, stored before the
+        // submission is sent, and held here until they are. The submission
+        // goes out with no input of its own.
+        let as_blobs =
+            submission.coalescing_key.is_none() && !fits_inline(submission.serialized_input.len());
+        let payload = if as_blobs {
+            let payload = std::mem::take(&mut submission.serialized_input);
+            match self.shared.net.payload_memory().try_take(payload.len() as u64) {
+                Ok(Some(taken)) => Some((payload, taken)),
+                // Too many payloads in flight now: refused for now, like the
+                // leader's backpressure. One alone past the hard limit is
+                // refused by the session first, so it gets the same.
+                Ok(None) | Err(_) => {
+                    return Err(backpressure_error(
+                        py,
+                        "too many large payloads in flight past the hard memory limit".into(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         Ok(send_submission(
             &self.shared,
             self.host.handle(),
-            mint(
-                submission
-                    .into_submission(py)?
-                    .with_client(self.shared.net.local_worker_id()),
-                &Uuid7Ids,
-                &self.clock,
-            ),
+            mint(submission, &Uuid7Ids, &self.clock),
+            payload,
         ))
     }
 

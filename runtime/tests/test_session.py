@@ -18,6 +18,7 @@ from kabudachi.config import Configuration
 from kabudachi.errors import (
     CertificationError,
     CoalescedPayloadTooLargeError,
+    PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
     RunStoppedError,
@@ -151,6 +152,12 @@ def test_a_certification_for_a_different_result_is_never_delivered():
             CoalescedPayloadTooLargeError,
             {},
             id="coalesced payload too large",
+        ),
+        pytest.param(
+            {"kind": EventKind.OUTCOME, "state": RunState.FAILED, "failure_kind": "PayloadTooLarge"},
+            PayloadTooLargeError,
+            {},
+            id="input past the claimant's hard limit",
         ),
         pytest.param(
             {"kind": EventKind.OUTCOME, "state": RunState.ORPHANED}, TaskOrphanedError, {}, id="orphaned"

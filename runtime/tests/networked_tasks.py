@@ -99,6 +99,12 @@ def big(request: Greeting) -> Greeting:
     return Greeting(text="x" * (2 * 1024 * 1024))
 
 
+@kabudachi.task(name="cluster.measure")
+def measure(request: Greeting) -> Greeting:
+    """Says how long its input's text was, and how it ended."""
+    return Greeting(text=request.text[-5:], times=len(request.text))
+
+
 def _join(older: Greeting, newer: Greeting) -> Greeting:
     return Greeting(text=f"{older.text}+{newer.text}", times=newer.times)
 
@@ -118,5 +124,6 @@ TASKS = {
     "awaits": awaits,
     "fleeting": fleeting,
     "big": big,
+    "measure": measure,
     "gather": gather,
 }

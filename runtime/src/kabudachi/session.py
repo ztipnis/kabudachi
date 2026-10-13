@@ -927,6 +927,8 @@ _KNOWN_FAILURES: dict[str, type[Exception]] = {
     "TaskTimeoutError": TaskTimeoutError,
     "HistoryTooLarge": TaskRecordFullError,
     "CoalescedPayloadTooLarge": CoalescedPayloadTooLargeError,
+    # A claimant whose hard memory limit the input alone is past.
+    "PayloadTooLarge": PayloadTooLargeError,
 }
 
 # How a task ended without a result, for the endings that carry nothing more

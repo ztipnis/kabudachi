@@ -143,9 +143,10 @@ class Cluster:
             "KABUDACHI_PROCESSES": "1",
             "KABUDACHI_CONCURRENCY": "1",
             # Past a few hundred bytes of pending input the leader compacts
-            # a coalescing key's retained chain; far below anything refused.
+            # a coalescing key's retained chain; far below anything refused,
+            # and high enough for a few megabytes of input in flight.
             "KABUDACHI_MEMORY_SOFT_LIMIT": "300",
-            "KABUDACHI_MEMORY_HARD_LIMIT": "1000000",
+            "KABUDACHI_MEMORY_HARD_LIMIT": "16000000",
             "KABUDACHI_TEST_MARKERS": str(markers),
         }
         founder = Worker(environment)

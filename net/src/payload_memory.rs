@@ -84,6 +84,12 @@ impl PayloadMemory {
         self.lock().in_use
     }
 
+    /// The hard limit: the most one payload can ever be counted at. `None`
+    /// with no limits.
+    pub fn hard_limit(&self) -> Option<u64> {
+        self.lock().limits.map(|limits| limits.hard)
+    }
+
     /// The hard limit less what is in use; `None` with no limits.
     pub fn room(&self) -> Option<u64> {
         let ledger = self.lock();

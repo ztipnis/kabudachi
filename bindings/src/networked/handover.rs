@@ -1,12 +1,17 @@
 //! How each piece of work the driver hands over changes the seam: a run to
 //! hold for Python, a run taken back, an abort deadline, or one withdrawn.
 
+use std::sync::Arc;
 use std::time::Instant as StdInstant;
 
+use kabudachi_core::blob::BlobOwner;
+use kabudachi_core::manifest::PAYLOAD_UNAVAILABLE_KIND;
 use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::messages::Claim as WireClaim;
+use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::Claim;
 use kabudachi_net::executor::{Report, Work};
+use kabudachi_net::payload_memory::{PAYLOAD_TOO_LARGE_KIND, Taken};
 
 use super::seam::{Seam, Shared};
 use crate::outcomes::PyEventKind;
@@ -64,6 +69,99 @@ impl Shared {
     }
 }
 
+/// Why a run whose input travels as blobs cannot be handed to Python.
+enum Resolving {
+    Unresolved,
+    TooLarge,
+}
+
+impl Shared {
+    /// A run whose input travels as blobs: once this process has room for
+    /// the input, they are fetched and checked before Python can take the
+    /// run, so a body always starts with its whole input. The input counts
+    /// in flight until the run ends. A run whose blobs cannot all be had
+    /// fails as `PayloadUnavailable`, and one whose input alone is past this
+    /// worker's hard limit as `PayloadTooLarge` (the driver reports either
+    /// started first); its task's retries apply.
+    pub(super) fn resolve_then_hand(self: Arc<Self>, wire: WireClaim) {
+        let Ok(mut claim) = Claim::try_from(&wire) else {
+            // The plain hand-over fails a claim this build cannot read.
+            return self.on_work(Work::Run(wire));
+        };
+        {
+            let mut seam = self.seam();
+            seam.offered = seam.offered.saturating_sub(1);
+            if seam.closed {
+                drop(seam);
+                return self.report(Report::Lost(claim.task_run_id));
+            }
+            seam.resolving.insert(claim.task_run_id.clone());
+        }
+        tokio::spawn(async move {
+            let outcome = self.fetch_input(&mut claim).await;
+            self.finish_resolving(claim, outcome);
+        });
+    }
+
+    /// Waits, still resolving, while other inputs fill this process's room:
+    /// a cancel or abort deadline meanwhile ends the run as before, and
+    /// `finish_resolving` then drops it. Puts the whole input in `claim`
+    /// and returns the room it takes, if its input travelled as blobs.
+    async fn fetch_input(&self, claim: &mut Claim) -> Result<Option<Taken>, Resolving> {
+        let manifest = match claim.input_manifest() {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(Resolving::Unresolved),
+        };
+        let taken = self
+            .net
+            .payload_memory()
+            .take_when_room(manifest.total_bytes())
+            .await
+            .map_err(|_| Resolving::TooLarge)?;
+        let owner = BlobOwner::Task(claim.task.task_id());
+        let fetched = self.net.fetch_blobs(&owner, &manifest).await;
+        claim
+            .resolve_input(|key| fetched.get(key).cloned())
+            .map(|()| Some(taken))
+            .map_err(|_| Resolving::Unresolved)
+    }
+
+    /// Hands a run whose blobs were fetched to Python, with its input
+    /// counted until the run ends, unless it ended meanwhile.
+    fn finish_resolving(&self, claim: Claim, outcome: Result<Option<Taken>, Resolving>) {
+        let run = claim.task_run_id.clone();
+        let report = {
+            let mut seam = self.seam();
+            if !seam.resolving.remove(&run) {
+                // Cancelled, aborted or stopped meanwhile: already reported.
+                return;
+            }
+            match outcome {
+                Ok(taken) => {
+                    if let Some(taken) = taken {
+                        seam.inputs_in_flight.insert(run, taken);
+                    }
+                    seam.handed.push_back(claim);
+                    None
+                }
+                Err(Resolving::Unresolved) => Some(Report::Failed {
+                    run,
+                    reason: PAYLOAD_UNAVAILABLE_KIND.into(),
+                }),
+                Err(Resolving::TooLarge) => Some(Report::Failed {
+                    run,
+                    reason: PAYLOAD_TOO_LARGE_KIND.into(),
+                }),
+            }
+        };
+        match report {
+            Some(report) => self.report(report),
+            None => self.wake(),
+        }
+    }
+}
+
 impl Seam {
     /// A run the driver handed over, which uses one offered place. It waits
     /// for Python to take it, or is lost at once if nothing more is taken.
@@ -87,10 +185,11 @@ impl Seam {
     }
 
     /// The driver took a run back. One Python holds is reported failed and
-    /// Python is told to stop its body; one it has not taken is reported
-    /// failed; one already ended needs nothing.
+    /// Python is told to stop its body; one it has not taken, or whose blobs
+    /// are still being fetched, is reported failed; one already ended needs
+    /// nothing.
     fn take_back(&mut self, run: TaskRunId) -> Handled {
-        let unstarted = self.take_handed(&run);
+        let unstarted = self.take_handed(&run) || self.resolving.remove(&run);
         match self.held.remove(&run) {
             Some(held) => {
                 self.events.push_back(PyEvent::networked(
@@ -109,10 +208,10 @@ impl Seam {
     }
 
     /// Another leader may replay the run once `deadline` passes. One not
-    /// yet taken never starts, so it is lost now; Python is told of one it
-    /// holds.
+    /// yet taken, or still having its blobs fetched, never starts, so it is
+    /// lost now; Python is told of one it holds.
     fn abort(&mut self, run: TaskRunId, deadline: StdInstant) -> Handled {
-        if self.take_handed(&run) {
+        if self.take_handed(&run) || self.resolving.remove(&run) {
             return Handled::report(Report::Lost(run));
         }
         let Some(held) = self.held.get(&run) else {
