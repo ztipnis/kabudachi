@@ -603,3 +603,23 @@ fn a_streamed_maps_batch_whose_record_was_lost_with_its_leader_is_counted_from_i
         assert_eq!((record.members, record.sealed), (5, true));
     }
 }
+
+/// Every member the old leader took had settled when its record was lost, but
+/// its last batch had not come: the successor finds nothing left to run, and
+/// must not take that for the end of the map.
+#[test]
+fn a_streamed_map_whose_held_members_all_settled_stays_open_after_a_takeover_until_its_last_batch() {
+    let mut old = Fixture::leading();
+    let map = submitted(&mut old, streamed_map(OnError::FailFast));
+    old.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    let mark = old.spy.mark();
+    old.scheduler.submit_members(item_batch(&map, 2, 3, false)).unwrap();
+    for index in 0..5 {
+        run_member(&mut old, &map, index, b"r");
+    }
+    let mut new = took_over(&old, rebuild_losing(&old, mark, is_composite_or_page));
+    assert!(finished(&mut new).is_empty(), "more members may still come");
+    assert_eq!(new.scheduler.composite_status(&map).unwrap().state, CompositeState::Running);
+    assert_eq!(new.scheduler.submit_members(item_batch(&map, 5, 0, true)).unwrap().members, 5);
+    assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+}
