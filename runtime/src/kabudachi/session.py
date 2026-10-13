@@ -54,6 +54,7 @@ from kabudachi.errors import (
     ConfigurationError,
     PayloadTooLargeError,
     ReduceEmptyError,
+    ReduceItemsLostError,
     ReducerContinuedError,
     ResultTooLargeError,
     ResultUnavailableError,
@@ -1203,6 +1204,7 @@ _KNOWN_FAILURES: dict[str, type[Exception]] = {
     "PayloadTooLarge": PayloadTooLargeError,
     "ReduceEmptyError": ReduceEmptyError,
     "ReducerContinuedError": ReducerContinuedError,
+    "ReduceItemsLostError": ReduceItemsLostError,
 }
 
 # How a task ended without a result, for the endings that carry nothing more

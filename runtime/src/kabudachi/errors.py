@@ -33,6 +33,11 @@ class ReducerContinuedError(KabudachiError, RuntimeError):
     operands and returns its result."""
 
 
+class ReduceItemsLostError(KabudachiError, RuntimeError):
+    """A reduce's stored items fell short of the count its record names, so it
+    has no result: folding the fewer would give a wrong answer."""
+
+
 class UnknownSerializerError(KabudachiError, LookupError):
     """No serializer is registered under the requested name."""
 
