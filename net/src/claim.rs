@@ -296,5 +296,7 @@ fn claim_reject_reason(rejection: ClaimRejection) -> ClaimRejectReason {
         ClaimRejection::Superseded => ClaimRejectReason::ClaimRejectSuperseded,
         ClaimRejection::KeyBusy => ClaimRejectReason::ClaimRejectKeyBusy,
         ClaimRejection::CannotRun => ClaimRejectReason::ClaimRejectCannotRun,
+        ClaimRejection::NotSubscribed => ClaimRejectReason::ClaimRejectNotSubscribed,
+        ClaimRejection::QueueFull => ClaimRejectReason::ClaimRejectQueueFull,
     }
 }

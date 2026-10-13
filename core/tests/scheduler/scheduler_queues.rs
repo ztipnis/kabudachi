@@ -2,11 +2,12 @@
 //! priority goes first; queues of one priority share claims by weight; and
 //! a task that waited past its queue's starvation age goes before all.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, WorkerId};
-use kabudachi_core::queues::{QueueOptions, QueuePolicy};
-use kabudachi_core::scheduler::Submission;
+use kabudachi_core::queues::{QueueOptions, QueuePolicy, Subscription};
+use kabudachi_core::scheduler::{ClaimRejection, Submission};
 use kabudachi_core::time::Duration;
 
 use crate::support::scheduler::{Fixture, TestScheduler};
@@ -95,4 +96,66 @@ fn a_higher_priority_goes_first_weights_share_a_tier_and_a_starving_task_goes_be
         "past its starvation age it goes before the higher tier"
     );
     assert_eq!(claimed_queues(&mut fixture.scheduler, 10), ["b", "b", "b"]);
+}
+
+#[test]
+fn scaffold_a_claim_outside_the_workers_queues_or_past_a_full_queue_is_refused() {
+    let mut fixture = Fixture::leading();
+    fixture.scheduler.set_queue_policy(QueuePolicy::new().with_queue(
+        "gpu",
+        QueueOptions {
+            max_running: NonZeroU32::new(1),
+            ..QueueOptions::DEFAULT
+        },
+    ));
+    let cpu = WorkerId::new("cpu");
+    let gpu = WorkerId::new("gpu");
+    fixture.scheduler.set_subscriptions(BTreeMap::from([
+        (
+            cpu.clone(),
+            Subscription::Only(BTreeSet::from(["default".to_owned()])),
+        ),
+        (
+            gpu.clone(),
+            Subscription::Only(BTreeSet::from(["gpu".to_owned()])),
+        ),
+    ]));
+    let first = fixture
+        .scheduler
+        .submit(Submission::new(
+            TaskDefinitionId::new("t"),
+            1,
+            b"1".to_vec(),
+            "gpu",
+        ))
+        .unwrap();
+    let second = fixture
+        .scheduler
+        .submit(Submission::new(
+            TaskDefinitionId::new("t"),
+            1,
+            b"2".to_vec(),
+            "gpu",
+        ))
+        .unwrap();
+
+    assert_eq!(
+        fixture.scheduler.request_claim(&cpu, &first).unwrap_err(),
+        ClaimRejection::NotSubscribed
+    );
+    assert!(fixture.scheduler.claim_oldest(&cpu, 5).unwrap().is_empty());
+    fixture.scheduler.request_claim(&gpu, &first).unwrap();
+    assert_eq!(
+        fixture.scheduler.request_claim(&gpu, &second).unwrap_err(),
+        ClaimRejection::QueueFull
+    );
+    assert!(fixture.scheduler.claim_oldest(&gpu, 5).unwrap().is_empty());
+    // A worker the scheduler knows no queues of may take any queue.
+    assert_eq!(
+        fixture
+            .scheduler
+            .request_claim(&WorkerId::new("new"), &second)
+            .unwrap_err(),
+        ClaimRejection::QueueFull
+    );
 }

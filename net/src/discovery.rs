@@ -202,7 +202,9 @@ impl Net {
                         | ClaimRejectReason::ClaimRejectFinished
                         | ClaimRejectReason::ClaimRejectSuperseded
                         | ClaimRejectReason::ClaimRejectKeyBusy
-                        | ClaimRejectReason::ClaimRejectCannotRun,
+                        | ClaimRejectReason::ClaimRejectCannotRun
+                        | ClaimRejectReason::ClaimRejectNotSubscribed
+                        | ClaimRejectReason::ClaimRejectQueueFull,
                     ) => search.found.stale += 1,
                     Ok(
                         ClaimRejectReason::ClaimRejectNotLeader

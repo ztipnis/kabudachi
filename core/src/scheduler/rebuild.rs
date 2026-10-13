@@ -282,5 +282,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.run_decided_at.clear();
         self.failed_compactions.clear();
         self.turns.clear();
+        self.running.clear();
     }
 }

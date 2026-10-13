@@ -58,6 +58,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .and_then(|digest| Digest::try_from(digest).ok())
             .unwrap_or_else(|| manifest::input_digest(&task));
         self.hold_installed(task, runs, current, digest, link);
+        if matches!(state, TaskRunState::Claimed | TaskRunState::Running) {
+            self.count_running(&task_id);
+        }
     }
 
     /// Counts an unfinished installed task's input, and the folded payloads its

@@ -76,7 +76,7 @@ use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::TaskRunRecord;
-use crate::queues::QueuePolicy;
+use crate::queues::{QueuePolicy, Subscription};
 use crate::task_record::RecordVersion;
 use crate::time::{Clock, Instant};
 
@@ -272,6 +272,12 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     queue_policy: QueuePolicy,
     /// Each queue's turns in its tier's round (see `fairness::Turns`).
     turns: Turns,
+    /// The queues each worker takes, as its heartbeats say. A worker not here
+    /// may take any queue.
+    subscriptions: BTreeMap<WorkerId, Subscription>,
+    /// Per queue, the runs that were claimed or running when last seen; finished
+    /// ones are pruned as runs are added, and never counted.
+    running: BTreeMap<String, BTreeSet<TaskRunId>>,
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
@@ -315,6 +321,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             conclusions: Vec::new(),
             queue_policy: QueuePolicy::default(),
             turns: Turns::default(),
+            subscriptions: BTreeMap::new(),
+            running: BTreeMap::new(),
         }
     }
 

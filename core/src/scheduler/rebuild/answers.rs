@@ -189,6 +189,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let run = claimed_run(worker, claim, stamped_at);
         self.hold_rebuilt(claim.task.clone(), run);
+        self.count_running(&task_id);
         if let Some(key) = key {
             self.occupancy.start(&key, &task_id);
         }

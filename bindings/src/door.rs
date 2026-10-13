@@ -555,7 +555,9 @@ impl<C: Clock + Send + 'static> SchedulerDoor<C> {
                         | ClaimRejection::Finished
                         | ClaimRejection::Superseded
                         | ClaimRejection::KeyBusy
-                        | ClaimRejection::CannotRun,
+                        | ClaimRejection::CannotRun
+                        | ClaimRejection::NotSubscribed
+                        | ClaimRejection::QueueFull,
                     ) => {
                         unreachable!("claim_oldest claims from its own queue as leader")
                     }

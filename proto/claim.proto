@@ -64,6 +64,10 @@ enum ClaimRejectReason {
   CLAIM_REJECT_KEY_BUSY = 7;
   CLAIM_REJECT_NOT_MEMBER = 8;
   CLAIM_REJECT_CANNOT_RUN = 9;
+  // The task's queue is not one the claimant's heartbeats say it takes.
+  CLAIM_REJECT_NOT_SUBSCRIBED = 10;
+  // The task's queue already has as many tasks claimed or running as it may.
+  CLAIM_REJECT_QUEUE_FULL = 11;
 }
 
 message ClaimReject {
@@ -77,8 +81,9 @@ message ClaimBatch {
 
 // `accept` or `reject` answers `REQUEST_CLAIM`; `batch` or `reject` answers
 // `CLAIM_OLDEST`. A batch holds only as many claims as fit in one message.
-// Today the leader refuses `CLAIM_OLDEST` only as `CLAIM_REJECT_NOT_LEADER`,
-// but a claimant must handle any reason.
+// The leader refuses `CLAIM_OLDEST` only as `CLAIM_REJECT_NOT_LEADER`: a queue
+// that is full, or that the claimant does not take, is skipped, not refused.
+// A claimant must still handle any reason.
 message ClaimResponse {
   oneof result {
     Claim accept = 1;
