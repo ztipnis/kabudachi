@@ -7,7 +7,7 @@ use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::queues::QueuePolicy;
 use kabudachi_core::scheduler::{Conclusion, Scheduler};
-use kabudachi_core::task_record::{LeaderRecords, RecordOutbox, Settled, Write};
+use kabudachi_core::task_record::{LeaderRecords, RecordKey, RecordOutbox, Settled, Write};
 use kabudachi_core::time::{Clock, WallTime};
 
 use super::stepper::NetRecords;
@@ -102,7 +102,8 @@ impl<C: Clock, I: IdGenerator> Deciding<'_, C, I> {
     /// still unsettled instead (see [`LeaderRecords::hold`]).
     pub(super) fn hold(&mut self, held: HeldAnswer, named: Option<&TaskId>, local: &mut Local) {
         let made = self.write();
-        if let Some(settled) = self.records.hold(held, made, named) {
+        let named = named.cloned().map(RecordKey::Task);
+        if let Some(settled) = self.records.hold(held, made, named.as_ref()) {
             send_answer(self.net, settled, local);
         }
     }
@@ -115,7 +116,8 @@ impl<C: Clock, I: IdGenerator> Deciding<'_, C, I> {
         named: Option<&TaskId>,
         local: &mut Local,
     ) {
-        if let Some(settled) = self.records.hold(held, Vec::new(), named) {
+        let named = named.cloned().map(RecordKey::Task);
+        if let Some(settled) = self.records.hold(held, Vec::new(), named.as_ref()) {
             send_answer(self.net, settled, local);
         }
     }

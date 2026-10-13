@@ -46,7 +46,7 @@ use crate::support::builders::past_any_suspicion;
 use crate::support::harness::{Answer, Cluster, Ticket};
 use kabudachi_core::configuration::Admission;
 use kabudachi_core::election::{Output, StopReason};
-use kabudachi_core::task_record::{VersionOrder, identify};
+use kabudachi_core::task_record::{RecordKey, VersionOrder, identify};
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::protocol::ids::TaskDefinitionId;
@@ -388,7 +388,7 @@ fn check_records_are_held(cluster: &mut Cluster, leader: &WorkerId, submissions:
     // cannot hear may hide a newer revision.
     let mut held = Vec::new();
     for task in submitted {
-        if cluster.scheduler_mut(leader).holds(&task) {
+        if cluster.scheduler_mut(leader).holds(&RecordKey::Task(task.clone())) {
             held.push(task);
         } else {
             assert!(

@@ -77,7 +77,7 @@ use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::TaskRunRecord;
 use crate::queues::{QueuePolicy, Subscription};
-use crate::task_record::RecordVersion;
+use crate::task_record::{RecordKey, RecordVersion};
 use crate::time::{Clock, Instant};
 
 mod backlog;
@@ -387,10 +387,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.reconciliation.is_uncertain(task)
     }
 
-    /// Whether it holds `task`: it decides the task, and a driver that kept
-    /// where it wrote its record can forget the task once this is false.
-    pub fn holds(&self, task: &TaskId) -> bool {
-        self.tasks.contains_key(task)
+    /// Whether it holds the record `key` names: it decides it, and a driver
+    /// that kept where it wrote the record can forget it once this is false.
+    /// It holds no composite record or page yet.
+    pub fn holds(&self, key: &RecordKey) -> bool {
+        match key {
+            RecordKey::Task(task) => self.tasks.contains_key(task),
+            RecordKey::Composite(_) | RecordKey::Page(..) => false,
+        }
     }
 
     /// How many tasks are queued to be claimed, including generations their

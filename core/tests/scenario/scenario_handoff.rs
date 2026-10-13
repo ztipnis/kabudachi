@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::task_record::{VersionOrder, identify};
+use kabudachi_core::task_record::{RecordKey, VersionOrder, identify};
 use kabudachi_core::time::Duration;
 
 use super::scenario_records::{STEP, SUSPECT, elected_among, plain, submitted};
@@ -210,7 +210,7 @@ fn a_revision_whose_write_was_refused_is_published_again_until_it_is_stored() {
     cluster.advance(STEP);
     assert_eq!(cluster.answer(ticket), Some(&Answer::NotLeader), "setup invariant");
     let task = TaskId::new("task-1");
-    assert!(cluster.scheduler_mut(&leader).holds(&task), "setup invariant");
+    assert!(cluster.scheduler_mut(&leader).holds(&RecordKey::Task(task.clone())), "setup invariant");
     for other in &others {
         cluster.records().set_up(other, true);
     }

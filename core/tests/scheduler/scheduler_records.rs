@@ -13,9 +13,7 @@ use kabudachi_core::scheduler::{
     Completion, Event, LeadershipGrant, LeaseEnd, MAX_SUBMISSION_BYTES, Submission, SubmitRejection,
     Submitted,
 };
-use kabudachi_core::task_record::{
-    HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordVersion, VersionOrder,
-};
+use kabudachi_core::task_record::{HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYTES, RecordKey, RecordVersion, VersionOrder};
 use kabudachi_core::time::{Instant, WallTime};
 use prost::Message;
 
@@ -373,7 +371,7 @@ fn a_republished_task_gets_a_newer_revision_with_the_same_contents() {
     let task = fixture.scheduler.submit(plain(b"a")).unwrap();
     let before = fixture.spy.newest_revision_of(&task).unwrap();
 
-    let republished = fixture.scheduler.republish(&[task.clone(), TaskId::new("unknown")]);
+    let republished = fixture.scheduler.republish(&[RecordKey::Task(task.clone()), RecordKey::Task(TaskId::new("unknown"))]);
 
     assert_eq!(republished, 1, "a task it does not hold is skipped");
     let after = fixture.spy.newest_revision_of(&task).unwrap();
@@ -391,7 +389,7 @@ fn a_scheduler_that_does_not_lead_republishes_nothing() {
     fixture.scheduler.set_leadership_grant(None);
     let mark = fixture.spy.mark();
 
-    assert_eq!(fixture.scheduler.republish(&[task]), 0);
+    assert_eq!(fixture.scheduler.republish(&[RecordKey::Task(task)]), 0);
 
     assert!(fixture.spy.revised_since(mark).is_empty());
     fixture.scheduler.set_leadership_grant(Some(unbounded_grant()));

@@ -10,7 +10,7 @@ use crate::protocol::generated::{
     AbsorbedGeneration, ChainEntry, FoldedPayload, TaskRecord, chain_entry,
 };
 use crate::protocol::ids::{IdGenerator, TaskId};
-use crate::task_record::RecordVersion;
+use crate::task_record::{RecordKey, RecordVersion};
 use crate::time::{Clock, Duration, WallTime};
 
 use super::{Observer, Scheduler};
@@ -101,16 +101,20 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         ChainEntry { entry: Some(entry) }
     }
 
-    /// Publishes a new revision of each of `tasks` it holds, unchanged but for
-    /// its version, so its driver can write it where it now belongs. Tasks it
+    /// Publishes a new revision of each of `keys` it holds, unchanged but for
+    /// its version, so its driver can write it where it now belongs. Records it
     /// does not hold, or holds uncertain, are skipped. Only a leader
     /// publishes: any other returns 0. Returns how many it published.
-    pub fn republish(&mut self, tasks: &[TaskId]) -> usize {
+    pub fn republish(&mut self, keys: &[RecordKey]) -> usize {
         if !self.is_leader() {
             return 0;
         }
-        let eligible: BTreeSet<&TaskId> = tasks
+        let eligible: BTreeSet<&TaskId> = keys
             .iter()
+            .filter_map(|key| match key {
+                RecordKey::Task(task) => Some(task),
+                RecordKey::Composite(_) | RecordKey::Page(..) => None,
+            })
             .filter(|task| {
                 self.tasks.contains_key(*task) && !self.reconciliation.is_uncertain(task)
             })

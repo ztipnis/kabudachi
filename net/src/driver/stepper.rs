@@ -2,10 +2,10 @@ use kabudachi_core::election::{
     AbortBy, AuthorityCall, AuthorityPerformer, AuthorityReply, HandOffTo, Input, MessageSink,
     Output, Step, WorkerNode, carry_out,
 };
-use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{IdGenerator, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::ElectionMessage;
 use kabudachi_core::scheduler::Scheduler;
-use kabudachi_core::task_record::{LeaderRecords, RecordOutbox, RecordPorts, Write};
+use kabudachi_core::task_record::{LeaderRecords, RecordKey, RecordOutbox, RecordPorts, Write};
 use kabudachi_core::time::{Clock, Instant};
 
 use super::answers::{Deciding, HeldAnswer};
@@ -140,8 +140,12 @@ pub(super) struct NetRecords<'a> {
 }
 
 impl RecordPorts for NetRecords<'_> {
-    fn place(&self, task: &TaskId, voters: &[WorkerId]) -> Option<Placement> {
-        placement(task, voters, self.factor)
+    fn place(&self, key: &RecordKey, voters: &[WorkerId]) -> Option<Placement> {
+        match key {
+            RecordKey::Task(task) => placement(task, voters, self.factor),
+            // Nothing publishes a composite record or page yet.
+            RecordKey::Composite(_) | RecordKey::Page(..) => None,
+        }
     }
 
     fn write(&mut self, writes: Vec<PlacedWrite>) {

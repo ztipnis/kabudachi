@@ -65,8 +65,8 @@ use kabudachi_core::scheduler::{
     Certification, Claim, Compacted, Completion, Scheduler, Submission,
 };
 use kabudachi_core::task_record::{
-    LeaderRecords, OfficeReconciliation, PlacedWrite, Placement, RecordPorts, Settled, Turn,
-    Write, WriteOutcome, office_to_reconcile,
+    LeaderRecords, OfficeReconciliation, PlacedWrite, Placement, RecordKey, RecordPorts, Settled,
+    Turn, Write, WriteOutcome, identify, office_to_reconcile,
 };
 use kabudachi_core::time::{Clock, Duration, Instant};
 use kabudachi_testkit::FaultingAuthority;
@@ -137,8 +137,8 @@ struct SpaceRecords<'a> {
 }
 
 impl RecordPorts for SpaceRecords<'_> {
-    fn place(&self, task: &TaskId, voters: &[WorkerId]) -> Option<Placement> {
-        let (holders, quorum) = RecordSpace::placement(task, voters, self.factor);
+    fn place(&self, key: &RecordKey, voters: &[WorkerId]) -> Option<Placement> {
+        let (holders, quorum) = RecordSpace::placement(key, voters, self.factor);
         (!holders.is_empty()).then_some(Placement { holders, quorum })
     }
 
@@ -942,7 +942,7 @@ impl Cluster {
             .leader_records
             .get_mut(at)
             .unwrap_or_else(|| unknown_node("hold_call_on", at))
-            .hold(ticket, made, Some(task));
+            .hold(ticket, made, Some(&RecordKey::Task(task.clone())));
         if let Some(settled) = held {
             self.resolve(settled);
         }
@@ -1392,7 +1392,7 @@ impl Cluster {
         let voters: Vec<WorkerId> = voters.into_iter().filter(|voter| voter != drainer).collect();
         for record in self.records.held_records(drainer) {
             let (holders, quorum) =
-                RecordSpace::placement(&Write::of(&record).task_id, &voters, self.replication_factor);
+                RecordSpace::placement(&RecordKey::Task(identify(&record).expect("a held record names its task").0), &voters, self.replication_factor);
             self.records.hand_off(drainer, &record, &holders, quorum, now);
         }
         self.down.insert(drainer.clone());

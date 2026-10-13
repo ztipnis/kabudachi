@@ -1,8 +1,9 @@
 use crate::blob::{BlobKey, BlobOwner, BlobRecord};
-use crate::protocol::generated::TaskRecord;
+use crate::protocol::generated::{CompositePage, CompositeRecord, TaskRecord};
 use crate::protocol::ids::WorkerId;
 use crate::scheduler::Observer;
 use crate::task_record::gate::Write;
+use crate::task_record::key::ShardRecord;
 use crate::task_record::store::VersionedRecords;
 use crate::time::{Clock, Duration};
 
@@ -82,11 +83,26 @@ impl<C: Clock> LocalRecords<C> {
     }
 }
 
-impl<C: Clock> Observer for LocalRecords<C> {
-    fn revision(&mut self, mut revision: TaskRecord) {
-        revision.placement = vec![self.worker.clone().into()];
-        let write = Write::of(&revision);
-        let kept = self.records.put(revision, self.clock.now()).is_ok();
+impl<C: Clock> LocalRecords<C> {
+    /// Puts `record` into the store as placed on this node alone.
+    fn keep(&mut self, mut record: ShardRecord) {
+        record.set_placement(vec![self.worker.clone().into()], Vec::new());
+        let write = Write::of(&record);
+        let kept = self.records.put(record, self.clock.now()).is_ok();
         self.settled.push((write, kept));
+    }
+}
+
+impl<C: Clock> Observer for LocalRecords<C> {
+    fn revision(&mut self, revision: TaskRecord) {
+        self.keep(revision.into());
+    }
+
+    fn composite_revision(&mut self, revision: CompositeRecord) {
+        self.keep(revision.into());
+    }
+
+    fn page_revision(&mut self, revision: CompositePage) {
+        self.keep(revision.into());
     }
 }

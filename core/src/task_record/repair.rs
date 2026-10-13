@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::protocol::generated::{self, TaskRecord};
-use crate::protocol::ids::{TaskId, WorkerId};
+use crate::protocol::ids::WorkerId;
 use crate::task_record::gate::{PlacedWrite, PriorPlacement, Write, WriteOutcome};
+use crate::task_record::key::RecordKey;
 use crate::task_record::version::{RecordVersion, VersionOrder};
 use crate::time::{Duration, Instant};
 
@@ -25,19 +26,19 @@ const IN_FLIGHT: usize = 64;
 pub struct Repair {
     retry_after: Duration,
     /// Where each record's newest write went, and in which version.
-    written: BTreeMap<TaskId, Written>,
+    written: BTreeMap<RecordKey, Written>,
     /// Writes issued whose outcome has not arrived.
     in_flight: Vec<Write>,
     /// The voters records could be placed on at the last check.
     seen: Option<Vec<WorkerId>>,
     /// Records whose placement changed, not yet published again.
-    pending: BTreeSet<TaskId>,
+    pending: BTreeSet<RecordKey>,
     /// Records whose joint write was stored, to be published once more on
     /// their placement alone. Kept while the scheduler does not lead.
-    ending_move: BTreeSet<TaskId>,
+    ending_move: BTreeSet<RecordKey>,
     /// Records whose newest write was refused, to publish again at the
     /// instant.
-    retries: BTreeMap<TaskId, Instant>,
+    retries: BTreeMap<RecordKey, Instant>,
     /// Whether the last check found something to wake for: the scheduler
     /// leads and there is room for a write.
     can_wake: bool,
@@ -92,6 +93,7 @@ impl Repair {
             let Ok((task, version)) = crate::task_record::store::identify(record) else {
                 continue;
             };
+            let task = RecordKey::Task(task);
             let holders: BTreeSet<WorkerId> =
                 record.placement.iter().cloned().map(WorkerId::from).collect();
             if holders.is_empty() {
@@ -140,7 +142,7 @@ impl Repair {
         if holders.is_empty() {
             return;
         }
-        let before = self.written.get(&issued.task_id);
+        let before = self.written.get(&issued.key);
         write.prior = before
             .map(|written| {
                 written
@@ -153,14 +155,16 @@ impl Repair {
                     .collect()
             })
             .unwrap_or_default();
-        write.record.prior_placements = write
+        let prior_placements = write
             .prior
             .iter()
             .map(|prior| generated::PlacementHolders {
                 holders: prior.holders.iter().cloned().map(Into::into).collect(),
             })
             .collect();
-        if let Some(before) = self.written.get_mut(&issued.task_id)
+        let placement = write.record.placement().to_vec();
+        write.record.set_placement(placement, prior_placements);
+        if let Some(before) = self.written.get_mut(&issued.key)
             && before.version == issued.version
         {
             // The same revision placed anew while its write is under way:
@@ -171,7 +175,7 @@ impl Repair {
             before.reach(issued.version, &holders);
             return;
         }
-        let mut written = self.written.remove(&issued.task_id).unwrap_or(Written {
+        let mut written = self.written.remove(&issued.key).unwrap_or(Written {
             version: issued.version,
             holders: BTreeSet::new(),
             moving: false,
@@ -182,7 +186,7 @@ impl Repair {
         written.holders = holders.clone();
         written.reach(issued.version, &holders);
         self.in_flight.push(issued.clone());
-        self.written.insert(issued.task_id, written);
+        self.written.insert(issued.key, written);
     }
 
     /// `outcome` of a write arrived at `now`. A stored write was stored at a
@@ -194,36 +198,36 @@ impl Repair {
     pub fn settled(&mut self, outcome: &WriteOutcome, now: Instant) {
         let newest = self
             .written
-            .get(&outcome.write.task_id)
+            .get(&outcome.write.key)
             .is_some_and(|written| written.version == outcome.write.version);
         if let Some(at) = self.in_flight.iter().position(|write| *write == outcome.write) {
             self.in_flight.remove(at);
         }
         if outcome.stored {
             if newest {
-                self.retries.remove(&outcome.write.task_id);
+                self.retries.remove(&outcome.write.key);
             }
-            if let Some(written) = self.written.get_mut(&outcome.write.task_id) {
+            if let Some(written) = self.written.get_mut(&outcome.write.key) {
                 let stored = outcome.write.version;
                 written
                     .chain
                     .retain(|(version, _)| version.order(&stored) != VersionOrder::Newer);
                 if newest && std::mem::take(&mut written.moving) {
-                    self.ending_move.insert(outcome.write.task_id.clone());
+                    self.ending_move.insert(outcome.write.key.clone());
                 }
             }
             return;
         }
         if newest {
             self.retries
-                .insert(outcome.write.task_id.clone(), now + self.retry_after);
+                .insert(outcome.write.key.clone(), now + self.retry_after);
         }
     }
 
     /// The records to publish again now. `in_office` says whether the node
     /// holds office, and `leading` whether its scheduler leads, which a
     /// leader that is still reconciling does not; `placeable` is the voters it
-    /// could place a record on, `holds` says whether it still holds a task,
+    /// could place a record on, `holds` says whether it still holds a record,
     /// and `place` where a record would be held now, if it can be placed. A
     /// leader whose voters changed finds every record held elsewhere than it
     /// would be now. Refused writes due again come first, then the moved
@@ -236,10 +240,10 @@ impl Repair {
         in_office: bool,
         leading: bool,
         placeable: &[WorkerId],
-        holds: impl Fn(&TaskId) -> bool,
-        place: impl Fn(&TaskId) -> Option<Vec<WorkerId>>,
+        holds: impl Fn(&RecordKey) -> bool,
+        place: impl Fn(&RecordKey) -> Option<Vec<WorkerId>>,
         now: Instant,
-    ) -> Vec<TaskId> {
+    ) -> Vec<RecordKey> {
         self.can_wake = false;
         if !in_office {
             *self = Repair::new(self.retry_after);
@@ -272,13 +276,13 @@ impl Repair {
             self.seen = Some(voters);
         }
         let room = IN_FLIGHT.saturating_sub(self.in_flight.len());
-        let due: Vec<TaskId> = self
+        let due: Vec<RecordKey> = self
             .retries
             .iter()
             .filter(|(_, at)| **at <= now)
             .map(|(task, _)| task.clone())
             .collect();
-        let batch: Vec<TaskId> = due
+        let batch: Vec<RecordKey> = due
             .into_iter()
             .chain(self.pending.iter().cloned())
             .take(room)

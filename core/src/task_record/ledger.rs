@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::protocol::ids::TaskId;
 use crate::task_record::gate::Write;
+use crate::task_record::key::RecordKey;
 use crate::task_record::version::{RecordVersion, VersionOrder};
 
 /// What an answer that made no write of its own waits on.
@@ -33,7 +33,7 @@ pub struct WriteLedger {
     refused: Vec<Write>,
     /// The newest revision stored of each task that still has a write
     /// pending, to judge a refusal that arrives after it.
-    stored: BTreeMap<TaskId, RecordVersion>,
+    stored: BTreeMap<RecordKey, RecordVersion>,
 }
 
 impl WriteLedger {
@@ -53,25 +53,25 @@ impl WriteLedger {
                 self.refuse(write);
             }
         }
-        if !self.pending.iter().any(|pending| pending.task_id == write.task_id) {
-            self.stored.remove(&write.task_id);
+        if !self.pending.iter().any(|pending| pending.key == write.key) {
+            self.stored.remove(&write.key);
         }
     }
 
     fn store(&mut self, write: &Write) {
-        let newest = self.stored.entry(write.task_id.clone()).or_insert(write.version);
+        let newest = self.stored.entry(write.key.clone()).or_insert(write.version);
         if matches!(newest.order(&write.version), VersionOrder::Newer) {
             *newest = write.version;
         }
         let newest = *newest;
         self.refused.retain(|refused| {
-            refused.task_id != write.task_id
+            refused.key != write.key
                 || matches!(newest.order(&refused.version), VersionOrder::Newer)
         });
     }
 
     fn refuse(&mut self, write: &Write) {
-        let superseded = self.stored.get(&write.task_id).is_some_and(|newest| {
+        let superseded = self.stored.get(&write.key).is_some_and(|newest| {
             !matches!(newest.order(&write.version), VersionOrder::Newer)
         });
         if !superseded && !self.refused.contains(write) {
@@ -92,22 +92,22 @@ impl WriteLedger {
         self.pending
             .iter()
             .filter(|pending| {
-                pending.task_id == write.task_id
+                pending.key == write.key
                     && matches!(write.version.order(&pending.version), VersionOrder::Newer)
             })
             .cloned()
             .collect()
     }
 
-    /// What an answer about `task` that made no write of its own waits on.
-    pub fn waits_on(&self, task: &TaskId) -> Waits {
-        if self.refused.iter().any(|write| write.task_id == *task) {
+    /// What an answer about `record` that made no write of its own waits on.
+    pub fn waits_on(&self, record: &RecordKey) -> Waits {
+        if self.refused.iter().any(|write| write.key == *record) {
             return Waits::Refused;
         }
         Waits::Writes(
             self.pending
                 .iter()
-                .filter(|write| write.task_id == *task)
+                .filter(|write| write.key == *record)
                 .cloned()
                 .collect(),
         )

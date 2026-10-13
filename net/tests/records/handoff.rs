@@ -110,10 +110,10 @@ async fn a_stub_arrives_over_the_wire_at_a_holder_a_joint_write_moved_the_record
         let (shard, writer) = ThreeVoters::start().await;
         let (former, other) = (shard.id(0), shard.id(1));
         let task = TaskId::new("task-1");
-        writer.write_records(vec![PlacedWrite::new(placed(&task, 0, std::slice::from_ref(&former)), 1)]);
+        writer.write_records(vec![PlacedWrite::new(placed(&task, 0, std::slice::from_ref(&former)).into(), 1)]);
         wait_until_held(shard.nets[0].clone(), vec![task.clone()]).await;
 
-        let mut moved = PlacedWrite::new(placed(&task, 1, std::slice::from_ref(&other)), 1);
+        let mut moved = PlacedWrite::new(placed(&task, 1, std::slice::from_ref(&other)).into(), 1);
         moved.prior = vec![PriorPlacement { holders: vec![former], quorum: 1 }];
         writer.write_records(vec![moved]);
 

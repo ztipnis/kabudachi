@@ -5,7 +5,7 @@
 use prost::Message as _;
 
 use crate::protocol::generated::{self, CompositePage, CompositeRecord, TaskRecord};
-use crate::protocol::ids::{CompositeId, TaskId};
+use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
 use crate::task_record::store::{PutRefusal, identify};
 use crate::task_record::version::RecordVersion;
 
@@ -126,6 +126,13 @@ impl ShardRecord {
         };
         *placement = holders;
         *prior_placements = prior;
+    }
+
+    /// Places the record on `holders`, keeping the prior placements it
+    /// carries.
+    pub fn place_on(&mut self, holders: Vec<WorkerId>) {
+        let prior = self.prior_placements().to_vec();
+        self.set_placement(holders.into_iter().map(Into::into).collect(), prior);
     }
 
     /// Whether nothing in the record changes again.

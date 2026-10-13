@@ -2,11 +2,11 @@
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::ids::TaskId;
-use kabudachi_core::task_record::{EffectGate, RecordVersion, Waits, Write, WriteLedger};
+use kabudachi_core::task_record::{EffectGate, RecordKey, RecordVersion, Waits, Write, WriteLedger};
 
 fn write(task: &str, revision: u64) -> Write {
     Write {
-        task_id: TaskId::new(task),
+        key: RecordKey::Task(TaskId::new(task)),
         version: RecordVersion {
             recovery_epoch: RecoveryEpoch::new(0, 0),
             leader_term: 1,
@@ -16,7 +16,7 @@ fn write(task: &str, revision: u64) -> Write {
 }
 
 fn waits_on(ledger: &WriteLedger, task: &str) -> Waits {
-    ledger.waits_on(&TaskId::new(task))
+    ledger.waits_on(&RecordKey::Task(TaskId::new(task)))
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn clearing_forgets_pending_and_refused_writes() {
 #[test]
 fn an_answer_held_in_one_office_is_never_settled_by_a_revision_of_a_later_one() {
     let later_office = |task: &str, recovery_epoch: RecoveryEpoch, leader_term: u64| Write {
-        task_id: TaskId::new(task),
+        key: RecordKey::Task(TaskId::new(task)),
         version: RecordVersion { recovery_epoch, leader_term, revision: 0 },
     };
     let mut ledger = WriteLedger::default();

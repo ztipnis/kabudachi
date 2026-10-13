@@ -76,7 +76,7 @@ impl RecordQueries {
             return;
         };
         let value = placed.record.encode_to_vec();
-        let key = record_key(&write.task_id);
+        let key = kad::RecordKey::new(&write.key.kad_bytes());
         // This worker's own copy first, so its acknowledgement counts for
         // each placement it belongs to.
         let goes_here = placed
@@ -230,7 +230,7 @@ impl RecordQueries {
         match result {
             Err(error) => {
                 tracing::debug!(
-                    task = unfinished.write.task_id.as_str(),
+                    key = ?unfinished.write.key,
                     %error,
                     "a record write did not reach its quorum"
                 );

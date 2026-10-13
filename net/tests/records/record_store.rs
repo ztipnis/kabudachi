@@ -91,7 +91,7 @@ async fn write_all(
         .collect();
     write_placed(
         writer,
-        records.into_iter().map(|record| PlacedWrite::new(record, quorum)).collect(),
+        records.into_iter().map(|record| PlacedWrite::new(record.into(), quorum)).collect(),
     )
     .await
 }
@@ -391,7 +391,7 @@ async fn a_write_that_moves_a_record_is_stored_only_once_the_placement_it_left_h
 
         let moved = placed_at(record("task-1", version(0, 0, 1, 1), "q"), &[&holder_id]);
         let joint = |from: &WorkerId| {
-            let mut write = PlacedWrite::new(moved.clone(), 1);
+            let mut write = PlacedWrite::new(moved.clone().into(), 1);
             write.prior = vec![PriorPlacement { holders: vec![from.clone()], quorum: 1 }];
             write
         };
