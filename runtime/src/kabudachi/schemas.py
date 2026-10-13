@@ -408,8 +408,10 @@ def fits(
         answers = [fits(shape, arm, wanted_serializer, serializers) for arm in typing.get_args(wanted)]
         return True if True in answers else (None if None in answers else False)
     if isinstance(shape, (Items, Each)):
-        if typing.get_origin(wanted) is not list:
-            return False
+        origin = typing.get_origin(wanted)
+        if origin is not list:
+            # A Sequence[X] or tuple[X, ...] may well take a list; only a plain class cannot.
+            return None if origin is not None else False
         (item,) = typing.get_args(wanted) or (Any,)
         entries = shape.entries if isinstance(shape, Items) else (shape.item,)
         answers = [fits(entry, item, wanted_serializer, serializers) for entry in entries]
@@ -434,10 +436,23 @@ def _value_fits(produced: Value, wanted: Any, wanted_serializer: str, serializer
             if answer is not None:
                 return answer
     consumer = backends[0]
-    if consumer is not None and produced.serializer != wanted_serializer and not consumer.supports(value_type):
-        # Bytes in the producer's format, which the consumer's backend cannot even hold.
+    if (
+        consumer is None
+        or not consumer.available()
+        or produced.serializer == wanted_serializer
+        or consumer.supports(value_type)
+    ):
+        return None
+    # The consumer's backend cannot hold the producer's type. Two types of one
+    # family still compose across backends, by their versions; types known to
+    # belong to different families do not; otherwise it cannot be told.
+    registry = process_schemas()
+    family = registry.family(value_type)
+    if family is None or registry.family(wanted) is None:
+        return None
+    if family != registry.family(wanted):
         return False
-    return None
+    return isinstance(registry.plan(family, registry.version_of(value_type), registry.version_of(wanted)), Runnable)
 
 
 def can_migrate(serializer: Any) -> bool:

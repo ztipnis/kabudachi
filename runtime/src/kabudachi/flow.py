@@ -99,7 +99,8 @@ class BoundTask:
         return Value(self.definition.output_type, self.definition.serializer)
 
     def check_types(self) -> None:
-        """A task joins nothing to check."""
+        """Nothing: a task's own output is not next to any other step, so the
+        checks happen between the stages of the flow or group that holds it."""
 
     def input_requirements(self) -> list[tuple[str, Any, str]]:
         """The (name, type, serializer name) of each task that takes the input of this step."""
@@ -357,7 +358,8 @@ class MapStep:
         return Each(_result_shape(Value(self.definition.output_type, self.definition.serializer), self._on_error))
 
     def check_types(self) -> None:
-        """A map joins nothing to check."""
+        """Nothing: a map's items are all its one task's, so there is no
+        adjacency inside it; what feeds it is checked by the enclosing flow."""
 
     def input_requirements(self) -> list[tuple[str, Any, str]]:
         """The (name, type, serializer name) of the task, whose input must be a list of what it takes."""

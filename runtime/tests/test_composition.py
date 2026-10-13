@@ -6,6 +6,7 @@ properties are checked too: payloads are folded in order whatever the
 compaction points, and the stage after a group runs exactly once."""
 
 import asyncio
+import dataclasses
 import functools
 import pickle
 import threading
@@ -17,6 +18,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from kabudachi import _native, schemas
+from kabudachi import serializers as serializer_registry
 from kabudachi._native import KabudachiError
 from kabudachi.body import fold_payloads
 from kabudachi.composites import INLINE_VALUE_BYTES, _batches
@@ -33,7 +35,7 @@ from kabudachi.errors import (
     TaskFailure,
     UnknownTaskError,
 )
-from kabudachi.flow import BoundTask, Flow, Group, flow, group
+from kabudachi.flow import BoundTask, Flow, Group, MapStep, flow, group
 from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.schemas import SchemaRegistry
 from kabudachi.serializers import SerializerRegistry
@@ -215,6 +217,19 @@ class RenamedV4(pydantic.BaseModel):
     title: str
 
 
+class RushV1(OrderV1):
+    pass
+
+
+class ParcelModel(pydantic.BaseModel):
+    weight: int
+
+
+@dataclasses.dataclass
+class ParcelRecord:
+    weight: int
+
+
 def order_schemas() -> SchemaRegistry:
     """Four classes as versions of one family, with an incompatible bump into the last."""
     registry = SchemaRegistry()
@@ -222,6 +237,8 @@ def order_schemas() -> SchemaRegistry:
     registry.declare(OrderV2, version=2, family="shop.Order")
     registry.declare(OrderV3, version=3, family="shop.Order")
     registry.declare(RenamedV4, version=4, family="shop.Order", migration=None)
+    registry.declare(ParcelModel, version=1, family="shop.Parcel")
+    registry.declare(ParcelRecord, version=2, family="shop.Parcel")
     return registry
 
 
@@ -265,15 +282,44 @@ def take_v4(request: RenamedV4) -> RenamedV4:
     return request
 
 
+def make_rush(request: OrderV1) -> RushV1:
+    return RushV1(text=request.text)
+
+
+def take_v1(request: OrderV1) -> OrderV1:
+    return request
+
+
+def take_optional(request: OrderV1 | None) -> OrderV1:
+    return request or OrderV1(text="")
+
+
+def make_parcel(request: ParcelModel) -> ParcelModel:
+    return request
+
+
+def take_record(request: ParcelRecord) -> ParcelRecord:
+    return request
+
+
 # Backends other than protobuf: a union of a message and a failure is not a protobuf type.
 SERIALIZER_OF = {
     make_v1: "pydantic",
     take_v2: "pydantic",
     take_v3: "pydantic",
     take_v4: "pydantic",
+    make_rush: "pydantic",
+    take_v1: "pydantic",
+    take_optional: "pickle",
+    make_parcel: "pydantic",
+    take_record: "dataclass",
     anything: "pickle",
     outcomes: "pickle",
 }
+
+
+def collecting_map(bound):
+    return MapStep(bound.definition, SerializerRegistry.with_defaults(), "collect_all")
 
 
 def declare_with_serializer(function):
@@ -325,12 +371,39 @@ FIT_CASES = [
     pytest.param(lambda d: (d(take_v3), d(take_v2)), "take_v3", id="a downgrade"),
     pytest.param(lambda d: (d(make_v1), d(take_v4)), "make_v1", id="across an incompatible bump"),
     pytest.param(lambda d: (d(make_v1), d(shout)), "make_v1", id="another family and serializer"),
+    pytest.param(
+        lambda d: (d(make_parcel), d(take_record)), None, id="one family across two JSON serializers"
+    ),
+    pytest.param(lambda d: (d(make_v1), d(take_optional)), None, id="a consumer that takes the type or None"),
+    pytest.param(lambda d: (d(make_rush), d(take_v1)), None, id="a subclass of what the consumer takes"),
+    pytest.param(
+        lambda d: (d(greetings_of), collecting_map(d(shout)), d(count)),
+        "TaskFailure",
+        id="a map under collect_all may hold a failure",
+    ),
+    pytest.param(
+        lambda d: (d(greetings_of), collecting_map(d(shout)), d(outcomes)),
+        None,
+        id="a map under collect_all into a consumer that takes failures",
+    ),
+    pytest.param(
+        lambda d: (d(shout), group(group(d(wrap)), d(wrap))), None, id="a group nested in a group"
+    ),
+    pytest.param(
+        lambda d: (group(group(d(shout), d(wrap)), d(wrap)), d(count)),
+        "count",
+        id="a nested group gives a list inside the list",
+    ),
 ]
 
 
 @pytest.mark.parametrize(("stages", "naming"), FIT_CASES)
 def test_a_composition_refuses_an_output_the_next_step_cannot_take(stages, naming, monkeypatch):
     monkeypatch.setattr(schemas, "_process_schemas", order_schemas())
+    # The check finds backends in the process's registry, so the pickle backend must be there.
+    process_backends = SerializerRegistry.with_defaults()
+    process_backends.register(Pickle())
+    monkeypatch.setattr(serializer_registry, "_process_serializers", process_backends)
 
     if naming is None:
         flow(*stages(declare_with_serializer))
