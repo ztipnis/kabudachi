@@ -5,14 +5,11 @@ are equal bytes. Nothing (`None`) is JSON `null`. A model whose family
 declares a `version_path` carries its version there.
 """
 
-import enum
-import json
 import types
 import typing
 from typing import Any
 
 from kabudachi import schemas
-from kabudachi.config import UNSET
 from kabudachi.errors import SerializationError, SerializerUnavailableError
 
 try:
@@ -23,45 +20,47 @@ except ImportError:
 _NONE_TYPE = type(None)
 
 
-class _Shape(enum.Enum):
-    NOTHING = "nothing"
-    MODEL = "model"
-    LIST = "list"
-
-
 def _is_model_type(candidate: Any) -> bool:
     return isinstance(candidate, type) and issubclass(candidate, _pydantic.BaseModel)
 
 
-def _classify(value_type: Any) -> tuple[_Shape, Any]:
+def _unordered(annotation: Any, seen: set[Any]) -> bool:
+    """Whether `annotation`, or a model inside it, holds a set, whose JSON
+    form would follow hash order and so differ between equal values."""
+    if annotation in (set, frozenset) or typing.get_origin(annotation) in (set, frozenset):
+        return True
+    if _is_model_type(annotation):
+        if annotation in seen:
+            return False
+        seen.add(annotation)
+        return any(_unordered(field.annotation, seen) for field in annotation.model_fields.values())
+    return any(_unordered(argument, seen) for argument in typing.get_args(annotation))
+
+
+def _ordered(model_type: Any) -> Any:
+    if _unordered(model_type, set()):
+        raise SerializationError(
+            f"the pydantic serializer cannot carry {model_type.__name__}: "
+            f"a set field has no stable order, so use a list or a sorted tuple"
+        )
+    return model_type
+
+
+def _classify(value_type: Any) -> tuple[schemas.Shape, Any]:
     """What `value_type` is and the model type inside it, or raises."""
     if _pydantic is None:
         raise SerializerUnavailableError("the pydantic serializer needs the 'pydantic' package")
     if value_type is _NONE_TYPE:
-        return _Shape.NOTHING, None
+        return schemas.Shape.NOTHING, None
     if _is_model_type(value_type):
-        return _Shape.MODEL, value_type
+        return schemas.Shape.ONE, _ordered(value_type)
     if typing.get_origin(value_type) is list:
         (item_type,) = typing.get_args(value_type) or (None,)
         if item_type is not None and _is_model_type(item_type):
-            return _Shape.LIST, item_type
+            return schemas.Shape.MANY, _ordered(item_type)
     raise SerializationError(
         f"the pydantic serializer supports BaseModel, list[BaseModel] and None, not {value_type!r}"
     )
-
-
-def _version_path(model_type: Any) -> tuple[str, ...] | None:
-    declared = schemas.process_schemas().schema_of(model_type)
-    return None if declared is None else declared.version_path
-
-
-def _parse(payload: Any) -> Any:
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise SerializationError(f"the payload must be bytes, not {type(payload).__name__}")
-    try:
-        return json.loads(bytes(payload))
-    except ValueError as error:
-        raise SerializationError(f"not valid JSON: {error}") from error
 
 
 def _require_instance(value: Any, model_type: Any) -> None:
@@ -141,11 +140,11 @@ class PydanticSerializer:
         `value_type`, or `null` for `None`. Raises `SerializationError` if it is
         not one, or cannot be encoded."""
         kind, model_type = _classify(value_type)
-        if kind is _Shape.NOTHING:
+        if kind is schemas.Shape.NOTHING:
             if value is not None:
                 raise SerializationError(f"expected None, got {type(value).__name__}")
             return schemas.json_bytes(None)
-        if kind is _Shape.MODEL:
+        if kind is schemas.Shape.ONE:
             return schemas.json_bytes(self._plain(value, model_type))
         if not isinstance(value, list):
             raise SerializationError(f"expected a list, got {type(value).__name__}")
@@ -157,7 +156,7 @@ class PydanticSerializer:
             plain = value.model_dump(mode="json", by_alias=True)
         except (ValueError, TypeError) as error:
             raise SerializationError(f"cannot serialize this {model_type.__name__}: {error}") from error
-        path = _version_path(model_type)
+        path = schemas.version_path_of(model_type)
         if path is not None:
             schemas.set_path(plain, path, schemas.process_schemas().version_of(model_type))
         return plain
@@ -169,19 +168,19 @@ class PydanticSerializer:
         message names a failing field, never its value.
         """
         kind, model_type = _classify(target_type)
-        plain = _parse(payload)
-        if kind is _Shape.NOTHING:
+        plain = schemas.parse_json(payload)
+        if kind is schemas.Shape.NOTHING:
             if plain is not None:
                 raise SerializationError("expected null for None")
             return None
-        if kind is _Shape.MODEL:
+        if kind is schemas.Shape.ONE:
             return self._build(plain, model_type)
         if not isinstance(plain, list):
             raise SerializationError("expected a JSON array for a list")
         return [self._build(item, model_type) for item in plain]
 
     def _build(self, plain: Any, model_type: Any) -> Any:
-        path = _version_path(model_type)
+        path = schemas.version_path_of(model_type)
         if path is not None and isinstance(plain, dict) and path[0] not in _keys(model_type):
             schemas.drop_path(plain, path)
         try:
@@ -194,13 +193,8 @@ class PydanticSerializer:
         `None` for a type whose family has none. Raises `SerializationError`
         if the payload should carry one and does not."""
         kind, model_type = _classify(value_type)
-        path = _version_path(model_type) if kind is _Shape.MODEL else None
-        if path is None:
-            return None
-        version = schemas.get_path(_parse(payload), path)
-        if isinstance(version, bool) or not isinstance(version, int):
-            raise SerializationError(f"the payload has no integer version at ${'.'.join(('', *path))}")
-        return version
+        path = schemas.version_path_of(model_type) if kind is schemas.Shape.ONE else None
+        return schemas.json_version(payload, path)
 
     def validate(self, value: Any) -> None:
         """Raises `SerializationError` if `value`, a model or a list of
@@ -217,37 +211,21 @@ class PydanticSerializer:
 
     def schema_family(self, value_type: Any) -> str | None:
         """The family of `value_type`, or `None` for a type this does not support."""
-        if not self.supports(value_type):
-            return None
-        return schemas.process_schemas().family(value_type)
+        return schemas.supported_family(self, value_type)
 
     def type_compatibility(self, produced: Any, consumed: Any) -> bool | None:
         """Whether a `produced` value fits where `consumed` is taken, judged
         by family and version; `None` for a type this does not support."""
-        return schemas.default_compatibility(self, produced, consumed, schemas.process_schemas())
+        return schemas.compatibility(self, produced, consumed)
 
     def load_plain(self, payload: bytes, value_type: Any) -> Any:
         """What a migration takes: the parsed JSON of `payload`."""
-        return _parse(payload)
+        return schemas.parse_json(payload)
 
     def dump_plain(self, plain: Any, value_type: Any) -> bytes:
         """`plain`, conformed to `value_type` by dropping the keys it lacks,
         through nested models (the default migration), as canonical JSON.
         The version at the family's `version_path` is kept."""
         kind, model_type = _classify(value_type)
-        if kind is _Shape.NOTHING:
-            return schemas.json_bytes(None)
-        path = _version_path(model_type)
-
-        def conform(item: Any) -> Any:
-            kept = _conform(item, model_type)
-            version = schemas.get_path(item, path) if path is not None else UNSET
-            if isinstance(kept, dict) and version is not UNSET:
-                schemas.set_path(kept, path, version)
-            return kept
-
-        if kind is _Shape.MODEL:
-            return schemas.json_bytes(conform(plain))
-        if not isinstance(plain, list):
-            raise SerializationError(f"expected a list, got {type(plain).__name__}")
-        return schemas.json_bytes([conform(item) for item in plain])
+        path = schemas.version_path_of(model_type) if kind is not schemas.Shape.NOTHING else None
+        return schemas.dump_conformed(plain, kind, path, lambda item: _conform(item, model_type))

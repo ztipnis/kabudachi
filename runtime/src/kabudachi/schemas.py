@@ -8,6 +8,7 @@ task's input in memory when it claims the task, one version at a time; the
 stored task never changes.
 """
 
+import enum
 import inspect
 import json
 import re
@@ -264,9 +265,13 @@ def migration(value_type: Any, *, from_version: int) -> Callable[[F], F]:
     family from `from_version` to `from_version + 1`. It takes the plain form
     of the older version and returns that of the newer."""
 
+    registry = process_schemas()
+    family = registry.family(value_type)
+    if family is None:
+        raise ValueError("None has no family to migrate")
+
     def register(function: F) -> F:
-        registry = process_schemas()
-        registry.add_migration(registry.family(value_type), from_version, function)
+        registry.add_migration(family, from_version, function)
         return function
 
     return register
@@ -392,3 +397,72 @@ def drop_path(plain: dict[str, Any], path: tuple[str, ...]) -> None:
         if child:
             break
         del parent[key]
+
+
+class Shape(enum.Enum):
+    """What a JSON serializer's type is: nothing, one value, or a list of them."""
+
+    NOTHING = "nothing"
+    ONE = "one"
+    MANY = "many"
+
+
+def version_path_of(value_type: Any) -> tuple[str, ...] | None:
+    """Where `value_type`'s family writes its version in JSON, if anywhere."""
+    declared = process_schemas().schema_of(value_type)
+    return None if declared is None else declared.version_path
+
+
+def parse_json(payload: Any) -> Any:
+    """The parsed JSON of `payload`; `SerializationError` if it is not bytes of JSON."""
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise SerializationError(f"the payload must be bytes, not {type(payload).__name__}")
+    try:
+        return json.loads(bytes(payload))
+    except ValueError as error:
+        raise SerializationError(f"not valid JSON: {error}") from error
+
+
+def json_version(payload: Any, path: tuple[str, ...] | None) -> int | None:
+    """The integer version at `path` in the JSON `payload`; `None` if there is
+    no `path`. Raises `SerializationError` if the payload has none there."""
+    if path is None:
+        return None
+    version = get_path(parse_json(payload), path)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise SerializationError(f"the payload has no integer version at ${'.'.join(('', *path))}")
+    return version
+
+
+def dump_conformed(
+    plain: Any, shape: Shape, path: tuple[str, ...] | None, conform: Callable[[Any], Any]
+) -> bytes:
+    """`plain` as canonical JSON with each item (or the one value) passed
+    through `conform`, which drops keys; the version at `path` is kept."""
+
+    def one(item: Any) -> Any:
+        kept = conform(item)
+        version = get_path(item, path) if path is not None else UNSET
+        if isinstance(kept, dict) and version is not UNSET:
+            set_path(kept, path, version)
+        return kept
+
+    if shape is Shape.NOTHING:
+        return json_bytes(None)
+    if shape is Shape.ONE:
+        return json_bytes(one(plain))
+    if not isinstance(plain, list):
+        raise SerializationError(f"expected a list, got {type(plain).__name__}")
+    return json_bytes([one(item) for item in plain])
+
+
+def supported_family(serializer: Any, value_type: Any) -> str | None:
+    """The family of `value_type`, or `None` for a type `serializer` does not support."""
+    if not serializer.supports(value_type):
+        return None
+    return process_schemas().family(value_type)
+
+
+def compatibility(serializer: Any, produced: Any, consumed: Any) -> bool | None:
+    """`default_compatibility` against this process's schemas."""
+    return default_compatibility(serializer, produced, consumed, process_schemas())

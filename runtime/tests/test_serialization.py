@@ -17,13 +17,13 @@ import pytest
 import kabudachi
 from kabudachi import schemas
 from kabudachi import serializers as serializers_module
+from kabudachi.dataclass_serializer import DataclassSerializer
 from kabudachi.errors import (
     DuplicateSerializerError,
     SerializationError,
     SerializerUnavailableError,
     UnknownSerializerError,
 )
-from kabudachi.dataclass_serializer import DataclassSerializer
 from kabudachi.protobuf_serializer import ProtobufSerializer
 from kabudachi.pydantic_serializer import PydanticSerializer
 from kabudachi.schemas import Incompatible, Newer, Runnable, SchemaRegistry
@@ -236,12 +236,14 @@ PROGRAM = textwrap.dedent(
     # The child imports kabudachi from wherever its parent does.
     sys.path[:0] = json.loads(sys.argv[1])
 
-    class BlockProtobuf(importlib.abc.MetaPathFinder):
-        def find_spec(self, name, path=None, target=None):
-            if name == "google.protobuf" or name.startswith("google.protobuf."):
-                raise ImportError("protobuf is not installed (blocked by the test)")
+    BLOCKED = ("google.protobuf", "pydantic", "pydantic_core")
 
-    sys.meta_path.insert(0, BlockProtobuf())
+    class BlockOptionalPackages(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path=None, target=None):
+            if any(name == blocked or name.startswith(blocked + ".") for blocked in BLOCKED):
+                raise ImportError(f"{name} is not installed (blocked by the test)")
+
+    sys.meta_path.insert(0, BlockOptionalPackages())
 
     import kabudachi
     from kabudachi.errors import SerializerUnavailableError
@@ -250,12 +252,13 @@ PROGRAM = textwrap.dedent(
 
     assert ProtobufSerializer().available() is False
 
-    try:
-        SerializerRegistry.with_defaults().get("protobuf")
-    except SerializerUnavailableError:
-        pass
-    else:
-        raise SystemExit("asking for the protobuf serializer should have failed")
+    for missing in ("protobuf", "pydantic"):
+        try:
+            SerializerRegistry.with_defaults().get(missing)
+        except SerializerUnavailableError:
+            pass
+        else:
+            raise SystemExit(f"asking for the {missing} serializer should have failed")
 
     try:
         ProtobufSerializer().encode(None, type(None))
@@ -269,7 +272,7 @@ PROGRAM = textwrap.dedent(
 )
 
 
-def test_the_package_imports_and_reports_a_missing_protobuf_on_use():
+def test_the_package_imports_and_reports_a_missing_optional_package_on_use():
     result = subprocess.run(
         [sys.executable, "-c", PROGRAM, json.dumps(sys.path)],
         capture_output=True,
@@ -408,6 +411,18 @@ class Parcel:
     label: Label | None = None
 
 
+@dataclasses.dataclass
+class Reading:
+    value: float | None
+    by_day: dict[str, float]
+
+
+class Crate(pydantic.BaseModel):
+    order: str
+    parts: list[Order]
+    main: Order | None = None
+
+
 JSON_CASES = [
     (PydanticSerializer(), Shipment(order="o1", items=["b", "a"], notes={"z": 1, "a": 2}), Shipment),
     (PydanticSerializer(), [Shipment(order="o1", items=[])], list[Shipment]),
@@ -423,18 +438,103 @@ def test_a_json_serializer_round_trips_and_encodes_equal_values_to_the_same_byte
     assert backend.decode(encoded, value_type) == value
     assert backend.encode(backend.decode(encoded, value_type), value_type) == encoded
     assert b" " not in encoded and b"\n" not in encoded, "compact separators"
-    if isinstance(value, Shipment):
-        assert encoded.index(b'"a"') < encoded.index(b'"z"'), "keys are sorted"
     backend.validate(backend.decode(encoded, value_type))
 
 
-@pytest.mark.parametrize("backend", [PydanticSerializer(), DataclassSerializer()])
-def test_a_json_serializer_refuses_what_it_cannot_carry(backend):
-    assert not backend.supports(Greeting)
-    assert not backend.supports(int)
+def test_a_json_serializer_sorts_keys():
+    encoded = PydanticSerializer().encode(
+        Shipment(order="o1", items=[], notes={"z": 1, "a": 2}), Shipment
+    )
+    assert b'"notes":{"a":2,"z":1}' in encoded
+
+
+@pytest.mark.parametrize(
+    "value, value_type, expected",
+    [
+        pytest.param(Parcel("o", [1, 2.5]), Parcel, b'"weights":[1.0,2.5]', id="in a list"),
+        pytest.param(Reading(3, {"mon": 4}), Reading, b'"by_day":{"mon":4.0},"value":3.0', id="in an optional and a dict"),
+    ],
+)
+def test_an_int_in_a_float_field_encodes_to_the_same_bytes_as_the_float(value, value_type, expected):
+    backend = DataclassSerializer()
+    encoded = backend.encode(value, value_type)
+    assert expected in encoded
+    assert backend.encode(backend.decode(encoded, value_type), value_type) == encoded
+
+
+def test_an_int_too_large_for_a_float_is_refused_not_overflowed():
+    backend = DataclassSerializer()
     with pytest.raises(SerializationError):
-        backend.decode(b"{not json", Shipment if isinstance(backend, PydanticSerializer) else Parcel)
-    assert backend.type_compatibility(Greeting, Greeting) is None
+        backend.encode(Parcel("o", [10**400]), Parcel)
+    with pytest.raises(SerializationError):
+        backend.decode(b'{"order":"o","weights":[1' + b"0" * 400 + b"]}", Parcel)
+
+
+class Tagged(pydantic.BaseModel):
+    tags: set[str]
+
+
+class FrozenTagged(pydantic.BaseModel):
+    tags: frozenset[str]
+
+
+class Holder(pydantic.BaseModel):
+    tagged: list[Tagged] | None = None
+
+
+@pytest.mark.parametrize("value_type", [Tagged, FrozenTagged, Holder, list[Holder]])
+def test_a_pydantic_model_with_a_set_is_refused_because_a_set_has_no_stable_order(value_type):
+    backend = PydanticSerializer()
+    assert not backend.supports(value_type)
+    with pytest.raises(SerializationError, match="set"):
+        backend.encode(None, value_type)
+
+
+@dataclasses.dataclass
+class Hidden:
+    shown: str
+    computed: str = dataclasses.field(init=False, default="x")
+
+
+def test_a_dataclass_with_a_field_init_cannot_set_is_refused():
+    assert not DataclassSerializer().supports(Hidden)
+
+
+REFUSALS = [
+    pytest.param(PydanticSerializer(), Shipment, b"{not json", "{not", id="pydantic not json"),
+    pytest.param(DataclassSerializer(), Parcel, b"{not json", "{not", id="dataclass not json"),
+    pytest.param(DataclassSerializer(), Parcel, b'{"order":"leaky-value"}', "leaky", id="dataclass missing required key"),
+    pytest.param(
+        DataclassSerializer(), Parcel, b'{"order":"o","weights":[],"leaky_key":1}', "leaky_key",
+        id="dataclass unknown key",
+    ),
+    pytest.param(
+        DataclassSerializer(), Parcel, b'{"order":7,"weights":["leaky-value"]}', "leaky",
+        id="dataclass wrong scalar type",
+    ),
+    pytest.param(
+        DataclassSerializer(), Reading, b'{"value":null,"by_day":{"leaky_key":"leaky-value"}}', "leaky",
+        id="dataclass wrong scalar type under a dict key",
+    ),
+    pytest.param(
+        PydanticSerializer(), Shipment, b'{"order":"o","items":"leaky-value"}', "leaky",
+        id="pydantic validation failure",
+    ),
+]
+
+
+@pytest.mark.parametrize("backend, value_type, payload, leak", REFUSALS)
+def test_a_json_serializer_refuses_bad_bytes_without_echoing_them(backend, value_type, payload, leak):
+    with pytest.raises(SerializationError) as refused:
+        backend.decode(payload, value_type)
+    assert leak not in str(refused.value)
+
+
+def test_a_json_serializer_refuses_types_it_cannot_carry():
+    for backend in (PydanticSerializer(), DataclassSerializer()):
+        assert not backend.supports(Greeting)
+        assert not backend.supports(int)
+        assert backend.type_compatibility(Greeting, Greeting) is None
 
 
 @pytest.mark.parametrize(
@@ -456,16 +556,56 @@ def test_the_default_migration_drops_fields_the_new_version_lacks_and_defaults_n
     assert backend.decode(migrated, target) == expected
 
 
-def test_a_family_with_a_version_path_carries_its_version_in_the_payload(monkeypatch):
+def test_the_default_migration_drops_fields_inside_nested_models_and_lists_of_them():
+    migrated = PydanticSerializer().dump_plain(
+        {
+            "order": "o",
+            "parts": [{"text": "t", "gone": 1}],
+            "main": {"text": "m", "gone": 2},
+            "gone": 3,
+        },
+        Crate,
+    )
+    assert json.loads(migrated) == {"order": "o", "parts": [{"text": "t"}], "main": {"text": "m"}}
+
+
+VERSIONED = [
+    pytest.param(PydanticSerializer(), Shipment, Shipment(order="o", items=[]), {"order": "o", "items": []}, id="pydantic"),
+    pytest.param(DataclassSerializer(), Parcel, Parcel(order="o", weights=[]), {"order": "o", "weights": []}, id="dataclass"),
+]
+
+
+@pytest.mark.parametrize("backend, cls, value, bare", VERSIONED)
+def test_a_family_with_a_version_path_carries_its_version_in_the_payload(
+    monkeypatch, backend, cls, value, bare
+):
     registry = SchemaRegistry()
     monkeypatch.setattr(schemas, "_process_schemas", registry)
-    registry.declare(Shipment, version=3, version_path="$.meta.v")
-    backend = PydanticSerializer()
-    encoded = backend.encode(Shipment(order="o", items=[]), Shipment)
+    registry.declare(cls, version=3, version_path="$.meta.v")
+
+    encoded = backend.encode(value, cls)
     assert json.loads(encoded)["meta"] == {"v": 3}
-    assert backend.extract_version(encoded, Shipment) == 3
-    assert backend.decode(encoded, Shipment) == Shipment(order="o", items=[]), "the version key is not a field"
-    old = json.dumps({"order": "o", "items": [], "meta": {"v": 1}}).encode()
-    assert backend.extract_version(old, Shipment) == 1
-    listed = backend.encode([Shipment(order="o", items=[])], list[Shipment])
-    assert backend.extract_version(listed, list[Shipment]) is None
+    assert backend.extract_version(encoded, cls) == 3
+    assert backend.decode(encoded, cls) == value, "the version key is not a field"
+    old = json.dumps({**bare, "meta": {"v": 1}}).encode()
+    assert backend.extract_version(old, cls) == 1
+    listed = backend.encode([value], list[cls])
+    assert backend.extract_version(listed, list[cls]) is None
+    kept = backend.dump_plain({**bare, "gone": 1, "meta": {"v": 2, "other": 1}}, cls)
+    assert json.loads(kept) == {**bare, "meta": {"v": 2}}, "the default migration keeps the version only"
+    with pytest.raises(SerializationError, match="version"):
+        backend.extract_version(json.dumps(bare).encode(), cls)
+
+
+def test_dropping_a_version_leaves_no_empty_objects_behind():
+    plain = {"a": {"b": {"v": 1}}, "keep": 1}
+    schemas.drop_path(plain, ("a", "b", "v"))
+    assert plain == {"keep": 1}
+    plain = {"a": {"b": {"v": 1}, "other": 2}}
+    schemas.drop_path(plain, ("a", "b", "v"))
+    assert plain == {"a": {"other": 2}}
+
+
+def test_a_migration_cannot_be_registered_for_none():
+    with pytest.raises(ValueError, match="family"):
+        schemas.migration(type(None), from_version=0)

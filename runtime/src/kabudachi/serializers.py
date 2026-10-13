@@ -3,12 +3,12 @@
 import pickle
 from typing import Any, Protocol
 
+from kabudachi.dataclass_serializer import DataclassSerializer
 from kabudachi.errors import (
     DuplicateSerializerError,
     SerializerUnavailableError,
     UnknownSerializerError,
 )
-from kabudachi.dataclass_serializer import DataclassSerializer
 from kabudachi.protobuf_serializer import ProtobufSerializer
 from kabudachi.pydantic_serializer import PydanticSerializer
 

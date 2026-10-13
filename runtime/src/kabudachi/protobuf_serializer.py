@@ -180,14 +180,12 @@ class ProtobufSerializer:
 
     def schema_family(self, value_type: Any) -> str | None:
         """The family of `value_type`, or `None` for a type this does not support."""
-        if not self.supports(value_type):
-            return None
-        return schemas.process_schemas().family(value_type)
+        return schemas.supported_family(self, value_type)
 
     def type_compatibility(self, produced: Any, consumed: Any) -> bool | None:
         """Whether a `produced` value fits where `consumed` is taken, judged
         by family and version; `None` for a type this does not support."""
-        return schemas.default_compatibility(self, produced, consumed, schemas.process_schemas())
+        return schemas.compatibility(self, produced, consumed)
 
     def load_plain(self, payload: bytes, value_type: Any) -> Any:
         """What a migration takes: `payload` parsed as `value_type`. Fields
