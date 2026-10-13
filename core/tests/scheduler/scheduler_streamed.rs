@@ -247,6 +247,13 @@ fn a_page_is_written_once_it_is_whole_or_its_composite_is_over_and_never_in_betw
     let record = fixture.spy.newest_composite(&map).unwrap();
     assert_eq!((record.members, record.sealed, record.finished), (total, true, true));
     assert_eq!(record.counts.unwrap().failed, 1);
+    assert_eq!(fixture.spy.page_revisions(&map, 0), 2, "page 0 is written again once, when the composite ends");
+    for page in 0..record.pages {
+        assert!(
+            fixture.spy.newest_page(&map, page).unwrap().finished,
+            "page {page} ends as a finished record, so it can be retired"
+        );
+    }
 }
 
 #[test]
@@ -318,7 +325,13 @@ fn a_hundred_thousand_item_map_streams_under_toggling_slow_down_once_each_and_in
     let mut entries_seen = 0;
     for page in 0..record.pages {
         let entries = fixture.spy.newest_page(&map, page).unwrap().entries;
-        assert_eq!(fixture.spy.page_revisions(&map, page), 1);
+        let whole = entries.len() as u64 == PAGE_ENTRIES;
+        assert_eq!(
+            fixture.spy.page_revisions(&map, page),
+            if whole { 2 } else { 1 },
+            "a whole page is written when it fills and again when the map ends; a partial one only when it ends"
+        );
+        assert!(fixture.spy.newest_page(&map, page).unwrap().finished, "page {page} is finished");
         entries_seen += entries.len() as u64;
         assert!(entries.windows(2).all(|pair| pair[0].index < pair[1].index), "page {page} is in order");
         for entry in entries {

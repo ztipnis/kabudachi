@@ -273,14 +273,17 @@ impl Composites {
         }
     }
 
-    /// The composite `id` is over: every page kept back is written now.
+    /// The composite `id` is over: every page is written now, those kept
+    /// back for the first time and those already written while it ran, which
+    /// were stamped unfinished and are rewritten as finished so a store can
+    /// begin retiring them.
     pub(super) fn release_pages(&mut self, id: &CompositeId) {
-        let kept: Vec<(CompositeId, u32)> = self
-            .unwritten_pages
-            .range((id.clone(), 0)..=(id.clone(), u32::MAX))
-            .cloned()
-            .collect();
-        for key in kept {
+        let Some(composite) = self.held.get(id) else {
+            return;
+        };
+        let pages = composite.pages();
+        for page in 0..pages {
+            let key = (id.clone(), page);
             self.unwritten_pages.remove(&key);
             self.unpublished_pages.insert(key);
         }

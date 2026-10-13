@@ -48,6 +48,8 @@ CLIENTS = {}
 
 # How many times SlowDown went from cleared to raised here, as sampled.
 RAISES = 0
+# The sampling task, held here so it is not garbage collected while it runs.
+SAMPLING: asyncio.Task | None = None
 SLOW_DOWN_SAMPLE_SECONDS = 0.02
 
 
@@ -158,8 +160,9 @@ async def answer(native, command: dict) -> dict:
 
 
 async def main() -> None:
+    global SAMPLING
     native = session.current_session().runtime
-    sampling = asyncio.create_task(count_slow_down_raises(native))
+    SAMPLING = asyncio.create_task(count_slow_down_raises(native))
     say(ready={
         "worker": native.worker_id(),
         "address": native.address(),
