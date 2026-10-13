@@ -500,6 +500,12 @@ def test_a_dataclass_with_a_field_init_cannot_set_is_refused():
     assert not DataclassSerializer().supports(Hidden)
 
 
+class Sealed(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    order: str
+
+
 REFUSALS = [
     pytest.param(PydanticSerializer(), Shipment, b"{not json", "{not", id="pydantic not json"),
     pytest.param(DataclassSerializer(), Parcel, b"{not json", "{not", id="dataclass not json"),
@@ -519,6 +525,14 @@ REFUSALS = [
     pytest.param(
         PydanticSerializer(), Shipment, b'{"order":"o","items":"leaky-value"}', "leaky",
         id="pydantic validation failure",
+    ),
+    pytest.param(
+        PydanticSerializer(), Shipment, b'{"order":"o","items":[],"notes":{"leaky_key":"x"}}', "leaky",
+        id="pydantic bad value under a dict key",
+    ),
+    pytest.param(
+        PydanticSerializer(), Sealed, b'{"order":"o","leaky_extra":1}', "leaky",
+        id="pydantic extra key on a model that forbids them",
     ),
 ]
 

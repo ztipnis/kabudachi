@@ -47,7 +47,7 @@ def _carries(annotation: Any, seen: set[Any]) -> bool:
         seen.add(annotation)
         try:
             hints = _hints(annotation)
-        except (NameError, TypeError, AttributeError):
+        except (NameError, TypeError, AttributeError, SyntaxError):
             return False
         return all(
             field.init and _carries(hints[field.name], seen)

@@ -268,7 +268,7 @@ def migration(value_type: Any, *, from_version: int) -> Callable[[F], F]:
     registry = process_schemas()
     family = registry.family(value_type)
     if family is None:
-        raise ValueError("None has no family to migrate")
+        raise ValueError(f"{value_type!r} has no family to migrate")
 
     def register(function: F) -> F:
         registry.add_migration(family, from_version, function)

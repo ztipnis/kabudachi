@@ -110,9 +110,33 @@ def _conform(plain: Any, model_type: Any) -> Any:
     return kept
 
 
+def _safe_location(model_type: Any, location: tuple[Any, ...]) -> str:
+    """The leading part of a pydantic error `location` that names model fields.
+
+    The location also holds input data (dict keys, extra field names, union arm
+    tags), so it is followed down the models and cut at the first part that is
+    not one of their fields; a list index is shown as `[index]`.
+    """
+    rendered = ""
+    current = model_type
+    for part in location:
+        if isinstance(part, int):
+            if current is None:
+                break
+            rendered += "[index]"
+            continue
+        fields = _keys(current) if current is not None else {}
+        if part not in fields:
+            break
+        rendered += f".{part}" if rendered else part
+        nested = _nested_model(fields[part].annotation)
+        current = nested[0] if nested is not None else None
+    return rendered
+
+
 def _first_failure(model_type: Any, error: Any) -> SerializationError:
     failures = error.errors()
-    where = ".".join(str(part) for part in failures[0]["loc"]) if failures else ""
+    where = _safe_location(model_type, tuple(failures[0]["loc"])) if failures else ""
     kind = failures[0]["type"] if failures else "invalid"
     named = f"field {where}" if where else "the value"
     return SerializationError(f"not a valid {model_type.__name__}: {named} is {kind}")
@@ -155,7 +179,9 @@ class PydanticSerializer:
         try:
             plain = value.model_dump(mode="json", by_alias=True)
         except (ValueError, TypeError) as error:
-            raise SerializationError(f"cannot serialize this {model_type.__name__}: {error}") from error
+            raise SerializationError(
+                f"cannot serialize this {model_type.__name__}: {type(error).__name__}"
+            ) from error
         path = schemas.version_path_of(model_type)
         if path is not None:
             schemas.set_path(plain, path, schemas.process_schemas().version_of(model_type))
