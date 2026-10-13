@@ -1434,7 +1434,13 @@ def test_the_reducer_decorator_declares_a_reducer_with_its_options(fresh_registr
     tree = kabudachi.reducer(serializer="pickle", name="decorated.tree", associative=True)(_concat).definition
     retried = kabudachi.reducer(serializer="pickle", name="decorated.retried", retries=2)(_concat).definition
     orphaned = kabudachi.reducer(serializer="pickle", name="decorated.orphaned", retriable=False)(_concat).definition
+    kept = kabudachi.reducer(
+        serializer="pickle", name="decorated.kept", raise_on_failed_migration=True
+    )(_concat).definition
 
+    assert [found.raise_on_failed_migration for found in (bare, kept)] == [False, True]
+    with pytest.raises(TaskDefinitionError, match="raise_on_failed_migration"):
+        kabudachi.reducer(serializer="pickle", name="decorated.refused", raise_on_failed_migration="yes")(_concat)
     assert bare.name == f"{_latest.__module__}._latest"
     assert [
         (found.reducer.associative, found.reducer.tree) for found in (bare, tree)

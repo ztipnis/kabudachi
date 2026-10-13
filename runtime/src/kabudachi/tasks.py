@@ -658,6 +658,7 @@ def reducer(
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
     reconnect_timeout: timedelta | None = ...,
+    raise_on_failed_migration: bool = ...,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 def reducer(
     func: Any = None,
@@ -675,6 +676,7 @@ def reducer(
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
     reconnect_timeout: timedelta | None = None,
+    raise_on_failed_migration: bool = False,
 ) -> Any:
     """Declares a reducer: a durable task `(item, previous) -> previous`
     that `.reduce(items)` folds over a list, left to right, one certified
@@ -694,7 +696,9 @@ def reducer(
 
     Takes the other options of `task`, with the same defaults, and raises
     `TaskDefinitionError` for a function that is not a reducer or an
-    inconsistent combination.
+    inconsistent combination. `raise_on_failed_migration=True` leaves a step
+    of the reduce whose item this worker cannot migrate for another worker
+    instead of dropping it, as for `task`.
     """
     options = {
         "name": name,
@@ -706,6 +710,7 @@ def reducer(
         "cancel_grace": cancel_grace,
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
+        "raise_on_failed_migration": raise_on_failed_migration,
         "associative": associative,
         "tree": tree,
         "merge": merge,
