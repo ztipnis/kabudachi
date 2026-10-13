@@ -110,6 +110,18 @@ def _largest_value(tree: Any) -> int:
     return max((_largest_value(stage) for stage in tree[2]), default=0)
 
 
+def refuse_oversized_values(runtime: Runtime, tree: Any) -> None:
+    """Raises `PayloadTooLargeError` if a value bound anywhere in the
+    described `tree` alone is past the hard limit this process can hold."""
+    limit = runtime.payload_limit
+    if limit is not None and (size := _largest_value(tree)) > limit:
+        raise PayloadTooLargeError(
+            f"a value bound in this step is {size} bytes, past the {limit} this process can hold",
+            size,
+            limit,
+        )
+
+
 class Composites:
     """The flows, groups and maps this session submitted, by composite id.
     The leader runs them; this only submits them, cancels them, and settles
@@ -139,13 +151,7 @@ class Composites:
             raise RunStoppedError("the run is stopping, so no more flows are accepted")
         tree = step.describe(self._session, previous)
         runtime = self._session.runtime
-        limit = runtime.payload_limit
-        if limit is not None and (size := _largest_value(tree)) > limit:
-            raise PayloadTooLargeError(
-                f"a value bound in this step is {size} bytes, past the {limit} this process can hold",
-                size,
-                limit,
-            )
+        refuse_oversized_values(runtime, tree)
         with self._lock:
             # Registered under the lock the finish is looked up under, so a
             # composite that ends at once is never missed.

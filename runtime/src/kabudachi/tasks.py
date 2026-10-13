@@ -316,13 +316,18 @@ class Task(wrapt.ObjectProxy):
 
     @classmethod
     def _task_name(cls, func: Callable[..., Any], chosen: str | Unset) -> str:
+        name = cls._chosen_or_default_name(func, chosen)
+        if name.startswith(RESERVED_NAME_PREFIX):
+            raise TaskDefinitionError(
+                f"the task name {name!r} cannot start with {RESERVED_NAME_PREFIX!r}, "
+                "which is kept for kabudachi's own runs; give the task a name="
+            )
+        return name
+
+    @classmethod
+    def _chosen_or_default_name(cls, func: Callable[..., Any], chosen: str | Unset) -> str:
         if chosen is not UNSET:
             cls._require_string("name", chosen)
-            if chosen.startswith(RESERVED_NAME_PREFIX):
-                raise TaskDefinitionError(
-                    f"the task name {chosen!r} cannot start with {RESERVED_NAME_PREFIX!r}, "
-                    "which is kept for kabudachi's own runs"
-                )
             return chosen
         qualified = getattr(func, "__qualname__", None)
         module = getattr(func, "__module__", None)

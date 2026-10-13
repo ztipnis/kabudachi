@@ -39,7 +39,7 @@ from typing import Any
 from kabudachi import _native
 from kabudachi._native import MAX_FAILURE_MESSAGE_BYTES, EventKind, RunState
 from kabudachi.body import Given, RunningBody, decode_resolved
-from kabudachi.composites import Composites, composite_is_running
+from kabudachi.composites import Composites, composite_is_running, refuse_oversized_values
 from kabudachi.config import Configuration
 from kabudachi.errors import (
     BackpressureError,
@@ -936,6 +936,7 @@ class Session:
         tree = step.describe(self)
         if step.is_task:
             tree = ("flow", "fail_fast", [tree])
+        refuse_oversized_values(self._runtime, tree)
         self._runtime.complete(claim.task_run_id, continuation=tree)
         if run.holds_handle:
             self._tasks.continuing(claim.task_id, _native.continuation_of(claim.task_run_id))

@@ -163,6 +163,17 @@ def test_a_task_name_cannot_take_the_reserved_prefix():
         )
 
 
+def test_a_task_named_by_default_cannot_land_in_the_reserved_prefix():
+    def refresh(request: Greeting) -> Greeting:
+        return request
+
+    refresh.__module__ = "kabudachi.extras"
+    refresh.__qualname__ = "refresh"
+
+    with pytest.raises(TaskDefinitionError, match="kabudachi."):
+        Task(refresh, registry=TaskRegistry(), serializers=SerializerRegistry.with_defaults())
+
+
 def test_a_task_failure_keeps_its_kind_and_message_across_the_task_process_pipe():
     failure = pickle.loads(pickle.dumps(TaskFailure("ValueError", "bad input")))
 
@@ -493,6 +504,25 @@ def test_cancelling_a_finished_flow_or_group_changes_nothing(build, results):
         return handle.cancel()
 
     assert run(with_events(world, body)) is False
+
+
+@pytest.mark.parametrize("shape", [flow, group])
+def test_cancelling_a_failed_flow_or_group_changes_nothing(shape):
+    def explode(request: Greeting) -> Greeting:
+        raise ValueError("stage failed")
+
+    world = World(shout, explode)
+    target = shape(*stages(world, "shout", "explode"))
+
+    async def body():
+        handle = target.start(world.session, Greeting(text="a"))
+        with pytest.raises(ValueError, match="stage failed"):
+            await handle
+        assert handle.cancel() is False
+        with pytest.raises(ValueError, match="stage failed"):
+            await handle
+
+    run(with_events(world, body))
 
 
 @FLOW_AND_GROUP
@@ -844,6 +874,23 @@ def test_a_returned_step_that_needs_an_input_is_refused_and_fails_the_run():
 
     async def body():
         with pytest.raises(TaskDefinitionError, match="input"):
+            await world.session.submit(planner.definition, Greeting())
+
+    run(with_events(world, body))
+
+    assert [e[0] for e in world.runtime.events][-1] == "fail"
+
+
+def test_a_returned_step_bound_to_a_value_past_the_hard_limit_alone_fails_the_run():
+    world = continuing_world(memory_soft_limit=SOFT_LIMIT, memory_hard_limit=200)
+
+    def plan(request: Greeting) -> Flow:
+        return flow(world.tasks["shout"].bind(Greeting(text="x" * 400)))
+
+    planner = declare_planner(world, plan)
+
+    async def body():
+        with pytest.raises(PayloadTooLargeError):
             await world.session.submit(planner.definition, Greeting())
 
     run(with_events(world, body))
@@ -1213,3 +1260,5 @@ def test_under_fail_fast_the_stage_runs_once_only_if_every_member_succeeds(failu
     else:
         assert seen == [], "a failed group must not start the stage after it"
         assert isinstance(outcome, ValueError)
+        failing = {f"member {i} failed" for i, count in enumerate(failures) if count > RETRIES}
+        assert str(outcome) in failing
