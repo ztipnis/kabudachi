@@ -344,17 +344,24 @@ impl NativeRuntime {
     }
 
     /// Reports that a claimed run failed with an error of type `failure_kind`
-    /// (the type's name, never the error's message), whether or not its body
-    /// started. Returns whether the task has retries left, so a new attempt
-    /// is now waiting to be claimed; `False` means the task has failed for
-    /// good.
+    /// (the type's name) and the error's message `failure_message` (never its
+    /// traceback; the leader keeps at most `MAX_FAILURE_MESSAGE_BYTES` of it),
+    /// whether or not its body started. Returns whether the task has retries
+    /// left, so a new attempt is now waiting to be claimed; `False` means the
+    /// task has failed for good.
     ///
     /// Raises `RuntimeError` if the run is unknown, is not this worker's, or
     /// has already finished; the failure is then not recorded.
-    fn report_failure(&self, task_run_id: &str, failure_kind: &str) -> PyResult<bool> {
+    #[pyo3(signature = (task_run_id, failure_kind, failure_message = ""))]
+    fn report_failure(
+        &self,
+        task_run_id: &str,
+        failure_kind: &str,
+        failure_message: &str,
+    ) -> PyResult<bool> {
         let failure = self
             .door
-            .report_failure(&TaskRunId::new(task_run_id), failure_kind)
+            .report_failure(&TaskRunId::new(task_run_id), failure_kind, failure_message)
             .map_err(|refusal| refused(refusal, rejected))?;
         Ok(failure.retry.is_some())
     }

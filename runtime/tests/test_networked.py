@@ -101,6 +101,18 @@ def delivered_to_its_submitter(cluster, leader):
     runner = cluster.by_id(record["runs"][0]["worker"])
     assert runner.ask(claimed=spun)["client"] == follower.id
 
+    # A body that fails: its run keeps the error's type and message (no
+    # traceback), and when it was claimed and started.
+    failing = follower.submit("fails", text="card declined")
+    record = finished(cluster, failing)
+    [run] = record["runs"]
+    assert (run["state"], run["failure_kind"], run["failure_message"]) == (
+        "FAILED",
+        "ValueError",
+        "card declined",
+    )
+    assert run["claimed_at"] is not None and run["started_at"] >= run["claimed_at"]
+
 
 def carried_as_blobs(cluster, leader):
     # An input and a result each larger than one message travel as blobs: the

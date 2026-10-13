@@ -43,6 +43,10 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<outcomes::PyEventKind>()?;
     m.add_class::<outcomes::PyCancelOutcome>()?;
     m.add_class::<outcomes::PyRunState>()?;
+    m.add(
+        "MAX_FAILURE_MESSAGE_BYTES",
+        kabudachi_core::scheduler::MAX_FAILURE_MESSAGE_BYTES,
+    )?;
     m.add("KabudachiError", m.py().get_type::<errors::KabudachiError>())?;
     m.add("BackpressureError", errors::backpressure_error_type(m.py())?)?;
     Ok(())

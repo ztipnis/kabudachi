@@ -92,6 +92,9 @@ async def answer(native, command: dict) -> dict:
                 "state": _STATES[run.state],
                 "worker": run.worker,
                 "failure_kind": run.failure_kind,
+                "failure_message": run.failure_message,
+                "claimed_at": run.claimed_at_ms,
+                "started_at": run.started_at_ms,
                 "digest": None if run.result_digest is None else run.result_digest.hex(),
                 "delivered": run.delivered,
             }

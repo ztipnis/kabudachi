@@ -339,13 +339,15 @@ impl NetworkedRuntime {
         Ok(())
     }
 
-    /// Hands the leader a run's failure, by its error's type name.
-    fn report_failure(&self, task_run_id: &str, failure_kind: &str) {
+    /// Hands the leader a run's failure, by its error's type name and
+    /// message (never its traceback).
+    #[pyo3(signature = (task_run_id, failure_kind, failure_message = ""))]
+    fn report_failure(&self, task_run_id: &str, failure_kind: &str, failure_message: &str) {
         self.shared
             .finish(TaskRunId::new(task_run_id), |run| Report::Failed {
                 run,
                 reason: failure_kind.to_owned(),
-                message: String::new(),
+                message: failure_message.to_owned(),
             });
     }
 

@@ -217,9 +217,12 @@ class Runtime(Protocol):
         """Cancels a task, and says how that ended. `None`: the cancel was
         sent, and the leader decides."""
 
-    def report_failure(self, task_run_id: str, failure_kind: str) -> bool | None:
-        """Reports that a claimed run failed, started or not; whether a retry
-        is now queued. `None` when the leader decides elsewhere."""
+    def report_failure(
+        self, task_run_id: str, failure_kind: str, failure_message: str = ""
+    ) -> bool | None:
+        """Reports that a claimed run failed, started or not, with the error's
+        type and message; whether a retry is now queued. `None` when the
+        leader decides elsewhere."""
 
     def report_lost(self, task_run_id: str) -> bool | None:
         """Reports that a claimed run was lost with the process that ran it;

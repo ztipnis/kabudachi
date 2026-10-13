@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from kabudachi._native import EventKind, RunState
+from kabudachi._native import MAX_FAILURE_MESSAGE_BYTES, EventKind, RunState
 from kabudachi.body import RunningBody
 from kabudachi.composites import Composites
 from kabudachi.config import Configuration
@@ -584,8 +584,8 @@ class Session:
         """Sees one handed-over run to its end and settles its handle,
         whatever happens.
 
-        A task that fails is reported to the leader, by its error's type,
-        before its handle is failed with the error itself.
+        A task that fails is reported to the leader, by its error's type and
+        message, before its handle is failed with the error itself.
         """
         body: RunningBody | None = None
         try:
@@ -700,7 +700,7 @@ class Session:
             run.body_abandoned(body)
             if not run.holds_handle:
                 self._tasks.held_body_abandoned(claim.task_id, body.exited)
-        retried = self._report_failure(claim, kind)
+        retried = self._report_failure(claim, kind, _message_of(error))
         if run.holds_handle:
             if retried:
                 self._tasks.retry_queued(claim.task_id)
@@ -816,7 +816,7 @@ class Session:
         _logger.warning("compaction of %s failed with %s", claim.definition_id, kind)
         _logger.debug("compaction of %s failed", claim.definition_id, exc_info=error)
         try:
-            self._runtime.report_failure(claim.task_run_id, kind)
+            self._runtime.report_failure(claim.task_run_id, kind, _message_of(error))
         except Exception as refusal:
             _logger.warning(
                 "the leader did not record the failed compaction of %s: %s",
@@ -896,13 +896,13 @@ class Session:
                 type(refusal).__name__,
             )
 
-    def _report_failure(self, claim: Any, kind: str) -> bool | None:
+    def _report_failure(self, claim: Any, kind: str, message: str) -> bool | None:
         """Tells the leader the run failed and says whether it will be retried.
-        Only the failure's kind goes, never the error's message. A refusal is
+        The failure's kind and message go, never its traceback. A refusal is
         logged, counts as no retry, and does not replace the error, which is
         what the handle's awaiter needs to see."""
         try:
-            return self._runtime.report_failure(claim.task_run_id, kind)
+            return self._runtime.report_failure(claim.task_run_id, kind, message)
         except Exception as refusal:
             _logger.warning(
                 "the leader did not record the failure of task %s: %s",
@@ -979,6 +979,15 @@ def _kind_of(error: BaseException) -> str:
     """The type name a failure is reported and logged by: the original type
     for an error a task process could only describe."""
     return error.kind if isinstance(error, TaskBodyError) else type(error).__name__
+
+
+def _message_of(error: BaseException) -> str:
+    """What a failure is recorded with besides its type: the error's own
+    message, never its traceback, cut to what the leader keeps. It is stored
+    in the task's record, so it is what the error says, as `str(error)` gives
+    it."""
+    encoded = str(error).encode("utf-8", "replace")[:MAX_FAILURE_MESSAGE_BYTES]
+    return encoded.decode("utf-8", "ignore")
 
 
 async def invoke_callback(function: Any, value: Any) -> None:
