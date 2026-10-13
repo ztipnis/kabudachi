@@ -38,7 +38,7 @@ from kabudachi.errors import (
 )
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskKind, TaskRegistry
-from kabudachi.schemas import SchemaRegistry, schema
+from kabudachi.schemas import MigrateRejectError, SchemaRegistry, schema
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session, validate_definitions
 from kabudachi.status import Durability, TaskStatus
@@ -81,6 +81,17 @@ def test_submission_carries_the_task_definition_encoded_input_queue_and_input_ve
     assert definition_id == "tests.echo"
     assert payload == argument.SerializeToString()
     assert (submitted_version, submitted_queue) == (version, queue)
+
+
+def test_a_session_with_its_own_schemas_runs_a_task_at_the_version_they_give_its_input():
+    schemas = SchemaRegistry()
+    schemas.declare(Greeting, version=4)
+    world = World(echo, schemas=schemas)
+
+    async def body():
+        return await world.call("echo", Greeting(text="hi"))
+
+    assert run(with_events(world, body)).text == "hi"
 
 
 def test_an_argument_of_the_wrong_type_is_refused_before_anything_is_submitted():
@@ -2065,16 +2076,31 @@ def test_a_task_whose_input_cannot_be_migrated_is_dropped_with_a_warning_and_end
     assert seen == []
     [warning] = [record.getMessage() for record in caplog.records if "dropping task" in record.getMessage()]
     assert f"task {task_id}" in warning
+    assert "tests.take_crate" in warning
     assert "tests.session.crate" in warning and "from version 1 to 2" in warning
     assert "secret" not in caplog.text
     assert [event[3] for event in world.runtime.events if event[0] == "blocked"] == [True]
 
 
-def migrating_flow(world, name, payload, version, wanted="succeeded"):
-    """Runs a one-stage flow whose member was submitted at `version` with
-    `payload` as its input; the composite's status once it is over."""
-    settings = world.session.submission_settings(world.tasks[name].definition)
-    tree = ("flow", "fail_fast", [("task", f"tests.{name}", version, settings, payload, [])])
+def flow_status(world, *members):
+    """Runs a flow of `members`, each a (task name, version, payload) a
+    submitter of that version made; a payload of `None` takes the result of
+    the member before. The composite's status once it is over."""
+    tree = (
+        "flow",
+        "fail_fast",
+        [
+            (
+                "task",
+                f"tests.{name}",
+                version,
+                world.session.submission_settings(world.tasks[name].definition),
+                payload,
+                [],
+            )
+            for name, version, payload in members
+        ],
+    )
 
     async def body():
         composite_id = world.runtime.submit_composite(tree)
@@ -2089,7 +2115,7 @@ def test_a_member_of_a_flow_has_its_input_migrated_before_its_run_is_reported_st
     seen = []
     world = parcel_world(seen)
 
-    status = migrating_flow(world, "take_parcel", encoded(ParcelV1(label="a", weight=3)), 1)
+    status = flow_status(world, ("take_parcel", 1, encoded(ParcelV1(label="a", weight=3))))
 
     assert status[0] == "succeeded"
     assert seen == [ParcelV2(label="A")]
@@ -2101,9 +2127,142 @@ def test_a_member_whose_input_cannot_be_migrated_never_runs_and_fails_its_flow(c
     world = crate_world(seen)
 
     with caplog.at_level(logging.WARNING, logger="kabudachi"):
-        status = migrating_flow(world, "take_crate", encoded(CrateV1(label="a")), 1)
+        status = flow_status(world, ("take_crate", 1, encoded(CrateV1(label="a"))))
 
     assert status[0] == "failed"
     assert seen == []
     assert "dropping task" in caplog.text
     assert [event[0] for event in world.runtime.events] == ["blocked"]
+
+
+class GadgetV1(pydantic.BaseModel):
+    label: str
+
+
+class GadgetV2(pydantic.BaseModel):
+    label: str
+
+
+def move_gadget(plain):
+    if plain["label"] == "refuse":
+        raise MigrateRejectError("only gadgets built on weekdays can move")
+    raise ValueError(f"cannot move the gadget labelled {plain['label']}")
+
+
+schema(GadgetV1, version=1, version_path="$.v", family="tests.session.gadget")
+schema(GadgetV2, version=2, version_path="$.v", family="tests.session.gadget", migration=move_gadget)
+
+
+@pytest.mark.parametrize(
+    ("label", "reason", "leaked"),
+    [
+        pytest.param("refuse", "was refused: only gadgets built on weekdays can move", None, id="a refusal"),
+        pytest.param("secret", "failed with ValueError", "secret", id="any other error"),
+    ],
+)
+def test_a_migration_that_raises_drops_the_task_and_only_a_refusal_gives_its_message(
+    label, reason, leaked, caplog
+):
+    seen = []
+
+    def take_gadget(gadget: GadgetV2) -> GadgetV2:
+        seen.append(gadget)
+        return gadget
+
+    world = World(take_gadget, serializer="pydantic")
+
+    async def body():
+        handle = submit_at(world, "take_gadget", encoded(GadgetV1(label=label)), 1)
+        with pytest.raises(MigrationError) as raised:
+            await asyncio.wait_for(handle, WAIT)
+        return str(raised.value)
+
+    with caplog.at_level(logging.WARNING, logger="kabudachi"):
+        message = run(with_events(world, body))
+
+    assert seen == []
+    [warning] = [record.getMessage() for record in caplog.records if "dropping task" in record.getMessage()]
+    assert "tests.take_gadget" in warning
+    for text in (message, warning):
+        assert reason in text
+        assert leaked is None or leaked not in text
+
+
+def test_a_result_a_member_takes_is_migrated_from_the_version_its_producer_wrote():
+    seen = []
+
+    def make_parcel(parcel: ParcelV2) -> ParcelV2:
+        return parcel
+
+    def take_parcel(parcel: ParcelV2) -> ParcelV2:
+        seen.append(parcel)
+        return parcel
+
+    world = World(make_parcel, take_parcel, serializer="pydantic")
+    store = world.runtime.store_result
+
+    async def stored_by_an_older_worker(task_id, outcome):
+        return await store(task_id, encoded(ParcelV1(label="a", weight=3)))
+
+    world.runtime.store_result = stored_by_an_older_worker
+
+    status = flow_status(
+        world,
+        ("make_parcel", 2, encoded(ParcelV2(label="unused"))),
+        ("take_parcel", 2, None),
+    )
+
+    assert status[0] == "succeeded"
+    assert seen == [ParcelV2(label="A")]
+
+
+def merge_parcels(older: ParcelV2, newer: ParcelV2) -> ParcelV2:
+    return ParcelV2(label=older.label + newer.label)
+
+
+def compaction(world, name, *payloads):
+    """Hands the session the leader's compaction of `payloads`, written at
+    version 1; what it completed the fold with and what it reported failed."""
+    from types import SimpleNamespace
+
+    folded, failed = [], []
+    world.runtime.complete_compaction = lambda run, payload: folded.append(payload)
+    world.runtime.report_failure = lambda run, kind, message="": failed.append((kind, message))
+    claim = SimpleNamespace(
+        compaction=True,
+        definition_id=world.tasks[name].definition.name,
+        task_run_id="run-1",
+        source_version=1,
+        chain=list(payloads),
+    )
+
+    async def body():
+        world.session._start(claim)
+        await world.session.wait_until_running_finish()
+
+    run(body())
+    return folded, failed
+
+
+def test_a_compaction_folds_the_chain_migrated_to_this_workers_version():
+    world = parcel_world([], kind=TaskKind.COALESCING, merge=merge_parcels)
+
+    folded, failed = compaction(
+        world, "take_parcel", encoded(ParcelV1(label="a", weight=1)), encoded(ParcelV1(label="b"))
+    )
+
+    assert failed == []
+    [payload] = folded
+    # Each payload was shelved by the explicit migration before the merge saw it.
+    assert SerializerRegistry.with_defaults().get("pydantic").decode(payload, ParcelV2) == ParcelV2(label="AB")
+
+
+def test_a_compaction_whose_chain_cannot_be_migrated_fails_with_a_migration_error_and_folds_nothing():
+    world = crate_world([], kind=TaskKind.COALESCING)
+
+    folded, failed = compaction(world, "take_crate", encoded(CrateV1(label="a")), encoded(CrateV1(label="b")))
+
+    assert folded == []
+    [(kind, message)] = failed
+    assert kind == "MigrationError"
+    assert "declared incompatible" in message

@@ -164,7 +164,9 @@ class Session:
         self._executor = (
             executor
             if executor is not None
-            else InProcessExecutor(registry, serializers, self.concurrency, default_hooks())
+            else InProcessExecutor(
+                registry, serializers, self.concurrency, default_hooks(), self._schemas
+            )
         )
         self._executor.accept_nested_calls(self)
         # Every run and compaction this session sees through to its end.
@@ -878,7 +880,9 @@ class Session:
         """The member's `resolved` input, each payload in it migrated to the
         version of the type it is decoded as: its own input as the member's
         input type, a result it takes as the type its producer returns. The
-        first payload that cannot be is the refusal."""
+        first payload that cannot be is the refusal. A payload that carries no
+        version of its own (a producer's result whose type has no version path)
+        is taken to be at the member claim's `source_version`."""
         refused: Newer | Incompatible | None = None
 
         def migrated(serializer_name: str, value_type: Any, payload: bytes) -> bytes:
@@ -950,8 +954,9 @@ class Session:
         keep = isinstance(refused, Newer) or definition.raise_on_failed_migration
         if not keep:
             _logger.warning(
-                "dropping task %s: its input (%s) cannot be migrated from version %d to %d: %s",
+                "dropping task %s (%s): its input (%s) cannot be migrated from version %d to %d: %s",
                 claim.task_id,
+                definition.name,
                 self._schemas.family(definition.input_type),
                 claim.source_version,
                 self._schemas.version_of(definition.input_type),

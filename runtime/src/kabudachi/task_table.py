@@ -313,10 +313,15 @@ class TaskTable:
     def released(self, run: Run) -> None:
         """The claim was given back to the leader without running: the task
         is queued again, not started, and its handle waits for whatever the
-        leader decides (another worker's run, or the end of the task)."""
+        leader decides (another worker's run, or the end of the task).
+
+        A task the leader already ended is left as it is. Giving a claim back
+        reports it to the leader before this is called, and a dropped task's
+        event can settle the handle in that same call, so the task may be
+        settled by the time its run is released."""
         with self._lock:
             record = run._record
-            if run._generation == record.generation:
+            if not record.settled and run._generation == record.generation:
                 record.started = False
 
     def run_ended(self, run: Run) -> None:

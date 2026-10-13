@@ -527,7 +527,9 @@ def _migrate(
     schemas: SchemaRegistry, serializer: Any, value_type: Any, payload: bytes, planned: Runnable
 ) -> bytes:
     """`payload` through each step of `planned`, conformed to `value_type`,
-    decoded and validated; its bytes at the new version."""
+    decoded and validated; its bytes at the new version. The version is
+    written into the plain payload at the schema's version path; for a
+    payload that is a list (a list-valued type), into each dict in it."""
     plain = serializer.load_plain(payload, value_type)
     for step in planned.steps:
         if step is not None:
