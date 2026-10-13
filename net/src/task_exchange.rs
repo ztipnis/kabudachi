@@ -54,6 +54,7 @@ use kabudachi_core::time::Clock;
 use libp2p::PeerId;
 use tokio::sync::oneshot;
 
+use crate::blobs::BlobRole;
 use crate::claimed_runs::{ClaimedRuns, HeldRun};
 use crate::exchange::Asked;
 use crate::messenger::Net;
@@ -528,7 +529,7 @@ impl Net {
         let mut failed = 0;
         loop {
             if let Some(placement) = self.placement_from_leader(owner, retry).await? {
-                if let Ok(manifest) = self.store_payload(owner, payload, placement).await {
+                if let Ok(manifest) = self.store_payload(BlobRole::Input, owner, payload, placement).await {
                     return Ok(manifest);
                 }
                 failed += 1;

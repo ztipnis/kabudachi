@@ -191,7 +191,7 @@
 mod record_queries;
 mod swarm_task;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -204,7 +204,7 @@ use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{ShardId, ShardName, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::ElectionMessage;
 pub use kabudachi_core::task_record::{PlacedWrite, WriteOutcome};
-use kabudachi_core::task_record::{Placement, Write};
+use kabudachi_core::task_record::{OwnerState, Placement, Write};
 use libp2p::futures::StreamExt as _;
 use libp2p::futures::stream::FuturesUnordered;
 use libp2p::request_response::{self, ResponseChannel};
@@ -213,6 +213,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::blob_exchange::codec::BlobCodec;
+use crate::blobs::BlobRole;
 use crate::claim::codec::ClaimCodec;
 use crate::claimed_runs::ClaimedRuns;
 use crate::exchange::{Asked, Exchange};
@@ -236,6 +237,9 @@ const ASK_AGAIN_LONGEST: Duration = Duration::from_secs(1);
 /// How long a direct blob ask waits for its holder: an answer is one read of
 /// a store, so a holder that takes longer is passed over for the next.
 const BLOB_ASK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a worker puts the blobs whose owner's record moved where that
+/// record now is, and asks the shard about owners it never held a record of.
+pub const BLOB_TENDING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What [`Net::dial_for_connection`] dials.
 pub(crate) enum DialTarget {
@@ -728,6 +732,8 @@ pub struct Net {
     /// left its shard (see [`Self::submit_to_leader`]).
     pub(crate) named_leader: watch::Sender<NamedLeader>,
     driver: JoinHandle<()>,
+    /// The blob-tending task of a `Net` that stores a shard's records.
+    tending: Option<JoinHandle<()>>,
 }
 
 impl Net {
@@ -781,6 +787,9 @@ impl Net {
         let peers = Peers::new(local_addr_tx, redial_policy);
 
         let driver = tokio::spawn(swarm_task::drive(swarm, identify_config, command_rx, inbound.clone(), peers));
+        let tending = records_shard
+            .is_some()
+            .then(|| tokio::spawn(tend_blobs(commands.clone(), held.clone())));
 
         Self {
             local_worker_id,
@@ -794,6 +803,7 @@ impl Net {
             claimed: ClaimedRuns::default(),
             named_leader: watch::Sender::new(NamedLeader::default()),
             driver,
+            tending,
         }
     }
 
@@ -1088,6 +1098,9 @@ impl Drop for Net {
         // in-flight send is already best-effort); abort it outright rather
         // than negotiating a graceful stop.
         self.driver.abort();
+        if let Some(tending) = &self.tending {
+            tending.abort();
+        }
     }
 }
 
@@ -1200,11 +1213,7 @@ impl Net {
     /// one holds the record, this `Net` stores no shard's records
     /// ([`Self::new`]), or the swarm task has stopped.
     pub async fn get_record(&self, task: TaskId) -> Option<TaskRecord> {
-        let (respond_to, answer) = oneshot::channel();
-        self.commands
-            .send(Command::GetRecord { task, respond_to })
-            .ok()?;
-        answer.await.ok().flatten()
+        get_record_through(&self.commands, task).await
     }
 
     /// Stores `bytes` as a blob owned by `owner`, in this worker's own store
@@ -1219,6 +1228,17 @@ impl Net {
         placement: Placement,
     ) -> Result<Digest, PutBlobError> {
         put_blob_through(&self.commands, owner, bytes, placement, false).await
+    }
+
+    /// Like [`Self::put_blob`], for a blob stored in `role`.
+    pub(crate) async fn put_blob_in(
+        &self,
+        role: BlobRole,
+        owner: BlobOwner,
+        bytes: Vec<u8>,
+        placement: Placement,
+    ) -> Result<Digest, PutBlobError> {
+        put_blob_through(&self.commands, owner, bytes, placement, role == BlobRole::Result).await
     }
 
     /// Stores a blob this worker holds, `held`, as [`Self::put_blob`] stores
@@ -1399,6 +1419,65 @@ impl Net {
     /// one task at a time.
     pub async fn wait_for_arrival(&self) {
         self.inbound.arrived.notified().await;
+    }
+}
+
+/// Looks `task`'s record up across the shard through the swarm task (see
+/// [`Net::get_record`]).
+async fn get_record_through(commands: &mpsc::UnboundedSender<Command>, task: TaskId) -> Option<TaskRecord> {
+    let (respond_to, answer) = oneshot::channel();
+    commands.send(Command::GetRecord { task, respond_to }).ok()?;
+    answer.await.ok().flatten()
+}
+
+/// Keeps the blobs `held` holds where their owners need them, until the swarm
+/// task stops.
+///
+/// - An owner whose record a leader moved to other holders: each of its
+///   blobs is put to them, at the majority every record placement uses, and
+///   put again each tick until the quorum stores it or a newer move replaces
+///   the target. Every holder that saw the move pushes, which is harmless:
+///   puts are idempotent.
+/// - An owner never seen here whose grace has passed: its record is looked up
+///   across the shard, and the store told whether it is unfinished, finished
+///   or gone. A composite owner is reported unfinished: its record cannot be
+///   looked up yet.
+async fn tend_blobs(commands: mpsc::UnboundedSender<Command>, held: HeldRecords) {
+    let mut moving: BTreeMap<BlobOwner, Vec<WorkerId>> = BTreeMap::new();
+    let mut ticks = tokio::time::interval(BLOB_TENDING_INTERVAL);
+    loop {
+        ticks.tick().await;
+        if commands.is_closed() {
+            return;
+        }
+        // A newer move of an owner replaces an older one still pending.
+        moving.extend(held.take_blob_moves());
+        let mut unfinished = BTreeMap::new();
+        for (owner, holders) in std::mem::take(&mut moving) {
+            let placement = Placement { quorum: holders.len() / 2 + 1, holders: holders.clone() };
+            let mut stored = true;
+            for (key, value) in held.blobs_of(&owner) {
+                let result = held.blob(&key).is_some_and(|blob| blob.result);
+                stored &= put_blob_through(&commands, owner.clone(), value, placement.clone(), result)
+                    .await
+                    .is_ok();
+            }
+            if !stored {
+                unfinished.insert(owner, holders);
+            }
+        }
+        moving = unfinished;
+        for owner in held.owners_to_check() {
+            let state = match &owner {
+                BlobOwner::Task(task) => match get_record_through(&commands, task.clone()).await {
+                    None => OwnerState::Gone,
+                    Some(record) if record.finished => OwnerState::Finished,
+                    Some(_) => OwnerState::Unfinished,
+                },
+                BlobOwner::Composite(_) => OwnerState::Unfinished,
+            };
+            held.owner_checked(&owner, state);
+        }
     }
 }
 

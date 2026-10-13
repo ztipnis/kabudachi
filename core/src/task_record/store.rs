@@ -86,7 +86,8 @@ pub enum OwnerState {
 ///
 /// It also holds blobs, each for the owners that stored it (see
 /// [`Self::put_blob`]). An owner whose record (or stub) it holds keeps its
-/// blobs exactly as long as that record. A leader's revision that moves the
+/// blobs exactly as long as that record, except that the blobs it stored as
+/// inputs go at once when the record shows it finished. A leader's revision that moves the
 /// record to other holders is noted ([`Self::take_blob_moves`]), so the blobs
 /// can follow it. An owner whose record it never held keeps its blobs until a
 /// look-up across the shard finds the record finished, a grace later, or gone
@@ -129,6 +130,9 @@ struct HeldBlob {
 #[derive(Debug, Clone)]
 struct BlobsOf {
     keys: BTreeSet<BlobKey>,
+    /// The keys among `keys` the owner stored as results: they stay as long
+    /// as its record, where its inputs go once it finishes.
+    results: BTreeSet<BlobKey>,
     /// The store has held the owner's record (or a stub of it): its blobs
     /// then stay exactly as long as that record does.
     seen: bool,
@@ -161,6 +165,14 @@ fn only_placed_elsewhere(held: &TaskRecord, record: &TaskRecord) -> bool {
 fn owner_held(records: &BTreeMap<TaskId, Held>, owner: &BlobOwner) -> bool {
     match owner {
         BlobOwner::Task(task) => records.contains_key(task),
+        BlobOwner::Composite(_) => false,
+    }
+}
+
+/// Whether `records` holds `owner`'s record, or its stub, finished.
+fn owner_finished(records: &BTreeMap<TaskId, Held>, owner: &BlobOwner) -> bool {
+    match owner {
+        BlobOwner::Task(task) => records.get(task).is_some_and(|held| held.record.finished),
         BlobOwner::Composite(_) => false,
     }
 }
@@ -296,6 +308,9 @@ impl VersionedRecords {
         now: Instant,
     ) -> Put {
         self.see_owner(&task, &record, origin);
+        if record.finished {
+            self.forget_inputs_of(&BlobOwner::Task(task.clone()));
+        }
         if leaves_me_out {
             self.records.insert(task, Held::stub_of(&record, finished_since, now));
             Put::Retired
@@ -449,13 +464,24 @@ impl VersionedRecords {
         if !key.holds(&record.value) {
             return Err(BlobRefusal::WrongKey);
         }
+        // An input that arrives after its owner finished is not needed: a
+        // holder that saw the finish dropped its own copy at once.
+        if !record.result && owner_finished(&self.records, &record.owner) {
+            return Ok(());
+        }
         self.admits(key, &record)?;
         let seen = owner_held(&self.records, &record.owner);
-        self.blob_owners
-            .entry(record.owner.clone())
-            .or_insert_with(|| BlobsOf { keys: BTreeSet::new(), seen, since: now, finished: false })
-            .keys
-            .insert(key.clone());
+        let of = self.blob_owners.entry(record.owner.clone()).or_insert_with(|| BlobsOf {
+            keys: BTreeSet::new(),
+            results: BTreeSet::new(),
+            seen,
+            since: now,
+            finished: false,
+        });
+        of.keys.insert(key.clone());
+        if record.result {
+            of.results.insert(key.clone());
+        }
         self.hold_blob(key, record);
         Ok(())
     }
@@ -533,7 +559,23 @@ impl VersionedRecords {
         let Some(of) = self.blob_owners.remove(owner) else {
             return;
         };
-        for key in of.keys {
+        self.release(owner, of.keys);
+    }
+
+    /// `owner`, whose record is finished, lets go of the blobs it stored as
+    /// inputs at once; those it stored as results stay with its record.
+    fn forget_inputs_of(&mut self, owner: &BlobOwner) {
+        let Some(of) = self.blob_owners.get_mut(owner) else {
+            return;
+        };
+        let inputs: BTreeSet<BlobKey> = of.keys.difference(&of.results).cloned().collect();
+        of.keys.retain(|key| of.results.contains(key));
+        self.release(owner, inputs);
+    }
+
+    /// `owner` lets go of `keys`; a blob no other owner holds is dropped.
+    fn release(&mut self, owner: &BlobOwner, keys: BTreeSet<BlobKey>) {
+        for key in keys {
             let Some(held) = self.blobs.get_mut(&key) else {
                 continue;
             };
@@ -584,6 +626,9 @@ impl VersionedRecords {
                 if let Some(of) = self.blob_owners.get_mut(owner) {
                     of.since = now;
                     of.finished = state == OwnerState::Finished;
+                }
+                if state == OwnerState::Finished {
+                    self.forget_inputs_of(owner);
                 }
             }
         }

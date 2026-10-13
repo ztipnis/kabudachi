@@ -24,7 +24,7 @@ use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::reconcile::HeldKey;
 use kabudachi_core::reconcile::wire::held_key;
 use kabudachi_core::task_record::{
-    MAX_RECORD_BYTES, ORPHAN_BLOB_GRACE, Origin, VersionedRecords, identify, looks_claimable,
+    MAX_RECORD_BYTES, ORPHAN_BLOB_GRACE, Origin, OwnerState, VersionedRecords, identify, looks_claimable,
 };
 use kabudachi_core::time::{Clock, RealClock, WallTime};
 use libp2p::PeerId;
@@ -84,6 +84,28 @@ impl HeldRecords {
     /// The blob held under `key`, if any.
     pub fn blob(&self, key: &BlobKey) -> Option<BlobRecord> {
         self.lock().blob(key)
+    }
+
+    /// The blobs `owner` holds here, with their bytes.
+    pub fn blobs_of(&self, owner: &BlobOwner) -> Vec<(BlobKey, Vec<u8>)> {
+        self.lock().blobs_of(owner)
+    }
+
+    /// Each owner whose record a leader moved to other holders since the last
+    /// call, with the holders it moved to.
+    pub(crate) fn take_blob_moves(&self) -> Vec<(BlobOwner, Vec<WorkerId>)> {
+        self.lock().take_blob_moves()
+    }
+
+    /// The owners never seen here whose grace has passed and whose record no
+    /// look-up has found finished.
+    pub(crate) fn owners_to_check(&self) -> Vec<BlobOwner> {
+        self.lock().owners_to_check(self.clock.now())
+    }
+
+    /// Records what a look-up across the shard found of `owner`.
+    pub(crate) fn owner_checked(&self, owner: &BlobOwner, state: OwnerState) {
+        self.lock().owner_checked(owner, state, self.clock.now());
     }
 
     /// Every blob held, with its owners.

@@ -4,6 +4,7 @@
 
 use std::num::NonZeroUsize;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, MAX_BLOB_BYTES};
@@ -16,6 +17,7 @@ use kabudachi_core::protocol::messages::{TaskRejectReason, claim_response, task_
 use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint};
 use kabudachi_core::task_record::{Placement, RecordVersion};
 use kabudachi_core::time::RealClock;
+use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::messenger::{Net, PutBlobError};
 use kabudachi_net::task_exchange::{LeaderRetry, NotStored, placement_of};
 use kabudachi_net::task_store::placement::ReplicationFactor;
@@ -242,7 +244,7 @@ async fn submitted_as_blobs(
         .expect("answered");
     let placement = placement_of(&placed, &task).expect("the leader places the task");
     let manifest = client
-        .store_payload(&task, input, placement)
+        .store_payload(BlobRole::Input, &task, input, placement)
         .await
         .expect("stored");
     submitted_with(
@@ -418,6 +420,114 @@ async fn a_large_input_reaches_its_claimant_and_a_drained_holder_hands_its_blobs
                     })
                 })
                 .await;
+            })
+            .await;
+    })
+    .await
+}
+
+/// A new task whose `input` the client stores as blobs, then submits by
+/// manifest, with the shard driven meanwhile: the task and its manifest.
+async fn submit_blobs(shard: &mut Voters, client: &Net, leader: &WorkerId, input: &[u8]) -> (TaskId, Manifest) {
+    let minted = mint(plain_with(b""), &Uuid7Ids, &RealClock::new());
+    let task = minted.task_id.clone();
+    let manifest = shard.drive_until(submitted_as_blobs(client, leader, minted, input)).await;
+    (task, manifest)
+}
+
+fn shard_id(nets: &[Arc<Net>], voter: usize) -> WorkerId {
+    nets[voter].local_worker_id()
+}
+
+/// The first voter of `count` not in `but`.
+fn shard_other_than(but: &[usize], count: usize) -> usize {
+    (0..count).find(|voter| !but.contains(voter)).expect("a voter left")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tasks_input_leaves_every_holder_when_it_finishes_and_follows_its_record_when_a_holder_dies() {
+    within_deadline(async {
+        let (mut shard, client) = Voters::start_with(4, two_holders()).await;
+        let leader = shard.drive_until_a_leader().await;
+        let leader_id = shard.id(leader);
+        shard.join_as_pending(&client, leader).await;
+        let nets = shard.nets.clone();
+
+        // A task whose input is stored as blobs, claimed and finished: its
+        // input's blobs leave every holder at once, long before the record's
+        // retention passes.
+        let finished_input = varied(MIB + 1);
+        let (finished, finished_manifest) = submit_blobs(&mut shard, &client, &leader_id, &finished_input).await;
+        let finished_keys: Vec<BlobKey> = finished_manifest.blob_keys().cloned().collect();
+        let claimant = shard_other_than(&[leader], nets.len());
+        shard
+            .drive_until(async {
+                let claim = claimed_when_due(&nets[claimant], &leader_id, &finished).await;
+                let carried = claim.input_manifest().expect("readable").expect("a manifest input");
+                assert_eq!(
+                    nets[claimant].resolve_manifest(&BlobOwner::Task(finished.clone()), &carried).await,
+                    Ok(finished_input.clone())
+                );
+                nets[claimant]
+                    .report_started(leader_id.clone(), claim.task_run_id.clone())
+                    .await
+                    .expect("answered");
+                nets[claimant]
+                    .complete(leader_id.clone(), claim.task_run_id.clone(), Digest::blake3(b"done"))
+                    .await
+                    .expect("answered");
+                wait_until(|| {
+                    finished_keys
+                        .iter()
+                        .all(|key| nets.iter().all(|net| net.held_records().blob(key).is_none()))
+                })
+                .await;
+            })
+            .await;
+
+        // Another task's input follows its record when a holder of it dies.
+        let input = varied(3 * MIB / 2);
+        let (task, manifest) = submit_blobs(&mut shard, &client, &leader_id, &input).await;
+        let keys: Vec<BlobKey> = manifest.blob_keys().cloned().collect();
+
+        // A holder of its record (not the leader) dies.
+        let dead = (0..nets.len())
+            .find(|voter| *voter != leader && nets[*voter].held_records().get(&task).is_some())
+            .expect("a holder other than the leader");
+        let dead_id = shard.id(dead);
+        shard.kill(dead);
+        let survivors: Vec<usize> = (0..nets.len()).filter(|voter| *voter != dead).collect();
+
+        shard
+            .drive_until(async {
+                // The leader places the record off the dead holder, and the
+                // blobs follow it: a majority of the new placement holds each.
+                wait_until(|| {
+                    survivors.iter().any(|voter| {
+                        let Some(record) = nets[*voter].held_records().get(&task) else {
+                            return false;
+                        };
+                        let placement: Vec<WorkerId> = record.placement.into_iter().map(WorkerId::from).collect();
+                        !placement.is_empty()
+                            && !placement.contains(&dead_id)
+                            && keys.iter().all(|key| {
+                                survivors
+                                    .iter()
+                                    .filter(|holder| placement.contains(&shard_id(&nets, **holder)))
+                                    .filter(|holder| nets[**holder].held_records().blob(key).is_some())
+                                    .count()
+                                    >= placement.len() / 2 + 1
+                            })
+                    })
+                })
+                .await;
+
+                // A survivor that holds none of it reads the input whole.
+                let reader = shard_other_than(&[leader, dead], nets.len());
+                assert_eq!(
+                    nets[reader].resolve_manifest(&BlobOwner::Task(task.clone()), &manifest).await,
+                    Ok(input.clone())
+                );
             })
             .await;
     })

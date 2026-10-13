@@ -305,22 +305,39 @@ fn a_holder_keeps_a_blob_under_its_own_digest_while_its_owner_is_unfinished_and_
         "a stub of an unfinished owner keeps its blobs"
     );
 
-    // Finished, the record (here, its stub) goes after its retention, and
-    // the blob with it.
+    // Finished, the blob it stored as an input goes at once; one it stored as
+    // a result stays as long as the record (here, its stub), which goes after
+    // its retention.
+    let result = b"result chunk";
+    let result_key = BlobKey::of(result);
+    held.put_blob(&result_key, BlobRecord { result: true, ..owned_by("t1", result) }, at(20 * GRACE))
+        .unwrap();
     held.put(task_record("t1", 5, &["b", "c"], true), at(20 * GRACE))
         .unwrap();
-    held.sweep(at(20 * GRACE + RETENTION));
     assert!(held.blob(&key).is_none());
+    assert!(held.blob(&result_key).is_some());
+    held.sweep(at(20 * GRACE + RETENTION));
+    assert!(held.blob(&result_key).is_none());
 
-    // An owner never seen here but found finished elsewhere lets go a grace
-    // after the answer.
+    // An owner never seen here but found finished elsewhere lets go of an
+    // input at once, and of a result a grace after the answer.
     let mut held = store();
     held.put_blob(&key, owned_by("t3", chunk), at(0)).unwrap();
+    held.put_blob(&result_key, BlobRecord { result: true, ..owned_by("t3", result) }, at(0))
+        .unwrap();
     held.owner_checked(&task("t3"), OwnerState::Finished, at(GRACE));
+    assert!(held.blob(&key).is_none());
     assert_eq!(held.next_due(), Some(at(2 * GRACE)));
     held.sweep(at(2 * GRACE - 1));
-    assert!(held.blob(&key).is_some());
+    assert!(held.blob(&result_key).is_some());
     held.sweep(at(2 * GRACE));
+    assert!(held.blob(&result_key).is_none());
+
+    // An input is still on its way when its owner's finish is seen: it is
+    // not kept.
+    let mut held = store();
+    held.put(task_record("t7", 1, &["a", "b"], true), at(0)).unwrap();
+    held.put_blob(&key, owned_by("t7", chunk), at(1)).unwrap();
     assert!(held.blob(&key).is_none());
 
     // A copy handed off by a draining worker names that worker's old holders:

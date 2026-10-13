@@ -15,16 +15,26 @@ use crate::messenger::{Net, PutBlobError};
 /// How many blobs one payload stores or fetches at once.
 const BLOBS_IN_FLIGHT: usize = 16;
 
+/// What a payload's blobs are stored as. A holder keeps part of its share of
+/// memory for results, which inputs cannot fill, and drops a finished task's
+/// input blobs at once while its result blobs stay as long as its record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobRole {
+    Input,
+    Result,
+}
+
 impl Net {
-    /// Cuts `payload` into blobs owned by the task `owner`, stores each at a
-    /// quorum of `placement` (see [`Net::put_blob`]), and returns the manifest
-    /// naming them. Fails if any blob was not stored.
+    /// Cuts `payload` into blobs owned by the task `owner`, stores each in
+    /// `role` at a quorum of `placement` (see [`Net::put_blob`]), and returns
+    /// the manifest naming them. Fails if any blob was not stored.
     ///
     /// Known limit: the caller's `payload` and the chunk copies made here are
     /// alive together, so peak memory is about twice the payload, while the
     /// memory ledger counts the payload once.
     pub async fn store_payload(
         &self,
+        role: BlobRole,
         owner: &TaskId,
         payload: &[u8],
         placement: Placement,
@@ -32,7 +42,7 @@ impl Net {
         let Chunked { manifest, chunks } = Manifest::chunk(payload);
         let mut puts =
             stream::iter(chunks.into_iter().map(|chunk| {
-                self.put_blob(BlobOwner::Task(owner.clone()), chunk, placement.clone())
+                self.put_blob_in(role, BlobOwner::Task(owner.clone()), chunk, placement.clone())
             }))
             .buffer_unordered(BLOBS_IN_FLIGHT);
         while let Some(put) = puts.next().await {
