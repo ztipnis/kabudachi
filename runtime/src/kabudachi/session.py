@@ -52,6 +52,8 @@ from kabudachi.errors import (
     CoalescedPayloadTooLargeError,
     ConfigurationError,
     PayloadTooLargeError,
+    ReduceEmptyError,
+    ReducerContinuedError,
     ResultTooLargeError,
     ResultUnavailableError,
     RunStoppedError,
@@ -773,6 +775,11 @@ class Session:
         return reading
 
     async def _given(self, claim: Any) -> Given:
+        if claim.reduce_node is not None:
+            # A reduce step works on items and earlier results, which the
+            # leader reads out as `reduce_operands`, not on a stage's input.
+            operands = await self._runtime.reduce_operands(claim.task_run_id)
+            return Given((), ("reduce", operands, claim.reduce_node[0] > 0))
         fields, resolved = await self._runtime.resolve_input(claim.task_run_id)
         return Given(tuple(fields), resolved)
 
@@ -1187,6 +1194,8 @@ _KNOWN_FAILURES: dict[str, type[Exception]] = {
     "CoalescedPayloadTooLarge": CoalescedPayloadTooLargeError,
     # A claimant whose hard memory limit the input alone is past.
     "PayloadTooLarge": PayloadTooLargeError,
+    "ReduceEmptyError": ReduceEmptyError,
+    "ReducerContinuedError": ReducerContinuedError,
 }
 
 # How a task ended without a result, for the endings that carry nothing more

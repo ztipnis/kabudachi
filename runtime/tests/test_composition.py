@@ -22,6 +22,7 @@ from kabudachi.composites import _batches
 from kabudachi.errors import (
     BackpressureError,
     PayloadTooLargeError,
+    ReduceEmptyError,
     RunStoppedError,
     RuntimeNotStartedError,
     SerializationError,
@@ -1589,3 +1590,164 @@ def test_under_fail_fast_the_stage_runs_once_only_if_every_member_succeeds(failu
         assert isinstance(outcome, ValueError)
         failing = {f"member {i} failed" for i, count in enumerate(failures) if count > RETRIES}
         assert str(outcome) in failing
+
+
+# --- reduce ---------------------------------------------------------------
+
+
+def chain_concat(item: str, previous: str) -> str:
+    return previous + item
+
+
+def tree_concat(item: str, previous: str) -> str:
+    return previous + item
+
+
+def count_letters(item: str, previous: dict) -> dict:
+    return {**previous, item: previous.get(item, 0) + 1}
+
+
+def add_counts(left: dict, right: dict) -> dict:
+    return {key: left.get(key, 0) + right.get(key, 0) for key in left | right}
+
+
+def explode_on_bad(item: str, previous: str) -> str:
+    if item == "bad":
+        raise ValueError("bad item")
+    return previous + item
+
+
+def reducing_world(*functions, **options):
+    """A world whose tasks use pickle, with `functions` declared as tasks
+    and `options` (name to Task options) declared alongside."""
+    world = World(serializer="pickle")
+    world.serializers.register(Pickle())
+    for function in functions:
+        world.tasks[function.__name__] = Task(
+            function,
+            registry=world.registry,
+            serializers=world.serializers,
+            name=f"tests.{function.__name__}",
+            serializer="pickle",
+            **options.get(function.__name__, {}),
+        )
+    return world
+
+
+def reduce_claims(world, name):
+    return [claim for claim in world.runtime.claimed if claim.definition_id == f"tests.{name}"]
+
+
+def test_an_associative_reduce_gives_the_chains_result_whether_it_runs_as_a_chain_or_a_tree():
+    world = reducing_world(chain_concat, tree_concat, tree_concat={"associative": True})
+    letters = list("abcdefg")
+
+    async def body():
+        chained = await world.tasks["chain_concat"].reduce(letters)
+        treed = await world.tasks["tree_concat"].reduce(letters, chunk_size=2)
+        return chained, treed
+
+    with activated(world):
+        assert run(with_events(world, body)) == ("abcdefg", "abcdefg")
+    assert len(reduce_claims(world, "chain_concat")) == 6, "a seedless chain runs one step per item after the first"
+    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "tree_concat"))
+    assert levels == [0, 0, 0, 0, 1, 1, 2], "four chunks of two, then three combines"
+
+
+def test_a_seeded_tree_folds_every_chunk_from_initial_and_combines_them_with_merge():
+    world = reducing_world(count_letters, count_letters={"tree": True, "merge": add_counts})
+
+    async def body():
+        return await world.tasks["count_letters"].reduce(list("abacabad"), initial={}, chunk_size=3)
+
+    with activated(world):
+        assert run(with_events(world, body)) == {"a": 4, "b": 2, "c": 1, "d": 1}
+    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "count_letters"))
+    assert levels == [0, 0, 0, 1, 2], "three chunks from the empty count, then merged pairwise"
+
+
+def test_an_empty_or_one_item_reduce_runs_no_step_and_a_seedless_empty_one_has_no_result():
+    world = reducing_world(chain_concat)
+    concat = world.tasks["chain_concat"]
+
+    async def body():
+        return await concat.reduce([], initial="seed"), await concat.reduce(["only"])
+
+    with activated(world):
+        assert run(with_events(world, body)) == ("seed", "only")
+        with pytest.raises(ReduceEmptyError):
+            concat.reduce([])
+    assert reduce_claims(world, "chain_concat") == []
+
+
+def test_a_reduce_the_leader_finds_empty_fails_with_reduce_empty_error():
+    from kabudachi.composites import ReduceHandle
+
+    world = reducing_world(chain_concat)
+    step = world.tasks["chain_concat"].reduce
+
+    async def body():
+        # The empty list is refused before it is sent, so this sends it as a
+        # list that turns out empty, as an expansion's can.
+        handle = world.session.composites._stream(
+            step.describe_streamed(world.session), iter(()), handle=ReduceHandle
+        )
+        with pytest.raises(ReduceEmptyError):
+            await handle
+
+    with activated(world):
+        run(with_events(world, body))
+
+
+def test_a_step_that_fails_after_its_retries_fails_the_reduce_and_no_later_step_runs():
+    world = reducing_world(explode_on_bad, explode_on_bad={"retries": 1})
+
+    async def body():
+        return await world.tasks["explode_on_bad"].reduce(["a", "bad", "c"], initial="")
+
+    with activated(world):
+        with pytest.raises(ValueError, match="bad item"):
+            run(with_events(world, body))
+    claims = [claim.reduce_node[1] for claim in reduce_claims(world, "explode_on_bad")]
+    assert claims == [0, 1, 1], "the failing step was tried twice and the step after it never ran"
+
+
+def test_a_step_lost_after_storing_its_result_and_before_complete_is_replayed_and_the_reduce_ends_as_the_chain_does():
+    world = reducing_world(chain_concat)
+    lost = []
+
+    def lose_the_first_completion_of_step_one(task_run_id):
+        # The session has stored the step's result blob (`store_result`) and is
+        # about to report COMPLETE: the run is lost instead, as when its worker dies.
+        claim = next(claim for claim in world.runtime.claimed if claim.task_run_id == task_run_id)
+        losing = claim.reduce_node == (0, 1) and not lost
+        if losing:
+            lost.append(task_run_id)
+            world.runtime.native.report_lost(task_run_id)
+        world.runtime.refuse_completion = losing
+
+    world.runtime.on_complete = lose_the_first_completion_of_step_one
+
+    async def body():
+        return await world.tasks["chain_concat"].reduce(list("abc"), initial="")
+
+    with activated(world):
+        assert run(with_events(world, body)) == "abc"
+    steps = [claim.reduce_node[1] for claim in reduce_claims(world, "chain_concat")]
+    assert lost and steps == [0, 1, 1, 2], "step 1 ran again on the same operands and step 2 took the replay's result"
+
+
+def test_a_reduce_reads_items_from_every_item_page_whether_they_are_inline_or_stored_as_blobs():
+    world = reducing_world(tree_concat, tree_concat={"associative": True})
+    # More items than one item page holds, with a few too long to sit on a page.
+    items = [f"{index:04d}" for index in range(2600)]
+    for index in (3, 1500, 2599):
+        items[index] = f"{index:04d}" + "x" * 200
+
+    async def body():
+        return await world.tasks["tree_concat"].reduce(items, chunk_size=900)
+
+    with activated(world):
+        assert run(with_events(world, body)) == "".join(items)
+    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "tree_concat"))
+    assert levels == [0, 0, 0, 1, 2], "three chunks, each reading across a page boundary"

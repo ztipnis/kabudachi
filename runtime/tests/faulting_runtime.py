@@ -264,6 +264,9 @@ class FaultingRuntime:
     async def resolve_input(self, task_run_id):
         return await self.native.resolve_input(task_run_id)
 
+    async def reduce_operands(self, task_run_id):
+        return await self.native.reduce_operands(task_run_id)
+
     def cancel(self, task_id):
         # Forwarded unchanged, but named here: `isinstance` against a runtime
         # protocol looks only at the class, so `__getattr__` alone is not enough.

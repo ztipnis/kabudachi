@@ -28,11 +28,24 @@ class Given:
     member's input. `resolved` is what it takes from before it
     (`("value", producer, bytes)`, `("failure", kind, message, task_id)` or
     `("list", [...])`), `("input", bytes)` for its own whole input when that
-    was stored as blobs, or `None` when the claim's `serialized_input` is the
-    whole input."""
+    was stored as blobs, `("reduce", operands, combines)` for a reduce step
+    (the operands `reduce_operands` gives, and whether the step combines two
+    results), or `None` when the claim's `serialized_input` is the whole
+    input."""
 
     fields: tuple[tuple[str, Any], ...]
     resolved: Any
+
+
+@dataclass(frozen=True)
+class ReduceArgument:
+    """What one reduce step works on, decoded. A fold starts from `start` and
+    folds each of `items` into it in order with the reducer; a combine joins
+    `start` (the left result) with its one item (the right one)."""
+
+    start: Any
+    items: tuple[Any, ...]
+    combines: bool
 
 
 @dataclass
@@ -47,6 +60,64 @@ class RunningBody:
     exited: "asyncio.Future[None]"
     """Done once the body has really stopped: for a synchronous body, once its
     thread has returned, which cancelling `outcome` does not wait for."""
+
+
+def reduce_argument(
+    definition: TaskDefinition,
+    serializer: Serializer,
+    operands: Sequence[tuple[str, Any]],
+    decode_resolved: Callable[[Any], Any],
+    combines: bool,
+) -> ReduceArgument:
+    """A reduce step's operands, as `reduce_operands` gives them, decoded: an
+    item by the reducer's item type, an initial value or a result by its
+    result type, and an entry of another stage's results by the task that
+    produced it."""
+
+    def decoded(operand: tuple[str, Any]) -> Any:
+        role, payload = operand
+        if role == "item":
+            return serializer.decode(payload, definition.input_type)
+        if role == "result":
+            return serializer.decode(payload, definition.output_type)
+        return decode_resolved(payload)
+
+    values = [decoded(operand) for operand in operands]
+    return ReduceArgument(values[0], tuple(values[1:]), combines)
+
+
+def _fold(definition: TaskDefinition, argument: ReduceArgument) -> Any:
+    reducing = definition.reducer
+    if argument.combines:
+        (right,) = argument.items
+        if reducing.merge is not None:
+            return reducing.merge(argument.start, right)
+        return definition.func(right, argument.start)
+    previous = argument.start
+    for item in argument.items:
+        previous = definition.func(item, previous)
+    return previous
+
+
+async def _fold_async(definition: TaskDefinition, argument: ReduceArgument) -> Any:
+    reducing = definition.reducer
+    if argument.combines:
+        (right,) = argument.items
+        if reducing.merge is not None:
+            return reducing.merge(argument.start, right)
+        return await definition.func(right, argument.start)
+    previous = argument.start
+    for item in argument.items:
+        previous = await definition.func(item, previous)
+    return previous
+
+
+def _invoke(definition: TaskDefinition, argument: Any) -> Any:
+    """The body's call: the function on its input, or a reduce step's fold or
+    combine, which calls the reducer (or its merge) once per item."""
+    if isinstance(argument, ReduceArgument):
+        return _fold_async(definition, argument) if definition.is_async else _fold(definition, argument)
+    return definition.func(argument)
 
 
 def start_body(
@@ -74,7 +145,7 @@ def start_body(
 
         async def contained() -> Any:
             try:
-                return await hooks.around_async(lambda: definition.func(argument))
+                return await hooks.around_async(lambda: _invoke(definition, argument))
             except Exception:
                 raise
             except asyncio.CancelledError as error:
@@ -92,11 +163,9 @@ def start_body(
         outcome = loop.create_task(contained())
         outcome.add_done_callback(lambda _: mark_exited())
     else:
-        func = definition.func
-
         def in_thread(value: Any) -> Any:
             try:
-                return hooks.around_sync(lambda: func(value))
+                return hooks.around_sync(lambda: _invoke(definition, value))
             except Exception:
                 raise
             except asyncio.CancelledError as error:
@@ -187,6 +256,14 @@ def member_argument(
     on a copy."""
     serializer = serializers.get(definition.serializer)
     match given.resolved:
+        case ("reduce", operands, combines):
+            return reduce_argument(
+                definition,
+                serializer,
+                operands,
+                lambda resolved: decode_resolved(registry, serializers, resolved),
+                combines,
+            )
         case None:
             argument = serializer.decode(serialized_input, definition.input_type)
         case ("input", data):

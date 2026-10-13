@@ -27,6 +27,12 @@ class ReduceEmptyError(KabudachiError, TypeError):
     A `TypeError`, as `functools.reduce` raises for the same case."""
 
 
+class ReducerContinuedError(KabudachiError, RuntimeError):
+    """A reduce step returned a continuation instead of a value, so there was
+    no value for the step after it to fold. A reducer is a function of its
+    operands and returns its result."""
+
+
 class UnknownSerializerError(KabudachiError, LookupError):
     """No serializer is registered under the requested name."""
 

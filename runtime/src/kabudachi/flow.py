@@ -9,9 +9,9 @@ stages.
 from dataclasses import dataclass
 from typing import Any
 
-from kabudachi.composites import FlowHandle, GroupHandle
+from kabudachi.composites import FlowHandle, GroupHandle, ReduceHandle
 from kabudachi.config import UNSET
-from kabudachi.errors import TaskDefinitionError
+from kabudachi.errors import ReduceEmptyError, TaskDefinitionError
 from kabudachi.handle import TaskHandle
 from kabudachi.registry import TaskDefinition, TaskKind
 from kabudachi.session import Session, current_session
@@ -370,6 +370,99 @@ class MapStep:
     def _members(self, inputs: Any) -> list[BoundTask]:
         """One fully bound task per item."""
         return [BoundTask(self.definition, value=item) for item in self._checked(inputs)]
+
+
+DEFAULT_CHUNK_SIZE = 64
+"""Items per chunk of a tree reduce, unless the caller says otherwise."""
+
+
+class ReduceStep:
+    """A reducer folded over a list, left to right, as one composite the
+    shard runs: `await task.reduce(items)` gives the folded value. Also a flow
+    stage that folds the list the stage before it gives: `task.reduce`, or
+    `task.reduce.options(initial=..., chunk_size=...)`.
+    """
+
+    is_step = True
+    is_task = False
+    needs_input = True
+
+    def __init__(
+        self,
+        definition: TaskDefinition,
+        serializers: Any,
+        initial: Any = UNSET,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+    ) -> None:
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or not 1 <= chunk_size < 2**32:
+            raise ValueError(f"chunk_size must be a positive integer, not {chunk_size!r}")
+        self.definition = definition
+        self._serializers = serializers
+        self._initial = initial
+        self._chunk_size = chunk_size
+        if initial is not UNSET:
+            serializers.get(definition.serializer).encode(initial, definition.output_type)
+
+    @property
+    def output_type(self) -> Any:
+        """The reducer's result type, which is what the reduce gives."""
+        return self.definition.output_type
+
+    def input_requirements(self) -> list[tuple[str, Any]]:
+        """The (name, type) of the reducer, whose input must be a list of its items."""
+        return [(self.definition.name, list[self.definition.input_type])]
+
+    def definitions(self) -> list[TaskDefinition]:
+        return [self.definition]
+
+    def options(self, *, initial: Any = UNSET, chunk_size: int = DEFAULT_CHUNK_SIZE) -> "ReduceStep":
+        """This reduce seeded with `initial` (which may be `None`; leaving it
+        out makes the first item the start) and with tree chunks of
+        `chunk_size` items, for use as a flow stage."""
+        return ReduceStep(self.definition, self._serializers, initial, chunk_size)
+
+    def __call__(
+        self, items: Any, *, initial: Any = UNSET, chunk_size: int = DEFAULT_CHUNK_SIZE
+    ) -> ReduceHandle:
+        """Folds `items` and returns the handle of the folded value. The items
+        go to the shard in batches, however many there are. Raises
+        `ReduceEmptyError` for no items and no `initial`."""
+        return self.options(initial=initial, chunk_size=chunk_size).start(current_session(), items)
+
+    def start(self, session: Session, previous: Any) -> ReduceHandle:
+        """Submits the reduce of the list `previous`, streaming its items."""
+        if not isinstance(previous, (list, tuple)):
+            raise TypeError(f"reduce takes a list of items, not {previous!r}")
+        if not previous and self._initial is UNSET:
+            raise ReduceEmptyError("a reduce of no items needs an initial value")
+        return session.composites.stream_reduce(self, previous)
+
+    def describe(self, session: Session, previous: Any = UNSET) -> tuple:
+        """This reduce as a flow stage, the tree `_native.describe_step`
+        encodes: one stage that takes the list it is given."""
+        if previous is not UNSET:
+            raise TypeError("a reduce's items stream in; describe it with no list")
+        return ("reduce", "fail_fast", [self._reducer(session)], self._described_options(session))
+
+    def describe_streamed(self, session: Session) -> tuple:
+        """The head of a reduce whose items stream in after it."""
+        return ("reduce", "fail_fast", [], self._described_options(session), "streamed")
+
+    def _reducer(self, session: Session) -> tuple:
+        definition = self.definition
+        settings = session.submission_settings(definition)
+        return ("task", definition.name, definition.version, settings, None, [])
+
+    def _described_options(self, session: Session) -> dict[str, Any]:
+        definition = self.definition
+        serializer = session.serializers.get(definition.serializer)
+        initial = None if self._initial is UNSET else serializer.encode(self._initial, definition.output_type)
+        return {
+            "reducer": self._reducer(session),
+            "tree": definition.reducer.tree,
+            "chunk_size": self._chunk_size,
+            "initial": initial,
+        }
 
 
 def _steps(kind: str, steps: tuple[Any, ...]) -> list[Any]:

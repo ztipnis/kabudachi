@@ -12,7 +12,7 @@ import wrapt
 from kabudachi._checks import is_count, is_non_negative_timedelta, is_positive_timedelta
 from kabudachi.config import UNSET, Unset
 from kabudachi.errors import TaskDefinitionError
-from kabudachi.flow import BoundTask, MapStep, bind_task, is_step_type
+from kabudachi.flow import BoundTask, MapStep, ReduceStep, bind_task, is_step_type
 from kabudachi.handle import TaskHandle
 from kabudachi.options import SubmissionOptions, submission_options
 from kabudachi.registry import (
@@ -230,12 +230,14 @@ class Task(wrapt.ObjectProxy):
         return MapStep(self._self_definition, self._self_serializers or process_serializers())
 
     @property
-    def reduce(self) -> Any:
-        """A reducer folded over a list of items. Raises `TypeError` for a
-        task that is not a reducer."""
+    def reduce(self) -> ReduceStep:
+        """A reducer folded over a list of items: `await task.reduce(items,
+        initial=..., chunk_size=...)` gives the folded value, and `task.reduce`
+        is also a `flow` stage that folds the list the stage before it gives.
+        Raises `TypeError` for a task that is not a reducer."""
         if self._self_definition.reducer is None:
             raise TypeError(f"{self._self_definition.name} takes one argument, so it is not a reducer")
-        raise NotImplementedError(f"{self._self_definition.name}: reduce is not available yet")
+        return ReduceStep(self._self_definition, self._self_serializers or process_serializers())
 
     def bind(self, *value: Any, **fields: Any) -> BoundTask:
         """This task with its input fixed, for use as a `flow` stage or called
