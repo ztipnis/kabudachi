@@ -255,14 +255,14 @@ def pool_served(tmp_path):
     reaped afterwards."""
     processes = []
 
-    def start(task_seconds):
+    def start(task_seconds, environment=None):
         process = subprocess.Popen(
             [sys.executable, "-c", POOL_PROGRAM, json.dumps(sys.path), str(task_seconds)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            env={**os.environ, "KABUDACHI_TEST_MARKERS": str(tmp_path)},
+            env={**os.environ, "KABUDACHI_TEST_MARKERS": str(tmp_path), **(environment or {})},
         )
         processes.append(process)
         ready, _, _ = select.select([process.stdout], [], [], STARTUP_SECONDS)
@@ -338,6 +338,19 @@ def test_sigterm_cancels_a_task_process_s_bodies_and_a_second_signal_sends_it(po
     assert time.monotonic() - forced_at < 5, errors
     assert lines[-1] == "forced", errors
     assert gone(int(second))
+
+
+def test_after_its_drain_grace_the_first_signal_stops_running_tasks_as_a_second_would(pool_served):
+    process, task_process = pool_served(task_seconds=60, environment={"KABUDACHI_DRAIN_GRACE": "1"})
+    signalled_at = time.monotonic()
+    process.send_signal(signal.SIGTERM)
+
+    lines, errors = finish(process, timeout=15)
+
+    # Not before the grace, and not after the task's 60 s or its 30 s cancel grace.
+    assert 1 <= time.monotonic() - signalled_at < 6, errors
+    assert lines[-1] == "forced", errors
+    assert gone(task_process)
 
 
 def test_task_processes_exit_when_their_worker_is_killed(pool_served):

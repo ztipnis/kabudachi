@@ -698,6 +698,10 @@ def test_an_unknown_setting_is_refused():
         ({"cancel_grace": 5}, "cancel_grace"),
         ({"cancel_grace": "5"}, "cancel_grace"),
         ({"cancel_grace": True}, "cancel_grace"),
+        ({"drain_grace": timedelta(seconds=-1)}, "drain_grace"),
+        ({"drain_grace": 5}, "drain_grace"),
+        ({"drain_wait_limit": timedelta(0)}, "drain_wait_limit"),
+        ({"drain_wait_limit": 5}, "drain_wait_limit"),
         ({"processes": -1}, "processes"),
         ({"processes": True}, "processes"),
         # Above the cap without `concurrency_override`.
@@ -953,6 +957,8 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_REPLICATION_FACTOR", "5")
     monkeypatch.setenv("KABUDACHI_SEED_ROUNDS", "7")
     monkeypatch.setenv("KABUDACHI_ROUTING_REFRESH", "30")
+    monkeypatch.setenv("KABUDACHI_DRAIN_GRACE", "4")
+    monkeypatch.setenv("KABUDACHI_DRAIN_WAIT_LIMIT", "120")
     configuration = Configuration()
 
     names = (
@@ -972,6 +978,8 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         "replication_factor",
         "seed_rounds",
         "routing_refresh",
+        "drain_grace",
+        "drain_wait_limit",
     )
     assert [configuration.resolve(name) for name in names] == [
         2,
@@ -990,6 +998,8 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         5,
         7,
         timedelta(seconds=30),
+        timedelta(seconds=4),
+        timedelta(seconds=120),
     ]
     assert authority_parts(configuration.resolve("authority")) == (
         "rediss://user:secret@cache.example:6380/",
@@ -1006,6 +1016,8 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
 
     monkeypatch.setenv("KABUDACHI_IMPORTS", "")
     assert Configuration().resolve("imports") is None
+    monkeypatch.setenv("KABUDACHI_DRAIN_GRACE", "")
+    assert Configuration().resolve("drain_grace") is None
     monkeypatch.setenv("KABUDACHI_MAX_RUNS_PER_PROCESS", "")
     assert Configuration().resolve("max_runs_per_process") is None
     monkeypatch.setenv("KABUDACHI_LISTEN", "")

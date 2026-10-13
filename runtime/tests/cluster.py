@@ -31,6 +31,9 @@ TIMINGS = {
     "KABUDACHI_RECONNECT_TIMEOUT": "2",
     "KABUDACHI_CANCEL_GRACE": "0.5",
     "KABUDACHI_ROLL_CALL_DEADLINE": "0.2",
+    # A leaving worker waits two heartbeat timeouts at most for its voters,
+    # and a sole worker that long for another.
+    "KABUDACHI_DRAIN_WAIT_LIMIT": "2",
 }
 HEARTBEAT_TIMEOUT = 1.0
 RECONNECT_TIMEOUT = 2.0

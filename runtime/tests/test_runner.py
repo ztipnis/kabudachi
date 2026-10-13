@@ -89,6 +89,10 @@ class StandInNetworked(FaultingNative):
     async def wait_until_reported(self):
         self.calls.append("reported")
 
+    async def drain(self):
+        self.calls.append("drain")
+        return (0, 0, [])
+
 
 @pytest.mark.parametrize("fails", [False, True], ids=["returns", "raises"])
 def test_a_networked_run_stops_taking_and_waits_for_its_reports_however_main_ends(
@@ -119,7 +123,7 @@ def test_a_networked_run_stops_taking_and_waits_for_its_reports_however_main_end
         assert kabudachi.run(main) == "done"
 
     native = only_native()
-    assert native.calls == ["ready", "stop_taking", "reported"]
+    assert native.calls == ["ready", "stop_taking", "reported", "drain"]
     assert native.shutdowns == 1
     assert session_module.active_session() is None
 

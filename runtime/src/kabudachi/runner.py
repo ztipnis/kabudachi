@@ -3,11 +3,13 @@
 import _thread
 import asyncio
 import inspect
+import logging
 import os
 import signal
 import socket
 import sys
 import threading
+import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Callable
@@ -37,6 +39,8 @@ from kabudachi.session import (
 )
 
 T = TypeVar("T")
+
+_log = logging.getLogger(__name__)
 
 
 @overload
@@ -72,7 +76,9 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     the waiting: task processes are stopped at once, tasks not finished are
     abandoned, `run` raises
     `KeyboardInterrupt`, and a synchronous task still in its thread keeps the
-    interpreter from exiting until it returns.
+    interpreter from exiting until it returns. With `drain_grace` set, tasks
+    still running that long after the first signal are stopped as a second
+    signal would stop them.
 
     With `listen` set, the process is a worker of the networked shard
     `shard`. It bootstraps from `seeds` or `authority`, `run` waits until it
@@ -82,7 +88,8 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     cancelling one asks the leader. When `main` returns, `run` waits until
     every task called has settled; then, as at the first signal, the worker
     also lets the runs it holds finish and waits until its leader has taken
-    their reports.
+    their reports, and then leaves the shard: a leader first hands its
+    leadership to another worker.
 
     Raises `TaskDefinitionError`, before `main` starts, if a registered task
     cannot work with the serializers of this process, and if `processes` is
@@ -107,7 +114,8 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
 
     with asyncio.Runner() as runner:
         if main is None:
-            with _StopSignals(runner.get_loop()) as signals:
+            grace = process_configuration().settings().drain_grace
+            with _StopSignals(runner.get_loop(), grace=grace) as signals:
 
                 async def serve() -> None:
                     await signals.stop.wait()
@@ -191,6 +199,9 @@ def _native_runtime(settings: Settings) -> Any:
             health_listen=settings.health_listen,
             queues=tuple(settings.queues or (settings.queue,)),
             queue_options=_queue_options(settings),
+            drain_wait_limit_ms=(
+                None if settings.drain_wait_limit is None else _millis(settings.drain_wait_limit)
+            ),
         )
     )
 
@@ -277,13 +288,20 @@ class _StopSignals:
     flag by one C statement. A garbage collection triggered during the drain
     runs finalizers on the watcher thread while it holds the lock; a finalizer
     that waits on something the main thread holds while its handler waits for
-    that lock would deadlock."""
+    that lock would deadlock.
+
+    With a `grace`, the watcher also counts the first signal's grace: once it
+    has run out, a second arrival is counted, and the run stops as a second
+    signal would stop it."""
 
     _SIGNALS = (signal.SIGINT, signal.SIGTERM)
     _POLL_SECONDS = 0.05
 
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, grace: timedelta | None = None) -> None:
         self._loop = loop
+        self._grace_seconds = None if grace is None else grace.total_seconds()
+        # When the first signal's grace runs out, once the first has arrived.
+        self._escalate_at: float | None = None
         self._arrived = 0
         # Whether the watcher ever sent the main thread a signal itself.
         self._resent = False
@@ -548,6 +566,13 @@ class _StopSignals:
 
     def _watch_pass(self, data: bytes) -> None:
         attributed = self._absorb(data)
+        if self._grace_seconds is not None and self._arrived == 1:
+            # The first signal's grace: once it has run out, the run stops as a
+            # second signal would stop it.
+            if self._escalate_at is None:
+                self._escalate_at = time.monotonic() + self._grace_seconds
+            elif time.monotonic() >= self._escalate_at:
+                self._arrived = 2
         self._settle_raised_state()
         # A poll that just read the re-send waits out the next one before
         # re-sending, so a main thread inside asyncio is not hammered.
@@ -717,6 +742,21 @@ async def _drain_held_runs(
     await _until_done_or_worker_stops(native.wait_until_reported(), events)
 
 
+async def _leave_shard(native: Any) -> None:
+    """Has a networked worker leave its shard through its node: a leader
+    hands its leadership over first, and the Task records the worker holds
+    go to the workers that stay. Records no other worker took leave with
+    the process, and are logged."""
+    _stored, _superseded, abandoned = await native.drain()
+    if abandoned:
+        _log.error(
+            "this worker left its shard holding %d Task records no other worker took, "
+            "which leave with it: %s",
+            len(abandoned),
+            ", ".join(abandoned),
+        )
+
+
 async def _run_with_worker(
     main: Callable[[], Awaitable[T]], executor: Executor, *, serving: bool = False
 ) -> T:
@@ -805,6 +845,7 @@ class _WorkerRun:
         # A claim loop that failed fails the run, once its held runs have
         # reported.
         claiming.result()
+        await _leave_shard(native)
 
     async def _stop_after(self, error: BaseException, native: Any) -> None:
         """Stops a run that `error` ended: nothing new starts, the runs a
@@ -835,6 +876,7 @@ class _WorkerRun:
             return
         try:
             await _drain_held_runs(session, native, self._claiming, events)
+            await _leave_shard(native)
         except Exception:
             # The error being raised says why the run ended; a runtime
             # failing meanwhile only cuts the drain short.

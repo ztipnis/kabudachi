@@ -44,8 +44,8 @@ mod seam;
 mod start;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::manifest::fits_inline;
@@ -55,6 +55,7 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::mint;
 use kabudachi_core::time::RealClock;
 use kabudachi_net::executor::{Report, executor_channel};
+use kabudachi_net::handoff::HandedOff;
 use kabudachi_net::worker::Worker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -75,14 +76,21 @@ use self::start::NetworkedArguments;
 
 const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
 
+/// How long a worker that has left its shard lingers so the messages that
+/// announced its departure reach the network before its caller exits.
+const DEPARTURE_FLUSH: StdDuration = StdDuration::from_millis(100);
+
 /// A worker of a networked shard, and the Tokio runtime it runs on.
 ///
-/// Call `shutdown()` when finished: the worker stops at once, without
-/// leaving its shard, and every awaitable still pending fails.
+/// Call `drain()` to leave the shard, then `shutdown()` when finished: the
+/// worker stops at once, without leaving its shard, and every awaitable
+/// still pending fails.
 #[pyclass(name = "NetworkedRuntime", frozen)]
 pub struct NetworkedRuntime {
     host: Host,
     shared: Arc<Shared>,
+    /// What the worker handed off, left by its task when it ends.
+    drained: Arc<Mutex<Option<HandedOff>>>,
     worker_id: String,
     address: String,
     clock: RealClock,
@@ -101,12 +109,13 @@ impl NetworkedRuntime {
     /// by founding the shard alone.
     ///
     /// Raises `ValueError` for an address that cannot be read, a timing or
-    /// authority TTL of zero, a replication factor or seed rounds of zero,
-    /// only one memory limit, no worker threads, an authority that cannot be
-    /// used, no queues, a blank queue name or queue options that are refused
-    /// (a zero weight, running limit or starvation age, or a queue given
-    /// twice), and `RuntimeError` if it cannot listen on its listen address.
-    /// `health_listen` raises `ValueError` for an address that is not
+    /// authority TTL of zero (`drain_wait_limit_ms`, which bounds each wait of
+    /// a leaving worker, included), a replication factor or seed rounds of
+    /// zero, only one memory limit, no worker threads, an authority that
+    /// cannot be used, no queues, a blank queue name or queue options that are
+    /// refused (a zero weight, running limit or starvation age, or a queue
+    /// given twice), and `RuntimeError` if it cannot listen on its listen
+    /// address. `health_listen` raises `ValueError` for an address that is not
     /// `ip:port` and `RuntimeError` when it cannot be bound.
     #[new]
     fn new(py: Python<'_>, arguments: NetworkedArguments) -> PyResult<Self> {
@@ -139,13 +148,14 @@ impl NetworkedRuntime {
             observed,
             arguments.retry(),
         ));
+        let drained = Arc::default();
         let host = Host::start(
             tokio,
             worker,
             source,
             Arc::clone(&shared),
             Arc::new(sender),
-            Arc::default(),
+            Arc::clone(&drained),
         );
         let registry = Arc::new(AtomicBool::new(false));
         let health = match health_listener {
@@ -181,6 +191,7 @@ impl NetworkedRuntime {
         Ok(NetworkedRuntime {
             host,
             shared,
+            drained,
             worker_id,
             address,
             clock: RealClock::new(),
@@ -493,6 +504,40 @@ impl NetworkedRuntime {
                 tokio::time::sleep(REPORTED_POLL).await;
             }
             Ok(true)
+        })
+    }
+
+    /// Asks the worker to leave its shard gracefully, a leader handing its
+    /// leadership over first, and returns an awaitable that resolves once it
+    /// has left to `(stored, superseded, abandoned)`: how many Task records it
+    /// handed over, how many the shard had already written past, and the ids
+    /// of those no other worker took, which leave with it. A worker already
+    /// gone, or shut down, resolves at once with nothing handed over.
+    fn drain<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.shared.net.request_drain();
+        let mut observed = self.shared.observed.clone();
+        let drained = Arc::clone(&self.drained);
+        self.host.bridge().spawn_into_py(py, async move {
+            while !observed.borrow_and_update().gone {
+                if observed.changed().await.is_err() {
+                    break;
+                }
+            }
+            // The departure message has been handed to the network task, which
+            // writes it on its own schedule; the process may exit as soon as
+            // this resolves and the message must be on the wire by then.
+            tokio::time::sleep(DEPARTURE_FLUSH).await;
+            let handed = drained
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .unwrap_or_default();
+            let abandoned: Vec<String> = handed
+                .abandoned
+                .iter()
+                .map(|task| task.as_str().to_owned())
+                .collect();
+            Ok((handed.stored, handed.superseded, abandoned))
         })
     }
 
