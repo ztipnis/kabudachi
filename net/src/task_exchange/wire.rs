@@ -8,10 +8,10 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelAnswer, CancelOutcome, CompositeAccepted, OutcomeAnswer, RunCertified, RunFailed, RunLost, SubmitComposite,
+    CancelAnswer, CancelOutcome, CompositeAccepted, MembersAccepted, OutcomeAnswer, RunCertified, RunFailed, RunLost, SubmitComposite,
     SubmitTask, TaskReject, TaskRejectReason, TaskResponse, task_response,
 };
-use kabudachi_core::scheduler::composite::{Step, SubmittedComposite};
+use kabudachi_core::scheduler::composite::{self as scheduler_composite, Step, SubmittedComposite};
 use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, Certification, Failure, LostRun, Outcome, OutcomeRejection, ReportRejection,
     Submission, Submitted, SubmitRejection, TraceContext,
@@ -129,10 +129,20 @@ pub(crate) fn submitted_composite(submit: &SubmitComposite) -> Result<SubmittedC
 }
 
 /// The answer that a composite is recorded.
-pub(crate) fn composite_accepted(id: CompositeId) -> CompositeAccepted {
+/// `slow_down`: the leader asks submitters to wait.
+pub(crate) fn composite_accepted(id: CompositeId, slow_down: bool) -> CompositeAccepted {
     CompositeAccepted {
         composite_id: Some(id.into()),
-        slow_down: false,
+        slow_down,
+    }
+}
+
+/// The answer that a batch of `composite`'s members is taken.
+pub(crate) fn members_accepted(composite: CompositeId, accepted: scheduler_composite::MembersAccepted) -> MembersAccepted {
+    MembersAccepted {
+        composite_id: Some(composite.into()),
+        members: accepted.members,
+        slow_down: accepted.slow_down,
     }
 }
 

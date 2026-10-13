@@ -18,13 +18,13 @@ use kabudachi_core::protocol::ids::{
     CompositeId, IdGenerator, IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::messages::{
-    ElectionMessage, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
+    CompositeAccepted, ElectionMessage, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeFinished, CompositeKind, OnError, Stage, Step as CompositeStep, SubmittedComposite,
-    TaskOptions,
+    BoundInput, BoundStep, CompositeFinished, CompositeKind, MemberBatch, OnError, Stage, Step as CompositeStep,
+    StreamedMember, SubmittedComposite, TaskOptions,
 };
 use kabudachi_core::scheduler::{Claim, Scheduler, Submission, Submitted, mint};
 use kabudachi_core::task_record::{RecordKey, RecordOutbox, RecordVersion};
@@ -861,6 +861,18 @@ pub async fn composite_submitted_as(
     id: &CompositeId,
     step: CompositeStep,
 ) -> CompositeId {
+    composite_accepted_as(client, leader, id, step).await;
+    id.clone()
+}
+
+/// Has `client` submit `step` to `leader` as the composite `id`, asking again
+/// until the leader's lease is ready, and returns the leader's whole answer.
+pub async fn composite_accepted_as(
+    client: &Net,
+    leader: &WorkerId,
+    id: &CompositeId,
+    step: CompositeStep,
+) -> CompositeAccepted {
     let submitted = SubmittedComposite {
         composite_id: id.clone(),
         submitted_at: WallTime::now(&RealClock::new()),
@@ -870,7 +882,7 @@ pub async fn composite_submitted_as(
     loop {
         let answer = client.submit_composite(leader.clone(), &submitted).await;
         match answer.map(|answer| answer.result) {
-            Ok(Some(task_response::Result::Composite(_))) => return id.clone(),
+            Ok(Some(task_response::Result::Composite(accepted))) => return accepted,
             Ok(Some(task_response::Result::Reject(reject)))
                 if !matches!(
                     TaskRejectReason::try_from(reject.reason),
@@ -883,6 +895,29 @@ pub async fn composite_submitted_as(
             }
             _ => tokio::time::sleep(StdDuration::from_millis(10)).await,
         }
+    }
+}
+
+/// A map whose items arrive in batches, each run by a task of its own.
+pub fn streamed_map(on_error: OnError) -> CompositeStep {
+    CompositeStep {
+        kind: CompositeKind::Map,
+        on_error,
+        stages: vec![Stage::Task(bound("each", BoundInput::Previous))],
+        streamed: true,
+    }
+}
+
+/// Items `start..start + count` of `map`, eight bytes each, the last batch
+/// when `last`.
+pub fn item_batch(map: &CompositeId, start: u64, count: u64, last: bool) -> MemberBatch {
+    MemberBatch {
+        composite_id: map.clone(),
+        start_index: start,
+        members: (start..start + count)
+            .map(|index| StreamedMember::Item(BoundInput::Value(index.to_be_bytes().to_vec())))
+            .collect(),
+        last,
     }
 }
 

@@ -6,3 +6,4 @@ mod composites;
 mod lifecycle;
 mod own_requests;
 mod results;
+mod streamed;

@@ -31,6 +31,11 @@
 //! ([`Net::complete_compaction`]): the leader's answer says whether it was
 //! applied.
 //!
+//! [`Net::submit_members`] sends a streamed composite's members to the leader
+//! in batches, each taken whole or refused whole, and [`Net::query_slow_down`]
+//! asks whether the leader still asks submitters to wait; every accepted
+//! submission's answer carries the same flag.
+//!
 //! [`Net::store_payload_at_leader`] stores a payload too large for one
 //! message where the leader would place its owner's record (a task's or a
 //! composite's), asking again as `submit_to_leader` does.
@@ -46,12 +51,12 @@ use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome,
-    RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, StartAccepted,
-    SubmitAccepted, SubmitComposite, SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse,
+    QuerySlowDown, RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted,
+    SlowDownState, StartAccepted, SubmitAccepted, SubmitComposite, SubmitMembers, SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse,
     task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
-use kabudachi_core::scheduler::composite::{Step, SubmittedComposite};
+use kabudachi_core::scheduler::composite::{MemberBatch, Step, SubmittedComposite};
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
 use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::Clock;
@@ -665,6 +670,30 @@ impl Net {
         .await
     }
 
+    /// Asks the shard's leader to take `batch`, the next members of a
+    /// streamed composite, until a leader decides it: accepted whole, or
+    /// refused for good. Asks again as [`Self::submit_to_leader`] does, with
+    /// the same `batch`, so a batch whose answer was lost creates nothing
+    /// twice; `None` once the worker has left its shard.
+    pub async fn submit_members(&self, batch: &MemberBatch, retry: LeaderRetry) -> Option<TaskResponse> {
+        self.ask_until_decided(task_request::Request::SubmitMembers(SubmitMembers::from(batch)), retry)
+            .await
+    }
+
+    /// Asks the shard's leader whether it still asks submitters to wait,
+    /// asking again as [`Self::submit_to_leader`] does; `None` once the
+    /// worker has left its shard. An answer that is not the leader's flag
+    /// (a refusal for good) counts as no wait.
+    pub async fn query_slow_down(&self, retry: LeaderRetry) -> Option<bool> {
+        let response = self
+            .ask_until_decided(task_request::Request::QuerySlowDown(QuerySlowDown {}), retry)
+            .await?;
+        Some(matches!(
+            response.result,
+            Some(task_response::Result::SlowDown(SlowDownState { slow_down: true }))
+        ))
+    }
+
     /// Asks the shard's leader to cancel the composite `id` until a leader
     /// decides it, as [`Self::cancel_at_leader`] does for a task.
     pub async fn cancel_composite_at_leader(&self, id: CompositeId, retry: LeaderRetry) -> Option<TaskResponse> {
@@ -823,8 +852,9 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
         Request::SubmitComposite(submit) => submit_composite(scheduler, submit),
         Request::QueryOutcome(query) => query_outcome(scheduler, query),
-        // The leader does not take member batches or answer SlowDown queries yet.
-        Request::SubmitMembers(_) | Request::QuerySlowDown(_) => Err(TaskRejectReason::TaskRejectMalformed),
+        Request::SubmitMembers(batch) => submit_members(scheduler, batch),
+        // Whether the leader asks submitters to wait is the driver's to say, ungated.
+        Request::QuerySlowDown(_) => Err(TaskRejectReason::TaskRejectMalformed),
     };
     match result {
         Ok(result) => TaskResponse {
@@ -845,12 +875,13 @@ fn submit<C: Clock, I: IdGenerator, O: Observer>(
     let Ok(submitted) = wire::submitted(task, clock) else {
         return Err(TaskRejectReason::TaskRejectMalformed);
     };
-    scheduler
-        .submit_minted(submitted)
+    let outcome = scheduler.submit_minted(submitted);
+    let slow_down = scheduler.slow_down();
+    outcome
         .map(|task_id| {
             task_response::Result::Submitted(SubmitAccepted {
                 task_id: Some(task_id.into()),
-                slow_down: false,
+                slow_down,
             })
         })
         .map_err(wire::submit_reject)
@@ -863,9 +894,24 @@ fn submit_composite<C: Clock, I: IdGenerator, O: Observer>(
     let Ok(submitted) = wire::submitted_composite(submit) else {
         return Err(TaskRejectReason::TaskRejectMalformed);
     };
+    let outcome = scheduler.submit_composite(submitted);
+    let slow_down = scheduler.slow_down();
+    outcome
+        .map(|id| task_response::Result::Composite(wire::composite_accepted(id, slow_down)))
+        .map_err(wire::submit_reject)
+}
+
+fn submit_members<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    submit: &SubmitMembers,
+) -> Answered {
+    let Ok(batch) = MemberBatch::try_from(submit) else {
+        return Err(TaskRejectReason::TaskRejectMalformed);
+    };
+    let composite = batch.composite_id.clone();
     scheduler
-        .submit_composite(submitted)
-        .map(|id| task_response::Result::Composite(wire::composite_accepted(id)))
+        .submit_members(batch)
+        .map(|accepted| task_response::Result::Members(wire::members_accepted(composite, accepted)))
         .map_err(wire::submit_reject)
 }
 
@@ -1063,6 +1109,14 @@ pub(crate) fn placements(
         result: Some(task_response::Result::Placements(RecordPlacements {
             placements: placed,
         })),
+    }
+}
+
+/// The answer to a SlowDown query: whether the leader asks submitters to
+/// wait. Not gated on any write: it decides nothing.
+pub(crate) fn slow_down_state(slow_down: bool) -> TaskResponse {
+    TaskResponse {
+        result: Some(task_response::Result::SlowDown(SlowDownState { slow_down })),
     }
 }
 
