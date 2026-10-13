@@ -16,6 +16,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
     DeliverResult, OutcomeAnswer, TaskRejectReason, deliver_result, task_response,
 };
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::Submission;
 use kabudachi_net::executor::Report;
 use kabudachi_net::messenger::Net;
@@ -170,6 +171,7 @@ impl Delivering {
             digest: digest(),
             delivered,
             continuation: None,
+            persistence: PersistenceState::Disabled,
         });
     }
 

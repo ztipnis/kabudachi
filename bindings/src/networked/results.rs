@@ -14,6 +14,7 @@ use kabudachi_core::protocol::messages::{
     DeliverResult, OutcomeAnswer, TaskResponse, deliver_result, task_response,
 };
 use kabudachi_core::protocol::task::TaskRunState as DomainRunState;
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::Event;
 use kabudachi_core::scheduler::composite::{CompositeFinished, Step};
 use kabudachi_net::blobs::BlobRole;
@@ -63,6 +64,7 @@ pub(super) async fn deliver_then_report(
         digest,
         delivered,
         continuation: None,
+        persistence: PersistenceState::Disabled,
     });
 }
 
@@ -133,6 +135,7 @@ pub(super) async fn store_then_report_step(
         digest: step.digest(),
         delivered: false,
         continuation: Some(step),
+        persistence: PersistenceState::Disabled,
     });
 }
 

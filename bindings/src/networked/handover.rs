@@ -60,6 +60,8 @@ impl Shared {
                 Work::Cancel(run) => seam.take_back(run),
                 Work::Abort { run, deadline } => seam.abort(run, deadline),
                 Work::AbortWithdrawn(run) => seam.withdraw_abort(&run),
+                // Nothing mirrors a certified result yet.
+                Work::Answered { .. } => return,
             }
         };
         self.settle(handled);

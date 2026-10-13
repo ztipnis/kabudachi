@@ -54,14 +54,18 @@ impl FakeExecutor {
     }
 
     /// The next run handed over, a task's or a compaction's, with the
-    /// discovery stage that found its task and its claim.
+    /// discovery stage that found its task and its claim. How the leader
+    /// answered a completion is not a run, and is passed over.
     pub async fn next_found(&mut self) -> (Stage, TaskRunId, Claim) {
-        match self.next_work().await {
-            Work::Run { claim, stage } | Work::Compact { claim, stage } => {
-                let run = claim.task_run_id.clone().expect("a granted claim names its run");
-                (stage, run.into(), claim)
+        loop {
+            match self.next_work().await {
+                Work::Answered { .. } => continue,
+                Work::Run { claim, stage } | Work::Compact { claim, stage } => {
+                    let run = claim.task_run_id.clone().expect("a granted claim names its run");
+                    return (stage, run.into(), claim);
+                }
+                other => panic!("expected a run handed over, got {other:?}"),
             }
-            other => panic!("expected a run handed over, got {other:?}"),
         }
     }
 
@@ -71,10 +75,14 @@ impl FakeExecutor {
         (run, claim)
     }
 
-    /// Panics if the driver hands over any work within `window`.
+    /// Panics if the driver hands over any work within `window`, other than
+    /// the leader's answer to a completion.
     pub async fn expect_no_work_for(&mut self, window: Duration) {
-        if let Ok(work) = timeout(window, self.work_source().next_work()).await {
-            panic!("expected no work, got {work:?}");
+        let until = tokio::time::Instant::now() + window;
+        while let Ok(work) = tokio::time::timeout_at(until, self.work_source().next_work()).await {
+            if !matches!(work, Some(Work::Answered { .. })) {
+                panic!("expected no work, got {work:?}");
+            }
         }
     }
 

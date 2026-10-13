@@ -3,8 +3,9 @@
 //!
 //! [`codec`] frames the `/kabudachi/task/1` messages; `wire` maps them to and
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
-//! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
-//! [`Net::report_lost`], [`Net::report_blocked`] (a task, not a run, that this
+//! [`Net::report_started`], [`Net::complete`],
+//! [`Net::report_persisted`] (how mirroring a certified result went),
+//! [`Net::fail`], [`Net::report_lost`], [`Net::report_blocked`] (a task, not a run, that this
 //! worker cannot run at its input version), [`Net::cancel`] and
 //! [`Net::query_outcome`], each sent to the leader the caller names.
 //! [`Net::submit_to_leader`], [`Net::cancel_at_leader`] and
@@ -213,19 +214,36 @@ impl Net {
 
     /// Tells `leader` `run` succeeded with a result of digest
     /// `result_digest`, for a run whose result went to no client. The
-    /// result itself is not sent.
+    /// result itself is not sent. `persistence` says whether this worker will
+    /// mirror the result (`Pending`) or not (`Disabled`).
     pub async fn complete(
         &self,
         leader: WorkerId,
         run: TaskRunId,
         result_digest: Digest,
+        persistence: PersistenceState,
     ) -> Result<TaskResponse, TaskFailure> {
         self.report(leader, task_request::Request::Completed(ReportCompleted {
             task_run_id: Some(run.into()),
             result_digest: Some(result_digest.into()),
             delivered: false,
             continuation: None,
-            persistence: generated::PersistenceState::Disabled as i32,
+            persistence: generated::PersistenceState::from(persistence) as i32,
+        }))
+        .await
+    }
+
+    /// Tells `leader` how mirroring `run`'s certified result went (`Stored`
+    /// or `Failed`).
+    pub async fn report_persisted(
+        &self,
+        leader: WorkerId,
+        run: TaskRunId,
+        state: PersistenceState,
+    ) -> Result<TaskResponse, TaskFailure> {
+        self.report(leader, task_request::Request::Persisted(ReportPersisted {
+            task_run_id: Some(run.into()),
+            state: generated::PersistenceState::from(state) as i32,
         }))
         .await
     }

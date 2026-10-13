@@ -66,6 +66,7 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::composite::{
     MEMBER_BATCH_BYTES, SubmittedComposite, expansion_source, member_input, reduce_operands, results,
 };
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::{SubmitRejection, mint};
 use kabudachi_core::time::{RealClock, WallTime};
 use kabudachi_net::blobs::BlobRole;
@@ -464,6 +465,7 @@ impl NetworkedRuntime {
                 digest,
                 delivered: false,
                 continuation: None,
+                persistence: PersistenceState::Disabled,
             }),
         }
         Ok(())

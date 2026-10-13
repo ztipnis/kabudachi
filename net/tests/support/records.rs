@@ -27,6 +27,7 @@ use kabudachi_core::scheduler::composite::{
     BoundInput, BoundStep, CompositeFinished, CompositeKind, ItemInput, MemberBatch, OnError, Stage, Step as CompositeStep,
     StreamedMember, SubmittedComposite, TaskOptions,
 };
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::{Claim, Scheduler, Submission, Submitted, mint};
 use kabudachi_core::task_record::{RecordKey, RecordOutbox, RecordVersion};
 use kabudachi_core::time::{Duration, RealClock, WallTime};
@@ -1032,7 +1033,7 @@ pub async fn claimed_member_run_through(net: &Net, leader: &WorkerId, claim: &Cl
     };
     loop {
         let answer = net
-            .complete(leader.clone(), claim.task_run_id.clone(), digest.clone())
+            .complete(leader.clone(), claim.task_run_id.clone(), digest.clone(), PersistenceState::Disabled)
             .await
             .expect("the leader answered");
         match answer.result {

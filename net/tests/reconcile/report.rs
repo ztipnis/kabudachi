@@ -8,6 +8,7 @@ use kabudachi_core::protocol::ids::{TaskId, TaskRunId};
 use kabudachi_core::protocol::messages::claim_response;
 use kabudachi_core::reconcile::wire::held_key;
 use kabudachi_core::reconcile::{Cursor, ReconcileTerm, ReportedState};
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::MAX_FAILURE_MESSAGE_BYTES;
 use kabudachi_core::task_record::RecordKey;
 
@@ -90,6 +91,7 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
                 bystander_id.clone(),
                 succeeded_run.clone(),
                 Digest::blake3(RESULT),
+                PersistenceState::Disabled,
             ))
             .await
             .expect("the bystander answered");

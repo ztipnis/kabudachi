@@ -11,6 +11,7 @@ use std::time::Duration as StdDuration;
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRunState;
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::TraceContext;
 use kabudachi_net::executor::{Report, Work};
 
@@ -55,6 +56,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             digest: Digest::blake3(RESULT),
             delivered: false,
             continuation: None,
+            persistence: PersistenceState::Disabled,
         });
         let leader_net = nets[leader].clone();
         shard
@@ -63,6 +65,11 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
                     && leader_net.claimed_runs().get(&run).is_none()
             }))
             .await;
+        assert_eq!(
+            shard.drive_until(executors[leader].next_work()).await,
+            Work::Answered { run: run.clone(), certified: true },
+            "the executor hears that its completion was certified"
+        );
 
         // A task the leader submits and cancels through its own network,
         // which its own driver answers like any other request, is one its

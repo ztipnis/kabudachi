@@ -9,6 +9,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRunState;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::messages::task_response;
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_net::claimed_runs::HeldRun;
 use kabudachi_net::messenger::Net;
 
@@ -45,7 +46,12 @@ async fn misdirected_completion(
         // bystander has answered the completion.
         let (started, misdirected) = tokio::join!(
             nets[worker].report_started(ids[leader].clone(), run.clone()),
-            nets[worker].complete(ids[bystander].clone(), run.clone(), Digest::blake3(b"out")),
+            nets[worker].complete(
+                ids[bystander].clone(),
+                run.clone(),
+                Digest::blake3(b"out"),
+                PersistenceState::Disabled,
+            ),
         );
         assert!(
             matches!(
@@ -60,7 +66,12 @@ async fn misdirected_completion(
         // The completion goes to a voter that does not lead: the worker's
         // ledger says it completed, and its leader never hears.
         let misdirected = nets[worker]
-            .complete(ids[bystander].clone(), run.clone(), Digest::blake3(b"out"))
+            .complete(
+                ids[bystander].clone(),
+                run.clone(),
+                Digest::blake3(b"out"),
+                PersistenceState::Disabled,
+            )
             .await;
         (run, misdirected)
     };
