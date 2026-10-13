@@ -134,6 +134,10 @@ where
         self.stepper
             .node
             .set_active_runs_digest(active_runs_digest(&self.net.claimed_runs().active_ids()));
+        // …and the places its executor has free.
+        self.stepper
+            .node
+            .set_available_capacity(self.executing.as_ref().map_or(0, Executing::free_places));
         if let Some(first) = self.first.take() {
             self.next_deadline = self.stepper.carry(first, None);
         }

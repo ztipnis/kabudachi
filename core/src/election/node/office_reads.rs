@@ -10,7 +10,7 @@ use crate::protocol::worker_state::WorkerState;
 use crate::reconcile::{Answered, ReconcileTerm};
 use crate::scheduler::LeaseEnd;
 use crate::time::Clock;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl<C> WorkerNode<C>
 where
@@ -185,6 +185,19 @@ where
                 runners
             }
             _ => BTreeSet::new(),
+        }
+    }
+
+    /// Each member's free places as its latest heartbeat said, this node's
+    /// own included. Empty unless it holds office.
+    pub fn member_capacities(&self) -> BTreeMap<WorkerId, u32> {
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => {
+                let mut capacities = office.member_capacities();
+                capacities.insert(self.my_id.clone(), self.report.available_capacity);
+                capacities
+            }
+            _ => BTreeMap::new(),
         }
     }
 

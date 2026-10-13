@@ -241,8 +241,7 @@ where
             recovery_epoch_seen: self.standing.epoch_number(),
             recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
             term_seen: self.standing.highest_term_seen(),
-            // Nothing reports this node's capacity yet.
-            available_capacity: 0,
+            available_capacity: self.report.available_capacity,
             active_task_runs_digest: self.report.active_runs_digest.clone(),
             shard_id: Some(self.shard_id.clone().into()),
             newest_accepted_ack: self.newest_accepted_ack,
@@ -284,5 +283,11 @@ where
     /// from now on says.
     pub fn set_runs_compaction(&mut self, runs: bool) {
         self.report.runs_compaction = runs;
+    }
+
+    /// The places this worker has free to run tasks in, which every
+    /// heartbeat it sends from now on says.
+    pub fn set_available_capacity(&mut self, places: u32) {
+        self.report.available_capacity = places;
     }
 }

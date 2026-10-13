@@ -344,6 +344,7 @@ impl NetworkedRuntime {
             .finish(TaskRunId::new(task_run_id), |run| Report::Failed {
                 run,
                 reason: failure_kind.to_owned(),
+                message: String::new(),
             });
     }
 

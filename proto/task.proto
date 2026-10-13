@@ -111,7 +111,8 @@ message TaskRun {
   // accepts. Unset while the run is still pending.
   WorkerId selected_worker = 7;
   // The type name of the error that failed the run (for example
-  // "ValueError"), never its message. Empty unless the run is FAILED.
+  // "ValueError"); its message is in `failure_message`. Empty unless the run
+  // is FAILED.
   string failure_kind = 9;
   // When the leader created this run and last changed it, by its wall clock.
   WallTime created_at = 10;

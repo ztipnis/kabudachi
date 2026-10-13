@@ -67,6 +67,8 @@ pub(crate) struct MemberReport {
     /// Whether it runs compaction, which the leader reads to know which
     /// workers can run the compaction it assigns.
     pub(crate) runs_compaction: bool,
+    /// The places it has free to run tasks in.
+    pub(crate) available_capacity: u32,
 }
 
 /// What one ack carries of the configuration the office leads. A joiner the

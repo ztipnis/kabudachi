@@ -14,7 +14,7 @@
 //! Per run, in order: `Started` once the body runs (a compaction run sends
 //! none), then exactly one of `Completed` (with the digest of its result, and
 //! whether the result reached the task's client first), `Failed` (with the
-//! error's type name), `Lost` (the process running it died or was killed at
+//! error's type name and message), `Lost` (the process running it died or was killed at
 //! an abort deadline, so no outcome is known), or, for a compaction run,
 //! `Compacted` (the fold). The driver takes each report to
 //! the leader in that order, asking again as leaders change, until one takes
@@ -88,7 +88,7 @@ pub enum Report {
     Capacity(u32),
     Started(TaskRunId),
     Completed { run: TaskRunId, digest: Digest, delivered: bool },
-    Failed { run: TaskRunId, reason: String },
+    Failed { run: TaskRunId, reason: String, message: String },
     Lost(TaskRunId),
     Compacted { run: TaskRunId, payload: Vec<u8> },
 }
@@ -419,6 +419,17 @@ impl<'n> Executing<'n> {
         Some(std::mem::take(&mut self.endpoint.held.credits))
     }
 
+    /// The places the executor offered that no run has taken: those not yet
+    /// claimed for, and those a claim under way reserved. A place counts once
+    /// across the end of a run of the driver, since [`Drop`] offers the
+    /// reserved ones again.
+    pub(crate) fn free_places(&self) -> u32 {
+        let reserved = self.discovering.as_ref().map_or(0, |(reserved, _)| *reserved)
+            + self.found.as_ref().map_or(0, |(reserved, _)| *reserved)
+            + self.own_claim.unwrap_or(0);
+        self.endpoint.held.credits.saturating_add(reserved)
+    }
+
     fn claim_under_way(&self) -> bool {
         self.discovering.is_some() || self.found.is_some() || self.own_claim.is_some()
     }
@@ -548,7 +559,7 @@ impl<'n> Executing<'n> {
                     delivered,
                 })
             }
-            Report::Failed { run, reason } => {
+            Report::Failed { run, reason, message } => {
                 let held = &self.endpoint.held;
                 // A leader fails only a running run: one that failed before its
                 // body started (its claim could not be read, or its input
@@ -566,7 +577,7 @@ impl<'n> Executing<'n> {
                 task_request::Request::Failed(ReportFailed {
                     task_run_id: Some(run.into()),
                     failure_kind: reason,
-                    failure_message: String::new(),
+                    failure_message: message,
                 })
             }
             Report::Lost(run) => {

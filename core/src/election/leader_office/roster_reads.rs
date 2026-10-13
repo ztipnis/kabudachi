@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::configuration::Tally;
 use crate::protocol::ids::WorkerId;
@@ -37,6 +37,12 @@ impl LeaderOffice {
     /// The members whose latest heartbeat said they run compaction.
     pub(crate) fn compaction_runners(&self) -> BTreeSet<WorkerId> {
         self.reports.compaction_runners(&self.roster)
+    }
+
+    /// The free places each member and pending joiner said it had in its
+    /// latest heartbeat.
+    pub(crate) fn member_capacities(&self) -> BTreeMap<WorkerId, u32> {
+        self.reports.capacities(&self.roster)
     }
 
     /// The voters of the committed configuration this office knows by id,
