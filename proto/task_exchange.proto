@@ -46,6 +46,9 @@ message SubmitTask {
   string trace_parent = 17;
   string trace_state = 18;
   string baggage = 19;
+  // The task's own retention (see `Task.result_ttl_ms`); unset for the
+  // shard's.
+  optional uint64 result_ttl_ms = 20;
 }
 
 message ReportStarted {

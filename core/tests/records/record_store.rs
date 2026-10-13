@@ -355,3 +355,25 @@ fn a_revision_that_changes_what_the_first_revision_fixed_is_refused_from_any_sen
     undescribed.version = composite_record(&bare, 0, 2).version;
     assert_eq!(composites.put(undescribed, NOW), Ok(Put::Stored), "a later revision still without one");
 }
+
+#[test]
+fn a_finished_record_that_chose_its_retention_is_kept_that_long_and_its_stub_too() {
+    let mut store = VersionedRecords::with_retention(Some(Duration::from_ticks(100))).held_by(WorkerId::new("me"));
+    let mut own = record("own", version(0, 0, 1, 0), "q");
+    own.finished = true;
+    own.task.as_mut().unwrap().result_ttl_ms = Some(120_000);
+    store.put(own, NOW).unwrap();
+    // Moved to another holder, the stub keeps the same retention.
+    let mut moved = placed(record("moved", version(0, 0, 1, 1), "q"), &["other"]);
+    moved.finished = true;
+    moved.task.as_mut().unwrap().result_ttl_ms = Some(120_000);
+    store.put(moved, NOW).unwrap();
+    let mut shard_default = record("default", version(0, 0, 1, 2), "q");
+    shard_default.finished = true;
+    store.put(shard_default, NOW).unwrap();
+
+    assert_eq!(store.sweep(Instant::at(100)), 1, "the shard's default applies to the record that chose none");
+    assert_eq!(store.next_due(), Some(Instant::at(120_000)));
+    assert_eq!(store.sweep(Instant::at(120_000)), 2);
+    assert_eq!(store.len(), 0);
+}

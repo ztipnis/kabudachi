@@ -205,6 +205,11 @@ pub struct Submission {
     pub member_of: Option<(CompositeId, u64)>,
     /// Where the task sits in the reduce it is a step of.
     pub reduce_node: Option<ReduceNode>,
+    /// How long the task is kept once finished, overriding the shard's
+    /// retention; zero keeps it only as long as the shard must
+    /// ([`MIN_TASK_RETENTION`](crate::protocol::records::MIN_TASK_RETENTION)).
+    /// `None` keeps the shard's.
+    pub result_ttl: Option<Duration>,
 }
 
 impl Submission {
@@ -233,7 +238,18 @@ impl Submission {
             trace: TraceContext::default(),
             member_of: None,
             reduce_node: None,
+            result_ttl: None,
         }
+    }
+
+    /// The task is kept `ttl` once finished instead of the shard's retention,
+    /// and never less than
+    /// [`MIN_TASK_RETENTION`](crate::protocol::records::MIN_TASK_RETENTION);
+    /// zero keeps no result.
+    #[must_use]
+    pub fn with_result_ttl(mut self, ttl: Duration) -> Self {
+        self.result_ttl = Some(ttl);
+        self
     }
 
     /// The task is stage or member `index` of `composite`.
@@ -598,5 +614,6 @@ fn task_of(task_id: TaskId, submitted_at: WallTime, submission: Submission) -> T
         trace: submission.trace,
         member_of: submission.member_of,
         reduce_node: submission.reduce_node,
+        result_ttl: submission.result_ttl,
     })
 }

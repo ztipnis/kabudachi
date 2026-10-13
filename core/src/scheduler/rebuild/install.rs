@@ -10,7 +10,7 @@ use crate::protocol::generated::{ChainEntry, CoalescingLink, TaskRecord, chain_e
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
-use crate::protocol::records::TaskRunRecord;
+use crate::protocol::records::{TaskRunRecord, task_retention};
 use crate::protocol::task::TaskRunState;
 use crate::reconcile::RECONCILE_SKEW_MARGIN;
 use crate::time::{Clock, Duration, Instant, WallTime};
@@ -45,9 +45,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .admit(&task_id, &task.queue, now, not_before, expires_at);
         }
         if finished && retained_by_composite {
-            self.retention.hold(&task_id, now);
+            self.retention.hold(&task_id, now, task_retention(&task));
         } else if finished {
-            self.retention.record(&task_id, now);
+            self.retention.record(&task_id, now, task_retention(&task));
         } else {
             self.count_unfinished(&task_id, &task, &retained_chain, state);
         }

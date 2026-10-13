@@ -4,6 +4,7 @@ use crate::blob::{BlobKey, BlobOwner, BlobRecord, MAX_BLOB_BYTES};
 use crate::protocol::digest::Digest;
 use crate::protocol::generated::TaskRecord;
 use crate::protocol::ids::{TaskId, WorkerId};
+use crate::protocol::records::task_retention;
 use crate::task_record::key::{RecordKey, ShardRecord};
 use crate::task_record::version::{RecordVersion, VersionOrder};
 use crate::time::{Duration, Instant};
@@ -89,10 +90,11 @@ pub enum OwnerState {
 /// holder learns that a newer revision exists and where it went.
 ///
 /// A finished record, or the stub of one, is dropped once its retention has
-/// passed, counted on this node's own clock from when it first held a
-/// finished revision of it that its leader does not keep for a composite (a
-/// member Task's record is kept until a revision says its composite is
-/// forgotten). Unfinished records are never dropped, and a put
+/// passed: the task's own, if it chose one, else the store's. The retention is
+/// counted on this node's own clock from when it first held a finished
+/// revision of it that its leader does not keep for a composite (a member
+/// Task's record is kept until a revision says its composite is forgotten).
+/// Unfinished records are never dropped, and a put
 /// is never refused for lack of room: the leader's memory budget bounds how
 /// much there is.
 ///
@@ -127,9 +129,10 @@ pub struct VersionedRecords {
     input_bytes: u64,
     /// The most bytes of blobs held, or `None` for no limit.
     blob_store_limit: Option<u64>,
-    /// The records held that have a finished revision, by when this store
-    /// first held one, kept only when there is a retention: a sweep reads
-    /// from the front instead of looking at every record.
+    /// The records held that have a finished revision and a retention, by when
+    /// that retention passes (the task's own, else the store's, counted from
+    /// when this store first held one): a sweep reads from the front instead
+    /// of looking at every record.
     finishing: BTreeMap<Instant, BTreeSet<RecordKey>>,
     /// The owners with blobs whose record (or stub) left the store since the
     /// last sweep, which lets their blobs go.
@@ -172,6 +175,9 @@ struct BlobsOf {
 struct Held {
     record: ShardRecord,
     finished_since: Option<Instant>,
+    /// The task's own retention, when it chose one; otherwise the store's
+    /// applies. Only a Task record has one.
+    kept_for: Option<Duration>,
     /// Whether `record` is only the key of a revision held elsewhere.
     stub: bool,
     /// The digest of what the first revision held here fixed (see
@@ -413,16 +419,14 @@ impl VersionedRecords {
     /// records and blobs it dropped.
     pub fn sweep(&mut self, now: Instant) -> usize {
         let mut dropped = 0;
-        if let Some(retention) = self.retention {
-            while let Some(due) = self.finishing.first_entry() {
-                if *due.key() + retention > now {
-                    break;
-                }
-                for key in due.remove() {
-                    if self.records.remove(&key).is_some() {
-                        dropped += 1;
-                        self.release_owner_of(&key);
-                    }
+        while let Some(due) = self.finishing.first_entry() {
+            if *due.key() > now {
+                break;
+            }
+            for key in due.remove() {
+                if self.records.remove(&key).is_some() {
+                    dropped += 1;
+                    self.release_owner_of(&key);
                 }
             }
         }
@@ -436,9 +440,7 @@ impl VersionedRecords {
     /// When the next finished record's retention, or finished-elsewhere
     /// owner's grace, passes, if any.
     pub fn next_due(&self) -> Option<Instant> {
-        let records = self.retention.and_then(|retention| {
-            self.finishing.first_key_value().map(|(since, _)| *since + retention)
-        });
+        let records = self.finishing.first_key_value().map(|(due, _)| *due);
         let blobs = self.orphan_grace.and_then(|grace| {
             self.unseen_finished.first_key_value().map(|(since, _)| *since + grace)
         });
@@ -467,7 +469,7 @@ impl VersionedRecords {
             return None;
         }
         let held = self.records.remove(key)?;
-        self.unindex_finish(key, held.finished_since);
+        self.unindex_finish(key, &held);
         self.release_owner_of(key);
         Some(held.record)
     }
@@ -504,23 +506,23 @@ impl VersionedRecords {
 impl VersionedRecords {
     /// Holds `held` under `key` in place of any record held there.
     fn insert_held(&mut self, key: RecordKey, held: Held) {
-        let since = held.finished_since;
+        let due = held.due(self.retention);
         if let Some(replaced) = self.records.insert(key.clone(), held) {
-            self.unindex_finish(&key, replaced.finished_since);
+            self.unindex_finish(&key, &replaced);
         }
-        if let (Some(_), Some(since)) = (self.retention, since) {
-            self.finishing.entry(since).or_default().insert(key);
+        if let Some(due) = due {
+            self.finishing.entry(due).or_default().insert(key);
         }
     }
 
-    fn unindex_finish(&mut self, key: &RecordKey, since: Option<Instant>) {
-        let Some(since) = since else {
+    fn unindex_finish(&mut self, key: &RecordKey, held: &Held) {
+        let Some(due) = held.due(self.retention) else {
             return;
         };
-        if let Some(keys) = self.finishing.get_mut(&since) {
+        if let Some(keys) = self.finishing.get_mut(&due) {
             keys.remove(key);
             if keys.is_empty() {
-                self.finishing.remove(&since);
+                self.finishing.remove(&due);
             }
         }
     }
@@ -816,13 +818,24 @@ impl VersionedRecords {
 }
 
 impl Held {
+    /// When the retention of this record passes, if it is finished and has one:
+    /// its own, else `store_retention`.
+    fn due(&self, store_retention: Option<Duration>) -> Option<Instant> {
+        Some(self.finished_since? + self.kept_for.or(store_retention)?)
+    }
+
     /// `finished_since` is kept once set; otherwise a finished `record`
     /// starts its retention at `now`.
     fn new(record: ShardRecord, finished_since: Option<Instant>, submission: Option<Digest>, now: Instant) -> Self {
         let finished_since = finished_since.or(record.retention_may_begin().then_some(now));
+        let kept_for = match &record {
+            ShardRecord::Task(record) => record.task.as_ref().and_then(task_retention),
+            ShardRecord::Composite(_) | ShardRecord::Page(_) => None,
+        };
         Held {
             record,
             finished_since,
+            kept_for,
             stub: false,
             submission,
         }
