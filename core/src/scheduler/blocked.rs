@@ -138,7 +138,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Puts `task_id`'s claimed run `run_id` back in the queue, as if it had
-    /// not been claimed: no attempt is spent and no run is added.
+    /// not been claimed: no attempt is spent and no run is added. It waits at
+    /// the back of its queue, like any requeued attempt, and without an
+    /// expiry: a claim already ended the expiry, which is only about starting
+    /// the task, and the block TTL bounds the wait instead.
     fn release_claim(&mut self, task_id: &TaskId, run_id: &TaskRunId) {
         let stamped_at = WallTime::now(&self.clock);
         let run = self
@@ -204,9 +207,19 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let now = self.clock.now();
         let wall_now = WallTime::now(&self.clock);
         self.blocked
-            .values()
-            .map(|blocked| blocked.since.deadline(self.version_block_ttl, now, wall_now))
+            .iter()
+            .filter(|(task, _)| self.current_state(task) == Some(TaskRunState::Queued))
+            .map(|(_, blocked)| blocked.since.deadline(self.version_block_ttl, now, wall_now))
             .min()
+    }
+
+    /// What blocks `task_id`, while its current run waits in the queue. A task
+    /// some other worker has claimed since, or that has ended, is not blocked:
+    /// nothing is waiting on the TTL, and its record shows no block.
+    pub(super) fn queued_block(&self, task_id: &TaskId) -> Option<&BlockedTask> {
+        self.blocked
+            .get(task_id)
+            .filter(|_| self.current_state(task_id) == Some(TaskRunState::Queued))
     }
 
     /// The state of `task_id`'s current run, if the task is held.

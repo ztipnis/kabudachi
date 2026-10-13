@@ -18,6 +18,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Takes a task that is over out of every place it was waiting in.
     pub(super) fn record_finished(&mut self, task_id: &TaskId, now: Instant) {
         self.release(task_id, now);
+        // A task that ends without starting is no longer blocked.
+        self.blocked.remove(task_id);
         if let Some(key) = self.compaction_key_of(task_id) {
             self.occupancy.end_compaction(&key, task_id);
         }

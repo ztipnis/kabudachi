@@ -7,9 +7,11 @@
 use kabudachi_core::protocol::ids::{TaskDefinitionId, WorkerId};
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
+use kabudachi_core::scheduler::composite::{CompositeState, OnError};
 use kabudachi_core::scheduler::{ClaimRejection, Event, Submission};
 use kabudachi_core::time::Clock;
 
+use crate::support::composites::{finished, group_of, submitted, task_stage, worker};
 use crate::support::scheduler::{Fixture, OFFICE, grant_of, newest_records, reconciling_after, ticks};
 
 fn submitted_at(version: u32) -> Submission {
@@ -130,6 +132,55 @@ fn a_task_blocked_past_the_ttl_fails_with_the_reason_unless_a_worker_started_it(
             assert_eq!(record.blocked_reason, "version 4 is newer than 3");
         }
     }
+}
+
+#[test]
+fn a_blocked_task_that_is_cancelled_leaves_no_block_deadline_and_no_stale_block_in_its_record() {
+    let mut fixture = Fixture::leading();
+    fixture.scheduler.set_version_block_ttl(ticks(100));
+    let task = fixture.scheduler.submit(submitted_at(4)).unwrap();
+    fixture
+        .scheduler
+        .report_blocked(&old(), &task, "newer".into(), false)
+        .unwrap();
+    assert!(fixture.scheduler.next_deadline().is_some(), "the block TTL is pending");
+
+    fixture.scheduler.cancel(&task).unwrap();
+    pass(&fixture, 500);
+
+    assert_eq!(
+        fixture.scheduler.next_deadline(),
+        None,
+        "a cancelled task has no block TTL left to wait for"
+    );
+    assert_eq!(fixture.scheduler.catch_up().migration_failed, 0);
+    assert_eq!(fixture.state(&task), TaskRunState::Cancelled);
+    let record = fixture.spy.newest_revision_of(&task).unwrap();
+    assert!(record.blocked_since.is_none());
+    assert!(record.blocked_reason.is_empty());
+}
+
+#[test]
+fn an_incompatible_report_on_a_group_member_fails_the_group() {
+    let mut fixture = Fixture::leading();
+    let group = submitted(
+        &mut fixture,
+        group_of(
+            OnError::FailFast,
+            vec![task_stage("a", Some(b"x")), task_stage("b", Some(b"y"))],
+        ),
+    );
+
+    let reason = "version 2 of shop.Order cannot be migrated to version 3";
+    fixture
+        .scheduler
+        .report_blocked(&worker(), &group.member_task(0), reason.into(), true)
+        .unwrap();
+
+    let finished = finished(&mut fixture);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].state, CompositeState::Failed);
+    assert_eq!(finished[0].failure.as_ref().unwrap().kind, "MigrationError");
 }
 
 #[test]
