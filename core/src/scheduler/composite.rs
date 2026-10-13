@@ -163,6 +163,33 @@ impl CompositeFinished {
     pub fn results(&self) -> Manifest {
         pages_manifest(&self.composite_id, self.pages)
     }
+
+    /// What the composite `record` stores of its end, as its client was told
+    /// it; `None` while it runs, or for a record that names no composite.
+    /// A client that missed the message settles from the record instead.
+    pub fn of_record(record: &generated::CompositeRecord) -> Option<CompositeFinished> {
+        let state = match generated::CompositeState::try_from(record.state) {
+            Ok(generated::CompositeState::Succeeded) => CompositeState::Succeeded,
+            Ok(generated::CompositeState::Failed) => CompositeState::Failed,
+            Ok(generated::CompositeState::Cancelled) => CompositeState::Cancelled,
+            _ => return None,
+        };
+        let parent_task = match &record.parent {
+            Some(generated::composite_record::Parent::ParentTask(task)) => Some(TaskId::from(task.clone())),
+            _ => None,
+        };
+        Some(CompositeFinished {
+            composite_id: CompositeId::from(record.composite_id.clone()?),
+            state,
+            failure: record
+                .failure
+                .as_ref()
+                .map(|failure| Failure { kind: failure.kind.clone(), message: failure.message.clone() }),
+            pages: record.pages,
+            client: record.client.clone().map(WorkerId::from),
+            parent_task,
+        })
+    }
 }
 
 /// What a leader tells a composite's client: the composite, how it ended,

@@ -8,8 +8,12 @@ use std::time::Duration;
 use kabudachi_core::blob::{BlobKey, BlobOwner};
 use kabudachi_core::protocol::generated::CompositeState as WireState;
 use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, Uuid7Ids, WorkerId};
-use kabudachi_core::scheduler::composite::{CompositeKind, CompositeState, Resolved, Stage, member_input, results};
+use kabudachi_core::protocol::messages::{CancelOutcome, task_response};
+use kabudachi_core::scheduler::composite::{
+    CompositeKind, CompositeState, Resolved, Stage, SubmittedComposite, member_input, results,
+};
 use kabudachi_core::task_record::RecordKey;
+use kabudachi_core::time::{RealClock, WallTime};
 use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::composites::NetSource;
 use kabudachi_net::executor::Report;
@@ -20,7 +24,7 @@ use crate::support::executor::FakeExecutor;
 use crate::support::records::{
     MIB, ThreeVoters, Voters, claimed_member_run_through, composite_submitted_as, composite_submitted_through,
     finished_heard_by, flow_of_bound, group_of_chunked, member_claimed_through, member_run_through,
-    member_started_through, plain_with, retry, submitted_through, varied,
+    member_started_through, plain_with, retry, submitted_through, two_holders, varied,
 };
 use crate::support::worker::poll_until;
 
@@ -269,6 +273,50 @@ async fn a_run_that_returns_a_step_is_certified_with_it_and_its_task_ends_only_w
                 nets.iter().filter_map(|net| net.held_records().get(&task)).any(|record| record.finished)
             }))
             .await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_stores_submits_and_cancels_a_composite_through_the_leader_its_node_names() {
+    within_deadline(async {
+        let mut shard = Voters::start_without_client(1, two_holders()).await;
+        let leader = shard.drive_until_a_leader().await;
+        let net = shard.nets[leader].clone();
+        let submitted = SubmittedComposite {
+            composite_id: Uuid7Ids.next_composite_id(),
+            submitted_at: WallTime::now(&RealClock::new()),
+            step: flow_of_bound(&["load"]),
+            client: Some(net.local_worker_id()),
+        };
+        // A value too large to inline is stored where the leader will place
+        // the composite, before the composite is submitted.
+        let owner = BlobOwner::Composite(submitted.composite_id.clone());
+        let chunk = varied(MIB / 4);
+        shard
+            .drive_until(net.store_blobs_at_leader(BlobRole::Input, &owner, vec![chunk.clone()], retry()))
+            .await
+            .expect("the shard stores the value");
+        let digest = BlobKey::of(&chunk).digest();
+        assert_eq!(shard.drive_until(net.get_blob(owner, &digest)).await, Some(chunk));
+
+        let answer = shard
+            .drive_until(net.submit_composite_to_leader(&submitted, retry()))
+            .await
+            .expect("a leader answers");
+        let Some(task_response::Result::Composite(accepted)) = answer.result else {
+            panic!("the leader records the composite: {answer:?}");
+        };
+        assert_eq!(CompositeId::from(accepted.composite_id.expect("it names the composite")), submitted.composite_id);
+
+        let answer = shard
+            .drive_until(net.cancel_composite_at_leader(submitted.composite_id.clone(), retry()))
+            .await
+            .expect("a leader answers");
+        let Some(task_response::Result::Cancelled(cancelled)) = answer.result else {
+            panic!("the leader answers a cancel: {answer:?}");
+        };
+        assert_eq!(cancelled.outcome(), CancelOutcome::Cancelled);
     })
     .await;
 }

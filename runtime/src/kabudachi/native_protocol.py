@@ -319,10 +319,11 @@ class Runtime(Protocol):
         the leader would not accept or one that takes an input, and
         `BackpressureError` past the hard memory limit."""
 
-    def cancel_composite(self, composite_id: str) -> CancelOutcome:
+    def cancel_composite(self, composite_id: str) -> CancelOutcome | None:
         """Cancels a composite and every member it has started; one still
         queued for want of a leader is dropped. Raises `RuntimeError` when this
-        worker is not the leader and the composite is not queued."""
+        worker is not the leader and the composite is not queued. `None`: the
+        cancel was sent, and the leader decides."""
 
     def composite_status(self, composite_id: str) -> tuple[str, int, int, int, int, int] | None:
         """A composite's state, the stage it is on, and the number of its

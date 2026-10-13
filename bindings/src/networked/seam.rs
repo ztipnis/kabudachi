@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::messages::Task;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::Claim;
 use kabudachi_net::executor::{Report, ReportSink};
@@ -44,6 +45,12 @@ pub(super) struct Seam {
     pub(super) delivering: BTreeSet<TaskId>,
     /// Tasks submitted here whose outcome has not come back.
     pub(super) awaiting: BTreeSet<TaskId>,
+    /// Composites submitted here whose submission no leader has answered
+    /// yet: a cancel of one waits, as for a task.
+    pub(super) delivering_composites: BTreeSet<CompositeId>,
+    /// Composites submitted here, and continuations of tasks submitted here,
+    /// that have not been told finished.
+    pub(super) awaiting_composites: BTreeSet<CompositeId>,
     /// Nothing more is taken: a run handed over is reported lost at once.
     pub(super) closed: bool,
 }
@@ -55,6 +62,9 @@ pub(super) struct HeldRun {
     pub(super) client: Option<WorkerId>,
     /// How long the result may take to reach the client: the run's reconnect timeout.
     pub(super) reconnect_timeout: StdDuration,
+    /// The run as the leader gave it, kept for a member of a composite or an
+    /// expansion, whose input is read from the composite's records.
+    pub(super) member: Option<Task>,
 }
 
 pub(super) struct Shared {
@@ -146,6 +156,7 @@ impl Shared {
                 task: claim.task.task_id(),
                 client: claim.task.client(),
                 reconnect_timeout: StdDuration::from_millis(claim.reconnect_timeout.as_ticks()),
+                member: claim.task.composite_id().is_some().then(|| claim.task.clone()),
             };
             seam.held.insert(claim.task_run_id.clone(), held);
         }
@@ -159,6 +170,15 @@ impl Shared {
 
     pub(super) fn holds(&self, run: &TaskRunId) -> bool {
         self.seam().held.contains_key(run)
+    }
+
+    /// The task a composite's member run is, and how long its reads may be
+    /// retried; `None` for a run Python does not hold, or one that is no
+    /// member.
+    pub(super) fn member_of(&self, run: &TaskRunId) -> Option<(Task, StdDuration)> {
+        let seam = self.seam();
+        let held = seam.held.get(run)?;
+        Some((held.member.clone()?, held.reconnect_timeout))
     }
 
     /// Ends a run Python held, and returns it; `None` if it held none (the

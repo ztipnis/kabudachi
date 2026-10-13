@@ -411,7 +411,8 @@ class Session:
 
     def _on_accepted(self, event: Any) -> None:
         # Stored on a quorum: its handle is `REPLICATED`.
-        self._tasks.replicated(event.task_id)
+        if not self._composites.accepted(event.task_id):
+            self._tasks.replicated(event.task_id)
 
     def _on_refused(self, event: Any) -> None:
         error: Exception = BackpressureError(
@@ -421,7 +422,8 @@ class Session:
             error = PayloadTooLargeError(
                 "the input is past the hard memory limit of the shard's leader"
             )
-        self._tasks.refused(event.task_id, error)
+        if not self._composites.refused(event.task_id, error):
+            self._tasks.refused(event.task_id, error)
 
     def _on_abort(self, event: Any) -> None:
         self._abort_at(event.task_run_id, event.seconds_left)
@@ -915,11 +917,6 @@ class Session:
         """The task returned `step`: certify the run, by the digest of the
         step, which the leader then runs as the task's continuation. The task
         is over, and its handle settled, when the continuation is."""
-        if not self._runtime.certifies_locally:
-            raise TaskDefinitionError(
-                f"task {claim.definition_id} returned a flow, group or bound task, which a "
-                "networked worker cannot run as a continuation yet"
-            )
         if not getattr(step, "is_step", False):
             raise TaskDefinitionError(
                 f"task {claim.definition_id} is declared to return a flow, group or bound task, "

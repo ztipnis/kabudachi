@@ -23,7 +23,10 @@ use tokio::task::JoinHandle;
 
 use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
-use crate::composite::{PyBytesValue, PyManifest, PyMemberInput, PyResolved, state_name, step_from_tree, take_large_values};
+use crate::composite::{
+    PyBytesValue, PyManifest, PyMemberInput, PyResolved, refuse_values_past_limit, state_name, step_from_tree,
+    take_large_values,
+};
 use crate::door::{Closed, DoorSource, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
 use crate::errors;
@@ -794,16 +797,7 @@ impl NativeRuntime {
     /// Refuses any of `values` alone past the hard memory limit, before
     /// anything is stored.
     fn refuse_values_past_limit(&self, py: Python<'_>, values: &[Vec<u8>]) -> PyResult<()> {
-        let Some(limit) = self.payload_limit else {
-            return Ok(());
-        };
-        match values.iter().find(|value| value.len() as u64 > limit) {
-            Some(value) => Err(errors::backpressure_error(
-                py,
-                format!("a payload of {} bytes is past the hard memory limit of {limit}", value.len()),
-            )),
-            None => Ok(()),
-        }
+        refuse_values_past_limit(py, self.payload_limit, values)
     }
 }
 

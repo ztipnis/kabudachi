@@ -82,7 +82,9 @@ class CompositeHandle(TaskHandle):
         return "cancelled" if isinstance(error, TaskCancelledError) else "failed"
 
     def _cancel_composite(self, composite_id: str) -> bool:
-        return self._runtime.cancel_composite(composite_id) == CancelOutcome.CANCELLED
+        outcome = self._runtime.cancel_composite(composite_id)
+        # `None`: sent to a leader elsewhere, which decides.
+        return outcome is None or outcome == CancelOutcome.CANCELLED
 
 
 class FlowHandle(CompositeHandle):
@@ -160,6 +162,30 @@ class Composites:
             self._open[composite_id] = handle
             self._known[composite_id] = handle
         return handle
+
+    def accepted(self, composite_id: str) -> bool:
+        """A networked leader stored the composite on a quorum of its shard:
+        its handle is `REPLICATED`. Whether `composite_id` is one submitted
+        here."""
+        # Under the lock the registration is made under, so a composite
+        # accepted at once is never missed.
+        with self._lock:
+            handle = self._known.get(composite_id)
+        if handle is None:
+            return False
+        handle._mark_stored()
+        return True
+
+    def refused(self, composite_id: str, error: BaseException) -> bool:
+        """The leader refused the composite for good: it was never stored, and
+        its handle fails with `error`. Whether `composite_id` is one
+        submitted here."""
+        with self._lock:
+            handle = self._open.pop(composite_id, None)
+            known = composite_id in self._known
+        if handle is not None:
+            handle._fail(error)
+        return known
 
     def finished(self, event: Event) -> None:
         """A composite is over (`COMPOSITE_FINISHED`): settles its handle, or,

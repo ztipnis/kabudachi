@@ -19,8 +19,8 @@
 
 use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::generated::{
-    self, BoundField, BoundTaskStep, StageDescription, StepDescription, bound_field, bound_task_step,
-    stage_description,
+    self, BoundField, BoundTaskStep, CompositeRecord, StageDescription, StepDescription, bound_field,
+    bound_task_step, stage_description,
 };
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
 use kabudachi_core::scheduler::composite::{
@@ -31,6 +31,8 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3::IntoPyObjectExt;
+
+use crate::errors;
 
 /// The manifest of a payload stored for a composite, which goes into a tree
 /// as `("manifest", manifest)`. Opaque to Python.
@@ -328,4 +330,42 @@ pub(crate) fn state_name(state: CompositeState) -> &'static str {
         CompositeState::Failed => "failed",
         CompositeState::Cancelled => "cancelled",
     }
+}
+
+/// Refuses any of `values` alone past the hard memory `limit`, before anything
+/// is stored.
+pub(crate) fn refuse_values_past_limit(py: Python<'_>, limit: Option<u64>, values: &[Vec<u8>]) -> PyResult<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    match values.iter().find(|value| value.len() as u64 > limit) {
+        Some(value) => Err(errors::backpressure_error(
+            py,
+            format!("a payload of {} bytes is past the hard memory limit of {limit}", value.len()),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A composite's status as Python reads it: `(state, next_stage, pending,
+/// succeeded, failed, cancelled)`.
+pub(crate) type CompositeStatusTuple = (&'static str, u64, u64, u64, u64, u64);
+
+/// How a composite's record says it stands.
+pub(crate) fn record_status(record: &CompositeRecord) -> CompositeStatusTuple {
+    let state = match generated::CompositeState::try_from(record.state) {
+        Ok(generated::CompositeState::Succeeded) => CompositeState::Succeeded,
+        Ok(generated::CompositeState::Failed) => CompositeState::Failed,
+        Ok(generated::CompositeState::Cancelled) => CompositeState::Cancelled,
+        _ => CompositeState::Running,
+    };
+    let counts = record.counts.unwrap_or_default();
+    (
+        state_name(state),
+        record.next_stage,
+        counts.pending,
+        counts.succeeded,
+        counts.failed,
+        counts.cancelled,
+    )
 }

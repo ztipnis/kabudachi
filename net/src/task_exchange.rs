@@ -35,6 +35,7 @@
 //! message where the leader would place its owner's record (a task's or a
 //! composite's), asking again as `submit_to_leader` does.
 
+use std::future::Future;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -60,7 +61,7 @@ use tokio::sync::oneshot;
 use crate::blobs::BlobRole;
 use crate::claimed_runs::{ClaimedRuns, HeldRun};
 use crate::exchange::Asked;
-use crate::messenger::Net;
+use crate::messenger::{Net, PutBlobError};
 use crate::peers::worker_id_of;
 use crate::task_exchange::codec::TaskCodec;
 use crate::task_exchange::wire::Malformed;
@@ -598,12 +599,44 @@ impl Net {
         payload: &[u8],
         retry: LeaderRetry,
     ) -> Result<Manifest, NotStored> {
+        self.stored_where_placed(owner, retry, |placement| self.store_payload(role, owner, payload, placement))
+            .await
+    }
+
+    /// Stores each of `blobs` in `role`, owned by `owner`, as
+    /// [`Self::store_payload_at_leader`] stores a payload's: for blobs a
+    /// caller has cut itself, such as a result's and the manifest naming it.
+    pub async fn store_blobs_at_leader(
+        &self,
+        role: BlobRole,
+        owner: &BlobOwner,
+        blobs: Vec<Vec<u8>>,
+        retry: LeaderRetry,
+    ) -> Result<(), NotStored> {
+        self.stored_where_placed(owner, retry, |placement| {
+            self.store_blobs(role, owner, blobs.clone(), placement)
+        })
+        .await
+    }
+
+    /// Runs `store` against the placement the leader gives `owner`'s record,
+    /// asking for a fresh one after a failed write, up to [`STORE_ATTEMPTS`]
+    /// writes.
+    async fn stored_where_placed<T, Fut>(
+        &self,
+        owner: &BlobOwner,
+        retry: LeaderRetry,
+        store: impl Fn(Placement) -> Fut,
+    ) -> Result<T, NotStored>
+    where
+        Fut: Future<Output = Result<T, PutBlobError>>,
+    {
         let key = record_key_of(owner);
         let mut failed = 0;
         loop {
             if let Some(placement) = self.placement_from_leader(&key, retry).await? {
-                if let Ok(manifest) = self.store_payload(role, owner, payload, placement).await {
-                    return Ok(manifest);
+                if let Ok(stored) = store(placement).await {
+                    return Ok(stored);
                 }
                 failed += 1;
                 if failed >= STORE_ATTEMPTS {
@@ -612,6 +645,32 @@ impl Net {
             }
             tokio::time::sleep(retry.ask_again_after).await;
         }
+    }
+
+    /// Asks the shard's leader to run `submitted` until a leader decides it:
+    /// recorded (`composite`), or refused for good. Asks again as
+    /// [`Self::submit_to_leader`] does, with the same `submitted`, so the
+    /// composite id holds; `None` once the worker has left its shard.
+    pub async fn submit_composite_to_leader(
+        &self,
+        submitted: &SubmittedComposite,
+        retry: LeaderRetry,
+    ) -> Option<TaskResponse> {
+        self.ask_until_decided(
+            task_request::Request::SubmitComposite(wire::submit_composite(submitted)),
+            retry,
+        )
+        .await
+    }
+
+    /// Asks the shard's leader to cancel the composite `id` until a leader
+    /// decides it, as [`Self::cancel_at_leader`] does for a task.
+    pub async fn cancel_composite_at_leader(&self, id: CompositeId, retry: LeaderRetry) -> Option<TaskResponse> {
+        let request = task_request::Request::Cancel(CancelTask {
+            task_id: None,
+            composite_id: Some(id.into()),
+        });
+        self.ask_until_decided(request, retry).await
     }
 
     /// Where the leader the node names would place the record `key` names, if

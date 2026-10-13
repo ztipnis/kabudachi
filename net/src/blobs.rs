@@ -39,15 +39,29 @@ impl Net {
         placement: Placement,
     ) -> Result<Manifest, PutBlobError> {
         let Chunked { manifest, chunks } = Manifest::chunk(payload);
-        let mut puts =
-            stream::iter(chunks.into_iter().map(|chunk| {
-                self.put_blob_in(role, owner.clone(), chunk, placement.clone())
-            }))
-            .buffer_unordered(BLOBS_IN_FLIGHT);
+        self.store_blobs(role, owner, chunks, placement).await?;
+        Ok(manifest)
+    }
+
+    /// Stores each of `blobs`, owned by `owner`, in `role` at a quorum of
+    /// `placement`. Fails if any was not stored.
+    pub async fn store_blobs(
+        &self,
+        role: BlobRole,
+        owner: &BlobOwner,
+        blobs: Vec<Vec<u8>>,
+        placement: Placement,
+    ) -> Result<(), PutBlobError> {
+        let mut puts = stream::iter(
+            blobs
+                .into_iter()
+                .map(|blob| self.put_blob_in(role, owner.clone(), blob, placement.clone())),
+        )
+        .buffer_unordered(BLOBS_IN_FLIGHT);
         while let Some(put) = puts.next().await {
             put?;
         }
-        Ok(manifest)
+        Ok(())
     }
 
     /// Every blob `manifest` names, owned by `owner`, that some holder could

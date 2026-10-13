@@ -161,8 +161,10 @@ Set `listen` and the worker joins a networked shard instead of running one of it
   that deadline, and kills its task process at the deadline.
 - Awaiting a task's result works as on one worker, inside task bodies too: the worker that runs the task
   delivers its result to the one that submitted it, and the handle settles once the leader certifies it.
-  If the result cannot reach the submitter, the await raises `ResultUnavailableError`. A task that
-  returns a flow, group or bound task fails with `TaskDefinitionError`. A result larger than the worker
+  If the result cannot reach the submitter, the await raises `ResultUnavailableError`. Flows, groups,
+  maps and tasks that return a flow, group or bound task run on a networked shard as on one worker:
+  the leader drives them, and the worker that submitted one hears when it is over (and re-reads its
+  record when the leader changes). A result larger than the worker
   can hold (`memory_hard_limit`, or half of it on a networked worker) fails the run with
   `ResultTooLargeError`; it is retried per `retries`.
 - `handle.cancel()` sends the cancel to the leader without waiting and returns `True`; the worker

@@ -11,8 +11,8 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
-    BoundInput, CompositeKind, CompositeState, EXPANSION_DEFINITION, MemberCounts, OnError, PAGE_ENTRIES,
-    Stage, Step,
+    BoundInput, CompositeFinished, CompositeKind, CompositeState, EXPANSION_DEFINITION, MemberCounts, OnError,
+    PAGE_ENTRIES, Stage, Step,
 };
 use kabudachi_core::scheduler::{
     Cancellation, ClaimRejection, Completion, Event, ReportRejection, Submission, SubmitRejection,
@@ -652,4 +652,37 @@ fn an_expansion_that_fails_fails_a_collect_all_map_too() {
     run_member(&mut fixture, &flow, 0, b"not a list");
     fail_member(&mut fixture, &flow.child(1), 0, "SerializationError");
     assert_eq!(finished(&mut fixture)[0].state, CompositeState::Failed);
+}
+
+#[test]
+fn a_finished_composites_record_gives_the_finish_its_client_was_told_and_a_running_one_gives_none() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(
+        &mut fixture,
+        flow_of(vec![task_stage("explode", Some(b"x")), task_stage("after", None)]),
+    );
+    assert_eq!(CompositeFinished::of_record(&fixture.spy.newest_composite(&flow).unwrap()), None);
+    fail_member(&mut fixture, &flow, 0, "ValueError");
+    let told = finished(&mut fixture);
+    let record = fixture.spy.newest_composite(&flow).unwrap();
+    assert_eq!(CompositeFinished::of_record(&record).as_ref(), Some(&told[0]));
+
+    // A task's continuation is told with the task that returned it.
+    let task = fixture
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
+        .unwrap();
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
+    fixture
+        .scheduler
+        .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step))
+        .unwrap();
+    let continuation = CompositeId::continuation_of(&claim.task_run_id);
+    run_member(&mut fixture, &continuation, 0, b"staged");
+    let told = finished(&mut fixture);
+    let record = fixture.spy.newest_composite(&continuation).unwrap();
+    assert_eq!(CompositeFinished::of_record(&record).as_ref(), Some(&told[0]));
+    assert_eq!(told[0].parent_task, Some(task));
 }

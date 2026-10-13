@@ -18,6 +18,13 @@
 //! a change of leader, every task still awaited is asked about again. A run
 //! held here delivers its result to its own client before it is reported.
 //!
+//! A composite is submitted and cancelled the same way, and its end comes
+//! back as `COMPOSITE_FINISHED`. The worker keeps the composites it awaits
+//! (those it submitted, and the continuations of tasks it submitted), and
+//! after a change of leader reads their records, so a notice lost with a
+//! leader still settles them. The records, pages and blobs of a composite are
+//! read from the shard.
+//!
 //! An input too large for one message travels as blobs. A submission stores
 //! them before it is sent. A run whose input is a manifest is held back until
 //! this worker has room for it under its memory limits and its blobs are
@@ -35,6 +42,7 @@
 //! Python (`ABORT`) for a run it holds, and a run not yet taken is reported
 //! lost at once.
 
+mod composites;
 mod delivery;
 mod handover;
 mod host;
@@ -48,12 +56,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::manifest::fits_inline;
+use kabudachi_core::blob::{BlobKey, BlobOwner, MAX_BLOB_BYTES};
+use kabudachi_core::manifest::{INLINE_PAYLOAD_BYTES, Manifest, fits_inline};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids};
+use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, Uuid7Ids};
+use kabudachi_core::protocol::messages::Task;
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::mint;
-use kabudachi_core::time::RealClock;
+use kabudachi_core::scheduler::composite::{
+    SubmittedComposite, expansion_source, member_input, results,
+};
+use kabudachi_core::scheduler::{SubmitRejection, mint};
+use kabudachi_core::time::{RealClock, WallTime};
+use kabudachi_net::blobs::BlobRole;
+use kabudachi_net::composites::NetSource;
 use kabudachi_net::executor::{Report, executor_channel};
 use kabudachi_net::handoff::HandedOff;
 use kabudachi_net::worker::Worker;
@@ -63,18 +78,29 @@ use tokio::sync::watch;
 
 use crate::arguments::SubmitArguments;
 use crate::bridge::CLOSED_MESSAGE;
+use crate::composite::{
+    CompositeStatusTuple, PyBytesValue, PyManifest, PyMemberInput, PyResolved, record_status,
+    refuse_values_past_limit, step_from_tree, take_large_values,
+};
 use crate::errors::backpressure_error;
 use crate::health;
 use crate::work::PyTaskRecord;
 
+use self::composites::{
+    cancel_composite_at_leader, read_until, send_composite, stored_until,
+};
 use self::delivery::{cancel_at_leader, send_submission};
 use self::host::Host;
 use self::observed::Observed;
-use self::results::deliver_then_report;
+use self::results::{deliver_then_report, store_then_report_step};
 use self::seam::{GONE_MESSAGE, Shared};
 use self::start::NetworkedArguments;
 
 const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
+
+/// What a write to the shard that gave up raises: the run it belongs to
+/// fails, and its task's policy retries it.
+const NOT_STORED_MESSAGE: &str = "the shard could not store the payload in time";
 
 /// A worker of a networked shard, and the Tokio runtime it runs on.
 ///
@@ -370,28 +396,40 @@ impl NetworkedRuntime {
         }
     }
 
-    /// Hands the leader a run's success, with the digest of its result.
-    /// `result`, the result itself, is first delivered to the task's client,
-    /// for up to the run's reconnect timeout, and the report says whether it
-    /// arrived. Raises `ValueError` for a digest of the wrong length, and for
-    /// `continues`: a networked worker certifies no continuation.
-    #[pyo3(signature = (task_run_id, result_digest, continues = false, *, result = None))]
+    /// Hands the leader a run's success. Give either `result_digest`, the
+    /// digest of the result, or `continuation`, the tree of the step the run
+    /// returned (see `describe_step`): the step runs as a composite and the
+    /// run is certified under the digest of its description. `result`, the
+    /// result itself, is first delivered to the task's client, for up to the
+    /// run's reconnect timeout, and the report says whether it arrived. The
+    /// values of a `continuation` too large to inline are first stored as
+    /// blobs the composite owns, nested stages' included; a run whose values
+    /// cannot be stored by its reconnect timeout is reported lost.
+    ///
+    /// Raises `ValueError` if neither or both are given, for a digest of the
+    /// wrong length, and for a `continuation` that is malformed or takes an
+    /// input, and `BackpressureError` if a value of the step alone is past
+    /// the hard memory limit.
+    #[pyo3(signature = (task_run_id, result_digest = None, continuation = None, *, result = None))]
     fn complete(
         &self,
+        py: Python<'_>,
         task_run_id: &str,
-        result_digest: &[u8],
-        continues: bool,
+        result_digest: Option<&[u8]>,
+        continuation: Option<&Bound<'_, PyAny>>,
         result: Option<Vec<u8>>,
     ) -> PyResult<()> {
-        if continues {
-            return Err(PyValueError::new_err(
-                "a networked worker certifies no continuation: its stages would be orchestrated \
-                 in this process",
-            ));
-        }
-        let digest = Digest::new(DigestAlgorithm::Blake3, result_digest.to_vec())
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let run = TaskRunId::new(task_run_id);
+        let digest = match (result_digest, continuation) {
+            (Some(digest), None) => Digest::new(DigestAlgorithm::Blake3, digest.to_vec())
+                .map_err(|error| PyValueError::new_err(error.to_string()))?,
+            (None, Some(tree)) => return self.complete_with_step(py, run, tree),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "give either result_digest or continuation, not both or neither",
+                ));
+            }
+        };
         let Some(held) = self.shared.end(&run) else {
             return Ok(());
         };
@@ -445,9 +483,217 @@ impl NetworkedRuntime {
             });
     }
 
-    /// No continuation is ever certified here, so there is none to end.
-    fn end_continuation(&self, _task_id: &str) -> bool {
-        false
+    /// Mints a composite for the tree `tree` describes (see `describe_step`)
+    /// and returns its id at once; the composite is then delivered to the
+    /// shard's leader, which `ACCEPTED` or `REFUSED` in `next_events()` says
+    /// the end of (`task_id` is the composite's id), and `COMPOSITE_FINISHED`
+    /// says it is over. Values of the tree too large to inline are first
+    /// stored in the shard as blobs the composite owns, nested stages'
+    /// included, and count against this process's memory limits until they
+    /// are.
+    ///
+    /// Raises `ValueError` if the tree describes a step the leader would not
+    /// accept, or one that takes an input, `BackpressureError` if its values
+    /// do not fit this process's room for payloads in flight now or one alone
+    /// is past the hard limit, and `RuntimeError` once the runtime has shut
+    /// down.
+    fn submit_composite(&self, py: Python<'_>, tree: &Bound<'_, PyAny>) -> PyResult<String> {
+        if !self.host.bridge().is_open() {
+            return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
+        }
+        let mut step = step_from_tree(tree)?;
+        if step.takes_input() {
+            return Err(PyValueError::new_err(SubmitRejection::StepTakesInput.to_string()));
+        }
+        let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+        refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), &values)?;
+        let mut stored = Vec::with_capacity(values.len());
+        for value in values {
+            // Too many payloads in flight now: refused for now. Whatever was
+            // counted so far is dropped, and counts no more.
+            let Ok(Some(taken)) = self.shared.net.payload_memory().try_take(value.len() as u64) else {
+                return Err(backpressure_error(
+                    py,
+                    "too many large payloads in flight past the hard memory limit".into(),
+                ));
+            };
+            stored.push((value, taken));
+        }
+        let submitted = SubmittedComposite {
+            composite_id: Uuid7Ids.next_composite_id(),
+            submitted_at: WallTime::now(&self.clock),
+            step,
+            client: Some(self.shared.net.local_worker_id()),
+        };
+        Ok(send_composite(&self.shared, self.host.handle(), submitted, stored))
+    }
+
+    /// Asks the shard's leader to cancel a composite, in the background, and
+    /// returns at once: whether it was cancelled is the leader's to say, and
+    /// `COMPOSITE_FINISHED` tells how it ended. Raises `RuntimeError` once
+    /// the runtime has shut down.
+    fn cancel_composite(&self, composite_id: &str) -> PyResult<()> {
+        if !self.host.bridge().is_open() {
+            return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
+        }
+        self.host.handle().spawn(cancel_composite_at_leader(
+            Arc::clone(&self.shared),
+            CompositeId::new(composite_id),
+        ));
+        Ok(())
+    }
+
+    /// Where a composite stands, as `(state, next_stage, pending, succeeded,
+    /// failed, cancelled)`, by the newest record of it the shard holds that
+    /// this worker reaches: not authoritative, so a change the leader has
+    /// just made may not show yet. `None` if no worker this one reaches holds
+    /// it. Raises `RuntimeError` once the runtime has shut down.
+    fn composite_status(
+        &self,
+        py: Python<'_>,
+        composite_id: &str,
+    ) -> PyResult<Option<CompositeStatusTuple>> {
+        if !self.host.bridge().is_open() {
+            return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
+        }
+        let net = Arc::clone(&self.shared.net);
+        let id = CompositeId::new(composite_id);
+        let handle = self.host.handle().clone();
+        let record = py.detach(|| handle.block_on(net.composite_record(&id)));
+        Ok(record.as_ref().map(record_status))
+    }
+
+    /// Returns an awaitable that resolves to a composite's results: `("list",
+    /// [...])` of its stages' or members' results in order, each `("value",
+    /// producer_definition_id, bytes)`, `("failure", kind, message)` or a
+    /// nested `("list", [...])`. A record, page or blob not found is asked
+    /// for again for up to the reconnect timeout.
+    ///
+    /// Raises `RuntimeError` if the shard no longer holds the composite or a
+    /// result it names.
+    fn composite_results<'py>(&self, py: Python<'py>, composite_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let shared = Arc::clone(&self.shared);
+        let within = self.reconnect_timeout;
+        self.host.bridge().spawn_into_py(py, async move {
+            let source = NetSource::new(Arc::clone(&shared.net));
+            let id = CompositeId::new(composite_id);
+            read_until(&shared, within, || results(&source, &id))
+                .await
+                .map(PyResolved)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    /// Returns an awaitable that resolves to what the member run
+    /// `task_run_id` is given besides its claim, as `(fields, input)` (see
+    /// `NativeRuntime.resolve_input`). A record, page or blob not found is
+    /// asked for again for up to the run's reconnect timeout.
+    ///
+    /// Raises `RuntimeError` if this worker does not hold the run or it is
+    /// not a composite's member, or a result it takes is no longer held.
+    fn resolve_input<'py>(&self, py: Python<'py>, task_run_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let (task, within) = self.member(task_run_id)?;
+        let shared = Arc::clone(&self.shared);
+        self.host.bridge().spawn_into_py(py, async move {
+            let source = NetSource::new(Arc::clone(&shared.net));
+            read_until(&shared, within, || member_input(&source, &task))
+                .await
+                .map(PyMemberInput)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    /// Returns an awaitable that resolves to the list the expansion run
+    /// `task_run_id` is to split (see `NativeRuntime.resolve_expansion`). A
+    /// record, page or blob not found is asked for again for up to the run's
+    /// reconnect timeout.
+    ///
+    /// Raises `RuntimeError` if this worker does not hold the run or it is no
+    /// expansion, or the list is no longer held.
+    fn resolve_expansion<'py>(&self, py: Python<'py>, task_run_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let (task, within) = self.member(task_run_id)?;
+        let shared = Arc::clone(&self.shared);
+        self.host.bridge().spawn_into_py(py, async move {
+            let source = NetSource::new(Arc::clone(&shared.net));
+            read_until(&shared, within, || expansion_source(&source, &task))
+                .await
+                .map(PyResolved)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    /// Returns an awaitable that resolves to the digest of a result: `data`
+    /// stored as blobs the task `task_id` owns, then the manifest naming them
+    /// as one more blob, which a composite's page names as the member's
+    /// result. Report that digest with `complete`. The blobs are stored where
+    /// the shard's leader places the task's record, and asked again for up to
+    /// the reconnect timeout.
+    ///
+    /// Raises `BackpressureError` if `data` is past the hard memory limit,
+    /// and `RuntimeError` if the shard could not store it in time, which
+    /// fails the run.
+    fn store_result<'py>(&self, py: Python<'py>, task_id: String, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), std::slice::from_ref(&data))?;
+        let cut = Manifest::of_result(&data);
+        let manifest = cut.manifest.encode();
+        if manifest.len() > MAX_BLOB_BYTES {
+            return Err(backpressure_error(
+                py,
+                "the result is too large to be named by one manifest blob".to_owned(),
+            ));
+        }
+        let digest = BlobKey::of(&manifest).digest().value().to_vec();
+        let mut blobs = cut.chunks;
+        blobs.push(manifest);
+        let shared = Arc::clone(&self.shared);
+        let within = self.reconnect_timeout;
+        let owner = BlobOwner::Task(TaskId::new(task_id));
+        self.host.bridge().spawn_into_py(py, async move {
+            // The result is in this process's memory already: counted, not
+            // waited for, while it is stored.
+            let _in_flight = shared.net.payload_memory().take_anyway(data.len() as u64).ok();
+            let bound = tokio::time::Instant::now() + within;
+            stored_until(&shared, bound, || {
+                shared
+                    .net
+                    .store_blobs_at_leader(BlobRole::Result, &owner, blobs.clone(), shared.retry)
+            })
+            .await
+            .map(|()| PyBytesValue(digest))
+            .ok_or_else(|| PyRuntimeError::new_err(NOT_STORED_MESSAGE))
+        })
+    }
+
+    /// Returns an awaitable that resolves to the opaque manifest of `data`,
+    /// stored as blobs the composite `composite_id` owns, where the shard's
+    /// leader places its record. The manifest goes into a tree as
+    /// `("manifest", manifest)`, in a tree whose root is that composite.
+    ///
+    /// Raises `BackpressureError` if `data` is past the hard memory limit,
+    /// and `RuntimeError` if the shard could not store it within the
+    /// reconnect timeout.
+    fn store_composite_payload<'py>(
+        &self,
+        py: Python<'py>,
+        composite_id: String,
+        data: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), std::slice::from_ref(&data))?;
+        let shared = Arc::clone(&self.shared);
+        let within = self.reconnect_timeout;
+        let owner = BlobOwner::Composite(CompositeId::new(composite_id));
+        self.host.bridge().spawn_into_py(py, async move {
+            let _in_flight = shared.net.payload_memory().take_anyway(data.len() as u64).ok();
+            let bound = tokio::time::Instant::now() + within;
+            stored_until(&shared, bound, || {
+                shared
+                    .net
+                    .store_payload_at_leader(BlobRole::Input, &owner, &data, shared.retry)
+            })
+            .await
+            .map(PyManifest)
+            .ok_or_else(|| PyRuntimeError::new_err(NOT_STORED_MESSAGE))
+        })
     }
 
     /// Asks the shard's leader to cancel a task, in the background, and
@@ -539,5 +785,38 @@ impl NetworkedRuntime {
     /// still pending fail. Does nothing if already shut down.
     fn shutdown(&self, py: Python<'_>) {
         self.host.shutdown(py, &self.shared);
+    }
+}
+
+impl NetworkedRuntime {
+    /// Hands the leader a run's success by the step `tree` describes. The
+    /// values too large to inline are stored first, under the composite the
+    /// step runs as, so the report finds them held.
+    fn complete_with_step(&self, py: Python<'_>, run: TaskRunId, tree: &Bound<'_, PyAny>) -> PyResult<()> {
+        let mut step = step_from_tree(tree)?;
+        if step.takes_input() {
+            return Err(PyValueError::new_err("a returned step cannot take an input"));
+        }
+        let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+        refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), &values)?;
+        let Some(held) = self.shared.end(&run) else {
+            return Ok(());
+        };
+        self.host.handle().spawn(store_then_report_step(
+            Arc::clone(&self.shared),
+            held,
+            run,
+            step,
+            values,
+        ));
+        Ok(())
+    }
+
+    /// The task of the member run `task_run_id` this worker holds, and how
+    /// long a read for it is asked again.
+    fn member(&self, task_run_id: &str) -> PyResult<(Task, StdDuration)> {
+        self.shared
+            .member_of(&TaskRunId::new(task_run_id))
+            .ok_or_else(|| PyRuntimeError::new_err("no such run"))
     }
 }

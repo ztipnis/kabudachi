@@ -58,7 +58,7 @@ impl Shared {
 /// grace keeps a late submission well clear of that first look-up, so blobs
 /// whose task the leader accepted are never dropped for a window an accepted
 /// submission could still be in.
-fn blob_submission_deadline() -> Duration {
+pub(super) fn blob_submission_deadline() -> Duration {
     Duration::from_millis(ORPHAN_BLOB_GRACE.as_ticks() / 2)
 }
 
