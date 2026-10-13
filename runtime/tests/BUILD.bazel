@@ -316,3 +316,35 @@ py_test(
         "@pypi//pytest",  # keep
     ],
 )
+
+# The tasks the migration test's submitter and worker declare at different
+# schema versions; `KABUDACHI_TEST_SCHEMA` picks the build.
+py_library(
+    name = "migration_tasks",
+    testonly = True,
+    srcs = ["migration_tasks.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//runtime/src/kabudachi",
+        "@pypi//pydantic",
+    ],
+)
+
+# A submitter at schema version 1 and a worker at version 3 in one shard of
+# two: migrates, drops an incompatible task, and fails a held one after a 3 s
+# block TTL. About 7 s on a laptop.
+py_test(
+    name = "test_networked_migration",
+    size = "medium",
+    timeout = "short",
+    srcs = ["test_networked_migration.py"],
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/tests:cluster",
+        "//runtime/tests:migration_tasks",
+        "@pypi//pytest",  # keep
+    ],
+)

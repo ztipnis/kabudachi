@@ -6,6 +6,7 @@ handle is awaited once, and a `settled` line says how that ended."""
 
 import asyncio
 import ctypes
+import importlib
 import json
 import os
 import signal
@@ -15,8 +16,11 @@ import threading
 import kabudachi
 from kabudachi import _native, runner, session
 
-import networked_tasks
 from proto_messages import Greeting
+
+# The tasks this worker's program declares: `networked_tasks`, or the module
+# a test names to run its own.
+tasks = importlib.import_module(os.environ.get("KABUDACHI_TEST_TASKS", "networked_tasks"))
 
 _STATES = {
     getattr(_native.RunState, name): name
@@ -35,9 +39,21 @@ async def settled(handle) -> None:
     try:
         result = await handle
         results = result if isinstance(result, list) else [result]
-        say(settled=handle.task_id, error=None, texts=[item.text for item in results])
+        say(
+            settled=handle.task_id,
+            error=None,
+            texts=[item.text for item in results],
+            value=_dump(result),
+        )
     except Exception as error:
-        say(settled=handle.task_id, error=type(error).__name__)
+        say(settled=handle.task_id, error=type(error).__name__, value=None)
+
+
+def _dump(result):
+    """A JSON form of the result: its `model_dump()` when it is a model, else its `text`."""
+    if isinstance(result, list):
+        return [_dump(item) for item in result]
+    return result.model_dump() if hasattr(result, "model_dump") else result.text
 
 
 # The handle of every task submitted here, by task id.
@@ -107,8 +123,12 @@ _PR_SET_PDEATHSIG = 1
 
 async def answer(native, command: dict) -> dict:
     if "submit" in command:
-        task = networked_tasks.TASKS[command["submit"]]
-        handle = task(Greeting(text=command.get("text", ""), times=command.get("times", 0)))
+        task = tasks.TASKS[command["submit"]]
+        if "input" in command:
+            argument = task.definition.input_type.model_validate(command["input"])
+        else:
+            argument = Greeting(text=command.get("text", ""), times=command.get("times", 0))
+        handle = task(argument)
         HANDLES[handle.task_id] = handle
         asyncio.create_task(settled(handle))
         return {"task_id": handle.task_id}
@@ -127,10 +147,19 @@ async def answer(native, command: dict) -> dict:
                 "started_at": run.started_at_ms,
                 "digest": None if run.result_digest is None else run.result_digest.hex(),
                 "delivered": run.delivered,
+                "source_version": run.source_version,
+                "execution_version": run.execution_version,
             }
             for run in record.runs
         ]
-        return {"record": {"finished": record.finished, "folded": record.folded, "runs": runs}}
+        return {
+            "record": {
+                "finished": record.finished,
+                "folded": record.folded,
+                "blocked_reason": record.blocked_reason,
+                "runs": runs,
+            }
+        }
     if "leader" in command:
         return {"leader": native.leader(), "voters": native.voters()}
     if "cancel" in command:
