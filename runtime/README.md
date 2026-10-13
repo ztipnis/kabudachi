@@ -356,3 +356,7 @@ matters.
   with task processes, and the body is abandoned to finish on its own, holding its concurrency place
   until it does. An async body that raises `KeyboardInterrupt` there is taken as a Ctrl-C and stops
   the whole run.
+- A flow's later stage or a group's member that the scheduler refuses when it starts (the queue is
+  full, or memory is past its limit) is not queued to try again: it fails, and so does the flow if
+  its policy fails on a failed member. The failure is a `BackpressureError`, which can pass once the
+  shard has room.
