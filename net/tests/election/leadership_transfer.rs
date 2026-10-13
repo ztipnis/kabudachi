@@ -26,7 +26,7 @@ fn holds_office(state: WorkerState) -> bool {
 async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certifies_the_runs() {
     within_deadline(async {
         let (mut shard, _client) = ThreeVoters::start().await;
-        let executors: Vec<FakeExecutor> = (0..3)
+        let mut executors: Vec<FakeExecutor> = (0..3)
             .map(|voter| {
                 let (executor, endpoint) = FakeExecutor::new();
                 shard.set_executor(voter, endpoint);
@@ -46,7 +46,6 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
         let task = shard
             .drive_until(submitted_through(&nets[runner], &leader_id, plain_with(b"handed over")))
             .await;
-        let mut executors = executors;
         let (run, _) = shard.drive_until(executors[runner].next_claim()).await;
         executors[runner].report(Report::Started(run.clone()));
         shard
@@ -54,8 +53,9 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
                 holding(&nets, &task, &[TaskRunState::Running]) >= QUORUM
             }))
             .await;
-        // Both followers have crawled their routing and told the leader, so
-        // it hands over as soon as it is asked.
+        // Both followers have crawled their routing; the pause only gives
+        // their reports time to reach the leader, so it hands over as soon as
+        // it is asked.
         for follower in &followers {
             while !shard.with(*follower, |node, _| node.routing_crawled()).await {
                 shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
@@ -92,7 +92,8 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
                 holding(&nets, &task, &[TaskRunState::Succeeded]) >= QUORUM
             }))
             .await;
-        while shard.with(successor, |node, _| node.voters().len()).await != 2 {
+        // The successor drops the old leader from its roster.
+        while shard.with(successor,|node, _| node.voters().len()).await != 2 {
             shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
         }
     })
