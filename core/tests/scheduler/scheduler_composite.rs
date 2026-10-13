@@ -141,7 +141,11 @@ fn a_finished_composite_and_its_pages_are_forgotten_with_the_result_ttl_and_a_le
     run_member(&mut fixture, &flow, 0, b"loaded");
     assert!(fixture.scheduler.holds(&page));
     let mark = fixture.spy.mark();
-    assert_eq!(fixture.scheduler.republish(&[composite.clone(), page.clone()]), 2);
+    assert_eq!(
+        fixture.scheduler.republish(&[composite.clone(), page.clone(), page.clone()]),
+        2,
+        "a key named twice is written once"
+    );
     assert_eq!(fixture.spy.mark() - mark, 2, "each held record is written again");
     fixture.clock.advance(ticks(99));
     fixture.scheduler.catch_up();
@@ -263,17 +267,6 @@ fn a_map_of_no_members_finishes_at_once_with_no_pages() {
     assert_eq!(finished_events.len(), 1);
     assert_eq!(finished_events[0].state, CompositeState::Succeeded);
     assert_eq!(finished_events[0].pages, 0);
-}
-
-#[test]
-fn republishing_a_key_named_twice_writes_it_once() {
-    let mut fixture = Fixture::leading();
-    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x"))]));
-    run_member(&mut fixture, &flow, 0, b"loaded");
-    let page = RecordKey::Page(flow.clone(), 0);
-    let mark = fixture.spy.mark();
-    assert_eq!(fixture.scheduler.republish(&[page.clone(), page]), 1);
-    assert_eq!(fixture.spy.mark() - mark, 1);
 }
 
 #[test]
@@ -663,28 +656,21 @@ fn a_list_that_splits_into_no_items_gives_the_next_stage_an_empty_list() {
 }
 
 #[test]
-fn an_expansion_that_fails_fails_its_map_and_the_flow() {
-    let mut fixture = Fixture::leading();
-    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous()]));
-    run_member(&mut fixture, &flow, 0, b"not a list");
-    fail_member(&mut fixture, &flow.child(1), 0, "SerializationError");
-    let finished = finished(&mut fixture);
-    assert_eq!(finished[0].state, CompositeState::Failed);
-    assert_eq!(finished[0].failure.as_ref().unwrap().kind, "SerializationError");
-}
-
-#[test]
-fn an_expansion_that_fails_fails_a_collect_all_map_too() {
-    let mut fixture = Fixture::leading();
-    let collecting = Stage::Composite(Step {
-        kind: CompositeKind::Map,
-        on_error: OnError::CollectAll,
-        stages: vec![task_stage("each", None)],
-    });
-    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), collecting]));
-    run_member(&mut fixture, &flow, 0, b"not a list");
-    fail_member(&mut fixture, &flow.child(1), 0, "SerializationError");
-    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Failed);
+fn an_expansion_that_fails_fails_its_map_and_the_flow_whatever_the_maps_error_policy() {
+    for on_error in [OnError::FailFast, OnError::CollectAll] {
+        let mut fixture = Fixture::leading();
+        let map = Stage::Composite(Step {
+            kind: CompositeKind::Map,
+            on_error,
+            stages: vec![task_stage("each", None)],
+        });
+        let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map]));
+        run_member(&mut fixture, &flow, 0, b"not a list");
+        fail_member(&mut fixture, &flow.child(1), 0, "SerializationError");
+        let finished = finished(&mut fixture);
+        assert_eq!(finished[0].state, CompositeState::Failed);
+        assert_eq!(finished[0].failure.as_ref().unwrap().kind, "SerializationError");
+    }
 }
 
 #[test]

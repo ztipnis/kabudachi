@@ -578,4 +578,3 @@ def test_a_stopped_leader_hands_over_and_leaves_and_the_two_left_keep_certifying
     eventually("the two left to follow a new leader of two voters", handed_over, timeout=10)
     task_id = others[0].submit("spin", times=0)
     certified_once(cluster, task_id, digest_of(spin, Greeting(text="spun")))
-

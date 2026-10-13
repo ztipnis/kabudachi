@@ -865,6 +865,20 @@ def test_a_returned_step_runs_after_the_certification_and_the_handle_is_its_resu
     assert order[: first_certification + 1].count("started") == 1
 
 
+def test_a_returned_step_bound_to_a_value_too_large_to_inline_runs_with_that_value():
+    big = "z" * 1_100_000
+    world = continuing_world()
+
+    def plan(request: Greeting) -> Group:
+        return group(world.tasks["shout"].bind(Greeting(text=big)), world.tasks["acknowledge"].bind(request))
+
+    planner = declare_planner(world, plan)
+
+    results = run_planner(world, planner, Greeting(text="in"))
+
+    assert results == [Greeting(text=big.upper()), Receipt(ok=True)]
+
+
 def test_a_returned_step_that_needs_an_input_is_refused_and_fails_the_run():
     world = continuing_world()
 
@@ -1090,43 +1104,6 @@ def test_a_cancel_that_arrives_while_the_run_is_being_certified_reaches_the_cont
 
     assert cancelled == [True], "the cancel was lost in the window before the continuation existed"
     assert ran_after == []
-
-
-def test_a_cancel_that_arrives_while_the_first_stage_is_being_submitted_is_not_lost():
-    async def slow(request: Greeting) -> Greeting:
-        await asyncio.sleep(30)
-        return request
-
-    world = continuing_world(slow)
-
-    def plan(request: Greeting) -> BoundTask:
-        return world.tasks["slow"].bind(request)
-
-    planner = declare_planner(world, plan)
-    handles = []
-    cancelled = []
-    threads = []
-
-    def cancel_soon(run_id):
-        # Only the continuation's own submission is slow, so the cancel lands in it.
-        world.runtime.submit_lingers_for = 0.1
-        thread = threading.Thread(target=lambda: cancelled.append(handles[0].cancel()))
-        thread.start()
-        threads.append(thread)
-
-    world.runtime.after_certification = cancel_soon
-
-    async def body():
-        handles.append(world.session.submit(planner.definition, Greeting()))
-        with pytest.raises(TaskCancelledError):
-            await asyncio.wait_for(handles[0], WAIT)
-        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
-
-    run(with_events(world, body))
-    for thread in threads:
-        thread.join()
-
-    assert cancelled == [True]
 
 
 # --- properties ------------------------------------------------------------

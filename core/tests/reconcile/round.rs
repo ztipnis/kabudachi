@@ -232,7 +232,7 @@ fn the_round_may_stop_when_every_voter_answered_or_a_quorum_did_after_the_grace(
 }
 
 #[test]
-fn pages_continue_after_the_last_run_then_the_last_key() {
+fn pages_continue_after_the_last_run_then_the_last_key_whatever_its_kind() {
     let mut round = ReconcileRound::new(TERM, [w("a")], Instant::at(0), GRACE);
     let run_page = ReportPage {
         runs: vec![running("t", "r9")],
@@ -249,6 +249,15 @@ fn pages_continue_after_the_last_run_then_the_last_key() {
     assert_eq!(
         round.page(&w("a"), key_page, Instant::at(0)),
         Some(Cursor::AfterKey(RecordKey::Task(TaskId::new("t7"))))
+    );
+    let composite_page = ReportPage {
+        keys: vec![held_composite(RecordKey::Page(CompositeId::new("c"), 2), version(1, 0), &["a"])],
+        ..ReportPage::default()
+    };
+    assert_eq!(
+        round.page(&w("a"), composite_page, Instant::at(0)),
+        Some(Cursor::AfterKey(RecordKey::Page(CompositeId::new("c"), 2))),
+        "a composite's key continues the page as a task's does"
     );
     assert_eq!(
         round.page(
@@ -519,20 +528,4 @@ fn a_page_is_rebuilt_with_its_composite_and_an_uncertain_page_makes_its_composit
     assert_eq!(rebuild.pages.len(), 1);
     assert_eq!(rebuild.pages[0].composite_id.clone().unwrap().value, "whole");
     assert_eq!(rebuild.uncertain_composites, BTreeSet::from([partial]));
-}
-
-#[test]
-fn pages_continue_after_a_composite_key_as_well_as_a_task_key() {
-    let mut round = ReconcileRound::new(TERM, [w("a")], Instant::at(0), GRACE);
-    let key = RecordKey::Page(CompositeId::new("c"), 2);
-    let next = round.page(
-        &w("a"),
-        ReportPage {
-            keys: vec![held_composite(key.clone(), version(1, 0), &["a"])],
-            ..ReportPage::default()
-        },
-        Instant::at(0),
-    );
-
-    assert_eq!(next, Some(Cursor::AfterKey(key)));
 }

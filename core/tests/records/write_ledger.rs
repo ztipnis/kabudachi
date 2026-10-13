@@ -47,9 +47,9 @@ fn composite_write(composite: &str, revision: u64) -> Write {
 }
 
 #[test]
-fn a_composite_waits_on_its_pages_writes_as_well_as_its_own_but_not_another_composites() {
+fn a_composite_waits_on_its_pages_writes_as_well_as_its_own_but_not_another_composites_or_a_tasks() {
     let mut ledger = WriteLedger::default();
-    ledger.made(&[composite_write("c", 0), page_write("c", 0, 0), page_write("other", 0, 0)]);
+    ledger.made(&[composite_write("c", 0), page_write("c", 0, 0), page_write("other", 0, 0), write("c", 0)]);
     let composite = RecordKey::Composite(CompositeId::new("c"));
 
     ledger.settled(&composite_write("c", 0), true, true);
