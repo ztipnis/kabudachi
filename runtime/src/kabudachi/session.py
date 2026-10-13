@@ -24,7 +24,6 @@ import asyncio
 import concurrent.futures
 import functools
 import inspect
-import json
 import logging
 import math
 import threading
@@ -33,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from kabudachi._native import MAX_FAILURE_MESSAGE_BYTES, EventKind, RunState
+from kabudachi._native import MAX_FAILURE_MESSAGE_BYTES, EventKind, RunState, describe_step
 from kabudachi.body import RunningBody
 from kabudachi.composites import Composites
 from kabudachi.config import Configuration
@@ -71,7 +70,7 @@ from kabudachi.handle import TaskHandle, run_callback_inline
 from kabudachi.lifecycle import default_hooks
 from kabudachi.native_protocol import Runtime
 from kabudachi.options import SubmissionOptions, SubmissionSettings
-from kabudachi.registry import TaskDefinition, TaskRegistry
+from kabudachi.registry import TaskDefinition, TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.status import CompositeStatus, TaskStatus
 from kabudachi.task_table import Run, TaskTable, result_digest
@@ -236,6 +235,22 @@ class Session:
                 return None
         return max(1, math.ceil(timeout / timedelta(milliseconds=1)))
 
+    def submission_settings(self, definition: TaskDefinition) -> dict[str, Any]:
+        """What a member of a composite carries to the leader for `definition`,
+        resolved here as a submit resolves it. The queue is the task's own,
+        else `queue`: a router picks by an argument that a composite's member
+        does not have yet."""
+        queue = definition.queue
+        if isinstance(queue, Unset):
+            queue = self._configuration.resolve("queue")
+        return {
+            "queue": queue,
+            "retries": definition.retries,
+            "ephemeral": definition.kind is TaskKind.EPHEMERAL,
+            "non_retriable": not definition.retriable,
+            "reconnect_timeout_ms": self._reconnect_timeout_ms(definition, queue),
+        }
+
     def submit_serialized(
         self, definition_id: str, payload: bytes, options: SubmissionOptions
     ) -> TaskHandle:
@@ -287,6 +302,11 @@ class Session:
     def runtime(self) -> Runtime:
         """The native runtime this session drives."""
         return self._runtime
+
+    @property
+    def serializers(self) -> SerializerRegistry:
+        """The serializers this session encodes and decodes tasks' values with."""
+        return self._serializers
 
     @property
     def stopping(self) -> bool:
@@ -790,8 +810,10 @@ class Session:
         for definition in step.definitions():
             if self._registry.get(definition.name) is None:
                 raise UnknownTaskError(f"this process has no task named {definition.name!r}")
-        description = json.dumps(step.describe(self._serializers), sort_keys=True)
-        digest = result_digest(description.encode())
+        tree = step.describe(self)
+        if step.is_task:
+            tree = ("flow", "fail_fast", [tree])
+        digest = result_digest(describe_step(tree))
         self._tasks.complete_with_continuation(run, claim.task_run_id, digest)
         # Certified: from here on nothing may fail the run, only the continuation.
         try:

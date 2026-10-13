@@ -152,6 +152,22 @@ class TaskBodyError(KabudachiError, RuntimeError):
         return (TaskBodyError, (str(self), self.kind))
 
 
+class TaskFailure(KabudachiError):
+    """A member of a `collect_all` group or map that failed: its entry in the
+    group's results, and what the next stage is given in its place. `kind`
+    is the error's type name and `message` its message, empty when the run
+    was remote and gave none."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(f"{kind}: {message}" if message else kind)
+        self.kind = kind
+        self.message = message
+
+    def __reduce__(self) -> tuple[Any, tuple[str, str]]:
+        # Crosses the pipe from a task process.
+        return (TaskFailure, (self.kind, self.message))
+
+
 class ResultUnavailableError(KabudachiError, RuntimeError):
     """A task's outcome is known to its shard but its result cannot be had
     here: it never reached this process (its worker could not reach this

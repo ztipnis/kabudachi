@@ -7,6 +7,7 @@ compaction points, and the stage after a group runs exactly once."""
 
 import asyncio
 import functools
+import pickle
 import threading
 from types import SimpleNamespace
 
@@ -14,7 +15,8 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from kabudachi._native import RunState
+from kabudachi import _native
+from kabudachi._native import KabudachiError, RunState
 from kabudachi.body import fold_payloads
 from kabudachi.errors import (
     RunStoppedError,
@@ -22,6 +24,7 @@ from kabudachi.errors import (
     SerializationError,
     TaskCancelledError,
     TaskDefinitionError,
+    TaskFailure,
     TaskInterruptedError,
     UnknownTaskError,
 )
@@ -96,6 +99,74 @@ def test_a_bound_task_is_checked_when_it_is_bound():
         declare(numbers).bind(text="x")
     with pytest.raises((TypeError, ValueError)):
         task.bind(times="many")
+
+
+# --- describe -----------------------------------------------------------
+
+
+def test_a_step_describes_the_same_bytes_every_time_and_a_bound_field_keeps_its_type():
+    world = World(shout, wrap)
+    inner = group(world.tasks["shout"].bind(times=0, text="b"), world.tasks["wrap"])
+    pipeline = flow(world.tasks["shout"].bind(Greeting(text="a")), inner)
+    first = _native.describe_step(pipeline.describe(world.session))
+    again = _native.describe_step(
+        flow(
+            world.tasks["shout"].bind(Greeting(text="a")),
+            group(world.tasks["shout"].bind(text="b", times=0), world.tasks["wrap"]),
+        ).describe(world.session)
+    )
+    assert first == again, "field order and object identity do not change the description"
+    [_, _, [bound, nested]] = pipeline.describe(world.session)
+    assert bound[4] == Greeting(text="a").SerializeToString()
+    [_, _, [overlaid, _]] = nested
+    assert overlaid[5] == [("text", "string", "b"), ("times", "int", 0)]
+
+
+COALESCING_STAGE = (
+    "a coalescing task cannot be a stage of a flow, group or map: "
+    "its generations would replace each other across them"
+)
+
+
+def test_a_coalescing_task_is_refused_as_a_stage_member_or_map_when_the_step_is_composed():
+    registry, serializers = TaskRegistry(), SerializerRegistry.with_defaults()
+
+    def refresh(request: Greeting) -> Greeting:
+        return request
+
+    coalescing = Task(
+        refresh, registry=registry, serializers=serializers, name="tests.refresh", kind=TaskKind.COALESCING
+    )
+    plain = declare(shout)
+    for compose in (
+        lambda: flow(plain, coalescing),
+        lambda: flow(coalescing.bind(Greeting(text="a"))),
+        lambda: group(plain, coalescing),
+        lambda: coalescing.map,
+    ):
+        with pytest.raises(TypeError) as refused:
+            compose()
+        assert str(refused.value) == COALESCING_STAGE
+
+
+def test_a_task_name_cannot_take_the_reserved_prefix():
+    def refresh(request: Greeting) -> Greeting:
+        return request
+
+    with pytest.raises(TaskDefinitionError, match="kabudachi."):
+        Task(
+            refresh,
+            registry=TaskRegistry(),
+            serializers=SerializerRegistry.with_defaults(),
+            name="kabudachi.expand",
+        )
+
+
+def test_a_task_failure_keeps_its_kind_and_message_across_the_task_process_pipe():
+    failure = pickle.loads(pickle.dumps(TaskFailure("ValueError", "bad input")))
+
+    assert isinstance(failure, KabudachiError)
+    assert (failure.kind, failure.message) == ("ValueError", "bad input")
 
 
 # --- flow definition ----------------------------------------------------
