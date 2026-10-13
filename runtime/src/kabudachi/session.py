@@ -863,10 +863,11 @@ class Session:
         if claim.reduce_node is not None:
             # A reduce step works on items and earlier results, which the
             # leader reads out as `reduce_operands`, not on a stage's input.
+            fields = ()
             operands = await self._runtime.reduce_operands(claim.task_run_id)
-            self._runtime.report_started(claim.task_run_id)
-            return Given((), ("reduce", operands, claim.reduce_node[0] > 0))
-        fields, resolved = await self._runtime.resolve_input(claim.task_run_id)
+            resolved = ("reduce", operands, claim.reduce_node[0] > 0)
+        else:
+            fields, resolved = await self._runtime.resolve_input(claim.task_run_id)
         given = self._admitted_given(claim, definition, tuple(fields), resolved)
         if isinstance(given, (Newer, Incompatible)):
             self._give_back(claim, definition, given)
@@ -879,8 +880,9 @@ class Session:
     ) -> Given | Newer | Incompatible:
         """The member's `resolved` input, each payload in it migrated to the
         version of the type it is decoded as: its own input as the member's
-        input type, a result it takes as the type its producer returns. The
-        first payload that cannot be is the refusal. A payload that carries no
+        input type, a result it takes as the type its producer returns. A
+        reduce step's operands likewise: an item as the reducer's input type,
+        an initial value or earlier result as its output type. The first payload that cannot be is the refusal. A payload that carries no
         version of its own (a producer's result whose type has no version path)
         is taken to be at the member claim's `source_version`."""
         refused: Newer | Incompatible | None = None
@@ -913,8 +915,18 @@ class Session:
                     return ("list", [walk(item) for item in entries])
             return entry
 
+        def operand(entry: tuple[str, Any]) -> tuple[str, Any]:
+            match entry:
+                case ("item", payload):
+                    return ("item", migrated(definition.serializer, definition.input_type, payload))
+                case ("result", payload):
+                    return ("result", migrated(definition.serializer, definition.output_type, payload))
+            return (entry[0], walk(entry[1]))
+
         own: bytes | None = None
         match resolved:
+            case ("reduce", operands, combines):
+                resolved = ("reduce", [operand(entry) for entry in operands], combines)
             case None:
                 own = migrated(definition.serializer, definition.input_type, claim.serialized_input)
             case ("input", payload):

@@ -2216,6 +2216,30 @@ def test_a_result_a_member_takes_is_migrated_from_the_version_its_producer_wrote
     assert seen == [ParcelV2(label="A")]
 
 
+def append_label(item: ParcelV2, previous: ParcelV2) -> ParcelV2:
+    return ParcelV2(label=previous.label + item.label)
+
+
+def test_a_reduce_step_has_the_items_stored_at_an_older_version_migrated_before_it_folds_them():
+    world = World(append_label, serializer="pydantic")
+    operands = world.runtime.reduce_operands
+
+    async def stored_by_an_older_worker(task_run_id):
+        return [
+            (role, encoded(ParcelV1(label=json.loads(payload)["label"], weight=3)) if role == "item" else payload)
+            for role, payload in await operands(task_run_id)
+        ]
+
+    world.runtime.reduce_operands = stored_by_an_older_worker
+
+    async def body():
+        reduce = world.tasks["append_label"].reduce.options(initial=ParcelV2(label=""))
+        return await reduce.start(world.session, [ParcelV2(label="a"), ParcelV2(label="b")])
+
+    # The explicit step shelved each stored item's label before the reducer saw it.
+    assert run(with_events(world, body)) == ParcelV2(label="AB")
+
+
 def merge_parcels(older: ParcelV2, newer: ParcelV2) -> ParcelV2:
     return ParcelV2(label=older.label + newer.label)
 
