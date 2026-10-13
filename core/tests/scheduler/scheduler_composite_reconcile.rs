@@ -108,7 +108,7 @@ fn a_continuation_committed_by_its_certifying_revision_is_rebuilt_from_the_run_w
     let generation = || Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_coalescing_key("k");
     let task = old.scheduler.submit(generation()).unwrap();
     let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
-    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("explode", Some(b"x"))]);
     let mark = old.spy.mark();
     old.scheduler
@@ -146,7 +146,7 @@ fn a_new_leader_answers_a_finished_continuing_task_as_continued() {
         .submit(Submission::new(TaskDefinitionId::new("plain"), 0, b"p".to_vec(), "default").with_client(client.clone()))
         .unwrap();
     let plain_claim = old.scheduler.request_claim(&worker(), &plain).unwrap();
-    old.scheduler.report_started(&worker(), &plain_claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &plain_claim.task_run_id, None).unwrap();
     old.scheduler
         .complete(&worker(), &plain_claim.task_run_id, Digest::blake3(b"result"), Completion::Final)
         .unwrap();
@@ -155,7 +155,7 @@ fn a_new_leader_answers_a_finished_continuing_task_as_continued() {
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_client(client))
         .unwrap();
     let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
-    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
     old.scheduler
         .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step.clone()))
@@ -187,7 +187,7 @@ fn a_run_whose_certifying_revision_was_lost_is_certified_with_its_step_from_the_
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
         .unwrap();
     let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
-    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"x"))]);
     let mark = old.spy.mark();
     old.scheduler
@@ -432,7 +432,7 @@ fn a_continuation_certified_while_its_composite_record_is_unknown_is_taken_from_
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
         .unwrap();
     let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
-    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"x"))]);
     let mark = old.spy.mark();
     old.scheduler

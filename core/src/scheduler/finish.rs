@@ -107,6 +107,31 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         });
     }
 
+    /// Fails `task_id`'s pending run for good with failure `kind`: no attempt
+    /// follows. The task leaves the waiting room and is finished, and `event`,
+    /// given the task and its run, reports it.
+    pub(super) fn fail_pending(
+        &mut self,
+        task_id: &TaskId,
+        kind: &str,
+        now: Instant,
+        event: impl FnOnce(TaskId, TaskRunId) -> Event,
+    ) {
+        let stamped_at = WallTime::now(&self.clock);
+        let run_id = self.current_run[task_id].clone();
+        let run = self
+            .runs
+            .get_mut(&run_id)
+            .expect("every current run is stored");
+        run.transition_to(TaskRunState::Failed, stamped_at)
+            .expect("a pending run can always fail");
+        run.failure_kind = kind.to_owned();
+        self.waiting.leave(task_id);
+        self.record_finished(task_id, now);
+        self.mark_decided(&run_id);
+        self.events.push(event(task_id.clone(), run_id));
+    }
+
     /// `older`, a pending generation, is replaced by `newer`, which has
     /// absorbed its payload: it is over, but not forgotten until `newer` is.
     pub(super) fn supersede(&mut self, older: &TaskId, newer: &TaskId) {

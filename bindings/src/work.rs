@@ -351,6 +351,16 @@ impl From<Event> for PyEvent {
                 task_run_id: task_run_id.as_str().to_owned(),
                 ..nothing
             },
+            Event::MigrationFailed {
+                task_id,
+                task_run_id,
+                reason,
+            } => PyEvent {
+                task_id: task_id.as_str().to_owned(),
+                task_run_id: task_run_id.as_str().to_owned(),
+                reason: Some(reason),
+                ..nothing
+            },
             Event::Superseded {
                 task_id,
                 task_run_id,

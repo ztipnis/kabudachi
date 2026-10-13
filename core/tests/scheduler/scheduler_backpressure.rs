@@ -62,7 +62,7 @@ fn start(fixture: &mut Fixture, task: &TaskId) -> TaskRunId {
     let claim = fixture.scheduler.request_claim(&worker(), task).unwrap();
     fixture
         .scheduler
-        .report_started(&worker(), &claim.task_run_id)
+        .report_started(&worker(), &claim.task_run_id, None)
         .unwrap();
     claim.task_run_id
 }
@@ -71,7 +71,7 @@ fn finish(fixture: &mut Fixture, task: &TaskId) {
     let claim = fixture.scheduler.request_claim(&worker(), task).unwrap();
     fixture
         .scheduler
-        .report_started(&worker(), &claim.task_run_id)
+        .report_started(&worker(), &claim.task_run_id, None)
         .unwrap();
     fixture
         .scheduler
@@ -81,7 +81,7 @@ fn finish(fixture: &mut Fixture, task: &TaskId) {
 
 /// Starts and completes the run a claim granted.
 fn complete(fixture: &mut Fixture, run: &TaskRunId) {
-    fixture.scheduler.report_started(&worker(), run).unwrap();
+    fixture.scheduler.report_started(&worker(), run, None).unwrap();
     fixture
         .scheduler
         .complete(&worker(), run, Digest::blake3(b"d"), Completion::Final)
@@ -93,7 +93,7 @@ fn the_results_a_run_read_as_its_input_count_until_the_run_is_decided() {
     let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
     let task = fixture.scheduler.submit(payload(10)).unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let run = claim.task_run_id.clone();
     assert!(slow_down_events(&mut fixture).is_empty());
 

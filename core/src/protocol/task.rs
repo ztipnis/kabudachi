@@ -65,6 +65,8 @@ impl TaskRunState {
                 | (TaskRunState::Queued, TaskRunState::Superseded)
                 | (TaskRunState::Queued, TaskRunState::Failed)
                 | (TaskRunState::Scheduled, TaskRunState::Failed)
+                // A claimant that cannot run the task's input version gives the run back before starting it.
+                | (TaskRunState::Claimed, TaskRunState::Queued)
                 | (TaskRunState::Claimed, TaskRunState::Running)
                 | (TaskRunState::Claimed, TaskRunState::Cancelled)
                 | (TaskRunState::Claimed, TaskRunState::Expired)

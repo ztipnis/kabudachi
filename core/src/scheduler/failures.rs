@@ -31,7 +31,7 @@ const MAX_FAILURE_KIND_BYTES: usize = 128;
 pub const MAX_FAILURE_MESSAGE_BYTES: usize = 1024;
 
 /// `text` cut to at most `max` bytes, at a character boundary.
-fn cut_to_fit(mut text: String, max: usize) -> String {
+pub(super) fn cut_to_fit(mut text: String, max: usize) -> String {
     if text.len() > max {
         let mut end = max;
         while !text.is_char_boundary(end) {

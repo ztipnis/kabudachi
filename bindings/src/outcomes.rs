@@ -26,6 +26,10 @@ pub enum PyEventKind {
     RecordFull,
     #[pyo3(name = "COALESCED_PAYLOAD_TOO_LARGE")]
     CoalescedPayloadTooLarge,
+    /// A task ended because no worker could run its input version; `reason`
+    /// says why, as the worker that gave it up wrote it.
+    #[pyo3(name = "MIGRATION_FAILED")]
+    MigrationFailed,
     /// A networked worker's submission was stored by its shard's leader.
     #[pyo3(name = "ACCEPTED")]
     Accepted,
@@ -65,6 +69,7 @@ impl From<&Event> for PyEventKind {
             Event::RecordFull { .. } => PyEventKind::RecordFull,
             Event::CoalescedPayloadTooLarge { .. } => PyEventKind::CoalescedPayloadTooLarge,
             Event::CompositeFinished(_) => PyEventKind::CompositeFinished,
+            Event::MigrationFailed { .. } => PyEventKind::MigrationFailed,
         }
     }
 }

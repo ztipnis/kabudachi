@@ -130,6 +130,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             published_at: Some(published_at.into()),
             finished: self.retention.holds(task_id),
             retained_by_composite: self.retention.is_held(task_id),
+            blocked_since: self
+                .blocked
+                .get(task_id)
+                .map(|blocked| blocked.since.into()),
+            blocked_reason: self
+                .blocked
+                .get(task_id)
+                .map(|blocked| blocked.reason.clone())
+                .or_else(|| self.ended_reasons.get(task_id).cloned())
+                .unwrap_or_default(),
         }
     }
 
@@ -214,6 +224,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.tasks.remove(&task_id);
             self.input_digests.remove(&task_id);
             self.links.remove(&task_id);
+            self.blocked.remove(&task_id);
+            self.ended_reasons.remove(&task_id);
             self.unpublished.remove(&task_id);
             forgotten += 1;
         }

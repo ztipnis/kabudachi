@@ -83,7 +83,7 @@ fn the_chain_keeps_growing_across_a_running_generation() {
     let running = claim_one(&mut fixture);
     fixture
         .scheduler
-        .report_started(&worker(), &running.task_run_id)
+        .report_started(&worker(), &running.task_run_id, None)
         .unwrap();
     fixture.scheduler.submit(refresh("b")).unwrap();
     fixture.scheduler.submit(refresh("c")).unwrap();
@@ -116,7 +116,7 @@ fn superseded_tasks_are_kept_until_the_generation_that_absorbed_them_finishes() 
     let claim = claim_one(&mut fixture);
     fixture
         .scheduler
-        .report_started(&worker(), &claim.task_run_id)
+        .report_started(&worker(), &claim.task_run_id, None)
         .unwrap();
     fixture.clock.advance(ticks(10_000));
     assert_eq!(fixture.scheduler.catch_up().forgotten, 0);
@@ -142,7 +142,7 @@ fn a_failed_generation_holds_its_key_while_it_waits_for_a_retry() {
     let first = claim_one(&mut fixture);
     fixture
         .scheduler
-        .report_started(&worker(), &first.task_run_id)
+        .report_started(&worker(), &first.task_run_id, None)
         .unwrap();
     let newer = fixture.scheduler.submit(refresh("b")).unwrap();
     fixture
@@ -163,7 +163,7 @@ fn a_failed_generation_holds_its_key_while_it_waits_for_a_retry() {
     );
     fixture
         .scheduler
-        .report_started(&worker(), &retry.task_run_id)
+        .report_started(&worker(), &retry.task_run_id, None)
         .unwrap();
     fixture
         .scheduler
@@ -182,7 +182,7 @@ fn cancelling_a_running_generation_frees_its_key() {
     let claim = claim_one(&mut fixture);
     fixture
         .scheduler
-        .report_started(&worker(), &claim.task_run_id)
+        .report_started(&worker(), &claim.task_run_id, None)
         .unwrap();
     let newer = fixture.scheduler.submit(refresh("b")).unwrap();
 
@@ -201,7 +201,7 @@ fn a_blocked_generation_does_not_hold_up_other_keys() {
     let running = claim_one(&mut fixture);
     fixture
         .scheduler
-        .report_started(&worker(), &running.task_run_id)
+        .report_started(&worker(), &running.task_run_id, None)
         .unwrap();
     let blocked = fixture
         .scheduler

@@ -248,7 +248,7 @@ pub fn start_member(fixture: &mut Fixture, composite: &CompositeId, index: u64) 
         .scheduler
         .request_claim(&worker(), &composite.member_task(index))
         .unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     claim
 }
 

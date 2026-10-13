@@ -93,6 +93,7 @@ impl From<&ReportedRun> for generated::ReportedRun {
             ),
             failure_message,
             continuation: run.continuation.as_ref().map(generated::StepDescription::from),
+            execution_version: 0,
         }
     }
 }

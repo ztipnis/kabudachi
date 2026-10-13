@@ -566,6 +566,7 @@ impl<'n> Executing<'n> {
                 self.endpoint.held.started.insert(run.clone());
                 task_request::Request::Started(ReportStarted {
                     task_run_id: Some(run.into()),
+                    execution_version: 0,
                 })
             }
             Report::Completed { run, digest, delivered, continuation } => {
@@ -589,6 +590,7 @@ impl<'n> Executing<'n> {
                 {
                     self.queue(task_request::Request::Started(ReportStarted {
                         task_run_id: Some(run.clone().into()),
+                        execution_version: 0,
                     }));
                 }
                 self.ended(&run);

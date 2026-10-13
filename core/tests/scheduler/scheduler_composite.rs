@@ -482,7 +482,7 @@ fn a_returned_step_runs_as_a_composite_and_its_task_finishes_with_it() {
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
         .unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
     assert_eq!(
         fixture.scheduler.complete(
@@ -526,7 +526,7 @@ fn a_client_hears_that_its_task_that_returned_a_step_is_over_from_the_step_alone
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_client(client))
         .unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
     fixture
         .scheduler
@@ -550,7 +550,7 @@ fn a_step_too_large_for_the_task_record_fails_its_run_for_good() {
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_retries(3))
         .unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("huge", Some(&vec![0; MAX_RECORD_BYTES as usize]))]);
     assert_eq!(
         fixture.scheduler.complete(
@@ -623,7 +623,7 @@ fn the_largest_step_a_record_can_carry_is_taken_and_one_byte_more_fails_its_run(
             .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
             .unwrap();
         let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-        fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+        fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
         // The first stage keeps the step's task running, so the revision that
         // certifies the run is the newest the task has.
         let step = flow_of(vec![task_stage("first", Some(b"f")), task_stage("big", Some(&vec![0; payload]))]);
@@ -662,7 +662,7 @@ fn cancelling_a_task_whose_step_is_running_cancels_the_step_and_the_task_never_r
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_retries(3))
         .unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("slow", Some(b"s")), task_stage("after", None)]);
     fixture
         .scheduler
@@ -865,7 +865,7 @@ fn a_finished_composites_record_gives_the_finish_its_client_was_told_and_a_runni
         .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
         .unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
     fixture
         .scheduler

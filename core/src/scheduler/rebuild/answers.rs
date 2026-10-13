@@ -128,7 +128,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         out: &mut Adopted,
     ) {
         if recorded == TaskRunState::Claimed && !matches!(state, ReportedState::Claimed) {
-            let _ = self.start_owned(worker, run_id);
+            let _ = self.start_owned(worker, run_id, None);
         }
         self.apply_reported_outcome(worker, run_id, state, continuation, out);
     }

@@ -66,7 +66,7 @@ fn a_failure_with_retries_left_publishes_the_failed_and_the_new_run_in_one_revis
     let mut fixture = Fixture::leading();
     let task = fixture.scheduler.submit(plain(b"in").with_retries(1)).unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let before = fixture.spy.revisions().len();
 
     fixture.scheduler.fail(&worker(), &claim.task_run_id, "ValueError").unwrap();
@@ -173,7 +173,7 @@ fn a_task_that_finishes_publishes_the_generations_it_absorbed_as_finished_too() 
     let older = fixture.scheduler.submit(plain(b"old").with_coalescing_key("k")).unwrap();
     let newer = fixture.scheduler.submit(plain(b"new").with_coalescing_key("k")).unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &newer).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
 
     fixture
         .scheduler
@@ -201,7 +201,7 @@ fn the_revision_that_ends_a_task_says_so_and_a_continuation_ends_it_later() {
     let mut fixture = Fixture::leading();
     let task = fixture.scheduler.submit(plain(b"a")).unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
 
     let continuation = continue_with_a_stage(&mut fixture, &claim.task_run_id);
     let certified = fixture.spy.newest_revision_of(&task).unwrap();
@@ -330,7 +330,7 @@ fn a_retry_that_would_outgrow_the_record_is_not_created_and_the_failure_stands()
     let mut retries = 0;
     loop {
         let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-        fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+        fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
         let failure = fixture.scheduler.fail(&worker(), &claim.task_run_id, "Boom").unwrap();
         if failure.retry.is_none() {
             break;
@@ -352,7 +352,7 @@ fn a_failure_kind_too_long_for_the_record_is_cut_so_the_record_stays_within_the_
     let mut fixture = Fixture::leading();
     let task = fixture.scheduler.submit(plain(b"in")).unwrap();
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
     let kind = "K".repeat(MAX_RECORD_BYTES as usize);
 
     fixture.scheduler.fail(&worker(), &claim.task_run_id, kind.as_str()).unwrap();

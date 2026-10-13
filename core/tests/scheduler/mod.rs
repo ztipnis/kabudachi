@@ -17,4 +17,5 @@ mod scheduler_reduce;
 mod scheduler_retention;
 mod scheduler_streamed;
 mod scheduler_timing;
+mod scheduler_versions;
 mod task_records;

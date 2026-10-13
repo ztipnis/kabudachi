@@ -344,5 +344,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.turns.clear();
         self.running.clear();
         self.composites.clear();
+        self.blocked.clear();
+        self.ended_reasons.clear();
     }
 }

@@ -15,7 +15,7 @@ use crate::protocol::task::TaskRunState;
 use crate::reconcile::RECONCILE_SKEW_MARGIN;
 use crate::time::{Clock, Duration, Instant, WallTime};
 
-use super::super::{Observer, Scheduler};
+use super::super::{BlockedTask, Observer, Scheduler};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Holds the task `record` describes, as its newest revision says.
@@ -28,6 +28,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             finished,
             retained_chain,
             retained_by_composite,
+            blocked_since,
+            blocked_reason,
             ..
         } = record;
         let (Some(task), Some(current)) = (task, runs.last().map(TaskRunRecord::task_run_id))
@@ -48,6 +50,22 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.retention.record(&task_id, now);
         } else {
             self.count_unfinished(&task_id, &task, &retained_chain, state);
+        }
+        if finished {
+            if !blocked_reason.is_empty() {
+                self.ended_reasons.insert(task_id.clone(), blocked_reason);
+            }
+        } else if let Some(since) = blocked_since {
+            // Who blocked it is not stored: the workers that cannot run it
+            // report again.
+            self.blocked.insert(
+                task_id.clone(),
+                BlockedTask {
+                    since: WallTime::from(since),
+                    reason: blocked_reason,
+                    by: BTreeSet::new(),
+                },
+            );
         }
         let lost = runs
             .iter()

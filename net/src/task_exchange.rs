@@ -50,14 +50,14 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome, QuerySlowDown,
-    RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, SlowDownState,
-    StartAccepted, SubmitAccepted, SubmitComposite, SubmitMembers, SubmitTask, TaskReject, TaskRejectReason,
-    TaskRequest, TaskResponse, task_request, task_response,
+    BlockNoted, CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome, QuerySlowDown,
+    RecordPlacements, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted,
+    SlowDownState, StartAccepted, SubmitAccepted, SubmitComposite, SubmitMembers, SubmitTask, TaskReject,
+    TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::composite::{MemberBatch, Step, SubmittedComposite};
-use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
+use kabudachi_core::scheduler::{BlockRejection, Completion, Observer, Scheduler, Submitted};
 use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::Clock;
 use libp2p::PeerId;
@@ -182,6 +182,7 @@ impl Net {
     ) -> Result<TaskResponse, TaskFailure> {
         self.report(leader, task_request::Request::Started(ReportStarted {
             task_run_id: Some(run.into()),
+            execution_version: 0,
         }))
         .await
     }
@@ -353,7 +354,8 @@ impl Net {
             | Request::QueryOutcome(_)
             | Request::SubmitComposite(_)
             | Request::SubmitMembers(_)
-            | Request::QuerySlowDown(_) => {}
+            | Request::QuerySlowDown(_)
+            | Request::Blocked(_) => {}
         }
     }
 
@@ -847,6 +849,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Compacted(report) => compacted(scheduler, from, report),
         Request::Failed(report) => failed(scheduler, from, report),
         Request::Lost(report) => lost(scheduler, from, report),
+        Request::Blocked(report) => blocked(scheduler, from, report),
         Request::Cancel(request) => cancel(scheduler, request),
         // Where records go is the driver's to say: it alone knows the voters.
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
@@ -921,10 +924,31 @@ fn started<C: Clock, I: IdGenerator, O: Observer>(
     report: &ReportStarted,
 ) -> Answered {
     let run = run_id(report.task_run_id.as_ref())?;
+    let execution_version = (report.execution_version != 0).then_some(report.execution_version);
     scheduler
-        .report_started(from, &run)
+        .report_started(from, &run, execution_version)
         .map(|()| task_response::Result::Started(StartAccepted {}))
         .map_err(wire::report_reject)
+}
+
+fn blocked<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    from: &WorkerId,
+    report: &ReportBlocked,
+) -> Answered {
+    let task = report
+        .task_id
+        .clone()
+        .map(TaskId::from)
+        .ok_or(TaskRejectReason::TaskRejectMalformed)?;
+    scheduler
+        .report_blocked(from, &task, report.reason.clone(), report.incompatible)
+        .map(|_| task_response::Result::Blocked(BlockNoted {}))
+        .map_err(|rejection| match rejection {
+            BlockRejection::NotLeader => TaskRejectReason::TaskRejectNotLeader,
+            BlockRejection::UnknownTask => TaskRejectReason::TaskRejectUnknownRun,
+            BlockRejection::NotReady => TaskRejectReason::TaskRejectNotReady,
+        })
 }
 
 fn completed<C: Clock, I: IdGenerator, O: Observer>(
@@ -1044,7 +1068,8 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
         | Request::QueryOutcome(_)
         | Request::SubmitComposite(_)
         | Request::SubmitMembers(_)
-        | Request::QuerySlowDown(_) => {
+        | Request::QuerySlowDown(_)
+        | Request::Blocked(_) => {
             return None;
         }
     };

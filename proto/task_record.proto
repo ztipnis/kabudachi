@@ -45,6 +45,13 @@ message TaskRecord {
   // are read through that composite until it is forgotten. Holders start the
   // retention of a finished record only once a revision clears this.
   bool retained_by_composite = 11;
+  // When a worker first reported it could not run this task's input version
+  // and left it for another, by the leader's wall clock; unset while none
+  // has, or once one started it.
+  WallTime blocked_since = 12;
+  // Why the latest such report, or the report that ended the task, could not
+  // run it, as the worker wrote it.
+  string blocked_reason = 13;
 }
 
 // The holders of one placement.

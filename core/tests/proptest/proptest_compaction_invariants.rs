@@ -128,7 +128,7 @@ proptest! {
         fixture.scheduler.set_compaction_runners(BTreeSet::from([runner()]));
         let holder = fixture.scheduler.submit(generation(b"h".to_vec())).unwrap();
         let held = fixture.scheduler.request_claim(&WorkerId::new("w1"), &holder).unwrap();
-        fixture.scheduler.report_started(&WorkerId::new("w1"), &held.task_run_id).unwrap();
+        fixture.scheduler.report_started(&WorkerId::new("w1"), &held.task_run_id, None).unwrap();
         let mut model = Model { fixture, submitted: Vec::new() };
         // A key's waiting generation needs at least one payload to fold.
         model.submit(1);
@@ -156,7 +156,7 @@ proptest! {
         inputs.push(newest.task.serialized_input.clone());
         prop_assert_eq!(fold_all(&inputs), fold_all(&model.submitted));
         let w2 = WorkerId::new("w2");
-        model.fixture.scheduler.report_started(&w2, &newest.task_run_id).unwrap();
+        model.fixture.scheduler.report_started(&w2, &newest.task_run_id, None).unwrap();
         model
             .fixture
             .scheduler

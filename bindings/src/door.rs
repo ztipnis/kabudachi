@@ -310,7 +310,7 @@ impl<C: Clock> SchedulerDoor<C> {
     pub fn report_started(&self, run: &TaskRunId) -> Result<(), Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
             settled_change(scheduler, |scheduler| {
-                scheduler.report_started(&self.worker, run)
+                scheduler.report_started(&self.worker, run, None)
             })
         }))
     }
@@ -394,7 +394,7 @@ impl<C: Clock> SchedulerDoor<C> {
                 if scheduler.task_run(run).map(TaskRunRecord::current_state)
                     == Some(TaskRunState::Claimed)
                 {
-                    scheduler.report_started(&self.worker, run)?;
+                    scheduler.report_started(&self.worker, run, None)?;
                 }
                 let failure = scheduler.fail_with_message(
                     &self.worker,

@@ -40,7 +40,7 @@ fn running(fixture: &mut Fixture, who: &WorkerId, task: &TaskId) -> TaskRunId {
     let claim = fixture.scheduler.request_claim(who, task).unwrap();
     fixture
         .scheduler
-        .report_started(who, &claim.task_run_id)
+        .report_started(who, &claim.task_run_id, None)
         .unwrap();
     claim.task_run_id
 }
@@ -68,7 +68,7 @@ fn a_replay_after_a_loss_does_not_use_up_a_retry() {
         .unwrap();
     fixture
         .scheduler
-        .report_started(&worker("w2"), &retry)
+        .report_started(&worker("w2"), &retry, None)
         .unwrap();
     let after_second_failure = fixture.scheduler.fail(&worker("w2"), &retry, "E").unwrap();
 
