@@ -123,9 +123,15 @@ where
                 Some(waking.map_or(suspicion, |at| at.min(suspicion)))
             }
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
-                earliest(next_heartbeat, self.next_roll_call_due())
+                earliest(
+                    earliest(next_heartbeat, self.next_roll_call_due()),
+                    self.drain_request.wakes_at(),
+                )
             }
-            WorkerState::RollCall => earliest(next_heartbeat, self.round.next_deadline()),
+            WorkerState::RollCall => earliest(
+                earliest(next_heartbeat, self.round.next_deadline()),
+                self.drain_request.wakes_at(),
+            ),
             WorkerState::Candidate => self.round.next_deadline(),
             WorkerState::LeaderReconciling | WorkerState::Leader => self.office_deadline(),
             _ => None,

@@ -46,6 +46,10 @@ where
                 }
             }
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
+                if self.drain_request.gave_up_waiting(self.clock.now()) {
+                    self.drain_without_a_leader();
+                    return;
+                }
                 if self.can_start_roll_call() {
                     let now = self.clock.now();
                     let timestamp_millis = self.clock.wall_clock_millis();
@@ -53,6 +57,12 @@ where
                 }
             }
             WorkerState::RollCall | WorkerState::Candidate => {
+                if self.state == WorkerState::RollCall
+                    && self.drain_request.gave_up_waiting(self.clock.now())
+                {
+                    self.drain_without_a_leader();
+                    return;
+                }
                 let now = self.clock.now();
                 self.decide(|round, view| round.on_deadline(view, now));
             }

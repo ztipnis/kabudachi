@@ -180,3 +180,43 @@ fn a_sole_voter_admits_its_pending_member_and_hands_over_to_it() {
     assert_eq!(hand_offs(&steps, &leader), vec![HandOffTo::Leader(joiner)]);
     assert_no_grant_overlap(&cluster);
 }
+
+#[test]
+fn a_sole_voter_with_no_other_worker_leads_until_its_drain_wait_ends_then_leaves_its_records_to_no_one() {
+    let (mut cluster, leader) = elected(1, 0);
+    cluster.record_steps();
+    let asked_at = cluster.now();
+    let wait = cluster.node(&leader).timings().drain_wait_limit;
+
+    cluster.drain(&leader);
+    assert!(run_until(&mut cluster, |cluster| cluster.states()[&leader] == WorkerState::Stopped));
+
+    assert!(cluster.now() - asked_at >= wait, "it waited for another voter");
+    let steps = cluster.take_steps();
+    assert_eq!(hand_offs(&steps, &leader), vec![HandOffTo::Voters(Vec::new())]);
+    assert!(transfers(&steps, &leader).is_empty());
+}
+
+#[test]
+fn a_node_asked_to_drain_with_no_leader_waits_its_drain_wait_then_leaves_without_one() {
+    let (mut cluster, leader) = elected(3, 0);
+    let cut_off = cluster.node_ids().into_iter().find(|id| *id != leader).expect("a follower");
+    let rest: BTreeSet<WorkerId> =
+        cluster.node_ids().into_iter().filter(|id| *id != cut_off).collect();
+    cluster.partition([cut_off.clone()].into_iter().collect(), rest);
+    assert!(run_until(&mut cluster, |cluster| cluster.states()[&cut_off] == WorkerState::NoQuorum));
+    cluster.record_steps();
+    let asked_at = cluster.now();
+    let wait = cluster.node(&cut_off).timings().drain_wait_limit;
+
+    cluster.drain(&cut_off);
+    assert!(run_until(&mut cluster, |cluster| cluster.states()[&cut_off] == WorkerState::Stopped));
+
+    let waited = cluster.now() - asked_at;
+    assert!(
+        waited >= wait && waited.as_ticks() < wait.as_ticks() + SUSPECT.as_ticks(),
+        "{waited:?}"
+    );
+    let steps = cluster.take_steps();
+    assert_eq!(hand_offs(&steps, &cut_off), vec![HandOffTo::Nobody]);
+}

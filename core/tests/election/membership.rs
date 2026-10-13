@@ -258,6 +258,42 @@ fn a_draining_leader_hands_over_and_names_the_leader_that_took_over_to_place_its
     );
 }
 
+/// A leader that handed over to a successor whose acks never vouch for a
+/// heartbeat of its own (it never reconciled) does not wait for it for ever:
+/// it leaves, through that successor, when its drain wait runs out.
+#[test]
+fn a_node_that_handed_leadership_over_leaves_at_its_deadline_when_its_successor_never_vouches() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let _ = leader.step(Input::Drain);
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+    let handed = crawled(&clock, &mut leader, &worker("p2"));
+    let successor = handed_to(&handed).expect("every other voter crawled, so it hands over");
+    let leaves_at =
+        clock.now() + crate::support::builders::timings(Duration::from_ticks(SUSPECT)).drain_wait_limit;
+    let configuration = leader.configuration().cloned().expect("a configuration");
+    let successors_term = leader.term() + 1;
+    let ack = || ack_message(leader_ack(&successor, successors_term, &configuration, Some(g0())));
+
+    deliver(&mut leader, &successor, ack());
+    assert_eq!(leader.state(), WorkerState::Active, "it follows its successor");
+    let beat_every = Duration::from_ticks(SUSPECT / 4);
+    while clock.now() + beat_every < leaves_at {
+        clock.advance(beat_every);
+        deliver(&mut leader, &successor, ack());
+        let _ = leader.step(Input::Tick);
+        assert_eq!(leader.state(), WorkerState::Active, "the drain wait has not run out");
+    }
+
+    clock.advance(leaves_at - clock.now());
+    let left = leader.step(Input::Tick).outputs;
+    assert_eq!(leader.state(), WorkerState::Stopped);
+    assert!(
+        left.contains(&Output::HandOff(HandOffTo::Leader(successor))),
+        "{left:?}"
+    );
+}
+
 /// What `leader_of_three_losing_quickly` does while `p1` sends `beats` and `p2`
 /// keeps the lease without echoing a generation, for `ticks`.
 fn run_leader_of_three_with_p1_beating(

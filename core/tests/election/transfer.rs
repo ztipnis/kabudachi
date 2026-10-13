@@ -4,16 +4,19 @@
 //! The voter it asks stands without waiting out a suspicion, and a voter
 //! that heard the leader is handing over answers that call.
 
-use kabudachi_core::election::{Input, Output};
+use kabudachi_core::configuration::{Configuration, Joint};
+use kabudachi_core::election::{HandOffTo, Input, Output};
 use kabudachi_core::protocol::checked::{Checked, CheckedPayload};
 use kabudachi_core::protocol::ids::WorkerId;
-use kabudachi_core::protocol::messages::{AckEcho, TransferLeadership};
+use kabudachi_core::protocol::messages::{
+    AckEcho, ElectionReject, ElectionRejectReason, TransferLeadership, election_message,
+};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::{Clock, Duration};
 
 use crate::support::builders::{
-    ack_message, checked, configuration_of, g0, heartbeat, heartbeat_message, leader_ack,
-    past_any_suspicion, roll_call, roll_call_message, transfer_message, vote_request,
+    ack_message, checked, configuration_of, g0, heartbeat, heartbeat_message, leader_ack, message,
+    past_any_suspicion, roll_call, roll_call_message, shard, transfer_message, vote_request,
     vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
@@ -212,4 +215,106 @@ fn a_draining_ack_leaves_the_leader_contact_stale_so_the_voter_still_suspects_in
     ));
     tick(&mut voter);
     assert_eq!(voter.state(), WorkerState::LeaderSuspect);
+}
+
+#[test]
+fn a_leader_handing_over_keeps_its_own_configuration_when_a_refusal_relays_a_batch_on_it() {
+    let clock = FakeClock::new();
+    let (a, b, c) = (worker("a"), worker("b"), worker("c"));
+    let mut leader = voter_node(&clock, &a, 3, SUSPECT);
+    connect(&mut leader, &[b.clone(), c.clone()]);
+    elect(&mut leader, &clock, SUSPECT, &[b.clone(), c.clone()]);
+    commit_founding(&mut leader, &clock, &[b.clone(), c.clone()]);
+    clock.advance(Duration::from_ticks(1));
+    confirm(&mut leader, &clock, &c);
+    let _ = leader.step(Input::TransferLeadership);
+    let held = leader.configuration().cloned().expect("a configuration");
+    // The batch a refuser knows of, started on the single configuration the
+    // leader holds: a follower that missed its start would adopt it.
+    let next = held.generation().next_change(leader.term());
+    let batch = Configuration::joint(Joint {
+        generation: next,
+        base: next,
+        batch_generation: next,
+        old_base: held.base(),
+        old_generation: held.generation(),
+        old_voter_count: 3,
+        new_voter_count: 4,
+    })
+    .expect("a well-formed batch");
+
+    let refusal = ElectionReject {
+        shard_id: Some(shard("shard-1").into()),
+        term: leader.term() + 1,
+        initiator_id: Some(a.clone().into()),
+        rejecter_id: Some(b.clone().into()),
+        reason: ElectionRejectReason::LeaderStillValid as i32,
+        highest_term_seen: leader.term(),
+        leader: None,
+        configuration: Some((&batch).into()),
+        recovery_epoch: Some(0),
+        recovery_epoch_lineage: 0,
+    };
+    deliver(
+        &mut leader,
+        &b,
+        message(election_message::Payload::ElectionReject(refusal)),
+    );
+
+    assert_eq!(leader.configuration(), Some(&held));
+}
+
+#[test]
+fn a_leader_of_a_joint_configuration_has_no_successor_and_departs_alone_when_its_drain_wait_ends() {
+    let clock = FakeClock::new();
+    let (a, b, c) = (worker("a"), worker("b"), worker("c"));
+    let mut leader = voter_node(&clock, &a, 3, SUSPECT);
+    connect(&mut leader, &[b.clone(), c.clone()]);
+    elect(&mut leader, &clock, SUSPECT, &[b.clone(), c.clone()]);
+    assert!(
+        leader.configuration().is_some_and(Configuration::is_joint),
+        "setup: its founding is not committed"
+    );
+    let wait_ends = clock.now() + leader.timings().drain_wait_limit;
+    let mut outputs = leader.step(Input::Drain).outputs;
+
+    // Both voters keep confirming its acks without echoing the founding's
+    // generation, so it keeps its office and the founding stays uncommitted.
+    let beat_every = Duration::from_ticks(SUSPECT / 4);
+    while clock.now() + beat_every < wait_ends {
+        clock.advance(beat_every);
+        for voter in [&b, &c] {
+            let beat = heartbeat(
+                voter,
+                Some(AckEcho {
+                    term: leader.term(),
+                    send_token: clock.now().as_ticks(),
+                }),
+            );
+            outputs.extend(deliver(&mut leader, voter, heartbeat_message(beat)));
+        }
+        outputs.extend(tick(&mut leader));
+        assert!(
+            matches!(leader.state(), WorkerState::LeaderReconciling | WorkerState::Leader),
+            "the drain wait has not run out: {:?}",
+            leader.state()
+        );
+    }
+    clock.advance(wait_ends - clock.now());
+    outputs.extend(tick(&mut leader));
+
+    assert_eq!(leader.state(), WorkerState::Stopped);
+    assert!(
+        !outputs
+            .iter()
+            .any(|output| matches!(output, Output::TransferLeadership { .. })),
+        "no voter of a joint configuration is a successor"
+    );
+    assert!(matches!(
+        outputs.iter().find_map(|output| match output {
+            Output::HandOff(to) => Some(to),
+            _ => None,
+        }),
+        Some(HandOffTo::Voters(_))
+    ));
 }

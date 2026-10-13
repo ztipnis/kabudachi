@@ -493,30 +493,37 @@ pub enum Input {
     /// The coordination authority answered a call this node asked for (see
     /// [`Output::Authority`]). A node with no authority ignores it.
     Authority(AuthorityReply),
-    /// Leave the shard gracefully: send `SelfRemove` to the leader this node follows, if any, or as
-    /// the leader announce the configuration without itself on a final ack
-    /// to every connected peer, and end `Stopped`. From `Active` this happens
-    /// at once. A `Leader` keeps leading until every other voter has reported
-    /// a routing crawl since its admission, or `drain_wait_limit` has passed
-    /// (see [`ElectionTimings::drain_wait_limit`]), and then hands its
-    /// leadership over to the voter that confirmed its acks last (see
+    /// Leave the shard gracefully: send `SelfRemove` to the leader this node
+    /// follows, if any, or as the leader announce the configuration without
+    /// itself on a final ack to every connected peer, and end `Stopped`. From
+    /// `Active` this happens at once. A `Leader` keeps leading until every
+    /// other voter has reported a routing crawl since its admission, or
+    /// `drain_wait_limit` has passed (see
+    /// [`ElectionTimings::drain_wait_limit`]), and then hands its leadership
+    /// over to the voter that confirmed its acks last (see
     /// [`Input::TransferLeadership`]). It leaves through the leader that
     /// takes over once that leader vouches for hearing it, or, if none does
     /// within a suspicion timeout of the hand-over, as it would alone. A
     /// leader with no other voter to hand over to keeps leading, so a pending
     /// member can be admitted and become one, until `drain_wait_limit` has
-    /// passed, and then leaves alone. From `Draining` or `Stopped` the request does
-    /// nothing; from any other state, `Fenced` among them, the node keeps it and
-    /// drains as soon as it reaches `Active`, `LeaderReconciling` or `Leader`,
-    /// in the same step. A leader that loses office while it waits keeps the
-    /// request, and the drain wait, its limit included, starts over when it
-    /// regains leadership. A driver asks once.
+    /// passed, and then leaves alone.
     ///
-    /// A drain kept in a state the node never leaves for `Active`,
-    /// `LeaderReconciling` or `Leader` waits for good: a node whose peers never return, which keeps
-    /// retrying roll calls from `NoQuorum`, or a `Bootstrapping` node that
-    /// never joins. A driver that waits for `Stopped` must not rely on it
-    /// there.
+    /// From `LeaderSuspect`, `RollCall` or `NoQuorum` the node keeps the
+    /// request and drains as soon as it reaches `Active`, `LeaderReconciling`
+    /// or `Leader`, in the same step; if it has found no leader by the time
+    /// `drain_wait_limit` has passed, it leaves without one, telling no one
+    /// and handing its records to no one (see [`HandOffTo::Nobody`]). From
+    /// `Draining` or `Stopped` the request does nothing; from any other state,
+    /// `Fenced` among them, the node keeps it and drains as soon as it
+    /// reaches `Active`, `LeaderReconciling` or `Leader`, in the same step. A
+    /// leader that loses office while it waits keeps the request, and the
+    /// drain wait, its limit included, starts over when it regains
+    /// leadership. A driver asks once.
+    ///
+    /// A drain kept in `Bootstrapping`, `Joining`, `Candidate` or `Fenced`
+    /// waits for good if the node never leaves it for a state that drains: a
+    /// `Bootstrapping` node that never joins, say. A driver that waits for
+    /// `Stopped` must not rely on it there.
     Drain,
     /// Hand leadership over without leaving: a `Leader` stops granting, acks
     /// every connected peer saying so, and asks the voter of its committed

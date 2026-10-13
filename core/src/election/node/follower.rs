@@ -9,8 +9,8 @@ use crate::queues::Subscription;
 use crate::time::{Clock, Instant};
 
 use super::super::EpochOrder;
-use super::super::drain::DrainRequest;
 use super::super::authority_standing::AuthorityStanding;
+use super::super::drain::DrainRequest;
 use super::super::standing::AckChange;
 use super::super::{Output, WorkerNode};
 

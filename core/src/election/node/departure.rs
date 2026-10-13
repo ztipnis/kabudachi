@@ -27,16 +27,35 @@ where
         {
             Asked::DrainNow => self.drain(),
             Asked::WaitToHandOver => self.hand_over_once_free(),
+            Asked::WaitForALeader if self.drain_request.gave_up_waiting(now) => {
+                self.drain_without_a_leader();
+            }
             Asked::WaitForALeader | Asked::Nothing => {}
         }
+    }
+
+    /// Leaves the shard with no leader to leave through: a node asked to
+    /// drain that found none within its drain wait. It tells no one, and no
+    /// one can choose where its records go (see [`HandOffTo::Nobody`]): the
+    /// next founding leaves it out, or the authority path counts it out.
+    pub(super) fn drain_without_a_leader(&mut self) {
+        self.drain_request = DrainRequest::NotAsked;
+        self.round.stop();
+        self.drop_recovery();
+        self.transition_to(WorkerState::Draining);
+        self.outputs.push(Output::HandOff(HandOffTo::Nobody));
+        self.stop_reason = Some(StopReason::Drained);
+        self.transition_to(WorkerState::Stopped);
     }
 
     /// A leader asked to drain hands its leadership over once every other
     /// voter has reported a routing crawl since its admission (so no worker
     /// is left knowing only this leader), or once its drain wait has run out,
-    /// to its successor (see [`LeaderOffice::successor`](crate::election::leader_office::LeaderOffice::successor)). With no successor
-    /// it keeps leading, so a pending member can be admitted and become one,
-    /// until its wait runs out; then it departs alone.
+    /// to its successor (see
+    /// [`LeaderOffice::successor`](crate::election::leader_office::LeaderOffice::successor)).
+    /// With no successor it keeps leading, so a pending member can be
+    /// admitted and become one, until its wait runs out; then it departs
+    /// alone.
     pub(super) fn hand_over_once_free(&mut self) {
         let now = self.clock.now();
         let DrainRequest::Waiting { until } = self.drain_request else {

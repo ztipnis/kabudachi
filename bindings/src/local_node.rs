@@ -70,7 +70,9 @@ pub fn local_node<C: Clock>(
             suspect_timeout,
             Duration::from_millis(HEARTBEAT_INTERVAL_MS),
         )
-        .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS)),
+        // A lone node has no one to hand leadership or records to: it leaves at once.
+        .with_roll_call_deadline(Duration::from_millis(ROLL_CALL_DEADLINE_MS))
+        .with_drain_wait_limit(Duration::from_ticks(0)),
     };
     let entry = Entry::Founding {
         shard_id,

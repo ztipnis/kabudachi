@@ -93,10 +93,9 @@ pub async fn run_election(
 }
 
 /// Asks `node` to drain, then steps it at the deadlines it reports until it
-/// is `Stopped`, and returns everything it produced. A lone node drains at
-/// once from `Active` or `Leader`; one suspecting a leader instead starts a
-/// roll call at its next `Tick`, due at once, elects itself at that call's
-/// deadline, and drains in that same step.
+/// is `Stopped`, and returns everything it produced. A lone node's drain wait
+/// is zero, so it drains at once from `Active` or `Leader`, and from
+/// `LeaderSuspect` too: it gives up waiting for a leader as it is asked.
 async fn drain(node: &mut LocalNode<RealClock>, clock: RealClock) -> Vec<Output> {
     // Stepping by hand, not through `carry_out`, is safe only because a
     // local node has no authority: no step asks for a reply to feed back.
