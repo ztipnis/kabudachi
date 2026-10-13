@@ -106,7 +106,7 @@ pub use cancel::{CancelRejection, Cancellation, HeldCancel};
 pub use claims::{Claim, ClaimRejection};
 pub use compaction::Compacted;
 pub use deadlines::CaughtUp;
-pub use failures::Failure;
+pub use failures::{Failure, MAX_FAILURE_MESSAGE_BYTES};
 use leadership::Leadership;
 pub use leadership::{LeadershipGrant, LeaseEnd};
 pub use loss::LostRun;

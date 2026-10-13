@@ -90,6 +90,7 @@ impl ClaimedRuns {
                 },
                 HeldRun::Failed { failure_kind } => ReportedState::Failed {
                     failure_kind: truncated(failure_kind, MAX_FAILURE_KIND_BYTES),
+                    failure_message: String::new(),
                 },
             };
             // The chain's generations have records of their own, and a

@@ -244,6 +244,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run.transition_to(TaskRunState::Claimed, stamped_at)
             .expect("a Queued run can always be claimed");
         run.selected_worker = Some(worker.clone().into());
+        run.claimed_at = Some(stamped_at.into());
         self.waiting.claimed(task_id);
         if let Some(key) = self.coalescing_key_of(task_id) {
             self.occupancy.start(&key, task_id);

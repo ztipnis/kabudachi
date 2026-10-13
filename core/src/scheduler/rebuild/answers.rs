@@ -152,8 +152,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                     out.certified.push(certified);
                 }
             }
-            ReportedState::Failed { failure_kind } => {
-                if let Ok(failed) = self.fail_owned(worker, run_id, failure_kind) {
+            ReportedState::Failed {
+                failure_kind,
+                failure_message,
+            } => {
+                if let Ok(failed) = self.fail_owned(worker, run_id, failure_kind, failure_message)
+                {
                     out.failed.push(failed);
                 }
             }

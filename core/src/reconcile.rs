@@ -55,9 +55,10 @@ pub enum ReportedState {
         result_digest: Digest,
         delivered: bool,
     },
-    /// Failed; no leader has recorded the failure.
+    /// Failed, with its error's message; no leader has recorded the failure.
     Failed {
         failure_kind: String,
+        failure_message: String,
     },
 }
 

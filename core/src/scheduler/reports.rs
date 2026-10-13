@@ -91,6 +91,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let run = self.owned_run(worker, run_id, TaskRunState::Claimed)?;
         run.transition_to(TaskRunState::Running, stamped_at)
             .expect("a Claimed run can always start");
+        run.started_at = Some(stamped_at.into());
         self.mark_decided(run_id);
         Ok(())
     }

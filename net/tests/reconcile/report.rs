@@ -118,7 +118,7 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
         assert!(pages > 1, "nine runs, eight of them of 200 KiB, take more than one page");
         for run in &runs {
             if run.claim.task_run_id == failed_run {
-                let ReportedState::Failed { failure_kind } = &run.state else {
+                let ReportedState::Failed { failure_kind, .. } = &run.state else {
                     panic!("the run the worker failed was reported {:?}", run.state);
                 };
                 assert!(!failure_kind.is_empty() && failure_kind.len() < long_kind.len());

@@ -498,6 +498,7 @@ fn a_reported_failure_is_applied_and_its_retry_queued() {
                     &f,
                     ReportedState::Failed {
                         failure_kind: "ValueError".into(),
+                        failure_message: "card declined".into(),
                     },
                 )],
             ),
@@ -508,6 +509,12 @@ fn a_reported_failure_is_applied_and_its_retry_queued() {
     assert_eq!(
         last_states(&new, &failed),
         [TaskRunState::Failed, TaskRunState::Queued]
+    );
+    let runs = new.scheduler.runs_of(&failed);
+    let failed_run = new.scheduler.task_run(&runs[0]).unwrap();
+    assert_eq!(
+        failed_run.failure_message, "card declined",
+        "the adopted failure keeps its message"
     );
 }
 

@@ -49,26 +49,33 @@ impl From<&ReportedRun> for generated::ReportedRun {
             chain: Vec::new(),
             ..generated::Claim::from(run.claim.clone())
         };
-        let (state, result_digest, failure_kind) = match &run.state {
+        let (state, result_digest, failure_kind, failure_message) = match &run.state {
             ReportedState::Claimed => (
                 generated::ReportedRunState::ReportedRunClaimed,
                 None,
+                String::new(),
                 String::new(),
             ),
             ReportedState::Running => (
                 generated::ReportedRunState::ReportedRunRunning,
                 None,
                 String::new(),
+                String::new(),
             ),
             ReportedState::Succeeded { result_digest, .. } => (
                 generated::ReportedRunState::ReportedRunSucceeded,
                 Some(result_digest.clone().into()),
                 String::new(),
+                String::new(),
             ),
-            ReportedState::Failed { failure_kind } => (
+            ReportedState::Failed {
+                failure_kind,
+                failure_message,
+            } => (
                 generated::ReportedRunState::ReportedRunFailed,
                 None,
                 failure_kind.clone(),
+                failure_message.clone(),
             ),
         };
         generated::ReportedRun {
@@ -83,7 +90,7 @@ impl From<&ReportedRun> for generated::ReportedRun {
                     ..
                 }
             ),
-            failure_message: String::new(),
+            failure_message,
         }
     }
 }
@@ -103,6 +110,7 @@ impl TryFrom<&generated::ReportedRun> for ReportedRun {
             },
             Ok(generated::ReportedRunState::ReportedRunFailed) => ReportedState::Failed {
                 failure_kind: run.failure_kind.clone(),
+                failure_message: run.failure_message.clone(),
             },
             Ok(generated::ReportedRunState::Unspecified) | Err(_) => return Err(MalformedReport),
         };
