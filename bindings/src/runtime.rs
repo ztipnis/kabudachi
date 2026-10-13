@@ -4,12 +4,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use kabudachi_core::blob::{BlobKey, BlobOwner, MAX_BLOB_BYTES};
+use kabudachi_core::manifest::{INLINE_PAYLOAD_BYTES, Manifest};
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{
-    IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
+    CompositeId, IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::composite::Step;
+use kabudachi_core::scheduler::composite::{member_input, results};
 use kabudachi_core::scheduler::{Completion, ReportRejection, Scheduler, SubmitRejection};
 use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
@@ -21,7 +23,8 @@ use tokio::task::JoinHandle;
 
 use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
-use crate::door::{Closed, Refusal, SchedulerDoor};
+use crate::composite::{PyBytesValue, PyManifest, PyMemberInput, PyResolved, state_name, step_from_tree, take_large_values};
+use crate::door::{Closed, DoorSource, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
 use crate::errors;
 use crate::health;
@@ -387,48 +390,209 @@ impl NativeRuntime {
             .map_err(|refusal| refused(refusal, rejected))
     }
 
-    /// Reports that a running run succeeded, with the digest of its result,
-    /// and returns the certification of that result.
+    /// Reports that a running run succeeded, and returns the certification of
+    /// its result. Give either `result_digest`, the digest of the result, or
+    /// `continuation`, the tree of the step the run returned (see
+    /// `describe_step`): the step runs as a composite and the run is
+    /// certified under the digest of its description, so the digest is not
+    /// given. Values of the step too large to inline are stored as blobs the
+    /// composite owns, nested stages' included. The task is not over (its
+    /// coalescing key stays held) until the composite is.
     ///
-    /// Raises `ValueError` if `result_digest` is not a BLAKE3 digest's length,
-    /// and `RuntimeError` if the run is unknown, is not running, or is not
-    /// this worker's; the result is then not certified. With `continuation`,
-    /// the encoded description of the step the run returned, the run is
-    /// certified under that step's digest and the step runs as a composite;
-    /// the task is not over (its coalescing key stays held) until that
-    /// composite is.
-    ///
-    /// Also raises `ValueError` if `continuation` is malformed, takes an
-    /// input, or is not what `result_digest` is the digest of.
-    #[pyo3(signature = (task_run_id, result_digest, continuation = None))]
+    /// Raises `ValueError` if neither or both are given, if `result_digest`
+    /// is not a BLAKE3 digest's length, or if `continuation` is malformed or
+    /// takes an input, `BackpressureError` if a value of the step alone is
+    /// past the hard memory limit, and `RuntimeError` if the run is unknown,
+    /// is not running, or is not this worker's; the result is then not
+    /// certified.
+    #[pyo3(signature = (task_run_id, result_digest = None, continuation = None))]
     fn complete(
         &self,
+        py: Python<'_>,
         task_run_id: &str,
-        result_digest: &[u8],
-        continuation: Option<&[u8]>,
+        result_digest: Option<&[u8]>,
+        continuation: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyCertification> {
-        let digest = Digest::new(DigestAlgorithm::Blake3, result_digest.to_vec())
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let completion = match continuation {
-            None => Completion::Final,
-            Some(bytes) => {
-                let step = Step::decode(bytes)
+        let run = TaskRunId::new(task_run_id);
+        let certification = match (result_digest, continuation) {
+            (Some(digest), None) => {
+                let digest = Digest::new(DigestAlgorithm::Blake3, digest.to_vec())
                     .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                self.door.complete(&run, digest, Completion::Final)
+            }
+            (None, Some(tree)) => {
+                let mut step = step_from_tree(tree)?;
                 if step.takes_input() {
                     return Err(PyValueError::new_err("a returned step cannot take an input"));
                 }
-                if step.digest() != digest {
-                    return Err(PyValueError::new_err(
-                        "the result digest is not the returned step's digest",
-                    ));
-                }
-                Completion::Continues(step)
+                let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+                self.refuse_values_past_limit(py, &values)?;
+                self.door.complete_with_step(&run, step, values)
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "give either result_digest or continuation, not both or neither",
+                ));
             }
         };
-        self.door
-            .complete(&TaskRunId::new(task_run_id), digest, completion)
+        certification
             .map(Into::into)
             .map_err(|refusal| refused(refusal, rejected))
+    }
+
+    /// Records the composite `tree` describes (see `describe_step`) and
+    /// returns its ID. A flow starts its first stage, and a group or map all
+    /// its members, once this worker leads. Values of the tree too large to
+    /// inline are stored as blobs the composite owns, nested stages'
+    /// included. The worker is told when it is over (`COMPOSITE_FINISHED`).
+    ///
+    /// Raises `ValueError` if the tree describes a step the leader would not
+    /// accept, or one that takes an input, `BackpressureError` if the
+    /// composite does not fit under the hard memory limit or a value of the
+    /// tree alone is past it, and `RuntimeError` if this worker is not the
+    /// leader or the runtime has shut down.
+    fn submit_composite(&self, py: Python<'_>, tree: &Bound<'_, PyAny>) -> PyResult<String> {
+        let mut step = step_from_tree(tree)?;
+        let values = take_large_values(&mut step, INLINE_PAYLOAD_BYTES as usize);
+        self.refuse_values_past_limit(py, &values)?;
+        let composite_id = self.door.submit_composite(step, values).map_err(|refusal| {
+            refused(refusal, |rejection| match rejection {
+                SubmitRejection::NotLeader => PyRuntimeError::new_err(rejection.to_string()),
+                SubmitRejection::StepTakesInput => PyValueError::new_err(rejection.to_string()),
+                SubmitRejection::TooLarge { .. }
+                | SubmitRejection::RecordTooLarge { .. }
+                | SubmitRejection::Backpressure { .. }
+                | SubmitRejection::KeyNotReady
+                | SubmitRejection::KeyBackpressure { .. }
+                | SubmitRejection::PayloadTooLarge { .. } => {
+                    errors::backpressure_error(py, rejection.to_string())
+                }
+            })
+        })?;
+        Ok(composite_id.as_str().to_owned())
+    }
+
+    /// Returns an awaitable that resolves to the digest of a result: `data`
+    /// stored as blobs the task `task_id` owns, then the manifest naming them
+    /// as one more blob, which a composite's page names as the member's
+    /// result. Report that digest with `complete`.
+    ///
+    /// Raises `BackpressureError` if `data` is past the hard memory limit.
+    fn store_result<'py>(&self, py: Python<'py>, task_id: String, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        self.refuse_values_past_limit(py, std::slice::from_ref(&data))?;
+        let cut = Manifest::of_result(&data);
+        let manifest = cut.manifest.encode();
+        if manifest.len() > MAX_BLOB_BYTES {
+            return Err(errors::backpressure_error(
+                py,
+                "the result is too large to be named by one manifest blob".to_owned(),
+            ));
+        }
+        let digest = BlobKey::of(&manifest).digest().value().to_vec();
+        let mut blobs = cut.chunks;
+        blobs.push(manifest);
+        let owner = BlobOwner::Task(TaskId::new(task_id));
+        let door = Arc::clone(&self.door);
+        self.bridge.spawn_into_py(py, async move {
+            door.store_result_blobs(&owner, blobs)?;
+            Ok(PyBytesValue(digest))
+        })
+    }
+
+    /// Returns an awaitable that resolves to the opaque manifest of `data`,
+    /// stored as blobs the composite `composite_id` owns. The manifest goes
+    /// into a tree as `("manifest", manifest)`, in a tree whose root is that
+    /// composite.
+    ///
+    /// Raises `BackpressureError` if `data` is past the hard memory limit.
+    fn store_composite_payload<'py>(
+        &self,
+        py: Python<'py>,
+        composite_id: String,
+        data: Vec<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.refuse_values_past_limit(py, std::slice::from_ref(&data))?;
+        let door = Arc::clone(&self.door);
+        self.bridge.spawn_into_py(py, async move {
+            let cut = Manifest::chunk(&data);
+            door.store_input_blobs(&BlobOwner::Composite(CompositeId::new(composite_id)), cut.chunks)?;
+            Ok(PyManifest(cut.manifest))
+        })
+    }
+
+    /// Cancels a composite and every member it has started: `CANCELLED` if it
+    /// was, `ALREADY_FINISHED` if it had finished, `UNKNOWN_TASK` if there is
+    /// no such composite.
+    ///
+    /// Raises `RuntimeError` if this worker is not the leader.
+    fn cancel_composite(&self, composite_id: &str) -> PyResult<PyCancelOutcome> {
+        let outcome = self
+            .door
+            .cancel_composite(&CompositeId::new(composite_id))
+            .map_err(|refusal| refused(refusal, |rejection| PyRuntimeError::new_err(rejection.to_string())))?;
+        Ok(outcome.into())
+    }
+
+    /// Where a composite stands, as `(state, next_stage, pending, succeeded,
+    /// failed, cancelled)`: `state` is `"running"`, `"succeeded"`, `"failed"`
+    /// or `"cancelled"`, `next_stage` the stage of a flow that runs or runs
+    /// next, and the rest count its members. `None` if the runtime holds no
+    /// such composite.
+    fn composite_status(&self, composite_id: &str) -> PyResult<Option<(&'static str, u64, u64, u64, u64, u64)>> {
+        let status = self.door.composite_status(&CompositeId::new(composite_id))?;
+        Ok(status.map(|status| {
+            let counts = status.counts;
+            (
+                state_name(status.state),
+                status.next_stage,
+                counts.pending,
+                counts.succeeded,
+                counts.failed,
+                counts.cancelled,
+            )
+        }))
+    }
+
+    /// Returns an awaitable that resolves to a composite's results: `("list",
+    /// [...])` of its stages' or members' results in order, each `("value",
+    /// producer_definition_id, bytes)`, `("failure", kind, message)` or a
+    /// nested `("list", [...])`.
+    ///
+    /// Raises `RuntimeError` if the runtime no longer holds the composite or a
+    /// result it names.
+    fn composite_results<'py>(&self, py: Python<'py>, composite_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let door = Arc::clone(&self.door);
+        self.bridge.spawn_into_py(py, async move {
+            results(&DoorSource(&door), &CompositeId::new(composite_id))
+                .await
+                .map(PyResolved)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
+    }
+
+    /// Returns an awaitable that resolves to what the member run
+    /// `task_run_id` is given besides its claim, as `(fields, input)`: the
+    /// `(name, value)` pairs bound into its input, and what it takes from
+    /// before it, `("value", producer_definition_id, bytes)`, `("failure",
+    /// kind, message)` or `("list", [...])` as `composite_results` has them,
+    /// `("input", bytes)` for its own whole input when that was stored as
+    /// blobs, or `None` when the claim's `serialized_input` is the whole
+    /// input.
+    ///
+    /// Raises `RuntimeError` if the run is unknown or not a composite's
+    /// member, or a result it takes is no longer held.
+    fn resolve_input<'py>(&self, py: Python<'py>, task_run_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let task = self
+            .door
+            .task_of_run(&TaskRunId::new(task_run_id))?
+            .ok_or_else(|| PyRuntimeError::new_err("no such run"))?;
+        let door = Arc::clone(&self.door);
+        self.bridge.spawn_into_py(py, async move {
+            member_input(&DoorSource(&door), &task)
+                .await
+                .map(PyMemberInput)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        })
     }
 
     /// Reports the fold of a compaction run: the payload made by merging the
@@ -598,6 +762,23 @@ impl Drop for NativeRuntime {
             .take();
         if let Some(runtime) = runtime {
             runtime.shutdown_background();
+        }
+    }
+}
+
+impl NativeRuntime {
+    /// Refuses any of `values` alone past the hard memory limit, before
+    /// anything is stored.
+    fn refuse_values_past_limit(&self, py: Python<'_>, values: &[Vec<u8>]) -> PyResult<()> {
+        let Some(limit) = self.payload_limit else {
+            return Ok(());
+        };
+        match values.iter().find(|value| value.len() as u64 > limit) {
+            Some(value) => Err(errors::backpressure_error(
+                py,
+                format!("a payload of {} bytes is past the hard memory limit of {limit}", value.len()),
+            )),
+            None => Ok(()),
         }
     }
 }

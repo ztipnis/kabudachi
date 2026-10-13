@@ -4,6 +4,7 @@ use pyo3::types::PyBytes;
 
 mod arguments;
 mod bridge;
+mod composite;
 mod door;
 mod election;
 mod errors;
@@ -38,6 +39,8 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_log::refresh_logging, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(result_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(composite::describe_step, m)?)?;
+    m.add_class::<composite::PyManifest>()?;
     m.add_class::<runtime::NativeRuntime>()?;
     m.add_class::<networked::NetworkedRuntime>()?;
     m.add_class::<work::PyClaim>()?;
