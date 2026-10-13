@@ -219,6 +219,7 @@ pub(crate) fn outcome_answer(task: &TaskId, outcome: Option<Outcome>) -> Outcome
         result_digest: outcome.result_digest.map(Into::into),
         failure_kind: outcome.failure_kind,
         superseded_by: outcome.superseded_by.map(Into::into),
+        continued: outcome.continued,
     }
 }
 

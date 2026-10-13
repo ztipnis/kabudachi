@@ -101,6 +101,48 @@ fn a_continuation_committed_by_its_certifying_revision_is_rebuilt_from_the_run_w
     assert!(new.scheduler.request_claim(&worker(), &waiting).is_ok(), "and its key is free");
 }
 
+/// A client asks a new leader about a task whose returned step finished under
+/// the old one. The answer says the run returned a step, so the client waits
+/// for the step's end, not a certification of the step's digest, which would
+/// match no result it holds. A task that returned a result says no such thing.
+#[test]
+fn a_new_leader_answers_a_finished_continuing_task_as_continued() {
+    let client = kabudachi_core::protocol::ids::WorkerId::new("client");
+    let mut old = Fixture::leading();
+    let plain = old
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("plain"), 0, b"p".to_vec(), "default").with_client(client.clone()))
+        .unwrap();
+    let plain_claim = old.scheduler.request_claim(&worker(), &plain).unwrap();
+    old.scheduler.report_started(&worker(), &plain_claim.task_run_id).unwrap();
+    old.scheduler
+        .complete(&worker(), &plain_claim.task_run_id, Digest::blake3(b"result"), Completion::Final)
+        .unwrap();
+    let task = old
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_client(client))
+        .unwrap();
+    let claim = old.scheduler.request_claim(&worker(), &task).unwrap();
+    old.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
+    old.scheduler
+        .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step.clone()))
+        .unwrap();
+    let continuation = CompositeId::continuation_of(&claim.task_run_id);
+    run_member(&mut old, &continuation, 0, b"staged");
+    assert_eq!(finished(&mut old)[0].parent_task, Some(task.clone()));
+
+    let mark = old.spy.mark();
+    let mut new = took_over(&old, rebuild_losing(&old, mark, |_| false));
+    let continued = new.scheduler.outcome(&task).unwrap().expect("the new leader holds it");
+    assert_eq!(
+        (continued.state, continued.finished, continued.continued, continued.result_digest),
+        (TaskRunState::Succeeded, true, true, Some(step.digest()))
+    );
+    let plain = new.scheduler.outcome(&plain).unwrap().expect("the new leader holds it");
+    assert_eq!((plain.finished, plain.continued), (true, false));
+}
+
 /// The certifying revision itself was not stored: the run is still
 /// running in the records, and only the worker's report says it returned
 /// a step. The report certifies it with that step, as any report certifies

@@ -62,6 +62,9 @@ message OutcomeAnswer {
   string failure_kind = 7;
   // The newer generation that replaced it, when it was superseded.
   TaskId superseded_by = 8;
+  // The run returned a step instead of a result: `result_digest` names the
+  // step, not a result, and the task is over when the step's composite is.
+  bool continued = 9;
 }
 
 message ResultMessage {

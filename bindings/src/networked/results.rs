@@ -271,7 +271,9 @@ fn outcome_event(task: &TaskId, answer: &OutcomeAnswer) -> Option<PyEvent> {
             None,
         ));
     }
-    if !answer.finished {
+    // A run that returned a step has no result to certify: the task is over
+    // when the step's composite is, which is told on its own.
+    if !answer.finished || answer.continued {
         return None;
     }
     let run = answer
@@ -378,11 +380,9 @@ async fn ask_about_awaited(shared: &Shared) {
     ask_about_composites(shared).await;
 }
 
-/// The run that returned a step, if `answer` says a run did and the step is
-/// still running.
+/// The run that returned a step, if `answer` says a run did, whether the step
+/// is still running or has ended: its composite's record says how it ended.
 fn continuing_run(answer: &OutcomeAnswer) -> Option<TaskRunId> {
-    let continuing = answer.known
-        && !answer.finished
-        && DomainRunState::try_from(answer.state()) == Ok(DomainRunState::Succeeded);
+    let continuing = answer.known && answer.continued;
     continuing.then(|| answer.task_run_id.clone().map(TaskRunId::from)).flatten()
 }
