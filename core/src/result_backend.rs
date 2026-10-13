@@ -68,8 +68,11 @@ pub struct ResultBounds {
 
 impl ResultBounds {
     /// 64 KiB inline, 256 KiB chunks, 256 KiB pages.
-    pub const DEFAULT: ResultBounds =
-        ResultBounds { inline_bytes: 64 * 1024, chunk_bytes: 256 * 1024, page_bytes: 256 * 1024 };
+    pub const DEFAULT: ResultBounds = ResultBounds {
+        inline_bytes: 64 * 1024,
+        chunk_bytes: 256 * 1024,
+        page_bytes: 256 * 1024,
+    };
 }
 
 /// Whose value a chunk is a part of.
@@ -112,10 +115,16 @@ impl ResultKey {
 /// failures, and lists, nested as the composites that made them were.
 ///
 /// A failure keeps the Task whose run raised it, so a resumed error names
-/// the same task as the original.
+/// the same task as the original. Stored, its kind is cut to 128 bytes and
+/// its message to a quarter of the bounds' `page_bytes`, ending in `…` when
+/// cut, so no failure makes a page unbounded.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultTree {
-    Value { producer: TaskDefinitionId, serializer: String, bytes: Vec<u8> },
+    Value {
+        producer: TaskDefinitionId,
+        serializer: String,
+        bytes: Vec<u8>,
+    },
     Failure(Failure),
     List(Vec<ResultTree>),
 }
@@ -123,7 +132,11 @@ pub enum ResultTree {
 /// One member of a composite's flattened results, in preorder.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoredMember {
-    Value { producer: TaskDefinitionId, serializer: String, bytes: StoredBytes },
+    Value {
+        producer: TaskDefinitionId,
+        serializer: String,
+        bytes: StoredBytes,
+    },
     Failure(Failure),
     /// The next `n` members, each with its own subtree, form a list.
     List(u64),
@@ -133,7 +146,11 @@ pub enum StoredMember {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoredBytes {
     Inline(Vec<u8>),
-    Chunks { first: u32, count: u32, total_bytes: u64 },
+    Chunks {
+        first: u32,
+        count: u32,
+        total_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,9 +158,15 @@ pub enum ResultValue {
     /// A task's value, whole.
     Payload(Vec<u8>),
     /// A task's value in `chunks` chunks.
-    Chunked { chunks: u32, total_bytes: u64 },
+    Chunked {
+        chunks: u32,
+        total_bytes: u64,
+    },
     /// A composite's head: how many pages and members its results have.
-    Composite { pages: u32, members: u64 },
+    Composite {
+        pages: u32,
+        members: u64,
+    },
     Page(Vec<StoredMember>),
     Chunk(Vec<u8>),
 }
@@ -179,19 +202,22 @@ impl ResultEntry {
         };
         let value = match &self.value {
             ResultValue::Payload(bytes) => generated::stored_result::Value::Payload(bytes.clone()),
-            ResultValue::Chunked { chunks, total_bytes } => {
-                generated::stored_result::Value::Chunked(generated::ChunkedValue {
-                    chunks: *chunks,
-                    total_bytes: *total_bytes,
-                })
-            }
+            ResultValue::Chunked {
+                chunks,
+                total_bytes,
+            } => generated::stored_result::Value::Chunked(generated::ChunkedValue {
+                chunks: *chunks,
+                total_bytes: *total_bytes,
+            }),
             ResultValue::Composite { pages, members } => {
                 generated::stored_result::Value::CompositeHead(generated::CompositeHead {
                     pages: *pages,
                     members: *members,
                 })
             }
-            ResultValue::Page(members) => generated::stored_result::Value::Page(page_to_wire(members)),
+            ResultValue::Page(members) => {
+                generated::stored_result::Value::Page(page_to_wire(members))
+            }
             ResultValue::Chunk(bytes) => generated::stored_result::Value::Chunk(bytes.clone()),
         };
         generated::StoredResult {
@@ -199,7 +225,9 @@ impl ResultEntry {
             task_run_id: self.run.clone().map(Into::into),
             result_digest: self.digest.clone().map(Into::into),
             value: Some(value),
-            expires_at: Some(generated::WallTime { unix_millis: self.expires_at.as_unix_millis() }),
+            expires_at: Some(generated::WallTime {
+                unix_millis: self.expires_at.as_unix_millis(),
+            }),
             index,
         }
         .encode_to_vec()
@@ -231,7 +259,10 @@ impl ResultEntry {
                 ResultKey::Task(task),
                 Some(run.ok_or(BackendError::Corrupt)?),
                 Some(digest.ok_or(BackendError::Corrupt)?),
-                ResultValue::Chunked { chunks: chunked.chunks, total_bytes: chunked.total_bytes },
+                ResultValue::Chunked {
+                    chunks: chunked.chunks,
+                    total_bytes: chunked.total_bytes,
+                },
             ),
             (
                 ResultOwner::Composite(composite),
@@ -240,7 +271,10 @@ impl ResultEntry {
                 ResultKey::Composite(composite),
                 None,
                 Some(digest.ok_or(BackendError::Corrupt)?),
-                ResultValue::Composite { pages: head.pages, members: head.members },
+                ResultValue::Composite {
+                    pages: head.pages,
+                    members: head.members,
+                },
             ),
             (ResultOwner::Composite(composite), generated::stored_result::Value::Page(page)) => (
                 ResultKey::Page(composite, wire.index),
@@ -248,12 +282,21 @@ impl ResultEntry {
                 None,
                 ResultValue::Page(page_from_wire(page)?),
             ),
-            (owner, generated::stored_result::Value::Chunk(bytes)) => {
-                (ResultKey::Chunk(owner, wire.index), None, None, ResultValue::Chunk(bytes))
-            }
+            (owner, generated::stored_result::Value::Chunk(bytes)) => (
+                ResultKey::Chunk(owner, wire.index),
+                None,
+                None,
+                ResultValue::Chunk(bytes),
+            ),
             _ => return Err(BackendError::Corrupt),
         };
-        Ok(ResultEntry { key, run, digest, value, expires_at })
+        Ok(ResultEntry {
+            key,
+            run,
+            digest,
+            value,
+            expires_at,
+        })
     }
 
     /// Whether `now` is at or past this entry's expiry.
@@ -264,16 +307,24 @@ impl ResultEntry {
 
 fn member_to_wire(member: &StoredMember) -> generated::StoredMember {
     let member = match member {
-        StoredMember::Value { producer, serializer, bytes } => {
+        StoredMember::Value {
+            producer,
+            serializer,
+            bytes,
+        } => {
             let bytes_of = match bytes {
-                StoredBytes::Inline(bytes) => generated::stored_value::BytesOf::Inline(bytes.clone()),
-                StoredBytes::Chunks { first, count, total_bytes } => {
-                    generated::stored_value::BytesOf::Chunks(generated::ChunkRange {
-                        first: *first,
-                        count: *count,
-                        total_bytes: *total_bytes,
-                    })
+                StoredBytes::Inline(bytes) => {
+                    generated::stored_value::BytesOf::Inline(bytes.clone())
                 }
+                StoredBytes::Chunks {
+                    first,
+                    count,
+                    total_bytes,
+                } => generated::stored_value::BytesOf::Chunks(generated::ChunkRange {
+                    first: *first,
+                    count: *count,
+                    total_bytes: *total_bytes,
+                }),
             };
             generated::stored_member::Member::Value(generated::StoredValue {
                 producer: Some(producer.clone().into()),
@@ -286,11 +337,15 @@ fn member_to_wire(member: &StoredMember) -> generated::StoredMember {
         }
         StoredMember::List(len) => generated::stored_member::Member::List(*len),
     };
-    generated::StoredMember { member: Some(member) }
+    generated::StoredMember {
+        member: Some(member),
+    }
 }
 
 fn page_to_wire(members: &[StoredMember]) -> generated::ResultPage {
-    generated::ResultPage { members: members.iter().map(member_to_wire).collect() }
+    generated::ResultPage {
+        members: members.iter().map(member_to_wire).collect(),
+    }
 }
 
 fn member_from_wire(wire: generated::StoredMember) -> Result<StoredMember, BackendError> {
@@ -307,7 +362,9 @@ fn member_from_wire(wire: generated::StoredMember) -> Result<StoredMember, Backe
                 },
             },
         },
-        generated::stored_member::Member::Failure(failure) => StoredMember::Failure((&failure).into()),
+        generated::stored_member::Member::Failure(failure) => {
+            StoredMember::Failure((&failure).into())
+        }
         generated::stored_member::Member::List(len) => StoredMember::List(len),
     })
 }
@@ -336,7 +393,8 @@ pub enum BackendError {
 ///
 /// An adapter is a key-value store with expiry: one result is several
 /// entries (see [`task_entries`], [`composite_entries`]), none larger than
-/// about the bounds' `page_bytes`. Calls block. Never call one on an async
+/// about the bounds' `page_bytes` (a stored failure's message is cut to fit;
+/// see [`ResultTree`]). Calls block. Never call one on an async
 /// runtime's own threads: use a blocking pool. A failed call changes no
 /// task's outcome; its caller logs it and records the run's persistence as
 /// failed.
@@ -359,7 +417,10 @@ pub struct InMemoryResultBackend<C: Clock> {
 
 impl<C: Clock> InMemoryResultBackend<C> {
     pub fn new(clock: C) -> Self {
-        InMemoryResultBackend { clock, entries: Mutex::new(BTreeMap::new()) }
+        InMemoryResultBackend {
+            clock,
+            entries: Mutex::new(BTreeMap::new()),
+        }
     }
 
     fn entries(&self) -> MutexGuard<'_, BTreeMap<String, Vec<u8>>> {
@@ -404,7 +465,10 @@ pub fn task_entries(
         for (index, piece) in payload.chunks(bounds.chunk_bytes.max(1)).enumerate() {
             entries.push(chunk_entry(&owner, index, piece, expires_at));
         }
-        ResultValue::Chunked { chunks: count_u32(entries.len()), total_bytes: payload.len() as u64 }
+        ResultValue::Chunked {
+            chunks: count_u32(entries.len()),
+            total_bytes: payload.len() as u64,
+        }
     };
     entries.push(ResultEntry {
         key: ResultKey::Task(task.clone()),
@@ -420,7 +484,12 @@ fn count_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-fn chunk_entry(owner: &ResultOwner, index: usize, bytes: &[u8], expires_at: WallTime) -> ResultEntry {
+fn chunk_entry(
+    owner: &ResultOwner,
+    index: usize,
+    bytes: &[u8],
+    expires_at: WallTime,
+) -> ResultEntry {
     ResultEntry {
         key: ResultKey::Chunk(owner.clone(), count_u32(index)),
         run: None,
@@ -435,6 +504,36 @@ fn chunk_entry(owner: &ResultOwner, index: usize, bytes: &[u8], expires_at: Wall
 fn framed_len(member: &StoredMember) -> usize {
     let len = member_to_wire(member).encoded_len();
     1 + prost::encoding::encoded_len_varint(len as u64) + len
+}
+
+/// The longest failure kind a stored failure keeps, in bytes.
+const MAX_FAILURE_KIND_BYTES: usize = 128;
+
+/// What a truncated failure message ends with.
+const TRUNCATION_MARKER: &str = "…";
+
+/// `text` cut to at most `max` bytes on a character boundary, ending with
+/// the truncation marker when anything was cut.
+fn truncated(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max.saturating_sub(TRUNCATION_MARKER.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{TRUNCATION_MARKER}", &text[..end])
+}
+
+/// `failure` as a page stores it: with its kind cut to
+/// `MAX_FAILURE_KIND_BYTES` and its message to a quarter of `page_bytes`, so
+/// one member never fills a page.
+fn bounded_failure(bounds: &ResultBounds, failure: &Failure) -> Failure {
+    Failure {
+        kind: truncated(&failure.kind, MAX_FAILURE_KIND_BYTES),
+        message: truncated(&failure.message, bounds.page_bytes / 4),
+        task: failure.task.clone(),
+    }
 }
 
 /// The entries that mirror composite `id`'s results, parts first, head last.
@@ -454,7 +553,11 @@ pub fn composite_entries(
             continue;
         };
         members.push(match item {
-            ResultTree::Value { producer, serializer, bytes } => {
+            ResultTree::Value {
+                producer,
+                serializer,
+                bytes,
+            } => {
                 let bytes = if bytes.len() <= bounds.inline_bytes {
                     StoredBytes::Inline(bytes.clone())
                 } else {
@@ -466,9 +569,13 @@ pub fn composite_entries(
                         total_bytes: bytes.len() as u64,
                     }
                 };
-                StoredMember::Value { producer: producer.clone(), serializer: serializer.clone(), bytes }
+                StoredMember::Value {
+                    producer: producer.clone(),
+                    serializer: serializer.clone(),
+                    bytes,
+                }
             }
-            ResultTree::Failure(failure) => StoredMember::Failure(failure.clone()),
+            ResultTree::Failure(failure) => StoredMember::Failure(bounded_failure(bounds, failure)),
             ResultTree::List(children) => {
                 open.push(children.iter());
                 StoredMember::List(children.len() as u64)
@@ -519,7 +626,10 @@ pub fn composite_entries(
         key: ResultKey::Composite(id.clone()),
         run: None,
         digest: Some(hasher.finish()),
-        value: ResultValue::Composite { pages: page_count, members: member_count },
+        value: ResultValue::Composite {
+            pages: page_count,
+            members: member_count,
+        },
         expires_at,
     });
     entries
@@ -541,8 +651,11 @@ impl CompositeHasher {
     }
 
     fn finish(&self) -> Digest {
-        Digest::new(DigestAlgorithm::Blake3, self.0.finalize().as_bytes().to_vec())
-            .expect("a BLAKE3 hash has a BLAKE3 digest's length")
+        Digest::new(
+            DigestAlgorithm::Blake3,
+            self.0.finalize().as_bytes().to_vec(),
+        )
+        .expect("a BLAKE3 hash has a BLAKE3 digest's length")
     }
 }
 
@@ -566,7 +679,9 @@ pub fn store_unless_complete(
             (ResultKey::Task(task), Some(run), Some(digest)) => {
                 read_task_value(backend, task, run, digest).map(|value| value.is_some())
             }
-            (ResultKey::Composite(id), ..) => read_composite(backend, id).map(|tree| tree.is_some()),
+            (ResultKey::Composite(id), ..) => {
+                read_composite(backend, id).map(|tree| tree.is_some())
+            }
             _ => Ok(false),
         };
         match held {
@@ -605,10 +720,18 @@ pub enum Mismatch {
 
 fn part(backend: &dyn ResultBackend, key: &ResultKey) -> Result<ResultEntry, ReadError> {
     let entry = backend.load(key)?.ok_or(ReadError::Incomplete)?;
-    if &entry.key == key { Ok(entry) } else { Err(ReadError::Mismatch(Mismatch::Shape)) }
+    if &entry.key == key {
+        Ok(entry)
+    } else {
+        Err(ReadError::Mismatch(Mismatch::Shape))
+    }
 }
 
-fn chunk(backend: &dyn ResultBackend, owner: &ResultOwner, index: u32) -> Result<Vec<u8>, ReadError> {
+fn chunk(
+    backend: &dyn ResultBackend,
+    owner: &ResultOwner,
+    index: u32,
+) -> Result<Vec<u8>, ReadError> {
     match part(backend, &ResultKey::Chunk(owner.clone(), index))?.value {
         ResultValue::Chunk(bytes) => Ok(bytes),
         _ => Err(ReadError::Mismatch(Mismatch::Shape)),
@@ -634,7 +757,10 @@ pub fn read_task_value(
     }
     let payload = match head.value {
         ResultValue::Payload(payload) => payload,
-        ResultValue::Chunked { chunks, total_bytes } => {
+        ResultValue::Chunked {
+            chunks,
+            total_bytes,
+        } => {
             let owner = ResultOwner::Task(task.clone());
             let mut payload = Vec::new();
             for index in 0..chunks {
@@ -655,7 +781,11 @@ pub fn read_task_value(
 
 /// A composite member with its bytes read back.
 enum Member {
-    Value { producer: TaskDefinitionId, serializer: String, bytes: Vec<u8> },
+    Value {
+        producer: TaskDefinitionId,
+        serializer: String,
+        bytes: Vec<u8>,
+    },
     Failure(Failure),
     List(u64),
 }
@@ -670,7 +800,8 @@ pub fn read_composite(
     let Some(head) = backend.load(&ResultKey::Composite(id.clone()))? else {
         return Ok(None);
     };
-    let (ResultValue::Composite { pages, members }, Some(digest)) = (head.value, head.digest) else {
+    let (ResultValue::Composite { pages, members }, Some(digest)) = (head.value, head.digest)
+    else {
         return Err(shape);
     };
 
@@ -684,22 +815,56 @@ pub fn read_composite(
         hasher.part(&page_to_wire(&page).encode_to_vec());
         stored.extend(page);
     }
+
+    // The chunks the pages name, read in order and hashed whole before any
+    // check of how the pages fit together: a changed part is a changed
+    // digest first.
+    let owner = ResultOwner::Composite(id.clone());
+    let mut chunk_count = 0u32;
+    for member in &stored {
+        if let StoredMember::Value {
+            bytes: StoredBytes::Chunks { first, count, .. },
+            ..
+        } = member
+        {
+            chunk_count = chunk_count.max(first.saturating_add(*count));
+        }
+    }
+    let mut chunks = Vec::new();
+    for index in 0..chunk_count {
+        let piece = chunk(backend, &owner, index)?;
+        hasher.part(&piece);
+        chunks.push(piece);
+    }
+    if hasher.finish() != digest {
+        return Err(ReadError::Mismatch(Mismatch::Digest));
+    }
+
     if stored.len() as u64 != members {
         return Err(shape);
     }
-
-    let owner = ResultOwner::Composite(id.clone());
     let mut next_chunk = 0u32;
     let mut read = Vec::with_capacity(stored.len());
     for member in stored {
         read.push(match member {
-            StoredMember::Value { producer, serializer, bytes: StoredBytes::Inline(bytes) } => {
-                Member::Value { producer, serializer, bytes }
-            }
             StoredMember::Value {
                 producer,
                 serializer,
-                bytes: StoredBytes::Chunks { first, count, total_bytes },
+                bytes: StoredBytes::Inline(bytes),
+            } => Member::Value {
+                producer,
+                serializer,
+                bytes,
+            },
+            StoredMember::Value {
+                producer,
+                serializer,
+                bytes:
+                    StoredBytes::Chunks {
+                        first,
+                        count,
+                        total_bytes,
+                    },
             } => {
                 if first != next_chunk {
                     return Err(shape);
@@ -707,21 +872,23 @@ pub fn read_composite(
                 next_chunk = first.checked_add(count).ok_or(shape.clone())?;
                 let mut bytes = Vec::new();
                 for index in first..next_chunk {
-                    let piece = chunk(backend, &owner, index)?;
-                    hasher.part(&piece);
-                    bytes.extend(piece);
+                    bytes.extend(std::mem::take(&mut chunks[index as usize]));
                 }
                 if bytes.len() as u64 != total_bytes {
                     return Err(shape);
                 }
-                Member::Value { producer, serializer, bytes }
+                Member::Value {
+                    producer,
+                    serializer,
+                    bytes,
+                }
             }
             StoredMember::Failure(failure) => Member::Failure(failure),
             StoredMember::List(len) => Member::List(len),
         });
     }
-    if hasher.finish() != digest {
-        return Err(ReadError::Mismatch(Mismatch::Digest));
+    if next_chunk as usize != chunks.len() {
+        return Err(shape);
     }
     rebuild(read).map(Some).ok_or(shape)
 }
@@ -736,9 +903,15 @@ fn rebuild(members: Vec<Member>) -> Option<ResultTree> {
             return None;
         }
         let mut done = match member {
-            Member::Value { producer, serializer, bytes } => {
-                ResultTree::Value { producer, serializer, bytes }
-            }
+            Member::Value {
+                producer,
+                serializer,
+                bytes,
+            } => ResultTree::Value {
+                producer,
+                serializer,
+                bytes,
+            },
             Member::Failure(failure) => ResultTree::Failure(failure),
             Member::List(0) => ResultTree::List(Vec::new()),
             Member::List(len) => {
@@ -770,10 +943,17 @@ pub enum TaskStanding {
     Unknown,
     Unfinished,
     /// The newest run ended without a value.
-    Ended { state: generated::TaskRunState, failure_kind: String },
+    Ended {
+        state: generated::TaskRunState,
+        failure_kind: String,
+    },
     /// The newest run returned a step; its results are the composite's.
     Continued(CompositeId),
-    Succeeded { run: TaskRunId, digest: Digest, persistence: Option<PersistenceState> },
+    Succeeded {
+        run: TaskRunId,
+        digest: Digest,
+        persistence: Option<PersistenceState>,
+    },
 }
 
 /// Where the task of `record` stands, by its newest run.
@@ -783,12 +963,18 @@ pub fn task_standing(record: Option<&generated::TaskRecord>) -> TaskStanding {
     let Some(run) = record.and_then(|record| record.runs.last()) else {
         return TaskStanding::Unknown;
     };
-    let Some(run_id) = run.identity.as_ref().and_then(|identity| identity.task_run_id.clone()) else {
+    let Some(run_id) = run
+        .identity
+        .as_ref()
+        .and_then(|identity| identity.task_run_id.clone())
+    else {
         return TaskStanding::Unknown;
     };
     let run_id = TaskRunId::from(run_id);
     match run.state() {
-        State::Scheduled | State::Queued | State::Claimed | State::Running => TaskStanding::Unfinished,
+        State::Scheduled | State::Queued | State::Claimed | State::Running => {
+            TaskStanding::Unfinished
+        }
         State::Succeeded if run.continuation.is_some() => {
             TaskStanding::Continued(CompositeId::continuation_of(&run_id))
         }
@@ -800,6 +986,9 @@ pub fn task_standing(record: Option<&generated::TaskRecord>) -> TaskStanding {
             },
             _ => TaskStanding::Unknown,
         },
-        state => TaskStanding::Ended { state, failure_kind: run.failure_kind.clone() },
+        state => TaskStanding::Ended {
+            state,
+            failure_kind: run.failure_kind.clone(),
+        },
     }
 }

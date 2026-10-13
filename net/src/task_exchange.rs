@@ -49,8 +49,7 @@ use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
-use kabudachi_core::protocol::ids::IdGenerator;
-use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     BlockNoted, CancelTask, CompactionApplied, PersistenceNoted, PlaceRecords, PlacedKey,
     PlacedWithAsker, QueryOutcome, QuerySlowDown, RecordPlacements, ReportBlocked, ReportCompacted,

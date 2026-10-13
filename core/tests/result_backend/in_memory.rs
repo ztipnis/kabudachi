@@ -23,5 +23,10 @@ impl BackendAdapter for InMemory {
 #[test]
 fn the_in_memory_backend_keeps_the_result_backend_contract() {
     let clock = WallClock::default();
-    check_result_backend_contract(&InMemory { clock: clock.clone() }, &clock);
+    check_result_backend_contract(
+        &InMemory {
+            clock: clock.clone(),
+        },
+        &clock,
+    );
 }
