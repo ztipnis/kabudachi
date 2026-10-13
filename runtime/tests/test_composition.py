@@ -32,6 +32,7 @@ from kabudachi.errors import (
     TaskFailure,
     UnknownTaskError,
 )
+from kabudachi.composites import INLINE_VALUE_BYTES
 from kabudachi.flow import BoundTask, Flow, Group, flow, group
 from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
@@ -1617,6 +1618,20 @@ def explode_on_bad(item: str, previous: str) -> str:
     return previous + item
 
 
+async def async_chain_concat(item: str, previous: str) -> str:
+    await asyncio.sleep(0)
+    return previous + item
+
+
+async def async_tree_concat(item: str, previous: str) -> str:
+    await asyncio.sleep(0)
+    return previous + item
+
+
+def concatenated(left: str, right: str) -> str:
+    return left + right
+
+
 def reducing_world(*functions, **options):
     """A world whose tasks use pickle, with `functions` declared as tasks
     and `options` (name to Task options) declared alongside."""
@@ -1713,7 +1728,15 @@ def test_a_step_that_fails_after_its_retries_fails_the_reduce_and_no_later_step_
 
 
 def test_a_step_lost_after_storing_its_result_and_before_complete_is_replayed_and_the_reduce_ends_as_the_chain_does():
-    world = reducing_world(chain_concat)
+    calls = []
+
+    def numbered_concat(item: str, previous: str) -> str:
+        # Not idempotent: each call leaves its own number in the result, so the
+        # replay's result differs from the lost first run's.
+        calls.append(item)
+        return f"{previous}{item}{len(calls)}"
+
+    world = reducing_world(numbered_concat)
     lost = []
 
     def lose_the_first_completion_of_step_one(task_run_id):
@@ -1729,12 +1752,48 @@ def test_a_step_lost_after_storing_its_result_and_before_complete_is_replayed_an
     world.runtime.on_complete = lose_the_first_completion_of_step_one
 
     async def body():
-        return await world.tasks["chain_concat"].reduce(list("abc"), initial="")
+        return await world.tasks["numbered_concat"].reduce(list("abc"), initial="")
 
     with activated(world):
-        assert run(with_events(world, body)) == "abc"
-    steps = [claim.reduce_node[1] for claim in reduce_claims(world, "chain_concat")]
-    assert lost and steps == [0, 1, 1, 2], "step 1 ran again on the same operands and step 2 took the replay's result"
+        assert run(with_events(world, body)) == "a1b3c4", "step 2 folded the replay's result (b3), not the lost run's (b2)"
+    steps = [claim.reduce_node[1] for claim in reduce_claims(world, "numbered_concat")]
+    assert lost and steps == [0, 1, 1, 2], "step 1 ran again on the same operands"
+
+
+def test_async_reducers_fold_a_chain_and_a_tree_whose_merge_is_synchronous():
+    world = reducing_world(
+        async_chain_concat,
+        async_tree_concat,
+        async_tree_concat={"tree": True, "merge": concatenated},
+    )
+
+    async def body():
+        chained = await world.tasks["async_chain_concat"].reduce(list("abcde"), initial="")
+        treed = await world.tasks["async_tree_concat"].reduce(list("abcde"), initial="", chunk_size=2)
+        return chained, treed
+
+    with activated(world):
+        assert run(with_events(world, body)) == ("abcde", "abcde")
+    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "async_tree_concat"))
+    assert levels == [0, 0, 0, 1, 2], "three chunks of two, two and one, then two combines"
+
+
+def test_a_reduce_seeded_with_an_initial_value_longer_than_a_record_reads_it_back_in_a_chain_and_in_every_chunk_of_a_tree():
+    world = reducing_world(
+        chain_concat, count_letters, count_letters={"tree": True, "merge": add_counts}
+    )
+    long_text = "s" * (INLINE_VALUE_BYTES * 3)
+    long_key = "k" * (INLINE_VALUE_BYTES * 3)
+
+    async def body():
+        chained = await world.tasks["chain_concat"].reduce(list("abc"), initial=long_text)
+        treed = await world.tasks["count_letters"].reduce(
+            list("abab"), initial={long_key: 0}, chunk_size=2
+        )
+        return chained, treed
+
+    with activated(world):
+        assert run(with_events(world, body)) == (long_text + "abc", {long_key: 0, "a": 2, "b": 2})
 
 
 def test_a_reduce_reads_items_from_every_item_page_whether_they_are_inline_or_stored_as_blobs():
