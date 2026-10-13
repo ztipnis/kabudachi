@@ -728,6 +728,9 @@ class _WorkerRun:
         await self._executor.start()
         try:
             native = _native_runtime(self._settings)
+            # The tasks are registered and the executor is up; whether the
+            # worker is ready now depends on its place in the shard alone.
+            native.registry_loaded()
             try:
                 return await self._serve(main, native)
             except BaseException as error:
@@ -756,7 +759,6 @@ class _WorkerRun:
         # Two loops, not `serve`: the event loop must outlive the claim loop,
         # through the drain, or events it has taken would be lost with it.
         claiming = self._claiming = asyncio.create_task(session.work())
-        native.registry_loaded()
         events = self._events = asyncio.create_task(session.watch_events())
         result = await _until_done_or_worker_stops(main(), claiming, events)
         await _until_done_or_worker_stops(session.wait_until_idle(), claiming, events)
