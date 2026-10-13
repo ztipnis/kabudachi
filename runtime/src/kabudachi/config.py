@@ -659,8 +659,6 @@ def _parse(value_type: Any, raw: str) -> Any:
         return timedelta(seconds=float(raw)) if raw.strip() else None  # empty is "not set"
     if value_type == int | None:
         return int(raw) if raw.strip() else None  # an empty value is "not set"
-    if value_type == timedelta | None:
-        return timedelta(seconds=float(raw)) if raw.strip() else None  # an empty value is "not set"
     return raw
 
 

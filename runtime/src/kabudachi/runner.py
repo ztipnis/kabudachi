@@ -200,7 +200,9 @@ def _native_runtime(settings: Settings) -> Any:
             queues=tuple(settings.queues or (settings.queue,)),
             queue_options=_queue_options(settings),
             drain_wait_limit_ms=(
-                None if settings.drain_wait_limit is None else _millis(settings.drain_wait_limit)
+                None
+                if settings.drain_wait_limit is None
+                else max(1, _millis(settings.drain_wait_limit))
             ),
         )
     )

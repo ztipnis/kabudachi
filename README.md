@@ -1833,7 +1833,7 @@ STOPPED
 
 The drained worker asks the leader it followed where each of its records goes now, writes each copy to the holders it names (as the record is held, naming the worker as its publisher, so the holder keeps it whatever holders the record names), waits for the acknowledgements, and writes again what was refused, until the drain wait limit. A copy a holder refuses because it holds a newer revision needs no handing over.
 
-Termination is soft and then hard, similar to a warm/cold shutdown in Celery. A soft terminate starts the drain above and lets running TaskRuns finish within a configured grace period; when the grace period elapses, running task subprocesses are cancelled cooperatively and then killed, and their TaskRuns follow the worker-loss semantics of §3.2.2. The Python runtime has no drain grace setting: a second SIGINT or SIGTERM to the worker is its hard terminate (§6.2).
+Termination is soft and then hard, similar to a warm/cold shutdown in Celery. A soft terminate starts the drain above and lets running TaskRuns finish within a configured grace period; when the grace period elapses, running task subprocesses are cancelled cooperatively and then killed, and their TaskRuns follow the worker-loss semantics of §3.2.2. The Python runtime's grace period is `Settings.drain_grace` (`KABUDACHI_DRAIN_GRACE`): after the first SIGINT or SIGTERM starts the drain, the runtime escalates to a hard stop once that grace has passed. A second SIGINT or SIGTERM to the worker is its hard terminate at any time (§6.2).
 
 ### 18.2 Leader shutdown
 
