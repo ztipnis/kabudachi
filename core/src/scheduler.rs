@@ -62,6 +62,13 @@
 //! too large is refused with `KeyBackpressure`, and a fold that does so fails
 //! the newest generation (`CoalescedPayloadTooLarge`).
 //!
+//! A run may return a step instead of a result ([`Completion::Continues`]).
+//! The run is certified under the step's digest and carries the step, so the
+//! revision that certifies it commits the step with it; the scheduler runs
+//! the step as a composite derived from that run. The task keeps its key and
+//! its memory until that composite is over, and then finishes; cancelling the
+//! task cancels the composite.
+//!
 //! Tasks and runs are stored privately and handed out only as shared
 //! references or clones, so nothing outside can edit a submitted Task or move
 //! a run without going through the transition table.
@@ -121,7 +128,7 @@ pub use observer::{NoObserver, Observer};
 pub use outcome::{Conclusion, Outcome, OutcomeRejection};
 pub use rebuild::{Adopted, ReconcileRefused, ReconcileRejection, Reconciled};
 use reconciliation::Reconciliation;
-pub use reports::{Certification, Completion, ContinuationRejection, ReportRejection};
+pub use reports::{Certification, Completion, ReportRejection};
 use retention::Retention;
 pub use submission::{Submission, SubmitRejection, Submitted, TraceContext, mint};
 use waiting_room::WaitingRoom;
@@ -165,6 +172,10 @@ const CHAIN_ENTRY_FRAMING_BYTES: u64 = 6;
 /// The failure kind of a coalescing generation whose folded chain grew too
 /// large to hand to any worker.
 pub const COALESCED_PAYLOAD_TOO_LARGE: &str = "CoalescedPayloadTooLarge";
+
+/// The failure kind of a run that returned a step too large for its task's
+/// record.
+pub const CONTINUATION_TOO_LARGE: &str = "ContinuationTooLarge";
 
 /// A version for measuring a record's size, which does not depend on it.
 const UNVERSIONED: RecordVersion = RecordVersion {
@@ -244,7 +255,7 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     occupancy: Occupancy,
     /// The bytes tasks hold, the limits on them and `SlowDown`.
     budget: MemoryBudget,
-    /// Tasks whose run is certified but whose continuation has not ended.
+    /// Tasks whose run is certified but whose continuation composite is not over.
     continuing: BTreeSet<TaskId>,
     /// How many runs of each task were lost with their worker. A replay of a
     /// lost run is not a retry, so these attempts do not count against the

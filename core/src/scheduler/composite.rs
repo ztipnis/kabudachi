@@ -296,9 +296,17 @@ pub enum MalformedStep {
     BadField,
     #[error("a bound input's manifest cannot be read")]
     BadManifest,
+    #[error("the bytes are not an encoded step description")]
+    Undecodable,
 }
 
 impl Step {
+    /// The step an encoded `StepDescription` describes.
+    pub fn decode(bytes: &[u8]) -> Result<Step, MalformedStep> {
+        let description = generated::StepDescription::decode(bytes).map_err(|_| MalformedStep::Undecodable)?;
+        Step::try_from(&description)
+    }
+
     /// The BLAKE3 digest of the step's encoding: what a returning run's
     /// result digest is when the step is its continuation.
     pub fn digest(&self) -> Digest {

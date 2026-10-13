@@ -6,13 +6,11 @@ use crate::protocol::ids::{IdGenerator, TaskId};
 use crate::time::Clock;
 
 use super::{
-    CancelRejection, Cancellation, ContinuationRejection, Observer, Scheduler, Submission,
-    SubmitRejection, Submitted,
+    CancelRejection, Cancellation, Observer, Scheduler, Submission, SubmitRejection, Submitted,
 };
 
-/// What its scheduler could not take yet: submissions made before it led,
-/// and ends of continuations it refused for want of leadership. Once it
-/// leads, [`Self::hand_over`] ends the continuations, then records the
+/// What its scheduler could not take yet: submissions made before it led.
+/// Once it leads, [`Self::hand_over`] records the
 /// submissions in the order they were made within a coalescing key. A
 /// submission whose record would not yet fit (it carries the input of the
 /// generation it supersedes) stays here until a later hand-over finds room,
@@ -26,8 +24,6 @@ pub struct Backlog {
     queued: Vec<Submitted>,
     /// The input bytes `queued` holds.
     queued_bytes: u64,
-    /// Continuations whose end was refused, in the order they were refused.
-    unended: Vec<TaskId>,
 }
 
 /// The coalescing key a submission competes under: its task definition and
@@ -97,24 +93,7 @@ impl Backlog {
         scheduler.cancel(task)
     }
 
-    /// Ends the continuation of `task`. Refused for want of leadership, it
-    /// is kept and ended by the first hand-over once the scheduler leads,
-    /// so the task is not left continuing for ever; the refusal is still
-    /// returned.
-    pub fn end_continuation<C: Clock, I: IdGenerator, O: Observer>(
-        &mut self,
-        scheduler: &mut Scheduler<C, I, O>,
-        task: &TaskId,
-    ) -> Result<bool, ContinuationRejection> {
-        let ended = scheduler.end_continuation(task);
-        if ended.is_err() && !self.unended.contains(task) {
-            self.unended.push(task.clone());
-        }
-        ended
-    }
-
-    /// Once the scheduler leads: ends the continuations kept, which frees
-    /// the memory they held, then records what waits here. Does nothing
+    /// Once the scheduler leads: records what waits here. Does nothing
     /// while it does not lead. Call it after every change that may free
     /// capacity or a key.
     pub fn hand_over<C: Clock, I: IdGenerator, O: Observer>(
@@ -123,12 +102,6 @@ impl Backlog {
     ) {
         if !scheduler.is_leader() {
             return;
-        }
-        for task in std::mem::take(&mut self.unended) {
-            // `Ok(false)` is a task that finished or was cancelled meanwhile and has
-            // nothing to end; the scheduler leads (checked above), so `NotLeader`
-            // cannot occur.
-            let _ = scheduler.end_continuation(&task);
         }
         self.record_queued(scheduler);
     }

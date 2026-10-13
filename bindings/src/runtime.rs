@@ -9,6 +9,7 @@ use kabudachi_core::protocol::ids::{
     IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::scheduler::composite::Step;
 use kabudachi_core::scheduler::{Completion, ReportRejection, Scheduler, SubmitRejection};
 use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
@@ -387,22 +388,35 @@ impl NativeRuntime {
     ///
     /// Raises `ValueError` if `result_digest` is not a BLAKE3 digest's length,
     /// and `RuntimeError` if the run is unknown, is not running, or is not
-    /// this worker's; the result is then not certified. With `continues`, the
-    /// result is a continuation: the run is certified, but the task is not
-    /// over (its coalescing key stays held) until `end_continuation`.
-    #[pyo3(signature = (task_run_id, result_digest, continues = false))]
+    /// this worker's; the result is then not certified. With `continuation`,
+    /// the encoded description of the step the run returned, the run is
+    /// certified under that step's digest and the step runs as a composite;
+    /// the task is not over (its coalescing key stays held) until that
+    /// composite is.
+    ///
+    /// Also raises `ValueError` if `continuation` is malformed, takes an
+    /// input, or is not what `result_digest` is the digest of.
+    #[pyo3(signature = (task_run_id, result_digest, continuation = None))]
     fn complete(
         &self,
         task_run_id: &str,
         result_digest: &[u8],
-        continues: bool,
+        continuation: Option<&[u8]>,
     ) -> PyResult<PyCertification> {
         let digest = Digest::new(DigestAlgorithm::Blake3, result_digest.to_vec())
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let completion = if continues {
-            Completion::Continues
-        } else {
-            Completion::Final
+        let completion = match continuation {
+            None => Completion::Final,
+            Some(bytes) => {
+                let step = Step::decode(bytes).map_err(|error| PyValueError::new_err(error.to_string()))?;
+                if step.takes_input() {
+                    return Err(PyValueError::new_err("a returned step cannot take an input"));
+                }
+                if step.digest() != digest {
+                    return Err(PyValueError::new_err("the result digest is not the returned step's digest"));
+                }
+                Completion::Continues(step)
+            }
         };
         self.door
             .complete(&TaskRunId::new(task_run_id), digest, completion)
@@ -423,18 +437,6 @@ impl NativeRuntime {
             .complete_compaction(&TaskRunId::new(task_run_id), folded.to_vec())
             .map(|compacted| compacted.applied)
             .map_err(|refusal| refused(refusal, rejected))
-    }
-
-    /// The continuation of a task completed with `continues` is over, however
-    /// it ended. Returns whether there was one to end.
-    fn end_continuation(&self, task_id: &str) -> PyResult<bool> {
-        self.door
-            .end_continuation(&TaskId::new(task_id))
-            .map_err(|refusal| {
-                refused(refusal, |rejection| {
-                    PyRuntimeError::new_err(rejection.to_string())
-                })
-            })
     }
 
     /// Reports that a claimed run failed with an error of type `failure_kind`

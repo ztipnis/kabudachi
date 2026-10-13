@@ -15,12 +15,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::support::clock::FakeClock;
+use crate::support::composites::{flow_of, task_stage};
 use crate::support::grant::unbounded_grant;
 use crate::support::ids::SequentialIds;
 use crate::support::scheduler::{lose_silent, state_of};
 use crate::support::spy::Spy;
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
@@ -94,6 +95,8 @@ struct Model {
     claims: Vec<Claim>,
     /// Tasks whose run was certified with a continuation that has not ended.
     continuing: BTreeSet<TaskId>,
+    /// Claims of the continuations' member tasks, which are not in `tasks`.
+    member_claims: Vec<Claim>,
     /// Tasks that were claimed at least once.
     ever_claimed: BTreeSet<TaskId>,
     /// The payload numbers each task folded when first claimed.
@@ -120,6 +123,7 @@ impl Model {
             tasks: BTreeMap::new(),
             claims: Vec::new(),
             continuing: BTreeSet::new(),
+            member_claims: Vec::new(),
             ever_claimed: BTreeSet::new(),
             folded_by: BTreeMap::new(),
         }
@@ -163,6 +167,10 @@ impl Model {
                     .claim_oldest(&self.worker, *limit as usize)
                     .unwrap();
                 for claim in claims {
+                    if !self.tasks.contains_key(&claim.task.task_id()) {
+                        self.member_claims.push(claim);
+                        continue;
+                    }
                     self.check_fold(&claim);
                     self.ever_claimed.insert(claim.task.task_id());
                     self.claims.push(claim);
@@ -180,12 +188,8 @@ impl Model {
                     let claim = &self.claims[i];
                     let run = &claim.task_run_id;
                     let done = if *continues {
-                        self.scheduler.complete(
-                            &self.worker,
-                            run,
-                            Digest::blake3(b"d"),
-                            Completion::Continues,
-                        )
+                        let step = flow_of(vec![task_stage("member", Some(b"m"))]);
+                        self.scheduler.complete(&self.worker, run, step.digest(), Completion::Continues(step))
                     } else {
                         self.scheduler
                             .complete(&self.worker, run, Digest::blake3(b"d"), Completion::Final)
@@ -207,7 +211,7 @@ impl Model {
                         .nth(*pick as usize % self.continuing.len())
                         .unwrap()
                         .clone();
-                    assert_eq!(self.scheduler.end_continuation(&task), Ok(true));
+                    self.end_continuation(&task);
                     self.continuing.remove(&task);
                 }
             }
@@ -230,6 +234,10 @@ impl Model {
                     if self.scheduler.cancel(&task).is_ok() {
                         // Whatever the worker held of it is no longer its to report on.
                         self.claims.retain(|claim| claim.task.task_id() != task);
+                        // Cancelling a continuing task cancels its continuation, which ends it.
+                        if self.continuing.remove(&task) {
+                            self.member_claims.clear();
+                        }
                     }
                 }
             }
@@ -248,7 +256,7 @@ impl Model {
             .filter_map(|(_, submitted)| submitted.key)
             .collect();
         let lost = lose_silent(&mut self.scheduler, &self.clock, &self.worker);
-        for run in &lost {
+        for run in lost.iter().filter(|run| self.tasks.contains_key(&run.task_id)) {
             let key = self.tasks[&run.task_id].key;
             match key {
                 Some(key) if waiting_keys.contains(&key) => {
@@ -262,6 +270,23 @@ impl Model {
         }
         // Every claim the worker held is over now; a replay is claimed anew.
         self.claims.clear();
+        self.member_claims.clear();
+    }
+
+    /// Ends `task`'s continuation the way a worker does: its one member task
+    /// runs and succeeds.
+    fn end_continuation(&mut self, task: &TaskId) {
+        let run = self.scheduler.runs_of(task).pop().unwrap();
+        let member = CompositeId::continuation_of(&run).member_task(0);
+        let held = self.member_claims.iter().position(|claim| claim.task.task_id() == member);
+        let claim = match held {
+            Some(at) => self.member_claims.remove(at),
+            None => self.scheduler.request_claim(&self.worker, &member).unwrap(),
+        };
+        let _ = self.scheduler.report_started(&self.worker, &claim.task_run_id);
+        self.scheduler
+            .complete(&self.worker, &claim.task_run_id, Digest::blake3(b"m"), Completion::Final)
+            .unwrap();
     }
 
     /// What a claim folds is what its generation absorbed,
@@ -331,9 +356,7 @@ impl Model {
 
     /// Finishes everything still open, so accounting can be checked at rest.
     fn drain(&mut self) {
-        for task in self.continuing.clone() {
-            assert_eq!(self.scheduler.end_continuation(&task), Ok(true));
-        }
+        // Cancelling a continuing task cancels its continuation below.
         self.continuing.clear();
         for task in self.tasks.keys().cloned().collect::<Vec<_>>() {
             let _ = self.scheduler.cancel(&task);

@@ -123,6 +123,7 @@ pub(crate) fn report_reject(rejection: ReportRejection) -> TaskRejectReason {
         ReportRejection::UnknownRun => TaskRejectReason::TaskRejectUnknownRun,
         ReportRejection::NotAuthoritative => TaskRejectReason::TaskRejectNotAuthoritative,
         ReportRejection::NotReady => TaskRejectReason::TaskRejectNotReady,
+        ReportRejection::ContinuationTooLarge => TaskRejectReason::TaskRejectRecordTooLarge,
     }
 }
 

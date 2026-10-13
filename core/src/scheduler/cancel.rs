@@ -1,6 +1,6 @@
 //! Cancelling a task, and the runs stored as cancelled that a worker still holds.
 
-use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, WallTime};
@@ -62,6 +62,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         // Compaction runs are internal: no client holds their ids.
         if self.is_compaction(task_id) {
             return Ok(Cancellation::UnknownTask);
+        }
+        // A task whose run returned a step is cancelled by cancelling the
+        // step: the task finishes once the step's composite is over.
+        if self.continuing.contains(task_id) {
+            return self.cancel_composite_now(&CompositeId::continuation_of(&run_id));
         }
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);

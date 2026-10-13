@@ -11,6 +11,7 @@ use kabudachi_core::scheduler::{
     TraceContext,
 };
 use kabudachi_core::time::Duration;
+use crate::support::composites::{continue_with_a_stage, end_continuation};
 use crate::support::scheduler::Fixture;
 
 const SOFT: u64 = 100;
@@ -85,7 +86,8 @@ fn complete(fixture: &mut Fixture, run: &TaskRunId) {
 
 #[test]
 fn memory_counts_exactly_the_unfinished_tasks() {
-    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
+    // Room for the continuation's own description and its first member too.
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: 10 * SOFT, hard: 10 * HARD });
     assert_eq!(fixture.scheduler.memory_in_use(), 0);
 
     // A queued and a delayed task both count.
@@ -137,16 +139,12 @@ fn memory_counts_exactly_the_unfinished_tasks() {
 
     let continuing = fixture.scheduler.submit(payload(40)).unwrap();
     let claim = start(&mut fixture, &continuing);
-    fixture
-        .scheduler
-        .complete(&worker(), &claim, Digest::blake3(b"d"), Completion::Continues)
-        .unwrap();
-    assert_eq!(
-        fixture.scheduler.memory_in_use(),
-        100,
+    let continuation = continue_with_a_stage(&mut fixture, &claim);
+    assert!(
+        fixture.scheduler.memory_in_use() >= 100,
         "a task with a continuation counts until it ends"
     );
-    assert_eq!(fixture.scheduler.end_continuation(&continuing), Ok(true));
+    end_continuation(&mut fixture, &continuation);
     assert_eq!(fixture.scheduler.memory_in_use(), 60);
 }
 

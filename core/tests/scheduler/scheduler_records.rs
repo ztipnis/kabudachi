@@ -17,6 +17,7 @@ use kabudachi_core::task_record::{HISTORY_TOO_LARGE_FAILURE_KIND, MAX_RECORD_BYT
 use kabudachi_core::time::{Instant, WallTime};
 use prost::Message;
 
+use crate::support::composites::{continue_with_a_stage, end_continuation};
 use crate::support::grant::unbounded_grant;
 use crate::support::scheduler::{Fixture, ticks};
 
@@ -202,17 +203,14 @@ fn the_revision_that_ends_a_task_says_so_and_a_continuation_ends_it_later() {
     let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
     fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
 
-    fixture
-        .scheduler
-        .complete(&worker(), &claim.task_run_id, Digest::blake3(b"step"), Completion::Continues)
-        .unwrap();
-    let certified = fixture.spy.revisions().last().cloned().unwrap();
+    let continuation = continue_with_a_stage(&mut fixture, &claim.task_run_id);
+    let certified = fixture.spy.newest_revision_of(&task).unwrap();
     assert!(!certified.finished, "a continuing task is not over");
 
-    assert_eq!(fixture.scheduler.end_continuation(&task), Ok(true));
-    let ended = fixture.spy.revisions().last().cloned().unwrap();
+    end_continuation(&mut fixture, &continuation);
+    let ended = fixture.spy.newest_revision_of(&task).unwrap();
     assert!(ended.finished);
-    assert_eq!(version_of(&ended).revision, version_of(&certified).revision + 1);
+    assert!(version_of(&ended).revision > version_of(&certified).revision);
 }
 
 #[test]

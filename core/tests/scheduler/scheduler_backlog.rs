@@ -6,7 +6,7 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
-    Backlog, Cancellation, ClaimRejection, Completion, ContinuationRejection, MemoryLimits,
+    Backlog, Cancellation, Completion, MemoryLimits,
     Submission, SubmitRejection,
 };
 
@@ -113,34 +113,4 @@ fn a_submission_its_record_cannot_hold_yet_waits_with_only_its_own_key() {
     assert_eq!(next.task.task_id(), third, "`second` was recorded first and `third` absorbed it");
     assert_eq!(next.chain, [half]);
     assert_eq!(fixture.state(&second), TaskRunState::Superseded);
-}
-
-#[test]
-fn a_continuation_end_refused_for_want_of_leadership_is_ended_once_the_scheduler_leads() {
-    let mut fixture = Fixture::leading();
-    let mut backlog = Backlog::default();
-    let flow = backlog.submit(&mut fixture.scheduler, generation(b"step", "k")).unwrap();
-    let run = fixture.scheduler.request_claim(&worker(), &flow).unwrap().task_run_id;
-    fixture.scheduler.report_started(&worker(), &run).unwrap();
-    fixture
-        .scheduler
-        .complete(&worker(), &run, Digest::blake3(b"step"), Completion::Continues)
-        .unwrap();
-    let waiting = backlog.submit(&mut fixture.scheduler, generation(b"next", "k")).unwrap();
-    fixture.scheduler.set_leadership_grant(None);
-
-    assert_eq!(
-        backlog.end_continuation(&mut fixture.scheduler, &flow),
-        Err(ContinuationRejection::NotLeader)
-    );
-    backlog.hand_over(&mut fixture.scheduler);
-    fixture.scheduler.set_leadership_grant(Some(unbounded_grant()));
-    assert_eq!(
-        fixture.scheduler.request_claim(&worker(), &waiting),
-        Err(ClaimRejection::KeyBusy),
-        "the flow holds its key until the hand-over ends it"
-    );
-    backlog.hand_over(&mut fixture.scheduler);
-
-    assert!(fixture.scheduler.request_claim(&worker(), &waiting).is_ok());
 }

@@ -29,7 +29,7 @@ use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{
     Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
-    Completion, ContinuationRejection, Event, Failure, LostRun, ReportRejection, Scheduler,
+    Completion, Event, Failure, LostRun, ReportRejection, Scheduler,
     Submission, SubmitRejection, Submitted,
 };
 use kabudachi_core::task_record::{LocalRecords, office_to_reconcile};
@@ -302,20 +302,6 @@ impl<C: Clock> SchedulerDoor<C> {
                     _ => {}
                 }
                 cancelled
-            })
-        }))
-    }
-
-    /// Ends the continuation of `task`. Refused for want of leadership, it
-    /// is kept by the backlog and ended once this node leads; the caller is
-    /// still told it was refused.
-    pub fn end_continuation(
-        &self,
-        task: &TaskId,
-    ) -> Result<bool, Refusal<ContinuationRejection>> {
-        refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
-            settled_backlog(inside, |backlog, scheduler| {
-                backlog.end_continuation(scheduler, task)
             })
         }))
     }

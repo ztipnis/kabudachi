@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::manifest::{Failure, Manifest, ManifestEntry};
 use crate::protocol::digest::Digest;
-use crate::protocol::ids::{CompositeId, IdGenerator, TaskId, WorkerId};
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
@@ -154,6 +154,25 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.start_stage(&id, index);
         }
         self.update_pressure();
+    }
+
+    /// Starts the composite `CompositeId::continuation_of(run)` from the step
+    /// stored on `run`, a certified run of `task_id`, with the task as its
+    /// parent. The step was committed by the revision that certified the run;
+    /// the composite is derived from it, so the same run always makes the
+    /// same composite and one already held is kept as it is.
+    pub(in crate::scheduler) fn commit_continuation(&mut self, task_id: &TaskId, run: &TaskRunId) {
+        let id = CompositeId::continuation_of(run);
+        if self.composites.held.contains_key(&id) {
+            return;
+        }
+        let step = self
+            .continuation_of_run(run)
+            .expect("only a certified run that returned a step continues");
+        let client = self.tasks[task_id].client();
+        let parent = CompositeParent::Task(task_id.clone());
+        let submitted_at = WallTime::now(&self.clock);
+        self.create_composite(id, step, Some(parent), client, None, submitted_at);
     }
 
     /// Starts stage or member `index` of `id`: a Task for a task step, a
@@ -373,7 +392,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         outcome
     }
 
-    fn cancel_composite_now(&mut self, id: &CompositeId) -> Result<Cancellation, CancelRejection> {
+    pub(in crate::scheduler) fn cancel_composite_now(&mut self, id: &CompositeId) -> Result<Cancellation, CancelRejection> {
         if !self.check_leader() {
             return Err(CancelRejection::NotLeader);
         }

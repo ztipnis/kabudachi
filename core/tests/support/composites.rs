@@ -2,7 +2,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{
     self, CompositeEntry, CompositePage, CompositeRecord, RecordVersion,
 };
-use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId, WorkerId};
 use kabudachi_core::scheduler::composite::{
     BoundInput, BoundStep, CompositeFinished, CompositeKind, OnError, PAGE_ENTRIES, Stage, Step,
     TaskOptions,
@@ -148,4 +148,21 @@ pub fn finished(fixture: &mut Fixture) -> Vec<CompositeFinished> {
 pub fn entry(fixture: &Fixture, composite: &CompositeId, index: u64) -> Option<CompositeEntry> {
     let page = fixture.spy.newest_page(composite, (index / PAGE_ENTRIES) as u32)?;
     page.entries.into_iter().find(|entry| entry.index == index)
+}
+
+/// Certifies `run`, a running run of `worker()`, as having returned a flow of
+/// one stage; returns the composite that stage runs in.
+pub fn continue_with_a_stage(fixture: &mut Fixture, run: &TaskRunId) -> CompositeId {
+    let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
+    fixture
+        .scheduler
+        .complete(&worker(), run, step.digest(), Completion::Continues(step))
+        .unwrap();
+    CompositeId::continuation_of(run)
+}
+
+/// Runs the stage of a continuation made by [`continue_with_a_stage`] to its
+/// end, which ends the continuation and so its task.
+pub fn end_continuation(fixture: &mut Fixture, continuation: &CompositeId) {
+    run_member(fixture, continuation, 0, b"staged");
 }

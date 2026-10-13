@@ -6,12 +6,15 @@ use kabudachi_core::blob::BlobKey;
 use kabudachi_core::manifest::{Manifest, ManifestEntry};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::composite_entry;
-use kabudachi_core::protocol::ids::TaskDefinitionId;
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId};
 use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::composite::{CompositeState, MemberCounts, OnError, PAGE_ENTRIES, Stage};
-use kabudachi_core::scheduler::{Cancellation, ClaimRejection, Completion, Event, SubmitRejection};
-use kabudachi_core::task_record::{RecordKey, ShardRecord};
+use kabudachi_core::scheduler::composite::{CompositeState, MemberCounts, OnError, PAGE_ENTRIES, Stage, Step};
+use kabudachi_core::scheduler::{
+    Cancellation, ClaimRejection, Completion, Event, ReportRejection, Submission, SubmitRejection,
+};
+use kabudachi_core::task_record::{MAX_RECORD_BYTES, RecordKey, ShardRecord};
 
 use crate::support::composites::*;
 use crate::support::scheduler::{Fixture, ticks};
@@ -369,4 +372,139 @@ fn a_composites_status_counts_its_members_by_state() {
     let status = fixture.scheduler.composite_status(&group).unwrap();
     assert_eq!(status.state, CompositeState::Running);
     assert_eq!(status.counts, MemberCounts { pending: 1, succeeded: 1, failed: 1, cancelled: 0 });
+}
+
+#[test]
+fn a_returned_step_runs_as_a_composite_and_its_task_finishes_with_it() {
+    let mut fixture = Fixture::leading();
+    let task = fixture
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
+        .unwrap();
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let step = flow_of(vec![task_stage("stage", Some(b"s"))]);
+    assert_eq!(
+        fixture.scheduler.complete(
+            &worker(),
+            &claim.task_run_id,
+            Digest::blake3(b"not the step"),
+            Completion::Continues(step.clone())
+        ),
+        Err(ReportRejection::NotAuthoritative),
+        "a continuation is certified only under its own digest"
+    );
+    fixture
+        .scheduler
+        .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step.clone()))
+        .unwrap();
+    let continuation = CompositeId::continuation_of(&claim.task_run_id);
+    assert_eq!(fixture.state(&task), TaskRunState::Succeeded);
+    assert_eq!(fixture.scheduler.continuation_of_run(&claim.task_run_id), Some(step.clone()));
+    let certifying = fixture.spy.newest_revision_of(&task).unwrap();
+    assert!(!certifying.finished, "the task is not over yet");
+    let run = certifying.runs.last().unwrap();
+    assert_eq!(run.current_state(), TaskRunState::Succeeded);
+    assert_eq!(
+        run.continuation.as_ref().map(|stored| Step::try_from(stored).unwrap()),
+        Some(step),
+        "the revision that certifies the run carries the step it returned"
+    );
+    run_member(&mut fixture, &continuation, 0, b"staged");
+    let finished = finished(&mut fixture);
+    assert_eq!(finished[0].parent_task, Some(task.clone()));
+    assert_eq!(finished[0].state, CompositeState::Succeeded);
+    assert!(fixture.spy.newest_revision_of(&task).unwrap().finished);
+}
+
+#[test]
+fn a_step_too_large_for_the_task_record_fails_its_run_for_good() {
+    let mut fixture = Fixture::leading();
+    let task = fixture
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_retries(3))
+        .unwrap();
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let step = flow_of(vec![task_stage("huge", Some(&vec![0; MAX_RECORD_BYTES as usize]))]);
+    assert_eq!(
+        fixture.scheduler.complete(
+            &worker(),
+            &claim.task_run_id,
+            step.digest(),
+            Completion::Continues(step)
+        ),
+        Err(ReportRejection::ContinuationTooLarge)
+    );
+    let run = fixture.scheduler.task_run(&claim.task_run_id).unwrap();
+    assert_eq!(run.current_state(), TaskRunState::Failed);
+    assert_eq!(run.failure_kind, "ContinuationTooLarge");
+    assert_eq!(fixture.scheduler.runs_of(&task).len(), 1, "the same body would return the same step");
+    assert!(fixture.spy.newest_revision_of(&task).unwrap().finished);
+}
+
+#[test]
+fn cancelling_a_task_whose_step_is_running_cancels_the_step_and_the_task_never_runs_again() {
+    let mut fixture = Fixture::leading();
+    let task = fixture
+        .scheduler
+        .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default").with_retries(3))
+        .unwrap();
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let step = flow_of(vec![task_stage("slow", Some(b"s")), task_stage("after", None)]);
+    fixture
+        .scheduler
+        .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step))
+        .unwrap();
+    let continuation = CompositeId::continuation_of(&claim.task_run_id);
+    let slow = start_member(&mut fixture, &continuation, 0);
+    assert_eq!(fixture.scheduler.cancel(&task), Ok(Cancellation::Cancelled { was_running: true }));
+    assert_eq!(fixture.run_state(&slow.task_run_id), TaskRunState::Cancelled);
+    let finished = finished(&mut fixture);
+    assert_eq!(finished[0].state, CompositeState::Cancelled);
+    assert_eq!(finished[0].parent_task, Some(task.clone()));
+    assert_eq!(fixture.scheduler.runs_of(&task).len(), 1, "a continuation's end never re-runs its task");
+}
+
+#[test]
+fn cancelling_a_group_member_that_already_returned_a_step_cancels_the_step_and_counts_the_member_cancelled() {
+    let mut fixture = Fixture::leading();
+    let group = submitted(
+        &mut fixture,
+        group_of(OnError::CollectAll, vec![task_stage("plan", Some(b"a")), task_stage("other", Some(b"b"))]),
+    );
+    let planner = start_member(&mut fixture, &group, 0);
+    let step = flow_of(vec![task_stage("slow", Some(b"s"))]);
+    fixture
+        .scheduler
+        .complete(&worker(), &planner.task_run_id, step.digest(), Completion::Continues(step))
+        .unwrap();
+    let slow = start_member(&mut fixture, &CompositeId::continuation_of(&planner.task_run_id), 0);
+    assert_eq!(
+        fixture.scheduler.cancel(&group.member_task(0)),
+        Ok(Cancellation::Cancelled { was_running: true }),
+        "a member that succeeded with a step is still not over, so it can be cancelled"
+    );
+    assert_eq!(fixture.run_state(&slow.task_run_id), TaskRunState::Cancelled);
+    let status = fixture.scheduler.composite_status(&group).unwrap();
+    assert_eq!(status.state, CompositeState::Running, "collect_all waits for the other member");
+    assert_eq!(status.counts, MemberCounts { pending: 1, succeeded: 0, failed: 0, cancelled: 1 });
+}
+
+#[test]
+fn stages_that_never_started_count_pending_after_their_flow_is_cancelled() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(
+        &mut fixture,
+        flow_of(vec![task_stage("slow", Some(b"s")), task_stage("second", None), task_stage("third", None)]),
+    );
+    start_member(&mut fixture, &flow, 0);
+    assert_eq!(
+        fixture.scheduler.cancel_composite(&flow),
+        Ok(Cancellation::Cancelled { was_running: true })
+    );
+    let status = fixture.scheduler.composite_status(&flow).unwrap();
+    assert_eq!(status.state, CompositeState::Cancelled);
+    assert_eq!(status.counts, MemberCounts { pending: 2, succeeded: 0, failed: 0, cancelled: 1 });
 }
