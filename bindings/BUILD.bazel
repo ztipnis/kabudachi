@@ -20,7 +20,9 @@ rust_shared_library(
         # A macOS extension leaves the Python symbols to the interpreter that
         # loads it, and needs the pre-chained-fixups Mach-O format
         # (https://pyo3.rs/main/building-and-distribution#macos,
-        # https://github.com/PyO3/pyo3/issues/5035).
+        # https://github.com/PyO3/pyo3/issues/5035). The C toolchain links
+        # for the macOS of the building machine; the wheel's macOS tag
+        # (//runtime:kabudachi_wheel) promises 11.0, so say so.
         "@platforms//os:macos": [
             "-C",
             "link-arg=-undefined",
@@ -28,6 +30,8 @@ rust_shared_library(
             "link-arg=dynamic_lookup",
             "-C",
             "link-arg=-Wl,-no_fixup_chains",
+            "-C",
+            "link-arg=-mmacosx-version-min=11.0",
         ],
         "//conditions:default": [],
     }),
@@ -47,12 +51,14 @@ rust_shared_library(
 )
 
 # Python imports an extension from a file named `<module>.so` on macOS and
-# Linux alike, though macOS names a shared library `.dylib`.
+# Linux alike, though macOS names a shared library `.dylib`. The wheel
+# (//runtime:kabudachi_wheel) packages this copy.
 copy_file(
     name = "_native_so",
     src = ":_native_shared",
     out = "kabudachi/_native.so",
     tags = ["no-remote-cache"],
+    visibility = ["//runtime:__pkg__"],
 )
 
 py_library(

@@ -270,3 +270,28 @@ py_test(
         "@pypi//pytest",  # keep
     ],
 )
+
+# The wheel's metadata matches pyproject.toml, and its version is the one
+# pyproject.toml, the package and MODULE.bazel name. It does not depend on the
+# package's sources: everything it reads comes from the wheel. Under 1 s on a
+# laptop, plus the wheel's build.
+py_test(
+    name = "test_wheel",
+    srcs = ["test_wheel.py"],
+    data = [
+        "//:MODULE.bazel",
+        "//runtime:kabudachi_wheel",
+        "//runtime:pyproject.toml",
+    ],  # keep
+    env = {
+        "MODULE_FILE": "$(rlocationpath //:MODULE.bazel)",
+        "PYPROJECT_FILE": "$(rlocationpath //runtime:pyproject.toml)",
+        "WHEEL_FILE": "$(rlocationpath //runtime:kabudachi_wheel)",
+    },  # keep
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "@pypi//packaging",  # keep
+        "@pypi//pytest",  # keep
+    ],
+)

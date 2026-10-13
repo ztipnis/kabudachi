@@ -47,3 +47,19 @@ py_library(
         "@pypi//wrapt",  # keep
     ],
 )
+
+# Every file of the package a wheel ships: what uv_build puts in one (all of
+# src/kabudachi except bytecode and, by pyproject.toml's wheel-exclude, this
+# BUILD file). //runtime:kabudachi_wheel packages it.
+filegroup(
+    name = "distribution",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "BUILD.bazel",
+            "**/__pycache__/**",
+            "**/*.pyc",
+        ],
+    ),
+    visibility = ["//runtime:__pkg__"],
+)

@@ -1,5 +1,95 @@
 # Package marker — required so //runtime:pyproject.toml and
 # //runtime:uv.lock are valid labels for uv.project() in MODULE.bazel.
-# It defines no targets and Gazelle never touches this file (see CLAUDE.md);
-# the only thing exported is the README, which a test runs the example of.
-exports_files(["README.md"])
+# Gazelle never touches this file (see CLAUDE.md). It exports the README,
+# which a test runs the example of and the wheel carries as its description,
+# and pyproject.toml, which the wheel test compares the wheel's metadata with,
+# and it builds the wheel.
+load("@rules_python//python:packaging.bzl", "py_wheel")
+
+exports_files([
+    "README.md",
+    "pyproject.toml",
+])
+
+# The distribution's metadata. It repeats pyproject.toml's [project] table,
+# which uv_build reads, and //runtime/tests:test_wheel fails on any
+# difference: change both together. A new extra is one entry in EXTRAS and
+# one in [project.optional-dependencies].
+VERSION = "0.1.0"
+
+SUMMARY = "Python developer-facing API and runtime for the kabudachi distributed task queue."
+
+AUTHOR = "Zach Tipnis"
+
+AUTHOR_EMAIL = "4670561+ztipnis@users.noreply.github.com"
+
+REQUIRES = [
+    "asgiref>=3.8",
+    "wrapt>=1.16",
+]
+
+EXTRAS = {
+    "protobuf": ["protobuf>=5.29"],
+}
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "macos_arm64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+# The installable wheel: the pure-Python package and the compiled extension.
+# The extension uses Python's stable ABI from 3.12 (bindings/Cargo.toml), so
+# one wheel per platform serves every CPython from 3.12 on (cp312-abi3).
+# Each platform tag is the oldest system the extension runs on:
+# - Linux: glibc's version, as `auditwheel show` finds it in the extension's
+#   symbols. It follows the glibc of the machine that links the extension.
+# - macOS: the extension's minimum macOS version (its LC_BUILD_VERSION minos).
+# Other platforms have no wheel, so the wheel and its test are skipped there.
+# Tagged no-remote-cache: it is another copy of the shared library.
+py_wheel(
+    name = "kabudachi_wheel",
+    abi = "abi3",
+    author = AUTHOR,
+    author_email = AUTHOR_EMAIL,
+    description_file = "README.md",
+    distribution = "kabudachi",
+    extra_requires = EXTRAS,
+    platform = select({
+        ":linux_x86_64": "manylinux_2_34_x86_64",
+        ":macos_arm64": "macosx_11_0_arm64",
+        # Never built: target_compatible_with rules these platforms out.
+        "//conditions:default": "unsupported",
+    }),
+    python_requires = ">=3.12",
+    python_tag = "cp312",
+    requires = REQUIRES,
+    # Inside the wheel, files sit at their import paths: kabudachi/...
+    strip_path_prefixes = [
+        "runtime/src/",
+        "bindings/",
+    ],
+    summary = SUMMARY,
+    tags = ["no-remote-cache"],
+    target_compatible_with = select({
+        ":linux_x86_64": [],
+        ":macos_arm64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    version = VERSION,
+    visibility = ["//runtime:__subpackages__"],
+    deps = [
+        "//bindings:_native_so",
+        "//runtime/src/kabudachi:distribution",
+    ],
+)

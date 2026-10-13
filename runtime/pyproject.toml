@@ -19,6 +19,10 @@ protobuf = ["protobuf>=5.29"]
 requires = ["uv_build>=0.8.3,<0.9.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+# Bazel's build file for the package; no installed package needs it.
+wheel-exclude = ["BUILD.bazel"]
+
 [dependency-groups]
 # Bazel's dependency hub only exposes this group, so what the tests need at run
 # time is repeated here even where it is also a runtime dependency or an extra.
