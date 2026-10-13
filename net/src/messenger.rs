@@ -1158,7 +1158,10 @@ impl Net {
     /// not waited for. A worker about to exit calls this so what it sent last
     /// is on the wire before the process ends; a `Net` dropped first loses
     /// whatever its swarm task had not yet written. Resolves at once if the
-    /// swarm task has stopped.
+    /// swarm task has stopped. It waits as long as the slowest message takes,
+    /// up to libp2p's request timeout (10 s) toward a peer that never answers;
+    /// a caller that must not wait that long bounds it with a timeout, as
+    /// `run_driver` does with the node's drain wait limit.
     pub async fn flush_sent(&self) {
         let (respond_to, flushed) = oneshot::channel();
         if self.commands.send(Command::FlushSent { respond_to }).is_ok() {

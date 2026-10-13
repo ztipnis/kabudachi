@@ -316,6 +316,7 @@ where
     C: Clock,
     I: IdGenerator,
 {
+    let flush_limit = Duration::from_millis(node.timings().drain_wait_limit.as_ticks());
     let mut run = DriverRun::start(
         node, first, net, scheduler, clock, authority, executor, config, observe,
     );
@@ -327,8 +328,18 @@ where
             let handed = run.hand_off(to).await;
             // What the final steps sent (the departure announcement among
             // it) is only queued for the network task; the worker may exit
-            // as soon as this returns, so wait until it was received.
-            net.flush_sent().await;
+            // as soon as this returns, so wait until it was received, but no
+            // longer than the drain wait limit: a peer that never answers
+            // would otherwise hold the worker for libp2p's request timeout.
+            if tokio::time::timeout(flush_limit, net.flush_sent())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    limit_ms = flush_limit.as_millis() as u64,
+                    "gave up waiting for the last election messages to be answered"
+                );
+            }
             return handed;
         }
         run.sleep().await;
