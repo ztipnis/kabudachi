@@ -18,7 +18,7 @@ use kabudachi_core::protocol::ids::{
     CompositeId, IdGenerator, IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::messages::{
-    ClaimResponse, CompositeAccepted, ElectionMessage, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
+    ClaimResponse, CompositeAccepted, TaskRecord, ElectionMessage, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
 };
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::worker_state::WorkerState;
@@ -695,10 +695,15 @@ pub fn takes(runs_compaction: bool) -> Takes {
     }
 }
 
+/// The task definition [`plain_with`] submits.
+pub fn demo_task() -> TaskDefinitionId {
+    TaskDefinitionId::new("demo.task")
+}
+
 /// A plain submission whose input is `input`.
 pub fn plain_with(input: &[u8]) -> Submission {
     Submission::new(
-        TaskDefinitionId::new("demo.task"),
+        demo_task(),
         1,
         input.to_vec(),
         "default",
@@ -726,6 +731,16 @@ pub fn claims_in(response: &ClaimResponse) -> Vec<TaskId> {
             .map(|claim| claim.task.as_ref().expect("a claim carries its task").task_id())
             .collect(),
         other => panic!("expected a batch of claims, got {other:?}"),
+    }
+}
+
+/// `net`'s record of `task` once `ready` holds of it.
+pub async fn record_until(net: &Net, task: &TaskId, ready: impl Fn(&TaskRecord) -> bool) -> TaskRecord {
+    loop {
+        match net.held_records().get(task) {
+            Some(record) if ready(&record) => return record,
+            _ => tokio::time::sleep(StdDuration::from_millis(10)).await,
+        }
     }
 }
 

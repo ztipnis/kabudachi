@@ -11,7 +11,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::generated::TaskRunState;
+use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::queues::Subscription;
 use kabudachi_core::task_record::RecordKey;
@@ -27,7 +28,8 @@ use libp2p::kad::KBucketKey;
 use crate::support::deadline::within_deadline;
 use crate::support::executor::FakeExecutor;
 use crate::support::records::{
-    Voters, claims_in, placing_among_every_voter, plain_with, submitted_with, wait_until_held,
+    Voters, claims_in, demo_task, placing_among_every_voter, plain_with, record_until, submitted_with,
+    wait_until_held,
 };
 
 /// How many task ids are tried before a shard's identities count as too
@@ -159,23 +161,12 @@ fn tasks(runs: &[(Stage, TaskId)]) -> Vec<TaskId> {
     runs.iter().map(|(_, task)| task.clone()).collect()
 }
 
-/// The reason `net`'s record of `task` gives for the task being blocked,
-/// once it shows one.
-async fn blocked_reason(net: &Net, task: &TaskId) -> String {
-    loop {
-        match net.held_records().get(task) {
-            Some(record) if record.blocked_since.is_some() => return record.blocked_reason,
-            _ => tokio::time::sleep(Duration::from_millis(10)).await,
-        }
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn work_is_found_own_records_first_then_nearer_peers_then_farther_and_spreads_over_every_worker() {
     within_deadline(async {
         // Peers in one distance class for every follower leave nothing to
         // tell nearer from farther, so start again (rarely) when no roles fit.
-        let runnable = RunnableVersions::default().with(TaskDefinitionId::new("demo.task"), RUNNABLE_VERSION);
+        let runnable = RunnableVersions::default().with(demo_task(), RUNNABLE_VERSION);
         let (mut shard, mut executors, roles, targets, (heavy_tasks, near_tasks, mut leader_tasks)) = loop {
             let mut shard = Voters::start_without_client(5, one_holder()).await;
             let executors: Vec<FakeExecutor> = (0..5)
@@ -267,7 +258,10 @@ async fn work_is_found_own_records_first_then_nearer_peers_then_farther_and_spre
             .collect();
         assert_eq!(leader_runs, expected, "the leader runs its own records, nearest first, before the shard's oldest");
         assert_eq!(steals_received(&nets).await, before, "the leader asks no one");
-        let reason = shard.drive_until(blocked_reason(&nets[leader], &newer)).await;
+        let blocked = shard
+            .drive_until(record_until(&nets[leader], &newer, |record| record.blocked_since.is_some()))
+            .await;
+        let reason = blocked.blocked_reason;
         assert!(reason.contains(&format!("newer than this worker's {RUNNABLE_VERSION}")), "{reason}");
 
         // The newer record leaves the shard: a worker not in its blocked set
@@ -282,6 +276,11 @@ async fn work_is_found_own_records_first_then_nearer_peers_then_farther_and_spre
             .drive_until(nets[other].report_blocked(ids[leader].clone(), newer.clone(), "not run here".to_owned(), true))
             .await
             .expect("the leader notes the block");
+        let ended = shard
+            .drive_until(record_until(&nets[leader], &newer, |record| record.finished))
+            .await;
+        let run = ended.runs.last().expect("the incompatible run is recorded");
+        assert_eq!(run.state(), TaskRunState::Failed, "the task ended for good");
 
         // Steal outward: the idle worker takes the near class's work, then
         // widens one class at a time until its places are filled.
