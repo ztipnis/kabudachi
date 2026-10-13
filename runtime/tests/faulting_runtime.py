@@ -42,6 +42,9 @@ class FaultingRuntime:
         self.claim_error = None
         self.event_error = None
         self.hold_claims = False
+        # How many of the next `store_result` calls give up, as a shard with no
+        # leader does: they resolve to `None` and store nothing.
+        self.store_gives_up = 0
         self.submit_lingers_for = 0
         self._claims_given = 0
         self._injected = asyncio.Queue()
@@ -228,6 +231,9 @@ class FaultingRuntime:
         return await self.native.composite_status(composite_id)
 
     async def store_result(self, task_id, data):
+        if self.store_gives_up > 0:
+            self.store_gives_up -= 1
+            return None
         return await self.native.store_result(task_id, data)
 
     async def store_composite_payload(self, composite_id, data):

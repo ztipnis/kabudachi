@@ -336,10 +336,11 @@ class Runtime(Protocol):
         runtime holds no such composite. Awaited, since a networked runtime
         asks its shard."""
 
-    async def store_result(self, task_id: str, data: bytes) -> bytes:
+    async def store_result(self, task_id: str, data: bytes) -> bytes | None:
         """Stores `data` as the blobs of a task's result and gives the digest
-        to certify it by. Raises `BackpressureError` past the hard memory
-        limit."""
+        to certify it by; `None` if a networked shard could not take it in time,
+        in which case the run is to be reported lost. Raises
+        `BackpressureError` past the hard memory limit."""
 
     async def store_composite_payload(self, composite_id: str, data: bytes) -> Any:
         """Stores `data` as blobs the composite owns and gives its opaque

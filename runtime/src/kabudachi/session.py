@@ -842,6 +842,12 @@ class Session:
             # A member's result goes to the shard as a blob, stored before the
             # run is reported, so the stage after it can always read it.
             digest = await self._runtime.store_result(claim.task_id, outcome)
+            if digest is None:
+                # The shard could not take the result in time (it has no
+                # leader, say): the run is lost, not failed, so the leader
+                # replays it as it replays a run lost with its worker.
+                self._lost(claim, run)
+                return
             self._runtime.complete(claim.task_run_id, digest)
             return
         if run.holds_handle:
@@ -1070,7 +1076,8 @@ class Session:
             )
 
     def _lost(self, claim: Any, run: Run) -> None:
-        """The process running the body died. The leader decides, as for a
+        """The run cannot be seen through: the process running the body died,
+        or the shard could not take its result. The leader decides, as for a
         lost worker: a new attempt (the handle waits for it), or the task is
         over (an ephemeral one, or a non-retriable one that may have had its
         effects). A refused report ends the task here too; failing a handle

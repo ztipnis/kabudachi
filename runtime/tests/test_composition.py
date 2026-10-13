@@ -320,6 +320,26 @@ def test_cancelling_a_flow_cancels_the_current_stage_and_starts_no_later_one():
     assert ran == []
 
 
+def test_a_stage_whose_result_cannot_be_stored_is_reported_lost_and_run_again_without_failing_the_flow():
+    ran = []
+
+    def counted(request: Greeting) -> Greeting:
+        ran.append(True)
+        return shout(request)
+
+    world = World(counted)
+    world.runtime.store_gives_up = 1
+    pipeline = flow(*stages(world, "counted"))
+
+    async def body():
+        return await pipeline.start(world.session, Greeting(text="a"))
+
+    assert run(with_events(world, body)) == [Greeting(text="A")]
+
+    assert len(ran) == 2
+    assert [event[0] for event in world.runtime.events].count("lost") == 1
+
+
 def test_a_task_that_waits_for_a_flow_gives_up_its_place_meanwhile():
     async def inner_stage(request: Greeting) -> Greeting:
         return request

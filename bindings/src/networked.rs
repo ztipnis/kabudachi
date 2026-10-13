@@ -635,9 +635,9 @@ impl NetworkedRuntime {
     /// the shard's leader places the task's record, and asked again for up to
     /// the reconnect timeout.
     ///
-    /// Raises `BackpressureError` if `data` is past the hard memory limit,
-    /// and `RuntimeError` if the shard could not store it in time, which
-    /// fails the run.
+    /// Raises `BackpressureError` if `data` is past the hard memory limit.
+    /// Resolves to `None` if the shard could not store it in time (it has no
+    /// leader, say): the run is then reported lost, so it is replayed.
     fn store_result<'py>(&self, py: Python<'py>, task_id: String, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         refuse_values_past_limit(py, self.shared.net.payload_memory().hard_limit(), std::slice::from_ref(&data))?;
         let cut = Manifest::of_result(&data);
@@ -659,14 +659,13 @@ impl NetworkedRuntime {
             // waited for, while it is stored.
             let _in_flight = shared.net.payload_memory().take_anyway(data.len() as u64).ok();
             let bound = tokio::time::Instant::now() + within;
-            stored_until(&shared, bound, || {
+            let stored = stored_until(&shared, bound, || {
                 shared
                     .net
                     .store_blobs_at_leader(BlobRole::Result, &owner, blobs.clone(), shared.retry)
             })
-            .await
-            .map(|()| PyBytesValue(digest))
-            .ok_or_else(|| PyRuntimeError::new_err(NOT_STORED_MESSAGE))
+            .await;
+            Ok(stored.map(|()| PyBytesValue(digest)))
         })
     }
 
