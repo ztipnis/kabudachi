@@ -54,19 +54,22 @@ use kabudachi_core::election::{
     AuthorityCall, AuthorityPerformer, AuthorityReply, AuthorityTimings, CallKind, Entry, HandOffTo,
     Identity, Input, Issuer, KnownConfiguration, MessageSink, Output, ReplyToken, Step, WorkerNode, carry_out,
 };
-use kabudachi_core::protocol::ids::{IncarnationId, ShardId, TaskId, WorkerId};
+use kabudachi_core::protocol::generated::CompositeRecord;
+use kabudachi_core::protocol::ids::{CompositeId, IncarnationId, ShardId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::reconcile::{ReconcileRound, ReportPage, ReportedRun, ReportedState, wire};
+use kabudachi_core::scheduler::composite::Step as ReturnedStep;
 use kabudachi_core::scheduler::{
     Certification, Claim, Compacted, Completion, Scheduler, Submission,
 };
 use kabudachi_core::task_record::{
-    LeaderRecords, OfficeReconciliation, PlacedWrite, Placement, RecordKey, RecordPorts, Settled,
-    Turn, Write, WriteOutcome, identify, office_to_reconcile,
+    LeaderRecords, OfficeReconciliation, PlacedWrite, Placement, RecordKey, RecordPorts,
+    RecordVersion, Settled, ShardRecord as StoredRecord, Turn, VersionOrder, Write, WriteOutcome,
+    identify, office_to_reconcile,
 };
 use kabudachi_core::time::{Clock, Duration, Instant};
 use kabudachi_testkit::FaultingAuthority;
@@ -879,6 +882,29 @@ impl Cluster {
         run: &TaskRunId,
         digest: Digest,
     ) -> Ticket {
+        self.complete_with(at, claimant, run, digest, Completion::Final)
+    }
+
+    /// `claimant` reports that `run` returned `step` instead of a result,
+    /// certified under the step's digest; the answer is held as `claim`'s is.
+    pub fn complete_continuing(
+        &mut self,
+        at: &WorkerId,
+        claimant: &WorkerId,
+        run: &TaskRunId,
+        step: ReturnedStep,
+    ) -> Ticket {
+        self.complete_with(at, claimant, run, step.digest(), Completion::Continues(step))
+    }
+
+    fn complete_with(
+        &mut self,
+        at: &WorkerId,
+        claimant: &WorkerId,
+        run: &TaskRunId,
+        digest: Digest,
+        completion: Completion,
+    ) -> Ticket {
         let task = self.task_of(at, run);
         // The claimant holds its result as completed from the moment it
         // reports it, whatever the leader answers, until certified.
@@ -891,10 +917,13 @@ impl Cluster {
                 result_digest: digest.clone(),
                 delivered: false,
             };
+            if let Completion::Continues(step) = &completion {
+                held.continuation = Some(step.clone());
+            }
         }
         let answer = match self
             .scheduler_mut(at)
-            .complete(claimant, run, digest, Completion::Final)
+            .complete(claimant, run, digest, completion)
         {
             Ok(certification) => Answer::Certified(certification),
             Err(rejection) => Answer::Refused(rejection.to_string()),
@@ -948,6 +977,24 @@ impl Cluster {
             self.resolve(settled);
         }
         ticket
+    }
+
+    /// The newest revision of the composite `id` any node holds.
+    pub fn newest_composite(&self, id: &CompositeId) -> Option<CompositeRecord> {
+        let key = RecordKey::Composite(id.clone());
+        self.node_ids()
+            .iter()
+            .filter_map(|holder| match self.records.held_record(holder, &key)? {
+                StoredRecord::Composite(record) => Some(record),
+                StoredRecord::Task(_) | StoredRecord::Page(_) => None,
+            })
+            .reduce(|newest, record| {
+                let revision = |record: &CompositeRecord| record.version.as_ref().map(RecordVersion::from);
+                match (revision(&newest), revision(&record)) {
+                    (Some(held), Some(other)) if held.order(&other) == VersionOrder::Newer => record,
+                    _ => newest,
+                }
+            })
     }
 
     /// What `ticket`'s call was answered; `None` while it is held.

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{
     self, CompositeEntry, CompositePage, CompositeRecord, RecordVersion,
@@ -7,9 +9,11 @@ use kabudachi_core::scheduler::composite::{
     BoundInput, BoundStep, CompositeFinished, CompositeKind, OnError, PAGE_ENTRIES, Stage, Step,
     TaskOptions,
 };
+use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{Claim, Completion, Event};
+use kabudachi_core::task_record::{RecordKey, ShardRecord};
 
-use crate::support::scheduler::Fixture;
+use crate::support::scheduler::{Fixture, OFFICE, grant_of, reconciling_after};
 
 fn version(term: u64, revision: u64) -> Option<RecordVersion> {
     Some(RecordVersion {
@@ -148,6 +152,42 @@ pub fn finished(fixture: &mut Fixture) -> Vec<CompositeFinished> {
 pub fn entry(fixture: &Fixture, composite: &CompositeId, index: u64) -> Option<CompositeEntry> {
     let page = fixture.spy.newest_page(composite, (index / PAGE_ENTRIES) as u32)?;
     page.entries.into_iter().find(|entry| entry.index == index)
+}
+
+/// What a new leader rebuilds from when the old one's last writes to the
+/// records `lost` names did not reach their holders: of those, the newest
+/// revision published before `mark`; of every other record, the newest.
+pub fn rebuild_losing(old: &Fixture, mark: usize, lost: impl Fn(&RecordKey) -> bool) -> Rebuild {
+    let mut newest: BTreeMap<RecordKey, ShardRecord> = BTreeMap::new();
+    for (at, record) in old.spy.shard_revisions().into_iter().enumerate() {
+        let key = record.identify().unwrap().0;
+        if at >= mark && lost(&key) {
+            continue;
+        }
+        newest.insert(key, record);
+    }
+    let mut rebuild = Rebuild::default();
+    for record in newest.into_values() {
+        match record {
+            ShardRecord::Task(task) => rebuild.records.push(task),
+            ShardRecord::Composite(composite) => rebuild.composites.push(composite),
+            ShardRecord::Page(page) => rebuild.pages.push(page),
+        }
+    }
+    rebuild
+}
+
+/// Whether `key` names a composite's record or one of its pages.
+pub fn is_composite_or_page(key: &RecordKey) -> bool {
+    matches!(key, RecordKey::Composite(_) | RecordKey::Page(..))
+}
+
+/// The next leader of what `old` led, rebuilt from `rebuild` and leading.
+pub fn took_over(old: &Fixture, rebuild: Rebuild) -> Fixture {
+    let mut new = reconciling_after(old);
+    new.scheduler.reconcile(rebuild).unwrap();
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+    new
 }
 
 /// Certifies `run`, a running run of `worker()`, as having returned a flow of

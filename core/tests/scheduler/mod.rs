@@ -6,6 +6,7 @@ mod scheduler_cancel;
 mod scheduler_coalescing;
 mod scheduler_compaction;
 mod scheduler_composite;
+mod scheduler_composite_reconcile;
 mod scheduler_lifecycle;
 mod scheduler_loss;
 mod scheduler_outcome;

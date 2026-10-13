@@ -1,17 +1,22 @@
 //! A held composite as the records the leader publishes: its record, and its
 //! pages of member outcomes.
 
+use std::collections::BTreeMap;
+
 use prost::Message as _;
 
+use crate::manifest::{Failure, Manifest};
+use crate::protocol::digest::Digest;
 use crate::protocol::generated::{
     self, CompositePage, CompositeRecord, composite_entry, composite_record, input_shape,
 };
-use crate::protocol::ids::{CompositeId, IdGenerator};
+use crate::protocol::ids::{CompositeId, IdGenerator, WorkerId};
 use crate::task_record::RecordVersion;
-use crate::time::{Clock, WallTime};
+use crate::time::{Clock, Instant, WallTime};
 
 use crate::scheduler::{Observer, Scheduler, UNVERSIONED};
 
+use super::held::Composite;
 use super::{CompositeParent, CompositeState, InputShape, MemberCounts, MemberOutcome, PAGE_ENTRIES, Step};
 
 impl From<CompositeState> for generated::CompositeState {
@@ -128,6 +133,78 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
     }
 
+    /// Holds the composite `record` describes, with the outcomes its `pages`
+    /// carry, as the newest revisions say. A record that cannot be read is
+    /// skipped: a leader wrote it from a step it had validated, so this is
+    /// a bug, never a peer's input. Says whether it was held.
+    pub(in crate::scheduler) fn install_composite(
+        &mut self,
+        record: CompositeRecord,
+        pages: &[CompositePage],
+        now: Instant,
+    ) -> bool {
+        let Some(id) = record.composite_id.clone().map(CompositeId::from) else {
+            return false;
+        };
+        let Some(composite) = self.composite_from(&id, record, pages) else {
+            tracing::error!(composite = id.as_str(), "a composite's stored record cannot be read");
+            return false;
+        };
+        if composite.state == CompositeState::Running {
+            self.budget.take(composite.bytes);
+        } else {
+            self.composites.record_finished(&id, now);
+        }
+        self.composites.held.insert(id, composite);
+        true
+    }
+
+    fn composite_from(&self, id: &CompositeId, record: CompositeRecord, pages: &[CompositePage]) -> Option<Composite> {
+        let step = Step::try_from(&record.description?).ok()?;
+        let state = match generated::CompositeState::try_from(record.state).ok()? {
+            generated::CompositeState::Running => CompositeState::Running,
+            generated::CompositeState::Succeeded => CompositeState::Succeeded,
+            generated::CompositeState::Failed => CompositeState::Failed,
+            generated::CompositeState::Cancelled => CompositeState::Cancelled,
+            _ => return None,
+        };
+        let parent = match record.parent {
+            None => None,
+            Some(composite_record::Parent::ParentComposite(parent)) => {
+                Some(CompositeParent::Composite { id: parent.into(), index: record.parent_index })
+            }
+            Some(composite_record::Parent::ParentTask(task)) => Some(CompositeParent::Task(task.into())),
+        };
+        let input = match (record.input.as_ref(), record.input_shape.and_then(|shape| shape.shape)) {
+            (None, _) => None,
+            (Some(manifest), Some(shape)) => Some((Manifest::try_from(manifest).ok()?, input_shape_of(shape))),
+            (Some(_), None) => return None,
+        };
+        if step.expands() && input.is_none() {
+            return None;
+        }
+        let outcomes: BTreeMap<u64, MemberOutcome> = pages
+            .iter()
+            .flat_map(|page| &page.entries)
+            .filter_map(outcome_of)
+            .collect();
+        let retained_by = self.retainer_of(parent.as_ref());
+        Some(Composite {
+            bytes: first_record_len(id, &step),
+            step,
+            root: record.root.map_or_else(|| id.clone(), CompositeId::from),
+            retained_by,
+            parent,
+            client: record.client.map(WorkerId::from),
+            input,
+            state,
+            next_stage: record.next_stage,
+            outcomes,
+            failure: record.failure.map(|failure| Failure { kind: failure.kind, message: failure.message }),
+            submitted_at: record.submitted_at.map_or_else(|| WallTime::now(&self.clock), WallTime::from),
+        })
+    }
+
     /// The composite's record as the scheduler holds it, unversioned: what a
     /// one-node runtime reads a member's step from.
     pub fn composite_record(&self, id: &CompositeId) -> Option<CompositeRecord> {
@@ -160,4 +237,28 @@ fn entry_of(index: u64, outcome: &MemberOutcome) -> generated::CompositeEntry {
         MemberOutcome::Child(child) => (composite_entry::Outcome::Child(child.clone().into()), None),
     };
     generated::CompositeEntry { index, outcome: Some(outcome), producer }
+}
+
+fn input_shape_of(shape: input_shape::Shape) -> InputShape {
+    match shape {
+        input_shape::Shape::ValueOf(producer) => InputShape::Value(producer.into()),
+        input_shape::Shape::List(_) => InputShape::List,
+    }
+}
+
+/// The outcome a page entry holds, with its member's index. An entry that
+/// names no outcome, or a value with no readable digest or producer, holds
+/// none: its member is settled again from its own record.
+fn outcome_of(entry: &generated::CompositeEntry) -> Option<(u64, MemberOutcome)> {
+    let outcome = match entry.outcome.as_ref()? {
+        composite_entry::Outcome::Value(digest) => MemberOutcome::Value {
+            digest: Digest::try_from(digest).ok()?,
+            producer: entry.producer.clone()?.into(),
+        },
+        composite_entry::Outcome::Failure(failure) => {
+            MemberOutcome::Failed(Failure { kind: failure.kind.clone(), message: failure.message.clone() })
+        }
+        composite_entry::Outcome::Child(child) => MemberOutcome::Child(child.clone().into()),
+    };
+    Some((entry.index, outcome))
 }

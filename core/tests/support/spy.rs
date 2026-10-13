@@ -63,6 +63,11 @@ impl Spy {
         self.0.borrow().iter().filter_map(task_record).cloned().collect()
     }
 
+    /// Every revision of every kind the scheduler published, in order.
+    pub fn shard_revisions(&self) -> Vec<ShardRecord> {
+        self.0.borrow().clone()
+    }
+
     /// Every composite revision the scheduler published, in order.
     pub fn composites(&self) -> Vec<CompositeRecord> {
         self.0

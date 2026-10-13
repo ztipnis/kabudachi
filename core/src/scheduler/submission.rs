@@ -389,7 +389,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// task. A task it has forgotten (past its result's time to live) that is
     /// submitted again is recorded afresh.
     pub fn submit_minted(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
-        let outcome = self.record_submission(submitted);
+        let outcome = if self.check_leader() {
+            self.record_submission(submitted)
+        } else {
+            Err(SubmitRejection::NotLeader)
+        };
         self.end_call();
         outcome
     }
@@ -402,11 +406,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Records `submitted` as a new task with its first run, unless it is
-    /// already held (a retry after a refusal) or is refused.
+    /// already held (a retry after a refusal) or is refused. It does not ask
+    /// whether this scheduler leads: a client's submission is checked by its
+    /// caller, and the Task a composite makes for a member is made by a
+    /// scheduler that is rebuilding too, before its grant arrives.
     pub(super) fn record_submission(&mut self, submitted: Submitted) -> Result<TaskId, SubmitRejection> {
-        if !self.check_leader() {
-            return Err(SubmitRejection::NotLeader);
-        }
         if self.tasks.contains_key(&submitted.task_id) {
             return Ok(submitted.task_id);
         }

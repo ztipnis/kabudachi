@@ -21,6 +21,7 @@ use crate::time::WallTime;
 mod drive;
 mod held;
 mod records;
+mod recover;
 
 pub(in crate::scheduler) use held::Composites;
 

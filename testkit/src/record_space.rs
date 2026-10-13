@@ -36,6 +36,8 @@ struct Space {
     /// Writers whose writes stay in flight, and the writes held so far.
     holding: BTreeSet<WorkerId>,
     in_flight: Vec<(WorkerId, PlacedWrite)>,
+    /// Which records every holder refuses, if any.
+    refusing: Option<Box<dyn Fn(&RecordKey) -> bool>>,
 }
 
 impl Space {
@@ -46,7 +48,10 @@ impl Space {
     fn deliver(&mut self, writer: &WorkerId, placed: &PlacedWrite, now: Instant, on_its_way: bool) {
         let write = Write::of(&placed.record);
         let mut stored = BTreeSet::new();
-        for holder in placed.recipients() {
+        let refused = self.refusing.as_ref().is_some_and(|refuses| {
+            placed.record.identify().is_ok_and(|(key, _)| refuses(&key))
+        });
+        for holder in placed.recipients().into_iter().filter(|_| !refused) {
             let reached = if on_its_way {
                 !self.down.contains(&holder)
             } else {
@@ -220,6 +225,13 @@ impl RecordSpace {
     /// the writes made from now on.
     pub fn set_ack_delay(&self, delay: Duration) {
         self.0.borrow_mut().ack_delay = Some(delay);
+    }
+
+    /// From now on every holder refuses the writes of the records `refused`
+    /// names, as it refuses a write it cannot store, until it is given another
+    /// rule. Writes made before are not undone.
+    pub fn refuse_writes_of(&self, refused: impl Fn(&RecordKey) -> bool + 'static) {
+        self.0.borrow_mut().refusing = Some(Box::new(refused));
     }
 
     /// A holder that is down stores nothing until it is up again.

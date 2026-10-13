@@ -70,6 +70,12 @@ impl Reconciliation {
         self.uncertain_composites.contains(composite)
     }
 
+    /// Whether any task or composite still waits for a record this leader
+    /// can rely on.
+    pub(super) fn has_unknown(&self) -> bool {
+        !self.uncertain.is_empty() || !self.uncertain_composites.is_empty()
+    }
+
     /// Whether `run` is one of an uncertain task's known runs.
     pub(super) fn holds_uncertain_run(&self, run: &TaskRunId) -> bool {
         self.uncertain.values().any(|runs| runs.contains(run))
@@ -119,6 +125,21 @@ impl Reconciliation {
             .or_default()
             .extend(runs);
         self.deferred.insert(task_id, record);
+    }
+
+    /// Takes late knowledge of composites: those of `installed` are known now,
+    /// and those of `uncertain` that `held` does not hold wait for a record.
+    pub(super) fn learn_composites(
+        &mut self,
+        installed: &[CompositeId],
+        uncertain: BTreeSet<CompositeId>,
+        held: impl Fn(&CompositeId) -> bool,
+    ) {
+        for id in installed {
+            self.uncertain_composites.remove(id);
+        }
+        self.uncertain_composites
+            .extend(uncertain.into_iter().filter(|id| !held(id)));
     }
 
     /// Takes late knowledge: returns the newest known record of every task
@@ -264,6 +285,7 @@ impl Reconciliation {
         answered: BTreeSet<WorkerId>,
         uncertain: BTreeMap<TaskId, BTreeSet<TaskRunId>>,
         uncertain_keys: BTreeMap<TaskId, CoalescingKey>,
+        uncertain_composites: BTreeSet<CompositeId>,
     ) -> ReconcileTerm {
         let office = self
             .office
@@ -274,7 +296,7 @@ impl Reconciliation {
         self.answered = answered;
         self.uncertain = uncertain;
         self.uncertain_keys = key_map(uncertain_keys);
-        self.uncertain_composites.clear();
+        self.uncertain_composites = uncertain_composites;
         self.deferred.clear();
         self.held_reports.clear();
         term

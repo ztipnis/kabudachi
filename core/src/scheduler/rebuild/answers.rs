@@ -13,6 +13,7 @@ use crate::protocol::task::TaskRunState;
 use crate::reconcile::{ANSWER_IN_FLIGHT, ReportedRun, ReportedState, WorkerRuns};
 use crate::time::{Clock, WallTime};
 
+use super::super::composite::Step;
 use super::super::{Claim, Completion, HeldCancel, Observer, Scheduler};
 use super::Adopted;
 
@@ -76,7 +77,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 self.hold_cancel(worker, task_id, run_id, &reported.state)
             }
             Some(recorded @ (TaskRunState::Claimed | TaskRunState::Running)) => {
-                self.adopt_reported(worker, &run_id, recorded, reported.state, out);
+                self.adopt_reported(worker, &run_id, recorded, reported.state, reported.continuation, out);
             }
             _ => {}
         }
@@ -123,21 +124,26 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run_id: &TaskRunId,
         recorded: TaskRunState,
         state: ReportedState,
+        continuation: Option<Step>,
         out: &mut Adopted,
     ) {
         if recorded == TaskRunState::Claimed && !matches!(state, ReportedState::Claimed) {
             let _ = self.start_owned(worker, run_id);
         }
-        self.apply_reported_outcome(worker, run_id, state, out);
+        self.apply_reported_outcome(worker, run_id, state, continuation, out);
     }
 
-    /// A success `worker` reports of its running run is certified, and a
-    /// failure applied; a claimed or running one changes nothing more.
+    /// A success `worker` reports of its running run is certified, with the
+    /// step it returned if it returned one, and a failure applied; a claimed
+    /// or running one changes nothing more. A run its certifying revision
+    /// was stored for is not running in the records, so is not here: its step
+    /// is on the run.
     fn apply_reported_outcome(
         &mut self,
         worker: &WorkerId,
         run_id: &TaskRunId,
         state: ReportedState,
+        continuation: Option<Step>,
         out: &mut Adopted,
     ) {
         match state {
@@ -146,8 +152,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 result_digest,
                 delivered,
             } => {
+                let completion = continuation.map_or(Completion::Final, Completion::Continues);
                 if let Ok(certified) =
-                    self.certify_owned(worker, run_id, result_digest, Completion::Final, delivered)
+                    self.certify_owned(worker, run_id, result_digest, completion, delivered)
                 {
                     out.certified.push(certified);
                 }

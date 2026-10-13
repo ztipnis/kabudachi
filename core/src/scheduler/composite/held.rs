@@ -21,6 +21,11 @@ pub(in crate::scheduler) struct Composite {
     /// blobs of every large value bound in it: its own id unless its parent
     /// is a composite, then its parent's root.
     pub(super) root: CompositeId,
+    /// The composite whose results name this one, which is kept as long as
+    /// that one is: its parent composite, or, for the continuation of a task
+    /// that is a member of a composite, that composite. A composite that is
+    /// not named by anything's results is forgotten on its own.
+    pub(super) retained_by: Option<CompositeId>,
     pub(super) client: Option<WorkerId>,
     /// What a nested composite takes, and how it decodes.
     pub(super) input: Option<(Manifest, InputShape)>,
@@ -51,6 +56,17 @@ impl Composite {
         self.failure
             .clone()
             .unwrap_or_else(|| Failure { kind: CANCELLED_KIND.to_owned(), message: String::new() })
+    }
+
+    /// The lowest-indexed failure, if a failure ends this composite.
+    pub(super) fn first_failure_it_fails_on(&self) -> Option<Failure> {
+        if !self.fails_on_first_failure() {
+            return None;
+        }
+        self.outcomes.values().find_map(|outcome| match outcome {
+            MemberOutcome::Failed(failure) => Some(failure.clone()),
+            MemberOutcome::Value { .. } | MemberOutcome::Child(_) => None,
+        })
     }
 
     /// How many pages the settled outcomes take.
@@ -92,6 +108,17 @@ impl Composites {
         *self = Composites::default();
     }
 
+    /// Marks every composite and page held as changed, so the next
+    /// publication writes them all again.
+    pub(in crate::scheduler) fn mark_all_unpublished(&mut self) {
+        for (id, composite) in &self.held {
+            self.unpublished.insert(id.clone());
+            for page in 0..composite.pages() {
+                self.unpublished_pages.insert((id.clone(), page));
+            }
+        }
+    }
+
     pub(super) fn record_finished(&mut self, id: &CompositeId, now: Instant) {
         self.finished_at.insert(id.clone(), now);
         self.finished.insert((now, id.clone()));
@@ -101,14 +128,14 @@ impl Composites {
         self.finished_at.contains_key(id)
     }
 
-    /// Whether `id`'s parent is a composite still held: a parent reads its
-    /// child's pages for the next stage's input until it is over itself, so
-    /// the child is forgotten only after it.
-    fn parent_is_held(&self, id: &CompositeId) -> bool {
-        match self.held.get(id).and_then(|composite| composite.parent.as_ref()) {
-            Some(CompositeParent::Composite { id: parent, .. }) => self.held.contains_key(parent),
-            Some(CompositeParent::Task(_)) | None => false,
-        }
+    /// Whether the composite that names `id`'s results is still held: it
+    /// reads them for its own results and for the next stage's input until
+    /// it is forgotten itself, so `id` is forgotten only after it.
+    fn retainer_is_held(&self, id: &CompositeId) -> bool {
+        self.held
+            .get(id)
+            .and_then(|composite| composite.retained_by.as_ref())
+            .is_some_and(|retainer| self.held.contains_key(retainer))
     }
 
     /// When the first finished composite that may be forgotten is due, with
@@ -116,7 +143,7 @@ impl Composites {
     pub(in crate::scheduler) fn next_due(&self, ttl: Duration) -> Option<Instant> {
         self.finished
             .iter()
-            .find(|(_, id)| !self.parent_is_held(id))
+            .find(|(_, id)| !self.retainer_is_held(id))
             .map(|(finished_at, _)| *finished_at + ttl)
     }
 
@@ -128,7 +155,7 @@ impl Composites {
                 .finished
                 .iter()
                 .take_while(|(finished_at, _)| now - *finished_at >= ttl)
-                .filter(|(_, id)| !self.parent_is_held(id))
+                .filter(|(_, id)| !self.retainer_is_held(id))
                 .map(|(_, id)| id.clone())
                 .collect();
             if due.is_empty() {
