@@ -54,6 +54,7 @@ pub struct QueuePolicy {
 }
 
 impl QueuePolicy {
+    /// A policy that gives every queue the default options.
     pub fn new() -> Self {
         Self::default()
     }
@@ -65,6 +66,7 @@ impl QueuePolicy {
         self
     }
 
+    /// The options of `queue`: its own, or the default when it has none.
     pub fn options(&self, queue: &str) -> QueueOptions {
         self.queues.get(queue).copied().unwrap_or_default()
     }
@@ -118,6 +120,7 @@ impl Subscription {
         }
     }
 
+    /// Whether a worker with this subscription takes tasks of `queue`.
     pub fn includes(&self, queue: &str) -> bool {
         match self {
             Subscription::Every => true,
