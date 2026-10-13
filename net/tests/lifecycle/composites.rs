@@ -8,7 +8,7 @@ use std::time::Duration;
 use kabudachi_core::blob::{BlobKey, BlobOwner};
 use kabudachi_core::protocol::generated::CompositeState as WireState;
 use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, Uuid7Ids, WorkerId};
-use kabudachi_core::protocol::messages::{CancelOutcome, task_response};
+use kabudachi_core::protocol::messages::{CancelOutcome, TaskRejectReason, task_response};
 use kabudachi_core::scheduler::MemoryLimits;
 use kabudachi_core::scheduler::composite::{
     CompositeKind, CompositeState, Resolved, Stage, SubmittedComposite, Unresolved, member_input, results,
@@ -341,6 +341,17 @@ async fn a_client_stores_submits_and_cancels_a_composite_through_the_leader_its_
             step: flow_of_bound(&["load"]),
             client: Some(net.local_worker_id()),
         };
+        // An id with a `/` would name a page of another composite's records.
+        let slashed = SubmittedComposite { composite_id: CompositeId::new("x/5"), ..submitted.clone() };
+        let answer = shard
+            .drive_until(net.submit_composite_to_leader(&slashed, retry()))
+            .await
+            .expect("a leader answers");
+        let Some(task_response::Result::Reject(reject)) = answer.result else {
+            panic!("the leader refuses an id that is a record key's page: {answer:?}");
+        };
+        assert_eq!(reject.reason, TaskRejectReason::TaskRejectMalformed as i32);
+
         // A value too large to inline is stored where the leader will place
         // the composite, before the composite is submitted.
         let owner = BlobOwner::Composite(submitted.composite_id.clone());

@@ -16,6 +16,7 @@ use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, Certification, Failure, LostRun, Outcome, OutcomeRejection, ReportRejection,
     Submission, Submitted, SubmitRejection, TraceContext,
 };
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::{Clock, Duration, WallTime};
 
 /// Why a request could not be read.
@@ -52,7 +53,10 @@ pub(crate) fn submit_task(submitted: &Submitted) -> SubmitTask {
 /// The submission `task` asks for, as it arrives on this node: its delay and
 /// expiry count from `clock`'s reading now.
 pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitted, Malformed> {
-    let task_id = task.task_id.clone().ok_or(Malformed)?;
+    let task_id = TaskId::from(task.task_id.clone().ok_or(Malformed)?);
+    if !RecordKey::may_name_a_task(&task_id) {
+        return Err(Malformed);
+    }
     let submitted_at = task.submitted_at.ok_or(Malformed)?;
     let definition_id = task.task_definition_id.clone().ok_or(Malformed)?;
     let input_manifest = task
@@ -69,7 +73,7 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
         return Err(Malformed);
     }
     Ok(Submitted::received(
-        TaskId::from(task_id),
+        task_id,
         WallTime::from(submitted_at),
         Submission {
             definition_id: TaskDefinitionId::from(definition_id),
@@ -112,8 +116,12 @@ pub(crate) fn submit_composite(submitted: &SubmittedComposite) -> SubmitComposit
 /// The composite `submit` asks for.
 pub(crate) fn submitted_composite(submit: &SubmitComposite) -> Result<SubmittedComposite, Malformed> {
     let step = submit.description.as_ref().ok_or(Malformed)?;
+    let composite_id = CompositeId::from(submit.composite_id.clone().ok_or(Malformed)?);
+    if !RecordKey::may_name_a_composite(&composite_id) {
+        return Err(Malformed);
+    }
     Ok(SubmittedComposite {
-        composite_id: CompositeId::from(submit.composite_id.clone().ok_or(Malformed)?),
+        composite_id,
         submitted_at: WallTime::from(submit.submitted_at.ok_or(Malformed)?),
         step: Step::try_from(step).map_err(|_| Malformed)?,
         client: submit.client.clone().map(WorkerId::from),

@@ -24,6 +24,18 @@ pub enum RecordKey {
 }
 
 impl RecordKey {
+    /// Whether a Task may be recorded under `id`: its key must not read back
+    /// as a composite's.
+    pub fn may_name_a_task(id: &TaskId) -> bool {
+        !id.as_str().starts_with(COMPOSITE_PREFIX)
+    }
+
+    /// Whether a composite may be recorded under `id`: a `/` would make its
+    /// key read back as a page of another composite's.
+    pub fn may_name_a_composite(id: &CompositeId) -> bool {
+        !id.as_str().contains('/')
+    }
+
     /// The bytes kad stores the record under: a task id's own bytes (as
     /// before composites existed), `composite/<id>`, or
     /// `composite/<id>/<page>`.
