@@ -51,8 +51,9 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     while it waits, and takes its place back as soon as it resumes, even if
     that briefly puts more than `concurrency` bodies in progress. The
     `processes`, `concurrency` and `imports` settings are read when `run`
-    starts. Native log records go to the `kabudachi.native` loggers at the
-    levels set when `run` starts.
+    starts. Native log records go to the `kabudachi.native` loggers; those
+    below the effective level of `kabudachi.native` itself when `run` starts
+    are not forwarded, whatever level a child logger is set to.
 
     When `main` returns, `run` waits for every task that was called to finish
     before it stops the worker. If `main` raises, or is cancelled, tasks

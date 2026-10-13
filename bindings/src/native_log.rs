@@ -9,7 +9,7 @@
 //! and their levels. A full queue drops records, and the number dropped is
 //! logged once it drains.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
 
@@ -62,62 +62,92 @@ impl Log for Forwarding {
 
 static CACHE: OnceLock<ResetHandle> = OnceLock::new();
 
+/// Set by an `atexit` callback, which runs before the interpreter starts to
+/// finalize: from then on records are dropped instead of forwarded.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+
+#[pyfunction]
+fn stop_forwarding() {
+    STOPPED.store(true, Ordering::SeqCst);
+}
+
 /// Installs the forwarding logger and starts the thread that hands its
 /// records to Python, at the level Python's `logging` sets for
 /// `kabudachi.native` now. A second call, or a logger installed already by
-/// someone else, changes nothing.
+/// someone else, changes nothing. Records emitted once the interpreter begins
+/// to exit are dropped.
 pub(crate) fn install(py: Python<'_>) -> PyResult<()> {
     let python = Logger::new(py, Caching::LoggersAndLevels)?
         .set_prefix(PREFIX)
         .filter(LevelFilter::Trace);
     let cache = python.reset_handle();
+    let level = effective_level(py)?;
     let (lines, queue) = sync_channel(QUEUE_LENGTH);
     let dropped = Arc::new(AtomicU64::new(0));
     let forwarding = Forwarding {
         lines,
         dropped: Arc::clone(&dropped),
     };
-    if log::set_boxed_logger(Box::new(forwarding)).is_err() {
-        return Ok(());
-    }
-    let _ = CACHE.set(cache);
-    log::set_max_level(effective_level(py)?);
+    // Spawned before the logger is installed, so nothing that can fail runs
+    // after it. If installing fails, `forwarding` drops with its sender and
+    // the thread ends at once.
     std::thread::Builder::new()
         .name("kabudachi-log".into())
         .spawn(move || forward(queue, python, dropped))
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    if log::set_boxed_logger(Box::new(forwarding)).is_err() {
+        return Ok(());
+    }
+    log::set_max_level(level);
+    let _ = CACHE.set(cache);
+    py.import("atexit")?
+        .call_method1("register", (wrap_pyfunction!(stop_forwarding, py)?,))?;
     Ok(())
 }
 
 /// The only code that takes the GIL for a log record: it runs on one thread
 /// that holds no lock of this crate's and that no other thread waits for.
+///
+/// Attaching to a finalizing interpreter is undefined on some builds, so no
+/// record is forwarded once `STOPPED` is set. A record already waiting for the
+/// GIL when finalization starts can still race with it; that window is
+/// accepted. Each record is logged inside `Python::try_attach` so that
+/// `pyo3-log`'s own attach finds the thread attached and never has to
+/// initialize the interpreter.
 fn forward(queue: Receiver<Line>, python: Logger, dropped: Arc<AtomicU64>) {
     while let Ok(line) = queue.recv() {
-        python.log(
-            &Record::builder()
-                .level(line.level)
-                .target(&line.target)
-                .args(format_args!("{}", line.message))
-                .build(),
-        );
+        if STOPPED.load(Ordering::SeqCst) {
+            continue;
+        }
         let lost = dropped.swap(0, Ordering::Relaxed);
-        if lost > 0 {
+        Python::try_attach(|_| {
             python.log(
                 &Record::builder()
-                    .level(Level::Warn)
-                    .target(TARGET)
-                    .args(format_args!(
-                        "{lost} native log records were dropped: the queue to Python was full"
-                    ))
+                    .level(line.level)
+                    .target(&line.target)
+                    .args(format_args!("{}", line.message))
                     .build(),
             );
-        }
+            if lost > 0 {
+                python.log(
+                    &Record::builder()
+                        .level(Level::Warn)
+                        .target(TARGET)
+                        .args(format_args!(
+                            "{lost} native log records were dropped: the queue to Python was full"
+                        ))
+                        .build(),
+                );
+            }
+        });
     }
 }
 
 /// Reads again the level Python's `logging` sets for `kabudachi.native` and
-/// its children, and forgets the levels cached for them: what `logging`
-/// was configured with by now applies from here on.
+/// forgets the levels cached for it and its children: what `logging` was
+/// configured with by now applies from here on. A record below
+/// `kabudachi.native`'s own effective level is never forwarded, whatever level
+/// a child logger is set to.
 #[pyfunction]
 pub(crate) fn refresh_logging(py: Python<'_>) -> PyResult<()> {
     if let Some(cache) = CACHE.get() {
@@ -128,13 +158,13 @@ pub(crate) fn refresh_logging(py: Python<'_>) -> PyResult<()> {
 }
 
 fn effective_level(py: Python<'_>) -> PyResult<LevelFilter> {
-    let level: u32 = py
+    let level: i64 = py
         .import("logging")?
         .call_method1("getLogger", (PREFIX,))?
         .call_method0("getEffectiveLevel")?
         .extract()?;
     Ok(match level {
-        0..=5 => LevelFilter::Trace,
+        i64::MIN..=5 =>LevelFilter::Trace,
         6..=10 => LevelFilter::Debug,
         11..=20 => LevelFilter::Info,
         21..=30 => LevelFilter::Warn,
