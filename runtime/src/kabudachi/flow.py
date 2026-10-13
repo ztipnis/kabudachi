@@ -354,7 +354,12 @@ class MapStep:
 
     def _checked(self, inputs: Any) -> list[Any]:
         """The items of `inputs`, each checked before any is submitted, so a
-        bad one leaves nothing half done."""
+        bad one leaves nothing half done. Each is encoded here only to prove
+        it can be, and the bytes are dropped: the stream encodes an item again
+        as its batch is built, so the encoded items of a long list are never
+        held at once, outside the payload memory the stream waits on, and the
+        failure of a bad item stays a synchronous error rather than a failed
+        handle."""
         if not isinstance(inputs, (list, tuple)):
             raise TypeError(f"map takes a list of inputs, not {inputs!r}")
         serializer = self._serializers.get(self.definition.serializer)
