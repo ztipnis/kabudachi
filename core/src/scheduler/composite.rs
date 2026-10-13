@@ -31,7 +31,8 @@ pub use reduce::{
     ReduceRoot, ReduceShape,
 };
 pub use resolve::{
-    CompositeSource, MemberInput, Resolved, Unresolved, expansion_source, member_input, resolve_manifest, results,
+    CompositeSource, MemberInput, ReduceOperand, Resolved, Unresolved, expansion_source, member_input,
+    reduce_operands, resolve_manifest, results,
 };
 
 /// The most members one batch of a streamed composite carries.

@@ -6,6 +6,7 @@
 //! the records and blobs, which are the scheduler's own copy in a one-node
 //! runtime and the shard's over the network, and decodes them itself.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -22,7 +23,11 @@ use crate::protocol::ids::{CompositeId, TaskDefinitionId};
 use crate::protocol::messages::Task;
 use crate::protocol::messages::prelude::*;
 
-use super::{BoundInput, BoundStep, CompositeKind, Stage, Step, TaskOptions};
+use super::reduce::item_page;
+use super::{
+    BoundInput, BoundStep, CompositeKind, Operand, PAGE_ENTRIES, ReducePlan, ReduceRoot, ReduceShape, Stage, Step,
+    TaskOptions,
+};
 
 /// Where a reader finds a composite's records and the blobs they name: the
 /// scheduler's own copy in a one-node runtime, the shard over the network.
@@ -84,6 +89,27 @@ impl MemberInput {
     }
 }
 
+/// One operand of a reduce step, as its worker decodes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReduceOperand {
+    /// An item from the reduce's own item pages, encoded by the reducer as its item type.
+    Item(Vec<u8>),
+    /// The initial value or an earlier step's result, encoded by the reducer as its result type.
+    Result(Vec<u8>),
+    /// An item that is an entry of the previous stage's results, decoded by its own producer.
+    Resolved(Resolved),
+}
+
+impl ReduceOperand {
+    /// The bytes of the values in it.
+    pub fn payload_bytes(&self) -> u64 {
+        match self {
+            ReduceOperand::Item(bytes) | ReduceOperand::Result(bytes) => bytes.len() as u64,
+            ReduceOperand::Resolved(resolved) => resolved.payload_bytes(),
+        }
+    }
+}
+
 /// Why a record or a blob a reader needs could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Unresolved {
@@ -115,10 +141,10 @@ pub async fn member_input<S: CompositeSource>(source: &S, task: &Task) -> Result
         .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
     let step = step_of(&record)?;
     let index = task.composite_index;
-    // A reduce step's operands are results of earlier steps and items on the
-    // reduce's item pages, which a reader fetches through its own call; this
-    // call, which reads a stage's template and input, has nothing to answer
-    // for it, so it is refused as malformed rather than guessed at.
+    // A reduce step's operands are results of earlier steps and items on item
+    // pages, which `reduce_operands` reads; this call, which reads a stage's
+    // template and input, has nothing to answer for it, so it is refused as
+    // malformed rather than guessed at.
     if step.kind == CompositeKind::Reduce {
         return Err(Unresolved::Malformed);
     }
@@ -220,6 +246,47 @@ pub async fn expansion_source<S: CompositeSource>(source: &S, task: &Task) -> Re
     resolve_manifest(source, &manifest, producer.as_ref(), owner.as_ref()).await
 }
 
+/// What reduce step `task` works on, in the order it takes it: its planned
+/// operands, read from the reduce's record (its item count and initial value),
+/// from item pages (the reduce's own, or the previous stage's results) and
+/// from the step's input manifest (earlier results, in order).
+pub async fn reduce_operands<S: CompositeSource>(source: &S, task: &Task) -> Result<Vec<ReduceOperand>, Unresolved> {
+    let id = task.composite_id().ok_or(Unresolved::Malformed)?;
+    let record = source
+        .composite(&id)
+        .await
+        .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
+    let step = step_of(&record)?;
+    let shape = step.reduce.as_ref().ok_or(Unresolved::Malformed)?;
+    let planned = ReducePlan::new(record.reduce_items, shape)
+        .step(task.composite_index)
+        .ok_or(Unresolved::Malformed)?;
+    let earlier = task
+        .input_manifest
+        .as_ref()
+        .map(|manifest| Manifest::try_from(manifest).map_err(|_| Unresolved::Malformed))
+        .transpose()?;
+    let mut results = earlier.iter().flat_map(|manifest| manifest.entries());
+    let mut pages = Pages::new(source);
+    let mut operands = Vec::with_capacity(planned.operands.len());
+    for operand in planned.operands {
+        operands.push(match operand {
+            Operand::Initial => ReduceOperand::Result(initial_bytes(source, &record, shape).await?),
+            Operand::Item(item) if takes_pages(&record) => {
+                ReduceOperand::Resolved(page_item(source, &mut pages, &record, item).await?)
+            }
+            Operand::Item(item) => ReduceOperand::Item(own_item(source, &mut pages, &id, item).await?),
+            Operand::Result(before) => match results.next() {
+                Some(ManifestEntry::Blob(key)) => {
+                    ReduceOperand::Result(read_result(source, &BlobOwner::Task(id.member_task(before)), key).await?)
+                }
+                _ => return Err(Unresolved::Malformed),
+            },
+        });
+    }
+    Ok(operands)
+}
+
 /// `manifest` as one value or a list. A manifest of pages is a list: the
 /// entries of those pages in order, each resolved in turn (a child composite's
 /// entry is that composite's results, nested). A manifest of one blob is one
@@ -252,6 +319,12 @@ fn resolving_manifest<'a, S: CompositeSource>(
             let bytes = read_result(source, owner, key).await?;
             return Ok(Resolved::Value { producer: producer.clone(), bytes });
         }
+        // A reduce's results are its one value, whatever the page that names it holds.
+        if let [ManifestEntry::Page { composite, .. }] = manifest.entries()
+            && is_reduce(source, composite).await
+        {
+            return resolving_results(source, composite).await;
+        }
         let mut list = Vec::new();
         for entry in manifest.entries() {
             match entry {
@@ -278,6 +351,9 @@ fn resolving_results<'a, S: CompositeSource>(source: &'a S, id: &'a CompositeId)
             .composite(id)
             .await
             .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
+        if let Some(shape) = step_of(&record).ok().and_then(|step| step.reduce) {
+            return reduce_result(source, id, &record, &shape).await;
+        }
         let mut list = Vec::new();
         for page in 0..record.pages {
             let held = source.page(id, page).await.ok_or_else(|| Unresolved::MissingPage(id.clone(), page))?;
@@ -324,6 +400,138 @@ async fn read_result<S: CompositeSource>(source: &S, owner: &BlobOwner, key: &Bl
     }
     let manifest = Manifest::decode(&bytes).map_err(|_| Unresolved::Malformed)?;
     source.payload(owner, &manifest).await
+}
+
+/// Whether the composite `id` is a reduce. A composite that cannot be read is
+/// not: reading its pages reports why.
+async fn is_reduce<S: CompositeSource>(source: &S, id: &CompositeId) -> bool {
+    match source.composite(id).await {
+        Some(record) => step_of(&record).is_ok_and(|step| step.reduce.is_some()),
+        None => false,
+    }
+}
+
+/// The pages a reader has fetched in one call, so a step that takes many
+/// items from one page reads that page once.
+struct Pages<'a, S> {
+    source: &'a S,
+    held: BTreeMap<(CompositeId, u32), CompositePage>,
+}
+
+impl<'a, S: CompositeSource> Pages<'a, S> {
+    fn new(source: &'a S) -> Self {
+        Pages { source, held: BTreeMap::new() }
+    }
+
+    /// Entry `index` of page `page` of `composite`.
+    async fn entry(&mut self, composite: &CompositeId, page: u32, index: u64) -> Result<CompositeEntry, Unresolved> {
+        let key = (composite.clone(), page);
+        if !self.held.contains_key(&key) {
+            let read = self
+                .source
+                .page(composite, page)
+                .await
+                .ok_or_else(|| Unresolved::MissingPage(composite.clone(), page))?;
+            self.held.insert(key.clone(), read);
+        }
+        self.held[&key]
+            .entries
+            .iter()
+            .find(|entry| entry.index == index)
+            .cloned()
+            .ok_or(Unresolved::Malformed)
+    }
+}
+
+/// Whether the reduce `record` folds the results of another composite, read
+/// from that composite's pages, instead of items sent to it.
+fn takes_pages(record: &CompositeRecord) -> bool {
+    matches!(record.input_shape.as_ref().and_then(|shape| shape.shape.as_ref()), Some(input_shape::Shape::List(_)))
+}
+
+/// The reduce's initial value, encoded by the reducer as its result type.
+async fn initial_bytes<S: CompositeSource>(
+    source: &S,
+    record: &CompositeRecord,
+    shape: &ReduceShape,
+) -> Result<Vec<u8>, Unresolved> {
+    match shape.initial.as_ref().ok_or(Unresolved::Malformed)? {
+        BoundInput::Value(bytes) => Ok(bytes.clone()),
+        BoundInput::Chunked(manifest) => {
+            // The tree's root owns every large bound value.
+            let root: CompositeId = record.root.clone().ok_or(Unresolved::Malformed)?.into();
+            source.payload(&BlobOwner::Composite(root), manifest).await
+        }
+        BoundInput::Previous => Err(Unresolved::Malformed),
+    }
+}
+
+/// Item `index` of the reduce `id`'s own item pages, encoded by the reducer as
+/// its item type.
+async fn own_item<S: CompositeSource>(
+    source: &S,
+    pages: &mut Pages<'_, S>,
+    id: &CompositeId,
+    index: u64,
+) -> Result<Vec<u8>, Unresolved> {
+    let entry = pages.entry(id, item_page(index), index).await?;
+    match entry.outcome.ok_or(Unresolved::Malformed)? {
+        composite_entry::Outcome::Item(bytes) => Ok(bytes),
+        composite_entry::Outcome::ItemManifest(manifest) => {
+            let manifest = Manifest::try_from(&manifest).map_err(|_| Unresolved::Malformed)?;
+            source.payload(&BlobOwner::Composite(id.clone()), &manifest).await
+        }
+        _ => Err(Unresolved::Malformed),
+    }
+}
+
+/// Item `index` of the reduce `record`, when it folds another composite's
+/// results: that composite's entry `index`, resolved as its client would.
+async fn page_item<S: CompositeSource>(
+    source: &S,
+    pages: &mut Pages<'_, S>,
+    record: &CompositeRecord,
+    index: u64,
+) -> Result<Resolved, Unresolved> {
+    let given = record
+        .input
+        .as_ref()
+        .ok_or(Unresolved::Malformed)
+        .and_then(|manifest| Manifest::try_from(manifest).map_err(|_| Unresolved::Malformed))?;
+    let page = u32::try_from(index / PAGE_ENTRIES).map_err(|_| Unresolved::Malformed)?;
+    let composite = given
+        .entries()
+        .iter()
+        .find_map(|entry| match entry {
+            ManifestEntry::Page { composite, page: held } if *held == page => Some(composite),
+            _ => None,
+        })
+        .ok_or(Unresolved::Malformed)?;
+    let entry = pages.entry(composite, page, index).await?;
+    resolving_entry(source, composite, &entry).await
+}
+
+/// What the reduce `id` gives: its initial value, its one item, or its last
+/// step's value. A reduce of nothing has none.
+async fn reduce_result<S: CompositeSource>(
+    source: &S,
+    id: &CompositeId,
+    record: &CompositeRecord,
+    shape: &ReduceShape,
+) -> Result<Resolved, Unresolved> {
+    let producer = shape.reducer.definition.clone();
+    let mut pages = Pages::new(source);
+    match ReducePlan::new(record.reduce_items, shape).root() {
+        ReduceRoot::Empty => Err(Unresolved::Malformed),
+        ReduceRoot::Initial => Ok(Resolved::Value { producer, bytes: initial_bytes(source, record, shape).await? }),
+        ReduceRoot::Item(index) if takes_pages(record) => page_item(source, &mut pages, record, index).await,
+        ReduceRoot::Item(index) => Ok(Resolved::Value { producer, bytes: own_item(source, &mut pages, id, index).await? }),
+        ReduceRoot::Step(step) => {
+            let page = u32::try_from(step / PAGE_ENTRIES).map_err(|_| Unresolved::Malformed)?;
+            let entry = pages.entry(id, page, step).await?;
+            resolving_entry(source, id, &entry).await
+        }
+    }
 }
 
 fn step_of(record: &CompositeRecord) -> Result<Step, Unresolved> {
