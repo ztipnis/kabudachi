@@ -504,6 +504,12 @@ def flow(*stages: Any) -> Flow:
     if not stages:
         raise ValueError("a flow needs at least one stage")
     steps = _steps("flow", stages)
+    if isinstance(steps[0], ReduceStep):
+        raise TypeError(
+            f"{steps[0].definition.name}.reduce cannot be the first stage of a flow: "
+            f"give it its items with {steps[0].definition.name}.reduce(items), "
+            "or put it after a stage that returns a list"
+        )
     for before, after in zip(steps, steps[1:]):
         produced = before.output_type
         if produced is None:

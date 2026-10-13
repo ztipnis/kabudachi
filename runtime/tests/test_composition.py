@@ -805,12 +805,21 @@ def test_groups_whose_members_fail_alike_are_each_given_their_own_member_error()
     assert (error_early.who, error_late.who) == ("early", "late")
 
 
-def test_a_map_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_takes():
-    def numbers_of(request: Greeting) -> list[Receipt]:
-        return [Receipt(ok=True)]
+@pytest.mark.parametrize(("stage", "consumer"), [("map", "upper"), ("reduce", "chain_concat")])
+def test_a_map_or_reduce_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_takes(stage, consumer):
+    def numbers_of(text: str) -> list[int]:
+        return [1]
 
-    with pytest.raises(TaskDefinitionError, match="shout"):
-        flow(declare(numbers_of), declare(shout).map)
+    def not_a_list(text: str) -> str:
+        return text
+
+    world = reducing_world(numbers_of, not_a_list, upper, chain_concat)
+    step = getattr(world.tasks[consumer], stage)
+
+    with pytest.raises(TaskDefinitionError, match=consumer):
+        flow(world.tasks["numbers_of"], step)
+    with pytest.raises(TaskDefinitionError, match=consumer):
+        flow(world.tasks["not_a_list"], step)
 
 
 # --- backpressure -------------------------------------------------------
@@ -1778,7 +1787,7 @@ def test_async_reducers_fold_a_chain_and_a_tree_whose_merge_is_synchronous():
     assert levels == [0, 0, 0, 1, 2], "three chunks of two, two and one, then two combines"
 
 
-def test_a_reduce_seeded_with_an_initial_value_longer_than_a_record_reads_it_back_in_a_chain_and_in_every_chunk_of_a_tree():
+def test_a_reduce_seeded_with_an_initial_value_longer_than_an_inline_value_reads_it_back_in_a_chain_and_in_every_chunk_of_a_tree():
     world = reducing_world(
         chain_concat, count_letters, count_letters={"tree": True, "merge": add_counts}
     )
@@ -1871,11 +1880,8 @@ def test_a_list_larger_than_one_record_reduces_in_order_whether_it_is_given_or_r
     assert len(reduces) == 2 and len(world.runtime.members_sent) >= 4, "each list went in more than one batch"
 
 
-def test_a_reduce_stage_must_follow_a_stage_that_returns_a_list_of_its_items_and_names_its_requirement_with_its_serializer():
-    world = reducing_world(split_words, chain_concat, upper)
-    concat = world.tasks["chain_concat"].reduce
+def test_a_reduce_cannot_be_the_first_stage_of_a_flow_and_says_how_to_give_it_items():
+    world = reducing_world(chain_concat)
 
-    assert concat.input_requirements() == [("tests.chain_concat", list[str], "pickle")]
-    flow(world.tasks["split_words"], concat)
-    with pytest.raises(TaskDefinitionError, match="upper"):
-        flow(world.tasks["upper"], concat)
+    with pytest.raises(TypeError, match=r"chain_concat.*first stage.*reduce\(items\)"):
+        flow(world.tasks["chain_concat"].reduce)
