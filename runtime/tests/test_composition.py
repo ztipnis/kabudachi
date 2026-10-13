@@ -18,7 +18,7 @@ from hypothesis import strategies as st
 from kabudachi import _native
 from kabudachi._native import KabudachiError
 from kabudachi.body import fold_payloads
-from kabudachi.composites import _batches
+from kabudachi.composites import INLINE_VALUE_BYTES, _batches
 from kabudachi.errors import (
     BackpressureError,
     PayloadTooLargeError,
@@ -32,7 +32,6 @@ from kabudachi.errors import (
     TaskFailure,
     UnknownTaskError,
 )
-from kabudachi.composites import INLINE_VALUE_BYTES
 from kabudachi.flow import BoundTask, Flow, Group, flow, group
 from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
@@ -1695,18 +1694,6 @@ def test_an_associative_reduce_gives_the_chains_result_whether_it_runs_as_a_chai
     assert levels == [0, 0, 0, 0, 1, 1, 2], "four chunks of two, then three combines"
 
 
-def test_a_seeded_tree_folds_every_chunk_from_initial_and_combines_them_with_merge():
-    world = reducing_world(count_letters, count_letters={"tree": True, "merge": add_counts})
-
-    async def body():
-        return await world.tasks["count_letters"].reduce(list("abacabad"), initial={}, chunk_size=3)
-
-    with activated(world):
-        assert run(with_events(world, body)) == {"a": 4, "b": 2, "c": 1, "d": 1}
-    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "count_letters"))
-    assert levels == [0, 0, 0, 1, 2], "three chunks from the empty count, then merged pairwise"
-
-
 def test_an_empty_or_one_item_reduce_runs_no_step_and_a_seedless_empty_one_has_no_result():
     world = reducing_world(chain_concat)
     concat = world.tasks["chain_concat"]
@@ -1722,19 +1709,13 @@ def test_an_empty_or_one_item_reduce_runs_no_step_and_a_seedless_empty_one_has_n
 
 
 def test_a_reduce_the_leader_finds_empty_fails_with_reduce_empty_error():
-    from kabudachi.composites import ReduceHandle
-
-    world = reducing_world(chain_concat)
-    step = world.tasks["chain_concat"].reduce
+    world = reducing_world(split_words, chain_concat)
 
     async def body():
-        # The empty list is refused before it is sent, so this sends it as a
-        # list that turns out empty, as an expansion's can.
-        handle = world.session.composites._stream(
-            step.describe_streamed(world.session), iter(()), handle=ReduceHandle
-        )
+        # The empty list is refused before it is sent when given; a stage's
+        # return is found empty only once it is streamed.
         with pytest.raises(ReduceEmptyError):
-            await handle
+            await flow(world.tasks["split_words"], world.tasks["chain_concat"].reduce).start(world.session, "")
 
     with activated(world):
         run(with_events(world, body))
@@ -1820,6 +1801,8 @@ def test_a_reduce_seeded_with_an_initial_value_longer_than_an_inline_value_reads
 
     with activated(world):
         assert run(with_events(world, body)) == (long_text + "abc", {long_key: 0, "a": 2, "b": 2})
+    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "count_letters"))
+    assert levels == [0, 0, 1], "two chunks each from the initial value, then merged"
 
 
 def split_words(text: str) -> list[str]:

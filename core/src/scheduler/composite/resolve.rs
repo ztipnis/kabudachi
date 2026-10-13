@@ -23,10 +23,10 @@ use crate::protocol::ids::{CompositeId, TaskDefinitionId};
 use crate::protocol::messages::Task;
 use crate::protocol::messages::prelude::*;
 
-use super::reduce::item_page;
+use super::reduce::try_item_page;
 use super::{
-    BoundInput, BoundStep, CompositeKind, Operand, PAGE_ENTRIES, ReducePlan, ReduceRoot, ReduceShape, Stage, Step,
-    TaskOptions,
+    BoundInput, BoundStep, CompositeKind, Operand, PAGE_ENTRIES, ReduceNode, ReducePlan, ReduceRoot, ReduceShape,
+    Stage, Step, TaskOptions,
 };
 
 /// Where a reader finds a composite's records and the blobs they name: the
@@ -175,7 +175,10 @@ pub async fn member_input<S: CompositeSource>(source: &S, task: &Task) -> Result
             let owner = BlobOwner::Task(id.member_task(previous - 1));
             match &step.stages[previous as usize - 1] {
                 Stage::Task(before) => (Some(before.definition.clone()), Some(owner)),
-                Stage::Composite(_) => (None, None),
+                // A reduce gives one value, encoded by its reducer.
+                Stage::Composite(before) => {
+                    (before.reduce.as_ref().map(|shape| shape.reducer.definition.clone()), None)
+                }
             }
         }
         _ => (input_producer(&record), input_owner(source, &record).await?),
@@ -258,9 +261,17 @@ pub async fn reduce_operands<S: CompositeSource>(source: &S, task: &Task) -> Res
         .ok_or_else(|| Unresolved::MissingComposite(id.clone()))?;
     let step = step_of(&record)?;
     let shape = step.reduce.as_ref().ok_or(Unresolved::Malformed)?;
+    // A copy of the record from before the reduce was sealed counts fewer
+    // items than the step was planned on: another holder has a newer one.
+    if !record.sealed {
+        return Err(Unresolved::MissingComposite(id));
+    }
     let planned = ReducePlan::new(record.reduce_items, shape)
         .step(task.composite_index)
         .ok_or(Unresolved::Malformed)?;
+    if task.reduce_node.as_ref().map(ReduceNode::from) != Some(planned.node) {
+        return Err(Unresolved::MissingComposite(id));
+    }
     let earlier = task
         .input_manifest
         .as_ref()
@@ -319,9 +330,10 @@ fn resolving_manifest<'a, S: CompositeSource>(
             let bytes = read_result(source, owner, key).await?;
             return Ok(Resolved::Value { producer: producer.clone(), bytes });
         }
-        // A reduce's results are its one value, whatever the page that names it holds.
+        // A reduce's results are its one value (its reader is given the
+        // reducer as the producer), whatever the page that names it holds.
         if let [ManifestEntry::Page { composite, .. }] = manifest.entries()
-            && is_reduce(source, composite).await
+            && producer.is_some()
         {
             return resolving_results(source, composite).await;
         }
@@ -402,15 +414,6 @@ async fn read_result<S: CompositeSource>(source: &S, owner: &BlobOwner, key: &Bl
     source.payload(owner, &manifest).await
 }
 
-/// Whether the composite `id` is a reduce. A composite that cannot be read is
-/// not: reading its pages reports why.
-async fn is_reduce<S: CompositeSource>(source: &S, id: &CompositeId) -> bool {
-    match source.composite(id).await {
-        Some(record) => step_of(&record).is_ok_and(|step| step.reduce.is_some()),
-        None => false,
-    }
-}
-
 /// The pages a reader has fetched in one call, so a step that takes many
 /// items from one page reads that page once.
 struct Pages<'a, S> {
@@ -474,7 +477,8 @@ async fn own_item<S: CompositeSource>(
     id: &CompositeId,
     index: u64,
 ) -> Result<Vec<u8>, Unresolved> {
-    let entry = pages.entry(id, item_page(index), index).await?;
+    let page = try_item_page(index).ok_or(Unresolved::Malformed)?;
+    let entry = pages.entry(id, page, index).await?;
     match entry.outcome.ok_or(Unresolved::Malformed)? {
         composite_entry::Outcome::Item(bytes) => Ok(bytes),
         composite_entry::Outcome::ItemManifest(manifest) => {

@@ -26,8 +26,8 @@ use tokio::task::JoinHandle;
 use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::composite::{
-    PyBytesValue, PyManifest, PyMemberInput, PyReduceOperands, PyResolved, member_batch, refuse_values_past_limit, spill_step,
-    state_name, step_from_tree,
+    PyBytesValue, PyManifest, PyMemberInput, PyReduceOperands, PyResolved, member_batch, refuse_values_past_limit,
+    spill_step, state_name, step_from_tree,
 };
 use crate::door::{Closed, DoorSource, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};

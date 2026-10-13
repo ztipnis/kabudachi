@@ -81,8 +81,8 @@ use tokio::sync::watch;
 use crate::arguments::SubmitArguments;
 use crate::bridge::CLOSED_MESSAGE;
 use crate::composite::{
-    CompositeStatusTuple, PyBytesValue, PyManifest, PyMemberInput, PyReduceOperands, PyResolved, member_batch, record_status,
-    refuse_values_past_limit, spill_step, step_from_tree,
+    CompositeStatusTuple, PyBytesValue, PyManifest, PyMemberInput, PyReduceOperands, PyResolved, member_batch,
+    record_status, refuse_values_past_limit, spill_step, step_from_tree,
 };
 use crate::errors::backpressure_error;
 use crate::health;

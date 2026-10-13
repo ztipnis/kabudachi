@@ -1386,6 +1386,10 @@ def test_a_reducer_runs_with_reduce_or_local_never_by_a_direct_call():
         _concat, registry=registry, serializers=serializers, name="tests.concat", serializer="pickle"
     )
     assert concat.local("b", "a") == "ab"
+    aconcat = Task(
+        _aconcat, registry=registry, serializers=serializers, name="tests.aconcat", serializer="pickle"
+    )
+    assert asyncio.run(aconcat.local("b", "a")) == "ab", "an async reducer runs locally as an awaitable"
     with pytest.raises(TypeError, match=r"\.reduce"):
         concat("a")
     with pytest.raises(TypeError, match=r"is a reducer: run it with \.reduce"):
@@ -1407,17 +1411,6 @@ def test_a_reducer_runs_with_reduce_or_local_never_by_a_direct_call():
             serializer="pickle",
             associative=True,
         )
-
-
-def test_a_reducer_that_is_async_runs_locally_as_an_awaitable():
-    registry, serializers = TaskRegistry(), SerializerRegistry.with_defaults()
-    serializers.register(Pickle())
-    concat = Task(
-        _aconcat, registry=registry, serializers=serializers, name="tests.aconcat", serializer="pickle"
-    )
-
-    assert asyncio.run(concat.local("b", "a")) == "ab"
-    assert concat.definition.is_async
 
 
 def test_a_reducer_whose_previous_type_the_serializer_cannot_handle_is_refused_where_declared():

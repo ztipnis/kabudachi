@@ -30,7 +30,7 @@ pub struct ReduceShape {
     pub tree: bool,
     /// Items per tree chunk, at least 1 for a tree; unused by a chain.
     pub chunk_size: u32,
-    /// The result before any item is folded: `Value` or `Chunked` (blobs the reduce owns). `None`: the
+    /// The result before any item is folded: `Value` or `Chunked` (blobs the root of the reduce's tree owns). `None`: the
     /// first item is.
     pub initial: Option<BoundInput>,
 }
@@ -350,9 +350,15 @@ impl ReducePlan {
     }
 }
 
-/// The page of a reduce that holds its item `index`.
+/// The page of a reduce that holds its item `index`, a page the leader has
+/// room for.
 pub(super) fn item_page(index: u64) -> u32 {
-    ITEM_PAGES + u32::try_from(index / PAGE_ENTRIES).expect("item pages stay below 2^31")
+    try_item_page(index).expect("item pages stay below 2^31")
+}
+
+/// [`item_page`] for an index a reader was given, which may be past any page.
+pub(super) fn try_item_page(index: u64) -> Option<u32> {
+    u32::try_from(index / PAGE_ENTRIES).ok().and_then(|page| ITEM_PAGES.checked_add(page))
 }
 
 impl ReduceItem {

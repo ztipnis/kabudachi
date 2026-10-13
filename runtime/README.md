@@ -339,11 +339,10 @@ a flow's earlier stage returns empty it fails the reduce, so awaiting it raises 
 `ReduceEmptyError` is also a `TypeError`, as in `functools.reduce`.
 
 A list of any size is sent to the shard in batches, as a map's items are, so it may be larger than one
-record or one message: an item or an `initial` too long to be stored inline is stored as a blob that
-the reduce owns, and the reducer reads it back whole. As with `group` and `map`, the batches pause
-while memory use is past `memory_soft_limit`, and the reduce fails with `BackpressureError` if a batch
-would pass `memory_hard_limit`. A step must return a value: a reducer that returns a step fails the
-reduce with `ReducerContinuedError`.
+record or one message: an item or an `initial` too long to be stored inline is stored as blobs that
+the root of the reduce's tree owns, and the reducer reads it back whole. Memory limits apply as
+they do to maps (see "Large groups and maps"). A step must return a value: a reducer that returns a
+step fails the reduce with `ReducerContinuedError`.
 
 ## Coalescing and backpressure
 
