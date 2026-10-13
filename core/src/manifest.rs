@@ -49,6 +49,7 @@ pub fn input_digest(task: &generated::Task) -> Digest {
     }
 }
 
+/// An error a body raised, as a list of outcomes carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     /// The error's type name.
@@ -56,6 +57,7 @@ pub struct Failure {
     pub message: String,
 }
 
+/// One part of a manifest: a blob of a cut payload, or one outcome of a list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEntry {
     Blob(BlobKey),
@@ -65,6 +67,8 @@ pub enum ManifestEntry {
     Page { composite: CompositeId, page: u32 },
 }
 
+/// A payload cut into blobs, or a list of outcomes, and the bytes it stands
+/// for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     entries: Vec<ManifestEntry>,
@@ -107,6 +111,7 @@ pub enum InvalidManifest {
 }
 
 impl Manifest {
+    /// A manifest of `entries`, standing for `total_bytes`.
     pub fn new(entries: Vec<ManifestEntry>, total_bytes: u64) -> Manifest {
         Manifest { entries, total_bytes }
     }

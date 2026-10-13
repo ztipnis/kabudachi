@@ -554,7 +554,10 @@ impl<'n> Executing<'n> {
                 // body started (its claim could not be read, or its input
                 // fetched) is reported started first. A cancelled run was
                 // ended by the leader already, and is reported as it is.
-                if !held.started.contains(&run) && !held.cancelled.contains(&run) && held.handed.contains_key(&run) {
+                if !held.started.contains(&run)
+                    && !held.cancelled.contains(&run)
+                    && held.handed.contains_key(&run)
+                {
                     self.queue(task_request::Request::Started(ReportStarted {
                         task_run_id: Some(run.clone().into()),
                     }));

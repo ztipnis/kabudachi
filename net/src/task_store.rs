@@ -15,6 +15,7 @@
 //! the store has room for it.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -89,6 +90,11 @@ impl HeldRecords {
     /// The blobs `owner` holds here, with their bytes.
     pub fn blobs_of(&self, owner: &BlobOwner) -> Vec<(BlobKey, Vec<u8>)> {
         self.lock().blobs_of(owner)
+    }
+
+    /// The blobs `owner` stored as results, among those it holds here.
+    pub(crate) fn results_of(&self, owner: &BlobOwner) -> BTreeSet<BlobKey> {
+        self.lock().results_of(owner)
     }
 
     /// Each owner whose record a leader moved to other holders since the last

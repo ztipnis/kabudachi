@@ -113,9 +113,12 @@ enum Fetched {
     Unavailable,
 }
 
-/// `event`, with a delivered manifest's blobs joined into its payload once
-/// this process has room for it. The payload stops counting in flight when
-/// it is handed on to the session.
+/// `event`, with a delivered manifest's blobs joined into its payload. The
+/// payload counts in flight while it is fetched, and stops when it is handed
+/// on to the session. It is counted, not waited for: a body of this process
+/// that awaits this very result is holding its own input's bytes, which stay
+/// counted until it ends, and a reader waiting for room past them would wait
+/// for ever. Only a result alone past the hard limit is refused.
 async fn with_payload(net: &Net, event: ResultEvent) -> Fetched {
     let ResultEvent::Delivered {
         task,
@@ -132,7 +135,7 @@ async fn with_payload(net: &Net, event: ResultEvent) -> Fetched {
     if manifest.check_cut_payload().is_err() {
         return Fetched::Unavailable;
     }
-    let Ok(_in_flight) = net.payload_memory().take_when_room(manifest.total_bytes()).await else {
+    let Ok(_in_flight) = net.payload_memory().take_anyway(manifest.total_bytes()) else {
         return Fetched::TooLarge { task, run };
     };
     let owner = BlobOwner::Task(task.clone());

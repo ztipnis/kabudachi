@@ -223,6 +223,8 @@ fn drop_oldest_outcomes() {
         running: bool,
         submission: Submission,
         accepted: bool,
+        /// Whether the refusal is for good, the payload alone past the hard limit.
+        never_fits: bool,
         memory: u64,
         /// How many older payloads the next claim folds, when it is checked.
         folded: Option<usize>,
@@ -234,6 +236,7 @@ fn drop_oldest_outcomes() {
             running: false,
             submission: generation(90, "k"),
             accepted: false,
+            never_fits: false,
             memory: 180,
             folded: Some(1),
         },
@@ -243,6 +246,7 @@ fn drop_oldest_outcomes() {
             running: false,
             submission: generation(180, "k").with_drop_oldest(),
             accepted: true,
+            never_fits: false,
             memory: 180,
             folded: Some(0),
         },
@@ -252,6 +256,7 @@ fn drop_oldest_outcomes() {
             running: false,
             submission: generation(201, "k").with_drop_oldest(),
             accepted: false,
+            never_fits: true,
             memory: 120,
             folded: None,
         },
@@ -261,6 +266,7 @@ fn drop_oldest_outcomes() {
             running: false,
             submission: generation(50, "mine").with_drop_oldest(),
             accepted: false,
+            never_fits: false,
             memory: 190,
             folded: None,
         },
@@ -270,6 +276,7 @@ fn drop_oldest_outcomes() {
             running: true,
             submission: generation(60, "k").with_drop_oldest(),
             accepted: false,
+            never_fits: false,
             memory: 150,
             folded: None,
         },
@@ -288,6 +295,12 @@ fn drop_oldest_outcomes() {
         let outcome = fixture.scheduler.submit(row.submission);
 
         assert_eq!(outcome.is_ok(), row.accepted, "{}", row.what);
+        assert_eq!(
+            matches!(outcome, Err(SubmitRejection::PayloadTooLarge { .. })),
+            row.never_fits,
+            "{}",
+            row.what
+        );
         assert_eq!(fixture.scheduler.memory_in_use(), row.memory, "{}", row.what);
         if let Some(folded) = row.folded {
             let claim = fixture

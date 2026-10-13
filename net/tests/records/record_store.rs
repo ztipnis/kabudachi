@@ -10,7 +10,7 @@ use kabudachi_core::protocol::generated::{self, Task, TaskRecord};
 use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::task_record::{MAX_RECORD_BYTES, RecordVersion, Write};
 use kabudachi_core::task_record::PriorPlacement;
-use kabudachi_net::messenger::{Net, PlacedWrite};
+use kabudachi_net::messenger::{Net, PlacedWrite, RecordLookup};
 use kabudachi_net::task_store::{HeldRecords, TaskRecordStore, record_key};
 use libp2p::kad::store::RecordStore;
 use libp2p::kad::{Record, RecordKey};
@@ -160,6 +160,13 @@ async fn lookup(reader: &Net, task: &str) -> Option<TaskRecord> {
         .expect("the lookup ended within the timeout")
 }
 
+/// What `reader` makes of looking `task` up, with a miss told apart.
+async fn missing(reader: &Net, task: &str) -> RecordLookup {
+    timeout(TEST_TIMEOUT, reader.find_record(TaskId::new(task)))
+        .await
+        .expect("the lookup ended within the timeout")
+}
+
 fn queue_of(found: Option<TaskRecord>) -> Option<String> {
     found.and_then(|record| record.task).map(|task| task.queue)
 }
@@ -178,6 +185,12 @@ async fn a_lookup_finds_the_newest_revision_among_the_peers_and_the_reader_itsel
         assert!(write_one(&reader, record("task-1", version(0, 0, 2, 0), "new"), &[&fresh_id], 1).await);
         assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("new"));
         assert_eq!(lookup(&reader, "task-2").await, None, "no one holds task-2");
+
+        // A miss is "held nowhere" only when every peer the reader knows
+        // answered; a reader that knows no peer cannot say.
+        assert_eq!(missing(&reader, "task-2").await, RecordLookup::NotFound);
+        let alone = Net::for_shard(shard("shard-1").name(), None);
+        assert_eq!(missing(&alone, "task-2").await, RecordLookup::Unanswered);
 
         // The reader's own copy counts: a newer revision only it holds.
         let (reader, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;

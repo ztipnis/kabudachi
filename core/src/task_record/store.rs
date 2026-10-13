@@ -366,10 +366,12 @@ impl VersionedRecords {
     /// owner's grace, passes, if any.
     pub fn next_due(&self) -> Option<Instant> {
         let records = self.retention.and_then(|retention| {
-            self.records.values().filter_map(|held| held.finished_since).min().map(|since| since + retention)
+            let finished = self.records.values().filter_map(|held| held.finished_since);
+            finished.min().map(|since| since + retention)
         });
         let blobs = self.orphan_grace.and_then(|grace| {
-            self.blob_owners.values().filter(|of| !of.seen && of.finished).map(|of| of.since + grace).min()
+            let finished_elsewhere = self.blob_owners.values().filter(|of| !of.seen && of.finished);
+            finished_elsewhere.map(|of| of.since + grace).min()
         });
         records.into_iter().chain(blobs).min()
     }
@@ -552,6 +554,11 @@ impl VersionedRecords {
             .collect()
     }
 
+    /// The blobs `owner` stored as results, among those it holds here.
+    pub fn results_of(&self, owner: &BlobOwner) -> BTreeSet<BlobKey> {
+        self.blob_owners.get(owner).map(|of| of.results.clone()).unwrap_or_default()
+    }
+
     /// `owner` lets go of its blobs at once: a blob no other owner holds is
     /// dropped.
     pub fn forget_blobs_of(&mut self, owner: &BlobOwner) {
@@ -580,13 +587,24 @@ impl VersionedRecords {
                 continue;
             };
             held.owners.remove(owner);
-            if held.owners.is_empty()
-                && let Some(gone) = self.blobs.remove(&key)
-            {
-                let len = gone.value.len() as u64;
+            let len = held.value.len() as u64;
+            if held.owners.is_empty() {
+                let was_result = held.result;
+                self.blobs.remove(&key);
                 self.blob_bytes -= len;
-                if !gone.result {
+                if !was_result {
                     self.input_bytes -= len;
+                }
+            } else if held.result {
+                // A blob stays a result only while some owner left holds it
+                // as one; otherwise it counts against the inputs again.
+                let stored_as_result = held.owners.iter().any(|other| {
+                    let of = self.blob_owners.get(other);
+                    of.is_some_and(|of| of.results.contains(&key))
+                });
+                if !stored_as_result {
+                    held.result = false;
+                    self.input_bytes += len;
                 }
             }
         }

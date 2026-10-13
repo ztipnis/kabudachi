@@ -187,6 +187,17 @@ message PlacedKey {
   repeated WorkerId holders = 2;
   // How many of them must store a copy.
   uint32 quorum = 3;
+  // Where the record is really placed when the asker is a voter among the
+  // nearest to the task: `holders` leaves the asker out, so this names the
+  // placement with it in, and the quorum of that. Absent when the asker is not
+  // among the holders, where `holders` is the real placement. A writer of
+  // blobs stores them there, and keeps its own copy only then.
+  PlacedWithAsker with_asker = 4;
+}
+
+message PlacedWithAsker {
+  repeated WorkerId holders = 1;
+  uint32 quorum = 2;
 }
 
 message RecordPlacements {

@@ -19,7 +19,7 @@ use kabudachi_core::task_record::{Placement, RecordVersion};
 use kabudachi_core::time::RealClock;
 use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::messenger::{Net, PutBlobError};
-use kabudachi_net::task_exchange::{LeaderRetry, NotStored, placement_of};
+use kabudachi_net::task_exchange::{LeaderRetry, NotStored, placement_with_asker_of};
 use kabudachi_net::task_store::placement::ReplicationFactor;
 use kabudachi_net::task_store::{TaskRecordStore, record_key};
 use libp2p::PeerId;
@@ -103,13 +103,18 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
         .await
         .expect("the write ended within the timeout");
         assert_eq!(stored, Ok(Digest::blake3(&chunk)));
-        for holder in [&first, &second, &writer] {
+        for holder in [&first, &second] {
             assert_eq!(
                 holder.held_records().blob(&key).map(|record| record.value),
                 Some(chunk.clone()),
-                "each holder, and the writer itself, keeps a copy"
+                "each holder keeps a copy"
             );
         }
+        assert_eq!(
+            writer.held_records().blob(&key),
+            None,
+            "a writer outside the placement keeps none: it would never be told the owner's record"
+        );
 
         // The owner's record names the holders. The outsider belongs to another
         // shard, so its kad lookup reaches no holder of this one: only the
@@ -192,14 +197,30 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
             Err(PutBlobError::NotStored)
         );
 
-        // A writer whose own store has no room is told so, and no holder had
-        // stored the blob by then.
+        // A writer that is one of the holders keeps its own copy, which
+        // counts towards the quorum: one more holder is enough for two.
+        let among = Placement {
+            holders: vec![writer.local_worker_id(), first.local_worker_id()],
+            quorum: 2,
+        };
+        let mine = b"a blob its writer holds".to_vec();
+        writer
+            .put_blob(owned_by("task-3"), mine.clone(), among.clone())
+            .await
+            .expect("stored");
+        assert_eq!(
+            writer.held_records().blob(&BlobKey::of(&mine)).map(|record| record.value),
+            Some(mine)
+        );
+
+        // A holder whose own store has no room is told so, and no other holder
+        // had stored the blob by then.
         let held_by_writer = writer.held_records();
         held_by_writer.set_blob_store_limit(Some(held_by_writer.blob_bytes()));
         let refused = b"no room for this one".to_vec();
         assert_eq!(
             writer
-                .put_blob(owned_by("task-1"), refused.clone(), placement.clone())
+                .put_blob(owned_by("task-1"), refused.clone(), among)
                 .await,
             Err(PutBlobError::StoreFull)
         );
@@ -242,7 +263,7 @@ async fn submitted_as_blobs(
         .place_records(leader.clone(), vec![task.clone()])
         .await
         .expect("answered");
-    let placement = placement_of(&placed, &task).expect("the leader places the task");
+    let placement = placement_with_asker_of(&placed, &task).expect("the leader places the task");
     let manifest = client
         .store_payload(BlobRole::Input, &task, input, placement)
         .await
@@ -308,8 +329,11 @@ async fn new_input_stored(submitter: &Net) -> Result<Manifest, NotStored> {
         answer_within: Duration::from_secs(2),
         ask_again_after: Duration::from_millis(50),
     };
+    // Bytes no holder has a chunk of already: a holder keeps a chunk it holds
+    // for one more owner at no cost, however full it is.
+    let unheld: Vec<u8> = (0..MIB).map(|at| (at % 241) as u8).collect();
     submitter
-        .store_payload_at_leader(BlobRole::Input, &crowded, &varied(MIB), quick)
+        .store_payload_at_leader(BlobRole::Input, &crowded, &unheld, quick)
         .await
 }
 
@@ -341,6 +365,10 @@ async fn a_large_input_reaches_its_claimant_and_a_drained_holder_hands_its_blobs
                 let manifest = submitted_as_blobs(&client, &leader_id, minted, &input).await;
                 let owner = BlobOwner::Task(task.clone());
                 let keys: Vec<BlobKey> = manifest.blob_keys().cloned().collect();
+                assert!(
+                    keys.iter().all(|key| client.held_records().blob(key).is_none()),
+                    "a submitter outside the placement keeps none of the blobs it stored"
+                );
 
                 // A voter other than the leader holds every blob: it drains
                 // below, and some other voter claims.
@@ -491,6 +519,12 @@ async fn a_tasks_input_leaves_every_holder_when_it_finishes_and_follows_its_reco
                     .await
                     .expect("a result is stored where a new input is refused");
                 let result_keys: Vec<BlobKey> = stored.blob_keys().cloned().collect();
+                // The writer holds the result exactly when it is among the
+                // holders of the task's record, where it would be told it.
+                let holds_record = nets[claimant].held_records().get(&finished).is_some();
+                for key in &result_keys {
+                    assert_eq!(nets[claimant].held_records().blob(key).is_some(), holds_record);
+                }
                 for net in &stores {
                     net.held_records().set_blob_store_limit(None);
                 }
@@ -557,10 +591,10 @@ async fn a_tasks_input_leaves_every_holder_when_it_finishes_and_follows_its_reco
                 })
                 .await;
 
-                // A survivor that holds none of it reads the input whole.
-                let reader = shard_other_than(&[leader, dead], nets.len());
+                // The submitter, which holds none of it, reads the input whole.
+                assert!(keys.iter().all(|key| client.held_records().blob(key).is_none()));
                 assert_eq!(
-                    nets[reader].resolve_manifest(&BlobOwner::Task(task.clone()), &manifest).await,
+                    client.resolve_manifest(&BlobOwner::Task(task.clone()), &manifest).await,
                     Ok(input.clone())
                 );
             })

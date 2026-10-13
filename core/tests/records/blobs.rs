@@ -335,6 +335,25 @@ fn a_holder_keeps_a_blob_under_its_own_digest_while_its_owner_is_unfinished_and_
     held.sweep(at(2 * GRACE));
     assert!(held.blob(&result_key).is_none());
 
+    // A blob one owner stored as a result and another as an input is a
+    // result for the first alone, and only while it holds it: once it lets
+    // go, the blob counts against the inputs' share again.
+    let mut held = store().with_blob_store_limit(Some(40));
+    held.put_blob(&result_key, BlobRecord { result: true, ..owned_by("t8", result) }, at(0))
+        .unwrap();
+    held.put_blob(&result_key, owned_by("t9", result), at(0)).unwrap();
+    assert!(held.results_of(&task("t8")).contains(&result_key));
+    assert!(held.results_of(&task("t9")).is_empty());
+    assert!(held.blob(&result_key).unwrap().result);
+    held.forget_blobs_of(&task("t8"));
+    assert!(!held.blob(&result_key).unwrap().result);
+    let nine = b"123456789";
+    assert_eq!(
+        held.put_blob(&BlobKey::of(nine), owned_by("t9", nine), at(0)),
+        Err(BlobRefusal::StoreFull),
+        "the blob counts against the inputs again"
+    );
+
     // An input is still on its way when its owner's finish is seen: it is
     // not kept.
     let mut held = store();

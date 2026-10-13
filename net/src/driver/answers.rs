@@ -223,13 +223,8 @@ fn place_answer<C: Clock, I: IdGenerator>(
     if !deciding.scheduler.is_leader() {
         return task_exchange::not_leader();
     }
-    let voters: Vec<WorkerId> = deciding
-        .node
-        .placeable_voters()
-        .into_iter()
-        .filter(|voter| voter != asker)
-        .collect();
-    task_exchange::placements(place, &voters, deciding.factor)
+    let voters = deciding.node.placeable_voters();
+    task_exchange::placements(place, asker, &voters, deciding.factor)
 }
 
 /// Answers every inbound `/kabudachi/reconcile/1` request queued on `net`

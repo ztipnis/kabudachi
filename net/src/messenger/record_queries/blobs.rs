@@ -2,12 +2,13 @@
 //! placement, and the kad lookup that is the last resort of a blob fetch.
 
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 
 use kabudachi_core::blob::{BlobKey, BlobRecord};
 use kabudachi_core::protocol::generated;
 use kabudachi_core::task_record::Placement;
 use libp2p::kad::store::RecordStore as _;
-use libp2p::{Swarm, kad};
+use libp2p::{PeerId, Swarm, kad};
 use prost::Message as _;
 use tokio::sync::oneshot;
 
@@ -17,9 +18,11 @@ use crate::swarm::Behaviour;
 
 impl RecordQueries {
     /// Starts one blob write (see `Net::put_blob`): this worker's own copy
-    /// first, then the other holders over the records protocol, at the quorum
-    /// still missing. A store with no room for this worker's own copy ends it
-    /// at once, with nothing sent.
+    /// first if it is one of the holders, then the other holders over the
+    /// records protocol, at the quorum still missing. A worker that is no
+    /// holder keeps no copy: nothing would ever tell it the owner's record.
+    /// A store with no room for a holder's own copy ends it at once, with
+    /// nothing sent.
     pub(in crate::messenger) fn start_blob_put(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
@@ -35,12 +38,20 @@ impl RecordQueries {
         };
         let record_key = kad::RecordKey::new(&key.record_key());
         let value = generated::BlobRecord::from(record).encode_to_vec();
-        let stored_here = records.store_mut().put(kad::Record::new(record_key.clone(), value.clone()));
-        if stored_here.is_err() {
+        let holds_here = placement
+            .holders
+            .iter()
+            .any(|holder| PeerId::from_str(holder.as_str()).is_ok_and(|peer| peer == local));
+        if holds_here
+            && records
+                .store_mut()
+                .put(kad::Record::new(record_key.clone(), value.clone()))
+                .is_err()
+        {
             let _ = respond_to.send(Err(PutBlobError::StoreFull));
             return;
         }
-        let (remote, acked) = split_holders(&placement.holders, local, true);
+        let (remote, acked) = split_holders(&placement.holders, local, holds_here);
         let needed = placement.quorum.saturating_sub(acked);
         if needed == 0 {
             let _ = respond_to.send(Ok(()));

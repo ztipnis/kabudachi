@@ -43,8 +43,8 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, QueryOutcome, RecordPlacements,
-    ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, StartAccepted,
+    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome,
+    RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, StartAccepted,
     SubmitAccepted, SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse,
     task_request, task_response,
 };
@@ -511,11 +511,11 @@ impl Net {
 
     /// Stores `payload` as blobs in `role`, owned by the task `owner`, where
     /// the shard's leader would place the task's record, and returns their
-    /// manifest. The
-    /// leader is asked as [`Self::submit_to_leader`] asks it. A placement
-    /// leaves this worker out (see `PlaceRecords`), and [`Self::put_blob`]
-    /// keeps a copy here besides, so the blobs reach a quorum of the
-    /// record's placement whether or not this worker is in it. A write that
+    /// manifest. The leader is asked as [`Self::submit_to_leader`] asks it.
+    /// The placement is the record's real one (see
+    /// [`placement_with_asker_of`]), so this worker keeps a copy of the blobs
+    /// only if it is one of the holders, where its own copy counts towards
+    /// their quorum and its record arrives to keep them. A write that
     /// fails is made again, to a placement asked afresh, after
     /// `retry.ask_again_after`. `LeftShard` once the worker has left its
     /// shard; `Refused` once [`STORE_ATTEMPTS`] placements in a row answered
@@ -557,7 +557,7 @@ impl Net {
         )
         .await;
         Ok(match asked {
-            Ok(Ok(response)) => placement_of(&response, task),
+            Ok(Ok(response)) => placement_with_asker_of(&response, task),
             _ => None,
         })
     }
@@ -618,8 +618,8 @@ impl Net {
     }
 }
 
-/// Where `response`, a leader's answer to `PlaceRecords`, places `task`.
-pub fn placement_of(response: &TaskResponse, task: &TaskId) -> Option<Placement> {
+/// The answer `response`, a leader's answer to `PlaceRecords`, gives for `task`.
+fn placed_key<'a>(response: &'a TaskResponse, task: &TaskId) -> Option<&'a PlacedKey> {
     let Some(task_response::Result::Placements(answer)) = &response.result else {
         return None;
     };
@@ -627,10 +627,30 @@ pub fn placement_of(response: &TaskResponse, task: &TaskId) -> Option<Placement>
         .placements
         .iter()
         .find(|placed| placed.task_id.as_ref().is_some_and(|id| id.value == task.as_str()))
-        .map(|placed| Placement {
-            holders: placed.holders.iter().cloned().map(WorkerId::from).collect(),
-            quorum: usize::try_from(placed.quorum).unwrap_or(usize::MAX),
-        })
+}
+
+/// Where `response`, a leader's answer to `PlaceRecords`, places `task`, the
+/// asker left out.
+pub fn placement_of(response: &TaskResponse, task: &TaskId) -> Option<Placement> {
+    placed_key(response, task).map(|placed| Placement {
+        holders: placed.holders.iter().cloned().map(WorkerId::from).collect(),
+        quorum: usize::try_from(placed.quorum).unwrap_or(usize::MAX),
+    })
+}
+
+/// Where `response` places `task`'s record for a writer of its blobs: the real
+/// placement, which names the asker itself when it is among the nearest
+/// voters, and otherwise is [`placement_of`]. The asker then stores its own
+/// copy, as one of the holders, and no other writer keeps one.
+pub fn placement_with_asker_of(response: &TaskResponse, task: &TaskId) -> Option<Placement> {
+    let placed = placed_key(response, task)?;
+    Some(match &placed.with_asker {
+        Some(real) => Placement {
+            holders: real.holders.iter().cloned().map(WorkerId::from).collect(),
+            quorum: usize::try_from(real.quorum).unwrap_or(usize::MAX),
+        },
+        None => placement_of(response, task)?,
+    })
 }
 
 /// The leader's answer to `request` from `from`, as `scheduler` decides it.
@@ -802,30 +822,44 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
     run.clone().map(TaskRunId::from)
 }
 
-/// The leader's answer to `request`: where each task it names would be placed
-/// among `voters`, the voters it can place records on other than the asker,
-/// `factor` of them for each. A task that could not be placed (no voter, or a
-/// voter that is no peer) is left out. Not gated on the writes of any
-/// decision: it decides nothing. A request that names too many tasks, or one
-/// without its id, is malformed.
+/// The leader's answer to `request` from `asker`: where each task it names
+/// would be placed among the voters it can place records on other than the
+/// asker, `factor` of them for each. `voters` are all the voters it can place
+/// records on, the asker among them if it is one; when the asker would be
+/// among the nearest to a task, the answer also names the placement with it in
+/// (see [`placement_with_asker_of`]). A task that could not be placed (no
+/// voter, or a voter that is no peer) is left out. Not gated on the writes of
+/// any decision: it decides nothing. A request that names too many tasks, or
+/// one without its id, is malformed.
 pub(crate) fn placements(
     request: &PlaceRecords,
+    asker: &WorkerId,
     voters: &[WorkerId],
     factor: ReplicationFactor,
 ) -> TaskResponse {
     if request.task_ids.len() > MAX_PLACE_IDS {
         return wire::reject(TaskRejectReason::TaskRejectMalformed);
     }
+    let others: Vec<WorkerId> = voters.iter().filter(|voter| *voter != asker).cloned().collect();
     let placed = request
         .task_ids
         .iter()
         .filter_map(|task| {
             let task = TaskId::from(task.clone());
-            let Placement { holders, quorum } = placement(&task, voters, factor)?;
+            let Placement { holders, quorum } = placement(&task, &others, factor)?;
+            let with_asker = (others.len() < voters.len())
+                .then(|| placement(&task, voters, factor))
+                .flatten()
+                .filter(|real| real.holders.contains(asker))
+                .map(|real| PlacedWithAsker {
+                    holders: real.holders.into_iter().map(Into::into).collect(),
+                    quorum: u32::try_from(real.quorum).unwrap_or(u32::MAX),
+                });
             Some(PlacedKey {
                 task_id: Some(task.into()),
                 holders: holders.into_iter().map(Into::into).collect(),
                 quorum: u32::try_from(quorum).unwrap_or(u32::MAX),
+                with_asker,
             })
         })
         .collect();

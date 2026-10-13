@@ -303,7 +303,7 @@ enum Command {
     /// See `Net::get_record`.
     GetRecord {
         task: TaskId,
-        respond_to: oneshot::Sender<Option<TaskRecord>>,
+        respond_to: oneshot::Sender<RecordLookup>,
     },
     /// Runs an ask or an answer of one correlated protocol on the swarm
     /// task, which alone owns the swarm and its [`Exchanges`]; see
@@ -332,6 +332,22 @@ enum Command {
         key: BlobKey,
         respond_to: oneshot::Sender<Option<Vec<u8>>>,
     },
+}
+
+/// What a lookup of a task's record across the shard (see
+/// [`Net::find_record`]) came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordLookup {
+    /// The newest revision any holder returned.
+    Found(TaskRecord),
+    /// Every peer this worker knows answered, and none holds the record: it
+    /// is held nowhere in the shard.
+    NotFound,
+    /// The lookup could not say: it timed out, this worker knows no peer
+    /// yet, it knows more peers than one lookup asks, some peer did not
+    /// answer, this `Net` stores no shard's records, or the swarm task has
+    /// stopped.
+    Unanswered,
 }
 
 /// Why a blob was not stored.
@@ -1213,13 +1229,24 @@ impl Net {
     /// one holds the record, this `Net` stores no shard's records
     /// ([`Self::new`]), or the swarm task has stopped.
     pub async fn get_record(&self, task: TaskId) -> Option<TaskRecord> {
+        match self.find_record(task).await {
+            RecordLookup::Found(record) => Some(record),
+            RecordLookup::NotFound | RecordLookup::Unanswered => None,
+        }
+    }
+
+    /// Like [`Self::get_record`], but says whether a miss is because the
+    /// record is held nowhere ([`RecordLookup::NotFound`]) or because the
+    /// lookup could not tell ([`RecordLookup::Unanswered`]).
+    pub async fn find_record(&self, task: TaskId) -> RecordLookup {
         get_record_through(&self.commands, task).await
     }
 
-    /// Stores `bytes` as a blob owned by `owner`, in this worker's own store
-    /// and at `placement.quorum` of `placement.holders`. This worker's copy
-    /// counts towards the quorum when it is one of the holders, and is kept
-    /// either way. Resolves with the blob's digest once the quorum has
+    /// Stores `bytes` as a blob owned by `owner`, at `placement.quorum` of
+    /// `placement.holders`. This worker's own copy counts towards the quorum
+    /// when it is one of the holders, and is kept only then: a worker outside
+    /// the placement is never told the owner's record, so a copy there would
+    /// sit unclaimed. Resolves with the blob's digest once the quorum has
     /// stored it.
     pub async fn put_blob(
         &self,
@@ -1424,10 +1451,15 @@ impl Net {
 
 /// Looks `task`'s record up across the shard through the swarm task (see
 /// [`Net::get_record`]).
-async fn get_record_through(commands: &mpsc::UnboundedSender<Command>, task: TaskId) -> Option<TaskRecord> {
+async fn get_record_through(
+    commands: &mpsc::UnboundedSender<Command>,
+    task: TaskId,
+) -> RecordLookup {
     let (respond_to, answer) = oneshot::channel();
-    commands.send(Command::GetRecord { task, respond_to }).ok()?;
-    answer.await.ok().flatten()
+    if commands.send(Command::GetRecord { task, respond_to }).is_err() {
+        return RecordLookup::Unanswered;
+    }
+    answer.await.unwrap_or(RecordLookup::Unanswered)
 }
 
 /// Keeps the blobs `held` holds where their owners need them, until the swarm
@@ -1440,8 +1472,9 @@ async fn get_record_through(commands: &mpsc::UnboundedSender<Command>, task: Tas
 ///   puts are idempotent.
 /// - An owner never seen here whose grace has passed: its record is looked up
 ///   across the shard, and the store told whether it is unfinished, finished
-///   or gone. A composite owner is reported unfinished: its record cannot be
-///   looked up yet.
+///   or gone. Only a lookup that every peer this worker knows answered, none
+///   holding the record, finds it gone; one that could not say is reported
+///   unfinished, like a composite owner, whose record cannot be looked up yet.
 async fn tend_blobs(commands: mpsc::UnboundedSender<Command>, held: HeldRecords) {
     let mut moving: BTreeMap<BlobOwner, Vec<WorkerId>> = BTreeMap::new();
     let mut ticks = tokio::time::interval(BLOB_TENDING_INTERVAL);
@@ -1456,8 +1489,9 @@ async fn tend_blobs(commands: mpsc::UnboundedSender<Command>, held: HeldRecords)
         for (owner, holders) in std::mem::take(&mut moving) {
             let placement = Placement { quorum: holders.len() / 2 + 1, holders: holders.clone() };
             let mut stored = true;
+            let results = held.results_of(&owner);
             for (key, value) in held.blobs_of(&owner) {
-                let result = held.blob(&key).is_some_and(|blob| blob.result);
+                let result = results.contains(&key);
                 stored &= put_blob_through(&commands, owner.clone(), value, placement.clone(), result)
                     .await
                     .is_ok();
@@ -1470,9 +1504,11 @@ async fn tend_blobs(commands: mpsc::UnboundedSender<Command>, held: HeldRecords)
         for owner in held.owners_to_check() {
             let state = match &owner {
                 BlobOwner::Task(task) => match get_record_through(&commands, task.clone()).await {
-                    None => OwnerState::Gone,
-                    Some(record) if record.finished => OwnerState::Finished,
-                    Some(_) => OwnerState::Unfinished,
+                    RecordLookup::NotFound => OwnerState::Gone,
+                    RecordLookup::Found(record) if record.finished => OwnerState::Finished,
+                    // A lookup that could not say keeps the blobs, to be
+                    // asked about again a grace later.
+                    RecordLookup::Found(_) | RecordLookup::Unanswered => OwnerState::Unfinished,
                 },
                 BlobOwner::Composite(_) => OwnerState::Unfinished,
             };

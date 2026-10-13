@@ -109,8 +109,11 @@ def carried_as_blobs(cluster, leader):
     # back to the follower as chunks owned by the task.
     follower = next(worker for worker in cluster.workers if worker is not leader)
     big = ("0123456789" * (3 * 1024 * 1024 // 10 + 1))[: 3 * 1024 * 1024]
-    # Three in a row: the in-flight share of a worker is 8 MiB, so a run that
-    # leaves its input counted on any path makes the third be refused.
+    # Three in a row: the in-flight share of a worker is 8,000,000 bytes, so
+    # the submitter, which counts each input while it stores it, refuses the
+    # third if the first two stayed counted. This guards the submitter's side
+    # alone: the claimants of the three runs may be different workers, so a
+    # claimant that leaves a run's input counted is not caught here.
     for _ in range(3):
         echoed = follower.submit("echo", text=big)
         certified_once(cluster, echoed, digest_of(echo, Greeting(text=big)))

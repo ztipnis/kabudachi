@@ -18,7 +18,7 @@ use prost::Message as _;
 use tokio::sync::oneshot;
 
 use self::blobs::BlobRead;
-use super::{HandOffWrite, Inbound, PutBlobError};
+use super::{HandOffWrite, Inbound, PutBlobError, RecordLookup};
 use crate::swarm::Behaviour;
 use crate::task_store::record_key;
 
@@ -151,27 +151,29 @@ impl RecordQueries {
     }
 
     /// Starts a lookup of `task`'s record, answered with the newest revision
-    /// any holder returns; at once with none when this `Net` stores no
+    /// any holder returns; at once unanswered when this `Net` stores no
     /// shard's records.
     pub(super) fn start_read(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
         task: TaskId,
-        respond_to: oneshot::Sender<Option<TaskRecord>>,
+        respond_to: oneshot::Sender<RecordLookup>,
     ) {
         match swarm.behaviour_mut().records.as_mut() {
             Some(records) => {
+                let known = records.kbuckets().map(|bucket| bucket.num_entries()).sum();
                 let query = records.get_record(record_key(&task));
                 self.reads.insert(
                     query,
                     Read {
                         best: None,
+                        known,
                         respond_to,
                     },
                 );
             }
             None => {
-                let _ = respond_to.send(None);
+                let _ = respond_to.send(RecordLookup::Unanswered);
             }
         }
     }
@@ -265,7 +267,7 @@ impl RecordQueries {
         if step.last
             && let Some(read) = self.reads.remove(&id)
         {
-            read.finish();
+            read.finish(result);
         }
         if step.last
             && let Some(read) = self.blob_reads.remove(&id)
@@ -333,7 +335,9 @@ struct UnfinishedWrite {
 struct Read {
     /// The newest answer so far, with its version.
     best: Option<(RecordVersion, TaskRecord)>,
-    respond_to: oneshot::Sender<Option<TaskRecord>>,
+    /// The peers in this worker's routing table when the lookup started.
+    known: usize,
+    respond_to: oneshot::Sender<RecordLookup>,
 }
 
 impl Read {
@@ -354,9 +358,25 @@ impl Read {
         }
     }
 
-    /// Ends the lookup with the best answer, to a caller who may have
-    /// stopped waiting.
-    fn finish(self) {
-        let _ = self.respond_to.send(self.best.map(|(_, record)| record));
+    /// Ends the lookup, whose last step came to `last`, with the best answer,
+    /// to a caller who may have stopped waiting. A lookup that found nothing
+    /// says the record is held nowhere only if it asked every peer this
+    /// worker knew and each answered: a timeout, an empty routing table, a
+    /// shard with more peers than one lookup asks and a peer that did not
+    /// answer all leave it unanswered, for a holder may be among those not
+    /// asked.
+    fn finish(self, last: &kad::GetRecordResult) {
+        let lookup = match self.best {
+            Some((_, record)) => RecordLookup::Found(record),
+            None => match last {
+                Err(kad::GetRecordError::NotFound { closest_peers, .. })
+                    if self.known > 0 && closest_peers.len() >= self.known =>
+                {
+                    RecordLookup::NotFound
+                }
+                _ => RecordLookup::Unanswered,
+            },
+        };
+        let _ = self.respond_to.send(lookup);
     }
 }
