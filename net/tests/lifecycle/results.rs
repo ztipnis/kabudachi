@@ -191,6 +191,25 @@ impl Delivering {
         taken
     }
 
+    /// Waits until the leader has settled the run's Started report: a
+    /// majority holds the task running, and the leader has heard enough
+    /// acknowledgements to answer for the task, which it holds back while a
+    /// write of the task is unacknowledged. A leader cut off before then has
+    /// its write refused, and the run's reports queue behind it for good.
+    async fn settled_running(&mut self, task: &TaskId) {
+        let nets = self.shard.nets.clone();
+        let stored = task.clone();
+        self.shard
+            .drive_until(poll_until("a majority stored the run running", || {
+                holding(&nets, &stored, &[TaskRunState::Running]) >= 2
+            }))
+            .await;
+        let leader = self.shard.id(self.leader);
+        self.shard
+            .drive_until(outcome_of(&self.client, &leader, task))
+            .await;
+    }
+
     async fn next_events(&mut self, task: &TaskId) -> Vec<ResultEvent> {
         self.shard
             .drive_until(events_about(&self.client, task, 1))
@@ -324,13 +343,9 @@ async fn a_task_that_ends_without_a_result_is_concluded(at: &mut Delivering) {
 async fn a_run_is_not_certified_before_a_majority_stores_it(at: &mut Delivering) {
     at.runner = at.leader;
     let (task, run) = at.started(plain_with(b"unstored")).await;
+    at.settled_running(&task).await;
     let nets = at.shard.nets.clone();
     let stored = task.clone();
-    at.shard
-        .drive_until(poll_until("a majority stored the run running", || {
-            holding(&nets, &stored, &[TaskRunState::Running]) >= 2
-        }))
-        .await;
     let leader_id = at.shard.id(at.leader);
     for follower in at.shard.others(at.leader) {
         nets[at.leader].block_peer(at.shard.id(follower));
@@ -373,13 +388,7 @@ async fn results_reach_their_client_and_the_leader_tells_it_how_each_task_ended(
 /// A run whose result was delivered, running once a majority stored it so.
 async fn a_running_run_whose_result_was_delivered(at: &mut Delivering) -> (TaskId, TaskRunId) {
     let (task, run) = at.started(plain_with(b"adopted")).await;
-    let nets = at.shard.nets.clone();
-    let stored = task.clone();
-    at.shard
-        .drive_until(poll_until("the leader stored the run running", || {
-            holding(&nets, &stored, &[TaskRunState::Running]) >= 2
-        }))
-        .await;
+    at.settled_running(&task).await;
     assert_eq!(
         at.delivered(&task, &run).await,
         delivered_event(&task, &run)
