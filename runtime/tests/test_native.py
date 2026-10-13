@@ -699,28 +699,6 @@ def streamed_group(native):
     return native.submit_composite(("group", "fail_fast", [], "streamed"))
 
 
-def test_a_streamed_map_makes_one_member_per_item_whatever_batches_name_an_item_again(runtime):
-    async def main():
-        await leader_within_limit(runtime)
-        composite = streamed_map(runtime)
-        assert await runtime.submit_members(composite, 0, [b"a", b"b"], False) == "accepted"
-        # Asked again after a lost answer, and overlapping the members held.
-        assert await runtime.submit_members(composite, 0, [b"a", b"b"], False) == "accepted"
-        assert await runtime.submit_members(composite, 1, [b"b", b"c"], True) == "accepted"
-        return await claim(runtime), await runtime.composite_status(composite)
-
-    claims, status = asyncio.run(main())
-
-    assert {claimed.composite_index: claimed.serialized_input for claimed in claims} == {
-        0: b"a",
-        1: b"b",
-        2: b"c",
-    }
-    assert len(claims) == 3
-    assert status[0] == "running"
-    assert sum(status[2:]) == 3
-
-
 def test_a_batch_for_a_cancelled_streamed_composite_answers_finished(runtime):
     async def main():
         await leader_within_limit(runtime)

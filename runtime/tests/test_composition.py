@@ -884,29 +884,6 @@ async def with_watcher_only(world, body):
         await asyncio.gather(events, return_exceptions=True)
 
 
-def test_a_streamed_group_pauses_its_batches_while_slow_down_is_raised_but_a_plain_call_does_not():
-    world, released = held_world(shout, member_batch_items=1)
-    members = group(*([world.tasks["shout"]] * 3))
-
-    async def body():
-        holder = world.call("hold", PAST_SOFT_LIMIT)
-        await until_slow_down_seen(world)
-        handle = members.start(world.session, Greeting(text="a"))
-        await asyncio.sleep(0.05)
-        during = members_sent(world)
-        plain = await world.call("shout", Greeting(text="plain"))
-        released.set()  # the held input finishes, which clears SlowDown
-        results = await asyncio.wait_for(handle, WAIT)
-        await holder
-        return during, plain, results
-
-    during, plain, results = run(with_events(world, body))
-
-    assert during == 0, "no batch went while SlowDown was raised"
-    assert plain == Greeting(text="PLAIN"), "a plain call does not wait"
-    assert results == [Greeting(text="A")] * 3
-
-
 @pytest.mark.parametrize(
     ("end", "error"),
     [
@@ -1014,7 +991,7 @@ def test_members_are_batched_by_count_and_by_bytes_with_an_oversized_member_alon
     assert batches == expected
 
 
-def test_a_streamed_group_pauses_when_slow_down_is_raised_while_it_is_still_sending():
+def test_a_streamed_group_pauses_when_slow_down_is_raised_while_it_is_still_sending_but_a_plain_call_does_not():
     world, released = held_world(shout, concurrency=8, member_batch_items=1)
     members = group(*([world.tasks["hold"]] * 40))
 
@@ -1024,14 +1001,16 @@ def test_a_streamed_group_pauses_when_slow_down_is_raised_while_it_is_still_send
         paused_at = members_sent(world)
         await asyncio.sleep(0.05)
         while_slow = members_sent(world)
+        plain = await world.call("shout", Greeting(text="plain"))
         released.set()  # the held members finish, which clears SlowDown
         await asyncio.wait_for(handle, WAIT)
-        return paused_at, while_slow, members_sent(world)
+        return paused_at, while_slow, plain, members_sent(world)
 
-    paused_at, while_slow, after = run(with_events(world, body))
+    paused_at, while_slow, plain, after = run(with_events(world, body))
 
     assert while_slow == paused_at, "the group kept sending past the soft limit"
     assert paused_at < 40
+    assert plain == Greeting(text="PLAIN"), "a plain call does not wait"
     assert after == 40
 
 

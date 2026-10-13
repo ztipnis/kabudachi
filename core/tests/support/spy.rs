@@ -27,9 +27,6 @@ struct Log {
     /// when `newest_only`.
     slots: BTreeMap<(u8, String, u32), usize>,
     page_revisions: BTreeMap<(String, u32), usize>,
-    /// How many Task revisions were published in all, counting every one
-    /// even when `newest_only` keeps just the newest of each Task.
-    task_revisions: usize,
 }
 
 impl Log {
@@ -40,10 +37,7 @@ impl Log {
 
     fn record(&mut self, record: ShardRecord) {
         let key = match &record {
-            ShardRecord::Task(record) => {
-                self.task_revisions += 1;
-                (0, record_task(record).task_id().as_str().to_string(), 0)
-            }
+            ShardRecord::Task(record) => (0, record_task(record).task_id().as_str().to_string(), 0),
             ShardRecord::Composite(record) => (1, composite_key(record.composite_id.as_ref()), 0),
             ShardRecord::Page(page) => {
                 let id = composite_key(page.composite_id.as_ref());
@@ -88,8 +82,8 @@ impl PublishedRevisions for Spy {
 
 impl Spy {
     /// A spy that keeps only the newest revision of each Task record,
-    /// composite record and page (and still counts every page revision and
-    /// every Task revision), so a 100k-member test holds one record per key,
+    /// composite record and page (and still counts every page revision), so
+    /// a 100k-member test holds one record per key,
     /// not every revision. What reads the log as a history (`mark`,
     /// `published_since`, `revised_since`) has no meaning then and panics.
     pub fn newest_only() -> Spy {
@@ -166,11 +160,6 @@ impl Spy {
             }
             _ => None,
         })
-    }
-
-    /// How many Task revisions were published in all, of every Task.
-    pub fn task_revision_total(&self) -> usize {
-        self.0.borrow().task_revisions
     }
 
     /// How many revisions of page `index` of the composite `id` were published.

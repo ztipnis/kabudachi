@@ -13,7 +13,7 @@ use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::generated::{self, Task, TaskRecord, manifest_entry};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::task_record::{
-    BlobRefusal, Origin, OwnerState, RecordVersion, VersionedRecords,
+    BlobRefusal, Origin, OwnerState, RecordKey, RecordVersion, VersionedRecords,
 };
 use kabudachi_core::time::{Duration, Instant};
 
@@ -415,9 +415,8 @@ fn a_holder_keeps_a_blob_under_its_own_digest_while_its_owner_is_unfinished_and_
 
 /// A store holding `held` finished tasks, the first finished at tick 0 and
 /// each next one tick later, every one with a result blob of its own, none of
-/// them yet due; then the time `extra` further unfinished tasks, each with a
-/// blob, take to be put.
-fn time_puts_into_a_store_holding(held: u64, extra: u64) -> (VersionedRecords, std::time::Duration) {
+/// them yet due.
+fn store_holding(held: u64) -> VersionedRecords {
     let mut store = VersionedRecords::with_retention(Some(Duration::from_ticks(RETENTION_TICKS)));
     for n in 0..held {
         let name = format!("held-{n}");
@@ -426,39 +425,103 @@ fn time_puts_into_a_store_holding(held: u64, extra: u64) -> (VersionedRecords, s
         store.put_blob(&BlobKey::of(&value), record, at(n)).unwrap();
         store.put(task_record(&name, 1, &[], true), at(n)).unwrap();
     }
+    store
+}
+
+/// The time `extra` unfinished tasks, each with a blob and named from
+/// `round`, take to be put into `store`.
+fn time_puts(store: &mut VersionedRecords, round: u64, extra: u64, now: u64) -> std::time::Duration {
     let started = std::time::Instant::now();
     for n in 0..extra {
-        let name = format!("new-{n}");
+        let name = format!("new-{round}-{n}");
         let value = name.clone().into_bytes();
-        store.put_blob(&BlobKey::of(&value), owned_by(&name, &value), at(held)).unwrap();
-        store.put(task_record(&name, 1, &[], false), at(held)).unwrap();
+        store.put_blob(&BlobKey::of(&value), owned_by(&name, &value), at(now)).unwrap();
+        store.put(task_record(&name, 1, &[], false), at(now)).unwrap();
     }
-    (store, started.elapsed())
+    started.elapsed()
 }
 
 const RETENTION_TICKS: u64 = 1_000_000;
 
 #[test]
 fn putting_into_a_store_holding_many_unexpired_records_costs_no_more_than_into_a_small_one() {
-    let (_, small) = time_puts_into_a_store_holding(1_000, 500);
-    let (mut big, large) = time_puts_into_a_store_holding(64_000, 500);
+    const SMALL: u64 = 1_000;
+    const LARGE: u64 = 64_000;
+    let mut small = store_holding(SMALL);
+    let mut big = store_holding(LARGE);
+    // Each size is timed three times and the fastest taken, so a stall of a
+    // loaded host in one run does not decide it.
+    let fastest = |store: &mut VersionedRecords, held: u64| {
+        (0..3).map(|round| time_puts(store, round, 500, held)).min().unwrap()
+    };
+    let (small_time, large_time) = (fastest(&mut small, SMALL), fastest(&mut big, LARGE));
     // Work that rescanned every held record and blob on each put would cost
     // sixty-four times as much here, seconds, where this allows a few times.
     assert!(
-        large < small * 8 + std::time::Duration::from_millis(100),
-        "500 puts took {small:?} beside 1000 records and {large:?} beside 64000"
+        large_time < small_time * 8 + std::time::Duration::from_millis(100),
+        "500 puts took {small_time:?} beside 1000 records and {large_time:?} beside 64000"
     );
 
     // Expiry still drops exactly the records that are due, with their blobs:
     // the first ten were finished at ticks 0 to 9.
-    assert_eq!(big.len(), 64_000 + 500);
-    assert_eq!(big.blobs().len(), 64_000 + 500);
+    assert_eq!(big.len(), 64_000 + 1_500);
+    assert_eq!(big.blobs().len(), 64_000 + 1_500);
     assert_eq!(big.sweep(at(RETENTION_TICKS + 9)), 10 + 10);
-    assert_eq!(big.len(), 64_000 + 500 - 10);
-    assert_eq!(big.blobs().len(), 64_000 + 500 - 10);
+    assert_eq!(big.len(), 64_000 + 1_500 - 10);
+    assert_eq!(big.blobs().len(), 64_000 + 1_500 - 10);
     assert!(big.get(&TaskId::new("held-9")).is_none());
     assert!(big.get(&TaskId::new("held-10")).is_some());
     assert_eq!(big.next_due(), Some(at(RETENTION_TICKS + 10)));
     assert!(big.blobs_of(&task("held-9")).is_empty());
     assert_eq!(big.blobs_of(&task("held-10")).len(), 1);
+}
+
+#[test]
+fn blobs_leave_with_a_removed_record_and_expiry_and_grace_are_timed_from_the_right_moment() {
+    const RETENTION: u64 = 100;
+    const GRACE: u64 = 1000;
+    let store = || {
+        VersionedRecords::with_retention(Some(Duration::from_ticks(RETENTION)))
+            .with_orphan_blob_grace(Duration::from_ticks(GRACE))
+            .held_by(WorkerId::new("a"))
+    };
+    let chunk = b"chunk";
+    let key = BlobKey::of(chunk);
+
+    // A record taken out of the store takes its owner's blobs at the next sweep.
+    let mut held = store();
+    held.put_blob(&key, owned_by("t1", chunk), at(0)).unwrap();
+    held.put(task_record("t1", 1, &["a"], false), at(0)).unwrap();
+    assert!(held.remove(&RecordKey::Task(TaskId::new("t1"))).is_some());
+    held.sweep(at(1));
+    assert!(held.blob(&key).is_none());
+
+    // A later revision of a finished record does not restart its retention.
+    let mut held = store();
+    held.put(task_record("t2", 1, &["a"], true), at(0)).unwrap();
+    held.put(task_record("t2", 2, &["a"], true), at(50)).unwrap();
+    assert_eq!(held.next_due(), Some(at(RETENTION)));
+    assert_eq!(held.sweep(at(RETENTION)), 1);
+    assert!(held.get(&TaskId::new("t2")).is_none());
+
+    // An owner never seen here, found finished twice, is let go a grace after
+    // the second answer; had its record arrived first, it would be kept.
+    let result = BlobRecord { result: true, ..owned_by("t3", chunk) };
+    let mut held = store();
+    held.put_blob(&key, result.clone(), at(0)).unwrap();
+    held.owner_checked(&task("t3"), OwnerState::Finished, at(GRACE));
+    held.owner_checked(&task("t3"), OwnerState::Finished, at(2 * GRACE));
+    assert_eq!(held.next_due(), Some(at(3 * GRACE)));
+    held.sweep(at(3 * GRACE - 1));
+    assert!(held.blob(&key).is_some());
+    held.sweep(at(3 * GRACE));
+    assert!(held.blob(&key).is_none());
+
+    let mut held = store();
+    held.put_blob(&key, result, at(0)).unwrap();
+    held.owner_checked(&task("t3"), OwnerState::Finished, at(GRACE));
+    held.put(task_record("t3", 1, &["a"], false), at(GRACE)).unwrap();
+    assert_eq!(held.next_due(), None, "its record is here now, so no grace runs");
+    held.sweep(at(10 * GRACE));
+    assert!(held.blob(&key).is_some());
 }
