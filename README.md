@@ -3067,7 +3067,7 @@ Open: no net-level burst test of a large map's completion. Wanted: 300 members c
 
 Open: `owners_to_check` (`core/src/task_record/store.rs`) still scans every blob owner on each call, and `tend_blobs` calls it once a second per worker. Fix: index the unseen, unfinished owners by `since`, so a call reads only those due. Exposure: every worker with many blob owners, which a large streamed map or many blob-carrying submissions produce. Impact: moderate, a per-second scan whose cost grows with the owners held.
 
-Open: while a takeover has records not known yet, every member that settles in a composite re-checks all its members for an uncertain record (`holds_composite_back`), so settling a large composite costs its member count each time until the records are known. Exposure: a leader change while a map of many thousand members runs, until reconciliation learns the late records. Impact: high at scale, not moderate: for a map of about a million members the quadratic work during a takeover or reconcile window could run long enough to stall the leader.
+Open: while a takeover has records not known yet, every member that settles in a composite re-checks its members for an uncertain record (`holds_composite_back`). The scan walks all the members (`0..members`) only while reconciliation still has unknown records, so in that worst case settling a large composite costs its member count each time until the records are known. Exposure: a leader change while a map of many thousand members runs, until reconciliation learns the late records. Impact: high at scale, not moderate: for a map of about a million members the quadratic work during a takeover or reconcile window could run long enough to stall the leader.
 
 ### Phase 7: observability
 

@@ -173,13 +173,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         for index in 0..stages {
             self.settle_from_record(id, index);
         }
-        self.settle_members_nothing_names(id);
         if self.composites.held[id].step.expands() && !self.composites.held[id].sealed {
             self.resume_expansion(id);
             if self.composites.held[id].state != CompositeState::Running {
                 return;
             }
         }
+        // After the expansion is resumed: it may be what seals the composite,
+        // and only a sealed composite has members nothing will send again.
+        self.settle_members_nothing_names(id);
         let composite = &self.composites.held[id];
         if let Some(failure) = composite.first_failure_it_fails_on() {
             self.finish_composite(id, CompositeState::Failed, Some(failure));
