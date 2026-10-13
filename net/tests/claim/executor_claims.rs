@@ -271,6 +271,7 @@ async fn members_report_their_free_places_and_a_runs_trace_context_and_failure_m
                     .filter(|record| {
                         record.runs.first().is_some_and(|run| {
                             run.failure_message == "card declined"
+                                && run.failure_kind == "ValueError"
                                 && run.claimed_at.is_some()
                                 && run.started_at.is_some_and(|started| {
                                     started.unix_millis >= run.claimed_at.unwrap().unix_millis
@@ -293,6 +294,16 @@ async fn members_report_their_free_places_and_a_runs_trace_context_and_failure_m
             shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
         }
         assert_eq!(after, Some(1), "the claim took one of the follower's two places");
+        // It stays at one across several heartbeat periods: the run it holds
+        // is counted once, whatever the claim is doing, so the figure never
+        // dips while the claim and its report are in flight.
+        let mut sampled = Vec::new();
+        for _ in 0..30 {
+            let seen = shard.with(leader, |node, _| node.member_capacities()).await;
+            sampled.push(seen.get(&follower_id).copied());
+            shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
+        }
+        assert_eq!(sampled, vec![Some(1); 30], "the follower's free places never dipped");
     })
     .await;
 }

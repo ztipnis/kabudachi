@@ -14,11 +14,10 @@
 //! Per run, in order: `Started` once the body runs (a compaction run sends
 //! none), then exactly one of `Completed` (with the digest of its result, and
 //! whether the result reached the task's client first), `Failed` (with the
-//! error's type name and message), `Lost` (the process running it died or was killed at
-//! an abort deadline, so no outcome is known), or, for a compaction run,
-//! `Compacted` (the fold). The driver takes each report to
-//! the leader in that order, asking again as leaders change, until one takes
-//! it. An executor may report `Failed` with no `Started`, for a run whose body
+//! error's type name and message), `Lost` (the process running it died or was
+//! killed at an abort deadline, so no outcome is known), or, for a compaction
+//! run, `Compacted` (the fold). The driver takes each report to the leader in
+//! that order, asking again as leaders change, until one takes it. An executor may report `Failed` with no `Started`, for a run whose body
 //! never started; the driver reports it started first, since a leader fails
 //! only a running run.
 //!
