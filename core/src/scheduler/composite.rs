@@ -22,8 +22,10 @@ mod drive;
 mod held;
 mod records;
 mod recover;
+mod resolve;
 
 pub(in crate::scheduler) use held::Composites;
+pub use resolve::{CompositeSource, MemberInput, Resolved, Unresolved, member_input, resolve_manifest, results};
 
 /// How many member outcomes one page of a composite holds.
 pub const PAGE_ENTRIES: u64 = 1024;
@@ -308,10 +310,16 @@ impl Step {
         Step::try_from(&description)
     }
 
+    /// The step as the bytes of its description. The same step always
+    /// encodes the same bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        generated::StepDescription::from(self).encode_to_vec()
+    }
+
     /// The BLAKE3 digest of the step's encoding: what a returning run's
     /// result digest is when the step is its continuation.
     pub fn digest(&self) -> Digest {
-        Digest::blake3(&generated::StepDescription::from(self).encode_to_vec())
+        Digest::blake3(&self.encode())
     }
 
     /// Whether the step needs an input from whatever runs before it: its

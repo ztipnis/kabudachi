@@ -608,7 +608,7 @@ impl VersionedRecords {
 
     /// `owner`, whose record is finished, lets go of the blobs it stored as
     /// inputs at once; those it stored as results stay with its record.
-    fn forget_inputs_of(&mut self, owner: &BlobOwner) {
+    pub fn forget_inputs_of(&mut self, owner: &BlobOwner) {
         let Some(of) = self.blob_owners.get_mut(owner) else {
             return;
         };

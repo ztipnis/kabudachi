@@ -370,6 +370,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.runs.get(run_id)
     }
 
+    /// The Task `run_id` is a run of; `None` if the run is unknown or its
+    /// task has been forgotten.
+    pub fn task_of_run(&self, run_id: &TaskRunId) -> Option<&Task> {
+        self.tasks.get(&self.runs.get(run_id)?.task_id())
+    }
+
     /// Every run of `task_id`, oldest attempt first; empty if the task is
     /// unknown or has been forgotten.
     pub fn runs_of(&self, task_id: &TaskId) -> Vec<TaskRunId> {

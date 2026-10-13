@@ -52,6 +52,17 @@ impl<C: Clock> LocalRecords<C> {
     /// unless its submission is refused or dropped, and then
     /// [`Self::forget_blobs_of`] is called.
     pub fn put_blobs(&mut self, owner: &BlobOwner, chunks: Vec<Vec<u8>>) {
+        self.put(owner, chunks, false);
+    }
+
+    /// [`Self::put_blobs`] for the blobs of a run's result: they stay with
+    /// the owner's record when it finishes, where an owner's inputs go at
+    /// once.
+    pub fn put_result_blobs(&mut self, owner: &BlobOwner, chunks: Vec<Vec<u8>>) {
+        self.put(owner, chunks, true);
+    }
+
+    fn put(&mut self, owner: &BlobOwner, chunks: Vec<Vec<u8>>, result: bool) {
         let now = self.clock.now();
         for chunk in chunks {
             let key = BlobKey::of(&chunk);
@@ -59,7 +70,7 @@ impl<C: Clock> LocalRecords<C> {
                 value: chunk,
                 owner: owner.clone(),
                 placement: vec![self.worker.clone()],
-                result: false,
+                result,
             };
             self.records
                 .put_blob(&key, record, now)
@@ -75,6 +86,12 @@ impl<C: Clock> LocalRecords<C> {
     /// The `owner` that will never run: its blobs are dropped.
     pub fn forget_blobs_of(&mut self, owner: &BlobOwner) {
         self.records.forget_blobs_of(owner);
+    }
+
+    /// The `owner` that is over: the blobs it stored as inputs are dropped,
+    /// and those it stored as results stay until its record is forgotten.
+    pub fn forget_input_blobs_of(&mut self, owner: &BlobOwner) {
+        self.records.forget_inputs_of(owner);
     }
 
     /// Each write since the last call, and whether the store kept it.

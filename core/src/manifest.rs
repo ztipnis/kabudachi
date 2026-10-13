@@ -16,6 +16,11 @@ use crate::scheduler::MAX_SUBMISSION_BYTES;
 /// How large each blob of a cut payload is; the last may be shorter.
 pub const BLOB_CHUNK_BYTES: usize = 256 * 1024;
 
+/// The largest result that stands in its manifest whole, as one inline entry.
+/// A larger one is cut into blobs. Half a blob, so the encoded manifest is
+/// always a blob itself.
+pub const INLINE_RESULT_BYTES: usize = BLOB_CHUNK_BYTES / 2;
+
 /// What a message keeps beside an inline payload: its queue, definition id,
 /// coalescing key and framing.
 const INLINE_HEADROOM_BYTES: u64 = 64 * 1024;
@@ -108,6 +113,8 @@ pub enum InvalidManifest {
     PageWithoutComposite,
     #[error("a manifest of {blobs} blobs names {total_bytes} bytes, which they cannot hold")]
     TotalBytesOutOfRange { blobs: usize, total_bytes: u64 },
+    #[error("the bytes are not an encoded manifest")]
+    Undecodable,
 }
 
 impl Manifest {
@@ -127,6 +134,34 @@ impl Manifest {
             },
             chunks,
         }
+    }
+
+    /// The manifest of a run's result: the result as one inline entry when it
+    /// is small, else cut into blobs as [`Self::chunk`] does, with the bytes
+    /// of the blobs to store (none when it is inline). Either way the encoded
+    /// manifest is a blob itself, which a reader fetches first.
+    pub fn of_result(payload: &[u8]) -> Chunked {
+        if payload.len() <= INLINE_RESULT_BYTES {
+            return Chunked {
+                manifest: Manifest {
+                    entries: vec![ManifestEntry::Inline(payload.to_vec())],
+                    total_bytes: payload.len() as u64,
+                },
+                chunks: Vec::new(),
+            };
+        }
+        Manifest::chunk(payload)
+    }
+
+    /// The manifest as the bytes a blob holds.
+    pub fn encode(&self) -> Vec<u8> {
+        generated::Manifest::from(self.clone()).encode_to_vec()
+    }
+
+    /// The manifest `bytes` encode.
+    pub fn decode(bytes: &[u8]) -> Result<Manifest, InvalidManifest> {
+        let wire = generated::Manifest::decode(bytes).map_err(|_| InvalidManifest::Undecodable)?;
+        Manifest::try_from(&wire)
     }
 
     pub fn entries(&self) -> &[ManifestEntry] {
@@ -168,7 +203,7 @@ impl Manifest {
     /// The BLAKE3 digest of the manifest's encoding: the same for every
     /// worker, since the encoding of a message with no maps is fixed.
     pub fn digest(&self) -> Digest {
-        Digest::blake3(&generated::Manifest::from(self.clone()).encode_to_vec())
+        Digest::blake3(&self.encode())
     }
 
     /// The payload, joined from its entries in order. `blob` looks each blob
