@@ -342,7 +342,10 @@ def test_a_pipeline_whose_leader_is_killed_between_its_stages_ends_as_it_would_h
         eventually("its first stage to start", lambda: first_stage_started_on(cluster, tmp_path))
         leader.kill()
         assert outcome(client, piped) == PIPELINE_OF_A
-        assert states(cluster.record(piped)) == ["SUCCEEDED"], "the body never ran twice"
+        # A slow election (a second term) can outlast the body's worker's abort
+        # deadline, so the new leader replays the body.
+        runs = states(cluster.record(piped))
+        assert runs[-1] == "SUCCEEDED" and set(runs[:-1]) <= {"LOST"}, runs
         # At least once each: a stage in flight when the leader died may be
         # replayed. None commits a result twice.
         assert len(list(tmp_path.glob("shout.*"))) >= 3

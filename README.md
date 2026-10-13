@@ -3055,6 +3055,8 @@ Open: with a replication factor of 2, writes stall while a record's holder is de
 
 Open: `//runtime/tests:test_networked` is intermittent under load in the composite scenarios: a stopped leader's hand-over sometimes outlasts its timeout. It is not shown fixed.
 
+Open: a leader killed between a pipeline's stages can replay the pipeline's body when the election outlasts the abort deadline of the follower running it: the follower aborts the body when it has been out of contact with a leader for too long, and the new leader replays it, so the body's first run is `LOST`. This is the at-least-once guarantee, not a defect, but the test must allow it. Also worth examining: leader failover sometimes needs a second term (the survivors log `no seed answered a round` and then rejoin), which can exceed that deadline.
+
 Open: the docs pass after composites. The description of an implicit flow's lifetime (`Scheduler::end_continuation`, in the sections on coalescing and on leader-change reconciliation) and the exit criterion that says nothing over the network ends a continuation still describe the previous design, in which a worker ended a continuation itself; now the leader derives a continuation from the run that returned the step and ends it with the step. `RemoteResultUnavailableError` is still described as raised by every await on a networked worker, though a flow, group or returned step awaited there now runs on the leader.
 
 ### Phase 7: observability
