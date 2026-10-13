@@ -6,23 +6,29 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::protocol::ids::TaskId;
 use crate::time::Instant;
 
-/// Where tasks wait to be claimed: queued in the order they started waiting,
-/// or scheduled until their delay passes; and, until first claimed, by when
-/// they expire. A task is in exactly one of the queue and the schedule while
-/// it waits, and in the expiries exactly while it waits with an expiry.
+/// Where tasks wait to be claimed: queued, per queue, in the order they
+/// started waiting, or scheduled until their delay passes; and, until first
+/// claimed, by when they expire. A task is in exactly one of the queues and
+/// the schedule while it waits, and in the expiries exactly while it waits
+/// with an expiry.
 #[derive(Debug, Default)]
 pub(super) struct WaitingRoom {
     places: BTreeMap<TaskId, Place>,
-    queue: BTreeMap<u64, TaskId>,
+    /// Per queue name, its queued tasks by ticket, each with when it started
+    /// waiting there. A queue with nothing queued has no entry.
+    queues: BTreeMap<String, BTreeMap<u64, (Instant, TaskId)>>,
     scheduled: BTreeMap<(Instant, u64), TaskId>,
     expiries: BTreeSet<(Instant, TaskId)>,
-    /// Orders the queue, and tasks scheduled for the same instant, by when
+    /// How many tasks the queues hold together.
+    queued: usize,
+    /// Orders each queue, and tasks scheduled for the same instant, by when
     /// they started waiting.
     next_ticket: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Place {
+    queue: String,
     spot: Spot,
     expires_at: Option<Instant>,
 }
@@ -34,11 +40,14 @@ enum Spot {
 }
 
 impl WaitingRoom {
-    /// A new task starts waiting: scheduled until `not_before` if given,
-    /// queued otherwise, and with `expires_at` it expires then unless claimed.
+    /// A new task of `queue` starts waiting at `now`: scheduled until
+    /// `not_before` if given, queued otherwise, and with `expires_at` it
+    /// expires then unless claimed.
     pub(super) fn admit(
         &mut self,
         task: &TaskId,
+        queue: &str,
+        now: Instant,
         not_before: Option<Instant>,
         expires_at: Option<Instant>,
     ) {
@@ -49,14 +58,21 @@ impl WaitingRoom {
                 Spot::Scheduled(due, ticket)
             }
             None => {
-                self.queue.insert(ticket, task.clone());
+                self.enqueue(queue, ticket, now, task);
                 Spot::Queued(ticket)
             }
         };
         if let Some(expires_at) = expires_at {
             self.expiries.insert((expires_at, task.clone()));
         }
-        self.places.insert(task.clone(), Place { spot, expires_at });
+        self.places.insert(
+            task.clone(),
+            Place {
+                queue: queue.to_owned(),
+                spot,
+                expires_at,
+            },
+        );
     }
 
     /// Every task stops waiting.
@@ -64,15 +80,16 @@ impl WaitingRoom {
         *self = WaitingRoom::default();
     }
 
-    /// The next attempt of a task that was claimed (a retry or a replay)
-    /// waits again at the back of the queue, never with an expiry: expiry is
-    /// only about starting.
-    pub(super) fn requeue(&mut self, task: &TaskId) {
+    /// The next attempt of a task of `queue` that was claimed (a retry or a
+    /// replay) waits again from `now` at the back of its queue, never with an
+    /// expiry: expiry is only about starting.
+    pub(super) fn requeue(&mut self, task: &TaskId, queue: &str, now: Instant) {
         let ticket = self.take_ticket();
-        self.queue.insert(ticket, task.clone());
+        self.enqueue(queue, ticket, now, task);
         self.places.insert(
             task.clone(),
             Place {
+                queue: queue.to_owned(),
                 spot: Spot::Queued(ticket),
                 expires_at: None,
             },
@@ -91,9 +108,7 @@ impl WaitingRoom {
             return;
         };
         match place.spot {
-            Spot::Queued(ticket) => {
-                self.queue.remove(&ticket);
-            }
+            Spot::Queued(ticket) => self.dequeue(&place.queue, ticket),
             Spot::Scheduled(due, ticket) => {
                 self.scheduled.remove(&(due, ticket));
             }
@@ -118,9 +133,9 @@ impl WaitingRoom {
         expired
     }
 
-    /// Moves every scheduled task due by `now` to the back of the queue,
-    /// earliest due first (ties in the order they started waiting), and
-    /// returns them.
+    /// Moves every scheduled task due by `now` to the back of its queue,
+    /// waiting from `now`, earliest due first (ties in the order they started
+    /// waiting), and returns them.
     pub(super) fn release_due(&mut self, now: Instant) -> Vec<TaskId> {
         let mut released = Vec::new();
         while let Some(((due, _), _)) = self.scheduled.first_key_value() {
@@ -129,7 +144,8 @@ impl WaitingRoom {
             }
             let (_, task) = self.scheduled.pop_first().expect("just seen");
             let ticket = self.take_ticket();
-            self.queue.insert(ticket, task.clone());
+            let queue = self.places[&task].queue.clone();
+            self.enqueue(&queue, ticket, now, &task);
             self.places
                 .get_mut(&task)
                 .expect("a scheduled task has a place")
@@ -139,17 +155,29 @@ impl WaitingRoom {
         released
     }
 
-    /// Queued tasks after queue position `after`, oldest first, with their
-    /// positions.
-    pub(super) fn queued_after(
+    /// The names of the queues that have tasks queued.
+    pub(super) fn queues(&self) -> impl Iterator<Item = &str> {
+        self.queues.keys().map(String::as_str)
+    }
+
+    pub(super) fn has_queued(&self, queue: &str) -> bool {
+        self.queues.contains_key(queue)
+    }
+
+    /// The oldest task queued in `queue` past ticket `after` if given, with its
+    /// ticket and when it started waiting.
+    pub(super) fn queued_in_after(
         &self,
+        queue: &str,
         after: Option<u64>,
-    ) -> impl Iterator<Item = (u64, &TaskId)> {
-        let rest = match after {
-            Some(position) => self.queue.range(position + 1..),
-            None => self.queue.range(..),
+    ) -> Option<(u64, Instant, TaskId)> {
+        let queued = self.queues.get(queue)?;
+        let mut rest = match after {
+            Some(ticket) => queued.range(ticket + 1..),
+            None => queued.range(..),
         };
-        rest.map(|(position, task)| (*position, task))
+        rest.next()
+            .map(|(ticket, (since, task))| (*ticket, *since, task.clone()))
     }
 
     /// The earliest delay or expiry.
@@ -161,7 +189,27 @@ impl WaitingRoom {
 
     /// How many tasks are queued, which `Scheduler::pending_len` reports.
     pub(super) fn queued_len(&self) -> usize {
-        self.queue.len()
+        self.queued
+    }
+
+    fn enqueue(&mut self, queue: &str, ticket: u64, since: Instant, task: &TaskId) {
+        self.queues
+            .entry(queue.to_owned())
+            .or_default()
+            .insert(ticket, (since, task.clone()));
+        self.queued += 1;
+    }
+
+    fn dequeue(&mut self, queue: &str, ticket: u64) {
+        let Some(queued) = self.queues.get_mut(queue) else {
+            return;
+        };
+        if queued.remove(&ticket).is_some() {
+            self.queued -= 1;
+        }
+        if queued.is_empty() {
+            self.queues.remove(queue);
+        }
     }
 
     fn take_ticket(&mut self) -> u64 {

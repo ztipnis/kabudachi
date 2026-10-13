@@ -24,6 +24,7 @@ use kabudachi_core::protocol::messages::{
     Claim, ClaimBatch, ClaimOldest, ClaimReject, ClaimRejectReason, ClaimRequest, ClaimResponse,
     claim_request, claim_response,
 };
+use kabudachi_core::queues::Subscription;
 use kabudachi_core::scheduler::{self, ClaimRejection, Observer, Scheduler};
 use kabudachi_core::time::Clock;
 use libp2p::PeerId;
@@ -191,7 +192,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, R: Observer>(
             // Every claim the scheduler makes is one `batch` accepted,
             // in the same order, so `batch` already holds the answer.
             scheduler
-                .claim_oldest_fitting(claimant, limit, |claim| batch.try_add(claim))
+                .claim_oldest_fitting(claimant, &Subscription::Every, limit, |claim| batch.try_add(claim))
                 .map(|_| {
                     claim_response::Result::Batch(ClaimBatch {
                         claims: batch.claims,

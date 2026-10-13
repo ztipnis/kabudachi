@@ -7,6 +7,7 @@ pub mod hashing;
 pub mod in_memory_authority;
 pub mod manifest;
 pub mod protocol;
+pub mod queues;
 pub mod reconcile;
 pub mod scheduler;
 pub mod task_record;

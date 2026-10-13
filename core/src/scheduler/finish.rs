@@ -127,7 +127,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .or_default()
             .push(next_id.clone());
         self.runs.insert(next_id.clone(), next);
-        self.waiting.requeue(task_id);
+        let queue = self.tasks[task_id].queue.clone();
+        self.waiting.requeue(task_id, &queue, self.clock.now());
         self.mark_decided(&next_id);
         Some(next_id)
     }

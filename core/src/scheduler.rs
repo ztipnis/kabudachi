@@ -76,6 +76,7 @@ use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun};
 use crate::protocol::records::TaskRunRecord;
+use crate::queues::QueuePolicy;
 use crate::task_record::RecordVersion;
 use crate::time::{Clock, Instant};
 
@@ -85,6 +86,7 @@ mod claims;
 mod compaction;
 mod deadlines;
 mod failures;
+mod fairness;
 mod finish;
 mod leadership;
 mod loss;
@@ -107,6 +109,7 @@ pub use claims::{Claim, ClaimRejection};
 pub use compaction::Compacted;
 pub use deadlines::CaughtUp;
 pub use failures::{Failure, MAX_FAILURE_MESSAGE_BYTES};
+use fairness::Turns;
 use leadership::Leadership;
 pub use leadership::{LeadershipGrant, LeaseEnd};
 pub use loss::LostRun;
@@ -265,6 +268,10 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     failed_compactions: BTreeMap<Key, TaskId>,
     /// Conclusions not yet taken, oldest first.
     conclusions: Vec<Conclusion>,
+    /// How the leader orders and limits each queue (see `crate::queues`).
+    queue_policy: QueuePolicy,
+    /// Each queue's turns in its tier's round (see `fairness::Turns`).
+    turns: Turns,
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
@@ -306,6 +313,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             silent: BTreeMap::new(),
             failed_compactions: BTreeMap::new(),
             conclusions: Vec::new(),
+            queue_policy: QueuePolicy::default(),
+            turns: Turns::default(),
         }
     }
 

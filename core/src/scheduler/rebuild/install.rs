@@ -38,7 +38,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if matches!(state, TaskRunState::Scheduled | TaskRunState::Queued) {
             let (not_before, expires_at) =
                 installed_wait_bounds(&task, state, runs.len() == 1, now, wall_now);
-            self.waiting.admit(&task_id, not_before, expires_at);
+            self.waiting
+                .admit(&task_id, &task.queue, now, not_before, expires_at);
         }
         if finished {
             self.retention.record(&task_id, now);
