@@ -367,7 +367,7 @@ class Session:
 
     def _on_refused(self, event: Any) -> None:
         error: Exception = BackpressureError(
-            f"the leader refused task {event.task_id}: {event.reason}"
+            f"task {event.task_id} was refused: {event.reason}"
         )
         if event.reason == "TASK_REJECT_PAYLOAD_TOO_LARGE":
             error = PayloadTooLargeError(

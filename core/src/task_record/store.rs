@@ -648,7 +648,14 @@ impl VersionedRecords {
             return;
         }
         match state {
-            OwnerState::Gone if self.blob_owners.get(owner).is_some_and(|of| of.gone) => {
+            OwnerState::Gone
+                if self
+                    .blob_owners
+                    .get(owner)
+                    .is_some_and(|of| {
+                        of.gone && self.orphan_grace.is_some_and(|grace| of.since + grace <= now)
+                    }) =>
+            {
                 self.forget_blobs_of(owner);
             }
             OwnerState::Gone | OwnerState::Unfinished | OwnerState::Finished => {

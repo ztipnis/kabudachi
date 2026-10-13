@@ -50,7 +50,7 @@ impl Shared {
 }
 
 /// How long a submission that carries its input as blobs may take, from the
-/// first blob stored to the leader's answer, before it is refused as
+/// start of storing them to the leader's answer, before it is refused as
 /// backpressure. Holders drop the blobs of an owner whose record they never
 /// saw once the leader has twice, an orphan grace apart, said it knows no such
 /// task; the first such look-up comes a grace after the first blob. Half a
@@ -117,6 +117,11 @@ pub(super) async fn deliver(
             Err(_) => {
                 let reason = TaskRejectReason::TaskRejectBackpressure.as_str_name();
                 shared.refuse(&task, reason);
+                // The request may already have reached the leader, which then
+                // holds a task whose handle was refused: cancel it, so a retry
+                // by the user cannot run it twice. A leader that never saw it
+                // answers that the task is unknown.
+                tokio::spawn(cancel_at_leader(Arc::clone(&shared), task));
                 return;
             }
         },
