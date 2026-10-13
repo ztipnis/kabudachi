@@ -344,7 +344,8 @@ py_test(
     deps = [
         "//bindings:_native",  # keep
         "//runtime/tests:cluster",
-        "//runtime/tests:migration_tasks",
+        # Imported by the workers' program by name (`KABUDACHI_TEST_TASKS`), not by the test.
+        "//runtime/tests:migration_tasks",  # keep
         "@pypi//pytest",  # keep
     ],
 )
