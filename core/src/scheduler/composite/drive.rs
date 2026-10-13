@@ -34,6 +34,14 @@ use super::{
 /// The results of a composite a stage is to take were not found.
 struct ResultsGone;
 
+/// What a batch adds once it is admitted.
+enum Admitted {
+    /// Asked again: every member or item it names is held already.
+    Repeat,
+    /// The members or items past those held, by index.
+    Fresh(Vec<(u64, StreamedMember)>),
+}
+
 impl BoundStep {
     /// The submission of this step as a Task. The input is the step's own
     /// bytes when it is bound to a value; when it is bound to blobs, none, since
@@ -117,18 +125,37 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     fn record_members(&mut self, batch: MemberBatch) -> Result<MembersAccepted, SubmitRejection> {
+        let (id, last) = (batch.composite_id.clone(), batch.last);
+        let end = batch.start_index.saturating_add(batch.members.len() as u64);
+        let fresh = match self.admit_batch(batch)? {
+            Admitted::Repeat => return Ok(self.members_accepted(&id)),
+            Admitted::Fresh(fresh) => fresh,
+        };
+        if self.composites.held[&id].step.kind == CompositeKind::Reduce {
+            self.take_reduce_items(&id, fresh, last)?;
+        } else {
+            self.take_members(&id, fresh, end, last)?;
+        }
+        self.update_pressure();
+        Ok(self.members_accepted(&id))
+    }
+
+    /// Checks a batch against the composite it is for, and says what it adds:
+    /// nothing if every member or item it names is held already, else those
+    /// past the ones held.
+    fn admit_batch(&mut self, batch: MemberBatch) -> Result<Admitted, SubmitRejection> {
         if !self.check_leader() {
             return Err(SubmitRejection::NotLeader);
         }
-        let id = batch.composite_id.clone();
-        if self.reconciliation.is_uncertain_composite(&id) {
+        let id = &batch.composite_id;
+        if self.reconciliation.is_uncertain_composite(id) {
             return Err(SubmitRejection::NotReady);
         }
-        let composite = self.composites.held.get(&id).ok_or(SubmitRejection::UnknownComposite)?;
+        let composite = self.composites.held.get(id).ok_or(SubmitRejection::UnknownComposite)?;
         if !composite.takes_batches() {
             return Err(SubmitRejection::NotStreamed);
         }
-        let (held, start) = (composite.members, batch.start_index);
+        let (held, start) = (composite.batch_held(), batch.start_index);
         if start > held {
             return Err(SubmitRejection::MemberGap { held, start });
         }
@@ -137,7 +164,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .ok_or(SubmitRejection::MemberGap { held, start })?;
         if end <= held && (composite.sealed || !batch.last) {
             // Asked again: every member it names is held already.
-            return Ok(self.members_accepted(&id));
+            return Ok(Admitted::Repeat);
         }
         if composite.state != CompositeState::Running {
             return Err(SubmitRejection::CompositeFinished);
@@ -145,8 +172,19 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if composite.sealed {
             return Err(SubmitRejection::MemberGap { held, start: end });
         }
-        let fresh: Vec<(u64, StreamedMember)> =
-            (start..).zip(batch.members).filter(|(index, _)| *index >= held).collect();
+        Ok(Admitted::Fresh((start..).zip(batch.members).filter(|(index, _)| *index >= held).collect()))
+    }
+
+    /// Takes the new members of a map or group's batch, whole or not at all,
+    /// and starts them; the last batch seals the composite.
+    fn take_members(
+        &mut self,
+        id: &CompositeId,
+        fresh: Vec<(u64, StreamedMember)>,
+        end: u64,
+        last: bool,
+    ) -> Result<(), SubmitRejection> {
+        let composite = &self.composites.held[id];
         // A member that is a composite is weighed by what starting it takes
         // (its record and the inputs of what it starts at once), so a batch
         // is not accepted only for the members' first stages to be refused.
@@ -162,21 +200,20 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .map(|(index, member)| composite.member_stage(member).map(|stage| (index, stage)))
             .collect::<Result<_, SubmitRejection>>()?;
         self.budget.check_room(needed, || 0)?;
-        let composite = self.composites.held.get_mut(&id).expect("held above");
+        let composite = self.composites.held.get_mut(id).expect("held above");
         composite.members = composite.members.max(end);
         composite.outcomes.grow_to(composite.members);
-        composite.sealed |= batch.last;
+        composite.sealed |= last;
         self.composites.unpublished.insert(id.clone());
         for (index, stage) in members {
-            self.start_member_stage(&id, index, stage);
+            self.start_member_stage(id, index, stage);
         }
-        self.finish_if_complete(&id);
-        self.update_pressure();
-        Ok(self.members_accepted(&id))
+        self.finish_if_complete(id);
+        Ok(())
     }
 
     fn members_accepted(&self, id: &CompositeId) -> MembersAccepted {
-        MembersAccepted { members: self.composites.held[id].members, slow_down: self.budget.slow_down() }
+        MembersAccepted { members: self.composites.held[id].batch_held(), slow_down: self.budget.slow_down() }
     }
 
     /// Whether `submitted` could be recorded now with `queued_bytes` more
@@ -256,6 +293,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 bytes,
                 members,
                 sealed,
+                items_taken: 0,
+                partial_items: Vec::new(),
+                filled_item_pages: BTreeMap::new(),
             },
         );
         self.composites.unpublished.insert(id.clone());

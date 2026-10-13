@@ -4,8 +4,12 @@
 
 use crate::manifest::Manifest;
 use crate::protocol::generated::{self, composite_entry, reduce_options};
+use crate::protocol::ids::{CompositeId, IdGenerator};
+use crate::scheduler::{Observer, Scheduler, SubmitRejection};
+use crate::time::Clock;
 
-use super::{BoundInput, BoundStep, MalformedStep};
+use super::held::Composite;
+use super::{BoundInput, BoundStep, INLINE_VALUE_BYTES, ItemInput, MalformedStep, PAGE_ENTRIES, StreamedMember};
 
 /// The first page of a reduce's items; item `k` is on page
 /// `ITEM_PAGES + k / PAGE_ENTRIES`.
@@ -314,5 +318,124 @@ impl ReducePlan {
         } else {
             self.slot_step(level - 1, 2 * position)
         }
+    }
+}
+
+/// The page of a reduce that holds its item `index`.
+pub(super) fn item_page(index: u64) -> u32 {
+    ITEM_PAGES + u32::try_from(index / PAGE_ENTRIES).expect("item pages stay below 2^31")
+}
+
+impl ReduceItem {
+    /// What holding it costs the leader: its inline bytes, or its manifest's.
+    fn held_bytes(&self) -> u64 {
+        match self {
+            ReduceItem::Value(bytes) => bytes.len() as u64,
+            ReduceItem::Manifest(manifest) => manifest.encode().len() as u64,
+        }
+    }
+}
+
+impl Composite {
+    /// The item pages the leader still has: those that filled during this
+    /// call and are not yet published, and the partly filled last one.
+    pub(super) fn held_item_pages(&self) -> Vec<u32> {
+        let partial = (!self.partial_items.is_empty()).then(|| item_page(self.items_taken - 1));
+        self.filled_item_pages.keys().copied().chain(partial).collect()
+    }
+
+    /// The entries of item page `page`, if the leader still has that page.
+    pub(in crate::scheduler) fn item_page_entries(&self, page: u32) -> Option<Vec<generated::CompositeEntry>> {
+        if page < ITEM_PAGES {
+            return None;
+        }
+        let items = match self.filled_item_pages.get(&page) {
+            Some(items) => items,
+            None if self.held_item_pages().contains(&page) => &self.partial_items,
+            None => return None,
+        };
+        let first = u64::from(page - ITEM_PAGES) * PAGE_ENTRIES;
+        Some(
+            (first..)
+                .zip(items)
+                .map(|(index, item)| generated::CompositeEntry {
+                    index,
+                    outcome: Some(composite_entry::Outcome::from(item)),
+                    producer: None,
+                })
+                .collect(),
+        )
+    }
+}
+
+impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
+    /// Takes a batch's new items into a reduce, whole or not at all, and
+    /// marks every item page they touch for publication; the last batch seals
+    /// the reduce. An item is at most `INLINE_VALUE_BYTES` inline or blobs the
+    /// reduce owns, so a page of `PAGE_ENTRIES` entries fits one record.
+    pub(super) fn take_reduce_items(
+        &mut self,
+        id: &CompositeId,
+        fresh: Vec<(u64, StreamedMember)>,
+        last: bool,
+    ) -> Result<(), SubmitRejection> {
+        let items: Vec<ReduceItem> = fresh
+            .into_iter()
+            .map(|(_, member)| match member {
+                StreamedMember::Item(ItemInput::Value(bytes)) if bytes.len() <= INLINE_VALUE_BYTES => {
+                    Ok(ReduceItem::Value(bytes))
+                }
+                StreamedMember::Item(ItemInput::Chunked(manifest)) => Ok(ReduceItem::Manifest(manifest)),
+                // A longer inline item would not fit an item page: its sender spills it.
+                StreamedMember::Item(_) | StreamedMember::Stage(_) => Err(SubmitRejection::MemberKind),
+            })
+            .collect::<Result<_, _>>()?;
+        let needed = items.iter().map(ReduceItem::held_bytes).sum();
+        self.budget.check_room(needed, || 0)?;
+        self.budget.take(needed);
+        let composite = self.composites.held.get_mut(id).expect("admitted above");
+        composite.bytes += needed;
+        for item in items {
+            let page = item_page(composite.items_taken);
+            composite.partial_items.push(item);
+            composite.items_taken += 1;
+            self.composites.unpublished_pages.insert((id.clone(), page));
+            if composite.partial_items.len() as u64 == PAGE_ENTRIES {
+                let full = std::mem::take(&mut composite.partial_items);
+                composite.filled_item_pages.insert(page, full);
+            }
+        }
+        self.composites.unpublished.insert(id.clone());
+        if last {
+            self.seal_reduce(id);
+        }
+        Ok(())
+    }
+
+    /// Lets the full item page `page` of `id` go once it is published,
+    /// giving its bytes back to the budget unless the composite's whole
+    /// weight already went back when it finished.
+    pub(in crate::scheduler) fn release_item_page(&mut self, id: &CompositeId, page: u32) {
+        let finished = self.composites.is_finished(id);
+        let Some(composite) = self.composites.held.get_mut(id) else {
+            return;
+        };
+        if let Some(items) = composite.filled_item_pages.remove(&page) {
+            let released: u64 = items.iter().map(ReduceItem::held_bytes).sum();
+            composite.bytes -= released;
+            if !finished {
+                self.budget.give_back(released);
+            }
+        }
+    }
+
+    /// A reduce's item count is final: it now has a plan, and its members are
+    /// that plan's steps.
+    pub(super) fn seal_reduce(&mut self, id: &CompositeId) {
+        let composite = self.composites.held.get_mut(id).expect("a held reduce");
+        composite.sealed = true;
+        composite.members = composite.reduce_plan().expect("a sealed reduce has a plan").steps();
+        composite.outcomes.grow_to(composite.members);
+        self.composites.unpublished.insert(id.clone());
     }
 }

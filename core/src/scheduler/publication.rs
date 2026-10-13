@@ -11,6 +11,7 @@ use crate::protocol::ids::{IdGenerator, TaskId};
 use crate::task_record::{RecordKey, RecordVersion};
 use crate::time::{Clock, Duration, WallTime};
 
+use super::composite::ITEM_PAGES;
 use super::{Observer, Scheduler};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
@@ -66,13 +67,21 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let records = std::mem::take(&mut self.composites.unpublished);
         let mut published = 0;
         for (id, page) in pages {
-            if !self.composites.held.contains_key(&id) {
+            let Some(composite) = self.composites.held.get(&id) else {
+                continue;
+            };
+            let item_page = page >= ITEM_PAGES;
+            // An item page the leader no longer has was published already.
+            if item_page && composite.item_page_entries(page).is_none() {
                 continue;
             }
             let version = self.leadership.next_version(recovery_epoch, term);
             let record = self.page_record_of(&id, page, version, published_at);
             self.observer.page_revision(record);
             published += 1;
+            if item_page {
+                self.release_item_page(&id, page);
+            }
         }
         for id in records {
             if !self.composites.held.contains_key(&id) {

@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{
-    self, CompositeEntry, CompositePage, CompositeRecord, RecordVersion,
+    self, CompositeEntry, CompositePage, CompositeRecord, RecordVersion, composite_entry,
 };
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId, WorkerId};
 use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeFinished, CompositeKind, ItemInput, MemberBatch, OnError, PAGE_ENTRIES, Stage,
-    Step, StreamedMember, TaskOptions,
+    BoundInput, BoundStep, CompositeFinished, CompositeKind, ITEM_PAGES, ItemInput, MemberBatch, OnError, PAGE_ENTRIES,
+    ReduceShape, Stage, Step, StreamedMember, TaskOptions,
 };
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{Claim, Completion, Event, MemoryLimits};
@@ -128,6 +128,61 @@ pub fn item_batch(map: &CompositeId, start: u64, count: u64, last: bool) -> Memb
             .collect(),
         last,
     }
+}
+
+/// The reducer every test reduce runs, taking its input.
+pub fn reducer() -> BoundStep {
+    BoundStep {
+        definition: TaskDefinitionId::new("fold"),
+        version: 0,
+        options: TaskOptions::on_queue("default"),
+        input: BoundInput::Previous,
+        fields: Vec::new(),
+    }
+}
+
+/// A reduce whose items stream in: a tree of `chunk`-item chunks when given,
+/// else a chain; seeded with `initial` when given.
+pub fn streamed_reduce(chunk: Option<u32>, initial: Option<&[u8]>) -> Step {
+    Step {
+        kind: CompositeKind::Reduce,
+        on_error: OnError::FailFast,
+        stages: Vec::new(),
+        streamed: true,
+        reduce: Some(ReduceShape {
+            reducer: reducer(),
+            tree: chunk.is_some(),
+            chunk_size: chunk.unwrap_or(0),
+            initial: initial.map(|value| BoundInput::Value(value.to_vec())),
+        }),
+    }
+}
+
+/// A batch of reduce items `start..`, one per value.
+pub fn items_batch(reduce: &CompositeId, start: u64, values: &[&[u8]], last: bool) -> MemberBatch {
+    MemberBatch {
+        composite_id: reduce.clone(),
+        start_index: start,
+        members: values
+            .iter()
+            .map(|value| StreamedMember::Item(ItemInput::Value(value.to_vec())))
+            .collect(),
+        last,
+    }
+}
+
+/// The inline item entries of `reduce`'s item page `page`, as last published.
+pub fn items_on_page(fixture: &Fixture, reduce: &CompositeId, page: u32) -> Vec<(u64, Vec<u8>)> {
+    let Some(page) = fixture.spy.newest_page(reduce, ITEM_PAGES + page) else {
+        return Vec::new();
+    };
+    page.entries
+        .into_iter()
+        .map(|entry| match entry.outcome {
+            Some(composite_entry::Outcome::Item(bytes)) => (entry.index, bytes),
+            other => panic!("an inline item page holds items, not {other:?}"),
+        })
+        .collect()
 }
 
 /// Settings of a task stage, which the builders above leave at their defaults.

@@ -18,8 +18,8 @@ use crate::scheduler::{Observer, Scheduler, UNVERSIONED};
 
 use super::held::{Composite, Outcomes};
 use super::{
-    BoundInput, CompositeKind, CompositeParent, CompositeState, InputShape, MemberCounts, MemberOutcome, PAGE_ENTRIES,
-    Stage, Step,
+    BoundInput, CompositeKind, CompositeParent, CompositeState, ITEM_PAGES, InputShape, MemberCounts, MemberOutcome,
+    PAGE_ENTRIES, Stage, Step,
 };
 
 impl From<CompositeState> for generated::CompositeState {
@@ -142,7 +142,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             root: Some(composite.root.clone().into()),
             members: composite.members,
             sealed: composite.sealed,
-            reduce_items: 0,
+            reduce_items: composite.items_taken,
         }
     }
 
@@ -157,11 +157,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     ) -> CompositePage {
         let composite = &self.composites.held[id];
         let first = u64::from(page) * PAGE_ENTRIES;
-        let entries = composite
-            .outcomes
-            .range(first..first + PAGE_ENTRIES)
-            .map(|(index, outcome)| entry_of(*index, outcome))
-            .collect();
+        let entries = if page >= ITEM_PAGES {
+            composite.item_page_entries(page).expect("only an item page the leader holds is built")
+        } else {
+            composite
+                .outcomes
+                .range(first..first + PAGE_ENTRIES)
+                .map(|(index, outcome)| entry_of(*index, outcome))
+                .collect()
+        };
         CompositePage {
             version: Some(version.into()),
             composite_id: Some(id.clone().into()),
@@ -249,6 +253,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             bytes: budget_len(id, &step),
             members,
             sealed,
+            items_taken: 0,
+            partial_items: Vec::new(),
+            filled_item_pages: BTreeMap::new(),
             step,
             root: record.root.map_or_else(|| id.clone(), CompositeId::from),
             retained_by,

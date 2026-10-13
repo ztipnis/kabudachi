@@ -11,7 +11,7 @@ use crate::time::{Duration, Instant, WallTime};
 
 use super::{
     BoundStep, CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape,
-    MemberCounts, MemberOutcome, OnError, PAGE_ENTRIES, Stage, Step, StreamedMember,
+    MemberCounts, MemberOutcome, OnError, PAGE_ENTRIES, ReduceItem, ReducePlan, Stage, Step, StreamedMember,
 };
 
 /// One composite this scheduler drives, or keeps until its retention ends.
@@ -45,6 +45,14 @@ pub(in crate::scheduler) struct Composite {
     pub(super) members: u64,
     /// No batch adds a member: always true unless members arrive in batches.
     pub(super) sealed: bool,
+    /// A reduce's items taken from its batches so far.
+    pub(super) items_taken: u64,
+    /// The items of a reduce's last item page while that page is partly
+    /// filled: all the leader keeps of the items it took.
+    pub(super) partial_items: Vec<ReduceItem>,
+    /// Item pages that filled during this call, kept only until they are
+    /// published.
+    pub(super) filled_item_pages: BTreeMap<u32, Vec<ReduceItem>>,
 }
 
 /// The outcomes of the members that settled, by index, with the tallies a
@@ -136,6 +144,18 @@ impl Composite {
     /// Whether its members arrive in batches.
     pub(super) fn takes_batches(&self) -> bool {
         self.step.takes_batches()
+    }
+
+    /// How far its batches have filled it: a reduce's items, else its members.
+    pub(super) fn batch_held(&self) -> u64 {
+        if self.step.kind == CompositeKind::Reduce { self.items_taken } else { self.members }
+    }
+
+    /// The plan of a reduce whose item count is final; `None` for any other
+    /// composite, and for a reduce still taking items.
+    pub(super) fn reduce_plan(&self) -> Option<ReducePlan> {
+        let shape = self.step.reduce.as_ref()?;
+        self.sealed.then(|| ReducePlan::new(self.items_taken, shape))
     }
 
     /// The stage a streamed member is to run as: a map's item is the input of
@@ -258,6 +278,9 @@ impl Composites {
         self.unpublished.insert(id.clone());
         for page in 0..pages {
             self.page_changed(id, page);
+        }
+        for page in self.held[id].held_item_pages() {
+            self.unpublished_pages.insert((id.clone(), page));
         }
     }
 
