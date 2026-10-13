@@ -106,6 +106,15 @@ fn a_step_that_cannot_be_driven_is_refused() {
     };
     map.stages.push(map.stages[0].clone());
     assert_eq!(refused(two_templates), MalformedStep::MapShape);
+    // A map's one input-taking member must be a task: a composite there
+    // has no task to run on each item.
+    let mut composite_template = StepDescription::from(&every_kind());
+    let generated::stage_description::Step::Composite(map) = composite_template.stages[2].step.as_mut().unwrap()
+    else {
+        panic!("a map stage")
+    };
+    map.stages = StepDescription::from(&every_kind()).stages[2..3].to_vec();
+    assert_eq!(refused(composite_template), MalformedStep::MapShape);
 }
 
 #[test]

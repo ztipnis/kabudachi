@@ -438,7 +438,8 @@ impl Step {
     /// Whether the step is a map over a list it is given, which an
     /// expansion run must first split into items.
     pub fn expands(&self) -> bool {
-        self.kind == CompositeKind::Map && self.stages.len() == 1 && self.stages[0].takes_input()
+        self.kind == CompositeKind::Map
+            && matches!(self.stages.as_slice(), [Stage::Task(template)] if matches!(template.input, BoundInput::Previous))
     }
 
     /// A map's members are all bound to their items, or it has one member
