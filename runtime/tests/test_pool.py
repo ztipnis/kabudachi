@@ -96,6 +96,26 @@ def test_bodies_run_in_task_processes_spread_over_the_pool_and_send_back_results
     assert size == 4 * 1024 * 1024
 
 
+def test_a_pool_starts_and_runs_a_task_when_the_router_is_a_lambda():
+    routed = []
+
+    def route(name, value):
+        routed.append(name)
+        return None
+
+    # A lambda cannot be pickled, so a router sent to the task processes
+    # would keep them from starting.
+    kabudachi.configure(processes=1, router=lambda name, value: route(name, value))
+
+    async def main():
+        return await pool_tasks.where_async(Greeting(text="0.5"))
+
+    result = kabudachi.run(main)
+
+    assert result.times != os.getpid()
+    assert routed == ["pool.where_async"]
+
+
 def declare_in_script_a_task():
     def scripted(request: Greeting) -> Greeting:
         return request
