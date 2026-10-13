@@ -595,6 +595,9 @@ class Configuration:
 
         Raises `ConfigurationError` for an unknown setting or an invalid
         value, in which case none of the settings in this call are applied.
+
+        A networked worker reads all of its networked settings when `run()`
+        starts, so a change made after that applies from the next `run()`.
         """
         configured = {**self._configured, **settings}
         validated = self._validate(configured)

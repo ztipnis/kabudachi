@@ -944,3 +944,26 @@ def test_a_context_filter_puts_the_running_task_on_each_record_its_body_logs():
     assert by_message["in a sync body"].task_id == second
     assert by_message["in a sync body"].task_name == "tests.logs_sync"
     assert by_message["in a sync body"].attempt == 1
+
+
+def test_native_events_reach_python_logging_under_kabudachi_native(caplog):
+    caplog.set_level(logging.INFO, logger="kabudachi.native")
+
+    async def main():
+        return None
+
+    kabudachi.run(main)
+
+    def leads():
+        return [
+            record
+            for record in caplog.records
+            if record.name.startswith("kabudachi.native.") and "leads" in record.getMessage()
+        ]
+
+    deadline = time.monotonic() + 5
+    while not leads() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    [record] = leads()
+    assert record.name == "kabudachi.native.kabudachi_bindings.runtime"
+    assert record.levelno == logging.INFO

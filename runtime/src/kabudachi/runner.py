@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import Any, TypeVar, overload
 
 from kabudachi import _native
+from kabudachi._native import refresh_logging
 from kabudachi.config import Configuration, Settings, authority_parts, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
@@ -50,7 +51,8 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     while it waits, and takes its place back as soon as it resumes, even if
     that briefly puts more than `concurrency` bodies in progress. The
     `processes`, `concurrency` and `imports` settings are read when `run`
-    starts.
+    starts. Native log records go to the `kabudachi.native` loggers at the
+    levels set when `run` starts.
 
     When `main` returns, `run` waits for every task that was called to finish
     before it stops the worker. If `main` raises, or is cancelled, tasks
@@ -94,6 +96,7 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     if active_session() is not None:
         raise RuntimeError("kabudachi.run() is already running in this process")
     validate_definitions(default_registry(), process_serializers())
+    refresh_logging()
     executor = _executor_for(process_configuration())
 
     with asyncio.Runner() as runner:

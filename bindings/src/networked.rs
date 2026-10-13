@@ -104,7 +104,9 @@ impl NetworkedRuntime {
     /// authority TTL of zero, a replication factor or seed rounds of zero,
     /// only one memory limit, no worker threads or an authority that cannot
     /// be used, and `RuntimeError` if it cannot listen
-    /// on its listen address.
+    /// on its listen address. `health_listen` raises `ValueError` for an
+    /// address that is not `ip:port` and `RuntimeError` when it cannot be
+    /// bound.
     #[new]
     fn new(py: Python<'_>, arguments: NetworkedArguments) -> PyResult<Self> {
         arguments.check()?;

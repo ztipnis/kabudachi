@@ -9,6 +9,7 @@ mod election;
 mod errors;
 mod health;
 mod local_node;
+mod native_log;
 mod networked;
 mod outcomes;
 mod runtime;
@@ -32,6 +33,8 @@ fn result_digest<'py>(py: Python<'py>, data: &[u8]) -> Bound<'py, PyBytes> {
 
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    native_log::install(m.py())?;
+    m.add_function(wrap_pyfunction!(native_log::refresh_logging, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(result_digest, m)?)?;
     m.add_class::<runtime::NativeRuntime>()?;

@@ -48,7 +48,9 @@ pub(crate) fn serve(
         .route("/readyz", get(readyz))
         .with_state(Arc::new(probe));
     handle.spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::warn!(target: "kabudachi_bindings::health", "the health server stopped: {error}");
+        }
     });
     Ok(bound)
 }

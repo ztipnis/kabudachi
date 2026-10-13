@@ -98,7 +98,8 @@ impl NativeRuntime {
     /// which says how the runtime runs and what each of its fields means.
     ///
     /// Raises `ValueError` if `worker_threads` is zero or only one of the two
-    /// memory limits is given.
+    /// memory limits is given, or if `health_listen` is not an `ip:port`
+    /// address; `RuntimeError` if `health_listen` cannot be bound.
     #[new]
     fn new(
         py: Python<'_>,
@@ -257,7 +258,12 @@ impl NativeRuntime {
             state
                 .wait_for(|current| *current == WorkerState::Leader)
                 .await
-                .map(|_| ())
+                .map(|_| {
+                    tracing::info!(
+                        target: "kabudachi_bindings::runtime",
+                        "this worker leads its shard of one"
+                    );
+                })
                 .map_err(|_| {
                     // The election only ends early on a shutdown, unless it panicked.
                     let reason = if bridge.is_open() {
