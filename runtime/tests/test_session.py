@@ -1900,3 +1900,24 @@ def test_a_router_picks_the_queue_of_a_task_that_names_none_where_it_is_submitte
         ("tests.routed", "bad"),
         ("tests.routed", "number"),
     ]
+
+
+def test_an_input_past_the_payload_limit_is_refused_without_running_the_router():
+    hard = 10_000
+    world = World(routed, memory_soft_limit=hard // 2, memory_hard_limit=hard)
+    routed_values = []
+
+    def router(name, value):
+        routed_values.append(name)
+        return "gpu"
+
+    world.configuration.configure(router=router)
+    oversized = Greeting(text="x" * (hard * 2))
+
+    with pytest.raises(PayloadTooLargeError):
+        world.call("routed", oversized)
+    with pytest.raises(PayloadTooLargeError):
+        world.session.submit_serialized("tests.routed", oversized.SerializeToString(), SubmissionOptions())
+
+    assert routed_values == []
+    assert world.runtime.submitted == []

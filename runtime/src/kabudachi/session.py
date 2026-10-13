@@ -194,7 +194,6 @@ class Session:
         options: SubmissionOptions,
         value: Callable[[], Any],
     ) -> TaskHandle:
-        queue = self._queue_of(definition, value)
         limit = self._runtime.payload_limit
         if limit is not None and len(payload) > limit:
             raise PayloadTooLargeError(
@@ -202,6 +201,7 @@ class Session:
                 len(payload),
                 limit,
             )
+        queue = self._queue_of(definition, value)
         settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
         return self._tasks.submit(definition, payload, options, settings)
 
