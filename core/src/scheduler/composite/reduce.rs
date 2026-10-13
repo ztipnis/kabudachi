@@ -380,10 +380,16 @@ impl Composite {
     }
 
     /// How many item pages the reduce's items fill, none for a reduce that
-    /// folds another composite's results.
+    /// folds another composite's results. A reduce that ended short of the
+    /// items its record counted still has item pages for all of them.
     pub(super) fn item_page_count(&self) -> u32 {
         if self.step.kind == CompositeKind::Reduce && self.takes_batches() {
-            u32::try_from(self.items_taken.div_ceil(PAGE_ENTRIES)).expect("item pages stay below 2^31")
+            let items = if self.state == CompositeState::Running {
+                self.items_taken
+            } else {
+                self.items_taken.max(self.items_floor)
+            };
+            u32::try_from(items.div_ceil(PAGE_ENTRIES)).expect("item pages stay below 2^31")
         } else {
             0
         }

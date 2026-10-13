@@ -40,4 +40,8 @@ impl Observer for NoObserver {
     fn composite_revision(&mut self, _: CompositeRecord) {}
 
     fn page_revision(&mut self, _: CompositePage) {}
+
+    fn stores_at_once(&self) -> bool {
+        true
+    }
 }

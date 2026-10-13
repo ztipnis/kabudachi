@@ -258,12 +258,18 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 // item pages hold, from index 0 with no gap, whatever its
                 // record counts, and is sealed only if the record says so
                 // and the pages hold all it counts.
-                let (taken, partial) =
-                    if batches { items_on(pages) } else { (record.reduce_items, Vec::new()) };
-                bytes += partial.iter().map(ReduceItem::held_bytes).sum::<u64>();
-                let sealed = !batches || (record.sealed && record.reduce_items == taken);
-                let members = if sealed { ReducePlan::new(taken, shape).steps() } else { 0 };
-                (members, sealed, taken, partial)
+                // A finished one has its item pages rewritten empty, so its
+                // record is all there is to trust.
+                if batches && state != CompositeState::Running {
+                    (record.members, record.sealed, record.reduce_items, Vec::new())
+                } else {
+                    let (taken, partial) =
+                        if batches { items_on(pages) } else { (record.reduce_items, Vec::new()) };
+                    bytes += partial.iter().map(ReduceItem::held_bytes).sum::<u64>();
+                    let sealed = !batches || (record.sealed && record.reduce_items == taken);
+                    let members = if sealed { ReducePlan::new(taken, shape).steps() } else { 0 };
+                    (members, sealed, taken, partial)
+                }
             }
             None if batches => (record.members, record.sealed, 0, Vec::new()),
             None => (step.stages.len() as u64, true, 0, Vec::new()),
@@ -273,7 +279,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             members,
             sealed,
             items_taken,
-            items_floor: if batches { record.reduce_items } else { 0 },
+            items_floor: if batches && state == CompositeState::Running { record.reduce_items } else { 0 },
             partial_items,
             filled_item_pages: BTreeMap::new(),
             published_item_pages: BTreeMap::new(),

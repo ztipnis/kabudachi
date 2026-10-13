@@ -402,6 +402,31 @@ fn a_finished_reduce_writes_every_item_page_finished_whether_the_leader_still_he
 }
 
 #[test]
+fn a_new_leader_keeps_a_finished_reduce_fed_in_batches_as_the_record_says_though_its_full_item_pages_were_rewritten_empty() {
+    let mut old = Fixture::leading();
+    let reduce = submitted(&mut old, one_chunk_reduce(2));
+    let values: Vec<Vec<u8>> = (0..PAGE_ENTRIES + 2).map(item).collect();
+    let values: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+    old.scheduler.submit_members(items_batch(&reduce, 0, &values, true)).unwrap();
+    // The full page's write was stored, so the leader let it go and rewrites it empty.
+    let first = RecordKey::Page(reduce.clone(), ITEM_PAGES);
+    let stored = old.spy.newest_page(&reduce, ITEM_PAGES).unwrap().version.unwrap();
+    old.scheduler.record_stored(&first, RecordVersion::from(&stored));
+    run_member(&mut old, &reduce, 0, b"folded");
+    assert_eq!(finished(&mut old)[0].state, CompositeState::Succeeded);
+    let rewritten = old.spy.newest_page(&reduce, ITEM_PAGES).unwrap();
+    assert!(rewritten.finished && rewritten.entries.is_empty(), "the full item page was rewritten finished and empty");
+    let new = took_over(&old, rebuild_losing(&old, 0, |_| false));
+    assert_eq!(new.scheduler.composite_status(&reduce).unwrap().state, CompositeState::Succeeded);
+    let record = new.scheduler.composite_record(&reduce).unwrap();
+    assert_eq!(
+        (record.reduce_items, record.sealed, record.members),
+        (PAGE_ENTRIES + 2, true, 1),
+        "the republished record still counts the items its result is planned from"
+    );
+}
+
+#[test]
 fn a_new_leader_drives_a_half_combined_tree_on_and_makes_each_step_once() {
     let mut old = Fixture::leading();
     // Chunks 0-3; combines 4 = (0, 1), 5 = (2, 3); root 6 = (4, 5).
@@ -513,6 +538,10 @@ fn a_reduce_whose_stored_items_fall_short_of_its_record_fails_when_its_expansion
     assert_eq!(end.state, CompositeState::Failed);
     assert_eq!(end.failure.as_ref().unwrap().kind, REDUCE_ITEMS_LOST_KIND, "not a reduce of the items that survived");
     assert_eq!(new.scheduler.composite_status(&reduce).unwrap().state, CompositeState::Failed);
+    assert!(
+        new.spy.newest_page(&reduce, ITEM_PAGES).is_some_and(|page| page.finished),
+        "the item pages the record counted are rewritten finished though the leader held none of them"
+    );
 }
 
 #[test]
