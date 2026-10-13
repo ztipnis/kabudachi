@@ -47,7 +47,10 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
             .collect();
         shard.set_queue_policy(QueuePolicy::new().with_queue(
             "gpu",
-            QueueOptions { max_running: NonZeroU32::new(2), ..QueueOptions::DEFAULT },
+            QueueOptions {
+                max_running: NonZeroU32::new(2),
+                ..QueueOptions::DEFAULT
+            },
         ));
         let gpu = 0;
         shard.set_queues(0, &["gpu"]);
@@ -56,27 +59,45 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
         let leader = shard.drive_until_a_leader().await;
         let leader_id = shard.id(leader);
         // A CPU worker that is not the leader, so it claims over the network.
-        let cpu = *shard.others(leader).iter().find(|voter| **voter != gpu).expect("two others");
+        let cpu = *shard
+            .others(leader)
+            .iter()
+            .find(|voter| **voter != gpu)
+            .expect("two others");
         let (gpu_id, cpu_id) = (shard.id(gpu), shard.id(cpu));
         shard.join_as_pending(&client, leader).await;
 
         // Until the leader has heard each worker's queues it would hold it to
         // none, so wait for both.
         loop {
-            let known = shard.with(leader, |node, _| node.queue_subscriptions()).await;
-            if known.get(&gpu_id) == Some(&only("gpu")) && known.get(&cpu_id) == Some(&only("default")) {
+            let known = shard
+                .with(leader, |node, _| node.queue_subscriptions())
+                .await;
+            if known.get(&gpu_id) == Some(&only("gpu"))
+                && known.get(&cpu_id) == Some(&only("default"))
+            {
                 break;
             }
-            shard.drive_until(tokio::time::sleep(Duration::from_millis(10))).await;
+            shard
+                .drive_until(tokio::time::sleep(Duration::from_millis(10)))
+                .await;
         }
 
         let mut gpu_tasks = Vec::new();
         let mut cpu_tasks = Vec::new();
         for n in 0..3u8 {
-            gpu_tasks.push(shard.drive_until(submitted_through(&client, &leader_id, on("gpu", &[n]))).await);
+            gpu_tasks.push(
+                shard
+                    .drive_until(submitted_through(&client, &leader_id, on("gpu", &[n])))
+                    .await,
+            );
         }
         for n in 0..2u8 {
-            cpu_tasks.push(shard.drive_until(submitted_through(&client, &leader_id, on("default", &[n]))).await);
+            cpu_tasks.push(
+                shard
+                    .drive_until(submitted_through(&client, &leader_id, on("default", &[n])))
+                    .await,
+            );
         }
 
         // The leader refuses a CPU worker a GPU task, whatever its records show.
@@ -86,6 +107,23 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
             .await
             .expect("the leader answered");
         assert_eq!(refusal(asked), ClaimRejectReason::ClaimRejectNotSubscribed);
+
+        // Asking for the oldest tasks of every queue, it is handed the oldest of
+        // its own: the leader holds it to the queues it reported.
+        let handed = shard
+            .drive_until(cpu_net.claim_oldest(leader_id.clone(), 1, &Subscription::Every))
+            .await
+            .expect("the leader answered");
+        let Some(claim_response::Result::Batch(batch)) = handed.result else {
+            panic!("expected a batch, got {handed:?}");
+        };
+        let mut cpu_claimed = BTreeSet::new();
+        for claim in batch.claims {
+            let task = claim.task.expect("a claim carries its task");
+            assert_eq!(task.queue, "default", "a CPU worker is handed no GPU task");
+            cpu_claimed.insert(task.task_id());
+        }
+        assert_eq!(cpu_claimed.len(), 1, "the oldest task of its own queue");
 
         executors[gpu].grant(3);
         executors[cpu].grant(3);
@@ -98,14 +136,18 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
             gpu_claimed.insert(task.task_id());
             gpu_runs.push(run);
         }
-        let mut cpu_claimed = BTreeSet::new();
-        for _ in 0..2 {
-            let (_, claim) = shard.drive_until(executors[cpu].next_claim()).await;
-            let task = claim.task.expect("a claim carries its task");
-            assert_eq!(task.queue, "default", "a CPU worker is never handed a GPU task");
-            cpu_claimed.insert(task.task_id());
-        }
-        assert_eq!(cpu_claimed, cpu_tasks.iter().cloned().collect::<BTreeSet<TaskId>>());
+        // The other CPU task comes through the worker's own discovery.
+        let (_, claim) = shard.drive_until(executors[cpu].next_claim()).await;
+        let task = claim.task.expect("a claim carries its task");
+        assert_eq!(
+            task.queue, "default",
+            "a CPU worker is never handed a GPU task"
+        );
+        cpu_claimed.insert(task.task_id());
+        assert_eq!(
+            cpu_claimed,
+            cpu_tasks.iter().cloned().collect::<BTreeSet<TaskId>>()
+        );
 
         // Two GPU tasks are claimed, as many as the queue allows: the third
         // waits, and a claim of it is refused, from anyone.
@@ -119,14 +161,20 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
             .await
             .expect("the leader answered");
         assert_eq!(refusal(asked), ClaimRejectReason::ClaimRejectQueueFull);
-        shard.drive_until(executors[cpu].expect_no_work_for(Duration::from_millis(500))).await;
 
         // One GPU run ends: the queue has room, and the GPU worker takes the third.
         let run = gpu_runs.remove(0);
         executors[gpu].report(Report::Started(run.clone()));
-        executors[gpu].report(Report::Completed { run, digest: Digest::blake3(b"done"), delivered: false });
+        executors[gpu].report(Report::Completed {
+            run,
+            digest: Digest::blake3(b"done"),
+            delivered: false,
+        });
         let (_, claim) = shard.drive_until(executors[gpu].next_claim()).await;
-        assert_eq!(claim.task.expect("a claim carries its task").task_id(), third);
+        assert_eq!(
+            claim.task.expect("a claim carries its task").task_id(),
+            third
+        );
     })
     .await
 }

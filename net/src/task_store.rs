@@ -163,7 +163,12 @@ impl HeldRecords {
             .filter(|record| {
                 runs_compaction || record.task.as_ref().is_some_and(|task| task.compacts.is_none())
             })
-            .filter(|record| record.task.as_ref().is_some_and(|task| queues.includes(&task.queue)))
+            .filter(|record| {
+                record
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| queues.includes(&task.queue))
+            })
             .filter_map(|record| {
                 let (task, _) = identify(record).ok()?;
                 let held = record.task.as_ref()?;

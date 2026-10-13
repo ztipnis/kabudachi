@@ -2,16 +2,17 @@
 //! holds itself, nearest keys first; then by asking shard peers, the nearest
 //! distance class first and widening one class at a time; last by asking the
 //! leader for the oldest pending tasks. Only tasks of the queues this worker
-//! takes are candidates, and each stage tries the most urgent first. Every task found is claimed from the
-//! leader, which may refuse one this worker's view showed as waiting: that
-//! view can be stale, and a refusal only moves discovery on.
+//! takes are candidates, and each stage tries the most urgent first. Every
+//! task found is claimed from the leader, which may refuse one this worker's
+//! view showed as waiting: that view can be stale, and a refusal only moves
+//! discovery on.
 //!
 //! A worker keeps no list of peers for this. The peers to steal from are read
 //! from the records `kad` routing table ([`Net::steal_targets`]) each time
 //! [`Net::discover`] runs, and forgotten when it returns.
 
-use std::collections::BTreeSet;
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use std::str::FromStr;
 use std::time::Duration;
@@ -177,7 +178,11 @@ impl Net {
             .map(KBucketKey::from);
         candidates.sort_by_key(|candidate: &Candidate| {
             (
-                Reverse(takes.policy.rank(&candidate.queue, waited(now, candidate.submitted_at))),
+                Reverse(
+                    takes
+                        .policy
+                        .rank(&candidate.queue, waited(now, candidate.submitted_at)),
+                ),
                 local
                     .as_ref()
                     .map(|local| KBucketKey::new(record_key(&candidate.task)).distance(local)),
@@ -270,7 +275,10 @@ impl Net {
 /// How long a task submitted at `submitted_at` has waited by `now`; zero if
 /// the clocks disagree the other way.
 pub(crate) fn waited(now: WallTime, submitted_at: WallTime) -> CoreDuration {
-    CoreDuration::from_millis(now.as_unix_millis().saturating_sub(submitted_at.as_unix_millis()))
+    CoreDuration::from_millis(
+        now.as_unix_millis()
+            .saturating_sub(submitted_at.as_unix_millis()),
+    )
 }
 
 fn stop(found: &mut Found, why: DiscoveryStop) -> ControlFlow<()> {

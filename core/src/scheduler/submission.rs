@@ -397,8 +397,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let task = task_of(task_id, submitted_at, submission);
         let run = self.first_run_within_limit(&task, not_before.is_some(), &input_digest)?;
         let task_id = self.hold_submitted(task, run, input_digest);
-        self.waiting
-            .admit(&task_id, &self.tasks[&task_id].queue, now, not_before, expires_at);
+        self.waiting.admit(
+            &task_id,
+            &self.tasks[&task_id].queue,
+            now,
+            not_before,
+            expires_at,
+        );
         self.absorb_waiting_generation(&task_id);
         self.drop_oldest_until_it_fits(&task_id, now);
         self.update_pressure();

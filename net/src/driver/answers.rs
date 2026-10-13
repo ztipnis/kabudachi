@@ -261,8 +261,9 @@ pub(super) fn respond_to_reconcile_requests<C: Clock>(node: &WorkerNode<C>, net:
 
 /// Answers every inbound `/kabudachi/steal/1` request queued on `net` with
 /// the tasks this worker holds records of that look claimable in the asker's
-/// queues, most urgent first by `policy`. Every worker answers: it needs no leadership and decides nothing, since a task it names
-/// must still be claimed from the leader.
+/// queues, most urgent first by `policy`. Every worker answers: it needs no
+/// leadership and decides nothing, since a task it names must still be
+/// claimed from the leader.
 pub(super) fn respond_to_steal_requests<C: Clock>(net: &Net, clock: &C, policy: &QueuePolicy) {
     let now = WallTime::now(clock);
     for handle in net.poll_steal_requests() {

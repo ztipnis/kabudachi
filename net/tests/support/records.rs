@@ -247,8 +247,12 @@ impl Voters {
     /// Makes `voter` take work only from `queues`. Only before the shard is
     /// first driven.
     pub fn set_queues(&mut self, voter: usize, queues: &[&str]) {
-        assert!(matches!(self.voters[voter], Voter::Idle(_)), "set before the shard is first driven");
-        self.queues[voter] = Subscription::Only(queues.iter().map(|name| (*name).to_owned()).collect());
+        assert!(
+            matches!(self.voters[voter], Voter::Idle(_)),
+            "set before the shard is first driven"
+        );
+        self.queues[voter] =
+            Subscription::Only(queues.iter().map(|name| (*name).to_owned()).collect());
     }
 
     /// Gives every voter `policy`. Only before the shard is first driven.

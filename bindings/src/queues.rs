@@ -53,11 +53,9 @@ pub(crate) fn queue_policy(options: Vec<QueueOptionsArgument>) -> PyResult<Queue
 pub(crate) fn subscription(queues: Option<Vec<String>>) -> PyResult<Subscription> {
     match queues {
         None => Ok(Subscription::Every),
-        Some(names) if names.is_empty() || names.iter().any(|name| name.trim().is_empty()) => {
-            Err(PyValueError::new_err(
-                "queues must name at least one queue, none of them empty",
-            ))
-        }
+        Some(names) if names.is_empty() || names.iter().any(|name| name.trim().is_empty()) => Err(
+            PyValueError::new_err("queues must name at least one queue, none of them empty"),
+        ),
         Some(names) => Ok(Subscription::Only(names.into_iter().collect())),
     }
 }

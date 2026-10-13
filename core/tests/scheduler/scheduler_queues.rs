@@ -101,13 +101,15 @@ fn a_higher_priority_goes_first_weights_share_a_tier_and_a_starving_task_goes_be
 #[test]
 fn scaffold_a_claim_outside_the_workers_queues_or_past_a_full_queue_is_refused() {
     let mut fixture = Fixture::leading();
-    fixture.scheduler.set_queue_policy(QueuePolicy::new().with_queue(
-        "gpu",
-        QueueOptions {
-            max_running: NonZeroU32::new(1),
-            ..QueueOptions::DEFAULT
-        },
-    ));
+    fixture
+        .scheduler
+        .set_queue_policy(QueuePolicy::new().with_queue(
+            "gpu",
+            QueueOptions {
+                max_running: NonZeroU32::new(1),
+                ..QueueOptions::DEFAULT
+            },
+        ));
     let cpu = WorkerId::new("cpu");
     let gpu = WorkerId::new("gpu");
     fixture.scheduler.set_subscriptions(BTreeMap::from([

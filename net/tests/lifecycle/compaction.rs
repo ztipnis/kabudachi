@@ -70,9 +70,15 @@ async fn a_worker_that_runs_compaction_folds_the_chain_its_leader_hands_it() {
                     .find(|net| net.held_records().get(&compaction).is_some())
                     .expect("a majority holds the run's record")
                     .local_worker_id();
-                let offered = client.steal(holder.clone(), 10, &takes(true)).await.expect("the peer answered");
+                let offered = client
+                    .steal(holder.clone(), 10, &takes(true))
+                    .await
+                    .expect("the peer answered");
                 assert!(offered.contains(&compaction));
-                let withheld = client.steal(holder, 10, &takes(false)).await.expect("the peer answered");
+                let withheld = client
+                    .steal(holder, 10, &takes(false))
+                    .await
+                    .expect("the peer answered");
                 assert!(!withheld.contains(&compaction));
 
                 let refused = client

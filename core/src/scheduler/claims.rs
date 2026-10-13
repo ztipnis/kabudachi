@@ -133,10 +133,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let Some(max) = self.queue_policy.options(queue).max_running else {
             return false;
         };
-        let running = self
-            .running
-            .get(queue)
-            .map_or(0, |runs| runs.iter().filter(|run| self.is_active(run)).count());
+        let running = self.running.get(queue).map_or(0, |runs| {
+            runs.iter().filter(|run| self.is_active(run)).count()
+        });
         running >= max.get() as usize
     }
 

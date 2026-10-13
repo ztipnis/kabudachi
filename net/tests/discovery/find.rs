@@ -22,7 +22,8 @@ use libp2p::kad::{KBucketDistance, KBucketKey};
 use crate::support::deadline::within_deadline;
 use crate::support::net::wait_until_registered;
 use crate::support::records::{
-    ThreeVoters, Voters, claimed, plain_with, submitted_through, submitted_with, takes, wait_until_held,
+    ThreeVoters, Voters, claimed, plain_with, submitted_through, submitted_with, takes,
+    wait_until_held,
 };
 
 /// Each record is written to one voter only, so who holds what differs from

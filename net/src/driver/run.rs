@@ -83,8 +83,9 @@ where
         };
         let timings = node.timings();
         let retry_after = Duration::from_millis(timings.heartbeat_interval.as_ticks());
-        let executing = executor
-            .map(|endpoint| Executing::new(endpoint, net, retry_after, timings.reconnect_timeout, takes));
+        let executing = executor.map(|endpoint| {
+            Executing::new(endpoint, net, retry_after, timings.reconnect_timeout, takes)
+        });
         net.subscribe_to_shard(node.shard_id());
         let search = leader_search(node, net, &config, authority.is_some());
         let records = LeaderRecords::new(node.office_term(), timings.heartbeat_interval);

@@ -79,12 +79,7 @@ impl Net {
     /// answer, or this `Net` is the peer. A compaction run is offered only if
     /// `takes` says this worker runs them, and a task only if its queue is one
     /// `takes` names.
-    pub async fn steal(
-        &self,
-        peer: WorkerId,
-        limit: usize,
-        takes: &Takes,
-    ) -> Option<Vec<TaskId>> {
+    pub async fn steal(&self, peer: WorkerId, limit: usize, takes: &Takes) -> Option<Vec<TaskId>> {
         if peer == self.local_worker_id() {
             return None;
         }
@@ -135,10 +130,16 @@ pub(crate) fn candidates_for_steal(
 ) -> Vec<TaskId> {
     let mut found = held.claimable(now, runs_compaction, queues);
     found.sort_by(|a, b| {
-        let rank = |candidate: &Candidate| policy.rank(&candidate.queue, waited(now, candidate.submitted_at));
+        let rank = |candidate: &Candidate| {
+            policy.rank(&candidate.queue, waited(now, candidate.submitted_at))
+        };
         rank(b)
             .cmp(&rank(a))
-            .then(a.submitted_at.as_unix_millis().cmp(&b.submitted_at.as_unix_millis()))
+            .then(
+                a.submitted_at
+                    .as_unix_millis()
+                    .cmp(&b.submitted_at.as_unix_millis()),
+            )
             .then(a.task.cmp(&b.task))
     });
     found
