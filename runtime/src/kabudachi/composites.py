@@ -6,18 +6,23 @@ This only submits composites, cancels them, and settles each handle when its
 composite finishes.
 """
 
+import asyncio
+import contextvars
+import functools
 import threading
 import weakref
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Iterable, Iterator
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from kabudachi import _native
 from kabudachi._native import CancelOutcome
 from kabudachi.errors import (
     PayloadTooLargeError,
     RunStoppedError,
     RuntimeNotStartedError,
     TaskCancelledError,
+    TaskInterruptedError,
 )
 from kabudachi.handle import TaskHandle
 from kabudachi.hosted_work import LoopHostedWork
@@ -28,6 +33,17 @@ if TYPE_CHECKING:
     from kabudachi.session import Session
 
 _COUNTED = ("pending", "running", "succeeded", "failed", "cancelled")
+
+MEMBER_BATCH_ITEMS: int = _native.MEMBER_BATCH_ITEMS
+"""Most members one batch of a streamed group or map holds."""
+
+MEMBER_BATCH_BYTES: int = _native.MEMBER_BATCH_BYTES
+"""Most bytes of member input one batch holds; a member larger than this has
+its bound values stored as blobs before it is sent."""
+
+# What a member costs in a batch beyond the values bound in it: its
+# definition, version, options and framing.
+_MEMBER_OVERHEAD_BYTES = 64
 
 
 class CompositeHandle(TaskHandle):
@@ -56,6 +72,11 @@ class CompositeHandle(TaskHandle):
             replicable=not runtime.certifies_locally,
         )
         self._runtime = runtime
+        self.cancel_requested = False
+        """Whether a cancel of this composite was asked, so a stream still
+        sending its members stops."""
+        self.streaming = False
+        """Whether a stream of members has begun for this composite."""
 
     async def status(self) -> CompositeStatus:
         """How the composite stands: its state, its stages or members by
@@ -82,9 +103,13 @@ class CompositeHandle(TaskHandle):
         return "cancelled" if isinstance(error, TaskCancelledError) else "failed"
 
     def _cancel_composite(self, composite_id: str) -> bool:
+        # The flag first: a stream waiting to send its next batch sees it.
+        self.cancel_requested = True
         outcome = self._runtime.cancel_composite(composite_id)
         # `None`: sent to a leader elsewhere, which decides.
-        return outcome is None or outcome == CancelOutcome.CANCELLED
+        cancelled = outcome is None or outcome == CancelOutcome.CANCELLED
+        self.cancel_requested = cancelled
+        return cancelled
 
 
 class FlowHandle(CompositeHandle):
@@ -132,6 +157,8 @@ class Composites:
     def __init__(self, session: "Session", hosted: LoopHostedWork) -> None:
         self._session = session
         self._hosted = hosted
+        self.batch_items = MEMBER_BATCH_ITEMS
+        """At most this many members per batch; a test may lower it."""
         self._lock = threading.Lock()
         self._open: dict[str, CompositeHandle] = {}
         # Every handle still alive, finished or not, for status reads.
@@ -141,16 +168,29 @@ class Composites:
 
     def submit(self, step: Any, previous: Any) -> Any:
         """Submits `step`, its first stages bound to `previous` when they take
-        an input, and returns its handle, a `step.handle_type`. Raises as a
-        submit does: `BackpressureError` past the hard limit,
-        `PayloadTooLargeError` for a value bound in it that is past the hard
-        limit alone, and `RunStoppedError` once the run is stopping."""
+        an input, and returns its handle, a `step.handle_type`. A flow goes
+        whole. A group, or a map called with its list, sends its head now and
+        its members in batches from the run's loop, waiting out SlowDown
+        before each batch. Raises as a submit does: `BackpressureError` past
+        the hard memory limit (for a stream, through its handle once it is
+        under way), `PayloadTooLargeError` for a value bound in a flow that is
+        past the hard limit alone, and `RunStoppedError` once the run is
+        stopping."""
+        from kabudachi.flow import Group, MappedList
+
         if not self._hosted.has_loop():
             raise RuntimeNotStartedError(
                 "flows and groups can only be started while kabudachi.run() is serving"
             )
         if self._session.stopping:
             raise RunStoppedError("the run is stopping, so no more flows are accepted")
+        if isinstance(step, Group):
+            return self._stream(step.describe_streamed(), step.members_described(self._session, previous))
+        if isinstance(step, MappedList):
+            return self._stream(*self._mapped(step))
+        return self._submit_whole(step, previous)
+
+    def _submit_whole(self, step: Any, previous: Any) -> Any:
         tree = step.describe(self._session, previous)
         runtime = self._session.runtime
         refuse_oversized_values(runtime, tree)
@@ -162,6 +202,135 @@ class Composites:
             self._open[composite_id] = handle
             self._known[composite_id] = handle
         return handle
+
+    def _mapped(self, mapped: Any) -> tuple[tuple, Iterator[bytes]]:
+        """A mapped list's head, holding its one template, and its items
+        encoded as the template takes them, lazily."""
+        definition = mapped.definition
+        serializer = self._session.serializers.get(definition.serializer)
+        settings = self._session.submission_settings(definition)
+        template = ("task", definition.name, definition.version, settings, None, [])
+        items = (serializer.encode(item, definition.input_type) for item in mapped.items)
+        return ("map", mapped.on_error, [template], "streamed"), items
+
+    def _stream(
+        self,
+        head: tuple,
+        members: Iterator[Any],
+        handle: type["GroupHandle"] = GroupHandle,
+        inline_bytes: int = MEMBER_BATCH_BYTES,
+    ) -> "GroupHandle":
+        """Submits `head` and hosts what sends `members`, returning a
+        `handle` for it. The bindings store the bound values of a member
+        whose inline bytes pass `inline_bytes` as blobs. A run that cannot
+        host it is left with nothing: the head it took is cancelled."""
+        with self._lock:
+            composite_id = self._session.runtime.submit_composite(head)
+            streamed = handle(composite_id, self._session.runtime, self._session.callback_runner)
+            self._open[composite_id] = streamed
+            self._known[composite_id] = streamed
+        try:
+            self._host(self._send_members(composite_id, members, streamed, inline_bytes), streamed)
+        except BaseException:
+            with self._lock:
+                self._open.pop(composite_id, None)
+            self._session.runtime.cancel_composite(composite_id)
+            raise
+        return streamed
+
+    def _host(self, coroutine: Any, handle: "GroupHandle") -> None:
+        """Runs one stream on the run's loop. Raises, leaving the handle to
+        be dropped by the caller, if the run cannot take it."""
+        # Its own context, so awaiting its batches is not counted as the
+        # calling task body waiting.
+        if not self._hosted.spawn(
+            coroutine,
+            context=contextvars.Context(),
+            when_done=functools.partial(self._ended, handle),
+        ):
+            raise RuntimeNotStartedError("the run's event loop has closed")
+
+    def _ended(self, handle: "GroupHandle") -> None:
+        """The stream's coroutine ended. One cancelled before it began, as a
+        closing loop does, never sent anything: the composite is cancelled and
+        the handle fails here, so nobody waits on it for ever."""
+        if not handle.streaming and not handle.done():
+            self._abandon(
+                handle.task_id,
+                handle,
+                TaskInterruptedError(f"{handle.task_id} was interrupted before it was sent"),
+            )
+
+    async def _send_members(
+        self, composite_id: str, members: Iterator[Any], handle: "GroupHandle", inline_bytes: int
+    ) -> None:
+        """Sends `members` in batches of at most `batch_items` members and
+        `MEMBER_BATCH_BYTES` of inline input, the last marked so, until the
+        leader says the composite is over. A stop, a cancel or a refusal ends
+        the stream: what was sent is cancelled and the handle fails."""
+        handle.streaming = True
+        start = 0
+        try:
+            batches = _batches(members, self.batch_items, MEMBER_BATCH_BYTES)
+            batch = next(batches, [])
+            while True:
+                following = next(batches, None)
+                last = following is None
+                if not await self._send(composite_id, start, batch, last, handle, inline_bytes) or last:
+                    return
+                start, batch = start + len(batch), following
+        except BaseException as error:
+            self._abandon(composite_id, handle, error)
+            if not isinstance(error, Exception):
+                raise
+
+    async def _send(
+        self,
+        composite_id: str,
+        start: int,
+        batch: list[Any],
+        last: bool,
+        handle: "GroupHandle",
+        inline_bytes: int,
+    ) -> bool:
+        """One batch, once there is room; whether the leader still takes more."""
+        await self._wait_for_room(handle)
+        answer = await self._session.runtime.submit_members(
+            composite_id, start, batch, last, inline_bytes=inline_bytes
+        )
+        return answer == "accepted"
+
+    async def _wait_for_room(self, handle: "GroupHandle") -> None:
+        """Waits while the leader says memory use is past its soft limit
+        (SlowDown). Ends early, by failing, if the run is stopping or the
+        composite is cancelled, so waiting never outlives either."""
+        # Yield first, so a SLOW_DOWN raised by the last batch, and a cancel
+        # or stop that arrived meanwhile, are seen before the next batch.
+        await asyncio.sleep(0)
+        while True:
+            if self._session.stopping:
+                raise RunStoppedError("the run stopped while this was being sent")
+            if handle.cancel_requested:
+                raise TaskCancelledError(f"{handle.task_id} was cancelled")
+            if self._session.has_room():
+                return
+            await self._session.wait_for_room()
+
+    def _abandon(self, composite_id: str, handle: "GroupHandle", error: BaseException) -> None:
+        """The stream ended early: the leader cancels what it took, and the
+        handle fails with why, unless the cancel's notice settled it first."""
+        with self._lock:
+            self._open.pop(composite_id, None)
+        try:
+            self._session.runtime.cancel_composite(composite_id)
+        except Exception:
+            pass  # the runtime is gone, so there is nothing left to cancel
+        if not handle.done():
+            handle._fail(
+                error
+                if isinstance(error, Exception)
+                else TaskInterruptedError(f"{handle.task_id} was interrupted while it was being sent")
+            )
 
     def accepted(self, composite_id: str) -> bool:
         """A networked leader stored the composite on a quorum of its shard:
@@ -223,3 +392,39 @@ class Composites:
                 if self._open.pop(composite_id, None) is None:
                     continue
             handle._fail(RunStoppedError("the run stopped before this could finish"))
+
+
+def _batches(members: Iterable[Any], max_items: int, max_bytes: int) -> Iterator[list[Any]]:
+    """`members` in consecutive batches of at most `max_items` members and
+    `max_bytes` of inline input. A member larger than `max_bytes` goes in a
+    batch of its own: the bindings store its bound values as blobs before they
+    send it."""
+    batch: list[Any] = []
+    size = 0
+    for member in members:
+        length = _inline_bytes(member)
+        if batch and (len(batch) == max_items or size + length > max_bytes):
+            yield batch
+            batch, size = [], 0
+        batch.append(member)
+        size += length
+    if batch:
+        yield batch
+
+
+def _inline_bytes(member: Any) -> int:
+    """What a member weighs in a batch: a map item's own bytes, or, for a
+    group's member, the values and fields bound in its tree and a fixed cost
+    for each task."""
+    if isinstance(member, bytes):
+        return len(member) + _MEMBER_OVERHEAD_BYTES
+    if member[0] == "task":
+        _, _, _, _, value, fields = member
+        weight = _MEMBER_OVERHEAD_BYTES + (len(value) if isinstance(value, bytes) else 0)
+        for _, _, field_value in fields:
+            if isinstance(field_value, str):
+                weight += len(field_value.encode())
+            else:
+                weight += len(field_value) if isinstance(field_value, bytes) else 8
+        return weight
+    return sum(_inline_bytes(stage) for stage in member[2])

@@ -6,6 +6,8 @@ retries, timeouts and queues stay per stage and nothing is inherited between
 stages.
 """
 
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from kabudachi.composites import FlowHandle, GroupHandle
@@ -272,6 +274,16 @@ class Group:
         members = [member.describe(session, previous) for member in self.members]
         return ("group", self.on_error, members)
 
+    def describe_streamed(self) -> tuple:
+        """The head of the group as it is streamed: its members follow in
+        batches."""
+        return ("group", self.on_error, [], "streamed")
+
+    def members_described(self, session: Session, previous: Any) -> Iterator[tuple]:
+        """Each member as a tree, bound to `previous` as `describe` binds it,
+        one at a time."""
+        return (member.describe(session, previous) for member in self.members)
+
     def check_arguments(self, arguments: tuple[Any, ...]) -> None:
         """Raises `TypeError` unless `arguments` is what the group takes."""
         _check_arguments("this group", self.needs_input, arguments)
@@ -282,6 +294,15 @@ class Group:
 
     def start(self, session: Session, previous: Any) -> GroupHandle:
         return session.composites.submit(self, previous)
+
+
+@dataclass(frozen=True)
+class MappedList:
+    """A map called with its list: `definition` run on every item, in order."""
+
+    definition: TaskDefinition
+    items: list[Any]
+    on_error: str
 
 
 class MapStep:
@@ -323,21 +344,27 @@ class MapStep:
         _check_arguments(f"{self.definition.name}.map", True, arguments)
 
     def __call__(self, inputs: Any, *, on_error: str = "fail_fast") -> GroupHandle:
-        step = MapStep(self.definition, self._serializers, _policy(on_error))
-        return current_session().composites.submit(step, inputs)
+        return self.start(current_session(), inputs, _policy(on_error))
 
-    def start(self, session: Session, previous: Any) -> GroupHandle:
-        return session.composites.submit(self, previous)
+    def start(self, session: Session, previous: Any, on_error: str = "fail_fast") -> GroupHandle:
+        """Submits the map over the list `previous`, streaming its items."""
+        return session.composites.submit(
+            MappedList(self.definition, self._checked(previous), _policy(on_error)), UNSET
+        )
 
-    def _members(self, inputs: Any) -> list[BoundTask]:
-        """One fully bound task per item. Every item is checked before any is
-        submitted, so a bad one leaves nothing half done."""
+    def _checked(self, inputs: Any) -> list[Any]:
+        """The items of `inputs`, each checked before any is submitted, so a
+        bad one leaves nothing half done."""
         if not isinstance(inputs, (list, tuple)):
             raise TypeError(f"map takes a list of inputs, not {inputs!r}")
         serializer = self._serializers.get(self.definition.serializer)
         for item in inputs:
             serializer.encode(item, self.definition.input_type)
-        return [BoundTask(self.definition, value=item) for item in inputs]
+        return list(inputs)
+
+    def _members(self, inputs: Any) -> list[BoundTask]:
+        """One fully bound task per item."""
+        return [BoundTask(self.definition, value=item) for item in self._checked(inputs)]
 
 
 def _steps(kind: str, steps: tuple[Any, ...]) -> list[Any]:

@@ -612,6 +612,19 @@ def test_map_runs_the_task_on_every_input_and_keeps_the_order_of_the_inputs():
     assert [g.text for g in run(with_events(world, body))] == ["A", "B", "C"]
 
 
+def test_a_map_longer_than_a_batch_is_sent_in_batches_that_continue_where_the_last_ended():
+    world = World(shout, concurrency=8, member_batch_items=3)
+
+    async def body():
+        with activated(world):
+            return await world.tasks["shout"].map(greetings(*"abcdefg"))
+
+    results = run(with_events(world, body))
+
+    assert [g.text for g in results] == list("ABCDEFG")
+    assert [(start, count) for _, start, count in world.runtime.members_sent] == [(0, 3), (3, 3), (6, 1)]
+
+
 def test_mapping_an_empty_list_gives_an_empty_list_and_submits_nothing():
     world = World(shout)
 
@@ -784,6 +797,7 @@ def test_a_map_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_ta
 # a submission that would go past the hard one is refused.
 SOFT_LIMIT = 100
 HARD_LIMIT = 1_000
+PAST_SOFT_LIMIT = Greeting(text="x" * 150)
 
 
 def held_world(*functions, hard_limit=HARD_LIMIT, **options):
@@ -814,22 +828,140 @@ def run_states(world):
     ]
 
 
-def test_a_group_past_the_hard_limit_is_refused_whole_and_starts_nothing():
-    # Two members would fit and the third would not: the group is refused as a
-    # whole, so none of them is started.
-    world, released = held_world(hard_limit=100)
+def members_sent(world):
+    """How many members the leader took in batches so far."""
+    return sum(count for _, _, count in world.runtime.members_sent)
+
+
+async def until_slow_down_seen(world):
+    """Waits until the runtime says memory use is past its soft limit."""
+    while world.session.has_room():
+        await asyncio.sleep(0.005)
+
+
+async def with_watcher_only(world, body):
+    """Like `with_events`, but no worker claims anything, so every task the
+    body submits stays pending and its input stays counted."""
+    await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
+    events = asyncio.ensure_future(world.session.watch_events())
+    try:
+        return await asyncio.wait_for(body(), WAIT)
+    finally:
+        events.cancel()
+        await asyncio.gather(events, return_exceptions=True)
+
+
+def test_a_streamed_group_pauses_its_batches_while_slow_down_is_raised_but_a_plain_call_does_not():
+    world, released = held_world(shout, member_batch_items=1)
+    members = group(*([world.tasks["shout"]] * 3))
+
+    async def body():
+        holder = world.call("hold", PAST_SOFT_LIMIT)
+        await until_slow_down_seen(world)
+        handle = members.start(world.session, Greeting(text="a"))
+        await asyncio.sleep(0.05)
+        during = members_sent(world)
+        plain = await world.call("shout", Greeting(text="plain"))
+        released.set()  # the held input finishes, which clears SlowDown
+        results = await asyncio.wait_for(handle, WAIT)
+        await holder
+        return during, plain, results
+
+    during, plain, results = run(with_events(world, body))
+
+    assert during == 0, "no batch went while SlowDown was raised"
+    assert plain == Greeting(text="PLAIN"), "a plain call does not wait"
+    assert results == [Greeting(text="A")] * 3
+
+
+@pytest.mark.parametrize(
+    ("end", "error"),
+    [
+        pytest.param(
+            lambda world, handle: asyncio.ensure_future(world.session.stop_claiming()), RunStoppedError, id="stop"
+        ),
+        pytest.param(lambda world, handle: handle.cancel(), TaskCancelledError, id="cancel"),
+    ],
+)
+def test_stopping_or_cancelling_a_streamed_group_that_is_waiting_out_slow_down_sends_nothing_more(end, error):
+    world = World(shout, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT, member_batch_items=1)
+    members = group(world.tasks["shout"], world.tasks["shout"])
+
+    async def body():
+        world.call("shout", PAST_SOFT_LIMIT)  # never claimed: its input stays counted
+        await until_slow_down_seen(world)
+        handle = members.start(world.session, Greeting())
+        await asyncio.sleep(0.05)
+        end(world, handle)
+        with pytest.raises(error):
+            await asyncio.wait_for(handle, WAIT)
+
+    run(with_watcher_only(world, body))
+
+    assert members_sent(world) == 0
+
+
+def test_a_streamed_group_that_hits_the_hard_limit_midway_fails_and_cancels_the_members_it_sent():
+    # Two members fit and the third does not. With equal limits SlowDown is
+    # never raised first, so the stream reaches the hard limit rather than
+    # pausing. Members hold, so the cancel reaches them still running.
+    world, released = held_world(hard_limit=100, member_batch_items=1)
     members = group(*([world.tasks["hold"]] * 3))
 
     async def body():
+        handle = members.start(world.session, Greeting(text="x" * 40))
         with pytest.raises(BackpressureError):
-            members.start(world.session, Greeting(text="x" * 40))
+            await handle
         released.set()
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        return await world.native.composite_status(handle.task_id)
 
-    run(with_events(world, body))
+    state, _, pending, running, succeeded, failed, cancelled = run(with_events(world, body))
 
-    assert world.runtime.claimed == []
-    assert run_states(world) == []
+    assert members_sent(world) == 2
+    assert (state, cancelled, pending + running + succeeded + failed) == ("cancelled", 2, 0)
+
+
+def test_a_streamed_group_pauses_when_slow_down_is_raised_while_it_is_still_sending():
+    world, released = held_world(shout, concurrency=8, member_batch_items=1)
+    members = group(*([world.tasks["hold"]] * 40))
+
+    async def body():
+        handle = members.start(world.session, Greeting(text="x" * 60))
+        await until_slow_down_seen(world)
+        paused_at = members_sent(world)
+        await asyncio.sleep(0.05)
+        while_slow = members_sent(world)
+        released.set()  # the held members finish, which clears SlowDown
+        await asyncio.wait_for(handle, WAIT)
+        return paused_at, while_slow, members_sent(world)
+
+    paused_at, while_slow, after = run(with_events(world, body))
+
+    assert while_slow == paused_at, "the group kept sending past the soft limit"
+    assert paused_at < 40
+    assert after == 40
+
+
+def test_cancelling_a_streamed_group_part_way_through_starts_no_further_member():
+    world, released = held_world(concurrency=8, member_batch_items=1)
+    members = group(*([world.tasks["hold"]] * 6))
+
+    async def body():
+        handle = members.start(world.session, Greeting())
+        while members_sent(world) < 2:
+            await asyncio.sleep(0)
+        assert handle.cancel() is True
+        with pytest.raises(TaskCancelledError):
+            await asyncio.wait_for(handle, WAIT)
+        released.set()
+        await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        return await world.native.composite_status(handle.task_id)
+
+    state, _, pending, running, succeeded, _, cancelled = run(with_events(world, body))
+
+    assert members_sent(world) < 6
+    assert (state, pending, running, succeeded, cancelled) == ("cancelled", 0, 0, 0, members_sent(world))
 
 
 def test_a_stage_reading_a_large_result_holds_it_against_the_memory_limit_until_its_run_ends():
