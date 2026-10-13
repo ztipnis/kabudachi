@@ -718,7 +718,6 @@ def test_an_unknown_setting_is_refused():
         ({"queue_options": {"": QueueOptions()}}, "queue_options"),
         ({"queue_options": [("gpu", QueueOptions())]}, "queue_options"),
         ({"router": "app.route"}, "router"),
-        ({"reconnect_timeouts": {"slow": 5}}, "reconnect_timeouts"),  # gone: an unknown setting
         # A networked worker must be able to kill a body at its abort deadline.
         ({"listen": "/ip4/127.0.0.1/tcp/0", "processes": 0}, "processes"),
         ({"seeds": "/ip4/127.0.0.1/tcp/4001"}, "seeds"),

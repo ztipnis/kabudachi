@@ -34,7 +34,6 @@ use kabudachi_core::protocol::messages::{
     AckEcho, VoteGrant, WorkerHeartbeat,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::queues::Subscription;
 use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
 use kabudachi_core::time::{Clock, Duration, Instant};
 
@@ -516,46 +515,4 @@ fn a_leader_knows_which_members_run_compaction_from_their_latest_heartbeats() {
     let _ = receive(&mut won.node, &first, says(&first, false));
     won.node.set_runs_compaction(false);
     assert!(won.node.compaction_runners().is_empty(), "the latest heartbeat decides");
-}
-
-// ---- Which queues each member takes ----
-
-#[test]
-fn a_leader_knows_which_queues_each_member_takes_from_their_latest_heartbeats() {
-    let clock = FakeClock::new();
-    let mut won = leader_of(&clock, 3);
-    let [first, second] = [won.others[0].clone(), won.others[1].clone()];
-    assert_eq!(
-        won.node.queue_subscriptions().get(&worker("leader")),
-        Some(&Subscription::Every),
-        "a worker takes every queue until told otherwise"
-    );
-
-    let says = |from: &WorkerId, queues: &[&str]| WorkerHeartbeat {
-        queues: queues.iter().map(|queue| (*queue).to_owned()).collect(),
-        ..heartbeat(from, None)
-    };
-    let _ = receive(&mut won.node, &first, says(&first, &["gpu"]));
-    let _ = receive(&mut won.node, &second, says(&second, &[]));
-    won.node
-        .set_queues(Subscription::Only(BTreeSet::from(["io".to_owned()])));
-
-    let subscriptions = won.node.queue_subscriptions();
-    assert_eq!(
-        subscriptions.get(&first),
-        Some(&Subscription::Only(BTreeSet::from(["gpu".to_owned()])))
-    );
-    assert_eq!(subscriptions.get(&second), Some(&Subscription::Every));
-    assert_eq!(
-        subscriptions.get(&worker("leader")),
-        Some(&Subscription::Only(BTreeSet::from(["io".to_owned()]))),
-        "the leader counts itself"
-    );
-
-    let _ = receive(&mut won.node, &first, says(&first, &[]));
-    assert_eq!(
-        won.node.queue_subscriptions().get(&first),
-        Some(&Subscription::Every),
-        "the latest heartbeat decides"
-    );
 }

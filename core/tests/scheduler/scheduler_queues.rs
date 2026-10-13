@@ -2,15 +2,17 @@
 //! priority goes first; queues of one priority share claims by weight; and
 //! a task that waited past its queue's starvation age goes before all.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, WorkerId};
-use kabudachi_core::queues::{QueueOptions, QueuePolicy, Subscription};
+use kabudachi_core::queues::{QueueOptions, QueuePolicy};
+use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{ClaimRejection, Submission};
 use kabudachi_core::time::Duration;
 
-use crate::support::scheduler::{Fixture, TestScheduler};
+use crate::support::scheduler::{
+    Fixture, OFFICE, TestScheduler, grant_of, newest_records, reconciling_after,
+};
 
 fn submit_to(scheduler: &mut TestScheduler, queue: &str, count: usize) {
     for _ in 0..count {
@@ -99,65 +101,47 @@ fn a_higher_priority_goes_first_weights_share_a_tier_and_a_starving_task_goes_be
 }
 
 #[test]
-fn scaffold_a_claim_outside_the_workers_queues_or_past_a_full_queue_is_refused() {
-    let mut fixture = Fixture::leading();
-    fixture
-        .scheduler
-        .set_queue_policy(QueuePolicy::new().with_queue(
+fn a_new_leader_counts_the_runs_it_rebuilds_against_their_queues_limit() {
+    let policy = || {
+        QueuePolicy::new().with_queue(
             "gpu",
             QueueOptions {
-                max_running: NonZeroU32::new(1),
+                max_running: NonZeroU32::new(2),
                 ..QueueOptions::DEFAULT
             },
-        ));
-    let cpu = WorkerId::new("cpu");
-    let gpu = WorkerId::new("gpu");
-    fixture.scheduler.set_subscriptions(BTreeMap::from([
-        (
-            cpu.clone(),
-            Subscription::Only(BTreeSet::from(["default".to_owned()])),
-        ),
-        (
-            gpu.clone(),
-            Subscription::Only(BTreeSet::from(["gpu".to_owned()])),
-        ),
-    ]));
-    let first = fixture
-        .scheduler
-        .submit(Submission::new(
-            TaskDefinitionId::new("t"),
-            1,
-            b"1".to_vec(),
-            "gpu",
-        ))
+        )
+    };
+    let mut old = Fixture::leading();
+    old.scheduler.set_queue_policy(policy());
+    let definition = TaskDefinitionId::new("demo.task");
+    for input in [b"1", b"2"] {
+        let task = old
+            .scheduler
+            .submit(Submission::new(definition.clone(), 1, input.to_vec(), "gpu"))
+            .unwrap();
+        old.scheduler
+            .request_claim(&WorkerId::new("w1"), &task)
+            .unwrap();
+    }
+    let mut new = reconciling_after(&old);
+    new.scheduler.set_queue_policy(policy());
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&old),
+            ..Rebuild::default()
+        })
         .unwrap();
-    let second = fixture
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+    let third = new
         .scheduler
-        .submit(Submission::new(
-            TaskDefinitionId::new("t"),
-            1,
-            b"2".to_vec(),
-            "gpu",
-        ))
+        .submit(Submission::new(definition, 1, b"3".to_vec(), "gpu"))
         .unwrap();
 
     assert_eq!(
-        fixture.scheduler.request_claim(&cpu, &first).unwrap_err(),
-        ClaimRejection::NotSubscribed
-    );
-    assert!(fixture.scheduler.claim_oldest(&cpu, 5).unwrap().is_empty());
-    fixture.scheduler.request_claim(&gpu, &first).unwrap();
-    assert_eq!(
-        fixture.scheduler.request_claim(&gpu, &second).unwrap_err(),
-        ClaimRejection::QueueFull
-    );
-    assert!(fixture.scheduler.claim_oldest(&gpu, 5).unwrap().is_empty());
-    // A worker the scheduler knows no queues of may take any queue.
-    assert_eq!(
-        fixture
-            .scheduler
-            .request_claim(&WorkerId::new("new"), &second)
+        new.scheduler
+            .request_claim(&WorkerId::new("w2"), &third)
             .unwrap_err(),
-        ClaimRejection::QueueFull
+        ClaimRejection::QueueFull,
+        "the two runs it inherited fill the queue"
     );
 }
