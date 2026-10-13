@@ -109,8 +109,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let Rebuild {
             records,
+            composites: _,
+            pages: _,
             uncertain,
             uncertain_keys,
+            uncertain_composites: _,
             reports,
         } = rebuild;
         self.clear_tasks();
@@ -167,8 +170,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let Rebuild {
             records,
+            composites: _,
+            pages: _,
             uncertain,
             uncertain_keys,
+            uncertain_composites: _,
             reports,
         } = learnt;
         let tasks = &self.tasks;

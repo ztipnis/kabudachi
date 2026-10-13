@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::protocol::generated::{self, TaskRecord};
+use crate::protocol::generated;
 use crate::protocol::ids::WorkerId;
 use crate::task_record::gate::{PlacedWrite, PriorPlacement, Write, WriteOutcome};
-use crate::task_record::key::RecordKey;
+use crate::task_record::key::{RecordKey, ShardRecord};
 use crate::task_record::version::{RecordVersion, VersionOrder};
 use crate::time::{Duration, Instant};
 
@@ -88,21 +88,20 @@ impl Repair {
     /// `records`, which a rebuild or a late answer gave this leader, were held
     /// as their placements say. A record this leader has written since keeps
     /// its own entry.
-    pub fn found(&mut self, records: &[TaskRecord]) {
+    pub fn found(&mut self, records: &[ShardRecord]) {
         for record in records {
-            let Ok((task, version)) = crate::task_record::store::identify(record) else {
+            let Ok((task, version)) = record.identify() else {
                 continue;
             };
-            let task = RecordKey::Task(task);
             let holders: BTreeSet<WorkerId> =
-                record.placement.iter().cloned().map(WorkerId::from).collect();
+                record.placement().iter().cloned().map(WorkerId::from).collect();
             if holders.is_empty() {
                 continue;
             }
             // The placements the revision was written to jointly are still
             // ones the record may be known by.
             let carried: Vec<BTreeSet<WorkerId>> = record
-                .prior_placements
+                .prior_placements()
                 .iter()
                 .map(|prior| prior.holders.iter().cloned().map(WorkerId::from).collect())
                 .collect();

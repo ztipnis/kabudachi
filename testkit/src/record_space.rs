@@ -275,6 +275,27 @@ impl RecordSpace {
             .unwrap_or_default()
     }
 
+    /// What `holder` reports of every kind of record: each record it holds
+    /// and the stub of each revision held elsewhere.
+    pub fn reported_shard_records(&self, holder: &WorkerId) -> Vec<ShardRecord> {
+        self.0
+            .borrow()
+            .stores
+            .get(holder)
+            .map(|store| store.reported().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// What `holder` holds of the record `key` names.
+    pub fn held_record(&self, holder: &WorkerId, key: &RecordKey) -> Option<ShardRecord> {
+        self.0
+            .borrow()
+            .stores
+            .get(holder)
+            .and_then(|store| store.get_record(key))
+            .cloned()
+    }
+
     /// What `holder` holds of `task`.
     pub fn held_by(&self, holder: &WorkerId, task: &TaskId) -> Option<TaskRecord> {
         self.0

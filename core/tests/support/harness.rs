@@ -766,6 +766,7 @@ impl Cluster {
                             ..claim.clone()
                         },
                         state: ReportedState::Claimed,
+                        continuation: None,
                     },
                 );
             }
@@ -1498,9 +1499,9 @@ impl Cluster {
             }
         }
         let is_member = |worker: &WorkerId| self.nodes.get(id).is_some_and(|node| node.is_member(worker));
-        for task in round.missing_records(is_member) {
+        for key in round.missing_records(is_member) {
             for holder in round.answered() {
-                if let Some(record) = self.records.held_by(&holder, &task) {
+                if let Some(record) = self.records.held_record(&holder, &key) {
                     round.fetched(record);
                 }
             }
@@ -1518,7 +1519,7 @@ impl Cluster {
                 .unwrap_or_default(),
             keys: self
                 .records
-                .reported_records(worker)
+                .reported_shard_records(worker)
                 .iter()
                 .filter_map(|record| wire::held_key(record).ok())
                 .collect(),

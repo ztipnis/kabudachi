@@ -2,7 +2,8 @@
 //! holds.
 
 use kabudachi_core::protocol::generated;
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId};
+use kabudachi_core::protocol::ids::TaskRunId;
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::protocol::messages::{ReconcileReport, ReconcileRequest, reconcile_request};
 use prost::encoding::message;
 
@@ -33,7 +34,15 @@ pub(crate) fn page_of(
         Some(reconcile_request::After::AfterRun(run)) => Some(TaskRunId::from(run.clone())),
         _ => None,
     };
-    let runs_sent = matches!(&request.after, Some(reconcile_request::After::AfterKey(_)));
+    let keys_after = match &request.after {
+        Some(reconcile_request::After::AfterKey(task)) => Some(RecordKey::Task(task.clone().into())),
+        Some(reconcile_request::After::AfterRecord(bytes)) => RecordKey::from_kad_bytes(bytes),
+        _ => None,
+    };
+    let runs_sent = matches!(
+        &request.after,
+        Some(reconcile_request::After::AfterKey(_) | reconcile_request::After::AfterRecord(_))
+    );
     if !runs_sent {
         runs.reported_runs_after(runs_after.as_ref(), |run| {
             let fits = page.add_run(generated::ReportedRun::from(&run));
@@ -43,10 +52,6 @@ pub(crate) fn page_of(
     }
 
     if exhausted && !request.runs_only {
-        let keys_after = match &request.after {
-            Some(reconcile_request::After::AfterKey(task)) => Some(TaskId::from(task.clone())),
-            _ => None,
-        };
         exhausted = held.keys_after(keys_after.as_ref(), |key| {
             page.add_key(generated::HeldKey::from(&key))
         });

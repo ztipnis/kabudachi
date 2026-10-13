@@ -417,7 +417,7 @@ impl<E> LeaderRecords<E> {
         if node.office_term() != Some(reconciliation.office()) {
             return Some(Turn::Ended);
         }
-        let found = learnt.records.clone();
+        let found = learnt.found();
         match scheduler.adopt(learnt) {
             Ok(adopted) => {
                 self.repair.found(&found);
@@ -488,7 +488,7 @@ impl<E> LeaderRecords<E> {
     ) -> Option<Turn> {
         // Where the rebuild's records were held is noted first, so a revision
         // that moves one is written to the holders it left too.
-        self.repair.found(&rebuild.records);
+        self.repair.found(&rebuild.found());
         match scheduler.reconcile(rebuild) {
             Ok(rebuilt) => {
                 tracing::info!(

@@ -3,10 +3,11 @@
 use crate::protocol::digest::Digest;
 use crate::protocol::generated;
 use crate::protocol::messages::prelude::*;
-use crate::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
+use crate::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use crate::reconcile::{CoalescingKey, HeldKey, ReportPage, ReportedRun, ReportedState};
 use crate::scheduler::Claim;
-use crate::task_record::{RecordVersion, identify};
+use crate::scheduler::composite::Step;
+use crate::task_record::{RecordKey, RecordVersion, ShardRecord};
 use crate::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -91,7 +92,7 @@ impl From<&ReportedRun> for generated::ReportedRun {
                 }
             ),
             failure_message,
-            continuation: None,
+            continuation: run.continuation.as_ref().map(generated::StepDescription::from),
         }
     }
 }
@@ -115,14 +116,28 @@ impl TryFrom<&generated::ReportedRun> for ReportedRun {
             },
             Ok(generated::ReportedRunState::Unspecified) | Err(_) => return Err(MalformedReport),
         };
-        Ok(ReportedRun { claim, state })
+        let continuation = run
+            .continuation
+            .as_ref()
+            .map(|description| Step::try_from(description).map_err(|_| MalformedReport))
+            .transpose()?;
+        Ok(ReportedRun {
+            claim,
+            state,
+            continuation,
+        })
     }
 }
 
 impl From<&HeldKey> for generated::HeldKey {
     fn from(key: &HeldKey) -> Self {
+        let (task_id, composite_id, page) = match &key.key {
+            RecordKey::Task(task) => (Some(task.clone().into()), None, None),
+            RecordKey::Composite(id) => (None, Some(id.clone().into()), None),
+            RecordKey::Page(id, page) => (None, Some(id.clone().into()), Some(*page)),
+        };
         generated::HeldKey {
-            task_id: Some(key.task_id.clone().into()),
+            task_id,
             version: Some(key.version.into()),
             input_digest: key.input_digest.clone().map(Into::into),
             latest_run: key.latest_run.clone().map(Into::into),
@@ -133,8 +148,8 @@ impl From<&HeldKey> for generated::HeldKey {
                 .as_ref()
                 .map(|coalescing| coalescing.definition.clone().into()),
             coalescing_key: key.coalescing.as_ref().map(|coalescing| coalescing.key.clone()),
-            composite_id: None,
-            page: None,
+            composite_id,
+            page,
         }
     }
 }
@@ -143,12 +158,14 @@ impl TryFrom<&generated::HeldKey> for HeldKey {
     type Error = MalformedReport;
 
     fn try_from(key: &generated::HeldKey) -> Result<Self, MalformedReport> {
+        let record = match (key.task_id.clone(), key.composite_id.clone(), key.page) {
+            (Some(task), None, None) => RecordKey::Task(TaskId::from(task)),
+            (None, Some(id), None) => RecordKey::Composite(CompositeId::from(id)),
+            (None, Some(id), Some(page)) => RecordKey::Page(CompositeId::from(id), page),
+            _ => return Err(MalformedReport),
+        };
         Ok(HeldKey {
-            task_id: key
-                .task_id
-                .clone()
-                .map(TaskId::from)
-                .ok_or(MalformedReport)?,
+            key: record,
             version: key
                 .version
                 .as_ref()
@@ -208,30 +225,37 @@ pub fn report(page: &ReportPage) -> generated::ReconcileReport {
 }
 
 /// The summary of `record` a worker reports for it.
-pub fn held_key(record: &generated::TaskRecord) -> Result<HeldKey, MalformedReport> {
-    let (task_id, version) = identify(record).map_err(|_| MalformedReport)?;
+pub fn held_key(record: &ShardRecord) -> Result<HeldKey, MalformedReport> {
+    let (key, version) = record.identify().map_err(|_| MalformedReport)?;
+    let placement = record.placement().iter().cloned().map(WorkerId::from).collect();
+    let ShardRecord::Task(task_record) = record else {
+        return Ok(HeldKey {
+            key,
+            version,
+            input_digest: None,
+            latest_run: None,
+            placement,
+            finished: record.is_finished(),
+            coalescing: None,
+        });
+    };
     Ok(HeldKey {
-        task_id,
+        key,
         version,
-        input_digest: record
+        input_digest: task_record
             .input_digest
             .as_ref()
             .map(|digest| Digest::try_from(digest).map_err(|_| MalformedReport))
             .transpose()?,
-        latest_run: record
+        latest_run: task_record
             .runs
             .last()
             .and_then(|run| run.identity.as_ref())
             .and_then(|identity| identity.task_run_id.clone())
             .map(TaskRunId::from),
-        placement: record
-            .placement
-            .iter()
-            .cloned()
-            .map(WorkerId::from)
-            .collect(),
-        finished: record.finished,
-        coalescing: record.task.as_ref().and_then(|task| {
+        placement,
+        finished: task_record.finished,
+        coalescing: task_record.task.as_ref().and_then(|task| {
             Some(CoalescingKey {
                 definition: task.task_definition_id(),
                 key: task.coalescing_key.clone()?,

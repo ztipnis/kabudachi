@@ -101,6 +101,7 @@ impl ClaimedRuns {
             let run = ReportedRun {
                 claim: Claim { chain: Vec::new(), ..claim },
                 state,
+                continuation: None,
             };
             if !take(run) {
                 return;

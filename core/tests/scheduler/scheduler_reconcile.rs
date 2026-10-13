@@ -347,6 +347,7 @@ fn reported(claim: &Claim, state: ReportedState) -> ReportedRun {
             ..claim.clone()
         },
         state,
+        continuation: None,
     }
 }
 

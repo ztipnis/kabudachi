@@ -10,7 +10,7 @@ use kabudachi_core::protocol::generated::{ElectionCertificate, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::messages::ReconcileRequest;
 use kabudachi_core::reconcile::{Cursor, DriftWatch, ReconcileTerm, ReportPage, wire};
-use kabudachi_core::task_record::OfficeReconciliation;
+use kabudachi_core::task_record::{OfficeReconciliation, RecordKey};
 use kabudachi_core::time::{Clock, Duration, Instant};
 use libp2p::futures::StreamExt;
 use libp2p::futures::future::BoxFuture;
@@ -275,12 +275,12 @@ impl<'n> LeaderReconciliation<'n> {
         self.scan_again_at = None;
         self.unlooked = 0;
         self.read_held_records(node);
-        for task in self
+        for key in self
             .reconciling
             .round()
             .missing_records(|worker| node.is_member(worker))
         {
-            self.look_up(task, now);
+            self.look_up(key, now);
         }
     }
 
@@ -293,21 +293,26 @@ impl<'n> LeaderReconciliation<'n> {
     /// Takes every record the round lacks that this worker's own store holds.
     fn read_held_records<C: Clock>(&mut self, node: &WorkerNode<C>) {
         let held = self.net.held_records();
-        for task in self
+        for key in self
             .reconciling
             .round()
             .missing_records(|worker| node.is_member(worker))
         {
-            if let Some(record) = held.get(&task) {
+            if let Some(record) = held.get_record(&key) {
                 self.reconciling.round_mut().fetched(record);
             }
         }
     }
 
-    /// Looks `task` up, unless a lookup of it runs, it was looked up too
-    /// recently (the round is scanned again when that cools down), or the
-    /// most lookups run that may (scanned again when one ends).
-    fn look_up(&mut self, task: TaskId, now: Instant) {
+    /// Looks the record `key` names up over the network, unless a lookup of
+    /// it runs, it was looked up too recently (the round is scanned again
+    /// when that cools down), or the most lookups run that may (scanned again
+    /// when one ends). Only a Task record can be looked up this way; any
+    /// other is taken from this worker's own store only.
+    fn look_up(&mut self, key: RecordKey, now: Instant) {
+        let RecordKey::Task(task) = key else {
+            return;
+        };
         if self.fetching.contains(&task) {
             return;
         }

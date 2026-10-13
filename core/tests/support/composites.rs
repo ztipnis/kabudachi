@@ -13,9 +13,9 @@ fn version(term: u64, revision: u64) -> Option<RecordVersion> {
     })
 }
 
-/// A flow of one task, the description every record below carries.
-fn one_stage_flow() -> generated::StepDescription {
-    let step = Step {
+/// A flow of one task, the step every record below describes.
+pub fn one_stage_flow() -> Step {
+    Step {
         kind: CompositeKind::Flow,
         on_error: OnError::FailFast,
         stages: vec![Stage::Task(BoundStep {
@@ -25,8 +25,7 @@ fn one_stage_flow() -> generated::StepDescription {
             input: BoundInput::Value(b"x".to_vec()),
             fields: Vec::new(),
         })],
-    };
-    generated::StepDescription::from(&step)
+    }
 }
 
 /// A composite's record at epoch (0, 0), with no placement.
@@ -34,7 +33,7 @@ pub fn composite_record(id: &CompositeId, term: u64, revision: u64) -> Composite
     CompositeRecord {
         version: version(term, revision),
         composite_id: Some(id.clone().into()),
-        description: Some(one_stage_flow()),
+        description: Some(generated::StepDescription::from(&one_stage_flow())),
         ..Default::default()
     }
 }

@@ -12,7 +12,7 @@
 //! by itself.
 //!
 //! An answer is paged: a worker's runs first, in run id order, then a summary
-//! of each record it holds, in task id order, each page within the message
+//! of each record it holds, in record key order, each page within the message
 //! limit and each carrying the cursor the next request continues from. What a
 //! report must drop to fit is logged, never silently cut. `leader` runs a
 //! new leader's side of the exchange for the driver: it asks and fetches the
@@ -26,6 +26,7 @@ use kabudachi_core::protocol::generated::ElectionCertificate;
 use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::{ReconcileReport, ReconcileRequest, reconcile_request};
 use kabudachi_core::reconcile::{Cursor, ReconcileTerm, ReportPage, wire};
+use kabudachi_core::task_record::RecordKey;
 use libp2p::PeerId;
 
 use crate::exchange::Asked;
@@ -41,7 +42,8 @@ pub(crate) mod report;
 pub(crate) fn request_after(cursor: Cursor) -> reconcile_request::After {
     match cursor {
         Cursor::AfterRun(run) => reconcile_request::After::AfterRun(run.into()),
-        Cursor::AfterKey(task) => reconcile_request::After::AfterKey(task.into()),
+        Cursor::AfterKey(RecordKey::Task(task)) => reconcile_request::After::AfterKey(task.into()),
+        Cursor::AfterKey(key) => reconcile_request::After::AfterRecord(key.kad_bytes()),
     }
 }
 

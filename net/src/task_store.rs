@@ -91,6 +91,11 @@ impl HeldRecords {
         self.lock().get(task).cloned()
     }
 
+    /// The newest revision of the record `key` names that this worker holds.
+    pub fn get_record(&self, key: &RecordKey) -> Option<ShardRecord> {
+        self.lock().get_record(key).cloned()
+    }
+
     /// The blob held under `key`, if any.
     pub fn blob(&self, key: &BlobKey) -> Option<BlobRecord> {
         self.lock().blob(key)
@@ -195,16 +200,12 @@ impl HeldRecords {
 
     /// Feeds `take` a summary of each record held after `after` (every one
     /// for `None`), and of each stub of a revision held elsewhere (see
-    /// [`VersionedRecords::reported`]), in task id order, until it refuses one. Says whether it
-    /// took every record: `false` means the refused one, and all after it,
-    /// remain.
-    pub fn keys_after(&self, after: Option<&TaskId>, mut take: impl FnMut(HeldKey) -> bool) -> bool {
+    /// [`VersionedRecords::reported`]), in record key order, until it refuses
+    /// one. Says whether it took every record: `false` means the refused one,
+    /// and all after it, remain.
+    pub fn keys_after(&self, after: Option<&RecordKey>, mut take: impl FnMut(HeldKey) -> bool) -> bool {
         self.lock()
             .reported()
-            .filter_map(|record| match record {
-                ShardRecord::Task(record) => Some(record),
-                ShardRecord::Composite(_) | ShardRecord::Page(_) => None,
-            })
             .filter_map(|record| {
                 let key = match held_key(record) {
                     Ok(key) => key,
@@ -213,7 +214,7 @@ impl HeldRecords {
                         return None;
                     }
                 };
-                after.is_none_or(|after| key.task_id > *after).then_some(key)
+                after.is_none_or(|after| key.key > *after).then_some(key)
             })
             .all(|key| take(key))
     }

@@ -9,6 +9,7 @@ use kabudachi_core::protocol::messages::claim_response;
 use kabudachi_core::reconcile::wire::held_key;
 use kabudachi_core::reconcile::{Cursor, ReconcileTerm, ReportedState};
 use kabudachi_core::scheduler::MAX_FAILURE_MESSAGE_BYTES;
+use kabudachi_core::task_record::RecordKey;
 
 use crate::support::deadline::within_deadline;
 use crate::support::records::{ThreeVoters, plain_with, proof_of_office, wait_until_held};
@@ -116,7 +117,7 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
                 break;
             }
             cursor = Some(match (page.keys.last(), page.runs.last()) {
-                (Some(key), _) => Cursor::AfterKey(key.task_id.clone()),
+                (Some(key), _) => Cursor::AfterKey(key.key.clone()),
                 (None, Some(run)) => Cursor::AfterRun(run.claim.task_run_id.clone()),
                 (None, None) => panic!("a page that is not the last holds something"),
             });
@@ -160,12 +161,13 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
         let mut expected = tasks.clone();
         expected.sort();
         assert_eq!(run_tasks, expected, "a run for every task claimed");
-        let key_tasks: Vec<_> = keys.iter().map(|key| key.task_id.clone()).collect();
-        assert_eq!(key_tasks, expected, "every record held, in id order, once");
+        let key_tasks: Vec<_> = keys.iter().map(|key| key.key.clone()).collect();
+        let expected_keys: Vec<_> = expected.iter().cloned().map(RecordKey::Task).collect();
+        assert_eq!(key_tasks, expected_keys, "every record held, in id order, once");
         for key in keys {
             let held = worker_net
                 .held_records()
-                .get(&key.task_id)
+                .get_record(&key.key)
                 .expect("the worker holds the record it reported");
             assert_eq!(
                 Ok(key),

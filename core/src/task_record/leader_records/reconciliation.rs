@@ -257,7 +257,10 @@ impl OfficeReconciliation {
         }
         self.news = false;
         let learnt = self.round.take_settled(|worker| node.is_member(worker));
-        let teaches = !learnt.records.is_empty() || !learnt.reports.is_empty();
+        let teaches = !learnt.records.is_empty()
+            || !learnt.composites.is_empty()
+            || !learnt.pages.is_empty()
+            || !learnt.reports.is_empty();
         teaches.then_some(Progress::Learnt(learnt))
     }
 
