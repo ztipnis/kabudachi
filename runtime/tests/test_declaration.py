@@ -1147,23 +1147,6 @@ def test_an_async_callback_on_a_bare_handle_settled_outside_a_loop_runs_to_compl
     assert not [w for w in recwarn if "never awaited" in str(w.message)]
 
 
-def test_cancelling_a_flow_after_a_stage_that_failed_does_not_claim_to_have_cancelled_it():
-    from kabudachi.composites import FlowHandle
-
-    failed, succeeded = TaskHandle("stage-1"), TaskHandle("stage-2")
-    failed._fail(ValueError("stage failed"))
-    succeeded._resolve("done")
-
-    flow_after_failure, flow_after_success = FlowHandle("flow-1", 2), FlowHandle("flow-2", 2)
-    flow_after_failure._current = (failed, False)
-    flow_after_success._current = (succeeded, False)
-
-    # The first flow is about to fail with the stage's own error; the second
-    # has a stage still to start, which the cancel stops.
-    assert flow_after_failure.cancel() is False
-    assert flow_after_success.cancel() is True
-
-
 @pytest.mark.parametrize(
     ("declare_hook", "match"),
     [

@@ -261,6 +261,8 @@ class _TaskProcess:
             frame.chain,
             frame.serialized_input,
             hooks,
+            None,
+            frame.given,
         )
         self._track(frame.run_id, body.outcome, body.exited, self._report_result)
 
@@ -454,21 +456,15 @@ class _ChildSession:
 
 
 class _ChildComposites:
-    """Flows and groups called here: started by the worker, which holds them."""
+    """Flows, groups and maps called here: started by the worker, which holds them."""
 
     def __init__(self, process: _TaskProcess) -> None:
         self._process = process
 
-    def submit_flow(self, flow: Any, previous: Any) -> TaskHandle:
-        return self._submit("flow", flow, previous)
-
-    def submit_group(self, group: Any, previous: Any) -> TaskHandle:
-        return self._submit("group", group, previous)
-
-    def _submit(self, kind: str, step: Any, previous: Any) -> TaskHandle:
+    def submit(self, step: Any, previous: Any) -> TaskHandle:
         sent, before = pickle.dumps(step), pickle.dumps(previous)
         return self._process.requests.ask(
-            lambda request: ipc.Submit(request, composite=kind, step=sent, previous=before),
+            lambda request: ipc.Submit(request, composite=True, step=sent, previous=before),
             submission=True,
         )
 

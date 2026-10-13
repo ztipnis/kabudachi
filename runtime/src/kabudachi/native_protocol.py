@@ -313,15 +313,16 @@ class Runtime(Protocol):
 
     def submit_composite(self, tree: Any) -> str:
         """Records the composite `tree` describes, as `_native.describe_step`
-        encodes it, and returns its id. The runtime reports its end as an
+        encodes it, and returns its id. Before this worker leads the
+        composite is queued, as a task is. The runtime reports its end as an
         `EventKind.COMPOSITE_FINISHED` event. Raises `ValueError` for a step
-        the leader would not accept or one that takes an input,
-        `BackpressureError` past the hard memory limit and `RuntimeError`
-        when this worker is not the leader."""
+        the leader would not accept or one that takes an input, and
+        `BackpressureError` past the hard memory limit."""
 
     def cancel_composite(self, composite_id: str) -> CancelOutcome:
-        """Cancels a composite and every member it has started. Raises
-        `RuntimeError` when this worker is not the leader."""
+        """Cancels a composite and every member it has started; one still
+        queued for want of a leader is dropped. Raises `RuntimeError` when this
+        worker is not the leader and the composite is not queued."""
 
     def composite_status(self, composite_id: str) -> tuple[str, int, int, int, int, int] | None:
         """A composite's state, the stage it is on, and the number of its
@@ -342,6 +343,13 @@ class Runtime(Protocol):
         """A composite's results in order: `("list", [...])` of `("value",
         producer_definition_id, bytes)`, `("failure", kind, message)` and
         nested lists. Raises `RuntimeError` when a result is no longer held."""
+
+    async def resolve_expansion(self, task_run_id: str) -> Any:
+        """The list the expansion run `task_run_id` is to split, as
+        `composite_results` has a list: `("value", producer_definition_id,
+        bytes)` of the list one task returned, or a `("list", [...])`.
+        Raises `RuntimeError` when the run is no expansion or the list is no
+        longer held."""
 
     async def resolve_input(self, task_run_id: str) -> Any:
         """What a composite member's run is given besides its claim, as

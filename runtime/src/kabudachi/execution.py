@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Protocol
 
-from kabudachi.body import RunningBody, fold_compaction, run_serialized
+from kabudachi.body import Given, RunningBody, fold_compaction, run_serialized
 from kabudachi.concurrency_places import BodyWaits, ConcurrencyPlaces
 from kabudachi.errors import TaskTimeoutError
 from kabudachi.handle import TaskHandle, current_body
@@ -53,6 +53,10 @@ class RunJob:
     after: "asyncio.Future[None] | None" = None
     """Done once an earlier body of the same task has exited; this body
     starts only then, so one task never has two bodies running."""
+    given: "asyncio.Future[Given] | None" = None
+    """For a member of a composite: what its run is given besides the claim,
+    once the leader has read it out. The body starts only then, and fails with
+    whatever failed reading it."""
 
 
 @dataclass(frozen=True)
@@ -71,7 +75,7 @@ class NestedCalls(Protocol):
         self, definition_id: str, payload: bytes, options: SubmissionOptions
     ) -> TaskHandle: ...
 
-    def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle: ...
+    def submit_composite(self, step: Any, previous: Any) -> TaskHandle: ...
 
     def cancel_task(self, task_id: str) -> bool:
         """Cancels a task such a body called, by its id, and says whether it
@@ -201,6 +205,7 @@ class InProcessExecutor:
             job.serialized_input,
             hooks,
             job.after,
+            job.given,
         )
         self._hold(job.run_id, body)
         return body

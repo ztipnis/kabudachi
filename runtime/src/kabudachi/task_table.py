@@ -9,15 +9,16 @@ reports each event; the `CancelledError` handling and the order of the calls it
 makes stay in `Session`.
 
 One lock guards the table. The native calls whose outcome the bookkeeping must
-agree with (submit and register, cancel routing, complete with a continuation)
-are made under it. Handles are resolved and failed outside it, because a
-callback on a handle may re-enter the table. A networked task's record is
-kept until a leader's word settles it, as a one-node task's is.
+agree with (submit and register, cancel routing) are made under it. Handles are
+resolved and failed outside it, because a callback on a handle may re-enter the
+table. A networked task's record is kept until a leader's word settles it, as a
+one-node task's is.
 """
 
 import asyncio
 import logging
 import threading
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,6 +44,9 @@ ResultDecoder = Callable[[str, bytes], Any]
 
 _logger = logging.getLogger("kabudachi")
 
+# How many errors of failed members are kept for the composites that await them.
+_MEMBER_ERRORS_KEPT = 256
+
 
 def result_digest(result: bytes) -> bytes:
     """The digest a run's result is certified by (BLAKE3)."""
@@ -59,19 +63,6 @@ def _run_stopped(handle: TaskHandle, unstarted: str) -> RunStoppedError:
             "elsewhere"
         )
     return RunStoppedError(f"the run stopped before {unstarted}")
-
-
-class _StartingContinuation:
-    """Stands for a continuation between its run being certified and its first
-    stage being started, so a cancel in that window is not lost."""
-
-    def __init__(self) -> None:
-        self.cancel_requested = False
-
-    def cancel(self) -> bool:
-        """Remembers the cancel, for the continuation to act on once it exists."""
-        self.cancel_requested = True
-        return True
 
 
 @dataclass
@@ -96,8 +87,8 @@ class _Record:
     body: RunningBody | None = None
     # A body that outlived its hard limit, and that a retry waits for.
     abandoned: "asyncio.Future[None] | None" = None
-    # The continuation of a task that returned a step, until it is over.
-    continuation: Any = None
+    # The id of the composite a task that returned a step now runs as, until it is over.
+    continuation: str | None = None
     # Bumped by each claim, so a retry's run cannot be undone by an abandoned
     # earlier run ending later (both await the same future).
     generation: int = 0
@@ -186,6 +177,8 @@ class TaskTable:
         # their hard limit, by task id, until each exits: a retry of the task
         # handed back here waits for it.
         self._held_abandoned: dict[str, asyncio.Future[None]] = {}
+        # Errors of members that failed here for good, oldest first.
+        self._member_errors: deque[tuple[str, str, BaseException]] = deque(maxlen=_MEMBER_ERRORS_KEPT)
 
     # submitted
 
@@ -242,27 +235,17 @@ class TaskTable:
 
     def cancel(self, task_id: str) -> bool:
         """Asks the runtime to cancel `task_id`, which then tells this process
-        through an event; says whether it was cancelled."""
+        through an event; says whether it was cancelled. A task that returned
+        a step is cancelled by cancelling the continuation it runs as, which
+        the leader does."""
         with self._lock:
             record = self._records.get(task_id)
-            continuation = record.continuation if record is not None else None
-            if continuation is None:
-                # Under the lock, so a completion that carries a continuation
-                # is either not accepted yet (this cancels the run) or already
-                # has its continuation registered (found above).
-                outcome = self._runtime.cancel(task_id)
-                # `None`: sent to a leader elsewhere, which decides.
-                cancelled = outcome is None or self._cancelled(outcome)
-                if cancelled and record is not None:
-                    record.cancel_requested = True
-                return cancelled
-            if isinstance(continuation, _StartingContinuation):
-                # Under the lock, so `continuation_started` cannot swap in the
-                # real handle before it sees this cancel.
-                return continuation.cancel()
-        # The run is certified and over; what can still be cancelled is its
-        # continuation, outside the lock because cancelling it takes the lock.
-        return continuation.cancel()
+            outcome = self._runtime.cancel(task_id)
+            # `None`: sent to a leader elsewhere, which decides.
+            cancelled = outcome is None or self._cancelled(outcome)
+            if cancelled and record is not None:
+                record.cancel_requested = True
+            return cancelled
 
     # replicated, refused, concluded, status
 
@@ -392,55 +375,54 @@ class TaskTable:
             return
         record.handle._resolve(value)
 
-    # complete with continuation, continuation started / over
+    # continuing, continuation over
 
-    def complete_with_continuation(self, run: Run, task_run_id: str, digest: bytes) -> None:
-        """Certifies the run's step (native `complete(..., continues=True)`)
-        and records the continuation as starting, under one lock. Raises what
-        the runtime raises; nothing is recorded then."""
+    def continuing(self, task_id: str, composite_id: str) -> None:
+        """The task's run was certified as the step it returned, which now
+        runs as the composite `composite_id`: its handle waits for that."""
         with self._lock:
-            self._runtime.complete(task_run_id, digest, True)
-            # Registered in the same step as the certification, so a cancel of
-            # the task's handle always finds the continuation, or the run.
-            run._record.continuation = _StartingContinuation()
+            record = self._records.get(task_id)
+            if record is not None:
+                record.continuation = composite_id
 
-    def continuation_started(self, run: Run, handle: TaskHandle) -> None:
-        """Cancels `handle` at once if a cancel arrived while it was starting."""
-        with self._lock:
-            starting = run._record.continuation
-            run._record.continuation = handle
-        if getattr(starting, "cancel_requested", False):
-            handle.cancel()  # cancelled while the first stage was being started
-
-    def continuation_over(self, task_id: str, error: BaseException | None, result: Any) -> None:
-        """Ends the continuation for the leader, then settles the task with
-        `result` or `error`. If the runtime refuses the end, the refusal is
-        logged: the end is applied when leadership returns, unless the runtime
-        has shut down."""
+    def continuation_over(self, task_id: str) -> TaskHandle | None:
+        """The task's continuation is over: settles the task, once, and
+        returns its handle for the caller to resolve or fail with the
+        continuation's end, or `None` if it was settled already."""
         with self._lock:
             record = self._records.get(task_id)
             if record is not None:
                 record.continuation = None
-                # Forgets the task if this was the last thing keeping it: a
-                # no-op while its run is still active, where `run_ended`
-                # forgets it instead.
-                self._retire(task_id, record)
-        try:
-            self._runtime.end_continuation(task_id)
-        except Exception as refusal:
-            _logger.info(
-                "the runtime refused ending the continuation of task %s (%s); it is applied"
-                " when leadership returns unless the runtime has shut down",
-                task_id,
-                type(refusal).__name__,
-            )
-        handle = self._settle(task_id)
-        if handle is None:
-            return
-        if error is not None:
-            handle._fail(error)
-            return
-        handle._resolve(result)
+        return self._settle(task_id)
+
+    def continuations(self) -> list[tuple[str, str]]:
+        """The (task id, composite id) of every task still waiting for its continuation."""
+        with self._lock:
+            return [
+                (task_id, record.continuation)
+                for task_id, record in self._records.items()
+                if record.continuation is not None and not record.settled
+            ]
+
+    # members that failed here
+
+    def member_failed(self, kind: str, message: str, error: BaseException) -> None:
+        """A run of a member of a composite failed here for good with `error`,
+        of type `kind` and with `message`. Kept, for a few hundred failures at
+        most, for whoever awaits the composite to be given it as it was."""
+        with self._lock:
+            self._member_errors.append((kind, message, error))
+
+    def member_error(self, kind: str, message: str) -> BaseException | None:
+        """The oldest error kept for a member that failed with `kind` and
+        `message` (any, while the leader gives none), taken; `None` if this
+        process ran no such member."""
+        with self._lock:
+            for kept in self._member_errors:
+                if kept[0] == kind and message in ("", kept[1]):
+                    self._member_errors.remove(kept)
+                    return kept[2]
+        return None
 
     # failed with retry, failed (final, expired, superseded, interrupted)
 

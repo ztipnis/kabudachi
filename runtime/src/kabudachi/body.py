@@ -8,17 +8,31 @@ fails, and it is left to finish on its own, its outcome discarded.
 
 import asyncio
 import functools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from typing import Any
 
 from asgiref.sync import sync_to_async
 
-from kabudachi.errors import TaskBodyError, UnknownTaskError, body_error, may_be_ctrl_c
+from kabudachi.errors import TaskBodyError, TaskFailure, UnknownTaskError, body_error, may_be_ctrl_c
 from kabudachi.lifecycle import RunHooks
 from kabudachi.registry import TaskDefinition, TaskRegistry
 from kabudachi.serializers import Serializer, SerializerRegistry
+
+
+@dataclass(frozen=True)
+class Given:
+    """What the run of a composite's member is given besides its claim, as the
+    leader reads it out. `fields` are the `(name, value)` pairs bound into the
+    member's input. `resolved` is what it takes from before it
+    (`("value", producer, bytes)`, `("failure", kind, message)` or `("list",
+    [...])`), `("input", bytes)` for its own whole input when that was stored
+    as blobs, or `None` when the claim's `serialized_input` is the whole
+    input."""
+
+    fields: tuple[tuple[str, Any], ...]
+    resolved: Any
 
 
 @dataclass
@@ -133,6 +147,56 @@ def task_named(
     return definition
 
 
+def decode_resolved(
+    registry: TaskRegistry,
+    serializers: SerializerRegistry,
+    resolved: Any,
+    failure: Callable[[str, str], Any] = TaskFailure,
+) -> Any:
+    """The value a stage's `resolved` result stands for: a value decoded by
+    the serializer and output type of the task that produced it, a failure as
+    `failure(kind, message)`, a list of either as a list. Raises
+    `UnknownTaskError` for a producer this process does not have."""
+    match resolved:
+        case ("value", producer, data):
+            definition = registry.get(producer)
+            if definition is None:
+                raise UnknownTaskError(f"this process has no task named {producer!r}")
+            return serializers.get(definition.serializer).decode(data, definition.output_type)
+        case ("failure", kind, message):
+            return failure(kind, message)
+        case ("list", entries):
+            return [decode_resolved(registry, serializers, entry, failure) for entry in entries]
+    raise ValueError(f"cannot read {resolved!r} as a stage's result")
+
+
+def member_argument(
+    registry: TaskRegistry,
+    serializers: SerializerRegistry,
+    definition: TaskDefinition,
+    serialized_input: bytes,
+    given: Given,
+) -> Any:
+    """The argument a composite's member runs on: its input, as the claim, its
+    own stored blobs or the stage before it give it, with its bound fields set
+    on a copy."""
+    serializer = serializers.get(definition.serializer)
+    match given.resolved:
+        case None:
+            argument = serializer.decode(serialized_input, definition.input_type)
+        case ("input", data):
+            argument = serializer.decode(data, definition.input_type)
+        case resolved:
+            argument = decode_resolved(registry, serializers, resolved)
+    if not given.fields:
+        return argument
+    merged = type(argument)()
+    merged.CopyFrom(argument)
+    for name, value in given.fields:
+        setattr(merged, name, value)
+    return merged
+
+
 def fold_payloads(
     definition: TaskDefinition, serializer: Serializer, payloads: Sequence[bytes]
 ) -> Any:
@@ -156,10 +220,13 @@ def run_serialized(
     serialized_input: bytes,
     hooks: RunHooks,
     after: "asyncio.Future[None] | None" = None,
+    given: "Given | asyncio.Future[Given] | None" = None,
 ) -> RunningBody:
     """Starts the task `definition_id` on its serialized input, folded onto
     the payloads of the generations it superseded (`chain`, oldest first),
-    between the run hooks in `hooks`, once `after`, if given, is done. The
+    between the run hooks in `hooks`, once `after`, if given, is done. A
+    member of a composite runs on what it is `given` instead, once that has
+    arrived. The
     outcome is the encoded result, or, for a task that returns a step, the
     step itself. Started in the caller's context, so the body sees the
     caller's context variables."""
@@ -172,7 +239,11 @@ def run_serialized(
                 await asyncio.wait({after})
             definition = task_named(registry, definition_id, source_version)
             serializer = serializers.get(definition.serializer)
-            argument = fold_payloads(definition, serializer, [*chain, serialized_input])
+            if given is None:
+                argument = fold_payloads(definition, serializer, [*chain, serialized_input])
+            else:
+                arrived = await given if isinstance(given, asyncio.Future) else given
+                argument = member_argument(registry, serializers, definition, serialized_input, arrived)
             body = start_body(definition, argument, threads, hooks)
         except BaseException:
             # Nothing started, so nothing is left running.

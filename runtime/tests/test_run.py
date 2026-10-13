@@ -151,9 +151,10 @@ def test_a_flow_and_a_group_report_their_stages_and_members():
         for _ in range(2):
             assert await asyncio.to_thread(started.acquire, timeout=10)
         # Both held bodies are running: the flow is at its first stage, the
-        # group waits on one member while the others have ended.
+        # group waits on one member while the others have ended. The leader
+        # counts what has not ended as pending, running or not.
         in_flight = await flowed.status(), await group_counts_reach(
-            grouped, {"succeeded": 1, "failed": 1, "running": 1}
+            grouped, {"succeeded": 1, "failed": 1, "pending": 1}
         )
         gate.set()
         await flowed
@@ -166,12 +167,12 @@ def test_a_flow_and_a_group_report_their_stages_and_members():
         "flow",
         "running",
         0,
-        {"running": 1, "pending": 1},
+        {"pending": 2},
     )
     assert (grouping.kind, grouping.state, dict(grouping.counts)) == (
         "group",
         "running",
-        {"succeeded": 1, "failed": 1, "running": 1},
+        {"succeeded": 1, "failed": 1, "pending": 1},
     )
     assert (flowed.kind, flowed.state, flowed.stage, dict(flowed.counts)) == (
         "flow",

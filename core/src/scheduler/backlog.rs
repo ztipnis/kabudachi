@@ -26,6 +26,10 @@ pub struct Backlog {
     queued: Vec<Submitted>,
     /// Composites not yet recorded, in the order they were made.
     queued_composites: Vec<SubmittedComposite>,
+    /// Composites cancelled before they were recorded, whose clients are told
+    /// once the scheduler leads: a scheduler that is taking over forgets what
+    /// it said before it did.
+    dropped_composites: Vec<SubmittedComposite>,
     /// The input bytes `queued` holds, and the record bytes of
     /// `queued_composites`.
     queued_bytes: u64,
@@ -105,8 +109,8 @@ impl Backlog {
     }
 
     /// Cancels the composite `id`: one still waiting here is dropped, so it
-    /// never runs, and its client is told it was cancelled; any other is the
-    /// scheduler's to cancel.
+    /// never runs, and its client is told it was cancelled once the scheduler
+    /// leads; any other is the scheduler's to cancel.
     pub fn cancel_composite<C: Clock, I: IdGenerator, O: Observer>(
         &mut self,
         scheduler: &mut Scheduler<C, I, O>,
@@ -115,7 +119,7 @@ impl Backlog {
         if let Some(at) = self.queued_composites.iter().position(|queued| queued.composite_id == *id) {
             let dropped = self.queued_composites.remove(at);
             self.queued_bytes -= dropped.record_bytes();
-            scheduler.announce_dropped(&dropped);
+            self.dropped_composites.push(dropped);
             return Ok(Cancellation::Cancelled { was_running: false });
         }
         scheduler.cancel_composite(id)
@@ -165,6 +169,9 @@ impl Backlog {
             return;
         }
         self.record_queued(scheduler);
+        for dropped in std::mem::take(&mut self.dropped_composites) {
+            scheduler.announce_dropped(&dropped);
+        }
     }
 
     /// Whether a submission of `submission`'s coalescing key still waits here.

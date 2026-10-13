@@ -141,16 +141,18 @@ fn composites_submitted_before_the_scheduler_leads_start_once_it_leads_and_a_can
         Ok(Cancellation::Cancelled { was_running: false })
     );
     assert_eq!(backlog.composite_status(&fixture.scheduler, &dropped), None);
+
+    assert!(finished(&mut fixture).is_empty(), "nothing is said before the scheduler leads");
+
+    fixture.scheduler.set_leadership_grant(Some(unbounded_grant()));
+    backlog.hand_over(&mut fixture.scheduler);
+
     let events = finished(&mut fixture);
     assert_eq!(
         events.iter().map(|event| (event.composite_id.clone(), event.state)).collect::<Vec<_>>(),
         [(dropped.clone(), CompositeState::Cancelled)],
         "its client is told, as it is of a composite cancelled while it runs"
     );
-
-    fixture.scheduler.set_leadership_grant(Some(unbounded_grant()));
-    backlog.hand_over(&mut fixture.scheduler);
-
     let mut claimed = claimed_tasks(&mut fixture);
     claimed.sort();
     let mut expected = vec![task, kept.member_task(0)];
