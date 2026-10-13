@@ -370,6 +370,7 @@ def test_a_stage_running_on_a_killed_worker_is_replayed_once_and_the_pipeline_en
         assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 10
         steps = tasks_made_of(tmp_path, ["join"])
         assert steps and committed_at_most_once(cluster, tmp_path, ["join"]) == len(steps)
+        assert any("LOST" in states(finished(cluster, step)) for step in steps), "a join step was lost and replayed"
     finally:
         cluster.close()
 

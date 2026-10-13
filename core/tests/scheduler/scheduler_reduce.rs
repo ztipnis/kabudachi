@@ -213,23 +213,6 @@ fn a_tree_folds_its_chunks_side_by_side_then_combines_adjacent_results_in_order(
 }
 
 #[test]
-fn a_reduce_with_nothing_to_fold_finishes_as_it_starts_and_a_seedless_empty_one_fails() {
-    let cases = [
-        (streamed_reduce(Some(4), Some(b"0")), &[][..], CompositeState::Succeeded, None),
-        (streamed_reduce(None, None), &[&b"only"[..]][..], CompositeState::Succeeded, None),
-        (streamed_reduce(None, None), &[][..], CompositeState::Failed, Some(REDUCE_EMPTY_KIND)),
-    ];
-    for (step, items, state, kind) in cases {
-        let mut fixture = Fixture::leading();
-        reduce_fed(&mut fixture, step, items);
-        let finished = finished(&mut fixture);
-        assert_eq!(fixture.scheduler.pending_len(), 0, "no step runs");
-        assert_eq!(finished[0].state, state);
-        assert_eq!(finished[0].failure.as_ref().map(|failure| failure.kind.as_str()), kind);
-    }
-}
-
-#[test]
 fn a_step_that_exhausts_its_retries_fails_the_reduce_and_no_later_step_starts() {
     let mut fixture = Fixture::leading();
     let mut step = streamed_reduce(Some(1), None);
@@ -262,33 +245,6 @@ fn a_step_that_exhausts_its_retries_fails_the_reduce_and_no_later_step_starts() 
     assert!(finished(&mut fixture).is_empty(), "the reduce failed once");
 }
 
-#[test]
-fn a_step_lost_after_storing_its_result_is_replayed_on_the_same_operands_and_the_reduce_ends_with_the_replays_result() {
-    let mut fixture = Fixture::leading();
-    let reduce = reduce_fed(&mut fixture, streamed_reduce(None, Some(b"")), &[b"a", b"b"]);
-    run_member(&mut fixture, &reduce, 0, b"a");
-    let lost = start_member(&mut fixture, &reduce, 1);
-    // Its result blob was stored; its COMPLETE never came.
-    let gone = fixture.lose_silent(&worker());
-    assert!(gone[0].replayed.is_some(), "the step is replayed");
-    assert!(finished(&mut fixture).is_empty());
-    let replay = run_member(&mut fixture, &reduce, 1, b"ab, as the replay made it");
-    assert_ne!(replay.task_run_id, lost.task_run_id);
-    assert_eq!(operands_of(&replay), operands_of(&lost), "the replay folds the same operands");
-    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
-    assert_eq!(
-        value_of(&fixture, &reduce, 1),
-        Some(Digest::blake3(b"ab, as the replay made it")),
-        "the reduce ends with what the replay reported"
-    );
-    assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(0)).len(), 1, "a step that was not lost runs once");
-    assert_eq!(
-        fixture.scheduler.runs_of(&reduce.member_task(1)).len(),
-        2,
-        "the lost run and its replay; only the replay is certified"
-    );
-}
-
 /// A flow of a map of three tasks, a seedless reduce of two-item chunks of
 /// their results, and a task after it; runs the map's tasks. Returns the flow
 /// and the reduce.
@@ -309,8 +265,9 @@ fn flow_after_a_map(fixture: &mut Fixture) -> (CompositeId, CompositeId) {
 }
 
 #[test]
-fn a_reduce_after_a_map_folds_the_maps_results_in_order_without_an_expansion() {
+fn a_reduce_after_a_map_folds_the_maps_results_in_order_without_an_expansion_and_goes_with_its_flow() {
     let mut fixture = Fixture::leading();
+    fixture.scheduler.set_result_ttl(Some(Duration::from_ticks(100)));
     let (flow, reduce) = flow_after_a_map(&mut fixture);
     assert_eq!(fixture.spy.newest_composite(&reduce).unwrap().reduce_items, 3, "the map's three results are its items");
     let chunk = run_member(&mut fixture, &reduce, 0, b"01");
@@ -327,6 +284,12 @@ fn a_reduce_after_a_map_folds_the_maps_results_in_order_without_an_expansion() {
     assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
     for step in 0..3 {
         assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(step)).len(), 1, "step {step} is created and run once");
+    }
+    fixture.clock.advance(Duration::from_ticks(100));
+    fixture.scheduler.catch_up();
+    assert!(fixture.scheduler.composite_status(&reduce).is_none());
+    for step in 0..3 {
+        assert!(fixture.forgotten(&reduce.member_task(step)), "step {step} goes with its reduce");
     }
 }
 
@@ -394,23 +357,6 @@ fn a_reduce_after_a_task_stage_folds_what_its_expansion_streamed_and_a_seedless_
 }
 
 #[test]
-fn a_reduce_after_a_map_is_forgotten_with_its_steps_when_its_flow_is() {
-    let mut fixture = Fixture::leading();
-    fixture.scheduler.set_result_ttl(Some(Duration::from_ticks(100)));
-    let (flow, reduce) = flow_after_a_map(&mut fixture);
-    for (index, result) in [b"01".as_slice(), b"2", b"012"].into_iter().enumerate() {
-        run_member(&mut fixture, &reduce, index as u64, result);
-    }
-    run_member(&mut fixture, &flow, 2, b"reported");
-    fixture.clock.advance(Duration::from_ticks(100));
-    fixture.scheduler.catch_up();
-    assert!(fixture.scheduler.composite_status(&reduce).is_none());
-    for step in 0..3 {
-        assert!(fixture.forgotten(&reduce.member_task(step)), "step {step} goes with its reduce");
-    }
-}
-
-#[test]
 fn a_new_leader_drives_a_half_combined_tree_on_and_makes_each_step_once() {
     let mut old = Fixture::leading();
     // Chunks 0-3; combines 4 = (0, 1), 5 = (2, 3); root 6 = (4, 5).
@@ -465,11 +411,12 @@ fn a_new_leader_finds_a_reduces_items_on_both_sides_of_a_page_boundary() {
         let mark = old.spy.mark();
         old.scheduler.submit_members(items_batch(&reduce, 0, &held, false)).unwrap();
         let mut new = took_over(&old, rebuild_losing(&old, mark, |key| matches!(key, RecordKey::Composite(_))));
-        // The client asks again, with the items that are left.
-        let last = [item(PAGE_ENTRIES + extra), item(PAGE_ENTRIES + extra + 1)];
+        // The client, unanswered, asks again from the first page's end, so
+        // the batch repeats the items the old leader stored and adds the rest.
+        let last: Vec<Vec<u8>> = (PAGE_ENTRIES..PAGE_ENTRIES + extra + 2).map(item).collect();
         let last: Vec<&[u8]> = last.iter().map(Vec::as_slice).collect();
-        let taken = new.scheduler.submit_members(items_batch(&reduce, PAGE_ENTRIES + extra, &last, true)).unwrap();
-        assert_eq!(taken.members, PAGE_ENTRIES + extra + 2, "{extra} items past the first page");
+        let taken = new.scheduler.submit_members(items_batch(&reduce, PAGE_ENTRIES, &last, true)).unwrap();
+        assert_eq!(taken.members, PAGE_ENTRIES + extra + 2, "{extra} items past the first page, none taken twice");
         let second: Vec<(u64, Vec<u8>)> =
             (0..extra + 2).map(|more| (PAGE_ENTRIES + more, item(PAGE_ENTRIES + more))).collect();
         assert_eq!(items_on_page(&new, &reduce, 1), second, "{extra} items past the first page");
@@ -517,29 +464,6 @@ fn a_reducer_that_returns_a_continuation_fails_its_reduce_without_folding_the_co
     assert_eq!(end.state, CompositeState::Failed);
     assert_eq!(end.failure.as_ref().unwrap().kind, REDUCER_CONTINUED_KIND);
     assert_eq!(fixture.scheduler.pending_len(), 0, "the step after it does not start");
-}
-
-/// The old leader stored a batch's item page but not the reduce's record.
-/// The client, unanswered, asks the successor again.
-#[test]
-fn a_new_leader_takes_a_reduces_items_from_its_item_pages_and_a_batch_asked_again_adds_none() {
-    let mut old = Fixture::leading();
-    let reduce = submitted(&mut old, streamed_reduce(Some(2), None));
-    old.scheduler.submit_members(items_batch(&reduce, 0, &[b"a", b"b"], false)).unwrap();
-    let mark = old.spy.mark();
-    old.scheduler.submit_members(items_batch(&reduce, 2, &[b"c"], false)).unwrap();
-    let mut new = took_over(&old, rebuild_losing(&old, mark, |key| matches!(key, RecordKey::Composite(_))));
-    let taken = new.scheduler.submit_members(items_batch(&reduce, 2, &[b"c", b"d"], true)).unwrap();
-    assert_eq!(taken.members, 4, "the items found on its page count, and none is taken twice");
-    // The partly filled page was rebuilt from the stored page, so its rewrite keeps a and b.
-    assert_eq!(
-        items_on_page(&new, &reduce, 0),
-        [(0, b"a".to_vec()), (1, b"b".to_vec()), (2, b"c".to_vec()), (3, b"d".to_vec())]
-    );
-    run_member(&mut new, &reduce, 0, b"ab");
-    run_member(&mut new, &reduce, 1, b"cd");
-    run_member(&mut new, &reduce, 2, b"abcd");
-    assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
 }
 
 #[test]

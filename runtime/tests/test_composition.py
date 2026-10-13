@@ -992,6 +992,23 @@ def test_members_are_batched_by_count_and_by_bytes_with_an_oversized_member_alon
     assert batches == expected
 
 
+def test_a_reduce_whose_items_pass_the_hard_limit_fails_with_backpressure_error_and_runs_no_step():
+    def fold(item: Greeting, previous: Greeting) -> Greeting:
+        return Greeting(text=previous.text + item.text)
+
+    world = World(fold, memory_soft_limit=100, memory_hard_limit=100, member_batch_items=1)
+
+    async def body():
+        handle = world.tasks["fold"].reduce([Greeting(text="x" * 40)] * 4, initial=Greeting())
+        with pytest.raises(BackpressureError):
+            await handle
+
+    with activated(world):
+        run(with_events(world, body))
+
+    assert world.runtime.claimed == [], "the reduce was never sealed, so no step ran"
+
+
 def test_a_streamed_group_pauses_when_slow_down_is_raised_while_it_is_still_sending_but_a_plain_call_does_not():
     world, released = held_world(shout, concurrency=8, member_batch_items=1)
     members = group(*([world.tasks["hold"]] * 40))
@@ -1805,22 +1822,6 @@ def test_a_reduce_seeded_with_an_initial_value_longer_than_an_inline_value_reads
         assert run(with_events(world, body)) == (long_text + "abc", {long_key: 0, "a": 2, "b": 2})
 
 
-def test_a_reduce_reads_items_from_every_item_page_whether_they_are_inline_or_stored_as_blobs():
-    world = reducing_world(tree_concat, tree_concat={"associative": True})
-    # More items than one item page holds, with a few too long to sit on a page.
-    items = [f"{index:04d}" for index in range(2600)]
-    for index in (3, 1500, 2599):
-        items[index] = f"{index:04d}" + "x" * 200
-
-    async def body():
-        return await world.tasks["tree_concat"].reduce(items, chunk_size=900)
-
-    with activated(world):
-        assert run(with_events(world, body)) == "".join(items)
-    levels = sorted(claim.reduce_node[0] for claim in reduce_claims(world, "tree_concat"))
-    assert levels == [0, 0, 0, 1, 2], "three chunks, each reading across a page boundary"
-
-
 def split_words(text: str) -> list[str]:
     return text.split()
 
@@ -1833,13 +1834,11 @@ def join_words(item: str, previous: str) -> str:
     return f"{previous} {item}".strip()
 
 
-def _numbered(count: int) -> list[str]:
-    """`count` items of about 1 KB, each starting with its own index."""
-    return [f"{index:06d}" + "x" * 994 for index in range(count)]
-
-
 def numbered(count: int) -> list[str]:
-    return _numbered(count)
+    """`count` items starting with their own index: every seventh is just that
+    index, short enough to sit inline on an item page, and the rest about 1 KB,
+    stored as blobs."""
+    return [f"{index:06d}" + ("" if index % 7 == 0 else "x" * 994) for index in range(count)]
 
 
 def take_tag(item: str, previous: str) -> str:
@@ -1863,13 +1862,13 @@ def test_a_reduce_stage_folds_a_maps_results_from_its_pages_and_a_returned_list_
     assert len(expansions) == 2, "the map's list and the second flow's list were streamed; the map's results were not"
 
 
-def test_a_list_larger_than_one_record_reduces_in_order_whether_it_is_given_or_returned():
-    count = _native.MAX_RECORD_BYTES // 1000 + 64  # more item bytes than one record holds
+def test_a_list_larger_than_one_record_reduces_in_order_across_item_pages_whether_it_is_given_or_returned():
+    count = _native.MAX_RECORD_BYTES // 800 + 64  # more item bytes than one record holds
     world = reducing_world(numbered, take_tag, take_tag={"tree": True, "merge": concatenated})
-    tag = world.tasks["take_tag"].reduce.options(initial="", chunk_size=64)
+    tag = world.tasks["take_tag"].reduce.options(initial="", chunk_size=100)
 
     async def body():
-        given = await world.tasks["take_tag"].reduce(_numbered(count), initial="", chunk_size=64)
+        given = await world.tasks["take_tag"].reduce(numbered(count), initial="", chunk_size=100)
         returned = await flow(world.tasks["numbered"], tag).start(world.session, count)
         return given, returned[-1]
 

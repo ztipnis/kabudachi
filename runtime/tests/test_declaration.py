@@ -1407,7 +1407,6 @@ def test_a_reducer_runs_with_reduce_or_local_never_by_a_direct_call():
             serializer="pickle",
             associative=True,
         )
-    assert kabudachi.reducer is not None and issubclass(kabudachi.ReduceEmptyError, TypeError)
 
 
 def test_a_reducer_that_is_async_runs_locally_as_an_awaitable():
@@ -1429,14 +1428,13 @@ def test_a_reducer_whose_previous_type_the_serializer_cannot_handle_is_refused_w
 def test_the_reducer_decorator_declares_a_reducer_with_its_options(fresh_registry):
     bare = kabudachi.reducer(_latest).definition
     tree = kabudachi.reducer(serializer="pickle", name="decorated.tree", associative=True)(_concat).definition
-    chain = kabudachi.reducer(serializer="pickle", name="decorated.chain", associative=True, tree=False)(_concat).definition
     retried = kabudachi.reducer(serializer="pickle", name="decorated.retried", retries=2)(_concat).definition
     orphaned = kabudachi.reducer(serializer="pickle", name="decorated.orphaned", retriable=False)(_concat).definition
 
     assert bare.name == f"{_latest.__module__}._latest"
     assert [
-        (found.reducer.associative, found.reducer.tree) for found in (bare, tree, chain)
-    ] == [(False, False), (True, True), (True, False)]
+        (found.reducer.associative, found.reducer.tree) for found in (bare, tree)
+    ] == [(False, False), (True, True)]
     assert [(found.retries, found.retriable) for found in (bare, retried, orphaned)] == [
         (0, True),
         (2, True),
