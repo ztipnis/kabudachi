@@ -535,6 +535,12 @@ impl Step {
         self.streamed || self.expands()
     }
 
+    /// Whether the step expands a list and its template has fields set: each
+    /// item is the template's whole input, so none could be given them.
+    fn template_has_fields(&self) -> bool {
+        self.expands() && matches!(self.stages.as_slice(), [Stage::Task(template)] if !template.fields.is_empty())
+    }
+
     /// A map's members are all bound to their items, or it has one member
     /// that takes the list it is given.
     fn is_map_shaped(&self) -> bool {
@@ -628,13 +634,13 @@ impl TryFrom<&generated::StepDescription> for Step {
             let fed = match kind {
                 CompositeKind::Map => matches!(
                     step.stages.as_slice(),
-                    [Stage::Task(template)] if matches!(template.input, BoundInput::Previous)
+                    [Stage::Task(template)] if matches!(template.input, BoundInput::Previous) && template.fields.is_empty()
                 ),
                 _ => step.stages.is_empty(),
             };
             return if fed { Ok(step) } else { Err(MalformedStep::StreamedWithStages) };
         }
-        if kind == CompositeKind::Map && !step.is_map_shaped() {
+        if kind == CompositeKind::Map && (!step.is_map_shaped() || step.template_has_fields()) {
             return Err(MalformedStep::MapShape);
         }
         Ok(step)

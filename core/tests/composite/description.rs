@@ -119,6 +119,25 @@ fn a_step_that_cannot_be_driven_is_refused() {
     };
     map.stages = StepDescription::from(&every_kind()).stages[2..3].to_vec();
     assert_eq!(refused(composite_template), MalformedStep::MapShape);
+    // An item is a map's template's whole input, so a template over a list
+    // cannot also have fields set on it: it would reject every item.
+    let with_field = |streamed| {
+        let mut wire = StepDescription::from(&every_kind());
+        let generated::stage_description::Step::Composite(map) = wire.stages[2].step.as_mut().unwrap() else {
+            panic!("a map stage")
+        };
+        let generated::stage_description::Step::Task(template) = map.stages[0].step.as_mut().unwrap() else {
+            panic!("a task template")
+        };
+        template.fields.push(generated::BoundField {
+            name: "label".into(),
+            value: Some(generated::bound_field::Value::StringValue("a".into())),
+        });
+        map.streamed = streamed;
+        wire
+    };
+    assert_eq!(refused(with_field(false)), MalformedStep::MapShape);
+    assert_eq!(refused(with_field(true)), MalformedStep::StreamedWithStages);
 }
 
 /// A streamed map: one template that takes each item, no members.

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::manifest::Failure;
 use crate::protocol::ids::{CompositeId, IdGenerator, TaskDefinitionId, TaskId, TaskRunId};
 use crate::protocol::messages::prelude::*;
 use crate::protocol::records::TaskRunRecord as _;
@@ -16,7 +17,7 @@ use crate::time::Clock;
 
 use crate::scheduler::{Observer, Scheduler};
 
-use super::{CompositeKind, CompositeState, EXPANSION_DEFINITION, MemberOutcome, Stage};
+use super::{CompositeKind, CompositeState, EXPANSION_DEFINITION, LOST_KIND, MemberOutcome, Stage};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Brings every composite rebuilt from records up to what its members'
@@ -172,6 +173,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         for index in 0..stages {
             self.settle_from_record(id, index);
         }
+        self.settle_members_nothing_names(id);
         if self.composites.held[id].step.expands() && !self.composites.held[id].sealed {
             self.resume_expansion(id);
             if self.composites.held[id].state != CompositeState::Running {
@@ -232,6 +234,29 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         };
         if let Some(outcome) = outcome {
             self.record_member(id, index, outcome);
+        }
+    }
+
+    /// Settles as lost every member of a sealed composite fed in batches that
+    /// has no outcome and no Task or child composite: the batch that made it
+    /// reached the holders in part, and with the composite sealed nothing
+    /// sends it again, so the composite would otherwise wait for it forever.
+    /// Members whose records are merely unknown were waited for before this.
+    fn settle_members_nothing_names(&mut self, id: &CompositeId) {
+        let composite = &self.composites.held[id];
+        if !composite.takes_batches() || !composite.sealed {
+            return;
+        }
+        let nameless: Vec<u64> = composite
+            .outcomes
+            .open()
+            .filter(|index| {
+                !self.tasks.contains_key(&id.member_task(*index)) && !self.composites.held.contains_key(&id.child(*index))
+            })
+            .collect();
+        for index in nameless {
+            let failure = Failure::new(LOST_KIND, "the record of the member was not found");
+            self.record_member(id, index, MemberOutcome::Failed(failure));
         }
     }
 

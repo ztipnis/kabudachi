@@ -151,7 +151,9 @@ impl Composite {
                 _ => Err(SubmitRejection::MemberKind),
             },
             (CompositeKind::Group, StreamedMember::Stage(stage))
-                if !stage.takes_input() && !stage.is_or_holds_streamed() =>
+                if !stage.takes_input()
+                    && !stage.is_or_holds_streamed()
+                    && !matches!(&stage, Stage::Task(task) if !task.fields.is_empty()) =>
             {
                 Ok(stage)
             }

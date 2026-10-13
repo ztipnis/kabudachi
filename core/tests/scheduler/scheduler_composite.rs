@@ -676,10 +676,10 @@ fn stages_that_never_started_count_pending_after_their_flow_is_cancelled() {
     assert_eq!(status.counts, MemberCounts { pending: 2, running: 0, succeeded: 0, failed: 0, cancelled: 1 });
 }
 
-fn map_over_previous() -> Stage {
+fn map_over_previous(on_error: OnError) -> Stage {
     Stage::Composite(Step {
         kind: CompositeKind::Map,
-        on_error: OnError::FailFast,
+        on_error,
         stages: vec![task_stage("each", None)],
         streamed: false,
     })
@@ -690,7 +690,7 @@ fn a_map_after_a_stage_is_fed_by_its_expansion_run_and_the_next_stage_takes_the_
     let mut fixture = Fixture::leading();
     let flow = submitted(
         &mut fixture,
-        flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(), task_stage("report", None)]),
+        flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(OnError::FailFast), task_stage("report", None)]),
     );
     run_member(&mut fixture, &flow, 0, b"[1, 2]");
     let map = flow.child(1);
@@ -721,7 +721,7 @@ fn a_map_after_a_stage_is_fed_by_its_expansion_run_and_the_next_stage_takes_the_
 
     let empty = submitted(
         &mut fixture,
-        flow_of(vec![task_stage("load", Some(b"y")), map_over_previous(), task_stage("report", None)]),
+        flow_of(vec![task_stage("load", Some(b"y")), map_over_previous(OnError::FailFast), task_stage("report", None)]),
     );
     run_member(&mut fixture, &empty, 0, b"[]");
     let split = fixture.scheduler.request_claim(&worker(), &empty.child(1).expansion_task()).unwrap();
@@ -736,12 +736,30 @@ fn a_map_after_a_stage_is_fed_by_its_expansion_run_and_the_next_stage_takes_the_
         Some(Manifest::new(Vec::new(), 0)),
         "an empty list maps to an empty list"
     );
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
 }
 
 #[test]
-fn an_expansion_that_fails_fails_its_map_and_one_lost_with_its_worker_restreams_without_doubling() {
+fn an_expansion_that_fails_fails_its_map_and_the_flow_whatever_the_maps_error_policy() {
+    for on_error in [OnError::FailFast, OnError::CollectAll] {
+        let mut fixture = Fixture::leading();
+        let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(on_error)]));
+        run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
+        let map = flow.child(1);
+        let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+        fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+        fixture.scheduler.fail(&worker(), &expansion.task_run_id, "SerializationError").unwrap();
+        let finished = finished(&mut fixture);
+        assert_eq!(finished[0].state, CompositeState::Failed, "{on_error:?}");
+        assert_eq!(finished[0].failure.as_ref().unwrap().kind, "SerializationError", "{on_error:?}");
+    }
+}
+
+#[test]
+fn an_expansion_lost_with_its_worker_restreams_without_doubling() {
     let mut fixture = Fixture::leading();
-    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous()]));
+    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(OnError::FailFast)]));
     run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
     let map = flow.child(1);
     let first = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
@@ -753,10 +771,32 @@ fn an_expansion_that_fails_fails_its_map_and_one_lost_with_its_worker_restreams_
     fixture.scheduler.report_started(&worker(), &replay.task_run_id).unwrap();
     assert_eq!(fixture.scheduler.submit_members(item_batch(&map, 0, 3, false)).unwrap().members, 3);
     assert_eq!(fixture.scheduler.pending_len(), 3, "the replay's batch made only the third member");
-    fixture.scheduler.fail(&worker(), &replay.task_run_id, "SerializationError").unwrap();
-    let finished = finished(&mut fixture);
-    assert_eq!(finished[0].state, CompositeState::Failed);
-    assert_eq!(finished[0].failure.as_ref().unwrap().kind, "SerializationError");
+    fixture
+        .scheduler
+        .complete(&worker(), &replay.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    for index in 0..3 {
+        run_member(&mut fixture, &map, index, b"done");
+    }
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn a_map_that_fails_fast_while_its_expansion_still_streams_cancels_the_expansion() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map_over_previous(OnError::FailFast)]));
+    run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
+    let map = flow.child(1);
+    let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    fail_member(&mut fixture, &map, 0, "ValueError");
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Failed);
+    assert_eq!(
+        fixture.state(&map.expansion_task()),
+        TaskRunState::Cancelled,
+        "a worker still splitting the list is told to stop"
+    );
 }
 
 #[test]

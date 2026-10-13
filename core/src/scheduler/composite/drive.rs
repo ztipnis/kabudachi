@@ -597,6 +597,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         composite.failure = failure.clone();
         let (bytes, parent, client) = (composite.bytes, composite.parent.clone(), composite.client.clone());
         let pages = composite.pages();
+        let expands = composite.step.expands();
+        // A map that ends without all of its items, which a failing member or
+        // a cancel does, has no use for the rest of them: its expansion run
+        // is stopped, since its next batch would find the map over.
+        let expansion = id.expansion_task();
+        if expands && state != CompositeState::Succeeded && self.tasks.contains_key(&expansion) {
+            let _ = self.cancel_task(&expansion);
+        }
         self.budget.give_back(bytes);
         self.composites.record_finished(id, now);
         self.composites.release_pages(id);

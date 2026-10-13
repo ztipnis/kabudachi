@@ -470,6 +470,102 @@ fn a_continuation_certified_while_its_composite_record_is_unknown_is_taken_from_
     assert_eq!(finished[0].state, CompositeState::Succeeded);
 }
 
+/// A map over the list the stage before it returns.
+fn expanding_map() -> Stage {
+    Stage::Composite(Step {
+        kind: CompositeKind::Map,
+        on_error: OnError::FailFast,
+        stages: vec![task_stage("each", None)],
+        streamed: false,
+    })
+}
+
+/// The expansion run of a map ended and every item's member ended, but the
+/// old leader's last call stored only the Tasks: the map's record never said
+/// it was sealed. The successor seals it from the expansion run's own record,
+/// or, when that record is not known yet, waits for it and then does.
+#[test]
+fn a_map_whose_seal_was_lost_with_its_leader_is_sealed_from_its_expansion_runs_record() {
+    for unknown_at_first in [false, true] {
+        let mut old = Fixture::leading();
+        let flow = submitted(
+            &mut old,
+            flow_of(vec![
+                task_stage("load", Some(b"x")),
+                expanding_map(),
+                task_stage("report", Some(b"r")),
+            ]),
+        );
+        run_member(&mut old, &flow, 0, b"[1, 2]");
+        let map = flow.child(1);
+        let expansion_task = map.expansion_task();
+        let expansion = old.scheduler.request_claim(&worker(), &expansion_task).unwrap();
+        old.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        old.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+        for index in 0..2 {
+            run_member(&mut old, &map, index, b"done");
+        }
+        let mark = old.spy.mark();
+        old.scheduler
+            .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+            .unwrap();
+        let mut rebuild = rebuild_losing(&old, mark, is_composite_or_page);
+        let mut unknown_record = None;
+        if unknown_at_first {
+            let known = rebuild
+                .records
+                .iter()
+                .position(|record| record.task.as_ref().unwrap().task_id() == expansion_task)
+                .unwrap();
+            unknown_record = Some(rebuild.records.remove(known));
+            rebuild.uncertain.insert(expansion_task.clone(), Default::default());
+        }
+        let mut new = took_over(&old, rebuild);
+        if let Some(record) = unknown_record {
+            assert_eq!(
+                new.scheduler.composite_status(&map).unwrap().state,
+                CompositeState::Running,
+                "the map waits while its expansion run's end is unknown"
+            );
+            new.scheduler
+                .adopt(Rebuild { records: vec![record], ..Rebuild::default() })
+                .unwrap();
+        }
+        assert_eq!(
+            new.scheduler.composite_status(&map).unwrap().state,
+            CompositeState::Succeeded,
+            "(expansion record unknown at first: {unknown_at_first})"
+        );
+        run_member(&mut new, &flow, 2, b"reported");
+        assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+        assert!(new.spy.newest_composite(&map).unwrap().sealed);
+    }
+}
+
+/// A sealed map names a member whose Task record never reached a holder: the
+/// expansion run that would have sent it again is over, so nothing ever will.
+/// The map settles the member as lost rather than waiting for it forever.
+#[test]
+fn a_sealed_map_does_not_wait_for_a_member_whose_task_record_was_lost() {
+    let mut old = Fixture::leading();
+    let flow = submitted(&mut old, flow_of(vec![task_stage("load", Some(b"x")), expanding_map()]));
+    run_member(&mut old, &flow, 0, b"[1, 2, 3]");
+    let map = flow.child(1);
+    let expansion = old.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
+    old.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    old.scheduler.submit_members(item_batch(&map, 0, 3, false)).unwrap();
+    run_member(&mut old, &map, 0, b"done");
+    run_member(&mut old, &map, 2, b"done");
+    old.scheduler
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    let missing = RecordKey::Task(map.member_task(1));
+    let mut new = took_over(&old, rebuild_losing(&old, 0, |key| *key == missing));
+    let finished = finished(&mut new);
+    assert_eq!(finished[0].state, CompositeState::Failed);
+    assert_eq!(finished[0].failure.as_ref().unwrap().kind, "TaskLostError");
+}
+
 /// The old leader stored a batch's member records but not the map's record.
 /// Its successor counts the members it finds: the submitter, whether it carries
 /// on with the next batch or asks for the lost one again, is taken once, and
