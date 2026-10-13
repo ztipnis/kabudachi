@@ -40,6 +40,23 @@ class SerializationError(KabudachiError, ValueError):
     that was asked for."""
 
 
+class PayloadTooLargeError(SerializationError):
+    """A task's encoded input is larger than the hard memory limit of the
+    process that must hold it, so it was not submitted: this one's
+    `memory_hard_limit`, or the shard leader's. Submitting it again is
+    refused again. `size` and `limit` are in bytes, `None` where not known
+    here (a leader's refusal names neither)."""
+
+    def __init__(self, message: str, size: int | None = None, limit: int | None = None) -> None:
+        super().__init__(message)
+        self.size = size
+        self.limit = limit
+
+    def __reduce__(self) -> tuple[Any, tuple[str, int | None, int | None]]:
+        # Crosses the pipe from a task process with its sizes.
+        return (PayloadTooLargeError, (str(self), self.size, self.limit))
+
+
 class RuntimeNotStartedError(KabudachiError, RuntimeError):
     """A task was submitted while `kabudachi.run()` was not running."""
 

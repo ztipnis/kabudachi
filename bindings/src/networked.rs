@@ -136,6 +136,13 @@ impl NetworkedRuntime {
         false
     }
 
+    /// The largest payload this worker holds whole: none is bounded here yet,
+    /// since an input never travels except inline.
+    #[getter]
+    fn payload_limit(&self) -> Option<u64> {
+        None
+    }
+
     /// The incarnation of the shard this worker joined; empty before it has.
     fn shard_id(&self) -> String {
         self.shared.observed.borrow().shard_id.clone()

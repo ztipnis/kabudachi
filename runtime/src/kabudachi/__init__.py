@@ -10,6 +10,7 @@ from kabudachi.composites import FlowHandle, GroupHandle
 from kabudachi.config import configure
 from kabudachi.errors import (
     DurabilityUnavailableError,
+    PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
     TaskOrphanedError,
@@ -42,6 +43,7 @@ __all__ = [
     "group",
     "Group",
     "GroupHandle",
+    "PayloadTooLargeError",
     "process_init",
     "register_serializer",
     "ResultTooLargeError",

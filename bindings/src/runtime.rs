@@ -66,6 +66,9 @@ pub struct NativeRuntime {
     /// The one way into the scheduler, which refuses everything once the
     /// runtime has shut down.
     door: Arc<SchedulerDoor<RealClock>>,
+    /// The hard memory limit, which is the largest payload this runtime
+    /// holds whole.
+    payload_limit: Option<u64>,
 }
 
 #[pymethods]
@@ -142,6 +145,7 @@ impl NativeRuntime {
             state,
             shard_id,
             door,
+            payload_limit: limits.map(|limits| limits.hard),
         })
     }
 
@@ -150,6 +154,13 @@ impl NativeRuntime {
     #[getter]
     fn certifies_locally(&self) -> bool {
         true
+    }
+
+    /// The largest payload this runtime holds whole: its hard memory limit,
+    /// or `None` when no limit is set.
+    #[getter]
+    fn payload_limit(&self) -> Option<u64> {
+        self.payload_limit
     }
 
     /// The incarnation of the shard this runtime founded at start: `local/`

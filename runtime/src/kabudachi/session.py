@@ -41,6 +41,7 @@ from kabudachi.config import Configuration
 from kabudachi.errors import (
     BackpressureError,
     CoalescedPayloadTooLargeError,
+    PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
     RuntimeNotStartedError,
@@ -175,7 +176,8 @@ class Session:
 
         Safe to call from any thread. Raises `SerializationError`, before
         anything is queued, if `argument` is not what the task takes, and
-        `RunStoppedError` once the run is stopping.
+        `PayloadTooLargeError` if the encoded `argument` alone is larger than
+        `memory_hard_limit`, and `RunStoppedError` once the run is stopping.
         """
         serializer = self._serializers.get(definition.serializer)
         payload = serializer.encode(argument, definition.input_type)
@@ -185,6 +187,13 @@ class Session:
         self, definition: TaskDefinition, payload: bytes, options: SubmissionOptions
     ) -> TaskHandle:
         queue = self._configuration.resolve("queue", definition.queue)
+        limit = self._runtime.payload_limit
+        if limit is not None and len(payload) > limit:
+            raise PayloadTooLargeError(
+                f"task {definition.name}'s input is {len(payload)} bytes, past the {limit} this process can hold",
+                len(payload),
+                limit,
+            )
         settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
         return self._tasks.submit(definition, payload, options, settings)
 
@@ -358,10 +367,14 @@ class Session:
         self._tasks.replicated(event.task_id)
 
     def _on_refused(self, event: Any) -> None:
-        self._tasks.refused(
-            event.task_id,
-            BackpressureError(f"the leader refused task {event.task_id}: {event.reason}"),
+        error: Exception = BackpressureError(
+            f"the leader refused task {event.task_id}: {event.reason}"
         )
+        if event.reason == "TASK_REJECT_PAYLOAD_TOO_LARGE":
+            error = PayloadTooLargeError(
+                "the input is past the hard memory limit of the shard's leader"
+            )
+        self._tasks.refused(event.task_id, error)
 
     def _on_abort(self, event: Any) -> None:
         self._abort_at(event.task_run_id, event.seconds_left)

@@ -119,7 +119,10 @@ class OneNodeArguments:
     soft one `next_events()` reports an `EventKind.SLOW_DOWN` event with
     `active` set, and past the hard one `submit` raises
     `BackpressureError`. Both or neither must be given, and the soft one
-    must not be above the hard one, which `kabudachi.configure` checks.
+    must not be above the hard one, which `kabudachi.configure` checks. An
+    input larger than one message is kept in this runtime's own store as
+    blobs and handed back whole with its claim; it counts against the
+    memory limits like any other input.
     """
 
     worker_threads: int = _DEFAULT_WORKER_THREADS
@@ -178,6 +181,10 @@ class Runtime(Protocol):
     certification, a retry). `False` for a worker of a networked shard: its
     reports go to a leader that may be another process, the reports below
     then return `None`, and certifications and outcomes arrive as events."""
+
+    payload_limit: int | None
+    """The largest payload this process holds whole: a one-node runtime's
+    hard memory limit. `None` when no limit is set."""
 
     def shard_id(self) -> str:
         """The incarnation of the shard this runtime founded at start."""

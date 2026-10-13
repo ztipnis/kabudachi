@@ -5,10 +5,12 @@ the environment), then the task's own explicit setting. A task setting of
 `None` is a choice like any other; only `UNSET` means the task chose nothing.
 """
 
+import functools
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, get_type_hints
 from urllib.parse import SplitResult, parse_qs, urlsplit
 
@@ -43,12 +45,73 @@ UNSET = Unset()
 
 ENVIRONMENT_PREFIX = "KABUDACHI_"
 
-# Bytes of serialized task input the scheduler may hold for tasks that have not
-# finished. Past the soft limit bulk submission (group, map) pauses; past the
-# hard limit a submission raises `BackpressureError`. Fixed
-# numbers, not derived from the memory of the machine.
-DEFAULT_MEMORY_SOFT_LIMIT = 256 * 1024 * 1024
-DEFAULT_MEMORY_HARD_LIMIT = 512 * 1024 * 1024
+# Bytes of task payload the process may hold. The scheduler counts every
+# unfinished task's input; a networked process also counts the blob payloads
+# crossing the network through it. Past the soft limit bulk submission (group,
+# map) pauses; past the hard limit a submission raises `BackpressureError`,
+# and a payload that alone is past it is refused with `PayloadTooLargeError`
+# (an input) or fails its run with `ResultTooLargeError` (a result). Unless
+# set, the limits are these shares of the memory this process may use, read
+# once at start.
+MEMORY_SOFT_SHARE = 4
+MEMORY_HARD_SHARE = 2
+
+# cgroup v1 reports "no limit" as a number near 2**63; anything from 2**60 up
+# is no limit.
+_CGROUP_V1_UNLIMITED = 2**60
+
+
+def available_memory(
+    cgroup_root: Path = Path("/sys/fs/cgroup"), proc_cgroup: Path = Path("/proc/self/cgroup")
+) -> int:
+    """The bytes of memory this process may use: its cgroup's limit (v2, then
+    v1) when one is set and below physical memory, else physical memory."""
+    physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    limit = _cgroup_limit(cgroup_root, proc_cgroup)
+    return physical if limit is None else min(limit, physical)
+
+
+def _cgroup_limit(root: Path, proc_cgroup: Path) -> int | None:
+    try:
+        lines = proc_cgroup.read_text().splitlines()
+    except OSError:
+        lines = []
+    v2_path, v1_path = None, None
+    for line in lines:
+        hierarchy, _, rest = line.partition(":")
+        controllers, _, path = rest.partition(":")
+        if hierarchy == "0" and controllers == "":
+            v2_path = path
+        elif "memory" in controllers.split(","):
+            v1_path = path
+    candidates = []
+    if v2_path is not None:
+        candidates += [root / v2_path.lstrip("/") / "memory.max", root / "memory.max"]
+    if v1_path is not None:
+        v1 = root / "memory"
+        candidates += [v1 / v1_path.lstrip("/") / "memory.limit_in_bytes", v1 / "memory.limit_in_bytes"]
+    for candidate in candidates:
+        try:
+            text = candidate.read_text().strip()
+        except OSError:
+            continue
+        if text == "max":
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            continue
+        return None if value >= _CGROUP_V1_UNLIMITED else value
+    return None
+
+
+@functools.cache
+def _available_at_start() -> int:
+    return available_memory()
+
+
+def _memory_at_start() -> int:
+    return _available_at_start()
 
 # The key prefix of an `authority` URL that does not set its own.
 DEFAULT_KEY_PREFIX = "kabudachi:"
@@ -164,11 +227,15 @@ class Settings:
     """How many seconds a finished task is kept, so its result and state can
     still be looked up, before it is forgotten."""
 
-    memory_soft_limit: int = DEFAULT_MEMORY_SOFT_LIMIT
-    """Bytes of pending task input past which bulk submission pauses."""
+    memory_soft_limit: int | None = None
+    """Bytes of task payload past which bulk submission pauses: a quarter of
+    the memory this process may use unless set."""
 
-    memory_hard_limit: int = DEFAULT_MEMORY_HARD_LIMIT
-    """Bytes of pending task input past which a submission is refused."""
+    memory_hard_limit: int | None = None
+    """Bytes of task payload past which a submission is refused for now, and
+    past which a single payload is refused for good: half of the memory this
+    process may use unless set. A payload larger than one message (about
+    1 MiB) travels as 256 KiB chunks stored in the shard."""
 
     cancel_grace: timedelta = timedelta(seconds=30)
     """How long a task past its timeout has to stop once asked, before its
@@ -253,12 +320,28 @@ class Settings:
 
     def _check_memory(self) -> None:
         for name in ("memory_soft_limit", "memory_hard_limit"):
-            _require_count(name, getattr(self, name), minimum=1, what="a positive number of bytes")
-        if self.memory_soft_limit > self.memory_hard_limit:
+            limit = getattr(self, name)
+            if limit is not None:
+                _require_count(name, limit, minimum=1, what="a positive number of bytes")
+        soft, hard = self._memory_limits_with_defaults()
+        if soft > hard:
             raise ValueError(
-                f"memory_soft_limit ({self.memory_soft_limit}) must not be above "
-                f"memory_hard_limit ({self.memory_hard_limit})"
+                f"memory_soft_limit ({soft}) must not be above memory_hard_limit ({hard})"
             )
+        object.__setattr__(self, "memory_soft_limit", soft)
+        object.__setattr__(self, "memory_hard_limit", hard)
+
+    def _memory_limits_with_defaults(self) -> tuple[int, int]:
+        """The soft and hard limits, a missing one filled from the memory this
+        process may use: half for the hard limit, and a quarter for the soft
+        one unless the hard limit is lower."""
+        hard = self.memory_hard_limit
+        if hard is None:
+            hard = _memory_at_start() // MEMORY_HARD_SHARE
+        soft = self.memory_soft_limit
+        if soft is None:
+            soft = min(_memory_at_start() // MEMORY_SOFT_SHARE, hard)
+        return soft, hard
 
     def _check_stopping(self) -> None:
         if not is_non_negative_timedelta(self.cancel_grace):
@@ -515,8 +598,9 @@ def configure(**settings: Any) -> None:
     each named queue may go unheard past a suspicion before the leader
     replays it (a task's own `reconnect_timeout` wins), and
     `memory_soft_limit` and `memory_hard_limit`, in bytes of pending task
-    input (past the soft one `group` and `map` pause, past the hard one a
-    submission raises `BackpressureError`). `listen`, `seeds`,
+    payload (past the soft one `group` and `map` pause, past the hard one a
+    submission raises `BackpressureError`; a quarter and half of the memory
+    this process may use unless set). `listen`, `seeds`,
     `external_address`, `authority` and `shard` make this a worker of a
     networked shard (see each setting; `authority` is a URL that may set
     `?key_prefix=` and `?ttl=`); `heartbeat_interval`,

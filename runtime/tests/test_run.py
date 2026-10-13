@@ -619,6 +619,31 @@ def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
     assert isinstance(refused, RuntimeError)
 
 
+def test_an_input_larger_than_one_message_reaches_its_task_and_one_alone_past_the_hard_limit_is_refused():
+    from kabudachi.errors import PayloadTooLargeError, SerializationError
+
+    @declare
+    def measure(request: Greeting) -> Greeting:
+        return Greeting(text=request.text[-5:], times=len(request.text))
+
+    hard = 5 * 1024 * 1024
+    kabudachi.configure(memory_soft_limit=2 * 1024 * 1024, memory_hard_limit=hard)
+    # Varied, so chunks put back out of order would not match.
+    big = ("0123456789" * (3 * 1024 * 1024 // 10 + 1))[: 3 * 1024 * 1024]
+
+    async def main():
+        measured = await measure(Greeting(text=big))
+        with pytest.raises(PayloadTooLargeError) as refused:
+            measure(Greeting(text="y" * (hard + 1)))
+        return measured, refused.value
+
+    measured, refused = kabudachi.run(main)
+    assert measured == Greeting(text=big[-5:], times=len(big))
+    # Not transient: a serialization error, never a backpressure one.
+    assert isinstance(refused, SerializationError)
+    assert refused.limit == hard and refused.size > refused.limit
+
+
 def test_a_long_chain_is_compacted_while_its_key_is_busy_and_folds_in_order():
     """A key's running generation holds it while newer ones pile up past the
     soft limit; a compaction folds the waiting payloads on a free worker
