@@ -67,7 +67,9 @@
 //! each goes, or, if it led, places them among its other voters, and writes
 //! each copy to those holders before it returns. A leader answers that
 //! question for any asker, a worker it has already taken out of its roster
-//! included, as it decides nothing.
+//! included, as it decides nothing. Before it returns it also waits until
+//! every election message it sent was answered or failed (see
+//! `Net::flush_sent`), so its departure is on the wire when the process exits.
 //!
 //! A node that takes office reconciles before it leads (see
 //! `crate::reconcile::leader`). The driver asks every worker of the office's
@@ -322,7 +324,12 @@ where
         // A node that drained has nothing more to do but hand its records
         // over; the worker may exit once that is done.
         if let Some(to) = run.drained() {
-            return run.hand_off(to).await;
+            let handed = run.hand_off(to).await;
+            // What the final steps sent (the departure announcement among
+            // it) is only queued for the network task; the worker may exit
+            // as soon as this returns, so wait until it was received.
+            net.flush_sent().await;
+            return handed;
         }
         run.sleep().await;
     }

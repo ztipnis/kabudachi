@@ -18,7 +18,7 @@ use libp2p::core::ConnectedPoint;
 use libp2p::core::transport::ListenerId;
 use libp2p::futures::StreamExt;
 use libp2p::kad::store::RecordStore as _;
-use libp2p::request_response;
+use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, identify, kad};
@@ -94,6 +94,55 @@ struct Pending {
     records: RecordQueries,
     /// Bootstrap queries that have had a failed step, until their last step.
     crawls: CrawlTracker,
+    /// The direct election messages sent and not yet answered.
+    elections: ElectionSends,
+}
+
+/// The direct election messages the swarm task sent that their peer has not
+/// answered (or that failed), and the [`Command::FlushSent`]s waiting for
+/// them.
+#[derive(Default)]
+struct ElectionSends {
+    unanswered: HashSet<OutboundRequestId>,
+    flushes: Vec<PendingFlush>,
+}
+
+/// A flush waiting for the messages that were unanswered when it asked.
+struct PendingFlush {
+    awaiting: HashSet<OutboundRequestId>,
+    respond_to: oneshot::Sender<()>,
+}
+
+impl ElectionSends {
+    fn flush(&mut self, respond_to: oneshot::Sender<()>) {
+        if self.unanswered.is_empty() {
+            let _ = respond_to.send(());
+        } else {
+            self.flushes.push(PendingFlush {
+                awaiting: self.unanswered.clone(),
+                respond_to,
+            });
+        }
+    }
+
+    /// Notes that the message sent as `id` was answered or failed, and ends
+    /// each flush that waited for nothing else.
+    fn settled(&mut self, id: OutboundRequestId) {
+        if !self.unanswered.remove(&id) {
+            return;
+        }
+        let (finished, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.flushes)
+            .into_iter()
+            .map(|mut flush| {
+                flush.awaiting.remove(&id);
+                flush
+            })
+            .partition(|flush| flush.awaiting.is_empty());
+        self.flushes = waiting;
+        for flush in finished {
+            let _ = flush.respond_to.send(());
+        }
+    }
 }
 
 /// A `Command::DialForConnection` in flight.
@@ -199,7 +248,11 @@ fn handle_command(
     now: Instant,
 ) {
     match command {
-        Command::Send { to, message } => send_direct(swarm, peers, to, message, now),
+        Command::Send { to, message } => {
+            let id = send_direct(swarm, peers, to, message, now);
+            pending.elections.unanswered.insert(id);
+        }
+        Command::FlushSent { respond_to } => pending.elections.flush(respond_to),
         Command::Subscribe { topic } => subscribe(swarm, &topic),
         Command::Publish { topic, message } => publish(swarm, peers, topic, message, now),
         Command::Dial { addr } => {
@@ -241,7 +294,7 @@ fn send_direct(
     to: PeerId,
     mut message: ElectionMessage,
     now: Instant,
-) {
+) -> OutboundRequestId {
     if let Some(own) = peers.own_address() {
         stamp_own_address(&mut message, &own);
     }
@@ -254,7 +307,7 @@ fn send_direct(
     swarm
         .behaviour_mut()
         .request_response
-        .send_request_with_addresses(&to, message, address.into_iter().collect());
+        .send_request_with_addresses(&to, message, address.into_iter().collect())
 }
 
 fn subscribe(swarm: &mut Swarm<Behaviour>, topic: &gossipsub::IdentTopic) {
@@ -568,6 +621,13 @@ fn handle_behaviour_event(
                 .request_response
                 .send_response(channel, Ack);
         }
+        BehaviourEvent::RequestResponse(
+            request_response::Event::Message {
+                message: request_response::Message::Response { request_id, .. },
+                ..
+            }
+            | request_response::Event::OutboundFailure { request_id, .. },
+        ) => pending.elections.settled(request_id),
         BehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. }) => {
             if let Some(input) = gossip_input(message) {
                 arrived(inbound, peers, input, now);

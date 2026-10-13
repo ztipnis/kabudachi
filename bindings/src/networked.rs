@@ -76,10 +76,6 @@ use self::start::NetworkedArguments;
 
 const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
 
-/// How long a worker that has left its shard lingers so the messages that
-/// announced its departure reach the network before its caller exits.
-const DEPARTURE_FLUSH: StdDuration = StdDuration::from_millis(100);
-
 /// A worker of a networked shard, and the Tokio runtime it runs on.
 ///
 /// Call `drain()` to leave the shard, then `shutdown()` when finished: the
@@ -523,10 +519,6 @@ impl NetworkedRuntime {
                     break;
                 }
             }
-            // The departure message has been handed to the network task, which
-            // writes it on its own schedule; the process may exit as soon as
-            // this resolves and the message must be on the wire by then.
-            tokio::time::sleep(DEPARTURE_FLUSH).await;
             let handed = drained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
