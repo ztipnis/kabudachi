@@ -5,6 +5,7 @@ use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::generated::composite_entry;
 use kabudachi_core::scheduler::SubmitRejection;
 use kabudachi_core::scheduler::composite::{ITEM_PAGES, ItemInput, MemberBatch, PAGE_ENTRIES, StreamedMember};
+use kabudachi_core::task_record::ShardRecord;
 
 use crate::support::composites::*;
 use crate::support::scheduler::Fixture;
@@ -16,7 +17,12 @@ fn a_reduces_items_fill_its_item_pages_in_order_once_each_and_its_last_batch_sea
     let values: Vec<Vec<u8>> = (0..PAGE_ENTRIES + 2).map(item).collect();
     let values: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
     let split = (PAGE_ENTRIES - 1) as usize;
+    let mark = fixture.spy.mark();
     let taken = fixture.scheduler.submit_members(items_batch(&reduce, 0, &values[..split], false)).unwrap();
+    let published = fixture.spy.published_since(mark);
+    let page_at = published.iter().position(|record| matches!(record, ShardRecord::Page(_)));
+    let record_at = published.iter().position(|record| matches!(record, ShardRecord::Composite(_)));
+    assert!(page_at.unwrap() < record_at.unwrap(), "the item page is published before the record that counts its items");
     assert_eq!(taken.members, PAGE_ENTRIES - 1, "a reduce answers with the items it holds");
     assert_eq!(items_on_page(&fixture, &reduce, 0).len(), split, "a partly filled item page is written with its batch");
     assert_eq!(fixture.scheduler.pending_len(), 0, "no step starts before the reduce is sealed");
@@ -67,6 +73,13 @@ fn a_reduce_keeps_only_its_partly_filled_item_page_so_a_stream_twice_the_hard_li
         fixture.scheduler.submit_members(items_batch(&reduce, start, &items, page == 3)).unwrap();
         assert_eq!(items_on_page(&fixture, &reduce, page as u32).len() as u64, PAGE_ENTRIES);
         assert_eq!(fixture.scheduler.memory_in_use(), in_use, "a full page is let go once it is written");
+        for written in 0..=page as u32 {
+            assert_eq!(
+                fixture.spy.page_revisions(&reduce, ITEM_PAGES + written),
+                1,
+                "a full page is written once and never again"
+            );
+        }
     }
     // Four pages, twice the hard limit, went in: each full page was written
     // and let go before the next batch was admitted.
@@ -97,7 +110,13 @@ fn an_item_page_holds_small_items_inline_or_as_blobs_and_refuses_a_batch_with_an
         ],
         ..items_batch(&reduce, 0, &[], false)
     };
+    let in_use = fixture.scheduler.memory_in_use();
     assert_eq!(fixture.scheduler.submit_members(mixed).unwrap().members, 2);
+    assert_eq!(
+        fixture.scheduler.memory_in_use() - in_use,
+        1 + blobs.encoded_len() as u64,
+        "an inline item costs its bytes and a stored one its manifest"
+    );
     let page = fixture.spy.newest_page(&reduce, ITEM_PAGES).unwrap();
     let outcomes: Vec<_> = page.entries.iter().map(|entry| (entry.index, entry.outcome.clone())).collect();
     assert_eq!(

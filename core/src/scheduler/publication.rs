@@ -72,7 +72,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             };
             let item_page = page >= ITEM_PAGES;
             // An item page the leader no longer has was published already.
-            if item_page && composite.item_page_entries(page).is_none() {
+            if item_page && !composite.holds_item_page(page) {
                 continue;
             }
             let version = self.leadership.next_version(recovery_epoch, term);

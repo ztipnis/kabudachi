@@ -331,7 +331,7 @@ impl ReduceItem {
     fn held_bytes(&self) -> u64 {
         match self {
             ReduceItem::Value(bytes) => bytes.len() as u64,
-            ReduceItem::Manifest(manifest) => manifest.encode().len() as u64,
+            ReduceItem::Manifest(manifest) => manifest.encoded_len() as u64,
         }
     }
 }
@@ -344,6 +344,15 @@ impl Composite {
         self.filled_item_pages.keys().copied().chain(partial).collect()
     }
 
+    /// Whether the leader still has item page `page`.
+    pub(in crate::scheduler) fn holds_item_page(&self, page: u32) -> bool {
+        page >= ITEM_PAGES && (self.filled_item_pages.contains_key(&page) || self.is_partial_page(page))
+    }
+
+    fn is_partial_page(&self, page: u32) -> bool {
+        !self.partial_items.is_empty() && item_page(self.items_taken - 1) == page
+    }
+
     /// The entries of item page `page`, if the leader still has that page.
     pub(in crate::scheduler) fn item_page_entries(&self, page: u32) -> Option<Vec<generated::CompositeEntry>> {
         if page < ITEM_PAGES {
@@ -351,7 +360,7 @@ impl Composite {
         }
         let items = match self.filled_item_pages.get(&page) {
             Some(items) => items,
-            None if self.held_item_pages().contains(&page) => &self.partial_items,
+            None if self.is_partial_page(page) => &self.partial_items,
             None => return None,
         };
         let first = u64::from(page - ITEM_PAGES) * PAGE_ENTRIES;
@@ -379,6 +388,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         fresh: Vec<(u64, StreamedMember)>,
         last: bool,
     ) -> Result<(), SubmitRejection> {
+        debug_assert!(!self.composites.held[id].sealed, "admission refuses every new item of a sealed reduce");
         let items: Vec<ReduceItem> = fresh
             .into_iter()
             .map(|(_, member)| match member {
