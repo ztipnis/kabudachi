@@ -29,6 +29,7 @@ from kabudachi.errors import (
     SerializationError,
     TaskDefinitionError,
 )
+from kabudachi.flow import Flow
 from kabudachi.handle import TaskHandle
 from kabudachi.lifecycle import HookRegistry
 from kabudachi.options import SubmissionOptions, submission_options
@@ -36,6 +37,7 @@ from kabudachi.registry import TaskKind, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.tasks import Task
 from proto_messages import Greeting, Receipt
+from session_world import Pickle
 
 
 def declare(function):
@@ -68,7 +70,7 @@ def no_parameters() -> Receipt:
     return Receipt()
 
 
-def two_parameters(request: Greeting, extra: Greeting) -> Receipt:
+def three_parameters(request: Greeting, extra: Greeting, more: Greeting) -> Receipt:
     return Receipt()
 
 
@@ -249,7 +251,7 @@ def test_missing_annotations_are_refused():
         define(unannotated_output)
 
 
-@pytest.mark.parametrize("func", [no_parameters, two_parameters, variadic, keyword_variadic])
+@pytest.mark.parametrize("func", [no_parameters, three_parameters, variadic, keyword_variadic])
 def test_a_task_takes_exactly_one_argument(func):
     with pytest.raises(TaskDefinitionError, match="one"):
         define(func)
@@ -1210,3 +1212,136 @@ def test_every_kind_of_task_keeps_its_own_reconnect_timeout(fresh_registry):
         timedelta(seconds=6),
         timedelta(seconds=7),
     ]
+
+
+def _concat(item: str, previous: str) -> str:
+    return previous + item
+
+
+def _count(item: str, previous: dict) -> dict:
+    return {**previous, item: previous.get(item, 0) + 1}
+
+
+def _add_counts(left: dict, right: dict) -> dict:
+    return {key: left.get(key, 0) + right.get(key, 0) for key in left | right}
+
+
+async def _async_merge(left: dict, right: dict) -> dict:
+    return left
+
+
+def _shout(item: str) -> str:
+    return item.upper()
+
+
+def _plan(item: str, previous: str) -> Flow:
+    raise AssertionError("never run")
+
+
+@pytest.mark.parametrize(
+    ("function", "options", "refusal", "shape"),
+    [
+        pytest.param(_concat, {}, None, (False, False), id="a two-parameter task is a chain reducer"),
+        pytest.param(
+            _concat,
+            {"reduces": True, "associative": True},
+            None,
+            (True, True),
+            id="associative defaults to a tree",
+        ),
+        pytest.param(
+            _concat,
+            {"reduces": True, "associative": True, "tree": False},
+            None,
+            (True, False),
+            id="an associative chain",
+        ),
+        pytest.param(
+            _count,
+            {"reduces": True, "tree": True, "merge": _add_counts},
+            None,
+            (False, True),
+            id="a tree with merge",
+        ),
+        pytest.param(
+            _count, {"reduces": True, "tree": True}, "exactly one", None, id="a tree needs a way to combine"
+        ),
+        pytest.param(
+            _concat,
+            {"reduces": True, "associative": True, "merge": _add_counts},
+            "exactly one",
+            None,
+            id="not two ways",
+        ),
+        pytest.param(
+            _count, {"reduces": True, "associative": True}, "own type", None, id="associative needs P to be T"
+        ),
+        pytest.param(
+            _count, {"reduces": True, "merge": _add_counts}, "tree=True", None, id="merge without a tree"
+        ),
+        pytest.param(
+            _count,
+            {"reduces": True, "tree": True, "merge": _async_merge},
+            "synchronous",
+            None,
+            id="an async merge",
+        ),
+        pytest.param(
+            _count,
+            {"reduces": True, "tree": True, "merge": lambda left: left},
+            "two values",
+            None,
+            id="a merge of one value",
+        ),
+        pytest.param(_shout, {"reduces": True}, "two", None, id="@reducer needs two parameters"),
+        pytest.param(_plan, {}, "step", None, id="a reducer cannot return a step"),
+        pytest.param(_concat, {"kind": TaskKind.COALESCING}, "coalescing", None, id="a reducer cannot coalesce"),
+        pytest.param(_concat, {"kind": TaskKind.EPHEMERAL}, "durable", None, id="a reducer is durable"),
+    ],
+)
+def test_a_reducer_takes_item_and_previous_and_a_tree_has_exactly_one_way_to_combine(
+    function, options, refusal, shape
+):
+    registry, serializers = TaskRegistry(), SerializerRegistry.with_defaults()
+    serializers.register(Pickle())
+
+    def declare():
+        return Task(
+            function,
+            registry=registry,
+            serializers=serializers,
+            name="tests.reducer",
+            serializer="pickle",
+            **options,
+        )
+
+    if refusal is not None:
+        with pytest.raises(TaskDefinitionError, match=refusal):
+            declare()
+        assert "tests.reducer" not in registry
+        return
+    reducing = declare().definition.reducer
+    assert (reducing.associative, reducing.tree) == shape
+
+
+def test_a_reducer_runs_with_reduce_or_local_never_by_a_direct_call():
+    registry, serializers = TaskRegistry(), SerializerRegistry.with_defaults()
+    serializers.register(Pickle())
+    concat = Task(
+        _concat, registry=registry, serializers=serializers, name="tests.concat", serializer="pickle"
+    )
+    assert concat.local("b", "a") == "ab"
+    with pytest.raises(TypeError, match=r"\.reduce"):
+        concat("a")
+    with pytest.raises(TypeError, match="not a reducer"):
+        Task(_shout, registry=registry, serializers=serializers, name="tests.shout", serializer="pickle").reduce
+    with pytest.raises(TypeError):
+        Task(
+            _shout,
+            registry=registry,
+            serializers=serializers,
+            name="tests.plain",
+            serializer="pickle",
+            associative=True,
+        )
+    assert kabudachi.reducer is not None and issubclass(kabudachi.ReduceEmptyError, TypeError)

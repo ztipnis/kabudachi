@@ -22,6 +22,11 @@ class DuplicateTaskError(TaskDefinitionError):
     """Two tasks were given the same name."""
 
 
+class ReduceEmptyError(KabudachiError, TypeError):
+    """A reduce of no items was given no initial value, so it has no result.
+    A `TypeError`, as `functools.reduce` raises for the same case."""
+
+
 class UnknownSerializerError(KabudachiError, LookupError):
     """No serializer is registered under the requested name."""
 

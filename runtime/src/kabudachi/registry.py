@@ -20,6 +20,25 @@ class TaskKind(enum.Enum):
 
 
 @dataclass(frozen=True)
+class ReducerShape:
+    """How a task of two parameters `(item, previous)` folds a list: the
+    definition's `input_type` is the item's type and its `output_type` the
+    type of the result so far."""
+
+    previous_type: Any
+    """The type of the second parameter, which is also what the task returns."""
+    associative: bool
+    """Whether the fold may be evaluated as a tree: items and results are of
+    one type, and the combine of two adjacent results is the reducer itself."""
+    tree: bool
+    """Whether a reduce folds chunks of the list side by side and combines
+    adjacent results, rather than one item after another."""
+    merge: Callable[[Any, Any], Any] | None
+    """For a tree that is not associative: combines the results of two
+    adjacent branches, `merge(left, right)`."""
+
+
+@dataclass(frozen=True)
 class TaskDefinition:
     """What a task is, fixed when its module is imported. The callable never
     leaves this process; everything else identifies the task to others."""
@@ -64,6 +83,9 @@ class TaskDefinition:
     """How long a run may go without its worker being heard, past the time
     it takes to suspect a silent worker, before the leader replays it.
     `None` leaves it to the queue's setting, else the shard's."""
+    reducer: ReducerShape | None = None
+    """For a task of two parameters `(item, previous)`: how it folds a list.
+    `None` for a task of one."""
 
     def __reduce__(self) -> tuple[Any, tuple[str]]:
         # Sent between a worker and its task processes by name: both imported
@@ -71,10 +93,12 @@ class TaskDefinition:
         return (registered_definition, (self.name,))
 
     def types_unsupported_by(self, serializer: Serializer) -> list[tuple[str, Any]]:
-        """The ("input" | "return", type) pairs `serializer` cannot encode. A
-        task that returns a step has its return left out: a returned step is
-        never encoded."""
+        """The ("input" | "previous" | "return", type) pairs `serializer`
+        cannot encode. A task that returns a step has its return left out: a
+        returned step is never encoded."""
         checked = [("input", self.input_type)]
+        if self.reducer is not None:
+            checked.append(("previous", self.reducer.previous_type))
         if not self.continues:
             checked.append(("return", self.output_type))
         return [
