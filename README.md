@@ -3069,6 +3069,8 @@ Open: `owners_to_check` (`core/src/task_record/store.rs`) still scans every blob
 
 Open: while a takeover has records not known yet, every member that settles in a composite re-checks its members for an uncertain record (`holds_composite_back`). The scan walks all the members (`0..members`) only while reconciliation still has unknown records, so in that worst case settling a large composite costs its member count each time until the records are known. Exposure: a leader change while a map of many thousand members runs, until reconciliation learns the late records. Impact: high at scale, not moderate: for a map of about a million members the quadratic work during a takeover or reconcile window could run long enough to stall the leader.
 
+Open: a joiner whose leader dies before its first ack has no configuration yet, and with no other live member and an empty or flushed authority it stays `LeaderSuspect`: it neither abandons the shard nor runs a stranded search. An unconfigured node starts no roll call (`core/src/election/node/timers.rs`), and the empty authority read is not acted on for it (`core/src/election/authority_standing/replies.rs`); `StrandedWatch` (`net/src/leader_search.rs`) does not cover it. A restart recovers it. Exposure: rare, the join window plus loss of the leader plus a flushed authority. Impact: that node is stuck until restarted. Fix direction: let an unconfigured `LeaderSuspect` node act on an empty authority read, or extend `StrandedWatch` to cover it; either changes documented behaviour, so it needs a design ruling first.
+
 ### Phase 7: observability
 
 Prometheus and tracing should exist earlier for development, but this phase hardens:
