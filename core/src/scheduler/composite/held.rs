@@ -7,6 +7,7 @@ use std::ops::Deref;
 use crate::manifest::{Failure, Manifest};
 use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
 use crate::scheduler::SubmitRejection;
+use crate::task_record::RecordVersion;
 use crate::time::{Duration, Instant, WallTime};
 
 use super::{
@@ -50,9 +51,12 @@ pub(in crate::scheduler) struct Composite {
     /// The items of a reduce's last item page while that page is partly
     /// filled: all the leader keeps of the items it took.
     pub(super) partial_items: Vec<ReduceItem>,
-    /// Item pages that filled during this call, kept only until they are
-    /// published.
+    /// Item pages that are full, kept until their write is stored: a refused
+    /// write is published again from here, and so is a write that must move.
     pub(super) filled_item_pages: BTreeMap<u32, Vec<ReduceItem>>,
+    /// The newest version published of each full item page held, which a
+    /// stored write of that version or a newer one lets go.
+    pub(super) published_item_pages: BTreeMap<u32, RecordVersion>,
 }
 
 /// The outcomes of the members that settled, by index, with the tallies a

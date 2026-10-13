@@ -15,7 +15,7 @@ use kabudachi_core::scheduler::composite::{
     REDUCE_EMPTY_KIND, REDUCER_CONTINUED_KIND, ReduceNode, Stage, Step, StreamedMember,
 };
 use kabudachi_core::scheduler::{Claim, ClaimRejection, Completion, SubmitRejection};
-use kabudachi_core::task_record::{RecordKey, ShardRecord};
+use kabudachi_core::task_record::{RecordKey, RecordVersion, ShardRecord};
 use kabudachi_core::time::Duration;
 
 use crate::support::composites::*;
@@ -64,7 +64,7 @@ fn page_of_items(page: u64) -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn a_reduce_keeps_only_its_partly_filled_item_page_so_a_stream_twice_the_hard_limit_goes_through() {
+fn a_reduce_keeps_a_full_item_page_until_its_write_is_stored_so_a_stream_twice_the_hard_limit_goes_through() {
     let page_bytes = PAGE_ENTRIES * 8;
     let (mut fixture, reduce) = leading_with_room_for(streamed_reduce(None, None), 2 * page_bytes, 2 * page_bytes);
     let in_use = fixture.scheduler.memory_in_use();
@@ -82,17 +82,23 @@ fn a_reduce_keeps_only_its_partly_filled_item_page_so_a_stream_twice_the_hard_li
         let items: Vec<&[u8]> = items.iter().map(Vec::as_slice).collect();
         let start = page as u64 * PAGE_ENTRIES;
         fixture.scheduler.submit_members(items_batch(&reduce, start, &items, page == 3)).unwrap();
+        let key = RecordKey::Page(reduce.clone(), ITEM_PAGES + page as u32);
         assert_eq!(items_on_page(&fixture, &reduce, page as u32).len() as u64, PAGE_ENTRIES);
-        assert_eq!(fixture.scheduler.memory_in_use(), in_use, "a full page is let go once it is written");
-        for written in 0..=page as u32 {
-            assert_eq!(
-                fixture.spy.page_revisions(&reduce, ITEM_PAGES + written),
-                1,
-                "a full page is written once and never again"
-            );
+        assert!(fixture.scheduler.holds(&key), "a full page is held until its write is stored, for repair to move or retry");
+        assert_eq!(fixture.scheduler.memory_in_use(), in_use + page_bytes, "and it still counts against memory");
+        if page == 0 {
+            // Its write was refused: repair asks for it again, and the leader still has it to give.
+            assert_eq!(fixture.scheduler.republish(&[key.clone()]), 1);
+            assert_eq!(items_on_page(&fixture, &reduce, 0).len() as u64, PAGE_ENTRIES, "the retry carries every item");
         }
+        let stored = fixture.spy.newest_page(&reduce, ITEM_PAGES + page as u32).unwrap().version.unwrap();
+        fixture.scheduler.record_stored(&key, RecordVersion::from(&stored));
+        assert!(!fixture.scheduler.holds(&key), "a stored page is let go");
+        assert_eq!(fixture.scheduler.memory_in_use(), in_use, "and gives its bytes back");
+        let writes = if page == 0 { 2 } else { 1 };
+        assert_eq!(fixture.spy.page_revisions(&reduce, ITEM_PAGES + page as u32), writes);
     }
-    // Four pages, twice the hard limit, went in: each full page was written
+    // Four pages, twice the hard limit, went in: each full page was stored
     // and let go before the next batch was admitted.
     let record = fixture.spy.newest_composite(&reduce).unwrap();
     assert_eq!((record.reduce_items, record.sealed), (4 * PAGE_ENTRIES, true));

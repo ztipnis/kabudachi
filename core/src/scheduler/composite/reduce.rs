@@ -8,6 +8,7 @@ use crate::protocol::generated::{self, composite_entry, reduce_options};
 use crate::protocol::ids::{CompositeId, IdGenerator};
 use crate::scheduler::{Observer, Scheduler, SubmitRejection};
 use crate::scheduler::Submitted;
+use crate::task_record::{RecordKey, RecordVersion, VersionOrder};
 use crate::time::{Clock, WallTime};
 
 use super::held::Composite;
@@ -360,8 +361,8 @@ impl ReduceItem {
 }
 
 impl Composite {
-    /// The item pages the leader still has: those that filled during this
-    /// call and are not yet published, and the partly filled last one.
+    /// The item pages the leader still has: the full ones whose write is not
+    /// stored yet, and the partly filled last one.
     pub(super) fn held_item_pages(&self) -> Vec<u32> {
         let partial = (!self.partial_items.is_empty()).then(|| item_page(self.items_taken - 1));
         self.filled_item_pages.keys().copied().chain(partial).collect()
@@ -445,20 +446,51 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         Ok(())
     }
 
-    /// Lets the full item page `page` of `id` go once it is published,
-    /// giving its bytes back to the budget unless the composite's whole
-    /// weight already went back when it finished.
-    pub(in crate::scheduler) fn release_item_page(&mut self, id: &CompositeId, page: u32) {
+    /// Lets the full item page `page` of `id` go, giving its bytes back to
+    /// the budget unless the composite's whole weight already went back when
+    /// it finished. Says whether it held the page.
+    pub(in crate::scheduler) fn release_item_page(&mut self, id: &CompositeId, page: u32) -> bool {
         let finished = self.composites.is_finished(id);
         let Some(composite) = self.composites.held.get_mut(id) else {
+            return false;
+        };
+        composite.published_item_pages.remove(&page);
+        let Some(items) = composite.filled_item_pages.remove(&page) else {
+            return false;
+        };
+        let released: u64 = items.iter().map(ReduceItem::held_bytes).sum();
+        composite.bytes -= released;
+        if !finished {
+            self.budget.give_back(released);
+        }
+        true
+    }
+
+    /// Notes `version` as the newest revision published of item page `page`
+    /// of `id`, if the page is full: only a stored write of it or a newer one
+    /// lets the leader go of the page.
+    pub(in crate::scheduler) fn item_page_published(&mut self, id: &CompositeId, page: u32, version: RecordVersion) {
+        if let Some(composite) = self.composites.held.get_mut(id)
+            && composite.filled_item_pages.contains_key(&page)
+        {
+            composite.published_item_pages.insert(page, version);
+        }
+    }
+
+    /// The write of `version` of `key` was stored where it belongs: a full
+    /// item page published at that version or an older one is let go, since
+    /// no write is left to retry or to move.
+    pub fn record_stored(&mut self, key: &RecordKey, version: RecordVersion) {
+        let RecordKey::Page(id, page) = key else {
             return;
         };
-        if let Some(items) = composite.filled_item_pages.remove(&page) {
-            let released: u64 = items.iter().map(ReduceItem::held_bytes).sum();
-            composite.bytes -= released;
-            if !finished {
-                self.budget.give_back(released);
-            }
+        let published = self
+            .composites
+            .held
+            .get(id)
+            .and_then(|composite| composite.published_item_pages.get(page));
+        if published.is_some_and(|published| published.order(&version) != VersionOrder::Older) {
+            self.release_item_page(id, *page);
         }
     }
 

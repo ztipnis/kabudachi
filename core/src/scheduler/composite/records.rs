@@ -270,6 +270,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             items_taken,
             partial_items,
             filled_item_pages: BTreeMap::new(),
+            published_item_pages: BTreeMap::new(),
             step,
             root: record.root.map_or_else(|| id.clone(), CompositeId::from),
             retained_by,

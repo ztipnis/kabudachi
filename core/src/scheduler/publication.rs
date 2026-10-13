@@ -71,7 +71,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 continue;
             };
             let item_page = page >= ITEM_PAGES;
-            // An item page the leader no longer has was published already.
+            // An item page the leader no longer has was stored already.
             if item_page && !composite.holds_item_page(page) {
                 continue;
             }
@@ -80,7 +80,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.observer.page_revision(record);
             published += 1;
             if item_page {
-                self.release_item_page(&id, page);
+                self.item_page_published(&id, page, version);
+                if self.observer.stores_at_once() {
+                    self.release_item_page(&id, page);
+                }
             }
         }
         for id in records {

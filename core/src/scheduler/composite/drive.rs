@@ -307,6 +307,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 items_taken: items,
                 partial_items: Vec::new(),
                 filled_item_pages: BTreeMap::new(),
+                published_item_pages: BTreeMap::new(),
             },
         );
         self.composites.unpublished.insert(id.clone());
