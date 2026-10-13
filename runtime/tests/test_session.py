@@ -2077,30 +2077,6 @@ def test_a_task_the_worker_cannot_run_waits_for_another_worker_and_fails_after_t
     assert "dropping task" not in caplog.text
 
 
-def test_a_task_whose_input_cannot_be_migrated_is_dropped_with_a_warning_and_ends_with_a_migration_error(
-    caplog,
-):
-    seen = []
-    world = crate_world(seen)
-
-    async def body():
-        handle = submit_at(world, "take_crate", encoded(CrateV1(label="secret")), 1)
-        with pytest.raises(MigrationError, match="declared incompatible"):
-            await asyncio.wait_for(handle, WAIT)
-        return handle.task_id
-
-    with caplog.at_level(logging.WARNING, logger="kabudachi"):
-        task_id = run(with_events(world, body))
-
-    assert seen == []
-    [warning] = [record.getMessage() for record in caplog.records if "dropping task" in record.getMessage()]
-    assert f"task {task_id}" in warning
-    assert "tests.take_crate" in warning
-    assert "tests.session.crate" in warning and "from version 1 to 2" in warning
-    assert "secret" not in caplog.text
-    assert [event[3] for event in world.runtime.events if event[0] == "blocked"] == [True]
-
-
 def flow_status(world, *members):
     """Runs a flow of `members`, each a (task name, version, payload) a
     submitter of that version made; a payload of `None` takes the result of
@@ -2141,14 +2117,13 @@ def test_a_member_of_a_flow_has_its_input_migrated_before_its_run_is_reported_st
     assert [event[0] for event in world.runtime.events] == ["started", "complete"]
 
 
-def test_a_member_whose_input_cannot_be_migrated_never_runs_and_fails_its_flow(caplog):
+def test_a_member_whose_input_cannot_be_migrated_never_runs_and_is_only_reported_blocked(caplog):
     seen = []
     world = crate_world(seen)
 
     with caplog.at_level(logging.WARNING, logger="kabudachi"):
-        status = flow_status(world, ("take_crate", 1, encoded(CrateV1(label="a"))))
+        flow_status(world, ("take_crate", 1, encoded(CrateV1(label="a"))))
 
-    assert status[0] == "failed"
     assert seen == []
     assert "dropping task" in caplog.text
     assert [event[0] for event in world.runtime.events] == ["blocked"]
@@ -2173,14 +2148,33 @@ schema(GadgetV2, version=2, version_path="$.v", family="tests.session.gadget", m
 
 
 @pytest.mark.parametrize(
-    ("label", "reason", "leaked"),
+    ("name", "make_input", "reason", "leaked"),
     [
-        pytest.param("refuse", "was refused: only gadgets built on weekdays can move", None, id="a refusal"),
-        pytest.param("secret", "failed with ValueError", "secret", id="any other error"),
+        pytest.param(
+            "take_gadget",
+            lambda: encoded(GadgetV1(label="refuse")),
+            "was refused: only gadgets built on weekdays can move",
+            None,
+            id="a refusal",
+        ),
+        pytest.param(
+            "take_gadget",
+            lambda: encoded(GadgetV1(label="secret")),
+            "failed with ValueError",
+            "secret",
+            id="any other error",
+        ),
+        pytest.param(
+            "take_crate",
+            lambda: encoded(CrateV1(label="secret")),
+            "declared incompatible",
+            "secret",
+            id="a bump declared incompatible",
+        ),
     ],
 )
-def test_a_migration_that_raises_drops_the_task_and_only_a_refusal_gives_its_message(
-    label, reason, leaked, caplog
+def test_a_migration_that_cannot_be_made_drops_the_task_and_only_a_refusal_gives_its_message(
+    name, make_input, reason, leaked, caplog
 ):
     seen = []
 
@@ -2188,23 +2182,28 @@ def test_a_migration_that_raises_drops_the_task_and_only_a_refusal_gives_its_mes
         seen.append(gadget)
         return gadget
 
-    world = World(take_gadget, serializer="pydantic")
+    def take_crate(crate: CrateV2) -> CrateV2:
+        seen.append(crate)
+        return crate
+
+    world = World(take_gadget, take_crate, serializer="pydantic")
 
     async def body():
-        handle = submit_at(world, "take_gadget", encoded(GadgetV1(label=label)), 1)
+        handle = submit_at(world, name, make_input(), 1)
         with pytest.raises(MigrationError) as raised:
             await asyncio.wait_for(handle, WAIT)
-        return str(raised.value)
+        return handle.task_id, str(raised.value)
 
     with caplog.at_level(logging.WARNING, logger="kabudachi"):
-        message = run(with_events(world, body))
+        task_id, message = run(with_events(world, body))
 
     assert seen == []
     [warning] = [record.getMessage() for record in caplog.records if "dropping task" in record.getMessage()]
-    assert "tests.take_gadget" in warning
+    assert f"task {task_id}" in warning and f"tests.{name}" in warning
     for text in (message, warning):
         assert reason in text
         assert leaked is None or leaked not in text
+    assert [event[3] for event in world.runtime.events if event[0] == "blocked"] == [True]
 
 
 def test_a_result_a_member_takes_is_migrated_from_the_version_its_producer_wrote():

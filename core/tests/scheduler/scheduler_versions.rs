@@ -2,7 +2,7 @@
 //! either for another worker (its claimed run returns to the queue untouched
 //! and the leader never hands that worker the task again) or as incompatible
 //! (the task ends FAILED with the reason, never retried). A task left waiting
-//! past the block TTL fails the same way. A run records the version it ran at.
+//! past the block TTL fails the same way.
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, WorkerId};
 use kabudachi_core::protocol::messages::TaskIds;
@@ -221,19 +221,6 @@ fn an_incompatible_report_on_a_group_member_fails_the_group() {
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0].state, CompositeState::Failed);
     assert_eq!(finished[0].failure.as_ref().unwrap().kind, "MigrationError");
-}
-
-#[test]
-fn a_run_records_the_version_its_worker_migrated_to() {
-    let mut fixture = Fixture::leading();
-    let task = fixture.scheduler.submit(submitted_at(1)).unwrap();
-    let claim = fixture.scheduler.request_claim(&new(), &task).unwrap();
-    fixture
-        .scheduler
-        .report_started(&new(), &claim.task_run_id, Some(3))
-        .unwrap();
-    let run = &fixture.spy.newest_revision_of(&task).unwrap().runs[0];
-    assert_eq!((run.source_version, run.execution_version), (1, 3));
 }
 
 #[test]

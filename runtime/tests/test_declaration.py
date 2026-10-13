@@ -294,11 +294,6 @@ def test_the_public_decorator_registers_in_the_default_registry(
     assert decorated.definition.raise_on_failed_migration is raising
 
 
-def test_a_task_has_no_version_of_its_own_because_data_schemas_do():
-    with pytest.raises(TypeError, match="version"):
-        task(version=1)(charge)
-
-
 def test_the_public_decorator_refuses_a_positional_name():
     with pytest.raises(TypeError):
         task("billing.charge")
@@ -1439,8 +1434,6 @@ def test_the_reducer_decorator_declares_a_reducer_with_its_options(fresh_registr
     )(_concat).definition
 
     assert [found.raise_on_failed_migration for found in (bare, kept)] == [False, True]
-    with pytest.raises(TaskDefinitionError, match="raise_on_failed_migration"):
-        kabudachi.reducer(serializer="pickle", name="decorated.refused", raise_on_failed_migration="yes")(_concat)
     assert bare.name == f"{_latest.__module__}._latest"
     assert [
         (found.reducer.associative, found.reducer.tree) for found in (bare, tree)

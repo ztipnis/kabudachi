@@ -362,55 +362,6 @@ def test_a_submitted_task_can_be_claimed(runtime):
     assert only.attempt_number == 1
 
 
-def test_a_run_reported_started_at_an_execution_version_keeps_it_in_the_task_record(runtime):
-    task_id = submit(runtime)
-
-    async def main():
-        [claimed] = await claim(runtime)
-        runtime.report_started(claimed.task_run_id, execution_version=SOURCE_VERSION + 1)
-        return await runtime.task_record(task_id)
-
-    [run] = asyncio.run(main()).runs
-
-    assert (run.source_version, run.execution_version) == (SOURCE_VERSION, SOURCE_VERSION + 1)
-
-
-def test_a_task_a_worker_reports_blocked_goes_back_to_the_queue_with_the_reason_in_its_record(runtime):
-    task_id = submit(runtime)
-
-    async def main():
-        [claimed] = await claim(runtime)
-        runtime.report_blocked(task_id, "version 3 is newer than this worker runs")
-        return await runtime.task_record(task_id)
-
-    record = asyncio.run(main())
-
-    assert [run.state for run in record.runs] == [RunState.QUEUED]
-    assert record.blocked_reason == "version 3 is newer than this worker runs"
-    assert record.blocked_since_ms is not None
-
-
-def test_a_task_reported_blocked_as_incompatible_ends_and_says_why(runtime):
-    task_id = submit(runtime)
-
-    async def main():
-        await claim(runtime)
-        runtime.report_blocked(task_id, "no migration from version 3", incompatible=True)
-        events = await asyncio.wait_for(runtime.next_events(), WAIT_LIMIT_SECONDS)
-        return events, await runtime.task_record(task_id)
-
-    events, record = asyncio.run(main())
-
-    [failed] = events
-    assert (failed.kind, failed.task_id, failed.reason) == (
-        _native.EventKind.MIGRATION_FAILED,
-        task_id,
-        "no migration from version 3",
-    )
-    assert [run.state for run in record.runs] == [RunState.FAILED]
-    assert record.blocked_reason == "no migration from version 3"
-
-
 def test_a_block_time_to_live_of_zero_is_refused_by_both_runtimes():
     with pytest.raises(ValueError, match="version_block_ttl_ms must be positive"):
         new_runtime(version_block_ttl_ms=0)

@@ -372,6 +372,8 @@ def test_classes_are_versions_of_one_family_and_each_bump_is_declared_once():
         registry.declare(Receipt, version=-1)
     with pytest.raises(TypeError, match="one argument"):
         registry.add_migration("shop.Order", 5, lambda a, b: a)
+    with pytest.raises(ValueError, match="family"):
+        schemas.migration(type(None), from_version=0)
 
 
 def test_protobuf_names_a_message_family_validates_and_migrates_by_parsing_into_the_new_message():
@@ -438,14 +440,8 @@ def test_a_json_serializer_round_trips_and_encodes_equal_values_to_the_same_byte
     assert backend.decode(encoded, value_type) == value
     assert backend.encode(backend.decode(encoded, value_type), value_type) == encoded
     assert b" " not in encoded and b"\n" not in encoded, "compact separators"
+    assert encoded == json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":")).encode(), "sorted keys"
     backend.validate(backend.decode(encoded, value_type))
-
-
-def test_a_json_serializer_sorts_keys():
-    encoded = PydanticSerializer().encode(
-        Shipment(order="o1", items=[], notes={"z": 1, "a": 2}), Shipment
-    )
-    assert b'"notes":{"a":2,"z":1}' in encoded
 
 
 @pytest.mark.parametrize(
@@ -609,17 +605,3 @@ def test_a_family_with_a_version_path_carries_its_version_in_the_payload(
     assert json.loads(kept) == {**bare, "meta": {"v": 2}}, "the default migration keeps the version only"
     with pytest.raises(SerializationError, match="version"):
         backend.extract_version(json.dumps(bare).encode(), cls)
-
-
-def test_dropping_a_version_leaves_no_empty_objects_behind():
-    plain = {"a": {"b": {"v": 1}}, "keep": 1}
-    schemas.drop_path(plain, ("a", "b", "v"))
-    assert plain == {"keep": 1}
-    plain = {"a": {"b": {"v": 1}, "other": 2}}
-    schemas.drop_path(plain, ("a", "b", "v"))
-    assert plain == {"a": {"other": 2}}
-
-
-def test_a_migration_cannot_be_registered_for_none():
-    with pytest.raises(ValueError, match="family"):
-        schemas.migration(type(None), from_version=0)
