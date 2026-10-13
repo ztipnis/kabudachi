@@ -348,6 +348,7 @@ fn reported(claim: &Claim, state: ReportedState) -> ReportedRun {
         },
         state,
         continuation: None,
+        execution_version: None,
     }
 }
 

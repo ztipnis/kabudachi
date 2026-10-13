@@ -394,7 +394,7 @@ impl NetworkedRuntime {
     fn report_started(&self, task_run_id: &str) {
         let run = TaskRunId::new(task_run_id);
         if self.shared.holds(&run) {
-            self.shared.report(Report::Started(run));
+            self.shared.report(Report::Started { run, execution_version: None });
         }
     }
 

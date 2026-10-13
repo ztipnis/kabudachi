@@ -5,7 +5,9 @@
 //! takes are candidates, and each stage tries the most urgent first. Every
 //! task found is claimed from the leader, which may refuse one this worker's
 //! view showed as waiting: that view can be stale, and a refusal only moves
-//! discovery on.
+//! discovery on. A task of its own records whose input is newer than the
+//! worker runs is not claimed: the worker tells the leader, which then hands
+//! it that task no more.
 //!
 //! A worker keeps no list of peers for this. The peers to steal from are read
 //! from the records `kad` routing table ([`Net::steal_targets`]) each time
@@ -24,6 +26,7 @@ use kabudachi_core::protocol::messages::{
 use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::{Duration as CoreDuration, WallTime};
+use kabudachi_core::versions::RunnableVersions;
 use libp2p::PeerId;
 use libp2p::futures::future::join_all;
 use libp2p::kad::KBucketKey;
@@ -41,6 +44,9 @@ pub struct Takes {
     pub queues: Subscription,
     /// How it ranks candidates (its own copy of the shard's queue policy).
     pub policy: QueuePolicy,
+    /// The input version it runs of each task definition: its own-records
+    /// stage skips, and reports to the leader, a task whose input is newer.
+    pub runnable: RunnableVersions,
 }
 
 /// Where a claimed task was found.
@@ -136,7 +142,14 @@ impl Net {
     ) -> Found {
         let mut search =
             Search { found: Found::default(), tried: BTreeSet::new(), room: input_room };
-        let own = self.own_candidates(now, takes);
+        let (own, newer) = self.own_candidates(now, takes);
+        // A leader cannot send itself a request: its scheduler is told in
+        // process. An error is ignored: the record then stays unblocked, so
+        // the next round reports the task again, or another worker claims it.
+        if leader != self.local_worker_id() {
+            join_all(newer.into_iter().map(|(task, reason)| self.report_blocked(leader.clone(), task, reason, false)))
+                .await;
+        }
         if self.claim_each(&leader, Stage::Own, own, limit, &mut search).await.is_break() {
             return search.found;
         }
@@ -171,9 +184,24 @@ impl Net {
     /// claimable now: most urgent first, then nearest (by the distance between
     /// a task's key and this worker's), then oldest; each with the bytes of
     /// input it carries as blobs.
-    fn own_candidates(&self, now: WallTime, takes: &Takes) -> Vec<(TaskId, Option<u64>)> {
+    ///
+    /// A task whose input is newer than `takes.runnable` is no candidate. The
+    /// ones whose record does not yet show the leader was told they are
+    /// blocked are returned beside, each with its reason, for the caller to
+    /// report: this reports nothing itself.
+    fn own_candidates(&self, now: WallTime, takes: &Takes) -> (Vec<(TaskId, Option<u64>)>, Vec<(TaskId, String)>) {
         let held = self.held_records();
         let mut candidates = held.claimable(now, takes.runs_compaction, &takes.queues);
+        let mut newer = Vec::new();
+        candidates.retain(|candidate| match held.newer_than(&candidate.task, &takes.runnable) {
+            None => true,
+            Some(input) => {
+                if !input.reported {
+                    newer.push((candidate.task.clone(), input.reason));
+                }
+                false
+            }
+        });
         let local = PeerId::from_str(self.local_worker_id().as_str())
             .ok()
             .map(KBucketKey::from);
@@ -190,13 +218,14 @@ impl Net {
                 candidate.submitted_at.as_unix_millis(),
             )
         });
-        candidates
+        let candidates = candidates
             .into_iter()
             .map(|candidate| {
                 let input = held.blob_input_bytes(&candidate.task);
                 (candidate.task, Some(input))
             })
-            .collect()
+            .collect();
+        (candidates, newer)
     }
 
     /// Asks the leader for each of `candidates` not yet tried and not past

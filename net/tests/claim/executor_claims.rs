@@ -49,7 +49,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             .await;
         let (run, _) = shard.drive_until(executors[leader].next_claim()).await;
         assert!(holding(&nets, &own, &[TaskRunState::Claimed]) >= QUORUM);
-        executors[leader].report(Report::Started(run.clone()));
+        executors[leader].report(Report::Started { run: run.clone(), execution_version: None });
         executors[leader].report(Report::Completed {
             run: run.clone(),
             digest: Digest::blake3(RESULT),
@@ -72,7 +72,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             .drive_until(submitted_through(&leader_net, &leader_id, plain_with(b"cancelled")))
             .await;
         let (run, _) = shard.drive_until(executors[leader].next_claim()).await;
-        executors[leader].report(Report::Started(run.clone()));
+        executors[leader].report(Report::Started { run: run.clone(), execution_version: None });
         shard
             .drive_until(poll_until("the leader stored its run running", || {
                 holding(&nets, &cancelled, &[TaskRunState::Running]) >= QUORUM
@@ -92,7 +92,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             .drive_until(submitted_through(&client, &leader_id, plain_with(b"remote")))
             .await;
         let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
-        executors[follower].report(Report::Started(run.clone()));
+        executors[follower].report(Report::Started { run: run.clone(), execution_version: None });
         shard
             .drive_until(poll_until("the leader stored the follower's run running", || {
                 holding(&nets, &remote, &[TaskRunState::Running]) >= QUORUM
@@ -119,7 +119,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             .drive_until(submitted_through(&client, &leader_id, plain_with(b"lost")))
             .await;
         let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
-        executors[follower].report(Report::Started(run.clone()));
+        executors[follower].report(Report::Started { run: run.clone(), execution_version: None });
         executors[follower].report(Report::Lost(run));
         shard
             .drive_until(poll_until("the leader decided the lost run and queued its replay", || {
@@ -132,7 +132,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
         // lost and replayed again.
         executors[follower].grant(1);
         let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
-        executors[follower].report(Report::Started(run));
+        executors[follower].report(Report::Started { run, execution_version: None });
         drop(executors.remove(follower));
         shard
             .drive_until(poll_until("the leader replays the run its executor abandoned", || {
@@ -146,7 +146,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
         let own_executor = if follower < leader { leader - 1 } else { leader };
         executors[own_executor].grant(1);
         let (run, _) = shard.drive_until(executors[own_executor].next_claim()).await;
-        executors[own_executor].report(Report::Started(run.clone()));
+        executors[own_executor].report(Report::Started { run: run.clone(), execution_version: None });
         executors[own_executor].stop_taking_work();
         shard
             .drive_until(poll_until("the leader replays the run its executor no longer reads", || {
@@ -259,7 +259,7 @@ async fn members_report_their_free_places_and_a_runs_trace_context_and_failure_m
             (task.trace_parent, task.trace_state, task.baggage),
             (trace.trace_parent, trace.trace_state, trace.baggage)
         );
-        executors[follower].report(Report::Started(run.clone()));
+        executors[follower].report(Report::Started { run: run.clone(), execution_version: None });
         executors[follower].report(Report::Failed {
             run,
             reason: "ValueError".into(),

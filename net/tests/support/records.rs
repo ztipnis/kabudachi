@@ -29,6 +29,7 @@ use kabudachi_core::scheduler::composite::{
 use kabudachi_core::scheduler::{Claim, Scheduler, Submission, Submitted, mint};
 use kabudachi_core::task_record::{RecordKey, RecordOutbox, RecordVersion};
 use kabudachi_core::time::{Duration, RealClock, WallTime};
+use kabudachi_core::versions::RunnableVersions;
 use kabudachi_net::discovery::Takes;
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::executor::ExecutorEndpoint;
@@ -675,6 +676,7 @@ pub fn takes(runs_compaction: bool) -> Takes {
         runs_compaction,
         queues: Subscription::Every,
         policy: QueuePolicy::new(),
+        runnable: RunnableVersions::default(),
     }
 }
 

@@ -12,7 +12,8 @@
 //! never make the driver claim more than the executor can hold.
 //!
 //! Per run, in order: `Started` once the body runs (a compaction run sends
-//! none), then exactly one of `Completed` (with the digest of its result, and
+//! none; a run whose input this worker cannot run sends `Blocked` instead
+//! and nothing after it), then exactly one of `Completed` (with the digest of its result, and
 //! whether the result reached the task's client first), `Failed` (with the
 //! error's type name and message), `Lost` (the process running it died or was
 //! killed at an abort deadline, so no outcome is known), or, for a compaction
@@ -56,10 +57,10 @@ use std::time::{Duration, Instant};
 use kabudachi_core::election::AbortBy;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::StepDescription;
-use kabudachi_core::protocol::ids::{TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    Claim, ClaimResponse, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, TaskRejectReason,
-    TaskResponse, claim_response, task_request,
+    Claim, ClaimResponse, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted,
+    TaskRejectReason, TaskResponse, claim_response, task_request,
 };
 use kabudachi_core::scheduler::composite::Step;
 use kabudachi_core::task_record::Settled;
@@ -88,7 +89,14 @@ pub enum Work {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Report {
     Capacity(u32),
-    Started(TaskRunId),
+    /// The body runs. `execution_version` is the version of its input it
+    /// runs, if it migrated the input; `None` for one run as submitted.
+    Started { run: TaskRunId, execution_version: Option<u32> },
+    /// The worker cannot run `task`'s input at its version, for `reason`:
+    /// the claim goes back to the leader, which queues the task for another
+    /// worker, or, if `incompatible`, ends it. The run sends no further
+    /// report. Sent instead of `Started` for a run whose body never began.
+    Blocked { task: TaskId, reason: String, incompatible: bool },
     /// The run succeeded. `continuation` is the step it returned: the run's
     /// result is that step's digest, and the step is certified with it.
     Completed { run: TaskRunId, digest: Digest, delivered: bool, continuation: Option<Step> },
@@ -205,6 +213,9 @@ pub(crate) struct Held {
     pub(crate) started: BTreeSet<TaskRunId>,
     /// Per run, the reports no leader has taken yet, oldest first.
     pub(crate) waiting: BTreeMap<TaskRunId, VecDeque<RunReport>>,
+    /// The run each task reported blocked was claimed as, while that report
+    /// waits: a block names its task, and waits under its run.
+    pub(crate) blocked: BTreeMap<TaskId, TaskRunId>,
     /// The executor dropped its handle, or either half of it: nothing more
     /// is claimed for it.
     pub(crate) gone: bool,
@@ -562,11 +573,26 @@ impl<'n> Executing<'n> {
                 held.credits = held.credits.saturating_add(places);
                 return;
             }
-            Report::Started(run) => {
+            Report::Started { run, execution_version } => {
                 self.endpoint.held.started.insert(run.clone());
                 task_request::Request::Started(ReportStarted {
                     task_run_id: Some(run.into()),
-                    execution_version: 0,
+                    execution_version: execution_version.unwrap_or(0),
+                })
+            }
+            Report::Blocked { task, reason, incompatible } => {
+                // The block names its task, and waits under the run this
+                // worker claimed for it. A task it holds no claim for has no
+                // claim to give back.
+                let Some(run) = self.net.claimed_runs().claimed_run_of(&task) else {
+                    return;
+                };
+                self.ended(&run);
+                self.endpoint.held.blocked.insert(task.clone(), run);
+                task_request::Request::Blocked(ReportBlocked {
+                    task_id: Some(task.into()),
+                    reason,
+                    incompatible,
                 })
             }
             Report::Completed { run, digest, delivered, continuation } => {
@@ -622,7 +648,7 @@ impl<'n> Executing<'n> {
     /// again; any other answer ends it, and the run's next report may go. A
     /// start refused because the run is not this worker's stops its body.
     fn on_reply(&mut self, request: RunReport, reply: Result<TaskResponse, TaskFailure>) {
-        let run = reported_run(&request).expect("every report the driver sends names its run");
+        let run = self.run_of(&request).expect("every report the driver sends names its run");
         self.sending.remove(&run);
         let retry = match &reply {
             Err(_) => true,
@@ -640,6 +666,14 @@ impl<'n> Executing<'n> {
         if retry {
             self.retry_at.get_or_insert(TokioInstant::now() + self.retry_after);
             return;
+        }
+        if let task_request::Request::Blocked(report) = &request {
+            // The leader has the claim back: the run is no longer this
+            // worker's to report to a new leader.
+            if let Some(task) = report.task_id.clone() {
+                self.endpoint.held.blocked.remove(&TaskId::from(task));
+            }
+            self.net.claimed_runs().forget(&run);
         }
         let waiting = &mut self.endpoint.held.waiting;
         if let Some(reports) = waiting.get_mut(&run) {
@@ -723,8 +757,20 @@ impl<'n> Executing<'n> {
         self.endpoint.held.started.remove(run);
     }
 
+    /// The run `request` waits under: the one it reports on, or, for a block,
+    /// the one claimed for the task it names.
+    fn run_of(&self, request: &RunReport) -> Option<TaskRunId> {
+        match request {
+            task_request::Request::Blocked(report) => {
+                let task = TaskId::from(report.task_id.clone()?);
+                self.endpoint.held.blocked.get(&task).cloned()
+            }
+            other => reported_run(other),
+        }
+    }
+
     fn queue(&mut self, request: RunReport) {
-        let run = reported_run(&request).expect("every report the driver makes names its run");
+        let run = self.run_of(&request).expect("every report the driver makes names its run");
         self.endpoint.held.waiting.entry(run).or_default().push_back(request);
     }
 }

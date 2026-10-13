@@ -770,6 +770,7 @@ impl Cluster {
                         },
                         state: ReportedState::Claimed,
                         continuation: None,
+                        execution_version: None,
                     },
                 );
             }

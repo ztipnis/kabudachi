@@ -30,6 +30,7 @@ use kabudachi_core::task_record::{
     looks_claimable,
 };
 use kabudachi_core::time::{Clock, RealClock, WallTime};
+use kabudachi_core::versions::RunnableVersions;
 use libp2p::PeerId;
 use libp2p::kad;
 use prost::Message as _;
@@ -54,6 +55,14 @@ pub(crate) struct Candidate {
     pub(crate) submitted_at: WallTime,
     pub(crate) queue: String,
     pub(crate) task: TaskId,
+}
+
+/// A task whose input is newer than a worker runs.
+pub(crate) struct NewerInput {
+    /// Why the worker cannot run it.
+    pub(crate) reason: String,
+    /// Whether the record already shows the leader was told it is blocked.
+    pub(crate) reported: bool,
 }
 
 /// The records this worker holds, shared by its kad record store (which
@@ -204,6 +213,16 @@ impl HeldRecords {
             .and_then(|record| record.task.as_ref())
             .and_then(|task| task.input_manifest.as_ref())
             .map_or(0, |manifest| manifest.total_bytes)
+    }
+
+    /// Why this worker, running the versions `runnable` names, cannot run
+    /// `task`, as its copy of the record shows; `None` for a task it may run
+    /// or does not hold.
+    pub(crate) fn newer_than(&self, task: &TaskId, runnable: &RunnableVersions) -> Option<NewerInput> {
+        let records = self.lock();
+        let record = records.get(task)?;
+        let reason = runnable.newer(record.task.as_ref()?)?;
+        Some(NewerInput { reason, reported: record.blocked_since.is_some() })
     }
 
     /// Feeds `take` a summary of each record held after `after` (every one

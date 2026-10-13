@@ -4,7 +4,9 @@
 //! [`codec`] frames the `/kabudachi/task/1` messages; `wire` maps them to and
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
 //! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
-//! [`Net::report_lost`], [`Net::cancel`] and [`Net::query_outcome`], each
+//! [`Net::report_lost`], [`Net::report_blocked`] (a task, not a run, that this
+//! worker cannot run at its input version), [`Net::cancel`] and
+//! [`Net::query_outcome`], each
 //! sent to the leader the caller names. [`Net::submit_to_leader`],
 //! [`Net::cancel_at_leader`] and [`Net::query_outcome_at_leader`] instead
 //! find the leader themselves, the one the worker's node names, and
@@ -187,6 +189,26 @@ impl Net {
         .await
     }
 
+    /// Tells `leader` this worker cannot run `task`'s input at its version,
+    /// for `reason`. The leader gives back a claim this worker held on it and
+    /// hands this worker the task no more; if `incompatible`, the input can
+    /// never be migrated and the task ends. The leader reads no payload: the
+    /// reason is the worker's own words.
+    pub async fn report_blocked(
+        &self,
+        leader: WorkerId,
+        task: TaskId,
+        reason: String,
+        incompatible: bool,
+    ) -> Result<TaskResponse, TaskFailure> {
+        let request = task_request::Request::Blocked(ReportBlocked {
+            task_id: Some(task.into()),
+            reason,
+            incompatible,
+        });
+        self.ask_task(leader, request).await
+    }
+
     /// Tells `leader` `run` succeeded with a result of digest
     /// `result_digest`, for a run whose result went to no client. The
     /// result itself is not sent.
@@ -295,6 +317,9 @@ impl Net {
             return;
         };
         match request {
+            task_request::Request::Started(report) if report.execution_version != 0 => {
+                self.claimed.set_execution_version(&run, report.execution_version);
+            }
             task_request::Request::Completed(report) => {
                 let continuation = report.continuation.as_ref().map(Step::try_from).transpose();
                 if let (Ok(result_digest), Ok(continuation)) =

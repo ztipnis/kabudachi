@@ -93,7 +93,7 @@ impl From<&ReportedRun> for generated::ReportedRun {
             ),
             failure_message,
             continuation: run.continuation.as_ref().map(generated::StepDescription::from),
-            execution_version: 0,
+            execution_version: run.execution_version.unwrap_or(0),
         }
     }
 }
@@ -133,6 +133,7 @@ impl TryFrom<&generated::ReportedRun> for ReportedRun {
             claim,
             state,
             continuation,
+            execution_version: (run.execution_version != 0).then_some(run.execution_version),
         })
     }
 }
