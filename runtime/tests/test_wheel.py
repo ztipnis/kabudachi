@@ -1,12 +1,14 @@
 """The wheel //runtime:kabudachi_wheel builds, checked as a user gets it: its
 metadata says what pyproject.toml says, the version is the one the package and
 the Bazel module name, it installs with pip into a fresh virtual environment,
-and from there it runs a flow on a worker of its own."""
+and from there it runs a flow on a worker of its own and across a networked
+shard of two."""
 
 import ast
 import json
 import os
 import re
+import socket
 import subprocess
 import tomllib
 import venv
@@ -166,3 +168,37 @@ def test_the_installed_wheel_runs_a_flow_on_a_worker_of_its_own(installed):
     # Imported from the installed wheel, extension included.
     assert Path(shown["package"]).resolve().is_relative_to(installed["site"])
     assert Path(shown["native"]).resolve().is_relative_to(installed["site"])
+
+
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def found_shard(installed: dict) -> tuple[subprocess.Popen, str]:
+    """A worker serving a shard it founded alone, and the address it listens
+    on. A port another process takes before the worker binds it makes the
+    worker exit before it serves; then another port is tried."""
+    for _ in range(3):
+        address = f"/ip4/127.0.0.1/tcp/{free_port()}"
+        founder = start(installed, "serve", KABUDACHI_LISTEN=address)
+        if founder.stdout.readline():
+            return founder, address
+        founder.wait()
+    raise AssertionError(f"the founding worker never served: {founder.stderr.read()}")
+
+
+def test_the_installed_wheel_runs_a_flow_across_a_networked_shard_of_two(installed):
+    founder, address = found_shard(installed)
+    try:
+        # The second worker starts its program only once it has joined the
+        # shard the first one leads; the flow's result comes back to it.
+        shown = flow(installed, KABUDACHI_LISTEN="/ip4/127.0.0.1/tcp/0", KABUDACHI_SEEDS=address)
+        assert shown["result"] == 41
+
+        founder.stdin.close()
+        assert founder.wait(timeout=RUN_SECONDS) == 0, founder.stderr.read()
+    finally:
+        founder.kill()
+        founder.wait()
