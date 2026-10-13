@@ -298,6 +298,8 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
+        # Runs as a program in the Linux tag test.
+        "@pypi//auditwheel",  # keep
         # The wheel's dependencies, linked into the environment it is
         # installed in, since the test has no network to download them.
         "@pypi//asgiref",  # keep

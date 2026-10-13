@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import tomllib
 import venv
 import zipfile
@@ -168,6 +169,21 @@ def test_the_installed_wheel_runs_a_flow_on_a_worker_of_its_own(installed):
     # Imported from the installed wheel, extension included.
     assert Path(shown["package"]).resolve().is_relative_to(installed["site"])
     assert Path(shown["native"]).resolve().is_relative_to(installed["site"])
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="manylinux tags describe Linux wheels")
+def test_the_linux_wheel_claims_the_platform_its_symbols_allow():
+    shown = subprocess.run(
+        [sys.executable, "-c", "import sys; from auditwheel.main import main; sys.exit(main())",
+         "show", "--json", WHEEL],
+        capture_output=True, text=True,
+    )
+    assert shown.returncode == 0, shown.stderr
+    claimed = WHEEL.name.removesuffix(".whl").rsplit("-", 1)[1]
+    # The most compatible tag the extension's glibc symbols and linked
+    # libraries allow: claiming an older glibc breaks the import there,
+    # claiming a newer one refuses systems it runs on.
+    assert json.loads(shown.stdout)["overall_tag"] == claimed
 
 
 def free_port() -> int:
