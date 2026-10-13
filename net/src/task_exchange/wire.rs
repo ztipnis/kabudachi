@@ -3,7 +3,7 @@
 //! [`Malformed`], which the leader answers as a refusal instead of panicking
 //! on a peer's bad message.
 
-use kabudachi_core::manifest::Manifest;
+use kabudachi_core::manifest::{InvalidManifest, Manifest};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
@@ -54,7 +54,11 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
     let input_manifest = task
         .input_manifest
         .as_ref()
-        .map(Manifest::try_from)
+        .map(|wire| {
+            let manifest = Manifest::try_from(wire)?;
+            manifest.check_cut_payload()?;
+            Ok::<_, InvalidManifest>(manifest)
+        })
         .transpose()
         .map_err(|_| Malformed)?;
     if input_manifest.is_some() && !task.serialized_input.is_empty() {

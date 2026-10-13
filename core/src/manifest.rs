@@ -132,6 +132,26 @@ impl Manifest {
         self.total_bytes
     }
 
+    /// Whether this manifest, known to stand for one cut payload, is
+    /// well-formed as one. Cut blobs are all full but the last, so a
+    /// manifest of only blobs pins its length to within one chunk. A manifest
+    /// that is a list of outcomes has no such bound and is not checked here.
+    pub fn check_cut_payload(&self) -> Result<(), InvalidManifest> {
+        let blobs = self.entries.len() as u64;
+        let only_blobs = self.entries.iter().all(|entry| matches!(entry, ManifestEntry::Blob(_)));
+        let chunk = BLOB_CHUNK_BYTES as u64;
+        if only_blobs
+            && blobs > 0
+            && !(((blobs - 1) * chunk + 1)..=blobs * chunk).contains(&self.total_bytes)
+        {
+            return Err(InvalidManifest::TotalBytesOutOfRange {
+                blobs: self.entries.len(),
+                total_bytes: self.total_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// The blobs the entries name, in order.
     pub fn blob_keys(&self) -> impl Iterator<Item = &BlobKey> {
         self.entries.iter().filter_map(|entry| match entry {
@@ -232,20 +252,6 @@ impl TryFrom<&generated::Manifest> for Manifest {
     fn try_from(wire: &generated::Manifest) -> Result<Self, InvalidManifest> {
         let entries: Vec<ManifestEntry> =
             wire.entries.iter().map(ManifestEntry::try_from).collect::<Result<_, _>>()?;
-        // Cut blobs are all full but the last, so a manifest of only blobs
-        // pins its length to within one chunk; other entries have no such bound.
-        let blobs = entries.len() as u64;
-        let only_blobs = entries.iter().all(|entry| matches!(entry, ManifestEntry::Blob(_)));
-        let chunk = BLOB_CHUNK_BYTES as u64;
-        if only_blobs
-            && blobs > 0
-            && !(((blobs - 1) * chunk + 1)..=blobs * chunk).contains(&wire.total_bytes)
-        {
-            return Err(InvalidManifest::TotalBytesOutOfRange {
-                blobs: entries.len(),
-                total_bytes: wire.total_bytes,
-            });
-        }
         Ok(Manifest {
             entries,
             total_bytes: wire.total_bytes,

@@ -123,15 +123,17 @@ fn a_payload_past_the_inline_bound_is_cut_into_chunks_that_join_back_only_whole_
     }));
     assert!(Manifest::try_from(&unusable).is_err());
 
-    // A manifest of only blobs names a length within one chunk of theirs: a
-    // larger or smaller one is refused on arrival, the extremes still pass.
+    // A cut payload's manifest of only blobs names a length within one chunk
+    // of theirs: a larger or smaller one is refused when checked as a cut
+    // payload, the extremes still pass. As a list of outcomes it is read
+    // whatever its length.
     let blobs = wire.entries.len();
     for total_bytes in [(blobs - 1) * BLOB_CHUNK_BYTES + 1, blobs * BLOB_CHUNK_BYTES] {
         let edge = generated::Manifest {
             total_bytes: total_bytes as u64,
             ..wire.clone()
         };
-        assert!(Manifest::try_from(&edge).is_ok(), "{total_bytes}");
+        assert_eq!(Manifest::try_from(&edge).unwrap().check_cut_payload(), Ok(()), "{total_bytes}");
     }
     for total_bytes in [
         0,
@@ -143,7 +145,7 @@ fn a_payload_past_the_inline_bound_is_cut_into_chunks_that_join_back_only_whole_
             ..wire.clone()
         };
         assert_eq!(
-            Manifest::try_from(&off),
+            Manifest::try_from(&off).unwrap().check_cut_payload(),
             Err(InvalidManifest::TotalBytesOutOfRange {
                 blobs,
                 total_bytes: total_bytes as u64
