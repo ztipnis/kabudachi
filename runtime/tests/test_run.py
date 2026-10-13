@@ -861,6 +861,24 @@ def test_a_body_or_hook_that_raises_system_exit_or_keyboard_interrupt_or_cancels
     assert neighbour == "finished", "a body beside them ran to its end"
 
 
+def test_a_body_whose_error_cannot_be_turned_into_text_still_fails_its_run():
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("no text")
+
+    @declare
+    async def breaks(request: Greeting) -> Greeting:
+        raise Unprintable()
+
+    async def main():
+        async with asyncio.timeout(10):
+            return await asyncio.gather(breaks(Greeting()), return_exceptions=True)
+
+    (outcome,) = kabudachi.run(main)
+
+    assert type(outcome) is Unprintable
+
+
 def test_off_the_main_thread_what_is_not_an_exception_fails_only_what_raised_it():
     """No signal reaches a loop off the main thread, so a `KeyboardInterrupt`
     there is never a Ctrl-C, nor a `CancelledError` nobody asked for a stop:

@@ -996,8 +996,12 @@ def _message_of(error: BaseException) -> str:
     """What a failure is recorded with besides its type: the error's own
     message, never its traceback, cut to what the leader keeps. It is stored
     in the task's record, so it is what the error says, as `str(error)` gives
-    it."""
-    encoded = str(error).encode("utf-8", "replace")[:MAX_FAILURE_MESSAGE_BYTES]
+    it. An error that cannot be turned into text has no message."""
+    try:
+        text = str(error)
+    except Exception:
+        text = ""
+    encoded = text.encode("utf-8", "replace")[:MAX_FAILURE_MESSAGE_BYTES]
     return encoded.decode("utf-8", "ignore")
 
 
