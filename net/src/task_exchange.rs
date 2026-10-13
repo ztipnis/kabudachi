@@ -6,14 +6,13 @@
 //! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
 //! [`Net::report_lost`], [`Net::report_blocked`] (a task, not a run, that this
 //! worker cannot run at its input version), [`Net::cancel`] and
-//! [`Net::query_outcome`], each
-//! sent to the leader the caller names. [`Net::submit_to_leader`],
-//! [`Net::cancel_at_leader`] and [`Net::query_outcome_at_leader`] instead
-//! find the leader themselves, the one the worker's node names, and
-//! ask again until a leader decides, as the executor's reports are asked
-//! again (see `crate::executor`). A call addressed to this worker itself,
-//! while it leads, is answered by its own driver the same way. The calls
-//! about a run also keep this worker's
+//! [`Net::query_outcome`], each sent to the leader the caller names.
+//! [`Net::submit_to_leader`], [`Net::cancel_at_leader`] and
+//! [`Net::query_outcome_at_leader`] instead find the leader themselves, the
+//! one the worker's node names, and ask again until a leader decides, as the
+//! executor's reports are asked again (see `crate::executor`). A call
+//! addressed to this worker itself, while it leads, is answered by its own
+//! driver the same way. The calls about a run also keep this worker's
 //! [`ClaimedRuns`](crate::claimed_runs::ClaimedRuns) ledger, from the answers
 //! they get.
 //!

@@ -13,15 +13,15 @@
 //!
 //! Per run, in order: `Started` once the body runs (a compaction run sends
 //! none; a run whose input this worker cannot run sends `Blocked` instead
-//! and nothing after it), then exactly one of `Completed` (with the digest of its result, and
-//! whether the result reached the task's client first), `Failed` (with the
-//! error's type name and message), `Lost` (the process running it died or was
-//! killed at an abort deadline, so no outcome is known), or, for a compaction
-//! run, `Compacted` (the fold). The driver takes each report to the leader in
-//! that order, asking again as leaders change, until one takes it. An
-//! executor may report `Failed` with no `Started`, for a run whose body never
-//! started; the driver reports it started first, since a leader fails only a
-//! running run.
+//! and nothing after it), then exactly one of `Completed` (with the digest of
+//! its result, and whether the result reached the task's client first),
+//! `Failed` (with the error's type name and message), `Lost` (the process
+//! running it died or was killed at an abort deadline, so no outcome is
+//! known), or, for a compaction run, `Compacted` (the fold). The driver takes
+//! each report to the leader in that order, asking again as leaders change,
+//! until one takes it. An executor may report `Failed` with no `Started`, for
+//! a run whose body never started; the driver reports it started first, since
+//! a leader fails only a running run.
 //!
 //! ## What the driver sends: [`Work`]
 //!
@@ -583,7 +583,11 @@ impl<'n> Executing<'n> {
             Report::Blocked { task, reason, incompatible } => {
                 // The block names its task, and waits under the run this
                 // worker claimed for it. A task it holds no claim for has no
-                // claim to give back.
+                // claim to give back. A block already waiting for its answer
+                // is the same block: it is not reported twice.
+                if self.endpoint.held.blocked.contains_key(&task) {
+                    return;
+                }
                 let Some(run) = self.net.claimed_runs().claimed_run_of(&task) else {
                     return;
                 };
@@ -669,7 +673,10 @@ impl<'n> Executing<'n> {
         }
         if let task_request::Request::Blocked(report) = &request {
             // The leader has the claim back: the run is no longer this
-            // worker's to report to a new leader.
+            // worker's to report to a new leader. A rejection ends it the
+            // same way: a leader that does not know the run or the task, or
+            // does not lead, holds no claim of this worker's to give back,
+            // so the run is not this worker's either.
             if let Some(task) = report.task_id.clone() {
                 self.endpoint.held.blocked.remove(&TaskId::from(task));
             }
