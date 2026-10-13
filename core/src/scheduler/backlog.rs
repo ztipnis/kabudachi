@@ -102,7 +102,7 @@ impl Backlog {
             return scheduler.submit_composite(minted);
         }
         scheduler.check_composite(&minted, self.queued_bytes)?;
-        self.queued_bytes += minted.record_bytes();
+        self.queued_bytes += minted.memory_bytes();
         let id = minted.composite_id.clone();
         self.queued_composites.push(minted);
         Ok(id)
@@ -118,7 +118,7 @@ impl Backlog {
     ) -> Result<Cancellation, CancelRejection> {
         if let Some(at) = self.queued_composites.iter().position(|queued| queued.composite_id == *id) {
             let dropped = self.queued_composites.remove(at);
-            self.queued_bytes -= dropped.record_bytes();
+            self.queued_bytes -= dropped.memory_bytes();
             self.dropped_composites.push(dropped);
             return Ok(Cancellation::Cancelled { was_running: false });
         }
@@ -222,6 +222,6 @@ impl Backlog {
             .iter()
             .map(|submitted| submitted.submission.payload_bytes())
             .sum::<u64>()
-            + self.queued_composites.iter().map(SubmittedComposite::record_bytes).sum::<u64>();
+            + self.queued_composites.iter().map(SubmittedComposite::memory_bytes).sum::<u64>();
     }
 }

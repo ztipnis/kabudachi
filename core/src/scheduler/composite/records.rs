@@ -17,7 +17,10 @@ use crate::time::{Clock, Instant, WallTime};
 use crate::scheduler::{Observer, Scheduler, UNVERSIONED};
 
 use super::held::Composite;
-use super::{CompositeParent, CompositeState, InputShape, MemberCounts, MemberOutcome, PAGE_ENTRIES, Step};
+use super::{
+    BoundInput, CompositeKind, CompositeParent, CompositeState, InputShape, MemberCounts, MemberOutcome, PAGE_ENTRIES,
+    Stage, Step,
+};
 
 impl From<CompositeState> for generated::CompositeState {
     fn from(state: CompositeState) -> Self {
@@ -62,6 +65,29 @@ pub(super) fn first_record_len(id: &CompositeId, step: &Step) -> u64 {
         ..Default::default()
     }
     .encoded_len() as u64
+}
+
+/// What starting `step` as the composite `id` takes of the memory budget: its
+/// record, and the input each Task it starts at once holds beside it, down
+/// through the composites it starts at once. A flow starts only its first
+/// stage, and a later one takes its input when it starts.
+pub(super) fn start_bytes(id: &CompositeId, step: &Step) -> u64 {
+    let started = match step.kind {
+        CompositeKind::Flow => &step.stages[..step.stages.len().min(1)],
+        _ => &step.stages[..],
+    };
+    let members: u64 = started
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| match stage {
+            Stage::Task(bound) => match &bound.input {
+                BoundInput::Value(bytes) => bytes.len() as u64,
+                BoundInput::Chunked(_) | BoundInput::Previous => 0,
+            },
+            Stage::Composite(child) => start_bytes(&id.child(index as u64), child),
+        })
+        .sum();
+    first_record_len(id, step) + members
 }
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {

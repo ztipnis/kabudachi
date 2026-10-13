@@ -103,8 +103,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// Whether `submitted` could be recorded now with `queued_bytes` more
     /// promised to composites and tasks not yet recorded: it needs no input,
-    /// its record fits one record, and its description fits under the hard
-    /// limit with them. Records nothing, so it needs no leadership.
+    /// its record fits one record, and what starting it takes of memory (see
+    /// [`SubmittedComposite::memory_bytes`]) fits under the hard limit with
+    /// them. Records nothing, so it needs no leadership.
     pub fn check_composite(&self, submitted: &SubmittedComposite, queued_bytes: u64) -> Result<(), SubmitRejection> {
         if submitted.step.takes_input() {
             return Err(SubmitRejection::StepTakesInput);
@@ -113,7 +114,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if size > Self::record_limit() {
             return Err(SubmitRejection::RecordTooLarge { size, limit: Self::record_limit() });
         }
-        self.budget.check_room(size + queued_bytes, || 0)
+        self.budget.check_room(submitted.memory_bytes() + queued_bytes, || 0)
     }
 
     /// Tells the client of `dropped`, a composite cancelled before the

@@ -5,13 +5,17 @@
 
 use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
+use kabudachi_core::protocol::generated::{self, CompositeRecord};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::scheduler::{
     Completion, Event, MAX_SUBMISSION_BYTES, MemoryLimits, Submission, SubmitRejection,
     TraceContext,
 };
+use kabudachi_core::scheduler::composite::{CompositeState, OnError};
 use kabudachi_core::time::Duration;
-use crate::support::composites::{continue_with_a_stage, end_continuation};
+use prost::Message as _;
+
+use crate::support::composites::{continue_with_a_stage, end_continuation, group_of, task_stage};
 use crate::support::scheduler::Fixture;
 
 const SOFT: u64 = 100;
@@ -86,7 +90,8 @@ fn complete(fixture: &mut Fixture, run: &TaskRunId) {
 
 #[test]
 fn memory_counts_exactly_the_unfinished_tasks() {
-    // Room for the continuation's own description and its first member too.
+    // Room for the continuation's own description, which alone outweighs
+    // the hard limit of the other tests.
     let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: 10 * SOFT, hard: 10 * HARD });
     assert_eq!(fixture.scheduler.memory_in_use(), 0);
 
@@ -140,8 +145,20 @@ fn memory_counts_exactly_the_unfinished_tasks() {
     let continuing = fixture.scheduler.submit(payload(40)).unwrap();
     let claim = start(&mut fixture, &continuing);
     let continuation = continue_with_a_stage(&mut fixture, &claim);
-    assert!(
-        fixture.scheduler.memory_in_use() > 100,
+    // The task's own 40 bytes still count, and so do the step it returned and
+    // its one member's input (the stage is bound to `s`).
+    let record = fixture.scheduler.composite_record(&continuation).unwrap();
+    let description = CompositeRecord {
+        composite_id: record.composite_id,
+        description: record.description,
+        state: generated::CompositeState::Running as i32,
+        root: record.root,
+        ..CompositeRecord::default()
+    }
+    .encoded_len() as u64;
+    assert_eq!(
+        fixture.scheduler.memory_in_use(),
+        100 + description + 1,
         "a task with a continuation counts until it ends"
     );
     end_continuation(&mut fixture, &continuation);
@@ -210,6 +227,36 @@ fn a_submission_is_refused_past_the_hard_limit_and_accepted_when_it_exactly_fill
 
     assert!(fixture.scheduler.submit(payload(50)).is_ok());
     assert_eq!(fixture.scheduler.memory_in_use(), HARD);
+}
+
+#[test]
+fn a_group_is_accepted_when_its_description_and_its_members_inputs_fit_together_and_refused_whole_when_they_do_not() {
+    // The description holds each bound value that its member's task holds too.
+    let group = |fixture: &Fixture, size: usize| {
+        let member = task_stage("member", Some(&vec![b'v'; size]));
+        fixture.scheduler.mint_composite(group_of(OnError::FailFast, vec![member]), None)
+    };
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: 1_500, hard: 1_500 });
+
+    // Its description alone fits the hard limit; with the member's copy it does not.
+    let too_big = group(&fixture, 1_000);
+    assert!(too_big.record_bytes() < 1_500 && too_big.record_bytes() + 1_000 > 1_500);
+    assert!(matches!(
+        fixture.scheduler.submit_composite(too_big),
+        Err(SubmitRejection::Backpressure { .. })
+    ));
+    assert_eq!(fixture.scheduler.memory_in_use(), 0, "refused before anything was recorded");
+
+    let fits = group(&fixture, 500);
+    let description = fits.record_bytes();
+    let id = fixture.scheduler.submit_composite(fits).unwrap();
+    assert_eq!(fixture.scheduler.memory_in_use(), description + 500);
+    assert_eq!(
+        fixture.scheduler.composite_status(&id).unwrap().state,
+        CompositeState::Running,
+        "its member was recorded, not refused"
+    );
+    assert_eq!(fixture.scheduler.pending_len(), 1);
 }
 
 #[test]

@@ -100,9 +100,16 @@ pub struct SubmittedComposite {
 }
 
 impl SubmittedComposite {
-    /// The bytes its record takes of a record and of the memory budget.
+    /// The bytes its record takes of a record.
     pub fn record_bytes(&self) -> u64 {
         records::first_record_len(&self.composite_id, &self.step)
+    }
+
+    /// The bytes starting it takes of the memory budget: its record, and the
+    /// input of every Task that starts at once, which the record holds a copy
+    /// of as well.
+    pub fn memory_bytes(&self) -> u64 {
+        records::start_bytes(&self.composite_id, &self.step)
     }
 }
 
