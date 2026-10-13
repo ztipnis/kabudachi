@@ -72,8 +72,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 continue;
             };
             let item_page = page >= ITEM_PAGES;
-            // An item page the leader no longer has was stored already.
-            if item_page && !composite.holds_item_page(page) {
+            // An item page the leader no longer has was stored already, and
+            // is written again only to say its reduce is over.
+            if item_page && !composite.holds_item_page(page) && !self.composites.is_finished(&id) {
                 continue;
             }
             let version = self.leadership.next_version(recovery_epoch, term);

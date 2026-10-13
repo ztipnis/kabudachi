@@ -12,7 +12,7 @@ use crate::time::{Duration, Instant, WallTime};
 
 use super::{
     BoundStep, CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape,
-    MemberCounts, MemberOutcome, OnError, PAGE_ENTRIES, ReduceItem, ReducePlan, Stage, Step, StreamedMember,
+    ITEM_PAGES, MemberCounts, MemberOutcome, OnError, PAGE_ENTRIES, ReduceItem, ReducePlan, Stage, Step, StreamedMember,
 };
 
 /// One composite this scheduler drives, or keeps until its retention ends.
@@ -317,6 +317,15 @@ impl Composites {
         let Some(composite) = self.held.get(id) else {
             return;
         };
+        // A reduce's item pages are rewritten as finished too, whether the
+        // leader still holds them or let them go once stored: a holder
+        // retires them only from a finished revision. They sit apart from the
+        // results pages looped over below, at ITEM_PAGES onward.
+        for page in 0..composite.item_page_count() {
+            let key = (id.clone(), ITEM_PAGES + page);
+            self.unwritten_pages.remove(&key);
+            self.unpublished_pages.insert(key);
+        }
         let pages = composite.pages();
         for page in 0..pages {
             let key = (id.clone(), page);
@@ -330,7 +339,7 @@ impl Composites {
         self.finished.insert((now, id.clone()));
     }
 
-    pub(super) fn is_finished(&self, id: &CompositeId) -> bool {
+    pub(in crate::scheduler) fn is_finished(&self, id: &CompositeId) -> bool {
         self.finished_at.contains_key(id)
     }
 

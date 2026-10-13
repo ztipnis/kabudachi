@@ -13,7 +13,7 @@ use crate::time::{Clock, WallTime};
 
 use super::held::Composite;
 use super::{
-    BoundInput, BoundStep, CompositeState, INLINE_VALUE_BYTES, ItemInput, MalformedStep, MemberOutcome, PAGE_ENTRIES,
+    BoundInput, BoundStep, CompositeKind, CompositeState, INLINE_VALUE_BYTES, ItemInput, MalformedStep, MemberOutcome, PAGE_ENTRIES,
     SpilledValue, StreamedMember, spill_value,
 };
 
@@ -366,6 +366,21 @@ impl Composite {
     pub(super) fn held_item_pages(&self) -> Vec<u32> {
         let partial = (!self.partial_items.is_empty()).then(|| item_page(self.items_taken - 1));
         self.filled_item_pages.keys().copied().chain(partial).collect()
+    }
+
+    /// How many item pages the reduce's items fill, none for a reduce that
+    /// folds another composite's results.
+    pub(super) fn item_page_count(&self) -> u32 {
+        if self.step.kind == CompositeKind::Reduce && self.takes_batches() {
+            u32::try_from(self.items_taken.div_ceil(PAGE_ENTRIES)).expect("item pages stay below 2^31")
+        } else {
+            0
+        }
+    }
+
+    /// Whether `page` is one of the item pages the reduce's items fill.
+    pub(in crate::scheduler) fn is_item_page_of_items(&self, page: u32) -> bool {
+        page >= ITEM_PAGES && page - ITEM_PAGES < self.item_page_count()
     }
 
     /// Whether the leader still has item page `page`.

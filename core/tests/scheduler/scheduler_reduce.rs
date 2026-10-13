@@ -382,6 +382,26 @@ fn a_reduce_after_a_task_stage_folds_what_its_expansion_streamed_and_a_seedless_
 }
 
 #[test]
+fn a_finished_reduce_writes_every_item_page_finished_whether_the_leader_still_held_it_or_not() {
+    let mut fixture = Fixture::leading();
+    let reduce = submitted(&mut fixture, one_chunk_reduce(2));
+    let values: Vec<Vec<u8>> = (0..PAGE_ENTRIES + 2).map(item).collect();
+    let values: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+    fixture.scheduler.submit_members(items_batch(&reduce, 0, &values, true)).unwrap();
+    // The first page's write was stored, so the leader let it go.
+    let first = RecordKey::Page(reduce.clone(), ITEM_PAGES);
+    let stored = fixture.spy.newest_page(&reduce, ITEM_PAGES).unwrap().version.unwrap();
+    fixture.scheduler.record_stored(&first, RecordVersion::from(&stored));
+    assert!(!fixture.scheduler.holds(&first));
+    run_member(&mut fixture, &reduce, 0, b"folded");
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+    for page in 0..2 {
+        let newest = fixture.spy.newest_page(&reduce, ITEM_PAGES + page).unwrap();
+        assert!(newest.finished, "item page {page} is rewritten as finished so a holder can retire it");
+    }
+}
+
+#[test]
 fn a_new_leader_drives_a_half_combined_tree_on_and_makes_each_step_once() {
     let mut old = Fixture::leading();
     // Chunks 0-3; combines 4 = (0, 1), 5 = (2, 3); root 6 = (4, 5).

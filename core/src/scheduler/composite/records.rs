@@ -158,7 +158,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let composite = &self.composites.held[id];
         let first = u64::from(page) * PAGE_ENTRIES;
         let entries = if page >= ITEM_PAGES {
-            composite.item_page_entries(page).expect("only an item page the leader holds is built")
+            // A finished reduce's item page the leader let go is written empty:
+            // its steps are done, so nothing reads its items.
+            composite
+                .item_page_entries(page)
+                .or_else(|| self.composites.is_finished(id).then(Vec::new))
+                .expect("only an item page the leader holds, or one of a finished reduce, is built")
         } else {
             composite
                 .outcomes

@@ -426,7 +426,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 .held
                 .get(id)
                 .is_some_and(|composite| {
-                    *page < composite.pages() || composite.holds_item_page(*page)
+                    *page < composite.pages()
+                        || composite.holds_item_page(*page)
+                        || (self.composites.is_finished(id) && composite.is_item_page_of_items(*page))
                 }),
         }
     }
