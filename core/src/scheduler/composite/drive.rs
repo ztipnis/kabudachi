@@ -379,7 +379,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                     message: "the run succeeded without a readable result digest".to_owned(),
                 }),
             },
-            state => MemberOutcome::Failed(failure_of(state, &run.failure_kind)),
+            state => MemberOutcome::Failed(failure_of(state, &run.failure_kind, &run.failure_message)),
         };
         Some(outcome)
     }

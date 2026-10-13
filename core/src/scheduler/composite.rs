@@ -267,8 +267,9 @@ pub enum InputShape {
 }
 
 /// The failure a member that ended in `state` is recorded with: the kind its
-/// run failed with when it has one, else the kind the state itself names.
-pub(crate) fn failure_of(state: TaskRunState, kind: &str) -> Failure {
+/// run failed with when it has one, else the kind the state itself names,
+/// with the run's own message when it failed.
+pub(crate) fn failure_of(state: TaskRunState, kind: &str, message: &str) -> Failure {
     let by_state = match state {
         TaskRunState::Failed => "",
         TaskRunState::Expired => EXPIRED_KIND,
@@ -283,7 +284,8 @@ pub(crate) fn failure_of(state: TaskRunState, kind: &str) -> Failure {
         | TaskRunState::Succeeded => unreachable!("a member whose task ended did not fail: {state:?}"),
     };
     let kind = if kind.is_empty() { by_state } else { kind };
-    Failure { kind: kind.to_owned(), message: String::new() }
+    let message = if state == TaskRunState::Failed { message } else { "" };
+    Failure { kind: kind.to_owned(), message: message.to_owned() }
 }
 
 /// A composite as its submitter described it.

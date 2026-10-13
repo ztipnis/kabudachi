@@ -172,6 +172,12 @@ async def shout(request: Greeting) -> Greeting:
     return Greeting(text=request.text.upper())
 
 
+@kabudachi.task(name="cluster.refuse")
+async def refuse(request: Greeting) -> Greeting:
+    """Fails with a message naming its input."""
+    raise ValueError(f"refused {request.text}")
+
+
 @kabudachi.task(name="cluster.plan")
 async def plan(request: Greeting) -> kabudachi.Flow:
     """Returns a flow, which runs as this task's continuation."""
@@ -180,12 +186,19 @@ async def plan(request: Greeting) -> kabudachi.Flow:
 
 @kabudachi.task(name="cluster.pipeline")
 async def pipeline(request: Greeting) -> list[Greeting]:
-    """Awaits a flow, a group and a returned step from inside a body: on a
-    networked worker each is a composite the leader runs."""
+    """Awaits a flow, a group, a returned step and a group with a failing
+    member from inside a body: on a networked worker each is a composite the
+    leader runs. Ends with what the failed member's client was told."""
     flowed = await kabudachi.flow(load.bind(request), shout)()
     grouped = await kabudachi.group(load.bind(request), shout.bind(request))()
     planned = await plan(request)
-    return [flowed[-1], *grouped, *planned]
+    gathered = await kabudachi.group(load.bind(request), refuse.bind(request), on_error="collect_all")()
+    # A member this process ran gives back its own error; any other, a
+    # `TaskFailure` holding the kind and message the leader recorded.
+    failure = gathered[1]
+    kind = getattr(failure, "kind", type(failure).__name__)
+    message = getattr(failure, "message", str(failure))
+    return [flowed[-1], *grouped, *planned, Greeting(text=f"{kind}: {message}")]
 
 
 TASKS = {
@@ -202,4 +215,5 @@ TASKS = {
     "gather": gather,
     "pipeline": pipeline,
     "plan": plan,
+    "refuse": refuse,
 }

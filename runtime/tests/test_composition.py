@@ -688,7 +688,8 @@ def test_a_collect_all_failure_reaches_awaiting_code_and_the_next_stage_as_the_m
     assert isinstance(direct[1], ValueError), "code awaiting the group is given the error its own member raised"
     assert seen[0][0] == Greeting(text="X")
     assert isinstance(seen[0][1], TaskFailure), "the next stage is given the failure, whatever its serializer"
-    assert seen[0][1].kind == "ValueError"
+    assert (seen[0][1].kind, seen[0][1].message) == ("ValueError", "member failed")
+    assert str(direct[1]) == "member failed"
     assert staged[-1] == "after"
 
 
@@ -1245,7 +1246,7 @@ def test_under_collect_all_the_stage_after_a_group_runs_once_with_every_outcome(
             assert entry == Greeting(text=f"m{index}")
         else:
             assert isinstance(entry, TaskFailure)
-            assert entry.kind == "ValueError"
+            assert (entry.kind, entry.message) == ("ValueError", f"member {index} failed")
     assert outcome[-1] == "stage"
 
 

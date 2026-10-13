@@ -34,8 +34,8 @@ from proto_messages import Greeting
 
 
 # What `pipeline` of "a" gives: a flow's last result, a group's results, and
-# a returned flow's results.
-PIPELINE_OF_A = ["LOADED A", "loaded a", "A", "loaded a", "LOADED A"]
+# a returned flow's results, and what a failed group member's client was told.
+PIPELINE_OF_A = ["LOADED A", "loaded a", "A", "loaded a", "LOADED A", "ValueError: refused a"]
 
 
 def finished(shard, task_id):

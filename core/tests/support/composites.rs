@@ -129,10 +129,14 @@ pub fn start_member(fixture: &mut Fixture, composite: &CompositeId, index: u64) 
     claim
 }
 
-/// Fails member `index` for good (it has no retries).
+/// Fails member `index` for good (it has no retries), with the message
+/// `member <index> failed`.
 pub fn fail_member(fixture: &mut Fixture, composite: &CompositeId, index: u64, kind: &str) {
     let claim = start_member(fixture, composite, index);
-    fixture.scheduler.fail(&worker(), &claim.task_run_id, kind).unwrap();
+    fixture
+        .scheduler
+        .fail_with_message(&worker(), &claim.task_run_id, kind, format!("member {index} failed"))
+        .unwrap();
 }
 
 /// The `CompositeFinished` events taken from the scheduler so far.

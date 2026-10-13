@@ -74,7 +74,8 @@ fn a_failed_stage_fails_the_flow_and_no_later_stage_is_ever_made() {
     fail_member(&mut fixture, &flow, 0, "ValueError");
     let finished = finished(&mut fixture);
     assert_eq!(finished[0].state, CompositeState::Failed);
-    assert_eq!(finished[0].failure.as_ref().unwrap().kind, "ValueError");
+    let failure = finished[0].failure.as_ref().unwrap();
+    assert_eq!((failure.kind.as_str(), failure.message.as_str()), ("ValueError", "member 0 failed"));
     assert_eq!(
         fixture.scheduler.request_claim(&worker(), &flow.member_task(1)),
         Err(ClaimRejection::TaskUnknown)
@@ -201,13 +202,20 @@ fn collect_all_waits_for_every_member_and_records_each_failure_as_its_entry() {
     fixture.scheduler.cancel(&group.member_task(2)).unwrap();
     let finished_events = finished(&mut fixture);
     assert_eq!(finished_events[0].state, CompositeState::Succeeded);
-    let kinds: Vec<Option<String>> = (0..3)
+    let failures: Vec<Option<(String, String)>> = (0..3)
         .map(|index| match entry(&fixture, &group, index).unwrap().outcome {
-            Some(composite_entry::Outcome::Failure(failure)) => Some(failure.kind),
+            Some(composite_entry::Outcome::Failure(failure)) => Some((failure.kind, failure.message)),
             _ => None,
         })
         .collect();
-    assert_eq!(kinds, [None, Some("ValueError".into()), Some("TaskCancelledError".into())]);
+    assert_eq!(
+        failures,
+        [
+            None,
+            Some(("ValueError".into(), "member 1 failed".into())),
+            Some(("TaskCancelledError".into(), String::new()))
+        ]
+    );
 }
 
 #[test]
