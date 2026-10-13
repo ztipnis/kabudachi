@@ -56,7 +56,8 @@ pub(super) struct AuthorityArguments {
 
 impl NetworkedArguments {
     /// Raises `ValueError` for no worker threads, a replication factor or
-    /// seed rounds of zero, or a timing or authority TTL of zero.
+    /// seed rounds of zero, a timing or authority TTL of zero, or a roll-call
+    /// deadline that is not less than the heartbeat timeout.
     pub(super) fn check(&self) -> PyResult<()> {
         if self.worker_threads == 0 {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));
@@ -83,7 +84,21 @@ impl NetworkedArguments {
                 return Err(PyValueError::new_err(format!("{name} must be positive")));
             }
         }
+        if self.roll_call_deadline() >= self.heartbeat_timeout_ms {
+            return Err(PyValueError::new_err(
+                "roll_call_deadline_ms must be less than heartbeat_timeout_ms",
+            ));
+        }
         Ok(())
+    }
+
+    /// The roll-call deadline in milliseconds: the one given, or the default.
+    fn roll_call_deadline(&self) -> u64 {
+        self.roll_call_deadline_ms.unwrap_or_else(|| {
+            ROLL_CALL_DEADLINE_MS
+                .min(self.heartbeat_timeout_ms / 4)
+                .max(1)
+        })
     }
 
     /// The worker's config, its driver's end of the executor seam included.
@@ -146,13 +161,7 @@ impl NetworkedArguments {
             CoreDuration::from_millis(self.heartbeat_timeout_ms),
             CoreDuration::from_millis(self.heartbeat_interval_ms),
         )
-        .with_roll_call_deadline(CoreDuration::from_millis(
-            self.roll_call_deadline_ms.unwrap_or_else(|| {
-                ROLL_CALL_DEADLINE_MS
-                    .min(self.heartbeat_timeout_ms / 4)
-                    .max(1)
-            }),
-        ))
+        .with_roll_call_deadline(CoreDuration::from_millis(self.roll_call_deadline()))
         .with_reconnect_timeout(CoreDuration::from_millis(self.reconnect_timeout_ms))
     }
 }

@@ -333,7 +333,9 @@ class Settings:
             )
         if self.roll_call_deadline is not None and (
             not is_positive_timedelta(self.roll_call_deadline)
-            or self.roll_call_deadline >= self.heartbeat_timeout
+            # In whole milliseconds, as the native side reads them.
+            or round(self.roll_call_deadline.total_seconds() * 1000)
+            >= round(self.heartbeat_timeout.total_seconds() * 1000)
         ):
             raise ValueError(
                 "roll_call_deadline must be a positive timedelta below heartbeat_timeout "
@@ -598,8 +600,11 @@ class Configuration:
 
         A networked worker reads all of its networked settings when `run()`
         starts, so a change made after that applies from the next `run()`.
+
+        A failed task's error message is stored in the task's replicated
+        record, so it can contain task data.
         """
-        configured = {**self._configured, **settings}
+        configured ={**self._configured, **settings}
         validated = self._validate(configured)
         if "reconnect_timeouts" in settings:
             # A copy: a mapping the caller changes later changes nothing here.
