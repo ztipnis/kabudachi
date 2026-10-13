@@ -474,13 +474,17 @@ def unreached_while_the_leader_is_killed(cluster, tmp_path):
     # worker, and is stopped once its own is cancelled. The other two runs
     # cannot deliver to it within their reconnect timeout: one certifies
     # with its result undelivered, the other is cancelled while it delivers.
-    # The leader is then killed while it and the other follower each run a
+    # The undelivered one must run on the leader, which is then killed with
+    # its buffered delivery: a surviving worker holding it would still
+    # deliver the buffered result once the client resumes, and a matching
+    # certified digest would settle the handle with that result instead of
+    # leaving it unavailable. The leader is then killed while it and the other follower each run a
     # task, so the client, resumed, learns how its tasks ended only by
     # asking the leader the two survivors elect, under which every run
     # certifies once.
     leader = cluster.leader()
     client, other = [worker for worker in cluster.workers if worker is not leader]
-    texts, holders, own, unreached, interrupted = one_on_each_worker(cluster, tmp_path, client)
+    texts, holders, own, unreached, interrupted = one_on_each_worker(cluster, tmp_path, client, leader)
     client.ask(cancel=own)
     eventually("its own body to stop", lambda: (tmp_path / f"{texts[own]}.stopped").exists())
 
@@ -500,17 +504,18 @@ def unreached_while_the_leader_is_killed(cluster, tmp_path):
     certified_once_and_settled(cluster, other, tasks)
 
 
-def one_on_each_worker(cluster, tmp_path, client):
+def one_on_each_worker(cluster, tmp_path, client, leader):
     """Three gated holds `client` submits, once one runs on each worker:
-    each task's text, each text's worker, the task `client` runs itself, and
-    the other two."""
+    each task's text, each text's worker, the task `client` runs itself, the
+    one `leader` runs, and the one the other follower runs."""
     texts = {client.submit("hold", text=f"unreached-{n}", times=GATED): f"unreached-{n}" for n in range(3)}
     # Idle workers poll for work at growing intervals, up to 5 s, and a worker
     # just resumed or rejoined starts from its longest: each of three claims
     # can wait one.
     holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()), timeout=45)
     [own] = [task for task, text in texts.items() if holders[text] is client]
-    unreached, interrupted = [task for task in texts if task != own]
+    [unreached] = [task for task, text in texts.items() if holders[text] is leader]
+    [interrupted] = [task for task in texts if task not in (own, unreached)]
     return texts, holders, own, unreached, interrupted
 
 
