@@ -201,6 +201,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             let claim = self.claim_to_be(&task_id);
             if fits(&claim) {
                 self.mark_claimed(worker, &task_id);
+                self.turns.charge();
                 claims.push(claim);
             } else if claims.is_empty() {
                 passed.insert(task_id);
@@ -208,11 +209,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 break;
             }
         }
+        let waiting = &self.waiting;
+        self.turns.forget_empty(|queue| waiting.has_queued(queue));
         Ok(claims)
     }
 
     /// The task `worker` should be handed next from the queues `asked` names,
-    /// skipping `passed`, and takes its queue's turn.
+    /// skipping `passed`. Its queue's turn is spent by `fairness::Turns::charge` once
+    /// it is claimed.
     fn next_to_claim(
         &mut self,
         worker: &WorkerId,

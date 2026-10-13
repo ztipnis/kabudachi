@@ -5,7 +5,7 @@
 use std::num::NonZeroU32;
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, WorkerId};
-use kabudachi_core::queues::{QueueOptions, QueuePolicy};
+use kabudachi_core::queues::{QueueOptions, QueuePolicy, Subscription};
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{ClaimRejection, Submission};
 use kabudachi_core::time::Duration;
@@ -143,5 +143,43 @@ fn a_new_leader_counts_the_runs_it_rebuilds_against_their_queues_limit() {
             .unwrap_err(),
         ClaimRejection::QueueFull,
         "the two runs it inherited fill the queue"
+    );
+}
+
+#[test]
+fn a_front_the_caller_refuses_does_not_spend_its_queues_turn() {
+    let mut fixture = Fixture::leading();
+    let definition = TaskDefinitionId::new("demo.task");
+    // Oldest first: two tasks of queue `a`, then one of `b`.
+    for (input, queue) in [("refused", "a"), ("a-next", "a"), ("b-only", "b")] {
+        fixture
+            .scheduler
+            .submit(Submission::new(
+                definition.clone(),
+                1,
+                input.as_bytes().to_vec(),
+                queue,
+            ))
+            .unwrap();
+    }
+
+    let claims = fixture
+        .scheduler
+        .claim_oldest_fitting(
+            &WorkerId::new("w1"),
+            &Subscription::Every,
+            2,
+            |claim| claim.task.serialized_input != b"refused",
+        )
+        .unwrap();
+
+    let inputs: Vec<&[u8]> = claims
+        .iter()
+        .map(|claim| claim.task.serialized_input.as_slice())
+        .collect();
+    assert_eq!(
+        inputs,
+        [b"a-next".as_slice(), b"b-only".as_slice()],
+        "the refused front passed, so a's turn is still its own for the task behind it"
     );
 }
