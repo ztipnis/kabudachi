@@ -80,18 +80,23 @@ where
     ///
     /// - `Active`: the first instant past its jittered suspicion timeout
     ///   (see [`Self::jittered_suspect_timeout`]), or its next heartbeat to
-    ///   its leader if that comes first.
+    ///   its leader if that comes first, or the end of its wait for the
+    ///   leader it handed over to (see [`Input::Drain`](crate::election::Input::Drain)).
     /// - `LeaderSuspect` and `NoQuorum`: when it may start a roll call (see
     ///   [`Self::next_roll_call_due`]), or its next heartbeat to its leader
-    ///   if that comes first; `None` for a node with neither, a joiner with
-    ///   no configuration and no leader to heartbeat.
+    ///   if that comes first, or the end of a drain's wait for a leader;
+    ///   `None` for a node with none of these, a joiner with no
+    ///   configuration and no leader to heartbeat.
     /// - `RollCall`: its roll call's deadline, or its next heartbeat to its
-    ///   leader if that comes first.
+    ///   leader if that comes first, or the end of a drain's wait for a
+    ///   leader.
     /// - `Candidate`: its vote's deadline.
     /// - `LeaderReconciling` and `Leader`: when it goes `NoQuorum` unless
     ///   more confirmations arrive (never, for a leader that alone is a
-    ///   quorum), or when it next has a worker to report silent or lost,
-    ///   whichever comes first.
+    ///   quorum), when it next has a worker to report silent or lost, the
+    ///   end of a hand-over it began (a draining node then departs alone),
+    ///   or, with no hand-over under way, the end of a drain's wait to hand
+    ///   over, whichever comes first.
     /// - Every other state: `None`.
     ///
     /// With an authority, also the lease's next registration or fence
@@ -139,9 +144,9 @@ where
     }
 
     /// What a node in office waits for: going `NoQuorum` unless more
-    /// confirmations arrive, its next worker to report lost or silent, the end
-    /// of a hand-over under way, and a kept drain's wake-up, whichever comes
-    /// first.
+    /// confirmations arrive, its next worker to report lost or silent, and the
+    /// end of a hand-over under way or, with none, of a drain's wait,
+    /// whichever comes first.
     fn office_deadline(&self) -> Option<Instant> {
         let office = self.office.as_ref();
         let no_quorum = office.and_then(|office| {
@@ -159,9 +164,16 @@ where
             office.next_silent_at(self.clock.now(), self.timings.suspect_timeout)
         });
         let transfer_ends = self.transfer.as_ref().map(|transfer| transfer.until);
+        // While a hand-over lasts, a drain's wait ends no sooner than it
+        // does: a `Tick` before then moves nothing, so reporting the wait's
+        // end would leave the node due without end.
+        let drain_wakes = match self.transfer {
+            Some(_) => None,
+            None => self.drain_request.wakes_at(),
+        };
         earliest(
             earliest(earliest(no_quorum, lost), transfer_ends),
-            earliest(self.drain_request.wakes_at(), silent),
+            earliest(drain_wakes, silent),
         )
     }
 
@@ -192,6 +204,11 @@ where
         }
         if let Some(authority) = self.authority.as_mut() {
             authority.state_changed(next);
+        }
+        // The roll call a leader's hand-over asked for is over once the node
+        // leaves the states it runs in.
+        if !matches!(next, WorkerState::LeaderSuspect | WorkerState::RollCall) {
+            self.handed_over_by = None;
         }
         // Only a rejoining node keeps a read it awaits or a pointer it holds.
         if !matches!(next, WorkerState::Bootstrapping | WorkerState::Joining) {

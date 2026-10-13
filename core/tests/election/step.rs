@@ -12,8 +12,8 @@ use crate::support::builders::{
 };
 use crate::support::clock::FakeClock;
 use crate::support::node::{
-    connect, deliver, finish_reconciling, leader_of_three as committed_leader, stand_as_candidate,
-    start_roll_call, state_changes, tick,
+    commit_founding, connect, deliver, elect, finish_reconciling, known_node,
+    leader_of_three as committed_leader, stand_as_candidate, start_roll_call, state_changes, tick,
 };
 use kabudachi_core::election::{
     ElectionTimings, Entry, HandOffTo, Identity, Input, Output, WorkerNode,
@@ -413,6 +413,88 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
         assert_kept_drain_ends_at_the_wait_limit(waiting_in);
     }
     assert_hand_over_ends_at_the_wait_limit();
+
+    // A drain wait shorter than the suspicion timeout, asked of a leader
+    // before or during a hand-over: its wait cannot end a tick the hand-over
+    // under way does not, so the node does not report the wait's end while
+    // that hand-over lasts.
+    assert_drain_in_office_leaves_at(DrainAskedAt::Start, SUSPECT_TIMEOUT + SUSPECT_TIMEOUT / 2 - 1);
+    assert_drain_in_office_leaves_at(DrainAskedAt::DuringAHandOver, 2 * SUSPECT_TIMEOUT);
+}
+
+/// When a leader is asked to drain.
+#[derive(Clone, Copy)]
+enum DrainAskedAt {
+    /// Before any hand-over: it begins its own at the end of its wait.
+    Start,
+    /// Just after it began one of its own accord.
+    DuringAHandOver,
+}
+
+/// A leader whose drain wait is shorter than its suspicion timeout, asked to
+/// drain as `asked` says, its voters confirming it throughout: each `Tick` at
+/// a deadline it reports moves it on, and it leaves alone, with no successor
+/// taking up the hand-over, `leaves_after` ticks after the request.
+fn assert_drain_in_office_leaves_at(asked: DrainAskedAt, leaves_after: u64) {
+    let clock = FakeClock::new();
+    let wait_limit = Duration::from_ticks(SUSPECT_TIMEOUT / 2 - 1);
+    let mut leader = known_node(
+        &clock,
+        &worker("w1"),
+        voter_of(3),
+        ElectionTimings {
+            drain_wait_limit: wait_limit,
+            ..timings(Duration::from_ticks(SUSPECT_TIMEOUT))
+        },
+    );
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    connect(&mut leader, &[p1.clone(), p2.clone()]);
+    elect(&mut leader, &clock, SUSPECT_TIMEOUT, &[p1.clone(), p2.clone()]);
+    commit_founding(&mut leader, &clock, &[p1.clone(), p2.clone()]);
+
+    let asked_at = clock.now();
+    if let DrainAskedAt::DuringAHandOver = asked {
+        let _ = leader.step(Input::TransferLeadership);
+    }
+    let mut deadline = leader.step(Input::Drain).next_deadline;
+    let mut outputs = Vec::new();
+    for _ in 0..500 {
+        if leader.state() == WorkerState::Stopped {
+            break;
+        }
+        let due = deadline.expect("a node waiting to leave reports a deadline");
+        // The voters heartbeat every few ticks, keeping the leader's lease.
+        let at = due.min(clock.now() + Duration::from_ticks(SUSPECT_TIMEOUT / 4));
+        clock.advance(at - clock.now());
+        for voter in [&p1, &p2] {
+            deadline = confirm(&mut leader, &clock, voter);
+        }
+        if deadline.is_some_and(|due| due > clock.now()) {
+            continue;
+        }
+        let before = leader.state();
+        let ticked = leader.step(Input::Tick);
+        assert!(
+            leader.state() != before
+                || ticked
+                    .next_deadline
+                    .is_none_or(|next| next > clock.now()),
+            "a Tick at its deadline {:?} left a {before:?} node due again at {:?}",
+            clock.now(),
+            ticked.next_deadline
+        );
+        outputs.extend(ticked.outputs);
+        deadline = ticked.next_deadline;
+    }
+
+    assert_eq!(leader.state(), WorkerState::Stopped, "it never left");
+    assert_eq!(clock.now(), asked_at + Duration::from_ticks(leaves_after));
+    assert!(
+        outputs
+            .iter()
+            .any(|output| matches!(output, Output::HandOff(HandOffTo::Voters(_)))),
+        "{outputs:?}"
+    );
 }
 
 /// A voter with no leader, in `waiting_in`, asked to drain: each `Tick` at a
