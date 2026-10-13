@@ -492,7 +492,8 @@ class ReduceStep:
     def _reducer(self, session: Session) -> tuple:
         definition = self.definition
         settings = session.submission_settings(definition)
-        return ("task", definition.name, definition.version, settings, None, [])
+        version = session.schemas.version_of(definition.input_type)
+        return ("task", definition.name, version, settings, None, [])
 
     def _described_options(self, session: Session) -> dict[str, Any]:
         definition = self.definition

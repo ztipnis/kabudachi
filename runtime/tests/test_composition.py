@@ -2075,3 +2075,11 @@ def test_a_reduce_cannot_be_the_first_stage_of_a_flow_and_says_how_to_give_it_it
 
     with pytest.raises(TypeError, match=r"chain_concat.*first stage.*reduce\(items\)"):
         flow(world.tasks["chain_concat"].reduce)
+
+
+def test_a_reduce_stage_names_its_requirement_with_its_serializer_and_follows_a_stage_that_returns_a_list_of_its_items():
+    world = reducing_world(split_words, chain_concat)
+    concat = world.tasks["chain_concat"].reduce
+
+    assert concat.input_requirements() == [("tests.chain_concat", list[str], "pickle")]
+    flow(world.tasks["split_words"], concat)

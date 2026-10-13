@@ -326,7 +326,7 @@ fn expanding(fixture: &mut Fixture) -> (CompositeId, CompositeId, Claim) {
     run_member(fixture, &flow, 0, b"[...]");
     let reduce = flow.child(1);
     let expansion = fixture.scheduler.request_claim(&worker(), &reduce.expansion_task()).unwrap();
-    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
     let asked = Expansion::decode(&expansion.task.serialized_input[..]).unwrap();
     let Some(expansion::Then::Reduce(reducer)) = asked.then else {
         panic!("a reduce's expansion names its reducer");
@@ -598,7 +598,7 @@ fn a_reduce_after_a_map_that_expanded_folds_the_members_the_expansion_streamed()
     run_member(&mut fixture, &flow, 0, b"[...]");
     let map = flow.child(1);
     let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
-    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
     fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
     fixture
         .scheduler

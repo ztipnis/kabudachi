@@ -577,7 +577,7 @@ fn a_returned_step_too_large_only_after_spilling_fails_its_run_and_a_spilled_lar
             .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
             .unwrap();
         let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
-        fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+        fixture.scheduler.report_started(&worker(), &claim.task_run_id, None).unwrap();
         let step = step.spill().step;
         let certified =
             fixture.scheduler.complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step));
@@ -740,7 +740,7 @@ fn a_map_after_a_stage_is_fed_by_its_expansion_run_and_the_next_stage_takes_the_
     run_member(&mut fixture, &flow, 0, b"[1, 2]");
     let map = flow.child(1);
     let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
-    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
     assert_eq!(expansion.task.task_definition_id().as_str(), EXPANSION_DEFINITION);
     let asked = Expansion::decode(&expansion.task.serialized_input[..]).unwrap();
     assert_eq!(
@@ -770,7 +770,7 @@ fn a_map_after_a_stage_is_fed_by_its_expansion_run_and_the_next_stage_takes_the_
     );
     run_member(&mut fixture, &empty, 0, b"[]");
     let split = fixture.scheduler.request_claim(&worker(), &empty.child(1).expansion_task()).unwrap();
-    fixture.scheduler.report_started(&worker(), &split.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &split.task_run_id, None).unwrap();
     fixture
         .scheduler
         .complete(&worker(), &split.task_run_id, Digest::blake3(b""), Completion::Final)
@@ -792,7 +792,7 @@ fn an_expansion_that_fails_fails_its_map_and_the_flow_whatever_the_maps_error_po
         run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
         let map = flow.child(1);
         let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
-        fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+        fixture.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
         fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
         fixture.scheduler.fail(&worker(), &expansion.task_run_id, "SerializationError").unwrap();
         let finished = finished(&mut fixture);
@@ -808,12 +808,12 @@ fn an_expansion_lost_with_its_worker_restreams_without_doubling() {
     run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
     let map = flow.child(1);
     let first = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
-    fixture.scheduler.report_started(&worker(), &first.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &first.task_run_id, None).unwrap();
     fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
     let lost = fixture.lose_silent(&worker());
     assert!(lost[0].replayed.is_some(), "the expansion is replayed");
     let replay = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
-    fixture.scheduler.report_started(&worker(), &replay.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &replay.task_run_id, None).unwrap();
     assert_eq!(fixture.scheduler.submit_members(item_batch(&map, 0, 3, false)).unwrap().members, 3);
     assert_eq!(fixture.scheduler.pending_len(), 3, "the replay's batch made only the third member");
     fixture
@@ -833,7 +833,7 @@ fn a_map_that_fails_fast_while_its_expansion_still_streams_cancels_the_expansion
     run_member(&mut fixture, &flow, 0, b"[1, 2, 3]");
     let map = flow.child(1);
     let expansion = fixture.scheduler.request_claim(&worker(), &map.expansion_task()).unwrap();
-    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id, None).unwrap();
     fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
     fail_member(&mut fixture, &map, 0, "ValueError");
     assert_eq!(finished(&mut fixture)[0].state, CompositeState::Failed);
