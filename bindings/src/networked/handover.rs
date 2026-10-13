@@ -185,11 +185,22 @@ impl Seam {
                 self.handed.push_back(claim);
                 Handled::wake()
             }
-            None => self.untaken(wire.task_run_id.map(|run| Report::Failed {
-                run: run.into(),
-                reason: MALFORMED_KIND.into(),
-                message: String::new(),
-            })),
+            None => {
+                let failed = wire.task_run_id.map(|run| Report::Failed {
+                    run: run.into(),
+                    reason: MALFORMED_KIND.into(),
+                    message: String::new(),
+                });
+                if self.closed {
+                    Handled {
+                        report: failed,
+                        wake: false,
+                        place_back: false,
+                    }
+                } else {
+                    self.untaken(failed)
+                }
+            }
         }
     }
 

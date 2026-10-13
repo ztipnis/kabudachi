@@ -410,8 +410,8 @@ def test_a_run_whose_result_no_store_has_room_for_is_lost_at_its_bound_and_its_r
 
 def test_a_worker_whose_run_is_cancelled_before_python_takes_it_offers_its_place_again(tmp_path):
     # Only the last worker claims, with two places and an in-flight share of
-    # 6 MB: of two tasks queued together, whichever its first claim reaches
-    # first runs, and the other's input does not fit beside it, so that run
+    # 6 MB: of two tasks queued together (the claimant is held still until both
+    # are), whichever its first claim reaches first runs, and the other's input does not fit beside it, so that run
     # waits for room before Python can take it. The waiting run is cancelled,
     # and the place it held must be offered again: a third task runs on that
     # worker while the first still runs.
@@ -421,10 +421,13 @@ def test_a_worker_whose_run_is_cancelled_before_python_takes_it_offers_its_place
     cluster = Cluster.start(tmp_path, overrides={0: claims_nothing, 1: claims_nothing, 2: claimant})
     try:
         submitter = cluster.workers[0]
-        texts = {
-            submitter.submit("weigh", text="weighA01" + varied_text(2_500_000)): "weighA01",
-            submitter.submit("weigh", text="weighB01" + varied_text(3_800_000)): "weighB01",
-        }
+        with stopped(cluster.workers[2]):
+            texts = {
+                submitter.submit("weigh", text="weighA01" + varied_text(2_500_000)): "weighA01",
+                submitter.submit("weigh", text="weighB01" + varied_text(3_800_000)): "weighB01",
+            }
+            for task in texts:
+                eventually("the task to be queued", lambda task=task: cluster.record(task) is not None)
         [running] = eventually(
             "one of them to run",
             lambda: [task for task, key in texts.items() if (tmp_path / f"{key}.started").exists()],
@@ -437,7 +440,7 @@ def test_a_worker_whose_run_is_cancelled_before_python_takes_it_offers_its_place
 
         next_in_line = submitter.submit("hold", text="after001")
         certified_once(cluster, next_in_line, digest_of(hold, Greeting(text="after001")))
-        assert not (tmp_path / f"{texts[running]}.ended").exists()
+        assert not cluster.record(running)["finished"]
         (tmp_path / f"{texts[running]}.go").touch()
     finally:
         cluster.close()
