@@ -51,14 +51,16 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    BlockNoted, CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome, QuerySlowDown,
-    RecordPlacements, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted,
+    BlockNoted, CancelTask, CompactionApplied, PersistenceNoted, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome, QuerySlowDown,
+    RecordPlacements, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportPersisted,
+    ReportStarted,
     SlowDownState, StartAccepted, SubmitAccepted, SubmitComposite, SubmitMembers, SubmitTask, TaskReject,
     TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::composite::{MemberBatch, Step, SubmittedComposite};
-use kabudachi_core::scheduler::{BlockRejection, Completion, Observer, Scheduler, Submitted};
+use kabudachi_core::result_backend::PersistenceState;
+use kabudachi_core::scheduler::{BlockRejection, Completion, Observer, Reported, Scheduler, Submitted};
 use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::Clock;
 use libp2p::PeerId;
@@ -222,6 +224,7 @@ impl Net {
             result_digest: Some(result_digest.into()),
             delivered: false,
             continuation: None,
+            persistence: generated::PersistenceState::Disabled as i32,
         }))
         .await
     }
@@ -239,6 +242,7 @@ impl Net {
             result_digest: Some(step.digest().into()),
             delivered: false,
             continuation: Some(StepDescription::from(step)),
+            persistence: generated::PersistenceState::Disabled as i32,
         }))
         .await
     }
@@ -380,6 +384,8 @@ impl Net {
             | Request::SubmitMembers(_)
             | Request::QuerySlowDown(_)
             | Request::Blocked(_) => {}
+            // The ledger forgot the run when it was certified.
+            Request::Persisted(_) => {}
         }
     }
 
@@ -874,6 +880,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Failed(report) => failed(scheduler, from, report),
         Request::Lost(report) => lost(scheduler, from, report),
         Request::Blocked(report) => blocked(scheduler, from, report),
+        Request::Persisted(report) => persisted(scheduler, from, report),
         Request::Cancel(request) => cancel(scheduler, request),
         // Where records go is the driver's to say: it alone knows the voters.
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
@@ -991,9 +998,26 @@ fn completed<C: Clock, I: IdGenerator, O: Observer>(
             _ => return Err(TaskRejectReason::TaskRejectMalformed),
         },
     };
+    let reported = Reported {
+        delivered: report.delivered,
+        persistence: PersistenceState::try_from(report.persistence()).unwrap_or(PersistenceState::Disabled),
+    };
     scheduler
-        .complete_delivered(from, &run, digest, completion, report.delivered)
+        .complete_reported(from, &run, digest, completion, reported)
         .map(|certification| task_response::Result::Certified(wire::certified(certification)))
+        .map_err(wire::report_reject)
+}
+
+fn persisted<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    from: &WorkerId,
+    report: &ReportPersisted,
+) -> Answered {
+    let run = run_id(report.task_run_id.as_ref())?;
+    let state = PersistenceState::try_from(report.state()).map_err(|_| TaskRejectReason::TaskRejectMalformed)?;
+    scheduler
+        .note_persistence(from, &run, state)
+        .map(|()| task_response::Result::Persisted(PersistenceNoted {}))
         .map_err(wire::report_reject)
 }
 
@@ -1086,6 +1110,7 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
         Request::Failed(report) => &report.task_run_id,
         Request::Compacted(report) => &report.task_run_id,
         Request::Lost(report) => &report.task_run_id,
+        Request::Persisted(report) => &report.task_run_id,
         Request::Submit(_)
         | Request::Cancel(_)
         | Request::Place(_)

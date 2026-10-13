@@ -21,6 +21,20 @@ enum TaskRunState {
   ORPHANED = 11;
 }
 
+// Whether a certified run's result was mirrored to a result backend:
+// PERSISTENCE_STATE_DISABLED (nothing is mirrored),
+// PERSISTENCE_STATE_PENDING (its worker is mirroring it),
+// PERSISTENCE_STATE_STORED, or PERSISTENCE_STATE_FAILED (the backend refused
+// or did not answer; the run's outcome stands). Unspecified on runs not
+// certified, and on runs certified before a worker could say.
+enum PersistenceState {
+  PERSISTENCE_STATE_UNSPECIFIED = 0;
+  PERSISTENCE_STATE_DISABLED = 1;
+  PERSISTENCE_STATE_PENDING = 2;
+  PERSISTENCE_STATE_STORED = 3;
+  PERSISTENCE_STATE_FAILED = 4;
+}
+
 // A moment by the wall clock of the worker that stamped it, in milliseconds
 // since the Unix epoch. Workers' clocks disagree, so compare two only as far
 // as their clocks are known to agree, and never measure a timeout with one.
@@ -145,4 +159,7 @@ message TaskRun {
   // the task's continuation. Written in the revision that certifies the
   // run, so storing that revision commits the continuation with it.
   StepDescription continuation = 18;
+  // Set when the run is certified, and again when its worker reports how
+  // mirroring went.
+  PersistenceState persistence = 17;
 }

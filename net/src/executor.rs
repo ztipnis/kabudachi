@@ -613,6 +613,7 @@ impl<'n> Executing<'n> {
                     result_digest: Some(digest.into()),
                     delivered,
                     continuation: continuation.as_ref().map(StepDescription::from),
+                    persistence: kabudachi_core::protocol::generated::PersistenceState::Disabled as i32,
                 })
             }
             Report::Failed { run, reason, message } => {

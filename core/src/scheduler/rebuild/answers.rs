@@ -163,7 +163,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             } => {
                 let completion = continuation.map_or(Completion::Final, Completion::Continues);
                 if let Ok(certified) =
-                    self.certify_owned(worker, run_id, result_digest, completion, delivered)
+                    self.certify_owned(worker, run_id, result_digest, completion, delivered, None)
                 {
                     out.certified.push(certified);
                 }
@@ -268,6 +268,7 @@ fn claimed_run(worker: &WorkerId, claim: &Claim, stamped_at: WallTime) -> TaskRu
         started_at: None,
         failure_message: String::new(),
         continuation: None,
+        persistence: generated::PersistenceState::Unspecified as i32,
     };
     run.transition_to(TaskRunState::Claimed, stamped_at)
         .expect("a queued run can be claimed");
