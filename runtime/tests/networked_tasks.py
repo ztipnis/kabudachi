@@ -140,9 +140,15 @@ def _join(older: Greeting, newer: Greeting) -> Greeting:
 
 @kabudachi.coalescing_task(name="cluster.gather", merge=_join)
 async def gather(request: Greeting) -> Greeting:
-    """Holds `times` milliseconds, then returns the input it was given, the
+    """Holds `times` milliseconds, or, for a negative `times`, until the test
+    creates a `<text>.go` marker, then returns the input it was given, the
     superseded generations' payloads folded in."""
-    await asyncio.sleep(request.times / 1000)
+    if request.times >= 0:
+        await asyncio.sleep(request.times / 1000)
+    else:
+        go = _markers() / f"{request.text}.go"
+        while not go.exists():
+            await asyncio.sleep(0.01)
     return request
 
 

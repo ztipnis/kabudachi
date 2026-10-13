@@ -74,7 +74,7 @@ def test_a_cluster_delivers_results_compacts_and_keeps_its_runs_through_a_busy_t
     delivered_to_its_submitter(cluster, leader)
     carried_as_blobs(cluster, leader)
     awaited_across_workers(cluster, leader)
-    compacted(cluster, leader)
+    compacted(cluster, leader, tmp_path)
     task_process_killed(cluster, leader, tmp_path)
     cancelled_while_running(cluster, leader, tmp_path)
     worker_killed(cluster, leader)
@@ -130,18 +130,21 @@ def awaited_across_workers(cluster, leader):
     assert eventually("the caller's handle to settle", lambda: settled(leader, awaiting))["error"] is None
 
 
-def compacted(cluster, leader):
+def compacted(cluster, leader, tmp_path):
     # A coalescing key held by a running generation retains the payloads of
     # those superseded behind it, past the soft memory limit: the leader makes
     # a compaction run, a worker folds the chain in a task process, and the
     # newest generation's record keeps the fold. It then runs on the whole
     # chain, folded in order.
-    holding = leader.submit("gather", text="a", times=2000)
-    # Running, so it holds the key: the generations after it wait behind it.
+    holding = leader.submit("gather", text="a", times=GATED)
+    # Running, so it holds the key: the generations after it wait behind it,
+    # for as long as the test holds it, however long an idle worker takes to
+    # claim the compaction run.
     eventually("the first generation to run", lambda: running_on(cluster, holding))
     parts = [letter * 200 for letter in "bcd"]
     newest = [leader.submit("gather", text=part) for part in parts][-1]
     eventually("the retained chain to be compacted", lambda: (cluster.record(newest) or {}).get("folded"))
+    (tmp_path / "a.go").touch()
 
     # The compaction run's own record entry, if the record lists it, is not
     # the generation's result: the last run that succeeded is.
@@ -215,7 +218,8 @@ def test_a_client_too_small_to_hold_a_result_has_its_handle_fail_while_the_run_c
         inflated = workers[client].submit("inflate", text="x" * 900_000)
         eventually("the client's handle to settle", lambda: settled(workers[client], inflated))
         assert settled(workers[client], inflated)["error"] == "ResultTooLargeError"
-        [run] = cluster.record(inflated)["runs"]
+        # The result reaches the client before the leader certifies the run.
+        [run] = finished(cluster, inflated)["runs"]
         assert run["state"] == "SUCCEEDED"
         assert run["worker"] != workers[client].id
     finally:
@@ -347,7 +351,10 @@ def one_on_each_worker(cluster, tmp_path, client):
     each task's text, each text's worker, the task `client` runs itself, and
     the other two."""
     texts = {client.submit("hold", text=f"unreached-{n}", times=GATED): f"unreached-{n}" for n in range(3)}
-    holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()))
+    # Idle workers poll for work at growing intervals, up to 5 s, and a worker
+    # just resumed or rejoined starts from its longest: each of three claims
+    # can wait one.
+    holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()), timeout=45)
     [own] = [task for task, text in texts.items() if holders[text] is client]
     unreached, interrupted = [task for task in texts if task != own]
     return texts, holders, own, unreached, interrupted
