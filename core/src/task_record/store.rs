@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::protocol::digest::Digest;
 use crate::blob::{BlobKey, BlobOwner, BlobRecord, MAX_BLOB_BYTES};
+use crate::protocol::digest::Digest;
 use crate::protocol::generated::TaskRecord;
 use crate::protocol::ids::{TaskId, WorkerId};
 use crate::task_record::key::{RecordKey, ShardRecord};

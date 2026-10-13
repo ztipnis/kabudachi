@@ -18,7 +18,7 @@ use kabudachi_core::protocol::ids::{
     CompositeId, IdGenerator, IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::messages::{
-    ClaimResponse, CompositeAccepted, TaskRecord, ElectionMessage, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
+    ClaimResponse, CompositeAccepted, ElectionMessage, TaskRecord, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
 };
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::worker_state::WorkerState;

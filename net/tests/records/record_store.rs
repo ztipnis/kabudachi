@@ -173,8 +173,15 @@ async fn missing(reader: &Net, task: &str) -> RecordLookup {
         .expect("the lookup ended within the timeout")
 }
 
-fn queue_of(found: Option<TaskRecord>) -> Option<String> {
-    found.and_then(|record| record.task).map(|task| task.queue)
+/// `record` as a later revision: its submission stays what it was (a holder
+/// refuses a revision that changes it), and `note` tells the revision apart.
+fn revised(record: &TaskRecord, version: RecordVersion, note: &str) -> TaskRecord {
+    TaskRecord { version: Some(version.into()), blocked_reason: note.to_owned(), ..record.clone() }
+}
+
+/// The note of the revision `found` is.
+fn note_of(found: Option<TaskRecord>) -> Option<String> {
+    found.map(|record| record.blocked_reason)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -184,12 +191,15 @@ async fn a_lookup_finds_the_newest_revision_among_the_peers_and_the_reader_itsel
         // and nothing at all for a task no one holds.
         let [reader, stale, fresh] = three_connected(shard("shard-1")).await;
         let (stale_id, fresh_id) = (stale.local_worker_id(), fresh.local_worker_id());
+        let first = record("task-1", version(0, 0, 1, 1), "q");
         assert!(
-            write_one(&reader, record("task-1", version(0, 0, 1, 1), "old"), &[&stale_id, &fresh_id], 2)
+            write_one(&reader, revised(&first, version(0, 0, 1, 1), "old"), &[&stale_id, &fresh_id], 2)
                 .await
         );
-        assert!(write_one(&reader, record("task-1", version(0, 0, 2, 0), "new"), &[&fresh_id], 1).await);
-        assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("new"));
+        assert!(
+            write_one(&reader, revised(&first, version(0, 0, 2, 0), "new"), &[&fresh_id], 1).await
+        );
+        assert_eq!(note_of(lookup(&reader, "task-1").await).as_deref(), Some("new"));
         assert_eq!(lookup(&reader, "task-2").await, None, "no one holds task-2");
 
         // A miss is "held nowhere" only when every peer the reader knows
@@ -201,17 +211,19 @@ async fn a_lookup_finds_the_newest_revision_among_the_peers_and_the_reader_itsel
         // The reader's own copy counts: a newer revision only it holds.
         let (reader, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;
         let holders = [&reader.local_worker_id(), &holder.local_worker_id()];
-        assert!(write_one(&reader, record("task-1", version(0, 0, 1, 0), "mine"), &holders, 2).await);
+        let first = record("task-1", version(0, 0, 1, 0), "q");
+        assert!(write_one(&reader, revised(&first, version(0, 0, 1, 0), "mine"), &holders, 2).await);
         assert!(
-            write_one(&reader, record("task-1", version(0, 0, 1, 1), "newer"), &[holders[0]], 1).await
+            write_one(&reader, revised(&first, version(0, 0, 1, 1), "newer"), &[holders[0]], 1).await
         );
-        assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("newer"));
+        assert_eq!(note_of(lookup(&reader, "task-1").await).as_deref(), Some("newer"));
 
         // Holders that dialed the reader are found too, though it never dialed them.
         let [reader, writer, first, second] = reader_dialed_by_holders(shard("shard-1")).await;
         let holders = [&first.local_worker_id(), &second.local_worker_id()];
-        assert!(write_one(&writer, record("task-1", version(0, 0, 1, 0), "held"), &holders, 2).await);
-        assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("held"));
+        let held = record("task-1", version(0, 0, 1, 0), "q");
+        assert!(write_one(&writer, revised(&held, version(0, 0, 1, 0), "held"), &holders, 2).await);
+        assert_eq!(note_of(lookup(&reader, "task-1").await).as_deref(), Some("held"));
     })
     .await
 }
