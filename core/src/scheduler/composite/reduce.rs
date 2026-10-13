@@ -41,18 +41,6 @@ pub enum ReduceItem {
     Manifest(Manifest),
 }
 
-impl ReduceItem {
-    /// The item an entry of an item page holds; `None` for an entry that
-    /// holds none, or whose manifest cannot be read.
-    pub fn of_entry(entry: &generated::CompositeEntry) -> Option<ReduceItem> {
-        match entry.outcome.as_ref()? {
-            composite_entry::Outcome::Item(bytes) => Some(ReduceItem::Value(bytes.clone())),
-            composite_entry::Outcome::ItemManifest(manifest) => Manifest::try_from(manifest).ok().map(ReduceItem::Manifest),
-            _ => None,
-        }
-    }
-}
-
 impl From<&ReduceItem> for composite_entry::Outcome {
     fn from(item: &ReduceItem) -> Self {
         match item {
@@ -97,6 +85,8 @@ impl TryFrom<&generated::ReduceOptions> for ReduceShape {
 
 impl From<&ReduceShape> for generated::ReduceOptions {
     fn from(shape: &ReduceShape) -> Self {
+        // The wire cannot carry a `Previous` initial value; a reduce never has one.
+        debug_assert!(!matches!(shape.initial, Some(BoundInput::Previous)));
         let initial = match &shape.initial {
             None | Some(BoundInput::Previous) => None,
             Some(BoundInput::Value(bytes)) => Some(reduce_options::Initial::InitialValue(bytes.clone())),

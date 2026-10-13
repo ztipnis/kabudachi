@@ -197,7 +197,13 @@ fn a_streamed_step_and_its_member_batches_read_back_exactly_and_a_streamed_flow_
 #[test]
 fn a_task_stage_with_no_queue_or_the_reserved_expansion_definition_is_refused() {
     let refused = |step: &Step| Step::try_from(&StepDescription::from(step)).unwrap_err();
-    let flow_of = |stage| Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages: vec![stage], streamed: false, reduce: None };
+    let flow_of = |stage| Step {
+        kind: CompositeKind::Flow,
+        on_error: OnError::FailFast,
+        stages: vec![stage],
+        streamed: false,
+        reduce: None,
+    };
     let mut no_queue = bound("work", BoundInput::Value(b"x".to_vec()));
     no_queue.options.queue = String::new();
     assert_eq!(refused(&flow_of(Stage::Task(no_queue))), MalformedStep::NoQueue);
@@ -339,7 +345,8 @@ fn a_reduce_description_reads_back_exactly_and_one_that_cannot_be_planned_is_ref
     let mut bound_item = reduce.clone();
     bound_item.stages = vec![task("fold", BoundInput::Value(b"a".to_vec()))];
     let mut other_reducer = reduce.clone();
-    other_reducer.stages[0] = Stage::Task(BoundStep { definition: TaskDefinitionId::new("other"), ..shape.reducer.clone() });
+    other_reducer.stages[0] =
+        Stage::Task(BoundStep { definition: TaskDefinitionId::new("other"), ..shape.reducer.clone() });
     let mut fields_bound = reduce.clone();
     let field = BoundField { name: "count".into(), value: FieldValue::Int(0) };
     fields_bound.reduce.as_mut().unwrap().reducer.fields = vec![field];
@@ -349,5 +356,9 @@ fn a_reduce_description_reads_back_exactly_and_one_that_cannot_be_planned_is_ref
     }
     let mut shaped_flow = StepDescription::from(&reduce);
     shaped_flow.kind = generated::CompositeKind::Flow as i32;
-    assert_eq!(Step::try_from(&shaped_flow).unwrap_err(), MalformedStep::ReduceShape, "only a reduce takes reduce options");
+    assert_eq!(
+        Step::try_from(&shaped_flow).unwrap_err(),
+        MalformedStep::ReduceShape,
+        "only a reduce takes reduce options"
+    );
 }

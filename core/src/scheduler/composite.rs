@@ -571,7 +571,8 @@ pub enum MalformedStep {
     #[error("a member batch names no composite")]
     NoComposite,
     #[error(
-        "a reduce needs fail_fast, its reducer, the one reducer stage taking its list, and a tree chunk of at least one item; only a reduce takes reduce options"
+        "a reduce needs fail_fast, its reducer, the one reducer stage taking its list, \
+         and a tree chunk of at least one item; only a reduce takes reduce options"
     )]
     ReduceShape,
     #[error("the bytes are not an encoded step description")]
