@@ -17,6 +17,7 @@ from kabudachi.config import Configuration, QueueOptions
 from kabudachi.errors import (
     CertificationError,
     CoalescedPayloadTooLargeError,
+    ConfigurationError,
     PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
@@ -1853,3 +1854,49 @@ def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
         "tests.queue_reconnect": 90_000,
         "tests.tiny_reconnect": 1,
     }
+
+
+def routed(request: Greeting) -> Greeting:
+    return request
+
+
+def pinned(request: Greeting) -> Greeting:
+    return request
+
+
+def test_a_router_picks_the_queue_of_a_task_that_names_none_where_it_is_submitted():
+    world = World(routed)
+    pinned_task = Task(
+        pinned,
+        registry=world.registry,
+        serializers=world.serializers,
+        name="tests.pinned",
+        queue="pinned",
+    )
+    seen = []
+
+    def router(name, value):
+        seen.append((name, value.text))
+        return {"gpu": "gpu", "none": None, "number": 7}.get(value.text, "")
+
+    world.configuration.configure(router=router, queue="fallback")
+    world.call("routed", Greeting(text="gpu"))
+    world.call("routed", Greeting(text="none"))
+    world.session.submit(pinned_task.definition, Greeting(text="gpu"))
+    # A body in a task process submits its input encoded; it is decoded here
+    # for the router.
+    world.session.submit_serialized(
+        "tests.routed", Greeting(text="gpu").SerializeToString(), SubmissionOptions()
+    )
+    for refused in ("bad", "number"):
+        with pytest.raises(ConfigurationError, match="router"):
+            world.call("routed", Greeting(text=refused))
+
+    assert [queue for *_, queue in world.runtime.submitted] == ["gpu", "fallback", "pinned", "gpu"]
+    assert seen == [
+        ("tests.routed", "gpu"),
+        ("tests.routed", "none"),
+        ("tests.routed", "gpu"),
+        ("tests.routed", "bad"),
+        ("tests.routed", "number"),
+    ]

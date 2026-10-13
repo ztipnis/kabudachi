@@ -40,6 +40,7 @@ from kabudachi.config import Configuration
 from kabudachi.errors import (
     BackpressureError,
     CoalescedPayloadTooLargeError,
+    ConfigurationError,
     PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
@@ -56,7 +57,7 @@ from kabudachi.errors import (
     UnknownTaskError,
     interrupted,
 )
-from kabudachi.config import UNSET
+from kabudachi.config import UNSET, Unset
 from kabudachi.execution import (
     CompactJob,
     Executor,
@@ -178,16 +179,22 @@ class Session:
         Safe to call from any thread. Raises `SerializationError`, before
         anything is queued, if `argument` is not what the task takes, and
         `PayloadTooLargeError` if the encoded `argument` alone is larger than
-        `memory_hard_limit`, and `RunStoppedError` once the run is stopping.
+        `memory_hard_limit`, `RunStoppedError` once the run is stopping, and
+        `ConfigurationError` if the router returns something that is not a
+        queue name or `None`.
         """
         serializer = self._serializers.get(definition.serializer)
         payload = serializer.encode(argument, definition.input_type)
-        return self._record(definition, payload, options or SubmissionOptions())
+        return self._record(definition, payload, options or SubmissionOptions(), lambda: argument)
 
     def _record(
-        self, definition: TaskDefinition, payload: bytes, options: SubmissionOptions
+        self,
+        definition: TaskDefinition,
+        payload: bytes,
+        options: SubmissionOptions,
+        value: Callable[[], Any],
     ) -> TaskHandle:
-        queue = self._configuration.resolve("queue", definition.queue)
+        queue = self._queue_of(definition, value)
         limit = self._runtime.payload_limit
         if limit is not None and len(payload) > limit:
             raise PayloadTooLargeError(
@@ -197,6 +204,24 @@ class Session:
             )
         settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
         return self._tasks.submit(definition, payload, options, settings)
+
+    def _queue_of(self, definition: TaskDefinition, value: Callable[[], Any]) -> str:
+        """The queue a task of `definition` goes to: its own, else the one
+        the router picks for its argument (`value()`, called only when a
+        router runs), else `queue`."""
+        if not isinstance(definition.queue, Unset):
+            return definition.queue
+        router = self._configuration.resolve("router")
+        if router is not None:
+            chosen = router(definition.name, value())
+            if chosen is not None:
+                if not isinstance(chosen, str) or not chosen.strip():
+                    raise ConfigurationError(
+                        f"the router returned {chosen!r} for {definition.name}; "
+                        "it must return a queue name or None"
+                    )
+                return chosen
+        return self._configuration.resolve("queue")
 
     def _reconnect_timeout_ms(self, definition: TaskDefinition, queue: str) -> int | None:
         """The reconnect timeout a run of `definition` sent to `queue`
@@ -220,7 +245,10 @@ class Session:
         definition = self._registry.get(definition_id)
         if definition is None:
             raise UnknownTaskError(f"this process has no task named {definition_id!r}")
-        return self._record(definition, payload, options)
+        serializer = self._serializers.get(definition.serializer)
+        return self._record(
+            definition, payload, options, lambda: serializer.decode(payload, definition.input_type)
+        )
 
     def submit_composite(self, kind: str, composite: Any, previous: Any) -> TaskHandle:
         """Starts a flow (`kind` "flow") or group a body in a task process called."""
