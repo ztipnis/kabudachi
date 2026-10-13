@@ -57,6 +57,10 @@ pub struct PyClaim {
     /// split over, and it reports the map that results.
     #[pyo3(get)]
     expansion: bool,
+    /// For a step of a reduce: its `(level, position)` in the reduce; a level
+    /// above 0 combines two results. `None` for any other task.
+    #[pyo3(get)]
+    reduce_node: Option<(u32, u64)>,
 }
 
 #[pymethods]
@@ -89,6 +93,7 @@ impl From<Claim> for PyClaim {
             composite_id,
             composite_index: claim.task.composite_index,
             expansion,
+            reduce_node: claim.task.reduce_node.as_ref().map(|node| (node.level, node.position)),
             task_id: claim.task.task_id().as_str().to_owned(),
             task_run_id: claim.task_run_id.as_str().to_owned(),
             definition_id: claim.task.task_definition_id().as_str().to_owned(),
