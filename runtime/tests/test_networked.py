@@ -462,9 +462,13 @@ def cut_off_by_its_deadline(cluster, tmp_path):
                 return task, holder
 
     cut_off, holder = eventually("a follower to run one of them", on_a_follower)
-    for task in held:
-        if task != cut_off:
-            leader.ask(cancel=task)
+    others = [task for task in held if task != cut_off]
+    for task in others:
+        leader.ask(cancel=task)
+    # Decided before the other workers stop: a cancel in flight to a stopped
+    # worker would be neither heard nor decided.
+    for task in others:
+        finished(cluster, task)
     text = held[cut_off]
     # With the other two stopped, nobody can tell the holder to stop its run:
     # only its own abort deadline can.
@@ -544,8 +548,7 @@ def one_on_each_worker(cluster, tmp_path, client, leader):
     each task's text, each text's worker, the task `client` runs itself, the
     one `leader` runs, and the one the other follower runs."""
     texts = {client.submit("hold", text=f"unreached-{n}", times=GATED): f"unreached-{n}" for n in range(3)}
-    # Idle workers poll for work at growing intervals, up to 5 s, and a worker
-    # just resumed or rejoined starts from its longest: each of three claims
+    # Idle workers poll for work at growing intervals, up to 5 s, so a claim
     # can wait one.
     holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()), timeout=45)
     [own] = [task for task, text in texts.items() if holders[text] is client]
