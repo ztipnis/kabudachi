@@ -27,12 +27,23 @@ struct Log {
     /// when `newest_only`.
     slots: BTreeMap<(u8, String, u32), usize>,
     page_revisions: BTreeMap<(String, u32), usize>,
+    /// How many Task revisions were published in all, counting every one
+    /// even when `newest_only` keeps just the newest of each Task.
+    task_revisions: usize,
 }
 
 impl Log {
+    fn expect_history(&self) -> &Log {
+        assert!(!self.newest_only, "a newest-only spy keeps no history to read by position");
+        self
+    }
+
     fn record(&mut self, record: ShardRecord) {
         let key = match &record {
-            ShardRecord::Task(record) => (0, record_task(record).task_id().as_str().to_string(), 0),
+            ShardRecord::Task(record) => {
+                self.task_revisions += 1;
+                (0, record_task(record).task_id().as_str().to_string(), 0)
+            }
             ShardRecord::Composite(record) => (1, composite_key(record.composite_id.as_ref()), 0),
             ShardRecord::Page(page) => {
                 let id = composite_key(page.composite_id.as_ref());
@@ -77,26 +88,28 @@ impl PublishedRevisions for Spy {
 
 impl Spy {
     /// A spy that keeps only the newest revision of each Task record,
-    /// composite record and page (and still counts every page revision), so
-    /// a 100k-member test holds one record per key, not every revision.
+    /// composite record and page (and still counts every page revision and
+    /// every Task revision), so a 100k-member test holds one record per key,
+    /// not every revision. What reads the log as a history (`mark`,
+    /// `published_since`, `revised_since`) has no meaning then and panics.
     pub fn newest_only() -> Spy {
         Spy(Rc::new(RefCell::new(Log { newest_only: true, ..Log::default() })))
     }
 
     /// How many revisions so far: a mark for `revised_since`.
     pub fn mark(&self) -> usize {
-        self.0.borrow().records.len()
+        self.0.borrow().expect_history().records.len()
     }
 
     /// Every record published after `mark`, in order, left in the log.
     pub fn published_since(&self, mark: usize) -> Vec<ShardRecord> {
-        self.0.borrow().records[mark..].to_vec()
+        self.0.borrow().expect_history().records[mark..].to_vec()
     }
 
     /// The tasks revised after `mark`, in order of publication: what the
     /// calls since changed, while the scheduler led.
     pub fn revised_since(&self, mark: usize) -> Vec<TaskId> {
-        self.0.borrow().records[mark..]
+        self.0.borrow().expect_history().records[mark..]
             .iter()
             .filter_map(task_record)
             .map(|record| record_task(record).task_id())
@@ -137,7 +150,14 @@ impl Spy {
     /// The newest revision published of page `index` of the composite `id`,
     /// if any.
     pub fn newest_page(&self, id: &CompositeId, index: u32) -> Option<CompositePage> {
-        self.0.borrow().records.iter().rev().find_map(|record| match record {
+        let log = self.0.borrow();
+        if log.newest_only {
+            return match log.slots.get(&(2, id.as_str().to_string(), index)).map(|slot| &log.records[*slot]) {
+                Some(ShardRecord::Page(page)) => Some(page.clone()),
+                _ => None,
+            };
+        }
+        log.records.iter().rev().find_map(|record| match record {
             ShardRecord::Page(page)
                 if page.index == index
                     && page.composite_id.as_ref().is_some_and(|held| held.value == id.as_str()) =>
@@ -146,6 +166,11 @@ impl Spy {
             }
             _ => None,
         })
+    }
+
+    /// How many Task revisions were published in all, of every Task.
+    pub fn task_revision_total(&self) -> usize {
+        self.0.borrow().task_revisions
     }
 
     /// How many revisions of page `index` of the composite `id` were published.

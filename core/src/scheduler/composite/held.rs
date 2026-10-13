@@ -97,6 +97,7 @@ impl Outcomes {
 
     /// Records `outcome` for member `index`, which has none yet.
     pub(super) fn insert(&mut self, index: u64, outcome: MemberOutcome) {
+        debug_assert!(!self.settled.contains_key(&index), "member {index} already has an outcome");
         match &outcome {
             MemberOutcome::Value { .. } | MemberOutcome::Child(_) => self.succeeded += 1,
             MemberOutcome::Failed(failure) if failure.kind == CANCELLED_KIND => self.cancelled += 1,

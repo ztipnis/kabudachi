@@ -267,16 +267,40 @@ fn a_hundred_thousand_item_map_streams_under_toggling_slow_down_once_each_and_in
     let map = submitted(&mut fixture, streamed_map(OnError::FailFast));
     let (mut sent, mut ran, mut waiting) = (0u64, 0u64, false);
     let mut toggles = Vec::new();
-    while ran < ITEMS {
+    let mut revisions_per_member = None;
+    for _ in 0..10 * ITEMS / MEMBER_BATCH_ITEMS {
+        if ran == ITEMS {
+            break;
+        }
         if !waiting && sent < ITEMS {
             let count = MEMBER_BATCH_ITEMS.min(ITEMS - sent);
             let batch = item_batch(&map, sent, count, sent + count == ITEMS);
+            let before = fixture.spy.task_revision_total();
             let accepted = fixture.scheduler.submit_members(batch.clone()).unwrap();
-            if sent == 4 * MEMBER_BATCH_ITEMS {
-                assert_eq!(fixture.scheduler.submit_members(batch).unwrap().members, accepted.members);
-            }
+            let made = fixture.spy.task_revision_total() - before;
+            assert_eq!(made % count as usize, 0, "every new member is made the same way");
+            let per_member = *revisions_per_member.get_or_insert(made / count as usize);
+            assert_eq!(made, count as usize * per_member);
             sent += count;
             waiting = accepted.slow_down;
+            if sent == 4 * MEMBER_BATCH_ITEMS {
+                let again = fixture.scheduler.submit_members(batch).unwrap();
+                assert_eq!(again.members, accepted.members);
+                assert_eq!(
+                    fixture.spy.task_revision_total() - before,
+                    made,
+                    "a batch asked again makes no member"
+                );
+                // Half of this batch is held; only the other half is new.
+                let half = MEMBER_BATCH_ITEMS / 2;
+                let overlapping = item_batch(&map, sent - half, MEMBER_BATCH_ITEMS, false);
+                let before = fixture.spy.task_revision_total();
+                let answer = fixture.scheduler.submit_members(overlapping).unwrap();
+                assert_eq!(answer.members, sent + half);
+                assert_eq!(fixture.spy.task_revision_total() - before, half as usize * per_member);
+                sent += half;
+                waiting |= answer.slow_down;
+            }
         } else {
             for index in ran..(ran + RUN_AT_ONCE).min(sent) {
                 let claim = run_member(&mut fixture, &map, index, &item(index));
@@ -290,14 +314,24 @@ fn a_hundred_thousand_item_map_streams_under_toggling_slow_down_once_each_and_in
             _ => None,
         }));
     }
+    assert_eq!(ran, ITEMS, "the submitter and the worker made progress every turn");
     assert!(toggles.iter().filter(|raised| **raised).count() >= 10, "SlowDown toggled: {toggles:?}");
+    assert!(
+        toggles.iter().enumerate().all(|(at, raised)| *raised == (at % 2 == 0)) && toggles.len() % 2 == 0,
+        "SlowDown was raised then cleared, alternately, and ended cleared: {toggles:?}"
+    );
+    assert!(!fixture.scheduler.slow_down());
     assert_eq!(fixture.scheduler.composite_status(&map).unwrap().state, CompositeState::Succeeded);
     let record = fixture.spy.newest_composite(&map).unwrap();
     assert_eq!((record.members, record.counts.unwrap().succeeded), (ITEMS, ITEMS));
+    let mut entries_seen = 0;
     for page in 0..record.pages {
         let entries = fixture.spy.newest_page(&map, page).unwrap().entries;
         assert_eq!(fixture.spy.page_revisions(&map, page), 1);
+        entries_seen += entries.len() as u64;
+        assert!(entries.windows(2).all(|pair| pair[0].index < pair[1].index), "page {page} is in order");
         for entry in entries {
+            assert_eq!(entry.index / PAGE_ENTRIES, u64::from(page), "entry {} is on its own page", entry.index);
             assert_eq!(
                 entry.outcome,
                 Some(composite_entry::Outcome::Value(Digest::blake3(&item(entry.index)).into())),
@@ -307,4 +341,5 @@ fn a_hundred_thousand_item_map_streams_under_toggling_slow_down_once_each_and_in
             );
         }
     }
+    assert_eq!(entries_seen, ITEMS, "every item has exactly one result");
 }
