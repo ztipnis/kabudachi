@@ -1,0 +1,22 @@
+[package]
+name = "kabudachi-redis-result-backend"
+version = "0.1.0"
+edition = "2024"
+autotests = false
+
+[lib]
+name = "kabudachi_redis_result_backend"
+
+[dependencies]
+kabudachi-core = { path = "../core" }
+kabudachi-redis-authority = { path = "../redis_authority" }
+redis = { version = "1.7", default-features = false, features = ["tls-rustls", "tls-rustls-webpki-roots"] }
+thiserror = "2"
+
+[dev-dependencies]
+kabudachi-testkit = { path = "../testkit" }
+kabudachi-valkey-test-support = { path = "../redis_authority/tests/support" }
+
+[[test]]
+name = "redis_result_backend_test"
+path = "tests/contract.rs"

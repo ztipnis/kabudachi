@@ -1692,6 +1692,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kabudachi-redis-result-backend"
+version = "0.1.0"
+dependencies = [
+ "kabudachi-core",
+ "kabudachi-redis-authority",
+ "kabudachi-testkit",
+ "kabudachi-valkey-test-support",
+ "redis",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kabudachi-testkit"
 version = "0.1.0"
 dependencies = [
@@ -1702,7 +1714,6 @@ dependencies = [
 name = "kabudachi-valkey-test-support"
 version = "0.1.0"
 dependencies = [
- "kabudachi-redis-authority",
  "redis",
  "tempfile",
 ]

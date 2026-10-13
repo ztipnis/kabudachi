@@ -15,12 +15,14 @@ const ADMIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum ServerMode {
     Standalone,
     Cluster,
-    /// A standalone server where `user` may run only the adapter's commands
-    /// on keys matching `key_pattern`, as the adapter's `url` connects.
+    /// A standalone server where `user` may run only `commands` on keys
+    /// matching `key_pattern`, as the adapter's `url` connects.
     StandaloneWithAcl {
         user: String,
         password: String,
         key_pattern: String,
+        /// The commands the user may run.
+        commands: &'static [&'static str],
     },
 }
 
@@ -158,10 +160,12 @@ impl ValkeyServer {
                         user,
                         password,
                         key_pattern,
+                        commands,
                     } => ServerMode::StandaloneWithAcl {
                         user: user.clone(),
                         password: password.clone(),
                         key_pattern: key_pattern.clone(),
+                        commands,
                     },
                 },
                 assign_slots,
@@ -258,6 +262,7 @@ impl ValkeyServer {
                 user,
                 password,
                 key_pattern,
+                commands,
             } => {
                 let mut rule = vec![
                     "ACL".to_string(),
@@ -270,11 +275,7 @@ impl ValkeyServer {
                     "resetchannels".into(),
                     "-@all".into(),
                 ];
-                rule.extend(
-                    kabudachi_redis_authority::COMMANDS
-                        .iter()
-                        .map(|command| format!("+{command}")),
-                );
+                rule.extend(commands.iter().map(|command| format!("+{command}")));
                 self.admin(&rule.iter().map(String::as_str).collect::<Vec<_>>());
             }
         }

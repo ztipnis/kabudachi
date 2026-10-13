@@ -61,7 +61,9 @@ pub enum ConfigError {
 
 impl RedisAuthorityConfig {
     /// Checks the config and returns each URL with its database path set.
-    pub(crate) fn validated_urls(&self) -> Result<Vec<String>, ConfigError> {
+    /// An adapter that connects on its own calls this once, up front, so a
+    /// bad config fails when the adapter is made, not at its first call.
+    pub fn validated_urls(&self) -> Result<Vec<String>, ConfigError> {
         self.check_url_count()?;
         let urls = self
             .urls

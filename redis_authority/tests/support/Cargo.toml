@@ -9,6 +9,5 @@ name = "valkey_test_support"
 path = "lib.rs"
 
 [dependencies]
-kabudachi-redis-authority = { path = "../.." }
 redis = { version = "1.7", default-features = false }
 tempfile = "3"

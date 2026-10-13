@@ -1,0 +1,28 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@crates//:defs.bzl", "all_crate_deps")
+
+rust_library(
+    name = "redis_result_backend",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "kabudachi_redis_result_backend",
+    edition = "2024",
+    deps = all_crate_deps(normal = True) + ["//core", "//redis_authority"],
+    visibility = ["//visibility:public"],
+)
+
+# Real-time: two expiry waits of under half a second each.
+rust_test(
+    name = "redis_result_backend_test",
+    srcs = glob(["tests/*.rs"]),
+    crate_root = "tests/contract.rs",
+    edition = "2024",
+    size = "small",
+    tags = ["no-remote-cache"],
+    deps = [
+        ":redis_result_backend",
+        "//core",
+        "//redis_authority",
+        "//redis_authority:valkey_test_support",
+        "//testkit",
+    ] + all_crate_deps(normal = True, normal_dev = True),
+)
