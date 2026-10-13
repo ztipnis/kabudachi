@@ -3,6 +3,8 @@
 
 use std::panic::AssertUnwindSafe;
 
+use kabudachi_core::protocol::ids::TaskId;
+use kabudachi_core::result_backend::{ResultBackend, ResultKey};
 use kabudachi_core::time::{Duration, RealClock, WallTime};
 use kabudachi_py_result_backend::PythonResultBackend;
 use kabudachi_testkit::{BackendAdapter, PassTime, check_result_backend_contract};
@@ -68,7 +70,24 @@ fn check_result_backend(
     })
 }
 
+/// What loading a key from `make_backend()` ends in, as text: the error the
+/// adapter answers with (waiting at most `timeout_ms` for the object), or
+/// `"stored nothing"` when the load answered. Called from any thread, the
+/// loop's own included.
+#[pyfunction]
+fn load_error(py: Python<'_>, make_backend: Py<PyAny>, event_loop: Py<PyAny>, timeout_ms: u64) -> PyResult<String> {
+    let object = make_backend.call0(py)?;
+    let backend = PythonResultBackend::new(object, event_loop)
+        .with_timeout(std::time::Duration::from_millis(timeout_ms));
+    let key = ResultKey::Task(TaskId::new("task"));
+    Ok(py.detach(|| match backend.load(&key) {
+        Ok(_) => "stored nothing".to_owned(),
+        Err(error) => error.to_string(),
+    }))
+}
+
 #[pymodule]
 fn _kabudachi_contract(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(check_result_backend, module)?)
+    module.add_function(wrap_pyfunction!(check_result_backend, module)?)?;
+    module.add_function(wrap_pyfunction!(load_error, module)?)
 }
