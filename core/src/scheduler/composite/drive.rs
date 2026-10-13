@@ -147,7 +147,16 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let fresh: Vec<(u64, StreamedMember)> =
             (start..).zip(batch.members).filter(|(index, _)| *index >= held).collect();
-        let needed: u64 = fresh.iter().map(|(_, member)| member.budget_bytes()).sum();
+        // A member that is a composite is weighed by what starting it takes
+        // (its record and the inputs of what it starts at once), so a batch
+        // is not accepted only for the members' first stages to be refused.
+        let needed: u64 = fresh
+            .iter()
+            .map(|(index, member)| match member {
+                StreamedMember::Stage(Stage::Composite(step)) => super::records::start_bytes(&id.child(*index), step),
+                _ => member.budget_bytes(),
+            })
+            .sum();
         let members: Vec<(u64, Stage)> = fresh
             .into_iter()
             .map(|(index, member)| composite.member_stage(member).map(|stage| (index, stage)))

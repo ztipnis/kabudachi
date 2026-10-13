@@ -97,6 +97,34 @@ fn a_chunked_item_weighs_its_whole_input_so_a_batch_that_cannot_hold_it_is_refus
 }
 
 #[test]
+fn a_batch_of_flows_weighs_each_flow_and_its_first_input_so_it_is_refused_whole_or_runs_whole() {
+    let flows = |group: &CompositeId| MemberBatch {
+        composite_id: group.clone(),
+        start_index: 0,
+        members: (0..2)
+            .map(|_| StreamedMember::Stage(Stage::Composite(flow_of(vec![task_stage("b", Some(&[9; 32]))]))))
+            .collect(),
+        last: false,
+    };
+    // What the batch takes of memory once it runs, read from a roomy leader.
+    let (mut roomy, group) = leading_with_room_for(streamed_group(OnError::FailFast), 1 << 20, 2 << 20);
+    let before = roomy.scheduler.memory_in_use();
+    roomy.scheduler.submit_members(flows(&group)).unwrap();
+    let cost = roomy.scheduler.memory_in_use() - before;
+
+    let (mut fixture, group) = leading_with_room_for(streamed_group(OnError::FailFast), 16, cost - 1);
+    assert!(matches!(fixture.scheduler.submit_members(flows(&group)), Err(SubmitRejection::Backpressure { .. })));
+    assert_eq!(fixture.scheduler.pending_len(), 0, "no flow of the refused batch started a task");
+    assert!(fixture.scheduler.composite_status(&group.child(0)).is_none(), "nor was a flow made");
+    assert_eq!(fixture.scheduler.composite_status(&group).unwrap().state, CompositeState::Running);
+    assert!(finished(&mut fixture).is_empty(), "the group was not failed by a refused batch");
+
+    let (mut fixture, group) = leading_with_room_for(streamed_group(OnError::FailFast), 16, cost);
+    fixture.scheduler.submit_members(flows(&group)).unwrap();
+    assert_eq!(fixture.scheduler.pending_len(), 2, "a batch that fits starts every flow's first stage");
+}
+
+#[test]
 fn a_sealed_composite_takes_no_new_member_but_answers_a_batch_it_took() {
     let mut fixture = Fixture::leading();
     let map = submitted(&mut fixture, streamed_map(OnError::FailFast));
