@@ -26,7 +26,7 @@ const ROLL_CALL_DEADLINE_MS: u64 = 250;
 
 #[derive(FromPyObject)]
 pub(super) struct NetworkedArguments {
-    shard: String,
+    pub(super) shard: String,
     pub(super) listen: String,
     heartbeat_interval_ms: u64,
     heartbeat_timeout_ms: u64,
@@ -42,6 +42,7 @@ pub(super) struct NetworkedArguments {
     replication_factor: usize,
     seed_rounds: u32,
     routing_refresh_ms: Option<u64>,
+    pub(super) health_listen: Option<String>,
 }
 
 /// The shard's coordination authority: a `redis://` or `rediss://` server.

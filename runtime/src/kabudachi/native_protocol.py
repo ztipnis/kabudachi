@@ -122,7 +122,8 @@ class OneNodeArguments:
     must not be above the hard one, which `kabudachi.configure` checks. An
     input larger than one message is kept in this runtime's own store as
     blobs and handed back whole with its claim; it counts against the
-    memory limits like any other input.
+    memory limits like any other input. With `health_listen` (`ip:port`;
+    port 0 picks one), the runtime serves `/healthz` and `/readyz` there.
     """
 
     worker_threads: int = _DEFAULT_WORKER_THREADS
@@ -130,6 +131,7 @@ class OneNodeArguments:
     result_ttl_ms: int = _DEFAULT_RESULT_TTL_MS
     memory_soft_limit: int | None = None
     memory_hard_limit: int | None = None
+    health_listen: str | None = None
 
 
 @dataclass(frozen=True)
@@ -159,7 +161,8 @@ class NetworkedArguments:
     roll-call deadline; `replication_factor` voters store each record;
     `seed_rounds` silent rounds pass before a worker with seeds founds the
     shard alone; `routing_refresh_ms` is the period of the routing crawl
-    nothing prompted.
+    nothing prompted. With `health_listen`, the worker serves `/healthz` and
+    `/readyz` there, as for `OneNodeArguments`.
     """
 
     shard: str
@@ -178,6 +181,7 @@ class NetworkedArguments:
     replication_factor: int = 3
     seed_rounds: int = 3
     routing_refresh_ms: int | None = None
+    health_listen: str | None = None
 
 
 @runtime_checkable
@@ -197,6 +201,23 @@ class Runtime(Protocol):
 
     def shard_id(self) -> str:
         """The incarnation of the shard this runtime founded at start."""
+        ...
+
+    def worker_id(self) -> str:
+        """This worker's id."""
+        ...
+
+    def shard_name(self) -> str:
+        """The name of this worker's shard: `local` for a one-node runtime."""
+        ...
+
+    def health_address(self) -> str | None:
+        """The `ip:port` the health endpoints are served on, or `None`
+        unless `health_listen` was given."""
+        ...
+
+    def registry_loaded(self) -> None:
+        """Says the worker is set up to take work, so `/readyz` can answer 200."""
         ...
 
     def submit(self, submission: SubmitArguments) -> str:

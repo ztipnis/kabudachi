@@ -8,6 +8,8 @@ import logging
 import pickle
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import timedelta
 
 import pytest
@@ -17,6 +19,7 @@ from kabudachi import config as config_module
 from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
+from kabudachi import session as session_module
 from kabudachi.config import Configuration
 from kabudachi import Durability, TaskStatus
 from kabudachi._native import RunState
@@ -49,6 +52,27 @@ def fresh_process_state(monkeypatch):
 
 def declare(function, **options):
     return kabudachi.task(name=f"tests.{function.__name__}", **options)(function)
+
+
+def test_a_one_node_worker_serves_health_and_is_ready_once_it_leads():
+    kabudachi.configure(health_listen="127.0.0.1:0")
+
+    async def main():
+        address = session_module.current_session().runtime.health_address()
+        statuses = []
+        for path in ("/healthz", "/readyz", "/missing"):
+            statuses.append(await asyncio.to_thread(_status, f"http://{address}{path}"))
+        return statuses
+
+    assert kabudachi.run(main) == [200, 200, 404]
+
+
+def _status(url: str) -> int:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
 
 
 def test_a_synchronous_task_is_run_and_its_result_awaited():

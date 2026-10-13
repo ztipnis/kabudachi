@@ -7,6 +7,7 @@ mod bridge;
 mod door;
 mod election;
 mod errors;
+mod health;
 mod local_node;
 mod networked;
 mod outcomes;

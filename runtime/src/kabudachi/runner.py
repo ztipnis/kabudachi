@@ -137,6 +137,7 @@ def _native_runtime(settings: Settings) -> Any:
                 result_ttl_ms=settings.result_ttl * 1000,
                 memory_soft_limit=settings.memory_soft_limit,
                 memory_hard_limit=settings.memory_hard_limit,
+                health_listen=settings.health_listen,
             ),
         )
     authority = None
@@ -162,6 +163,7 @@ def _native_runtime(settings: Settings) -> Any:
             seed_rounds=settings.seed_rounds,
             roll_call_deadline_ms=_optional_millis(settings.roll_call_deadline),
             routing_refresh_ms=_optional_millis(settings.routing_refresh),
+            health_listen=settings.health_listen,
         )
     )
 
@@ -750,6 +752,7 @@ class _WorkerRun:
         # Two loops, not `serve`: the event loop must outlive the claim loop,
         # through the drain, or events it has taken would be lost with it.
         claiming = self._claiming = asyncio.create_task(session.work())
+        native.registry_loaded()
         events = self._events = asyncio.create_task(session.watch_events())
         result = await _until_done_or_worker_stops(main(), claiming, events)
         await _until_done_or_worker_stops(session.wait_until_idle(), claiming, events)

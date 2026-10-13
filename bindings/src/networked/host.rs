@@ -4,6 +4,7 @@
 //! tasks submitted here, and the task that asks a new leader about those
 //! still awaited.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
@@ -32,6 +33,8 @@ pub(super) struct Host {
     handle: Handle,
     bridge: Bridge,
     observed: Arc<watch::Sender<Observed>>,
+    /// True while the pump task runs.
+    pumping: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     pump: Mutex<Option<JoinHandle<()>>>,
     /// The tasks that read result messages and ask a new leader.
@@ -67,7 +70,11 @@ impl Host {
         });
         let results = tokio.spawn(read_results(Arc::clone(&shared)));
         let outcomes = tokio.spawn(ask_after_leader_change(Arc::clone(&shared)));
+        let pumping = Arc::new(AtomicBool::new(true));
+        let pump_guard = StoppedOnDrop(Arc::clone(&pumping));
         let pump = tokio.spawn(async move {
+            // Dropped however this ends, a panic or an abort included.
+            let _pumping = pump_guard;
             let mut source = source;
             while let Some(work) = source.next_work().await {
                 match work {
@@ -84,6 +91,7 @@ impl Host {
             bridge: Bridge::new(handle.clone()),
             handle,
             observed,
+            pumping,
             worker: Mutex::new(Some(running)),
             pump: Mutex::new(Some(pump)),
             background: Mutex::new(vec![results, outcomes]),
@@ -96,6 +104,11 @@ impl Host {
 
     pub(super) fn handle(&self) -> &Handle {
         &self.handle
+    }
+
+    /// Whether the pump task still runs; it ends with the seam.
+    pub(super) fn pumping(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.pumping)
     }
 
     /// Stops the worker at once and shuts the runtime down; awaitables
@@ -130,6 +143,15 @@ impl Host {
             });
             runtime.shutdown_timeout(SHUTDOWN_GRACE);
         });
+    }
+}
+
+/// Marks the pump stopped when dropped.
+struct StoppedOnDrop(Arc<AtomicBool>);
+
+impl Drop for StoppedOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 

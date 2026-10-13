@@ -134,6 +134,7 @@ async def main() -> None:
         "address": native.address(),
         "shard": native.shard_id(),
         "certifies_locally": native.certifies_locally,
+        "health": native.health_address(),
     })
     while line := await asyncio.to_thread(sys.stdin.readline):
         command = json.loads(line)
