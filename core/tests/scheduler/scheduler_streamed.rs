@@ -280,6 +280,7 @@ fn a_hundred_thousand_item_map_streams_under_toggling_slow_down_once_each_and_in
             let made = fixture.spy.task_revision_total() - before;
             assert_eq!(made % count as usize, 0, "every new member is made the same way");
             let per_member = *revisions_per_member.get_or_insert(made / count as usize);
+            assert!(per_member > 0, "creating a member publishes its Task");
             assert_eq!(made, count as usize * per_member);
             sent += count;
             waiting = accepted.slow_down;

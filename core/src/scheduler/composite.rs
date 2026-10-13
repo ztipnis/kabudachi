@@ -356,15 +356,17 @@ impl StreamedMember {
 
     /// The member with its bound values spilled when its inline bytes pass
     /// `inline_bytes` (at most `MEMBER_BATCH_BYTES`, so any batch fits one
-    /// frame): an item's one value whole, a stage's values longer than
-    /// `INLINE_VALUE_BYTES`. Every value is owned by the streamed composite:
+    /// frame): an item's one value whole, a stage's values, each only when
+    /// longer than `INLINE_VALUE_BYTES`, since a manifest costs about that. Every value is owned by the streamed composite:
     /// a composite member's nested values too, since only a top-level group,
     /// a root, streams composite members.
     pub fn spill(self, inline_bytes: u64) -> (StreamedMember, Vec<SpilledValue>) {
         let inline_bytes = inline_bytes.min(MEMBER_BATCH_BYTES);
         let mut values = Vec::new();
         let member = match self {
-            StreamedMember::Item(BoundInput::Value(bytes)) if bytes.len() as u64 > inline_bytes => {
+            StreamedMember::Item(BoundInput::Value(bytes))
+                if bytes.len() as u64 > inline_bytes && bytes.len() > INLINE_VALUE_BYTES =>
+            {
                 StreamedMember::Item(spill_value(bytes, &mut values))
             }
             StreamedMember::Stage(stage) if stage.inline_bytes() > inline_bytes => {

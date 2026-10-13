@@ -50,10 +50,10 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome,
-    QuerySlowDown, RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted,
-    SlowDownState, StartAccepted, SubmitAccepted, SubmitComposite, SubmitMembers, SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse,
-    task_request, task_response,
+    CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome, QuerySlowDown,
+    RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, SlowDownState,
+    StartAccepted, SubmitAccepted, SubmitComposite, SubmitMembers, SubmitTask, TaskReject, TaskRejectReason,
+    TaskRequest, TaskResponse, task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::composite::{MemberBatch, Step, SubmittedComposite};

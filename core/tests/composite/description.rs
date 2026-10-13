@@ -2,10 +2,10 @@
 //! submitter: it must read back exactly, digest the same every time, and be
 //! refused when it cannot be driven.
 
+use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
-use kabudachi_core::manifest::Manifest;
 use kabudachi_core::scheduler::composite::{
     BoundField, BoundInput, BoundStep, CompositeKind, EXPANSION_DEFINITION, FieldValue, INLINE_VALUE_BYTES,
     MalformedStep, MemberBatch, OnError, Spilled, SpilledValue, Stage, Step, StreamedMember, TaskOptions,
@@ -289,6 +289,10 @@ fn a_streamed_member_spills_only_once_its_inline_bytes_pass_the_senders_bound() 
     let (spilled, values) = item.spill(999);
     assert_eq!(spilled, StreamedMember::Item(BoundInput::Chunked(Manifest::chunk(&value).manifest)));
     assert_eq!(values, [SpilledValue { bytes: value.clone() }], "an item's one value goes whole");
+
+    // A value no longer than a one-chunk manifest costs is never worth spilling.
+    let short = StreamedMember::Item(BoundInput::Value(vec![5; INLINE_VALUE_BYTES]));
+    assert_eq!(short.clone().spill(0), (short, Vec::new()), "a short item stays inline below any bound");
 
     let stage = StreamedMember::Stage(bound_group(vec![vec![1; INLINE_VALUE_BYTES], value.clone()]).stages.remove(1));
     let (spilled, values) = stage.clone().spill(10);

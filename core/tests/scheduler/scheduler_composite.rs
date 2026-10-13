@@ -596,6 +596,23 @@ fn a_returned_step_too_large_only_after_spilling_fails_its_run_and_a_spilled_lar
 }
 
 #[test]
+fn a_composite_is_refused_at_submit_for_its_structure_alone_and_one_with_large_values_is_taken() {
+    let mut fixture = Fixture::leading();
+    let one = |count| flow_of(vec![task_stage("a", Some(b"x")); count]);
+    let stage_len = one(2).encoded_len() - one(1).encoded_len();
+    let stages = (MAX_RECORD_BYTES / stage_len + 1) as usize;
+    let minted = fixture.scheduler.mint_composite(one(stages).spill().step, Some(worker()));
+    assert!(
+        matches!(fixture.scheduler.submit_composite(minted), Err(SubmitRejection::RecordTooLarge { .. })),
+        "too many stages pass a record whatever their values"
+    );
+
+    let large = flow_of(vec![task_stage("a", Some(&vec![0; 600 * 1024])); 3]).spill().step;
+    let minted = fixture.scheduler.mint_composite(large, Some(worker()));
+    assert!(fixture.scheduler.submit_composite(minted).is_ok(), "three 600 KiB values leave the step");
+}
+
+#[test]
 fn the_largest_step_a_record_can_carry_is_taken_and_one_byte_more_fails_its_run() {
     // Whether a step of this many payload bytes was taken, and the size of the record then published
     // with the empty version the limit is measured at.
