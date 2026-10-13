@@ -3059,6 +3059,12 @@ Open: a leader killed between a pipeline's stages can replay the pipeline's body
 
 Open: the docs pass after composites. The description of an implicit flow's lifetime (`Scheduler::end_continuation`, in the sections on coalescing and on leader-change reconciliation) and the exit criterion that says nothing over the network ends a continuation still describe the previous design, in which a worker ended a continuation itself; now the leader derives a continuation from the run that returned the step and ends it with the step. `RemoteResultUnavailableError` is still described as raised by every await on a networked worker, though a flow, group or returned step awaited there now runs on the leader.
 
+Open: a leader's refused write to a record it no longer holds is forgotten (`Repair::check` drops the retry), while the write ledger's refusal of that record stands until the scheduler stops leading. Answers naming such a record keep getting `NotLeader`. Exposure: needs a refusal and the record's removal before the retry falls due; rare. Impact: severe for the clients concerned, which spin on `NotLeader` for the leader's tenure. The fix is to clear the ledger's refusal when the retry is dropped.
+
+Open: no per-peer budget on a leader's record writes (`net/src/messenger/record_queries.rs`), so a burst of writes to one holder is refused wholesale when kad's 32 streams per connection are taken or its 5 s query timeout passes. Exposure: plausible, a leader serving many concurrent completions, or a slow or overloaded holder. Impact: severe until refused writes are published again, which `Repair` now does oldest-due first. Before that fix a refused composite starved behind refused Task retries, its ledger refusal never cleared, and every answer naming the composite was `NotLeader` for the leader's tenure, with the final composite revision unstored so a takeover rebuilt from an older record. A per-peer budget would shrink the refusal wave.
+
+Open: no net-level burst test of a large map's completion. Wanted: 300 members completed in one `with()`, after which `submit_members` must return `CompositeFinished` within a deadline.
+
 ### Phase 7: observability
 
 Prometheus and tracing should exist earlier for development, but this phase hardens:
