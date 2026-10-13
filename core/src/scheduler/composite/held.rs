@@ -96,6 +96,20 @@ impl Composite {
         })
     }
 
+    /// Whether page `page` should go out now: the composite is over, or every
+    /// index the page covers has settled. A page of a composite that may still
+    /// grow is whole only when it is full.
+    fn page_due(&self, page: u32) -> bool {
+        if self.state != CompositeState::Running {
+            return true;
+        }
+        let first = u64::from(page) * PAGE_ENTRIES;
+        let end = first + PAGE_ENTRIES;
+        let end = if self.sealed { end.min(self.members) } else { end };
+        let width = end.saturating_sub(first);
+        (self.outcomes.len() as u64) >= width && self.outcomes.range(first..end).count() as u64 == width
+    }
+
     /// How many pages the settled outcomes take.
     pub(in crate::scheduler) fn pages(&self) -> u32 {
         self.outcomes
@@ -128,6 +142,9 @@ pub(in crate::scheduler) struct Composites {
     pub(in crate::scheduler) held: BTreeMap<CompositeId, Composite>,
     pub(in crate::scheduler) unpublished: BTreeSet<CompositeId>,
     pub(in crate::scheduler) unpublished_pages: BTreeSet<(CompositeId, u32)>,
+    /// Pages that changed but are not whole yet, so are not written until
+    /// they are or their composite is over.
+    unwritten_pages: BTreeSet<(CompositeId, u32)>,
     /// The Tasks whose ends are being settled into their composites right
     /// now, outermost first: a composite that ends meanwhile says so.
     pub(in crate::scheduler) settling: Vec<TaskId>,
@@ -152,6 +169,31 @@ impl Composites {
         self.unpublished.insert(id.clone());
         for page in 0..composite.pages() {
             self.unpublished_pages.insert((id.clone(), page));
+        }
+    }
+
+    /// Page `page` of the held composite `id` changed: it is written at the
+    /// next publication if it is due, and kept back otherwise.
+    pub(super) fn page_changed(&mut self, id: &CompositeId, page: u32) {
+        let key = (id.clone(), page);
+        if self.held[id].page_due(page) {
+            self.unwritten_pages.remove(&key);
+            self.unpublished_pages.insert(key);
+        } else {
+            self.unwritten_pages.insert(key);
+        }
+    }
+
+    /// The composite `id` is over: every page kept back is written now.
+    pub(super) fn release_pages(&mut self, id: &CompositeId) {
+        let kept: Vec<(CompositeId, u32)> = self
+            .unwritten_pages
+            .range((id.clone(), 0)..=(id.clone(), u32::MAX))
+            .cloned()
+            .collect();
+        for key in kept {
+            self.unwritten_pages.remove(&key);
+            self.unpublished_pages.insert(key);
         }
     }
 
@@ -218,6 +260,7 @@ impl Composites {
         });
         self.unpublished.remove(id);
         self.unpublished_pages.retain(|(composite, _)| composite != id);
+        self.unwritten_pages.retain(|(composite, _)| composite != id);
         if let Some(finished_at) = self.finished_at.remove(id) {
             self.finished.remove(&(finished_at, id.clone()));
         }

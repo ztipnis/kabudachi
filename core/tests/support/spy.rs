@@ -102,6 +102,19 @@ impl Spy {
         })
     }
 
+    /// How many revisions of page `index` of the composite `id` were published.
+    pub fn page_revisions(&self, id: &CompositeId, index: u32) -> usize {
+        self.0
+            .borrow()
+            .iter()
+            .filter(|record| {
+                matches!(record, ShardRecord::Page(page)
+                    if page.index == index
+                        && page.composite_id.as_ref().is_some_and(|held| held.value == id.as_str()))
+            })
+            .count()
+    }
+
     /// Every revision the scheduler published of `task`, in order.
     pub fn revisions_of(&self, task: &TaskId) -> Vec<TaskRecord> {
         self.revisions()

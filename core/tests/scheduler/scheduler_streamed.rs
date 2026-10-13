@@ -7,7 +7,7 @@ use kabudachi_core::protocol::generated::composite_entry;
 use kabudachi_core::protocol::ids::CompositeId;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
-    CompositeState, MemberBatch, MembersAccepted, OnError, Stage, StreamedMember,
+    CompositeState, MemberBatch, MembersAccepted, OnError, PAGE_ENTRIES, Stage, StreamedMember,
 };
 use kabudachi_core::scheduler::{ClaimRejection, SubmitRejection};
 
@@ -151,4 +151,26 @@ fn each_accepted_batch_says_whether_slow_down_is_raised() {
         run_member(&mut fixture, &map, index, b"r");
     }
     assert!(!fixture.scheduler.slow_down(), "the map is over and weighs nothing");
+}
+
+#[test]
+fn a_page_is_written_once_it_is_whole_or_its_composite_is_over_and_never_in_between() {
+    let mut fixture = Fixture::leading();
+    let map = submitted(&mut fixture, streamed_map(OnError::CollectAll));
+    let total = PAGE_ENTRIES + 2;
+    fixture.scheduler.submit_members(item_batch(&map, 0, PAGE_ENTRIES, false)).unwrap();
+    fixture.scheduler.submit_members(item_batch(&map, PAGE_ENTRIES, 2, true)).unwrap();
+    for index in 0..PAGE_ENTRIES - 1 {
+        run_member(&mut fixture, &map, index, b"r");
+    }
+    assert!(fixture.spy.newest_page(&map, 0).is_none(), "page 0 is not whole yet");
+    run_member(&mut fixture, &map, PAGE_ENTRIES - 1, b"r");
+    assert_eq!(fixture.spy.page_revisions(&map, 0), 1, "page 0 went out once, whole");
+    run_member(&mut fixture, &map, PAGE_ENTRIES, b"r");
+    assert!(fixture.spy.newest_page(&map, 1).is_none());
+    fail_member(&mut fixture, &map, PAGE_ENTRIES + 1, "ValueError");
+    assert_eq!(fixture.spy.newest_page(&map, 1).unwrap().entries.len(), 2);
+    let record = fixture.spy.newest_composite(&map).unwrap();
+    assert_eq!((record.members, record.sealed, record.finished), (total, true, true));
+    assert_eq!(record.counts.unwrap().failed, 1);
 }

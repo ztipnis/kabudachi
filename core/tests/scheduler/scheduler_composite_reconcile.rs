@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::composite_entry;
+use kabudachi_core::protocol::generated::{CompositeEntry, CompositePage, composite_entry};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
@@ -391,8 +391,17 @@ fn a_composite_whose_page_is_learnt_after_the_rebuild_moves_on_once_it_is_learnt
     );
     run_member(&mut old, &group, 0, b"a");
     let mut rebuild = rebuild_losing(&old, 0, |_| false);
-    let pages = std::mem::take(&mut rebuild.pages);
-    assert!(!pages.is_empty(), "the member's outcome was published on a page");
+    assert!(rebuild.pages.is_empty(), "a page is not written before it is whole");
+    let page = CompositePage {
+        version: rebuild.composites[0].version.clone(),
+        entries: vec![CompositeEntry {
+            index: 0,
+            outcome: Some(composite_entry::Outcome::Value(Digest::blake3(b"a").into())),
+            producer: Some(TaskDefinitionId::new("a").into()),
+        }],
+        ..page(&group, 0, 0, 0)
+    };
+    let pages = vec![page];
     rebuild.uncertain_composites.insert(group.clone());
     let mut new = took_over(&old, rebuild);
     new.scheduler

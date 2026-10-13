@@ -502,11 +502,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         composite.outcomes.insert(index, outcome);
         let pages_after = composite.pages();
         self.composites.unpublished.insert(id.clone());
-        self.composites.unpublished_pages.insert((id.clone(), (index / PAGE_ENTRIES) as u32));
+        self.composites.page_changed(id, (index / PAGE_ENTRIES) as u32);
         // The record now names every page up to the newest, so the pages
-        // below the one that grew it are published, empty, with it.
+        // below the one that grew it are due with it once they are whole.
         for page in pages_before..pages_after {
-            self.composites.unpublished_pages.insert((id.clone(), page));
+            self.composites.page_changed(id, page);
         }
         true
     }
@@ -563,6 +563,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let pages = composite.pages();
         self.budget.give_back(bytes);
         self.composites.record_finished(id, now);
+        self.composites.release_pages(id);
         self.composites.unpublished.insert(id.clone());
         let parent_task = match &parent {
             Some(CompositeParent::Task(task)) => Some(task.clone()),
