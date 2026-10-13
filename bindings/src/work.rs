@@ -175,6 +175,10 @@ pub struct PyEvent {
     /// failed.
     #[pyo3(get)]
     failure_message: String,
+    /// For `COMPOSITE_FINISHED`: the Task whose run raised the error that
+    /// ended the composite, when a run did.
+    #[pyo3(get)]
+    failure_task_id: Option<String>,
     /// For `COMPOSITE_FINISHED`: the composite that is over.
     #[pyo3(get)]
     composite_id: String,
@@ -238,6 +242,7 @@ impl PyEvent {
             composite_state: None,
             failure_kind: String::new(),
             failure_message: String::new(),
+            failure_task_id: None,
             composite_id: String::new(),
             parent_task_id: None,
         }
@@ -344,8 +349,9 @@ impl From<Event> for PyEvent {
                 ..nothing
             },
             Event::CompositeFinished(finished) => {
-                let failure = finished.failure.unwrap_or(Failure { kind: String::new(), message: String::new() });
+                let failure = finished.failure.unwrap_or(Failure::new("", ""));
                 PyEvent {
+                    failure_task_id: failure.task.map(|task| task.as_str().to_owned()),
                     composite_id: finished.composite_id.as_str().to_owned(),
                     parent_task_id: finished.parent_task.map(|task| task.as_str().to_owned()),
                     composite_state: Some(state_name(finished.state)),

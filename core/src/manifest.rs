@@ -10,7 +10,7 @@ use prost::Message as _;
 use crate::blob::BlobKey;
 use crate::protocol::digest::{Digest, InvalidDigest};
 use crate::protocol::generated::{self, manifest_entry};
-use crate::protocol::ids::CompositeId;
+use crate::protocol::ids::{CompositeId, TaskId};
 use crate::scheduler::MAX_SUBMISSION_BYTES;
 
 /// How large each blob of a cut payload is; the last may be shorter.
@@ -60,6 +60,38 @@ pub struct Failure {
     /// The error's type name.
     pub kind: String,
     pub message: String,
+    /// The Task whose run failed, when a Task's run did: the worker that ran
+    /// it keeps the error it raised under this id. A composite that ends on a
+    /// member's failure carries the member's on.
+    pub task: Option<TaskId>,
+}
+
+impl Failure {
+    /// A failure that no Task's run raised.
+    pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
+        Failure { kind: kind.into(), message: message.into(), task: None }
+    }
+
+    /// This failure as the failure of `task`'s run.
+    pub fn of_task(self, task: TaskId) -> Self {
+        Failure { task: Some(task), ..self }
+    }
+}
+
+impl From<Failure> for generated::Failure {
+    fn from(failure: Failure) -> Self {
+        generated::Failure { kind: failure.kind, message: failure.message, task: failure.task.map(Into::into) }
+    }
+}
+
+impl From<&generated::Failure> for Failure {
+    fn from(wire: &generated::Failure) -> Self {
+        Failure {
+            kind: wire.kind.clone(),
+            message: wire.message.clone(),
+            task: wire.task.clone().map(TaskId::from),
+        }
+    }
 }
 
 /// One part of a manifest: a blob of a cut payload, or one outcome of a list.
@@ -238,9 +270,7 @@ impl From<ManifestEntry> for generated::ManifestEntry {
     fn from(entry: ManifestEntry) -> Self {
         let entry = match entry {
             ManifestEntry::Blob(key) => manifest_entry::Entry::Blob(key.digest().into()),
-            ManifestEntry::Failure(Failure { kind, message }) => {
-                manifest_entry::Entry::Failure(generated::Failure { kind, message })
-            }
+            ManifestEntry::Failure(failure) => manifest_entry::Entry::Failure(failure.into()),
             ManifestEntry::Inline(bytes) => manifest_entry::Entry::Inline(bytes),
             ManifestEntry::Page { composite, page } => manifest_entry::Entry::Page(generated::PageRef {
                 composite_id: Some(composite.into()),
@@ -269,10 +299,7 @@ impl TryFrom<&generated::ManifestEntry> for ManifestEntry {
             Some(manifest_entry::Entry::Blob(digest)) => {
                 Ok(ManifestEntry::Blob(BlobKey::from(&Digest::try_from(digest)?)))
             }
-            Some(manifest_entry::Entry::Failure(failure)) => Ok(ManifestEntry::Failure(Failure {
-                kind: failure.kind.clone(),
-                message: failure.message.clone(),
-            })),
+            Some(manifest_entry::Entry::Failure(failure)) => Ok(ManifestEntry::Failure(failure.into())),
             Some(manifest_entry::Entry::Inline(bytes)) => Ok(ManifestEntry::Inline(bytes.clone())),
             Some(manifest_entry::Entry::Page(page)) => Ok(ManifestEntry::Page {
                 composite: page

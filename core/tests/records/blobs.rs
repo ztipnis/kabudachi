@@ -107,10 +107,7 @@ fn a_payload_past_the_inline_bound_is_cut_into_chunks_that_join_back_only_whole_
 
     // A list of outcomes is not one payload.
     let outcomes = Manifest::new(
-        vec![ManifestEntry::Failure(Failure {
-            kind: "ValueError".into(),
-            message: "no".into(),
-        })],
+        vec![ManifestEntry::Failure(Failure::new("ValueError", "no"))],
         0,
     );
     assert_eq!(outcomes.join(|_| None), Err(Unresolved::NotAPayload));

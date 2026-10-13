@@ -236,10 +236,7 @@ fn resolving_entry<'a, S: CompositeSource>(
                 let bytes = read_result(source, &owner, &key).await?;
                 Ok(Resolved::Value { producer, bytes })
             }
-            composite_entry::Outcome::Failure(failure) => Ok(Resolved::Failure(Failure {
-                kind: failure.kind.clone(),
-                message: failure.message.clone(),
-            })),
+            composite_entry::Outcome::Failure(failure) => Ok(Resolved::Failure(Failure::from(failure))),
             composite_entry::Outcome::Child(child) => {
                 let child: CompositeId = child.clone().into();
                 resolving_results(source, &child).await

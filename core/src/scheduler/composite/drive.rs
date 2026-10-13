@@ -219,7 +219,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         .as_member_of(id.clone(), 0);
         let submitted = Submitted::received(id.member_task(0), WallTime::now(&self.clock), submission, &self.clock);
         if let Err(refused) = self.record_submission(submitted) {
-            let failure = Failure { kind: refused.kind().to_owned(), message: refused.to_string() };
+            let failure = Failure::new(refused.kind(), refused.to_string());
             self.settle_member(id, 0, MemberOutcome::Failed(failure));
         }
     }
@@ -271,10 +271,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return;
         }
         let Ok(input) = self.stage_input(id, index) else {
-            let failure = Failure {
-                kind: LOST_KIND.to_owned(),
-                message: "the results of the stage before were not found".to_owned(),
-            };
+            let failure = Failure::new(LOST_KIND, "the results of the stage before were not found");
             self.finish_composite(id, CompositeState::Failed, Some(failure));
             return;
         };
@@ -339,7 +336,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             &self.clock,
         );
         if let Err(refused) = self.record_submission(submitted) {
-            let failure = Failure { kind: refused.kind().to_owned(), message: refused.to_string() };
+            let failure = Failure::new(refused.kind(), refused.to_string());
             self.settle_member(id, index, MemberOutcome::Failed(failure));
         }
     }
@@ -371,20 +368,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                     Some(child) if child.state == CompositeState::Running => return None,
                     Some(child) if child.state == CompositeState::Succeeded => MemberOutcome::Child(continuation),
                     Some(child) => MemberOutcome::Failed(child.failure_or_cancelled()),
-                    None => MemberOutcome::Failed(Failure {
-                        kind: LOST_KIND.to_owned(),
-                        message: "the record of the step the task returned was not found".to_owned(),
-                    }),
+                    None => MemberOutcome::Failed(Failure::new(LOST_KIND, "the record of the step the task returned was not found")),
                 }
             }
             TaskRunState::Succeeded => match run.result_digest.as_ref().and_then(|digest| Digest::try_from(digest).ok()) {
                 Some(digest) => MemberOutcome::Value { digest, producer: self.tasks[task_id].task_definition_id() },
-                None => MemberOutcome::Failed(Failure {
-                    kind: LOST_KIND.to_owned(),
-                    message: "the run succeeded without a readable result digest".to_owned(),
-                }),
+                None => MemberOutcome::Failed(Failure::new(LOST_KIND, "the run succeeded without a readable result digest")),
             },
-            state => MemberOutcome::Failed(failure_of(state, &run.failure_kind, &run.failure_message)),
+            state => MemberOutcome::Failed(failure_of(task_id, state, &run.failure_kind, &run.failure_message)),
         };
         Some(outcome)
     }

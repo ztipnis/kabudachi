@@ -561,7 +561,7 @@ impl NetworkedRuntime {
 
     /// Returns an awaitable that resolves to a composite's results: `("list",
     /// [...])` of its stages' or members' results in order, each `("value",
-    /// producer_definition_id, bytes)`, `("failure", kind, message)` or a
+    /// producer_definition_id, bytes)`, `("failure", kind, message, task_id)` or a
     /// nested `("list", [...])`. A record, page or blob not found is asked
     /// for again for up to the reconnect timeout.
     ///

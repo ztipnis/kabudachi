@@ -158,6 +158,8 @@ class Session:
         self._composites = Composites(self, self._hosted)
         # Runs of composites' members, and expansions, under way here.
         self._members_running = 0
+        # Finished composites whose results are being read to settle a handle.
+        self._deliveries = 0
         # What this does with each kind of event the runtime decides on its own.
         self._event_handlers: dict[EventKind, Callable[[Any], None]] = {
             EventKind.EXPIRED: self._on_expired,
@@ -453,15 +455,39 @@ class Session:
         with the failure that ended it, or as cancelled."""
         match event.state:
             case "succeeded":
+                self._deliveries += 1
                 if not self._hosted.spawn(self._deliver(handle, event.composite_id)):
+                    self._deliveries -= 1
                     handle._fail(RunStoppedError("the run ended before the results could be read"))
             case "failed":
                 handle._fail(self._failure_of(handle.task_id, event))
             case _:
                 handle._fail(TaskCancelledError(f"{handle.task_id} was cancelled"))
+        self._release_member_errors()
+
+    def _awaits_composites(self) -> bool:
+        """Whether anything here still waits for a composite, so may be given
+        the error a member of it failed with."""
+        return bool(
+            self._composites.pending() or self._tasks.continuations() or self._deliveries > 0
+        )
+
+    def _release_member_errors(self) -> None:
+        """Drops the errors kept for members once nothing here awaits a
+        composite: those that were not taken, such as a failed sibling of the
+        member that ended its composite, will not be asked for."""
+        if not self._awaits_composites():
+            self._tasks.drop_member_errors()
 
     async def _deliver(self, handle: TaskHandle, composite_id: str) -> None:
         """Resolves `handle` with the results of the finished composite."""
+        try:
+            await self._resolve_with_results(handle, composite_id)
+        finally:
+            self._deliveries -= 1
+            self._release_member_errors()
+
+    async def _resolve_with_results(self, handle: TaskHandle, composite_id: str) -> None:
         try:
             resolved = await self._runtime.composite_results(composite_id)
         except Exception as error:
@@ -484,7 +510,7 @@ class Session:
         the error of the member that ended it if this process ran that member,
         else an error of the kind and message the leader gives."""
         kind, message = event.failure_kind, event.failure_message
-        held = self._tasks.member_error(kind, message)
+        held = self._tasks.member_error(event.failure_task_id)
         if held is not None:
             return held
         known = _KNOWN_FAILURES.get(kind)
@@ -500,8 +526,8 @@ class Session:
         failure = self._own_failure if own_errors else TaskFailure
         return decode_resolved(self._registry, self._serializers, resolved, failure)
 
-    def _own_failure(self, kind: str, message: str) -> BaseException:
-        return self._tasks.member_error(kind, message) or TaskFailure(kind, message)
+    def _own_failure(self, kind: str, message: str, task_id: str | None) -> BaseException:
+        return self._tasks.member_error(task_id) or TaskFailure(kind, message)
 
     def _on_outcome(self, event: Any) -> None:
         if event.state is None:
@@ -631,6 +657,7 @@ class Session:
                 self._tasks.failed(
                     task_id, RunStoppedError("the run stopped before this task's step could finish")
                 )
+        self._release_member_errors()
 
     def _run_callback(self, function: Any, value: Any) -> None:
         """Runs a task callback on the event loop, from whichever thread the
@@ -876,10 +903,10 @@ class Session:
                 self._tasks.held_body_abandoned(claim.task_id, body.exited)
         message = _message_of(error)
         retried = self._report_failure(claim, kind, message)
-        if claim.composite_id is not None and not retried:
+        if claim.composite_id is not None and not retried and self._awaits_composites():
             # Kept before anything else is heard of the member, for whoever
             # awaits its composite.
-            self._tasks.member_failed(kind, message, error)
+            self._tasks.member_failed(claim.task_id, error)
         if run.holds_handle:
             if retried:
                 self._tasks.retry_queued(claim.task_id)
@@ -972,8 +999,8 @@ class Session:
             self._runtime.complete(claim.task_run_id, continuation=("map", request.on_error, members))
         except Exception as error:
             kind, message = _kind_of(error), _message_of(error)
-            if not self._report_failure(claim, kind, message):
-                self._tasks.member_failed(kind, message, error)
+            if not self._report_failure(claim, kind, message) and self._awaits_composites():
+                self._tasks.member_failed(claim.task_id, error)
         finally:
             self._member_ended()
 

@@ -26,10 +26,10 @@ class Given:
     """What the run of a composite's member is given besides its claim, as the
     leader reads it out. `fields` are the `(name, value)` pairs bound into the
     member's input. `resolved` is what it takes from before it
-    (`("value", producer, bytes)`, `("failure", kind, message)` or `("list",
-    [...])`), `("input", bytes)` for its own whole input when that was stored
-    as blobs, or `None` when the claim's `serialized_input` is the whole
-    input."""
+    (`("value", producer, bytes)`, `("failure", kind, message, task_id)` or
+    `("list", [...])`), `("input", bytes)` for its own whole input when that
+    was stored as blobs, or `None` when the claim's `serialized_input` is the
+    whole input."""
 
     fields: tuple[tuple[str, Any], ...]
     resolved: Any
@@ -147,15 +147,20 @@ def task_named(
     return definition
 
 
+def _task_failure(kind: str, message: str, task_id: str | None) -> TaskFailure:
+    return TaskFailure(kind, message)
+
+
 def decode_resolved(
     registry: TaskRegistry,
     serializers: SerializerRegistry,
     resolved: Any,
-    failure: Callable[[str, str], Any] = TaskFailure,
+    failure: Callable[[str, str, str | None], Any] = _task_failure,
 ) -> Any:
     """The value a stage's `resolved` result stands for: a value decoded by
     the serializer and output type of the task that produced it, a failure as
-    `failure(kind, message)`, a list of either as a list. Raises
+    `failure(kind, message, task_id)`, a list of either as a list. `task_id`
+    is the task whose run raised the error, or `None`. Raises
     `UnknownTaskError` for a producer this process does not have."""
     match resolved:
         case ("value", producer, data):
@@ -163,8 +168,8 @@ def decode_resolved(
             if definition is None:
                 raise UnknownTaskError(f"this process has no task named {producer!r}")
             return serializers.get(definition.serializer).decode(data, definition.output_type)
-        case ("failure", kind, message):
-            return failure(kind, message)
+        case ("failure", kind, message, task_id):
+            return failure(kind, message, task_id)
         case ("list", entries):
             return [decode_resolved(registry, serializers, entry, failure) for entry in entries]
     raise ValueError(f"cannot read {resolved!r} as a stage's result")

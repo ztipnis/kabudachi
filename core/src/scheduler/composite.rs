@@ -197,10 +197,7 @@ impl CompositeFinished {
         Some(CompositeFinished {
             composite_id: CompositeId::from(record.composite_id.clone()?),
             state,
-            failure: record
-                .failure
-                .as_ref()
-                .map(|failure| Failure { kind: failure.kind.clone(), message: failure.message.clone() }),
+            failure: record.failure.as_ref().map(Failure::from),
             pages: record.pages,
             client: record.client.clone().map(WorkerId::from),
             parent_task,
@@ -218,10 +215,7 @@ impl From<&CompositeFinished> for generated::CompositeFinished {
             composite_id: Some(finished.composite_id.clone().into()),
             state: generated::CompositeState::from(finished.state) as i32,
             results: Some(finished.results().into()),
-            failure: finished
-                .failure
-                .clone()
-                .map(|Failure { kind, message }| generated::Failure { kind, message }),
+            failure: finished.failure.clone().map(Into::into),
             parent_task: finished.parent_task.clone().map(Into::into),
         }
     }
@@ -255,10 +249,7 @@ impl TryFrom<&generated::CompositeFinished> for CompositeFinished {
         Ok(CompositeFinished {
             composite_id,
             state,
-            failure: wire.failure.as_ref().map(|failure| Failure {
-                kind: failure.kind.clone(),
-                message: failure.message.clone(),
-            }),
+            failure: wire.failure.as_ref().map(Failure::from),
             pages,
             client: None,
             parent_task: wire.parent_task.clone().map(TaskId::from),
@@ -287,7 +278,7 @@ pub enum InputShape {
 /// The failure a member that ended in `state` is recorded with: the kind its
 /// run failed with when it has one, else the kind the state itself names,
 /// with the run's own message when it failed.
-pub(crate) fn failure_of(state: TaskRunState, kind: &str, message: &str) -> Failure {
+pub(crate) fn failure_of(task: &TaskId, state: TaskRunState, kind: &str, message: &str) -> Failure {
     let by_state = match state {
         TaskRunState::Failed => "",
         TaskRunState::Expired => EXPIRED_KIND,
@@ -303,7 +294,7 @@ pub(crate) fn failure_of(state: TaskRunState, kind: &str, message: &str) -> Fail
     };
     let kind = if kind.is_empty() { by_state } else { kind };
     let message = if state == TaskRunState::Failed { message } else { "" };
-    Failure { kind: kind.to_owned(), message: message.to_owned() }
+    Failure::new(kind, message).of_task(task.clone())
 }
 
 /// A composite as its submitter described it.

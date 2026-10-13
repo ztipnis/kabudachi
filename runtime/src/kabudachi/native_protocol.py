@@ -69,6 +69,9 @@ class Event(Protocol):
     failure_message: str
     """For `EventKind.COMPOSITE_FINISHED`: the error's message, when the
     composite failed."""
+    failure_task_id: str | None
+    """For `EventKind.COMPOSITE_FINISHED`: the task whose run raised the error
+    that ended the composite, when a run did."""
     composite_id: str
     """For `EventKind.COMPOSITE_FINISHED`: the composite that is over."""
     parent_task_id: str | None
@@ -345,7 +348,7 @@ class Runtime(Protocol):
 
     async def composite_results(self, composite_id: str) -> Any:
         """A composite's results in order: `("list", [...])` of `("value",
-        producer_definition_id, bytes)`, `("failure", kind, message)` and
+        producer_definition_id, bytes)`, `("failure", kind, message, task_id)` and
         nested lists. Raises `RuntimeError` when a result is no longer held."""
 
     async def resolve_expansion(self, task_run_id: str) -> Any:

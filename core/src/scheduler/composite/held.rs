@@ -55,7 +55,7 @@ impl Composite {
     pub(super) fn failure_or_cancelled(&self) -> Failure {
         self.failure
             .clone()
-            .unwrap_or_else(|| Failure { kind: CANCELLED_KIND.to_owned(), message: String::new() })
+            .unwrap_or_else(|| Failure::new(CANCELLED_KIND, ""))
     }
 
     /// The lowest-indexed failure, if a failure ends this composite.

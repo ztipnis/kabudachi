@@ -693,6 +693,63 @@ def test_a_collect_all_failure_reaches_awaiting_code_and_the_next_stage_as_the_m
     assert staged[-1] == "after"
 
 
+def test_a_member_that_failed_alike_but_ended_nothing_is_not_given_to_a_later_group():
+    def explode(request: Greeting) -> Greeting:
+        error = ValueError("alike")
+        error.who = request.text
+        raise error
+
+    world = World(explode)
+    both_fail = group(world.tasks["explode"], world.tasks["explode"])
+    one_fails = group(world.tasks["explode"])
+
+    async def failure_of(handle):
+        with pytest.raises(ValueError) as raised:
+            await handle
+        return raised.value
+
+    async def body():
+        # Both members raise, and the group fails with one of the errors: the
+        # other is left over, with the same type and message.
+        await failure_of(both_fail.start(world.session, Greeting(text="first")))
+        return await failure_of(one_fails.start(world.session, Greeting(text="second")))
+
+    error = run(with_events(world, body))
+
+    assert error.who == "second"
+
+
+def test_groups_whose_members_fail_alike_are_each_given_their_own_member_error():
+    released = asyncio.Event()
+
+    async def explode(request: Greeting) -> Greeting:
+        error = ValueError("alike")
+        error.who = request.text
+        raise error
+
+    async def linger(request: Greeting) -> Greeting:
+        await released.wait()
+        return request
+
+    world = World(explode, linger)
+    tasks = world.tasks
+    # The first group's member fails first, and its group ends last.
+    ends_last = group(tasks["explode"], tasks["linger"], on_error="collect_all")
+    ends_first = group(tasks["explode"], on_error="collect_all")
+
+    async def body():
+        late = ends_last.start(world.session, Greeting(text="late"))
+        early = ends_first.start(world.session, Greeting(text="early"))
+        (error_early,) = await early
+        released.set()
+        error_late, _ = await late
+        return error_early, error_late
+
+    error_early, error_late = run(with_events(world, body))
+
+    assert (error_early.who, error_late.who) == ("early", "late")
+
+
 def test_a_map_stage_must_follow_a_stage_that_returns_a_list_of_what_the_task_takes():
     def numbers_of(request: Greeting) -> list[Receipt]:
         return [Receipt(ok=True)]

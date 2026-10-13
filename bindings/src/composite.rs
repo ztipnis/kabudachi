@@ -249,7 +249,8 @@ impl<'py> IntoPyObject<'py> for PyBytesValue {
 }
 
 /// A [`Resolved`] as Python reads it: `("value", producer, bytes)`,
-/// `("failure", kind, message)` or `("list", [...])`.
+/// `("failure", kind, message, task_id)` or `("list", [...])`. `task_id` is
+/// the Task whose run raised the error, or `None` for a failure no run raised.
 pub(crate) struct PyResolved(pub(crate) Resolved);
 
 impl<'py> IntoPyObject<'py> for PyResolved {
@@ -267,7 +268,10 @@ fn resolved_object(py: Python<'_>, resolved: Resolved) -> PyResult<Bound<'_, PyA
         Resolved::Value { producer, bytes } => {
             ("value", producer.as_str(), PyBytes::new(py, &bytes)).into_bound_py_any(py)
         }
-        Resolved::Failure(failure) => ("failure", failure.kind, failure.message).into_bound_py_any(py),
+        Resolved::Failure(failure) => {
+            let task = failure.task.map(|task| task.as_str().to_owned());
+            ("failure", failure.kind, failure.message, task).into_bound_py_any(py)
+        }
         Resolved::List(items) => {
             let items = items
                 .into_iter()

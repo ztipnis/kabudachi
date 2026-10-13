@@ -5,10 +5,12 @@ import "digest.proto";
 import "ids.proto";
 
 // A failed member's outcome where a list of outcomes stands in for values:
-// the error's type name and its message.
+// the error's type name and its message, and the Task whose run failed, when
+// a Task's run did. A composite that ends on a member's failure carries it on.
 message Failure {
   string kind = 1;
   string message = 2;
+  TaskId task = 3;
 }
 
 // One page of a composite's member outcomes, stored as its own record.

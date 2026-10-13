@@ -567,7 +567,7 @@ impl NativeRuntime {
 
     /// Returns an awaitable that resolves to a composite's results: `("list",
     /// [...])` of its stages' or members' results in order, each `("value",
-    /// producer_definition_id, bytes)`, `("failure", kind, message)` or a
+    /// producer_definition_id, bytes)`, `("failure", kind, message, task_id)` or a
     /// nested `("list", [...])`.
     ///
     /// Raises `RuntimeError` if the runtime no longer holds the composite or a
@@ -586,7 +586,7 @@ impl NativeRuntime {
     /// `task_run_id` is given besides its claim, as `(fields, input)`: the
     /// `(name, value)` pairs bound into its input, and what it takes from
     /// before it, `("value", producer_definition_id, bytes)`, `("failure",
-    /// kind, message)` or `("list", [...])` as `composite_results` has them,
+    /// kind, message, task_id)` or `("list", [...])` as `composite_results` has them,
     /// `("input", bytes)` for its own whole input when that was stored as
     /// blobs, or `None` when the claim's `serialized_input` is the whole
     /// input.

@@ -18,7 +18,6 @@ one-node task's is.
 import asyncio
 import logging
 import threading
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,10 +42,6 @@ ResultDecoder = Callable[[str, bytes], Any]
 """Decodes a certified result, given the name of the task that produced it."""
 
 _logger = logging.getLogger("kabudachi")
-
-# How many errors of failed members are kept for the composites that await them.
-_MEMBER_ERRORS_KEPT = 256
-
 
 def result_digest(result: bytes) -> bytes:
     """The digest a run's result is certified by (BLAKE3)."""
@@ -177,8 +172,8 @@ class TaskTable:
         # their hard limit, by task id, until each exits: a retry of the task
         # handed back here waits for it.
         self._held_abandoned: dict[str, asyncio.Future[None]] = {}
-        # Errors of members that failed here for good, oldest first.
-        self._member_errors: deque[tuple[str, str, BaseException]] = deque(maxlen=_MEMBER_ERRORS_KEPT)
+        # Errors of members that failed here for good, by the member's task id.
+        self._member_errors: dict[str, BaseException] = {}
 
     # submitted
 
@@ -406,23 +401,26 @@ class TaskTable:
 
     # members that failed here
 
-    def member_failed(self, kind: str, message: str, error: BaseException) -> None:
-        """A run of a member of a composite failed here for good with `error`,
-        of type `kind` and with `message`. Kept, for a few hundred failures at
-        most, for whoever awaits the composite to be given it as it was."""
+    def member_failed(self, task_id: str, error: BaseException) -> None:
+        """A run of the member task `task_id` of a composite failed here for
+        good with `error`. Kept, until taken or dropped, for whoever awaits the
+        composite to be given it as it was."""
         with self._lock:
-            self._member_errors.append((kind, message, error))
+            self._member_errors[task_id] = error
 
-    def member_error(self, kind: str, message: str) -> BaseException | None:
-        """The oldest error kept for a member that failed with `kind` and
-        `message` (any, while the leader gives none), taken; `None` if this
-        process ran no such member."""
+    def member_error(self, task_id: str | None) -> BaseException | None:
+        """The error the run of member `task_id` failed with here, taken;
+        `None` if no run of it failed here, or it was taken or dropped."""
+        if task_id is None:
+            return None
         with self._lock:
-            for kept in self._member_errors:
-                if kept[0] == kind and message in ("", kept[1]):
-                    self._member_errors.remove(kept)
-                    return kept[2]
-        return None
+            return self._member_errors.pop(task_id, None)
+
+    def drop_member_errors(self) -> None:
+        """Nobody awaits a composite any more: the errors kept for their
+        members will not be asked for."""
+        with self._lock:
+            self._member_errors.clear()
 
     # failed with retry, failed (final, expired, superseded, interrupted)
 

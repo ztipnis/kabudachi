@@ -122,7 +122,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             next_stage: composite.next_stage,
             counts: Some(composite.counts(self.running_members(id)).into()),
             pages: composite.pages(),
-            failure: composite.failure.clone().map(failure_message),
+            failure: composite.failure.clone().map(Into::into),
             submitted_at: Some(composite.submitted_at.into()),
             placement: Vec::new(),
             prior_placements: Vec::new(),
@@ -227,7 +227,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             state,
             next_stage: record.next_stage,
             outcomes,
-            failure: record.failure.map(|failure| Failure { kind: failure.kind, message: failure.message }),
+            failure: record.failure.as_ref().map(Failure::from),
             submitted_at: record.submitted_at.map_or_else(|| WallTime::now(&self.clock), WallTime::from),
         })
     }
@@ -250,17 +250,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 }
 
-fn failure_message(failure: crate::manifest::Failure) -> generated::Failure {
-    generated::Failure { kind: failure.kind, message: failure.message }
-}
-
 fn entry_of(index: u64, outcome: &MemberOutcome) -> generated::CompositeEntry {
     let (outcome, producer) = match outcome {
         MemberOutcome::Value { digest, producer } => (
             composite_entry::Outcome::Value(digest.clone().into()),
             Some(producer.clone().into()),
         ),
-        MemberOutcome::Failed(failure) => (composite_entry::Outcome::Failure(failure_message(failure.clone())), None),
+        MemberOutcome::Failed(failure) => (composite_entry::Outcome::Failure(failure.clone().into()), None),
         MemberOutcome::Child(child) => (composite_entry::Outcome::Child(child.clone().into()), None),
     };
     generated::CompositeEntry { index, outcome: Some(outcome), producer }
@@ -282,9 +278,7 @@ fn outcome_of(entry: &generated::CompositeEntry) -> Option<(u64, MemberOutcome)>
             digest: Digest::try_from(digest).ok()?,
             producer: entry.producer.clone()?.into(),
         },
-        composite_entry::Outcome::Failure(failure) => {
-            MemberOutcome::Failed(Failure { kind: failure.kind.clone(), message: failure.message.clone() })
-        }
+        composite_entry::Outcome::Failure(failure) => MemberOutcome::Failed(Failure::from(failure)),
         composite_entry::Outcome::Child(child) => MemberOutcome::Child(child.clone().into()),
     };
     Some((entry.index, outcome))

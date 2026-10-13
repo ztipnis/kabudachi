@@ -6,7 +6,7 @@ use kabudachi_core::blob::BlobKey;
 use kabudachi_core::manifest::{Manifest, ManifestEntry};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{Expansion, composite_entry};
-use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
@@ -244,6 +244,29 @@ fn fail_fast_fails_the_group_at_its_first_failure_and_leaves_running_members_alo
         .unwrap();
     assert!(finished(&mut fixture).is_empty(), "the group finished once");
     assert!(entry(&fixture, &group, 1).is_some(), "the late result is still recorded");
+}
+
+#[test]
+fn a_composites_failure_names_the_task_whose_run_failed_through_every_composite_it_ended() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(
+        &mut fixture,
+        flow_of(vec![Stage::Composite(group_of(
+            OnError::FailFast,
+            vec![task_stage("fine", Some(b"a")), task_stage("explode", Some(b"b"))],
+        ))]),
+    );
+    let group = flow.child(0);
+
+    fail_member(&mut fixture, &group, 1, "ValueError");
+
+    let failed = &finished(&mut fixture)[0];
+    assert_eq!(failed.composite_id, flow);
+    assert_eq!(failed.failure.as_ref().and_then(|failure| failure.task.clone()), Some(group.member_task(1)));
+    let Some(composite_entry::Outcome::Failure(recorded)) = entry(&fixture, &flow, 0).unwrap().outcome else {
+        panic!("the flow records its group's failure");
+    };
+    assert_eq!(recorded.task.map(TaskId::from), Some(group.member_task(1)));
 }
 
 #[test]
