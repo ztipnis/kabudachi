@@ -3,4 +3,5 @@
 
 mod backoff;
 mod find;
+mod queues;
 mod steal;

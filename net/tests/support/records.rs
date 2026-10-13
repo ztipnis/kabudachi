@@ -18,9 +18,11 @@ use kabudachi_core::protocol::messages::{
     ElectionMessage, WorkerHeartbeat, claim_response, election_message, task_response,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::{Scheduler, Submission, Submitted, mint};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::{Duration, RealClock, WallTime};
+use kabudachi_net::discovery::Takes;
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::executor::ExecutorEndpoint;
 use kabudachi_net::handoff::HandedOff;
@@ -90,6 +92,10 @@ pub struct Voters {
     voters: Vec<Voter>,
     ids: Vec<WorkerId>,
     replication_factor: ReplicationFactor,
+    /// The queues each voter takes work from.
+    queues: Vec<Subscription>,
+    /// The queue policy every voter is given.
+    queue_policy: QueuePolicy,
     /// Keeps each net's hosting thread running for as long as the voters live.
     _hosts: Vec<Hosting>,
     states: Vec<watch::Receiver<WorkerState>>,
@@ -218,6 +224,8 @@ impl Voters {
             voters,
             ids,
             replication_factor,
+            queues: vec![Subscription::Every; count],
+            queue_policy: QueuePolicy::new(),
             _hosts: hosts,
             states,
             senders,
@@ -234,6 +242,18 @@ impl Voters {
             panic!("set before the shard is first driven");
         };
         driven.executor = Some(executor);
+    }
+
+    /// Makes `voter` take work only from `queues`. Only before the shard is
+    /// first driven.
+    pub fn set_queues(&mut self, voter: usize, queues: &[&str]) {
+        assert!(matches!(self.voters[voter], Voter::Idle(_)), "set before the shard is first driven");
+        self.queues[voter] = Subscription::Only(queues.iter().map(|name| (*name).to_owned()).collect());
+    }
+
+    /// Gives every voter `policy`. Only before the shard is first driven.
+    pub fn set_queue_policy(&mut self, policy: QueuePolicy) {
+        self.queue_policy = policy;
     }
 
     /// Runs `act` on `voter`'s node and scheduler and returns what it
@@ -293,10 +313,6 @@ impl Voters {
 
     /// Starts driving every idle voter not killed.
     fn start_idle(&mut self) {
-        let config = DriverConfig {
-            replication_factor: self.replication_factor,
-            ..DriverConfig::default()
-        };
         for voter in 0..self.voters.len() {
             if self.killed[voter] || !matches!(self.voters[voter], Voter::Idle(_)) {
                 continue;
@@ -304,13 +320,19 @@ impl Voters {
             let Voter::Idle(driven) = std::mem::replace(&mut self.voters[voter], Voter::Gone) else {
                 unreachable!("checked idle above");
             };
+            let config = DriverConfig {
+                replication_factor: self.replication_factor,
+                queues: self.queues[voter].clone(),
+                queue_policy: self.queue_policy.clone(),
+                ..DriverConfig::default()
+            };
             let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
             let task = tokio::spawn(drive_in_background(
                 voter,
                 *driven,
                 self.nets[voter].clone(),
                 self.clock,
-                config.clone(),
+                config,
                 self.senders[voter].clone(),
                 receiver,
                 self.handed_off.clone(),
@@ -609,6 +631,16 @@ fn voter(clock: RealClock, id: WorkerId, count: usize) -> WorkerNode<RealClock> 
         None,
     )
     .0
+}
+
+/// What a worker takes that runs compaction as asked and takes every queue,
+/// with the default queue policy.
+pub fn takes(runs_compaction: bool) -> Takes {
+    Takes {
+        runs_compaction,
+        queues: Subscription::Every,
+        policy: QueuePolicy::new(),
+    }
 }
 
 /// A plain submission whose input is `input`.

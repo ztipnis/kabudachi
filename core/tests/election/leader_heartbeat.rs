@@ -34,8 +34,8 @@ use kabudachi_core::protocol::messages::{
     AckEcho, VoteGrant, WorkerHeartbeat,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
 use kabudachi_core::queues::Subscription;
+use kabudachi_core::scheduler::{LeadershipGrant, LeaseEnd};
 use kabudachi_core::time::{Clock, Duration, Instant};
 
 const SHARD: &str = "shard-1";

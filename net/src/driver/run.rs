@@ -20,6 +20,7 @@ use super::events::{catch_up_if_due, drain_events};
 use super::own_work::drive_executor;
 use super::stepper::{Collected, Stepper};
 use crate::authority::AuthorityClient;
+use crate::discovery::Takes;
 use crate::executor::{Executing, ExecutorEndpoint, HostAbort};
 use crate::handoff::{HandedOff, hand_off_held_records};
 use crate::leader_search::{DrivenSearch, JoinOverNet};
@@ -73,10 +74,17 @@ where
         observe: O,
     ) -> Self {
         node.set_runs_compaction(executor.is_some());
+        node.set_queues(config.queues.clone());
+        scheduler.set_queue_policy(config.queue_policy.clone());
+        let takes = Takes {
+            runs_compaction: true,
+            queues: config.queues.clone(),
+            policy: config.queue_policy.clone(),
+        };
         let timings = node.timings();
         let retry_after = Duration::from_millis(timings.heartbeat_interval.as_ticks());
         let executing = executor
-            .map(|endpoint| Executing::new(endpoint, net, retry_after, timings.reconnect_timeout));
+            .map(|endpoint| Executing::new(endpoint, net, retry_after, timings.reconnect_timeout, takes));
         net.subscribe_to_shard(node.shard_id());
         let search = leader_search(node, net, &config, authority.is_some());
         let records = LeaderRecords::new(node.office_term(), timings.heartbeat_interval);
@@ -218,6 +226,10 @@ where
         // run them: the scheduler is told who they are as the heartbeats say.
         let runners = self.stepper.node.compaction_runners();
         self.stepper.scheduler.set_compaction_runners(runners);
+        // The leader holds each claimant to the queues its heartbeats name.
+        self.stepper
+            .scheduler
+            .set_subscriptions(self.stepper.node.queue_subscriptions());
         // A deadline the node reported is handed on before the await in
         // `answer_requests`: it is not reported again, so a driver dropped
         // there must not lose it.
@@ -234,7 +246,7 @@ where
         respond_to_claim_requests(&mut deciding, local);
         respond_to_task_requests(&mut deciding, &self.clock, local);
         respond_to_reconcile_requests(self.stepper.node, self.net);
-        respond_to_steal_requests(self.net, &self.clock);
+        respond_to_steal_requests(self.net, &self.clock, &self.config.queue_policy);
         self.stepper.write_revisions();
         let mut ports = self.stepper.ports();
         self.stepper.records.repair(

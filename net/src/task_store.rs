@@ -22,6 +22,7 @@ use std::time::Duration;
 use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord};
 use kabudachi_core::protocol::generated::{self, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
+use kabudachi_core::queues::Subscription;
 use kabudachi_core::reconcile::HeldKey;
 use kabudachi_core::reconcile::wire::held_key;
 use kabudachi_core::task_record::{
@@ -46,6 +47,13 @@ pub const MAX_RECORD_PACKET_BYTES: usize = MAX_RECORD_BYTES as usize + 64 * 1024
 /// whose claim could not be recorded hears "not the leader" rather than
 /// nothing.
 pub const RECORD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A task whose record looks claimable, as discovery ranks it.
+pub(crate) struct Candidate {
+    pub(crate) submitted_at: WallTime,
+    pub(crate) queue: String,
+    pub(crate) task: TaskId,
+}
 
 /// The records this worker holds, shared by its kad record store (which
 /// peers write into and read from) and the rest of the worker (which reads
@@ -140,24 +148,30 @@ impl HeldRecords {
     }
 
     /// Each task whose record, as this worker holds it, looks claimable at
-    /// `now` (see `looks_claimable`), with when it was submitted, in task id
-    /// order. A compaction run counts only for a worker that
-    /// `runs_compaction`.
+    /// `now` (see `looks_claimable`) and is of one of `queues`, with when it
+    /// was submitted and its queue, in task id order. A compaction run counts
+    /// only for a worker that `runs_compaction`.
     pub(crate) fn claimable(
         &self,
         now: WallTime,
         runs_compaction: bool,
-    ) -> Vec<(WallTime, TaskId)> {
+        queues: &Subscription,
+    ) -> Vec<Candidate> {
         self.lock()
             .iter()
             .filter(|record| looks_claimable(record, now))
             .filter(|record| {
                 runs_compaction || record.task.as_ref().is_some_and(|task| task.compacts.is_none())
             })
+            .filter(|record| record.task.as_ref().is_some_and(|task| queues.includes(&task.queue)))
             .filter_map(|record| {
                 let (task, _) = identify(record).ok()?;
-                let submitted_at = record.task.as_ref()?.submitted_at?;
-                Some((WallTime::from(submitted_at), task))
+                let held = record.task.as_ref()?;
+                Some(Candidate {
+                    submitted_at: WallTime::from(held.submitted_at?),
+                    queue: held.queue.clone(),
+                    task,
+                })
             })
             .collect()
     }

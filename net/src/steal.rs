@@ -17,14 +17,16 @@ use std::time::Duration;
 
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{StealRequest, StealResponse};
+use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::time::WallTime;
 use libp2p::PeerId;
 
+use crate::discovery::{Takes, waited};
 use crate::exchange::Asked;
 use crate::messenger::Net;
 use crate::peers::worker_id_of;
 use crate::steal::codec::StealCodec;
-use crate::task_store::HeldRecords;
+use crate::task_store::{Candidate, HeldRecords};
 
 pub mod codec;
 
@@ -63,6 +65,11 @@ impl StealRequestHandle {
     pub fn runs_compaction(&self) -> bool {
         self.0.request.runs_compaction
     }
+
+    /// The queues the asker takes from, so only tasks of those are offered.
+    pub fn queues(&self) -> Subscription {
+        Subscription::from_names(&self.0.request.queues)
+    }
 }
 
 impl Net {
@@ -70,12 +77,13 @@ impl Net {
     /// most `limit` of them, oldest submission first. `None` if no answer
     /// came within [`STEAL_TIMEOUT`]: the peer could not be reached or did not
     /// answer, or this `Net` is the peer. A compaction run is offered only if
-    /// `runs_compaction` says this worker runs them.
+    /// `takes` says this worker runs them, and a task only if its queue is one
+    /// `takes` names.
     pub async fn steal(
         &self,
         peer: WorkerId,
         limit: usize,
-        runs_compaction: bool,
+        takes: &Takes,
     ) -> Option<Vec<TaskId>> {
         if peer == self.local_worker_id() {
             return None;
@@ -86,8 +94,8 @@ impl Net {
             to,
             StealRequest {
                 limit,
-                runs_compaction,
-                queues: Vec::new(),
+                runs_compaction: takes.runs_compaction,
+                queues: takes.queues.names(),
             },
         );
         let response = tokio::time::timeout(STEAL_TIMEOUT, asked).await.ok()??;
@@ -114,19 +122,28 @@ impl Net {
 }
 
 /// The answer to a steal request: the tasks of `held` that look claimable at
-/// `now`, oldest submission first, at most `limit` and [`MAX_STEAL_IDS`]. A
-/// compaction run is among them only when the asker `runs_compaction`.
+/// `now` in the asker's `queues`, most urgent first by `policy`, then oldest
+/// submission first, at most `limit` and [`MAX_STEAL_IDS`]. A compaction run is
+/// among them only when the asker `runs_compaction`.
 pub(crate) fn candidates_for_steal(
     held: &HeldRecords,
     now: WallTime,
     limit: usize,
     runs_compaction: bool,
+    queues: &Subscription,
+    policy: &QueuePolicy,
 ) -> Vec<TaskId> {
-    let mut found = held.claimable(now, runs_compaction);
-    found.sort();
+    let mut found = held.claimable(now, runs_compaction, queues);
+    found.sort_by(|a, b| {
+        let rank = |candidate: &Candidate| policy.rank(&candidate.queue, waited(now, candidate.submitted_at));
+        rank(b)
+            .cmp(&rank(a))
+            .then(a.submitted_at.as_unix_millis().cmp(&b.submitted_at.as_unix_millis()))
+            .then(a.task.cmp(&b.task))
+    });
     found
         .into_iter()
         .take(limit.min(MAX_STEAL_IDS))
-        .map(|(_, task)| task)
+        .map(|candidate| candidate.task)
         .collect()
 }

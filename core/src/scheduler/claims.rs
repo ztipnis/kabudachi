@@ -89,13 +89,13 @@ pub enum ClaimRejection {
 }
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
-    /// Replaces what the scheduler knows of each worker's queues. A worker not
-    /// in `subscriptions` is held to none: it may take any queue.
+    /// Replaces what the scheduler knows of each worker's queues. A worker with
+    /// no entry is not limited: it may take any queue.
     pub fn set_subscriptions(&mut self, subscriptions: BTreeMap<WorkerId, Subscription>) {
         self.subscriptions = subscriptions;
     }
 
-    /// The queues `worker` takes.
+    /// The queues `worker` takes: every queue if it has no entry.
     fn subscription_of(&self, worker: &WorkerId) -> Subscription {
         self.subscriptions
             .get(worker)

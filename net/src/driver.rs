@@ -107,6 +107,11 @@
 //! without a result (see `crate::result_transport`). The revisions published
 //! when draining ends the scheduler's call are written too.
 //!
+//! A worker takes work only from the queues of its [`DriverConfig::queues`]: its
+//! heartbeats name them, the leader hands it nothing else, and its own
+//! discovery looks only there. Its [`DriverConfig::queue_policy`] orders what
+//! it claims as leader and what it looks at first as a follower.
+//!
 //! With a coordination authority configured, it is also the sole caller of
 //! [`kabudachi_core::election::AuthorityCall::perform`]. Each step's
 //! `Output::Authority(call)` is performed by the worker's
@@ -157,6 +162,7 @@ use std::time::Duration;
 
 use kabudachi_core::election::{Input, Step, WorkerNode};
 use kabudachi_core::protocol::ids::IdGenerator;
+use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::Scheduler;
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::Clock;
@@ -189,6 +195,12 @@ pub struct DriverConfig {
     pub retry_interval: Duration,
     /// How many voters each Task record is written to.
     pub replication_factor: ReplicationFactor,
+    /// The queues this worker takes work from; every worker's heartbeats say
+    /// them.
+    pub queues: Subscription,
+    /// How the queues are ordered and limited. Every worker of a shard should
+    /// give the same policy: its leader's decides what each claim gets.
+    pub queue_policy: QueuePolicy,
 }
 
 impl Default for DriverConfig {
@@ -199,6 +211,8 @@ impl Default for DriverConfig {
             join_peer_timeout: DEFAULT_JOIN_PEER_TIMEOUT,
             retry_interval: DEFAULT_RETRY_INTERVAL,
             replication_factor: ReplicationFactor::DEFAULT,
+            queues: Subscription::Every,
+            queue_policy: QueuePolicy::new(),
         }
     }
 }

@@ -275,8 +275,8 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     /// The queues each worker takes, as its heartbeats say. A worker not here
     /// may take any queue.
     subscriptions: BTreeMap<WorkerId, Subscription>,
-    /// Per queue, the runs that were claimed or running when last seen; finished
-    /// ones are pruned as runs are added, and never counted.
+    /// Per queue, the runs that were claimed or running when added. Finished
+    /// runs are ignored when counted and dropped as runs are added.
     running: BTreeMap<String, BTreeSet<TaskRunId>>,
 }
 

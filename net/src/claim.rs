@@ -112,14 +112,16 @@ impl Net {
     /// task first, or a `ClaimReject`. The batch may hold fewer than
     /// `limit`, or none: the leader hands out only as many as fit in one
     /// message, and, when `input_room` is given, only tasks whose inputs,
-    /// carried as blobs, add up to no more than it. The caller names the
-    /// leader, as for [`Self::request_claim`]. See [`ClaimFailure`] for why there may be no
-    /// answer. It is the last stage of [`Self::discover`], after the tasks
-    /// this worker's own records and its peers' show.
+    /// carried as blobs, add up to no more than it. Only tasks of `queues` are
+    /// handed out. The caller names the leader, as for [`Self::request_claim`].
+    /// See [`ClaimFailure`] for why there may be no answer. It is the last
+    /// stage of [`Self::discover`], after the tasks this worker's own records
+    /// and its peers' show.
     pub async fn claim_oldest(
         &self,
         leader: WorkerId,
         limit: u32,
+        queues: &Subscription,
         input_room: Option<u64>,
     ) -> Result<ClaimResponse, ClaimFailure> {
         let response = self
@@ -127,7 +129,7 @@ impl Net {
                 leader,
                 claim_request::Request::Oldest(ClaimOldest {
                     limit,
-                    queues: Vec::new(),
+                    queues: queues.names(),
                     input_room,
                 }),
             )
@@ -196,7 +198,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, R: Observer>(
             // Every claim the scheduler makes is one `batch` accepted,
             // in the same order, so `batch` already holds the answer.
             scheduler
-                .claim_oldest_fitting(claimant, &Subscription::Every, limit, |claim| batch.try_add(claim))
+                .claim_oldest_fitting(claimant, &Subscription::from_names(&oldest.queues), limit, |claim| batch.try_add(claim))
                 .map(|_| {
                     claim_response::Result::Batch(ClaimBatch {
                         claims: batch.claims,

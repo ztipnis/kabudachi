@@ -27,6 +27,7 @@ use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, ShardName, Uuid7Ids, WorkerId};
+use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::{MemoryLimits, Scheduler};
 use kabudachi_core::task_record::RecordOutbox;
 use kabudachi_core::time::RealClock;
@@ -115,6 +116,11 @@ pub struct WorkerConfig {
     /// hands it over, and the worker says it runs compaction. With none it
     /// claims nothing and runs no compaction.
     pub executor: Option<ExecutorEndpoint>,
+    /// The queues the worker takes work from; every queue by default.
+    pub queues: Subscription,
+    /// How the shard's queues are ordered and limited. Every worker of a shard
+    /// should give the same policy: its leader's decides what each claim gets.
+    pub queue_policy: QueuePolicy,
 }
 
 impl WorkerConfig {
@@ -147,6 +153,8 @@ impl WorkerConfig {
             result_ttl: None,
             memory_limits: None,
             executor: None,
+            queues: Subscription::Every,
+            queue_policy: QueuePolicy::new(),
         }
     }
 
@@ -175,6 +183,20 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_executor(mut self, endpoint: ExecutorEndpoint) -> Self {
         self.executor = Some(endpoint);
+        self
+    }
+
+    /// Takes work only from `queues`.
+    #[must_use]
+    pub fn with_queues(mut self, queues: Subscription) -> Self {
+        self.queues = queues;
+        self
+    }
+
+    /// Orders and limits the shard's queues by `policy`.
+    #[must_use]
+    pub fn with_queue_policy(mut self, policy: QueuePolicy) -> Self {
+        self.queue_policy = policy;
         self
     }
 
@@ -374,6 +396,8 @@ impl Worker {
                 join_peer_timeout: config.join_peer_timeout,
                 retry_interval: config.retry_interval,
                 replication_factor: config.replication_factor,
+                queues: config.queues.clone(),
+                queue_policy: config.queue_policy.clone(),
             },
             // Borrowed, so `observe` outlives the guards above: once it is
             // dropped, the worker shows out of its shard.
