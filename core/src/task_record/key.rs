@@ -144,6 +144,15 @@ impl ShardRecord {
         }
     }
 
+    /// Whether a holder's retention of the record may begin: it is finished,
+    /// and its leader no longer keeps it for a composite whose results name it.
+    pub fn retention_may_begin(&self) -> bool {
+        match self {
+            ShardRecord::Task(record) => record.finished && !record.retained_by_composite,
+            ShardRecord::Composite(_) | ShardRecord::Page(_) => self.is_finished(),
+        }
+    }
+
     /// The record's wire encoding.
     pub fn encode_to_vec(&self) -> Vec<u8> {
         match self {
@@ -178,9 +187,10 @@ impl ShardRecord {
                 version: record.version,
                 placement: record.placement.clone(),
                 finished: record.finished,
+                retained_by_composite: record.retained_by_composite,
                 ..Default::default()
             }),
-            ShardRecord::Composite(record) => ShardRecord::Composite(CompositeRecord {
+            ShardRecord::Composite(record) =>ShardRecord::Composite(CompositeRecord {
                 version: record.version,
                 composite_id: record.composite_id.clone(),
                 placement: record.placement.clone(),

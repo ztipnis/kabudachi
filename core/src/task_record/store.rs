@@ -85,7 +85,9 @@ pub enum OwnerState {
 ///
 /// A finished record, or the stub of one, is dropped once its retention has
 /// passed, counted on this node's own clock from when it first held a
-/// finished revision of it. Unfinished records are never dropped, and a put
+/// finished revision of it that its leader does not keep for a composite (a
+/// member Task's record is kept until a revision says its composite is
+/// forgotten). Unfinished records are never dropped, and a put
 /// is never refused for lack of room: the leader's memory budget bounds how
 /// much there is.
 ///
@@ -706,7 +708,7 @@ impl Held {
     /// `finished_since` is kept once set; otherwise a finished `record`
     /// starts its retention at `now`.
     fn new(record: ShardRecord, finished_since: Option<Instant>, now: Instant) -> Self {
-        let finished_since = finished_since.or(record.is_finished().then_some(now));
+        let finished_since = finished_since.or(record.retention_may_begin().then_some(now));
         Held {
             record,
             finished_since,

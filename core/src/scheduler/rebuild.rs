@@ -306,6 +306,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 installed.push(id);
             }
         }
+        self.release_orphaned_members();
         self.update_pressure();
         installed
     }

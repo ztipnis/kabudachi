@@ -64,6 +64,38 @@ fn the_stage_after_a_group_runs_once_whichever_record_of_the_groups_end_was_lost
     }
 }
 
+/// A member kept for its group by the old leader is kept by the successor
+/// too, and let go with the group; a member whose group record was lost has
+/// nothing to wait for.
+#[test]
+fn a_successor_keeps_a_finished_member_for_its_group_and_lets_it_go_with_the_group() {
+    let mut old = Fixture::leading();
+    old.scheduler.set_result_ttl(Some(ticks(100)));
+    let group = submitted(
+        &mut old,
+        group_of(OnError::CollectAll, vec![task_stage("a", Some(b"a")), task_stage("b", Some(b"b"))]),
+    );
+    run_member(&mut old, &group, 0, b"a");
+    let (first, second) = (group.member_task(0), group.member_task(1));
+
+    let mut lost_group = took_over(&old, rebuild_losing(&old, 0, |_| false));
+    lost_group.scheduler.set_result_ttl(Some(ticks(100)));
+    let mut orphaned = took_over(&old, rebuild_losing(&old, 0, is_composite_or_page));
+    orphaned.scheduler.set_result_ttl(Some(ticks(100)));
+
+    for fixture in [&mut lost_group, &mut orphaned] {
+        fixture.clock.advance(ticks(250));
+        fixture.scheduler.catch_up();
+    }
+    assert!(!lost_group.forgotten(&first), "its group is still held and unfinished");
+    assert!(orphaned.forgotten(&first), "its group's record is gone: nothing to keep it for");
+
+    run_member(&mut lost_group, &group, 1, b"b");
+    lost_group.clock.advance(ticks(100));
+    lost_group.scheduler.catch_up();
+    assert!(lost_group.forgotten(&first) && lost_group.forgotten(&second));
+}
+
 /// A continuation is committed by the revision that certifies its run: the
 /// step is on the run. The composite's record and pages were lost with the
 /// leader and no worker reports anything, yet the successor derives the

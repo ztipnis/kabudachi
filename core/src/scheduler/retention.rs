@@ -1,7 +1,7 @@
 //! When finished tasks are forgotten: a result TTL after they finished, or
 //! never.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::protocol::ids::TaskId;
 use crate::time::{Duration, Instant};
@@ -15,6 +15,10 @@ pub(super) struct Retention {
     finished: BTreeSet<(Instant, TaskId)>,
     /// The same tasks, for asking whether one is over.
     over: BTreeSet<TaskId>,
+    /// Tasks that are over but kept regardless of their TTL, with when they
+    /// finished: members of a composite that is still held, whose results are
+    /// read through it. Each joins `finished` when it is released.
+    held: BTreeMap<TaskId, Instant>,
 }
 
 impl Retention {
@@ -31,12 +35,38 @@ impl Retention {
     pub(super) fn clear(&mut self) {
         self.finished.clear();
         self.over.clear();
+        self.held.clear();
     }
 
     /// `task` is over as of `now`.
     pub(super) fn record(&mut self, task: &TaskId, now: Instant) {
         self.finished.insert((now, task.clone()));
         self.over.insert(task.clone());
+    }
+
+    /// `task` is over as of `now`, and kept until [`Self::release`] however
+    /// long ago that was.
+    pub(super) fn hold(&mut self, task: &TaskId, now: Instant) {
+        self.held.insert(task.clone(), now);
+        self.over.insert(task.clone());
+    }
+
+    /// Whether `task` is over and kept until released.
+    pub(super) fn is_held(&self, task: &TaskId) -> bool {
+        self.held.contains_key(task)
+    }
+
+    /// The tasks that are over and kept until released.
+    pub(super) fn held(&self) -> Vec<TaskId> {
+        self.held.keys().cloned().collect()
+    }
+
+    /// `task` is no longer kept regardless of its TTL: it is forgotten
+    /// `ttl` after it finished, which may be now.
+    pub(super) fn release(&mut self, task: &TaskId) {
+        if let Some(finished_at) = self.held.remove(task) {
+            self.finished.insert((finished_at, task.clone()));
+        }
     }
 
     /// Whether `task` is over and not yet forgotten.

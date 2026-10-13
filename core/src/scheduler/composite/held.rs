@@ -4,12 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::manifest::{Failure, Manifest};
-use crate::protocol::ids::{CompositeId, WorkerId};
+use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
 use crate::time::{Duration, Instant, WallTime};
 
 use super::{
     CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape, MemberCounts,
-    MemberOutcome, OnError, PAGE_ENTRIES, Step,
+    MemberOutcome, OnError, PAGE_ENTRIES, Stage, Step,
 };
 
 /// One composite this scheduler drives, or keeps until its retention ends.
@@ -149,8 +149,10 @@ impl Composites {
     }
 
     /// Forgets every finished composite, with its pages, that finished at
-    /// least `ttl` before `now` and whose parent composite is gone.
-    pub(in crate::scheduler) fn forget_due(&mut self, ttl: Duration, now: Instant) {
+    /// least `ttl` before `now` and whose parent composite is gone. Returns
+    /// the Tasks that were members of them, which are no longer kept for them.
+    pub(in crate::scheduler) fn forget_due(&mut self, ttl: Duration, now: Instant) -> Vec<TaskId> {
+        let mut members = Vec::new();
         loop {
             let due: Vec<CompositeId> = self
                 .finished
@@ -160,20 +162,26 @@ impl Composites {
                 .map(|(_, id)| id.clone())
                 .collect();
             if due.is_empty() {
-                return;
+                return members;
             }
             for id in due {
-                self.forget(&id);
+                members.extend(self.forget(&id));
             }
         }
     }
 
-    fn forget(&mut self, id: &CompositeId) {
-        self.held.remove(id);
+    fn forget(&mut self, id: &CompositeId) -> Vec<TaskId> {
+        let members = self.held.remove(id).map_or_else(Vec::new, |composite| {
+            (0..composite.step.stages.len() as u64)
+                .filter(|index| matches!(composite.step.stages[*index as usize], Stage::Task(_)))
+                .map(|index| id.member_task(index))
+                .collect()
+        });
         self.unpublished.remove(id);
         self.unpublished_pages.retain(|(composite, _)| composite != id);
         if let Some(finished_at) = self.finished_at.remove(id) {
             self.finished.remove(&(finished_at, id.clone()));
         }
+        members
     }
 }

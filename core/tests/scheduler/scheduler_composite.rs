@@ -159,6 +159,42 @@ fn a_finished_composite_and_its_pages_are_forgotten_with_the_result_ttl_and_a_le
 }
 
 #[test]
+fn a_member_is_kept_with_its_results_until_its_group_is_forgotten_however_long_ago_it_finished() {
+    let mut fixture = Fixture::leading();
+    fixture.scheduler.set_result_ttl(Some(ticks(100)));
+    let group = submitted(
+        &mut fixture,
+        group_of(OnError::CollectAll, vec![task_stage("early", Some(b"a")), task_stage("late", Some(b"b"))]),
+    );
+    let (early, late) = (group.member_task(0), group.member_task(1));
+    run_member(&mut fixture, &group, 0, b"first");
+
+    fixture.clock.advance(ticks(250));
+    fixture.scheduler.catch_up();
+    assert!(!fixture.forgotten(&early), "its group still waits for the other member");
+    let record = fixture.spy.newest_revision_of(&early).unwrap();
+    assert!(
+        record.finished && record.retained_by_composite,
+        "holders are told to keep it while the group is held"
+    );
+
+    run_member(&mut fixture, &group, 1, b"second");
+    fixture.clock.advance(ticks(99));
+    fixture.scheduler.catch_up();
+    assert!(!fixture.forgotten(&early), "kept as long as the group, which is kept a ttl after it finishes");
+
+    fixture.clock.advance(ticks(1));
+    fixture.scheduler.catch_up();
+    assert!(fixture.scheduler.composite_status(&group).is_none());
+    assert!(fixture.forgotten(&early) && fixture.forgotten(&late));
+    let record = fixture.spy.newest_revision_of(&early).unwrap();
+    assert!(
+        record.finished && !record.retained_by_composite,
+        "the last revision the holders see lets their retention begin"
+    );
+}
+
+#[test]
 fn fail_fast_fails_the_group_at_its_first_failure_and_leaves_running_members_alone() {
     let mut fixture = Fixture::leading();
     let group = submitted(

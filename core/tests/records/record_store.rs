@@ -1,6 +1,7 @@
 //! A worker's store of Task records keeps the newest revision of each, in
 //! the order every worker agrees on, and refuses anything else.
 
+use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord};
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
@@ -102,6 +103,38 @@ fn a_finished_record_is_dropped_once_its_retention_has_passed_and_an_unfinished_
         store.get(&TaskId::new("running")).is_some(),
         "an unfinished record never expires"
     );
+}
+
+#[test]
+fn a_finished_record_its_leader_keeps_for_a_composite_stays_with_its_result_blobs_until_a_revision_lets_go() {
+    let mut store = VersionedRecords::with_retention(Some(Duration::from_ticks(100)));
+    let member = TaskId::new("member");
+    let result = BlobRecord {
+        value: b"result".to_vec(),
+        owner: BlobOwner::Task(member.clone()),
+        placement: Vec::new(),
+        result: true,
+    };
+    let mut kept = record("member", version(0, 0, 1, 0), "q");
+    kept.finished = true;
+    kept.retained_by_composite = true;
+    store.put(kept.clone(), Instant::at(10)).unwrap();
+    store.put_blob(&BlobKey::of(b"result"), result, Instant::at(10)).unwrap();
+
+    assert_eq!(store.sweep(Instant::at(100_000)), 0, "kept however long ago it finished");
+    assert!(store.get(&member).is_some());
+    assert_eq!(store.blobs_of(&BlobOwner::Task(member.clone())).len(), 1);
+    assert_eq!(store.next_due(), None);
+
+    let mut released = kept;
+    released.version = Some(version(0, 0, 1, 1).into());
+    released.retained_by_composite = false;
+    store.put(released, Instant::at(100_000)).unwrap();
+
+    assert_eq!(store.sweep(Instant::at(100_099)), 0, "its retention counts from the revision that let go");
+    assert_eq!(store.next_due(), Some(Instant::at(100_100)));
+    assert_eq!(store.sweep(Instant::at(100_100)), 2, "the record and its blob");
+    assert!(store.get(&member).is_none());
 }
 
 #[test]

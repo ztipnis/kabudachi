@@ -113,6 +113,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             prior_placements: Vec::new(),
             published_at: Some(published_at.into()),
             finished: self.retention.holds(task_id),
+            retained_by_composite: self.retention.is_held(task_id),
         }
     }
 
@@ -171,7 +172,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// mutating call ends with it.
     pub(super) fn forget_due(&mut self) -> usize {
         if let Some(ttl) = self.retention.ttl() {
-            self.composites.forget_due(ttl, self.clock.now());
+            let members = self.composites.forget_due(ttl, self.clock.now());
+            if !members.is_empty() {
+                // Holders learn their retention may begin before the leader
+                // forgets the members it may forget at once.
+                self.release_members(members);
+                self.publish_changed();
+            }
         }
         let Some(due) = self.retention.next_due() else {
             return 0;
