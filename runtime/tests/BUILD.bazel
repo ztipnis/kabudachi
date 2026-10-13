@@ -63,6 +63,8 @@ py_test(
     pytest_main = True,  # keep
     venv = "dev",  # keep
     deps = [
+        # Imported only inside the subprocess the test starts, so Gazelle cannot see it.
+        ":proto_messages",  # keep
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
         "@pypi//pytest",  # keep
