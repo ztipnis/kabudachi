@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import types
+import typing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1238,6 +1239,29 @@ def _plan(item: str, previous: str) -> Flow:
     raise AssertionError("never run")
 
 
+def _mismatched(item: str, previous: str) -> int:
+    return 0
+
+
+def _wide(item: Greeting, previous: int) -> int:
+    return previous
+
+
+async def _aconcat(item: str, previous: str) -> str:
+    return previous + item
+
+
+def _latest(item: Greeting, previous: Greeting) -> Greeting:
+    return item
+
+
+def _merge_declared_inside_a_function():
+    def merge(left: dict, right: dict) -> dict:
+        return left
+
+    return merge
+
+
 @pytest.mark.parametrize(
     ("function", "options", "refusal", "shape"),
     [
@@ -1293,6 +1317,33 @@ def _plan(item: str, previous: str) -> Flow:
             None,
             id="a merge of one value",
         ),
+        pytest.param(
+            _count,
+            {"reduces": True, "tree": True, "merge": _merge_declared_inside_a_function()},
+            "module-level",
+            None,
+            id="a merge declared inside a function",
+        ),
+        pytest.param(
+            _concat,
+            {"reduces": True, "associative": True, "tree": False, "merge": _add_counts},
+            "associative reducer takes no merge",
+            None,
+            id="an associative chain with a merge names the merge, not the tree",
+        ),
+        pytest.param(
+            _concat, {"reduces": True, "associative": 1}, "True or False", None, id="associative must be a bool"
+        ),
+        pytest.param(
+            _concat,
+            {"reduces": True, "associative": True, "tree": "yes"},
+            "True or False",
+            None,
+            id="tree must be a bool or None",
+        ),
+        pytest.param(
+            _mismatched, {}, "type of its previous", None, id="a reducer returns the type of previous"
+        ),
         pytest.param(_shout, {"reduces": True}, "two", None, id="@reducer needs two parameters"),
         pytest.param(_plan, {}, "step", None, id="a reducer cannot return a step"),
         pytest.param(_concat, {"kind": TaskKind.COALESCING}, "coalescing", None, id="a reducer cannot coalesce"),
@@ -1320,8 +1371,12 @@ def test_a_reducer_takes_item_and_previous_and_a_tree_has_exactly_one_way_to_com
             declare()
         assert "tests.reducer" not in registry
         return
-    reducing = declare().definition.reducer
+    definition = declare().definition
+    reducing = definition.reducer
     assert (reducing.associative, reducing.tree) == shape
+    assert reducing.previous_type is typing.get_type_hints(function)["previous"]
+    assert reducing.merge is options.get("merge")
+    assert definition.merge is None
 
 
 def test_a_reducer_runs_with_reduce_or_local_never_by_a_direct_call():
@@ -1333,6 +1388,14 @@ def test_a_reducer_runs_with_reduce_or_local_never_by_a_direct_call():
     assert concat.local("b", "a") == "ab"
     with pytest.raises(TypeError, match=r"\.reduce"):
         concat("a")
+    with pytest.raises(TypeError, match=r"is a reducer: run it with \.reduce"):
+        concat.options(delay=timedelta(seconds=1))("a")
+    with pytest.raises(TypeError, match=r"tests\.concat is a reducer: run it with \.reduce"):
+        concat.map
+    with pytest.raises(TypeError, match=r"tests\.concat is a reducer: run it with \.reduce"):
+        concat.bind("a")
+    with pytest.raises(TypeError, match=r"local takes \(item, previous\)"):
+        concat.local("a")
     with pytest.raises(TypeError, match="not a reducer"):
         Task(_shout, registry=registry, serializers=serializers, name="tests.shout", serializer="pickle").reduce
     with pytest.raises(TypeError):
@@ -1345,3 +1408,38 @@ def test_a_reducer_runs_with_reduce_or_local_never_by_a_direct_call():
             associative=True,
         )
     assert kabudachi.reducer is not None and issubclass(kabudachi.ReduceEmptyError, TypeError)
+
+
+def test_a_reducer_that_is_async_runs_locally_as_an_awaitable():
+    registry, serializers = TaskRegistry(), SerializerRegistry.with_defaults()
+    serializers.register(Pickle())
+    concat = Task(
+        _aconcat, registry=registry, serializers=serializers, name="tests.aconcat", serializer="pickle"
+    )
+
+    assert asyncio.run(concat.local("b", "a")) == "ab"
+    assert concat.definition.is_async
+
+
+def test_a_reducer_whose_previous_type_the_serializer_cannot_handle_is_refused_where_declared():
+    with pytest.raises(TaskDefinitionError, match="previous type"):
+        declare(_wide)
+
+
+def test_the_reducer_decorator_declares_a_reducer_with_its_options(fresh_registry):
+    bare = kabudachi.reducer(_latest).definition
+    tree = kabudachi.reducer(serializer="pickle", name="decorated.tree", associative=True)(_concat).definition
+    chain = kabudachi.reducer(serializer="pickle", name="decorated.chain", associative=True, tree=False)(_concat).definition
+    retried = kabudachi.reducer(serializer="pickle", name="decorated.retried", retries=2)(_concat).definition
+    orphaned = kabudachi.reducer(serializer="pickle", name="decorated.orphaned", retriable=False)(_concat).definition
+
+    assert bare.name == f"{_latest.__module__}._latest"
+    assert [
+        (found.reducer.associative, found.reducer.tree) for found in (bare, tree, chain)
+    ] == [(False, False), (True, True), (True, False)]
+    assert [(found.retries, found.retriable) for found in (bare, retried, orphaned)] == [
+        (0, True),
+        (2, True),
+        (0, False),
+    ]
+    assert registry_module.default_registry().get("decorated.tree") is tree

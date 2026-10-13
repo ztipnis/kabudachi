@@ -187,12 +187,12 @@ class Task(wrapt.ObjectProxy):
         Only works while `kabudachi.run()` is running. A reducer is not
         called: it is run with `.reduce(items)`, or here with `.local`.
         """
-        if self._self_definition.reducer is not None:
-            raise TypeError(
-                f"{self._self_definition.name} is a reducer: "
-                "run it with .reduce(items) or .local(item, previous)"
-            )
+        self._refuse_reducer("run it with .reduce(items) or .local(item, previous)")
         return current_session().submit(self._self_definition, argument)
+
+    def _refuse_reducer(self, instead: str) -> None:
+        if self._self_definition.reducer is not None:
+            raise TypeError(f"{self._self_definition.name} is a reducer: {instead}")
 
     def options(
         self,
@@ -213,6 +213,7 @@ class Task(wrapt.ObjectProxy):
         submission; a `@task` has none. Raises `ValueError` or
         `TypeError` at once if the options are wrong or contradict each other.
         """
+        self._refuse_reducer("run it with .reduce(items)")
         if key is not None and self._self_definition.kind is not TaskKind.COALESCING:
             raise ValueError("only a coalescing task takes a key")
         chosen = submission_options(delay=delay, eta=eta, expires=expires, key=key)
@@ -223,7 +224,9 @@ class Task(wrapt.ObjectProxy):
         """This task run on every item of a list: `await task.map(items)` gives
         the results in the order of the items, and `task.map` is also a `flow`
         stage that takes the list the stage before it returns. Each item is an
-        independent task; `on_error` is the policy of a `group`."""
+        independent task; `on_error` is the policy of a `group`. Raises
+        `TypeError` for a reducer."""
+        self._refuse_reducer("run it with .reduce(items)")
         return MapStep(self._self_definition, self._self_serializers or process_serializers())
 
     @property
@@ -240,8 +243,9 @@ class Task(wrapt.ObjectProxy):
         called with no argument; `bind(field=value, ...)` sets fields on the
         message the bound task is called with, and only works when the task's
         input is a protobuf message. Raises `TypeError` or `ValueError` at
-        once for a binding that cannot work.
+        once for a binding that cannot work, and for a reducer.
         """
+        self._refuse_reducer("run it with .reduce(items)")
         serializers = self._self_serializers or process_serializers()
         return bind_task(self._self_definition, serializers, value, fields)
 
@@ -496,11 +500,17 @@ class Task(wrapt.ObjectProxy):
                 "an associative reducer folds items into a result of their own type, "
                 f"but {name!r} takes {item_type!r} and returns {output_type!r}"
             )
+        if associative and merge is not None:
+            raise TaskDefinitionError(
+                "an associative reducer takes no merge: it combines two results itself, "
+                "and a tree needs exactly one way to combine two results, "
+                "associative=True or a merge function, not both"
+            )
         tree = associative if tree is None else tree
-        if tree and associative == (merge is not None):
+        if tree and not associative and merge is None:
             raise TaskDefinitionError(
                 "a tree reducer needs exactly one way to combine two results, "
-                f"associative=True or a merge function, not {'both' if associative else 'neither'}"
+                "associative=True or a merge function, not neither"
             )
         if merge is not None and not tree:
             raise TaskDefinitionError("merge combines the results of a tree's branches, so it needs tree=True")
@@ -585,8 +595,10 @@ def task(
     """Declares a durable task: work that survives the loss of the worker
     running it. Use it bare (`@task`) or with options (`@task(queue="gpu")`).
 
-    The function takes exactly one argument, its input, and both that and the
-    return value must be annotated with types its serializer supports. Every
+    The function takes exactly one argument, its input (a function of two
+    parameters `(item, previous)` is a reducer: see `reducer`), and both that
+    and the return value must be annotated with types its serializer
+    supports. Every
     worker of a shard must import the same tasks under the same names,
     because a task is sent to a worker by name.
 
@@ -726,7 +738,9 @@ def ephemeral_task(
     worker running it, and losing every worker may lose it.
 
     Takes the same arguments, and raises the same errors, as `task`, whose
-    documentation also covers what every worker must agree on.
+    documentation also covers what every worker must agree on. Its function
+    takes one argument: a reducer (two parameters) must be durable, so see
+    `reducer`.
     """
     options = {
         "name": name,
@@ -791,7 +805,9 @@ def coalescing_task(
     of refusing it with `BackpressureError`. It is never the
     default: a dropped payload is never folded.
 
-    Takes the other arguments, and raises the errors, of `task`.
+    Takes the other arguments, and raises the errors, of `task`. Its function
+    takes one argument: a function of two parameters is a reducer, which
+    cannot coalesce (see `reducer`).
     """
     options = {
         "name": name,
