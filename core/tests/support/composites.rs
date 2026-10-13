@@ -36,6 +36,7 @@ pub fn one_stage_flow() -> Step {
             input: BoundInput::Value(b"x".to_vec()),
             fields: Vec::new(),
         })],
+        streamed: false,
     }
 }
 
@@ -75,17 +76,17 @@ pub fn task_stage(name: &str, value: Option<&[u8]>) -> Stage {
 }
 
 pub fn flow_of(stages: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages }
+    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages, streamed: false }
 }
 
 /// A group of `members` run side by side under `on_error`.
 pub fn group_of(on_error: OnError, members: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Group, on_error, stages: members }
+    Step { kind: CompositeKind::Group, on_error, stages: members, streamed: false }
 }
 
 /// A map whose members are bound to their items, failing fast.
 pub fn map_of(members: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members }
+    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members, streamed: false }
 }
 
 /// Settings of a task stage, which the builders above leave at their defaults.

@@ -312,6 +312,7 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
             kind: CompositeKind::Map,
             on_error: OnError::FailFast,
             stages: vec![task_stage("each", None)],
+            streamed: false,
         });
         let flow = submitted(
             &mut fixture,
@@ -321,7 +322,7 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
         let expansion = start_member(&mut fixture, &flow.child(1), 0);
         let Stage::Task(mut item) = task_stage("each", None) else { unreachable!("a task stage") };
         item.input = BoundInput::Value(b"1".to_vec());
-        let items = Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: vec![Stage::Task(item)] };
+        let items = Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: vec![Stage::Task(item)], streamed: false };
         fixture
             .scheduler
             .complete(&worker(), &expansion.task_run_id, items.digest(), Completion::Continues(items))

@@ -129,7 +129,7 @@ fn composite_description(tree: &Bound<'_, PyAny>) -> PyResult<StepDescription> {
         other => return Err(PyValueError::new_err(format!("{other:?} is not an error policy"))),
     };
     let stages = stages.iter().map(stage_description).collect::<PyResult<Vec<_>>>()?;
-    Ok(StepDescription { kind: kind as i32, on_error: on_error as i32, stages })
+    Ok(StepDescription { kind: kind as i32, on_error: on_error as i32, stages, streamed: false })
 }
 
 fn stage_description(stage: &Bound<'_, PyAny>) -> PyResult<StageDescription> {

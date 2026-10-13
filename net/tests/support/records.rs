@@ -825,7 +825,7 @@ pub fn flow_of_bound(names: &[&str]) -> CompositeStep {
             Stage::Task(bound(name, input))
         })
         .collect();
-    CompositeStep { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages }
+    CompositeStep { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages, streamed: false }
 }
 
 /// A group of one member, bound to the input `manifest` names.
@@ -834,6 +834,7 @@ pub fn group_of_chunked(name: &str, manifest: Manifest) -> CompositeStep {
         kind: CompositeKind::Group,
         on_error: OnError::FailFast,
         stages: vec![Stage::Task(bound(name, BoundInput::Chunked(manifest)))],
+        streamed: false,
     }
 }
 

@@ -689,6 +689,7 @@ fn map_over_previous() -> Stage {
         kind: CompositeKind::Map,
         on_error: OnError::FailFast,
         stages: vec![task_stage("each", None)],
+        streamed: false,
     })
 }
 
@@ -713,6 +714,7 @@ fn a_map_after_a_stage_is_split_by_an_expansion_run_and_the_next_stage_takes_the
         kind: CompositeKind::Map,
         on_error: OnError::FailFast,
         stages: vec![item_member(b"1"), item_member(b"2")],
+        streamed: false,
     };
     fixture
         .scheduler
@@ -740,7 +742,7 @@ fn a_list_that_splits_into_no_items_gives_the_next_stage_an_empty_list() {
     );
     run_member(&mut fixture, &flow, 0, b"[]");
     let expansion = start_member(&mut fixture, &flow.child(1), 0);
-    let items = Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: Vec::new() };
+    let items = Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: Vec::new(), streamed: false };
     fixture
         .scheduler
         .complete(&worker(), &expansion.task_run_id, items.digest(), Completion::Continues(items))
@@ -758,6 +760,7 @@ fn an_expansion_that_fails_fails_its_map_and_the_flow_whatever_the_maps_error_po
             kind: CompositeKind::Map,
             on_error,
             stages: vec![task_stage("each", None)],
+            streamed: false,
         });
         let flow = submitted(&mut fixture, flow_of(vec![task_stage("load", Some(b"x")), map]));
         run_member(&mut fixture, &flow, 0, b"not a list");

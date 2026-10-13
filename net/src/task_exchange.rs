@@ -346,7 +346,9 @@ impl Net {
             | Request::Cancel(_)
             | Request::Place(_)
             | Request::QueryOutcome(_)
-            | Request::SubmitComposite(_) => {}
+            | Request::SubmitComposite(_)
+            | Request::SubmitMembers(_)
+            | Request::QuerySlowDown(_) => {}
         }
     }
 
@@ -821,6 +823,8 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
         Request::SubmitComposite(submit) => submit_composite(scheduler, submit),
         Request::QueryOutcome(query) => query_outcome(scheduler, query),
+        // The leader does not take member batches or answer SlowDown queries yet.
+        Request::SubmitMembers(_) | Request::QuerySlowDown(_) => Err(TaskRejectReason::TaskRejectMalformed),
     };
     match result {
         Ok(result) => TaskResponse {
@@ -846,6 +850,7 @@ fn submit<C: Clock, I: IdGenerator, O: Observer>(
         .map(|task_id| {
             task_response::Result::Submitted(SubmitAccepted {
                 task_id: Some(task_id.into()),
+                slow_down: false,
             })
         })
         .map_err(wire::submit_reject)
@@ -991,7 +996,9 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
         | Request::Cancel(_)
         | Request::Place(_)
         | Request::QueryOutcome(_)
-        | Request::SubmitComposite(_) => {
+        | Request::SubmitComposite(_)
+        | Request::SubmitMembers(_)
+        | Request::QuerySlowDown(_) => {
             return None;
         }
     };

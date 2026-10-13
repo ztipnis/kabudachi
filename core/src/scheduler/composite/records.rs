@@ -129,6 +129,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             published_at: Some(published_at.into()),
             finished: self.composites.is_finished(id),
             root: Some(composite.root.clone().into()),
+            members: 0,
+            sealed: false,
         }
     }
 

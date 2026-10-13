@@ -319,6 +319,8 @@ pub(super) fn record_named<C: Clock, I: IdGenerator>(
         task_request::Request::Submit(submit) => task(&submit.task_id),
         task_request::Request::Cancel(cancel) => task(&cancel.task_id).or_else(|| composite(&cancel.composite_id)),
         task_request::Request::SubmitComposite(submit) => composite(&submit.composite_id),
+        task_request::Request::SubmitMembers(submit) => composite(&submit.composite_id),
+        task_request::Request::QuerySlowDown(_) => None,
         task_request::Request::Started(report) => of_run(&report.task_run_id),
         task_request::Request::Completed(report) => of_run(&report.task_run_id),
         task_request::Request::Failed(report) => of_run(&report.task_run_id),

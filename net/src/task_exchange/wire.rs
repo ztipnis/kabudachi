@@ -132,6 +132,7 @@ pub(crate) fn submitted_composite(submit: &SubmitComposite) -> Result<SubmittedC
 pub(crate) fn composite_accepted(id: CompositeId) -> CompositeAccepted {
     CompositeAccepted {
         composite_id: Some(id.into()),
+        slow_down: false,
     }
 }
 
