@@ -15,7 +15,9 @@ use crate::support::node::{
     connect, deliver, finish_reconciling, leader_of_three as committed_leader, stand_as_candidate,
     start_roll_call, state_changes, tick,
 };
-use kabudachi_core::election::{ElectionTimings, Entry, Identity, Input, Output, WorkerNode};
+use kabudachi_core::election::{
+    ElectionTimings, Entry, HandOffTo, Identity, Input, Output, WorkerNode,
+};
 use kabudachi_core::protocol::ids::{IncarnationId, WorkerId};
 use kabudachi_core::protocol::messages::{
     AckEcho, ElectionMessage, JoinResponse, election_message,
@@ -399,6 +401,157 @@ fn a_tick_at_the_deadline_moves_a_node_on_in_every_state_that_reports_one() {
     let led = finish_reconciling(&mut lone);
     assert_eq!(state_changes(&led), vec![WorkerState::Leader]);
     assert_eq!(lone.step(Input::Tick).next_deadline, None);
+
+    // A drain asked while a node waits for a leader: a tick at each deadline
+    // it reports leaves it stopped, without a leader, exactly when its drain
+    // wait ends.
+    for waiting_in in [
+        WorkerState::LeaderSuspect,
+        WorkerState::RollCall,
+        WorkerState::NoQuorum,
+    ] {
+        assert_kept_drain_ends_at_the_wait_limit(waiting_in);
+    }
+    assert_hand_over_ends_at_the_wait_limit();
+}
+
+/// A voter with no leader, in `waiting_in`, asked to drain: each `Tick` at a
+/// deadline it reports comes no later than its drain wait's end, and the one
+/// at that end stops it, handing its records to nobody.
+fn assert_kept_drain_ends_at_the_wait_limit(waiting_in: WorkerState) {
+    let clock = FakeClock::new();
+    let (w1, w2) = (worker("w1"), worker("w2"));
+    let mut voter = node(&clock, &w1, &[w1.clone(), w2.clone()]);
+    let mut deadline = voter.step(Input::PeerConnected(w2)).next_deadline;
+    while voter.state() != waiting_in {
+        let due = deadline.expect("a voter with no leader reports a deadline");
+        clock.advance(due - clock.now());
+        deadline = voter.step(Input::Tick).next_deadline;
+    }
+
+    let leaves_at = clock.now() + timings(Duration::from_ticks(SUSPECT_TIMEOUT)).drain_wait_limit;
+    let asked = voter.step(Input::Drain);
+    assert_eq!(voter.state(), waiting_in, "the drain is kept");
+    let mut deadline = asked.next_deadline;
+    let mut outputs = Vec::new();
+    for _ in 0..500 {
+        if voter.state() == WorkerState::Stopped {
+            break;
+        }
+        let due = deadline.expect("a node waiting to leave reports a deadline");
+        assert!(
+            due <= leaves_at,
+            "a {:?} node reports {due:?}, beyond its drain wait's end {leaves_at:?}",
+            voter.state()
+        );
+        clock.advance(due - clock.now());
+        let ticked = voter.step(Input::Tick);
+        outputs.extend(ticked.outputs);
+        deadline = ticked.next_deadline;
+    }
+
+    assert_eq!(voter.state(), WorkerState::Stopped, "{waiting_in:?} never left");
+    assert_eq!(clock.now(), leaves_at, "left from {waiting_in:?}");
+    assert!(
+        outputs.contains(&Output::HandOff(HandOffTo::Nobody)),
+        "{waiting_in:?}: {outputs:?}"
+    );
+}
+
+/// A leader that handed its leadership over to a successor that acks it
+/// without ever vouching for hearing it: it follows (`Active`), and the
+/// `Tick` at each deadline it reports comes no later than its hand-over's
+/// end, where it leaves through the successor.
+fn assert_hand_over_ends_at_the_wait_limit() {
+    let clock = FakeClock::new();
+    let mut leader = committed_leader(&clock, SUSPECT_TIMEOUT);
+    let (p1, p2) = (worker("p1"), worker("p2"));
+    let limit = timings(Duration::from_ticks(SUSPECT_TIMEOUT)).drain_wait_limit;
+    let beat_every = Duration::from_ticks(SUSPECT_TIMEOUT / 4);
+
+    // Its voters keep its lease through the wait to hand over; at the wait's
+    // end it hands over.
+    let hands_over_at = clock.now() + limit;
+    let _ = leader.step(Input::Drain);
+    let mut handed = Vec::new();
+    for _ in 0..500 {
+        if !handed.is_empty() {
+            break;
+        }
+        clock.advance(beat_every.min(hands_over_at - clock.now()));
+        // `p1` has crawled the routing table since its admission, so it can
+        // take the leadership; `p2` has not.
+        let mut outputs = Vec::new();
+        for voter in [&p1, &p2] {
+            let mut beat = heartbeat(
+                voter,
+                Some(AckEcho {
+                    term: leader.term(),
+                    send_token: clock.now().as_ticks(),
+                }),
+            );
+            let held = leader.configuration().map(|configuration| configuration.generation());
+            beat.configuration_generation = held.map(Into::into);
+            if *voter == p1 {
+                beat.routing_crawled = true;
+                beat.admission_generation = held.map(Into::into);
+            }
+            outputs.extend(
+                leader
+                    .step(message_input(voter, heartbeat_message(beat)))
+                    .outputs,
+            );
+        }
+        outputs.extend(leader.step(Input::Tick).outputs);
+        handed = outputs
+            .into_iter()
+            .filter_map(|output| match output {
+                Output::TransferLeadership { to } => Some(to),
+                _ => None,
+            })
+            .collect();
+    }
+    assert!(!handed.is_empty(), "it never handed over");
+    let successor = handed.remove(0);
+    assert_eq!(clock.now(), hands_over_at, "setup invariant");
+
+    let leaves_at = clock.now() + limit;
+    let configuration = leader.configuration().cloned().expect("a configuration");
+    let successors_term = leader.term() + 1;
+    let ack = || {
+        ack_message(leader_ack(
+            &successor,
+            successors_term,
+            &configuration,
+            Some(g0()),
+        ))
+    };
+    let mut deadline = deliver_step(&mut leader, &successor, ack());
+    assert_eq!(leader.state(), WorkerState::Active, "it follows its successor");
+    let mut outputs = Vec::new();
+    for _ in 0..500 {
+        if leader.state() == WorkerState::Stopped {
+            break;
+        }
+        let due = deadline.expect("a node waiting to leave reports a deadline");
+        assert!(
+            due <= leaves_at,
+            "an {:?} node reports {due:?}, beyond its hand-over's end {leaves_at:?}",
+            leader.state()
+        );
+        clock.advance(due - clock.now());
+        let _ = deliver_step(&mut leader, &successor, ack());
+        let ticked = leader.step(Input::Tick);
+        outputs.extend(ticked.outputs);
+        deadline = ticked.next_deadline;
+    }
+
+    assert_eq!(leader.state(), WorkerState::Stopped, "it never left");
+    assert_eq!(clock.now(), leaves_at);
+    assert!(
+        outputs.contains(&Output::HandOff(HandOffTo::Leader(successor))),
+        "{outputs:?}"
+    );
 }
 
 /// `voter`'s heartbeat confirming the ack `leader` sent it at this instant.

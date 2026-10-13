@@ -8,7 +8,7 @@ use crate::support::builders::checked;
 use crate::support::builders::{
     ack_message, committed_from_g0, configuration_of, epoch, g0, heartbeat, heartbeat_message,
     leader_ack, past_any_suspicion, roll_call, roll_call_message, roll_call_reply, self_remove,
-    self_remove_message, single_at, vote_grant, vote_grant_message, vote_request,
+    self_remove_message, single_at, timings, vote_grant, vote_grant_message, vote_request,
     vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
@@ -270,7 +270,7 @@ fn a_node_that_handed_leadership_over_leaves_at_its_deadline_when_its_successor_
     let handed = crawled(&clock, &mut leader, &worker("p2"));
     let successor = handed_to(&handed).expect("every other voter crawled, so it hands over");
     let leaves_at =
-        clock.now() + crate::support::builders::timings(Duration::from_ticks(SUSPECT)).drain_wait_limit;
+        clock.now() + timings(Duration::from_ticks(SUSPECT)).drain_wait_limit;
     let configuration = leader.configuration().cloned().expect("a configuration");
     let successors_term = leader.term() + 1;
     let ack = || ack_message(leader_ack(&successor, successors_term, &configuration, Some(g0())));
@@ -291,6 +291,54 @@ fn a_node_that_handed_leadership_over_leaves_at_its_deadline_when_its_successor_
     assert!(
         left.contains(&Output::HandOff(HandOffTo::Leader(successor))),
         "{left:?}"
+    );
+}
+
+/// A leader that handed over, then stops hearing its successor, has no leader
+/// to leave through: it suspects, and at its deadline leaves with nobody to
+/// hand its records to, not through the successor it lost.
+#[test]
+fn a_node_that_handed_leadership_over_and_lost_its_successor_leaves_without_a_leader_at_its_deadline() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let _ = leader.step(Input::Drain);
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+    let handed = crawled(&clock, &mut leader, &worker("p2"));
+    let successor = handed_to(&handed).expect("every other voter crawled, so it hands over");
+    let leaves_at =
+        clock.now() + timings(Duration::from_ticks(SUSPECT)).drain_wait_limit;
+    let configuration = leader.configuration().cloned().expect("a configuration");
+    let ack = leader_ack(&successor, leader.term() + 1, &configuration, Some(g0()));
+    deliver(&mut leader, &successor, ack_message(ack));
+    assert_eq!(leader.state(), WorkerState::Active, "it follows its successor");
+
+    // The successor never acks again.
+    let mut deadline = leader.step(Input::Tick).next_deadline;
+    let mut waited_in = Vec::new();
+    let mut outputs = Vec::new();
+    for _ in 0..500 {
+        if leader.state() == WorkerState::Stopped {
+            break;
+        }
+        let due = deadline.expect("a node waiting to leave reports a deadline");
+        assert!(due <= leaves_at, "{due:?} lies beyond its deadline {leaves_at:?}");
+        clock.advance(due - clock.now());
+        let ticked = leader.step(Input::Tick);
+        waited_in.push(leader.state());
+        outputs.extend(ticked.outputs);
+        deadline = ticked.next_deadline;
+    }
+
+    assert_eq!(leader.state(), WorkerState::Stopped, "it never left");
+    assert_eq!(clock.now(), leaves_at);
+    assert!(waited_in.contains(&WorkerState::LeaderSuspect), "{waited_in:?}");
+    assert!(
+        outputs.contains(&Output::HandOff(HandOffTo::Nobody)),
+        "{outputs:?}"
+    );
+    assert!(
+        !outputs.contains(&Output::HandOff(HandOffTo::Leader(successor))),
+        "{outputs:?}"
     );
 }
 

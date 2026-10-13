@@ -46,6 +46,9 @@ where
                 }
             }
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
+                // A node that handed its leadership over and then lost the
+                // successor gives up here too, at its hand-over's end: with
+                // no leader to leave through, it leaves without one.
                 if self.drain_request.gave_up_waiting(self.clock.now()) {
                     self.drain_without_a_leader();
                     return;

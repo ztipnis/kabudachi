@@ -17,7 +17,9 @@ where
     /// hands its leadership over once every other voter has crawled or the
     /// wait limit has passed, and leaves through its successor (see
     /// [`Self::hand_over_once_free`]). From a state that will reach one of
-    /// them later it keeps the request for [`Self::transition_to`] to apply; a
+    /// them later it keeps the request for [`Self::transition_to`] to apply
+    /// (a `LeaderSuspect`, `RollCall` or `NoQuorum` node waits for a leader up
+    /// to `drain_wait_limit`, then leaves without one); a
     /// node already draining, or one that can never drain again, ignores it.
     pub(super) fn request_drain(&mut self) {
         let now = self.clock.now();
