@@ -159,3 +159,43 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
     })
     .await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_fails_before_its_body_starts_ends_failed_at_the_leader() {
+    within_deadline(async {
+        let (mut shard, client) = ThreeVoters::start().await;
+        let mut executors: Vec<FakeExecutor> = (0..3)
+            .map(|voter| {
+                let (executor, endpoint) = FakeExecutor::new();
+                shard.set_executor(voter, endpoint);
+                executor
+            })
+            .collect();
+        let leader = shard.drive_until_a_leader().await;
+        let leader_id = shard.id(leader);
+        shard.join_as_pending(&client, leader).await;
+        let follower = shard.others(leader)[0];
+        let nets = shard.nets.clone();
+
+        // A follower is handed a run and fails it without ever starting it,
+        // as an executor does whose claim cannot be read or whose input
+        // cannot be fetched.
+        executors[follower].grant(1);
+        let task = shard
+            .drive_until(submitted_through(&client, &leader_id, plain_with(b"unstartable")))
+            .await;
+        let (run, _) = shard.drive_until(executors[follower].next_claim()).await;
+        executors[follower].report(Report::Failed {
+            run: run.clone(),
+            reason: "PayloadUnavailable".into(),
+        });
+        let follower_net = nets[follower].clone();
+        shard
+            .drive_until(poll_until("the leader recorded the failure", || {
+                holding(&nets, &task, &[TaskRunState::Failed]) >= QUORUM
+                    && follower_net.claimed_runs().get(&run).is_none()
+            }))
+            .await;
+    })
+    .await
+}

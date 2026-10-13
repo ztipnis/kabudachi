@@ -18,7 +18,9 @@
 //! an abort deadline, so no outcome is known), or, for a compaction run,
 //! `Compacted` (the fold). The driver takes each report to
 //! the leader in that order, asking again as leaders change, until one takes
-//! it.
+//! it. An executor may report `Failed` with no `Started`, for a run whose body
+//! never started; the driver reports it started first, since a leader fails
+//! only a running run.
 //!
 //! ## What the driver sends: [`Work`]
 //!
@@ -195,6 +197,8 @@ pub(crate) struct Held {
     pub(crate) handed: BTreeMap<TaskRunId, CoreDuration>,
     /// The runs of `handed` the executor was already told to stop.
     pub(crate) cancelled: BTreeSet<TaskRunId>,
+    /// The runs of `handed` the executor reported started.
+    pub(crate) started: BTreeSet<TaskRunId>,
     /// Per run, the reports no leader has taken yet, oldest first.
     pub(crate) waiting: BTreeMap<TaskRunId, VecDeque<RunReport>>,
     /// The executor dropped its handle, or either half of it: nothing more
@@ -530,9 +534,12 @@ impl<'n> Executing<'n> {
                 held.credits = held.credits.saturating_add(places);
                 return;
             }
-            Report::Started(run) => task_request::Request::Started(ReportStarted {
-                task_run_id: Some(run.into()),
-            }),
+            Report::Started(run) => {
+                self.endpoint.held.started.insert(run.clone());
+                task_request::Request::Started(ReportStarted {
+                    task_run_id: Some(run.into()),
+                })
+            }
             Report::Completed { run, digest, delivered } => {
                 self.ended(&run);
                 task_request::Request::Completed(ReportCompleted {
@@ -542,6 +549,16 @@ impl<'n> Executing<'n> {
                 })
             }
             Report::Failed { run, reason } => {
+                let held = &self.endpoint.held;
+                // A leader fails only a running run: one that failed before its
+                // body started (its claim could not be read, or its input
+                // fetched) is reported started first. A cancelled run was
+                // ended by the leader already, and is reported as it is.
+                if !held.started.contains(&run) && !held.cancelled.contains(&run) && held.handed.contains_key(&run) {
+                    self.queue(task_request::Request::Started(ReportStarted {
+                        task_run_id: Some(run.clone().into()),
+                    }));
+                }
                 self.ended(&run);
                 task_request::Request::Failed(ReportFailed {
                     task_run_id: Some(run.into()),
@@ -654,6 +671,7 @@ impl<'n> Executing<'n> {
     fn lose_handed(&mut self) {
         for run in std::mem::take(&mut self.endpoint.held.handed).into_keys() {
             self.endpoint.held.cancelled.remove(&run);
+            self.endpoint.held.started.remove(&run);
             self.queue_lost(run);
         }
     }
@@ -667,6 +685,7 @@ impl<'n> Executing<'n> {
     fn ended(&mut self, run: &TaskRunId) {
         self.endpoint.held.handed.remove(run);
         self.endpoint.held.cancelled.remove(run);
+        self.endpoint.held.started.remove(run);
     }
 
     fn queue(&mut self, request: RunReport) {
