@@ -1,5 +1,6 @@
 use kabudachi_core::election::WorkerNode;
-use kabudachi_core::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::generated;
+use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     ClaimResponse, PlaceRecords, ResultCertified, TaskResponse, claim_request, task_request,
 };
@@ -59,6 +60,9 @@ pub(super) enum HeldAnswer {
     /// How a task with a client ended, told to the client once the
     /// revision that ended it is stored.
     Concluded(Conclusion),
+    /// That a composite is over, told to its client once its terminal
+    /// records are stored.
+    Finished { client: WorkerId, finished: generated::CompositeFinished },
 }
 
 /// What settled answers leave this worker itself to act on.
@@ -98,25 +102,23 @@ impl<C: Clock, I: IdGenerator> Deciding<'_, C, I> {
 
     /// Writes what the decision just made changed, then holds `held` until
     /// those writes settle, and sends it at once if nothing holds it. One
-    /// that made no write of its own waits for the writes of `named`'s task
-    /// still unsettled instead (see [`LeaderRecords::hold`]).
-    pub(super) fn hold(&mut self, held: HeldAnswer, named: Option<&TaskId>, local: &mut Local) {
+    /// that made no write of its own waits for the writes of the record
+    /// `named` names still unsettled instead (see [`LeaderRecords::hold`]).
+    pub(super) fn hold(&mut self, held: HeldAnswer, named: Option<RecordKey>, local: &mut Local) {
         let made = self.write();
-        let named = named.cloned().map(RecordKey::Task);
         if let Some(settled) = self.records.hold(held, made, named.as_ref()) {
             send_answer(self.net, settled, local);
         }
     }
 
-    /// Holds `held`, which made no write of its own, until the writes of
-    /// `named`'s task still unsettled are stored.
+    /// Holds `held`, which made no write of its own, until the writes of the
+    /// record `named` names still unsettled are stored.
     pub(super) fn hold_unwritten(
         &mut self,
         held: HeldAnswer,
-        named: Option<&TaskId>,
+        named: Option<RecordKey>,
         local: &mut Local,
     ) {
-        let named = named.cloned().map(RecordKey::Task);
         if let Some(settled) = self.records.hold(held, Vec::new(), named.as_ref()) {
             send_answer(self.net, settled, local);
         }
@@ -142,8 +144,8 @@ pub(super) fn respond_to_claim_requests<C: Clock, I: IdGenerator>(
             continue;
         }
         let response = claim::answer(deciding.scheduler, &handle.from(), handle.request());
-        let task = claimed_task(handle.request());
-        deciding.hold(HeldAnswer::Claim { handle, response }, task.as_ref(), local);
+        let task = claimed_task(handle.request()).map(RecordKey::Task);
+        deciding.hold(HeldAnswer::Claim { handle, response }, task, local);
     }
 }
 
@@ -182,10 +184,10 @@ pub(super) fn respond_to_task_requests<C: Clock, I: IdGenerator>(
                 .respond_task(handle, task_exchange::not_member());
             continue;
         }
-        let named = task_named(deciding.scheduler, handle.request());
+        let named = record_named(deciding.scheduler, handle.request());
         let response =
             task_exchange::answer(deciding.scheduler, &handle.from(), handle.request(), clock);
-        deciding.hold(HeldAnswer::Task { handle, response }, named.as_ref(), local);
+        deciding.hold(HeldAnswer::Task { handle, response }, named, local);
     }
 }
 
@@ -287,29 +289,32 @@ pub(super) fn respond_to_steal_requests<C: Clock>(net: &Net, clock: &C, policy: 
     }
 }
 
-/// The task a request names, for the requests that name one, or whose run
-/// `scheduler` holds (a report names its run).
-pub(super) fn task_named<C: Clock, I: IdGenerator>(
+/// The record a request names, for the requests that name one (a task, or a
+/// composite), or whose run `scheduler` holds (a report names its run).
+pub(super) fn record_named<C: Clock, I: IdGenerator>(
     scheduler: &Scheduler<C, I, RecordOutbox>,
     request: &task_request::Request,
-) -> Option<TaskId> {
+) -> Option<RecordKey> {
     let of_run = |run: &Option<_>| {
         let run = TaskRunId::from(Clone::clone(run.as_ref()?));
         scheduler
             .task_run(&run)
             .and_then(|held| held.identity.as_ref()?.task_id.clone())
-            .map(TaskId::from)
+            .map(|task| RecordKey::Task(TaskId::from(task)))
     };
+    let task = |task: &Option<_>| Some(RecordKey::Task(TaskId::from(Clone::clone(task.as_ref()?))));
+    let composite = |id: &Option<_>| Some(RecordKey::Composite(CompositeId::from(Clone::clone(id.as_ref()?))));
     match request {
-        task_request::Request::Submit(task) => task.task_id.clone().map(TaskId::from),
-        task_request::Request::Cancel(cancel) => cancel.task_id.clone().map(TaskId::from),
+        task_request::Request::Submit(submit) => task(&submit.task_id),
+        task_request::Request::Cancel(cancel) => task(&cancel.task_id).or_else(|| composite(&cancel.composite_id)),
+        task_request::Request::SubmitComposite(submit) => composite(&submit.composite_id),
         task_request::Request::Started(report) => of_run(&report.task_run_id),
         task_request::Request::Completed(report) => of_run(&report.task_run_id),
         task_request::Request::Failed(report) => of_run(&report.task_run_id),
         task_request::Request::Compacted(report) => of_run(&report.task_run_id),
         task_request::Request::Lost(report) => of_run(&report.task_run_id),
-        task_request::Request::QueryOutcome(query) => query.task_id.clone().map(TaskId::from),
-        task_request::Request::Place(_) | task_request::Request::SubmitComposite(_) => None,
+        task_request::Request::QueryOutcome(query) => task(&query.task_id),
+        task_request::Request::Place(_) => None,
     }
 }
 
@@ -339,6 +344,10 @@ pub(super) fn send_answer(net: &Net, settled: Settled<HeldAnswer>, local: &mut L
         // The ending may not have been stored: the client asks the next
         // leader how the task stands.
         Settled::NotLeader(HeldAnswer::Concluded(_)) => {}
+        Settled::Released(HeldAnswer::Finished { client, finished }) => tell_finished(net, client, finished),
+        // The ending may not have been stored: the client reads the
+        // composite's record when it next looks.
+        Settled::NotLeader(HeldAnswer::Finished { .. }) => {}
     }
 }
 
@@ -366,4 +375,16 @@ fn tell_client(net: &Net, conclusion: Conclusion) {
             ));
         }
     }
+}
+
+/// Tells a composite's client it is over, in the background. The composite is
+/// durable either way: a client that never takes it reads the record.
+fn tell_finished(net: &Net, client: WorkerId, finished: generated::CompositeFinished) {
+    let composite = finished.composite_id.clone().map(CompositeId::from);
+    let told = net.send_composite_finished(client, finished);
+    tokio::spawn(async move {
+        if !told.await {
+            tracing::debug!(?composite, "a composite's client did not take that it is over");
+        }
+    });
 }

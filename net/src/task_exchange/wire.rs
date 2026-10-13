@@ -6,11 +6,12 @@
 use kabudachi_core::manifest::{InvalidManifest, Manifest};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    CancelAnswer, CancelOutcome, OutcomeAnswer, RunCertified, RunFailed, RunLost, SubmitTask, TaskReject,
-    TaskRejectReason, TaskResponse, task_response,
+    CancelAnswer, CancelOutcome, CompositeAccepted, OutcomeAnswer, RunCertified, RunFailed, RunLost, SubmitComposite,
+    SubmitTask, TaskReject, TaskRejectReason, TaskResponse, task_response,
 };
+use kabudachi_core::scheduler::composite::{Step, SubmittedComposite};
 use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, Certification, Failure, LostRun, Outcome, OutcomeRejection, ReportRejection,
     Submission, Submitted, SubmitRejection, TraceContext,
@@ -95,6 +96,35 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
         },
         clock,
     ))
+}
+
+/// `submitted` as a request: everything its client fixed, so that asking
+/// again names the same composite.
+pub(crate) fn submit_composite(submitted: &SubmittedComposite) -> SubmitComposite {
+    SubmitComposite {
+        composite_id: Some(submitted.composite_id.clone().into()),
+        submitted_at: Some(submitted.submitted_at.into()),
+        description: Some(generated::StepDescription::from(&submitted.step)),
+        client: submitted.client.clone().map(Into::into),
+    }
+}
+
+/// The composite `submit` asks for.
+pub(crate) fn submitted_composite(submit: &SubmitComposite) -> Result<SubmittedComposite, Malformed> {
+    let step = submit.description.as_ref().ok_or(Malformed)?;
+    Ok(SubmittedComposite {
+        composite_id: CompositeId::from(submit.composite_id.clone().ok_or(Malformed)?),
+        submitted_at: WallTime::from(submit.submitted_at.ok_or(Malformed)?),
+        step: Step::try_from(step).map_err(|_| Malformed)?,
+        client: submit.client.clone().map(WorkerId::from),
+    })
+}
+
+/// The answer that a composite is recorded.
+pub(crate) fn composite_accepted(id: CompositeId) -> CompositeAccepted {
+    CompositeAccepted {
+        composite_id: Some(id.into()),
+    }
 }
 
 /// The digest a request carries, if it carries a usable one.

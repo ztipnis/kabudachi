@@ -87,7 +87,7 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
         assert!(handed.abandoned.is_empty(), "{handed:?}");
         assert_eq!(watch.state(leader), WorkerState::Stopped);
 
-        executors[runner].report(Report::Completed { run, digest: Digest::blake3(b"done"), delivered: false });
+        executors[runner].report(Report::Completed { run, digest: Digest::blake3(b"done"), delivered: false, continuation: None });
         shard
             .drive_until(poll_until("the successor certified the run", || {
                 holding(&nets, &task, &[TaskRunState::Succeeded]) >= QUORUM

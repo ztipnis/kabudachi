@@ -165,6 +165,63 @@ impl CompositeFinished {
     }
 }
 
+/// What a leader tells a composite's client: the composite, how it ended,
+/// its failure if it has one, and its pages as the results. The client's own
+/// id is not told to the client.
+impl From<&CompositeFinished> for generated::CompositeFinished {
+    fn from(finished: &CompositeFinished) -> Self {
+        generated::CompositeFinished {
+            composite_id: Some(finished.composite_id.clone().into()),
+            state: generated::CompositeState::from(finished.state) as i32,
+            results: Some(finished.results().into()),
+            failure: finished
+                .failure
+                .clone()
+                .map(|Failure { kind, message }| generated::Failure { kind, message }),
+            parent_task: finished.parent_task.clone().map(Into::into),
+        }
+    }
+}
+
+/// A finish message that does not name a composite, one of its states, or its
+/// pages in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a composite's finish message cannot be read")]
+pub struct MalformedFinished;
+
+impl TryFrom<&generated::CompositeFinished> for CompositeFinished {
+    type Error = MalformedFinished;
+
+    /// The composite as a client reads it: with no client of its own to tell.
+    fn try_from(wire: &generated::CompositeFinished) -> Result<Self, MalformedFinished> {
+        let composite_id = CompositeId::from(wire.composite_id.clone().ok_or(MalformedFinished)?);
+        let state = match generated::CompositeState::try_from(wire.state) {
+            Ok(generated::CompositeState::Running) => CompositeState::Running,
+            Ok(generated::CompositeState::Succeeded) => CompositeState::Succeeded,
+            Ok(generated::CompositeState::Failed) => CompositeState::Failed,
+            Ok(generated::CompositeState::Cancelled) => CompositeState::Cancelled,
+            _ => return Err(MalformedFinished),
+        };
+        let results = Manifest::try_from(wire.results.as_ref().ok_or(MalformedFinished)?)
+            .map_err(|_| MalformedFinished)?;
+        let pages = u32::try_from(results.entries().len()).map_err(|_| MalformedFinished)?;
+        if results.entries() != pages_manifest(&composite_id, pages).entries() {
+            return Err(MalformedFinished);
+        }
+        Ok(CompositeFinished {
+            composite_id,
+            state,
+            failure: wire.failure.as_ref().map(|failure| Failure {
+                kind: failure.kind.clone(),
+                message: failure.message.clone(),
+            }),
+            pages,
+            client: None,
+            parent_task: wire.parent_task.clone().map(TaskId::from),
+        })
+    }
+}
+
 /// A manifest naming the first `pages` pages of `composite`.
 fn pages_manifest(composite: &CompositeId, pages: u32) -> Manifest {
     let entries = (0..pages)

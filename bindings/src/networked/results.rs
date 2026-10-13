@@ -58,6 +58,7 @@ pub(super) async fn deliver_then_report(
         run,
         digest,
         delivered,
+        continuation: None,
     });
 }
 
@@ -210,6 +211,9 @@ impl Seam {
                 self.awaiting.remove(&task);
                 Some(event)
             }
+            // Python submits no composite from a networked worker yet, so
+            // none is awaited here.
+            ResultEvent::CompositeFinished(_) => None,
         }
     }
 }

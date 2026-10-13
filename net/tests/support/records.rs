@@ -1,6 +1,7 @@
 //! A shard of voters driven in the background over real loopback sockets, for
 //! tests of what a leader does with its records.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -10,23 +11,32 @@ use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{
     ElectionTimings, Entry, Identity, Input, KnownConfiguration, Step, WorkerNode,
 };
+use kabudachi_core::blob::BlobOwner;
+use kabudachi_core::manifest::{Manifest, ManifestEntry};
 use kabudachi_core::protocol::generated::{CompositeRecord, ElectionCertificate, TaskRunState};
 use kabudachi_core::protocol::ids::{
-    CompositeId, IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
+    CompositeId, IdGenerator, IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::messages::{
-    ElectionMessage, WorkerHeartbeat, claim_response, election_message, task_response,
+    ElectionMessage, TaskRejectReason, WorkerHeartbeat, claim_response, election_message, task_response,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::queues::{QueuePolicy, Subscription};
-use kabudachi_core::scheduler::{Scheduler, Submission, Submitted, mint};
-use kabudachi_core::task_record::{RecordOutbox, RecordVersion};
+use kabudachi_core::scheduler::composite::{
+    BoundInput, BoundStep, CompositeFinished, CompositeKind, OnError, Stage, Step as CompositeStep, SubmittedComposite,
+    TaskOptions,
+};
+use kabudachi_core::scheduler::{Claim, Scheduler, Submission, Submitted, mint};
+use kabudachi_core::task_record::{RecordKey, RecordOutbox, RecordVersion};
 use kabudachi_core::time::{Duration, RealClock, WallTime};
 use kabudachi_net::discovery::Takes;
 use kabudachi_net::driver::{DriverConfig, run_driver};
 use kabudachi_net::executor::ExecutorEndpoint;
 use kabudachi_net::handoff::HandedOff;
+use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::messenger::Net;
+use kabudachi_net::result_transport::ResultEvent;
+use kabudachi_net::task_exchange::{LeaderRetry, placement_with_asker_of};
 use kabudachi_net::task_store::placement::ReplicationFactor;
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -781,5 +791,190 @@ pub fn composite_record(id: &CompositeId, term: u64, revision: u64) -> Composite
         version: Some(RecordVersion { recovery_epoch: RecoveryEpoch::new(0, 0), leader_term: term, revision }.into()),
         composite_id: Some(id.clone().into()),
         ..CompositeRecord::default()
+    }
+}
+
+pub const MIB: usize = 1024 * 1024;
+
+/// `len` bytes that differ from chunk to chunk.
+pub fn varied(len: usize) -> Vec<u8> {
+    (0..len).map(|at| (at % 251) as u8).collect()
+}
+
+/// Every record is placed on two voters.
+pub fn two_holders() -> ReplicationFactor {
+    ReplicationFactor::new(NonZeroUsize::new(2).expect("two"))
+}
+
+/// How a call to the leader that stores for a client keeps asking.
+pub fn retry() -> LeaderRetry {
+    LeaderRetry {
+        answer_within: StdDuration::from_secs(2),
+        ask_again_after: StdDuration::from_millis(50),
+    }
+}
+
+/// A flow whose stages run `names` in turn: the first is bound to an input
+/// of its own, and each later one takes the result of the one before.
+pub fn flow_of_bound(names: &[&str]) -> CompositeStep {
+    let stages = names
+        .iter()
+        .enumerate()
+        .map(|(at, name)| {
+            let input = if at == 0 { BoundInput::Value(b"start".to_vec()) } else { BoundInput::Previous };
+            Stage::Task(bound(name, input))
+        })
+        .collect();
+    CompositeStep { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages }
+}
+
+/// A group of one member, bound to the input `manifest` names.
+pub fn group_of_chunked(name: &str, manifest: Manifest) -> CompositeStep {
+    CompositeStep {
+        kind: CompositeKind::Group,
+        on_error: OnError::FailFast,
+        stages: vec![Stage::Task(bound(name, BoundInput::Chunked(manifest)))],
+    }
+}
+
+fn bound(name: &str, input: BoundInput) -> BoundStep {
+    BoundStep {
+        definition: TaskDefinitionId::new(name),
+        version: 1,
+        options: TaskOptions::on_queue("default"),
+        input,
+        fields: Vec::new(),
+    }
+}
+
+/// Has `client` submit `step` to `leader` as a composite it awaits, asking
+/// again until the leader's lease is ready, and returns the composite's id.
+pub async fn composite_submitted_through(client: &Net, leader: &WorkerId, step: CompositeStep) -> CompositeId {
+    composite_submitted_as(client, leader, &Uuid7Ids.next_composite_id(), step).await
+}
+
+/// Like [`composite_submitted_through`], under the given composite id.
+pub async fn composite_submitted_as(
+    client: &Net,
+    leader: &WorkerId,
+    id: &CompositeId,
+    step: CompositeStep,
+) -> CompositeId {
+    let submitted = SubmittedComposite {
+        composite_id: id.clone(),
+        submitted_at: WallTime::now(&RealClock::new()),
+        step,
+        client: Some(client.local_worker_id()),
+    };
+    loop {
+        let answer = client.submit_composite(leader.clone(), &submitted).await;
+        match answer.map(|answer| answer.result) {
+            Ok(Some(task_response::Result::Composite(_))) => return id.clone(),
+            Ok(Some(task_response::Result::Reject(reject)))
+                if !matches!(
+                    TaskRejectReason::try_from(reject.reason),
+                    Ok(TaskRejectReason::TaskRejectNotLeader
+                        | TaskRejectReason::TaskRejectNotReady
+                        | TaskRejectReason::TaskRejectNotMember)
+                ) =>
+            {
+                panic!("the leader refused the composite for good: {reject:?}");
+            }
+            _ => tokio::time::sleep(StdDuration::from_millis(10)).await,
+        }
+    }
+}
+
+/// Has `net` claim member `index` of `composite` from `leader`, asking again
+/// until the leader grants it: the stage may not exist yet, or the member's
+/// last run may not be over.
+pub async fn member_claimed_through(net: &Net, leader: &WorkerId, composite: &CompositeId, index: u64) -> Claim {
+    let member = composite.member_task(index);
+    loop {
+        let answer = net.request_claim(leader.clone(), member.clone()).await.expect("the leader answered");
+        if let Some(claim_response::Result::Accept(wire)) = answer.result {
+            return Claim::try_from(&wire).expect("a well-formed claim");
+        }
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    }
+}
+
+/// Has `net` claim member `index` of `composite` and report it started.
+pub async fn member_started_through(net: &Net, leader: &WorkerId, composite: &CompositeId, index: u64) -> Claim {
+    let claim = member_claimed_through(net, leader, composite, index).await;
+    started(net, leader, &claim).await;
+    claim
+}
+
+/// Has `net` claim member `index` of `composite`, run it to `result` and
+/// report it completed.
+pub async fn member_run_through(net: &Net, leader: &WorkerId, composite: &CompositeId, index: u64, result: &[u8]) {
+    let claim = member_claimed_through(net, leader, composite, index).await;
+    claimed_member_run_through(net, leader, &claim, result).await;
+}
+
+/// Has `net` run the member `claim` granted it to `result`: start it, store
+/// `result` as the member Task's result where the leader places its record,
+/// and report it completed.
+pub async fn claimed_member_run_through(net: &Net, leader: &WorkerId, claim: &Claim, result: &[u8]) {
+    started(net, leader, claim).await;
+    let member = TaskId::from(claim.task.task_id.clone().expect("a claim names its task"));
+    let owner = BlobOwner::Task(member.clone());
+    let key = RecordKey::Task(member);
+    let placed = net.place_records(leader.clone(), vec![key.clone()]).await.expect("the leader answered");
+    let placement = placement_with_asker_of(&placed, &key).expect("the leader places the member");
+    let stored = net
+        .store_payload(BlobRole::Result, &owner, result, placement.clone())
+        .await
+        .expect("the result is stored");
+    // The result is the digest of the blob that holds its encoded manifest.
+    let holder = net
+        .store_payload(BlobRole::Result, &owner, &stored.encode(), placement)
+        .await
+        .expect("the result's manifest is stored");
+    let digest = match holder.entries() {
+        [ManifestEntry::Blob(key)] => key.digest(),
+        other => panic!("a manifest fits one blob: {other:?}"),
+    };
+    loop {
+        let answer = net
+            .complete(leader.clone(), claim.task_run_id.clone(), digest.clone())
+            .await
+            .expect("the leader answered");
+        match answer.result {
+            Some(task_response::Result::Certified(_)) => return,
+            Some(task_response::Result::Reject(reject))
+                if matches!(
+                    TaskRejectReason::try_from(reject.reason),
+                    Ok(TaskRejectReason::TaskRejectNotLeader | TaskRejectReason::TaskRejectNotReady)
+                ) =>
+            {
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+            other => panic!("expected the run certified, got {other:?}"),
+        }
+    }
+}
+
+async fn started(net: &Net, leader: &WorkerId, claim: &Claim) {
+    let answer = net
+        .report_started(leader.clone(), claim.task_run_id.clone())
+        .await
+        .expect("the leader answered");
+    assert!(
+        matches!(answer.result, Some(task_response::Result::Started(_))),
+        "expected the start acknowledged, got {answer:?}"
+    );
+}
+
+/// The first composite `client` is told is over, as it reads it.
+pub async fn finished_heard_by(client: &Net) -> CompositeFinished {
+    loop {
+        for event in client.take_result_events() {
+            if let ResultEvent::CompositeFinished(wire) = event {
+                return CompositeFinished::try_from(&wire).expect("the finish message reads");
+            }
+        }
+        client.result_arrived().await;
     }
 }

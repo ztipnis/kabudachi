@@ -2,6 +2,7 @@
 //! reach their client, over real sockets.
 
 mod compaction;
+mod composites;
 mod lifecycle;
 mod own_requests;
 mod results;

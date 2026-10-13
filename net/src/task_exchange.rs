@@ -42,14 +42,15 @@ use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
-use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome,
     RecordPlacements, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted, StartAccepted,
-    SubmitAccepted, SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse,
+    SubmitAccepted, SubmitComposite, SubmitTask, TaskReject, TaskRejectReason, TaskRequest, TaskResponse,
     task_request, task_response,
 };
 use kabudachi_core::protocol::ids::IdGenerator;
+use kabudachi_core::scheduler::composite::{Step, SubmittedComposite};
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
 use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::Clock;
@@ -142,6 +143,28 @@ impl Net {
         submitted: Submitted,
     ) -> Result<TaskResponse, TaskFailure> {
         let request = task_request::Request::Submit(wire::submit_task(&submitted));
+        self.ask_task(leader, request).await
+    }
+
+    /// Asks `leader` to run `submitted`. Answered `composite` once the leader
+    /// has stored the composite's first record where it must be, or a reason:
+    /// `TASK_REJECT_NOT_LEADER` means ask again (with the same `submitted`,
+    /// so the composite id holds).
+    pub async fn submit_composite(
+        &self,
+        leader: WorkerId,
+        submitted: &SubmittedComposite,
+    ) -> Result<TaskResponse, TaskFailure> {
+        let request = task_request::Request::SubmitComposite(wire::submit_composite(submitted));
+        self.ask_task(leader, request).await
+    }
+
+    /// Asks `leader` to cancel the composite `id` and everything it runs.
+    pub async fn cancel_composite(&self, leader: WorkerId, id: CompositeId) -> Result<TaskResponse, TaskFailure> {
+        let request = task_request::Request::Cancel(CancelTask {
+            task_id: None,
+            composite_id: Some(id.into()),
+        });
         self.ask_task(leader, request).await
     }
 
@@ -249,12 +272,16 @@ impl Net {
         };
         match request {
             task_request::Request::Completed(report) => {
-                if let Ok(result_digest) = wire::digest(report.result_digest.as_ref()) {
+                let continuation = report.continuation.as_ref().map(Step::try_from).transpose();
+                if let (Ok(result_digest), Ok(continuation)) =
+                    (wire::digest(report.result_digest.as_ref()), continuation)
+                {
                     self.claimed.set(
                         &run,
                         HeldRun::Completed {
                             result_digest,
                             delivered: report.delivered,
+                            continuation,
                         },
                     );
                 }
@@ -716,8 +743,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Cancel(request) => cancel(scheduler, request),
         // Where records go is the driver's to say: it alone knows the voters.
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
-        // Composites are not driven by this leader yet.
-        Request::SubmitComposite(_) => Err(TaskRejectReason::TaskRejectMalformed),
+        Request::SubmitComposite(submit) => submit_composite(scheduler, submit),
         Request::QueryOutcome(query) => query_outcome(scheduler, query),
     };
     match result {
@@ -749,6 +775,19 @@ fn submit<C: Clock, I: IdGenerator, O: Observer>(
         .map_err(wire::submit_reject)
 }
 
+fn submit_composite<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    submit: &SubmitComposite,
+) -> Answered {
+    let Ok(submitted) = wire::submitted_composite(submit) else {
+        return Err(TaskRejectReason::TaskRejectMalformed);
+    };
+    scheduler
+        .submit_composite(submitted)
+        .map(|id| task_response::Result::Composite(wire::composite_accepted(id)))
+        .map_err(wire::submit_reject)
+}
+
 fn started<C: Clock, I: IdGenerator, O: Observer>(
     scheduler: &mut Scheduler<C, I, O>,
     from: &WorkerId,
@@ -769,8 +808,16 @@ fn completed<C: Clock, I: IdGenerator, O: Observer>(
     let run = run_id(report.task_run_id.as_ref())?;
     let digest = wire::digest(report.result_digest.as_ref())
         .map_err(|Malformed| TaskRejectReason::TaskRejectMalformed)?;
+    let completion = match &report.continuation {
+        None => Completion::Final,
+        // A step the run returns is not given an input beyond the run's own.
+        Some(description) => match Step::try_from(description) {
+            Ok(step) if !step.takes_input() => Completion::Continues(step),
+            _ => return Err(TaskRejectReason::TaskRejectMalformed),
+        },
+    };
     scheduler
-        .complete_delivered(from, &run, digest, Completion::Final, report.delivered)
+        .complete_delivered(from, &run, digest, completion, report.delivered)
         .map(|certification| task_response::Result::Certified(wire::certified(certification)))
         .map_err(wire::report_reject)
 }
@@ -824,13 +871,14 @@ fn cancel<C: Clock, I: IdGenerator, O: Observer>(
     scheduler: &mut Scheduler<C, I, O>,
     cancel: &CancelTask,
 ) -> Answered {
-    match cancel.task_id.clone() {
-        Some(task) => scheduler
-            .cancel(&TaskId::from(task))
-            .map(|cancellation| task_response::Result::Cancelled(wire::cancel_answer(cancellation)))
-            .map_err(wire::cancel_reject),
-        None => Err(TaskRejectReason::TaskRejectMalformed),
-    }
+    let cancelled = match (cancel.task_id.clone(), cancel.composite_id.clone()) {
+        (Some(task), None) => scheduler.cancel(&TaskId::from(task)),
+        (None, Some(composite)) => scheduler.cancel_composite(&CompositeId::from(composite)),
+        _ => return Err(TaskRejectReason::TaskRejectMalformed),
+    };
+    cancelled
+        .map(|cancellation| task_response::Result::Cancelled(wire::cancel_answer(cancellation)))
+        .map_err(wire::cancel_reject)
 }
 
 fn query_outcome<C: Clock, I: IdGenerator, O: Observer>(

@@ -2,7 +2,6 @@
 //! holds to voters its leader chose, and the leader then places each of them
 //! among the voters left.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
@@ -11,15 +10,12 @@ use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, Worke
 use kabudachi_core::task_record::{RecordKey, RecordVersion};
 use kabudachi_net::messenger::{Net, PlacedWrite};
 use kabudachi_core::task_record::PriorPlacement;
-use kabudachi_net::task_store::placement::ReplicationFactor;
 
 use crate::support::deadline::within_deadline;
 use crate::support::election::wait_until;
-use crate::support::records::{ThreeVoters, Voters, composite_record, plain_with, submitted_through, wait_until_held};
-
-fn two_holders() -> ReplicationFactor {
-    ReplicationFactor::new(NonZeroUsize::new(2).expect("two"))
-}
+use crate::support::records::{
+    ThreeVoters, Voters, composite_record, plain_with, submitted_through, two_holders, wait_until_held,
+};
 
 /// How many of `nets` other than `except` hold `task`, counting only copies
 /// whose placement is accepted by `counts`.

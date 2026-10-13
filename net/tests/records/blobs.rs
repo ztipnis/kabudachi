@@ -2,7 +2,6 @@
 //! written to; fetched from the holders of their owner's record first, and
 //! by their digest from any peer of the shard only if those miss.
 
-use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +20,7 @@ use kabudachi_core::time::RealClock;
 use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::messenger::{Net, PutBlobError};
 use kabudachi_net::task_exchange::{LeaderRetry, NotStored, placement_of, placement_with_asker_of};
-use kabudachi_net::task_store::placement::{ReplicationFactor, placement};
+use kabudachi_net::task_store::placement::placement;
 use kabudachi_net::task_store::TaskRecordStore;
 use libp2p::PeerId;
 use libp2p::kad::Record;
@@ -32,7 +31,7 @@ use tokio::time::timeout;
 use crate::support::deadline::within_deadline;
 use crate::support::election::wait_until;
 use crate::support::net::connect_to;
-use crate::support::records::{Voters, plain_with, submitted_with};
+use crate::support::records::{MIB, Voters, plain_with, submitted_with, two_holders, varied};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -238,17 +237,6 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
         );
     })
     .await
-}
-
-const MIB: usize = 1024 * 1024;
-
-/// `len` bytes that differ from chunk to chunk.
-fn varied(len: usize) -> Vec<u8> {
-    (0..len).map(|at| (at % 251) as u8).collect()
-}
-
-fn two_holders() -> ReplicationFactor {
-    ReplicationFactor::new(NonZeroUsize::new(2).expect("two"))
 }
 
 /// Has `client` store `input` where `leader` places `minted`'s record, then

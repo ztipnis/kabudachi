@@ -410,6 +410,7 @@ impl NetworkedRuntime {
                 run,
                 digest,
                 delivered: false,
+                continuation: None,
             }),
         }
         Ok(())
