@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::coalescing::{self, Key};
 use crate::protocol::generated::TaskRecord;
-use crate::protocol::ids::{TaskId, TaskRunId, WorkerId};
+use crate::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::Task;
 use crate::protocol::messages::prelude::*;
 use crate::protocol::records::TaskRunRecord;
@@ -35,6 +35,9 @@ pub(super) struct Reconciliation {
     /// The coalescing key of each task in `uncertain` that has one. While any
     /// generation of a key is in here, no generation of that key is installed.
     uncertain_keys: BTreeMap<TaskId, Key>,
+    /// Composites some worker holds whose newest record cannot be known yet:
+    /// cancels of them are answered `NotReady`.
+    uncertain_composites: BTreeSet<CompositeId>,
     /// Records known for certain that are held back with their key: a
     /// generation of the key has no record this leader can rely on yet.
     deferred: BTreeMap<TaskId, TaskRecord>,
@@ -60,6 +63,11 @@ impl Reconciliation {
     /// Whether `task`'s newest record cannot be known yet.
     pub(super) fn is_uncertain(&self, task: &TaskId) -> bool {
         self.uncertain.contains_key(task)
+    }
+
+    /// Whether `composite`'s newest record cannot be known yet.
+    pub(super) fn is_uncertain_composite(&self, composite: &CompositeId) -> bool {
+        self.uncertain_composites.contains(composite)
     }
 
     /// Whether `run` is one of an uncertain task's known runs.
@@ -266,6 +274,7 @@ impl Reconciliation {
         self.answered = answered;
         self.uncertain = uncertain;
         self.uncertain_keys = key_map(uncertain_keys);
+        self.uncertain_composites.clear();
         self.deferred.clear();
         self.held_reports.clear();
         term

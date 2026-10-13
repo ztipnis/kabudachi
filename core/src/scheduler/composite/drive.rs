@@ -17,7 +17,9 @@ use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Duration, WallTime};
 
 use crate::blob::BlobKey;
-use crate::scheduler::{Event, Observer, Scheduler, Submission, SubmitRejection, Submitted};
+use crate::scheduler::{
+    Cancellation, CancelRejection, Event, Observer, Scheduler, Submission, SubmitRejection, Submitted,
+};
 
 use super::held::Composite;
 use super::{
@@ -317,8 +319,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         failure: Option<Failure>,
     ) {
         let now = self.clock.now();
+        // A cancelled composite is marked cancelled before its members are
+        // cancelled, so that they settle nothing; it finishes once they are.
+        let ended = self.composites.is_finished(id);
         let composite = self.composites.held.get_mut(id).expect("only a held composite finishes");
-        if composite.state != CompositeState::Running {
+        let being_cancelled = state == CompositeState::Cancelled && composite.state == CompositeState::Cancelled && !ended;
+        if composite.state != CompositeState::Running && !being_cancelled {
             return;
         }
         composite.state = state;
@@ -356,6 +362,54 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             None => {}
         }
         self.update_pressure();
+    }
+
+    /// Cancels a composite: its current stage, or every unfinished member,
+    /// and with them every child composite. `AlreadyFinished` once it is over;
+    /// `UnknownTask` for an id it does not hold.
+    pub fn cancel_composite(&mut self, id: &CompositeId) -> Result<Cancellation, CancelRejection> {
+        let outcome = self.cancel_composite_now(id);
+        self.end_call();
+        outcome
+    }
+
+    fn cancel_composite_now(&mut self, id: &CompositeId) -> Result<Cancellation, CancelRejection> {
+        if !self.check_leader() {
+            return Err(CancelRejection::NotLeader);
+        }
+        if self.reconciliation.is_uncertain_composite(id) {
+            return Err(CancelRejection::NotReady);
+        }
+        let Some(composite) = self.composites.held.get_mut(id) else {
+            return Ok(Cancellation::UnknownTask);
+        };
+        if composite.state != CompositeState::Running {
+            return Ok(Cancellation::AlreadyFinished);
+        }
+        // Cancelled first, so the members cancelled below start and settle nothing.
+        composite.state = CompositeState::Cancelled;
+        let unsettled: Vec<u64> = (0..composite.step.stages.len() as u64)
+            .filter(|index| !composite.outcomes.contains_key(index))
+            .collect();
+        let mut was_running = false;
+        for index in unsettled {
+            was_running |= self.cancel_stage(id, index);
+        }
+        self.finish_composite(id, CompositeState::Cancelled, None);
+        Ok(Cancellation::Cancelled { was_running })
+    }
+
+    /// Cancels stage or member `index` of `id` if it was started; says
+    /// whether a worker held anything of it.
+    fn cancel_stage(&mut self, id: &CompositeId, index: u64) -> bool {
+        let task = id.member_task(index);
+        if self.tasks.contains_key(&task) {
+            return matches!(self.cancel_task(&task), Ok(Cancellation::Cancelled { was_running: true }));
+        }
+        matches!(
+            self.cancel_composite_now(&id.child(index)),
+            Ok(Cancellation::Cancelled { was_running: true })
+        )
     }
 
     /// Where the composite `id` stands, or `None` for one this scheduler

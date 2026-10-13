@@ -49,7 +49,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         outcome
     }
 
-    fn cancel_task(&mut self, task_id: &TaskId) -> Result<Cancellation, CancelRejection> {
+    pub(super) fn cancel_task(&mut self, task_id: &TaskId) -> Result<Cancellation, CancelRejection> {
         if !self.check_leader() {
             return Err(CancelRejection::NotLeader);
         }

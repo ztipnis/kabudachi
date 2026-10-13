@@ -9,8 +9,8 @@ use kabudachi_core::protocol::generated::composite_entry;
 use kabudachi_core::protocol::ids::TaskDefinitionId;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::composite::{CompositeState, OnError, PAGE_ENTRIES};
-use kabudachi_core::scheduler::{ClaimRejection, Completion, SubmitRejection};
+use kabudachi_core::scheduler::composite::{CompositeState, MemberCounts, OnError, PAGE_ENTRIES, Stage};
+use kabudachi_core::scheduler::{Cancellation, ClaimRejection, Completion, Event, SubmitRejection};
 use kabudachi_core::task_record::{RecordKey, ShardRecord};
 
 use crate::support::composites::*;
@@ -252,4 +252,115 @@ fn republishing_a_key_named_twice_writes_it_once() {
     let mark = fixture.spy.mark();
     assert_eq!(fixture.scheduler.republish(&[page.clone(), page]), 1);
     assert_eq!(fixture.spy.mark() - mark, 1);
+}
+
+#[test]
+fn a_group_stage_is_a_child_composite_whose_results_the_next_stage_takes_as_its_pages() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(
+        &mut fixture,
+        flow_of(vec![
+            task_stage("load", Some(b"x")),
+            Stage::Composite(group_of(
+                OnError::FailFast,
+                vec![task_stage("shout", None), task_stage("wrap", None)],
+            )),
+            task_stage("report", None),
+        ]),
+    );
+    run_member(&mut fixture, &flow, 0, b"loaded");
+    let group = flow.child(1);
+    // Both records name the flow as their tree's root: the owner of every
+    // large value bound in it, which a member's worker reads from the record.
+    for id in [&flow, &group] {
+        let root = fixture.scheduler.composite_record(id).unwrap().root;
+        assert_eq!(root, Some(flow.clone().into()), "{id:?} names its root");
+    }
+    for index in 0..2 {
+        let member = run_member(&mut fixture, &group, index, &[index as u8]);
+        assert_eq!(
+            member.input_manifest().unwrap(),
+            Some(Manifest::new(vec![ManifestEntry::Blob(BlobKey::of(b"loaded"))], 0)),
+            "each member takes the flow's previous result"
+        );
+    }
+    let report = run_member(&mut fixture, &flow, 2, b"reported");
+    assert_eq!(
+        report.input_manifest().unwrap(),
+        Some(Manifest::new(vec![ManifestEntry::Page { composite: group.clone(), page: 0 }], 0))
+    );
+    assert_eq!(
+        entry(&fixture, &flow, 1).unwrap().outcome,
+        Some(composite_entry::Outcome::Child(group.clone().into()))
+    );
+    let finished = finished(&mut fixture);
+    assert_eq!(finished.len(), 1, "only the submitted composite has a client");
+    assert_eq!(finished[0].composite_id, flow);
+}
+
+#[test]
+fn cancelling_a_flow_cancels_its_running_group_member_by_member_and_nothing_after_starts() {
+    let mut fixture = Fixture::leading();
+    let flow = submitted(
+        &mut fixture,
+        flow_of(vec![
+            Stage::Composite(group_of(
+                OnError::FailFast,
+                vec![task_stage("slow", Some(b"a")), task_stage("queued", Some(b"b"))],
+            )),
+            task_stage("after", None),
+        ]),
+    );
+    let group = flow.child(0);
+    let slow = start_member(&mut fixture, &group, 0);
+    assert_eq!(
+        fixture.scheduler.cancel_composite(&flow),
+        Ok(Cancellation::Cancelled { was_running: true })
+    );
+    assert_eq!(fixture.run_state(&slow.task_run_id), TaskRunState::Cancelled);
+    assert_eq!(fixture.state(&group.member_task(1)), TaskRunState::Cancelled);
+    let events = fixture.scheduler.take_events();
+    assert!(
+        events.contains(&Event::Cancelled {
+            task_id: group.member_task(0),
+            task_run_id: slow.task_run_id.clone(),
+            was_running: true,
+        }),
+        "the running member's worker is told to stop"
+    );
+    let finished: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::CompositeFinished(finished) => Some(finished),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].state, CompositeState::Cancelled);
+    assert_eq!(
+        fixture.scheduler.composite_status(&group).unwrap().state,
+        CompositeState::Cancelled
+    );
+    assert_eq!(fixture.scheduler.cancel_composite(&flow), Ok(Cancellation::AlreadyFinished));
+    assert_eq!(
+        fixture.scheduler.request_claim(&worker(), &flow.member_task(1)),
+        Err(ClaimRejection::TaskUnknown)
+    );
+}
+
+#[test]
+fn a_composites_status_counts_its_members_by_state() {
+    let mut fixture = Fixture::leading();
+    let group = submitted(
+        &mut fixture,
+        group_of(
+            OnError::CollectAll,
+            vec![task_stage("a", Some(b"a")), task_stage("b", Some(b"b")), task_stage("c", Some(b"c"))],
+        ),
+    );
+    run_member(&mut fixture, &group, 0, b"ok");
+    fail_member(&mut fixture, &group, 1, "ValueError");
+    let status = fixture.scheduler.composite_status(&group).unwrap();
+    assert_eq!(status.state, CompositeState::Running);
+    assert_eq!(status.counts, MemberCounts { pending: 1, succeeded: 1, failed: 1, cancelled: 0 });
 }
