@@ -144,7 +144,11 @@ impl NativeRuntime {
         );
         let retention = CoreDuration::from_millis(arguments.result_ttl_ms);
         let mut new_scheduler =
-            Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::new(worker_id.clone(), clock, Some(retention)));
+            Scheduler::with_observer(
+                clock,
+                Uuid7Ids,
+                LocalRecords::new(worker_id.clone(), clock, Some(retention)),
+            );
         new_scheduler.set_result_ttl(Some(retention));
         new_scheduler.set_memory_limits(limits);
         new_scheduler.set_queue_policy(policy);
@@ -299,8 +303,8 @@ impl NativeRuntime {
     /// again will not help, if the task's input alone is past the hard memory
     /// limit (the session refuses that first with `PayloadTooLargeError`, so
     /// only a caller of this method directly reaches it), and `RuntimeError`
-    /// if the runtime has shut down. Before this worker leads the task is queued and its id returned
-    /// at once; it is recorded, in order, when the worker comes to lead. A
+    /// if the runtime has shut down. Before this worker leads the task is queued and its id
+    /// returned at once; it is recorded, in order, when the worker comes to lead. A
     /// task whose record cannot yet fit stays queued, with everything behind
     /// it, until the generation it supersedes ends, and no error is raised
     /// for it.
@@ -408,12 +412,15 @@ impl NativeRuntime {
         let completion = match continuation {
             None => Completion::Final,
             Some(bytes) => {
-                let step = Step::decode(bytes).map_err(|error| PyValueError::new_err(error.to_string()))?;
+                let step = Step::decode(bytes)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?;
                 if step.takes_input() {
                     return Err(PyValueError::new_err("a returned step cannot take an input"));
                 }
                 if step.digest() != digest {
-                    return Err(PyValueError::new_err("the result digest is not the returned step's digest"));
+                    return Err(PyValueError::new_err(
+                        "the result digest is not the returned step's digest",
+                    ));
                 }
                 Completion::Continues(step)
             }

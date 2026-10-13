@@ -6,8 +6,7 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
-    Backlog, Cancellation, Completion, MemoryLimits,
-    Submission, SubmitRejection,
+    Backlog, Cancellation, Completion, MemoryLimits, Submission, SubmitRejection,
 };
 
 use crate::support::grant::unbounded_grant;

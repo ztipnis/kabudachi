@@ -16,6 +16,8 @@ use kabudachi_core::scheduler::{
 };
 use kabudachi_core::task_record::{MAX_RECORD_BYTES, RecordKey, ShardRecord};
 
+use prost::Message as _;
+
 use crate::support::composites::*;
 use crate::support::scheduler::{Fixture, ticks};
 
@@ -441,6 +443,43 @@ fn a_step_too_large_for_the_task_record_fails_its_run_for_good() {
     assert_eq!(run.failure_kind, "ContinuationTooLarge");
     assert_eq!(fixture.scheduler.runs_of(&task).len(), 1, "the same body would return the same step");
     assert!(fixture.spy.newest_revision_of(&task).unwrap().finished);
+}
+
+#[test]
+fn the_largest_step_a_record_can_carry_is_taken_and_one_byte_more_fails_its_run() {
+    // Whether a step of this many payload bytes was taken, and the largest record then published.
+    let returns_step_of = |payload: usize| {
+        let mut fixture = Fixture::leading();
+        let task = fixture
+            .scheduler
+            .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
+            .unwrap();
+        let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+        fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+        let step = flow_of(vec![task_stage("big", Some(&vec![0; payload]))]);
+        let taken = fixture
+            .scheduler
+            .complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step))
+            .is_ok();
+        let published = fixture.spy.newest_revision_of(&task).unwrap().encoded_len();
+        (taken, published as u64)
+    };
+    let (mut taken, mut refused) = (0, MAX_RECORD_BYTES as usize);
+    assert!(returns_step_of(taken).0 && !returns_step_of(refused).0);
+    while refused - taken > 1 {
+        let middle = (taken + refused) / 2;
+        if returns_step_of(middle).0 {
+            taken = middle;
+        } else {
+            refused = middle;
+        }
+    }
+    let (_, published) = returns_step_of(taken);
+    assert!(published <= MAX_RECORD_BYTES, "the largest step taken still fits its record");
+    assert!(
+        published + 2048 > MAX_RECORD_BYTES,
+        "and the limit is tight: {published} bytes published against {MAX_RECORD_BYTES}"
+    );
 }
 
 #[test]

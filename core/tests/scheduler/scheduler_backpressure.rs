@@ -141,7 +141,7 @@ fn memory_counts_exactly_the_unfinished_tasks() {
     let claim = start(&mut fixture, &continuing);
     let continuation = continue_with_a_stage(&mut fixture, &claim);
     assert!(
-        fixture.scheduler.memory_in_use() >= 100,
+        fixture.scheduler.memory_in_use() > 100,
         "a task with a continuation counts until it ends"
     );
     end_continuation(&mut fixture, &continuation);

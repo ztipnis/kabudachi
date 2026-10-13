@@ -4,16 +4,14 @@
 //! is the newest for its key. An ephemeral task's lost run is not replayed, and a
 //! non-retriable task's running run is orphaned instead.
 
-use crate::support::composites::{continue_with_a_stage};
+use crate::support::composites::continue_with_a_stage;
 use crate::support::scheduler::Fixture;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
-use kabudachi_core::scheduler::{
-    ClaimRejection, Completion, ReportRejection, Submission,
-};
+use kabudachi_core::scheduler::{ClaimRejection, Completion, ReportRejection, Submission};
 
 fn worker(name: &str) -> WorkerId {
     WorkerId::new(name)

@@ -168,6 +168,7 @@ fn a_task_with_a_continuation_is_not_forgotten_until_it_ends() {
 
     end_continuation(&mut fixture, &continuation);
     fixture.clock.advance(Duration::from_ticks(100));
-    fixture.scheduler.catch_up();
+    // The task and the one stage member of the step it returned.
+    assert_eq!(fixture.scheduler.catch_up().forgotten, 2);
     assert!(fixture.forgotten(&task));
 }

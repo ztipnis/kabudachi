@@ -4,7 +4,6 @@
 use prost::Message as _;
 
 use crate::protocol::digest::Digest;
-use crate::protocol::generated;
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::TaskRun;
 use crate::protocol::records::TaskRunRecord;
@@ -166,7 +165,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             if step.digest() != result_digest {
                 return Err(ReportRejection::NotAuthoritative);
             }
-            if self.continuation_overflows(run_id, step, stamped_at) {
+            if self.continuation_overflows(run_id, step, &result_digest, stamped_at) {
                 // The same body would return the same step, so no retry.
                 self.fail_for_good(worker, run_id, CONTINUATION_TOO_LARGE);
                 return Err(ReportRejection::ContinuationTooLarge);
@@ -200,14 +199,28 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     }
 
     /// Whether the record of `run_id`'s task would pass the record limit once
-    /// the run carries `step`.
-    fn continuation_overflows(&self, run_id: &TaskRunId, step: &Step, stamped_at: WallTime) -> bool {
+    /// the run is certified carrying `step`, measured on the record with the
+    /// certified run in place.
+    fn continuation_overflows(
+        &self,
+        run_id: &TaskRunId,
+        step: &Step,
+        result_digest: &Digest,
+        stamped_at: WallTime,
+    ) -> bool {
         let task_id = self.runs[run_id].task_id();
-        let step_len = generated::StepDescription::from(step).encoded_len();
-        // Adding the step to the run also adds its field tag and length prefix.
-        let framing = 1 + prost::encoding::encoded_len_varint(step_len as u64);
-        let grown = (self.record_of(&task_id, UNVERSIONED, stamped_at).encoded_len() + framing + step_len) as u64;
-        grown > Self::record_limit()
+        let mut record = self.record_of(&task_id, UNVERSIONED, stamped_at);
+        let certified = record
+            .runs
+            .iter_mut()
+            .find(|run| run.task_run_id() == *run_id)
+            .expect("a task's record holds each of its runs");
+        certified
+            .transition_to(TaskRunState::Succeeded, stamped_at)
+            .expect("a Running run can always succeed");
+        certified.result_digest = Some(result_digest.clone().into());
+        certified.continuation = Some(step.into());
+        record.encoded_len() as u64 > Self::record_limit()
     }
 
     /// The step a certified run returned, read from the run.
