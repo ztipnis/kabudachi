@@ -108,14 +108,15 @@ impl Composites {
         *self = Composites::default();
     }
 
-    /// Marks every composite and page held as changed, so the next
-    /// publication writes them all again.
-    pub(in crate::scheduler) fn mark_all_unpublished(&mut self) {
-        for (id, composite) in &self.held {
-            self.unpublished.insert(id.clone());
-            for page in 0..composite.pages() {
-                self.unpublished_pages.insert((id.clone(), page));
-            }
+    /// Marks the composite `id` and its pages as changed, so the next
+    /// publication writes them again.
+    pub(in crate::scheduler) fn mark_unpublished(&mut self, id: &CompositeId) {
+        let Some(composite) = self.held.get(id) else {
+            return;
+        };
+        self.unpublished.insert(id.clone());
+        for page in 0..composite.pages() {
+            self.unpublished_pages.insert((id.clone(), page));
         }
     }
 

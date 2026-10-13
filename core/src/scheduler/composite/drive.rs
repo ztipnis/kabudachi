@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 
 use prost::Message as _;
 
-use crate::blob::BlobKey;
 use crate::manifest::{Failure, Manifest, ManifestEntry};
 use crate::protocol::digest::Digest;
 use crate::protocol::generated;
@@ -20,6 +19,7 @@ use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Duration, WallTime};
 
+use crate::blob::BlobKey;
 use crate::scheduler::{
     Cancellation, CancelRejection, Event, Observer, Scheduler, Submission, SubmitRejection, Submitted,
 };

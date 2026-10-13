@@ -285,3 +285,21 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
         assert!(leading.scheduler.composite_record(&split).is_none(), "and the items (takeover: {takeover})");
     }
 }
+
+#[test]
+fn a_composite_record_learnt_after_the_rebuild_is_written_again_at_the_new_term() {
+    let mut old = Fixture::leading();
+    let flow = submitted(&mut old, flow_of(vec![task_stage("a", Some(b"a")), task_stage("b", None)]));
+    let mut rebuild = rebuild_losing(&old, 0, |_| false);
+    let composites = std::mem::take(&mut rebuild.composites);
+    let pages = std::mem::take(&mut rebuild.pages);
+    let mut new = took_over(&old, rebuild);
+    assert_eq!(new.spy.newest_composite(&flow), None, "the rebuild did not know the composite");
+    new.scheduler
+        .adopt(Rebuild { composites, pages, ..Rebuild::default() })
+        .unwrap();
+    assert!(new.scheduler.composite_status(&flow).is_some());
+    let written = new.spy.newest_composite(&flow).expect("the composite learnt late is published");
+    let version = written.version.unwrap();
+    assert_eq!(version.leader_term, 2, "it is written at the new leader's term, fencing the old leader's writes");
+}

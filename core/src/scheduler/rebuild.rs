@@ -131,9 +131,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let mut applied = Adopted::default();
         self.apply_reports(reports, &mut applied);
         self.recover_composites();
-        // Every composite and page is written again at the office's term,
-        // as every installed Task record is.
-        self.composites.mark_all_unpublished();
         let republished = if self
             .leadership
             .may_publish_under(office.recovery_epoch, office.term)
@@ -303,6 +300,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             }
             let pages = pages_of.remove(&id).unwrap_or_default();
             if self.install_composite(record, &pages, now) {
+                // Written again at the office's term, as every installed
+                // Task record is.
+                self.composites.mark_unpublished(&id);
                 installed.push(id);
             }
         }
