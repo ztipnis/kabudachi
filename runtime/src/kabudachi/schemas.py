@@ -268,3 +268,75 @@ def migration(value_type: Any, *, from_version: int) -> Callable[[F], F]:
         return function
 
     return register
+
+
+# --- what a serializer says about types --------------------------------------
+#
+# Serializers may implement `extract_version`, `validate`, `schema_family`,
+# `type_compatibility`, `load_plain` and `dump_plain`. These call them, and
+# answer with a default for a backend that lacks one.
+
+
+def _member(serializer: Any, name: str) -> Callable[..., Any] | None:
+    member = getattr(serializer, name, None)
+    if member is not None and not callable(member):
+        raise TypeError(f"{serializer!r} is not a serializer: {name} must be callable")
+    return member
+
+
+def extract_version(serializer: Any, payload: bytes, value_type: Any) -> int | None:
+    """The version `payload` says it is, or `None` when it does not say (or
+    `serializer` cannot tell), in which case the task's own source version is
+    the payload's."""
+    member = _member(serializer, "extract_version")
+    return None if member is None else member(payload, value_type)
+
+
+def validate(serializer: Any, value: Any) -> None:
+    """Checks a decoded `value` with `serializer`, which raises
+    `SerializationError` for one that is not valid. A serializer without the
+    check accepts it."""
+    member = _member(serializer, "validate")
+    if member is not None:
+        member(value)
+
+
+def schema_family(serializer: Any, value_type: Any, schemas: SchemaRegistry) -> str | None:
+    """The family of `value_type` as `serializer` names it, else as `schemas` does."""
+    member = _member(serializer, "schema_family")
+    return schemas.family(value_type) if member is None else member(value_type)
+
+
+def type_compatibility(serializer: Any, produced: Any, consumed: Any) -> bool | None:
+    """Whether a `produced` value can be given where `consumed` is taken,
+    judged by `serializer`; `None` when it does not say."""
+    member = _member(serializer, "type_compatibility")
+    return None if member is None else member(produced, consumed)
+
+
+def default_compatibility(
+    serializer: Any, produced: Any, consumed: Any, schemas: SchemaRegistry
+) -> bool | None:
+    """Whether a `produced` value can be given where `consumed` is taken,
+    judged by family and version: the same family, and a migration plan
+    from the producer's version up to the consumer's that crosses no bump
+    declared incompatible. `None` when `serializer` does not handle one of
+    the types."""
+    if not (serializer.supports(produced) and serializer.supports(consumed)):
+        return None
+    if (typing.get_origin(produced) is list) != (typing.get_origin(consumed) is list):
+        return False
+    family = schema_family(serializer, produced, schemas)
+    wanted = schema_family(serializer, consumed, schemas)
+    if family is None or family != wanted:
+        return family is None and wanted is None
+    planned = schemas.plan(family, schemas.version_of(produced), schemas.version_of(consumed))
+    return isinstance(planned, Runnable)
+
+
+def can_migrate(serializer: Any) -> bool:
+    """Whether `serializer` can take part in a migration: it has `load_plain`
+    and `dump_plain`."""
+    return _member(serializer, "load_plain") is not None and _member(
+        serializer, "dump_plain"
+    ) is not None

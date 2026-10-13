@@ -14,6 +14,7 @@ import pydantic
 import pytest
 
 import kabudachi
+from kabudachi import schemas
 from kabudachi import serializers as serializers_module
 from kabudachi.errors import (
     DuplicateSerializerError,
@@ -365,3 +366,26 @@ def test_classes_are_versions_of_one_family_and_each_bump_is_declared_once():
         registry.declare(Receipt, version=-1)
     with pytest.raises(TypeError, match="one argument"):
         registry.add_migration("shop.Order", 5, lambda a, b: a)
+
+
+def test_protobuf_names_a_message_family_validates_and_migrates_by_parsing_into_the_new_message():
+    assert serializer.schema_family(Greeting) == Greeting.DESCRIPTOR.full_name
+    assert serializer.schema_family(list[Greeting]) == Greeting.DESCRIPTOR.full_name
+    assert serializer.extract_version(greeting("a").SerializeToString(), Greeting) is None
+    serializer.validate(greeting("a"))
+    assert serializer.type_compatibility(Greeting, Greeting) is True
+    assert serializer.type_compatibility(Greeting, Receipt) is False
+    assert serializer.type_compatibility(Greeting, dict) is None, "not a type it knows"
+    # A Receipt's bytes read as a Greeting: fields the Greeting lacks are dropped, not carried.
+    plain = serializer.load_plain(Receipt(ok=True).SerializeToString(), Greeting)
+    assert serializer.dump_plain(plain, Greeting) == b""
+
+
+def test_a_backend_without_the_schema_members_still_works_with_defaults():
+    text = Utf8Text()
+    registry = SchemaRegistry()
+    assert schemas.schema_family(text, str, registry) == "builtins.str"
+    assert schemas.extract_version(text, b"x", str) is None
+    schemas.validate(text, "x")
+    assert schemas.type_compatibility(text, str, str) is None, "the backend does not say, so unknown"
+    assert not schemas.can_migrate(text)
