@@ -65,9 +65,10 @@ where
     /// stale contact no tick had yet acted on.
     ///
     /// A node that this ack's leader asked to take over its leadership
-    /// ignores that leader's other acks of that term for as long as the roll
-    /// call it started stays open: one sent before the hand-over, arriving
-    /// after it on another stream, would otherwise end the call.
+    /// ignores that leader's other acks of that term for as long as it stays
+    /// in `LeaderSuspect` or `RollCall`: one sent before the hand-over,
+    /// arriving after it on another stream, would otherwise end the call. A
+    /// roll call that ends back in `LeaderSuspect` does not end this.
     pub(super) fn on_leader_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>) {
         if !ack.leader_draining
             && self.handed_over_by.as_ref() == Some(&(ack.leader_id(), ack.term))

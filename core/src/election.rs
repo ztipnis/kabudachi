@@ -240,10 +240,11 @@ where
     /// Whether the newest ack this node accepted said its leader is handing
     /// over: that leader no longer counts as valid against a roll call.
     leader_draining: bool,
-    /// The leader and term that asked this node to take over, while the roll
-    /// call it started for that stays open: that leader's ordinary acks of
+    /// The leader and term that asked this node to take over, while the node
+    /// stays in `LeaderSuspect` or `RollCall`: that leader's ordinary acks of
     /// that term are ignored, so one it sent before it handed over and that
-    /// arrives after (on another stream) cannot end the call.
+    /// arrives after (on another stream) cannot end the call. A roll call
+    /// that ends back in `LeaderSuspect` keeps it.
     handed_over_by: Option<(WorkerId, u64)>,
     /// The admission generation this node held when its last routing crawl
     /// completed.

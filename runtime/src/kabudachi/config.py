@@ -354,7 +354,9 @@ class Settings:
     a leader for its voters to be ready to take over (and, alone, for another
     voter to hand over to), a worker with no leader for one to appear, and every
     worker for the Task records it holds to be stored by others. Records still
-    held then leave with it, and are logged. `None` is ten heartbeat timeouts.
+    held then leave with it, and are logged. Shutdown gives up waiting for the
+    node to leave after four such waits plus a heartbeat timeout, and then shuts
+    down. `None` is ten heartbeat timeouts.
     `KABUDACHI_DRAIN_WAIT_LIMIT` gives it in seconds."""
 
     def __post_init__(self) -> None:

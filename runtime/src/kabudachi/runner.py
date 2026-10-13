@@ -749,7 +749,8 @@ async def _drain_held_runs(
 
 _DRAIN_WAIT_SUSPICIONS = 10
 """How many heartbeat timeouts the native runtime's drain wait limit is when
-`Settings.drain_wait_limit` is `None`."""
+`Settings.drain_wait_limit` is `None`. It copies the Rust constant
+`ElectionTimings::DEFAULT_DRAIN_WAIT_SUSPICIONS`; keep the two equal."""
 
 _DRAIN_WAITS = 4
 """The most waits at the drain wait limit a leaving worker can spend: its
