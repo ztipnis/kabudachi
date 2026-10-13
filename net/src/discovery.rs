@@ -7,7 +7,9 @@
 //! view showed as waiting: that view can be stale, and a refusal only moves
 //! discovery on. A task of its own records whose input is newer than the
 //! worker runs is not claimed: the worker tells the leader, which then hands
-//! it that task no more.
+//! it that task no more. A leader claims from its own scheduler in the same
+//! order, less the peers: every pending task is in that scheduler, so its
+//! oldest stand for whatever peers hold (see `crate::driver`).
 //!
 //! A worker keeps no list of peers for this. The peers to steal from are read
 //! from the records `kad` routing table ([`Net::steal_targets`]) each time
@@ -191,8 +193,11 @@ impl Net {
     /// A task whose input is newer than `takes.runnable` is no candidate. The
     /// ones whose record does not yet show the leader was told they are
     /// blocked are returned beside, each with its reason, for the caller to
-    /// report: this reports nothing itself.
-    fn own_candidates(&self, now: WallTime, takes: &Takes) -> (Vec<(TaskId, Option<u64>)>, Vec<(TaskId, String)>) {
+    /// report: this reports nothing itself. A leader's driver takes its own
+    /// claims' first stage from here too, so both order and filter alike; the
+    /// caller reports the newer tasks, a follower over the network, a leader
+    /// to its own scheduler.
+    pub(crate) fn own_candidates(&self, now: WallTime, takes: &Takes) -> (Vec<(TaskId, Option<u64>)>, Vec<(TaskId, String)>) {
         let held = self.held_records();
         let mut candidates = held.claimable(now, takes.runs_compaction, &takes.queues);
         let mut newer = Vec::new();

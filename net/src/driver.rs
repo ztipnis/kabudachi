@@ -33,7 +33,9 @@
 //! A worker given an executor (see `crate::executor`) claims work for it: while
 //! the executor has offered room, the node knows its leader, and some leader
 //! has vouched for hearing this worker, it discovers and claims work from
-//! that leader and hands each run over. It takes each report the executor
+//! that leader and hands each run over. A leader claims from its own
+//! scheduler: the records it holds first, nearest first, then the shard's
+//! oldest pending tasks. It takes each report the executor
 //! makes to the leader, in order per run, asking again as leaders change
 //! until one takes it. When the node reports an abort deadline, every run
 //! handed over is told to abort by its own deadline, from its reconnect

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::messages::Claim;
+use kabudachi_net::discovery::Stage;
 use kabudachi_net::executor::{ExecutorEndpoint, Report, ReportSink, Work, WorkSource, executor_channel};
 use tokio::time::timeout;
 
@@ -52,15 +53,22 @@ impl FakeExecutor {
             .expect("the worker's driver holds its executor endpoint")
     }
 
-    /// The next run handed over, a task's or a compaction's, with its claim.
-    pub async fn next_claim(&mut self) -> (TaskRunId, Claim) {
+    /// The next run handed over, a task's or a compaction's, with the
+    /// discovery stage that found its task and its claim.
+    pub async fn next_found(&mut self) -> (Stage, TaskRunId, Claim) {
         match self.next_work().await {
-            Work::Run(claim) | Work::Compact(claim) => {
+            Work::Run { claim, stage } | Work::Compact { claim, stage } => {
                 let run = claim.task_run_id.clone().expect("a granted claim names its run");
-                (run.into(), claim)
+                (stage, run.into(), claim)
             }
             other => panic!("expected a run handed over, got {other:?}"),
         }
+    }
+
+    /// The next run handed over, a task's or a compaction's, with its claim.
+    pub async fn next_claim(&mut self) -> (TaskRunId, Claim) {
+        let (_, run, claim) = self.next_found().await;
+        (run, claim)
     }
 
     /// Panics if the driver hands over any work within `window`.
