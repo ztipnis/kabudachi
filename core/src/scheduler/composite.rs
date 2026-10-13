@@ -641,8 +641,32 @@ impl Step {
             && matches!(self.stages.as_slice(), [Stage::Task(template)] if matches!(template.input, BoundInput::Previous))
     }
 
-    /// Whether the step's members arrive in batches: it is streamed, or it is
-    /// a map whose expansion run sends the items it splits a list into.
+    /// Whether the step, given `input`, must have an expansion run stream in
+    /// the list it takes: a map over a list, or a reduce whose one stage takes
+    /// a list that a task stage returned as one value. A reduce given another
+    /// composite's results folds them from its pages instead.
+    pub(in crate::scheduler) fn expands_given(&self, input: &Option<(Manifest, InputShape)>) -> bool {
+        match self.kind {
+            CompositeKind::Map => self.expands(),
+            CompositeKind::Reduce => {
+                !self.streamed
+                    && matches!(self.stages.as_slice(), [only] if only.takes_input())
+                    && matches!(input, Some((_, InputShape::Value(_))))
+            }
+            CompositeKind::Flow | CompositeKind::Group => false,
+        }
+    }
+
+    /// Whether the step, given `input`, has members that arrive in batches:
+    /// it is streamed, or an expansion run sends the items it splits a list
+    /// into.
+    pub(in crate::scheduler) fn takes_batches_given(&self, input: &Option<(Manifest, InputShape)>) -> bool {
+        self.streamed || self.expands_given(input)
+    }
+
+    /// Whether the step's members arrive in batches whatever its input is: it
+    /// is streamed, or it is a map whose expansion run sends the items it
+    /// splits a list into.
     pub(in crate::scheduler) fn takes_batches(&self) -> bool {
         self.streamed || self.expands()
     }

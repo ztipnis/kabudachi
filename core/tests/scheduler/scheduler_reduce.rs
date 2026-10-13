@@ -1,15 +1,21 @@
 //! Reduces one leader drives: a reduce takes its items in batches into its
 //! own item pages before any step runs.
 
+use prost::Message as _;
+
 use kabudachi_core::blob::BlobKey;
 use kabudachi_core::manifest::{Manifest, ManifestEntry};
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::composite_entry;
+use kabudachi_core::protocol::generated::{Expansion, composite_entry, expansion};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId};
+use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::composite::{
-    CompositeState, ITEM_PAGES, ItemInput, MemberBatch, PAGE_ENTRIES, REDUCE_EMPTY_KIND, ReduceNode, StreamedMember,
+    CompositeKind, CompositeState, EXPANSION_DEFINITION, ITEM_PAGES, ItemInput, MemberBatch, OnError, PAGE_ENTRIES,
+    REDUCE_EMPTY_KIND, ReduceNode, Stage, Step, StreamedMember,
 };
 use kabudachi_core::scheduler::{Claim, ClaimRejection, Completion, SubmitRejection};
 use kabudachi_core::task_record::ShardRecord;
+use kabudachi_core::time::Duration;
 
 use crate::support::composites::*;
 use crate::support::scheduler::Fixture;
@@ -280,4 +286,107 @@ fn a_step_lost_after_storing_its_result_is_replayed_on_the_same_operands_and_the
         2,
         "the lost run and its replay; only the replay is certified"
     );
+}
+
+/// A flow of a map of three tasks, a seedless reduce of two-item chunks of
+/// their results, and a task after it; runs the map's tasks. Returns the flow
+/// and the reduce.
+fn flow_after_a_map(fixture: &mut Fixture) -> (CompositeId, CompositeId) {
+    let map = Stage::Composite(Step {
+        kind: CompositeKind::Map,
+        on_error: OnError::FailFast,
+        stages: [b"1", b"2", b"3"].iter().map(|item| task_stage("each", Some(*item))).collect(),
+        streamed: false,
+        reduce: None,
+    });
+    let flow = submitted(fixture, flow_of(vec![map, reduce_template(Some(2), None), task_stage("report", None)]));
+    for index in 0..3 {
+        run_member(fixture, &flow.child(0), index, &[index as u8]);
+    }
+    let reduce = flow.child(1);
+    (flow, reduce)
+}
+
+#[test]
+fn a_reduce_after_a_map_folds_the_maps_results_in_order_without_an_expansion() {
+    let mut fixture = Fixture::leading();
+    let (flow, reduce) = flow_after_a_map(&mut fixture);
+    assert_eq!(fixture.spy.newest_composite(&reduce).unwrap().reduce_items, 3, "the map's three results are its items");
+    let chunk = run_member(&mut fixture, &reduce, 0, b"01");
+    assert_ne!(chunk.task.task_definition_id().as_str(), EXPANSION_DEFINITION);
+    assert_eq!(node_of(&chunk), node(0, 0));
+    run_member(&mut fixture, &reduce, 1, b"2");
+    run_member(&mut fixture, &reduce, 2, b"012");
+    let report = run_member(&mut fixture, &flow, 2, b"reported");
+    assert_eq!(
+        operands_of(&report),
+        Some(vec![ManifestEntry::Page { composite: reduce.clone(), page: 0 }]),
+        "the stage after a reduce takes the reduce's one result"
+    );
+    assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+    for step in 0..3 {
+        assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(step)).len(), 1, "step {step} is created and run once");
+    }
+}
+
+/// A flow of a task stage returning a list and a seedless reduce of it;
+/// runs the stage and its expansion, which streams `items` into the reduce
+/// and then completes, sealing it. Returns the flow and the reduce.
+fn expanded(fixture: &mut Fixture, items: &[&[u8]]) -> (CompositeId, CompositeId) {
+    let flow = submitted(fixture, flow_of(vec![task_stage("load", Some(b"x")), reduce_template(None, None)]));
+    run_member(fixture, &flow, 0, b"[...]");
+    let reduce = flow.child(1);
+    let expansion = fixture.scheduler.request_claim(&worker(), &reduce.expansion_task()).unwrap();
+    fixture.scheduler.report_started(&worker(), &expansion.task_run_id).unwrap();
+    let asked = Expansion::decode(&expansion.task.serialized_input[..]).unwrap();
+    let Some(expansion::Then::Reduce(reducer)) = asked.then else {
+        panic!("a reduce's expansion names its reducer");
+    };
+    assert_eq!(reducer.definition, Some(TaskDefinitionId::new("fold").into()));
+    fixture.scheduler.submit_members(items_batch(&reduce, 0, items, false)).unwrap();
+    assert_eq!(fixture.scheduler.pending_len(), 0, "no step starts before the expansion seals the reduce");
+    fixture
+        .scheduler
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    (flow, reduce)
+}
+
+#[test]
+fn a_reduce_after_a_task_stage_folds_what_its_expansion_streamed_and_a_seedless_one_of_nothing_fails_from_the_leader() {
+    let mut fixture = Fixture::leading();
+    fixture.scheduler.set_result_ttl(Some(Duration::from_ticks(100)));
+    let (flow, reduce) = expanded(&mut fixture, &[b"a", b"b"]);
+    let step = run_member(&mut fixture, &reduce, 0, b"ab");
+    assert_eq!(node_of(&step), node(0, 0));
+    assert_eq!(items_on_page(&fixture, &reduce, 0), [(0, b"a".to_vec()), (1, b"b".to_vec())]);
+    let ended = finished(&mut fixture);
+    let flow_end = ended.iter().find(|end| end.composite_id == flow).unwrap();
+    assert_eq!(flow_end.state, CompositeState::Succeeded);
+    fixture.clock.advance(Duration::from_ticks(100));
+    fixture.scheduler.catch_up();
+    assert!(fixture.forgotten(&reduce.expansion_task()), "the expansion run goes with its reduce");
+
+    let (empty, _) = expanded(&mut fixture, &[]);
+    let ended = finished(&mut fixture);
+    let failed = ended.iter().find(|end| end.composite_id == empty).unwrap();
+    assert_eq!(failed.state, CompositeState::Failed);
+    assert_eq!(failed.failure.as_ref().unwrap().kind, REDUCE_EMPTY_KIND);
+}
+
+#[test]
+fn a_reduce_after_a_map_is_forgotten_with_its_steps_when_its_flow_is() {
+    let mut fixture = Fixture::leading();
+    fixture.scheduler.set_result_ttl(Some(Duration::from_ticks(100)));
+    let (flow, reduce) = flow_after_a_map(&mut fixture);
+    for (index, result) in [b"01".as_slice(), b"2", b"012"].into_iter().enumerate() {
+        run_member(&mut fixture, &reduce, index as u64, result);
+    }
+    run_member(&mut fixture, &flow, 2, b"reported");
+    fixture.clock.advance(Duration::from_ticks(100));
+    fixture.scheduler.catch_up();
+    assert!(fixture.scheduler.composite_status(&reduce).is_none());
+    for step in 0..3 {
+        assert!(fixture.forgotten(&reduce.member_task(step)), "step {step} goes with its reduce");
+    }
 }

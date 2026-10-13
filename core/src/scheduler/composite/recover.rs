@@ -144,7 +144,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let composite = &self.composites.held[id];
         let uncertain = &self.reconciliation;
         uncertain.is_uncertain_composite(id)
-            || (composite.step.expands() && uncertain.is_uncertain(&id.expansion_task()))
+            || (composite.expands() && uncertain.is_uncertain(&id.expansion_task()))
             || (0..composite.members).any(|index| {
                 let task = id.member_task(index);
                 uncertain.is_uncertain(&task)
@@ -173,7 +173,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         for index in 0..stages {
             self.settle_from_record(id, index);
         }
-        if self.composites.held[id].step.expands() && !self.composites.held[id].sealed {
+        if self.composites.held[id].expands() && !self.composites.held[id].sealed {
             self.resume_expansion(id);
             if self.composites.held[id].state != CompositeState::Running {
                 return;
@@ -267,7 +267,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// submitter or its expansion run sends the members again if they are
     /// missing.
     fn ensure_stage(&mut self, id: &CompositeId, index: u64) {
-        if !self.composites.held[id].step.takes_batches() {
+        if !self.composites.held[id].takes_batches() {
             self.start_stage(id, index);
         }
     }

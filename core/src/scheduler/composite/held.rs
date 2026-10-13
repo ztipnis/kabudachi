@@ -141,9 +141,17 @@ impl Outcomes {
 }
 
 impl Composite {
+    /// Whether an expansion run must stream in the list this composite is
+    /// given: a map, or a reduce whose one stage takes a list that a task stage
+    /// returned as one value. A reduce given another composite's results folds
+    /// them from its pages instead.
+    pub(super) fn expands(&self) -> bool {
+        self.step.expands_given(&self.input)
+    }
+
     /// Whether its members arrive in batches.
     pub(super) fn takes_batches(&self) -> bool {
-        self.step.takes_batches()
+        self.step.takes_batches_given(&self.input)
     }
 
     /// How far its batches have filled it: a reduce's items, else its members.
@@ -367,8 +375,9 @@ impl Composites {
         let members = self.held.remove(id).map_or_else(Vec::new, |composite| {
             // A composite fed in batches keeps no stage once it has started
             // it: a child's index names no Task, which retention never holds.
-            let fed = composite.step.takes_batches();
-            let expansion = composite.step.expands().then(|| id.expansion_task());
+            // A reduce's members are all its steps' Tasks.
+            let fed = composite.takes_batches() || composite.step.kind == CompositeKind::Reduce;
+            let expansion = composite.expands().then(|| id.expansion_task());
             (0..composite.members)
                 .filter(|index| fed || matches!(composite.step.stages[*index as usize], Stage::Task(_)))
                 .map(|index| id.member_task(index))

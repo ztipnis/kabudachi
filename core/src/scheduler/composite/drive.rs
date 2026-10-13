@@ -266,16 +266,23 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             _ => id.clone(),
         };
         let retained_by = self.retainer_of(parent.as_ref());
+        let expands = step.expands_given(&input);
+        let batches = step.streamed || expands;
+        // A reduce has no member until it is sealed: its members are its
+        // plan's steps, which need its item count.
+        let reduce = step.kind == CompositeKind::Reduce;
         let starts: Vec<u64> = match step.kind {
             CompositeKind::Flow => vec![0],
-            _ if step.takes_batches() => Vec::new(),
+            _ if batches || reduce => Vec::new(),
             _ => (0..step.stages.len() as u64).collect(),
         };
         // A map over an empty list has no member to wait for; a composite
         // fed in batches has none yet, and waits for its last batch.
-        let empty = step.stages.is_empty() && !step.takes_batches();
-        let expands = step.expands();
-        let (members, sealed) = if step.takes_batches() { (0, false) } else { (step.stages.len() as u64, true) };
+        let empty = step.stages.is_empty() && !batches;
+        let (members, sealed) = if batches || reduce { (0, false) } else { (step.stages.len() as u64, true) };
+        // A reduce given the results of a composite folds them from that
+        // composite's pages: they are its items.
+        let items = if reduce && !batches { self.items_in(input.as_ref()) } else { 0 };
         self.composites.held.insert(
             id.clone(),
             Composite {
@@ -293,7 +300,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 bytes,
                 members,
                 sealed,
-                items_taken: 0,
+                items_taken: items,
                 partial_items: Vec::new(),
                 filled_item_pages: BTreeMap::new(),
             },
@@ -304,6 +311,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         if expands {
             self.submit_expansion(&id);
+        } else if reduce && !batches {
+            self.seal_reduce(&id);
         } else {
             for index in starts {
                 self.start_stage(&id, index);
@@ -312,13 +321,27 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.update_pressure();
     }
 
-    /// Records the expansion run that splits the list an expanding map is
-    /// given. The run is not a member: it sends the map its items in batches,
-    /// and its certification seals the map.
+    /// How many results the composite `input` names pages of holds: those of
+    /// a held composite's members, none for a list of no pages.
+    fn items_in(&self, input: Option<&(Manifest, InputShape)>) -> u64 {
+        let first = input.and_then(|(manifest, _)| manifest.entries().first());
+        let Some(ManifestEntry::Page { composite, .. }) = first else {
+            return 0;
+        };
+        self.composites.held.get(composite).expect("the composite whose results a reduce folds is held").members
+    }
+
+    /// Records the expansion run that splits the list an expanding map or
+    /// reduce is given. The run is not a member: it sends the composite its
+    /// items in batches, and its certification seals it.
     pub(super) fn submit_expansion(&mut self, id: &CompositeId) {
         let composite = &self.composites.held[id];
         let Stage::Task(template) = &composite.step.stages[0] else {
-            unreachable!("a map that expands has one task member");
+            unreachable!("a composite that expands has one task stage");
+        };
+        let then = match &composite.step.reduce {
+            Some(shape) => generated::expansion::Then::Reduce((&shape.reducer).into()),
+            None => generated::expansion::Then::Map(template.into()),
         };
         let (source, shape) = composite
             .input
@@ -326,7 +349,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("only a stage after another expands, and it is given that stage's result");
         let expansion = generated::Expansion {
             source: Some(source.into()),
-            then: Some(generated::expansion::Then::Map(template.into())),
+            then: Some(then),
             producer: match shape {
                 InputShape::Value(producer) => Some(producer.into()),
                 InputShape::List => None,
@@ -469,14 +492,28 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 Manifest::new(vec![ManifestEntry::Blob(BlobKey::from(digest))], 0),
                 InputShape::Value(producer.clone()),
             )),
-            MemberOutcome::Child(child) => Ok((self.results_manifest(child).ok_or(ResultsGone)?, InputShape::List)),
+            MemberOutcome::Child(child) => {
+                let manifest = self.results_manifest(child).ok_or(ResultsGone)?;
+                // A reduce's results are one value, encoded by its reducer's
+                // serializer; any other composite's are a list.
+                let shape = match &self.composites.held[child].step.reduce {
+                    Some(shape) => InputShape::Value(shape.reducer.definition.clone()),
+                    None => InputShape::List,
+                };
+                Ok((manifest, shape))
+            }
             MemberOutcome::Failed(_) => unreachable!("no stage starts after a failed one"),
         }
     }
 
-    /// The manifest of a held composite's pages, if it is held.
+    /// The manifest of a held composite's results, if it is held: its pages,
+    /// or, for a reduce, its first page whatever its page count, since a
+    /// reduce's results are one value.
     fn results_manifest(&self, id: &CompositeId) -> Option<Manifest> {
         let composite = self.composites.held.get(id)?;
+        if composite.step.kind == CompositeKind::Reduce {
+            return Some(Manifest::new(vec![ManifestEntry::Page { composite: id.clone(), page: 0 }], 0));
+        }
         Some(pages_manifest(id, composite.pages()))
     }
 
@@ -515,10 +552,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
     }
 
-    /// The expansion run of the map `id` ended as `outcome`. Success means
-    /// every item has been sent, so the map is sealed at the members it holds;
-    /// failure fails the map whatever its policy, since without the items it
-    /// has no results. Members already accepted run on and are ignored.
+    /// The expansion run of the map or reduce `id` ended as `outcome`. Success
+    /// means every item has been sent, so the map is sealed at the members it
+    /// holds, and a reduce, unless its last batch sealed it, at the items it
+    /// holds, which plans and starts it; failure fails it whatever its
+    /// policy, since without the items it has no results. Members already
+    /// accepted run on and are ignored.
     pub(super) fn expansion_finished(&mut self, id: &CompositeId, outcome: MemberOutcome) {
         let Some(composite) = self.composites.held.get_mut(id) else {
             return;
@@ -528,6 +567,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         match outcome {
             MemberOutcome::Failed(failure) => self.finish_composite(id, CompositeState::Failed, Some(failure)),
+            MemberOutcome::Value { .. } | MemberOutcome::Child(_) if composite.step.kind == CompositeKind::Reduce => {
+                if !composite.sealed {
+                    self.seal_reduce(id);
+                }
+            }
             MemberOutcome::Value { .. } | MemberOutcome::Child(_) => {
                 composite.sealed = true;
                 self.composites.unpublished.insert(id.clone());
@@ -654,8 +698,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         composite.failure = failure.clone();
         let (bytes, parent, client) = (composite.bytes, composite.parent.clone(), composite.client.clone());
         let pages = composite.pages();
-        let expands = composite.step.expands();
-        // A map that ends without all of its items, which a failing member or
+        let expands = composite.expands();
+        // A map or reduce that ends without all of its items, which a failing member or
         // a cancel does, has no use for the rest of them: its expansion run
         // is stopped, since its next batch would find the map over.
         let expansion = id.expansion_task();

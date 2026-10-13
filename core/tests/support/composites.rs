@@ -158,6 +158,15 @@ pub fn streamed_reduce(chunk: Option<u32>, initial: Option<&[u8]>) -> Step {
     }
 }
 
+/// A reduce that is a stage of a flow: it takes the list the stage before it
+/// gives, through its one reducer stage, and is shaped as `streamed_reduce` is.
+pub fn reduce_template(chunk: Option<u32>, initial: Option<&[u8]>) -> Stage {
+    let mut step = streamed_reduce(chunk, initial);
+    step.streamed = false;
+    step.stages = vec![Stage::Task(reducer())];
+    Stage::Composite(step)
+}
+
 /// A batch of reduce items `start..`, one per value.
 pub fn items_batch(reduce: &CompositeId, start: u64, values: &[&[u8]], last: bool) -> MemberBatch {
     MemberBatch {
