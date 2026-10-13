@@ -19,6 +19,9 @@ pub(super) struct SlowDownWatch {
     raised: bool,
     /// A poll is asking the leader.
     polling: bool,
+    /// How many answers have said to wait, so a poll can tell whether one
+    /// arrived while its own question was in flight.
+    raises: u64,
     /// This process's payloads in flight are past their soft share and have
     /// not fallen to 80% of it.
     local: bool,
@@ -66,6 +69,7 @@ pub(super) fn heard_slow_down(shared: &Arc<Shared>, raised: bool) {
         let poll = !watch.polling;
         watch.raised = true;
         watch.polling = true;
+        watch.raises = watch.raises.wrapping_add(1);
         // Pushed under the watch lock, so the events follow the flag's order.
         // Lock order: watch, then seam; nothing takes the seam and then the watch.
         if announce {
@@ -88,20 +92,29 @@ pub(super) fn heard_slow_down(shared: &Arc<Shared>, raised: bool) {
 async fn poll_slow_down(shared: Arc<Shared>) {
     loop {
         tokio::time::sleep(shared.retry.ask_again_after).await;
-        if shared.net.query_slow_down(shared.retry).await != Some(true) {
-            break;
+        let raises_before = shared
+            .slow_down
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .raises;
+        if shared.net.query_slow_down(shared.retry).await == Some(true) {
+            continue;
         }
-    }
-    {
         let mut watch = shared
             .slow_down
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // An answer that raised SlowDown while this one was in flight is
+        // newer than it: ask again rather than clear what it raised.
+        if watch.raises != raises_before {
+            continue;
+        }
         watch.raised = false;
         watch.polling = false;
         // Pushed under the watch lock: a raise that lands after this sees the
         // cleared flag and queues its event after this one.
         shared.seam().events.push_back(PyEvent::slow_down(false));
+        break;
     }
     shared.wake();
 }
