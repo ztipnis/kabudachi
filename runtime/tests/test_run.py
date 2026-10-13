@@ -23,6 +23,7 @@ from kabudachi._native import RunState
 from kabudachi.errors import (
     DurabilityUnavailableError,
     PayloadTooLargeError,
+    ResultTooLargeError,
     RuntimeNotStartedError,
     SerializationError,
     StartupError,
@@ -621,10 +622,14 @@ def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
     assert isinstance(refused, RuntimeError)
 
 
-def test_an_input_larger_than_one_message_reaches_its_task_and_one_alone_past_the_hard_limit_is_refused():
+def test_a_payload_larger_than_one_message_goes_through_a_task_and_back_and_one_alone_past_the_hard_limit_is_refused():
     @declare
-    def measure(request: Greeting) -> Greeting:
-        return Greeting(text=request.text[-5:], times=len(request.text))
+    def echo(request: Greeting) -> Greeting:
+        return request
+
+    @declare
+    def grow(request: Greeting) -> Greeting:
+        return Greeting(text=request.text * 2)
 
     hard = 5 * 1024 * 1024
     kabudachi.configure(memory_soft_limit=2 * 1024 * 1024, memory_hard_limit=hard)
@@ -632,13 +637,15 @@ def test_an_input_larger_than_one_message_reaches_its_task_and_one_alone_past_th
     big = ("0123456789" * (3 * 1024 * 1024 // 10 + 1))[: 3 * 1024 * 1024]
 
     async def main():
-        measured = await measure(Greeting(text=big))
+        echoed = await echo(Greeting(text=big))
         with pytest.raises(PayloadTooLargeError) as refused:
-            measure(Greeting(text="y" * (hard + 1)))
-        return measured, refused.value
+            echo(Greeting(text="y" * (hard + 1)))
+        with pytest.raises(ResultTooLargeError):
+            await grow(Greeting(text=big))
+        return echoed, refused.value
 
-    measured, refused = kabudachi.run(main)
-    assert measured == Greeting(text=big[-5:], times=len(big))
+    echoed, refused = kabudachi.run(main)
+    assert echoed == Greeting(text=big)
     # Not transient: a serialization error, never a backpressure one.
     assert isinstance(refused, SerializationError)
     assert refused.limit == hard and refused.size > refused.limit

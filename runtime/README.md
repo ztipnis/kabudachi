@@ -146,8 +146,9 @@ Set `listen` and the worker joins a networked shard instead of running one of it
 - Awaiting a task's result works as on one worker, inside task bodies too: the worker that runs the task
   delivers its result to the one that submitted it, and the handle settles once the leader certifies it.
   If the result cannot reach the submitter, the await raises `ResultUnavailableError`. A task that
-  returns a flow, group or bound task fails with `TaskDefinitionError`. A result too large to send in
-  one message fails the run with `ResultTooLargeError`.
+  returns a flow, group or bound task fails with `TaskDefinitionError`. A result larger than the worker
+  can hold (`memory_hard_limit`, or half of it on a networked worker) fails the run with
+  `ResultTooLargeError`; it is retried per `retries`.
 - `handle.cancel()` sends the cancel to the leader without waiting and returns `True`; the worker
   running the task hears of it from the leader and stops it.
 - When `main` returns, or at the first signal when serving without `main`, `run()` waits until every
@@ -263,7 +264,7 @@ names its type), `TaskOutcomeError` (a task ended without a result for a reason 
 base of the next two), `TaskLostError` (a task's process died and the task is not run again),
 `TaskOrphanedError` (a run of a task not safe to run twice was running when its worker was lost),
 `ResultUnavailableError` (the outcome is known but the result cannot be had here; `task_id` names the
-task), `ResultTooLargeError` (a result too large to send to its awaiter) and
+task), `ResultTooLargeError` (a result larger than the hard memory limit of the worker that ran it or of its awaiter) and
 `DurabilityUnavailableError` (the durability asked for cannot be reached), all in `kabudachi.errors`.
 
 ## Configuration

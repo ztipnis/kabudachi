@@ -273,29 +273,13 @@ def test_a_networked_handle_settled_before_its_task_was_stored_still_answers_dur
     assert "never retrieved" not in caplog.text
 
 
-class ClaimForAClient:
-    """A claim whose result goes to the worker that submitted its task."""
+def test_a_result_alone_past_the_hard_limit_fails_the_run_before_it_completes():
+    hard = 10_000
 
-    client = "peer"
-
-    def __init__(self, claim):
-        self._claim = claim
-
-    def __getattr__(self, name):
-        return getattr(self._claim, name)
-
-
-def test_a_result_too_large_to_send_to_its_client_fails_the_run_before_it_completes():
     def oversized(request: Greeting) -> Greeting:
-        return Greeting(text="x" * (_native.MAX_RESULT_PAYLOAD_BYTES + 1))
+        return Greeting(text="x" * (hard + 1))
 
-    world = World(oversized)
-    claim_pending = world.runtime.claim_pending
-
-    async def claims_for_a_client(limit):
-        return [ClaimForAClient(claim) for claim in await claim_pending(limit)]
-
-    world.runtime.claim_pending = claims_for_a_client
+    world = World(oversized, memory_soft_limit=hard // 2, memory_hard_limit=hard)
 
     async def body():
         with pytest.raises(ResultTooLargeError):

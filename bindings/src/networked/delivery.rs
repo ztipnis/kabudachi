@@ -6,6 +6,7 @@ use std::sync::Arc;
 use kabudachi_core::protocol::ids::TaskId;
 use kabudachi_core::protocol::messages::{TaskRejectReason, task_response};
 use kabudachi_core::scheduler::Submitted;
+use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::payload_memory::Taken;
 use kabudachi_net::task_exchange::NotStored;
 use tokio::runtime::Handle;
@@ -60,7 +61,7 @@ pub(super) async fn deliver(
     if let Some((payload, _in_flight)) = payload {
         match shared
             .net
-            .store_payload_at_leader(&task, &payload, shared.retry)
+            .store_payload_at_leader(BlobRole::Input, &task, &payload, shared.retry)
             .await
         {
             Ok(manifest) => {

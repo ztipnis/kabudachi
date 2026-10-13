@@ -130,13 +130,23 @@ class Worker:
 
 
 class Cluster:
-    """Three workers of one shard, seeded from the first, which founds it."""
+    """Workers of one shard (three by default), seeded from the first, which
+    founds it."""
 
     def __init__(self, workers: list[Worker]) -> None:
         self.workers = workers
 
     @classmethod
-    def start(cls, markers: Path, size: int = 3) -> "Cluster":
+    def start(
+        cls,
+        markers: Path,
+        size: int = 3,
+        overrides: dict[int, dict[str, str]] | None = None,
+    ) -> "Cluster":
+        """`overrides` gives worker `i`, the founder being 0, environment
+        settings besides the shared ones; configured values only, so nothing
+        depends on the host's memory."""
+        overrides = overrides or {}
         environment = {
             **TIMINGS,
             "KABUDACHI_LISTEN": "/ip4/127.0.0.1/tcp/0",
@@ -149,14 +159,14 @@ class Cluster:
             "KABUDACHI_MEMORY_HARD_LIMIT": "16000000",
             "KABUDACHI_TEST_MARKERS": str(markers),
         }
-        founder = Worker(environment)
+        founder = Worker({**environment, **overrides.get(0, {})})
         workers = [founder]
         try:
             seeded = {**environment, "KABUDACHI_SEEDS": founder.address}
             # One at a time, so a start that fails leaves the earlier ones
             # listed, and closed below.
-            for _ in range(size - 1):
-                workers.append(Worker(seeded))
+            for index in range(1, size):
+                workers.append(Worker({**seeded, **overrides.get(index, {})}))
             cluster = cls(workers)
             eventually("every worker to follow one leader of three voters", cluster.led)
         except BaseException:

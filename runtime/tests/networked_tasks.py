@@ -93,16 +93,16 @@ async def fleeting(request: Greeting) -> Greeting:
     return Greeting(text=request.text)
 
 
-@kabudachi.task(name="cluster.big")
-def big(request: Greeting) -> Greeting:
-    """Returns a result larger than one frame can carry."""
-    return Greeting(text="x" * (2 * 1024 * 1024))
+@kabudachi.task(name="cluster.echo")
+def echo(request: Greeting) -> Greeting:
+    """Returns its input as it came."""
+    return request
 
 
-@kabudachi.task(name="cluster.measure")
-def measure(request: Greeting) -> Greeting:
-    """Says how long its input's text was, and how it ended."""
-    return Greeting(text=request.text[-5:], times=len(request.text))
+@kabudachi.task(name="cluster.inflate")
+def inflate(request: Greeting) -> Greeting:
+    """Returns its input's text twice over."""
+    return Greeting(text=request.text * 2)
 
 
 def _join(older: Greeting, newer: Greeting) -> Greeting:
@@ -123,7 +123,7 @@ TASKS = {
     "nests": nests,
     "awaits": awaits,
     "fleeting": fleeting,
-    "big": big,
-    "measure": measure,
+    "echo": echo,
+    "inflate": inflate,
     "gather": gather,
 }

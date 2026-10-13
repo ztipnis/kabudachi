@@ -59,6 +59,10 @@ class NotingClaims:
         return getattr(self._runtime, name)
 
     async def claim_pending(self, limit: int):
+        if os.environ.get("KABUDACHI_TEST_CLAIMS_NOTHING"):
+            # Never asks the runtime for claims, so Python offers its driver
+            # no places and the worker runs nothing: a pure client.
+            await asyncio.Event().wait()
         claims = await self._runtime.claim_pending(limit)
         CLIENTS.update((claim.task_id, claim.client) for claim in claims)
         return claims

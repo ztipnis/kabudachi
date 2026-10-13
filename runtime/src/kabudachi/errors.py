@@ -167,8 +167,9 @@ class ResultUnavailableError(KabudachiError, RuntimeError):
 
 
 class ResultTooLargeError(KabudachiError, RuntimeError):
-    """A task returned a result too large to send to the worker awaiting it,
-    so its run failed."""
+    """A task's result is larger than the hard memory limit of the process that
+    must hold it whole: the worker that ran it (the run failed) or this one,
+    awaiting it."""
 
 
 class DurabilityUnavailableError(KabudachiError, RuntimeError):

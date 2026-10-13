@@ -39,7 +39,7 @@ pub use generated::{
 };
 pub use generated::{
     CertifiedAck, DeliverResult, OutcomeAnswer, QueryOutcome, ResultAck, ResultCertified,
-    ResultMessage, result_message,
+    ResultMessage, deliver_result, result_message,
 };
 pub use generated::{StealRequest, StealResponse};
 

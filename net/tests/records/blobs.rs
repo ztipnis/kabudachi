@@ -301,7 +301,7 @@ async fn a_new_input_is_refused_while_every_store_is_full(stores: &[&Net], submi
     };
     assert_eq!(
         submitter
-            .store_payload_at_leader(&crowded, &varied(MIB), quick)
+            .store_payload_at_leader(BlobRole::Input, &crowded, &varied(MIB), quick)
             .await,
         Err(NotStored::Refused)
     );

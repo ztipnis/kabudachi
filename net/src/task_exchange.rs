@@ -509,8 +509,9 @@ impl Net {
         self.ask_until_decided(request, retry).await
     }
 
-    /// Stores `payload` as blobs owned by the task `owner`, where the shard's
-    /// leader would place the task's record, and returns their manifest. The
+    /// Stores `payload` as blobs in `role`, owned by the task `owner`, where
+    /// the shard's leader would place the task's record, and returns their
+    /// manifest. The
     /// leader is asked as [`Self::submit_to_leader`] asks it. A placement
     /// leaves this worker out (see `PlaceRecords`), and [`Self::put_blob`]
     /// keeps a copy here besides, so the blobs reach a quorum of the
@@ -522,6 +523,7 @@ impl Net {
     /// its caller treats as backpressure.
     pub async fn store_payload_at_leader(
         &self,
+        role: BlobRole,
         owner: &TaskId,
         payload: &[u8],
         retry: LeaderRetry,
@@ -529,7 +531,7 @@ impl Net {
         let mut failed = 0;
         loop {
             if let Some(placement) = self.placement_from_leader(owner, retry).await? {
-                if let Ok(manifest) = self.store_payload(BlobRole::Input, owner, payload, placement).await {
+                if let Ok(manifest) = self.store_payload(role, owner, payload, placement).await {
                     return Ok(manifest);
                 }
                 failed += 1;

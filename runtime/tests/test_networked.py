@@ -24,7 +24,7 @@ from cluster import (
     settled,
     states,
 )
-from networked_tasks import awaits, fleeting, gather, hold, measure, spin
+from networked_tasks import awaits, echo, fleeting, gather, hold, spin
 from proto_messages import Greeting
 
 
@@ -103,16 +103,19 @@ def delivered_to_its_submitter(cluster, leader):
 
 
 def carried_as_blobs(cluster, leader):
-    # An input larger than one message travels as blobs: the follower stores
-    # its chunks where the leader will place the task's record, and whichever
-    # worker runs it reads them back whole.
+    # An input and a result each larger than one message travel as blobs: the
+    # follower stores the input's chunks where the leader places the task's
+    # record, the worker that runs it reads them back, and its result comes
+    # back to the follower as chunks owned by the task.
     follower = next(worker for worker in cluster.workers if worker is not leader)
     big = ("0123456789" * (3 * 1024 * 1024 // 10 + 1))[: 3 * 1024 * 1024]
     # Three in a row: the in-flight share of a worker is 8 MiB, so a run that
     # leaves its input counted on any path makes the third be refused.
     for _ in range(3):
-        measured = follower.submit("measure", text=big)
-        certified_once(cluster, measured, digest_of(measure, Greeting(text=big[-5:], times=len(big))))
+        echoed = follower.submit("echo", text=big)
+        certified_once(cluster, echoed, digest_of(echo, Greeting(text=big)))
+        held = eventually("the follower to hold the echoed result", lambda: settled(follower, echoed))
+        assert held["error"] is None, held
 
 
 def awaited_across_workers(cluster, leader):
@@ -122,16 +125,6 @@ def awaited_across_workers(cluster, leader):
     record = certified_once(cluster, awaiting, digest_of(awaits, Greeting(text="REPLICATED")))
     assert [run["delivered"] for run in record["runs"]] == [True]
     assert eventually("the caller's handle to settle", lambda: settled(leader, awaiting))["error"] is None
-
-    # A result too large for one frame fails its run, and its awaiter hears why.
-    too_big = leader.submit("big")
-    record = finished(cluster, too_big)
-    assert [(run["state"], run["failure_kind"]) for run in record["runs"]] == [
-        ("FAILED", "ResultTooLargeError")
-    ]
-    assert eventually("the big task's handle", lambda: settled(leader, too_big))["error"] == (
-        "ResultTooLargeError"
-    )
 
 
 def compacted(cluster, leader):
@@ -199,6 +192,31 @@ def worker_killed(cluster, leader):
             record = certified_once(cluster, each, digest_of(fleeting, Greeting(text=f"worker-{n}")))
             assert [run["delivered"] for run in record["runs"]] == [True]
             assert eventually("its handle", lambda: settled(leader, each))["error"] is None
+
+
+def test_a_client_too_small_to_hold_a_result_has_its_handle_fail_while_the_run_completes_elsewhere(tmp_path):
+    leader, client, other = 0, 1, 2
+    cluster = Cluster.start(
+        tmp_path,
+        overrides={
+            # The client holds at most half its limit in flight, 1.5 MB, and
+            # claims nothing, so every run is on a larger worker.
+            client: {"KABUDACHI_MEMORY_HARD_LIMIT": "3000000", "KABUDACHI_TEST_CLAIMS_NOTHING": "1"},
+        },
+    )
+    try:
+        workers = cluster.workers
+        assert cluster.leader() is workers[leader]
+        # A 0.9 MB input travels inline and fits the client; its 1.8 MB
+        # result does not.
+        inflated = workers[client].submit("inflate", text="x" * 900_000)
+        eventually("the client's handle to settle", lambda: settled(workers[client], inflated))
+        assert settled(workers[client], inflated)["error"] == "ResultTooLargeError"
+        [run] = cluster.record(inflated)["runs"]
+        assert run["state"] == "SUCCEEDED"
+        assert run["worker"] in (workers[leader].id, workers[other].id)
+    finally:
+        cluster.close()
 
 
 def test_a_cut_off_worker_stops_its_run_by_its_deadline_an_unreached_client_still_hears_its_tasks_ends_and_runs_certify_once_when_their_leader_is_killed(

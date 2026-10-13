@@ -25,23 +25,14 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
     CertifiedAck, DeliverResult, OutcomeAnswer, ResultAck, ResultCertified, ResultMessage,
-    result_message,
+    deliver_result, result_message,
 };
 use libp2p::PeerId;
 
-use crate::framing::MAX_MESSAGE_BYTES;
 use crate::messenger::Net;
 use crate::result_transport::codec::ResultCodec;
 
 pub mod codec;
-
-/// Room a delivery leaves in its frame for everything but the payload:
-/// two ids, a digest and the message framing.
-const RESULT_FRAMING_BYTES: u32 = 4096;
-
-/// The largest result a delivery carries in one frame. A larger one is not
-/// delivered: its run fails instead.
-pub const MAX_RESULT_PAYLOAD_BYTES: usize = (MAX_MESSAGE_BYTES - RESULT_FRAMING_BYTES) as usize;
 
 /// How long a leader keeps asking a client to take a certification or a
 /// conclusion. A client that does not take it in time asks the next leader
@@ -51,12 +42,13 @@ pub const PUSH_WITHIN: Duration = Duration::from_secs(30);
 /// A result message that arrived for this worker as a client.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultEvent {
-    /// A run's result, not certified yet.
+    /// A run's result, not certified yet: its bytes, or the manifest of
+    /// blobs that hold them.
     Delivered {
         task: TaskId,
         run: TaskRunId,
         digest: Digest,
-        payload: Vec<u8>,
+        body: deliver_result::Body,
     },
     /// The leader certified this run's result as the task's.
     Certified {
@@ -109,7 +101,7 @@ fn delivered(delivery: DeliverResult) -> Option<ResultEvent> {
         task: delivery.task_id?.into(),
         run: delivery.task_run_id?.into(),
         digest: Digest::try_from(&delivery.result_digest?).ok()?,
-        payload: delivery.payload,
+        body: delivery.body?,
     })
 }
 

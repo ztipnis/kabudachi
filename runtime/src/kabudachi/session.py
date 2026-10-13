@@ -33,7 +33,6 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from kabudachi import _native
 from kabudachi._native import EventKind, RunState
 from kabudachi.body import RunningBody
 from kabudachi.composites import Composites
@@ -639,10 +638,10 @@ class Session:
         self._complete(claim, run, outcome)
 
     def _complete(self, claim: Any, run: Run, outcome: Any) -> None:
-        if claim.client is not None and len(outcome) > _native.MAX_RESULT_PAYLOAD_BYTES:
+        limit = self._runtime.payload_limit
+        if limit is not None and len(outcome) > limit:
             raise ResultTooLargeError(
-                f"task {claim.definition_id} returned {len(outcome)} bytes, more than the "
-                f"{_native.MAX_RESULT_PAYLOAD_BYTES} that can be sent to the worker awaiting it"
+                f"task {claim.definition_id} returned {len(outcome)} bytes, past the {limit} this process can hold"
             )
         if run.holds_handle:
             self._tasks.result_held(claim.task_id, claim.task_run_id, outcome)
