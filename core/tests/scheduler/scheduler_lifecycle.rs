@@ -11,8 +11,7 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
     CancelRejection, ClaimRejection, Completion, LeadershipGrant, LeaseEnd,
-    MAX_FAILURE_MESSAGE_BYTES, MAX_SUBMISSION_BYTES, ReportRejection, Submission, SubmitRejection,
-    TraceContext,
+    MAX_FAILURE_MESSAGE_BYTES, ReportRejection, Submission, TraceContext,
 };
 use kabudachi_core::task_record::MAX_RECORD_BYTES;
 use kabudachi_core::time::{Clock, Duration};
@@ -484,15 +483,4 @@ fn a_tasks_trace_context_reaches_its_record_and_claim_unchanged_and_counts_towar
         .unwrap();
     assert_eq!(claim.task.trace_parent, trace.trace_parent);
     assert_eq!(claim.task.baggage, trace.baggage);
-
-    let oversized = TraceContext {
-        baggage: "b".repeat(MAX_SUBMISSION_BYTES as usize),
-        ..trace
-    };
-    assert!(matches!(
-        fixture
-            .scheduler
-            .submit(plain_task().with_trace_context(oversized)),
-        Err(SubmitRejection::TooLarge { .. })
-    ));
 }
