@@ -242,8 +242,9 @@ class Runtime(Protocol):
         self, task_run_id: str, failure_kind: str, failure_message: str = ""
     ) -> bool | None:
         """Reports that a claimed run failed, started or not, with the error's
-        type and message; whether a retry is now queued. `None` when the
-        leader decides elsewhere."""
+        type and message; whether a retry is now queued. The message is stored
+        in the task's replicated record, so it can contain task data. `None`
+        when the leader decides elsewhere."""
 
     def report_lost(self, task_run_id: str) -> bool | None:
         """Reports that a claimed run was lost with the process that ran it;
