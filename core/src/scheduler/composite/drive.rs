@@ -27,8 +27,8 @@ use crate::scheduler::{
 use super::held::Composite;
 use super::{
     BoundInput, BoundStep, CompositeFinished, CompositeKind, CompositeParent, CompositeState,
-    CompositeStatus, EXPANSION_DEFINITION, InputShape, LOST_KIND, MemberOutcome, PAGE_ENTRIES, Stage,
-    Step, SubmittedComposite, failure_of, pages_manifest,
+    CompositeStatus, EXPANSION_DEFINITION, InputShape, LOST_KIND, MemberBatch, MemberOutcome, MembersAccepted,
+    PAGE_ENTRIES, Stage, Step, StreamedMember, SubmittedComposite, failure_of, pages_manifest,
 };
 
 /// The results of a composite a stage is to take were not found.
@@ -101,6 +101,72 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         Ok(composite_id)
     }
 
+    /// Adds a batch of members to a streamed composite, or refuses it whole.
+    /// A batch whose members are all held already is answered as accepted
+    /// and changes nothing, so a submitter that lost an answer asks again.
+    pub fn submit_members(&mut self, batch: MemberBatch) -> Result<MembersAccepted, SubmitRejection> {
+        let outcome = self.record_members(batch);
+        self.end_call();
+        outcome
+    }
+
+    /// Whether SlowDown is raised: memory in use passed the soft limit and
+    /// has not yet fallen back below 80% of it.
+    pub fn slow_down(&self) -> bool {
+        self.budget.slow_down()
+    }
+
+    fn record_members(&mut self, batch: MemberBatch) -> Result<MembersAccepted, SubmitRejection> {
+        if !self.check_leader() {
+            return Err(SubmitRejection::NotLeader);
+        }
+        let id = batch.composite_id.clone();
+        if self.reconciliation.is_uncertain_composite(&id) {
+            return Err(SubmitRejection::NotReady);
+        }
+        let composite = self.composites.held.get(&id).ok_or(SubmitRejection::UnknownComposite)?;
+        if !composite.takes_batches() {
+            return Err(SubmitRejection::NotStreamed);
+        }
+        let (held, start) = (composite.members, batch.start_index);
+        let end = start + batch.members.len() as u64;
+        if start > held {
+            return Err(SubmitRejection::MemberGap { held, start });
+        }
+        if end <= held && (composite.sealed || !batch.last) {
+            // Asked again: every member it names is held already.
+            return Ok(self.members_accepted(&id));
+        }
+        if composite.state != CompositeState::Running {
+            return Err(SubmitRejection::CompositeFinished);
+        }
+        if composite.sealed {
+            return Err(SubmitRejection::MemberGap { held, start: end });
+        }
+        let fresh: Vec<(u64, StreamedMember)> =
+            (start..).zip(batch.members).filter(|(index, _)| *index >= held).collect();
+        let needed: u64 = fresh.iter().map(|(_, member)| member.input_bytes()).sum();
+        let members: Vec<(u64, Stage)> = fresh
+            .into_iter()
+            .map(|(index, member)| composite.member_stage(member).map(|stage| (index, stage)))
+            .collect::<Result<_, SubmitRejection>>()?;
+        self.budget.check_room(needed, || 0)?;
+        let composite = self.composites.held.get_mut(&id).expect("held above");
+        composite.members = composite.members.max(end);
+        composite.sealed |= batch.last;
+        self.composites.unpublished.insert(id.clone());
+        for (index, stage) in members {
+            self.start_member_stage(&id, index, stage);
+        }
+        self.finish_if_complete(&id);
+        self.update_pressure();
+        Ok(self.members_accepted(&id))
+    }
+
+    fn members_accepted(&self, id: &CompositeId) -> MembersAccepted {
+        MembersAccepted { members: self.composites.held[id].members, slow_down: self.budget.slow_down() }
+    }
+
     /// Whether `submitted` could be recorded now with `queued_bytes` more
     /// promised to composites and tasks not yet recorded: it needs no input,
     /// its record fits one record, and what starting it takes of memory (see
@@ -144,7 +210,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         input: Option<(Manifest, InputShape)>,
         submitted_at: WallTime,
     ) {
-        let bytes = super::records::first_record_len(&id, &step);
+        let bytes = super::records::budget_len(&id, &step);
         self.budget.take(bytes);
         let root = match &parent {
             Some(CompositeParent::Composite { id: parent, .. }) => self.composites.held[parent].root.clone(),
@@ -153,10 +219,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let retained_by = self.retainer_of(parent.as_ref());
         let starts: Vec<u64> = match step.kind {
             CompositeKind::Flow => vec![0],
+            _ if step.streamed => Vec::new(),
             _ => (0..step.stages.len() as u64).collect(),
         };
-        let empty = step.stages.is_empty();
+        // A map over an empty list has no member to wait for; a streamed
+        // composite has none yet, and waits for its last batch.
+        let empty = step.stages.is_empty() && !step.streamed;
         let expands = step.expands();
+        let (members, sealed) = if step.streamed { (0, false) } else { (step.stages.len() as u64, true) };
         self.composites.held.insert(
             id.clone(),
             Composite {
@@ -172,11 +242,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 failure: None,
                 submitted_at,
                 bytes,
+                members,
+                sealed,
             },
         );
         self.composites.unpublished.insert(id.clone());
         if empty {
-            // A map over an empty list has no member to wait for.
             self.finish_composite(&id, CompositeState::Succeeded, None);
         }
         if expands {
@@ -265,11 +336,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return;
         }
         let stage = composite.step.stages[index as usize].clone();
-        let started = match &stage {
-            Stage::Task(_) => self.tasks.contains_key(&id.member_task(index)),
-            Stage::Composite(_) => self.composites.held.contains_key(&id.child(index)),
-        };
-        if started {
+        if self.stage_started(id, index, &stage) {
             return;
         }
         let Ok(input) = self.stage_input(id, index) else {
@@ -277,6 +344,28 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             self.finish_composite(id, CompositeState::Failed, Some(failure));
             return;
         };
+        self.launch_stage(id, index, stage, input);
+    }
+
+    /// Starts member `index` of the streamed composite `id`, which runs
+    /// `stage` and takes no input. Starting what already exists changes
+    /// nothing, and nothing starts in a composite that is over.
+    fn start_member_stage(&mut self, id: &CompositeId, index: u64, stage: Stage) {
+        if self.composites.held[id].state != CompositeState::Running || self.stage_started(id, index, &stage) {
+            return;
+        }
+        self.launch_stage(id, index, stage, None);
+    }
+
+    /// Whether the Task or child composite stage `index` of `id` makes exists.
+    fn stage_started(&self, id: &CompositeId, index: u64, stage: &Stage) -> bool {
+        match stage {
+            Stage::Task(_) => self.tasks.contains_key(&id.member_task(index)),
+            Stage::Composite(_) => self.composites.held.contains_key(&id.child(index)),
+        }
+    }
+
+    fn launch_stage(&mut self, id: &CompositeId, index: u64, stage: Stage, input: Option<(Manifest, InputShape)>) {
         match stage {
             Stage::Task(bound) => self.submit_member(id, index, &bound, input.map(|(manifest, _)| manifest)),
             Stage::Composite(step) => {
@@ -425,7 +514,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     fn advance(&mut self, id: &CompositeId, index: u64, outcome: MemberOutcome) {
         let composite = &self.composites.held[id];
         let stages = composite.step.stages.len() as u64;
-        let settled = composite.outcomes.len() as u64;
         match (composite.step.kind, outcome) {
             (_, MemberOutcome::Failed(failure)) if composite.fails_on_first_failure() => {
                 self.finish_composite(id, CompositeState::Failed, Some(failure));
@@ -435,8 +523,19 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 self.start_stage(id, index + 1);
             }
             (CompositeKind::Flow, _) => self.finish_composite(id, CompositeState::Succeeded, None),
-            _ if settled == stages => self.finish_composite(id, CompositeState::Succeeded, None),
-            _ => {}
+            _ => self.finish_if_complete(id),
+        }
+    }
+
+    /// Ends a group or map as succeeded once its last batch is in and every
+    /// member has settled.
+    fn finish_if_complete(&mut self, id: &CompositeId) {
+        let composite = &self.composites.held[id];
+        if composite.state == CompositeState::Running
+            && composite.sealed
+            && composite.outcomes.len() as u64 == composite.members
+        {
+            self.finish_composite(id, CompositeState::Succeeded, None);
         }
     }
 
@@ -525,7 +624,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         // Cancelled first, so the members cancelled below start and settle nothing.
         composite.state = CompositeState::Cancelled;
-        let unsettled: Vec<u64> = (0..composite.step.stages.len() as u64)
+        let unsettled: Vec<u64> = (0..composite.members)
             .filter(|index| !composite.outcomes.contains_key(index))
             .collect();
         let mut was_running = false;
@@ -564,7 +663,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// settled and whose current run is claimed or started.
     pub(in crate::scheduler) fn running_members(&self, id: &CompositeId) -> u64 {
         let composite = &self.composites.held[id];
-        (0..composite.step.stages.len() as u64)
+        (0..composite.members)
             .filter(|index| !composite.outcomes.contains_key(index))
             .filter(|index| {
                 self.current_run.get(&id.member_task(*index)).is_some_and(|run| {

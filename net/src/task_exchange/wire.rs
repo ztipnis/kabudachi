@@ -152,7 +152,13 @@ pub(crate) fn submit_reject(rejection: SubmitRejection) -> TaskRejectReason {
         SubmitRejection::KeyNotReady => TaskRejectReason::TaskRejectNotReady,
         SubmitRejection::KeyBackpressure { .. } => TaskRejectReason::TaskRejectBackpressure,
         SubmitRejection::PayloadTooLarge { .. } => TaskRejectReason::TaskRejectPayloadTooLarge,
-        SubmitRejection::StepTakesInput => TaskRejectReason::TaskRejectMalformed,
+        SubmitRejection::StepTakesInput
+        | SubmitRejection::UnknownComposite
+        | SubmitRejection::NotStreamed
+        | SubmitRejection::MemberGap { .. }
+        | SubmitRejection::MemberKind => TaskRejectReason::TaskRejectMalformed,
+        SubmitRejection::NotReady => TaskRejectReason::TaskRejectNotReady,
+        SubmitRejection::CompositeFinished => TaskRejectReason::TaskRejectCompositeFinished,
     }
 }
 

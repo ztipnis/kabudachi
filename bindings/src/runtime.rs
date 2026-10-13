@@ -321,7 +321,14 @@ impl NativeRuntime {
             .submit(submission)
             .map_err(|refusal| {
                 refused(refusal, |rejection| match rejection {
-                    SubmitRejection::NotLeader => {
+                    // The member-batch refusals answer a batch, not a task.
+                    SubmitRejection::NotLeader
+                    | SubmitRejection::NotReady
+                    | SubmitRejection::UnknownComposite
+                    | SubmitRejection::NotStreamed
+                    | SubmitRejection::MemberGap { .. }
+                    | SubmitRejection::MemberKind
+                    | SubmitRejection::CompositeFinished => {
                         PyRuntimeError::new_err(rejection.to_string())
                     }
                     SubmitRejection::StepTakesInput => {
@@ -464,7 +471,14 @@ impl NativeRuntime {
         self.refuse_values_past_limit(py, &values)?;
         let composite_id = self.door.submit_composite(step, values).map_err(|refusal| {
             refused(refusal, |rejection| match rejection {
-                SubmitRejection::NotLeader => PyRuntimeError::new_err(rejection.to_string()),
+                // The member-batch refusals answer a batch, not a composite.
+                SubmitRejection::NotLeader
+                | SubmitRejection::NotReady
+                | SubmitRejection::UnknownComposite
+                | SubmitRejection::NotStreamed
+                | SubmitRejection::MemberGap { .. }
+                | SubmitRejection::MemberKind
+                | SubmitRejection::CompositeFinished => PyRuntimeError::new_err(rejection.to_string()),
                 SubmitRejection::StepTakesInput => PyValueError::new_err(rejection.to_string()),
                 SubmitRejection::TooLarge { .. }
                 | SubmitRejection::RecordTooLarge { .. }

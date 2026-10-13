@@ -85,7 +85,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let composite = &self.composites.held[id];
         let uncertain = &self.reconciliation;
         uncertain.is_uncertain_composite(id)
-            || (0..composite.step.stages.len() as u64).any(|index| {
+            || (0..composite.members).any(|index| {
                 let task = id.member_task(index);
                 uncertain.is_uncertain(&task)
                     || uncertain.is_uncertain_composite(&id.child(index))
@@ -109,7 +109,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if self.composites.held[id].state != CompositeState::Running {
             return;
         }
-        let stages = self.composites.held[id].step.stages.len() as u64;
+        let stages = self.composites.held[id].members;
         for index in 0..stages {
             self.settle_from_record(id, index);
         }
@@ -120,7 +120,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let open: Vec<u64> = (0..stages).filter(|index| !composite.outcomes.contains_key(index)).collect();
         match (composite.step.kind, open.first()) {
-            (_, None) => self.finish_composite(id, CompositeState::Succeeded, None),
+            (_, None) if composite.sealed => self.finish_composite(id, CompositeState::Succeeded, None),
             (CompositeKind::Flow, Some(&first)) => {
                 self.composites.held.get_mut(id).expect("held above").next_stage = first;
                 self.ensure_stage(id, first);
@@ -142,24 +142,28 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         if composite.outcomes.contains_key(&index) {
             return;
         }
-        let outcome = match &composite.step.stages[index as usize] {
-            Stage::Task(_) => {
-                let task = id.member_task(index);
-                if !self.retention.holds(&task) {
-                    return;
+        // A streamed composite keeps no stage once it has started it: a member
+        // is a child composite only if there is one.
+        let is_task = match composite.step.stages.get(index as usize) {
+            Some(Stage::Task(_)) => true,
+            Some(Stage::Composite(_)) => false,
+            None => !self.composites.held.contains_key(&id.child(index)),
+        };
+        let outcome = if is_task {
+            let task = id.member_task(index);
+            if !self.retention.holds(&task) {
+                return;
+            }
+            self.member_outcome_of(&task)
+        } else {
+            let child = id.child(index);
+            self.composites.held.get(&child).and_then(|child_composite| match child_composite.state {
+                CompositeState::Running => None,
+                CompositeState::Succeeded => Some(MemberOutcome::Child(child.clone())),
+                CompositeState::Failed | CompositeState::Cancelled => {
+                    Some(MemberOutcome::Failed(child_composite.failure_or_cancelled()))
                 }
-                self.member_outcome_of(&task)
-            }
-            Stage::Composite(_) => {
-                let child = id.child(index);
-                self.composites.held.get(&child).and_then(|child_composite| match child_composite.state {
-                    CompositeState::Running => None,
-                    CompositeState::Succeeded => Some(MemberOutcome::Child(child.clone())),
-                    CompositeState::Failed | CompositeState::Cancelled => {
-                        Some(MemberOutcome::Failed(child_composite.failure_or_cancelled()))
-                    }
-                })
-            }
+            })
         };
         if let Some(outcome) = outcome {
             self.record_member(id, index, outcome);
@@ -176,6 +180,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             }
             return;
         }
-        self.start_stage(id, index);
+        if !self.composites.held[id].step.streamed {
+            self.start_stage(id, index);
+        }
     }
 }

@@ -7,9 +7,11 @@ use crate::manifest::{Failure, Manifest};
 use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
 use crate::time::{Duration, Instant, WallTime};
 
+use crate::scheduler::SubmitRejection;
+
 use super::{
-    CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape, MemberCounts,
-    MemberOutcome, OnError, PAGE_ENTRIES, Stage, Step,
+    BoundInput, BoundStep, CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape,
+    MemberCounts, MemberOutcome, OnError, PAGE_ENTRIES, Stage, Step, StreamedMember,
 };
 
 /// One composite this scheduler drives, or keeps until its retention ends.
@@ -38,9 +40,34 @@ pub(in crate::scheduler) struct Composite {
     /// The encoded description's size, counted against the memory budget
     /// until the composite finishes.
     pub(super) bytes: u64,
+    /// How many members it holds: its stages' count unless it is streamed,
+    /// whose members arrive in batches.
+    pub(super) members: u64,
+    /// No batch adds a member: always true unless members arrive in batches.
+    pub(super) sealed: bool,
 }
 
 impl Composite {
+    /// Whether its members arrive in batches.
+    pub(super) fn takes_batches(&self) -> bool {
+        self.step.streamed
+    }
+
+    /// The stage a streamed member is to run as: a map's item is the input of
+    /// its template, a group's stage is run as it is unless it needs an input,
+    /// which a streamed composite has none to give.
+    pub(super) fn member_stage(&self, member: StreamedMember) -> Result<Stage, SubmitRejection> {
+        match (self.step.kind, member) {
+            (CompositeKind::Map, StreamedMember::Item(input)) => match (&self.step.stages[..], input) {
+                (_, BoundInput::Previous) => Err(SubmitRejection::MemberKind),
+                ([Stage::Task(template)], input) => Ok(Stage::Task(BoundStep { input, ..template.clone() })),
+                _ => Err(SubmitRejection::MemberKind),
+            },
+            (CompositeKind::Group, StreamedMember::Stage(stage)) if !stage.takes_input() => Ok(stage),
+            _ => Err(SubmitRejection::MemberKind),
+        }
+    }
+
     /// Whether the first stage or member to fail for good ends the
     /// composite: a flow's always does, a group's or map's by its policy, and
     /// an expanding map's always, since its one member is the run that
@@ -87,7 +114,8 @@ impl Composite {
                 MemberOutcome::Failed(_) => counts.failed += 1,
             }
         }
-        counts.pending = (self.step.stages.len() as u64)
+        counts.pending = self
+            .members
             .saturating_sub(self.outcomes.len() as u64)
             .saturating_sub(running);
         counts
@@ -179,8 +207,12 @@ impl Composites {
 
     fn forget(&mut self, id: &CompositeId) -> Vec<TaskId> {
         let members = self.held.remove(id).map_or_else(Vec::new, |composite| {
-            (0..composite.step.stages.len() as u64)
-                .filter(|index| matches!(composite.step.stages[*index as usize], Stage::Task(_)))
+            // A streamed composite keeps no stage once it has started it: a
+            // child's index names no Task, which retention never holds.
+            (0..composite.members)
+                .filter(|index| {
+                    composite.step.streamed || matches!(composite.step.stages[*index as usize], Stage::Task(_))
+                })
                 .map(|index| id.member_task(index))
                 .collect()
         });

@@ -101,6 +101,11 @@ impl MemoryBudget {
         }
     }
 
+    /// Whether `SlowDown` is raised.
+    pub(super) fn slow_down(&self) -> bool {
+        self.slow_down
+    }
+
     /// The bytes counted in use, which `Scheduler::memory_in_use` reports.
     pub(super) fn in_use(&self) -> u64 {
         self.in_use

@@ -68,11 +68,22 @@ pub(super) fn first_record_len(id: &CompositeId, step: &Step) -> u64 {
     .encoded_len() as u64
 }
 
+/// What a held composite takes of the memory budget until it finishes: its
+/// first record, or for a streamed composite only its description, since the
+/// record would otherwise raise SlowDown before any member exists.
+pub(super) fn budget_len(id: &CompositeId, step: &Step) -> u64 {
+    if step.streamed { step.encoded_len() } else { first_record_len(id, step) }
+}
+
 /// What starting `step` as the composite `id` takes of the memory budget: its
 /// record, and the input each Task it starts at once holds beside it, down
 /// through the composites it starts at once. A flow starts only its first
-/// stage, and a later one takes its input when it starts.
+/// stage, and a later one takes its input when it starts. A streamed
+/// composite starts no member, so it takes only what it holds.
 pub(super) fn start_bytes(id: &CompositeId, step: &Step) -> u64 {
+    if step.streamed {
+        return budget_len(id, step);
+    }
     let started = match step.kind {
         CompositeKind::Flow => &step.stages[..step.stages.len().min(1)],
         _ => &step.stages[..],
@@ -129,8 +140,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             published_at: Some(published_at.into()),
             finished: self.composites.is_finished(id),
             root: Some(composite.root.clone().into()),
-            members: 0,
-            sealed: false,
+            members: composite.members,
+            sealed: composite.sealed,
         }
     }
 
@@ -228,8 +239,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .filter_map(outcome_of)
             .collect();
         let retained_by = self.retainer_of(parent.as_ref());
+        let (members, sealed) = if step.streamed {
+            (record.members, record.sealed)
+        } else {
+            (step.stages.len() as u64, true)
+        };
         Some(Composite {
-            bytes: first_record_len(id, &step),
+            bytes: budget_len(id, &step),
+            members,
+            sealed,
             step,
             root: record.root.map_or_else(|| id.clone(), CompositeId::from),
             retained_by,

@@ -52,6 +52,23 @@ pub enum SubmitRejection {
     /// submitted: nothing runs before it to give it one.
     #[error("the composite takes an input, and nothing runs before it to give it one")]
     StepTakesInput,
+    /// The composite's records are not known to this leader yet: ask again.
+    #[error("the composite's records are not known to this leader yet")]
+    NotReady,
+    #[error("no such composite")]
+    UnknownComposite,
+    #[error("the composite's members do not arrive in batches")]
+    NotStreamed,
+    /// A batch starts past the members the composite holds, or adds a member
+    /// to a composite whose last batch is in.
+    #[error("a batch starts at member {start} but the composite holds {held}")]
+    MemberGap { held: u64, start: u64 },
+    /// A member that does not fit its composite: a stage for a map, an item
+    /// for a group, or a group member that takes an input.
+    #[error("the member does not fit the composite it is sent to")]
+    MemberKind,
+    #[error("the composite is over and takes no more members")]
+    CompositeFinished,
 }
 
 impl SubmitRejection {
@@ -66,6 +83,12 @@ impl SubmitRejection {
             SubmitRejection::KeyBackpressure { .. } => "KeyBackpressureError",
             SubmitRejection::PayloadTooLarge { .. } => "PayloadTooLargeError",
             SubmitRejection::StepTakesInput => "StepTakesInput",
+            SubmitRejection::NotReady => "NotReady",
+            SubmitRejection::UnknownComposite => "UnknownComposite",
+            SubmitRejection::NotStreamed => "NotStreamed",
+            SubmitRejection::MemberGap { .. } => "MemberGap",
+            SubmitRejection::MemberKind => "MemberKind",
+            SubmitRejection::CompositeFinished => "CompositeFinished",
         }
     }
 }

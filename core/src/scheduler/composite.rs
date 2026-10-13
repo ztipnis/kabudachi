@@ -483,6 +483,11 @@ impl Step {
         generated::StepDescription::from(self).encode_to_vec()
     }
 
+    /// The length of the step's encoding.
+    pub fn encoded_len(&self) -> u64 {
+        generated::StepDescription::from(self).encoded_len() as u64
+    }
+
     /// The BLAKE3 digest of the step's encoding: what a returning run's
     /// result digest is when the step is its continuation.
     pub fn digest(&self) -> Digest {
