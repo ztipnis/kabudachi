@@ -489,8 +489,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .held
             .get(id)
             .and_then(|composite| composite.published_item_pages.get(page));
-        if published.is_some_and(|published| published.order(&version) != VersionOrder::Older) {
-            self.release_item_page(id, *page);
+        if published.is_some_and(|published| published.order(&version) != VersionOrder::Older)
+            && self.release_item_page(id, *page)
+        {
+            self.update_pressure();
         }
     }
 

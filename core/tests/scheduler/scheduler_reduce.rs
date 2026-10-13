@@ -14,7 +14,7 @@ use kabudachi_core::scheduler::composite::{
     CompositeKind, CompositeState, EXPANSION_DEFINITION, ITEM_PAGES, ItemInput, MemberBatch, OnError, PAGE_ENTRIES,
     REDUCE_EMPTY_KIND, REDUCER_CONTINUED_KIND, ReduceNode, Stage, Step, StreamedMember,
 };
-use kabudachi_core::scheduler::{Claim, ClaimRejection, Completion, SubmitRejection};
+use kabudachi_core::scheduler::{Claim, ClaimRejection, Completion, Event, SubmitRejection};
 use kabudachi_core::task_record::{RecordKey, RecordVersion, ShardRecord};
 use kabudachi_core::time::Duration;
 
@@ -106,6 +106,25 @@ fn a_reduce_keeps_a_full_item_page_until_its_write_is_stored_so_a_stream_twice_t
     assert_eq!(
         fixture.scheduler.submit_members(items_batch(&reduce, 4 * PAGE_ENTRIES, &[b"late"], false)),
         Err(SubmitRejection::CompositeFinished)
+    );
+}
+
+#[test]
+fn slow_down_clears_when_a_stored_item_page_is_let_go_with_no_other_activity() {
+    let page_bytes = PAGE_ENTRIES * 8;
+    let (mut fixture, reduce) = leading_with_room_for(streamed_reduce(None, None), page_bytes - 1, 4 * page_bytes);
+    let page = page_of_items(0);
+    let page: Vec<&[u8]> = page.iter().map(Vec::as_slice).collect();
+    assert!(
+        fixture.scheduler.submit_members(items_batch(&reduce, 0, &page, false)).unwrap().slow_down,
+        "a full page passes the soft limit"
+    );
+    let stored = fixture.spy.newest_page(&reduce, ITEM_PAGES).unwrap().version.unwrap();
+    fixture.scheduler.record_stored(&RecordKey::Page(reduce.clone(), ITEM_PAGES), RecordVersion::from(&stored));
+    assert!(!fixture.scheduler.slow_down(), "the page was let go, so SlowDown clears with no other activity");
+    assert!(
+        fixture.scheduler.take_events().iter().any(|event| matches!(event, Event::SlowDown { active: false })),
+        "and the submitters are told"
     );
 }
 

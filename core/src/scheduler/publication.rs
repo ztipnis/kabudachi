@@ -66,6 +66,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let pages = std::mem::take(&mut self.composites.unpublished_pages);
         let records = std::mem::take(&mut self.composites.unpublished);
         let mut published = 0;
+        let mut released = false;
         for (id, page) in pages {
             let Some(composite) = self.composites.held.get(&id) else {
                 continue;
@@ -81,10 +82,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             published += 1;
             if item_page {
                 self.item_page_published(&id, page, version);
-                if self.observer.stores_at_once() {
-                    self.release_item_page(&id, page);
-                }
+                released |= self.observer.stores_at_once() && self.release_item_page(&id, page);
             }
+        }
+        // The bytes given back may end SlowDown, which no later call need.
+        if released {
+            self.update_pressure();
         }
         for id in records {
             if !self.composites.held.contains_key(&id) {
