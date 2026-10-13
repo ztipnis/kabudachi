@@ -11,7 +11,8 @@ use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
     CancelRejection, ClaimRejection, Completion, LeadershipGrant, LeaseEnd,
-    MAX_FAILURE_MESSAGE_BYTES, ReportRejection, Submission,
+    MAX_FAILURE_MESSAGE_BYTES, MAX_SUBMISSION_BYTES, ReportRejection, Submission, SubmitRejection,
+    TraceContext,
 };
 use kabudachi_core::task_record::MAX_RECORD_BYTES;
 use kabudachi_core::time::{Clock, Duration};
@@ -437,4 +438,61 @@ fn failure_messages_never_push_a_record_past_its_limit() {
         TaskRunState::Failed,
         "the history filled before the retries ran out"
     );
+}
+
+#[test]
+fn a_tasks_trace_context_reaches_its_record_and_claim_unchanged_and_counts_toward_its_size() {
+    let mut fixture = Fixture::leading();
+    let trace = TraceContext {
+        trace_parent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
+        trace_state: "vendor=opaque".into(),
+        baggage: "tenant=acme".into(),
+    };
+    let plain_task = || {
+        Submission::new(
+            TaskDefinitionId::new("demo.task"),
+            1,
+            b"in".to_vec(),
+            "default",
+        )
+    };
+    let task_id = fixture
+        .scheduler
+        .submit(plain_task().with_trace_context(trace.clone()))
+        .unwrap();
+    let record = newest_records(&fixture)
+        .into_iter()
+        .find(|record| {
+            record
+                .task
+                .as_ref()
+                .is_some_and(|task| task.task_id() == task_id)
+        })
+        .unwrap();
+    let stored = record.task.unwrap();
+    assert_eq!(
+        (stored.trace_parent, stored.trace_state, stored.baggage),
+        (
+            trace.trace_parent.clone(),
+            trace.trace_state.clone(),
+            trace.baggage.clone()
+        )
+    );
+    let claim = fixture
+        .scheduler
+        .request_claim(&worker("w1"), &task_id)
+        .unwrap();
+    assert_eq!(claim.task.trace_parent, trace.trace_parent);
+    assert_eq!(claim.task.baggage, trace.baggage);
+
+    let oversized = TraceContext {
+        baggage: "b".repeat(MAX_SUBMISSION_BYTES as usize),
+        ..trace
+    };
+    assert!(matches!(
+        fixture
+            .scheduler
+            .submit(plain_task().with_trace_context(oversized)),
+        Err(SubmitRejection::TooLarge { .. })
+    ));
 }

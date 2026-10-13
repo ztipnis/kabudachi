@@ -13,7 +13,7 @@ use kabudachi_core::protocol::messages::{
 };
 use kabudachi_core::scheduler::{
     CancelRejection, Cancellation, Certification, Failure, LostRun, Outcome, OutcomeRejection, ReportRejection,
-    Submission, Submitted, SubmitRejection,
+    Submission, Submitted, SubmitRejection, TraceContext,
 };
 use kabudachi_core::time::{Clock, Duration, WallTime};
 
@@ -86,6 +86,7 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
                 .then(|| Duration::from_millis(task.reconnect_timeout_ms)),
             client: task.client.clone().map(WorkerId::from),
             input_manifest,
+            trace: TraceContext::default(),
         },
         clock,
     ))

@@ -118,7 +118,7 @@ pub use rebuild::{Adopted, ReconcileRefused, ReconcileRejection, Reconciled};
 use reconciliation::Reconciliation;
 pub use reports::{Certification, Completion, ContinuationRejection, ReportRejection};
 use retention::Retention;
-pub use submission::{Submission, SubmitRejection, Submitted, mint};
+pub use submission::{Submission, SubmitRejection, Submitted, TraceContext, mint};
 use waiting_room::WaitingRoom;
 
 /// The largest message a worker accepts, which bounds what one claim can
