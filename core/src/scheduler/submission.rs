@@ -324,7 +324,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 limit: MAX_SUBMISSION_BYTES,
             });
         }
-        // The carried input (bytes or encoded manifest), queue, definition id
+        // The carried input (bytes or encoded manifest), queue, definition id,
         // key and trace context: the shared claim-weight sum.
         let size = submission.claim_weight();
         if size > MAX_SUBMISSION_BYTES {
