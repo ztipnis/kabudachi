@@ -3065,6 +3065,10 @@ Open: no per-peer budget on a leader's record writes (`net/src/messenger/record_
 
 Open: no net-level burst test of a large map's completion. Wanted: 300 members completed in one `with()`, after which `submit_members` must return `CompositeFinished` within a deadline. Exposure: the burst needs a map of hundreds of members completing together, plausible for any large map. Impact: severe if it regressed, because a composite's final revision could stay unstored and its answers `NotLeader`, and nothing would catch it.
 
+Open: `owners_to_check` (`core/src/task_record/store.rs`) still scans every blob owner on each call, and `tend_blobs` calls it once a second per worker. Fix: index the unseen, unfinished owners by `since`, so a call reads only those due. Exposure: every worker with many blob owners, which a large streamed map or many blob-carrying submissions produce. Impact: moderate, a per-second scan whose cost grows with the owners held.
+
+Open: while a takeover has records not known yet, every member that settles in a composite re-checks all its members for an uncertain record (`holds_composite_back`), so settling a large composite costs its member count each time until the records are known. Exposure: a leader change while a map of many thousand members runs, until reconciliation learns the late records. Impact: moderate, a burst of quadratic work in a short window.
+
 ### Phase 7: observability
 
 Prometheus and tracing should exist earlier for development, but this phase hardens:
