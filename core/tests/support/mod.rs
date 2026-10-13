@@ -1,6 +1,7 @@
 pub mod authority;
 pub mod builders;
 pub mod clock;
+pub mod composites;
 pub mod grant;
 pub mod harness;
 pub mod ids;

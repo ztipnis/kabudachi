@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::election::{DropMessages, Input, NoAuthority, Step, WorkerNode, carry_out};
 use kabudachi_core::manifest::{Chunked, Manifest, fits_inline};
 use kabudachi_core::protocol::digest::Digest;
@@ -200,7 +201,7 @@ impl<C: Clock> SchedulerDoor<C> {
                 let task = submitted.task_id.clone();
                 backlog
                     .submit_minted(scheduler, submitted)
-                    .inspect_err(|_| scheduler.observer_mut().forget_blobs_of(&task))
+                    .inspect_err(|_| scheduler.observer_mut().forget_blobs_of(&BlobOwner::Task(task.clone())))
             })
         }))
     }
@@ -293,7 +294,7 @@ impl<C: Clock> SchedulerDoor<C> {
                 let cancelled = backlog.cancel(scheduler, task);
                 match cancelled {
                     Ok(Cancellation::Cancelled { was_running: false }) => {
-                        scheduler.observer_mut().forget_blobs_of(task);
+                        scheduler.observer_mut().forget_blobs_of(&BlobOwner::Task(task.clone()));
                     }
                     Ok(Cancellation::Cancelled { was_running: true }) => {
                         forget_blobs_if_finished(scheduler, task);
@@ -610,7 +611,7 @@ fn as_blobs<C: Clock>(scheduler: &mut DoorScheduler<C>, mut submitted: Submitted
         return submitted;
     }
     let Chunked { manifest, chunks } = Manifest::chunk(input);
-    scheduler.observer_mut().put_blobs(&submitted.task_id, chunks);
+    scheduler.observer_mut().put_blobs(&BlobOwner::Task(submitted.task_id.clone()), chunks);
     submitted.submission = submitted.submission.with_input_manifest(manifest);
     submitted
 }
@@ -633,7 +634,7 @@ fn forget_blobs_if_finished<C: Clock>(scheduler: &mut DoorScheduler<C>, task: &T
     if let Ok(Some(outcome)) = scheduler.outcome(task)
         && outcome.finished
     {
-        scheduler.observer_mut().forget_blobs_of(task);
+        scheduler.observer_mut().forget_blobs_of(&BlobOwner::Task(task.clone()));
     }
 }
 

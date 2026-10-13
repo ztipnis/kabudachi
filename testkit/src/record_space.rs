@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
-use kabudachi_core::task_record::{Origin, PlacedWrite, VersionedRecords, Write};
+use kabudachi_core::task_record::{Origin, PlacedWrite, ShardRecord, VersionedRecords, Write};
 use kabudachi_core::time::{Duration, Instant};
 
 /// The shard's Task records as the simulator's nodes hold them: each node
@@ -263,7 +263,15 @@ impl RecordSpace {
             .borrow()
             .stores
             .get(holder)
-            .map(|store| store.reported().cloned().collect())
+            .map(|store| {
+                store
+                    .reported()
+                    .filter_map(|record| match record {
+                        ShardRecord::Task(record) => Some(record.clone()),
+                        ShardRecord::Composite(_) | ShardRecord::Page(_) => None,
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

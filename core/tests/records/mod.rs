@@ -2,6 +2,7 @@
 
 mod blobs;
 mod candidate;
+mod composite_records;
 mod local_records;
 mod record_store;
 mod repair;

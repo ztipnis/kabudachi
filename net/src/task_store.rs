@@ -26,7 +26,8 @@ use kabudachi_core::queues::Subscription;
 use kabudachi_core::reconcile::HeldKey;
 use kabudachi_core::reconcile::wire::held_key;
 use kabudachi_core::task_record::{
-    MAX_RECORD_BYTES, ORPHAN_BLOB_GRACE, Origin, OwnerState, VersionedRecords, identify, looks_claimable,
+    MAX_RECORD_BYTES, ORPHAN_BLOB_GRACE, Origin, OwnerState, RecordKey, ShardRecord, VersionedRecords, identify,
+    looks_claimable,
 };
 use kabudachi_core::time::{Clock, RealClock, WallTime};
 use libp2p::PeerId;
@@ -200,6 +201,10 @@ impl HeldRecords {
     pub fn keys_after(&self, after: Option<&TaskId>, mut take: impl FnMut(HeldKey) -> bool) -> bool {
         self.lock()
             .reported()
+            .filter_map(|record| match record {
+                ShardRecord::Task(record) => Some(record),
+                ShardRecord::Composite(_) | ShardRecord::Page(_) => None,
+            })
             .filter_map(|record| {
                 let key = match held_key(record) {
                     Ok(key) => key,
@@ -346,8 +351,8 @@ impl kad::store::RecordStore for TaskRecordStore {
     }
 
     fn remove(&mut self, key: &kad::RecordKey) {
-        if let Ok(task) = std::str::from_utf8(key.as_ref()) {
-            self.held.lock().remove(&TaskId::new(task));
+        if let Some(key) = RecordKey::from_kad_bytes(key.as_ref()) {
+            self.held.lock().remove(&key);
         }
     }
 

@@ -4,7 +4,7 @@
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::task_record::{Origin, Put, PutRefusal, RecordVersion, VersionedRecords};
+use kabudachi_core::task_record::{Origin, Put, PutRefusal, RecordVersion, ShardRecord, VersionedRecords};
 use kabudachi_core::time::{Duration, Instant};
 
 const NOW: Instant = Instant::at(0);
@@ -200,10 +200,10 @@ fn a_holder_that_a_record_moved_away_from_reports_where_it_went_until_the_task_f
     // that asks this holder learns the revision and its holders.
     assert!(store.get(&task).is_none());
     assert_eq!(store.iter().count(), 0);
-    let reported: Vec<&TaskRecord> = store.reported().collect();
+    let reported: Vec<&ShardRecord> = store.reported().collect();
     assert_eq!(reported.len(), 1);
-    assert_eq!(reported[0].version.as_ref().map(RecordVersion::from), Some(version(0, 0, 1, 1)));
-    assert_eq!(reported[0].placement, placed(TaskRecord::default(), &["a", "b"]).placement);
+    assert_eq!(reported[0].identify().map(|(_, version)| version), Ok(version(0, 0, 1, 1)));
+    assert_eq!(reported[0].placement(), placed(TaskRecord::default(), &["a", "b"]).placement);
 
     // A write that is not newer than the stub is refused, and one that names
     // this holder again replaces it with the record.

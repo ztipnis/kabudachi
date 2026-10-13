@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::blob::{BlobKey, BlobOwner, BlobRecord, MAX_BLOB_BYTES};
-use crate::protocol::generated::{self, TaskRecord};
+use crate::protocol::generated::TaskRecord;
 use crate::protocol::ids::{TaskId, WorkerId};
+use crate::task_record::key::{RecordKey, ShardRecord};
 use crate::task_record::version::{RecordVersion, VersionOrder};
 use crate::time::{Duration, Instant};
 
@@ -72,7 +73,8 @@ pub enum OwnerState {
     Gone,
 }
 
-/// The newest revision of each Task record a worker holds. A put never
+/// The newest revision of each record a worker holds: Task records,
+/// composite records and composite pages, each under its [`RecordKey`]. A put never
 /// replaces a record with an older one, nor with a different one of the same
 /// version, unless it differs only in the voters it is placed on. A store
 /// that knows its holder keeps only a stub of a revision the leader moves to
@@ -101,7 +103,7 @@ pub enum OwnerState {
 /// fill only half of it, so results always have room left.
 #[derive(Debug, Clone, Default)]
 pub struct VersionedRecords {
-    records: BTreeMap<TaskId, Held>,
+    records: BTreeMap<RecordKey, Held>,
     retention: Option<Duration>,
     holder: Option<WorkerId>,
     blobs: BTreeMap<BlobKey, HeldBlob>,
@@ -151,7 +153,7 @@ struct BlobsOf {
 
 #[derive(Debug, Clone)]
 struct Held {
-    record: TaskRecord,
+    record: ShardRecord,
     finished_since: Option<Instant>,
     /// Whether `record` is only the key of a revision held elsewhere.
     stub: bool,
@@ -159,33 +161,42 @@ struct Held {
 
 /// Whether `record` is `held` placed on other holders (and so written to other
 /// prior placements), and nothing else differs.
-fn only_placed_elsewhere(held: &TaskRecord, record: &TaskRecord) -> bool {
+fn only_placed_elsewhere(held: &ShardRecord, record: &ShardRecord) -> bool {
     let mut replaced = record.clone();
-    replaced.placement.clone_from(&held.placement);
-    replaced.prior_placements.clone_from(&held.prior_placements);
+    replaced.set_placement(held.placement().to_vec(), held.prior_placements().to_vec());
     replaced == *held
 }
 
-/// Whether `records` holds `owner`'s record or its stub. Only a task's record
-/// is ever held here.
-fn owner_held(records: &BTreeMap<TaskId, Held>, owner: &BlobOwner) -> bool {
+/// The record key of the record that owns `owner`'s blobs.
+fn owner_key(owner: &BlobOwner) -> RecordKey {
     match owner {
-        BlobOwner::Task(task) => records.contains_key(task),
-        BlobOwner::Composite(_) => false,
+        BlobOwner::Task(task) => RecordKey::Task(task.clone()),
+        BlobOwner::Composite(id) => RecordKey::Composite(id.clone()),
     }
+}
+
+/// The owner of the blobs the record under `key` keeps: a page keeps none.
+fn blob_owner_of(key: &RecordKey) -> Option<BlobOwner> {
+    match key {
+        RecordKey::Task(task) => Some(BlobOwner::Task(task.clone())),
+        RecordKey::Composite(id) => Some(BlobOwner::Composite(id.clone())),
+        RecordKey::Page(..) => None,
+    }
+}
+
+/// Whether `records` holds `owner`'s record or its stub.
+fn owner_held(records: &BTreeMap<RecordKey, Held>, owner: &BlobOwner) -> bool {
+    records.contains_key(&owner_key(owner))
 }
 
 /// Whether `records` holds `owner`'s record, or its stub, finished.
-fn owner_finished(records: &BTreeMap<TaskId, Held>, owner: &BlobOwner) -> bool {
-    match owner {
-        BlobOwner::Task(task) => records.get(task).is_some_and(|held| held.record.finished),
-        BlobOwner::Composite(_) => false,
-    }
+fn owner_finished(records: &BTreeMap<RecordKey, Held>, owner: &BlobOwner) -> bool {
+    records.get(&owner_key(owner)).is_some_and(|held| held.record.is_finished())
 }
 
 /// The holders `record` is placed on.
-fn holders_of(record: &TaskRecord) -> Vec<WorkerId> {
-    record.placement.iter().cloned().map(WorkerId::from).collect()
+fn holders_of(record: &ShardRecord) -> Vec<WorkerId> {
+    record.placement().iter().cloned().map(WorkerId::from).collect()
 }
 
 /// What a store does with a revision of a task it already holds.
@@ -200,11 +211,11 @@ enum Admission {
 /// sent by `origin`, leaves what it holds unchanged, or refuses it.
 fn admission(
     held: &Held,
-    record: &TaskRecord,
+    record: &ShardRecord,
     version: RecordVersion,
     origin: Origin,
 ) -> Result<Admission, PutRefusal> {
-    let (_, held_version) = identify(&held.record)?;
+    let (_, held_version) = held.record.identify()?;
     match held_version.order(&version) {
         VersionOrder::Newer => Ok(Admission::Keep),
         VersionOrder::Same => same_version(held, record, origin),
@@ -213,7 +224,7 @@ fn admission(
 }
 
 /// What a store does with `record` when it holds the same version, `held`.
-fn same_version(held: &Held, record: &TaskRecord, origin: Origin) -> Result<Admission, PutRefusal> {
+fn same_version(held: &Held, record: &ShardRecord, origin: Origin) -> Result<Admission, PutRefusal> {
     // Only the key of this revision is held: a record that names this
     // holder now is the revision itself, and one that does not is the
     // same stub, perhaps placed elsewhere again.
@@ -261,7 +272,7 @@ impl VersionedRecords {
 
     /// Puts `record`, at `now` by this node's monotonic clock, after dropping
     /// every finished record whose retention has passed.
-    pub fn put(&mut self, record: TaskRecord, now: Instant) -> Result<Put, PutRefusal> {
+    pub fn put(&mut self, record: impl Into<ShardRecord>, now: Instant) -> Result<Put, PutRefusal> {
         self.put_from(record, Origin::Leader, now)
     }
 
@@ -273,30 +284,31 @@ impl VersionedRecords {
     /// names, and a copy of the revision already held changes nothing.
     pub fn put_from(
         &mut self,
-        record: TaskRecord,
+        record: impl Into<ShardRecord>,
         origin: Origin,
         now: Instant,
     ) -> Result<Put, PutRefusal> {
+        let record = record.into();
         self.sweep(now);
-        let (task, version) = identify(&record)?;
+        let (key, version) = record.identify()?;
         let leaves_me_out = self.leaves_me_out(&record, origin);
-        let Some(held) = self.records.get(&task) else {
-            return Ok(self.keep(task, record, leaves_me_out, origin, None, now));
+        let Some(held) = self.records.get(&key) else {
+            return Ok(self.keep(key, record, leaves_me_out, origin, None, now));
         };
         let since = held.finished_since;
         match admission(held, &record, version, origin)? {
-            Admission::Keep => Ok(self.keep(task, record, leaves_me_out, origin, since, now)),
+            Admission::Keep => Ok(self.keep(key, record, leaves_me_out, origin, since, now)),
             Admission::Unchanged => Ok(Put::Unchanged),
         }
     }
 
     /// Whether `record`, a leader's revision whose placement names holders,
     /// leaves this store's own holder out.
-    fn leaves_me_out(&self, record: &TaskRecord, origin: Origin) -> bool {
+    fn leaves_me_out(&self, record: &ShardRecord, origin: Origin) -> bool {
         origin == Origin::Leader
             && self.holder.as_ref().is_some_and(|me| {
-                !record.placement.is_empty()
-                    && !record.placement.iter().any(|holder| WorkerId::from(holder.clone()) == *me)
+                !record.placement().is_empty()
+                    && !record.placement().iter().any(|holder| WorkerId::from(holder.clone()) == *me)
             })
     }
 
@@ -306,38 +318,39 @@ impl VersionedRecords {
     /// (`None` if none was) are what that revision already established.
     fn keep(
         &mut self,
-        task: TaskId,
-        record: TaskRecord,
+        key: RecordKey,
+        record: ShardRecord,
         leaves_me_out: bool,
         origin: Origin,
         finished_since: Option<Instant>,
         now: Instant,
     ) -> Put {
-        self.see_owner(&task, &record, origin);
-        if record.finished {
-            self.forget_inputs_of(&BlobOwner::Task(task.clone()));
+        if let Some(owner) = blob_owner_of(&key) {
+            self.see_owner(&key, owner.clone(), &record, origin);
+            if record.is_finished() {
+                self.forget_inputs_of(&owner);
+            }
         }
         if leaves_me_out {
-            self.records.insert(task, Held::stub_of(&record, finished_since, now));
+            self.records.insert(key, Held::stub_of(&record, finished_since, now));
             Put::Retired
         } else {
-            self.records.insert(task, Held::new(record, finished_since, now));
+            self.records.insert(key, Held::new(record, finished_since, now));
             Put::Stored
         }
     }
 
-    /// Marks the owner `task` seen, once its record is held, and notes a move
-    /// if a leader's `record` placed it on other holders than the revision
-    /// held so far. Only a leader's re-placement is a move: a handed-off copy
-    /// names its old holders.
-    fn see_owner(&mut self, task: &TaskId, record: &TaskRecord, origin: Origin) {
-        let owner = BlobOwner::Task(task.clone());
+    /// Marks `owner`, whose record is under `key`, seen once that record is
+    /// held, and notes a move if a leader's `record` placed it on other
+    /// holders than the revision held so far. Only a leader's re-placement is
+    /// a move: a handed-off copy names its old holders.
+    fn see_owner(&mut self, key: &RecordKey, owner: BlobOwner, record: &ShardRecord, origin: Origin) {
         let Some(of) = self.blob_owners.get_mut(&owner) else {
             return;
         };
         of.seen = true;
         let after = holders_of(record);
-        let before = self.records.get(task).map(|held| holders_of(&held.record));
+        let before = self.records.get(key).map(|held| holders_of(&held.record));
         let moved = origin == Origin::Leader
             && !after.is_empty()
             && before.is_some_and(|before| before.iter().collect::<BTreeSet<_>>() != after.iter().collect());
@@ -385,30 +398,47 @@ impl VersionedRecords {
     /// The record held of `task`, if this store holds one and not only a
     /// stub of it.
     pub fn get(&self, task: &TaskId) -> Option<&TaskRecord> {
-        self.records.get(task).filter(|held| !held.stub).map(|held| &held.record)
+        match self.get_record(&RecordKey::Task(task.clone()))? {
+            ShardRecord::Task(record) => Some(record),
+            ShardRecord::Composite(_) | ShardRecord::Page(_) => None,
+        }
     }
 
-    /// Removes the record held of `task`; a stub stays, for it is no copy to
-    /// remove and a reader still learns from it.
-    pub fn remove(&mut self, task: &TaskId) -> Option<TaskRecord> {
-        if self.records.get(task).is_some_and(|held| held.stub) {
+    /// The record held under `key`, if this store holds one and not only a
+    /// stub of it.
+    pub fn get_record(&self, key: &RecordKey) -> Option<&ShardRecord> {
+        self.records.get(key).filter(|held| !held.stub).map(|held| &held.record)
+    }
+
+    /// Removes the record held under `key`; a stub stays, for it is no copy
+    /// to remove and a reader still learns from it.
+    pub fn remove(&mut self, key: &RecordKey) -> Option<ShardRecord> {
+        if self.records.get(key).is_some_and(|held| held.stub) {
             return None;
         }
-        self.records.remove(task).map(|held| held.record)
+        self.records.remove(key).map(|held| held.record)
     }
 
-    /// The records held, the newest revision of each task: no stub.
+    /// The Task records held, the newest revision of each task: no stub.
     pub fn iter(&self) -> impl Iterator<Item = &TaskRecord> {
+        self.records().filter_map(|record| match record {
+            ShardRecord::Task(record) => Some(record),
+            ShardRecord::Composite(_) | ShardRecord::Page(_) => None,
+        })
+    }
+
+    /// Every record held, of every kind, the newest revision of each: no stub.
+    pub fn records(&self) -> impl Iterator<Item = &ShardRecord> {
         self.records.values().filter(|held| !held.stub).map(|held| &held.record)
     }
 
-    /// What a holder reports of its tasks: each record, and the stub of each
-    /// revision held elsewhere, the newest revision of each task.
-    pub fn reported(&self) -> impl Iterator<Item = &TaskRecord> {
+    /// What a holder reports: each record of every kind, and the stub of each
+    /// revision held elsewhere, the newest revision of each.
+    pub fn reported(&self) -> impl Iterator<Item = &ShardRecord> {
         self.records.values().map(|held| &held.record)
     }
 
-    /// The tasks held, as records or as stubs.
+    /// The records held, as records or as stubs.
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -675,8 +705,8 @@ impl VersionedRecords {
 impl Held {
     /// `finished_since` is kept once set; otherwise a finished `record`
     /// starts its retention at `now`.
-    fn new(record: TaskRecord, finished_since: Option<Instant>, now: Instant) -> Self {
-        let finished_since = finished_since.or(record.finished.then_some(now));
+    fn new(record: ShardRecord, finished_since: Option<Instant>, now: Instant) -> Self {
+        let finished_since = finished_since.or(record.is_finished().then_some(now));
         Held {
             record,
             finished_since,
@@ -684,25 +714,12 @@ impl Held {
         }
     }
 
-    /// The stub of `record`: its task (named by its id, its definition and its
-    /// coalescing key), version, holders and whether it is finished, and
-    /// nothing else.
-    fn stub_of(record: &TaskRecord, finished_since: Option<Instant>, now: Instant) -> Self {
-        let key = TaskRecord {
-            task: record.task.as_ref().map(|task| generated::Task {
-                task_id: task.task_id.clone(),
-                task_definition_id: task.task_definition_id.clone(),
-                coalescing_key: task.coalescing_key.clone(),
-                ..Default::default()
-            }),
-            version: record.version,
-            placement: record.placement.clone(),
-            finished: record.finished,
-            ..Default::default()
-        };
+    /// The stub of `record`: its key fields, version, holders and whether it
+    /// is finished, and nothing else.
+    fn stub_of(record: &ShardRecord, finished_since: Option<Instant>, now: Instant) -> Self {
         Held {
             stub: true,
-            ..Held::new(key, finished_since, now)
+            ..Held::new(record.stub(), finished_since, now)
         }
     }
 }
