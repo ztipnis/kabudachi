@@ -170,6 +170,9 @@ fn a_chain_runs_one_step_per_item_each_on_its_item_and_the_result_before_it() {
     assert_eq!(finished[0].state, CompositeState::Succeeded);
     assert_eq!(value_of(&fixture, &reduce, 2), Some(Digest::blake3(b"abc")));
     assert_eq!(fixture.spy.newest_composite(&reduce).unwrap().counts.unwrap().succeeded, 3);
+    for step in 0..3 {
+        assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(step)).len(), 1, "step {step} is created and run once");
+    }
 }
 
 #[test]
@@ -197,6 +200,9 @@ fn a_tree_folds_its_chunks_side_by_side_then_combines_adjacent_results_in_order(
         "left before right: the carried chunk is the right operand"
     );
     assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
+    for step in 0..5 {
+        assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(step)).len(), 1, "step {step} is created and run once");
+    }
 }
 
 #[test]
@@ -226,7 +232,10 @@ fn a_step_that_exhausts_its_retries_fails_the_reduce_and_no_later_step_starts() 
     let slow = start_member(&mut fixture, &reduce, 1);
     fail_member(&mut fixture, &reduce, 0, "ValueError");
     assert!(finished(&mut fixture).is_empty(), "a failure with retries left settles nothing");
+    assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(0)).len(), 2, "the failed run and its queued retry");
+    // The second call claims that retry; it has none left, so its failure is final.
     fail_member(&mut fixture, &reduce, 0, "ValueError");
+    assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(0)).len(), 2, "the retry was the last run");
     let ended = finished(&mut fixture);
     assert_eq!(ended[0].state, CompositeState::Failed);
     assert_eq!(ended[0].failure.as_ref().unwrap().kind, "ValueError");
@@ -246,32 +255,29 @@ fn a_step_that_exhausts_its_retries_fails_the_reduce_and_no_later_step_starts() 
     assert!(finished(&mut fixture).is_empty(), "the reduce failed once");
 }
 
-/// The value a seeded two-item chain ends with when its second step's worker
-/// is lost after storing its result and before reporting it, or not at all.
-fn chain_root(lose_the_second_step: bool) -> (Option<Digest>, usize) {
+#[test]
+fn a_step_lost_after_storing_its_result_is_replayed_on_the_same_operands_and_the_reduce_ends_with_the_replays_result() {
     let mut fixture = Fixture::leading();
     let reduce = reduce_fed(&mut fixture, streamed_reduce(None, Some(b"")), &[b"a", b"b"]);
     run_member(&mut fixture, &reduce, 0, b"a");
-    if lose_the_second_step {
-        let lost = start_member(&mut fixture, &reduce, 1);
-        // Its result blob was stored; its COMPLETE never came.
-        let gone = fixture.lose_silent(&worker());
-        assert!(gone[0].replayed.is_some(), "the step is replayed");
-        assert!(finished(&mut fixture).is_empty());
-        let replay = run_member(&mut fixture, &reduce, 1, b"ab");
-        assert_ne!(replay.task_run_id, lost.task_run_id);
-        assert_eq!(operands_of(&replay), operands_of(&lost), "the replay folds the same operands");
-    } else {
-        run_member(&mut fixture, &reduce, 1, b"ab");
-    }
+    let lost = start_member(&mut fixture, &reduce, 1);
+    // Its result blob was stored; its COMPLETE never came.
+    let gone = fixture.lose_silent(&worker());
+    assert!(gone[0].replayed.is_some(), "the step is replayed");
+    assert!(finished(&mut fixture).is_empty());
+    let replay = run_member(&mut fixture, &reduce, 1, b"ab, as the replay made it");
+    assert_ne!(replay.task_run_id, lost.task_run_id);
+    assert_eq!(operands_of(&replay), operands_of(&lost), "the replay folds the same operands");
     assert_eq!(finished(&mut fixture)[0].state, CompositeState::Succeeded);
-    (value_of(&fixture, &reduce, 1), fixture.scheduler.runs_of(&reduce.member_task(1)).len())
-}
-
-#[test]
-fn a_step_lost_after_storing_its_result_is_replayed_on_the_same_operands_and_the_reduce_ends_as_the_chain_does() {
-    let (clean, _) = chain_root(false);
-    let (replayed, runs) = chain_root(true);
-    assert_eq!(replayed, clean);
-    assert_eq!(runs, 2, "the lost run and its replay; only the replay is certified");
+    assert_eq!(
+        value_of(&fixture, &reduce, 1),
+        Some(Digest::blake3(b"ab, as the replay made it")),
+        "the reduce ends with what the replay reported"
+    );
+    assert_eq!(fixture.scheduler.runs_of(&reduce.member_task(0)).len(), 1, "a step that was not lost runs once");
+    assert_eq!(
+        fixture.scheduler.runs_of(&reduce.member_task(1)).len(),
+        2,
+        "the lost run and its replay; only the replay is certified"
+    );
 }
