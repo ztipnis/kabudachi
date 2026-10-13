@@ -71,7 +71,10 @@ pub(crate) use wire::outcome_answer;
 /// The most task ids one placement request carries (see
 /// [`Net::place_records`]): a worker with more asks in pages, so that an
 /// answer, which names every holder, stays far below a message's size limit.
-pub(crate) const MAX_PLACE_IDS: usize = 256;
+/// An answer names a task's holders twice when the asker is among the nearest
+/// voters (the plain placement and the real one), so the page is half what
+/// one list of holders would allow.
+pub(crate) const MAX_PLACE_IDS: usize = 128;
 
 /// Why a task-exchange call got no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,6 +468,13 @@ pub(crate) struct NamedLeader {
     left: bool,
 }
 
+impl NamedLeader {
+    /// The leader named, unless the worker has left its shard.
+    pub(crate) fn leader(&self) -> Option<WorkerId> {
+        self.leader.clone().filter(|_| !self.left)
+    }
+}
+
 impl Net {
     /// Asks the shard's leader to record `submitted` until a leader decides
     /// it, and returns that decision: stored, or refused for good. The
@@ -827,8 +837,9 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
 /// asker, `factor` of them for each. `voters` are all the voters it can place
 /// records on, the asker among them if it is one; when the asker would be
 /// among the nearest to a task, the answer also names the placement with it in
-/// (see [`placement_with_asker_of`]). A task that could not be placed (no
-/// voter, or a voter that is no peer) is left out. Not gated on the writes of
+/// (see [`placement_with_asker_of`]); when the asker is the only voter, that
+/// is the whole answer and the plain placement is empty. A task that could not
+/// be placed (no voter, or a voter that is no peer) is left out. Not gated on the writes of
 /// any decision: it decides nothing. A request that names too many tasks, or
 /// one without its id, is malformed.
 pub(crate) fn placements(
@@ -846,7 +857,6 @@ pub(crate) fn placements(
         .iter()
         .filter_map(|task| {
             let task = TaskId::from(task.clone());
-            let Placement { holders, quorum } = placement(&task, &others, factor)?;
             let with_asker = (others.len() < voters.len())
                 .then(|| placement(&task, voters, factor))
                 .flatten()
@@ -855,6 +865,13 @@ pub(crate) fn placements(
                     holders: real.holders.into_iter().map(Into::into).collect(),
                     quorum: u32::try_from(real.quorum).unwrap_or(u32::MAX),
                 });
+            // With no voter but the asker the plain placement is empty, and
+            // the real one, the asker alone, is the answer.
+            let Placement { holders, quorum } = match placement(&task, &others, factor) {
+                Some(plain) => plain,
+                None if with_asker.is_some() => Placement { holders: Vec::new(), quorum: 0 },
+                None => return None,
+            };
             Some(PlacedKey {
                 task_id: Some(task.into()),
                 holders: holders.into_iter().map(Into::into).collect(),

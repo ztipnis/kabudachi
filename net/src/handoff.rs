@@ -111,6 +111,8 @@ struct BlobHandOver {
     owner: TaskId,
     blob: BlobRecord,
     placement: Placement,
+    /// Whether `owner` stored the blob as one of its results.
+    result: bool,
 }
 
 /// Hands every blob this worker holds, for each task that owns it, to the
@@ -176,7 +178,8 @@ fn sorted(
         match round.placed.get(&owner) {
             Some((holders, quorum)) => {
                 let placement = Placement { holders: holders.clone(), quorum: *quorum };
-                handovers.push(BlobHandOver { key, owner, blob, placement });
+                let result = held.results_of(&BlobOwner::Task(owner.clone())).contains(&key);
+                handovers.push(BlobHandOver { key, owner, blob, placement, result });
             }
             None if round.unanswered.contains(&owner) => again.push((key, owner)),
             None => done.blobs_abandoned.push(key),
@@ -197,7 +200,7 @@ async fn hand_over_blobs(
         let stored = join_all(chunk.iter().map(|handover| {
             let owner = BlobOwner::Task(handover.owner.clone());
             let (blob, placement) = (handover.blob.clone(), handover.placement.clone());
-            timeout_at(deadline, net.put_blob_as_held(owner, blob, placement))
+            timeout_at(deadline, net.put_blob_as_held(owner, blob, placement, handover.result))
         }))
         .await;
         for (handover, stored) in chunk.iter().zip(stored) {
@@ -249,7 +252,9 @@ async fn place(
                 };
                 let mut placed = Placed::new();
                 for key in answer.placements {
-                    if let Some(task) = key.task_id {
+                    // An answer with no holder but the asker places the task
+                    // nowhere a drained worker can hand it.
+                    if let Some(task) = key.task_id.filter(|_| !key.holders.is_empty()) {
                         placed.insert(
                             TaskId::from(task),
                             (

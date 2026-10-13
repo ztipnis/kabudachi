@@ -3,7 +3,7 @@
 //! lookups. Each query's state lives here from the command that starts it to
 //! the event that ends it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
@@ -161,7 +161,10 @@ impl RecordQueries {
     ) {
         match swarm.behaviour_mut().records.as_mut() {
             Some(records) => {
-                let known = records.kbuckets().map(|bucket| bucket.num_entries()).sum();
+                let known = records
+                    .kbuckets()
+                    .flat_map(|bucket| bucket.iter().map(|entry| *entry.node.key.preimage()).collect::<Vec<_>>())
+                    .collect();
                 let query = records.get_record(record_key(&task));
                 self.reads.insert(
                     query,
@@ -336,7 +339,7 @@ struct Read {
     /// The newest answer so far, with its version.
     best: Option<(RecordVersion, TaskRecord)>,
     /// The peers in this worker's routing table when the lookup started.
-    known: usize,
+    known: HashSet<PeerId>,
     respond_to: oneshot::Sender<RecordLookup>,
 }
 
@@ -361,16 +364,18 @@ impl Read {
     /// Ends the lookup, whose last step came to `last`, with the best answer,
     /// to a caller who may have stopped waiting. A lookup that found nothing
     /// says the record is held nowhere only if it asked every peer this
-    /// worker knew and each answered: a timeout, an empty routing table, a
-    /// shard with more peers than one lookup asks and a peer that did not
-    /// answer all leave it unanswered, for a holder may be among those not
-    /// asked.
+    /// worker knew and each answered (every one of them is among the peers
+    /// the lookup heard from, whatever else it heard from): a timeout, an
+    /// empty routing table, a shard with more peers than one lookup asks and a
+    /// peer that did not answer all leave it unanswered, for a holder may be
+    /// among those not asked.
     fn finish(self, last: &kad::GetRecordResult) {
         let lookup = match self.best {
             Some((_, record)) => RecordLookup::Found(record),
             None => match last {
                 Err(kad::GetRecordError::NotFound { closest_peers, .. })
-                    if self.known > 0 && closest_peers.len() >= self.known =>
+                    if !self.known.is_empty()
+                        && self.known.iter().all(|peer| closest_peers.contains(peer)) =>
                 {
                     RecordLookup::NotFound
                 }
