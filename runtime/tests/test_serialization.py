@@ -10,6 +10,7 @@ import sys
 import textwrap
 from types import SimpleNamespace
 
+import pydantic
 import pytest
 
 import kabudachi
@@ -21,6 +22,7 @@ from kabudachi.errors import (
     UnknownSerializerError,
 )
 from kabudachi.protobuf_serializer import ProtobufSerializer
+from kabudachi.schemas import Incompatible, Newer, Runnable, SchemaRegistry
 from kabudachi.serializers import SerializerRegistry
 from proto_messages import Greeting, Receipt, Strict
 
@@ -273,3 +275,93 @@ def test_the_package_imports_and_reports_a_missing_protobuf_on_use():
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "ok"
+
+
+# --- schema families and migrations ----------------------------------------
+
+class Order(pydantic.BaseModel):
+    text: str
+
+
+class Shipment(pydantic.BaseModel):
+    order: str
+    items: list[str]
+    notes: dict[str, int] = {}
+
+
+def bump(name):
+    def step(plain):
+        return {**plain, "seen": [*plain.get("seen", []), name]}
+
+    return step
+
+
+INCOMPATIBLE = None
+
+
+# Bumps by from_version: a name for an explicit step, INCOMPATIBLE, or absent for the default.
+@pytest.mark.parametrize(
+    "bumps, source, target, expected",
+    [
+        ({}, 2, 2, []),
+        ({1: "1>2", 2: "2>3"}, 1, 3, ["1>2", "2>3"]),
+        ({1: "1>2"}, 1, 3, ["1>2", "default"]),
+        ({}, 0, 2, ["default", "default"]),
+        (
+            {2: INCOMPATIBLE},
+            1,
+            3,
+            Incompatible("version 2 of tests.Order cannot be migrated to version 3: the bump is declared incompatible"),
+        ),
+        ({2: INCOMPATIBLE}, 3, 3, []),
+        ({1: "1>2", 2: "2>3"}, 4, 3, Newer("version 4 of tests.Order is newer than this worker's 3")),
+        ({}, 1, 0, Newer("version 1 of tests.Order is newer than this worker's 0")),
+    ],
+)
+def test_a_migration_plan_takes_explicit_and_default_steps_and_stops_at_an_incompatible_bump(
+    bumps, source, target, expected
+):
+    registry = SchemaRegistry()
+    registry.declare(Order, version=target, family="tests.Order")
+    for from_version, name in bumps.items():
+        registry.add_migration("tests.Order", from_version, None if name is INCOMPATIBLE else bump(name))
+    planned = registry.plan("tests.Order", source, target)
+    if not isinstance(expected, list):
+        assert planned == expected
+        return
+    assert isinstance(planned, Runnable) and planned.version == target
+    plain = {}
+    for step in planned.steps:
+        plain = bump("default")(plain) if step is None else step(plain)
+    assert plain.get("seen", []) == expected
+
+
+def test_classes_are_versions_of_one_family_and_each_bump_is_declared_once():
+    class OrderV1(pydantic.BaseModel):
+        text: str
+
+    class OrderV2(pydantic.BaseModel):
+        text: str
+        priority: int = 0
+
+    registry = SchemaRegistry()
+    upgrade = bump("1>2")
+    registry.declare(OrderV1, version=1, family="shop.Order", version_path="$.v")
+    registry.declare(OrderV2, version=2, family="shop.Order", version_path="$.v", migration=upgrade)
+    # The same declaration again (a module imported under two names) is allowed.
+    registry.declare(OrderV2, version=2, family="shop.Order", version_path="$.v", migration=upgrade)
+    assert registry.family(list[OrderV1]) == "shop.Order"
+    assert registry.schema_of(OrderV2).version_path == ("v",)
+    assert registry.version_of(type(None)) == 0
+    with pytest.raises(ValueError, match="already declared"):
+        registry.declare(OrderV1, version=3, family="shop.Order", version_path="$.v")
+    with pytest.raises(ValueError, match="version 2 of shop.Order"):
+        registry.declare(Receipt, version=2, family="shop.Order", version_path="$.v")
+    with pytest.raises(ValueError, match="version_path"):
+        registry.declare(Shipment, version=3, family="shop.Order", version_path="$.other")
+    with pytest.raises(ValueError, match="already has a migration from version 1"):
+        registry.add_migration("shop.Order", 1, bump("again"))
+    with pytest.raises(ValueError, match="non-negative"):
+        registry.declare(Receipt, version=-1)
+    with pytest.raises(TypeError, match="one argument"):
+        registry.add_migration("shop.Order", 5, lambda a, b: a)

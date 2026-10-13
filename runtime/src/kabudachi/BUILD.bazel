@@ -27,6 +27,7 @@ py_library(
         "registry.py",
         "run_info.py",
         "runner.py",
+        "schemas.py",
         "serializers.py",
         "session.py",
         "status.py",
@@ -44,6 +45,7 @@ py_library(
         "//bindings:_native",  # keep
         "@pypi//asgiref",  # keep
         "@pypi//protobuf",  # keep
+        "@pypi//pydantic",  # keep
         "@pypi//wrapt",  # keep
     ],
 )

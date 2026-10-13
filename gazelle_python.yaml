@@ -1,5 +1,6 @@
 manifest:
   modules_mapping:
+    annotated_types: annotated_types
     asgiref: asgiref
     attr: attrs
     attrs: attrs
@@ -12,10 +13,14 @@ manifest:
     packaging: packaging
     pluggy: pluggy
     py: pytest
+    pydantic: pydantic
+    pydantic_core: pydantic_core
     pyelftools_0: pyelftools
     pygments: pygments
     pytest: pytest
     sortedcontainers: sortedcontainers
+    typing_extensions: typing_extensions
+    typing_inspection: typing_inspection
     wrapt: wrapt
   pip_repository:
     name: pypi

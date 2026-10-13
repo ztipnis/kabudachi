@@ -90,6 +90,7 @@ py_test(
     deps = [
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "@pypi//pydantic",
         "@pypi//pytest",  # keep
     ],
 )

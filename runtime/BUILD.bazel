@@ -30,6 +30,8 @@ REQUIRES = [
 
 EXTRAS = {
     "protobuf": ["protobuf>=5.29"],
+    "pydantic": ["pydantic>=2.7,<3"],
+    "dataclass": [],
 }
 
 config_setting(
