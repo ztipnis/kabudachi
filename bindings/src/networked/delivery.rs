@@ -2,10 +2,12 @@
 //! event that tells Python how the leader answered.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kabudachi_core::protocol::ids::TaskId;
 use kabudachi_core::protocol::messages::{TaskRejectReason, task_response};
 use kabudachi_core::scheduler::Submitted;
+use kabudachi_core::task_record::ORPHAN_BLOB_GRACE;
 use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::payload_memory::Taken;
 use kabudachi_net::task_exchange::NotStored;
@@ -47,23 +49,44 @@ impl Shared {
     }
 }
 
+/// How long a submission that carries its input as blobs may take, from the
+/// first blob stored to the leader's answer, before it is refused as
+/// backpressure. Holders drop the blobs of an owner whose record they never
+/// saw once the leader has twice, an orphan grace apart, said it knows no such
+/// task; the first such look-up comes a grace after the first blob. Half a
+/// grace keeps a late submission well clear of that first look-up, so blobs
+/// whose task the leader accepted are never dropped for a window an accepted
+/// submission could still be in.
+fn blob_submission_deadline() -> Duration {
+    Duration::from_millis(ORPHAN_BLOB_GRACE.as_ticks() / 2)
+}
+
 /// Asks leaders to store `submitted` until one does or refuses it for
 /// good, and says which. A `payload` too large for one message is first
 /// stored as blobs where the leader will place the task's record, and the
-/// submission carries their manifest. The payload stops counting in flight
-/// once its blobs are stored.
+/// submission carries their manifest; the storing and the submission together
+/// take no longer than [`blob_submission_deadline`], else the handle fails as
+/// for backpressure. The payload stops counting in flight once its blobs are
+/// stored.
 pub(super) async fn deliver(
     shared: Arc<Shared>,
     mut submitted: Submitted,
     payload: Option<(Vec<u8>, Taken)>,
 ) {
     let task = submitted.task_id.clone();
+    let mut give_up_at = None;
     if let Some((payload, _in_flight)) = payload {
-        match shared
-            .net
-            .store_payload_at_leader(BlobRole::Input, &task, &payload, shared.retry)
-            .await
-        {
+        let at = tokio::time::Instant::now() + blob_submission_deadline();
+        give_up_at = Some(at);
+        let stored = tokio::time::timeout_at(
+            at,
+            shared
+                .net
+                .store_payload_at_leader(BlobRole::Input, &task, &payload, shared.retry),
+        )
+        .await
+        .unwrap_or(Err(NotStored::Refused));
+        match stored {
             Ok(manifest) => {
                 submitted.submission = submitted.submission.with_input_manifest(manifest);
             }
@@ -86,7 +109,18 @@ pub(super) async fn deliver(
             }
         }
     }
-    let answer = shared.net.submit_to_leader(submitted, shared.retry).await;
+    let submission = shared.net.submit_to_leader(submitted, shared.retry);
+    let answer = match give_up_at {
+        None => submission.await,
+        Some(at) => match tokio::time::timeout_at(at, submission).await {
+            Ok(answer) => answer,
+            Err(_) => {
+                let reason = TaskRejectReason::TaskRejectBackpressure.as_str_name();
+                shared.refuse(&task, reason);
+                return;
+            }
+        },
+    };
     // Out of its shard, no leader will answer: nothing is said, but a
     // cancel waiting for this submission must not wait for ever.
     let Some(response) = answer else {

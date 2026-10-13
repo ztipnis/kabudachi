@@ -65,7 +65,10 @@ pub enum OwnerState {
     Unfinished,
     /// Its record is finished: its blobs go a grace from now.
     Finished,
-    /// No one holds its record: its blobs go now.
+    /// The shard's leader holds no record of it. That is not yet proof: its
+    /// submission may still be on its way, or its record not yet learned by
+    /// the leader, so the first such answer keeps the blobs and asks again a
+    /// grace later. Its blobs go on a second answer of gone in a row.
     Gone,
 }
 
@@ -90,7 +93,7 @@ pub enum OwnerState {
 /// inputs go at once when the record shows it finished. A leader's revision that moves the
 /// record to other holders is noted ([`Self::take_blob_moves`]), so the blobs
 /// can follow it. An owner whose record it never held keeps its blobs until a
-/// look-up across the shard finds the record finished, a grace later, or gone
+/// look-up across the shard finds the record finished, a grace later, or gone twice running
 /// ([`Self::owners_to_check`], [`Self::owner_checked`]). A blob goes when its
 /// last owner lets go. A store may be given a share of memory for its blobs
 /// ([`Self::with_blob_store_limit`]): a blob it does not hold yet is refused
@@ -141,6 +144,9 @@ struct BlobsOf {
     since: Instant,
     /// For an owner never seen: the last look-up found its record finished.
     finished: bool,
+    /// For an owner never seen: the last look-up found it gone, and none
+    /// since has found otherwise.
+    gone: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -479,6 +485,7 @@ impl VersionedRecords {
             seen,
             since: now,
             finished: false,
+            gone: false,
         });
         of.keys.insert(key.clone());
         if record.result {
@@ -631,7 +638,9 @@ impl VersionedRecords {
             .collect()
     }
 
-    /// What a look-up across the shard found of `owner` at `now`.
+    /// What a look-up across the shard found of `owner` at `now`. An answer
+    /// of gone drops the blobs only when the previous look-up, a grace
+    /// earlier, said gone too.
     pub fn owner_checked(&mut self, owner: &BlobOwner, state: OwnerState, now: Instant) {
         // The record arrived since the look-up began: the answer is stale,
         // and the blobs now follow the record.
@@ -639,11 +648,14 @@ impl VersionedRecords {
             return;
         }
         match state {
-            OwnerState::Gone => self.forget_blobs_of(owner),
-            OwnerState::Unfinished | OwnerState::Finished => {
+            OwnerState::Gone if self.blob_owners.get(owner).is_some_and(|of| of.gone) => {
+                self.forget_blobs_of(owner);
+            }
+            OwnerState::Gone | OwnerState::Unfinished | OwnerState::Finished => {
                 if let Some(of) = self.blob_owners.get_mut(owner) {
                     of.since = now;
                     of.finished = state == OwnerState::Finished;
+                    of.gone = state == OwnerState::Gone;
                 }
                 if state == OwnerState::Finished {
                     self.forget_inputs_of(owner);

@@ -274,28 +274,34 @@ fn a_holder_keeps_a_blob_under_its_own_digest_while_its_owner_is_unfinished_and_
     );
 
     // t2 is still unfinished somewhere in the shard: kept, and asked about
-    // again a grace later. Once found gone, it lets go at once.
+    // again a grace later. Found gone once, it is kept and asked about again a
+    // grace later (its record may be on its way); found gone twice running, it
+    // lets go at once.
     held.owner_checked(&task("t2"), OwnerState::Unfinished, at(10 * GRACE));
     assert!(held.owners_to_check(at(10 * GRACE + GRACE - 1)).is_empty());
     held.owner_checked(&task("t2"), OwnerState::Gone, at(11 * GRACE));
+    assert!(held.blob(&key).is_some(), "one answer of gone is not enough");
+    assert!(held.owners_to_check(at(11 * GRACE + GRACE - 1)).is_empty());
+    assert_eq!(held.owners_to_check(at(12 * GRACE)), vec![task("t2")]);
+    held.owner_checked(&task("t2"), OwnerState::Gone, at(12 * GRACE));
     assert_eq!(held.blobs(), vec![(key.clone(), vec![task("t1")])]);
 
     // The leader moves t1's record from [a, b] to [a, c]: the move is noted,
     // once; the same placement again notes nothing.
-    held.put(task_record("t1", 2, &["a", "c"], false), at(11 * GRACE))
+    held.put(task_record("t1", 2, &["a", "c"], false), at(12 * GRACE))
         .unwrap();
     assert_eq!(
         held.take_blob_moves(),
         vec![(task("t1"), vec![WorkerId::new("a"), WorkerId::new("c")])]
     );
     assert!(held.take_blob_moves().is_empty());
-    held.put(task_record("t1", 3, &["a", "c"], false), at(11 * GRACE))
+    held.put(task_record("t1", 3, &["a", "c"], false), at(12 * GRACE))
         .unwrap();
     assert!(held.take_blob_moves().is_empty());
 
     // Moved off this holder entirely, it keeps a stub, and so the blob,
     // while the record is unfinished; the move is noted for it to push.
-    held.put(task_record("t1", 4, &["b", "c"], false), at(11 * GRACE))
+    held.put(task_record("t1", 4, &["b", "c"], false), at(12 * GRACE))
         .unwrap();
     assert_eq!(
         held.take_blob_moves(),
