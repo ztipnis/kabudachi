@@ -3,6 +3,7 @@
 //! reads from the scheduler's own public state.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use kabudachi_core::protocol::generated::{CompositePage, CompositeRecord, TaskRecord};
@@ -15,19 +16,56 @@ use kabudachi_core::task_record::{PublishedRevisions, ShardRecord};
 /// Hand the scheduler a clone (`Scheduler::with_observer`) and read through
 /// the one you keep: every clone shares one log.
 #[derive(Debug, Clone, Default)]
-pub struct Spy(Rc<RefCell<Vec<ShardRecord>>>);
+pub struct Spy(Rc<RefCell<Log>>);
+
+#[derive(Debug, Default)]
+struct Log {
+    records: Vec<ShardRecord>,
+    /// Whether a revision replaces the held revision of its key.
+    newest_only: bool,
+    /// Where the held revision of each key sits in `records`, kept only
+    /// when `newest_only`.
+    slots: BTreeMap<(u8, String, u32), usize>,
+    page_revisions: BTreeMap<(String, u32), usize>,
+}
+
+impl Log {
+    fn record(&mut self, record: ShardRecord) {
+        let key = match &record {
+            ShardRecord::Task(record) => (0, record_task(record).task_id().as_str().to_string(), 0),
+            ShardRecord::Composite(record) => (1, composite_key(record.composite_id.as_ref()), 0),
+            ShardRecord::Page(page) => {
+                let id = composite_key(page.composite_id.as_ref());
+                *self.page_revisions.entry((id.clone(), page.index)).or_default() += 1;
+                (2, id, page.index)
+            }
+        };
+        if !self.newest_only {
+            self.records.push(record);
+        } else if let Some(slot) = self.slots.get(&key) {
+            self.records[*slot] = record;
+        } else {
+            self.slots.insert(key, self.records.len());
+            self.records.push(record);
+        }
+    }
+}
+
+fn composite_key(id: Option<&kabudachi_core::protocol::generated::CompositeId>) -> String {
+    id.map(|held| held.value.clone()).unwrap_or_default()
+}
 
 impl Observer for Spy {
     fn revision(&mut self, revision: TaskRecord) {
-        self.0.borrow_mut().push(revision.into());
+        self.0.borrow_mut().record(revision.into());
     }
 
     fn composite_revision(&mut self, revision: CompositeRecord) {
-        self.0.borrow_mut().push(revision.into());
+        self.0.borrow_mut().record(revision.into());
     }
 
     fn page_revision(&mut self, revision: CompositePage) {
-        self.0.borrow_mut().push(revision.into());
+        self.0.borrow_mut().record(revision.into());
     }
 }
 
@@ -38,20 +76,27 @@ impl PublishedRevisions for Spy {
 }
 
 impl Spy {
+    /// A spy that keeps only the newest revision of each Task record,
+    /// composite record and page (and still counts every page revision), so
+    /// a 100k-member test holds one record per key, not every revision.
+    pub fn newest_only() -> Spy {
+        Spy(Rc::new(RefCell::new(Log { newest_only: true, ..Log::default() })))
+    }
+
     /// How many revisions so far: a mark for `revised_since`.
     pub fn mark(&self) -> usize {
-        self.0.borrow().len()
+        self.0.borrow().records.len()
     }
 
     /// Every record published after `mark`, in order, left in the log.
     pub fn published_since(&self, mark: usize) -> Vec<ShardRecord> {
-        self.0.borrow()[mark..].to_vec()
+        self.0.borrow().records[mark..].to_vec()
     }
 
     /// The tasks revised after `mark`, in order of publication: what the
     /// calls since changed, while the scheduler led.
     pub fn revised_since(&self, mark: usize) -> Vec<TaskId> {
-        self.0.borrow()[mark..]
+        self.0.borrow().records[mark..]
             .iter()
             .filter_map(task_record)
             .map(|record| record_task(record).task_id())
@@ -60,18 +105,19 @@ impl Spy {
 
     /// Every Task revision the scheduler published, in order.
     pub fn revisions(&self) -> Vec<TaskRecord> {
-        self.0.borrow().iter().filter_map(task_record).cloned().collect()
+        self.0.borrow().records.iter().filter_map(task_record).cloned().collect()
     }
 
     /// Every revision of every kind the scheduler published, in order.
     pub fn shard_revisions(&self) -> Vec<ShardRecord> {
-        self.0.borrow().clone()
+        self.0.borrow().records.clone()
     }
 
     /// Every composite revision the scheduler published, in order.
     pub fn composites(&self) -> Vec<CompositeRecord> {
         self.0
             .borrow()
+            .records
             .iter()
             .filter_map(|record| match record {
                 ShardRecord::Composite(record) => Some(record.clone()),
@@ -91,7 +137,7 @@ impl Spy {
     /// The newest revision published of page `index` of the composite `id`,
     /// if any.
     pub fn newest_page(&self, id: &CompositeId, index: u32) -> Option<CompositePage> {
-        self.0.borrow().iter().rev().find_map(|record| match record {
+        self.0.borrow().records.iter().rev().find_map(|record| match record {
             ShardRecord::Page(page)
                 if page.index == index
                     && page.composite_id.as_ref().is_some_and(|held| held.value == id.as_str()) =>
@@ -106,13 +152,10 @@ impl Spy {
     pub fn page_revisions(&self, id: &CompositeId, index: u32) -> usize {
         self.0
             .borrow()
-            .iter()
-            .filter(|record| {
-                matches!(record, ShardRecord::Page(page)
-                    if page.index == index
-                        && page.composite_id.as_ref().is_some_and(|held| held.value == id.as_str()))
-            })
-            .count()
+            .page_revisions
+            .get(&(id.as_str().to_string(), index))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Every revision the scheduler published of `task`, in order.
@@ -128,6 +171,7 @@ impl Spy {
     pub fn newest_revision_of(&self, task: &TaskId) -> Option<TaskRecord> {
         self.0
             .borrow()
+            .records
             .iter()
             .rev()
             .filter_map(task_record)
@@ -139,7 +183,9 @@ impl Spy {
     /// `Cluster` drains this after each step to write the revisions, so a
     /// cluster node's spy has an empty `revisions()` once a step has run.
     pub fn take_revisions(&self) -> Vec<ShardRecord> {
-        std::mem::take(&mut *self.0.borrow_mut())
+        let mut log = self.0.borrow_mut();
+        log.slots.clear();
+        std::mem::take(&mut log.records)
     }
 
     /// `task` as its newest revision carries it. Panics if none was

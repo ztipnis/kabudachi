@@ -16,7 +16,7 @@ use crate::time::{Clock, Instant, WallTime};
 
 use crate::scheduler::{Observer, Scheduler, UNVERSIONED};
 
-use super::held::Composite;
+use super::held::{Composite, Outcomes};
 use super::{
     BoundInput, CompositeKind, CompositeParent, CompositeState, InputShape, MemberCounts, MemberOutcome, PAGE_ENTRIES,
     Stage, Step,
@@ -256,7 +256,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             input,
             state,
             next_stage: record.next_stage,
-            outcomes,
+            outcomes: Outcomes::of(outcomes, members),
             failure: record.failure.as_ref().map(Failure::from),
             submitted_at: record.submitted_at.map_or_else(|| WallTime::now(&self.clock), WallTime::from),
         })

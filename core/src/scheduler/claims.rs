@@ -116,6 +116,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// Counts the current run of `task_id`, if it is not a compaction, as one
     /// of its queue's runs, and drops the finished ones.
     pub(super) fn count_running(&mut self, task_id: &TaskId) {
+        self.note_member_claimed(task_id);
         if self.is_compaction(task_id) {
             return;
         }

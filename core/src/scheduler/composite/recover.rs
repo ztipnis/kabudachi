@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 
 use crate::protocol::ids::{CompositeId, IdGenerator, TaskDefinitionId, TaskId, TaskRunId};
 use crate::protocol::messages::prelude::*;
+use crate::protocol::records::TaskRunRecord as _;
+use crate::protocol::task::TaskRunState;
 use crate::time::Clock;
 
 use crate::scheduler::{Observer, Scheduler};
@@ -25,6 +27,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.resolve_retainers();
         self.derive_continuations();
         self.count_streamed_members();
+        self.note_claimed_members();
         let ids: Vec<CompositeId> = self.composites.held.keys().cloned().collect();
         for id in ids {
             if !self.holds_composite_back(&id) {
@@ -45,6 +48,24 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .collect();
         for task in ended {
             self.finish_continuation(&task);
+        }
+    }
+
+    /// Notes every member Task a worker holds, for the composite that counts
+    /// the running ones.
+    fn note_claimed_members(&mut self) {
+        let held: Vec<TaskId> = self
+            .tasks
+            .keys()
+            .filter(|task| {
+                self.current_run.get(*task).is_some_and(|run| {
+                    matches!(self.runs[run].current_state(), TaskRunState::Claimed | TaskRunState::Running)
+                })
+            })
+            .cloned()
+            .collect();
+        for task in held {
+            self.note_member_claimed(&task);
         }
     }
 
@@ -75,6 +96,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             let counted = composite.members.max(named).max(settled);
             if counted > composite.members {
                 composite.members = counted;
+                composite.outcomes.grow_to(counted);
                 self.composites.unpublished.insert(id.clone());
             }
         }

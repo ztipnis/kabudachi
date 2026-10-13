@@ -2,6 +2,7 @@
 //! come, and when a finished one is forgotten.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 
 use crate::manifest::{Failure, Manifest};
 use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
@@ -33,7 +34,7 @@ pub(in crate::scheduler) struct Composite {
     pub(super) state: CompositeState,
     pub(super) next_stage: u64,
     /// Every stage or member that has settled, by index.
-    pub(super) outcomes: BTreeMap<u64, MemberOutcome>,
+    pub(super) outcomes: Outcomes,
     pub(super) failure: Option<Failure>,
     pub(super) submitted_at: WallTime,
     /// The encoded description's size, counted against the memory budget
@@ -44,6 +45,90 @@ pub(in crate::scheduler) struct Composite {
     pub(super) members: u64,
     /// No batch adds a member: always true unless members arrive in batches.
     pub(super) sealed: bool,
+}
+
+/// The outcomes of the members that settled, by index, with the tallies a
+/// 100k-member composite needs in constant time: every status, record and
+/// page check would otherwise walk them all.
+#[derive(Debug, Clone, Default)]
+pub(in crate::scheduler) struct Outcomes {
+    settled: BTreeMap<u64, MemberOutcome>,
+    /// The indices below `members` with no outcome yet.
+    open: BTreeSet<u64>,
+    /// The unsettled members whose Task has been claimed: a superset of the
+    /// ones whose run is claimed or started now, which the reader checks.
+    claimed: BTreeSet<u64>,
+    members: u64,
+    succeeded: u64,
+    failed: u64,
+    cancelled: u64,
+    /// How many outcomes each page holds.
+    per_page: BTreeMap<u32, u64>,
+}
+
+impl Deref for Outcomes {
+    type Target = BTreeMap<u64, MemberOutcome>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.settled
+    }
+}
+
+impl Outcomes {
+    /// The outcomes `settled` names, for a composite of `members` members.
+    pub(super) fn of(settled: BTreeMap<u64, MemberOutcome>, members: u64) -> Self {
+        let mut outcomes = Outcomes::default();
+        for (index, outcome) in settled {
+            outcomes.insert(index, outcome);
+        }
+        outcomes.grow_to(members);
+        outcomes
+    }
+
+    /// Notes that the composite now holds `members` members.
+    pub(super) fn grow_to(&mut self, members: u64) {
+        for index in self.members..members {
+            if !self.settled.contains_key(&index) {
+                self.open.insert(index);
+            }
+        }
+        self.members = self.members.max(members);
+    }
+
+    /// Records `outcome` for member `index`, which has none yet.
+    pub(super) fn insert(&mut self, index: u64, outcome: MemberOutcome) {
+        match &outcome {
+            MemberOutcome::Value { .. } | MemberOutcome::Child(_) => self.succeeded += 1,
+            MemberOutcome::Failed(failure) if failure.kind == CANCELLED_KIND => self.cancelled += 1,
+            MemberOutcome::Failed(_) => self.failed += 1,
+        }
+        *self.per_page.entry((index / PAGE_ENTRIES) as u32).or_default() += 1;
+        self.open.remove(&index);
+        self.claimed.remove(&index);
+        self.settled.insert(index, outcome);
+    }
+
+    /// The members that have no outcome yet, in order.
+    pub(super) fn open(&self) -> impl Iterator<Item = u64> + '_ {
+        self.open.iter().copied()
+    }
+
+    /// Notes that member `index`'s Task was claimed.
+    pub(super) fn note_claimed(&mut self, index: u64) {
+        if !self.settled.contains_key(&index) {
+            self.claimed.insert(index);
+        }
+    }
+
+    /// The unsettled members whose Task was claimed, in order.
+    pub(super) fn claimed(&self) -> impl Iterator<Item = u64> + '_ {
+        self.claimed.iter().copied()
+    }
+
+    /// How many outcomes page `page` holds.
+    fn in_page(&self, page: u32) -> u64 {
+        self.per_page.get(&page).copied().unwrap_or(0)
+    }
 }
 
 impl Composite {
@@ -109,7 +194,7 @@ impl Composite {
         let end = first + PAGE_ENTRIES;
         let end = if self.sealed { end.min(self.members) } else { end };
         let width = end.saturating_sub(first);
-        (self.outcomes.len() as u64) >= width && self.outcomes.range(first..end).count() as u64 == width
+        self.outcomes.in_page(page) >= width
     }
 
     /// How many pages the settled outcomes take.
@@ -122,14 +207,13 @@ impl Composite {
     /// The members by state, `running` of those not settled being claimed or
     /// started.
     pub(super) fn counts(&self, running: u64) -> MemberCounts {
-        let mut counts = MemberCounts { running, ..MemberCounts::default() };
-        for outcome in self.outcomes.values() {
-            match outcome {
-                MemberOutcome::Value { .. } | MemberOutcome::Child(_) => counts.succeeded += 1,
-                MemberOutcome::Failed(failure) if failure.kind == CANCELLED_KIND => counts.cancelled += 1,
-                MemberOutcome::Failed(_) => counts.failed += 1,
-            }
-        }
+        let mut counts = MemberCounts {
+            running,
+            succeeded: self.outcomes.succeeded,
+            failed: self.outcomes.failed,
+            cancelled: self.outcomes.cancelled,
+            ..MemberCounts::default()
+        };
         counts.pending = self
             .members
             .saturating_sub(self.outcomes.len() as u64)

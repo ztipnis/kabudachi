@@ -24,7 +24,7 @@ use crate::scheduler::{
     CancelRejection, Cancellation, Event, Observer, Scheduler, Submission, SubmitRejection, Submitted,
 };
 
-use super::held::Composite;
+use super::held::{Composite, Outcomes};
 use super::{
     BoundInput, BoundStep, CompositeFinished, CompositeKind, CompositeParent, CompositeState,
     CompositeStatus, EXPANSION_DEFINITION, InputShape, LOST_KIND, MemberBatch, MemberOutcome, MembersAccepted,
@@ -155,6 +155,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.budget.check_room(needed, || 0)?;
         let composite = self.composites.held.get_mut(&id).expect("held above");
         composite.members = composite.members.max(end);
+        composite.outcomes.grow_to(composite.members);
         composite.sealed |= batch.last;
         self.composites.unpublished.insert(id.clone());
         for (index, stage) in members {
@@ -240,7 +241,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 input,
                 state: CompositeState::Running,
                 next_stage: 0,
-                outcomes: BTreeMap::new(),
+                outcomes: Outcomes::of(BTreeMap::new(), members),
                 failure: None,
                 submitted_at,
                 bytes,
@@ -660,9 +661,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         // Cancelled first, so the members cancelled below start and settle nothing.
         composite.state = CompositeState::Cancelled;
-        let unsettled: Vec<u64> = (0..composite.members)
-            .filter(|index| !composite.outcomes.contains_key(index))
-            .collect();
+        let unsettled: Vec<u64> = composite.outcomes.open().collect();
         let mut was_running = false;
         for index in unsettled {
             was_running |= self.cancel_stage(id, index);
@@ -699,12 +698,30 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         })
     }
 
+    /// Notes, for the composite holding the Task `task_id` as a member, that
+    /// it was claimed, so counting the running members visits only the
+    /// members that were.
+    pub(in crate::scheduler) fn note_member_claimed(&mut self, task_id: &TaskId) {
+        let task = &self.tasks[task_id];
+        let Some(id) = task.composite_id() else {
+            return;
+        };
+        if task.task_definition_id().as_str() == EXPANSION_DEFINITION {
+            return;
+        }
+        let index = task.composite_index;
+        if let Some(composite) = self.composites.held.get_mut(&id) {
+            composite.outcomes.note_claimed(index);
+        }
+    }
+
     /// How many members of the held composite `id` are Tasks that have not
     /// settled and whose current run is claimed or started.
     pub(in crate::scheduler) fn running_members(&self, id: &CompositeId) -> u64 {
         let composite = &self.composites.held[id];
-        (0..composite.members)
-            .filter(|index| !composite.outcomes.contains_key(index))
+        composite
+            .outcomes
+            .claimed()
             .filter(|index| {
                 self.current_run.get(&id.member_task(*index)).is_some_and(|run| {
                     matches!(self.runs[run].current_state(), TaskRunState::Claimed | TaskRunState::Running)

@@ -9,13 +9,14 @@ use kabudachi_core::protocol::generated::composite_entry;
 use kabudachi_core::protocol::ids::CompositeId;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
-    BoundField, BoundInput, CompositeState, FieldValue, MemberBatch, MembersAccepted, OnError, PAGE_ENTRIES,
-    Stage, StreamedMember,
+    BoundField, BoundInput, CompositeState, FieldValue, MEMBER_BATCH_ITEMS, MemberBatch, MembersAccepted,
+    OnError, PAGE_ENTRIES, Stage, StreamedMember,
 };
-use kabudachi_core::scheduler::{ClaimRejection, SubmitRejection};
+use kabudachi_core::scheduler::{ClaimRejection, Event, MemoryLimits, SubmitRejection};
 
 use crate::support::composites::*;
 use crate::support::scheduler::Fixture;
+use crate::support::spy::Spy;
 
 #[test]
 fn a_streamed_map_runs_each_item_once_in_order_and_ends_once_its_last_batch_is_in() {
@@ -248,4 +249,62 @@ fn a_streamed_item_held_as_blobs_reaches_its_task_as_the_manifest_its_budget_cou
     let claim = start_member(&mut fixture, &map, 0);
     assert_eq!(claim.input_manifest().unwrap(), Some(manifest), "the Task names the blobs the budget weighed");
     assert!(claim.task.serialized_input.is_empty());
+}
+
+/// The map case at the leader: a submitter streams 100k items in full batches,
+/// pausing whenever an answer says SlowDown and resuming once the scheduler
+/// clears it, while a worker runs the oldest members. Every member is made
+/// once, takes its own item, and its result lands at its own index; SlowDown
+/// is raised and cleared many times on the way.
+#[test]
+fn a_hundred_thousand_item_map_streams_under_toggling_slow_down_once_each_and_in_order() {
+    const ITEMS: u64 = 100_000;
+    const RUN_AT_ONCE: u64 = 512;
+    let mut fixture = Fixture::leading_with(
+        MemoryLimits { soft: 16 * 1024, hard: 64 * 1024 },
+        Spy::newest_only(),
+    );
+    let map = submitted(&mut fixture, streamed_map(OnError::FailFast));
+    let (mut sent, mut ran, mut waiting) = (0u64, 0u64, false);
+    let mut toggles = Vec::new();
+    while ran < ITEMS {
+        if !waiting && sent < ITEMS {
+            let count = MEMBER_BATCH_ITEMS.min(ITEMS - sent);
+            let batch = item_batch(&map, sent, count, sent + count == ITEMS);
+            let accepted = fixture.scheduler.submit_members(batch.clone()).unwrap();
+            if sent == 4 * MEMBER_BATCH_ITEMS {
+                assert_eq!(fixture.scheduler.submit_members(batch).unwrap().members, accepted.members);
+            }
+            sent += count;
+            waiting = accepted.slow_down;
+        } else {
+            for index in ran..(ran + RUN_AT_ONCE).min(sent) {
+                let claim = run_member(&mut fixture, &map, index, &item(index));
+                assert_eq!(claim.task.serialized_input, item(index));
+            }
+            ran = (ran + RUN_AT_ONCE).min(sent);
+            waiting = fixture.scheduler.slow_down();
+        }
+        toggles.extend(fixture.scheduler.take_events().into_iter().filter_map(|event| match event {
+            Event::SlowDown { active } => Some(active),
+            _ => None,
+        }));
+    }
+    assert!(toggles.iter().filter(|raised| **raised).count() >= 10, "SlowDown toggled: {toggles:?}");
+    assert_eq!(fixture.scheduler.composite_status(&map).unwrap().state, CompositeState::Succeeded);
+    let record = fixture.spy.newest_composite(&map).unwrap();
+    assert_eq!((record.members, record.counts.unwrap().succeeded), (ITEMS, ITEMS));
+    for page in 0..record.pages {
+        let entries = fixture.spy.newest_page(&map, page).unwrap().entries;
+        assert_eq!(fixture.spy.page_revisions(&map, page), 1);
+        for entry in entries {
+            assert_eq!(
+                entry.outcome,
+                Some(composite_entry::Outcome::Value(Digest::blake3(&item(entry.index)).into())),
+                "result {} is item {}'s",
+                entry.index,
+                entry.index
+            );
+        }
+    }
 }
