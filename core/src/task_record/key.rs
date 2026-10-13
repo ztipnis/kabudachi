@@ -190,7 +190,7 @@ impl ShardRecord {
                 retained_by_composite: record.retained_by_composite,
                 ..Default::default()
             }),
-            ShardRecord::Composite(record) =>ShardRecord::Composite(CompositeRecord {
+            ShardRecord::Composite(record) => ShardRecord::Composite(CompositeRecord {
                 version: record.version,
                 composite_id: record.composite_id.clone(),
                 placement: record.placement.clone(),
