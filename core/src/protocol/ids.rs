@@ -157,8 +157,9 @@ fn derived_id(tag: &str, parent: &str, index: u64) -> String {
 /// `MAX_SUBMISSION_BYTES` always fits one claim message. The scheduler checks
 /// every ID it mints and panics on a longer one.
 ///
-/// A task ID must not contain `/`: record keys use it to tell composite
-/// records from Task records.
+/// A minted task ID must not contain `/`: record keys use it to tell
+/// composite records from Task records. The leader also refuses client-chosen
+/// task IDs that start with `composite/`.
 pub trait IdGenerator {
     fn next_task_id(&self) -> TaskId;
     fn next_task_run_id(&self) -> TaskRunId;

@@ -1086,7 +1086,7 @@ class Session:
             # Cancelled first, the leader's `cancelled` event settles the
             # handle, as for a cancelled body that failed.
             return
-        _logger.warning("task %s was lost with the process that ran it", claim.task_id)
+        _logger.warning("task %s was reported lost", claim.task_id)
         try:
             replayed = self._runtime.report_lost(claim.task_run_id)
         except Exception as refusal:

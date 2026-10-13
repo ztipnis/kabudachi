@@ -9,9 +9,10 @@ use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
 use crate::task_record::store::{PutRefusal, identify};
 use crate::task_record::version::RecordVersion;
 
-/// The prefix of every composite record's and page's kad key. A task id
-/// never contains `/` (see `IdGenerator`), so no Task record's key starts
-/// with it.
+/// The prefix of every composite record's and page's kad key. Minted task
+/// ids contain no `/` (see `IdGenerator`), and the leader refuses
+/// client-chosen task ids starting with this prefix (see
+/// [`RecordKey::may_name_a_task`]), so no Task record's key starts with it.
 const COMPOSITE_PREFIX: &str = "composite/";
 
 /// Which record of a shard a revision is.
