@@ -93,14 +93,13 @@ impl Shared {
         };
         let shared = Arc::clone(self);
         self.handle.spawn(async move {
+            let _running = MirrorRunning(Arc::clone(&shared));
             let certified = certified || certified_in_record(&shared.net, &kept).await;
             if certified && let Some(backend) = shared.backend.clone() {
                 let run = kept.run.clone();
                 let state = mirror(backend, move || kept.entries()).await;
                 shared.report(Report::Persisted { run, state });
             }
-            shared.seam().mirrors_running -= 1;
-            shared.wake();
         });
     }
 
@@ -116,6 +115,16 @@ impl Shared {
         if handled.wake {
             self.wake();
         }
+    }
+}
+
+/// Counts a mirror out when dropped, however its task ends, a panic included.
+struct MirrorRunning(Arc<Shared>);
+
+impl Drop for MirrorRunning {
+    fn drop(&mut self) {
+        self.0.seam().mirrors_running -= 1;
+        self.0.wake();
     }
 }
 

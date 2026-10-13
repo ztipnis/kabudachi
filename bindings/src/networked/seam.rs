@@ -62,6 +62,8 @@ pub(super) struct Seam {
     pub(super) closed: bool,
     /// Runs reported completed whose result is mirrored once the leader
     /// certifies them, until the leader answers the report.
+    /// Each holds a copy of the run's result until the leader answers, the
+    /// report is abandoned, or the run ends another way.
     pub(super) mirroring: BTreeMap<TaskRunId, Mirror>,
     /// Mirrors being stored now, after their report was answered.
     pub(super) mirrors_running: usize,
@@ -141,10 +143,26 @@ impl Shared {
         {
             // Dropped after the lock is released, which wakes the claims
             // waiting for room.
-            let freed = self.seam().inputs_in_flight.remove(run);
+            let freed = {
+                let mut seam = self.seam();
+                // A run that ends any way but certified has nothing to mirror.
+                if !matches!(&report, Report::Completed { .. }) {
+                    seam.mirroring.remove(run);
+                }
+                seam.inputs_in_flight.remove(run)
+            };
             drop(freed);
         }
-        let _ = self.reports.report(report);
+        let completed = match &report {
+            Report::Completed { run, .. } => Some(run.clone()),
+            _ => None,
+        };
+        // A report the driver cannot take is never answered: nothing to mirror.
+        if self.reports.report(report).is_err()
+            && let Some(run) = completed
+        {
+            self.seam().mirroring.remove(&run);
+        }
     }
 
     /// Hands the driver a report that this worker cannot run `task` at its
