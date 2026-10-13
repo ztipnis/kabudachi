@@ -41,7 +41,6 @@ from kabudachi._native import MAX_FAILURE_MESSAGE_BYTES, EventKind, RunState
 from kabudachi.body import Given, RunningBody, decode_resolved
 from kabudachi.composites import (
     MEMBER_BATCH_BYTES,
-    MEMBER_BATCH_ITEMS,
     Composites,
     _batches,
     composite_is_running,
@@ -1004,11 +1003,16 @@ class Session:
             self._runtime.report_started(claim.task_run_id)
             encoded = (serializer.encode(item, template.input_type) for item in items)
             start = 0
-            for batch in _batches(encoded, MEMBER_BATCH_ITEMS, MEMBER_BATCH_BYTES):
+            for batch in _batches(encoded, self._composites.batch_items, MEMBER_BATCH_BYTES):
                 while not self.has_room():
+                    if self.stopping:
+                        raise RunStoppedError("the run stopped while this was being sent")
                     await self.wait_for_room()
                 if await self._runtime.submit_members(claim.composite_id, start, batch, False) != "accepted":
-                    return  # the map is over: its members are no longer wanted
+                    # The map ended without all its items (a member failed, or
+                    # it was cancelled), which cancels this run: nothing is left
+                    # to complete or report.
+                    return
                 start += len(batch)
             self._runtime.complete(claim.task_run_id, result_digest(b""))
         except Exception as error:

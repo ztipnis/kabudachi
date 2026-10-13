@@ -6,7 +6,6 @@ retries, timeouts and queues stay per stage and nothing is inherited between
 stages.
 """
 
-from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -279,10 +278,11 @@ class Group:
         batches."""
         return ("group", self.on_error, [], "streamed")
 
-    def members_described(self, session: Session, previous: Any) -> Iterator[tuple]:
-        """Each member as a tree, bound to `previous` as `describe` binds it,
-        one at a time."""
-        return (member.describe(session, previous) for member in self.members)
+    def members_described(self, session: Session, previous: Any) -> list[tuple]:
+        """Each member as a tree, bound to `previous` as `describe` binds it.
+        All at once, so a `previous` that does not fit raises here, and later
+        changes to it do not reach members not yet sent."""
+        return [member.describe(session, previous) for member in self.members]
 
     def check_arguments(self, arguments: tuple[Any, ...]) -> None:
         """Raises `TypeError` unless `arguments` is what the group takes."""

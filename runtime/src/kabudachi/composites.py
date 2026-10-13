@@ -9,6 +9,7 @@ composite finishes.
 import asyncio
 import contextvars
 import functools
+import logging
 import threading
 import weakref
 from collections.abc import Awaitable, Iterable, Iterator
@@ -32,7 +33,12 @@ from kabudachi.status import CompositeStatus
 if TYPE_CHECKING:
     from kabudachi.session import Session
 
+_logger = logging.getLogger("kabudachi")
+
 _COUNTED = ("pending", "running", "succeeded", "failed", "cancelled")
+
+# What the native runtime says to every call made after it shut down.
+_CLOSED_MESSAGE = "has shut down"
 
 MEMBER_BATCH_ITEMS: int = _native.MEMBER_BATCH_ITEMS
 """Most members one batch of a streamed group or map holds."""
@@ -216,7 +222,7 @@ class Composites:
     def _stream(
         self,
         head: tuple,
-        members: Iterator[Any],
+        members: Iterable[Any],
         handle: type["GroupHandle"] = GroupHandle,
         inline_bytes: int = MEMBER_BATCH_BYTES,
     ) -> "GroupHandle":
@@ -262,7 +268,7 @@ class Composites:
             )
 
     async def _send_members(
-        self, composite_id: str, members: Iterator[Any], handle: "GroupHandle", inline_bytes: int
+        self, composite_id: str, members: Iterable[Any], handle: "GroupHandle", inline_bytes: int
     ) -> None:
         """Sends `members` in batches of at most `batch_items` members and
         `MEMBER_BATCH_BYTES` of inline input, the last marked so, until the
@@ -323,8 +329,15 @@ class Composites:
             self._open.pop(composite_id, None)
         try:
             self._session.runtime.cancel_composite(composite_id)
-        except Exception:
-            pass  # the runtime is gone, so there is nothing left to cancel
+        except RuntimeError as refusal:
+            if _CLOSED_MESSAGE in str(refusal):
+                _logger.debug("%s needs no cancel: the runtime has shut down", composite_id)
+            else:
+                # This worker is not the leader and the composite is not
+                # queued: the members it took may be left running.
+                _logger.warning(
+                    "the members of %s that were sent could not be cancelled: %s", composite_id, refusal
+                )
         if not handle.done():
             handle._fail(
                 error
