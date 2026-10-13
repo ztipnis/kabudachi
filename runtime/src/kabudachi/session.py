@@ -117,8 +117,6 @@ class Session:
         executor: Executor | None = None,
     ) -> None:
         self._runtime = runtime
-        # This worker's shard name and id, read on the first run handed over.
-        self._identity: tuple[str, str] | None = None
         self._registry = registry
         self._serializers = serializers
         self._configuration = configuration
@@ -140,6 +138,8 @@ class Session:
         self._here: dict[str, _HeldHere] = {}
         # What came for held runs not started yet, by run id, oldest first.
         self._early: dict[str, _Early] = {}
+        # This worker's shard name and id, read on the first run handed over.
+        self._identity: tuple[str, str] | None = None
         try:
             # Built inside the run's loop, as `run()` does.
             self._hosted.attach(asyncio.get_running_loop())
