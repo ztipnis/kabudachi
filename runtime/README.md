@@ -278,12 +278,48 @@ declared a task or hook), `process_start_timeout` (how long a task process has t
 and report ready, default 60 s), `max_runs_per_process` (runs a task process takes before it is
 replaced; no limit by default; the fresh one starts once it has drained and exited, and until then it
 counts against `processes`), `queue`, `result_ttl` (seconds a finished task is kept), `cancel_grace`,
-`reconnect_timeouts` (per queue, the seconds a run may go unheard before the leader runs it again; in
-the environment as `queue=seconds` pairs separated by commas), `memory_soft_limit` and
+`queues`, `queue_options` and `router` (see "Queues" below), `memory_soft_limit` and
 `memory_hard_limit` (bytes), and the networked settings `listen`, `seeds`, `external_address`,
 `authority`, `shard`, `heartbeat_interval`, `heartbeat_timeout` and `reconnect_timeout` (see
-"Networked workers"). In the environment a duration is a number of seconds, and `seeds` and
-`imports` are comma-separated lists.
+"Networked workers"). In the environment a duration is a number of seconds, and `seeds`, `imports`
+and `queues` are comma-separated lists.
+
+### Queues
+
+`queues` is the queues a worker takes tasks from, a non-empty tuple of names. A worker in a shard of
+one takes every queue by default, since nothing else could run the rest; a worker on a network takes
+`queue` alone, so a queue is served only by the workers that name it.
+
+`queue_options` gives a queue its own `kabudachi.QueueOptions`, and a queue it does not name has the
+defaults:
+
+```python
+kabudachi.configure(
+    queues=("default", "gpu"),
+    queue_options={"gpu": kabudachi.QueueOptions(priority=10, max_running=4)},
+)
+```
+
+- `priority` (an integer, `0` by default): a worker asking for work gets the highest priority that
+  has any waiting.
+- `weight` (a positive integer, `1` by default): among queues of one priority, how many tasks this
+  queue hands out for each one a queue of weight 1 does.
+- `max_running` (a positive integer, or `None` for no limit, the default): the most tasks of the queue
+  claimed or running at once across the shard.
+- `reconnect_timeout` (a positive `timedelta`, or `None` for the shard's, the default): how long a run
+  of a task sent here may go without its worker being heard, past the time it takes to suspect a
+  silent worker, before the leader runs it again. A task's own `reconnect_timeout` wins.
+- `result_ttl` (a positive `timedelta`, `None` to keep nothing; by default the process's
+  `result_ttl`): how long a finished task sent here is kept. A task's own wins.
+- `starvation_age` (a positive `timedelta`, or `None` for never, the default): how long a task may
+  wait before it goes ahead of every priority.
+
+An invalid option raises `ValueError` when the `QueueOptions` is built. Every worker of a shard should give the same queue
+options; the leader's decide.
+
+`router(name, value) -> str | None` picks the queue of a task that names none, when it is
+submitted: it is called with the task's name and its argument, and returns a queue name, or `None`
+for `queue`. It runs in the submitting process only.
 
 ## Logging
 
