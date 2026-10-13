@@ -505,9 +505,10 @@ impl NetworkedRuntime {
 
     /// Asks the worker to leave its shard gracefully, a leader handing its
     /// leadership over first, and returns an awaitable that resolves once it
-    /// has left to `(stored, superseded, abandoned)`: how many Task records it
-    /// handed over, how many the shard had already written past, and the ids
-    /// of those no other worker took, which leave with it. A worker already
+    /// has left to `(stored, superseded, abandoned)`: how many records it
+    /// handed over, how many the shard had already written past, and the keys
+    /// of those no other worker took, which leave with it (a Task record's
+    /// is its task id). A worker already
     /// gone, or shut down, resolves at once with nothing handed over.
     fn drain<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.shared.net.request_drain();
@@ -527,7 +528,7 @@ impl NetworkedRuntime {
             let abandoned: Vec<String> = handed
                 .abandoned
                 .iter()
-                .map(|task| task.as_str().to_owned())
+                .map(|key| String::from_utf8_lossy(&key.kad_bytes()).into_owned())
                 .collect();
             Ok((handed.stored, handed.superseded, abandoned))
         })

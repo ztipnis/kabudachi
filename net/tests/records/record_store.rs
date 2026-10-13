@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord};
 use kabudachi_core::coordination_authority::RecoveryEpoch;
-use kabudachi_core::protocol::generated::{self, Task, TaskRecord};
-use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::task_record::{MAX_RECORD_BYTES, RecordVersion, Write};
+use kabudachi_core::protocol::generated::{self, CompositePage, CompositeRecord, Task, TaskRecord};
+use kabudachi_core::protocol::ids::{CompositeId, ShardId, TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::task_record::{MAX_RECORD_BYTES, RecordKey as ShardKey, RecordVersion, ShardRecord, Write};
 use kabudachi_core::task_record::PriorPlacement;
 use kabudachi_net::messenger::{Net, PlacedWrite, RecordLookup};
-use kabudachi_net::task_store::{HeldRecords, TaskRecordStore, record_key};
+use kabudachi_net::task_store::{HeldRecords, TaskRecordStore};
 use libp2p::kad::store::RecordStore;
 use libp2p::kad::{Record, RecordKey};
 use prost::Message as _;
@@ -19,6 +19,7 @@ use tokio::time::timeout;
 
 use crate::support::deadline::within_deadline;
 use crate::support::net::connect_to;
+use crate::support::records::composite_record;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -41,6 +42,11 @@ fn record(task: &str, version: RecordVersion, queue: &str) -> TaskRecord {
         }),
         ..TaskRecord::default()
     }
+}
+
+/// The kad key a task's record is stored under.
+fn task_key(task: &TaskId) -> RecordKey {
+    RecordKey::new(&ShardKey::Task(task.clone()).kad_bytes())
 }
 
 fn shard(name: &str) -> ShardId {
@@ -285,26 +291,26 @@ fn the_store_keeps_only_what_is_a_well_formed_record_of_its_own_key() {
     };
     let stored = record("task-1", version(0, 0, 1, 1), "q");
 
-    assert!(!put(&mut store, record_key(&task), b"not a record".to_vec()), "undecodable");
+    assert!(!put(&mut store, task_key(&task), b"not a record".to_vec()), "undecodable");
     assert!(
         !put(&mut store, RecordKey::new(&"other"), stored.encode_to_vec()),
         "a record stored under another task's key"
     );
     assert!(
-        !put(&mut store, record_key(&task), vec![0; MAX_RECORD_BYTES as usize + 1]),
+        !put(&mut store, task_key(&task), vec![0; MAX_RECORD_BYTES as usize + 1]),
         "a value past the largest record"
     );
     let mut unversioned = stored.clone();
     unversioned.version = None;
     assert!(
-        !put(&mut store, record_key(&task), unversioned.encode_to_vec()),
+        !put(&mut store, task_key(&task), unversioned.encode_to_vec()),
         "a record with no version"
     );
     assert!(held.task_ids().is_empty());
 
-    assert!(put(&mut store, record_key(&task), stored.encode_to_vec()));
+    assert!(put(&mut store, task_key(&task), stored.encode_to_vec()));
     assert_eq!(held.task_ids(), vec![task.clone()]);
-    let served = store.get(&record_key(&task)).expect("the record is served");
+    let served = store.get(&task_key(&task)).expect("the record is served");
     assert_eq!(TaskRecord::decode(&served.value[..]).unwrap(), stored);
 
     // A blob is kept only under the key its own bytes name, and served back.
@@ -322,6 +328,40 @@ fn the_store_keeps_only_what_is_a_well_formed_record_of_its_own_key() {
     assert!(put(&mut store, own.clone(), blob.clone()));
     assert_eq!(store.get(&own).map(|served| served.value.clone()), Some(blob));
     assert_eq!(held.task_ids(), vec![task], "a blob is not a task");
+}
+
+#[test]
+fn a_composite_record_and_its_page_are_stored_and_served_under_their_keys_and_refused_under_another() {
+    let held = HeldRecords::new(None);
+    let mut store = TaskRecordStore::new(held.clone());
+    let id = CompositeId::new("c1");
+    let record = composite_record(&id, 1, 0);
+    let key = ShardKey::Composite(id.clone());
+    store
+        .put(Record::new(RecordKey::new(&key.kad_bytes()), record.encode_to_vec()))
+        .expect("stored under its own key");
+    assert_eq!(held.get_record(&key), Some(ShardRecord::Composite(record.clone())));
+    let served = store.get(&RecordKey::new(&key.kad_bytes())).expect("the record is served");
+    assert_eq!(CompositeRecord::decode(&served.value[..]).unwrap(), record);
+    // A composite record decodes as page 0, so it is a page under page 1's
+    // key only by a key it does not name.
+    let elsewhere = ShardKey::Page(id.clone(), 1).kad_bytes();
+    assert!(
+        store.put(Record::new(RecordKey::new(&elsewhere), record.encode_to_vec())).is_err(),
+        "a record under a key it does not name is refused"
+    );
+    let page = CompositePage {
+        version: record.version,
+        composite_id: record.composite_id.clone(),
+        index: 1,
+        ..CompositePage::default()
+    };
+    let page_key = ShardKey::Page(id, 1);
+    store
+        .put(Record::new(RecordKey::new(&page_key.kad_bytes()), page.encode_to_vec()))
+        .expect("a page is stored under its own key");
+    assert_eq!(held.get_record(&page_key), Some(ShardRecord::Page(page)));
+    assert!(held.task_ids().is_empty(), "a composite is not a task");
 }
 
 fn blob_of(bytes: &[u8], owner: &str, result: bool) -> (RecordKey, Vec<u8>) {

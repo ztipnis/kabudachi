@@ -22,6 +22,7 @@ use kabudachi_core::protocol::messages::{
     Claim, ClaimRejectReason, ClaimResponse, claim_response,
 };
 use kabudachi_core::queues::{QueuePolicy, Subscription};
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::{Duration as CoreDuration, WallTime};
 use libp2p::PeerId;
 use libp2p::futures::future::join_all;
@@ -29,7 +30,7 @@ use libp2p::kad::KBucketKey;
 
 use crate::messenger::Net;
 use crate::steal::MAX_STEAL_IDS;
-use crate::task_store::{Candidate, record_key};
+use crate::task_store::Candidate;
 
 /// What a worker takes when it looks for work, and how it ranks what it finds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +186,7 @@ impl Net {
                 ),
                 local
                     .as_ref()
-                    .map(|local| KBucketKey::new(record_key(&candidate.task)).distance(local)),
+                    .map(|local| KBucketKey::new(RecordKey::Task(candidate.task.clone()).kad_bytes()).distance(local)),
                 candidate.submitted_at.as_unix_millis(),
             )
         });

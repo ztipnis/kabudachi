@@ -1,5 +1,6 @@
-//! What a drained worker does with the Task records it holds before it
-//! exits: hand each to the holders its leader would place it on now, wait
+//! What a drained worker does with the records it holds (Tasks', composites'
+//! and composite pages') before it exits: hand each to the holders its leader
+//! would place it on now, wait
 //! for them to store it, and write again what was refused, until a deadline.
 //!
 //! A drained follower knows no voters, so it asks the leader it followed
@@ -10,24 +11,22 @@
 //! because it holds a newer revision needs no handing over: the leader wrote
 //! past it.
 //!
-//! Blobs go after the records, each to the placement of every task that owns
-//! it, by the same placement asks. A blob owned by a composite is left to its
-//! holders until composite records can be placed.
+//! Blobs go after the records, each to the placement of every task or
+//! composite that owns it, by the same placement asks.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord};
 use kabudachi_core::election::HandOffTo;
-use kabudachi_core::protocol::generated::TaskRecord;
-use kabudachi_core::protocol::ids::{TaskId, WorkerId};
+use kabudachi_core::protocol::ids::WorkerId;
 use kabudachi_core::protocol::messages::task_response;
-use kabudachi_core::task_record::{Placement, VersionOrder, identify};
+use kabudachi_core::task_record::{Placement, RecordKey, ShardRecord, VersionOrder};
 use libp2p::futures::future::join_all;
 use tokio::time::{Instant, sleep, timeout_at};
 
-use crate::messenger::{HandOffWrite, Net};
-use crate::task_exchange::MAX_PLACE_IDS;
+use crate::messenger::{HandOffWrite, Net, RecordLookup};
+use crate::task_exchange::{MAX_PLACE_IDS, placed_record, record_key_of};
 use crate::task_store::HeldRecords;
 use crate::task_store::placement::{ReplicationFactor, placement};
 
@@ -44,7 +43,7 @@ pub struct HandedOff {
     pub superseded: usize,
     /// Records not stored by the deadline, or that no one could be asked to
     /// store.
-    pub abandoned: Vec<TaskId>,
+    pub abandoned: Vec<RecordKey>,
     /// Blobs, counted once per owner, that a quorum of their owner's
     /// placement stored.
     pub blobs_stored: usize,
@@ -54,16 +53,16 @@ pub struct HandedOff {
 }
 
 /// Where a record goes: the holders and how many of them must store it.
-type Placed = BTreeMap<TaskId, (Vec<WorkerId>, usize)>;
+type Placed = BTreeMap<RecordKey, (Vec<WorkerId>, usize)>;
 
-/// What asking where `tasks` go got.
+/// What asking where `keys` go got.
 #[derive(Default)]
 struct Round {
     placed: Placed,
-    /// Tasks whose placement no one answered: asked again after the delay.
-    unanswered: Vec<TaskId>,
-    /// Tasks the answer left out: no voter could hold them.
-    unplaceable: Vec<TaskId>,
+    /// Records whose placement no one answered: asked again after the delay.
+    unanswered: Vec<RecordKey>,
+    /// Records the answer left out: no voter could hold them.
+    unplaceable: Vec<RecordKey>,
 }
 
 /// Hands every record this worker holds to the holders `to` says, writing
@@ -78,14 +77,14 @@ pub(crate) async fn hand_off_held_records(
     deadline: Instant,
 ) -> HandedOff {
     let mut done = HandedOff::default();
-    let mut waiting = net.held_records().task_ids();
+    let mut waiting = net.held_records().record_keys();
     while !waiting.is_empty() && Instant::now() < deadline {
         let Some(round) = place(net, &to, &waiting, factor, deadline).await else {
             break;
         };
         done.abandoned.extend(round.unplaceable);
         let mut again = round.unanswered;
-        let placeable: Vec<TaskId> = round.placed.keys().cloned().collect();
+        let placeable: Vec<RecordKey> = round.placed.keys().cloned().collect();
         for chunk in placeable.chunks(IN_FLIGHT) {
             again.extend(hand_over(net, chunk, &round.placed, deadline, &mut done).await);
         }
@@ -96,32 +95,31 @@ pub(crate) async fn hand_off_held_records(
     }
     done.abandoned.extend(waiting);
     if !done.abandoned.is_empty() {
-        let records: Vec<&str> = done.abandoned.iter().map(TaskId::as_str).collect();
         tracing::error!(
-            count = records.len(),
-            records = ?records,
-            "this worker is leaving its shard with Task records no other worker took; they leave with it"
+            count = done.abandoned.len(),
+            records = ?done.abandoned,
+            "this worker is leaving its shard with records no other worker took; they leave with it"
         );
     }
     hand_off_held_blobs(net, &to, factor, retry_after, deadline, &mut done).await;
     done
 }
 
-/// A blob this worker holds, and the task that owns it.
-type Owned = (BlobKey, TaskId);
+/// A blob this worker holds, and the task or composite that owns it.
+type Owned = (BlobKey, BlobOwner);
 
 /// A blob to write to the holders its owner's record would be placed on.
 struct BlobHandOver {
     key: BlobKey,
-    owner: TaskId,
+    owner: BlobOwner,
     blob: BlobRecord,
     placement: Placement,
     /// Whether `owner` stored the blob as one of its results.
     result: bool,
 }
 
-/// Hands every blob this worker holds, for each task that owns it, to the
-/// holders the task's record would be placed on, writing again after
+/// Hands every blob this worker holds, for each owner it has, to the holders
+/// the owner's record would be placed on, writing again after
 /// `retry_after` what was not stored, until `deadline`.
 async fn hand_off_held_blobs(
     net: &Net,
@@ -134,8 +132,8 @@ async fn hand_off_held_blobs(
     let held = net.held_records();
     let mut waiting = owned_blobs(&held);
     while !waiting.is_empty() && Instant::now() < deadline {
-        let owners: BTreeSet<TaskId> = waiting.iter().map(|(_, owner)| owner.clone()).collect();
-        let owners: Vec<TaskId> = owners.into_iter().collect();
+        let owners: BTreeSet<RecordKey> = waiting.iter().map(|(_, owner)| record_key_of(owner)).collect();
+        let owners: Vec<RecordKey> = owners.into_iter().collect();
         let Some(round) = place(net, to, &owners, factor, deadline).await else {
             break;
         };
@@ -152,14 +150,12 @@ async fn hand_off_held_blobs(
     }
 }
 
-/// Each blob held, once for every task that owns it.
+/// Each blob held, once for every owner it has.
 fn owned_blobs(held: &HeldRecords) -> Vec<Owned> {
     let mut owned = Vec::new();
     for (key, owners) in held.blobs() {
         for owner in owners {
-            if let BlobOwner::Task(task) = owner {
-                owned.push((key.clone(), task));
-            }
+            owned.push((key.clone(), owner));
         }
     }
     owned
@@ -180,13 +176,14 @@ fn sorted(
         let Some(blob) = held.blob(&key) else {
             continue;
         };
-        match round.placed.get(&owner) {
+        let record = record_key_of(&owner);
+        match round.placed.get(&record) {
             Some((holders, quorum)) => {
                 let placement = Placement { holders: holders.clone(), quorum: *quorum };
-                let result = held.results_of(&BlobOwner::Task(owner.clone())).contains(&key);
+                let result = held.results_of(&owner).contains(&key);
                 handovers.push(BlobHandOver { key, owner, blob, placement, result });
             }
-            None if round.unanswered.contains(&owner) => again.push((key, owner)),
+            None if round.unanswered.contains(&record) => again.push((key, owner)),
             None => done.blobs_abandoned.push(key),
         }
     }
@@ -203,7 +200,7 @@ async fn hand_over_blobs(
     let mut unstored = Vec::new();
     for chunk in handovers.chunks(IN_FLIGHT) {
         let stored = join_all(chunk.iter().map(|handover| {
-            let owner = BlobOwner::Task(handover.owner.clone());
+            let owner = handover.owner.clone();
             let (blob, placement) = (handover.blob.clone(), handover.placement.clone());
             timeout_at(deadline, net.put_blob_as_held(owner, blob, placement, handover.result))
         }))
@@ -219,13 +216,13 @@ async fn hand_over_blobs(
     unstored
 }
 
-/// Where each of `tasks` goes, if anyone can say: the leader a follower
+/// Where each of `keys` goes, if anyone can say: the leader a follower
 /// followed answers, a leader's own voters place locally. `None` when no one
 /// can, which ends the hand-off.
 async fn place(
     net: &Net,
     to: &HandOffTo,
-    tasks: &[TaskId],
+    keys: &[RecordKey],
     factor: ReplicationFactor,
     deadline: Instant,
 ) -> Option<Round> {
@@ -233,17 +230,17 @@ async fn place(
     match to {
         HandOffTo::Nobody => return None,
         HandOffTo::Voters(voters) => {
-            for task in tasks {
-                match placement(task, voters, factor) {
+            for key in keys {
+                match placement(key, voters, factor) {
                     Some(placed) => {
-                        round.placed.insert(task.clone(), (placed.holders, placed.quorum));
+                        round.placed.insert(key.clone(), (placed.holders, placed.quorum));
                     }
-                    None => round.unplaceable.push(task.clone()),
+                    None => round.unplaceable.push(key.clone()),
                 }
             }
         }
         HandOffTo::Leader(leader) => {
-            for page in tasks.chunks(MAX_PLACE_IDS) {
+            for page in keys.chunks(MAX_PLACE_IDS) {
                 let asked = timeout_at(deadline, net.place_records(leader.clone(), page.to_vec())).await;
                 // A leader that has not answered, or does not lead yet, is
                 // asked again after the delay.
@@ -257,11 +254,11 @@ async fn place(
                 };
                 let mut placed = Placed::new();
                 for key in answer.placements {
-                    // An answer with no holder but the asker places the task
+                    // An answer with no holder but the asker places the record
                     // nowhere a drained worker can hand it.
-                    if let Some(task) = key.task_id.filter(|_| !key.holders.is_empty()) {
+                    if let Some(record) = placed_record(&key).filter(|_| !key.holders.is_empty()) {
                         placed.insert(
-                            TaskId::from(task),
+                            record,
                             (
                                 key.holders.into_iter().map(WorkerId::from).collect(),
                                 usize::try_from(key.quorum).unwrap_or(usize::MAX),
@@ -269,12 +266,12 @@ async fn place(
                         );
                     }
                 }
-                for task in page {
-                    match placed.remove(task) {
+                for key in page {
+                    match placed.remove(key) {
                         Some(placement) => {
-                            round.placed.insert(task.clone(), placement);
+                            round.placed.insert(key.clone(), placement);
                         }
-                        None => round.unplaceable.push(task.clone()),
+                        None => round.unplaceable.push(key.clone()),
                     }
                 }
             }
@@ -283,20 +280,20 @@ async fn place(
     Some(round)
 }
 
-/// Hands each of `tasks` to the holders `placed` names, and returns those
+/// Hands each of `keys` to the holders `placed` names, and returns those
 /// that were neither stored nor superseded. A record no longer held (a
 /// finished one past its retention) needs nothing.
 async fn hand_over(
     net: &Net,
-    tasks: &[TaskId],
+    keys: &[RecordKey],
     placed: &Placed,
     deadline: Instant,
     done: &mut HandedOff,
-) -> Vec<TaskId> {
+) -> Vec<RecordKey> {
     let held = net.held_records();
     let mut sent = Vec::new();
-    for task in tasks {
-        let (Some(record), Some((holders, quorum))) = (held.get(task), placed.get(task)) else {
+    for key in keys {
+        let (Some(record), Some((holders, quorum))) = (held.get_record(key), placed.get(key)) else {
             continue;
         };
         let stored = net.hand_off(HandOffWrite {
@@ -304,41 +301,41 @@ async fn hand_over(
             holders: holders.clone(),
             quorum: *quorum,
         });
-        sent.push((task.clone(), record, stored));
+        sent.push((key.clone(), record, stored));
     }
     let mut unstored = Vec::new();
-    for (task, record, stored) in sent {
+    for (key, record, stored) in sent {
         if timeout_at(deadline, stored).await.unwrap_or(false) {
             done.stored += 1;
         } else {
-            unstored.push((task, record));
+            unstored.push((key, record));
         }
     }
     // Which refusals mean the leader wrote past the copy, looked up together
     // and no later than the deadline.
-    let superseded = join_all(unstored.iter().map(|(task, record)| async move {
-        timeout_at(deadline, is_superseded(net, task, record)).await.unwrap_or(false)
+    let superseded = join_all(unstored.iter().map(|(key, record)| async move {
+        timeout_at(deadline, is_superseded(net, key, record)).await.unwrap_or(false)
     }))
     .await;
     let mut refused = Vec::new();
-    for ((task, _), superseded) in unstored.into_iter().zip(superseded) {
+    for ((key, _), superseded) in unstored.into_iter().zip(superseded) {
         if superseded {
             done.superseded += 1;
         } else {
-            refused.push(task);
+            refused.push(key);
         }
     }
     refused
 }
 
-/// Whether a newer revision of `task`'s record than `record` is held
+/// Whether a newer revision of the record `key` names than `record` is held
 /// anywhere the lookup reaches.
-async fn is_superseded(net: &Net, task: &TaskId, record: &TaskRecord) -> bool {
-    let Ok((_, ours)) = identify(record) else {
+async fn is_superseded(net: &Net, key: &RecordKey, record: &ShardRecord) -> bool {
+    let Ok((_, ours)) = record.identify() else {
         return false;
     };
-    let Some(found) = net.get_record(task.clone()).await else {
+    let RecordLookup::Found(found) = net.find_shard_record(key.clone()).await else {
         return false;
     };
-    identify(&found).is_ok_and(|(_, theirs)| ours.order(&theirs) == VersionOrder::Newer)
+    found.identify().is_ok_and(|(_, theirs)| ours.order(&theirs) == VersionOrder::Newer)
 }

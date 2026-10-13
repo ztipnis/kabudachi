@@ -86,10 +86,11 @@ async fn result_body(
         .take_anyway(payload.len() as u64)
         .ok();
     let bound = tokio::time::Instant::now() + held.reconnect_timeout;
+    let owner = BlobOwner::Task(held.task.clone());
     loop {
         let store = shared
             .net
-            .store_payload_at_leader(BlobRole::Result, &held.task, &payload, shared.retry);
+            .store_payload_at_leader(BlobRole::Result, &owner, &payload, shared.retry);
         match tokio::time::timeout_at(bound, store).await {
             Ok(Ok(manifest)) => return Some(deliver_result::Body::Manifest(manifest.into())),
             Ok(Err(NotStored::Refused)) => tokio::time::sleep(shared.retry.ask_again_after).await,

@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::protocol::ids::TaskId;
 use kabudachi_core::protocol::messages::{TaskRejectReason, task_response};
 use kabudachi_core::scheduler::Submitted;
@@ -82,7 +83,7 @@ pub(super) async fn deliver(
             at,
             shared
                 .net
-                .store_payload_at_leader(BlobRole::Input, &task, &payload, shared.retry),
+                .store_payload_at_leader(BlobRole::Input, &BlobOwner::Task(task.clone()), &payload, shared.retry),
         )
         .await
         .unwrap_or(Err(NotStored::Refused));

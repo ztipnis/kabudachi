@@ -16,13 +16,13 @@ use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, Uuid7Ids,
 use kabudachi_core::protocol::messages::{TaskRejectReason, claim_response, task_response};
 use kabudachi_core::queues::Subscription;
 use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint};
-use kabudachi_core::task_record::{Placement, RecordVersion};
+use kabudachi_core::task_record::{Placement, RecordKey, RecordVersion};
 use kabudachi_core::time::RealClock;
 use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::messenger::{Net, PutBlobError};
 use kabudachi_net::task_exchange::{LeaderRetry, NotStored, placement_of, placement_with_asker_of};
 use kabudachi_net::task_store::placement::{ReplicationFactor, placement};
-use kabudachi_net::task_store::{TaskRecordStore, record_key};
+use kabudachi_net::task_store::TaskRecordStore;
 use libp2p::PeerId;
 use libp2p::kad::Record;
 use libp2p::kad::store::RecordStore as _;
@@ -129,7 +129,7 @@ async fn a_blob_is_stored_by_a_quorum_of_its_placement_and_fetched_from_its_owne
             connect_to(&outsider, &outsider_address, holder).await;
         }
         let mut handed = Record::new(
-            record_key(&TaskId::new("task-1")),
+            libp2p::kad::RecordKey::new(&RecordKey::Task(TaskId::new("task-1")).kad_bytes()),
             record_on("task-1", &holders).encode_to_vec(),
         );
         handed.publisher = PeerId::from_str(first.local_worker_id().as_str()).ok();
@@ -261,12 +261,12 @@ async fn submitted_as_blobs(
 ) -> Manifest {
     let task = minted.task_id.clone();
     let placed = client
-        .place_records(leader.clone(), vec![task.clone()])
+        .place_records(leader.clone(), vec![RecordKey::Task(task.clone())])
         .await
         .expect("answered");
-    let placement = placement_with_asker_of(&placed, &task).expect("the leader places the task");
+    let placement = placement_with_asker_of(&placed, &RecordKey::Task(task.clone())).expect("the leader places the task");
     let manifest = client
-        .store_payload(BlobRole::Input, &task, input, placement)
+        .store_payload(BlobRole::Input, &BlobOwner::Task(task.clone()), input, placement)
         .await
         .expect("stored");
     submitted_with(
@@ -334,7 +334,7 @@ async fn new_input_stored(submitter: &Net) -> Result<Manifest, NotStored> {
     // for one more owner at no cost, however full it is.
     let unheld: Vec<u8> = (0..MIB).map(|at| (at % 241) as u8).collect();
     submitter
-        .store_payload_at_leader(BlobRole::Input, &crowded, &unheld, quick)
+        .store_payload_at_leader(BlobRole::Input, &BlobOwner::Task(crowded.clone()), &unheld, quick)
         .await
 }
 
@@ -516,7 +516,7 @@ async fn a_tasks_input_leaves_every_holder_when_it_finishes_and_follows_its_reco
                 };
                 let result = varied(200_000);
                 let stored = nets[claimant]
-                    .store_payload_at_leader(BlobRole::Result, &finished, &result, quick)
+                    .store_payload_at_leader(BlobRole::Result, &BlobOwner::Task(finished.clone()), &result, quick)
                     .await
                     .expect("a result is stored where a new input is refused");
                 let result_keys: Vec<BlobKey> = stored.blob_keys().cloned().collect();
@@ -603,7 +603,7 @@ async fn a_tasks_input_leaves_every_holder_when_it_finishes_and_follows_its_reco
 fn task_placed_with(voters: &[WorkerId], member: &WorkerId, member_holds: bool) -> TaskId {
     loop {
         let task = mint(plain_with(b""), &Uuid7Ids, &RealClock::new()).task_id;
-        let real = placement(&task, voters, two_holders()).expect("voters place a task");
+        let real = placement(&RecordKey::Task(task.clone()), voters, two_holders()).expect("voters place a task");
         if real.holders.contains(member) == member_holds {
             return task;
         }
@@ -620,23 +620,23 @@ async fn a_writer_among_the_nearest_voters_is_told_the_real_placement_and_keeps_
         let voters: Vec<WorkerId> = (0..nets.len()).map(|voter| shard.id(voter)).collect();
         let writer = shard_other_than(&[leader], nets.len());
         let task = task_placed_with(&voters, &voters[writer], true);
-        let real = placement(&task, &voters, two_holders()).expect("placed");
+        let real = placement(&RecordKey::Task(task.clone()), &voters, two_holders()).expect("placed");
 
         shard
             .drive_until(async {
                 let answer = nets[writer]
-                    .place_records(leader_id.clone(), vec![task.clone()])
+                    .place_records(leader_id.clone(), vec![RecordKey::Task(task.clone())])
                     .await
                     .expect("answered");
-                let told = placement_with_asker_of(&answer, &task).expect("the leader places the task");
+                let told = placement_with_asker_of(&answer, &RecordKey::Task(task.clone())).expect("the leader places the task");
                 assert_eq!(told.holders, real.holders, "the answer names the real holders");
                 assert_eq!(told.quorum, real.quorum, "and their quorum");
-                let others = placement_of(&answer, &task).expect("placed without the writer");
+                let others = placement_of(&answer, &RecordKey::Task(task.clone())).expect("placed without the writer");
                 assert!(!others.holders.contains(&voters[writer]), "the writer left out of the plain placement");
 
                 let payload = varied(MIB + 1);
                 let manifest = nets[writer]
-                    .store_payload(BlobRole::Input, &task, &payload, told)
+                    .store_payload(BlobRole::Input, &BlobOwner::Task(task.clone()), &payload, told)
                     .await
                     .expect("stored");
                 let keys: Vec<BlobKey> = manifest.blob_keys().cloned().collect();
@@ -676,12 +676,12 @@ async fn a_writer_outside_the_nearest_voters_keeps_no_copy_and_a_lone_voter_plac
         shard
             .drive_until(async {
                 let answer = nets[writer]
-                    .place_records(leader_id.clone(), vec![task.clone()])
+                    .place_records(leader_id.clone(), vec![RecordKey::Task(task.clone())])
                     .await
                     .expect("answered");
-                let told = placement_with_asker_of(&answer, &task).expect("the leader places the task");
+                let told = placement_with_asker_of(&answer, &RecordKey::Task(task.clone())).expect("the leader places the task");
                 let manifest = nets[writer]
-                    .store_payload(BlobRole::Input, &task, &varied(MIB + 1), told)
+                    .store_payload(BlobRole::Input, &BlobOwner::Task(task.clone()), &varied(MIB + 1), told)
                     .await
                     .expect("stored");
                 assert!(
@@ -708,7 +708,7 @@ async fn a_writer_outside_the_nearest_voters_keeps_no_copy_and_a_lone_voter_plac
         let manifest = shard
             .drive_until(timeout(
                 TEST_TIMEOUT,
-                net.store_payload_at_leader(BlobRole::Input, &task, &input, quick),
+                net.store_payload_at_leader(BlobRole::Input, &BlobOwner::Task(task.clone()), &input, quick),
             ))
             .await
             .expect("the store ended within the timeout")

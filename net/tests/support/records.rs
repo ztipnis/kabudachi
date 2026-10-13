@@ -10,9 +10,9 @@ use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::election::{
     ElectionTimings, Entry, Identity, Input, KnownConfiguration, Step, WorkerNode,
 };
-use kabudachi_core::protocol::generated::{ElectionCertificate, TaskRunState};
+use kabudachi_core::protocol::generated::{CompositeRecord, ElectionCertificate, TaskRunState};
 use kabudachi_core::protocol::ids::{
-    IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
+    CompositeId, IncarnationId, ShardId, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::messages::{
     ElectionMessage, WorkerHeartbeat, claim_response, election_message, task_response,
@@ -20,7 +20,7 @@ use kabudachi_core::protocol::messages::{
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::{Scheduler, Submission, Submitted, mint};
-use kabudachi_core::task_record::RecordOutbox;
+use kabudachi_core::task_record::{RecordOutbox, RecordVersion};
 use kabudachi_core::time::{Duration, RealClock, WallTime};
 use kabudachi_net::discovery::Takes;
 use kabudachi_net::driver::{DriverConfig, run_driver};
@@ -772,4 +772,14 @@ pub fn holding(nets: &[Arc<Net>], task: &TaskId, runs: &[TaskRunState]) -> usize
         .filter_map(|net| net.held_records().get(task))
         .filter(|record| record.runs.iter().map(|run| run.state()).eq(runs.iter().copied()))
         .count()
+}
+
+/// The record of the composite `id` as a leader of `term` wrote it at
+/// `revision`, placed on no one yet.
+pub fn composite_record(id: &CompositeId, term: u64, revision: u64) -> CompositeRecord {
+    CompositeRecord {
+        version: Some(RecordVersion { recovery_epoch: RecoveryEpoch::new(0, 0), leader_term: term, revision }.into()),
+        composite_id: Some(id.clone().into()),
+        ..CompositeRecord::default()
+    }
 }

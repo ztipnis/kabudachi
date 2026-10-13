@@ -32,12 +32,13 @@
 //! applied.
 //!
 //! [`Net::store_payload_at_leader`] stores a payload too large for one
-//! message where the leader would place its task's record, asking again as
-//! `submit_to_leader` does.
+//! message where the leader would place its owner's record (a task's or a
+//! composite's), asking again as `submit_to_leader` does.
 
 use std::str::FromStr;
 use std::time::Duration;
 
+use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
@@ -50,6 +51,7 @@ use kabudachi_core::protocol::messages::{
 };
 use kabudachi_core::protocol::ids::IdGenerator;
 use kabudachi_core::scheduler::{Completion, Observer, Scheduler, Submitted};
+use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::Clock;
 use libp2p::PeerId;
 use tokio::sync::oneshot;
@@ -68,12 +70,12 @@ mod wire;
 
 pub(crate) use wire::outcome_answer;
 
-/// The most task ids one placement request carries (see
-/// [`Net::place_records`]): a worker with more asks in pages, so that an
-/// answer, which names every holder, stays far below a message's size limit.
-/// An answer names a task's holders twice when the asker is among the nearest
-/// voters (the plain placement and the real one), so the page is half what
-/// one list of holders would allow.
+/// The most record keys (task ids and composite record keys together) one
+/// placement request carries (see [`Net::place_records`]): a worker with more
+/// asks in pages, so that an answer, which names every holder, stays far below
+/// a message's size limit. An answer names a record's holders twice when the
+/// asker is among the nearest voters (the plain placement and the real one),
+/// so the page is half what one list of holders would allow.
 pub(crate) const MAX_PLACE_IDS: usize = 128;
 
 /// Why a task-exchange call got no answer.
@@ -328,20 +330,25 @@ impl Net {
         self.ask_task(leader, request).await
     }
 
-    /// Asks `leader` where it would place each of `tasks` now, this worker
+    /// Asks `leader` where it would place each of `keys` now, this worker
     /// left out: a draining worker, which knows no voters, asks before it
-    /// hands its copies over. No more than [`MAX_PLACE_IDS`] ids at once;
-    /// the answer names the holders and the quorum of each task the leader
+    /// hands its copies over. No more than [`MAX_PLACE_IDS`] keys at once;
+    /// the answer names the holders and the quorum of each record the leader
     /// could place.
     pub async fn place_records(
         &self,
         leader: WorkerId,
-        tasks: Vec<TaskId>,
+        keys: Vec<RecordKey>,
     ) -> Result<TaskResponse, TaskFailure> {
-        let request = task_request::Request::Place(PlaceRecords {
-            task_ids: tasks.into_iter().map(Into::into).collect(),
-            record_keys: Vec::new(),
-        });
+        let mut task_ids = Vec::new();
+        let mut record_keys = Vec::new();
+        for key in keys {
+            match key {
+                RecordKey::Task(task) => task_ids.push(task.into()),
+                other => record_keys.push(other.kad_bytes()),
+            }
+        }
+        let request = task_request::Request::Place(PlaceRecords { task_ids, record_keys });
         self.ask_task(leader, request).await
     }
 
@@ -528,9 +535,9 @@ impl Net {
         self.ask_until_decided(request, retry).await
     }
 
-    /// Stores `payload` as blobs in `role`, owned by the task `owner`, where
-    /// the shard's leader would place the task's record, and returns their
-    /// manifest. The leader is asked as [`Self::submit_to_leader`] asks it.
+    /// Stores `payload` as blobs in `role`, owned by `owner`, where the shard's
+    /// leader would place the owner's record (a task's or a composite's), and
+    /// returns their manifest. The leader is asked as [`Self::submit_to_leader`] asks it.
     /// The placement is the record's real one (see
     /// [`placement_with_asker_of`]), so this worker keeps a copy of the blobs
     /// only if it is one of the holders, where its own copy counts towards
@@ -543,13 +550,14 @@ impl Net {
     pub async fn store_payload_at_leader(
         &self,
         role: BlobRole,
-        owner: &TaskId,
+        owner: &BlobOwner,
         payload: &[u8],
         retry: LeaderRetry,
     ) -> Result<Manifest, NotStored> {
+        let key = record_key_of(owner);
         let mut failed = 0;
         loop {
-            if let Some(placement) = self.placement_from_leader(owner, retry).await? {
+            if let Some(placement) = self.placement_from_leader(&key, retry).await? {
                 if let Ok(manifest) = self.store_payload(role, owner, payload, placement).await {
                     return Ok(manifest);
                 }
@@ -562,21 +570,21 @@ impl Net {
         }
     }
 
-    /// Where the leader the node names would place `task`'s record, if it
-    /// answered in time.
+    /// Where the leader the node names would place the record `key` names, if
+    /// it answered in time.
     async fn placement_from_leader(
         &self,
-        task: &TaskId,
+        key: &RecordKey,
         retry: LeaderRetry,
     ) -> Result<Option<Placement>, NotStored> {
         let leader = self.routed_leader().await.ok_or(NotStored::LeftShard)?;
         let asked = tokio::time::timeout(
             retry.answer_within,
-            self.place_records(leader, vec![task.clone()]),
+            self.place_records(leader, vec![key.clone()]),
         )
         .await;
         Ok(match asked {
-            Ok(Ok(response)) => placement_with_asker_of(&response, task),
+            Ok(Ok(response)) => placement_with_asker_of(&response, key),
             _ => None,
         })
     }
@@ -637,38 +645,52 @@ impl Net {
     }
 }
 
-/// The answer `response`, a leader's answer to `PlaceRecords`, gives for `task`.
-fn placed_key<'a>(response: &'a TaskResponse, task: &TaskId) -> Option<&'a PlacedKey> {
+/// The record key whose records a blob of `owner` is kept with.
+pub(crate) fn record_key_of(owner: &BlobOwner) -> RecordKey {
+    match owner {
+        BlobOwner::Task(task) => RecordKey::Task(task.clone()),
+        BlobOwner::Composite(id) => RecordKey::Composite(id.clone()),
+    }
+}
+
+/// The record `placed`, an entry of a leader's answer to `PlaceRecords`,
+/// places; `None` for an entry that names none.
+pub(crate) fn placed_record(placed: &PlacedKey) -> Option<RecordKey> {
+    match &placed.task_id {
+        Some(task) => Some(RecordKey::Task(task.clone().into())),
+        None => RecordKey::from_kad_bytes(&placed.record_key).filter(|_| !placed.record_key.is_empty()),
+    }
+}
+
+/// The answer `response`, a leader's answer to `PlaceRecords`, gives for `key`.
+fn placed_key<'a>(response: &'a TaskResponse, key: &RecordKey) -> Option<&'a PlacedKey> {
     let Some(task_response::Result::Placements(answer)) = &response.result else {
         return None;
     };
-    answer
-        .placements
-        .iter()
-        .find(|placed| placed.task_id.as_ref().is_some_and(|id| id.value == task.as_str()))
+    answer.placements.iter().find(|placed| placed_record(placed).as_ref() == Some(key))
 }
 
-/// Where `response`, a leader's answer to `PlaceRecords`, places `task`, the
-/// asker left out.
-pub fn placement_of(response: &TaskResponse, task: &TaskId) -> Option<Placement> {
-    placed_key(response, task).map(|placed| Placement {
+/// Where `response`, a leader's answer to `PlaceRecords`, places the record
+/// `key` names, the asker left out.
+pub fn placement_of(response: &TaskResponse, key: &RecordKey) -> Option<Placement> {
+    placed_key(response, key).map(|placed| Placement {
         holders: placed.holders.iter().cloned().map(WorkerId::from).collect(),
         quorum: usize::try_from(placed.quorum).unwrap_or(usize::MAX),
     })
 }
 
-/// Where `response` places `task`'s record for a writer of its blobs: the real
+/// Where `response` places the record `key` names, for a writer of its blobs: the real
 /// placement, which names the asker itself when it is among the nearest
 /// voters, and otherwise is [`placement_of`]. The asker then stores its own
 /// copy, as one of the holders, and no other writer keeps one.
-pub fn placement_with_asker_of(response: &TaskResponse, task: &TaskId) -> Option<Placement> {
-    let placed = placed_key(response, task)?;
+pub fn placement_with_asker_of(response: &TaskResponse, key: &RecordKey) -> Option<Placement> {
+    let placed = placed_key(response, key)?;
     Some(match &placed.with_asker {
         Some(real) => Placement {
             holders: real.holders.iter().cloned().map(WorkerId::from).collect(),
             quorum: usize::try_from(real.quorum).unwrap_or(usize::MAX),
         },
-        None => placement_of(response, task)?,
+        None => placement_of(response, key)?,
     })
 }
 
@@ -852,33 +874,34 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
     run.clone().map(TaskRunId::from)
 }
 
-/// The leader's answer to `request` from `asker`: where each task it names
-/// would be placed among the voters it can place records on other than the
-/// asker, `factor` of them for each. `voters` are all the voters it can place
+/// The leader's answer to `request` from `asker`: where each record it names
+/// (by task id, or by the key of a composite record or page) would be placed
+/// among the voters it can place records on other than the asker, `factor` of
+/// them for each. `voters` are all the voters it can place
 /// records on, the asker among them if it is one; when the asker would be
 /// among the nearest to a task, the answer also names the placement with it in
 /// (see [`placement_with_asker_of`]); when the asker is the only voter, that
-/// is the whole answer and the plain placement is empty. A task that could not
-/// be placed (no voter, or a voter that is no peer) is left out. Not gated on the writes of
-/// any decision: it decides nothing. A request that names too many tasks, or
-/// one without its id, is malformed.
+/// is the whole answer and the plain placement is empty. A record that could
+/// not be placed (no voter, or a voter that is no peer) is left out. Not gated
+/// on the writes of any decision: it decides nothing. A request that names too
+/// many keys, ids and record keys together, is malformed.
 pub(crate) fn placements(
     request: &PlaceRecords,
     asker: &WorkerId,
     voters: &[WorkerId],
     factor: ReplicationFactor,
 ) -> TaskResponse {
-    if request.task_ids.len() > MAX_PLACE_IDS {
+    if request.task_ids.len() + request.record_keys.len() > MAX_PLACE_IDS {
         return wire::reject(TaskRejectReason::TaskRejectMalformed);
     }
     let others: Vec<WorkerId> = voters.iter().filter(|voter| *voter != asker).cloned().collect();
-    let placed = request
-        .task_ids
-        .iter()
-        .filter_map(|task| {
-            let task = TaskId::from(task.clone());
+    let tasks = request.task_ids.iter().map(|task| RecordKey::Task(task.clone().into()));
+    let composites = request.record_keys.iter().filter_map(|bytes| RecordKey::from_kad_bytes(bytes));
+    let placed = tasks
+        .chain(composites)
+        .filter_map(|key| {
             let with_asker = (others.len() < voters.len())
-                .then(|| placement(&task, voters, factor))
+                .then(|| placement(&key, voters, factor))
                 .flatten()
                 .filter(|real| real.holders.contains(asker))
                 .map(|real| PlacedWithAsker {
@@ -887,17 +910,21 @@ pub(crate) fn placements(
                 });
             // With no voter but the asker the plain placement is empty, and
             // the real one, the asker alone, is the answer.
-            let Placement { holders, quorum } = match placement(&task, &others, factor) {
+            let Placement { holders, quorum } = match placement(&key, &others, factor) {
                 Some(plain) => plain,
                 None if with_asker.is_some() => Placement { holders: Vec::new(), quorum: 0 },
                 None => return None,
             };
+            let (task_id, record_key) = match key {
+                RecordKey::Task(task) => (Some(task.into()), Vec::new()),
+                other => (None, other.kad_bytes()),
+            };
             Some(PlacedKey {
-                task_id: Some(task.into()),
+                task_id,
                 holders: holders.into_iter().map(Into::into).collect(),
                 quorum: u32::try_from(quorum).unwrap_or(u32::MAX),
                 with_asker,
-                record_key: Vec::new(),
+                record_key,
             })
         })
         .collect();

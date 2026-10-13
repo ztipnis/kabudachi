@@ -11,6 +11,7 @@ pub mod bootstrap;
 pub mod claim;
 pub mod claimed_runs;
 pub mod codec;
+pub mod composites;
 pub mod discovery;
 pub mod driver;
 mod exchange;

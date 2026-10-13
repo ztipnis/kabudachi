@@ -200,13 +200,13 @@ use std::time::Duration;
 use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord, MAX_BLOB_BYTES};
 use kabudachi_core::election::Input;
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::TaskRecord;
-use kabudachi_core::protocol::ids::{ShardId, ShardName, TaskId, WorkerId};
+use kabudachi_core::protocol::generated::{CompositePage, CompositeRecord, TaskRecord};
+use kabudachi_core::protocol::ids::{CompositeId, ShardId, ShardName, TaskId, WorkerId};
 use kabudachi_core::protocol::messages::{
     ElectionMessage, QueryOutcome, TaskRequest, task_request, task_response,
 };
 pub use kabudachi_core::task_record::{PlacedWrite, WriteOutcome};
-use kabudachi_core::task_record::{OwnerState, Placement, Write};
+use kabudachi_core::task_record::{OwnerState, Placement, RecordKey, ShardRecord, Write};
 use libp2p::futures::StreamExt as _;
 use libp2p::futures::stream::FuturesUnordered;
 use libp2p::request_response::{self, ResponseChannel};
@@ -311,8 +311,8 @@ enum Command {
     },
     /// See `Net::get_record`.
     GetRecord {
-        task: TaskId,
-        respond_to: oneshot::Sender<RecordLookup>,
+        key: RecordKey,
+        respond_to: oneshot::Sender<RecordLookup<ShardRecord>>,
     },
     /// Runs an ask or an answer of one correlated protocol on the swarm
     /// task, which alone owns the swarm and its [`Exchanges`]; see
@@ -343,12 +343,12 @@ enum Command {
     },
 }
 
-/// What a lookup of a task's record across the shard (see
-/// [`Net::find_record`]) came to.
+/// What a lookup of a record across the shard (see [`Net::find_record`])
+/// came to.
 #[derive(Debug, Clone, PartialEq)]
-pub enum RecordLookup {
+pub enum RecordLookup<R = TaskRecord> {
     /// The newest revision any holder returned.
-    Found(TaskRecord),
+    Found(R),
     /// Every peer this worker knows answered, and none holds the record: it
     /// is held nowhere in the shard.
     NotFound,
@@ -379,7 +379,7 @@ pub enum PutBlobError {
 #[derive(Debug, Clone)]
 pub(crate) struct HandOffWrite {
     /// The record exactly as the worker holds it.
-    pub record: TaskRecord,
+    pub record: ShardRecord,
     /// The voters to send it to, this worker not among them.
     pub holders: Vec<WorkerId>,
     /// How many of them must store it for the hand-off to count.
@@ -1263,11 +1263,41 @@ impl Net {
         }
     }
 
+    /// The newest revision of the record of the composite `id` that this
+    /// worker or any shard peer holds, read as [`Self::get_record`] reads a
+    /// Task record.
+    pub async fn composite_record(&self, id: &CompositeId) -> Option<CompositeRecord> {
+        match self.find_shard_record(RecordKey::Composite(id.clone())).await {
+            RecordLookup::Found(ShardRecord::Composite(record)) => Some(record),
+            _ => None,
+        }
+    }
+
+    /// The newest revision of page `page` of the composite `id` that this
+    /// worker or any shard peer holds, read as [`Self::get_record`] reads a
+    /// Task record.
+    pub async fn composite_page(&self, id: &CompositeId, page: u32) -> Option<CompositePage> {
+        match self.find_shard_record(RecordKey::Page(id.clone(), page)).await {
+            RecordLookup::Found(ShardRecord::Page(record)) => Some(record),
+            _ => None,
+        }
+    }
+
+    /// Like [`Self::find_record`], for the record of any kind `key` names.
+    pub(crate) async fn find_shard_record(&self, key: RecordKey) -> RecordLookup<ShardRecord> {
+        look_up_through(&self.commands, key).await
+    }
+
     /// Like [`Self::get_record`], but says whether a miss is because the
     /// record is held nowhere ([`RecordLookup::NotFound`]) or because the
     /// lookup could not tell ([`RecordLookup::Unanswered`]).
     pub async fn find_record(&self, task: TaskId) -> RecordLookup {
-        get_record_through(&self.commands, task).await
+        match self.find_shard_record(RecordKey::Task(task)).await {
+            RecordLookup::Found(ShardRecord::Task(record)) => RecordLookup::Found(record),
+            RecordLookup::NotFound => RecordLookup::NotFound,
+            // A lookup answers only records of the kind its key names.
+            RecordLookup::Found(_) | RecordLookup::Unanswered => RecordLookup::Unanswered,
+        }
     }
 
     /// Stores `bytes` as a blob owned by `owner`, at `placement.quorum` of
@@ -1337,8 +1367,10 @@ impl Net {
                 Some(record) => record.placement,
                 None => self.get_record(task.clone()).await.map(|record| record.placement).unwrap_or_default(),
             },
-            // A composite's record holders are found once composite records exist.
-            BlobOwner::Composite(_) => Vec::new(),
+            BlobOwner::Composite(id) => match self.held.get_record(&RecordKey::Composite(id.clone())) {
+                Some(record) => record.placement().to_vec(),
+                None => self.composite_record(id).await.map(|record| record.placement).unwrap_or_default(),
+            },
         };
         let me = self.local_worker_id();
         let mut asks: FuturesUnordered<_> = holders
@@ -1541,14 +1573,14 @@ impl LeaderLine {
     }
 }
 
-/// Looks `task`'s record up across the shard through the swarm task (see
-/// [`Net::get_record`]).
-async fn get_record_through(
+/// Looks the record `key` names up across the shard through the swarm task
+/// (see [`Net::get_record`]).
+async fn look_up_through(
     commands: &mpsc::UnboundedSender<Command>,
-    task: TaskId,
-) -> RecordLookup {
+    key: RecordKey,
+) -> RecordLookup<ShardRecord> {
     let (respond_to, answer) = oneshot::channel();
-    if commands.send(Command::GetRecord { task, respond_to }).is_err() {
+    if commands.send(Command::GetRecord { key, respond_to }).is_err() {
         return RecordLookup::Unanswered;
     }
     answer.await.unwrap_or(RecordLookup::Unanswered)
@@ -1566,8 +1598,10 @@ async fn get_record_through(
 ///   asked how its task stands, and the store told whether it is unfinished,
 ///   finished or gone. Only the leader's word that it holds no such task finds
 ///   it gone, whatever the size of the shard; no leader named, none answering,
-///   or one that cannot say yet is reported unfinished, like a composite
-///   owner, whose record cannot be looked up yet.
+///   or one that cannot say yet is reported unfinished.
+/// - A composite owner never seen here whose grace has passed: its record is
+///   looked up across the shard, and it is gone only if every peer this
+///   worker knows answered and none holds it.
 async fn tend_blobs(commands: mpsc::UnboundedSender<Command>, held: HeldRecords, leader: LeaderLine) {
     let mut moving: BTreeMap<BlobOwner, Vec<WorkerId>> = BTreeMap::new();
     let mut ticks = tokio::time::interval(BLOB_TENDING_INTERVAL);
@@ -1597,10 +1631,22 @@ async fn tend_blobs(commands: mpsc::UnboundedSender<Command>, held: HeldRecords,
         for owner in held.owners_to_check() {
             let state = match &owner {
                 BlobOwner::Task(task) => leader.owner_state(task).await,
-                BlobOwner::Composite(_) => OwnerState::Unfinished,
+                BlobOwner::Composite(id) => composite_owner_state(&commands, id).await,
             };
             held.owner_checked(&owner, state);
         }
+    }
+}
+
+/// How the composite `id` stands by a look-up of its record across the shard:
+/// gone only if every peer this worker knows answered and none holds it, so a
+/// look-up that could not say leaves it unfinished, to be asked about again a
+/// grace later.
+async fn composite_owner_state(commands: &mpsc::UnboundedSender<Command>, id: &CompositeId) -> OwnerState {
+    match look_up_through(commands, RecordKey::Composite(id.clone())).await {
+        RecordLookup::Found(record) if record.is_finished() => OwnerState::Finished,
+        RecordLookup::Found(_) | RecordLookup::Unanswered => OwnerState::Unfinished,
+        RecordLookup::NotFound => OwnerState::Gone,
     }
 }
 

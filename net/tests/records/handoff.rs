@@ -7,15 +7,15 @@ use std::sync::Arc;
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
-use kabudachi_core::task_record::RecordVersion;
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::task_record::{RecordKey, RecordVersion};
 use kabudachi_net::messenger::{Net, PlacedWrite};
 use kabudachi_core::task_record::PriorPlacement;
 use kabudachi_net::task_store::placement::ReplicationFactor;
 
 use crate::support::deadline::within_deadline;
 use crate::support::election::wait_until;
-use crate::support::records::{ThreeVoters, Voters, plain_with, submitted_through, wait_until_held};
+use crate::support::records::{ThreeVoters, Voters, composite_record, plain_with, submitted_through, wait_until_held};
 
 fn two_holders() -> ReplicationFactor {
     ReplicationFactor::new(NonZeroUsize::new(2).expect("two"))
@@ -60,12 +60,21 @@ async fn a_drained_voter_hands_its_records_over_before_its_driver_returns_and_th
                     }
                 }
 
+                // A composite record the drainer holds, written by the
+                // leader to it and the leader itself.
+                let composite = CompositeId::new("composite-1");
+                let composite_key = RecordKey::Composite(composite.clone());
+                let mut record = composite_record(&composite, 1, 0);
+                record.placement = vec![drainer_id.clone().into(), leader_id.clone().into()];
+                nets[submitter].write_records(vec![PlacedWrite::new(record.into(), 2)]);
+                wait_until(|| nets[drainer].held_records().get_record(&composite_key).is_some()).await;
+
                 nets[drainer].request_drain();
                 let handed = handed_off.returned(drainer).await;
 
                 // The leader may have written a record anew already, past the
                 // drainer's copy: then that copy needs no handing over.
-                assert_eq!(handed.stored + handed.superseded, tasks.len(), "{handed:?}");
+                assert_eq!(handed.stored + handed.superseded, tasks.len() + 1, "{handed:?}");
                 assert!(handed.abandoned.is_empty(), "{handed:?}");
                 for task in &tasks {
                     assert!(
@@ -73,6 +82,14 @@ async fn a_drained_voter_hands_its_records_over_before_its_driver_returns_and_th
                         "{task:?} is held by two voters besides the drainer once its driver has returned"
                     );
                 }
+                let composite_holders = (0..nets.len())
+                    .filter(|voter| *voter != drainer)
+                    .filter(|voter| nets[*voter].held_records().get_record(&composite_key).is_some())
+                    .count();
+                assert!(
+                    composite_holders >= 2,
+                    "the composite record is held by two voters besides the drainer once its driver has returned"
+                );
 
                 // The leader hears the drainer leave: it publishes each record
                 // again, placed on voters that remain.

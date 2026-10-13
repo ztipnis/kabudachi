@@ -1,5 +1,5 @@
-//! Where a shard keeps its Task records, and how its workers store them for
-//! one another.
+//! Where a shard keeps its records (Tasks', composites' and composite pages'),
+//! and how its workers store them for one another.
 //!
 //! Every worker of a shard runs a second `kad` behaviour (the swarm's
 //! `records`), apart from the one that routes, on a protocol only the shard's
@@ -153,6 +153,14 @@ impl HeldRecords {
             .collect()
     }
 
+    /// The key of every record this worker holds, of every kind.
+    pub fn record_keys(&self) -> Vec<RecordKey> {
+        self.lock()
+            .records()
+            .filter_map(|record| record.identify().ok().map(|(key, _)| key))
+            .collect()
+    }
+
     /// Each task whose record, as this worker holds it, looks claimable at
     /// `now` (see `looks_claimable`) and is of one of `queues`, with when it
     /// was submitted and its queue, in task id order. A compaction run counts
@@ -229,11 +237,6 @@ impl HeldRecords {
     }
 }
 
-/// The kad key a task's record is stored under: its task id's bytes.
-pub fn record_key(task: &TaskId) -> kad::RecordKey {
-    kad::RecordKey::new(&task.as_str().as_bytes())
-}
-
 /// kad's view of [`HeldRecords`]: a put decodes the record and is refused
 /// (an `Err`, so kad resets the stream instead of acknowledging it) unless
 /// it is newer than what is held or an identical republish. A record that
@@ -279,25 +282,30 @@ impl TaskRecordStore {
         }
     }
 
-    fn encoded(record: &TaskRecord) -> Option<kad::Record> {
-        let (task, _) = identify(record).ok()?;
-        Some(kad::Record::new(record_key(&task), record.encode_to_vec()))
+    fn encoded(record: &ShardRecord) -> Option<kad::Record> {
+        let (key, _) = record.identify().ok()?;
+        Some(kad::Record::new(kad::RecordKey::new(&key.kad_bytes()), record.encode_to_vec()))
     }
 }
 
-/// The task record `record` holds, with its task, if it is a well-formed
-/// record stored under its own task's key; refused otherwise (see the
-/// store's doc on refusals).
-fn task_record_under_its_key(record: &kad::Record) -> kad::store::Result<(TaskId, TaskRecord)> {
-    let decoded = TaskRecord::decode(&record.value[..]).map_err(|error| {
-        tracing::debug!(%error, "refusing a value that is not a task record");
-        kad::store::Error::ValueTooLarge
+/// The record `record` holds, with its key, if it is a well-formed record of
+/// the kind its key names and stored under the key it names itself; refused
+/// otherwise (see the store's doc on refusals).
+fn shard_record_under_its_key(record: &kad::Record) -> kad::store::Result<(RecordKey, ShardRecord)> {
+    let refused = || kad::store::Error::ValueTooLarge;
+    let key = RecordKey::from_kad_bytes(record.key.as_ref()).ok_or_else(|| {
+        tracing::debug!("refusing a record stored under a key no record has");
+        refused()
     })?;
-    match identify(&decoded) {
-        Ok((task, _)) if record_key(&task) == record.key => Ok((task, decoded)),
+    let decoded = ShardRecord::decode(&key, &record.value[..]).map_err(|error| {
+        tracing::debug!(%error, "refusing a value that does not decode as the record its key names");
+        refused()
+    })?;
+    match decoded.identify() {
+        Ok((named, _)) if named == key => Ok((key, decoded)),
         _ => {
             tracing::debug!("refusing a record that is malformed or stored under another key");
-            Err(kad::store::Error::ValueTooLarge)
+            Err(refused())
         }
     }
 }
@@ -324,8 +332,7 @@ impl kad::store::RecordStore for TaskRecordStore {
                 generated::BlobRecord::from(held).encode_to_vec(),
             )));
         }
-        let task = TaskId::new(std::str::from_utf8(key.as_ref()).ok()?);
-        let held = self.held.get(&task)?;
+        let held = self.held.get_record(&RecordKey::from_kad_bytes(key.as_ref())?)?;
         Self::encoded(&held).map(Cow::Owned)
     }
 
@@ -337,7 +344,7 @@ impl kad::store::RecordStore for TaskRecordStore {
         if let Some(blob) = BlobKey::from_record_key(record.key.as_ref()) {
             return self.put_blob(&blob, &record.value);
         }
-        let (task, decoded) = task_record_under_its_key(&record)?;
+        let (key, decoded) = shard_record_under_its_key(&record)?;
         match self
             .held
             .lock()
@@ -345,7 +352,7 @@ impl kad::store::RecordStore for TaskRecordStore {
         {
             Ok(_) => Ok(()),
             Err(refusal) => {
-                tracing::debug!(task = task.as_str(), %refusal, "refusing a record");
+                tracing::debug!(?key, %refusal, "refusing a record");
                 Err(kad::store::Error::MaxRecords)
             }
         }
@@ -361,7 +368,7 @@ impl kad::store::RecordStore for TaskRecordStore {
         let records: Vec<Cow<'_, kad::Record>> = self
             .held
             .lock()
-            .iter()
+            .records()
             .filter_map(Self::encoded)
             .map(Cow::Owned)
             .collect();

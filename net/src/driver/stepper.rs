@@ -141,11 +141,7 @@ pub(super) struct NetRecords<'a> {
 
 impl RecordPorts for NetRecords<'_> {
     fn place(&self, key: &RecordKey, voters: &[WorkerId]) -> Option<Placement> {
-        match key {
-            RecordKey::Task(task) => placement(task, voters, self.factor),
-            // Nothing publishes a composite record or page yet.
-            RecordKey::Composite(_) | RecordKey::Page(..) => None,
-        }
+        placement(key, voters, self.factor)
     }
 
     fn write(&mut self, writes: Vec<PlacedWrite>) {

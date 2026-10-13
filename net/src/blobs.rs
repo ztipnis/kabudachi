@@ -1,12 +1,11 @@
 //! Payloads too large for one message, over the shard's blobs: stored as a
-//! manifest of chunks owned by a task, and put back together, checked, by
+//! manifest of chunks owned by a task or a composite, and put back together, checked, by
 //! whoever needs them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use kabudachi_core::blob::{BlobKey, BlobOwner};
 use kabudachi_core::manifest::{Chunked, Manifest, Unresolved};
-use kabudachi_core::protocol::ids::TaskId;
 use kabudachi_core::task_record::Placement;
 use libp2p::futures::{StreamExt, stream};
 
@@ -25,7 +24,7 @@ pub enum BlobRole {
 }
 
 impl Net {
-    /// Cuts `payload` into blobs owned by the task `owner`, stores each in
+    /// Cuts `payload` into blobs owned by `owner`, stores each in
     /// `role` at a quorum of `placement` (see [`Net::put_blob`]), and returns
     /// the manifest naming them. Fails if any blob was not stored.
     ///
@@ -35,14 +34,14 @@ impl Net {
     pub async fn store_payload(
         &self,
         role: BlobRole,
-        owner: &TaskId,
+        owner: &BlobOwner,
         payload: &[u8],
         placement: Placement,
     ) -> Result<Manifest, PutBlobError> {
         let Chunked { manifest, chunks } = Manifest::chunk(payload);
         let mut puts =
             stream::iter(chunks.into_iter().map(|chunk| {
-                self.put_blob_in(role, BlobOwner::Task(owner.clone()), chunk, placement.clone())
+                self.put_blob_in(role, owner.clone(), chunk, placement.clone())
             }))
             .buffer_unordered(BLOBS_IN_FLIGHT);
         while let Some(put) = puts.next().await {
