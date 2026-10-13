@@ -38,8 +38,11 @@ rust_shared_library(
         "//net",
         "//redis_authority",
         "@crates//:axum",
+        "@crates//:log",
         "@crates//:pyo3",
+        "@crates//:pyo3-log",
         "@crates//:tokio",
+        "@crates//:tracing",
     ],
 )
 
