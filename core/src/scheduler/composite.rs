@@ -27,8 +27,8 @@ mod resolve;
 
 pub(in crate::scheduler) use held::Composites;
 pub use reduce::{
-    ITEM_PAGES, Operand, PlannedStep, REDUCE_EMPTY_KIND, REDUCER_CONTINUED_KIND, ReduceItem, ReduceNode, ReducePlan,
-    ReduceRoot, ReduceShape,
+    ITEM_PAGES, Operand, PlannedStep, REDUCE_EMPTY_KIND, REDUCE_ITEMS_LOST_KIND, REDUCER_CONTINUED_KIND, ReduceItem,
+    ReduceNode, ReducePlan, ReduceRoot, ReduceShape,
 };
 pub use resolve::{
     CompositeSource, MemberInput, ReduceOperand, Resolved, Unresolved, expansion_source, member_input,

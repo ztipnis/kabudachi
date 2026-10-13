@@ -273,6 +273,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             members,
             sealed,
             items_taken,
+            items_floor: if batches { record.reduce_items } else { 0 },
             partial_items,
             filled_item_pages: BTreeMap::new(),
             published_item_pages: BTreeMap::new(),

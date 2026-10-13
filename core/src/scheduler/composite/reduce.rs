@@ -135,6 +135,11 @@ pub const REDUCE_EMPTY_KIND: &str = "ReduceEmptyError";
 /// still running has no value to fold.
 pub const REDUCER_CONTINUED_KIND: &str = "ReducerContinuedError";
 
+/// The failure kind of a reduce whose stored items fell short of the count
+/// its record names when its items ended: folding the fewer would give a
+/// wrong result.
+pub const REDUCE_ITEMS_LOST_KIND: &str = "ReduceItemsLostError";
+
 /// One operand of a reduce step, in the order the step takes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
@@ -515,6 +520,14 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// that plan's steps.
     pub(super) fn seal_reduce(&mut self, id: &CompositeId) {
         let composite = self.composites.held.get_mut(id).expect("a held reduce");
+        if composite.items_taken < composite.items_floor {
+            let message = format!(
+                "the reduce held {} of the {} items its record counted",
+                composite.items_taken, composite.items_floor
+            );
+            self.finish_composite(id, CompositeState::Failed, Some(Failure::new(REDUCE_ITEMS_LOST_KIND, message)));
+            return;
+        }
         composite.sealed = true;
         composite.members = composite.reduce_plan().expect("a sealed reduce has a plan").steps();
         composite.outcomes.grow_to(composite.members);

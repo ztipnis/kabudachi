@@ -48,6 +48,10 @@ pub(in crate::scheduler) struct Composite {
     pub(super) sealed: bool,
     /// A reduce's items taken from its batches so far.
     pub(super) items_taken: u64,
+    /// How many items the stored record of a reduce fed in batches counted
+    /// when this leader installed it, which its item pages may no longer
+    /// hold: the reduce is never sealed with fewer.
+    pub(super) items_floor: u64,
     /// The items of a reduce's last item page while that page is partly
     /// filled: all the leader keeps of the items it took.
     pub(super) partial_items: Vec<ReduceItem>,

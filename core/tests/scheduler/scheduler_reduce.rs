@@ -12,7 +12,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
     CompositeKind, CompositeState, EXPANSION_DEFINITION, ITEM_PAGES, ItemInput, MemberBatch, OnError, PAGE_ENTRIES,
-    REDUCE_EMPTY_KIND, REDUCER_CONTINUED_KIND, ReduceNode, Stage, Step, StreamedMember,
+    REDUCE_EMPTY_KIND, REDUCE_ITEMS_LOST_KIND, REDUCER_CONTINUED_KIND, ReduceNode, Stage, Step, StreamedMember,
 };
 use kabudachi_core::scheduler::{Claim, ClaimRejection, Completion, Event, SubmitRejection};
 use kabudachi_core::task_record::{RecordKey, RecordVersion, ShardRecord};
@@ -495,6 +495,24 @@ fn a_new_leader_counts_a_reduces_items_only_up_to_a_gap_in_its_item_pages_and_do
     assert_eq!(items_on_page(&new, &reduce, 0).len() as u64, PAGE_ENTRIES);
     run_member(&mut new, &reduce, 0, b"folded");
     assert_eq!(finished(&mut new)[0].state, CompositeState::Succeeded);
+}
+
+#[test]
+fn a_reduce_whose_stored_items_fall_short_of_its_record_fails_when_its_expansion_ends_instead_of_folding_fewer() {
+    let mut old = Fixture::leading();
+    let (flow, reduce, expansion) = expanding(&mut old);
+    let mark = old.spy.mark();
+    old.scheduler.submit_members(items_batch(&reduce, 0, &[b"a", b"b", b"c"], false)).unwrap();
+    old.scheduler
+        .complete(&worker(), &expansion.task_run_id, Digest::blake3(b""), Completion::Final)
+        .unwrap();
+    // The record counting three items and the expansion's end were stored; the item page was not.
+    let mut new = took_over(&old, rebuild_losing(&old, mark, |key| matches!(key, RecordKey::Page(..))));
+    let ended = finished(&mut new);
+    let end = ended.iter().find(|end| end.composite_id == flow).unwrap();
+    assert_eq!(end.state, CompositeState::Failed);
+    assert_eq!(end.failure.as_ref().unwrap().kind, REDUCE_ITEMS_LOST_KIND, "not a reduce of the items that survived");
+    assert_eq!(new.scheduler.composite_status(&reduce).unwrap().state, CompositeState::Failed);
 }
 
 #[test]
