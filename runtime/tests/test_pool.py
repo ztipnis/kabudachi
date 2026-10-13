@@ -5,6 +5,7 @@ processes, which import their tasks from `pool_tasks`."""
 
 import asyncio
 import functools
+import json
 import multiprocessing
 import os
 import struct
@@ -597,3 +598,21 @@ def test_a_body_raising_system_exit_or_keyboard_interrupt_fails_its_run_and_cost
     ], outcomes
     assert neighbour != os.getpid(), "the neighbour finished where it started"
     assert after not in (neighbour, os.getpid()), "the process was condemned and replaced"
+
+
+def test_a_body_in_a_task_process_sees_its_run_in_context_variables_async_or_sync():
+    kabudachi.configure(processes=1, concurrency=2)
+
+    async def main():
+        assert kabudachi.current_context() is None, "the caller is not in a run"
+        handles = [pool_tasks.context_async(Greeting()), pool_tasks.context_sync(Greeting())]
+        results = await asyncio.gather(*handles)
+        return [(handle.task_id, json.loads(result.text)) for handle, result in zip(handles, results)]
+
+    for (task_id, seen), name in zip(kabudachi.run(main), ("pool.context_async", "pool.context_sync")):
+        assert seen["task_id"] == task_id
+        assert seen["task_name"] == name
+        assert seen["attempt"] == 1
+        assert seen["shard"] == "local"
+        assert seen["run_id"] and seen["worker_id"]
+        assert (seen["trace_id"], seen["span_id"]) == ("", "")

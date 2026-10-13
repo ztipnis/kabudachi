@@ -19,6 +19,7 @@ from kabudachi.errors import (
 from kabudachi.flow import BoundTask, Flow, Group, flow, group
 from kabudachi.handle import TaskHandle
 from kabudachi.lifecycle import RunContext, after_run, before_run, process_init
+from kabudachi.run_info import RunInfo, current_context
 from kabudachi.runner import run
 from kabudachi.serializers import register_serializer
 from kabudachi.status import CompositeStatus, Durability, TaskStatus
@@ -33,6 +34,7 @@ __all__ = [
     "coalescing_task",
     "CompositeStatus",
     "configure",
+    "current_context",
     "BoundTask",
     "Durability",
     "DurabilityUnavailableError",
@@ -50,6 +52,7 @@ __all__ = [
     "ResultUnavailableError",
     "run",
     "RunContext",
+    "RunInfo",
     "task",
     "TaskHandle",
     "TaskOrphanedError",

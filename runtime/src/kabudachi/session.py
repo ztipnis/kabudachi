@@ -117,6 +117,8 @@ class Session:
         executor: Executor | None = None,
     ) -> None:
         self._runtime = runtime
+        # This worker's shard name and id, read on the first run handed over.
+        self._identity: tuple[str, str] | None = None
         self._registry = registry
         self._serializers = serializers
         self._configuration = configuration
@@ -551,15 +553,19 @@ class Session:
             if definition is None:
                 raise UnknownTaskError(f"this process has no task named {claim.definition_id!r}")
             self._runtime.report_started(claim.task_run_id)
+            shard, worker_id = self._shard_and_worker()
             body = self._executor.run(
                 RunJob(
                     run_id=claim.task_run_id,
+                    task_id=claim.task_id,
                     definition_id=claim.definition_id,
                     source_version=claim.source_version,
                     serialized_input=claim.serialized_input,
                     chain=tuple(claim.chain),
                     queue=claim.queue,
                     attempt=claim.attempt_number,
+                    shard=shard,
+                    worker_id=worker_id,
                     cancel_grace=self._cancel_grace(definition),
                     # A retry does not run beside the abandoned body it replaces.
                     after=after,
@@ -569,6 +575,11 @@ class Session:
             return error
         run.body_started(body)
         return definition, body, after
+
+    def _shard_and_worker(self) -> tuple[str, str]:
+        if self._identity is None:
+            self._identity = (self._runtime.shard_name(), self._runtime.worker_id())
+        return self._identity
 
     def _track(self, coroutine: Any) -> None:
         task = asyncio.get_running_loop().create_task(coroutine)

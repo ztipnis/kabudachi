@@ -16,6 +16,7 @@ import pytest
 
 import kabudachi
 from kabudachi import config as config_module
+from kabudachi import logging as kabudachi_logging
 from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
@@ -901,3 +902,45 @@ def test_off_the_main_thread_what_is_not_an_exception_fails_only_what_raised_it(
         "CancelledError: no resources",
     ], failed
     assert (type(outcome), getattr(outcome, "kind", None)) == (TaskBodyError, "KeyboardInterrupt")
+
+
+def test_a_context_filter_puts_the_running_task_on_each_record_its_body_logs():
+    records = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = Keep()
+    handler.addFilter(kabudachi_logging.ContextFilter())
+    logger = logging.getLogger("tests.context")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    @declare
+    async def logs_async(request: Greeting) -> Greeting:
+        logger.info("in an async body")
+        return request
+
+    @declare
+    def logs_sync(request: Greeting) -> Greeting:
+        logger.info("in a sync body")
+        return request
+
+    async def main():
+        logger.info("outside any body")
+        first, second = logs_async(Greeting()), logs_sync(Greeting())
+        await asyncio.gather(first, second)
+        return first.task_id, second.task_id
+
+    try:
+        first, second = kabudachi.run(main)
+    finally:
+        logger.removeHandler(handler)
+
+    by_message = {record.getMessage(): record for record in records}
+    assert by_message["outside any body"].task_id == ""
+    assert by_message["in an async body"].task_id == first
+    assert by_message["in a sync body"].task_id == second
+    assert by_message["in a sync body"].task_name == "tests.logs_sync"
+    assert by_message["in a sync body"].attempt == 1
