@@ -69,26 +69,33 @@ fn a_leader_stranded_by_a_stall_in_its_acks_leaves_no_quorum_once_they_flow_agai
     assert_settled(&cluster);
 }
 
+/// Two against two: no side holds a quorum of 3. The leader's lease runs
+/// out, every roll call on either side closes short of a quorum, and no
+/// scheduler on either side may grant anything; healed, one leader leads.
 #[test]
-fn a_shard_whose_every_node_lost_its_quorum_elects_a_leader_once_its_peers_return() {
+fn a_50_50_partition_elects_and_grants_on_neither_side_and_heals_to_one_leader() {
     let (mut cluster, _) = settled_cluster(4);
     let ids: Vec<WorkerId> = cluster.node_ids().into_iter().collect();
 
-    // Two against two: no side holds a quorum of 3. The leader's lease runs
-    // out, and every roll call on either side closes short of a quorum.
     cluster.partition(
         ids[..2].iter().cloned().collect(),
         ids[2..].iter().cloned().collect(),
     );
+    run_out_cut_off_leaders_lease(&mut cluster);
     let mut lost_quorum = BTreeSet::new();
     for _ in 0..40 {
-        cluster.advance(tick_size());
-        cluster.assert_at_most_one_in_leader_state();
         for (id, state) in cluster.states() {
             if state == WorkerState::NoQuorum {
                 lost_quorum.insert(id);
             }
         }
+        assert!(
+            cluster.valid_grant_holders().is_empty(),
+            "no side of an even split may grant: {:?}",
+            cluster.valid_grant_holders()
+        );
+        cluster.advance(tick_size());
+        cluster.assert_at_most_one_in_leader_state();
     }
     assert_eq!(cluster.leader(), None, "{:?}", cluster.states());
     assert_eq!(
@@ -104,6 +111,7 @@ fn a_shard_whose_every_node_lost_its_quorum_elects_a_leader_once_its_peers_retur
     cluster.run_until_quiescent(tick_size(), 60);
 
     assert_settled(&cluster);
+    assert_eq!(cluster.first_grant_overlap(), None);
 }
 
 /// A shard whose replies take longer to come back than the base roll call

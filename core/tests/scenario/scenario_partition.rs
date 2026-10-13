@@ -1,7 +1,8 @@
 //! Scenario tests for partitions and isolation, built on the
 //! `Cluster` harness, including the regression for the split brain the ring
-//! roll call produced when every survivor of a lost leader raced, and races
-//! of four or more roll calls started at the same instant.
+//! roll call produced when every survivor of a lost leader raced, races
+//! of four or more roll calls started at the same instant, a 51/49 split that
+//! keeps its leader, and a leader cut off with a minority.
 
 use crate::support::scenarios::{
     abort_deadline_at, assert_aborts_by, bootstrap_5_and_elect_leader, elect_new_leader_among,
@@ -395,5 +396,118 @@ fn a_worker_reported_lost_and_heard_again_before_a_runs_own_deadline_keeps_that_
         Err(ClaimRejection::AlreadySelected),
         "a worker heard again before its run's own deadline keeps the run"
     );
+    assert_eq!(cluster.first_grant_overlap(), None);
+}
+
+/// Three against two, the leader among the three: it keeps its grant
+/// without a gap on exactly a quorum, the two never lead, and once healed
+/// the same leader leads them in the same term.
+#[test]
+fn a_51_49_partition_keeps_the_majoritys_leader_and_heals_without_deposing_it() {
+    let suspect_timeout = Duration::from_ticks(10);
+    let tick_size = Duration::from_ticks(5);
+    let (mut cluster, leader) = bootstrap_5_and_elect_leader(suspect_timeout, tick_size);
+    let term = cluster.node(&leader).term();
+    let followers: Vec<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != leader)
+        .collect();
+    let majority: BTreeSet<WorkerId> =
+        [leader.clone(), followers[0].clone(), followers[1].clone()].into();
+    let minority: BTreeSet<WorkerId> = followers[2..].iter().cloned().collect();
+
+    cluster.partition(majority, minority.clone());
+    for _ in 0..4 * suspect_timeout.as_ticks() {
+        cluster.advance(Duration::from_ticks(1));
+        assert_eq!(
+            cluster.valid_grant_holders(),
+            BTreeSet::from([leader.clone()]),
+            "the leader of three of five keeps its grant throughout"
+        );
+        for id in &minority {
+            assert_ne!(cluster.states()[id], WorkerState::Leader, "two of five never lead");
+        }
+    }
+
+    cluster.heal();
+    cluster.run_until_quiescent(tick_size, 60);
+
+    assert_eq!(cluster.leader(), Some(leader.clone()));
+    assert_eq!(
+        cluster.node(&leader).term(),
+        term,
+        "the minority's roll calls did not depose it"
+    );
+    for id in &minority {
+        assert_eq!(cluster.states()[id], WorkerState::Active);
+        assert_eq!(
+            cluster.node(id).known_leader().map(|(id, _)| id),
+            Some(leader.clone())
+        );
+    }
+    assert_eq!(cluster.first_grant_overlap(), None);
+}
+
+/// The leader and one follower against three: one follower still hearing
+/// it is no quorum, so its lease runs out; the three elect a new leader, the
+/// follower left with the old one never leads, and once healed both follow
+/// the new leader.
+#[test]
+fn a_leader_cut_off_with_a_minority_loses_its_lease_and_both_follow_the_majoritys_new_leader() {
+    let suspect_timeout = Duration::from_ticks(10);
+    let tick_size = Duration::from_ticks(5);
+    let (mut cluster, old_leader) = bootstrap_5_and_elect_leader(suspect_timeout, tick_size);
+    let followers: Vec<WorkerId> = cluster
+        .node_ids()
+        .into_iter()
+        .filter(|id| *id != old_leader)
+        .collect();
+    let companion = followers[0].clone();
+    let majority: Vec<WorkerId> = followers[1..].to_vec();
+
+    cluster.partition(
+        [old_leader.clone(), companion.clone()].into(),
+        majority.iter().cloned().collect(),
+    );
+    run_out_cut_off_leaders_lease(&mut cluster);
+    assert_eq!(
+        cluster.states()[&old_leader],
+        WorkerState::NoQuorum,
+        "one follower still heard is no quorum of five"
+    );
+    assert!(!cluster.holds_valid_grant(&old_leader));
+
+    suspect_leader_by_hand(&mut cluster, &majority);
+    let new_leader = elect_new_leader_among(&mut cluster, &majority);
+    for _ in 0..3 * suspect_timeout.as_ticks() {
+        cluster.advance(Duration::from_ticks(1));
+        assert!(
+            cluster
+                .valid_grant_holders()
+                .is_subset(&BTreeSet::from([new_leader.clone()])),
+            "only the new leader may grant: {:?}",
+            cluster.valid_grant_holders()
+        );
+        for id in [&old_leader, &companion] {
+            assert_ne!(cluster.states()[id], WorkerState::Leader, "{id:?} leads two of five");
+        }
+    }
+    assert_eq!(
+        cluster.valid_grant_holders(),
+        BTreeSet::from([new_leader.clone()])
+    );
+
+    cluster.heal();
+    cluster.run_until_quiescent(tick_size, 60);
+
+    assert_eq!(cluster.leader(), Some(new_leader.clone()));
+    for id in [&old_leader, &companion] {
+        assert_eq!(cluster.states()[id], WorkerState::Active, "{id:?}");
+        assert_eq!(
+            cluster.node(id).known_leader().map(|(id, _)| id),
+            Some(new_leader.clone())
+        );
+    }
     assert_eq!(cluster.first_grant_overlap(), None);
 }
