@@ -747,12 +747,41 @@ async def _drain_held_runs(
     await _until_done_or_worker_stops(native.wait_until_reported(), events)
 
 
-async def _leave_shard(native: Any) -> None:
+_DRAIN_WAIT_SUSPICIONS = 10
+"""How many heartbeat timeouts the native runtime's drain wait limit is when
+`Settings.drain_wait_limit` is `None`."""
+
+_DRAIN_WAITS = 4
+"""The most waits at the drain wait limit a leaving worker can spend: its
+voters' routing crawls, its successor, handing its records over and flushing
+its last election messages."""
+
+
+def _leave_deadline(settings: Settings) -> float:
+    """The seconds a worker allows its node to finish leaving the shard: all
+    the waits it may spend (see `_DRAIN_WAITS`), plus a heartbeat timeout
+    for what goes on between them."""
+    limit = settings.drain_wait_limit
+    if limit is None:
+        limit = settings.heartbeat_timeout * _DRAIN_WAIT_SUSPICIONS
+    return (limit * _DRAIN_WAITS + settings.heartbeat_timeout).total_seconds()
+
+
+async def _leave_shard(native: Any, deadline: float) -> None:
     """Has a networked worker leave its shard through its node: a leader
     hands its leadership over first, and the Task records the worker holds
     go to the workers that stay. Records no other worker took leave with
-    the process, and are logged."""
-    _stored, _superseded, abandoned = await native.drain()
+    the process, and are logged. A node that cannot leave, as a fenced one
+    cannot, is given `deadline` seconds; the worker then shuts down anyway."""
+    try:
+        _stored, _superseded, abandoned = await asyncio.wait_for(native.drain(), deadline)
+    except asyncio.TimeoutError:
+        _log.warning(
+            "this worker's node did not finish leaving its shard within %.1f s; "
+            "shutting down with the Task records it still held, which leave with it",
+            deadline,
+        )
+        return
     if abandoned:
         _log.error(
             "this worker left its shard holding %d Task records no other worker took, "
@@ -850,7 +879,7 @@ class _WorkerRun:
         # A claim loop that failed fails the run, once its held runs have
         # reported.
         claiming.result()
-        await _leave_shard(native)
+        await _leave_shard(native, _leave_deadline(self._settings))
 
     async def _stop_after(self, error: BaseException, native: Any) -> None:
         """Stops a run that `error` ended: nothing new starts, the runs a
@@ -881,7 +910,7 @@ class _WorkerRun:
             return
         try:
             await _drain_held_runs(session, native, self._claiming, events)
-            await _leave_shard(native)
+            await _leave_shard(native, _leave_deadline(self._settings))
         except Exception:
             # The error being raised says why the run ended; a runtime
             # failing meanwhile only cuts the drain short.
