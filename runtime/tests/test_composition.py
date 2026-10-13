@@ -1154,6 +1154,61 @@ def test_a_returned_step_bound_to_a_value_past_the_hard_limit_alone_fails_the_ru
     assert [e[0] for e in world.runtime.events][-1] == "fail"
 
 
+def test_a_returned_step_whose_bound_values_pass_a_record_runs_with_them_stored_as_blobs():
+    world = continuing_world()
+    large = [Greeting(text=letter * 600_000) for letter in "abc"]
+
+    def plan(request: Greeting) -> Group:
+        return group(*(world.tasks["shout"].bind(value) for value in large))
+
+    planner = declare_planner(world, plan)
+    results = run_planner(world, planner, Greeting())
+
+    assert [result.text for result in results] == [value.text.upper() for value in large]
+
+
+def test_a_returned_step_too_large_by_its_structure_alone_fails_its_run_for_good_with_continuation_too_large():
+    world = continuing_world()
+    members = 40_000
+
+    def plan(request: Greeting) -> Group:
+        return group(*([world.tasks["shout"].bind(Greeting(text="x"))] * members))
+
+    tree = plan(Greeting()).describe(world.session)
+    assert len(_native.describe_step(tree)) > _native.MAX_RECORD_BYTES, "the structure alone passes a record"
+    planner = declare_planner(world, plan)
+
+    async def body():
+        handle = world.session.submit(planner.definition, Greeting())
+        with pytest.raises(RuntimeError, match="does not fit"):
+            await handle
+        return await world.native.task_record(handle.task_id)
+
+    record = run(with_events(world, body))
+
+    assert [(attempt.failure_kind, attempt.state) for attempt in record.runs] == [
+        ("ContinuationTooLarge", _native.RunState.FAILED)
+    ], "failed once, with no retry"
+
+
+def test_a_thousand_item_map_toggles_slow_down_and_keeps_its_order():
+    # Every batch of 50 items (about 450 bytes) passes the soft limit on
+    # its own, so each one raises SlowDown and the next waits for it to clear.
+    world = World(shout, memory_soft_limit=250, memory_hard_limit=1_000_000, concurrency=8, member_batch_items=50)
+    items = [Greeting(text=f"item {index}") for index in range(1_000)]
+
+    async def body():
+        with activated(world):
+            return await world.tasks["shout"].map(items)
+
+    results = run(with_events(world, body))
+
+    assert [result.text for result in results] == [item.text.upper() for item in items]
+    starts = [start for _, start, _ in world.runtime.members_sent]
+    assert starts == list(range(0, 1_000, 50)), "every batch once, in order"
+    assert world.runtime.slow_downs.count(True) >= 10 and world.runtime.slow_downs.count(False) >= 10
+
+
 def test_a_task_annotated_to_return_a_step_but_returning_something_else_fails():
     world = continuing_world()
 

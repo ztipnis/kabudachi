@@ -132,6 +132,8 @@ async def answer(native, command: dict) -> dict:
         status = await asyncio.wait_for(HANDLES[command["status"]].status(), 20)
         assert isinstance(status, kabudachi.TaskStatus)
         return {"status": {"state": status.state, "attempt": status.attempt, "delivered": status.delivered}}
+    if "slow_down" in command:
+        return {"slow_down": native.slow_down()}
     if "claimed" in command:
         return {"client": CLIENTS.get(command["claimed"])}
     if "reported" in command:

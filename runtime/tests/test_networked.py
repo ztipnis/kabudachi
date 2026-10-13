@@ -30,7 +30,7 @@ from cluster import (
     settled,
     states,
 )
-from networked_tasks import BULK_BYTES, awaits, bulk, echo, fleeting, gather, hold, spin, varied_text
+from networked_tasks import BULK_BYTES, awaits, bulk, echo, fleeting, gather, hold, maps, spin, varied_text
 from proto_messages import Greeting
 
 
@@ -90,6 +90,7 @@ def test_a_cluster_delivers_results_compacts_and_keeps_its_runs_through_a_busy_t
     carried_as_blobs(cluster, leader)
     awaited_across_workers(cluster, leader)
     compacted(cluster, leader, tmp_path)
+    slow_down_followed_across_workers(cluster, leader, tmp_path)
     task_process_killed(cluster, leader, tmp_path)
     cancelled_while_running(cluster, leader, tmp_path)
     worker_killed(cluster, leader)
@@ -208,6 +209,28 @@ def compacted(cluster, leader, tmp_path):
     record = finished(cluster, newest)
     succeeded = [run["digest"] for run in record["runs"] if run["state"] == "SUCCEEDED"]
     assert succeeded[-1] == digest_of(gather, Greeting(text="+".join(parts))), record
+
+
+def slow_down_followed_across_workers(cluster, leader, tmp_path):
+    follower = next(worker for worker in cluster.workers if worker is not leader)
+
+    # A blob input held in flight past the soft limit raises the submitter's
+    # own SlowDown, and its release clears it: the flag follows the payloads
+    # the submitter holds, with no word from the leader.
+    ballast = "ballast0" + "z" * (3 * 1024 * 1024)
+    weighed = follower.submit("weigh", text=ballast)
+    eventually("the submitter to hear SlowDown", lambda: follower.ask(slow_down=None)["slow_down"])
+    (tmp_path / "ballast0.go").touch()
+    eventually("the weighed task to finish", lambda: finished(cluster, weighed))
+    eventually("the submitter's SlowDown to clear", lambda: not follower.ask(slow_down=None)["slow_down"])
+
+    # A body maps over 300 items from its task process: the members go to the
+    # leader in one batch, which passes the cluster's 300-byte soft limit, so
+    # a worker besides the leader hears SlowDown and polls until it clears;
+    # the results come back in order.
+    mapped = follower.submit("maps", times=300)
+    expected = Greeting(text=",".join(str(index) for index in range(300)))
+    certified_once(cluster, mapped, digest_of(maps, expected))
 
 
 def task_process_killed(cluster, leader, tmp_path):
