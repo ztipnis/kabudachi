@@ -45,6 +45,10 @@ message CompositeEntry {
     Failure failure = 3;
     // The member was itself a composite: its results are that composite's.
     CompositeId child = 4;
+    // An item of a reduce, on one of its item pages: encoded by the
+    // reducer as its item type, inline or as blobs the reduce owns.
+    bytes item = 6;
+    Manifest item_manifest = 7;
   }
   // The task whose serializer encoded `value`.
   TaskDefinitionId producer = 5;
@@ -93,6 +97,9 @@ message CompositeRecord {
   uint64 members = 21;
   // A streamed composite's members are all in: no batch adds one.
   bool sealed = 22;
+  // A reduce: how many items it folds, or has taken so far while its items
+  // stream in.
+  uint64 reduce_items = 20;
 }
 
 // Up to 1024 member outcomes of one composite: page `index` holds members
@@ -109,12 +116,15 @@ message CompositePage {
 }
 
 // The input of an expansion run: a list another stage returned, to split
-// into one blob per item. Field 3 of `then` is left for reduce.
+// into one blob per item.
 message Expansion {
   Manifest source = 1;
   oneof then {
     // Run this task on every item, as a map.
     BoundTaskStep map = 2;
+    // Stream the items into the reduce this run feeds; each is encoded as
+    // this reducer's item.
+    BoundTaskStep reduce = 3;
   }
   // The task whose serializer encoded the list.
   TaskDefinitionId producer = 4;

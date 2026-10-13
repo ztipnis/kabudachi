@@ -88,6 +88,8 @@ message Task {
   // its stages or members this task is.
   CompositeId composite_id = 19;
   uint64 composite_index = 20;
+  // Set on a step of a reduce: where it sits in the reduce's chain or tree.
+  ReduceNode reduce_node = 25;
 }
 
 // The front of a coalescing key's waiting chain a compaction run folds: each

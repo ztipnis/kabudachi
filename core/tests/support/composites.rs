@@ -37,6 +37,7 @@ pub fn one_stage_flow() -> Step {
             fields: Vec::new(),
         })],
         streamed: false,
+        reduce: None,
     }
 }
 
@@ -76,27 +77,27 @@ pub fn task_stage(name: &str, value: Option<&[u8]>) -> Stage {
 }
 
 pub fn flow_of(stages: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages, streamed: false }
+    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages, streamed: false, reduce: None }
 }
 
 /// A group of `members` run side by side under `on_error`.
 pub fn group_of(on_error: OnError, members: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Group, on_error, stages: members, streamed: false }
+    Step { kind: CompositeKind::Group, on_error, stages: members, streamed: false, reduce: None }
 }
 
 /// A map whose members are bound to their items, failing fast.
 pub fn map_of(members: Vec<Stage>) -> Step {
-    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members, streamed: false }
+    Step { kind: CompositeKind::Map, on_error: OnError::FailFast, stages: members, streamed: false, reduce: None }
 }
 
 /// A map whose items arrive in batches, each run by `each`.
 pub fn streamed_map(on_error: OnError) -> Step {
-    Step { kind: CompositeKind::Map, on_error, stages: vec![task_stage("each", None)], streamed: true }
+    Step { kind: CompositeKind::Map, on_error, stages: vec![task_stage("each", None)], streamed: true, reduce: None }
 }
 
 /// A group whose members arrive in batches.
 pub fn streamed_group(on_error: OnError) -> Step {
-    Step { kind: CompositeKind::Group, on_error, stages: Vec::new(), streamed: true }
+    Step { kind: CompositeKind::Group, on_error, stages: Vec::new(), streamed: true, reduce: None }
 }
 
 /// The item a streamed map's member `index` is given.

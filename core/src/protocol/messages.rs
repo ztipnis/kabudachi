@@ -51,6 +51,7 @@ pub use generated::{
 pub use generated::{
     MembersAccepted, QuerySlowDown, SlowDownState, StreamedMember, SubmitMembers, streamed_member,
 };
+pub use generated::{ReduceNode, ReduceOptions, reduce_options};
 
 /// Whether every required ID field of a raw message is present. Nested
 /// messages are not checked; [`checked::decode`] covers them.

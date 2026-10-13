@@ -313,6 +313,7 @@ fn the_items_an_expansion_split_are_kept_as_long_as_the_flow_that_names_them() {
             on_error: OnError::FailFast,
             stages: vec![task_stage("each", None)],
             streamed: false,
+            reduce: None,
         });
         let flow = submitted(
             &mut fixture,
@@ -477,6 +478,7 @@ fn expanding_map() -> Stage {
         on_error: OnError::FailFast,
         stages: vec![task_stage("each", None)],
         streamed: false,
+        reduce: None,
     })
 }
 

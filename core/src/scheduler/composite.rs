@@ -22,9 +22,11 @@ mod drive;
 mod held;
 mod records;
 mod recover;
+mod reduce;
 mod resolve;
 
 pub(in crate::scheduler) use held::Composites;
+pub use reduce::{ITEM_PAGES, ReduceItem, ReduceNode, ReduceShape};
 pub use resolve::{
     CompositeSource, MemberInput, Resolved, Unresolved, expansion_source, member_input, resolve_manifest, results,
 };
@@ -321,6 +323,8 @@ pub struct Step {
     /// The members are not in `stages`: they arrive in batches, and the
     /// template, if any, takes each item as its input.
     pub streamed: bool,
+    /// How a reduce folds; set on a reduce, and only on one.
+    pub reduce: Option<ReduceShape>,
 }
 
 /// One member of a streamed composite, as its submitter sends it.
@@ -564,6 +568,10 @@ pub enum MalformedStep {
     EmptyMember,
     #[error("a member batch names no composite")]
     NoComposite,
+    #[error(
+        "a reduce needs fail_fast, its reducer, the one reducer stage taking its list, and a tree chunk of at least one item; only a reduce takes reduce options"
+    )]
+    ReduceShape,
     #[error("the bytes are not an encoded step description")]
     Undecodable,
 }
@@ -732,9 +740,7 @@ impl TryFrom<&generated::StepDescription> for Step {
             Ok(generated::CompositeKind::Flow) => CompositeKind::Flow,
             Ok(generated::CompositeKind::Group) => CompositeKind::Group,
             Ok(generated::CompositeKind::Map) => CompositeKind::Map,
-            // The reduce driver is not built yet: refusing it here keeps a
-            // reduce from being stored and never driven.
-            Ok(generated::CompositeKind::Reduce) => return Err(MalformedStep::UnsupportedKind),
+            Ok(generated::CompositeKind::Reduce) => CompositeKind::Reduce,
             _ => return Err(MalformedStep::UnknownKind),
         };
         let on_error = match generated::OnError::try_from(wire.on_error) {
@@ -755,7 +761,13 @@ impl TryFrom<&generated::StepDescription> for Step {
             return Err(MalformedStep::NoStages);
         }
         let stages = wire.stages.iter().map(Stage::try_from).collect::<Result<Vec<_>, _>>()?;
-        let step = Step { kind, on_error, stages, streamed: wire.streamed };
+        let reduce = wire.reduce.as_ref().map(ReduceShape::try_from).transpose()?;
+        let step = Step { kind, on_error, stages, streamed: wire.streamed, reduce };
+        if kind == CompositeKind::Reduce {
+            check_reduce(&step)?;
+        } else if step.reduce.is_some() {
+            return Err(MalformedStep::ReduceShape);
+        }
         if step.streamed {
             let fed = match kind {
                 CompositeKind::Map => matches!(
@@ -771,6 +783,24 @@ impl TryFrom<&generated::StepDescription> for Step {
         }
         Ok(step)
     }
+}
+
+/// A reduce is driven only if it fails on its first failed step, its
+/// reducer takes its input and binds no fields, a tree has chunks of at
+/// least one item, and it has the one stage of that very reducer, taking the
+/// list it is given.
+fn check_reduce(step: &Step) -> Result<(), MalformedStep> {
+    let Some(shape) = &step.reduce else {
+        return Err(MalformedStep::ReduceShape);
+    };
+    let reducer = &shape.reducer;
+    let takes_its_list = matches!(step.stages.as_slice(), [Stage::Task(bound)] if bound == reducer);
+    let well_formed = takes_its_list
+        && step.on_error == OnError::FailFast
+        && matches!(reducer.input, BoundInput::Previous)
+        && reducer.fields.is_empty()
+        && (!shape.tree || shape.chunk_size >= 1);
+    if well_formed { Ok(()) } else { Err(MalformedStep::ReduceShape) }
 }
 
 impl TryFrom<&generated::StageDescription> for Stage {
@@ -863,6 +893,7 @@ impl From<&Step> for generated::StepDescription {
             on_error: generated::OnError::from(step.on_error) as i32,
             stages: step.stages.iter().map(generated::StageDescription::from).collect(),
             streamed: step.streamed,
+            reduce: step.reduce.as_ref().map(generated::ReduceOptions::from),
         }
     }
 }

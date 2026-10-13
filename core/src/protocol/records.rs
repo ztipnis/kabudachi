@@ -110,6 +110,7 @@ pub fn new_task(new: NewTask) -> Task {
         baggage: new.trace.baggage,
         composite_id: new.member_of.as_ref().map(|(composite, _)| composite.clone().into()),
         composite_index: new.member_of.map_or(0, |(_, index)| index),
+        reduce_node: None,
     }
 }
 

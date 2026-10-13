@@ -726,6 +726,7 @@ fn map_over_previous(on_error: OnError) -> Stage {
         on_error,
         stages: vec![task_stage("each", None)],
         streamed: false,
+        reduce: None,
     })
 }
 

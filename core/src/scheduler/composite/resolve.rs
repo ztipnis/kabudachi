@@ -303,6 +303,7 @@ fn resolving_entry<'a, S: CompositeSource>(
                 let child: CompositeId = child.clone().into();
                 resolving_results(source, &child).await
             }
+            composite_entry::Outcome::Item(_) | composite_entry::Outcome::ItemManifest(_) => Err(Unresolved::Malformed),
         }
     })
 }

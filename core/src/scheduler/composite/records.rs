@@ -142,6 +142,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             root: Some(composite.root.clone().into()),
             members: composite.members,
             sealed: composite.sealed,
+            reduce_items: 0,
         }
     }
 
@@ -310,6 +311,8 @@ fn outcome_of(entry: &generated::CompositeEntry) -> Option<(u64, MemberOutcome)>
         },
         composite_entry::Outcome::Failure(failure) => MemberOutcome::Failed(Failure::from(failure)),
         composite_entry::Outcome::Child(child) => MemberOutcome::Child(child.clone().into()),
+        // An item of a reduce is no member's outcome.
+        composite_entry::Outcome::Item(_) | composite_entry::Outcome::ItemManifest(_) => return None,
     };
     Some((entry.index, outcome))
 }
