@@ -89,9 +89,10 @@ pub enum Rank {
 }
 
 /// The queues a worker takes work from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Subscription {
     /// Every queue.
+    #[default]
     Every,
     /// These queues only.
     Only(BTreeSet<String>),

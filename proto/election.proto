@@ -41,6 +41,8 @@ message WorkerHeartbeat {
   // The lineage of `recovery_epoch_seen` (see the coordination authority's
   // `RecoveryEpoch`).
   uint64 recovery_epoch_lineage = 14;
+  // The queues the sender takes work from. Empty: every queue.
+  repeated string queues = 15;
 }
 
 // Names one leader ack a heartbeat confirms receiving.

@@ -534,6 +534,7 @@ fn heartbeat_from(worker: &WorkerId) -> ElectionMessage {
             routing_crawled: false,
             admission_generation: None,
             runs_compaction: false,
+            queues: Vec::new(),
         })),
     }
 }

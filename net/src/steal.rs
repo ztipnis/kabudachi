@@ -87,6 +87,7 @@ impl Net {
             StealRequest {
                 limit,
                 runs_compaction,
+                queues: Vec::new(),
             },
         );
         let response = tokio::time::timeout(STEAL_TIMEOUT, asked).await.ok()??;

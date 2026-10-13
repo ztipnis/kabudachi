@@ -26,6 +26,9 @@ message ClaimRequest {
 // out now. The leader may answer with fewer, or none.
 message ClaimOldest {
   uint32 limit = 1;
+  // The queues to take from, of those the claimant's heartbeats name. Empty:
+  // all of them.
+  repeated string queues = 2;
   // The most input bytes, carried as blobs, the asker can take now; absent
   // for no bound. A task whose blob input is larger is passed over, and stays
   // pending for others.

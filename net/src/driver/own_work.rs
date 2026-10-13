@@ -145,6 +145,7 @@ fn decide_own_claim<C: Clock, I: IdGenerator>(
 ) {
     let request = claim_request::Request::Oldest(ClaimOldest {
         limit: places,
+        queues: Vec::new(),
         input_room: deciding.net.payload_memory().room(),
     });
     let response = claim::answer(

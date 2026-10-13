@@ -7,6 +7,7 @@ use crate::protocol::ids::WorkerId;
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{ElectionCertificate, ElectionMessage, election_message};
 use crate::protocol::worker_state::WorkerState;
+use crate::queues::Subscription;
 use crate::reconcile::{Answered, ReconcileTerm};
 use crate::scheduler::LeaseEnd;
 use crate::time::Clock;
@@ -196,6 +197,20 @@ where
                 let mut capacities = office.member_capacities();
                 capacities.insert(self.my_id.clone(), self.report.available_capacity);
                 capacities
+            }
+            _ => BTreeMap::new(),
+        }
+    }
+
+    /// The queues each member and pending member said in its latest heartbeat
+    /// that it takes, this node's own included. Empty unless it holds office:
+    /// only the leader's own roster is read.
+    pub fn queue_subscriptions(&self) -> BTreeMap<WorkerId, Subscription> {
+        match (&self.office, self.holds_office()) {
+            (Some(office), true) => {
+                let mut subscriptions = office.subscriptions();
+                subscriptions.insert(self.my_id.clone(), self.report.queues.clone());
+                subscriptions
             }
             _ => BTreeMap::new(),
         }

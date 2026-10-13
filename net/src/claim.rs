@@ -125,7 +125,11 @@ impl Net {
         let response = self
             .ask_leader(
                 leader,
-                claim_request::Request::Oldest(ClaimOldest { limit, input_room }),
+                claim_request::Request::Oldest(ClaimOldest {
+                    limit,
+                    queues: Vec::new(),
+                    input_room,
+                }),
             )
             .await?;
         self.keep_granted(&response);
