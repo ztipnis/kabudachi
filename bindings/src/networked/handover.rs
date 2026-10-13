@@ -145,7 +145,7 @@ impl Shared {
             match outcome {
                 Ok(taken) => {
                     if let Some(taken) = taken {
-                        seam.inputs_in_flight.insert(run, taken);
+                        seam.inputs_in_flight.insert(run, vec![taken]);
                     }
                     seam.handed.push_back(claim);
                     None

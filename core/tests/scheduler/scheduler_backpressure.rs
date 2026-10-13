@@ -89,6 +89,30 @@ fn complete(fixture: &mut Fixture, run: &TaskRunId) {
 }
 
 #[test]
+fn the_results_a_run_read_as_its_input_count_until_the_run_is_decided() {
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits { soft: SOFT, hard: HARD });
+    let task = fixture.scheduler.submit(payload(10)).unwrap();
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    let run = claim.task_run_id.clone();
+    assert!(slow_down_events(&mut fixture).is_empty());
+
+    fixture.scheduler.hold_member_input(&run, 150);
+    assert_eq!(fixture.scheduler.memory_in_use(), 160);
+    assert_eq!(slow_down_events(&mut fixture), [true], "what the run holds can raise SlowDown");
+
+    fixture.scheduler.hold_member_input(&run, 40);
+    assert_eq!(fixture.scheduler.memory_in_use(), 50, "reading again replaces what was held");
+    assert_eq!(slow_down_events(&mut fixture), [false]);
+
+    fixture.scheduler.fail(&worker(), &run, "ValueError").unwrap();
+    assert_eq!(fixture.scheduler.memory_in_use(), 0, "a decided run holds nothing");
+
+    fixture.scheduler.hold_member_input(&run, 40);
+    assert_eq!(fixture.scheduler.memory_in_use(), 0, "nothing is held for a run that is over");
+}
+
+#[test]
 fn memory_counts_exactly_the_unfinished_tasks() {
     // Room for the continuation's own description, which alone outweighs
     // the hard limit of the other tests.

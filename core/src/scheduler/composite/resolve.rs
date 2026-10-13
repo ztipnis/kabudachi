@@ -51,6 +51,17 @@ pub enum Resolved {
     List(Vec<Resolved>),
 }
 
+impl Resolved {
+    /// The bytes of every value in it.
+    pub fn payload_bytes(&self) -> u64 {
+        match self {
+            Resolved::Value { bytes, .. } => bytes.len() as u64,
+            Resolved::Failure(_) => 0,
+            Resolved::List(items) => items.iter().map(Resolved::payload_bytes).sum(),
+        }
+    }
+}
+
 /// What a member's worker needs besides its claim: its bound step, and the
 /// input it takes when it takes one.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +76,13 @@ pub struct MemberInput {
     pub own_input: Option<Vec<u8>>,
 }
 
+impl MemberInput {
+    /// The bytes of the results and blobs the member reads as its input.
+    pub fn payload_bytes(&self) -> u64 {
+        self.input.as_ref().map_or(0, Resolved::payload_bytes) + self.own_input.as_ref().map_or(0, |own| own.len() as u64)
+    }
+}
+
 /// Why a record or a blob a reader needs could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Unresolved {
@@ -74,6 +92,8 @@ pub enum Unresolved {
     MissingPage(CompositeId, u32),
     #[error("blob {0} could not be found")]
     MissingBlob(BlobKey),
+    #[error("a payload of {size} bytes is past the hard memory limit of {limit}")]
+    TooLarge { size: u64, limit: u64 },
     #[error("a record or blob a reader needs cannot be read")]
     Malformed,
 }

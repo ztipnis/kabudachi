@@ -68,7 +68,7 @@ use kabudachi_core::scheduler::composite::{
 use kabudachi_core::scheduler::{SubmitRejection, mint};
 use kabudachi_core::time::{RealClock, WallTime};
 use kabudachi_net::blobs::BlobRole;
-use kabudachi_net::composites::NetSource;
+use kabudachi_net::composites::{CountingSource, NetSource};
 use kabudachi_net::executor::{Report, executor_channel};
 use kabudachi_net::handoff::HandedOff;
 use kabudachi_net::worker::Worker;
@@ -590,12 +590,17 @@ impl NetworkedRuntime {
     fn resolve_input<'py>(&self, py: Python<'py>, task_run_id: &str) -> PyResult<Bound<'py, PyAny>> {
         let (task, within) = self.member(task_run_id)?;
         let shared = Arc::clone(&self.shared);
+        let run = TaskRunId::new(task_run_id);
         self.host.bridge().spawn_into_py(py, async move {
-            let source = NetSource::new(Arc::clone(&shared.net));
-            read_until(&shared, within, || member_input(&source, &task))
-                .await
-                .map(PyMemberInput)
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+            let source = CountingSource::new(Arc::clone(&shared.net));
+            let input = read_until(&shared, within, || {
+                source.begin();
+                member_input(&source, &task)
+            })
+            .await
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            shared.hold_inputs(&run, source.counted());
+            Ok(PyMemberInput(input))
         })
     }
 
@@ -609,12 +614,17 @@ impl NetworkedRuntime {
     fn resolve_expansion<'py>(&self, py: Python<'py>, task_run_id: &str) -> PyResult<Bound<'py, PyAny>> {
         let (task, within) = self.member(task_run_id)?;
         let shared = Arc::clone(&self.shared);
+        let run = TaskRunId::new(task_run_id);
         self.host.bridge().spawn_into_py(py, async move {
-            let source = NetSource::new(Arc::clone(&shared.net));
-            read_until(&shared, within, || expansion_source(&source, &task))
-                .await
-                .map(PyResolved)
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+            let source = CountingSource::new(Arc::clone(&shared.net));
+            let list = read_until(&shared, within, || {
+                source.begin();
+                expansion_source(&source, &task)
+            })
+            .await
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            shared.hold_inputs(&run, source.counted());
+            Ok(PyResolved(list))
         })
     }
 

@@ -4,7 +4,9 @@
 
 use crate::coalescing::{self, ChainItem};
 use crate::manifest;
-use crate::protocol::ids::{IdGenerator, TaskId};
+use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId};
+use crate::protocol::records::TaskRunRecord as _;
+use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Instant};
 
 use super::{Event, Observer, Scheduler, Submission, SubmitRejection};
@@ -40,6 +42,45 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// superseded one still needed by the generation that absorbed it.
     pub fn memory_in_use(&self) -> u64 {
         self.budget.in_use()
+    }
+
+    /// A worker read `bytes` of results as the input of the member run `run`,
+    /// which is claimed or running: they count against the limits, so
+    /// `SlowDown` and the refusal of what would not fit see them, until the
+    /// run is decided. Holding again for the same run replaces what it held.
+    pub fn hold_member_input(&mut self, run: &TaskRunId, bytes: u64) {
+        let holds = self
+            .runs
+            .get(run)
+            .is_some_and(|run| matches!(run.current_state(), TaskRunState::Claimed | TaskRunState::Running));
+        if !holds {
+            return;
+        }
+        if let Some(before) = self.member_inputs.insert(run.clone(), bytes) {
+            self.budget.give_back(before);
+        }
+        self.budget.take(bytes);
+        self.update_pressure();
+    }
+
+    /// `run` was decided: if it is over, or waits to run again, it holds no
+    /// results any more.
+    pub(super) fn release_decided_member_input(&mut self, run: &TaskRunId) {
+        if !self.member_inputs.contains_key(run) {
+            return;
+        }
+        if !matches!(self.runs[run].current_state(), TaskRunState::Claimed | TaskRunState::Running) {
+            self.release_member_input(run);
+        }
+    }
+
+    /// The run `run` no longer holds the results it read: they stop counting
+    /// against the limits.
+    pub(super) fn release_member_input(&mut self, run: &TaskRunId) {
+        if let Some(bytes) = self.member_inputs.remove(run) {
+            self.budget.give_back(bytes);
+            self.update_pressure();
+        }
     }
 
     /// Refuses `submission` if it would take memory past the hard limit and

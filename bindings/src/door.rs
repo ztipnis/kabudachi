@@ -267,6 +267,12 @@ impl<C: Clock> SchedulerDoor<C> {
         })
     }
 
+    /// Counts `bytes` the worker read as the input of the member run `run`
+    /// against the memory limits, until the run is decided.
+    pub fn hold_member_input(&self, run: &TaskRunId, bytes: u64) -> Result<(), Closed> {
+        self.change(Concerned::Nobody, |scheduler| scheduler.hold_member_input(run, bytes))
+    }
+
     pub fn report_started(&self, run: &TaskRunId) -> Result<(), Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
             settled_change(scheduler, |scheduler| {

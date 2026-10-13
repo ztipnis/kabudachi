@@ -156,13 +156,8 @@ impl Drop for StoppedOnDrop {
 }
 
 /// Whether a run's input travels as blobs this process fetches before the run
-/// is handed over. A composite member's does not: its manifest names a
-/// result of the composite, which its body reads through the composite's
-/// record. Those blobs are not counted against the payload memory: they are
-/// fetched when the body asks for its input, not before the run is handed
-/// over, so there is no claim-time moment to wait for room at, and each is a
-/// result the shard already holds within its own limits. Only the run's own
-/// input, which this process fetches before the run, is counted.
+/// is handed over. A composite member's does not: its manifest names results
+/// of the composite, which its body reads through the composite's record.
 fn input_is_blobs(wire: &WireClaim) -> bool {
     wire.task
         .as_ref()

@@ -322,6 +322,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.retention.clear();
         self.occupancy.clear();
         self.budget.reset_usage();
+        self.member_inputs.clear();
         self.continuing.clear();
         self.losses.clear();
         self.input_digests.clear();

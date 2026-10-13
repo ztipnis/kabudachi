@@ -599,11 +599,13 @@ impl NativeRuntime {
             .task_of_run(&TaskRunId::new(task_run_id))?
             .ok_or_else(|| PyRuntimeError::new_err("no such run"))?;
         let door = Arc::clone(&self.door);
+        let run = TaskRunId::new(task_run_id);
         self.bridge.spawn_into_py(py, async move {
-            member_input(&DoorSource(&door), &task)
+            let input = member_input(&DoorSource(&door), &task)
                 .await
-                .map(PyMemberInput)
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            door.hold_member_input(&run, input.payload_bytes())?;
+            Ok(PyMemberInput(input))
         })
     }
 
@@ -619,11 +621,13 @@ impl NativeRuntime {
             .task_of_run(&TaskRunId::new(task_run_id))?
             .ok_or_else(|| PyRuntimeError::new_err("no such run"))?;
         let door = Arc::clone(&self.door);
+        let run = TaskRunId::new(task_run_id);
         self.bridge.spawn_into_py(py, async move {
-            expansion_source(&DoorSource(&door), &task)
+            let list = expansion_source(&DoorSource(&door), &task)
                 .await
-                .map(PyResolved)
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            door.hold_member_input(&run, list.payload_bytes())?;
+            Ok(PyResolved(list))
         })
     }
 

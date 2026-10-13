@@ -34,9 +34,9 @@ pub(super) struct Seam {
     /// over as far as a cancel or an abort deadline is concerned, but not
     /// yet takeable. Each holds the handle that stops its fetch.
     pub(super) resolving: BTreeMap<TaskRunId, AbortHandle>,
-    /// The inputs of runs handed over that travelled as blobs, counted in
-    /// flight until each run ends.
-    pub(super) inputs_in_flight: BTreeMap<TaskRunId, Taken>,
+    /// The inputs of runs handed over that travelled as blobs, and the results
+    /// a member run read as its input, counted in flight until each run ends.
+    pub(super) inputs_in_flight: BTreeMap<TaskRunId, Vec<Taken>>,
     /// Every run Python took and has not ended.
     pub(super) held: BTreeMap<TaskRunId, HeldRun>,
     pub(super) events: VecDeque<PyEvent>,
@@ -114,6 +114,15 @@ impl Shared {
             drop(freed);
         }
         let _ = self.reports.report(report);
+    }
+
+    /// Counts `taken`, the payloads a member run `run` read as its input, in
+    /// flight until the run ends. A run that ended meanwhile counts nothing.
+    pub(super) fn hold_inputs(&self, run: &TaskRunId, taken: Vec<Taken>) {
+        let mut seam = self.seam();
+        if seam.held.contains_key(run) {
+            seam.inputs_in_flight.entry(run.clone()).or_default().extend(taken);
+        }
     }
 
     pub(super) fn wake(&self) {

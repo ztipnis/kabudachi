@@ -812,6 +812,38 @@ def test_a_group_past_the_hard_limit_is_refused_whole_and_starts_nothing():
     assert run_states(world) == []
 
 
+def test_a_stage_reading_a_large_result_holds_it_against_the_memory_limit_until_its_run_ends():
+    reading = asyncio.Event()
+    released = asyncio.Event()
+
+    async def big(request: Greeting) -> Greeting:
+        return Greeting(text="x" * 600)
+
+    async def read(request: Greeting) -> Greeting:
+        reading.set()
+        await released.wait()
+        return Greeting()
+
+    def small(request: Greeting) -> Greeting:
+        return request
+
+    world = World(big, read, small, memory_soft_limit=SOFT_LIMIT, memory_hard_limit=HARD_LIMIT)
+    pipeline = flow(world.tasks["big"], world.tasks["read"])
+    late = Greeting(text="y" * 500)
+
+    async def body():
+        done = pipeline.start(world.session, Greeting(text="in"))
+        await asyncio.wait_for(reading.wait(), WAIT)
+        # The 600 bytes the stage was given and the 500 would pass the limit.
+        with pytest.raises(BackpressureError):
+            world.session.submit(world.tasks["small"].definition, late)
+        released.set()
+        await done
+        return await world.session.submit(world.tasks["small"].definition, late)
+
+    assert run(with_events(world, body)) == late
+
+
 def test_a_step_bound_to_a_value_past_the_hard_limit_alone_is_refused_before_anything_is_stored():
     world, released = held_world(hard_limit=100)
     pipeline = flow(world.tasks["hold"].bind(Greeting(text="x" * 200)))

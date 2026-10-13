@@ -255,6 +255,9 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     occupancy: Occupancy,
     /// The bytes tasks hold, the limits on them and `SlowDown`.
     budget: MemoryBudget,
+    /// The bytes of results a worker read as the input of a member's run,
+    /// counted in `budget` until the run is decided.
+    member_inputs: BTreeMap<TaskRunId, u64>,
     /// Tasks whose run is certified but whose continuation composite is not over.
     continuing: BTreeSet<TaskId>,
     /// How many runs of each task were lost with their worker. A replay of a
@@ -326,6 +329,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             held_cancels: Vec::new(),
             occupancy: Occupancy::default(),
             budget: MemoryBudget::default(),
+            member_inputs: BTreeMap::new(),
             continuing: BTreeSet::new(),
             losses: BTreeMap::new(),
             unpublished: BTreeSet::new(),
@@ -447,6 +451,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.run_decided_at
             .insert(run_id.clone(), self.clock.now());
         self.unpublished.insert(self.runs[run_id].task_id());
+        self.release_decided_member_input(run_id);
     }
 
     fn mark_current_decided(&mut self, task_id: &TaskId) {

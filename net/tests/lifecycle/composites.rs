@@ -9,13 +9,14 @@ use kabudachi_core::blob::{BlobKey, BlobOwner};
 use kabudachi_core::protocol::generated::CompositeState as WireState;
 use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::{CancelOutcome, task_response};
+use kabudachi_core::scheduler::MemoryLimits;
 use kabudachi_core::scheduler::composite::{
-    CompositeKind, CompositeState, Resolved, Stage, SubmittedComposite, member_input, results,
+    CompositeKind, CompositeState, Resolved, Stage, SubmittedComposite, Unresolved, member_input, results,
 };
 use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::{RealClock, WallTime};
 use kabudachi_net::blobs::BlobRole;
-use kabudachi_net::composites::NetSource;
+use kabudachi_net::composites::{CountingSource, NetSource};
 use kabudachi_net::executor::Report;
 
 use crate::support::deadline::within_deadline;
@@ -216,6 +217,57 @@ async fn a_composite_whose_record_is_re_placed_off_a_killed_holder_still_resolve
             .await;
     })
     .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_counts_the_blobs_it_reads_as_its_input_in_flight_until_they_are_released() {
+    within_deadline(async {
+        let (mut shard, client) = Voters::start(3).await;
+        let leader = shard.drive_until_a_leader().await;
+        let leader_id = shard.id(leader);
+        shard.join_as_pending(&client, leader).await;
+        let nets = shard.nets.clone();
+        let reader = &nets[shard.others(leader)[0]];
+        let id = Uuid7Ids.next_composite_id();
+        let input = varied(3 * MIB / 2);
+        let chunks = shard
+            .drive_until(reader.store_payload_at_leader(
+                BlobRole::Input,
+                &BlobOwner::Composite(id.clone()),
+                &input,
+                retry(),
+            ))
+            .await
+            .expect("stored");
+        shard
+            .drive_until(composite_submitted_as(&client, &leader_id, &id, group_of_chunked("measure", chunks)))
+            .await;
+        let memory = Arc::clone(reader.payload_memory());
+        shard
+            .drive_until(async {
+                let claim = member_claimed_through(reader, &leader_id, &id, 0).await;
+                let source = CountingSource::new(Arc::clone(reader));
+
+                memory.set_limits(Some(MemoryLimits { soft: 4 * MIB as u64, hard: 8 * MIB as u64 }));
+                let given = member_input(&source, &claim.task).await.expect("the input resolves");
+                assert_eq!(given.own_input, Some(input.clone()));
+                let counted = source.counted();
+                assert_eq!(memory.in_use(), input.len() as u64, "the run holds its input");
+                drop(counted);
+                assert_eq!(memory.in_use(), 0, "its input is released with the run");
+
+                // An input alone past the hard limit is refused before it is fetched.
+                memory.set_limits(Some(MemoryLimits { soft: MIB as u64 / 4, hard: MIB as u64 }));
+                source.begin();
+                assert_eq!(
+                    member_input(&source, &claim.task).await.err(),
+                    Some(Unresolved::TooLarge { size: input.len() as u64, limit: MIB as u64 })
+                );
+                assert_eq!(memory.in_use(), 0);
+            })
+            .await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
