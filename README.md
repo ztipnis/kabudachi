@@ -3025,6 +3025,12 @@ Open (from Phase 5): on a networked worker, a task that returns a flow, group or
 
 Open: a Task record read, and so `TaskHandle.status()`, waits out the 5 s kad query timeout while a shard peer is connected but unresponsive (stopped, say). The lookup should finish once the record's placement holders, or a quorum of them, have answered.
 
+Open: large-input starvation. A claimant without room for a large blob input passes it over, and smaller inputs can keep taking that room, so a large input may wait indefinitely under steady load. Aging (raising a passed-over task's priority with its wait) is the known fix. For post-implementation load testing.
+
+Open: a task whose input is larger than every worker's in-flight share waits until its expiry, or indefinitely with none, in a shard where every voter holds every record. In a larger shard, a non-holder can steal it and fail it with `PayloadTooLarge`, so it can fail after its retries. One explicit memory limit per networked shard avoids both.
+
+Open: a record that is re-placed off a killed voter stalls. The re-placement is a joint write that needs a majority of the prior placement, and a killed voter stays a member of the configuration until it leaves, so with replication 2 and a dead holder in the prior placement, every later write for that task (a claim included) cannot be acknowledged. The blobs of such a task do follow the new placement; the claim does not go through until the dead voter leaves the configuration.
+
 ### Phase 7: observability
 
 Prometheus and tracing should exist earlier for development, but this phase hardens:
