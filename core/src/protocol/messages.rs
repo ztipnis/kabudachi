@@ -21,18 +21,19 @@ use crate::protocol::generated;
 use crate::protocol::ids;
 
 pub use generated::{
-    AckEcho, Claim, ClaimBatch, ClaimOldest, ClaimReject, ClaimRejectReason, ClaimRequest,
-    ClaimResponse, ElectionCertificate, ElectionMessage, ElectionReject, ElectionRejectReason,
-    JoinRequest, JoinResponse, KnownLeader, LeaderHeartbeatAck, RollCall, RollCallReply,
-    AbsorbedGeneration, ChainEntry, CoalescingLink, SelfRemove, Task, TaskRecord, TaskRun,
+    AbsorbedGeneration, AckEcho, ChainEntry, Claim, ClaimBatch, ClaimOldest, ClaimReject,
+    ClaimRejectReason, ClaimRequest, ClaimResponse, CoalescingLink, ElectionCertificate,
+    ElectionMessage, ElectionReject, ElectionRejectReason, JoinRequest, JoinResponse, KnownLeader,
+    LeaderHeartbeatAck, RollCall, RollCallReply, SelfRemove, Task, TaskRecord, TaskRun,
     TaskRunIdentity, TransferLeadership, VoteGrant, VoteRequest, WorkerHeartbeat, chain_entry,
     claim_request, claim_response, election_message,
 };
 pub use generated::{
-    BlockNoted, CancelAnswer, CancelOutcome, CancelTask, CompactionApplied, PlaceRecords, PlacedKey,
-    PersistenceNoted, PlacedWithAsker, RecordPlacements, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed,
-    ReportLost, ReportPersisted, ReportStarted, RunCertified, RunFailed, RunLost, StartAccepted, SubmitAccepted, SubmitTask, TaskReject,
-    TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
+    BlockNoted, CancelAnswer, CancelOutcome, CancelTask, CompactionApplied, PersistenceNoted,
+    PlaceRecords, PlacedKey, PlacedWithAsker, RecordPlacements, ReportBlocked, ReportCompacted,
+    ReportCompleted, ReportFailed, ReportLost, ReportPersisted, ReportStarted, RunCertified,
+    RunFailed, RunLost, StartAccepted, SubmitAccepted, SubmitTask, TaskReject, TaskRejectReason,
+    TaskRequest, TaskResponse, task_request, task_response,
 };
 pub use generated::{
     HeldKey, ReconcileReport, ReconcileRequest, ReportedRun, ReportedRunState, reconcile_request,
