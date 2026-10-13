@@ -486,7 +486,7 @@ def test_a_flow_or_group_that_was_never_started_because_the_run_stopped_fails(bu
     async def body():
         await world.call("shout", Greeting())  # takes the only claim
         handle = target.start(world.session, Greeting())  # everything of it waits for a claim
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await asyncio.wait_for(handle, WAIT)
 
@@ -948,11 +948,11 @@ def test_a_run_the_leader_will_not_certify_leaves_no_continuation_behind():
         with pytest.raises(RuntimeError):
             await world.session.submit(planner.definition, Greeting())
         await asyncio.wait_for(world.session.wait_until_idle(), WAIT)
+        [refused] = [event[1] for event in world.runtime.events if event[0] == "complete"]
+        assert await world.native.composite_status(_native.continuation_of(refused)) is None
 
     run(with_events(world, body))
 
-    [refused] = [event[1] for event in world.runtime.events if event[0] == "complete"]
-    assert world.native.composite_status(_native.continuation_of(refused)) is None
     assert world.runtime.claimed[0].definition_id == "tests.plan"
     assert len(world.runtime.claimed) == 1, "no stage of a continuation was ever made"
 
@@ -1042,7 +1042,7 @@ def test_stopping_fails_a_continuation_that_has_not_started_its_stage():
         handle = world.session.submit(planner.definition, Greeting())
         while ("complete" not in [event[0] for event in world.runtime.events]):
             await asyncio.sleep(0.005)  # the planning run is certified; its stage waits for a claim
-        world.session.stop_claiming()
+        await world.session.stop_claiming()
         with pytest.raises(RunStoppedError):
             await asyncio.wait_for(handle, WAIT)
 

@@ -224,8 +224,8 @@ class FaultingRuntime:
     def cancel_composite(self, composite_id):
         return self.native.cancel_composite(composite_id)
 
-    def composite_status(self, composite_id):
-        return self.native.composite_status(composite_id)
+    async def composite_status(self, composite_id):
+        return await self.native.composite_status(composite_id)
 
     async def store_result(self, task_id, data):
         return await self.native.store_result(task_id, data)

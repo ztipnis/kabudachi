@@ -540,24 +540,28 @@ impl NativeRuntime {
         Ok(outcome.into())
     }
 
-    /// Where a composite stands, as `(state, next_stage, pending, succeeded,
-    /// failed, cancelled)`: `state` is `"running"`, `"succeeded"`, `"failed"`
-    /// or `"cancelled"`, `next_stage` the stage of a flow that runs or runs
-    /// next, and the rest count its members. `None` if the runtime holds no
-    /// such composite.
-    fn composite_status(&self, composite_id: &str) -> PyResult<Option<(&'static str, u64, u64, u64, u64, u64)>> {
-        let status = self.door.composite_status(&CompositeId::new(composite_id))?;
-        Ok(status.map(|status| {
-            let counts = status.counts;
-            (
-                state_name(status.state),
-                status.next_stage,
-                counts.pending,
-                counts.succeeded,
-                counts.failed,
-                counts.cancelled,
-            )
-        }))
+    /// Returns an awaitable that resolves to where a composite stands, as
+    /// `(state, next_stage, pending, succeeded, failed, cancelled)`: `state`
+    /// is `"running"`, `"succeeded"`, `"failed"` or `"cancelled"`,
+    /// `next_stage` the stage of a flow that runs or runs next, and the rest
+    /// count its members. `None` if the runtime holds no such composite. It
+    /// is awaitable as a networked runtime's is, which asks the shard.
+    fn composite_status<'py>(&self, py: Python<'py>, composite_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let door = Arc::clone(&self.door);
+        self.bridge.spawn_into_py(py, async move {
+            let status = door.composite_status(&CompositeId::new(composite_id))?;
+            Ok(status.map(|status| {
+                let counts = status.counts;
+                (
+                    state_name(status.state),
+                    status.next_stage,
+                    counts.pending,
+                    counts.succeeded,
+                    counts.failed,
+                    counts.cancelled,
+                )
+            }))
+        })
     }
 
     /// Returns an awaitable that resolves to a composite's results: `("list",

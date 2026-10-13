@@ -67,6 +67,14 @@ class NotingClaims:
             await asyncio.Event().wait()
         claims = await self._runtime.claim_pending(limit)
         CLIENTS.update((claim.task_id, claim.client) for claim in claims)
+        # Written for the test, which reads them after this worker may have
+        # been killed: the tasks a pipeline made, and so which records to read.
+        markers = os.environ.get("KABUDACHI_TEST_MARKERS")
+        for claim in claims:
+            if markers and claim.definition_id.startswith("cluster."):
+                name = f"claimed.{claim.definition_id.removeprefix('cluster.')}.{claim.task_run_id}"
+                with open(os.path.join(markers, name), "w") as written:
+                    written.write(claim.task_id)
         # A worker that claimed the task named here runs nothing besides it,
         # so what that task calls runs on the other workers.
         last = os.environ.get("KABUDACHI_TEST_CLAIMS_NOTHING_AFTER")

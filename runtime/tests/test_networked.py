@@ -16,6 +16,7 @@ import pytest
 from cluster import (
     HEARTBEAT_TIMEOUT,
     RECONNECT_TIMEOUT,
+    STAGE_SECONDS,
     TIMINGS,
     Cluster,
     Worker,
@@ -271,11 +272,32 @@ def first_stage_started_on(cluster, markers):
     return next(worker for worker in cluster.workers if worker.pid == int(marker.read_text()))
 
 
+def committed_at_most_once(cluster, markers, definitions):
+    """No task a pipeline made of the `definitions`, found by the claim markers
+    the workers left, has more than one run that succeeded; returns how many
+    have one. A stage whose run is lost is replayed, and a run whose store
+    gave up fails the pipeline's body, whose retry makes every stage over
+    again as new tasks, so the stages run at least once and some tasks never
+    succeed; what must hold is that no result is committed twice."""
+    claimed = {
+        marker.read_text()
+        for definition in definitions
+        for marker in markers.glob(f"claimed.{definition}.*")
+    }
+    committed = 0
+    for task_id in claimed:
+        record = finished(cluster, task_id)
+        succeeded = states(record).count("SUCCEEDED")
+        assert succeeded <= 1, record
+        committed += succeeded
+    return committed
+
+
 def running_a_stage_besides(cluster, markers, kept):
     """A worker not among `kept` that started a `shout` stage a moment ago, so
     is still in it: a stage lasts a second."""
     for marker in markers.glob("shout.*"):
-        if time.time() - marker.stat().st_mtime > 0.5:
+        if time.time() - marker.stat().st_mtime > STAGE_SECONDS * 0.9:
             continue
         worker = next(worker for worker in cluster.workers if worker.pid == int(marker.read_text()))
         if worker not in kept:
@@ -302,8 +324,12 @@ def test_a_stage_running_on_a_killed_worker_is_replayed_once_and_the_pipeline_en
         victim.kill()
         assert outcome(leader, piped) == PIPELINE_OF_A
         assert states(cluster.record(piped)) == ["SUCCEEDED"], "the body never ran twice"
-        # Three stages, and the killed one's replay.
-        assert len(list(tmp_path.glob("shout.*"))) == 4
+        # Three stages, and at least the killed one's replay: a store that
+        # gave up on the dead worker fails the run it was in, whose retry
+        # replays the stage again, so a body may run more often. What holds is
+        # that no stage or planning task commits a result twice.
+        assert len(list(tmp_path.glob("shout.*"))) >= 4
+        assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 8
     finally:
         cluster.close()
 
@@ -317,7 +343,10 @@ def test_a_leader_killed_between_a_pipelines_stages_hands_it_to_its_successor_wh
         eventually("its first stage to start", lambda: first_stage_started_on(cluster, tmp_path))
         leader.kill()
         assert outcome(client, piped) == PIPELINE_OF_A
-        assert len(list(tmp_path.glob("shout.*"))) == 3
+        # At least once each: a stage in flight when the leader died may be
+        # replayed. None commits a result twice.
+        assert len(list(tmp_path.glob("shout.*"))) >= 3
+        assert committed_at_most_once(cluster, tmp_path, ["shout", "plan", "load"]) >= 8
     finally:
         cluster.close()
 

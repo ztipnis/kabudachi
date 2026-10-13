@@ -60,7 +60,7 @@ class CompositeHandle(TaskHandle):
     async def status(self) -> CompositeStatus:
         """How the composite stands: its state, its stages or members by
         state, and, for a flow, the index of the stage it is at or ended on."""
-        found = self._runtime.composite_status(self.task_id)
+        found = await self._runtime.composite_status(self.task_id)
         if found is None:
             # The leader no longer holds it: what this handle was settled with is all there is.
             return CompositeStatus(self.task_id, self.kind, self._settled_state(), MappingProxyType({}))
@@ -98,9 +98,9 @@ class GroupHandle(CompositeHandle):
     member order."""
 
 
-def composite_is_running(runtime: Runtime, composite_id: str) -> bool:
+async def composite_is_running(runtime: Runtime, composite_id: str) -> bool:
     """Whether the leader still has the composite running, or has lost track of it."""
-    found = runtime.composite_status(composite_id)
+    found = await runtime.composite_status(composite_id)
     return found is None or found[0] == "running"
 
 
@@ -209,7 +209,7 @@ class Composites:
         with self._lock:
             return bool(self._open)
 
-    def stopped(self) -> None:
+    async def stopped(self) -> None:
         """The run stopped and nothing runs here any more: a composite still
         running can never go on, since nothing will claim what is left of it.
         Its handle fails with `RunStoppedError`; one the leader has already
@@ -217,7 +217,7 @@ class Composites:
         with self._lock:
             open_handles = list(self._open.items())
         for composite_id, handle in open_handles:
-            if not composite_is_running(self._session.runtime, composite_id):
+            if not await composite_is_running(self._session.runtime, composite_id):
                 continue
             with self._lock:
                 if self._open.pop(composite_id, None) is None:

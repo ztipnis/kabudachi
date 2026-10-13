@@ -494,9 +494,13 @@ def test_a_composite_submitted_before_the_node_leads_waits_for_the_grant_and_a_c
     try:
         dropped = native.submit_composite(one_stage_flow("tests.dropped"))
         kept = native.submit_composite(one_stage_flow("tests.kept"))
-        assert native.composite_status(kept) == ("running", 0, 1, 0, 0, 0)
+
+        async def status_of(composite_id):
+            return await native.composite_status(composite_id)
+
+        assert asyncio.run(status_of(kept)) == ("running", 0, 1, 0, 0, 0)
         assert native.cancel_composite(dropped) == CancelOutcome.CANCELLED
-        assert native.composite_status(dropped) is None
+        assert asyncio.run(status_of(dropped)) is None
         assert native.worker_state() != "Leader"
 
         async def after_the_grant():
@@ -760,7 +764,7 @@ def test_scaffold_a_returned_step_keeps_its_large_value_and_reports_a_failed_mem
             native.report_failure(second.task_run_id, "ValueError", "bad input")
             [event] = [e for e in await native.next_events() if e.kind == _native.EventKind.COMPOSITE_FINISHED]
             assert (event.parent_task_id, event.state) == (parent, "succeeded")
-            assert native.composite_status(event.composite_id) == ("succeeded", 0, 0, 1, 1, 0)
+            assert await native.composite_status(event.composite_id) == ("succeeded", 0, 0, 1, 1, 0)
             return await native.composite_results(event.composite_id)
 
         kind, [value, failure] = asyncio.run(body())

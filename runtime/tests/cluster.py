@@ -37,6 +37,8 @@ TIMINGS = {
 }
 HEARTBEAT_TIMEOUT = 1.0
 RECONNECT_TIMEOUT = 2.0
+# How long a `shout` stage runs.
+STAGE_SECONDS = 1.0
 
 
 def eventually(description, probe, timeout=20.0):
@@ -193,7 +195,7 @@ class Cluster:
             "KABUDACHI_MEMORY_HARD_LIMIT": "16000000",
             "KABUDACHI_TEST_MARKERS": str(markers),
             # A `shout` stage runs this long, so a kill can land inside one.
-            "KABUDACHI_TEST_STAGE_SECONDS": "1",
+            "KABUDACHI_TEST_STAGE_SECONDS": str(STAGE_SECONDS),
         }
         founder = Worker({**environment, **overrides.get(0, {})})
         workers = [founder]

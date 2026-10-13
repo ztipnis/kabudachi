@@ -876,7 +876,7 @@ class _WorkerRun:
     ) -> None:
         # It also holds runs no handle here waits for: they finish, and the
         # leader takes their reports, before the worker goes.
-        session.stop_claiming()
+        await session.stop_claiming()
         native.stop_taking()
         await _drain_held_runs(session, native, claiming, events)
         # A claim loop that failed fails the run, once its held runs have
@@ -892,7 +892,7 @@ class _WorkerRun:
         session = self._session
         if session is None:
             return
-        session.stop_claiming()
+        await session.stop_claiming()
         if self._networked:
             # Ends a waiting claim, which must not be cancelled.
             native.stop_taking()
@@ -924,7 +924,7 @@ class _WorkerRun:
         if session is not None:
             # Also on the normal path: between the run going idle and being
             # deactivated a thread can still submit, and would never be served.
-            session.stop_claiming()
+            await session.stop_claiming()
             deactivate(session)
         await _cancel(self._claiming)
         await _cancel(self._events)

@@ -543,24 +543,20 @@ impl NetworkedRuntime {
         Ok(())
     }
 
-    /// Where a composite stands, as `(state, next_stage, pending, succeeded,
-    /// failed, cancelled)`, by the newest record of it the shard holds that
-    /// this worker reaches: not authoritative, so a change the leader has
-    /// just made may not show yet. `None` if no worker this one reaches holds
-    /// it. Raises `RuntimeError` once the runtime has shut down.
-    fn composite_status(
-        &self,
-        py: Python<'_>,
-        composite_id: &str,
-    ) -> PyResult<Option<CompositeStatusTuple>> {
-        if !self.host.bridge().is_open() {
-            return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
-        }
+    /// Returns an awaitable that resolves to where a composite stands, as
+    /// `(state, next_stage, pending, succeeded, failed, cancelled)`, by the
+    /// newest record of it the shard holds that this worker reaches: not
+    /// authoritative, so a change the leader has just made may not show yet.
+    /// `None` if no worker this one reaches holds it. Reading the record asks
+    /// the shard, so it is awaited rather than blocking the caller's loop.
+    ///
+    /// Raises `RuntimeError` once the runtime has shut down.
+    fn composite_status<'py>(&self, py: Python<'py>, composite_id: String) -> PyResult<Bound<'py, PyAny>> {
         let net = Arc::clone(&self.shared.net);
-        let id = CompositeId::new(composite_id);
-        let handle = self.host.handle().clone();
-        let record = py.detach(|| handle.block_on(net.composite_record(&id)));
-        Ok(record.as_ref().map(record_status))
+        self.host.bridge().spawn_into_py(py, async move {
+            let record = net.composite_record(&CompositeId::new(composite_id)).await;
+            Ok::<Option<CompositeStatusTuple>, PyErr>(record.as_ref().map(record_status))
+        })
     }
 
     /// Returns an awaitable that resolves to a composite's results: `("list",

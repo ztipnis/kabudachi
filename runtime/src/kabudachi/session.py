@@ -591,7 +591,7 @@ class Session:
                 loop.cancel()
             await asyncio.gather(*loops, return_exceptions=True)
 
-    def stop_claiming(self) -> None:
+    async def stop_claiming(self) -> None:
         """Stops the run: no more tasks start or are accepted, and every task
         that has not started fails with `RunStoppedError`, which also frees
         any running task that was waiting for one of them. Tasks already
@@ -599,7 +599,7 @@ class Session:
         self._tasks.stop_unstarted()
         self._executor.wake()
         if self._members_running == 0:
-            self._fail_stalled()
+            await self._fail_stalled()
 
     async def wait_until_running_finish(self) -> None:
         """Waits for every task that is running now to finish."""
@@ -620,14 +620,14 @@ class Session:
             or self._hosted.outstanding > 0
         )
 
-    def _fail_stalled(self) -> None:
+    async def _fail_stalled(self) -> None:
         """The run is stopping and no member runs here: a composite still
         running can never go on, and neither can a task waiting for the one it
         returned. They fail with `RunStoppedError`, unless the leader has just
         finished them, when their own finish settles them."""
-        self._composites.stopped()
+        await self._composites.stopped()
         for task_id, composite_id in self._tasks.continuations():
-            if composite_is_running(self._runtime, composite_id):
+            if await composite_is_running(self._runtime, composite_id):
                 self._tasks.failed(
                     task_id, RunStoppedError("the run stopped before this task's step could finish")
                 )
@@ -908,7 +908,8 @@ class Session:
     def _member_ended(self) -> None:
         self._members_running -= 1
         if self._members_running == 0 and self._tasks.stopping:
-            self._fail_stalled()
+            # Their state is read on the run's loop, counted as work until done.
+            self._hosted.spawn(self._fail_stalled())
 
     def _interrupted(self, task_id: str, error: BaseException) -> None:
         self._tasks.failed(task_id, interrupted(f"task {task_id}", error))

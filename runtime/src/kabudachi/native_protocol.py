@@ -325,10 +325,13 @@ class Runtime(Protocol):
         worker is not the leader and the composite is not queued. `None`: the
         cancel was sent, and the leader decides."""
 
-    def composite_status(self, composite_id: str) -> tuple[str, int, int, int, int, int] | None:
+    async def composite_status(
+        self, composite_id: str
+    ) -> tuple[str, int, int, int, int, int] | None:
         """A composite's state, the stage it is on, and the number of its
         members pending, succeeded, failed and cancelled; `None` when the
-        runtime holds no such composite."""
+        runtime holds no such composite. Awaited, since a networked runtime
+        asks its shard."""
 
     async def store_result(self, task_id: str, data: bytes) -> bytes:
         """Stores `data` as the blobs of a task's result and gives the digest
