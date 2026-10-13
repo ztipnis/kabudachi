@@ -9,7 +9,7 @@ use kabudachi_core::reconcile::{HeldKey, ReportPage, ReportedRun, ReportedState,
 use kabudachi_core::scheduler::Claim;
 use kabudachi_core::task_record::{RecordKey, RecordVersion};
 
-use crate::support::composites::one_stage_flow;
+use crate::support::composites::{flow_of, one_stage_flow, task_stage};
 
 fn held(key: RecordKey, revision: u64) -> HeldKey {
     HeldKey {
@@ -160,4 +160,22 @@ fn a_continuation_that_is_not_a_drivable_step_is_refused() {
     message.runs[0].continuation.as_mut().unwrap().stages.clear();
 
     assert_eq!(page(&message), Err(MalformedReport));
+}
+
+#[test]
+fn a_continuation_whose_first_stage_waits_for_an_input_is_refused() {
+    let sent = ReportPage {
+        runs: vec![ReportedRun {
+            claim: claim("r1"),
+            state: ReportedState::Succeeded {
+                result_digest: Digest::blake3(b"out"),
+                delivered: false,
+            },
+            continuation: Some(flow_of(vec![task_stage("shout", None)])),
+        }],
+        last: true,
+        ..ReportPage::default()
+    };
+
+    assert_eq!(page(&report(&sent)), Err(MalformedReport), "nothing runs before it to give it one");
 }

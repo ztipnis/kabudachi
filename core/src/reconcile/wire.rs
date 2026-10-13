@@ -119,7 +119,14 @@ impl TryFrom<&generated::ReportedRun> for ReportedRun {
         let continuation = run
             .continuation
             .as_ref()
-            .map(|description| Step::try_from(description).map_err(|_| MalformedReport))
+            .map(|description| {
+                // A step that takes an input has nothing before it to give it
+                // one, so a run that returned one is not drivable.
+                Step::try_from(description)
+                    .ok()
+                    .filter(|step| !step.takes_input())
+                    .ok_or(MalformedReport)
+            })
             .transpose()?;
         Ok(ReportedRun {
             claim,
