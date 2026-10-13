@@ -275,14 +275,18 @@ impl Repair {
             self.seen = Some(voters);
         }
         let room = IN_FLIGHT.saturating_sub(self.in_flight.len());
-        let due: Vec<RecordKey> = self
+        // Oldest due first, so a record refused again and again cannot keep one
+        // that fell due before it (whatever its kind) from a turn.
+        let mut due: Vec<(Instant, &RecordKey)> = self
             .retries
             .iter()
             .filter(|(_, at)| **at <= now)
-            .map(|(task, _)| task.clone())
+            .map(|(task, at)| (*at, task))
             .collect();
+        due.sort();
         let batch: Vec<RecordKey> = due
             .into_iter()
+            .map(|(_, task)| task.clone())
             .chain(self.pending.iter().cloned())
             .take(room)
             .collect();
