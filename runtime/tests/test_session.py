@@ -11,7 +11,6 @@ from datetime import timedelta
 
 import pytest
 
-from kabudachi import _native
 from kabudachi._native import EventKind, RunState, result_digest
 from kabudachi.concurrency_places import ConcurrencyPlaces
 from kabudachi.config import Configuration

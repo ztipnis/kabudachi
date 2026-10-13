@@ -23,7 +23,6 @@ from kabudachi._native import RunState
 from kabudachi.errors import (
     DurabilityUnavailableError,
     PayloadTooLargeError,
-    ResultTooLargeError,
     RuntimeNotStartedError,
     SerializationError,
     StartupError,
@@ -627,10 +626,6 @@ def test_a_payload_larger_than_one_message_goes_through_a_task_and_back_and_one_
     def echo(request: Greeting) -> Greeting:
         return request
 
-    @declare
-    def grow(request: Greeting) -> Greeting:
-        return Greeting(text=request.text * 2)
-
     hard = 5 * 1024 * 1024
     kabudachi.configure(memory_soft_limit=2 * 1024 * 1024, memory_hard_limit=hard)
     # Varied, so chunks put back out of order would not match.
@@ -640,8 +635,6 @@ def test_a_payload_larger_than_one_message_goes_through_a_task_and_back_and_one_
         echoed = await echo(Greeting(text=big))
         with pytest.raises(PayloadTooLargeError) as refused:
             echo(Greeting(text="y" * (hard + 1)))
-        with pytest.raises(ResultTooLargeError):
-            await grow(Greeting(text=big))
         return echoed, refused.value
 
     echoed, refused = kabudachi.run(main)

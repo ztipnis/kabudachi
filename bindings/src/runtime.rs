@@ -207,9 +207,8 @@ impl NativeRuntime {
     /// again will not help, if the task's input alone is past the hard memory
     /// limit (the session refuses that first with `PayloadTooLargeError`, so
     /// only a caller of this method directly reaches it), and `RuntimeError`
-    /// if the runtime has shut down. Before this worker leads the task is
-    /// queued and its id returned at once; it is recorded, in order, when
-    /// the worker comes to lead. A
+    /// if the runtime has shut down. Before this worker leads the task is queued and its id returned
+    /// at once; it is recorded, in order, when the worker comes to lead. A
     /// task whose record cannot yet fit stays queued, with everything behind
     /// it, until the generation it supersedes ends, and no error is raised
     /// for it.

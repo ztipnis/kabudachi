@@ -294,20 +294,23 @@ async fn a_new_input_is_refused_while_every_store_is_full(stores: &[&Net], submi
         net.held_records()
             .set_blob_store_limit(Some(net.held_records().blob_bytes()));
     }
+    assert_eq!(new_input_stored(submitter).await, Err(NotStored::Refused));
+    for net in stores {
+        net.held_records().set_blob_store_limit(None);
+    }
+}
+
+/// What `submitter` is told when it stores the blobs of a new task's input
+/// at the leader, giving up after a short while.
+async fn new_input_stored(submitter: &Net) -> Result<Manifest, NotStored> {
     let crowded = mint(plain_with(b""), &Uuid7Ids, &RealClock::new()).task_id;
     let quick = LeaderRetry {
         answer_within: Duration::from_secs(2),
         ask_again_after: Duration::from_millis(50),
     };
-    assert_eq!(
-        submitter
-            .store_payload_at_leader(BlobRole::Input, &crowded, &varied(MIB), quick)
-            .await,
-        Err(NotStored::Refused)
-    );
-    for net in stores {
-        net.held_records().set_blob_store_limit(None);
-    }
+    submitter
+        .store_payload_at_leader(BlobRole::Input, &crowded, &varied(MIB), quick)
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -468,6 +471,30 @@ async fn a_tasks_input_leaves_every_holder_when_it_finishes_and_follows_its_reco
                     nets[claimant].resolve_manifest(&BlobOwner::Task(finished.clone()), &carried).await,
                     Ok(finished_input.clone())
                 );
+
+                // Every store has room for a chunk or two and no more: a new
+                // input is refused, but this task's result, which is not
+                // held to the share inputs are, lands.
+                let stores: Vec<&Net> = nets.iter().map(|net| &**net).chain(std::iter::once(&client)).collect();
+                for net in &stores {
+                    net.held_records()
+                        .set_blob_store_limit(Some(net.held_records().blob_bytes() + 300_000));
+                }
+                assert_eq!(new_input_stored(&nets[claimant]).await, Err(NotStored::Refused));
+                let quick = LeaderRetry {
+                    answer_within: Duration::from_secs(2),
+                    ask_again_after: Duration::from_millis(50),
+                };
+                let result = varied(200_000);
+                let stored = nets[claimant]
+                    .store_payload_at_leader(BlobRole::Result, &finished, &result, quick)
+                    .await
+                    .expect("a result is stored where a new input is refused");
+                let result_keys: Vec<BlobKey> = stored.blob_keys().cloned().collect();
+                for net in &stores {
+                    net.held_records().set_blob_store_limit(None);
+                }
+
                 nets[claimant]
                     .report_started(leader_id.clone(), claim.task_run_id.clone())
                     .await
@@ -482,6 +509,14 @@ async fn a_tasks_input_leaves_every_holder_when_it_finishes_and_follows_its_reco
                         .all(|key| nets.iter().all(|net| net.held_records().blob(key).is_none()))
                 })
                 .await;
+                // The result's blobs outlive the finish, which is what the
+                // task's client fetches them by; only the input went.
+                for key in &result_keys {
+                    assert!(
+                        nets.iter().any(|net| net.held_records().blob(key).is_some()),
+                        "a result blob is kept after its owner finishes"
+                    );
+                }
             })
             .await;
 

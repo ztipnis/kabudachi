@@ -24,7 +24,7 @@ from cluster import (
     settled,
     states,
 )
-from networked_tasks import awaits, echo, fleeting, gather, hold, spin
+from networked_tasks import BULK_BYTES, awaits, bulk, echo, fleeting, gather, hold, spin, varied_text
 from proto_messages import Greeting
 
 
@@ -195,7 +195,7 @@ def worker_killed(cluster, leader):
 
 
 def test_a_client_too_small_to_hold_a_result_has_its_handle_fail_while_the_run_completes_elsewhere(tmp_path):
-    leader, client, other = 0, 1, 2
+    leader, client = 0, 1
     cluster = Cluster.start(
         tmp_path,
         overrides={
@@ -214,7 +214,35 @@ def test_a_client_too_small_to_hold_a_result_has_its_handle_fail_while_the_run_c
         assert settled(workers[client], inflated)["error"] == "ResultTooLargeError"
         [run] = cluster.record(inflated)["runs"]
         assert run["state"] == "SUCCEEDED"
-        assert run["worker"] in (workers[leader].id, workers[other].id)
+        assert run["worker"] != workers[client].id
+    finally:
+        cluster.close()
+
+
+def test_a_run_whose_result_no_store_has_room_for_is_lost_at_its_bound_and_its_replay_stores_it_once_room_is_made(
+    tmp_path,
+):
+    # Stores hold 6 MB each, inputs at most half of that. A held task's 2.5 MB
+    # input, past one message so it travels as blobs placed on all three
+    # workers, leaves 3.5 MB: a 4.5 MB result, under the payload limit,
+    # cannot be stored.
+    sized = {"KABUDACHI_MEMORY_HARD_LIMIT": "12000000"}
+    cluster = Cluster.start(tmp_path, overrides={index: sized for index in range(3)})
+    try:
+        leader = cluster.leader()
+        leader.submit("weigh", text="heavy001" + varied_text(2_500_000))
+        eventually("the weighty task to run", lambda: (tmp_path / "heavy001.started").exists())
+
+        bulked = leader.submit("bulk")
+        # Refused until the run's reconnect timeout, the run is then lost
+        # rather than left undelivered, and replayed.
+        eventually("the bulk run to be lost", lambda: "LOST" in states(cluster.record(bulked)), timeout=15)
+        assert not cluster.record(bulked)["finished"]
+
+        (tmp_path / "heavy001.go").touch()
+        record = certified_once(cluster, bulked, digest_of(bulk, Greeting(text=varied_text(BULK_BYTES))))
+        assert states(record)[0] == "LOST" and states(record)[-1] == "SUCCEEDED"
+        assert eventually("its handle", lambda: settled(leader, bulked))["error"] is None
     finally:
         cluster.close()
 

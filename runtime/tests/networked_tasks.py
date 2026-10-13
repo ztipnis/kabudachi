@@ -5,6 +5,7 @@ only the first run of a text holds."""
 
 import asyncio
 import os
+import random
 import time
 from pathlib import Path
 
@@ -105,6 +106,34 @@ def inflate(request: Greeting) -> Greeting:
     return Greeting(text=request.text * 2)
 
 
+@kabudachi.task(name="cluster.weigh")
+async def weigh(request: Greeting) -> Greeting:
+    """Holds until the test creates a `<key>.go` marker, `key` being the
+    first eight characters of its text, which is otherwise ballast to make the
+    input large. Leaves a `<key>.started` marker once running."""
+    key = request.text[:8]
+    (_markers() / f"{key}.started").touch()
+    go = _markers() / f"{key}.go"
+    while not go.exists():
+        await asyncio.sleep(0.01)
+    return Greeting(text=key)
+
+
+BULK_BYTES = 4_500_000
+
+
+def varied_text(length: int) -> str:
+    """`length` characters that differ from chunk to chunk, so none of the
+    chunks a payload is cut into is stored once for all."""
+    return random.Random(length).randbytes(length // 2).hex()
+
+
+@kabudachi.task(name="cluster.bulk")
+def bulk(request: Greeting) -> Greeting:
+    """Returns a fixed result of `BULK_BYTES`, whatever its input."""
+    return Greeting(text=varied_text(BULK_BYTES))
+
+
 def _join(older: Greeting, newer: Greeting) -> Greeting:
     return Greeting(text=f"{older.text}+{newer.text}", times=newer.times)
 
@@ -125,5 +154,7 @@ TASKS = {
     "fleeting": fleeting,
     "echo": echo,
     "inflate": inflate,
+    "weigh": weigh,
+    "bulk": bulk,
     "gather": gather,
 }
