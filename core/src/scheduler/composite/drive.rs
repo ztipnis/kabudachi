@@ -129,10 +129,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return Err(SubmitRejection::NotStreamed);
         }
         let (held, start) = (composite.members, batch.start_index);
-        let end = start + batch.members.len() as u64;
         if start > held {
             return Err(SubmitRejection::MemberGap { held, start });
         }
+        let end = start
+            .checked_add(batch.members.len() as u64)
+            .ok_or(SubmitRejection::MemberGap { held, start })?;
         if end <= held && (composite.sealed || !batch.last) {
             // Asked again: every member it names is held already.
             return Ok(self.members_accepted(&id));
@@ -145,7 +147,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         let fresh: Vec<(u64, StreamedMember)> =
             (start..).zip(batch.members).filter(|(index, _)| *index >= held).collect();
-        let needed: u64 = fresh.iter().map(|(_, member)| member.input_bytes()).sum();
+        let needed: u64 = fresh.iter().map(|(_, member)| member.budget_bytes()).sum();
         let members: Vec<(u64, Stage)> = fresh
             .into_iter()
             .map(|(index, member)| composite.member_stage(member).map(|stage| (index, stage)))

@@ -2,12 +2,14 @@
 //! whole or refused whole, and the composite ends once its last batch is in
 //! and every member has settled.
 
+use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::composite_entry;
 use kabudachi_core::protocol::ids::CompositeId;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::composite::{
-    CompositeState, MemberBatch, MembersAccepted, OnError, PAGE_ENTRIES, Stage, StreamedMember,
+    BoundField, BoundInput, CompositeState, FieldValue, MemberBatch, MembersAccepted, OnError, PAGE_ENTRIES,
+    Stage, StreamedMember,
 };
 use kabudachi_core::scheduler::{ClaimRejection, SubmitRejection};
 
@@ -63,6 +65,11 @@ fn a_batch_is_refused_whole_past_the_hard_limit_and_after_the_composite_is_over(
         fixture.scheduler.submit_members(item_batch(&map, 5, 1, false)),
         Err(SubmitRejection::MemberGap { held: 2, start: 5 })
     );
+    assert_eq!(
+        fixture.scheduler.submit_members(item_batch(&map, u64::MAX, 2, false)),
+        Err(SubmitRejection::MemberGap { held: 2, start: u64::MAX }),
+        "a start index whose batch would end past the largest index is a gap, not an overflow"
+    );
     fail_member(&mut fixture, &map, 0, "ValueError");
     assert_eq!(finished(&mut fixture)[0].state, CompositeState::Failed);
     assert_eq!(
@@ -75,6 +82,36 @@ fn a_batch_is_refused_whole_past_the_hard_limit_and_after_the_composite_is_over(
         2,
         "a batch it already took is still answered"
     );
+}
+
+#[test]
+fn a_chunked_item_weighs_its_whole_input_so_a_batch_that_cannot_hold_it_is_refused_whole() {
+    let (mut fixture, map) = leading_with_room_for(streamed_map(OnError::FailFast), 16, 40);
+    let mut batch = item_batch(&map, 0, 1, false);
+    batch.members.push(StreamedMember::Item(BoundInput::Chunked(Manifest::chunk(&[7; 64]).manifest)));
+    assert!(matches!(fixture.scheduler.submit_members(batch), Err(SubmitRejection::Backpressure { .. })));
+    assert_eq!(fixture.scheduler.pending_len(), 0, "the first item of the refused batch was not started");
+    assert_eq!(fixture.scheduler.submit_members(item_batch(&map, 0, 1, false)).unwrap().members, 1);
+}
+
+#[test]
+fn a_sealed_composite_takes_no_new_member_but_answers_a_batch_it_took() {
+    let mut fixture = Fixture::leading();
+    let map = submitted(&mut fixture, streamed_map(OnError::FailFast));
+    fixture.scheduler.submit_members(item_batch(&map, 0, 2, false)).unwrap();
+    assert_eq!(
+        fixture.scheduler.submit_members(item_batch(&map, 0, 2, true)).unwrap().members,
+        2,
+        "the last batch asked again seals the composite and adds nothing"
+    );
+    assert_eq!(fixture.scheduler.pending_len(), 2);
+    assert!(fixture.spy.newest_composite(&map).unwrap().sealed);
+    assert_eq!(
+        fixture.scheduler.submit_members(item_batch(&map, 1, 2, true)),
+        Err(SubmitRejection::MemberGap { held: 2, start: 3 }),
+        "a sealed composite takes no member, even from a batch that overlaps the held ones"
+    );
+    assert_eq!(fixture.scheduler.submit_members(item_batch(&map, 0, 2, true)).unwrap().members, 2);
 }
 
 #[test]
@@ -113,7 +150,27 @@ fn a_batch_of_the_wrong_kind_or_for_a_composite_that_is_not_streamed_is_refused(
     let mut wrong = item_batch(&map, 0, 1, false);
     wrong.members = vec![StreamedMember::Stage(task_stage("a", Some(b"a")))];
     assert_eq!(fixture.scheduler.submit_members(wrong), Err(SubmitRejection::MemberKind));
+    let mut fielded = streamed_map(OnError::FailFast);
+    let Stage::Task(template) = &mut fielded.stages[0] else { unreachable!("the template is a task") };
+    template.fields.push(BoundField { name: "flag".into(), value: FieldValue::Bool(true) });
+    let fielded = submitted(&mut fixture, fielded);
+    assert_eq!(
+        fixture.scheduler.submit_members(item_batch(&fielded, 0, 1, false)),
+        Err(SubmitRejection::MemberKind),
+        "an item is the whole input, so it has no fields set on it"
+    );
     let group = submitted(&mut fixture, streamed_group(OnError::FailFast));
+    let nested = MemberBatch {
+        composite_id: group.clone(),
+        start_index: 0,
+        members: vec![StreamedMember::Stage(Stage::Composite(streamed_map(OnError::FailFast)))],
+        last: false,
+    };
+    assert_eq!(
+        fixture.scheduler.submit_members(nested),
+        Err(SubmitRejection::MemberKind),
+        "a member cannot itself wait for members"
+    );
     let open = MemberBatch {
         composite_id: group.clone(),
         start_index: 0,

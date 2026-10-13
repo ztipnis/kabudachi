@@ -122,8 +122,8 @@ pub fn item_batch(map: &CompositeId, start: u64, count: u64, last: bool) -> Memb
     MemberBatch {
         composite_id: map.clone(),
         start_index: start,
-        members: (start..start + count)
-            .map(|index| StreamedMember::Item(BoundInput::Value(item(index))))
+        members: (0..count)
+            .map(|offset| StreamedMember::Item(BoundInput::Value(item(start.wrapping_add(offset)))))
             .collect(),
         last,
     }

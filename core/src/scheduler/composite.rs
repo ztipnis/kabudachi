@@ -326,18 +326,33 @@ pub enum StreamedMember {
 }
 
 impl StreamedMember {
-    /// The inline input the member's Task will carry, which is what the
-    /// memory budget counts for it: the length of a `Value`, and nothing for
-    /// a chunked item or stage and for a composite stage.
+    /// The input the member's Task will carry inline, which is what a batch
+    /// of members is bounded by on the wire: the length of a `Value`, and
+    /// nothing for a chunked item or stage, whose bytes are blobs, or for a
+    /// composite stage.
     pub fn input_bytes(&self) -> u64 {
-        let input = match self {
-            StreamedMember::Item(input) => input,
-            StreamedMember::Stage(Stage::Task(step)) => &step.input,
-            StreamedMember::Stage(Stage::Composite(_)) => return 0,
-        };
-        match input {
-            BoundInput::Value(bytes) => bytes.len() as u64,
-            BoundInput::Chunked(_) | BoundInput::Previous => 0,
+        match self.task_input() {
+            Some(BoundInput::Value(bytes)) => bytes.len() as u64,
+            _ => 0,
+        }
+    }
+
+    /// What the member weighs against the memory budget once its Task is
+    /// submitted: its whole input, inline or as the blobs of a manifest.
+    pub fn budget_bytes(&self) -> u64 {
+        match self.task_input() {
+            Some(BoundInput::Value(bytes)) => bytes.len() as u64,
+            Some(BoundInput::Chunked(manifest)) => manifest.total_bytes(),
+            Some(BoundInput::Previous) | None => 0,
+        }
+    }
+
+    /// The input of the Task the member is, if it is one.
+    fn task_input(&self) -> Option<&BoundInput> {
+        match self {
+            StreamedMember::Item(input) => Some(input),
+            StreamedMember::Stage(Stage::Task(step)) => Some(&step.input),
+            StreamedMember::Stage(Stage::Composite(_)) => None,
         }
     }
 }
@@ -546,6 +561,15 @@ impl ExpansionRequest {
 }
 
 impl Stage {
+    /// Whether this stage is a composite that waits for members to be sent,
+    /// at any depth.
+    pub fn is_or_holds_streamed(&self) -> bool {
+        match self {
+            Stage::Task(_) => false,
+            Stage::Composite(step) => step.streamed || step.stages.iter().any(Stage::is_or_holds_streamed),
+        }
+    }
+
     /// Whether the stage needs an input from whatever runs before it.
     pub fn takes_input(&self) -> bool {
         match self {

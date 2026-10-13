@@ -5,9 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::manifest::{Failure, Manifest};
 use crate::protocol::ids::{CompositeId, TaskId, WorkerId};
-use crate::time::{Duration, Instant, WallTime};
-
 use crate::scheduler::SubmitRejection;
+use crate::time::{Duration, Instant, WallTime};
 
 use super::{
     BoundInput, BoundStep, CANCELLED_KIND, CompositeKind, CompositeParent, CompositeState, InputShape,
@@ -55,15 +54,22 @@ impl Composite {
 
     /// The stage a streamed member is to run as: a map's item is the input of
     /// its template, a group's stage is run as it is unless it needs an input,
-    /// which a streamed composite has none to give.
+    /// which a streamed composite has none to give, or itself waits for
+    /// members. An item has no fields set on it: it is the whole input.
     pub(super) fn member_stage(&self, member: StreamedMember) -> Result<Stage, SubmitRejection> {
         match (self.step.kind, member) {
             (CompositeKind::Map, StreamedMember::Item(input)) => match (&self.step.stages[..], input) {
                 (_, BoundInput::Previous) => Err(SubmitRejection::MemberKind),
-                ([Stage::Task(template)], input) => Ok(Stage::Task(BoundStep { input, ..template.clone() })),
+                ([Stage::Task(template)], input) if template.fields.is_empty() => {
+                    Ok(Stage::Task(BoundStep { input, ..template.clone() }))
+                }
                 _ => Err(SubmitRejection::MemberKind),
             },
-            (CompositeKind::Group, StreamedMember::Stage(stage)) if !stage.takes_input() => Ok(stage),
+            (CompositeKind::Group, StreamedMember::Stage(stage))
+                if !stage.takes_input() && !stage.is_or_holds_streamed() =>
+            {
+                Ok(stage)
+            }
             _ => Err(SubmitRejection::MemberKind),
         }
     }
