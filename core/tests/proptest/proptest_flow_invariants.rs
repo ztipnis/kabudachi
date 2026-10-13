@@ -403,10 +403,7 @@ impl Model {
             }
         }
         for id in &self.composites {
-            let Some(status) = self.scheduler.composite_status(id) else {
-                continue;
-            };
-            if status.state != CompositeState::Running {
+            if self.scheduler.composite_status(id).is_none() {
                 continue;
             }
             let record = self.scheduler.composite_record(id).unwrap();
@@ -488,4 +485,27 @@ proptest! {
         }
         model.drain();
     }
+}
+
+/// Runs `ops` as a history, checking every invariant after each.
+fn replay(ops: &[Op]) {
+    let mut model = Model::new();
+    for op in ops {
+        model.apply(op);
+        model.check_invariants();
+    }
+    model.drain();
+}
+
+#[test]
+fn a_second_generation_of_a_key_is_never_claimed_beside_the_first() {
+    let keyed = || Op::Submit { key: Some(0), size: 1, retries: 0 };
+    replay(&[keyed(), Op::Claim { limit: 1 }, keyed(), Op::Claim { limit: 1 }]);
+}
+
+#[test]
+fn a_silent_worker_replays_only_the_newest_generation_of_a_key() {
+    let plain = || Op::Submit { key: None, size: 1, retries: 0 };
+    let keyed = || Op::Submit { key: Some(0), size: 1, retries: 0 };
+    replay(&[plain(), plain(), keyed(), Op::Claim { limit: 3 }, keyed(), Op::WorkerFallsSilent]);
 }

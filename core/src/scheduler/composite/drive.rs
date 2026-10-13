@@ -21,14 +21,14 @@ use crate::time::{Clock, Duration, WallTime};
 
 use crate::blob::BlobKey;
 use crate::scheduler::{
-    Cancellation, CancelRejection, Event, Observer, Scheduler, Submission, SubmitRejection, Submitted,
+    CancelRejection, Cancellation, Event, Observer, Scheduler, Submission, SubmitRejection, Submitted,
 };
 
 use super::held::Composite;
 use super::{
     BoundInput, BoundStep, CompositeFinished, CompositeKind, CompositeParent, CompositeState,
-    CompositeStatus, EXPANSION_DEFINITION, InputShape, LOST_KIND, MemberOutcome, PAGE_ENTRIES, Stage, Step, SubmittedComposite,
-    failure_of, pages_manifest,
+    CompositeStatus, EXPANSION_DEFINITION, InputShape, LOST_KIND, MemberOutcome, PAGE_ENTRIES, Stage,
+    Step, SubmittedComposite, failure_of, pages_manifest,
 };
 
 /// The results of a composite a stage is to take were not found.
