@@ -570,7 +570,12 @@ class _StopSignals:
             # The first signal's grace: once it has run out, the run stops as a
             # second signal would stop it.
             if self._escalate_at is None:
-                self._escalate_at = time.monotonic() + self._grace_seconds
+                # Never sooner than one poll: the main thread must have had
+                # time to run the first signal's handler, or the handler would
+                # take the second-signal branch and never stop gracefully.
+                self._escalate_at = time.monotonic() + max(
+                    self._grace_seconds, self._POLL_SECONDS
+                )
             elif time.monotonic() >= self._escalate_at:
                 self._arrived = 2
         self._settle_raised_state()
