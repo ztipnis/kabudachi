@@ -217,10 +217,12 @@ where
     }
 
     /// What the lease reads of this node while it leads: `None` unless it
-    /// is `Leader`, and, with an authority, holds the recovery fence (design
-    /// 4.5), whose end also ends its grant.
+    /// is `Leader`, and, with an authority, holds the recovery fence, whose
+    /// end also ends its grant. `None` too while it hands its leadership over
+    /// (see [`Input::TransferLeadership`](crate::election::Input::TransferLeadership)): it holds no grant and vouches for
+    /// no heartbeat then.
     pub(super) fn office(&self) -> Option<Office<'_>> {
-        if !self.holds_office() {
+        if !self.holds_office() || self.transfer.is_some() {
             return None;
         }
         let fence_end = match &self.authority {

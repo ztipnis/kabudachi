@@ -129,7 +129,7 @@ where
             // Unasked, and sent after the grant is withdrawn: no heartbeat
             // token to vouch for.
             let content = departure.ack_for(&peer);
-            self.send_ack_with(peer, content, None);
+            self.send_ack_with(peer, content, None, true);
         }
     }
 

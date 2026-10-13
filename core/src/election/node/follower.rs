@@ -44,6 +44,12 @@ where
     /// earlier than the ack's steps down to `Active` under the ack's leader;
     /// one of the ack's own term keeps it.
     ///
+    /// An ack that says its leader is handing leadership over changes less:
+    /// that leader is alive but leads no longer, so the ack refreshes no
+    /// contact, returns no node seeking a leader to `Active` and makes the
+    /// node forget no roll call; it records the leader, and the node no
+    /// longer counts that leader as valid against a roll call.
+    ///
     /// It also carries the leader's configuration and this node's admission
     /// generations in the leader's roster, which this node adopts as
     /// [`ShardStanding::accept_ack`](crate::election::standing::ShardStanding::accept_ack) says. An ack that names no admission
@@ -121,8 +127,14 @@ where
     /// a term it held or contested.
     fn follow_ack(&mut self, ack: &Checked<LeaderHeartbeatAck>, change: AckChange, outpaced: bool) {
         let now = self.clock.now();
-        self.last_leader_contact = now;
-        self.round.end_no_quorum_streak();
+        // A leader handing over is alive but leads no longer: its ack neither
+        // refreshes contact nor ends a suspicion or a roll call (its
+        // successor's included), and the calls above its term are kept.
+        self.leader_draining = ack.leader_draining;
+        if !ack.leader_draining {
+            self.last_leader_contact = now;
+            self.round.end_no_quorum_streak();
+        }
         self.record_ack(ack, now);
         if change.generation_changed || change.admission_changed {
             // Heartbeat at once: the echo of the new generation is what
@@ -131,14 +143,16 @@ where
             // `Roster::promise_admission`).
             self.next_heartbeat = None;
         }
-        if outpaced || self.seeks_a_leader() {
+        if outpaced || (!ack.leader_draining && self.seeks_a_leader()) {
             self.round.stop();
             self.drop_recovery();
             self.transition_to(WorkerState::Active);
         }
         // Whatever this node's state: see the forgetting described at
         // `on_leader_ack`.
-        self.round.follow_leader_of(ack.term);
+        if !ack.leader_draining {
+            self.round.follow_leader_of(ack.term);
+        }
     }
 
     /// Records `ack`, accepted at `now`: its vouching token for the lease, its

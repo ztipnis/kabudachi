@@ -90,6 +90,9 @@ message LeaderHeartbeatAck {
   // recipient's heartbeats show it no longer holds them, at most a bounded
   // number at a time.
   repeated TaskRunId cancelled_runs = 11;
+  // The leader is handing its leadership over: it holds no grant, and an
+  // election may begin while it still answers.
+  bool leader_draining = 12;
 }
 
 // A census of the shard's workers ahead of a vote, published on the shard's
@@ -258,6 +261,18 @@ message SelfRemove {
   uint64 leader_term = 6;
 }
 
+// A leader handing its leadership over asks `target_id` to stand for election
+// at once.
+message TransferLeadership {
+  ShardId shard_id = 1;
+  WorkerId leader_id = 2;
+  WorkerId target_id = 3;
+  uint64 recovery_epoch = 4;
+  uint64 recovery_epoch_lineage = 5;
+  // The term of the leadership handing over.
+  uint64 term = 6;
+}
+
 // The identity of a configuration, compared lexicographically: recovery
 // epoch (number, then lineage), term, counter.
 message Generation {
@@ -308,5 +323,6 @@ message ElectionMessage {
     ElectionReject election_reject = 7;
     ElectionCertificate election_certificate = 8;
     SelfRemove self_remove = 9;
+    TransferLeadership transfer_leadership = 10;
   }
 }

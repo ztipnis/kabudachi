@@ -9,7 +9,7 @@ use kabudachi_core::protocol::ids::{ShardId, WorkerId};
 use kabudachi_core::protocol::messages::{
     AckEcho, ElectionCertificate, ElectionMessage, ElectionReject, ElectionRejectReason,
     JoinResponse, KnownLeader, LeaderHeartbeatAck, RollCall, RollCallReply, SelfRemove, VoteGrant,
-    VoteRequest, WorkerHeartbeat, election_message,
+    TransferLeadership, VoteRequest, WorkerHeartbeat, election_message,
 };
 use kabudachi_core::time::Duration;
 
@@ -207,7 +207,23 @@ pub fn leader_ack(
         heartbeat_token: None,
         recovery_epoch_lineage: 0,
         cancelled_runs: Vec::new(),
+        leader_draining: false,
     }
+}
+
+/// `leader`'s request, as leader of `term` in `shard-1` at recovery epoch 0,
+/// that `target` stand for election at once.
+pub fn transfer_message(leader: &WorkerId, target: &WorkerId, term: u64) -> ElectionMessage {
+    message(election_message::Payload::TransferLeadership(
+        TransferLeadership {
+            shard_id: Some(shard(SHARD).into()),
+            leader_id: Some(leader.clone().into()),
+            target_id: Some(target.clone().into()),
+            recovery_epoch: 0,
+            recovery_epoch_lineage: 0,
+            term,
+        },
+    ))
 }
 
 pub fn ack_message(ack: LeaderHeartbeatAck) -> ElectionMessage {

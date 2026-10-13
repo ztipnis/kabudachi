@@ -40,6 +40,7 @@ where
             Input::AuthorityEpochAsked(token) => self.note_epoch_read_asked(token),
             Input::AuthorityEpochRead { token, held } => self.on_epoch_read(token, held),
             Input::Drain => self.request_drain(),
+            Input::TransferLeadership => self.transfer_leadership(),
             Input::RoutingCrawled => self.crawled_at_admission = self.admission(),
             Input::Reconciled(office) => self.on_reconciled(office),
             Input::WatchWorkers {
@@ -131,8 +132,9 @@ where
     }
 
     /// What a node in office waits for: going `NoQuorum` unless more
-    /// confirmations arrive, its next worker to report lost or silent, and a
-    /// kept drain's wake-up, whichever comes first.
+    /// confirmations arrive, its next worker to report lost or silent, the end
+    /// of a hand-over under way, and a kept drain's wake-up, whichever comes
+    /// first.
     fn office_deadline(&self) -> Option<Instant> {
         let office = self.office.as_ref();
         let no_quorum = office.and_then(|office| {
@@ -149,8 +151,9 @@ where
         let silent = office.and_then(|office| {
             office.next_silent_at(self.clock.now(), self.timings.suspect_timeout)
         });
+        let transfer_ends = self.transfer.as_ref().map(|transfer| transfer.until);
         earliest(
-            earliest(no_quorum, lost),
+            earliest(earliest(no_quorum, lost), transfer_ends),
             earliest(self.drain_request.wakes_at(), silent),
         )
     }
@@ -200,6 +203,7 @@ where
     /// the standing while this node still leads, so what it writes is not
     /// overwritten by the configuration this node led.
     pub(super) fn leave_office(&mut self) {
+        self.transfer = None;
         if let Some(office) = self.office.take() {
             office.hand_back(&mut self.standing, &self.my_id);
         }
@@ -272,6 +276,9 @@ where
                 if certificate.leader_id() == from =>
             {
                 self.on_election_certificate(&from, &certificate);
+            }
+            Some(CheckedPayload::TransferLeadership(asked)) if asked.leader_id() == from => {
+                self.on_transfer_leadership(&from, &asked);
             }
             _ => {}
         }

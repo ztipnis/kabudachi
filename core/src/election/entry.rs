@@ -342,6 +342,8 @@ impl<C: Clock> WorkerNode<C> {
             connected: BTreeSet::new(),
             lease: Lease::new(now),
             drain_request: DrainRequest::default(),
+            transfer: None,
+            leader_draining: false,
             crawled_at_admission: None,
             report: SelfReport::default(),
             cancelled_runs: CancelledRunsLedger::default(),

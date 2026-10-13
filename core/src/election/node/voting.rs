@@ -16,7 +16,9 @@ where
 {
     /// Whether this node's state takes part in elections: only `Active`,
     /// `LeaderSuspect`, `RollCall` and `NoQuorum` answer roll calls and
-    /// grant votes, a pending member among them.
+    /// grant votes, a pending member among them, and a leader handing its
+    /// leadership over, which takes part like a follower (granting a later
+    /// term makes it step down).
     pub(super) fn takes_part_in_elections(&self) -> bool {
         matches!(
             self.state,
@@ -24,7 +26,7 @@ where
                 | WorkerState::LeaderSuspect
                 | WorkerState::RollCall
                 | WorkerState::NoQuorum
-        )
+        ) || (self.transfer.is_some() && self.holds_office())
     }
 
     /// Has this node's election round decide, through `decide`, with a view

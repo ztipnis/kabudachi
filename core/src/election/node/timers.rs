@@ -49,6 +49,7 @@ where
                 self.decide(|round, view| round.on_deadline(view, now));
             }
             WorkerState::LeaderReconciling | WorkerState::Leader => {
+                self.end_transfer_if_due();
                 self.drain_once_free();
                 if self.holds_office() {
                     self.report_lost_workers();
@@ -88,7 +89,7 @@ where
     /// confirms this node's own epoch, or found the authority holding none:
     /// a node at an epoch the authority does not hold must rejoin, not elect
     /// a leader there that would pull the others off the authority's epoch.
-    fn may_stand(&self) -> bool {
+    pub(super) fn may_stand(&self) -> bool {
         match (self.authority.as_ref(), self.standing.epoch()) {
             (Some(authority), Some(own)) => authority.permits_standing(own),
             _ => true,
@@ -111,8 +112,13 @@ where
         lengthen_by_less_than_half(self.timings.suspect_timeout, share)
     }
 
+    /// Whether this node's leader still leads, against a roll call: heard
+    /// within a suspicion timeout and not handing its leadership over (nor
+    /// this node itself handing over).
     pub(super) fn current_leader_still_valid(&self) -> bool {
-        self.clock.now() - self.last_leader_contact <= self.timings.suspect_timeout
+        !self.leader_draining
+            && self.transfer.is_none()
+            && self.clock.now() - self.last_leader_contact <= self.timings.suspect_timeout
     }
 
     /// The latest term this node knows of: the highest it has seen, or that
