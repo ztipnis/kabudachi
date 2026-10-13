@@ -14,6 +14,7 @@ mod native_log;
 mod networked;
 mod outcomes;
 mod queues;
+mod result_backend;
 mod runtime;
 mod timers;
 mod work;
@@ -46,6 +47,9 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<composite::PyManifest>()?;
     m.add_class::<runtime::NativeRuntime>()?;
     m.add_class::<networked::NetworkedRuntime>()?;
+    m.add_class::<result_backend::PyRedisResultBackend>()?;
+    m.add_class::<result_backend::PyPythonResultBackend>()?;
+    m.add_class::<result_backend::PyResumed>()?;
     m.add_class::<work::PyClaim>()?;
     m.add_class::<work::PyCertification>()?;
     m.add_class::<work::PyEvent>()?;

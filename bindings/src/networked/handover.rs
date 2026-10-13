@@ -10,12 +10,15 @@ use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::messages::Claim as WireClaim;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::Claim;
+use kabudachi_core::result_backend::{TaskStanding, task_standing};
 use kabudachi_net::discovery::Stage;
 use kabudachi_net::executor::{Report, Work};
+use kabudachi_net::messenger::Net;
 use kabudachi_net::payload_memory::{PAYLOAD_TOO_LARGE_KIND, Taken};
 
 use super::seam::{Seam, Shared};
 use crate::outcomes::PyEventKind;
+use crate::result_backend::{Mirror, mirror};
 use crate::work::PyEvent;
 
 /// How a run the driver took back is reported: its body is being stopped,
@@ -52,7 +55,11 @@ impl Handled {
 impl Shared {
     /// Applies `work` to the seam under its lock, then reports and wakes
     /// outside it.
-    pub(super) fn on_work(&self, work: Work) {
+    pub(super) fn on_work(self: &Arc<Self>, work: Work) {
+        let work = match work {
+            Work::Answered { run, certified } => return self.answered(run, certified),
+            work => work,
+        };
         let handled = {
             let mut seam = self.seam();
             match work {
@@ -60,11 +67,41 @@ impl Shared {
                 Work::Cancel(run) => seam.take_back(run),
                 Work::Abort { run, deadline } => seam.abort(run, deadline),
                 Work::AbortWithdrawn(run) => seam.withdraw_abort(&run),
-                // Nothing mirrors a certified result yet.
-                Work::Answered { .. } => return,
+                Work::Answered { .. } => unreachable!("answered above"),
             }
         };
         self.settle(handled);
+    }
+
+    /// The leader answered the completion of `run` for good. If this worker
+    /// is to mirror the run's result and the answer certified that run, or
+    /// the task's record shows it certified under the digest the mirror
+    /// holds (the answer was a refusal of a resent report, or was lost), the
+    /// result is mirrored in the background and the leader told how that
+    /// went. A run the leader did not certify is never mirrored.
+    fn answered(self: &Arc<Self>, run: TaskRunId, certified: bool) {
+        let kept = {
+            let mut seam = self.seam();
+            let kept = seam.mirroring.remove(&run);
+            if kept.is_some() {
+                seam.mirrors_running += 1;
+            }
+            kept
+        };
+        let Some(kept) = kept else {
+            return;
+        };
+        let shared = Arc::clone(self);
+        self.handle.spawn(async move {
+            let certified = certified || certified_in_record(&shared.net, &kept).await;
+            if certified && let Some(backend) = shared.backend.clone() {
+                let run = kept.run.clone();
+                let state = mirror(backend, move || kept.entries()).await;
+                shared.report(Report::Persisted { run, state });
+            }
+            shared.seam().mirrors_running -= 1;
+            shared.wake();
+        });
     }
 
     /// Reports, offers a place again and wakes, as `handled` says, outside
@@ -80,6 +117,17 @@ impl Shared {
             self.wake();
         }
     }
+}
+
+/// Whether the task's record shows `kept`'s run certified under its digest:
+/// a leader certified it though this worker's report was refused, as a resent
+/// report of a certified run is.
+async fn certified_in_record(net: &Net, kept: &Mirror) -> bool {
+    let record = net.get_record(kept.task.clone()).await;
+    matches!(
+        task_standing(record.as_ref()),
+        TaskStanding::Succeeded { run, digest, .. } if run == kept.run && digest == kept.digest
+    )
 }
 
 /// Why a run whose input travels as blobs cannot be handed to Python.

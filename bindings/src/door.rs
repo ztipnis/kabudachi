@@ -35,9 +35,10 @@ use kabudachi_core::scheduler::composite::{
 };
 use kabudachi_core::scheduler::{
     Backlog, BlockRejection, Blocked, CancelRejection, Cancellation, Certification, Claim,
-    ClaimRejection, Compacted, Completion, Event, Failure, LostRun, ReportRejection, Scheduler,
+    ClaimRejection, Compacted, Completion, Event, Failure, LostRun, ReportRejection, Reported, Scheduler,
     Submission, SubmitRejection, Submitted,
 };
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::task_record::{LocalRecords, RecordKey, ShardRecord, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};
 use tokio::sync::{Notify, watch};
@@ -341,18 +342,39 @@ impl<C: Clock> SchedulerDoor<C> {
         }))
     }
 
+    /// Certifies `run` under `result_digest`, recording `persistence`: whether
+    /// this worker will mirror the result (`Pending`) or not (`Disabled`).
     pub fn complete(
         &self,
         run: &TaskRunId,
         result_digest: Digest,
         completion: Completion,
+        persistence: PersistenceState,
     ) -> Result<Certification, Refusal<ReportRejection>> {
+        let reported = Reported {
+            persistence,
+            ..Reported::default()
+        };
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
             settled_change(scheduler, |scheduler| {
                 let certification =
-                    scheduler.complete(&self.worker, run, result_digest, completion)?;
+                    scheduler.complete_reported(&self.worker, run, result_digest, completion, reported)?;
                 forget_blobs_if_finished(scheduler, &certification.task_id);
                 Ok(certification)
+            })
+        }))
+    }
+
+    /// Records how mirroring the certified result of `run` went (`Stored` or
+    /// `Failed`), in a new revision of the finished record.
+    pub fn note_persistence(
+        &self,
+        run: &TaskRunId,
+        state: PersistenceState,
+    ) -> Result<(), Refusal<ReportRejection>> {
+        refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
+            settled_change(scheduler, |scheduler| {
+                scheduler.note_persistence(&self.worker, run, state)
             })
         }))
     }

@@ -43,8 +43,11 @@ pub(super) async fn deliver_then_report(
     run: TaskRunId,
     digest: Digest,
     payload: Vec<u8>,
+    persistence: PersistenceState,
 ) {
     let Some(body) = result_body(&shared, &held, payload).await else {
+        // Never reported completed, so nothing will answer it.
+        shared.seam().mirroring.remove(&run);
         shared.report(Report::Lost(run));
         return;
     };
@@ -64,7 +67,7 @@ pub(super) async fn deliver_then_report(
         digest,
         delivered,
         continuation: None,
-        persistence: PersistenceState::Disabled,
+        persistence,
     });
 }
 

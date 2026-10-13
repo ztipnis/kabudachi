@@ -363,6 +363,7 @@ py_test(
     deps = [
         "//bindings:_native",  # keep
         "//bindings/contract",  # keep
+        "//runtime/src/kabudachi",
         "@pypi//pytest",  # keep
     ],
 )

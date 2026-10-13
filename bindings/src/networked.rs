@@ -66,7 +66,7 @@ use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::composite::{
     MEMBER_BATCH_BYTES, SubmittedComposite, expansion_source, member_input, reduce_operands, results,
 };
-use kabudachi_core::result_backend::PersistenceState;
+use kabudachi_core::result_backend::{PersistenceState, ResultBounds, composite_entries};
 use kabudachi_core::scheduler::{SubmitRejection, mint};
 use kabudachi_core::time::{RealClock, WallTime};
 use kabudachi_net::blobs::BlobRole;
@@ -87,6 +87,10 @@ use crate::composite::{
 };
 use crate::errors::backpressure_error;
 use crate::health;
+use crate::result_backend::{
+    Mirror, ResumedValue, backend_of, expiring_in, keep_for, mirror, persistence_for, resume_composite, resume_task,
+    tree_from_py,
+};
 use crate::work::PyTaskRecord;
 
 use self::composites::{
@@ -143,8 +147,18 @@ impl NetworkedRuntime {
     /// cannot listen on its listen address. `health_listen` raises
     /// `ValueError` for an address that is not `ip:port` and `RuntimeError`
     /// when it cannot be bound.
+    ///
+    /// `result_backend`, a `RedisResultBackend` or `PythonResultBackend`,
+    /// is where this worker mirrors the results of runs the leader has
+    /// certified; `TypeError` for anything else.
     #[new]
-    fn new(py: Python<'_>, arguments: NetworkedArguments) -> PyResult<Self> {
+    #[pyo3(signature = (arguments, result_backend = None))]
+    fn new(
+        py: Python<'_>,
+        arguments: NetworkedArguments,
+        result_backend: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let backend = backend_of(result_backend)?;
         arguments.check()?;
         // Bound before the worker bootstraps, so a port in use leaves nothing
         // running.
@@ -173,6 +187,9 @@ impl NetworkedRuntime {
             worker.net(),
             observed,
             arguments.retry(),
+            backend.clone(),
+            arguments.result_ttl_ms,
+            tokio.handle().clone(),
         ));
         let drained = Arc::default();
         let host = Host::start(
@@ -449,6 +466,25 @@ impl NetworkedRuntime {
         let Some(held) = self.shared.end(&run) else {
             return Ok(());
         };
+        let persistence = persistence_for(
+            self.shared.backend.is_some(),
+            result.as_deref().map(|result| (result, &digest)),
+            held.member.is_some(),
+            held.result_ttl_ms,
+        );
+        if let (PersistenceState::Pending, Some(payload)) = (persistence, &result) {
+            // Kept before the report goes, so the leader's answer finds it.
+            self.shared.seam().mirroring.insert(
+                run.clone(),
+                Mirror {
+                    task: held.task.clone(),
+                    run: run.clone(),
+                    digest: digest.clone(),
+                    payload: payload.clone(),
+                    keep_for: keep_for(held.result_ttl_ms, self.shared.result_ttl_ms),
+                },
+            );
+        }
         match (held.client.clone(), result) {
             (Some(client), Some(payload)) => {
                 self.host.handle().spawn(deliver_then_report(
@@ -458,6 +494,7 @@ impl NetworkedRuntime {
                     run,
                     digest,
                     payload,
+                    persistence,
                 ));
             }
             _ => self.shared.report(Report::Completed {
@@ -465,7 +502,7 @@ impl NetworkedRuntime {
                 digest,
                 delivered: false,
                 continuation: None,
-                persistence: PersistenceState::Disabled,
+                persistence,
             }),
         }
         Ok(())
@@ -810,6 +847,63 @@ impl NetworkedRuntime {
         })
     }
 
+    /// Stores a finished composite's resolved `results` (see `Resumed.results`
+    /// for the tree's form) in the result backend for `expires_in_ms`, in the
+    /// background. Does nothing without a backend; a failure of the backend is
+    /// logged, never raised.
+    ///
+    /// Raises `TypeError` if `results` is not a result tree.
+    fn mirror_composite(
+        &self,
+        composite_id: &str,
+        results: &Bound<'_, PyAny>,
+        expires_in_ms: u64,
+    ) -> PyResult<()> {
+        let Some(backend) = self.shared.backend.clone() else {
+            return Ok(());
+        };
+        let tree = tree_from_py(results)?;
+        let id = CompositeId::new(composite_id);
+        let expires_at = expiring_in(StdDuration::from_millis(expires_in_ms));
+        self.host.bridge().spawn_detached(async move {
+            mirror(backend, move || {
+                composite_entries(&ResultBounds::DEFAULT, &id, &tree, expires_at)
+            })
+            .await;
+        });
+        Ok(())
+    }
+
+    /// Returns an awaitable that resolves to a `Resumed`: where the task
+    /// stands by the newest record of it the shard holds that this worker
+    /// reaches, and, once it succeeded, its value from the result backend,
+    /// checked against the record. A task that returned a step resumes as its
+    /// composite.
+    fn resume_task<'py>(&self, py: Python<'py>, task_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let net = Arc::clone(&self.shared.net);
+        let backend = self.shared.backend.clone();
+        self.host.bridge().spawn_into_py(py, async move {
+            let task = TaskId::new(task_id);
+            let record = net.get_record(task.clone()).await;
+            let (composite, resumption) = resume_task(task, record, &NetSource::new(net), backend).await;
+            Ok(ResumedValue(composite, resumption))
+        })
+    }
+
+    /// Returns an awaitable that resolves to a `Resumed` for a composite, as
+    /// `resume_task` does for a task: the record if the shard still holds it,
+    /// then the results reassembled from the backend, or else from the shard
+    /// while it holds them.
+    fn resume_composite<'py>(&self, py: Python<'py>, composite_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let net = Arc::clone(&self.shared.net);
+        let backend = self.shared.backend.clone();
+        self.host.bridge().spawn_into_py(py, async move {
+            let id = CompositeId::new(composite_id);
+            let resumption = resume_composite(id.clone(), &NetSource::new(net), backend).await;
+            Ok(ResumedValue(Some(id), resumption))
+        })
+    }
+
     /// Takes no more runs: those handed over and not taken, or still
     /// being fetched, are reported lost, later ones too, and a claim waiting resolves empty. The driver
     /// may still hand over up to the places already offered; each is
@@ -819,15 +913,18 @@ impl NetworkedRuntime {
     }
 
     /// Returns an awaitable that resolves once the leader has taken the
-    /// last report on every run this worker claimed (`True`), or the
-    /// reconnect timeout has passed or the worker left its shard (`False`).
+    /// last report on every run this worker claimed and every result it is
+    /// mirroring is stored and reported (`True`), or the reconnect timeout
+    /// has passed or the worker left its shard (`False`). A mirror still
+    /// running then leaves its run's persistence `"pending"`.
     fn wait_until_reported<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let net = Arc::clone(&self.shared.net);
+        let shared = Arc::clone(&self.shared);
         let observed = self.shared.observed.clone();
         let within = self.reconnect_timeout;
         self.host.bridge().spawn_into_py(py, async move {
             let deadline = tokio::time::Instant::now() + within;
-            while !net.claimed_runs().snapshot().is_empty() {
+            while !net.claimed_runs().snapshot().is_empty() || shared.mirrors_pending() {
                 if observed.borrow().gone || tokio::time::Instant::now() >= deadline {
                     return Ok(false);
                 }

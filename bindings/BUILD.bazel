@@ -21,9 +21,11 @@ rust_shared_library(
     visibility = ["//visibility:private"],
     # The networked runtime hosts a net worker, with a Redis authority.
     deps = [
+        "//bindings/py_backend",
         "//core:core",
         "//net",
         "//redis_authority",
+        "//redis_result_backend",
         "@crates//:axum",
         "@crates//:log",
         "@crates//:pyo3",

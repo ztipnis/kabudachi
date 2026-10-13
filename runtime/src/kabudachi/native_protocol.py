@@ -126,6 +126,10 @@ class SubmitArguments:
     retries: int = 0
     drop_oldest: bool = False
     non_retriable: bool = False
+    result_ttl_ms: int | None = None
+    """How long the shard keeps the finished task, in milliseconds; `None`
+    keeps it as long as the shard's own result retention. With 0 it keeps no
+    result: nothing is mirrored to a result backend."""
 
 
 QueueOptionsArgument = tuple[str, int, int, int | None, int | None]
