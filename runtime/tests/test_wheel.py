@@ -2,7 +2,8 @@
 metadata says what pyproject.toml says, the version is the one the package and
 the Bazel module name, it installs with pip into a fresh virtual environment,
 and from there it runs a flow on a worker of its own and across a networked
-shard of two."""
+shard of two. On Linux its platform tag is the one its extension's symbols
+allow."""
 
 import ast
 import json
@@ -11,6 +12,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import tomllib
 import venv
 import zipfile
@@ -139,14 +141,14 @@ def installed(tmp_path_factory) -> dict:
     return {"python": python, "programs": programs, "site": site.resolve(), "environment": environment}
 
 
-def start(installed: dict, mode: str, **settings: str) -> subprocess.Popen:
+def start(installed: dict, mode: str, stderr=subprocess.PIPE, **settings: str) -> subprocess.Popen:
     return subprocess.Popen(
         [installed["python"], "wheel_smoke.py", mode],
         cwd=installed["programs"],
         env={**installed["environment"], **settings},
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=stderr,
         text=True,
     )
 
@@ -192,21 +194,35 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def found_shard(installed: dict) -> tuple[subprocess.Popen, str]:
+def found_shard(installed: dict, stderr_file: Path) -> tuple[subprocess.Popen, str]:
     """A worker serving a shard it founded alone, and the address it listens
-    on. A port another process takes before the worker binds it makes the
-    worker exit before it serves; then another port is tried."""
+    on. Its stderr goes to `stderr_file`, so an unread pipe never blocks it. A
+    port another process takes before the worker binds it makes the worker
+    exit before it serves; then another port is tried. A worker that neither
+    serves nor exits within RUN_SECONDS is killed and fails the test."""
     for _ in range(3):
         address = f"/ip4/127.0.0.1/tcp/{free_port()}"
-        founder = start(installed, "serve", KABUDACHI_LISTEN=address)
-        if founder.stdout.readline():
+        with stderr_file.open("w") as stderr:
+            founder = start(installed, "serve", stderr=stderr, KABUDACHI_LISTEN=address)
+        serving = []
+        reader = threading.Thread(target=lambda: serving.append(founder.stdout.readline()), daemon=True)
+        reader.start()
+        reader.join(RUN_SECONDS)
+        if reader.is_alive():
+            founder.kill()
+            founder.wait()
+            raise AssertionError(
+                f"the founding worker did not serve within {RUN_SECONDS}s: {stderr_file.read_text()}"
+            )
+        if serving[0]:
             return founder, address
         founder.wait()
-    raise AssertionError(f"the founding worker never served: {founder.stderr.read()}")
+    raise AssertionError(f"the founding worker never served: {stderr_file.read_text()}")
 
 
-def test_the_installed_wheel_runs_a_flow_across_a_networked_shard_of_two(installed):
-    founder, address = found_shard(installed)
+def test_the_installed_wheel_runs_a_flow_across_a_networked_shard_of_two(installed, tmp_path):
+    stderr_file = tmp_path / "founder.stderr"
+    founder, address = found_shard(installed, stderr_file)
     try:
         # The second worker starts its program only once it has joined the
         # shard the first one leads; the flow's result comes back to it.
@@ -214,7 +230,7 @@ def test_the_installed_wheel_runs_a_flow_across_a_networked_shard_of_two(install
         assert shown["result"] == 41
 
         founder.stdin.close()
-        assert founder.wait(timeout=RUN_SECONDS) == 0, founder.stderr.read()
+        assert founder.wait(timeout=RUN_SECONDS) == 0, stderr_file.read_text()
     finally:
         founder.kill()
         founder.wait()

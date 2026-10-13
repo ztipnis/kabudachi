@@ -276,9 +276,11 @@ py_test(
 )
 
 # The wheel, installed with pip into a fresh virtual environment, runs a flow
-# on a worker of its own and across a networked shard of two; its metadata matches pyproject.toml, and its version
-# is the one pyproject.toml, the package and MODULE.bazel name. It does not
-# depend on the package's sources: everything it runs comes from the wheel.
+# on a worker of its own and across a networked shard of two; its metadata
+# matches pyproject.toml, and its version is the one pyproject.toml, the
+# package and MODULE.bazel name. On Linux its platform tag matches its
+# extension's symbols. It does not depend on the package's sources:
+# everything it runs comes from the wheel.
 py_test(
     name = "test_wheel",
     size = "medium",
