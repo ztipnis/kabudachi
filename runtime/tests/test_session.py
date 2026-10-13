@@ -1973,6 +1973,25 @@ schema(CrateV1, version=1, version_path="$.v", family="tests.session.crate")
 schema(CrateV2, version=2, version_path="$.v", family="tests.session.crate", migration=None)
 
 
+class PlateV1(pydantic.BaseModel):
+    label: str
+
+
+class PlateV2(pydantic.BaseModel):
+    label: str
+
+
+class Tally(pydantic.BaseModel):
+    total: int
+
+
+# Versioned, but their payloads say nothing of their version: the claim's own
+# source version is the only word on what a payload of the family is at.
+schema(PlateV1, version=1, family="tests.session.plate")
+schema(PlateV2, version=2, family="tests.session.plate")
+schema(Tally, version=1, family="tests.session.tally")
+
+
 def parcel_world(seen, **world_options):
     def take_parcel(parcel: ParcelV2) -> ParcelV2:
         seen.append(parcel)
@@ -2240,13 +2259,63 @@ def test_a_reduce_step_has_the_items_stored_at_an_older_version_migrated_before_
     assert run(with_events(world, body)) == ParcelV2(label="AB")
 
 
+def add_plate(plate: PlateV2, tally: Tally) -> Tally:
+    return Tally(total=tally.total + len(plate.label))
+
+
+def test_a_reduce_over_a_versioned_item_type_does_not_take_its_other_family_result_for_an_item():
+    world = World(add_plate, serializer="pydantic")
+
+    async def body():
+        reduce = world.tasks["add_plate"].reduce.options(initial=Tally(total=0))
+        return await reduce.start(world.session, [PlateV2(label="a"), PlateV2(label="bc")])
+
+    # The running total has no version of its own; it is not at the items' version 2.
+    assert run(with_events(world, body)) == Tally(total=3)
+
+
+def test_a_result_of_an_older_class_of_the_family_reaches_its_consumer_as_the_class_its_producer_wrote():
+    seen = []
+
+    def make_plate(plate: PlateV1) -> PlateV1:
+        return plate
+
+    def take_plate(plate: PlateV2) -> PlateV2:
+        seen.append(plate)
+        return PlateV2(label=plate.label)
+
+    world = World(make_plate, take_plate, serializer="pydantic")
+
+    status = flow_status(
+        world,
+        ("make_plate", 1, encoded(PlateV1(label="a"))),
+        ("take_plate", 2, None),
+    )
+
+    assert status[0] == "succeeded"
+    assert seen == [PlateV1(label="a")]
+    assert [event[0] for event in world.runtime.events] == ["started", "complete", "started", "complete"]
+
+
 def merge_parcels(older: ParcelV2, newer: ParcelV2) -> ParcelV2:
     return ParcelV2(label=older.label + newer.label)
 
 
-def compaction(world, name, *payloads):
-    """Hands the session the leader's compaction of `payloads`, written at
-    version 1; what it completed the fold with and what it reported failed."""
+def merge_plates(older: PlateV2, newer: PlateV2) -> PlateV2:
+    return PlateV2(label=older.label + newer.label)
+
+
+def plate_world():
+    def fold_plate(plate: PlateV2) -> PlateV2:
+        return plate
+
+    return World(fold_plate, serializer="pydantic", kind=TaskKind.COALESCING, merge=merge_plates)
+
+
+def compaction(world, name, *payloads, source_version=1):
+    """Hands the session the leader's compaction of `payloads`, submitted at
+    `source_version`; what it completed the fold with and what it reported
+    failed."""
     from types import SimpleNamespace
 
     folded, failed = [], []
@@ -2256,7 +2325,7 @@ def compaction(world, name, *payloads):
         compaction=True,
         definition_id=world.tasks[name].definition.name,
         task_run_id="run-1",
-        source_version=1,
+        source_version=source_version,
         chain=list(payloads),
     )
 
@@ -2268,25 +2337,62 @@ def compaction(world, name, *payloads):
     return folded, failed
 
 
-def test_a_compaction_folds_the_chain_migrated_to_this_workers_version():
-    world = parcel_world([], kind=TaskKind.COALESCING, merge=merge_parcels)
+@pytest.mark.parametrize(
+    ("make_world", "name", "chain", "source_version"),
+    [
+        pytest.param(
+            lambda: parcel_world([], kind=TaskKind.COALESCING, merge=merge_parcels),
+            "take_parcel",
+            [encoded(ParcelV2(label="a")), encoded(ParcelV2(label="b"))],
+            1,
+            id="payloads that say they are at this worker's version",
+        ),
+        pytest.param(
+            plate_world,
+            "fold_plate",
+            [encoded(PlateV2(label="a")), encoded(PlateV2(label="b"))],
+            2,
+            id="payloads that do not, submitted at this worker's version",
+        ),
+    ],
+)
+def test_a_compaction_folds_a_chain_that_is_at_this_workers_version(make_world, name, chain, source_version):
+    world = make_world()
 
-    folded, failed = compaction(
-        world, "take_parcel", encoded(ParcelV1(label="a", weight=1)), encoded(ParcelV1(label="b"))
-    )
+    folded, failed = compaction(world, name, *chain, source_version=source_version)
 
     assert failed == []
     [payload] = folded
-    # Each payload was shelved by the explicit migration before the merge saw it.
-    assert SerializerRegistry.with_defaults().get("pydantic").decode(payload, ParcelV2) == ParcelV2(label="AB")
+    assert json.loads(payload)["label"] == "ab"
 
 
-def test_a_compaction_whose_chain_cannot_be_migrated_fails_with_a_migration_error_and_folds_nothing():
-    world = crate_world([], kind=TaskKind.COALESCING)
+@pytest.mark.parametrize(
+    ("make_world", "name", "chain", "source_version"),
+    [
+        pytest.param(
+            lambda: parcel_world([], kind=TaskKind.COALESCING, merge=merge_parcels),
+            "take_parcel",
+            [encoded(ParcelV1(label="a", weight=1)), encoded(ParcelV1(label="b"))],
+            1,
+            id="payloads that say they are at an older version",
+        ),
+        pytest.param(
+            plate_world,
+            "fold_plate",
+            [encoded(PlateV1(label="a")), encoded(PlateV1(label="b"))],
+            1,
+            id="payloads that do not, submitted at an older version",
+        ),
+    ],
+)
+def test_a_compaction_of_a_chain_at_another_version_fails_and_folds_nothing_for_a_claim_to_migrate(
+    make_world, name, chain, source_version
+):
+    world = make_world()
 
-    folded, failed = compaction(world, "take_crate", encoded(CrateV1(label="a")), encoded(CrateV1(label="b")))
+    folded, failed = compaction(world, name, *chain, source_version=source_version)
 
     assert folded == []
     [(kind, message)] = failed
     assert kind == "MigrationError"
-    assert "declared incompatible" in message
+    assert "a claim migrates it" in message

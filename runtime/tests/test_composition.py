@@ -10,6 +10,7 @@ import dataclasses
 import functools
 import pickle
 import threading
+from collections.abc import Sequence
 from types import SimpleNamespace
 
 import pydantic
@@ -258,6 +259,10 @@ def anything(request: list) -> Receipt:
     return Receipt(ok=bool(request))
 
 
+def count_sequence(request: Sequence[Greeting]) -> Receipt:
+    return Receipt(ok=bool(request))
+
+
 def outcomes(request: list[Greeting | TaskFailure]) -> Receipt:
     return Receipt(ok=bool(request))
 
@@ -313,6 +318,7 @@ SERIALIZER_OF = {
     take_optional: "pickle",
     make_parcel: "pydantic",
     take_record: "dataclass",
+    count_sequence: "pickle",
     anything: "pickle",
     outcomes: "pickle",
 }
@@ -374,6 +380,11 @@ FIT_CASES = [
     ),
     pytest.param(
         lambda d: (flow(d(shout), d(to_receipt)), d(tally)), "shout", id="a nested flow's list of mixed types"
+    ),
+    pytest.param(
+        lambda d: (group(d(shout), on_error="collect_all"), d(count_sequence)),
+        "TaskFailure",
+        id="collect_all may hold a failure a Sequence consumer does not take",
     ),
     pytest.param(lambda d: (d(make_v1), d(take_v3)), None, id="later versions of a family"),
     pytest.param(lambda d: (d(take_v3), d(take_v2)), "take_v3", id="a downgrade"),

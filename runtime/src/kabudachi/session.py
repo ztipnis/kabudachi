@@ -96,6 +96,7 @@ from kabudachi.schemas import (
     SchemaRegistry,
     admit,
     process_schemas,
+    version_mismatch,
 )
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.status import CompositeStatus, TaskStatus
@@ -746,15 +747,22 @@ class Session:
             definition = self._registry.get(claim.definition_id)
             chain = tuple(claim.chain)
             if definition is not None and chain:
-                # The payloads to fold are brought to this worker's version
-                # first. A compaction is the leader's own task, so one that
-                # cannot be is failed, and the leader leaves the chain as it was.
-                *older, newest = chain
-                admitted = self._admit(claim, definition, newest, tuple(older))
-                if not isinstance(admitted, Admitted):
-                    self._compaction_failed(claim, MigrationError(admitted.reason))
+                # The payloads are folded as they are, so only a chain already
+                # at this worker's version is: the folded payload is stored at
+                # that version, but the waiting generation keeps the version
+                # it was submitted at, and a claim would migrate it again. A
+                # chain at another version is failed, and the leader leaves it
+                # as it was for a claim to migrate.
+                mismatch = version_mismatch(
+                    self._schemas,
+                    self._serializers.get(definition.serializer),
+                    definition.input_type,
+                    claim.source_version,
+                    chain,
+                )
+                if mismatch is not None:
+                    self._compaction_failed(claim, MigrationError(mismatch))
                     return
-                chain = (*admitted.chain, admitted.serialized_input)
             if not self._runtime.certifies_locally:
                 grace = (
                     self._cancel_grace(definition)
@@ -882,12 +890,20 @@ class Session:
         version of the type it is decoded as: its own input as the member's
         input type, a result it takes as the type its producer returns. A
         reduce step's operands likewise: an item as the reducer's input type,
-        an initial value or earlier result as its output type. The first payload that cannot be is the refusal. A payload that carries no
-        version of its own (a producer's result whose type has no version path)
-        is taken to be at the member claim's `source_version`."""
+        an initial value or earlier result as its output type. The first
+        payload that cannot be migrated is the refusal.
+
+        A payload that carries no version of its own is taken to be at the
+        member claim's `source_version` only if it is the member's own input
+        (or an item, which is of the same type). That number is the version of
+        the member's input family and says nothing of any other payload: a
+        result, or an earlier result, with no version of its own is taken to
+        be at this worker's version of its type, not migrated."""
         refused: Newer | Incompatible | None = None
 
-        def migrated(serializer_name: str, value_type: Any, payload: bytes) -> bytes:
+        def migrated(
+            serializer_name: str, value_type: Any, payload: bytes, own_input: bool = False
+        ) -> bytes:
             nonlocal refused
             if refused is not None:
                 return payload
@@ -895,7 +911,7 @@ class Session:
                 self._schemas,
                 self._serializers.get(serializer_name),
                 value_type,
-                claim.source_version,
+                claim.source_version if own_input else self._schemas.version_of(value_type),
                 payload,
                 (),
             )
@@ -918,7 +934,10 @@ class Session:
         def operand(entry: tuple[str, Any]) -> tuple[str, Any]:
             match entry:
                 case ("item", payload):
-                    return ("item", migrated(definition.serializer, definition.input_type, payload))
+                    return (
+                        "item",
+                        migrated(definition.serializer, definition.input_type, payload, True),
+                    )
                 case ("result", payload):
                     return ("result", migrated(definition.serializer, definition.output_type, payload))
             return (entry[0], walk(entry[1]))
@@ -928,9 +947,14 @@ class Session:
             case ("reduce", operands, combines):
                 resolved = ("reduce", [operand(entry) for entry in operands], combines)
             case None:
-                own = migrated(definition.serializer, definition.input_type, claim.serialized_input)
+                own = migrated(
+                    definition.serializer, definition.input_type, claim.serialized_input, True
+                )
             case ("input", payload):
-                resolved = ("input", migrated(definition.serializer, definition.input_type, payload))
+                resolved = (
+                    "input",
+                    migrated(definition.serializer, definition.input_type, payload, True),
+                )
             case _:
                 resolved = walk(resolved)
         if refused is not None:
@@ -966,11 +990,10 @@ class Session:
         keep = isinstance(refused, Newer) or definition.raise_on_failed_migration
         if not keep:
             _logger.warning(
-                "dropping task %s (%s): its input (%s) cannot be migrated from version %d to %d: %s",
+                "dropping task %s (%s): its input (%s) cannot be migrated to version %d: %s",
                 claim.task_id,
                 definition.name,
                 self._schemas.family(definition.input_type),
-                claim.source_version,
                 self._schemas.version_of(definition.input_type),
                 refused.reason,
             )

@@ -673,10 +673,12 @@ impl<'n> Executing<'n> {
         }
         if let task_request::Request::Blocked(report) = &request {
             // The leader has the claim back: the run is no longer this
-            // worker's to report to a new leader. A rejection ends it the
-            // same way: a leader that does not know the run or the task, or
-            // does not lead, holds no claim of this worker's to give back,
-            // so the run is not this worker's either.
+            // worker's to report to a new leader. A rejection the leader
+            // will not take back later ends it the same way: a leader that
+            // does not know the run or the task holds no claim of this
+            // worker's to give back, so the run is not this worker's either.
+            // A leader that is not leading, or not sure yet, is retried above
+            // and never gets here.
             if let Some(task) = report.task_id.clone() {
                 self.endpoint.held.blocked.remove(&TaskId::from(task));
             }

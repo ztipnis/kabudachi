@@ -155,6 +155,34 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let queue = self.tasks[task_id].queue.clone();
         self.waiting.requeue(task_id, &queue, self.clock.now());
         self.mark_decided(run_id);
+        self.release_coalescing_generation(task_id);
+    }
+
+    /// A coalescing generation that was claimed and given back before any
+    /// attempt ran no longer holds its key: it waits again, as a rebuilding
+    /// leader would find it, and a newer generation of the key supersedes it
+    /// as it would any waiting one. A generation that ran before (a retry)
+    /// keeps the key, as retries do.
+    fn release_coalescing_generation(&mut self, task_id: &TaskId) {
+        if self.runs_of_task[task_id].len() != 1 {
+            return;
+        }
+        let Some(key) = self.coalescing_key_of(task_id) else {
+            return;
+        };
+        let Some(newer) = self.occupancy.release(&key, task_id) else {
+            return;
+        };
+        self.supersede(task_id, &newer);
+        let mut absorbed = self
+            .links
+            .get(task_id)
+            .map(|link| link.absorbed.clone())
+            .unwrap_or_default();
+        absorbed.push(task_id.clone().into());
+        let link = self.links.entry(newer).or_default();
+        absorbed.append(&mut link.absorbed);
+        link.absorbed = absorbed;
     }
 
     /// Whether `worker` told this leader it cannot run `task_id`.

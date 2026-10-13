@@ -77,7 +77,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 self.hold_cancel(worker, task_id, run_id, &reported.state)
             }
             Some(recorded @ (TaskRunState::Claimed | TaskRunState::Running)) => {
-                self.adopt_reported(worker, &run_id, recorded, reported.state, reported.continuation, reported.execution_version, out);
+                self.adopt_reported(
+                    worker,
+                    &run_id,
+                    recorded,
+                    reported.state,
+                    reported.continuation,
+                    reported.execution_version,
+                    out,
+                );
             }
             _ => {}
         }

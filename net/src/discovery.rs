@@ -143,9 +143,12 @@ impl Net {
         let mut search =
             Search { found: Found::default(), tried: BTreeSet::new(), room: input_room };
         let (own, newer) = self.own_candidates(now, takes);
-        // A leader cannot send itself a request: its scheduler is told in
-        // process. An error is ignored: the record then stays unblocked, so
-        // the next round reports the task again, or another worker claims it.
+        // A leader cannot send itself a request, and nothing here tells its
+        // own scheduler: a newer record of its own is blocked when
+        // `claim_oldest` hands it out and Python gives it back. An error
+        // reporting to another leader is ignored: the record then stays
+        // unblocked, so the next round reports the task again, or another
+        // worker claims it.
         if leader != self.local_worker_id() {
             join_all(newer.into_iter().map(|(task, reason)| self.report_blocked(leader.clone(), task, reason, false)))
                 .await;

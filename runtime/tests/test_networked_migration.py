@@ -53,7 +53,7 @@ def test_tasks_are_migrated_dropped_when_incompatible_and_held_until_the_ttl_whe
         assert "version 1 of tests.Invoice cannot be migrated to version 2" in record["blocked_reason"]
         # The worker's last-resort log handler prints a warning as its bare message.
         assert any(
-            line.startswith(f"dropping task {dropped}") and "tests.Invoice" in line and "from version 1 to 2" in line
+            line.startswith(f"dropping task {dropped}") and "tests.Invoice" in line and "version 1 of tests.Invoice cannot be migrated to version 2" in line
             for line in worker.error_lines()
         ), worker.error_lines()
 

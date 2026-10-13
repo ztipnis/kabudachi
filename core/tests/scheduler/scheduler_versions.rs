@@ -5,6 +5,7 @@
 //! past the block TTL fails the same way. A run records the version it ran at.
 
 use kabudachi_core::protocol::ids::{TaskDefinitionId, WorkerId};
+use kabudachi_core::protocol::messages::TaskIds;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::composite::{CompositeState, OnError};
@@ -69,6 +70,45 @@ fn a_blocked_claim_goes_back_to_the_queue_and_only_another_worker_gets_it() {
     assert!(fixture.scheduler.claim_oldest(&old(), 10).unwrap().is_empty());
     let [again] = <[_; 1]>::try_from(fixture.scheduler.claim_oldest(&new(), 10).unwrap()).unwrap();
     assert_eq!(again.task_run_id, claim.task_run_id);
+}
+
+#[test]
+fn a_coalescing_generation_given_back_waits_again_and_is_superseded_by_a_newer_one() {
+    for newer_before_the_block in [false, true] {
+        let mut fixture = Fixture::leading();
+        let older = fixture
+            .scheduler
+            .submit(submitted_at(4).with_coalescing_key("k"))
+            .unwrap();
+        fixture.scheduler.request_claim(&old(), &older).unwrap();
+        let mut newer = None;
+        if newer_before_the_block {
+            newer = Some(
+                fixture
+                    .scheduler
+                    .submit(submitted_at(3).with_coalescing_key("k"))
+                    .unwrap(),
+            );
+        }
+
+        fixture
+            .scheduler
+            .report_blocked(&old(), &older, "version 4 is newer than 3".into(), false)
+            .unwrap();
+        let newer = newer.unwrap_or_else(|| {
+            fixture
+                .scheduler
+                .submit(submitted_at(3).with_coalescing_key("k"))
+                .unwrap()
+        });
+
+        let case = format!("newer submitted before the block: {newer_before_the_block}");
+        assert_eq!(fixture.state(&older), TaskRunState::Superseded, "{case}");
+        let [claim] = <[_; 1]>::try_from(fixture.scheduler.claim_oldest(&old(), 10).unwrap())
+            .unwrap_or_else(|_| panic!("{case}: the newer generation is the one to claim"));
+        assert_eq!(claim.task.task_id(), newer, "{case}");
+        assert_eq!(claim.chain, vec![b"in".to_vec()], "{case}: it folds the given-back input");
+    }
 }
 
 #[test]

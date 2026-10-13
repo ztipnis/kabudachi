@@ -409,10 +409,13 @@ def fits(
         return True if True in answers else (None if None in answers else False)
     if isinstance(shape, (Items, Each)):
         origin = typing.get_origin(wanted)
-        if origin is not list:
-            # A Sequence[X] or tuple[X, ...] may well take a list; only a plain class cannot.
+        arguments = typing.get_args(wanted)
+        if origin is tuple and len(arguments) == 2 and arguments[1] is Ellipsis:
+            arguments = arguments[:1]
+        elif origin not in (list, Sequence):
+            # Any other generic may well take a list; only a plain class cannot.
             return None if origin is not None else False
-        (item,) = typing.get_args(wanted) or (Any,)
+        (item,) = arguments or (Any,)
         entries = shape.entries if isinstance(shape, Items) else (shape.item,)
         answers = [fits(entry, item, wanted_serializer, serializers) for entry in entries]
         return False if False in answers else (None if None in answers else True)
@@ -516,6 +519,36 @@ def admit(
         except Exception as error:
             return Incompatible(_failed(family, version, target, error))
     return Admitted(admitted[-1], tuple(admitted[:-1]), target)
+
+
+def version_mismatch(
+    schemas: SchemaRegistry,
+    serializer: Any,
+    value_type: Any,
+    source_version: int,
+    payloads: Sequence[bytes],
+) -> str | None:
+    """Why `payloads` are not all at this worker's version of `value_type`'s
+    family, each at the version it carries (or `source_version`); `None` when
+    they are. They are not migrated: a compaction folds them as they are, and
+    a payload it migrated would be taken, at its next claim, for one still at
+    `source_version`."""
+    family = schemas.family(value_type)
+    if family is None:
+        return None
+    target = schemas.version_of(value_type)
+    for payload in payloads:
+        try:
+            version = extract_version(serializer, payload, value_type)
+        except SerializationError as error:
+            return _failed(family, source_version, target, error)
+        version = source_version if version is None else version
+        if version != target:
+            return (
+                f"{family} is held at version {version}, not this worker's version {target}: "
+                "a claim migrates it, a compaction does not"
+            )
+    return None
 
 
 def _failed(family: str | None, version: int, target: int, error: Exception) -> str:
