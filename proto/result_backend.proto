@@ -1,0 +1,81 @@
+syntax = "proto3";
+package kabudachi;
+
+import "blob.proto";
+import "digest.proto";
+import "ids.proto";
+import "task.proto";
+
+// One entry of a result backend: a head (a task's value, or a composite's
+// results), a page of a composite's results, or a chunk of a large value. A
+// head is stored after every part it names.
+message StoredResult {
+  oneof owner {
+    TaskId task = 1;
+    CompositeId composite = 2;
+  }
+  // A task head's certified run.
+  TaskRunId task_run_id = 3;
+  // A head's digest: the run's certified digest, or the composite's digest
+  // over its pages and chunks.
+  Digest result_digest = 4;
+  oneof value {
+    // A task's value, whole.
+    bytes payload = 5;
+    // A task's value in chunks.
+    ChunkedValue chunked = 6;
+    // A composite's head.
+    CompositeHead composite_head = 8;
+    // A page of a composite's results.
+    ResultPage page = 9;
+    // A chunk of a large value.
+    bytes chunk = 10;
+  }
+  WallTime expires_at = 7;
+  // The page's or chunk's number, for a page or a chunk.
+  uint32 index = 11;
+}
+
+message ChunkedValue {
+  uint32 chunks = 1;
+  uint64 total_bytes = 2;
+}
+
+message CompositeHead {
+  uint32 pages = 1;
+  uint64 members = 2;
+}
+
+// Members of a composite's results in preorder: a list member is followed by
+// its own members.
+message ResultPage {
+  repeated StoredMember members = 1;
+}
+
+message StoredMember {
+  oneof member {
+    StoredValue value = 1;
+    // A member that failed: the error's kind and message, and the Task whose
+    // run raised it, when a Task's run did.
+    Failure failure = 2;
+    // A list of this many members, which follow.
+    uint64 list = 3;
+  }
+}
+
+message StoredValue {
+  // The definition whose run produced the value, and the name of the
+  // serializer that encoded it.
+  TaskDefinitionId producer = 1;
+  string serializer = 2;
+  oneof bytes_of {
+    bytes inline = 3;
+    ChunkRange chunks = 4;
+  }
+}
+
+message ChunkRange {
+  uint32 first = 1;
+  uint32 count = 2;
+  uint64 total_bytes = 3;
+}

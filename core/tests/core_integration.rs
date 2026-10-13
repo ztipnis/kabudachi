@@ -8,6 +8,7 @@ mod election;
 mod proptest;
 mod reconcile;
 mod records;
+mod result_backend;
 mod scenario;
 mod scheduler;
 mod support;
