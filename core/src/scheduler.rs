@@ -107,6 +107,7 @@ mod waiting_room;
 pub use backlog::Backlog;
 pub use cancel::{CancelRejection, Cancellation, HeldCancel};
 pub use claims::{Claim, ClaimRejection};
+use composite::Composites;
 pub use compaction::Compacted;
 pub use deadlines::CaughtUp;
 pub use failures::{Failure, MAX_FAILURE_MESSAGE_BYTES};
@@ -210,6 +211,9 @@ pub enum Event {
         task_id: TaskId,
         task_run_id: TaskRunId,
     },
+    /// A composite is over: its client, or the handle of the task it
+    /// continues, is to be told.
+    CompositeFinished(composite::CompositeFinished),
 }
 
 /// Owns all Tasks and TaskRuns and decides every claim and report. Drive it
@@ -279,6 +283,8 @@ pub struct Scheduler<C: Clock, I: IdGenerator, O: Observer = NoObserver> {
     /// Per queue, the runs that were claimed or running when added. Finished
     /// runs are ignored when counted and dropped as runs are added.
     running: BTreeMap<String, BTreeSet<TaskRunId>>,
+    /// The composites it drives, and keeps until their retention ends.
+    composites: Composites,
 }
 
 impl<C: Clock, I: IdGenerator> Scheduler<C, I, NoObserver> {
@@ -324,6 +330,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             turns: Turns::default(),
             subscriptions: BTreeMap::new(),
             running: BTreeMap::new(),
+            composites: Composites::default(),
         }
     }
 
@@ -389,11 +396,15 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 
     /// Whether it holds the record `key` names: it decides it, and a driver
     /// that kept where it wrote the record can forget it once this is false.
-    /// It holds no composite record or page yet.
     pub fn holds(&self, key: &RecordKey) -> bool {
         match key {
             RecordKey::Task(task) => self.tasks.contains_key(task),
-            RecordKey::Composite(_) | RecordKey::Page(..) => false,
+            RecordKey::Composite(id) => self.composites.held.contains_key(id),
+            RecordKey::Page(id, page) => self
+                .composites
+                .held
+                .get(id)
+                .is_some_and(|composite| *page < composite.pages()),
         }
     }
 

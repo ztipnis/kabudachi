@@ -6,8 +6,8 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
 use kabudachi_core::scheduler::composite::{
-    BoundField, BoundInput, BoundStep, CompositeKind, FieldValue, MalformedStep, OnError, Stage, Step,
-    TaskOptions,
+    BoundField, BoundInput, BoundStep, CompositeKind, EXPANSION_DEFINITION, FieldValue, MalformedStep, OnError,
+    Stage, Step, TaskOptions,
 };
 use prost::Message;
 
@@ -106,6 +106,17 @@ fn a_step_that_cannot_be_driven_is_refused() {
     };
     map.stages.push(map.stages[0].clone());
     assert_eq!(refused(two_templates), MalformedStep::MapShape);
+}
+
+#[test]
+fn a_task_stage_with_no_queue_or_the_reserved_expansion_definition_is_refused() {
+    let refused = |step: &Step| Step::try_from(&StepDescription::from(step)).unwrap_err();
+    let flow_of = |stage| Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages: vec![stage] };
+    let mut no_queue = bound("work", BoundInput::Value(b"x".to_vec()));
+    no_queue.options.queue = String::new();
+    assert_eq!(refused(&flow_of(Stage::Task(no_queue))), MalformedStep::NoQueue);
+    let expansion = bound(EXPANSION_DEFINITION, BoundInput::Value(b"x".to_vec()));
+    assert_eq!(refused(&flow_of(Stage::Task(expansion))), MalformedStep::ReservedDefinition);
 }
 
 #[test]

@@ -161,7 +161,7 @@ id_accessors!(TransferLeadershipIds for Checked<TransferLeadership>, of Transfer
 });
 id_accessors!(TaskIds for Task, of Task {
     required: [task_id: TaskId, task_definition_id: TaskDefinitionId],
-    optional: [client: WorkerId],
+    optional: [client: WorkerId, composite_id: CompositeId],
     repeated: [],
 });
 id_accessors!(TaskRunIdentityIds for TaskRunIdentity, of TaskRunIdentity {

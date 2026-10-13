@@ -289,5 +289,6 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.failed_compactions.clear();
         self.turns.clear();
         self.running.clear();
+        self.composites.clear();
     }
 }

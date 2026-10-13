@@ -189,7 +189,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         Ok(had_one)
     }
 
-    fn finish_continuation(&mut self, task_id: &TaskId) -> bool {
+    pub(super) fn finish_continuation(&mut self, task_id: &TaskId) -> bool {
         if !self.continuing.remove(task_id) {
             return false;
         }

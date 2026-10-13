@@ -10,7 +10,7 @@ use pyo3::types::PyType;
 
 /// What a scheduler event is about. `SLOW_DOWN` says memory use crossed the
 /// soft limit; the event's `active` says whether it was raised or cleared.
-/// The last seven come only from a networked worker.
+/// The networked ones (from `ACCEPTED` on) come only from a networked worker.
 #[pyclass(name = "EventKind", eq, eq_int, frozen, hash, skip_from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PyEventKind {
@@ -49,6 +49,10 @@ pub enum PyEventKind {
     /// no longer knows it (`state` is `None`).
     #[pyo3(name = "OUTCOME")]
     Outcome,
+    /// A composite the shard's leader drove is over: `composite_id` names it
+    /// and, when it was a task's continuation, `parent_task_id` names the task.
+    #[pyo3(name = "COMPOSITE_FINISHED")]
+    CompositeFinished,
 }
 
 impl From<&Event> for PyEventKind {
@@ -60,6 +64,7 @@ impl From<&Event> for PyEventKind {
             Event::Cancelled { .. } => PyEventKind::Cancelled,
             Event::RecordFull { .. } => PyEventKind::RecordFull,
             Event::CoalescedPayloadTooLarge { .. } => PyEventKind::CoalescedPayloadTooLarge,
+            Event::CompositeFinished(_) => PyEventKind::CompositeFinished,
         }
     }
 }

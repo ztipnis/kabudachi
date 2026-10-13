@@ -313,6 +313,9 @@ impl NativeRuntime {
                     SubmitRejection::NotLeader => {
                         PyRuntimeError::new_err(rejection.to_string())
                     }
+                    SubmitRejection::StepTakesInput => {
+                        PyValueError::new_err(rejection.to_string())
+                    }
                     SubmitRejection::TooLarge { .. }
                     | SubmitRejection::RecordTooLarge { .. }
                     | SubmitRejection::Backpressure { .. }

@@ -91,6 +91,7 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
                 trace_state: task.trace_state.clone(),
                 baggage: task.baggage.clone(),
             },
+            member_of: None,
         },
         clock,
     ))
@@ -112,6 +113,7 @@ pub(crate) fn submit_reject(rejection: SubmitRejection) -> TaskRejectReason {
         SubmitRejection::KeyNotReady => TaskRejectReason::TaskRejectNotReady,
         SubmitRejection::KeyBackpressure { .. } => TaskRejectReason::TaskRejectBackpressure,
         SubmitRejection::PayloadTooLarge { .. } => TaskRejectReason::TaskRejectPayloadTooLarge,
+        SubmitRejection::StepTakesInput => TaskRejectReason::TaskRejectMalformed,
     }
 }
 

@@ -29,6 +29,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
         self.update_pressure();
         self.conclude(task_id);
+        self.member_finished(task_id);
     }
 
     /// `task_id` is over and holds no payload any more: the task is forgotten

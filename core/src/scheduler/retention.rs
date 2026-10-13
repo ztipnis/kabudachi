@@ -22,6 +22,11 @@ impl Retention {
         self.ttl = ttl;
     }
 
+    /// How long a finished task is kept, or `None` for ever.
+    pub(super) fn ttl(&self) -> Option<Duration> {
+        self.ttl
+    }
+
     /// Forgets every task it holds, keeping the TTL.
     pub(super) fn clear(&mut self) {
         self.finished.clear();

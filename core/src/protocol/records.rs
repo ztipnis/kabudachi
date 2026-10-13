@@ -14,7 +14,7 @@
 use crate::manifest::Manifest;
 use crate::protocol::generated;
 use crate::protocol::ids::{
-    IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId, mint_task_run_id,
+    CompositeId, IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId, mint_task_run_id,
 };
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun, TaskRunIdentity};
@@ -49,6 +49,8 @@ pub struct NewTask {
     pub input_manifest: Option<Manifest>,
     /// The trace context the task carries; empty for none.
     pub trace: TraceContext,
+    /// The composite the task is a stage or member of, and its index there.
+    pub member_of: Option<(CompositeId, u64)>,
 }
 
 impl NewTask {
@@ -78,6 +80,7 @@ impl NewTask {
             client: None,
             input_manifest: None,
             trace: TraceContext::default(),
+            member_of: None,
         }
     }
 }
@@ -105,8 +108,8 @@ pub fn new_task(new: NewTask) -> Task {
         trace_parent: new.trace.trace_parent,
         trace_state: new.trace.trace_state,
         baggage: new.trace.baggage,
-        composite_id: None,
-        composite_index: 0,
+        composite_id: new.member_of.as_ref().map(|(composite, _)| composite.clone().into()),
+        composite_index: new.member_of.map_or(0, |(_, index)| index),
     }
 }
 

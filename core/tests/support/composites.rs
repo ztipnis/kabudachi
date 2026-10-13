@@ -1,8 +1,15 @@
-use kabudachi_core::protocol::generated::{self, CompositePage, CompositeRecord, RecordVersion};
-use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId};
-use kabudachi_core::scheduler::composite::{
-    BoundInput, BoundStep, CompositeKind, OnError, Stage, Step, TaskOptions,
+use kabudachi_core::protocol::digest::Digest;
+use kabudachi_core::protocol::generated::{
+    self, CompositeEntry, CompositePage, CompositeRecord, RecordVersion,
 };
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, WorkerId};
+use kabudachi_core::scheduler::composite::{
+    BoundInput, BoundStep, CompositeFinished, CompositeKind, OnError, PAGE_ENTRIES, Stage, Step,
+    TaskOptions,
+};
+use kabudachi_core::scheduler::{Claim, Completion, Event};
+
+use crate::support::scheduler::Fixture;
 
 fn version(term: u64, revision: u64) -> Option<RecordVersion> {
     Some(RecordVersion {
@@ -46,4 +53,89 @@ pub fn page(id: &CompositeId, index: u32, term: u64, revision: u64) -> Composite
         index,
         ..Default::default()
     }
+}
+
+pub fn worker() -> WorkerId {
+    WorkerId::new("w1")
+}
+
+/// A step running `name` on its input, or on `value` when bound.
+pub fn task_stage(name: &str, value: Option<&[u8]>) -> Stage {
+    Stage::Task(BoundStep {
+        definition: TaskDefinitionId::new(name),
+        version: 0,
+        options: TaskOptions::on_queue("default"),
+        input: value.map_or(BoundInput::Previous, |value| BoundInput::Value(value.to_vec())),
+        fields: Vec::new(),
+    })
+}
+
+pub fn flow_of(stages: Vec<Stage>) -> Step {
+    Step { kind: CompositeKind::Flow, on_error: OnError::FailFast, stages }
+}
+
+/// Settings of a task stage, which the builders above leave at their defaults.
+pub trait StageExt {
+    fn options_mut(&mut self) -> &mut TaskOptions;
+}
+
+impl StageExt for Stage {
+    fn options_mut(&mut self) -> &mut TaskOptions {
+        match self {
+            Stage::Task(step) => &mut step.options,
+            Stage::Composite(_) => panic!("a composite stage has no task options"),
+        }
+    }
+}
+
+/// Submits `step` for `worker()` as its client, and returns its id.
+pub fn submitted(fixture: &mut Fixture, step: Step) -> CompositeId {
+    let minted = fixture.scheduler.mint_composite(step, Some(worker()));
+    fixture.scheduler.submit_composite(minted).unwrap()
+}
+
+/// Claims, starts and completes member `index` of `composite` as `worker()`,
+/// with a result whose digest is that of `result`; returns the claim.
+pub fn run_member(fixture: &mut Fixture, composite: &CompositeId, index: u64, result: &[u8]) -> Claim {
+    let claim = start_member(fixture, composite, index);
+    fixture
+        .scheduler
+        .complete(&worker(), &claim.task_run_id, Digest::blake3(result), Completion::Final)
+        .unwrap();
+    claim
+}
+
+/// Claims and starts member `index` of `composite`; returns the claim.
+pub fn start_member(fixture: &mut Fixture, composite: &CompositeId, index: u64) -> Claim {
+    let claim = fixture
+        .scheduler
+        .request_claim(&worker(), &composite.member_task(index))
+        .unwrap();
+    fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+    claim
+}
+
+/// Fails member `index` for good (it has no retries).
+pub fn fail_member(fixture: &mut Fixture, composite: &CompositeId, index: u64, kind: &str) {
+    let claim = start_member(fixture, composite, index);
+    fixture.scheduler.fail(&worker(), &claim.task_run_id, kind).unwrap();
+}
+
+/// The `CompositeFinished` events taken from the scheduler so far.
+pub fn finished(fixture: &mut Fixture) -> Vec<CompositeFinished> {
+    fixture
+        .scheduler
+        .take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::CompositeFinished(finished) => Some(finished),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Entry `index` of `composite`'s pages, as last published.
+pub fn entry(fixture: &Fixture, composite: &CompositeId, index: u64) -> Option<CompositeEntry> {
+    let page = fixture.spy.newest_page(composite, (index / PAGE_ENTRIES) as u32)?;
+    page.entries.into_iter().find(|entry| entry.index == index)
 }

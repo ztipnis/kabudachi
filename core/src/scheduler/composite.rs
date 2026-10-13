@@ -11,10 +11,18 @@ use std::time::Duration;
 
 use prost::Message as _;
 
-use crate::manifest::Manifest;
+use crate::manifest::{Failure, Manifest, ManifestEntry};
 use crate::protocol::digest::Digest;
 use crate::protocol::generated;
-use crate::protocol::ids::TaskDefinitionId;
+use crate::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
+use crate::protocol::task::TaskRunState;
+use crate::time::WallTime;
+
+mod drive;
+mod held;
+mod records;
+
+pub(in crate::scheduler) use held::Composites;
 
 /// How many member outcomes one page of a composite holds.
 pub const PAGE_ENTRIES: u64 = 1024;
@@ -52,6 +60,134 @@ pub enum CompositeState {
     Succeeded,
     Failed,
     Cancelled,
+}
+
+/// The failure kind of a member the system cancelled, and so of a composite
+/// that was cancelled: the Python error class a client raises.
+pub const CANCELLED_KIND: &str = "TaskCancelledError";
+
+/// The failure kind of a member that expired before it could start.
+pub const EXPIRED_KIND: &str = "TaskExpiredError";
+
+/// The failure kind of a member whose worker was lost and which was not
+/// replayed.
+pub const LOST_KIND: &str = "TaskLostError";
+
+/// The failure kind of a member that was running when its worker was lost
+/// and is not safe to run twice.
+pub const ORPHANED_KIND: &str = "TaskOrphanedError";
+
+/// The failure kind of a member a newer generation of its coalescing key
+/// replaced.
+pub const SUPERSEDED_KIND: &str = "TaskSupersededError";
+
+/// How a composite was submitted: the id and time are fixed by whoever
+/// submits, before any leader sees it, so asking again names the same
+/// composite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubmittedComposite {
+    pub composite_id: CompositeId,
+    pub submitted_at: WallTime,
+    pub step: Step,
+    /// The worker told when the composite finishes; `None` when nobody
+    /// waits for it.
+    pub client: Option<WorkerId>,
+}
+
+/// What a composite is a part of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompositeParent {
+    /// Stage or member `index` of another composite.
+    Composite { id: CompositeId, index: u64 },
+    /// The continuation of this task's certified run.
+    Task(TaskId),
+}
+
+/// How one stage or member of a composite ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberOutcome {
+    /// The member's result: the digest of the blob that holds it, and the
+    /// task whose serializer encoded it.
+    Value { digest: Digest, producer: TaskDefinitionId },
+    Failed(Failure),
+    /// The member was itself a composite; its results are that composite's.
+    Child(CompositeId),
+}
+
+/// How many of a composite's members are in each state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemberCounts {
+    pub pending: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+}
+
+/// Where a composite stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompositeStatus {
+    pub state: CompositeState,
+    /// A flow's stage that runs, or runs next.
+    pub next_stage: u64,
+    pub counts: MemberCounts,
+}
+
+/// A composite is over: its client, or the handle of the task it continues,
+/// is to be told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeFinished {
+    pub composite_id: CompositeId,
+    pub state: CompositeState,
+    pub failure: Option<Failure>,
+    /// How many pages its member outcomes take.
+    pub pages: u32,
+    pub client: Option<WorkerId>,
+    /// Set when the composite is a task's continuation.
+    pub parent_task: Option<TaskId>,
+}
+
+impl CompositeFinished {
+    /// The composite's results: a manifest of its pages, in order.
+    pub fn results(&self) -> Manifest {
+        pages_manifest(&self.composite_id, self.pages)
+    }
+}
+
+/// A manifest naming the first `pages` pages of `composite`.
+fn pages_manifest(composite: &CompositeId, pages: u32) -> Manifest {
+    let entries = (0..pages)
+        .map(|page| ManifestEntry::Page { composite: composite.clone(), page })
+        .collect();
+    Manifest::new(entries, 0)
+}
+
+/// How a nested composite's input decodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputShape {
+    /// One value, encoded by this task's serializer.
+    Value(TaskDefinitionId),
+    /// A list whose entries name their own producers.
+    List,
+}
+
+/// The failure a member that ended in `state` is recorded with: the kind its
+/// run failed with when it has one, else the kind the state itself names.
+pub(crate) fn failure_of(state: TaskRunState, kind: &str) -> Failure {
+    let by_state = match state {
+        TaskRunState::Failed => "",
+        TaskRunState::Expired => EXPIRED_KIND,
+        TaskRunState::Lost => LOST_KIND,
+        TaskRunState::Orphaned => ORPHANED_KIND,
+        TaskRunState::Cancelled => CANCELLED_KIND,
+        TaskRunState::Superseded => SUPERSEDED_KIND,
+        TaskRunState::Scheduled
+        | TaskRunState::Queued
+        | TaskRunState::Claimed
+        | TaskRunState::Running
+        | TaskRunState::Succeeded => unreachable!("a member whose task ended did not fail: {state:?}"),
+    };
+    let kind = if kind.is_empty() { by_state } else { kind };
+    Failure { kind: kind.to_owned(), message: String::new() }
 }
 
 /// A composite as its submitter described it.
@@ -144,6 +280,10 @@ pub enum MalformedStep {
     EmptyStage,
     #[error("a task step names no definition")]
     NoDefinition,
+    #[error("a task step names no queue")]
+    NoQueue,
+    #[error("a task step names a definition reserved for the system")]
+    ReservedDefinition,
     #[error("the composite's kind or error policy is unknown")]
     UnknownKind,
     #[error("this kind of composite cannot be run here")]
@@ -254,8 +394,14 @@ impl TryFrom<&generated::BoundTaskStep> for BoundStep {
     type Error = MalformedStep;
 
     fn try_from(wire: &generated::BoundTaskStep) -> Result<Self, MalformedStep> {
-        let definition = wire.definition.clone().ok_or(MalformedStep::NoDefinition)?.into();
+        let definition: TaskDefinitionId = wire.definition.clone().ok_or(MalformedStep::NoDefinition)?.into();
+        if definition.as_str() == EXPANSION_DEFINITION {
+            return Err(MalformedStep::ReservedDefinition);
+        }
         let options = wire.options.clone().unwrap_or_default();
+        if options.queue.is_empty() {
+            return Err(MalformedStep::NoQueue);
+        }
         let input = match wire.input.as_ref() {
             None => BoundInput::Previous,
             Some(generated::bound_task_step::Input::Value(bytes)) => BoundInput::Value(bytes.clone()),
