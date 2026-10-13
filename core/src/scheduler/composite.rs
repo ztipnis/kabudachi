@@ -35,6 +35,13 @@ pub const MEMBER_BATCH_ITEMS: u64 = 1024;
 /// The most inline input one batch of a streamed composite carries.
 pub const MEMBER_BATCH_BYTES: u64 = 512 * 1024;
 
+/// A step encoded in at most this many bytes keeps its bound values inline.
+pub const STEP_INLINE_BYTES: u64 = 256 * 1024;
+
+/// Above `STEP_INLINE_BYTES`, a bound value longer than this is stored as
+/// blobs: a one-chunk manifest costs about as much.
+pub const INLINE_VALUE_BYTES: usize = 64;
+
 /// How many member outcomes one page of a composite holds.
 pub const PAGE_ENTRIES: u64 = 1024;
 
@@ -347,6 +354,27 @@ impl StreamedMember {
         }
     }
 
+    /// The member with its bound values spilled when its inline bytes pass
+    /// `inline_bytes` (at most `MEMBER_BATCH_BYTES`, so any batch fits one
+    /// frame): an item's one value whole, a stage's values longer than
+    /// `INLINE_VALUE_BYTES`. Every value is owned by the streamed composite:
+    /// a composite member's nested values too, since only a top-level group,
+    /// a root, streams composite members.
+    pub fn spill(self, inline_bytes: u64) -> (StreamedMember, Vec<SpilledValue>) {
+        let inline_bytes = inline_bytes.min(MEMBER_BATCH_BYTES);
+        let mut values = Vec::new();
+        let member = match self {
+            StreamedMember::Item(BoundInput::Value(bytes)) if bytes.len() as u64 > inline_bytes => {
+                StreamedMember::Item(spill_value(bytes, &mut values))
+            }
+            StreamedMember::Stage(stage) if stage.inline_bytes() > inline_bytes => {
+                StreamedMember::Stage(stage.spill(&mut values))
+            }
+            unchanged => unchanged,
+        };
+        (member, values)
+    }
+
     /// The input of the Task the member is, if it is one.
     fn task_input(&self) -> Option<&BoundInput> {
         match self {
@@ -374,6 +402,30 @@ pub struct MembersAccepted {
     pub members: u64,
     /// The leader's memory is past its soft limit.
     pub slow_down: bool,
+}
+
+/// A step with its large bound values moved to blobs, and the values, in
+/// the order the step names them, for the submitter to store before it
+/// submits (each stored as `Manifest::chunk` cuts it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spilled {
+    pub step: Step,
+    pub values: Vec<SpilledValue>,
+}
+
+/// One value moved out of a step. It is owned by the root of the step's
+/// tree, whatever composite in it holds its stage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpilledValue {
+    pub bytes: Vec<u8>,
+}
+
+/// `bytes` as the manifest of its chunks, with the bytes kept for the caller
+/// to store.
+fn spill_value(bytes: Vec<u8>, values: &mut Vec<SpilledValue>) -> BoundInput {
+    let manifest = Manifest::chunk(&bytes).manifest;
+    values.push(SpilledValue { bytes });
+    BoundInput::Chunked(manifest)
 }
 
 /// One stage of a flow, or one member of a group or map.
@@ -503,6 +555,24 @@ impl Step {
         generated::StepDescription::from(self).encoded_len() as u64
     }
 
+    /// This step as it should be stored: unchanged when it encodes in at
+    /// most `STEP_INLINE_BYTES`, otherwise with every bound value longer
+    /// than `INLINE_VALUE_BYTES` replaced by its chunks' manifest, depth
+    /// first in stage order. The same step always spills the same.
+    pub fn spill(self) -> Spilled {
+        let mut values = Vec::new();
+        if self.encoded_len() <= STEP_INLINE_BYTES {
+            return Spilled { step: self, values };
+        }
+        let step = self.spill_into(&mut values);
+        Spilled { step, values }
+    }
+
+    fn spill_into(self, values: &mut Vec<SpilledValue>) -> Step {
+        let stages = self.stages.into_iter().map(|stage| stage.spill(values)).collect();
+        Step { stages, ..self }
+    }
+
     /// The BLAKE3 digest of the step's encoding: what a returning run's
     /// result digest is when the step is its continuation.
     pub fn digest(&self) -> Digest {
@@ -579,6 +649,31 @@ impl Stage {
         match self {
             Stage::Task(_) => false,
             Stage::Composite(step) => step.streamed || step.stages.iter().any(Stage::is_or_holds_streamed),
+        }
+    }
+
+    /// The stage with every bound value longer than `INLINE_VALUE_BYTES`
+    /// moved to `values`, nested composites' included.
+    fn spill(self, values: &mut Vec<SpilledValue>) -> Stage {
+        match self {
+            Stage::Task(BoundStep { input: BoundInput::Value(bytes), definition, version, options, fields })
+                if bytes.len() > INLINE_VALUE_BYTES =>
+            {
+                let input = spill_value(bytes, values);
+                Stage::Task(BoundStep { definition, version, options, input, fields })
+            }
+            Stage::Task(step) => Stage::Task(step),
+            Stage::Composite(step) => Stage::Composite(step.spill_into(values)),
+        }
+    }
+
+    /// The bytes of the bound values the stage carries inline, nested
+    /// composites' included.
+    fn inline_bytes(&self) -> u64 {
+        match self {
+            Stage::Task(BoundStep { input: BoundInput::Value(bytes), .. }) => bytes.len() as u64,
+            Stage::Task(_) => 0,
+            Stage::Composite(step) => step.stages.iter().map(Stage::inline_bytes).sum(),
         }
     }
 

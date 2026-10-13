@@ -569,6 +569,33 @@ fn a_step_too_large_for_the_task_record_fails_its_run_for_good() {
 }
 
 #[test]
+fn a_returned_step_too_large_only_after_spilling_fails_its_run_and_a_spilled_large_one_runs() {
+    let mut fixture = Fixture::leading();
+    let mut returning = |step: Step| {
+        let task = fixture
+            .scheduler
+            .submit(Submission::new(TaskDefinitionId::new("plan"), 0, b"p".to_vec(), "default"))
+            .unwrap();
+        let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+        fixture.scheduler.report_started(&worker(), &claim.task_run_id).unwrap();
+        let step = step.spill().step;
+        let certified =
+            fixture.scheduler.complete(&worker(), &claim.task_run_id, step.digest(), Completion::Continues(step));
+        (claim, certified)
+    };
+    let (_, fits) = returning(group_of(OnError::FailFast, vec![task_stage("a", Some(&vec![0; 600 * 1024])); 3]));
+    assert!(fits.is_ok(), "three 600 KiB values leave the step");
+    // One more one-byte-bound stage adds this much; the group's own fields
+    // are left out, so the count below passes a record on stages alone.
+    let one = |count| group_of(OnError::FailFast, vec![task_stage("a", Some(b"x")); count]);
+    let stage_len = one(2).encoded_len() - one(1).encoded_len();
+    let stages = (MAX_RECORD_BYTES / stage_len + 1) as usize;
+    let (claim, refused) = returning(one(stages));
+    assert_eq!(refused, Err(ReportRejection::ContinuationTooLarge));
+    assert_eq!(fixture.scheduler.task_run(&claim.task_run_id).unwrap().current_state(), TaskRunState::Failed);
+}
+
+#[test]
 fn the_largest_step_a_record_can_carry_is_taken_and_one_byte_more_fails_its_run() {
     // Whether a step of this many payload bytes was taken, and the size of the record then published
     // with the empty version the limit is measured at.

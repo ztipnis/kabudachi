@@ -5,10 +5,12 @@
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskRunId};
+use kabudachi_core::manifest::Manifest;
 use kabudachi_core::scheduler::composite::{
-    BoundField, BoundInput, BoundStep, CompositeKind, EXPANSION_DEFINITION, FieldValue, MalformedStep, OnError,
-    MemberBatch, Stage, Step, StreamedMember, TaskOptions,
+    BoundField, BoundInput, BoundStep, CompositeKind, EXPANSION_DEFINITION, FieldValue, INLINE_VALUE_BYTES,
+    MalformedStep, MemberBatch, OnError, Spilled, SpilledValue, Stage, Step, StreamedMember, TaskOptions,
 };
+use kabudachi_core::task_record::MAX_RECORD_BYTES;
 use prost::Message;
 
 fn bound(name: &str, input: BoundInput) -> BoundStep {
@@ -210,4 +212,95 @@ fn derived_ids_differ_by_parent_index_and_kind_and_always_fit_an_id() {
         assert!(ids[i + 1..].iter().all(|other| other != id), "{id} derived twice");
     }
     assert_eq!(flow.member_task(1), flow.member_task(1));
+}
+
+fn bound_group(values: Vec<Vec<u8>>) -> Step {
+    Step {
+        kind: CompositeKind::Group,
+        on_error: OnError::FailFast,
+        stages: values.into_iter().map(|value| task("each", BoundInput::Value(value))).collect(),
+        streamed: false,
+    }
+}
+
+#[test]
+fn a_large_step_spills_its_long_values_to_blobs_the_same_way_every_time_and_a_small_one_keeps_them() {
+    let small = bound_group(vec![b"short".to_vec(), vec![7; 1024]]);
+    assert_eq!(small.clone().spill(), Spilled { step: small, values: Vec::new() });
+
+    let long = vec![9u8; 300 * 1024];
+    let large = bound_group(vec![vec![1; INLINE_VALUE_BYTES], long.clone(), vec![2; INLINE_VALUE_BYTES + 1]]);
+    let spilled = large.clone().spill();
+    assert_eq!(spilled, large.clone().spill(), "deterministic");
+    assert_eq!(
+        spilled.values,
+        [SpilledValue { bytes: long.clone() }, SpilledValue { bytes: vec![2; INLINE_VALUE_BYTES + 1] }]
+    );
+    let inputs: Vec<&BoundInput> = spilled
+        .step
+        .stages
+        .iter()
+        .map(|stage| match stage {
+            Stage::Task(bound) => &bound.input,
+            Stage::Composite(_) => unreachable!(),
+        })
+        .collect();
+    assert_eq!(inputs[0], &BoundInput::Value(vec![1; INLINE_VALUE_BYTES]), "a short value stays inline");
+    assert_eq!(inputs[1], &BoundInput::Chunked(Manifest::chunk(&long).manifest));
+    assert!(spilled.step.encoded_len() < 1024, "only manifests are left of the values");
+
+    // A nested composite's values spill too, depth first, for the root to own.
+    let nested = Step {
+        kind: CompositeKind::Flow,
+        on_error: OnError::FailFast,
+        stages: vec![task("first", BoundInput::Value(b"x".to_vec())), Stage::Composite(large)],
+        streamed: false,
+    };
+    assert_eq!(nested.spill().values, spilled.values);
+}
+
+/// What one more stage bound to `value_len` bytes adds to a group's
+/// encoding: the difference between two stages and one, so the group's own
+/// fields are not counted.
+fn stage_len(value_len: usize) -> u64 {
+    bound_group(vec![vec![0; value_len]; 2]).encoded_len() - bound_group(vec![vec![0; value_len]]).encoded_len()
+}
+
+/// The structure limit: once spilled, what is left is each stage's
+/// definition, options and a short value or a manifest. Enough stages pass
+/// a record whatever their values; a few stages bound to large values fit,
+/// because the values leave.
+#[test]
+fn after_spilling_only_a_steps_structure_counts_against_a_record() {
+    let stages = MAX_RECORD_BYTES / stage_len(INLINE_VALUE_BYTES) + 1;
+    let too_many = bound_group(vec![vec![0; INLINE_VALUE_BYTES]; stages as usize]).spill();
+    assert!(too_many.values.is_empty(), "values of at most 64 bytes stay inline");
+    assert!(too_many.step.encoded_len() > MAX_RECORD_BYTES);
+    let large = bound_group(vec![vec![0; 512 * 1024]; 4]).spill();
+    assert_eq!(large.values.len(), 4);
+    assert!(large.step.encoded_len() < MAX_RECORD_BYTES / 100);
+}
+
+#[test]
+fn a_streamed_member_spills_only_once_its_inline_bytes_pass_the_senders_bound() {
+    let value = vec![5u8; 1000];
+    let item = StreamedMember::Item(BoundInput::Value(value.clone()));
+    assert_eq!(item.clone().spill(1000), (item.clone(), Vec::new()), "at the bound it stays inline");
+    let (spilled, values) = item.spill(999);
+    assert_eq!(spilled, StreamedMember::Item(BoundInput::Chunked(Manifest::chunk(&value).manifest)));
+    assert_eq!(values, [SpilledValue { bytes: value.clone() }], "an item's one value goes whole");
+
+    let stage = StreamedMember::Stage(bound_group(vec![vec![1; INLINE_VALUE_BYTES], value.clone()]).stages.remove(1));
+    let (spilled, values) = stage.clone().spill(10);
+    assert_eq!(values, [SpilledValue { bytes: value.clone() }]);
+    assert_ne!(spilled, stage);
+
+    let mut nested = bound_group(vec![vec![1; INLINE_VALUE_BYTES], value.clone()]);
+    nested.stages.insert(0, task("first", BoundInput::Value(vec![3; INLINE_VALUE_BYTES + 1])));
+    let (_, values) = StreamedMember::Stage(Stage::Composite(nested)).spill(10);
+    assert_eq!(
+        values,
+        [SpilledValue { bytes: vec![3; INLINE_VALUE_BYTES + 1] }, SpilledValue { bytes: value }],
+        "a composite member's nested values spill in stage order"
+    );
 }
