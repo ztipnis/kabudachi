@@ -571,11 +571,12 @@ was stored with.
   or it holds no entry (the task kept nothing, the entry expired, or its worker died before mirroring), or
   when the entry does not match the record: a result is never returned unless it matches what the leader
   certified.
-- A backend that lost a plain task's result is not always fatal. If the result was large, its worker
-  stored it in the shard as blobs, and `resume` reads it from there and mirrors it back to the backend
-  (detached, never over an entry the backend holds whole; with a fresh expiry from now). A small result
-  lives only in the backend, so without it `resume` raises `ResultUnavailableError`. A task that kept no
-  result is not mirrored back.
+- A backend that lost a plain task's result is not always fatal. On the networked runtime, if the
+  result was large and was delivered to an awaiting client, its worker stored it in the shard as blobs,
+  and `resume` reads it from there and mirrors it back to the backend (detached, never over an entry the
+  backend holds whole; with a fresh expiry from now). A task nobody awaited, and any one-node run, has
+  no shard copy, and a small result never does, so without the backend entry `resume` raises
+  `ResultUnavailableError`. A task that kept no result is not mirrored back.
 - A flow, group or map resumes from the backend alone, even after the shard has forgotten it. If the
   backend has lost it, `resume` falls back to the pages the shard still holds, mirroring them again; once
   the shard has dropped them too, it raises `ResultUnavailableError`.
