@@ -304,9 +304,9 @@ async def _start_a_wait(native):
     native.wait_until_leader()
 
 
-# A script that leaves `run()` running when it ends: on a daemon thread,
-# with a body still awaiting in the one-node runtime, or a networked worker
-# that founded its shard alone and holds a task process, waiting.
+# A script that leaves `run()` running when it ends: on a daemon thread, with
+# a body still awaiting. Either the one-node runtime, which holds a task
+# process too, or a networked worker that founded its shard alone.
 UNFINISHED_RUN_PROGRAM = textwrap.dedent(
     """
     import asyncio

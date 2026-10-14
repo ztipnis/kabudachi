@@ -256,7 +256,7 @@ class InProcessExecutor:
         self._threads.shutdown(wait=False, cancel_futures=True)
 
     def stop_at_exit(self) -> None:
-        """Nothing here is a process the interpreter would wait for."""
+        """Bodies run in the worker itself, so there is no process to stop."""
 
 
 def _no_process_to_replace() -> None:

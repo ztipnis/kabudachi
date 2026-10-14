@@ -265,16 +265,28 @@ class ProcessPool:
         interpreter's exit, where the loop may never run again and a child
         left running would be waited for forever. Safe to call again, or after
         `stop`."""
-        processes = [child.process for child in (*self._children, *self._condemned)]
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
+        # The loop's thread is still running: a child that dies now must not
+        # be replaced, and one started just before this is found by the next
+        # pass below.
+        self._serving = False
         deadline = time.monotonic() + _EXIT_GRACE_SECONDS
-        for process in processes:
-            process.join(max(0.0, deadline - time.monotonic()))
-            if process.is_alive():
-                process.kill()
-                process.join(_EXIT_GRACE_SECONDS)
+        while True:
+            processes = [
+                child.process
+                for child in (*self._children, *self._condemned)
+                if child.process.is_alive()
+            ]
+            if not processes:
+                return
+            for process in processes:
+                process.terminate()
+            for process in processes:
+                process.join(max(0.0, deadline - time.monotonic()))
+                if process.is_alive():
+                    process.kill()
+                    process.join(_EXIT_GRACE_SECONDS)
+            if time.monotonic() > deadline + 2 * _EXIT_GRACE_SECONDS:
+                return
 
     async def _let_children_finish(self, children: list[_Child]) -> None:
         for child in children:
@@ -775,6 +787,8 @@ class ProcessPool:
 
     async def _replace_after(self, delay: float) -> None:
         await asyncio.sleep(delay)
+        if not self._serving:
+            return
         try:
             child = self._spawn()
         except Exception as error:

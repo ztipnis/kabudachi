@@ -831,13 +831,14 @@ class _WorkerRun:
         self._events: asyncio.Task[None] | None = None
 
     async def run(self, main: Callable[[], Awaitable[T]]) -> T:
-        await self._executor.start()
         # The interpreter joins task processes as it exits, before any thread
         # of this run is stopped, and they leave only when told to; so a run
         # still going then would hang it. Registered after multiprocessing's
-        # own exit function (imported above), it runs before it.
+        # own exit function (imported above), it runs before it, and before
+        # the executor starts, so a start still going at exit is covered too.
         atexit.register(self._executor.stop_at_exit)
         try:
+            await self._executor.start()
             native = _native_runtime(self._settings)
             # The tasks are registered and the executor is up; whether the
             # worker is ready now depends on its place in the shard alone.
@@ -850,8 +851,10 @@ class _WorkerRun:
             finally:
                 await self._end(native)
         finally:
-            atexit.unregister(self._executor.stop_at_exit)
-            await self._stop_executor()
+            try:
+                await self._stop_executor()
+            finally:
+                atexit.unregister(self._executor.stop_at_exit)
 
     async def _serve(self, main: Callable[[], Awaitable[T]], native: Any) -> T:
         if self._networked:
