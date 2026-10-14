@@ -12,6 +12,7 @@ import sys
 import threading
 import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -21,7 +22,7 @@ from kabudachi import coalescing_task, ephemeral_task, task
 from kabudachi import config as config_module
 from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
-from kabudachi.config import UNSET, Configuration, authority_parts
+from kabudachi.config import UNSET, Configuration, Settings, authority_parts
 from kabudachi.errors import (
     ConfigurationError,
     DuplicateTaskError,
@@ -833,10 +834,51 @@ def test_cancel_grace_can_come_from_the_environment_in_seconds(monkeypatch):
     assert Configuration().resolve("cancel_grace") == timedelta(seconds=2.5)
 
 
-def test_configuring_only_the_soft_limit_above_the_default_hard_limit_is_refused():
-    hard = config_module.DEFAULT_MEMORY_HARD_LIMIT
+GIB = 1024**3
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+@pytest.mark.parametrize(
+    "files, expected",
+    [
+        # cgroup v2, nested: the process's own cgroup's limit.
+        ({"proc": "0::/app.slice/worker\n", "app.slice/worker/memory.max": f"{2 * GIB}\n"}, 2 * GIB),
+        # cgroup v2 with no limit: physical memory.
+        ({"proc": "0::/\n", "memory.max": "max\n"}, None),
+        # cgroup v1: the memory controller's limit.
+        ({"proc": "4:memory:/docker/abc\n3:cpu:/x\n", "memory/docker/abc/memory.limit_in_bytes": f"{GIB}\n"}, GIB),
+        # cgroup v1's "no limit" is a huge number, not a word.
+        ({"proc": "4:memory:/\n", "memory/memory.limit_in_bytes": "9223372036854771712\n"}, None),
+        # No cgroup at all (macOS): physical memory.
+        ({}, None),
+        # A limit above physical memory cannot be used: physical memory.
+        ({"proc": "0::/\n", "memory.max": f"{2**62}\n"}, None),
+    ],
+)
+def test_available_memory_reads_the_cgroup_limit_and_falls_back_to_physical_memory(tmp_path, files, expected):
+    for name, text in files.items():
+        _write(tmp_path / ("self-cgroup" if name == "proc" else f"fs/{name}"), text)
+    physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+
+    found = config_module.available_memory(tmp_path / "fs", tmp_path / "self-cgroup")
+
+    assert found == (physical if expected is None else min(expected, physical))
+
+
+def test_memory_limits_default_to_a_quarter_and_a_half_of_available_memory_and_explicit_ones_win(monkeypatch):
+    monkeypatch.setattr(config_module, "_memory_at_start", lambda: 8 * GIB)
+
+    assert (Settings().memory_soft_limit, Settings().memory_hard_limit) == (2 * GIB, 4 * GIB)
+    assert Settings(memory_soft_limit=1000).memory_soft_limit == 1000
+    assert Settings(memory_hard_limit=GIB).memory_soft_limit == GIB, "a lower hard limit lowers the default soft one"
+    with pytest.raises(ValueError, match="soft"):
+        Settings(memory_soft_limit=4 * GIB + 1)
     with pytest.raises(ConfigurationError, match="soft"):
-        Configuration().configure(memory_soft_limit=hard + 1)
+        Configuration().configure(memory_soft_limit=4 * GIB + 1)
 
 
 @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "big"])

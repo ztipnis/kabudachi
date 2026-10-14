@@ -3,6 +3,7 @@
 //! SlowDown signal.
 
 use crate::coalescing::{self, ChainItem};
+use crate::manifest;
 use crate::protocol::ids::{IdGenerator, TaskId};
 use crate::time::{Clock, Instant};
 
@@ -28,6 +29,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// If the soft limit is above the hard one.
     pub fn set_memory_limits(&mut self, limits: Option<MemoryLimits>) {
         self.budget.set_limits(limits);
+    }
+
+    /// The limits [`Self::set_memory_limits`] set, if any.
+    pub fn memory_limits(&self) -> Option<MemoryLimits> {
+        self.budget.limits()
     }
 
     /// Serialized bytes of every task that has not finished, and of every
@@ -108,8 +114,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         }
     }
 
-    /// The serialized bytes of the task's input, which is what memory use counts.
+    /// What the task's input weighs, inline or as blobs, which is what memory
+    /// use counts.
     fn payload_len(&self, task_id: &TaskId) -> u64 {
-        self.tasks[task_id].serialized_input.len() as u64
+        manifest::payload_bytes(&self.tasks[task_id])
     }
 }

@@ -1,9 +1,9 @@
-//! The swarm task's `kad` queries of the shard's Task records: writes to a
-//! placement's quorum, a draining worker's hand-offs, and lookups. Each
-//! query's state lives here from the command that starts it to the event
-//! that ends it.
+//! The swarm task's `kad` queries of the shard's Task records and blobs:
+//! writes to a placement's quorum, a draining worker's hand-offs, and
+//! lookups. Each query's state lives here from the command that starts it to
+//! the event that ends it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
@@ -17,9 +17,12 @@ use libp2p::{PeerId, Swarm, kad};
 use prost::Message as _;
 use tokio::sync::oneshot;
 
-use super::{HandOffWrite, Inbound};
+use self::blobs::BlobRead;
+use super::{HandOffWrite, Inbound, PutBlobError, RecordLookup};
 use crate::swarm::Behaviour;
 use crate::task_store::record_key;
+
+mod blobs;
 
 /// The record queries in flight, each keyed by what the swarm reports its
 /// outcome under.
@@ -38,6 +41,11 @@ pub(super) struct RecordQueries {
     hand_offs: HashMap<kad::QueryId, oneshot::Sender<bool>>,
     /// Record lookups in flight, by their `kad` query.
     reads: HashMap<kad::QueryId, Read>,
+    /// Blob writes in flight to other workers, by their `kad` query, each to
+    /// say whether it reached its quorum.
+    blob_puts: HashMap<kad::QueryId, oneshot::Sender<Result<(), PutBlobError>>>,
+    /// Blob lookups in flight, by their `kad` query.
+    blob_reads: HashMap<kad::QueryId, BlobRead>,
 }
 
 impl RecordQueries {
@@ -143,47 +151,56 @@ impl RecordQueries {
     }
 
     /// Starts a lookup of `task`'s record, answered with the newest revision
-    /// any holder returns; at once with none when this `Net` stores no
+    /// any holder returns; at once unanswered when this `Net` stores no
     /// shard's records.
     pub(super) fn start_read(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
         task: TaskId,
-        respond_to: oneshot::Sender<Option<TaskRecord>>,
+        respond_to: oneshot::Sender<RecordLookup>,
     ) {
         match swarm.behaviour_mut().records.as_mut() {
             Some(records) => {
+                let known = records
+                    .kbuckets()
+                    .flat_map(|bucket| bucket.iter().map(|entry| *entry.node.key.preimage()).collect::<Vec<_>>())
+                    .collect();
                 let query = records.get_record(record_key(&task));
                 self.reads.insert(
                     query,
                     Read {
                         best: None,
+                        known,
                         respond_to,
                     },
                 );
             }
             None => {
-                let _ = respond_to.send(None);
+                let _ = respond_to.send(RecordLookup::Unanswered);
             }
         }
     }
 
     /// Takes one event of the records `kad`: the progress of a write, a
-    /// hand-off or a lookup this started. Any other event is ignored.
-    pub(super) fn on_event(&mut self, event: kad::Event, inbound: &Inbound) {
+    /// hand-off or a lookup this started. Any other event is ignored. Says
+    /// which query, if any, has done its work and should be finished.
+    pub(super) fn on_event(&mut self, event: kad::Event, inbound: &Inbound) -> Option<kad::QueryId> {
         match event {
             kad::Event::OutboundQueryProgressed {
                 id,
                 result: kad::QueryResult::PutRecord(result),
                 ..
-            } => self.on_put(id, &result, inbound),
+            } => {
+                self.on_put(id, &result, inbound);
+                None
+            }
             kad::Event::OutboundQueryProgressed {
                 id,
                 result: kad::QueryResult::GetRecord(result),
                 step,
                 ..
             } => self.on_get(id, &result, &step),
-            _ => {}
+            _ => None,
         }
     }
 
@@ -195,6 +212,11 @@ impl RecordQueries {
                 tracing::debug!(%error, "a record hand-off did not reach its quorum");
             }
             let _ = respond_to.send(result.is_ok());
+        } else if let Some(respond_to) = self.blob_puts.remove(&id) {
+            if let Err(error) = result {
+                tracing::debug!(%error, "a blob write did not reach its quorum");
+            }
+            let _ = respond_to.send(result.as_ref().map(|_| ()).map_err(|_| PutBlobError::NotStored));
         }
     }
 
@@ -229,18 +251,33 @@ impl RecordQueries {
         }
     }
 
-    fn on_get(&mut self, id: kad::QueryId, result: &kad::GetRecordResult, step: &kad::ProgressStep) {
+    /// One step of a lookup. A blob lookup that found a checked copy is
+    /// answered at once, and its query returned for the caller to finish: one
+    /// copy is enough, and the rest of the lookup is wasted.
+    fn on_get(
+        &mut self,
+        id: kad::QueryId,
+        result: &kad::GetRecordResult,
+        step: &kad::ProgressStep,
+    ) -> Option<kad::QueryId> {
         if let Some(read) = self.reads.get_mut(&id)
             && let Ok(kad::GetRecordOk::FoundRecord(found)) = result
         {
             read.offer(&found.record.value);
         }
+        let found_blob = self.answer_blob_lookup(id, result);
         // The lookup's last step, whether it found records or not.
         if step.last
             && let Some(read) = self.reads.remove(&id)
         {
-            read.finish();
+            read.finish(result);
         }
+        if step.last
+            && let Some(read) = self.blob_reads.remove(&id)
+        {
+            let _ = read.respond_to.send(None);
+        }
+        found_blob.then_some(id)
     }
 }
 
@@ -301,7 +338,9 @@ struct UnfinishedWrite {
 struct Read {
     /// The newest answer so far, with its version.
     best: Option<(RecordVersion, TaskRecord)>,
-    respond_to: oneshot::Sender<Option<TaskRecord>>,
+    /// The peers in this worker's routing table when the lookup started.
+    known: HashSet<PeerId>,
+    respond_to: oneshot::Sender<RecordLookup>,
 }
 
 impl Read {
@@ -322,9 +361,27 @@ impl Read {
         }
     }
 
-    /// Ends the lookup with the best answer, to a caller who may have
-    /// stopped waiting.
-    fn finish(self) {
-        let _ = self.respond_to.send(self.best.map(|(_, record)| record));
+    /// Ends the lookup, whose last step came to `last`, with the best answer,
+    /// to a caller who may have stopped waiting. A lookup that found nothing
+    /// says the record is held nowhere only if it asked every peer this
+    /// worker knew and each answered (every one of them is among the peers
+    /// the lookup heard from, whatever else it heard from): a timeout, an
+    /// empty routing table, a shard with more peers than one lookup asks and a
+    /// peer that did not answer all leave it unanswered, for a holder may be
+    /// among those not asked.
+    fn finish(self, last: &kad::GetRecordResult) {
+        let lookup = match self.best {
+            Some((_, record)) => RecordLookup::Found(record),
+            None => match last {
+                Err(kad::GetRecordError::NotFound { closest_peers, .. })
+                    if !self.known.is_empty()
+                        && self.known.iter().all(|peer| closest_peers.contains(peer)) =>
+                {
+                    RecordLookup::NotFound
+                }
+                _ => RecordLookup::Unanswered,
+            },
+        };
+        let _ = self.respond_to.send(lookup);
     }
 }

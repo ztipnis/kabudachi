@@ -106,6 +106,11 @@ id_newtype!(
     /// a name that stays stable across processes and restarts.
     TaskDefinitionId
 );
+id_newtype!(
+    /// Identifies a composite (a flow, group, map or reduce), minted like a
+    /// task id by the client that starts it.
+    CompositeId
+);
 
 /// Mints the IDs of new Tasks and TaskRuns. Clients and workers mint IDs
 /// independently, so an implementation must never hand out the same ID twice,

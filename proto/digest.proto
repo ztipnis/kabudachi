@@ -1,0 +1,15 @@
+syntax = "proto3";
+package kabudachi;
+
+// The hash function a Digest was computed with. A reader that does not know
+// the algorithm cannot check the digest, so it refuses it.
+enum DigestAlgorithm {
+  DIGEST_ALGORITHM_UNSPECIFIED = 0;
+  BLAKE3 = 1;
+}
+
+// A content hash: of a task's input, of a run's result, or of a blob.
+message Digest {
+  DigestAlgorithm algorithm = 1;
+  bytes value = 2;
+}

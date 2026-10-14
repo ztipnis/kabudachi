@@ -33,7 +33,6 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
-from kabudachi import _native
 from kabudachi._native import EventKind, RunState
 from kabudachi.body import RunningBody
 from kabudachi.composites import Composites
@@ -41,6 +40,7 @@ from kabudachi.config import Configuration
 from kabudachi.errors import (
     BackpressureError,
     CoalescedPayloadTooLargeError,
+    PayloadTooLargeError,
     ResultTooLargeError,
     ResultUnavailableError,
     RuntimeNotStartedError,
@@ -175,7 +175,8 @@ class Session:
 
         Safe to call from any thread. Raises `SerializationError`, before
         anything is queued, if `argument` is not what the task takes, and
-        `RunStoppedError` once the run is stopping.
+        `PayloadTooLargeError` if the encoded `argument` alone is larger than
+        `memory_hard_limit`, and `RunStoppedError` once the run is stopping.
         """
         serializer = self._serializers.get(definition.serializer)
         payload = serializer.encode(argument, definition.input_type)
@@ -185,6 +186,13 @@ class Session:
         self, definition: TaskDefinition, payload: bytes, options: SubmissionOptions
     ) -> TaskHandle:
         queue = self._configuration.resolve("queue", definition.queue)
+        limit = self._runtime.payload_limit
+        if limit is not None and len(payload) > limit:
+            raise PayloadTooLargeError(
+                f"task {definition.name}'s input is {len(payload)} bytes, past the {limit} this process can hold",
+                len(payload),
+                limit,
+            )
         settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
         return self._tasks.submit(definition, payload, options, settings)
 
@@ -358,10 +366,14 @@ class Session:
         self._tasks.replicated(event.task_id)
 
     def _on_refused(self, event: Any) -> None:
-        self._tasks.refused(
-            event.task_id,
-            BackpressureError(f"the leader refused task {event.task_id}: {event.reason}"),
+        error: Exception = BackpressureError(
+            f"task {event.task_id} was refused: {event.reason}"
         )
+        if event.reason == "TASK_REJECT_PAYLOAD_TOO_LARGE":
+            error = PayloadTooLargeError(
+                "the input is past the hard memory limit of the shard's leader"
+            )
+        self._tasks.refused(event.task_id, error)
 
     def _on_abort(self, event: Any) -> None:
         self._abort_at(event.task_run_id, event.seconds_left)
@@ -626,10 +638,10 @@ class Session:
         self._complete(claim, run, outcome)
 
     def _complete(self, claim: Any, run: Run, outcome: Any) -> None:
-        if claim.client is not None and len(outcome) > _native.MAX_RESULT_PAYLOAD_BYTES:
+        limit = self._runtime.payload_limit
+        if limit is not None and len(outcome) > limit:
             raise ResultTooLargeError(
-                f"task {claim.definition_id} returned {len(outcome)} bytes, more than the "
-                f"{_native.MAX_RESULT_PAYLOAD_BYTES} that can be sent to the worker awaiting it"
+                f"task {claim.definition_id} returned {len(outcome)} bytes, past the {limit} this process can hold"
             )
         if run.holds_handle:
             self._tasks.result_held(claim.task_id, claim.task_run_id, outcome)
@@ -914,6 +926,8 @@ _KNOWN_FAILURES: dict[str, type[Exception]] = {
     "TaskTimeoutError": TaskTimeoutError,
     "HistoryTooLarge": TaskRecordFullError,
     "CoalescedPayloadTooLarge": CoalescedPayloadTooLargeError,
+    # A claimant whose hard memory limit the input alone is past.
+    "PayloadTooLarge": PayloadTooLargeError,
 }
 
 # How a task ended without a result, for the endings that carry nothing more

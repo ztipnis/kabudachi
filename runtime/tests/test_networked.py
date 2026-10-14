@@ -24,7 +24,7 @@ from cluster import (
     settled,
     states,
 )
-from networked_tasks import awaits, fleeting, gather, hold, spin
+from networked_tasks import BULK_BYTES, awaits, bulk, echo, fleeting, gather, hold, spin, varied_text
 from proto_messages import Greeting
 
 
@@ -72,8 +72,9 @@ def test_a_cluster_delivers_results_compacts_and_keeps_its_runs_through_a_busy_t
 ):
     leader = cluster.leader()
     delivered_to_its_submitter(cluster, leader)
+    carried_as_blobs(cluster, leader)
     awaited_across_workers(cluster, leader)
-    compacted(cluster, leader)
+    compacted(cluster, leader, tmp_path)
     task_process_killed(cluster, leader, tmp_path)
     cancelled_while_running(cluster, leader, tmp_path)
     worker_killed(cluster, leader)
@@ -101,6 +102,25 @@ def delivered_to_its_submitter(cluster, leader):
     assert runner.ask(claimed=spun)["client"] == follower.id
 
 
+def carried_as_blobs(cluster, leader):
+    # An input and a result each larger than one message travel as blobs: the
+    # follower stores the input's chunks where the leader places the task's
+    # record, the worker that runs it reads them back, and its result comes
+    # back to the follower as chunks owned by the task.
+    follower = next(worker for worker in cluster.workers if worker is not leader)
+    big = ("0123456789" * (3 * 1024 * 1024 // 10 + 1))[: 3 * 1024 * 1024]
+    # Three in a row: the in-flight share of a worker is 8,000,000 bytes, so
+    # the submitter, which counts each input while it stores it, refuses the
+    # third if the first two stayed counted. This guards the submitter's side
+    # alone: the claimants of the three runs may be different workers, so a
+    # claimant that leaves a run's input counted is not caught here.
+    for _ in range(3):
+        echoed = follower.submit("echo", text=big)
+        certified_once(cluster, echoed, digest_of(echo, Greeting(text=big)))
+        held = eventually("the follower to hold the echoed result", lambda: settled(follower, echoed))
+        assert held["error"] is None, held
+
+
 def awaited_across_workers(cluster, leader):
     # A body that awaits a task it called gets its result, wherever each ran,
     # and sees the call kept by the shard.
@@ -109,29 +129,22 @@ def awaited_across_workers(cluster, leader):
     assert [run["delivered"] for run in record["runs"]] == [True]
     assert eventually("the caller's handle to settle", lambda: settled(leader, awaiting))["error"] is None
 
-    # A result too large for one frame fails its run, and its awaiter hears why.
-    too_big = leader.submit("big")
-    record = finished(cluster, too_big)
-    assert [(run["state"], run["failure_kind"]) for run in record["runs"]] == [
-        ("FAILED", "ResultTooLargeError")
-    ]
-    assert eventually("the big task's handle", lambda: settled(leader, too_big))["error"] == (
-        "ResultTooLargeError"
-    )
 
-
-def compacted(cluster, leader):
+def compacted(cluster, leader, tmp_path):
     # A coalescing key held by a running generation retains the payloads of
     # those superseded behind it, past the soft memory limit: the leader makes
     # a compaction run, a worker folds the chain in a task process, and the
     # newest generation's record keeps the fold. It then runs on the whole
     # chain, folded in order.
-    holding = leader.submit("gather", text="a", times=2000)
-    # Running, so it holds the key: the generations after it wait behind it.
+    holding = leader.submit("gather", text="a", times=GATED)
+    # Running, so it holds the key: the generations after it wait behind it,
+    # for as long as the test holds it, however long an idle worker takes to
+    # claim the compaction run.
     eventually("the first generation to run", lambda: running_on(cluster, holding))
     parts = [letter * 200 for letter in "bcd"]
     newest = [leader.submit("gather", text=part) for part in parts][-1]
     eventually("the retained chain to be compacted", lambda: (cluster.record(newest) or {}).get("folded"))
+    (tmp_path / "a.go").touch()
 
     # The compaction run's own record entry, if the record lists it, is not
     # the generation's result: the last run that succeeded is.
@@ -185,6 +198,60 @@ def worker_killed(cluster, leader):
             record = certified_once(cluster, each, digest_of(fleeting, Greeting(text=f"worker-{n}")))
             assert [run["delivered"] for run in record["runs"]] == [True]
             assert eventually("its handle", lambda: settled(leader, each))["error"] is None
+
+
+def test_a_client_too_small_to_hold_a_result_has_its_handle_fail_while_the_run_completes_elsewhere(tmp_path):
+    leader, client = 0, 1
+    cluster = Cluster.start(
+        tmp_path,
+        overrides={
+            # The client holds at most half its limit in flight, 1.5 MB, and
+            # claims nothing, so every run is on a larger worker.
+            client: {"KABUDACHI_MEMORY_HARD_LIMIT": "3000000", "KABUDACHI_TEST_CLAIMS_NOTHING": "1"},
+        },
+    )
+    try:
+        workers = cluster.workers
+        assert cluster.leader() is workers[leader]
+        # A 0.9 MB input travels inline and fits the client; its 1.8 MB
+        # result does not.
+        inflated = workers[client].submit("inflate", text="x" * 900_000)
+        eventually("the client's handle to settle", lambda: settled(workers[client], inflated))
+        assert settled(workers[client], inflated)["error"] == "ResultTooLargeError"
+        # The result reaches the client before the leader certifies the run.
+        [run] = finished(cluster, inflated)["runs"]
+        assert run["state"] == "SUCCEEDED"
+        assert run["worker"] != workers[client].id
+    finally:
+        cluster.close()
+
+
+def test_a_run_whose_result_no_store_has_room_for_is_lost_at_its_bound_and_its_replay_stores_it_once_room_is_made(
+    tmp_path,
+):
+    # Stores hold 6 MB each, inputs at most half of that. A held task's 2.5 MB
+    # input, past one message so it travels as blobs placed on all three
+    # workers, leaves 3.5 MB: a 4.5 MB result, under the payload limit,
+    # cannot be stored.
+    sized = {"KABUDACHI_MEMORY_HARD_LIMIT": "12000000"}
+    cluster = Cluster.start(tmp_path, overrides={index: sized for index in range(3)})
+    try:
+        leader = cluster.leader()
+        leader.submit("weigh", text="heavy001" + varied_text(2_500_000))
+        eventually("the weighty task to run", lambda: (tmp_path / "heavy001.started").exists())
+
+        bulked = leader.submit("bulk")
+        # Refused until the run's reconnect timeout, the run is then lost
+        # rather than left undelivered, and replayed.
+        eventually("the bulk run to be lost", lambda: "LOST" in states(cluster.record(bulked)), timeout=15)
+        assert not cluster.record(bulked)["finished"]
+
+        (tmp_path / "heavy001.go").touch()
+        record = certified_once(cluster, bulked, digest_of(bulk, Greeting(text=varied_text(BULK_BYTES))))
+        assert states(record)[0] == "LOST" and states(record)[-1] == "SUCCEEDED"
+        assert eventually("its handle", lambda: settled(leader, bulked))["error"] is None
+    finally:
+        cluster.close()
 
 
 def test_a_cut_off_worker_stops_its_run_by_its_deadline_an_unreached_client_still_hears_its_tasks_ends_and_runs_certify_once_when_their_leader_is_killed(
@@ -284,7 +351,10 @@ def one_on_each_worker(cluster, tmp_path, client):
     each task's text, each text's worker, the task `client` runs itself, and
     the other two."""
     texts = {client.submit("hold", text=f"unreached-{n}", times=GATED): f"unreached-{n}" for n in range(3)}
-    holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()))
+    # Idle workers poll for work at growing intervals, up to 5 s, and a worker
+    # just resumed or rejoined starts from its longest: each of three claims
+    # can wait one.
+    holders = eventually("all three to run", lambda: started_on(cluster, tmp_path, texts.values()), timeout=45)
     [own] = [task for task, text in texts.items() if holders[text] is client]
     unreached, interrupted = [task for task in texts if task != own]
     return texts, holders, own, unreached, interrupted

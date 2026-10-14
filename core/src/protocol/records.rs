@@ -11,6 +11,7 @@
 //! holds because the owner of the records, the scheduler, hands out
 //! only shared references and clones.
 
+use crate::manifest::Manifest;
 use crate::protocol::generated;
 use crate::protocol::ids::{
     IdGenerator, TaskDefinitionId, TaskId, TaskRunId, WorkerId, mint_task_run_id,
@@ -42,6 +43,9 @@ pub struct NewTask {
     pub reconnect_timeout: Option<Duration>,
     /// The worker that awaits the result, if one does across workers.
     pub client: Option<WorkerId>,
+    /// The input as blobs, when it is too large to travel inline: then
+    /// `serialized_input` is empty.
+    pub input_manifest: Option<Manifest>,
 }
 
 impl NewTask {
@@ -69,6 +73,7 @@ impl NewTask {
             non_retriable: false,
             reconnect_timeout: None,
             client: None,
+            input_manifest: None,
         }
     }
 }
@@ -92,6 +97,7 @@ pub fn new_task(new: NewTask) -> Task {
         compacts: None,
         reconnect_timeout_ms: new.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
         client: new.client.map(Into::into),
+        input_manifest: new.input_manifest.map(Into::into),
     }
 }
 

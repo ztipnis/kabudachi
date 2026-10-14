@@ -22,7 +22,9 @@ from kabudachi import Durability, TaskStatus
 from kabudachi._native import RunState
 from kabudachi.errors import (
     DurabilityUnavailableError,
+    PayloadTooLargeError,
     RuntimeNotStartedError,
+    SerializationError,
     StartupError,
     TaskBodyError,
     TaskDefinitionError,
@@ -617,6 +619,29 @@ def test_a_submission_past_the_hard_memory_limit_raises_backpressure_error():
     # A kabudachi error and a RuntimeError, as the pure-Python class was.
     assert isinstance(refused, KabudachiError)
     assert isinstance(refused, RuntimeError)
+
+
+def test_a_payload_larger_than_one_message_goes_through_a_task_and_back_and_one_alone_past_the_hard_limit_is_refused():
+    @declare
+    def echo(request: Greeting) -> Greeting:
+        return request
+
+    hard = 5 * 1024 * 1024
+    kabudachi.configure(memory_soft_limit=2 * 1024 * 1024, memory_hard_limit=hard)
+    # Varied, so chunks put back out of order would not match.
+    big = ("0123456789" * (3 * 1024 * 1024 // 10 + 1))[: 3 * 1024 * 1024]
+
+    async def main():
+        echoed = await echo(Greeting(text=big))
+        with pytest.raises(PayloadTooLargeError) as refused:
+            echo(Greeting(text="y" * (hard + 1)))
+        return echoed, refused.value
+
+    echoed, refused = kabudachi.run(main)
+    assert echoed == Greeting(text=big)
+    # Not transient: a serialization error, never a backpressure one.
+    assert isinstance(refused, SerializationError)
+    assert refused.limit == hard and refused.size > refused.limit
 
 
 def test_a_long_chain_is_compacted_while_its_key_is_busy_and_folds_in_order():

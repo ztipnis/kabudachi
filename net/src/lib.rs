@@ -5,6 +5,8 @@
 //! on `tokio`, to bridge the native runtime to Python, but not on `libp2p`.
 
 pub mod authority;
+pub mod blob_exchange;
+pub mod blobs;
 pub mod bootstrap;
 pub mod claim;
 pub mod claimed_runs;
@@ -19,6 +21,7 @@ pub mod join;
 pub mod join_codec;
 mod leader_search;
 pub mod messenger;
+pub mod payload_memory;
 mod peers;
 pub mod reconcile;
 pub mod result_transport;

@@ -4,21 +4,33 @@
 
 use std::sync::Arc;
 
+use kabudachi_core::blob::BlobOwner;
+use kabudachi_core::manifest::{Manifest, fits_inline};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    DeliverResult, OutcomeAnswer, TaskResponse, task_response,
+    DeliverResult, OutcomeAnswer, TaskResponse, deliver_result, task_response,
 };
 use kabudachi_core::protocol::task::TaskRunState as DomainRunState;
+use kabudachi_net::blobs::BlobRole;
 use kabudachi_net::executor::Report;
+use kabudachi_net::messenger::Net;
 use kabudachi_net::result_transport::ResultEvent;
+use kabudachi_net::task_exchange::NotStored;
 
 use super::seam::{HeldRun, Seam, Shared};
 use crate::work::PyEvent;
 
+/// The failure kind a client's handle fails with when the result alone is
+/// past this process's hard memory limit.
+const RESULT_TOO_LARGE_KIND: &str = "ResultTooLargeError";
+
 /// Delivers a run's result to its client, then reports the run completed,
 /// saying whether the result arrived. The run's reconnect timeout bounds the
-/// delivery: past it the leader may replay the run anyway.
+/// delivery: past it the leader may replay the run anyway. A result too
+/// large for one message is first stored as blobs, and a run whose result
+/// cannot be stored by then is reported lost, so a task that retries is
+/// replayed.
 pub(super) async fn deliver_then_report(
     shared: Arc<Shared>,
     client: WorkerId,
@@ -27,11 +39,15 @@ pub(super) async fn deliver_then_report(
     digest: Digest,
     payload: Vec<u8>,
 ) {
+    let Some(body) = result_body(&shared, &held, payload).await else {
+        shared.report(Report::Lost(run));
+        return;
+    };
     let delivery = DeliverResult {
         task_id: Some(held.task.into()),
         task_run_id: Some(run.clone().into()),
         result_digest: Some(digest.clone().into()),
-        payload,
+        body: Some(body),
     };
     let delivered = shared
         .net
@@ -45,7 +61,109 @@ pub(super) async fn deliver_then_report(
     });
 }
 
+/// What carries `payload` to the client: the payload itself, or, past one
+/// message, the manifest of blobs owned by the task, stored where its leader
+/// keeps the task's record, so they live, and move, with it. `None` if they
+/// could not be stored within the run's reconnect timeout.
+///
+/// The payload is in this process's memory already, so it is counted, not
+/// waited for, while it is stored: this worker claims no blob input
+/// meanwhile if that leaves no room. The session refused one alone past the
+/// limit before reporting, so counting it cannot be refused here. A shard
+/// whose stores are full refuses for now, and the store is asked again until
+/// the bound.
+async fn result_body(
+    shared: &Shared,
+    held: &HeldRun,
+    payload: Vec<u8>,
+) -> Option<deliver_result::Body> {
+    if fits_inline(payload.len()) {
+        return Some(deliver_result::Body::Payload(payload));
+    }
+    let _in_flight = shared
+        .net
+        .payload_memory()
+        .take_anyway(payload.len() as u64)
+        .ok();
+    let bound = tokio::time::Instant::now() + held.reconnect_timeout;
+    loop {
+        let store = shared
+            .net
+            .store_payload_at_leader(BlobRole::Result, &held.task, &payload, shared.retry);
+        match tokio::time::timeout_at(bound, store).await {
+            Ok(Ok(manifest)) => return Some(deliver_result::Body::Manifest(manifest.into())),
+            Ok(Err(NotStored::Refused)) => tokio::time::sleep(shared.retry.ask_again_after).await,
+            // Out of its shard, or past the bound.
+            Ok(Err(NotStored::LeftShard)) | Err(_) => return None,
+        }
+    }
+}
+
+/// What the result reader makes of one result event before the session sees
+/// it.
+enum Fetched {
+    /// `event`, a delivered manifest's blobs joined into its payload.
+    Event(ResultEvent),
+    /// The result alone is past this process's hard memory limit: its
+    /// awaiter's handle fails with `ResultTooLargeError`.
+    TooLarge { task: TaskId, run: TaskRunId },
+    /// Its blobs cannot be fetched. The result is then not held, as for a
+    /// delivery that never arrived, and its certification finds nothing to
+    /// match.
+    Unavailable,
+}
+
+/// `event`, with a delivered manifest's blobs joined into its payload. The
+/// payload counts in flight while it is fetched, and stops when it is handed
+/// on to the session. It is counted, not waited for: a body of this process
+/// that awaits this very result is holding its own input's bytes, which stay
+/// counted until it ends, and a reader waiting for room past them would wait
+/// for ever. Only a result alone past the hard limit is refused.
+async fn with_payload(net: &Net, event: ResultEvent) -> Fetched {
+    let ResultEvent::Delivered {
+        task,
+        run,
+        digest,
+        body: deliver_result::Body::Manifest(wire),
+    } = event
+    else {
+        return Fetched::Event(event);
+    };
+    let Ok(manifest) = Manifest::try_from(&wire) else {
+        return Fetched::Unavailable;
+    };
+    if manifest.check_cut_payload().is_err() {
+        return Fetched::Unavailable;
+    }
+    let Ok(_in_flight) = net.payload_memory().take_anyway(manifest.total_bytes()) else {
+        return Fetched::TooLarge { task, run };
+    };
+    let owner = BlobOwner::Task(task.clone());
+    let Ok(payload) = net.resolve_manifest(&owner, &manifest).await else {
+        return Fetched::Unavailable;
+    };
+    Fetched::Event(ResultEvent::Delivered {
+        task,
+        run,
+        digest,
+        body: deliver_result::Body::Payload(payload),
+    })
+}
+
 impl Shared {
+    /// Tells Python a result is past this process's hard memory limit, so
+    /// its awaiter's handle fails; the run stays completed.
+    fn on_result_too_large(&self, task: &TaskId, run: &TaskRunId) {
+        self.seam().events.push_back(PyEvent::outcome(
+            task.as_str(),
+            run.as_str(),
+            Some(DomainRunState::Failed.into()),
+            RESULT_TOO_LARGE_KIND.into(),
+            None,
+        ));
+        self.wake();
+    }
+
     /// Hands Python what arrived for a task submitted here: a result, a
     /// certification, or how the task ended without one.
     fn on_result(&self, event: ResultEvent) {
@@ -68,8 +186,16 @@ impl Seam {
     fn told(&mut self, event: ResultEvent) -> Option<PyEvent> {
         match event {
             ResultEvent::Delivered {
-                task, run, payload, ..
+                task,
+                run,
+                body: deliver_result::Body::Payload(payload),
+                ..
             } => Some(PyEvent::result(task.as_str(), run.as_str(), payload)),
+            // The reader joins a manifest's blobs before this.
+            ResultEvent::Delivered {
+                body: deliver_result::Body::Manifest(_),
+                ..
+            } => None,
             ResultEvent::Certified { task, run, digest } => {
                 self.awaiting.remove(&task);
                 Some(PyEvent::certified(
@@ -131,7 +257,11 @@ pub(super) async fn read_results(shared: Arc<Shared>) {
     loop {
         shared.net.result_arrived().await;
         for event in shared.net.take_result_events() {
-            shared.on_result(event);
+            match with_payload(&shared.net, event).await {
+                Fetched::Event(event) => shared.on_result(event),
+                Fetched::TooLarge { task, run } => shared.on_result_too_large(&task, &run),
+                Fetched::Unavailable => {}
+            }
         }
     }
 }

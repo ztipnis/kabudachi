@@ -62,6 +62,32 @@ pub struct Found {
     pub stopped: Option<DiscoveryStop>,
 }
 
+/// What one discovery has done so far.
+struct Search {
+    found: Found,
+    /// The candidates already asked for.
+    tried: BTreeSet<TaskId>,
+    /// The blob input bytes this worker can still take; `None` for no bound.
+    room: Option<u64>,
+}
+
+impl Search {
+    /// Whether a candidate known to carry `input` bytes as blobs is past the
+    /// room left. A candidate whose input is not known is never.
+    fn is_past_room(&self, input: Option<u64>) -> bool {
+        matches!((input, self.room), (Some(input), Some(left)) if input > left)
+    }
+
+    /// Keeps `claim`, found at `stage`, and takes its blob input from the
+    /// room left.
+    fn granted(&mut self, stage: Stage, claim: Claim) {
+        let input = claim.task.as_ref().and_then(|task| task.input_manifest.as_ref());
+        let input = input.map_or(0, |manifest| manifest.total_bytes);
+        self.room = self.room.map(|left| left.saturating_sub(input));
+        self.found.claims.push((stage, claim));
+    }
+}
+
 impl Net {
     /// Claims up to `limit` tasks from `leader`, looking in the stages above
     /// in order and stopping as soon as `limit` are claimed. Each candidate is
@@ -72,58 +98,61 @@ impl Net {
     ///
     /// A compaction run is a candidate only if `runs_compaction` says this
     /// worker runs them.
+    ///
+    /// `input_room` bounds the input bytes, carried as blobs, the claims may
+    /// add up to (`None` for no bound). A candidate of this worker's own
+    /// records whose input is past the room left is skipped without asking
+    /// the leader. A peer's candidate carries no size, so it is asked for,
+    /// and what it carries lowers the room left once it is granted; the last
+    /// stage sends the room left to the leader, which passes over a task
+    /// that does not fit it.
     pub async fn discover(
         &self,
         leader: WorkerId,
         limit: usize,
         now: WallTime,
         runs_compaction: bool,
+        input_room: Option<u64>,
     ) -> Found {
-        let mut found = Found::default();
-        let mut tried = BTreeSet::new();
+        let mut search =
+            Search { found: Found::default(), tried: BTreeSet::new(), room: input_room };
         let own = self.own_candidates(now, runs_compaction);
-        if self
-            .claim_each(&leader, Stage::Own, own, limit, &mut tried, &mut found)
-            .await
-            .is_break()
-        {
-            return found;
+        if self.claim_each(&leader, Stage::Own, own, limit, &mut search).await.is_break() {
+            return search.found;
         }
         for (class, peers) in self.steal_targets().await.into_iter().enumerate() {
-            if found.claims.len() >= limit {
-                return found;
+            if search.found.claims.len() >= limit {
+                return search.found;
             }
             // Ids already tried take answer slots without being candidates, so
             // ask for as many more as were tried.
-            let asked = (limit - found.claims.len() + tried.len()).min(MAX_STEAL_IDS);
+            let asked = (limit - search.found.claims.len() + search.tried.len()).min(MAX_STEAL_IDS);
             let answers = join_all(peers.into_iter().map(|peer| self.steal(peer, asked, runs_compaction))).await;
             let mut offered = BTreeSet::new();
-            let candidates: Vec<TaskId> = answers
+            let candidates: Vec<(TaskId, Option<u64>)> = answers
                 .into_iter()
                 .flatten()
                 .flatten()
                 .filter(|task| offered.insert(task.clone()))
+                .map(|task| (task, None))
                 .collect();
             let stage = Stage::Peer { class };
-            if self
-                .claim_each(&leader, stage, candidates, limit, &mut tried, &mut found)
-                .await
-                .is_break()
-            {
-                return found;
+            if self.claim_each(&leader, stage, candidates, limit, &mut search).await.is_break() {
+                return search.found;
             }
         }
-        if found.claims.len() < limit {
-            self.claim_oldest_into(&leader, limit, &mut found).await;
+        if search.found.claims.len() < limit {
+            self.claim_oldest_into(&leader, limit, &mut search).await;
         }
-        found
+        search.found
     }
 
     /// The tasks of this worker's own records that look claimable now,
-    /// nearest first by the distance between a task's key and this worker's.
-    fn own_candidates(&self, now: WallTime, runs_compaction: bool) -> Vec<TaskId> {
-        let mut candidates: Vec<TaskId> = self
-            .held_records()
+    /// nearest first by the distance between a task's key and this worker's,
+    /// each with the bytes of input it carries as blobs.
+    fn own_candidates(&self, now: WallTime, runs_compaction: bool) -> Vec<(TaskId, Option<u64>)> {
+        let held = self.held_records();
+        let mut candidates: Vec<TaskId> = held
             .claimable(now, runs_compaction)
             .into_iter()
             .map(|(_, task)| task)
@@ -133,31 +162,36 @@ impl Net {
             candidates.sort_by_key(|task| KBucketKey::new(record_key(task)).distance(&local));
         }
         candidates
+            .into_iter()
+            .map(|task| {
+                let input = held.blob_input_bytes(&task);
+                (task, Some(input))
+            })
+            .collect()
     }
 
-    /// Asks the leader for each of `candidates` not yet tried, until `limit`
-    /// are claimed. Breaks if the leader's answer means asking more is
-    /// pointless.
+    /// Asks the leader for each of `candidates` not yet tried and not past
+    /// the room left, until `limit` are claimed. Breaks if the leader's
+    /// answer means asking more is pointless.
     async fn claim_each(
         &self,
         leader: &WorkerId,
         stage: Stage,
-        candidates: Vec<TaskId>,
+        candidates: Vec<(TaskId, Option<u64>)>,
         limit: usize,
-        tried: &mut BTreeSet<TaskId>,
-        found: &mut Found,
+        search: &mut Search,
     ) -> ControlFlow<()> {
-        for task in candidates {
-            if found.claims.len() >= limit {
+        for (task, input) in candidates {
+            if search.found.claims.len() >= limit {
                 break;
             }
-            if !tried.insert(task.clone()) {
+            if !search.tried.insert(task.clone()) || search.is_past_room(input) {
                 continue;
             }
             match self.request_claim(leader.clone(), task).await {
                 Ok(ClaimResponse {
                     result: Some(claim_response::Result::Accept(claim)),
-                }) => found.claims.push((stage, claim)),
+                }) => search.granted(stage, claim),
                 Ok(ClaimResponse {
                     result: Some(claim_response::Result::Reject(reject)),
                 }) => match ClaimRejectReason::try_from(reject.reason) {
@@ -169,33 +203,35 @@ impl Net {
                         | ClaimRejectReason::ClaimRejectSuperseded
                         | ClaimRejectReason::ClaimRejectKeyBusy
                         | ClaimRejectReason::ClaimRejectCannotRun,
-                    ) => found.stale += 1,
+                    ) => search.found.stale += 1,
                     Ok(
                         ClaimRejectReason::ClaimRejectNotLeader
                         | ClaimRejectReason::ClaimRejectNotMember
                         | ClaimRejectReason::Unspecified,
                     )
-                    | Err(_) => return stop(found, DiscoveryStop::LeaderRefused),
+                    | Err(_) => return stop(&mut search.found, DiscoveryStop::LeaderRefused),
                 },
-                Ok(_) => return stop(found, DiscoveryStop::LeaderRefused),
-                Err(_) => return stop(found, DiscoveryStop::LeaderRefused),
+                Ok(_) => return stop(&mut search.found, DiscoveryStop::LeaderRefused),
+                Err(_) => return stop(&mut search.found, DiscoveryStop::LeaderRefused),
             }
         }
         ControlFlow::Continue(())
     }
 
     /// The last stage: the leader's oldest pending tasks, as many as are
-    /// still wanted.
-    async fn claim_oldest_into(&self, leader: &WorkerId, limit: usize, found: &mut Found) {
-        let wanted = u32::try_from(limit - found.claims.len()).unwrap_or(u32::MAX);
-        match self.claim_oldest(leader.clone(), wanted).await {
+    /// still wanted and as fit the room left.
+    async fn claim_oldest_into(&self, leader: &WorkerId, limit: usize, search: &mut Search) {
+        let wanted = u32::try_from(limit - search.found.claims.len()).unwrap_or(u32::MAX);
+        match self.claim_oldest(leader.clone(), wanted, search.room).await {
             Ok(ClaimResponse {
                 result: Some(claim_response::Result::Batch(batch)),
-            }) => found
-                .claims
-                .extend(batch.claims.into_iter().map(|claim| (Stage::Oldest, claim))),
-            Ok(_) => found.stopped = Some(DiscoveryStop::LeaderRefused),
-            Err(_) => found.stopped = Some(DiscoveryStop::LeaderRefused),
+            }) => {
+                for claim in batch.claims {
+                    search.granted(Stage::Oldest, claim);
+                }
+            }
+            Ok(_) => search.found.stopped = Some(DiscoveryStop::LeaderRefused),
+            Err(_) => search.found.stopped = Some(DiscoveryStop::LeaderRefused),
         }
     }
 }

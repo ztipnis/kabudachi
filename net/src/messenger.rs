@@ -102,6 +102,14 @@
 //! the voters that hold them, and reads the outcome of each write back;
 //! see `crate::task_store`.
 //!
+//! ## Blobs
+//!
+//! A `Net` built with [`Net::for_shard`] stores the shard's blobs in the
+//! same records store ([`Net::put_blob`]), and fetches one from the holders
+//! of its owner's record over `/kabudachi/blob/1` (see
+//! `crate::blob_exchange`), which the swarm task answers itself, falling
+//! back to the kad lookup ([`Net::get_blob`]).
+//!
 //! ## The bootstrap join protocol
 //!
 //! Join and claim are both correlated: `crate::exchange` holds the swarm
@@ -183,28 +191,37 @@
 mod record_queries;
 mod swarm_task;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord, MAX_BLOB_BYTES};
 use kabudachi_core::election::Input;
+use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRecord;
 use kabudachi_core::protocol::ids::{ShardId, ShardName, TaskId, WorkerId};
-use kabudachi_core::protocol::messages::ElectionMessage;
+use kabudachi_core::protocol::messages::{
+    ElectionMessage, QueryOutcome, TaskRequest, task_request, task_response,
+};
 pub use kabudachi_core::task_record::{PlacedWrite, WriteOutcome};
-use kabudachi_core::task_record::Write;
+use kabudachi_core::task_record::{OwnerState, Placement, Write};
+use libp2p::futures::StreamExt as _;
+use libp2p::futures::stream::FuturesUnordered;
 use libp2p::request_response::{self, ResponseChannel};
 use libp2p::{Multiaddr, PeerId, Swarm, gossipsub};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::blob_exchange::codec::BlobCodec;
+use crate::blobs::BlobRole;
 use crate::claim::codec::ClaimCodec;
 use crate::claimed_runs::ClaimedRuns;
 use crate::exchange::{Asked, Exchange};
 use crate::join_codec::JoinCodec;
 pub use crate::peers::{Diagnostics, RedialPolicy, Traffic};
+use crate::payload_memory::PayloadMemory;
 use crate::peers::{Carried, Peers, worker_id_of};
 use crate::reconcile::codec::ReconcileCodec;
 use crate::result_transport::ResultEvent;
@@ -219,6 +236,15 @@ use crate::task_store::HeldRecords;
 const ASK_AGAIN_FIRST: Duration = Duration::from_millis(100);
 /// The longest pause between its asks.
 const ASK_AGAIN_LONGEST: Duration = Duration::from_secs(1);
+/// How long a direct blob ask waits for its holder: an answer is one read of
+/// a store, so a holder that takes longer is passed over for the next.
+const BLOB_ASK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the leader may take to say how a task stands, for the blobs of an
+/// owner never seen here: later it is asked again, a grace after.
+const OWNER_ASK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a worker puts the blobs whose owner's record moved where that
+/// record now is, and asks the shard about owners it never held a record of.
+pub const BLOB_TENDING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What [`Net::dial_for_connection`] dials.
 pub(crate) enum DialTarget {
@@ -282,7 +308,7 @@ enum Command {
     /// See `Net::get_record`.
     GetRecord {
         task: TaskId,
-        respond_to: oneshot::Sender<Option<TaskRecord>>,
+        respond_to: oneshot::Sender<RecordLookup>,
     },
     /// Runs an ask or an answer of one correlated protocol on the swarm
     /// task, which alone owns the swarm and its [`Exchanges`]; see
@@ -298,6 +324,50 @@ enum Command {
         write: HandOffWrite,
         respond_to: oneshot::Sender<bool>,
     },
+    /// Stores a blob here and at a quorum of its placement (see
+    /// [`Net::put_blob`]).
+    PutBlob {
+        key: BlobKey,
+        record: BlobRecord,
+        placement: Placement,
+        respond_to: oneshot::Sender<Result<(), PutBlobError>>,
+    },
+    /// Finds a blob by the kad lookup (see [`Net::get_blob`]'s last resort).
+    LookUpBlob {
+        key: BlobKey,
+        respond_to: oneshot::Sender<Option<Vec<u8>>>,
+    },
+}
+
+/// What a lookup of a task's record across the shard (see
+/// [`Net::find_record`]) came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordLookup {
+    /// The newest revision any holder returned.
+    Found(TaskRecord),
+    /// Every peer this worker knows answered, and none holds the record: it
+    /// is held nowhere in the shard.
+    NotFound,
+    /// The lookup could not say: it timed out, this worker knows no peer
+    /// yet, it knows more peers than one lookup asks, some peer did not
+    /// answer, this `Net` stores no shard's records, or the swarm task has
+    /// stopped.
+    Unanswered,
+}
+
+/// Why a blob was not stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PutBlobError {
+    #[error("a blob of {size} bytes is past the {limit} a holder keeps")]
+    TooLarge { size: usize, limit: usize },
+    /// This worker's own store, which keeps a copy of every blob it writes,
+    /// has no room for it.
+    #[error("this worker's blob store is full")]
+    StoreFull,
+    /// Not enough of the placement stored it before the write timed out, or
+    /// this `Net` stores no shard's records.
+    #[error("the blob was not stored by a quorum of its placement")]
+    NotStored,
 }
 
 /// A copy a draining worker hands to the holders a placement named (see
@@ -321,6 +391,7 @@ pub(crate) struct Exchanges {
     reconcile: Exchange<ReconcileCodec>,
     steal: Exchange<StealCodec>,
     result: Exchange<ResultCodec>,
+    blob: Exchange<BlobCodec>,
 }
 
 /// A correlated protocol `Net` carries through an [`Exchange`]
@@ -333,6 +404,12 @@ pub(crate) trait Correlated:
     const ARRIVAL: Carried;
     fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self>;
     fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self>;
+}
+
+/// A correlated protocol whose inbound requests wait in a queue for the
+/// driver to answer. The blob exchange is answered by the swarm task itself,
+/// so it has none.
+pub(crate) trait Queued: Correlated {
     fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>>;
 }
 
@@ -344,6 +421,9 @@ impl Correlated for JoinCodec {
     fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
         &mut exchanges.join
     }
+}
+
+impl Queued for JoinCodec {
     fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
         &inbound.joins
     }
@@ -357,6 +437,9 @@ impl Correlated for ClaimCodec {
     fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
         &mut exchanges.claim
     }
+}
+
+impl Queued for ClaimCodec {
     fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
         &inbound.claims
     }
@@ -370,6 +453,9 @@ impl Correlated for TaskCodec {
     fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
         &mut exchanges.task
     }
+}
+
+impl Queued for TaskCodec {
     fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
         &inbound.tasks
     }
@@ -383,6 +469,9 @@ impl Correlated for ReconcileCodec {
     fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
         &mut exchanges.reconcile
     }
+}
+
+impl Queued for ReconcileCodec {
     fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
         &inbound.reconciles
     }
@@ -396,6 +485,9 @@ impl Correlated for StealCodec {
     fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
         &mut exchanges.steal
     }
+}
+
+impl Queued for StealCodec {
     fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
         &inbound.steals
     }
@@ -409,8 +501,21 @@ impl Correlated for ResultCodec {
     fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
         &mut exchanges.result
     }
+}
+
+impl Queued for ResultCodec {
     fn queue(inbound: &Inbound) -> &Mutex<VecDeque<Asked<Self>>> {
         &inbound.results
+    }
+}
+
+impl Correlated for BlobCodec {
+    const ARRIVAL: Carried = Carried::BlobRequest;
+    fn behaviour(behaviour: &mut Behaviour) -> &mut request_response::Behaviour<Self> {
+        &mut behaviour.blob
+    }
+    fn exchange(exchanges: &mut Exchanges) -> &mut Exchange<Self> {
+        &mut exchanges.blob
     }
 }
 
@@ -639,12 +744,17 @@ pub struct Net {
     records_shard: Option<ShardName>,
     /// The Task records this `Net` holds (see [`Self::held_records`]).
     held: HeldRecords,
+    /// The blob payloads this worker holds whole in flight (see
+    /// [`Self::payload_memory`]).
+    payload_memory: Arc<PayloadMemory>,
     /// The runs this worker claimed (see [`Self::claimed_runs`]).
     pub(crate) claimed: ClaimedRuns,
     /// The leader this worker's node last named, and whether the worker has
     /// left its shard (see [`Self::submit_to_leader`]).
     pub(crate) named_leader: watch::Sender<NamedLeader>,
     driver: JoinHandle<()>,
+    /// The blob-tending task of a `Net` that stores a shard's records.
+    tending: Option<JoinHandle<()>>,
 }
 
 impl Net {
@@ -696,8 +806,18 @@ impl Net {
         let inbound = Arc::new(Inbound::default());
         let (local_addr_tx, local_addr) = watch::channel(None);
         let peers = Peers::new(local_addr_tx, redial_policy);
+        let named_leader = watch::Sender::new(NamedLeader::default());
 
         let driver = tokio::spawn(swarm_task::drive(swarm, identify_config, command_rx, inbound.clone(), peers));
+        let tending = records_shard.is_some().then(|| {
+            let leader = LeaderLine {
+                local: local_worker_id.clone(),
+                commands: commands.clone(),
+                inbound: inbound.clone(),
+                named_leader: named_leader.subscribe(),
+            };
+            tokio::spawn(tend_blobs(commands.clone(), held.clone(), leader))
+        });
 
         Self {
             local_worker_id,
@@ -707,9 +827,11 @@ impl Net {
             shard: Mutex::new(None),
             records_shard,
             held,
+            payload_memory: PayloadMemory::new(None),
             claimed: ClaimedRuns::default(),
-            named_leader: watch::Sender::new(NamedLeader::default()),
+            named_leader,
             driver,
+            tending,
         }
     }
 
@@ -717,6 +839,13 @@ impl Net {
     /// [`Self::new`]).
     pub fn held_records(&self) -> HeldRecords {
         self.held.clone()
+    }
+
+    /// The ledger of blob payloads this worker holds whole while they cross
+    /// the network. Unlimited until [`crate::worker::Worker::run`] gives it
+    /// its share of the worker's memory limits.
+    pub fn payload_memory(&self) -> &Arc<PayloadMemory> {
+        &self.payload_memory
     }
 
     /// Holds at most `limit` inputs for this `Net`'s node (default
@@ -917,13 +1046,7 @@ impl Net {
         to: PeerId,
         request: C::Request,
     ) -> Option<C::Response> {
-        let (respond_to, response) = oneshot::channel();
-        self.commands
-            .send(Command::Exchange(Box::new(move |swarm, exchanges| {
-                C::exchange(exchanges).ask(C::behaviour(swarm.behaviour_mut()), &to, request, respond_to);
-            })))
-            .ok()?;
-        response.await.ok()?
+        ask_over::<C>(&self.commands, to, request).await
     }
 
     /// Asks `to` over protocol `C` until it answers with something
@@ -971,7 +1094,7 @@ impl Net {
     }
 
     /// Drains every inbound request of protocol `C` not yet answered.
-    pub(crate) fn take_asked<C: Correlated>(&self) -> Vec<Asked<C>> {
+    pub(crate) fn take_asked<C: Queued>(&self) -> Vec<Asked<C>> {
         drain(C::queue(&self.inbound))
     }
 
@@ -997,6 +1120,9 @@ impl Drop for Net {
         // in-flight send is already best-effort); abort it outright rather
         // than negotiating a graceful stop.
         self.driver.abort();
+        if let Some(tending) = &self.tending {
+            tending.abort();
+        }
     }
 }
 
@@ -1109,11 +1235,108 @@ impl Net {
     /// one holds the record, this `Net` stores no shard's records
     /// ([`Self::new`]), or the swarm task has stopped.
     pub async fn get_record(&self, task: TaskId) -> Option<TaskRecord> {
+        match self.find_record(task).await {
+            RecordLookup::Found(record) => Some(record),
+            RecordLookup::NotFound | RecordLookup::Unanswered => None,
+        }
+    }
+
+    /// Like [`Self::get_record`], but says whether a miss is because the
+    /// record is held nowhere ([`RecordLookup::NotFound`]) or because the
+    /// lookup could not tell ([`RecordLookup::Unanswered`]).
+    pub async fn find_record(&self, task: TaskId) -> RecordLookup {
+        get_record_through(&self.commands, task).await
+    }
+
+    /// Stores `bytes` as a blob owned by `owner`, at `placement.quorum` of
+    /// `placement.holders`. This worker's own copy counts towards the quorum
+    /// when it is one of the holders, and is kept only then: a worker outside
+    /// the placement is never told the owner's record, so a copy there would
+    /// sit unclaimed. Resolves with the blob's digest once the quorum has
+    /// stored it.
+    pub async fn put_blob(
+        &self,
+        owner: BlobOwner,
+        bytes: Vec<u8>,
+        placement: Placement,
+    ) -> Result<Digest, PutBlobError> {
+        put_blob_through(&self.commands, owner, bytes, placement, false).await
+    }
+
+    /// Like [`Self::put_blob`], for a blob stored in `role`.
+    pub(crate) async fn put_blob_in(
+        &self,
+        role: BlobRole,
+        owner: BlobOwner,
+        bytes: Vec<u8>,
+        placement: Placement,
+    ) -> Result<Digest, PutBlobError> {
+        put_blob_through(&self.commands, owner, bytes, placement, role == BlobRole::Result).await
+    }
+
+    /// Stores a blob this worker holds, `held`, as [`Self::put_blob`] stores
+    /// bytes, and as the kind `owner` holds it as: `result` says it is one of
+    /// `owner`'s results, not an input. A blob held for several owners is a
+    /// result for some and an input for others, so the kind is the caller's
+    /// to say per owner.
+    pub(crate) async fn put_blob_as_held(
+        &self,
+        owner: BlobOwner,
+        held: BlobRecord,
+        placement: Placement,
+        result: bool,
+    ) -> Result<Digest, PutBlobError> {
+        put_blob_through(&self.commands, owner, held.value, placement, result).await
+    }
+
+    /// The bytes of the blob `digest` names, which `owner` stored. Looked
+    /// for, in turn, in this worker's own store; at the holders of `owner`'s
+    /// record, asked directly and all at once; and, if they all miss, by the
+    /// kad lookup of the blob's key. Every answer is checked against the
+    /// digest. `None` if no one reachable holds it.
+    pub async fn get_blob(&self, owner: BlobOwner, digest: &Digest) -> Option<Vec<u8>> {
+        let key = BlobKey::from(digest);
+        if let Some(here) = self.held.blob(&key) {
+            return Some(here.value);
+        }
+        if let Some(found) = self.ask_holders_of(&owner, digest, &key).await {
+            return Some(found);
+        }
         let (respond_to, answer) = oneshot::channel();
-        self.commands
-            .send(Command::GetRecord { task, respond_to })
-            .ok()?;
+        self.commands.send(Command::LookUpBlob { key, respond_to }).ok()?;
         answer.await.ok().flatten()
+    }
+
+    /// The blob `key` names, from the first holder of `owner`'s record to
+    /// answer with bytes that check out.
+    async fn ask_holders_of(&self, owner: &BlobOwner, digest: &Digest, key: &BlobKey) -> Option<Vec<u8>> {
+        let holders = match owner {
+            BlobOwner::Task(task) => match self.held.get(task) {
+                Some(record) => record.placement,
+                None => self.get_record(task.clone()).await.map(|record| record.placement).unwrap_or_default(),
+            },
+            // A composite's record holders are found once composite records exist.
+            BlobOwner::Composite(_) => Vec::new(),
+        };
+        let me = self.local_worker_id();
+        let mut asks: FuturesUnordered<_> = holders
+            .into_iter()
+            .map(WorkerId::from)
+            .filter(|holder| *holder != me)
+            .filter_map(|holder| PeerId::from_str(holder.as_str()).ok())
+            .map(|peer| {
+                let asked = self.ask::<BlobCodec>(peer, digest.clone().into());
+                async move { tokio::time::timeout(BLOB_ASK_TIMEOUT, asked).await.ok().flatten() }
+            })
+            .collect();
+        while let Some(answer) = asks.next().await {
+            if let Some(record) = answer
+                && key.holds(&record.value)
+            {
+                return Some(record.value);
+            }
+        }
+        None
     }
 
     /// The peers in this worker's records `kad` routing table: the shard
@@ -1234,6 +1457,151 @@ impl Net {
     pub async fn wait_for_arrival(&self) {
         self.inbound.arrived.notified().await;
     }
+}
+
+/// Sends `request` to `to` over protocol `C` through the swarm task and
+/// awaits its answer (see [`Net::ask`]).
+async fn ask_over<C: Correlated>(
+    commands: &mpsc::UnboundedSender<Command>,
+    to: PeerId,
+    request: C::Request,
+) -> Option<C::Response> {
+    let (respond_to, response) = oneshot::channel();
+    commands
+        .send(Command::Exchange(Box::new(move |swarm, exchanges| {
+            C::exchange(exchanges).ask(C::behaviour(swarm.behaviour_mut()), &to, request, respond_to);
+        })))
+        .ok()?;
+    response.await.ok()?
+}
+
+/// What the blob-tending task needs to ask the shard's leader how a task
+/// stands: the leader this worker's node last named, and the ways to ask it.
+struct LeaderLine {
+    local: WorkerId,
+    commands: mpsc::UnboundedSender<Command>,
+    inbound: Arc<Inbound>,
+    named_leader: watch::Receiver<NamedLeader>,
+}
+
+impl LeaderLine {
+    /// Where `task` stands by the word of the leader this worker's node names:
+    /// gone if the leader holds no such task, finished or unfinished as it
+    /// says. A leader that is not named, does not answer within
+    /// [`OWNER_ASK_TIMEOUT`], or cannot say yet leaves it unfinished, to be
+    /// asked about again a grace later.
+    async fn owner_state(&self, task: &TaskId) -> OwnerState {
+        let Some(leader) = self.named_leader.borrow().leader() else {
+            return OwnerState::Unfinished;
+        };
+        let request = TaskRequest {
+            request: Some(task_request::Request::QueryOutcome(QueryOutcome {
+                task_id: Some(task.clone().into()),
+            })),
+        };
+        let asked = async {
+            if leader == self.local {
+                let (reply, answer) = oneshot::channel();
+                self.inbound.queue_own_task(OwnTask { request, reply });
+                answer.await.ok()
+            } else {
+                ask_over::<TaskCodec>(&self.commands, PeerId::from_str(leader.as_str()).ok()?, request).await
+            }
+        };
+        let Ok(Some(response)) = tokio::time::timeout(OWNER_ASK_TIMEOUT, asked).await else {
+            return OwnerState::Unfinished;
+        };
+        match response.result {
+            Some(task_response::Result::Outcome(outcome)) if !outcome.known => OwnerState::Gone,
+            Some(task_response::Result::Outcome(outcome)) if outcome.finished => OwnerState::Finished,
+            _ => OwnerState::Unfinished,
+        }
+    }
+}
+
+/// Looks `task`'s record up across the shard through the swarm task (see
+/// [`Net::get_record`]).
+async fn get_record_through(
+    commands: &mpsc::UnboundedSender<Command>,
+    task: TaskId,
+) -> RecordLookup {
+    let (respond_to, answer) = oneshot::channel();
+    if commands.send(Command::GetRecord { task, respond_to }).is_err() {
+        return RecordLookup::Unanswered;
+    }
+    answer.await.unwrap_or(RecordLookup::Unanswered)
+}
+
+/// Keeps the blobs `held` holds where their owners need them, until the swarm
+/// task stops.
+///
+/// - An owner whose record a leader moved to other holders: each of its
+///   blobs is put to them, at the majority every record placement uses, and
+///   put again each tick until the quorum stores it or a newer move replaces
+///   the target. Every holder that saw the move pushes, which is harmless:
+///   puts are idempotent.
+/// - An owner never seen here whose grace has passed: the shard's leader is
+///   asked how its task stands, and the store told whether it is unfinished,
+///   finished or gone. Only the leader's word that it holds no such task finds
+///   it gone, whatever the size of the shard; no leader named, none answering,
+///   or one that cannot say yet is reported unfinished, like a composite
+///   owner, whose record cannot be looked up yet.
+async fn tend_blobs(commands: mpsc::UnboundedSender<Command>, held: HeldRecords, leader: LeaderLine) {
+    let mut moving: BTreeMap<BlobOwner, Vec<WorkerId>> = BTreeMap::new();
+    let mut ticks = tokio::time::interval(BLOB_TENDING_INTERVAL);
+    loop {
+        ticks.tick().await;
+        if commands.is_closed() {
+            return;
+        }
+        // A newer move of an owner replaces an older one still pending.
+        moving.extend(held.take_blob_moves());
+        let mut unfinished = BTreeMap::new();
+        for (owner, holders) in std::mem::take(&mut moving) {
+            let placement = Placement { quorum: holders.len() / 2 + 1, holders: holders.clone() };
+            let mut stored = true;
+            let results = held.results_of(&owner);
+            for (key, value) in held.blobs_of(&owner) {
+                let result = results.contains(&key);
+                stored &= put_blob_through(&commands, owner.clone(), value, placement.clone(), result)
+                    .await
+                    .is_ok();
+            }
+            if !stored {
+                unfinished.insert(owner, holders);
+            }
+        }
+        moving = unfinished;
+        for owner in held.owners_to_check() {
+            let state = match &owner {
+                BlobOwner::Task(task) => leader.owner_state(task).await,
+                BlobOwner::Composite(_) => OwnerState::Unfinished,
+            };
+            held.owner_checked(&owner, state);
+        }
+    }
+}
+
+/// Sends one blob write to the swarm task (see [`Net::put_blob`]). `result`
+/// says the blob is stored as a run's result, not as an input.
+async fn put_blob_through(
+    commands: &mpsc::UnboundedSender<Command>,
+    owner: BlobOwner,
+    bytes: Vec<u8>,
+    placement: Placement,
+    result: bool,
+) -> Result<Digest, PutBlobError> {
+    if bytes.len() > MAX_BLOB_BYTES {
+        return Err(PutBlobError::TooLarge { size: bytes.len(), limit: MAX_BLOB_BYTES });
+    }
+    let key = BlobKey::of(&bytes);
+    let record = BlobRecord { value: bytes, owner, placement: placement.holders.clone(), result };
+    let (respond_to, stored) = oneshot::channel();
+    commands
+        .send(Command::PutBlob { key: key.clone(), record, placement, respond_to })
+        .map_err(|_| PutBlobError::NotStored)?;
+    stored.await.unwrap_or(Err(PutBlobError::NotStored))?;
+    Ok(key.digest())
 }
 
 /// The gossip topic the workers of the shard `name` publish election messages on. Every

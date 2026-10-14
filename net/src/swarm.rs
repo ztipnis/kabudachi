@@ -3,7 +3,7 @@
 //! handshake over TCP+noise+yamux.
 //!
 //! `Behaviour` holds `identify`, `gossipsub`, two `kad` behaviours (one that
-//! routes, one that stores the shard's Task records) and seven
+//! routes, one that stores the shard's Task records and blobs) and eight
 //! `request_response` behaviours: one carrying the election protocol (see
 //! `crate::codec`), one the bootstrap join protocol (see
 //! `crate::join_codec`), one the claim arbitration protocol (see
@@ -14,7 +14,9 @@
 //! claimable (see `crate::steal::codec`), and one the result transport, by
 //! which a worker that ran a task delivers its result to the task's client
 //! and a leader tells the client how the task ended (see
-//! `crate::result_transport::codec`) — each a deliberately separate wire protocol, not a
+//! `crate::result_transport::codec`), and one the blob exchange, by which a
+//! worker asks a holder for a blob (see `crate::blob_exchange::codec`) — each
+//! a deliberately separate wire protocol, not a
 //! variant folded into `ElectionMessage` (see `crate::join_codec`'s module
 //! doc). `gossipsub` carries the election messages a worker publishes to its
 //! whole shard rather than sends to one peer; every message is signed with
@@ -113,6 +115,7 @@ use libp2p::{
     tcp, yamux,
 };
 
+use crate::blob_exchange::codec::{BlobCodec, PROTOCOL as BLOB_PROTOCOL};
 use crate::claim::codec::{ClaimCodec, PROTOCOL as CLAIM_PROTOCOL};
 use crate::codec::{ElectionCodec, PROTOCOL};
 use crate::join_codec::{JoinCodec, PROTOCOL as JOIN_PROTOCOL};
@@ -180,6 +183,7 @@ pub struct Behaviour {
     pub reconcile: request_response::Behaviour<ReconcileCodec>,
     pub steal: request_response::Behaviour<StealCodec>,
     pub result: request_response::Behaviour<ResultCodec>,
+    pub blob: request_response::Behaviour<BlobCodec>,
 }
 
 /// libp2p's TCP transport, except that every dial it makes leaves from a
@@ -367,6 +371,11 @@ pub(crate) fn build_swarm(
             // whose client is another worker, lead a shard whose tasks have
             // clients, or await a result itself.
             result: asked_and_answered(RESULT_PROTOCOL),
+            // ProtocolSupport::Full on every node: any worker may ask a holder
+            // of a blob's owner's record for the blob, and every worker answers
+            // from its own store (see `answer_blob_request` in
+            // `crate::messenger::swarm_task`).
+            blob: asked_and_answered(BLOB_PROTOCOL),
             blocked: allow_block_list::Behaviour::default(),
         })
         .expect("behaviour construction never fails")

@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::{Input, Step, WorkerNode};
+use kabudachi_core::protocol::messages::Claim as WireClaim;
 use kabudachi_core::time::RealClock;
-use kabudachi_net::executor::WorkSource;
+use kabudachi_net::executor::{Work, WorkSource};
 use kabudachi_net::handoff::HandedOff;
 use kabudachi_net::worker::Worker;
 use pyo3::prelude::*;
@@ -69,7 +70,13 @@ impl Host {
         let pump = tokio.spawn(async move {
             let mut source = source;
             while let Some(work) = source.next_work().await {
-                shared.on_work(work);
+                match work {
+                    // Its input is fetched first, apart from the pump.
+                    Work::Run(wire) if input_is_blobs(&wire) => {
+                        Arc::clone(&shared).resolve_then_hand(wire);
+                    }
+                    work => shared.on_work(work),
+                }
             }
         });
         Host {
@@ -124,6 +131,13 @@ impl Host {
             runtime.shutdown_timeout(SHUTDOWN_GRACE);
         });
     }
+}
+
+/// Whether a run's input travels as blobs rather than in the claim.
+fn input_is_blobs(wire: &WireClaim) -> bool {
+    wire.task
+        .as_ref()
+        .is_some_and(|task| task.input_manifest.is_some())
 }
 
 impl Drop for Host {

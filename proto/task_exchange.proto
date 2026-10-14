@@ -1,6 +1,8 @@
 syntax = "proto3";
 package kabudachi;
 
+import "blob.proto";
+import "digest.proto";
 import "ids.proto";
 import "task.proto";
 import "result.proto";
@@ -34,6 +36,10 @@ message SubmitTask {
   uint64 reconnect_timeout_ms = 14;
   // The submitting worker, which awaits the result (see Task.client).
   WorkerId client = 15;
+  // Set instead of `serialized_input` when the input is too large for one
+  // message (see `Task.input_manifest`). Its blobs are stored before the
+  // submission is sent.
+  Manifest input_manifest = 16;
 }
 
 message ReportStarted {
@@ -118,6 +124,9 @@ enum TaskRejectReason {
   // that generation is found. Nothing of the request took effect, and the
   // asker keeps what it holds for the run.
   TASK_REJECT_NOT_READY = 10;
+  // The task's whole input is larger than the shard takes. Nothing of the
+  // request took effect; asking again is refused again.
+  TASK_REJECT_PAYLOAD_TOO_LARGE = 12;
 }
 
 message TaskReject {
@@ -178,6 +187,17 @@ message PlacedKey {
   repeated WorkerId holders = 2;
   // How many of them must store a copy.
   uint32 quorum = 3;
+  // Where the record is really placed when the asker is a voter among the
+  // nearest to the task: `holders` leaves the asker out, so this names the
+  // placement with it in, and the quorum of that. Absent when the asker is not
+  // among the holders, where `holders` is the real placement. A writer of
+  // blobs stores them there, and keeps its own copy only then.
+  PlacedWithAsker with_asker = 4;
+}
+
+message PlacedWithAsker {
+  repeated WorkerId holders = 1;
+  uint32 quorum = 2;
 }
 
 message RecordPlacements {

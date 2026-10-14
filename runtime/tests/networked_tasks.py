@@ -5,6 +5,7 @@ only the first run of a text holds."""
 
 import asyncio
 import os
+import random
 import time
 from pathlib import Path
 
@@ -93,10 +94,44 @@ async def fleeting(request: Greeting) -> Greeting:
     return Greeting(text=request.text)
 
 
-@kabudachi.task(name="cluster.big")
-def big(request: Greeting) -> Greeting:
-    """Returns a result larger than one frame can carry."""
-    return Greeting(text="x" * (2 * 1024 * 1024))
+@kabudachi.task(name="cluster.echo")
+def echo(request: Greeting) -> Greeting:
+    """Returns its input as it came."""
+    return request
+
+
+@kabudachi.task(name="cluster.inflate")
+def inflate(request: Greeting) -> Greeting:
+    """Returns its input's text twice over."""
+    return Greeting(text=request.text * 2)
+
+
+@kabudachi.task(name="cluster.weigh")
+async def weigh(request: Greeting) -> Greeting:
+    """Holds until the test creates a `<key>.go` marker, `key` being the
+    first eight characters of its text, which is otherwise ballast to make the
+    input large. Leaves a `<key>.started` marker once running."""
+    key = request.text[:8]
+    (_markers() / f"{key}.started").touch()
+    go = _markers() / f"{key}.go"
+    while not go.exists():
+        await asyncio.sleep(0.01)
+    return Greeting(text=key)
+
+
+BULK_BYTES = 4_500_000
+
+
+def varied_text(length: int) -> str:
+    """`length` characters that differ from chunk to chunk, so none of the
+    chunks a payload is cut into is stored once for all."""
+    return random.Random(length).randbytes(length // 2).hex()
+
+
+@kabudachi.task(name="cluster.bulk")
+def bulk(request: Greeting) -> Greeting:
+    """Returns a fixed result of `BULK_BYTES`, whatever its input."""
+    return Greeting(text=varied_text(BULK_BYTES))
 
 
 def _join(older: Greeting, newer: Greeting) -> Greeting:
@@ -105,9 +140,10 @@ def _join(older: Greeting, newer: Greeting) -> Greeting:
 
 @kabudachi.coalescing_task(name="cluster.gather", merge=_join)
 async def gather(request: Greeting) -> Greeting:
-    """Holds `times` milliseconds, then returns the input it was given, the
+    """Holds `times` milliseconds, or, for a negative `times`, until the test
+    creates a `<text>.go` marker, then returns the input it was given, the
     superseded generations' payloads folded in."""
-    await asyncio.sleep(request.times / 1000)
+    await _held(request)
     return request
 
 
@@ -117,6 +153,9 @@ TASKS = {
     "nests": nests,
     "awaits": awaits,
     "fleeting": fleeting,
-    "big": big,
+    "echo": echo,
+    "inflate": inflate,
+    "weigh": weigh,
+    "bulk": bulk,
     "gather": gather,
 }

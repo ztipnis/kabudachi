@@ -19,6 +19,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kabudachi_core::election::{DropMessages, Input, NoAuthority, Step, WorkerNode, carry_out};
+use kabudachi_core::manifest::{Chunked, Manifest, fits_inline};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::TaskRecord;
@@ -28,7 +29,7 @@ use kabudachi_core::reconcile::Rebuild;
 use kabudachi_core::scheduler::{
     Backlog, CancelRejection, Cancellation, Certification, Claim, ClaimRejection, Compacted,
     Completion, ContinuationRejection, Event, Failure, LostRun, ReportRejection, Scheduler,
-    Submission, SubmitRejection,
+    Submission, SubmitRejection, Submitted,
 };
 use kabudachi_core::task_record::{LocalRecords, office_to_reconcile};
 use kabudachi_core::time::{Clock, Instant};
@@ -187,11 +188,19 @@ impl<C: Clock> SchedulerDoor<C> {
     }
 
     /// Gives `submission` its task id at once; the backlog records it now or
-    /// holds it until the node leads. Wakes claims and timers.
+    /// holds it until the node leads. An input too large for one message is
+    /// kept in this node's own store as blobs owned by the task, which then
+    /// carries their manifest; a refused submission's blobs are dropped
+    /// again. Wakes claims and timers.
     pub fn submit(&self, submission: Submission) -> Result<TaskId, Refusal<SubmitRejection>> {
         refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
             settled_backlog(inside, |backlog, scheduler| {
-                backlog.submit(scheduler, submission)
+                let minted = scheduler.mint(submission);
+                let submitted = as_blobs(scheduler, minted);
+                let task = submitted.task_id.clone();
+                backlog
+                    .submit_minted(scheduler, submitted)
+                    .inspect_err(|_| scheduler.observer_mut().forget_blobs_of(&task))
             })
         }))
     }
@@ -212,7 +221,10 @@ impl<C: Clock> SchedulerDoor<C> {
     ) -> Result<Certification, Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
             settled_change(scheduler, |scheduler| {
-                scheduler.complete(&self.worker, run, result_digest, completion)
+                let certification =
+                    scheduler.complete(&self.worker, run, result_digest, completion)?;
+                forget_blobs_if_finished(scheduler, &certification.task_id);
+                Ok(certification)
             })
         }))
     }
@@ -249,7 +261,11 @@ impl<C: Clock> SchedulerDoor<C> {
                 {
                     scheduler.report_started(&self.worker, run)?;
                 }
-                scheduler.fail(&self.worker, run, failure_kind)
+                let failure = scheduler.fail(&self.worker, run, failure_kind)?;
+                if failure.retry.is_none() {
+                    forget_blobs_if_finished(scheduler, &failure.task_id);
+                }
+                Ok(failure)
             })
         }))
     }
@@ -263,10 +279,23 @@ impl<C: Clock> SchedulerDoor<C> {
     }
 
     /// Cancels `task`. A submission still waiting in the backlog is dropped,
-    /// so it never runs.
+    /// so it never runs. A task cancelled before it ran never runs, so its
+    /// blobs go at once.
     pub fn cancel(&self, task: &TaskId) -> Result<Cancellation, Refusal<CancelRejection>> {
         refuse(self.change_inside(Concerned::ClaimsAndTimers, |inside| {
-            settled_backlog(inside, |backlog, scheduler| backlog.cancel(scheduler, task))
+            settled_backlog(inside, |backlog, scheduler| {
+                let cancelled = backlog.cancel(scheduler, task);
+                match cancelled {
+                    Ok(Cancellation::Cancelled { was_running: false }) => {
+                        scheduler.observer_mut().forget_blobs_of(task);
+                    }
+                    Ok(Cancellation::Cancelled { was_running: true }) => {
+                        forget_blobs_if_finished(scheduler, task);
+                    }
+                    _ => {}
+                }
+                cancelled
+            })
         }))
     }
 
@@ -500,7 +529,11 @@ impl<C: Clock + Send + 'static> SchedulerDoor<C> {
                 }
                 let claims = match self.change(Concerned::Nobody, |scheduler| {
                     settled_change(scheduler, |scheduler| {
-                        scheduler.claim_oldest(&self.worker, limit)
+                        let claims = scheduler.claim_oldest(&self.worker, limit)?;
+                        Ok(claims
+                            .into_iter()
+                            .map(|claim| with_local_input(scheduler, claim))
+                            .collect())
                     })
                 })? {
                     Ok(claims) => claims,
@@ -550,6 +583,49 @@ impl<C: Clock + Send + 'static> SchedulerDoor<C> {
                 wake.changed().await.map_err(|_| Closed)?;
             }
         }
+    }
+}
+
+/// `submitted` with its input moved into this node's store as blobs when it
+/// is too large for one message. A coalescing generation's input is never
+/// moved, since it travels in one claim with its chain. An input alone past
+/// the hard memory limit is left for the scheduler to refuse.
+fn as_blobs<C: Clock>(scheduler: &mut DoorScheduler<C>, mut submitted: Submitted) -> Submitted {
+    let input = &submitted.submission.serialized_input;
+    let alone_too_large = scheduler
+        .memory_limits()
+        .is_some_and(|limits| input.len() as u64 > limits.hard);
+    if fits_inline(input.len())
+        || submitted.submission.coalescing_key.is_some()
+        || alone_too_large
+    {
+        return submitted;
+    }
+    let Chunked { manifest, chunks } = Manifest::chunk(input);
+    scheduler.observer_mut().put_blobs(&submitted.task_id, chunks);
+    submitted.submission = submitted.submission.with_input_manifest(manifest);
+    submitted
+}
+
+/// `claim` with its input back in it, joined from this node's own store.
+fn with_local_input<C: Clock>(scheduler: &mut DoorScheduler<C>, mut claim: Claim) -> Claim {
+    let records = scheduler.observer_mut();
+    claim
+        .resolve_input(|key| records.blob(key))
+        // A one-node store has no orphan grace, and drops a task's blobs
+        // only once the task's record is gone; a claim names a held record.
+        .expect("a one-node store holds every blob of a task it can hand out");
+    claim
+}
+
+/// Drops the blobs of `task` if the scheduler says it is over. A one-node
+/// task's blobs are all input, since its results never travel as blobs, so
+/// nothing is kept for retention.
+fn forget_blobs_if_finished<C: Clock>(scheduler: &mut DoorScheduler<C>, task: &TaskId) {
+    if let Ok(Some(outcome)) = scheduler.outcome(task)
+        && outcome.finished
+    {
+        scheduler.observer_mut().forget_blobs_of(task);
     }
 }
 

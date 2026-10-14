@@ -3,6 +3,7 @@
 //! refuses a submission past a hard one. A coalescing
 //! task may opt in to dropping its own oldest retained payloads instead.
 
+use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::scheduler::{
@@ -13,6 +14,7 @@ use crate::support::scheduler::Fixture;
 
 const SOFT: u64 = 100;
 const HARD: u64 = 200;
+const MIB: u64 = 1024 * 1024;
 
 fn worker() -> WorkerId {
     WorkerId::new("w1")
@@ -68,6 +70,15 @@ fn finish(fixture: &mut Fixture, task: &TaskId) {
     fixture
         .scheduler
         .complete(&worker(), &claim.task_run_id, Digest::blake3(b"d"), Completion::Final)
+        .unwrap();
+}
+
+/// Starts and completes the run a claim granted.
+fn complete(fixture: &mut Fixture, run: &TaskRunId) {
+    fixture.scheduler.report_started(&worker(), run).unwrap();
+    fixture
+        .scheduler
+        .complete(&worker(), run, Digest::blake3(b"d"), Completion::Final)
         .unwrap();
 }
 
@@ -212,6 +223,8 @@ fn drop_oldest_outcomes() {
         running: bool,
         submission: Submission,
         accepted: bool,
+        /// Whether the refusal is for good, the payload alone past the hard limit.
+        never_fits: bool,
         memory: u64,
         /// How many older payloads the next claim folds, when it is checked.
         folded: Option<usize>,
@@ -223,6 +236,7 @@ fn drop_oldest_outcomes() {
             running: false,
             submission: generation(90, "k"),
             accepted: false,
+            never_fits: false,
             memory: 180,
             folded: Some(1),
         },
@@ -232,15 +246,17 @@ fn drop_oldest_outcomes() {
             running: false,
             submission: generation(180, "k").with_drop_oldest(),
             accepted: true,
+            never_fits: false,
             memory: 180,
             folded: Some(0),
         },
         Row {
-            what: "drop_oldest never lets usage exceed the hard limit",
+            what: "a payload alone past the hard limit is refused, even with drop_oldest",
             existing: vec![(40, "k"), (40, "k"), (40, "k")],
             running: false,
             submission: generation(201, "k").with_drop_oldest(),
             accepted: false,
+            never_fits: true,
             memory: 120,
             folded: None,
         },
@@ -250,6 +266,7 @@ fn drop_oldest_outcomes() {
             running: false,
             submission: generation(50, "mine").with_drop_oldest(),
             accepted: false,
+            never_fits: false,
             memory: 190,
             folded: None,
         },
@@ -259,6 +276,7 @@ fn drop_oldest_outcomes() {
             running: true,
             submission: generation(60, "k").with_drop_oldest(),
             accepted: false,
+            never_fits: false,
             memory: 150,
             folded: None,
         },
@@ -277,6 +295,12 @@ fn drop_oldest_outcomes() {
         let outcome = fixture.scheduler.submit(row.submission);
 
         assert_eq!(outcome.is_ok(), row.accepted, "{}", row.what);
+        assert_eq!(
+            matches!(outcome, Err(SubmitRejection::PayloadTooLarge { .. })),
+            row.never_fits,
+            "{}",
+            row.what
+        );
         assert_eq!(fixture.scheduler.memory_in_use(), row.memory, "{}", row.what);
         if let Some(folded) = row.folded {
             let claim = fixture
@@ -326,4 +350,74 @@ fn what_makes_a_task_too_large_for_a_claim_frame_is_its_queue_and_key_as_well_as
 
     assert!(matches!(by_queue, Err(SubmitRejection::TooLarge { .. })));
     assert!(matches!(by_key, Err(SubmitRejection::TooLarge { .. })));
+}
+
+#[test]
+fn an_input_carried_as_blobs_weighs_its_whole_length_waits_for_room_and_is_refused_only_alone_past_the_hard_limit()
+ {
+    let mut fixture = Fixture::leading_with_limits(MemoryLimits {
+        soft: 2 * MIB,
+        hard: 4 * MIB,
+    });
+    let input = vec![7; 3 * MIB as usize];
+    let chunked = Manifest::chunk(&input);
+
+    let task = fixture
+        .scheduler
+        .submit(payload(0).with_input_manifest(chunked.manifest.clone()))
+        .unwrap();
+
+    // Memory counts the whole input, though the scheduler never holds it; the
+    // record names it by the manifest's digest; the claim carries the
+    // manifest, never bytes.
+    assert_eq!(fixture.scheduler.memory_in_use(), 3 * MIB);
+    let record = fixture.spy.newest_revision_of(&task).expect("recorded");
+    assert_eq!(record.input_digest, Some(chunked.manifest.digest().into()));
+    let claim = fixture.scheduler.request_claim(&worker(), &task).unwrap();
+    assert_eq!(claim.input_manifest(), Ok(Some(chunked.manifest.clone())));
+    assert!(claim.task.serialized_input.is_empty());
+
+    // A second one does not fit now: backpressure, which passes.
+    let second = payload(0).with_input_manifest(chunked.manifest.clone());
+    assert_eq!(
+        fixture.scheduler.submit(second.clone()),
+        Err(SubmitRejection::Backpressure {
+            hard_limit: 4 * MIB,
+            in_use: 3 * MIB,
+            needed: 3 * MIB,
+        })
+    );
+
+    // One that alone is past the hard limit never fits, whether as blobs or
+    // inline: refused for good.
+    let too_big = Manifest::chunk(&vec![7; 4 * MIB as usize + 1]).manifest;
+    assert_eq!(
+        fixture.scheduler.submit(payload(0).with_input_manifest(too_big)),
+        Err(SubmitRejection::PayloadTooLarge {
+            size: 4 * MIB + 1,
+            limit: 4 * MIB,
+        })
+    );
+    assert_eq!(
+        fixture.scheduler.submit(payload(4 * MIB as usize + 1)),
+        Err(SubmitRejection::PayloadTooLarge {
+            size: 4 * MIB + 1,
+            limit: 4 * MIB,
+        })
+    );
+
+    // A coalescing generation's payload travels in one claim with its chain,
+    // so never as blobs.
+    assert!(matches!(
+        fixture
+            .scheduler
+            .submit(generation(0, "k").with_input_manifest(chunked.manifest)),
+        Err(SubmitRejection::TooLarge { .. })
+    ));
+    assert_eq!(fixture.scheduler.memory_in_use(), 3 * MIB, "no refused submission counts");
+
+    // Once the first finishes, the second fits.
+    complete(&mut fixture, &claim.task_run_id);
+    assert!(fixture.scheduler.submit(second).is_ok());
+    assert_eq!(fixture.scheduler.memory_in_use(), 3 * MIB);
 }

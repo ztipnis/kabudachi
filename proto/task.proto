@@ -1,6 +1,8 @@
 syntax = "proto3";
 package kabudachi;
 
+import "blob.proto";
+import "digest.proto";
 import "ids.proto";
 
 enum TaskRunState {
@@ -23,19 +25,6 @@ enum TaskRunState {
 // as their clocks are known to agree, and never measure a timeout with one.
 message WallTime {
   uint64 unix_millis = 1;
-}
-
-// The hash function a Digest was computed with. A reader that does not know
-// the algorithm cannot check the digest, so it refuses it.
-enum DigestAlgorithm {
-  DIGEST_ALGORITHM_UNSPECIFIED = 0;
-  BLAKE3 = 1;
-}
-
-// A content hash: of a task's input, or of a run's result.
-message Digest {
-  DigestAlgorithm algorithm = 1;
-  bytes value = 2;
 }
 
 message TaskRunIdentity {
@@ -85,6 +74,10 @@ message Task {
   // worker running it delivers there. Unset for a task nobody awaits
   // across workers.
   WorkerId client = 18;
+  // Set instead of `serialized_input` when the input is too large for one
+  // message: the blobs that hold it, in order. A claimant fetches them before
+  // the body starts.
+  Manifest input_manifest = 21;
 }
 
 // The front of a coalescing key's waiting chain a compaction run folds: each

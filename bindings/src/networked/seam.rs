@@ -10,10 +10,12 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::Claim;
 use kabudachi_net::executor::{Report, ReportSink};
 use kabudachi_net::messenger::Net;
+use kabudachi_net::payload_memory::Taken;
 use kabudachi_net::task_exchange::LeaderRetry;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokio::sync::{Notify, watch};
+use tokio::task::AbortHandle;
 
 use super::observed::Observed;
 use crate::work::{PyClaim, PyEvent};
@@ -27,6 +29,13 @@ pub(super) struct Seam {
     pub(super) offered: u32,
     /// Runs handed over that Python has not taken, oldest first.
     pub(super) handed: VecDeque<Claim>,
+    /// Runs handed over whose input's blobs are still being fetched: handed
+    /// over as far as a cancel or an abort deadline is concerned, but not
+    /// yet takeable. Each holds the handle that stops its fetch.
+    pub(super) resolving: BTreeMap<TaskRunId, AbortHandle>,
+    /// The inputs of runs handed over that travelled as blobs, counted in
+    /// flight until each run ends.
+    pub(super) inputs_in_flight: BTreeMap<TaskRunId, Taken>,
     /// Every run Python took and has not ended.
     pub(super) held: BTreeMap<TaskRunId, HeldRun>,
     pub(super) events: VecDeque<PyEvent>,
@@ -81,8 +90,19 @@ impl Shared {
     }
 
     /// Hands `report` to the driver. A driver that has stopped shows as the
-    /// worker leaving its shard, which every wait reports.
+    /// worker leaving its shard, which every wait reports. A report that
+    /// ends a run gives back the room its input held.
     pub(super) fn report(&self, report: Report) {
+        if let Report::Completed { run, .. }
+        | Report::Failed { run, .. }
+        | Report::Lost(run)
+        | Report::Compacted { run, .. } = &report
+        {
+            // Dropped after the lock is released, which wakes the claims
+            // waiting for room.
+            let freed = self.seam().inputs_in_flight.remove(run);
+            drop(freed);
+        }
         let _ = self.reports.report(report);
     }
 
@@ -99,7 +119,7 @@ impl Shared {
                 return;
             }
             let free = u32::try_from(free).unwrap_or(u32::MAX);
-            let waiting = u32::try_from(seam.handed.len()).unwrap_or(u32::MAX);
+            let waiting = u32::try_from(seam.handed.len() + seam.resolving.len()).unwrap_or(u32::MAX);
             let more = free.saturating_sub(seam.offered.saturating_add(waiting));
             seam.offered += more;
             more
@@ -155,16 +175,23 @@ impl Shared {
         }
     }
 
-    /// Takes no more runs: those handed over and not taken are reported
-    /// lost, later ones too, and a claim waiting resolves empty.
+    /// Takes no more runs: those handed over and not taken, or still having
+    /// their blobs fetched, are reported lost, later ones too, and a claim
+    /// waiting resolves empty.
     pub(super) fn stop_taking(&self) {
         let unstarted: Vec<TaskRunId> = {
             let mut seam = self.seam();
             seam.closed = true;
-            seam.handed
+            let mut unstarted: Vec<TaskRunId> = seam
+                .handed
                 .drain(..)
                 .map(|claim| claim.task_run_id)
-                .collect()
+                .collect();
+            for (run, fetch) in std::mem::take(&mut seam.resolving) {
+                fetch.abort();
+                unstarted.push(run);
+            }
+            unstarted
         };
         for run in unstarted {
             self.report(Report::Lost(run));

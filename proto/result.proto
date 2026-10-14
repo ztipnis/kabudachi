@@ -1,6 +1,8 @@
 syntax = "proto3";
 package kabudachi;
 
+import "digest.proto";
+import "blob.proto";
 import "ids.proto";
 import "task.proto";
 
@@ -17,7 +19,12 @@ message DeliverResult {
   TaskId task_id = 1;
   TaskRunId task_run_id = 2;
   Digest result_digest = 3;
-  bytes payload = 4;
+  oneof body {
+    bytes payload = 4;
+    // A result too large for one message: the blobs that hold it, owned by
+    // the task, in order.
+    Manifest manifest = 5;
+  }
 }
 
 message ResultAck {}

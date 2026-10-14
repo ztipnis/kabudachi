@@ -97,8 +97,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
 /// What a claim of `task` weighs before its chain: its input, queue,
 /// definition id and coalescing key.
 pub(super) fn claim_weight_of(task: &Task) -> u64 {
+    let manifest_len = task
+        .input_manifest
+        .as_ref()
+        .map_or(0, |manifest| manifest.encoded_len() as u64);
     claim_weight_sum(
-        task.serialized_input.len(),
+        task.serialized_input.len() as u64 + manifest_len,
         &task.queue,
         task.task_definition_id().as_str(),
         task.coalescing_key.as_deref(),
@@ -106,12 +110,13 @@ pub(super) fn claim_weight_of(task: &Task) -> u64 {
 }
 
 /// The one sum of the parts a claim weighs before its chain, shared by a
-/// recorded task and a submission not yet recorded.
+/// recorded task and a submission not yet recorded. `carried_input` is what
+/// the claim carries for the input: its bytes, or its encoded manifest.
 pub(super) fn claim_weight_sum(
-    input_len: usize,
+    carried_input: u64,
     queue: &str,
     definition_id: &str,
     coalescing_key: Option<&str>,
 ) -> u64 {
-    (input_len + queue.len() + definition_id.len() + coalescing_key.map_or(0, str::len)) as u64
+    carried_input + (queue.len() + definition_id.len() + coalescing_key.map_or(0, str::len)) as u64
 }

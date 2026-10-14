@@ -14,7 +14,7 @@ use kabudachi_core::protocol::generated::TaskRunState;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{
-    DeliverResult, OutcomeAnswer, TaskRejectReason, task_response,
+    DeliverResult, OutcomeAnswer, TaskRejectReason, deliver_result, task_response,
 };
 use kabudachi_core::scheduler::Submission;
 use kabudachi_net::executor::Report;
@@ -38,7 +38,7 @@ fn delivery(task: &TaskId, run: &TaskRunId) -> DeliverResult {
         task_id: Some(task.clone().into()),
         task_run_id: Some(run.clone().into()),
         result_digest: Some(digest().into()),
-        payload: RESULT.to_vec(),
+        body: Some(deliver_result::Body::Payload(RESULT.to_vec())),
     }
 }
 
@@ -47,7 +47,7 @@ fn delivered_event(task: &TaskId, run: &TaskRunId) -> Vec<ResultEvent> {
         task: task.clone(),
         run: run.clone(),
         digest: digest(),
-        payload: RESULT.to_vec(),
+        body: deliver_result::Body::Payload(RESULT.to_vec()),
     }]
 }
 

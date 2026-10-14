@@ -43,9 +43,9 @@ async fn a_request_routed_to_the_leader_gets_its_decision_and_ends_once_the_work
             .expect("the worker is in its shard");
         let reason = match answer.result {
             Some(task_response::Result::Reject(reject)) => TaskRejectReason::try_from(reject.reason).ok(),
-            other => panic!("a submission past the hard limit was not refused: {other:?}"),
+            other => panic!("a payload alone past the hard limit was not refused: {other:?}"),
         };
-        assert_eq!(reason, Some(TaskRejectReason::TaskRejectBackpressure));
+        assert_eq!(reason, Some(TaskRejectReason::TaskRejectPayloadTooLarge));
         assert!(
             worker
                 .net

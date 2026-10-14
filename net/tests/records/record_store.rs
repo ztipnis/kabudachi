@@ -4,12 +4,13 @@
 
 use std::time::Duration;
 
+use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord};
 use kabudachi_core::coordination_authority::RecoveryEpoch;
-use kabudachi_core::protocol::generated::{Task, TaskRecord};
+use kabudachi_core::protocol::generated::{self, Task, TaskRecord};
 use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::task_record::{MAX_RECORD_BYTES, RecordVersion, Write};
 use kabudachi_core::task_record::PriorPlacement;
-use kabudachi_net::messenger::{Net, PlacedWrite};
+use kabudachi_net::messenger::{Net, PlacedWrite, RecordLookup};
 use kabudachi_net::task_store::{HeldRecords, TaskRecordStore, record_key};
 use libp2p::kad::store::RecordStore;
 use libp2p::kad::{Record, RecordKey};
@@ -159,6 +160,13 @@ async fn lookup(reader: &Net, task: &str) -> Option<TaskRecord> {
         .expect("the lookup ended within the timeout")
 }
 
+/// What `reader` makes of looking `task` up, with a miss told apart.
+async fn missing(reader: &Net, task: &str) -> RecordLookup {
+    timeout(TEST_TIMEOUT, reader.find_record(TaskId::new(task)))
+        .await
+        .expect("the lookup ended within the timeout")
+}
+
 fn queue_of(found: Option<TaskRecord>) -> Option<String> {
     found.and_then(|record| record.task).map(|task| task.queue)
 }
@@ -177,6 +185,12 @@ async fn a_lookup_finds_the_newest_revision_among_the_peers_and_the_reader_itsel
         assert!(write_one(&reader, record("task-1", version(0, 0, 2, 0), "new"), &[&fresh_id], 1).await);
         assert_eq!(queue_of(lookup(&reader, "task-1").await).as_deref(), Some("new"));
         assert_eq!(lookup(&reader, "task-2").await, None, "no one holds task-2");
+
+        // A miss is "held nowhere" only when every peer the reader knows
+        // answered; a reader that knows no peer cannot say.
+        assert_eq!(missing(&reader, "task-2").await, RecordLookup::NotFound);
+        let alone = Net::for_shard(shard("shard-1").name(), None);
+        assert_eq!(missing(&alone, "task-2").await, RecordLookup::Unanswered);
 
         // The reader's own copy counts: a newer revision only it holds.
         let (reader, holder) = two_connected(shard("shard-1"), shard("shard-1")).await;
@@ -292,6 +306,78 @@ fn the_store_keeps_only_what_is_a_well_formed_record_of_its_own_key() {
     assert_eq!(held.task_ids(), vec![task.clone()]);
     let served = store.get(&record_key(&task)).expect("the record is served");
     assert_eq!(TaskRecord::decode(&served.value[..]).unwrap(), stored);
+
+    // A blob is kept only under the key its own bytes name, and served back.
+    let blob = generated::BlobRecord::from(BlobRecord {
+        value: b"chunk".to_vec(),
+        owner: BlobOwner::Task(task.clone()),
+        placement: Vec::new(),
+        result: false,
+    })
+    .encode_to_vec();
+    let elsewhere = RecordKey::new(&BlobKey::of(b"other").record_key());
+    assert!(!put(&mut store, elsewhere, blob.clone()), "a blob under another digest's key");
+    let own = RecordKey::new(&BlobKey::of(b"chunk").record_key());
+    assert!(!put(&mut store, own.clone(), b"not a blob".to_vec()), "undecodable");
+    assert!(put(&mut store, own.clone(), blob.clone()));
+    assert_eq!(store.get(&own).map(|served| served.value.clone()), Some(blob));
+    assert_eq!(held.task_ids(), vec![task], "a blob is not a task");
+}
+
+fn blob_of(bytes: &[u8], owner: &str, result: bool) -> (RecordKey, Vec<u8>) {
+    let record = BlobRecord {
+        value: bytes.to_vec(),
+        owner: BlobOwner::Task(TaskId::new(owner)),
+        placement: Vec::new(),
+        result,
+    };
+    (RecordKey::new(&BlobKey::of(bytes).record_key()), generated::BlobRecord::from(record).encode_to_vec())
+}
+
+// A store's share of memory holds blobs until it is full, and inputs fill at
+// most half of it, so a result always has room left.
+#[test]
+fn the_store_refuses_a_new_blob_past_its_share_and_inputs_fill_only_half_of_it() {
+    const KIB: usize = 1024;
+    let held = HeldRecords::new(None);
+    held.set_blob_store_limit(Some(600 * KIB as u64));
+    let mut store = TaskRecordStore::new(held.clone());
+    let put = |store: &mut TaskRecordStore, (key, value): (RecordKey, Vec<u8>)| {
+        store.put(Record::new(key, value)).is_ok()
+    };
+    let (first, second, result, another_result) =
+        (vec![1; 256 * KIB], vec![2; 256 * KIB], vec![3; 256 * KIB], vec![4; 256 * KIB]);
+    let (small, another_small) = (vec![5; 40 * KIB], vec![6; 40 * KIB]);
+
+    assert!(put(&mut store, blob_of(&first, "task-1", false)));
+    assert_eq!(held.blob_bytes(), 256 * KIB as u64);
+    assert!(
+        !put(&mut store, blob_of(&second, "task-1", false)),
+        "a second input would take the inputs past half the share"
+    );
+    assert!(
+        put(&mut store, blob_of(&first, "task-2", false)),
+        "a blob already held gains an owner at no cost"
+    );
+    assert!(put(&mut store, blob_of(&result, "task-1", true)), "a result fits in the half kept for results");
+    assert!(put(&mut store, blob_of(&small, "task-1", false)));
+    assert!(
+        !put(&mut store, blob_of(&another_result, "task-1", true)),
+        "a result past the whole share is refused"
+    );
+    assert!(
+        !put(&mut store, blob_of(&another_small, "task-1", false)),
+        "inputs are at half the share"
+    );
+    assert!(
+        put(&mut store, blob_of(&first, "task-3", true)),
+        "a blob held is accepted again, as a result, with no room for a new one"
+    );
+    assert!(
+        put(&mut store, blob_of(&another_small, "task-1", false)),
+        "a blob stored as a result no longer counts against the inputs"
+    );
+    assert_eq!(held.blob_bytes(), 592 * KIB as u64, "each blob counts once");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

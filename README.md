@@ -3025,6 +3025,18 @@ Open (from Phase 5): on a networked worker, a task that returns a flow, group or
 
 Open: a Task record read, and so `TaskHandle.status()`, waits out the 5 s kad query timeout while a shard peer is connected but unresponsive (stopped, say). The lookup should finish once the record's placement holders, or a quorum of them, have answered.
 
+Open: large-input starvation. A claimant without room for a large blob input passes it over, and smaller inputs can keep taking that room, so a large input may wait indefinitely under steady load. Aging (raising a passed-over task's priority with its wait) is the known fix. For post-implementation load testing.
+
+Open: a task whose input is larger than every worker's in-flight share waits until its expiry, or indefinitely with none, in a shard where every voter holds every record. In a larger shard, a non-holder can steal it and fail it with `PayloadTooLarge`, so it can fail after its retries. One explicit memory limit per networked shard avoids both.
+
+Open: blob retention edges. (1) A holder that never saw an owner's record drops the owner's blobs only on a second answer of gone from the leader, a grace after the first, and a blob-carried submission is bounded to half a grace; what is left is a submission whose request is still in transit when the deadline cancels it: the leader may handle that request after answering the cancel with an unknown task, record the task, and run it though its handle was refused (no tombstone records the cancel), and the grace and the deadline are fixed constants, so no test can shorten them. (2) The tending task asks about due owners one at a time, each up to 5 s, so a dead named leader slows a tick and the blob re-puts in it; the asks should run concurrently. (3) An owner found finished is never asked about again, so its result blobs stay on a holder that never sees its record until the store drops them with the owner's retention elsewhere. (4) The store has no test seam for the orphan grace, so the leader-asked drop and the submission deadline are unproven by a test.
+
+Open: `//runtime/tests:test_networked` also failed intermittently under load with a result reported unavailable; that symptom is not shown fixed and is to be diagnosed before the phase closes.
+
+Open: an idle worker's claim backoff grows to 5 s (`IdleBackoff::MAX`) with no wake-up on new queued work, so work queued on an idle cluster can wait up to 5 s for a claimant. The fix is to clear the idle backoff when the leader announces pending work. `//runtime/tests:test_networked` failed intermittently under load because of it (a compaction run not claimed while the generation holding the key ran); its tests now hold the key until released and do not depend on the backoff.
+
+Open: a record that is re-placed off a killed voter stalls. The re-placement is a joint write that needs a majority of the prior placement, and a killed voter stays a member of the configuration until it leaves, so with replication 2 and a dead holder in the prior placement, every later write for that task (a claim included) cannot be acknowledged. The blobs of such a task do follow the new placement; the claim does not go through until the dead voter leaves the configuration.
+
 ### Phase 7: observability
 
 Prometheus and tracing should exist earlier for development, but this phase hardens:

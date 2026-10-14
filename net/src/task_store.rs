@@ -8,16 +8,25 @@
 //! acknowledged only if the record was stored, because `kad` answers a put
 //! the store refused by resetting the stream rather than acknowledging it. A
 //! writer that counts acknowledgements therefore counts holders.
+//!
+//! Blobs share the store. A blob's key is `blob/` and the hex of its BLAKE3
+//! digest (`BlobKey::record_key`), which no task id can be. A put under it is
+//! refused unless the value is a blob record whose bytes the key names, and
+//! the store has room for it.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use kabudachi_core::protocol::generated::TaskRecord;
+use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord};
+use kabudachi_core::protocol::generated::{self, TaskRecord};
 use kabudachi_core::protocol::ids::{TaskId, WorkerId};
 use kabudachi_core::reconcile::HeldKey;
 use kabudachi_core::reconcile::wire::held_key;
-use kabudachi_core::task_record::{MAX_RECORD_BYTES, Origin, VersionedRecords, identify, looks_claimable};
+use kabudachi_core::task_record::{
+    MAX_RECORD_BYTES, ORPHAN_BLOB_GRACE, Origin, OwnerState, VersionedRecords, identify, looks_claimable,
+};
 use kabudachi_core::time::{Clock, RealClock, WallTime};
 use libp2p::PeerId;
 use libp2p::kad;
@@ -53,7 +62,9 @@ impl HeldRecords {
     /// `None`.
     pub fn new(retention: Option<kabudachi_core::time::Duration>) -> Self {
         HeldRecords {
-            records: Arc::new(Mutex::new(VersionedRecords::with_retention(retention))),
+            records: Arc::new(Mutex::new(
+                VersionedRecords::with_retention(retention).with_orphan_blob_grace(ORPHAN_BLOB_GRACE),
+            )),
             clock: Arc::new(RealClock::new()),
         }
     }
@@ -69,6 +80,55 @@ impl HeldRecords {
     /// The newest revision of `task`'s record this worker holds.
     pub fn get(&self, task: &TaskId) -> Option<TaskRecord> {
         self.lock().get(task).cloned()
+    }
+
+    /// The blob held under `key`, if any.
+    pub fn blob(&self, key: &BlobKey) -> Option<BlobRecord> {
+        self.lock().blob(key)
+    }
+
+    /// The blobs `owner` holds here, with their bytes.
+    pub fn blobs_of(&self, owner: &BlobOwner) -> Vec<(BlobKey, Vec<u8>)> {
+        self.lock().blobs_of(owner)
+    }
+
+    /// The blobs `owner` stored as results, among those it holds here.
+    pub(crate) fn results_of(&self, owner: &BlobOwner) -> BTreeSet<BlobKey> {
+        self.lock().results_of(owner)
+    }
+
+    /// Each owner whose record a leader moved to other holders since the last
+    /// call, with the holders it moved to.
+    pub(crate) fn take_blob_moves(&self) -> Vec<(BlobOwner, Vec<WorkerId>)> {
+        self.lock().take_blob_moves()
+    }
+
+    /// The owners never seen here whose grace has passed and whose record no
+    /// look-up has found finished.
+    pub(crate) fn owners_to_check(&self) -> Vec<BlobOwner> {
+        self.lock().owners_to_check(self.clock.now())
+    }
+
+    /// Records what a look-up across the shard found of `owner`.
+    pub(crate) fn owner_checked(&self, owner: &BlobOwner, state: OwnerState) {
+        self.lock().owner_checked(owner, state, self.clock.now());
+    }
+
+    /// Every blob held, with its owners.
+    pub fn blobs(&self) -> Vec<(BlobKey, Vec<BlobOwner>)> {
+        self.lock().blobs()
+    }
+
+    /// Limits the bytes of blobs this worker holds, or lifts the limit with
+    /// `None`: a blob it does not hold yet is refused once the blobs held
+    /// would pass it.
+    pub fn set_blob_store_limit(&self, limit: Option<u64>) {
+        self.lock().set_blob_store_limit(limit);
+    }
+
+    /// The bytes of every blob held, each counted once.
+    pub fn blob_bytes(&self) -> u64 {
+        self.lock().blob_bytes()
     }
 
     /// Every task this worker holds a record of.
@@ -100,6 +160,17 @@ impl HeldRecords {
                 Some((WallTime::from(submitted_at), task))
             })
             .collect()
+    }
+
+    /// The bytes of `task`'s input, carried as blobs, that this worker's copy
+    /// of its record shows; 0 for an input that travels inline or a task not
+    /// held.
+    pub(crate) fn blob_input_bytes(&self, task: &TaskId) -> u64 {
+        self.lock()
+            .get(task)
+            .and_then(|record| record.task.as_ref())
+            .and_then(|task| task.input_manifest.as_ref())
+            .map_or(0, |manifest| manifest.total_bytes)
     }
 
     /// Feeds `take` a summary of each record held after `after` (every one
@@ -163,6 +234,26 @@ impl TaskRecordStore {
         TaskRecordStore { held }
     }
 
+    /// Keeps a blob record that arrived under `key`, or refuses it (see
+    /// `put`'s note on refusals) if it is not one, its bytes are not the ones
+    /// `key` names, or the store has no room for it.
+    fn put_blob(&mut self, key: &BlobKey, value: &[u8]) -> kad::store::Result<()> {
+        let Some(blob) = generated::BlobRecord::decode(value)
+            .ok()
+            .and_then(|wire| BlobRecord::try_from(wire).ok())
+        else {
+            tracing::debug!("refusing a value that is not a blob record");
+            return Err(kad::store::Error::ValueTooLarge);
+        };
+        match self.held.lock().put_blob(key, blob, self.held.clock.now()) {
+            Ok(()) => Ok(()),
+            Err(refusal) => {
+                tracing::debug!(blob = %key, %refusal, "refusing a blob");
+                Err(kad::store::Error::ValueTooLarge)
+            }
+        }
+    }
+
     fn encoded(record: &TaskRecord) -> Option<kad::Record> {
         let (task, _) = identify(record).ok()?;
         Some(kad::Record::new(record_key(&task), record.encode_to_vec()))
@@ -201,6 +292,13 @@ impl kad::store::RecordStore for TaskRecordStore {
     type ProvidedIter<'a> = std::iter::Empty<Cow<'a, kad::ProviderRecord>>;
 
     fn get(&self, key: &kad::RecordKey) -> Option<Cow<'_, kad::Record>> {
+        if let Some(blob) = BlobKey::from_record_key(key.as_ref()) {
+            let held = self.held.blob(&blob)?;
+            return Some(Cow::Owned(kad::Record::new(
+                key.clone(),
+                generated::BlobRecord::from(held).encode_to_vec(),
+            )));
+        }
         let task = TaskId::new(std::str::from_utf8(key.as_ref()).ok()?);
         let held = self.held.get(&task)?;
         Self::encoded(&held).map(Cow::Owned)
@@ -210,6 +308,9 @@ impl kad::store::RecordStore for TaskRecordStore {
         if record.value.len() as u64 > MAX_RECORD_BYTES {
             tracing::debug!(bytes = record.value.len(), "refusing a record past the size limit");
             return Err(kad::store::Error::ValueTooLarge);
+        }
+        if let Some(blob) = BlobKey::from_record_key(record.key.as_ref()) {
+            return self.put_blob(&blob, &record.value);
         }
         let (task, decoded) = task_record_under_its_key(&record)?;
         match self

@@ -3,3 +3,4 @@
 mod claim_arbitration;
 mod executor_claims;
 mod gossip_publish;
+mod payload_memory;

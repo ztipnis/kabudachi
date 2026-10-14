@@ -45,9 +45,5 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<outcomes::PyRunState>()?;
     m.add("KabudachiError", m.py().get_type::<errors::KabudachiError>())?;
     m.add("BackpressureError", errors::backpressure_error_type(m.py())?)?;
-    m.add(
-        "MAX_RESULT_PAYLOAD_BYTES",
-        kabudachi_net::result_transport::MAX_RESULT_PAYLOAD_BYTES,
-    )?;
     Ok(())
 }

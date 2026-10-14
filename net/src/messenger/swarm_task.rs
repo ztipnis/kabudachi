@@ -8,12 +8,16 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use kabudachi_core::blob::BlobKey;
 use kabudachi_core::election::Input;
 use kabudachi_core::protocol::checked;
+use kabudachi_core::protocol::digest::Digest;
+use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::messages::{ElectionMessage, election_message};
 use libp2p::core::ConnectedPoint;
 use libp2p::core::transport::ListenerId;
 use libp2p::futures::StreamExt;
+use libp2p::kad::store::RecordStore as _;
 use libp2p::request_response;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
@@ -23,7 +27,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use super::record_queries::RecordQueries;
-use super::{Command, Correlated, DialTarget, Exchanges, Inbound};
+use super::{Command, Correlated, DialTarget, Exchanges, Inbound, Queued};
+use crate::blob_exchange::codec::BlobCodec;
 use crate::claim::codec::ClaimCodec;
 use crate::codec::Ack;
 use crate::framing::decode_election;
@@ -223,6 +228,10 @@ fn handle_command(
         Command::WriteRecords(writes) => pending.records.start_writes(swarm, writes, inbound),
         Command::HandOff { write, respond_to } => pending.records.start_hand_off(swarm, write, respond_to),
         Command::GetRecord { task, respond_to } => pending.records.start_read(swarm, task, respond_to),
+        Command::PutBlob { key, record, placement, respond_to } => {
+            pending.records.start_blob_put(swarm, key, record, &placement, respond_to);
+        }
+        Command::LookUpBlob { key, respond_to } => pending.records.start_blob_lookup(swarm, key, respond_to),
     }
 }
 
@@ -564,9 +573,48 @@ fn handle_behaviour_event(
                 arrived(inbound, peers, input, now);
             }
         }
-        BehaviourEvent::Records(event) => pending.records.on_event(event, inbound),
+        BehaviourEvent::Records(event) => records_event(swarm, pending, event, inbound),
+        BehaviourEvent::Blob(request_response::Event::Message {
+            message: request_response::Message::Request { request, channel, .. },
+            ..
+        }) => answer_blob_request(swarm, peers, request, channel, now),
         other => settle_exchange(other, pending, inbound, peers, now),
     }
+}
+
+/// Takes one event of the shard's records `kad`, and ends the query it says
+/// has done its work: the rest of a blob lookup that found its copy is wasted.
+fn records_event(swarm: &mut Swarm<Behaviour>, pending: &mut Pending, event: kad::Event, inbound: &Inbound) {
+    let Some(done) = pending.records.on_event(event, inbound) else {
+        return;
+    };
+    let records = swarm.behaviour_mut().records.as_mut();
+    if let Some(mut running) = records.and_then(|records| records.query_mut(&done)) {
+        running.finish();
+    }
+}
+
+/// Answers a holder's direct ask for a blob from this worker's own store: the
+/// blob record, or an empty one when it holds no such blob.
+fn answer_blob_request(
+    swarm: &mut Swarm<Behaviour>,
+    peers: &mut Peers,
+    request: generated::Digest,
+    channel: request_response::ResponseChannel<generated::BlobRecord>,
+    now: Instant,
+) {
+    peers.observe(Observation::Carried(Carried::BlobRequest), now);
+    let answer = Digest::try_from(&request)
+        .ok()
+        .map(|digest| BlobKey::from(&digest))
+        .and_then(|key| {
+            let records = swarm.behaviour_mut().records.as_mut()?;
+            let found = records.store_mut().get(&kad::RecordKey::new(&key.record_key()))?;
+            generated::BlobRecord::decode(&found.value[..]).ok()
+        })
+        .unwrap_or_default();
+    // Best-effort: an asker that stopped waiting just drops it.
+    let _ = swarm.behaviour_mut().blob.send_response(channel, answer);
 }
 
 /// Feeds `kad`, and the shard's records `kad`, every dialable address
@@ -673,6 +721,10 @@ fn settle_exchange(
                 inbound.results_arrived.notify_one();
             }
         }
+        BehaviourEvent::Blob(event) => {
+            // Only this worker's own asks remain: the exchange settles them.
+            let _ = BlobCodec::exchange(exchanges).on_event(event);
+        }
         _ => {}
     }
 }
@@ -680,7 +732,7 @@ fn settle_exchange(
 /// Settles what `event` of protocol `C` settles (see `Exchange::on_event`),
 /// and queues an arriving request for the driver, counting it in the peer
 /// book's traffic; whether a request was queued.
-fn settle<C: Correlated>(
+fn settle<C: Queued>(
     exchanges: &mut Exchanges,
     event: request_response::Event<C::Request, C::Response>,
     inbound: &Inbound,
