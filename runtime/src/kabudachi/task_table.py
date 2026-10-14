@@ -31,7 +31,7 @@ from kabudachi.errors import (
 )
 from kabudachi.handle import TaskHandle
 from kabudachi.native_protocol import Certification, Runtime
-from kabudachi.options import SubmissionOptions
+from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskDefinition, TaskKind
 
 CallbackRunner = Callable[[Callable[[Any], Any], Any], None]
@@ -177,10 +177,8 @@ class TaskTable:
         self,
         definition: TaskDefinition,
         payload: bytes,
-        queue: str,
         options: SubmissionOptions,
-        *,
-        reconnect_timeout_ms: int | None = None,
+        settings: SubmissionSettings,
     ) -> TaskHandle:
         """Refuses with `RunStoppedError` once stopping; otherwise submits to
         the native runtime and registers the handle under one lock, so a
@@ -192,7 +190,7 @@ class TaskTable:
                 definition.name,
                 definition.version,
                 payload,
-                queue,
+                settings.queue,
                 definition.kind.value,
                 # A coalescing task always has a key: the default is "".
                 (options.key or "") if definition.kind is TaskKind.COALESCING else None,
@@ -200,7 +198,7 @@ class TaskTable:
                 delay_ms=options.delay_ms,
                 expires_in_ms=options.expires_in_ms,
                 drop_oldest=definition.drop_oldest,
-                reconnect_timeout_ms=reconnect_timeout_ms,
+                reconnect_timeout_ms=settings.reconnect_timeout_ms,
             )
             handle = TaskHandle(
                 task_id,

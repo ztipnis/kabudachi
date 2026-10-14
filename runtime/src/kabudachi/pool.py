@@ -116,6 +116,13 @@ class _Child:
     def busy(self) -> int:
         return sum(1 for slot in self.slots.values() if not slot.waiting)
 
+    def takes_runs(self, concurrency: int) -> bool:
+        """Whether a run can be sent here now: ready, neither draining nor
+        being stopped, and with a free place."""
+        if not self.ready or self.draining or self.terminating:
+            return False
+        return self.busy() < concurrency
+
     def send(self, frame: Any) -> None:
         """Sends `frame`, from any thread. A child that is gone is noticed by
         its exit, not here."""
@@ -166,6 +173,8 @@ class ProcessPool:
         self._quick_deaths = 0
 
     # places
+
+    stops_bodies_at_once = True
 
     def free(self) -> int:
         room = sum(
@@ -232,19 +241,25 @@ class ProcessPool:
             replacing.cancel()
         children = [*self._children, *self._condemned]
         if not kill:
-            for child in children:
-                child.draining = True
-                child.send(ipc.Drain())
-            await self.drain()
-            if children:
-                # Each child is still tearing down its loop and flushing output.
-                await asyncio.wait(
-                    {child.buried for child in children}, timeout=_TERMINATE_GRACE_SECONDS
-                )
+            await self._let_children_finish(children)
         for child in children:
             self._terminate(child)
         if children:
             await asyncio.wait({child.buried for child in children})
+        self._fail_unsent()
+
+    async def _let_children_finish(self, children: list[_Child]) -> None:
+        for child in children:
+            child.draining = True
+            child.send(ipc.Drain())
+        await self.drain()
+        if children:
+            # Each child is still tearing down its loop and flushing output.
+            await asyncio.wait(
+                {child.buried for child in children}, timeout=_TERMINATE_GRACE_SECONDS
+            )
+
+    def _fail_unsent(self) -> None:
         # Every child is gone, so a run still waiting for one (or gated behind
         # an earlier body) can never run.
         for slot in list(self._slots.values()):
@@ -257,10 +272,6 @@ class ProcessPool:
                     TaskProcessLost("the task processes were stopped before it could run")
                 )
             self._finish(slot)
-
-    @property
-    def stops_bodies_at_once(self) -> bool:
-        return True
 
     # handing over
 
@@ -350,12 +361,7 @@ class ProcessPool:
 
     def _least_busy(self) -> _Child | None:
         open_children = [
-            child
-            for child in self._children
-            if child.ready
-            and not child.draining
-            and not child.terminating
-            and child.busy() < self._settings.concurrency
+            child for child in self._children if child.takes_runs(self._settings.concurrency)
         ]
         return min(open_children, key=lambda child: (child.busy(), child.number), default=None)
 
@@ -466,20 +472,7 @@ class ProcessPool:
         runs only if they agree. Raises `StartupError` otherwise."""
         if ready.error is not None:
             raise StartupError(f"a task process {ready.error}")
-        problems = []
-        for definition in self._registry.definitions():
-            version = ready.definitions.get(definition.name)
-            if version is None:
-                problems.append(f"{definition.name} is missing")
-            elif version != definition.version:
-                problems.append(f"{definition.name} is at version {version}, not {definition.version}")
-            elif definition.serializer not in ready.serializers:
-                problems.append(
-                    f"{definition.name}'s serializer {definition.serializer!r} is not registered"
-                )
-        for described in (hook.described for hook in self._hooks.all()):
-            if described not in ready.hooks:
-                problems.append(f"{described} is missing")
+        problems = _disagreements(self._registry, self._hooks, ready)
         if problems:
             raise StartupError(
                 "a task process does not have the tasks and hooks this process has ("
@@ -551,19 +544,8 @@ class ProcessPool:
     def _submit_for(self, child: _Child, frame: ipc.Submit) -> None:
         """Submits what a body in `child` called, answers at once with the
         new task's id or the error, and sends the outcome once it settles."""
-        nested = self._nested
         try:
-            if nested is None:
-                raise RuntimeError("the process pool takes no nested calls before a session")
-            if frame.definition_id is not None and frame.payload is not None:
-                options = frame.options or SubmissionOptions()
-                handle = nested.submit_serialized(frame.definition_id, frame.payload, options)
-            elif frame.composite is not None and frame.step is not None and frame.previous is not None:
-                handle = nested.submit_composite(
-                    frame.composite, pickle.loads(frame.step), pickle.loads(frame.previous)
-                )
-            else:
-                raise ValueError("a submission names neither a task nor a flow or group")
+            handle = self._nested_handle(frame)
         except Exception as error:
             child.send(ipc.Reply(frame.request, error=ipc.portable(error)))
             return
@@ -583,6 +565,22 @@ class ProcessPool:
                 child.send(ipc.outcome_of(handle.task_id, outcome))
 
         handle._outcome.add_done_callback(settled)
+
+    def _nested_handle(self, frame: ipc.Submit) -> TaskHandle:
+        """The handle of the task, flow or group a body in a task process
+        called. Raises what the submission raised, or why it could not be
+        made."""
+        nested = self._nested
+        if nested is None:
+            raise RuntimeError("the process pool takes no nested calls before a session")
+        if frame.definition_id is not None and frame.payload is not None:
+            options = frame.options or SubmissionOptions()
+            return nested.submit_serialized(frame.definition_id, frame.payload, options)
+        if frame.composite is not None and frame.step is not None and frame.previous is not None:
+            return nested.submit_composite(
+                frame.composite, pickle.loads(frame.step), pickle.loads(frame.previous)
+            )
+        raise ValueError("a submission names neither a task nor a flow or group")
 
     def _retire(self, child: _Child) -> None:
         """`child` takes no new runs, finishes the ones it has and exits on
@@ -720,6 +718,27 @@ def _raisable(frame: ipc.Failed) -> BaseException:
         error = body_error(error)
     error.add_note(f"raised in a task process:\n{frame.traceback}")
     return error
+
+
+def _disagreements(registry: TaskRegistry, hooks: HookRegistry, ready: ipc.Ready) -> list[str]:
+    """How what a task process found differs from this process's tasks and
+    hooks: a task missing there, at another version or without its
+    serializer, and a hook missing there."""
+    problems = []
+    for definition in registry.definitions():
+        version = ready.definitions.get(definition.name)
+        if version is None:
+            problems.append(f"{definition.name} is missing")
+        elif version != definition.version:
+            problems.append(f"{definition.name} is at version {version}, not {definition.version}")
+        elif definition.serializer not in ready.serializers:
+            problems.append(
+                f"{definition.name}'s serializer {definition.serializer!r} is not registered"
+            )
+    for described in (hook.described for hook in hooks.all()):
+        if described not in ready.hooks:
+            problems.append(f"{described} is missing")
+    return problems
 
 
 def _frame_for(job: RunJob | CompactJob) -> ipc.Run | ipc.Compact:

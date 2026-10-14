@@ -26,7 +26,10 @@ from kabudachi import runner as runner_module
 from kabudachi import session as session_module
 from kabudachi.config import Configuration
 from kabudachi.errors import RunStoppedError
+from kabudachi.execution import InProcessExecutor
+from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
+from kabudachi.serializers import process_serializers
 from proto_messages import Greeting, make_message_class
 
 
@@ -46,6 +49,73 @@ def faulting_native(monkeypatch):
 def only_native():
     [native] = FaultingNative.instances
     return native
+
+
+class StandInNetworked(FaultingNative):
+    """Stands in for the `NetworkedRuntime` class: a shard of one that records
+    the calls a networked run makes on its way out."""
+
+    def __init__(self, shard, listen, **options):
+        limits = ("result_ttl_ms", "memory_soft_limit", "memory_hard_limit")
+        super().__init__(**{name: options[name] for name in limits})
+        self.calls = []
+        self._taking_stopped = asyncio.Event()
+
+    async def wait_until_ready(self):
+        self.calls.append("ready")
+        await self.native.wait_until_leader()
+
+    async def claim_pending(self, limit):
+        # A networked claim waiting for work ends once taking stops.
+        claim = asyncio.ensure_future(super().claim_pending(limit))
+        stopped = asyncio.ensure_future(self._taking_stopped.wait())
+        await asyncio.wait({claim, stopped}, return_when=asyncio.FIRST_COMPLETED)
+        stopped.cancel()
+        if claim.done():
+            return claim.result()
+        claim.cancel()
+        return []
+
+    def stop_taking(self):
+        self.calls.append("stop_taking")
+        self._taking_stopped.set()
+
+    async def wait_until_reported(self):
+        self.calls.append("reported")
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["returns", "raises"])
+def test_a_networked_run_stops_taking_and_waits_for_its_reports_however_main_ends(
+    monkeypatch, fails
+):
+    configuration = Configuration()
+    configuration.configure(processes=1, listen="/ip4/127.0.0.1/tcp/0")
+    monkeypatch.setattr(config_module, "_process_configuration", configuration)
+    monkeypatch.setattr(runner_module, "_native", SimpleNamespace(NetworkedRuntime=StandInNetworked))
+    # The run starts no task, so bodies may as well run in this process.
+    monkeypatch.setattr(
+        runner_module,
+        "_executor_for",
+        lambda configuration: InProcessExecutor(
+            registry_module.default_registry(), process_serializers(), 1, HookRegistry()
+        ),
+    )
+
+    async def main():
+        if fails:
+            raise KeyError("main failed")
+        return "done"
+
+    if fails:
+        with pytest.raises(KeyError):
+            kabudachi.run(main)
+    else:
+        assert kabudachi.run(main) == "done"
+
+    native = only_native()
+    assert native.calls == ["ready", "stop_taking", "reported"]
+    assert native.shutdowns == 1
+    assert session_module.active_session() is None
 
 
 def test_a_run_that_completes_shuts_the_native_runtime_down_and_ends_the_session():

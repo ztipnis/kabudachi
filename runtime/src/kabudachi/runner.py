@@ -287,6 +287,23 @@ class _StopSignals:
         self.stop = asyncio.Event()
 
     def __enter__(self) -> "_StopSignals":
+        self._check_handlers_restorable()
+        blocking = hasattr(signal, "pthread_sigmask")
+        before: set[signal.Signals] = set()
+        if blocking:
+            before = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        self._arrivals, self._wakeup = self._open_sockets(blocking, before)
+        try:
+            self._install()
+        except BaseException:
+            self._restore()
+            raise
+        finally:
+            if blocking:
+                signal.pthread_sigmask(signal.SIG_SETMASK, before)
+        return self
+
+    def _check_handlers_restorable(self) -> None:
         for number in self._SIGNALS:
             if signal.getsignal(number) is None:
                 # Not installed from Python, so it could not be put back.
@@ -294,10 +311,10 @@ class _StopSignals:
                     f"cannot serve: the {number.name} handler was not installed from Python "
                     "and could not be restored"
                 )
-        blocking = hasattr(signal, "pthread_sigmask")
-        before: set[signal.Signals] = set()
-        if blocking:
-            before = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+
+    def _open_sockets(
+        self, blocking: bool, before: set[signal.Signals]
+    ) -> tuple[socket.socket, socket.socket]:
         arrivals: socket.socket | None = None
         wakeup: socket.socket | None = None
         try:
@@ -316,28 +333,22 @@ class _StopSignals:
                 if sock is not None:
                     sock.close()
             raise
-        self._arrivals, self._wakeup = arrivals, wakeup
-        try:
-            self._arrivals.settimeout(self._POLL_SECONDS)
-            self._wakeup.setblocking(False)
-            self._previous_wakeup = signal.set_wakeup_fd(
-                self._wakeup.fileno(), warn_on_full_buffer=False
-            )
-            self._wakeup_installed = True
-            for number in self._SIGNALS:
-                self._previous[number] = signal.signal(number, self._handle)
-            self._previous_unraisable = sys.unraisablehook
-            sys.unraisablehook = self._unraisable
-            watcher = threading.Thread(target=self._watch, daemon=True)
-            watcher.start()
-            self._watcher = watcher
-        except BaseException:
-            self._restore()
-            raise
-        finally:
-            if blocking:
-                signal.pthread_sigmask(signal.SIG_SETMASK, before)
-        return self
+        return arrivals, wakeup
+
+    def _install(self) -> None:
+        self._arrivals.settimeout(self._POLL_SECONDS)
+        self._wakeup.setblocking(False)
+        self._previous_wakeup = signal.set_wakeup_fd(
+            self._wakeup.fileno(), warn_on_full_buffer=False
+        )
+        self._wakeup_installed = True
+        for number in self._SIGNALS:
+            self._previous[number] = signal.signal(number, self._handle)
+        self._previous_unraisable = sys.unraisablehook
+        sys.unraisablehook = self._unraisable
+        watcher = threading.Thread(target=self._watch, daemon=True)
+        watcher.start()
+        self._watcher = watcher
 
     def __exit__(self, *exc_info: object) -> None:
         self._restore()
@@ -352,44 +363,9 @@ class _StopSignals:
             # and the end of the drain.
             old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
         try:
-            failures: list[BaseException] = []
-
-            def step(action: Callable[..., object], *args: object) -> None:
-                # Each step stands alone: one failing (for example a handler an
-                # embedded interpreter refuses to set) must not skip the rest.
-                try:
-                    action(*args)
-                except Exception as error:
-                    failures.append(error)
-
-            if self._watcher is not None:
-                try:
-                    # Wakes the watcher at once; the byte is not a signal number.
-                    self._wakeup.send(b"\0")
-                except OSError:
-                    pass
-                self._watcher.join()
-            if self._previous_unraisable is not None:
-                if sys.unraisablehook == self._unraisable:
-                    sys.unraisablehook = self._previous_unraisable
-                # Kept, not cleared: a hook left installed by someone who wrapped
-                # and restored it must still chain to the original.
-            if blocking and self._resent:
-                # Ignoring a signal drops its pending instances. Never wait for
-                # one: another thread may have taken it already.
-                step(signal.signal, signal.SIGINT, signal.SIG_IGN)
-            # SIGINT goes last: a stray SIGINT taken by another thread must not
-            # raise from the restored default handler before SIGTERM and the
-            # wakeup fd are put back.
-            previous = self._previous
-            if signal.SIGTERM in previous:
-                step(signal.signal, signal.SIGTERM, previous[signal.SIGTERM])
-            if self._wakeup_installed:
-                step(signal.set_wakeup_fd, self._previous_wakeup)
-                self._wakeup_installed = False
-            if signal.SIGINT in previous:
-                step(signal.signal, signal.SIGINT, previous[signal.SIGINT])
-            previous.clear()
+            self._stop_watcher()
+            self._unhook_unraisable()
+            failures = self._put_handlers_back(blocking)
             if failures:
                 raise failures[0]
         finally:
@@ -401,6 +377,53 @@ class _StopSignals:
             finally:
                 if blocking:
                     signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+    def _stop_watcher(self) -> None:
+        if self._watcher is None:
+            return
+        try:
+            # Wakes the watcher at once; the byte is not a signal number.
+            self._wakeup.send(b"\0")
+        except OSError:
+            pass
+        self._watcher.join()
+
+    def _unhook_unraisable(self) -> None:
+        # Kept, not cleared: a hook left installed by someone who wrapped and
+        # restored it must still chain to the original.
+        if self._previous_unraisable is not None and sys.unraisablehook == self._unraisable:
+            sys.unraisablehook = self._previous_unraisable
+
+    def _put_handlers_back(self, blocking: bool) -> list[BaseException]:
+        """Puts back the signal handlers and wakeup fd in place before, every
+        step even if one fails. Returns what failed, first failure first."""
+        failures: list[BaseException] = []
+
+        def step(action: Callable[..., object], *args: object) -> None:
+            # Each step stands alone: one failing (for example a handler an
+            # embedded interpreter refuses to set) must not skip the rest.
+            try:
+                action(*args)
+            except Exception as error:
+                failures.append(error)
+
+        if blocking and self._resent:
+            # Ignoring a signal drops its pending instances. Never wait for
+            # one: another thread may have taken it already.
+            step(signal.signal, signal.SIGINT, signal.SIG_IGN)
+        # SIGINT goes last: a stray SIGINT taken by another thread must not
+        # raise from the restored default handler before SIGTERM and the
+        # wakeup fd are put back.
+        previous = self._previous
+        if signal.SIGTERM in previous:
+            step(signal.signal, signal.SIGTERM, previous[signal.SIGTERM])
+        if self._wakeup_installed:
+            step(signal.set_wakeup_fd, self._previous_wakeup)
+            self._wakeup_installed = False
+        if signal.SIGINT in previous:
+            step(signal.signal, signal.SIGINT, previous[signal.SIGINT])
+        previous.clear()
+        return failures
 
     def _second(self) -> bool:
         return self._arrived >= 2
@@ -465,51 +488,63 @@ class _StopSignals:
             try:
                 self._watch_pass(data)
             except Exception:
-                # Reported and kept going: a dead watcher would leave a second
-                # signal unable to interrupt a blocked loop, with no sign why.
-                # Printed once, and guarded: a pass that keeps failing would
-                # flood stderr every poll, and a broken stderr must not kill
-                # the watcher either.
-                if not self._reported:
-                    self._reported = True
-                    try:
-                        traceback.print_exc()
-                    except Exception:
-                        pass
+                self._report_watch_failure()
+
+    def _report_watch_failure(self) -> None:
+        # Reported and kept going: a dead watcher would leave a second
+        # signal unable to interrupt a blocked loop, with no sign why.
+        # Printed once, and guarded: a pass that keeps failing would
+        # flood stderr every poll, and a broken stderr must not kill
+        # the watcher either.
+        if self._reported:
+            return
+        self._reported = True
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
 
     def _watch_pass(self, data: bytes) -> None:
         attributed = self._absorb(data)
+        self._settle_raised_state()
+        # A poll that just read the re-send waits out the next one before
+        # re-sending, so a main thread inside asyncio is not hammered.
+        if self._needs_resend(attributed):
+            self._kick()
+
+    def _settle_raised_state(self) -> None:
         # Read once: the main thread can change it at any time after.
         state = self._state
         if state == _RAISED:
-            with self._lock:
-                # Checked again under the lock, and before the drain: a discard
-                # and a new raise since the read are both _RAISED, so a mark
-                # taken from a drain that ran before this point could be older
-                # than the new raise and later clear it for a press it
-                # already counted. The drain never waits (the socket is read
-                # without blocking) and only this thread touches what it
-                # updates, so the handler waits here for at most one drain (finalizers run by a
-                # collection during it excepted, see the class docstring).
-                if self._state == _RAISED:
-                    self._drain()
-                    self._state = self._arrived
+            self._mark_raise()
         elif state != _NOT_RAISED and self._arrived > state:
-            with self._lock:
-                # Only the raise whose mark was read is cleared; a newer one
-                # must stay.
-                if self._state == state:
-                    self._state = _NOT_RAISED
-        # A poll that just read the re-send waits out the next one before
-        # re-sending, so a main thread inside asyncio is not hammered.
-        if (
-            self._second()
-            and not self._is_raised()
-            and not self._outstanding
-            and not attributed
-            and not self._closing
-        ):
-            self._kick()
+            self._clear_raise(state)
+
+    def _mark_raise(self) -> None:
+        with self._lock:
+            # Checked again under the lock, and before the drain: a discard
+            # and a new raise since the read are both _RAISED, so a mark
+            # taken from a drain that ran before this point could be older
+            # than the new raise and later clear it for a press it
+            # already counted. The drain never waits (the socket is read
+            # without blocking) and only this thread touches what it
+            # updates, so the handler waits here for at most one drain (finalizers run by a
+            # collection during it excepted, see the class docstring).
+            if self._state == _RAISED:
+                self._drain()
+                self._state = self._arrived
+
+    def _clear_raise(self, mark: int) -> None:
+        with self._lock:
+            # Only the raise whose mark was read is cleared; a newer one
+            # must stay.
+            if self._state == mark:
+                self._state = _NOT_RAISED
+
+    def _needs_resend(self, attributed: bool) -> bool:
+        if not self._second() or self._is_raised():
+            return False
+        return not (self._outstanding or attributed or self._closing)
 
     def _unraisable(self, unraisable: "sys.UnraisableHookArgs") -> None:
         # CPython reports an exception it discards here. A discarded interrupt
@@ -523,19 +558,19 @@ class _StopSignals:
             previous(unraisable)
         finally:
             try:
-                exc_type = unraisable.exc_type
-                # Signal-raised interrupts only land on the main thread, so a
-                # discard elsewhere is not the outstanding raise.
-                if (
-                    threading.current_thread() is threading.main_thread()
-                    and self._is_raised()
-                    and not self._closing
-                    and isinstance(exc_type, type)
-                    and issubclass(exc_type, KeyboardInterrupt)
-                ):
+                if self._discarded_our_interrupt(unraisable.exc_type):
                     self._discard()
             except Exception:
                 pass
+
+    def _discarded_our_interrupt(self, exc_type: object) -> bool:
+        # Signal-raised interrupts only land on the main thread, so a
+        # discard elsewhere is not the outstanding raise.
+        if threading.current_thread() is not threading.main_thread():
+            return False
+        if not self._is_raised() or self._closing:
+            return False
+        return isinstance(exc_type, type) and issubclass(exc_type, KeyboardInterrupt)
 
     def _raise_between_callbacks(self) -> None:
         self._deferred = False
@@ -648,80 +683,132 @@ async def _run_with_worker(
     running bodies, which a body that ignores the cancel would hold up for its
     cancel grace. In this process nothing can be killed, so running bodies are
     still waited for."""
-    configuration = process_configuration()
-    settings = configuration.settings()
-    networked = settings.listen is not None
-    # Set once every body has finished: the task processes are then let go
-    # idle. Otherwise (a second signal, or a run cancelled while it waited
-    # for its bodies) they are stopped at once.
-    graceful = False
-    await executor.start()
-    try:
-        native = _native_runtime(settings)
-        session = None
-        claiming = None
-        events = None
+    return await _WorkerRun(process_configuration(), executor, serving=serving).run(main)
+
+
+class _WorkerRun:
+    """One run of the worker beside `main`: its native runtime, its session
+    and the session's two loops, and how each is stopped however the run
+    ends."""
+
+    def __init__(self, configuration: Configuration, executor: Executor, *, serving: bool) -> None:
+        self._configuration = configuration
+        self._settings = configuration.settings()
+        self._networked = self._settings.listen is not None
+        self._executor = executor
+        self._serving = serving
+        # Set once every body has finished: the task processes are then let go
+        # idle. Otherwise (a second signal, or a run cancelled while it waited
+        # for its bodies) they are stopped at once.
+        self._graceful = False
+        self._session: Session | None = None
+        self._claiming: asyncio.Task[None] | None = None
+        self._events: asyncio.Task[None] | None = None
+
+    async def run(self, main: Callable[[], Awaitable[T]]) -> T:
+        await self._executor.start()
         try:
-            if networked:
-                # Joined, with a leader it knows, which may be another process.
-                await native.wait_until_ready()
-            else:
-                await native.wait_until_leader()
-            session = Session(
-                native, default_registry(), process_serializers(), configuration, executor=executor
-            )
-            activate(session)
-            # Two loops, not `serve`: the event loop must outlive the claim loop,
-            # through the drain, or events it has taken would be lost with it.
-            claiming = asyncio.create_task(session.work())
-            events = asyncio.create_task(session.watch_events())
-            result = await _until_done_or_worker_stops(main(), claiming, events)
-            await _until_done_or_worker_stops(session.wait_until_idle(), claiming, events)
-            if networked:
-                # It also holds runs no handle here waits for: they finish,
-                # and the leader takes their reports, before the worker goes.
-                session.stop_claiming()
-                native.stop_taking()
-                await _drain_held_runs(session, native, claiming, events)
-                # A claim loop that failed fails the run, once its held runs
-                # have reported.
-                claiming.result()
-            graceful = True
-            return result
-        except BaseException as error:
-            if session is not None:
-                session.stop_claiming()
-                if networked:
-                    # Ends a waiting claim, which must not be cancelled.
-                    native.stop_taking()
-                forced = serving and isinstance(error, (asyncio.CancelledError, KeyboardInterrupt))
-                if networked and not forced and events is not None and not events.done():
-                    try:
-                        await _drain_held_runs(session, native, claiming, events)
-                    except Exception:
-                        # The error being raised says why the run ended; a
-                        # runtime failing meanwhile only cuts the drain short.
-                        pass
-                await _cancel(claiming)
-                await _cancel(events)
-                if forced and executor.stops_bodies_at_once:
-                    # Their runs settle as lost once their processes are gone.
-                    await executor.stop(kill=True)
-                await session.wait_until_running_finish()
-                graceful = True
-            raise
+            native = _native_runtime(self._settings)
+            try:
+                return await self._serve(main, native)
+            except BaseException as error:
+                await self._stop_after(error, native)
+                raise
+            finally:
+                await self._end(native)
         finally:
-            if session is not None:
-                # Also on the normal path: between the run going idle and being
-                # deactivated a thread can still submit, and would never be served.
-                session.stop_claiming()
-                deactivate(session)
-            await _cancel(claiming)
-            await _cancel(events)
-            native.shutdown()
-    finally:
+            await self._stop_executor()
+
+    async def _serve(self, main: Callable[[], Awaitable[T]], native: Any) -> T:
+        if self._networked:
+            # Joined, with a leader it knows, which may be another process.
+            await native.wait_until_ready()
+        else:
+            await native.wait_until_leader()
+        session = Session(
+            native,
+            default_registry(),
+            process_serializers(),
+            self._configuration,
+            executor=self._executor,
+        )
+        self._session = session
+        activate(session)
+        # Two loops, not `serve`: the event loop must outlive the claim loop,
+        # through the drain, or events it has taken would be lost with it.
+        claiming = self._claiming = asyncio.create_task(session.work())
+        events = self._events = asyncio.create_task(session.watch_events())
+        result = await _until_done_or_worker_stops(main(), claiming, events)
+        await _until_done_or_worker_stops(session.wait_until_idle(), claiming, events)
+        if self._networked:
+            await self._hand_back_held_runs(session, native, claiming, events)
+        self._graceful = True
+        return result
+
+    async def _hand_back_held_runs(
+        self,
+        session: Session,
+        native: Any,
+        claiming: "asyncio.Task[None]",
+        events: "asyncio.Task[None]",
+    ) -> None:
+        # It also holds runs no handle here waits for: they finish, and the
+        # leader takes their reports, before the worker goes.
+        session.stop_claiming()
+        native.stop_taking()
+        await _drain_held_runs(session, native, claiming, events)
+        # A claim loop that failed fails the run, once its held runs have
+        # reported.
+        claiming.result()
+
+    async def _stop_after(self, error: BaseException, native: Any) -> None:
+        """Stops a run that `error` ended: nothing new starts, the runs a
+        networked worker holds report unless a second signal forced the
+        stop, and the bodies still running are waited for (with a forced
+        stop, after their task processes are stopped)."""
+        session = self._session
+        if session is None:
+            return
+        session.stop_claiming()
+        if self._networked:
+            # Ends a waiting claim, which must not be cancelled.
+            native.stop_taking()
+        forced = self._serving and isinstance(error, (asyncio.CancelledError, KeyboardInterrupt))
+        if self._networked and not forced:
+            await self._drain_quietly(session, native)
+        await _cancel(self._claiming)
+        await _cancel(self._events)
+        if forced and self._executor.stops_bodies_at_once:
+            # Their runs settle as lost once their processes are gone.
+            await self._executor.stop(kill=True)
+        await session.wait_until_running_finish()
+        self._graceful = True
+
+    async def _drain_quietly(self, session: Session, native: Any) -> None:
+        events = self._events
+        if events is None or events.done():
+            return
         try:
-            await executor.stop(kill=not graceful)
+            await _drain_held_runs(session, native, self._claiming, events)
+        except Exception:
+            # The error being raised says why the run ended; a runtime
+            # failing meanwhile only cuts the drain short.
+            pass
+
+    async def _end(self, native: Any) -> None:
+        session = self._session
+        if session is not None:
+            # Also on the normal path: between the run going idle and being
+            # deactivated a thread can still submit, and would never be served.
+            session.stop_claiming()
+            deactivate(session)
+        await _cancel(self._claiming)
+        await _cancel(self._events)
+        native.shutdown()
+
+    async def _stop_executor(self) -> None:
+        try:
+            await self._executor.stop(kill=not self._graceful)
         except BaseException:
-            await executor.stop(kill=True)  # a second cancel must not leave children
+            await self._executor.stop(kill=True)  # a second cancel must not leave children
             raise

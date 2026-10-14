@@ -125,18 +125,29 @@ def bind_task(
     if not arguments and not fields:
         raise TypeError("bind needs a value, or fields to set")
     if arguments:
-        serializer = serializers.get(definition.serializer)
-        serializer.encode(arguments[0], definition.input_type)
-        return BoundTask(definition, value=arguments[0])
+        return _bind_value(definition, serializers, arguments[0])
+    return _bind_fields(definition, fields)
+
+
+def _bind_value(definition: TaskDefinition, serializers: Any, value: Any) -> BoundTask:
+    serializer = serializers.get(definition.serializer)
+    serializer.encode(value, definition.input_type)
+    return BoundTask(definition, value=value)
+
+
+def _bind_fields(definition: TaskDefinition, fields: dict[str, Any]) -> BoundTask:
     known = _message_fields(definition.input_type)
     for name, value in fields.items():
-        field = known.get(name)
-        if field is None:
-            raise ValueError(f"{definition.input_type.__name__} has no field {name!r}")
-        if field.is_repeated or field.cpp_type == field.CPPTYPE_MESSAGE:
-            raise TypeError(f"only scalar fields can be bound, and {name!r} is not one")
-        definition.input_type(**{name: value})  # refuses a value of the wrong type
+        _check_bound_field(definition, known.get(name), name, value)
     return BoundTask(definition, fields=dict(fields))
+
+
+def _check_bound_field(definition: TaskDefinition, field: Any, name: str, value: Any) -> None:
+    if field is None:
+        raise ValueError(f"{definition.input_type.__name__} has no field {name!r}")
+    if field.is_repeated or field.cpp_type == field.CPPTYPE_MESSAGE:
+        raise TypeError(f"only scalar fields can be bound, and {name!r} is not one")
+    definition.input_type(**{name: value})  # refuses a value of the wrong type
 
 
 class Flow:
@@ -144,6 +155,8 @@ class Flow:
 
     is_step = True
     is_task = False
+    output_type = None
+    """Unknown: a flow resolves to the list of its stages' results."""
 
     def __init__(self, stages: list[Any]) -> None:
         self.stages = stages
@@ -151,11 +164,6 @@ class Flow:
     @property
     def needs_input(self) -> bool:
         return self.stages[0].needs_input
-
-    @property
-    def output_type(self) -> Any:
-        """Unknown: a flow resolves to the list of its stages' results."""
-        return None
 
     def input_requirements(self) -> list[tuple[str, Any]]:
         """The (name, type) of each task the flow's input goes to.
@@ -177,9 +185,7 @@ class Flow:
 
     def __call__(self, *arguments: Any) -> FlowHandle:
         self.check_arguments(arguments)
-        return current_session().composites.submit_flow(
-            self, arguments[0] if arguments else UNSET
-        )
+        return self.start(current_session(), arguments[0] if arguments else UNSET)
 
     def start(self, session: Session, previous: Any) -> FlowHandle:
         return session.composites.submit_flow(self, previous if self.needs_input else UNSET)
@@ -202,6 +208,8 @@ class Group:
 
     is_step = True
     is_task = False
+    output_type = None
+    """Unknown: a group resolves to the list of its members' results."""
 
     def __init__(self, members: list[Any], on_error: str) -> None:
         self.members = members
@@ -210,11 +218,6 @@ class Group:
     @property
     def needs_input(self) -> bool:
         return any(member.needs_input for member in self.members)
-
-    @property
-    def output_type(self) -> Any:
-        """Unknown: a group resolves to the list of its members' results."""
-        return None
 
     def input_requirements(self) -> list[tuple[str, Any]]:
         """The (name, type) of each member task that takes the group's input."""
@@ -234,7 +237,7 @@ class Group:
 
     def __call__(self, *arguments: Any) -> GroupHandle:
         self.check_arguments(arguments)
-        return current_session().composites.submit_group(self, arguments[0] if arguments else UNSET)
+        return self.start(current_session(), arguments[0] if arguments else UNSET)
 
     def start(self, session: Session, previous: Any) -> GroupHandle:
         return session.composites.submit_group(self, previous)

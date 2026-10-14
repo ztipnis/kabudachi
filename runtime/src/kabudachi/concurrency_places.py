@@ -4,12 +4,11 @@ import asyncio
 import threading
 from typing import Any
 
-from kabudachi.handle import WaitObserver
 
-
-class _BodyWaits:
+class BodyWaits:
     """Tracks when one running task body is waiting for another task, so the
-    places can count it as not occupying one while it does."""
+    places can count it as not occupying one while it does. One place is given
+    back however many tasks the body waits for at once."""
 
     def __init__(self, places: "ConcurrencyPlaces") -> None:
         self._places = places
@@ -71,11 +70,6 @@ class ConcurrencyPlaces:
         """A body took its place back. Safe from any thread."""
         with self._lock:
             self._blocked -= 1
-
-    def watch_body(self) -> WaitObserver:
-        """What one running body reports its waits to: one place is given back
-        however many tasks it waits for at once."""
-        return _BodyWaits(self)
 
     def wake(self) -> None:
         """Makes a pending `wait_for_free` return, so its caller looks again.

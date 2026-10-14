@@ -63,7 +63,7 @@ from kabudachi.hosted_work import LoopHostedWork
 from kabudachi.handle import TaskHandle, run_callback_inline
 from kabudachi.lifecycle import default_hooks
 from kabudachi.native_protocol import Runtime
-from kabudachi.options import SubmissionOptions
+from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskDefinition, TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.task_table import Run, TaskTable, result_digest
@@ -141,6 +141,19 @@ class Session:
         self._below_soft_limit.set()
         # Every flow and group started here, and what runs them.
         self._composites = Composites(self, self._hosted)
+        # What this does with each kind of event the runtime decides on its own.
+        self._event_handlers: dict[EventKind, Callable[[Any], None]] = {
+            EventKind.EXPIRED: self._on_expired,
+            EventKind.CANCELLED: self._on_cancelled,
+            EventKind.RECORD_FULL: self._on_record_full,
+            EventKind.COALESCED_PAYLOAD_TOO_LARGE: self._on_coalesced_payload_too_large,
+            EventKind.SLOW_DOWN: self._on_slow_down,
+            EventKind.SUPERSEDED: self._on_superseded,
+            EventKind.ACCEPTED: self._on_accepted,
+            EventKind.REFUSED: self._on_refused,
+            EventKind.ABORT: self._on_abort,
+            EventKind.ABORT_WITHDRAWN: self._on_abort_withdrawn,
+        }
 
     def submit(
         self,
@@ -162,13 +175,8 @@ class Session:
         self, definition: TaskDefinition, payload: bytes, options: SubmissionOptions
     ) -> TaskHandle:
         queue = self._configuration.resolve("queue", definition.queue)
-        return self._tasks.submit(
-            definition,
-            payload,
-            queue,
-            options,
-            reconnect_timeout_ms=self._reconnect_timeout_ms(definition, queue),
-        )
+        settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
+        return self._tasks.submit(definition, payload, options, settings)
 
     def _reconnect_timeout_ms(self, definition: TaskDefinition, queue: str) -> int | None:
         """The reconnect timeout a run of `definition` sent to `queue`
@@ -274,66 +282,74 @@ class Session:
         self._hosted.attach(asyncio.get_running_loop())
         while True:
             for event in await self._runtime.next_events():
-                match event.kind:
-                    case EventKind.EXPIRED:
-                        self._tasks.failed(
-                            event.task_id,
-                            TaskExpiredError(
-                                f"task {event.task_id} expired before it could start"
-                            ),
-                        )
-                    case EventKind.CANCELLED:
-                        here = self._here.get(event.task_run_id)
-                        if here is None:
-                            self._tasks.cancelled_by_leader(event.task_id)
-                            self._hold_early(event.task_run_id).cancelled = True
-                        else:
-                            self._cancel_held(here, event.task_run_id)
-                    case EventKind.RECORD_FULL:
-                        self._tasks.failed(
-                            event.task_id,
-                            TaskRecordFullError(
-                                f"task {event.task_id} ended: its record had no room for another attempt"
-                            ),
-                        )
-                    case EventKind.COALESCED_PAYLOAD_TOO_LARGE:
-                        self._tasks.failed(
-                            event.task_id,
-                            CoalescedPayloadTooLargeError(
-                                f"task {event.task_id}'s folded payloads grew too large to run"
-                            ),
-                        )
-                    case EventKind.SLOW_DOWN if event.active:
-                        self._below_soft_limit.clear()
-                    case EventKind.SLOW_DOWN:
-                        self._below_soft_limit.set()
-                    case EventKind.SUPERSEDED:
-                        self._tasks.failed(
-                            event.task_id,
-                            TaskSupersededError(
-                                f"task {event.task_id} was superseded by {event.superseded_by}",
-                                event.superseded_by,
-                            ),
-                        )
-                    case EventKind.ACCEPTED:
-                        # Stored, and its result never comes back here: its
-                        # handle stays open for `cancel`, and nothing waits for it.
-                        self._tasks.stored(event.task_id)
-                    case EventKind.REFUSED:
-                        self._tasks.failed(
-                            event.task_id,
-                            BackpressureError(
-                                f"the leader refused task {event.task_id}: {event.reason}"
-                            ),
-                        )
-                    case EventKind.ABORT:
-                        self._abort_at(event.task_run_id, event.seconds_left)
-                    case EventKind.ABORT_WITHDRAWN:
-                        self._clear_abort(event.task_run_id)
-                    case unknown:
-                        raise RuntimeError(
-                            f"the native runtime reported an event of unknown kind {unknown!r}"
-                        )
+                handler = self._event_handlers.get(event.kind)
+                if handler is None:
+                    raise RuntimeError(
+                        f"the native runtime reported an event of unknown kind {event.kind!r}"
+                    )
+                handler(event)
+
+    def _on_expired(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            TaskExpiredError(f"task {event.task_id} expired before it could start"),
+        )
+
+    def _on_cancelled(self, event: Any) -> None:
+        here = self._here.get(event.task_run_id)
+        if here is None:
+            self._tasks.cancelled_by_leader(event.task_id)
+            self._hold_early(event.task_run_id).cancelled = True
+        else:
+            self._cancel_held(here, event.task_run_id)
+
+    def _on_record_full(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            TaskRecordFullError(
+                f"task {event.task_id} ended: its record had no room for another attempt"
+            ),
+        )
+
+    def _on_coalesced_payload_too_large(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            CoalescedPayloadTooLargeError(
+                f"task {event.task_id}'s folded payloads grew too large to run"
+            ),
+        )
+
+    def _on_slow_down(self, event: Any) -> None:
+        if event.active:
+            self._below_soft_limit.clear()
+        else:
+            self._below_soft_limit.set()
+
+    def _on_superseded(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            TaskSupersededError(
+                f"task {event.task_id} was superseded by {event.superseded_by}",
+                event.superseded_by,
+            ),
+        )
+
+    def _on_accepted(self, event: Any) -> None:
+        # Stored, and its result never comes back here: its handle stays
+        # open for `cancel`, and nothing waits for it.
+        self._tasks.stored(event.task_id)
+
+    def _on_refused(self, event: Any) -> None:
+        self._tasks.failed(
+            event.task_id,
+            BackpressureError(f"the leader refused task {event.task_id}: {event.reason}"),
+        )
+
+    def _on_abort(self, event: Any) -> None:
+        self._abort_at(event.task_run_id, event.seconds_left)
+
+    def _on_abort_withdrawn(self, event: Any) -> None:
+        self._clear_abort(event.task_run_id)
 
     def _hold_early(self, run_id: str) -> _Early:
         """What came for `run_id` before it started here, kept for `_start`
@@ -533,93 +549,127 @@ class Session:
             if isinstance(handed, BaseException):
                 raise handed
             definition, body, previous = handed
-            # The body waits for an abandoned one of this task to exit before
-            # it starts; its timeout counts from when it does.
-            if previous is not None:
-                await asyncio.wait({previous})
-            outcome = await run_within(
-                body,
-                definition.timeout,
-                self._cancel_grace(definition),
-                functools.partial(self._executor.condemn_host_of, claim.task_run_id),
-            )
-            if not run.outcome_counts:
-                # Cancelled, though the body carried on and returned anyway.
-                # The handle stays unsettled here on purpose: the leader's
-                # `cancelled` event settles it, pushed in the same call that
-                # answers "cancelled".
-                return
-            if definition.continues:
-                self._continue(claim, run, outcome)
-                return
-            if run.holds_handle:
-                self._tasks.result_held(claim.task_id, outcome)
-            certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
-            if certification is not None:
-                self._tasks.certified(certification)
+            await self._run_body(claim, run, definition, body, previous)
         except TaskProcessLost:
-            # Cancelled first, the leader's `cancelled` event settles the
-            # handle, as for a cancelled body that failed.
-            if run.outcome_counts:
-                self._lost(claim, run)
+            self._lost(claim, run)
         except asyncio.CancelledError as error:
-            current = asyncio.current_task()
-            cancelling = current is not None and current.cancelling()
-            if run.aborted and not cancelling:
-                # Another leader may run it again once the deadline passes:
-                # it is lost only once its body has really stopped.
-                if body is not None:
-                    await asyncio.wait({body.exited})
-                self._report_lost_quietly(claim)
-                return
-            if run.cancelled_by_leader and current is not None and not cancelling:
-                # Only the body was cancelled, because the task was: this is
-                # not this run being interrupted, and its handle is settled.
-                return
-            if run.holds_handle:
-                self._interrupted(claim.task_id, error)
-            raise
+            if not await self._cancellation_ends_here(claim, run, body, error):
+                raise
         except Exception as error:
-            if not run.outcome_counts:
-                # Cancelled, so its own failure no longer counts. The handle
-                # stays unsettled here on purpose: the leader's `cancelled`
-                # event settles it, pushed in the same call that answers
-                # "cancelled".
-                return
-            kind = _kind_of(error)
-            _logger.warning("task %s failed with %s", claim.task_id, kind)
-            # Only here, at DEBUG, does the error's own message (which can hold
-            # task input) reach the log; the warning above names its type only.
-            _logger.debug("task %s failed", claim.task_id, exc_info=error)
-            abandoned = body is not None and not body.exited.done()
-            if abandoned:
-                run.body_abandoned(body)
-                if not run.holds_handle:
-                    self._tasks.held_body_abandoned(claim.task_id, body.exited)
-            retried = self._report_failure(claim, kind)
-            if run.holds_handle:
-                if retried:
-                    self._tasks.retry_queued(claim.task_id)
-                else:
-                    self._tasks.failed(claim.task_id, error)
-            if abandoned:
-                # It keeps its place until it has really stopped.
-                await asyncio.wait({body.exited})
-                run.abandoned_body_exited()
+            await self._run_failed(claim, run, body, error)
         except BaseException as error:
             # Worse than cancelled: the task has no result, and whoever waits
             # for it must not wait forever.
-            if run.holds_handle:
-                self._interrupted(claim.task_id, error)
+            self._fail_held(claim, run, error)
             raise
         finally:
-            if run.holds_handle:
-                # On the abandoned-body retry path a newer run of this task can
-                # begin while this one still awaits `body.exited`; the table
-                # leaves the newer run's state alone when this stale one ends.
-                self._tasks.run_ended(run)
+            self._run_ended(claim, run)
+
+    async def _run_body(
+        self,
+        claim: Any,
+        run: Run,
+        definition: TaskDefinition,
+        body: RunningBody,
+        previous: "asyncio.Future[Any] | None",
+    ) -> None:
+        # The body waits for an abandoned one of this task to exit before
+        # it starts; its timeout counts from when it does.
+        if previous is not None:
+            await asyncio.wait({previous})
+        outcome = await run_within(
+            body,
+            definition.timeout,
+            self._cancel_grace(definition),
+            functools.partial(self._executor.condemn_host_of, claim.task_run_id),
+        )
+        if not run.outcome_counts:
+            # Cancelled, though the body carried on and returned anyway.
+            # The handle stays unsettled here on purpose: the leader's
+            # `cancelled` event settles it, pushed in the same call that
+            # answers "cancelled".
+            return
+        if definition.continues:
+            self._continue(claim, run, outcome)
+            return
+        self._complete(claim, run, outcome)
+
+    def _complete(self, claim: Any, run: Run, outcome: Any) -> None:
+        if run.holds_handle:
+            self._tasks.result_held(claim.task_id, outcome)
+        certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
+        if certification is not None:
+            self._tasks.certified(certification)
+
+    async def _cancellation_ends_here(
+        self,
+        claim: Any,
+        run: Run,
+        body: RunningBody | None,
+        error: asyncio.CancelledError,
+    ) -> bool:
+        """Whether the run's cancellation ends here instead of going on to
+        cancel the coroutine running it: the run was aborted at its deadline,
+        or only its body was cancelled because the leader cancelled the task.
+        Otherwise the run's handle is failed, and the caller re-raises."""
+        current = asyncio.current_task()
+        cancelling = current is not None and current.cancelling()
+        if run.aborted and not cancelling:
+            # Another leader may run it again once the deadline passes:
+            # it is lost only once its body has really stopped.
+            if body is not None:
+                await asyncio.wait({body.exited})
+            self._report_lost_quietly(claim)
+            return True
+        if run.cancelled_by_leader and current is not None and not cancelling:
+            # Only the body was cancelled, because the task was: this is
+            # not this run being interrupted, and its handle is settled.
+            return True
+        self._fail_held(claim, run, error)
+        return False
+
+    async def _run_failed(
+        self, claim: Any, run: Run, body: RunningBody | None, error: Exception
+    ) -> None:
+        if not run.outcome_counts:
+            # Cancelled, so its own failure no longer counts. The handle
+            # stays unsettled here on purpose: the leader's `cancelled`
+            # event settles it, pushed in the same call that answers
+            # "cancelled".
+            return
+        kind = _kind_of(error)
+        _logger.warning("task %s failed with %s", claim.task_id, kind)
+        # Only here, at DEBUG, does the error's own message (which can hold
+        # task input) reach the log; the warning above names its type only.
+        _logger.debug("task %s failed", claim.task_id, exc_info=error)
+        abandoned = body is not None and not body.exited.done()
+        if abandoned:
+            run.body_abandoned(body)
+            if not run.holds_handle:
+                self._tasks.held_body_abandoned(claim.task_id, body.exited)
+        retried = self._report_failure(claim, kind)
+        if run.holds_handle:
+            if retried:
+                self._tasks.retry_queued(claim.task_id)
             else:
-                self._forget_held(claim.task_run_id)
+                self._tasks.failed(claim.task_id, error)
+        if abandoned:
+            # It keeps its place until it has really stopped.
+            await asyncio.wait({body.exited})
+            run.abandoned_body_exited()
+
+    def _fail_held(self, claim: Any, run: Run, error: BaseException) -> None:
+        if run.holds_handle:
+            self._interrupted(claim.task_id, error)
+
+    def _run_ended(self, claim: Any, run: Run) -> None:
+        if run.holds_handle:
+            # On the abandoned-body retry path a newer run of this task can
+            # begin while this one still awaits `body.exited`; the table
+            # leaves the newer run's state alone when this stale one ends.
+            self._tasks.run_ended(run)
+        else:
+            self._forget_held(claim.task_run_id)
 
     def _interrupted(self, task_id: str, error: BaseException) -> None:
         self._tasks.failed(task_id, interrupted(f"task {task_id}", error))
@@ -685,35 +735,44 @@ class Session:
 
     async def _fold(self, claim: Any, body: RunningBody) -> None:
         try:
-            try:
-                folded = await body.outcome
-            except asyncio.CancelledError:
-                here = self._here.get(claim.task_run_id)
-                current = asyncio.current_task()
-                if here is None or (current is not None and current.cancelling()):
-                    raise
-                if not here.aborted:
-                    # The leader cancelled it: there is nothing to report.
-                    return
-                # Stopped at its abort deadline: failed, as a compaction lost
-                # with its process is, once its body has really stopped.
-                await asyncio.wait({body.exited})
-                raise TaskProcessLost(
-                    "the compaction was stopped at its abort deadline"
-                ) from None
+            folded = await self._folded(claim, body)
         except Exception as error:
-            kind = _kind_of(error)
-            _logger.warning("compaction of %s failed with %s", claim.definition_id, kind)
-            _logger.debug("compaction of %s failed", claim.definition_id, exc_info=error)
-            try:
-                self._runtime.report_failure(claim.task_run_id, kind)
-            except Exception as refusal:
-                _logger.warning(
-                    "the leader did not record the failed compaction of %s: %s",
-                    claim.definition_id,
-                    type(refusal).__name__,
-                )
+            self._compaction_failed(claim, error)
             return
+        if folded is not None:
+            self._hand_fold_to_leader(claim, folded)
+
+    async def _folded(self, claim: Any, body: RunningBody) -> bytes | None:
+        """The folded payload, or `None` if the leader cancelled the
+        compaction, which leaves nothing to report. A compaction stopped at
+        its abort deadline raises `TaskProcessLost` once its body has really
+        stopped, as one lost with its process does."""
+        try:
+            return await body.outcome
+        except asyncio.CancelledError:
+            here = self._here.get(claim.task_run_id)
+            current = asyncio.current_task()
+            if here is None or (current is not None and current.cancelling()):
+                raise
+            if not here.aborted:
+                return None
+            await asyncio.wait({body.exited})
+            raise TaskProcessLost("the compaction was stopped at its abort deadline") from None
+
+    def _compaction_failed(self, claim: Any, error: Exception) -> None:
+        kind = _kind_of(error)
+        _logger.warning("compaction of %s failed with %s", claim.definition_id, kind)
+        _logger.debug("compaction of %s failed", claim.definition_id, exc_info=error)
+        try:
+            self._runtime.report_failure(claim.task_run_id, kind)
+        except Exception as refusal:
+            _logger.warning(
+                "the leader did not record the failed compaction of %s: %s",
+                claim.definition_id,
+                type(refusal).__name__,
+            )
+
+    def _hand_fold_to_leader(self, claim: Any, folded: bytes) -> None:
         try:
             self._runtime.complete_compaction(claim.task_run_id, folded)
         except Exception as refusal:
@@ -731,6 +790,10 @@ class Session:
         over (an ephemeral one, or a non-retriable one that may have had its
         effects). A refused report ends the task here too; failing a handle
         the leader already settled changes nothing."""
+        if not run.outcome_counts:
+            # Cancelled first, the leader's `cancelled` event settles the
+            # handle, as for a cancelled body that failed.
+            return
         _logger.warning("task %s was lost with the process that ran it", claim.task_id)
         try:
             replayed = self._runtime.report_lost(claim.task_run_id)

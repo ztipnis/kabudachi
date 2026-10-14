@@ -76,6 +76,10 @@ class LifecycleHook:
     def described(self) -> str:
         return f"{self.kind.value} hook {self.name}"
 
+    def runs_for(self, queue: str | None) -> bool:
+        """Whether it is called for runs on `queue`; `None` asks for every hook."""
+        return queue is None or self.queues is None or queue in self.queues
+
 
 class HookRegistry:
     """Hooks, in the order they were declared."""
@@ -101,10 +105,7 @@ class HookRegistry:
         """The hooks of `kind`, in the order declared; given `queue`, only
         those called for that queue's runs."""
         return tuple(
-            hook
-            for hook in self._hooks
-            if hook.kind is kind
-            and (queue is None or hook.queues is None or queue in hook.queues)
+            hook for hook in self._hooks if hook.kind is kind and hook.runs_for(queue)
         )
 
 
@@ -192,21 +193,20 @@ async def initialize_process(hooks: HookRegistry) -> None:
     is the start's own cancellation."""
     for hook in hooks.of_kind(HookKind.PROCESS_INIT):
         try:
-            if hook.is_async:
-                await hook.func()
-            else:
-                hook.func()
-        except asyncio.CancelledError as error:
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
-                raise  # the start itself was stopped
-            raise _startup_failed(hook, error) from error
-        except KeyboardInterrupt as error:
-            if may_be_ctrl_c():
+            await _call_on_loop(hook)
+        except BaseException as error:
+            if _stops_the_start(error):
                 raise
             raise _startup_failed(hook, error) from error
-        except BaseException as error:
-            raise _startup_failed(hook, error) from error
+
+
+def _stops_the_start(error: BaseException) -> bool:
+    """Whether a `process_init` hook's error is let through as itself: the
+    start's own cancellation, or a `KeyboardInterrupt` that can be a Ctrl-C."""
+    if isinstance(error, asyncio.CancelledError):
+        current = asyncio.current_task()
+        return current is not None and current.cancelling() > 0
+    return isinstance(error, KeyboardInterrupt) and may_be_ctrl_c()
 
 
 def _startup_failed(hook: LifecycleHook, error: BaseException) -> StartupError:
@@ -272,10 +272,8 @@ class RunHooks:
             try:
                 _call_from_thread(hook, self.context, outcome)
             except BaseException as error:
-                self._cleanup_failed(hook, error)
+                escaped = self._after_failed(hook, error, escaped)
                 failed = True
-                if escaped is None and not isinstance(error, Exception):
-                    escaped = error
         if failed:
             self.recycle()
         return escaped
@@ -288,12 +286,20 @@ class RunHooks:
             try:
                 await _call_on_loop(hook, self.context, outcome)
             except BaseException as error:
-                self._cleanup_failed(hook, error)
+                escaped = self._after_failed(hook, error, escaped)
                 failed = True
-                if escaped is None and not isinstance(error, Exception):
-                    escaped = error
         if failed:
             self.recycle()
+        return escaped
+
+    def _after_failed(
+        self, hook: LifecycleHook, error: BaseException, escaped: BaseException | None
+    ) -> BaseException | None:
+        """Logs an `after_run` hook's failure. Returns the error to raise once
+        every hook has run: the first that is not an `Exception`."""
+        self._cleanup_failed(hook, error)
+        if escaped is None and not isinstance(error, Exception):
+            return error
         return escaped
 
     def _cleanup_failed(self, hook: LifecycleHook, error: BaseException) -> None:
