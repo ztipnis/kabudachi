@@ -953,6 +953,9 @@ pub enum TaskStanding {
         run: TaskRunId,
         digest: Digest,
         persistence: Option<PersistenceState>,
+        /// The digest of the blob holding the result's manifest, when the
+        /// run's worker stored the result in the shard as blobs.
+        result_manifest: Option<Digest>,
     },
 }
 
@@ -983,6 +986,7 @@ pub fn task_standing(record: Option<&generated::TaskRecord>) -> TaskStanding {
                 run: run_id,
                 digest,
                 persistence: PersistenceState::try_from(run.persistence()).ok(),
+                result_manifest: run.result_manifest.as_ref().and_then(|manifest| Digest::try_from(manifest).ok()),
             },
             _ => TaskStanding::Unknown,
         },

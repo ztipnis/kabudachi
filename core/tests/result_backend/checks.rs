@@ -227,7 +227,21 @@ fn a_task_stands_where_its_newest_run_does() {
             run: TaskRunId::new("a"),
             digest: Digest::blake3(b"result"),
             persistence: Some(PersistenceState::Pending),
+            result_manifest: None,
         }
+    );
+    assert_eq!(
+        task_standing(Some(&record(vec![generated::TaskRun {
+            result_manifest: Some(Digest::blake3(b"manifest").into()),
+            ..certified("a", generated::PersistenceState::Stored)
+        }]))),
+        TaskStanding::Succeeded {
+            run: TaskRunId::new("a"),
+            digest: Digest::blake3(b"result"),
+            persistence: Some(PersistenceState::Stored),
+            result_manifest: Some(Digest::blake3(b"manifest")),
+        },
+        "a result stored as blobs names the blob that holds its manifest"
     );
     assert_eq!(
         task_standing(Some(&record(vec![certified(
@@ -238,6 +252,7 @@ fn a_task_stands_where_its_newest_run_does() {
             run: TaskRunId::new("a"),
             digest: Digest::blake3(b"result"),
             persistence: None,
+            result_manifest: None,
         },
         "a run certified before a worker could say shows no state"
     );

@@ -53,7 +53,11 @@ fn a_certified_run_is_pending_until_its_worker_says_how_its_mirror_went() {
             &run,
             Digest::blake3(b"out"),
             Completion::Final,
-            Reported { delivered: false, persistence: PersistenceState::Pending },
+            Reported {
+                delivered: false,
+                persistence: PersistenceState::Pending,
+                result_manifest: None,
+            },
         )
         .unwrap();
     assert_eq!(persistence_of(&fixture, &run), generated::PersistenceState::Pending);

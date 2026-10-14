@@ -124,6 +124,9 @@ pub enum Report {
         delivered: bool,
         continuation: Option<Step>,
         persistence: PersistenceState,
+        /// The digest of the blob holding the result's manifest, when the
+        /// result was stored in the shard as blobs.
+        result_manifest: Option<Digest>,
     },
     /// How mirroring `run`'s certified result went: `Stored` or `Failed`.
     Persisted { run: TaskRunId, state: PersistenceState },
@@ -627,7 +630,7 @@ impl<'n> Executing<'n> {
                     incompatible,
                 })
             }
-            Report::Completed { run, digest, delivered, continuation, persistence } => {
+            Report::Completed { run, digest, delivered, continuation, persistence, result_manifest } => {
                 self.ended(&run);
                 task_request::Request::Completed(ReportCompleted {
                     task_run_id: Some(run.into()),
@@ -635,6 +638,7 @@ impl<'n> Executing<'n> {
                     delivered,
                     continuation: continuation.as_ref().map(StepDescription::from),
                     persistence: generated::PersistenceState::from(persistence) as i32,
+                    result_manifest: result_manifest.map(Into::into),
                 })
             }
             // The run ended at `Completed`.

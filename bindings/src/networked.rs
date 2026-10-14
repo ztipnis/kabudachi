@@ -503,6 +503,7 @@ impl NetworkedRuntime {
                 delivered: false,
                 continuation: None,
                 persistence,
+                result_manifest: None,
             }),
         }
         Ok(())
@@ -881,11 +882,12 @@ impl NetworkedRuntime {
     /// composite.
     fn resume_task<'py>(&self, py: Python<'py>, task_id: String) -> PyResult<Bound<'py, PyAny>> {
         let net = Arc::clone(&self.shared.net);
+        let runtime_ttl_ms = self.shared.result_ttl_ms;
         let backend = self.shared.backend.clone();
         self.host.bridge().spawn_into_py(py, async move {
             let task = TaskId::new(task_id);
             let record = net.get_record(task.clone()).await;
-            let (composite, resumption) = resume_task(task, record, &NetSource::new(net), backend).await;
+            let (composite, resumption) = resume_task(task, record, &NetSource::new(net), backend, runtime_ttl_ms).await;
             Ok(ResumedValue(composite, resumption))
         })
     }

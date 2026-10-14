@@ -223,3 +223,51 @@ def test_a_networked_worker_mirrors_what_its_leader_certified_and_the_shard_says
     assert persistence == "stored"
     assert f"task/{task_id}" in backend.entries
     assert (resumed.state, resumed.payload) == ("succeeded", b"the-result")
+
+
+class ForgetfulBackend(DictBackend):
+    """A backend that keeps nothing while `remembering` is false."""
+
+    remembering = False
+
+    async def store(self, key, entry, expires_at):
+        if self.remembering:
+            await super().store(key, entry, expires_at)
+
+
+def test_a_result_the_backend_lost_is_resumed_from_the_shards_blobs_and_mirrored_again():
+    # More than fits one message, so the worker stores it in the shard as blobs.
+    result = bytes(index % 251 for index in range(1_100_000))
+    backend = ForgetfulBackend()
+    with running_loop() as loop:
+        native = _native.NetworkedRuntime(
+            NetworkedArguments(
+                "results",
+                "/ip4/127.0.0.1/tcp/0",
+                heartbeat_interval_ms=100,
+                heartbeat_timeout_ms=1000,
+                reconnect_timeout_ms=2000,
+            ),
+            _native.PythonResultBackend(backend, loop),
+        )
+
+        async def main():
+            await asyncio.wait_for(native.wait_until_ready(), 5)
+            task_id = await run_one_task(native, result)
+            await persistence_once_settled(native, task_id)
+            lost = dict(backend.entries)
+            backend.remembering = True
+            resumed = await native.resume_task(task_id)
+            deadline = time.monotonic() + 5
+            while f"task/{task_id}" not in backend.entries and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            return task_id, lost, resumed
+
+        try:
+            task_id, lost, resumed = asyncio.run(main())
+        finally:
+            native.shutdown()
+
+    assert lost == {}
+    assert (resumed.state, resumed.payload, resumed.definition_id) == ("succeeded", result, "billing.charge")
+    assert f"task/{task_id}" in backend.entries

@@ -57,6 +57,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
             delivered: false,
             continuation: None,
             persistence: PersistenceState::Disabled,
+            result_manifest: None,
         });
         let leader_net = nets[leader].clone();
         shard

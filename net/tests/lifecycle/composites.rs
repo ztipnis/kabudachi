@@ -300,6 +300,7 @@ async fn a_run_that_returns_a_step_is_certified_with_it_and_its_task_ends_only_w
             delivered: false,
             continuation: Some(step),
             persistence: PersistenceState::Disabled,
+            result_manifest: None,
         });
 
         // The leader certifies the run and starts the step as a composite

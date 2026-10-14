@@ -40,12 +40,15 @@ pub enum Completion {
 }
 
 /// What a worker reports with a run's success besides its digest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reported {
     /// The result reached its task's client first.
     pub delivered: bool,
     /// Whether the worker will mirror the result (`Pending`) or not (`Disabled`).
     pub persistence: PersistenceState,
+    /// The digest of the blob holding the result's manifest, when the worker
+    /// stored the result in the shard as blobs.
+    pub result_manifest: Option<Digest>,
 }
 
 impl Default for Reported {
@@ -53,6 +56,7 @@ impl Default for Reported {
         Self {
             delivered: false,
             persistence: PersistenceState::Disabled,
+            result_manifest: None,
         }
     }
 }
@@ -201,13 +205,24 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         let Reported {
             delivered,
             persistence,
+            result_manifest,
         } = reported;
-        self.certify_owned(worker, run_id, result_digest, completion, delivered, Some(persistence))
+        self.certify_owned(
+            worker,
+            run_id,
+            result_digest,
+            completion,
+            delivered,
+            Some(persistence),
+            result_manifest,
+        )
     }
 
     /// Certifies `worker`'s running run. `persistence` is what the run records
     /// about mirroring its result; `None` leaves it unspecified, as when a
     /// rebuild adopts a result and cannot know whether its worker mirrors.
+    /// `result_manifest` is recorded only for a final run.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn certify_owned(
         &mut self,
         worker: &WorkerId,
@@ -216,6 +231,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         completion: Completion,
         delivered: bool,
         persistence: Option<PersistenceState>,
+        result_manifest: Option<Digest>,
     ) -> Result<Certification, ReportRejection> {
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);
@@ -241,6 +257,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             Completion::Continues(_) => persistence.map(|_| PersistenceState::Disabled),
             Completion::Final => persistence,
         };
+        if matches!(completion, Completion::Final) {
+            run.result_manifest = result_manifest.map(Into::into);
+        }
         if let Some(state) = persistence {
             run.persistence = generated::PersistenceState::from(state) as i32;
         }

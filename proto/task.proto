@@ -162,4 +162,11 @@ message TaskRun {
   // Set when the run is certified, and again when its worker reports how
   // mirroring went.
   PersistenceState persistence = 17;
+  // Set on a SUCCEEDED run whose result its worker stored in the shard as
+  // blobs: the digest of the blob that holds the result's manifest, owned by
+  // the task. A reader who needs the result and finds it nowhere else fetches
+  // that blob, then the blobs it names, and checks the joined payload against
+  // `result_digest`. Unset for a result sent inline, and for runs certified
+  // before workers said.
+  Digest result_manifest = 19;
 }

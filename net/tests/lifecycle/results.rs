@@ -172,6 +172,7 @@ impl Delivering {
             delivered,
             continuation: None,
             persistence: PersistenceState::Disabled,
+            result_manifest: None,
         });
     }
 

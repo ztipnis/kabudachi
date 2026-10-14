@@ -9,7 +9,8 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::manifest::Failure;
+use kabudachi_core::blob::{BlobKey, BlobOwner};
+use kabudachi_core::manifest::{Failure, Manifest};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated;
 use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, TaskRunId};
@@ -332,13 +333,17 @@ async fn read_backend<T: Send + 'static>(
 }
 
 /// How `task` stands and, if it succeeded, its value: from `backend`, checked
-/// against the record. A task that returned a step resumes as its composite.
-/// Returns the composite as well when it did.
+/// against the record, or else from the blobs its worker stored in the shard
+/// when the record names them, which are then mirrored to `backend` again
+/// (never over an entry it holds complete) for `runtime_ttl_ms`, or the
+/// task's own retention. A task that returned a step resumes as its
+/// composite. Returns the composite as well when it did.
 pub(crate) async fn resume_task(
     task: TaskId,
     record: Option<TaskRecord>,
     source: &impl CompositeSource,
     backend: Option<Arc<dyn ResultBackend>>,
+    runtime_ttl_ms: u64,
 ) -> (Option<CompositeId>, Resumption) {
     match task_standing(record.as_ref()) {
         TaskStanding::Unknown => (None, Resumption::Unknown),
@@ -355,24 +360,66 @@ pub(crate) async fn resume_task(
             let resumption = resume_composite(composite.clone(), source, backend).await;
             (Some(composite), resumption)
         }
-        TaskStanding::Succeeded { run, digest, persistence } => {
+        TaskStanding::Succeeded { run, digest, persistence, result_manifest } => {
             let key = format!("task/{}", task.as_str());
-            let definition = record
-                .as_ref()
-                .and_then(|record| record.task.as_ref())
-                .map(|task| task.task_definition_id());
+            let task_record = record.as_ref().and_then(|record| record.task.as_ref());
+            let definition = task_record.map(|task| task.task_definition_id());
+            let task_ttl_ms = task_record.and_then(|task| task.result_ttl_ms);
             let owner = task.clone();
-            let read = read_backend(backend, key, move |backend| {
-                read_task_value(backend, &owner, &run, &digest)
+            let (read_run, read_digest) = (run.clone(), digest.clone());
+            let read = read_backend(backend.clone(), key, move |backend| {
+                read_task_value(backend, &owner, &read_run, &read_digest)
             })
             .await;
             let resumption = match read {
                 Read::Found(payload) => Resumption::Value { definition, payload, persistence },
-                Read::Missing(reason) => Resumption::Unavailable { reason, persistence },
+                Read::Missing(reason) => {
+                    let shard = match &result_manifest {
+                        Some(manifest) => shard_value(source, &task, manifest, &digest).await,
+                        None => None,
+                    };
+                    match shard {
+                        Some(payload) => {
+                            // A result kept for no time is not put back.
+                            if let (Some(backend), true) = (backend, task_ttl_ms != Some(0)) {
+                                let mirror_back = Mirror {
+                                    task,
+                                    run,
+                                    digest,
+                                    payload: payload.clone(),
+                                    keep_for: keep_for(task_ttl_ms, runtime_ttl_ms),
+                                };
+                                tokio::spawn(async move {
+                                    mirror(backend, move || mirror_back.entries()).await;
+                                });
+                            }
+                            Resumption::Value { definition, payload, persistence }
+                        }
+                        None => Resumption::Unavailable { reason, persistence },
+                    }
+                }
             };
             (None, resumption)
         }
     }
+}
+
+/// The value of `task`, read from the blobs its worker stored in the shard:
+/// the blob named by `manifest_digest` holds the manifest of the chunks. `None`
+/// unless every blob is found and the joined bytes are the result `digest`
+/// certifies.
+async fn shard_value(
+    source: &impl CompositeSource,
+    task: &TaskId,
+    manifest_digest: &Digest,
+    digest: &Digest,
+) -> Option<Vec<u8>> {
+    let owner = BlobOwner::Task(task.clone());
+    let encoded = source.blob(&owner, &BlobKey::from(manifest_digest)).await?;
+    let manifest = Manifest::decode(&encoded).ok()?;
+    manifest.check_cut_payload().ok()?;
+    let payload = source.payload(&owner, &manifest).await.ok()?;
+    (&Digest::blake3(&payload) == digest).then_some(payload)
 }
 
 /// How composite `id` stands and, once it succeeded, its results: from

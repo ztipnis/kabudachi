@@ -917,11 +917,12 @@ impl NativeRuntime {
     /// returned a step resumes as its composite.
     fn resume_task<'py>(&self, py: Python<'py>, task_id: String) -> PyResult<Bound<'py, PyAny>> {
         let door = Arc::clone(&self.door);
+        let runtime_ttl_ms = self.result_ttl_ms;
         let backend = self.backend.clone();
         self.bridge.spawn_into_py(py, async move {
             let task = TaskId::new(task_id);
             let record = door.task_record(&task)?;
-            let (composite, resumption) = resume_task(task, record, &DoorSource(&door), backend).await;
+            let (composite, resumption) = resume_task(task, record, &DoorSource(&door), backend, runtime_ttl_ms).await;
             Ok(ResumedValue(composite, resumption))
         })
     }

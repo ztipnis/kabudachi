@@ -175,6 +175,7 @@ pub fn first_attempt(
         failure_message: String::new(),
         continuation: None,
         persistence: generated::PersistenceState::Unspecified as i32,
+        result_manifest: None,
     }
 }
 
@@ -202,6 +203,7 @@ pub fn retry_of(failed: &TaskRun, ids: &impl IdGenerator, at: WallTime) -> TaskR
         failure_message: String::new(),
         continuation: None,
         persistence: generated::PersistenceState::Unspecified as i32,
+        result_manifest: None,
     }
 }
 

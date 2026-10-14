@@ -94,6 +94,7 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
             delivered: false,
             continuation: None,
             persistence: PersistenceState::Disabled,
+            result_manifest: None,
         });
         shard
             .drive_until(poll_until("the successor certified the run", || {

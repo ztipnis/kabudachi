@@ -229,6 +229,7 @@ impl Net {
             delivered: false,
             continuation: None,
             persistence: generated::PersistenceState::from(persistence) as i32,
+            result_manifest: None,
         }))
         .await
     }
@@ -262,6 +263,7 @@ impl Net {
             delivered: false,
             continuation: Some(StepDescription::from(step)),
             persistence: generated::PersistenceState::Disabled as i32,
+            result_manifest: None,
         }))
         .await
     }
@@ -1017,9 +1019,16 @@ fn completed<C: Clock, I: IdGenerator, O: Observer>(
             _ => return Err(TaskRejectReason::TaskRejectMalformed),
         },
     };
+    let result_manifest = report
+        .result_manifest
+        .as_ref()
+        .map(|manifest| wire::digest(Some(manifest)))
+        .transpose()
+        .map_err(|Malformed| TaskRejectReason::TaskRejectMalformed)?;
     let reported = Reported {
         delivered: report.delivered,
         persistence: PersistenceState::try_from(report.persistence()).unwrap_or(PersistenceState::Disabled),
+        result_manifest,
     };
     scheduler
         .complete_reported(from, &run, digest, completion, reported)

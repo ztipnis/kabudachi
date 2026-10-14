@@ -82,6 +82,9 @@ message ReportCompleted {
   // worker will mirror the result once the run is certified, and report how
   // that went with ReportPersisted.
   PersistenceState persistence = 5;
+  // Set when the result was stored in the shard as blobs: the digest of the
+  // blob holding its manifest (see `TaskRun.result_manifest`).
+  Digest result_manifest = 6;
 }
 
 // How mirroring a certified run's result went: PERSISTENCE_STATE_STORED or
