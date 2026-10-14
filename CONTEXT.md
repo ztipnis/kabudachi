@@ -101,6 +101,14 @@ _Avoid_: leader state
 A node's request to leave its shard gracefully, from when it is asked until the node drains: kept while the node cannot drain yet, and, while it leads, held until every other voter has reported a routing crawl or its drain wait limit passes. It decides only when the node drains; the node carries the departure out, and the leader office supplies a draining leader's announcement.
 _Avoid_: drain state, pending drain
 
+**Contact floor**:
+The earliest time a rival leader could have won office, as a worker knows it: raised when a leader vouches for hearing the worker, and to the end of any grant the worker holds. A worker with no contact floor cannot name an abort deadline for a run it starts. A worker claims for its own runs only once it has one. In code `Lease::has_contact_floor`.
+_Avoid_: lease floor
+
+**Leadership transfer**:
+A leader's hand-over of office to a successor it asked to stand. The leader holds no grant until the hand-over's deadline; if it still holds office then, it leads again, or, draining, departs. In code `Transfer` (`core/src/election/transfer.rs`).
+_Avoid_: handoff, step-down
+
 **Lease change**:
 A grant or abort-deadline change the lease reports, which the node turns into its grant output or its abort-deadline output.
 
@@ -193,6 +201,28 @@ The scheduler's private parts for pending tasks, the payload memory of unfinishe
 **Scheduler reconciliation**:
 The scheduler's private part for what a rebuild left it: the office it reconciles for until that office's grant (only that grant takes effect, and it applies the losses of workers reported lost meanwhile that the rebuild did not hear from), the workers the rebuild heard from, and the tasks whose newest record is not known yet, with their coalescing keys, the records held back with those keys and the reports held for them. It decides nothing about tasks it does not hold back; installing records is the scheduler's.
 _Avoid_: rebuild state, uncertainty table
+
+## Composites and results
+
+**Composite**:
+A flow, group, map or reduce that the shard's leader drives, as its submitter described it (`CompositeKind`). Its members are tasks the leader creates; it ends when its members have, and it is Running, Succeeded, Failed or Cancelled (`CompositeState`).
+_Avoid_: pipeline, job
+
+**Composite page**:
+One page of a composite's member outcomes, holding up to 1,024 entries (`PAGE_ENTRIES`). A full page is written once; every page is rewritten as finished when the composite ends, so a holder can retire it.
+
+**Blob**:
+Bytes of at most 256 KiB (a chunk of a payload too large for one message) stored under the BLAKE3 digest of their content, for an owner, a task or a composite, whose lifetime bounds theirs. Two owners of the same bytes share one blob.
+
+**Manifest**:
+The ordered list that stands in for a large payload or a list of outcomes. For a payload, it names its blobs in order with the total length; for a list of outcomes, its entries are inline results, failures, or pages of further entries (`core/src/manifest.rs`).
+
+**Expansion run**:
+The internal run of the task `kabudachi.expand` that splits a list into one blob per item, so a map or reduce can create a member per item. A user task may not take that name.
+
+**Conclusion**:
+What a leader owes a task's client when the task ends: the task's outcome, to be told once the revision that ended the task is stored (`Conclusion`, drained with `Scheduler::take_conclusions`).
+_Avoid_: result (a conclusion may be a failure)
 
 ## The Python runtime
 
