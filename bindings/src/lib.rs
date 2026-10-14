@@ -2,6 +2,7 @@ use kabudachi_core::protocol::digest::Digest;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+mod arguments;
 mod bridge;
 mod door;
 mod election;

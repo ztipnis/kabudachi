@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 from kabudachi import _native
+from kabudachi.native_protocol import OneNodeArguments
 
 
 def _read_failure(future):
@@ -48,12 +49,28 @@ class FaultingRuntime:
     def __getattr__(self, name):
         return getattr(self.native, name)
 
-    def submit(self, definition_id, source_version, serialized_input, queue, kind, key, **options):
-        task_id = self.native.submit(
-            definition_id, source_version, serialized_input, queue, kind, key, **options
+    def submit(self, submission):
+        task_id = self.native.submit(submission)
+        self.submitted.append(
+            (
+                task_id,
+                submission.definition_id,
+                submission.source_version,
+                submission.serialized_input,
+                submission.settings.queue,
+            )
         )
-        self.submitted.append((task_id, definition_id, source_version, serialized_input, queue))
-        self.submit_options.append({"kind": kind, "key": key, **options})
+        self.submit_options.append(
+            {
+                "kind": submission.kind,
+                "key": submission.key,
+                "retries": submission.retries,
+                "delay_ms": submission.options.delay_ms,
+                "expires_in_ms": submission.options.expires_in_ms,
+                "drop_oldest": submission.drop_oldest,
+                "reconnect_timeout_ms": submission.settings.reconnect_timeout_ms,
+            }
+        )
         # Holds this call open after the task exists. `time.sleep` blocks the
         # event loop, so no worker on it can claim meanwhile: this only widens
         # the window for a cancel arriving from another thread.
@@ -186,9 +203,10 @@ class FaultingNative(FaultingRuntime):
 
     instances = []
 
-    def __init__(self, worker_id="worker", incarnation_id="incarnation", **options):
-        super().__init__(_native.NativeRuntime(worker_id, incarnation_id, **options))
-        self.options = options
+    def __init__(self, worker_id="worker", incarnation_id="incarnation", arguments=None):
+        arguments = arguments or OneNodeArguments()
+        super().__init__(_native.NativeRuntime(worker_id, incarnation_id, arguments))
+        self.arguments = arguments
         self.leader_error = None
         self.shutdowns = 0
         FaultingNative.instances.append(self)

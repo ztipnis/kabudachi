@@ -3,12 +3,10 @@ use std::time::Duration;
 
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{
-    IncarnationId, ShardName, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId,
+    IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
 use kabudachi_core::protocol::worker_state::WorkerState;
-use kabudachi_core::scheduler::{
-    Completion, MemoryLimits, ReportRejection, Scheduler, Submission, SubmitRejection,
-};
+use kabudachi_core::scheduler::{Completion, ReportRejection, Scheduler, SubmitRejection};
 use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -17,26 +15,32 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
+use crate::arguments::{SubmitArguments, memory_limits};
 use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::door::{Closed, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
 use crate::errors;
 use crate::local_node::local_node;
-use crate::outcomes::{PyCancelOutcome, PyRunState, coalescing};
+use crate::outcomes::{PyCancelOutcome, PyRunState};
 use crate::timers::run_timers;
 use crate::work::{PyCertification, PyClaim, PyEvent};
 
-const DEFAULT_WORKER_THREADS: usize = 2;
-/// A lone worker has no peer to wait for, so it starts electing itself at
-/// once, and leads once its one-voter roll call closes a millisecond later.
-const DEFAULT_SUSPECT_TIMEOUT_MS: u64 = 0;
 /// The shard of a process that runs no cluster: just this worker.
 const LOCAL_SHARD_NAME: &str = "local";
-/// Finished tasks are kept this long unless the caller says otherwise.
-const DEFAULT_RESULT_TTL_MS: u64 = 60 * 60 * 1000;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 const ELECTION_STOPPED_MESSAGE: &str = "the election task stopped unexpectedly";
+
+/// How a one-node runtime runs, read from the attributes of a
+/// `kabudachi.native_protocol.OneNodeArguments`.
+#[derive(FromPyObject)]
+pub(crate) struct OneNodeArguments {
+    worker_threads: usize,
+    suspect_timeout_ms: u64,
+    result_ttl_ms: u64,
+    memory_soft_limit: Option<u64>,
+    memory_hard_limit: Option<u64>,
+}
 
 /// The native side of kabudachi for one worker: a Tokio runtime that keeps
 /// the worker's leadership election going, the scheduler that hands out and
@@ -69,53 +73,24 @@ impl NativeRuntime {
     /// Starts the runtime and begins electing this worker leader.
     ///
     /// `worker_id` and `incarnation_id` identify this worker and this start
-    /// of it. `worker_threads` sizes the Tokio thread pool.
-    /// `suspect_timeout_ms` is how long the worker waits, with no leader to
-    /// hear from, before it elects itself; with 0, the default, it leads a
-    /// millisecond after it starts, when its one-voter roll call closes.
-    /// `result_ttl_ms` is how long a finished task is kept before it is
-    /// forgotten. `memory_soft_limit` and `memory_hard_limit` are in bytes of
-    /// serialized task input: past the soft one `next_events()` reports
-    /// an `EventKind.SLOW_DOWN` event with `active` set,
-    /// and past the hard one `submit` raises `kabudachi._native.BackpressureError`
-    /// (re-exported by `kabudachi.errors`). Both or neither must be given,
-    /// and the soft one must not be above the hard one, which
-    /// `kabudachi.configure` checks before the values reach here.
+    /// of it. `arguments` is a `kabudachi.native_protocol.OneNodeArguments`,
+    /// which says how the runtime runs and what each of its fields means.
     ///
     /// Raises `ValueError` if `worker_threads` is zero or only one of the two
     /// memory limits is given.
     #[new]
-    #[pyo3(signature = (
-        worker_id,
-        incarnation_id,
-        worker_threads = DEFAULT_WORKER_THREADS,
-        suspect_timeout_ms = DEFAULT_SUSPECT_TIMEOUT_MS,
-        result_ttl_ms = DEFAULT_RESULT_TTL_MS,
-        memory_soft_limit = None,
-        memory_hard_limit = None,
-    ))]
     fn new(
         worker_id: String,
         incarnation_id: String,
-        worker_threads: usize,
-        suspect_timeout_ms: u64,
-        result_ttl_ms: u64,
-        memory_soft_limit: Option<u64>,
-        memory_hard_limit: Option<u64>,
+        arguments: OneNodeArguments,
     ) -> PyResult<Self> {
-        if worker_threads == 0 {
+        if arguments.worker_threads == 0 {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));
         }
-        let limits = match (memory_soft_limit, memory_hard_limit) {
-            (None, None) => None,
-            (Some(soft), Some(hard)) => Some(MemoryLimits { soft, hard }),
-            _ => {
-                return Err(PyValueError::new_err("give both memory limits or neither"));
-            }
-        };
+        let limits = memory_limits(arguments.memory_soft_limit, arguments.memory_hard_limit)?;
 
         let tokio = Builder::new_multi_thread()
-            .worker_threads(worker_threads)
+            .worker_threads(arguments.worker_threads)
             .thread_name("kabudachi-native")
             .enable_time()
             .build()
@@ -133,9 +108,9 @@ impl NativeRuntime {
             IncarnationId::new(incarnation_id),
             &ShardName::new(LOCAL_SHARD_NAME),
             clock,
-            CoreDuration::from_millis(suspect_timeout_ms),
+            CoreDuration::from_millis(arguments.suspect_timeout_ms),
         );
-        let retention = CoreDuration::from_millis(result_ttl_ms);
+        let retention = CoreDuration::from_millis(arguments.result_ttl_ms);
         let mut new_scheduler =
             Scheduler::with_observer(clock, Uuid7Ids, LocalRecords::new(worker_id.clone(), clock, Some(retention)));
         new_scheduler.set_result_ttl(Some(retention));
@@ -208,95 +183,23 @@ impl NativeRuntime {
         })
     }
 
-    /// Records a new task and returns its ID. The task waits until a worker
-    /// claims it. Every call is a new task. `kind` is the task's `TaskKind`
-    /// value (`"task"`, `"ephemeral"` or `"coalescing"`); a coalescing task
-    /// always has a `key` (its default is `""`), and no other kind has one. A
-    /// run that fails is replaced by a new attempt up to `retries` times. With
-    /// `delay_ms` the task is not claimed before that long has passed; with
-    /// `expires_in_ms` it expires instead of running if it is still unclaimed
-    /// after that long. With `drop_oldest`, a coalescing task that would pass
-    /// the hard memory limit loses its key's oldest retained payloads to fit
-    /// instead of being refused. With `reconnect_timeout_ms`, a run of the
-    /// task may be replayed that long after its worker goes a suspicion
-    /// timeout unheard, instead of after the shard's reconnect timeout; it
-    /// must be positive.
+    /// Records a new task and returns its ID; `submission` says what it is
+    /// (see `kabudachi.native_protocol.SubmitArguments`). The task waits until
+    /// a worker claims it. Every call is a new task.
     ///
-    /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree or
-    /// `reconnect_timeout_ms` is zero,
-    /// `BackpressureError` if the task does not fit under the hard memory
-    /// limit, is too large to be claimed (about 1 MiB with its queue and
-    /// key), or, transiently, its coalescing key's newest generation is not
-    /// yet known to the scheduler (submit again shortly), and
-    /// `RuntimeError` if the runtime has shut down. Before this worker leads
-    /// the task is queued and its id returned at once; it is recorded, in
-    /// order, when the worker comes to lead. A task whose record cannot yet
-    /// fit stays queued, with everything behind it, until the generation it
-    /// supersedes ends, and no error is raised for it.
-    #[pyo3(signature = (
-        definition_id,
-        source_version,
-        serialized_input,
-        queue,
-        kind,
-        key,
-        *,
-        retries = 0,
-        delay_ms = None,
-        expires_in_ms = None,
-        drop_oldest = false,
-        reconnect_timeout_ms = None,
-    ))]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "each argument is a Python parameter"
-    )]
-    fn submit(
-        &self,
-        definition_id: &str,
-        source_version: u32,
-        serialized_input: &[u8],
-        queue: &str,
-        kind: &str,
-        key: Option<String>,
-        retries: u32,
-        delay_ms: Option<u64>,
-        expires_in_ms: Option<u64>,
-        drop_oldest: bool,
-        reconnect_timeout_ms: Option<u64>,
-        py: Python<'_>,
-    ) -> PyResult<String> {
-        let coalescing =
-            coalescing(kind, key, drop_oldest).map_err(PyValueError::new_err)?;
-        let mut submission = Submission::new(
-            TaskDefinitionId::new(definition_id),
-            source_version,
-            serialized_input.to_vec(),
-            queue,
-        )
-        .with_retries(retries);
-        if kind == "ephemeral" {
-            submission = submission.ephemeral();
-        }
-        if let Some(delay_ms) = delay_ms {
-            submission = submission.with_delay(CoreDuration::from_millis(delay_ms));
-        }
-        if let Some(expires_in_ms) = expires_in_ms {
-            submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
-        }
-        if let Some(reconnect_timeout_ms) = reconnect_timeout_ms {
-            if reconnect_timeout_ms == 0 {
-                return Err(PyValueError::new_err("reconnect_timeout_ms must be positive"));
-            }
-            submission =
-                submission.with_reconnect_timeout(CoreDuration::from_millis(reconnect_timeout_ms));
-        }
-        if let Some((key, drop_oldest)) = coalescing {
-            submission = submission.with_coalescing_key(key);
-            if drop_oldest {
-                submission = submission.with_drop_oldest();
-            }
-        }
+    /// Raises `ValueError` if the submission's `kind`, `key` and `drop_oldest`
+    /// disagree or its `reconnect_timeout_ms` is zero, `BackpressureError` if
+    /// the task does not fit under the hard memory limit, is too large to be
+    /// claimed (about 1 MiB with its queue and key), or, transiently, its
+    /// coalescing key's newest generation is not yet known to the scheduler
+    /// (submit again shortly), and `RuntimeError` if the runtime has shut
+    /// down. Before this worker leads the task is queued and its id returned
+    /// at once; it is recorded, in order, when the worker comes to lead. A
+    /// task whose record cannot yet fit stays queued, with everything behind
+    /// it, until the generation it supersedes ends, and no error is raised
+    /// for it.
+    fn submit(&self, py: Python<'_>, submission: SubmitArguments) -> PyResult<String> {
+        let submission = submission.into_submission(py)?;
         let task_id = self
             .door
             .submit(submission)

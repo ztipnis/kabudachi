@@ -29,6 +29,7 @@ from kabudachi.errors import (
     TaskTimeoutError,
 )
 from kabudachi.lifecycle import HookRegistry
+from kabudachi.native_protocol import OneNodeArguments
 from kabudachi.pool import ProcessPool, task_modules
 from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import process_serializers
@@ -300,7 +301,7 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
 
     async def main():
         pool = ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
-        native = _native.NativeRuntime("worker", "incarnation")
+        native = _native.NativeRuntime("worker", "incarnation", OneNodeArguments())
         runtime = FaultingRuntime(native)
         # Runs a shard's leader hands this worker, which settle no handle here.
         runtime.delivers_results = False
@@ -360,7 +361,9 @@ def test_a_compaction_handed_over_by_a_shard_ends_as_the_leader_says(markers, en
     async def main():
         pool = ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
         native = _native.NativeRuntime(
-            "worker", "incarnation", memory_soft_limit=400, memory_hard_limit=100_000
+            "worker",
+            "incarnation",
+            OneNodeArguments(memory_soft_limit=400, memory_hard_limit=100_000),
         )
         runtime = FaultingRuntime(native)
         # Runs a shard's leader hands this worker, which settle no handle here.

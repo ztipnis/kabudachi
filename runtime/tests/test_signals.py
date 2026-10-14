@@ -351,6 +351,7 @@ def test_task_processes_exit_when_their_worker_is_killed(pool_served):
 
 SERVE_SLOW_START_PROGRAM = textwrap.dedent(
     """
+    import dataclasses
     import json
     import signal
     import sys
@@ -368,8 +369,12 @@ SERVE_SLOW_START_PROGRAM = textwrap.dedent(
     class SlowToLead(FaultingNative):
         # The real runtime, built to wait out a suspicion timeout before it
         # leads, so a signal sent once it exists lands before leadership.
-        def __init__(self, *args, **options):
-            super().__init__(*args, suspect_timeout_ms=SUSPECT_TIMEOUT_MS, **options)
+        def __init__(self, worker_id, incarnation_id, arguments):
+            super().__init__(
+                worker_id,
+                incarnation_id,
+                dataclasses.replace(arguments, suspect_timeout_ms=SUSPECT_TIMEOUT_MS),
+            )
             print("started", flush=True)
 
         async def wait_until_leader(self):
@@ -476,6 +481,7 @@ def test_ctrl_c_interrupts_run_cleanly_and_run_works_again():
 
 INTERRUPT_BEFORE_LEADERSHIP_PROGRAM = textwrap.dedent(
     """
+    import dataclasses
     import json
     import sys
     from types import SimpleNamespace
@@ -490,8 +496,12 @@ INTERRUPT_BEFORE_LEADERSHIP_PROGRAM = textwrap.dedent(
 
 
     class SlowToLead(FaultingNative):
-        def __init__(self, *args, **options):
-            super().__init__(*args, suspect_timeout_ms=2000, **options)
+        def __init__(self, worker_id, incarnation_id, arguments):
+            super().__init__(
+                worker_id,
+                incarnation_id,
+                dataclasses.replace(arguments, suspect_timeout_ms=2000),
+            )
             print("started", flush=True)
 
 

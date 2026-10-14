@@ -16,7 +16,10 @@ py_library(
     srcs = ["faulting_runtime.py"],
     imports = ["."],
     visibility = ["//:__subpackages__"],
-    deps = ["//bindings:_native"],  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",  # keep
+    ],
 )
 
 # A session wired to a real native runtime, shared by the session, flow,

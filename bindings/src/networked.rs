@@ -23,346 +23,37 @@
 //! Python (`ABORT`) for a run it holds, and a run not yet taken is reported
 //! lost at once.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration as StdDuration, Instant as StdInstant};
+mod delivery;
+mod handover;
+mod host;
+mod observed;
+mod seam;
+mod start;
 
-use kabudachi_core::election::{ElectionTimings, Input, Step, WorkerNode};
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
+
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
-use kabudachi_core::protocol::ids::{ShardName, TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids, WorkerId};
-use kabudachi_core::protocol::messages::prelude::*;
-use kabudachi_core::protocol::messages::{TaskRejectReason, task_response};
-use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint};
-use kabudachi_core::time::{Duration as CoreDuration, RealClock};
-use kabudachi_net::executor::{Report, ReportSink, Work, WorkSource, executor_channel};
-use kabudachi_net::messenger::Net;
-use kabudachi_net::task_exchange::LeaderRetry;
-use kabudachi_net::worker::{AuthorityConfig, Multiaddr, Worker, WorkerConfig};
-use kabudachi_redis_authority::{RedisAuthority, RedisAuthorityConfig};
+use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids};
+use kabudachi_core::scheduler::mint;
+use kabudachi_core::time::RealClock;
+use kabudachi_net::executor::{Report, executor_channel};
+use kabudachi_net::worker::Worker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use tokio::runtime::{Builder, Handle, Runtime};
-use tokio::sync::{Notify, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::watch;
 
-use crate::bridge::{Bridge, CLOSED_MESSAGE};
-use crate::outcomes::{PyEventKind, coalescing};
-use crate::work::{PyClaim, PyEvent, PyTaskRecord};
+use crate::arguments::SubmitArguments;
+use crate::bridge::CLOSED_MESSAGE;
+use crate::work::PyTaskRecord;
 
-const DEFAULT_WORKER_THREADS: usize = 2;
-const DEFAULT_RESULT_TTL_MS: u64 = 60 * 60 * 1000;
-const SHUTDOWN_GRACE: StdDuration = StdDuration::from_secs(1);
-/// The default roll-call deadline, unless a quarter of the suspicion timeout
-/// is shorter: a roll call must close well inside it.
-const ROLL_CALL_DEADLINE_MS: u64 = 250;
-/// How a run the driver took back is reported: its body is being stopped,
-/// and nothing it ends with counts.
-const CANCELLED_KIND: &str = "TaskCancelledError";
-const MALFORMED_KIND: &str = "MalformedClaim";
-const GONE_MESSAGE: &str = "the worker left its shard";
+use self::delivery::{cancel_at_leader, send_submission};
+use self::host::Host;
+use self::observed::Observed;
+use self::seam::{GONE_MESSAGE, Shared};
+use self::start::NetworkedArguments;
+
 const REPORTED_POLL: StdDuration = StdDuration::from_millis(20);
-
-/// What the worker's node last showed.
-#[derive(Debug, Clone, Default, PartialEq)]
-struct Observed {
-    leader: Option<(WorkerId, u64)>,
-    voters: usize,
-    shard_id: String,
-    /// The worker is out of its shard: `Worker::run` ended, however it did.
-    gone: bool,
-}
-
-/// Marks the worker out of its shard when dropped: when `Worker::run`
-/// returns, and also when it panics or is aborted, so no wait outlives it.
-struct LeftOnDrop(Arc<watch::Sender<Observed>>);
-
-impl Drop for LeftOnDrop {
-    fn drop(&mut self) {
-        self.0.send_modify(|seen| seen.gone = true);
-    }
-}
-
-/// What passes between the driver and Python.
-#[derive(Default)]
-struct Seam {
-    /// Places offered to the driver that no run has used yet.
-    offered: u32,
-    /// Runs handed over that Python has not taken, oldest first.
-    handed: VecDeque<Claim>,
-    /// The task of every run Python took and has not ended.
-    held: BTreeMap<TaskRunId, TaskId>,
-    events: VecDeque<PyEvent>,
-    /// Tasks submitted here whose submission no leader has answered yet: a
-    /// cancel of one waits, so it never reaches a leader before the task.
-    delivering: BTreeSet<TaskId>,
-    /// Nothing more is taken: a run handed over is reported lost at once.
-    closed: bool,
-}
-
-struct Shared {
-    seam: Mutex<Seam>,
-    /// Woken whenever a claim or an event may be waiting.
-    changed: Notify,
-    reports: ReportSink,
-    net: Arc<Net>,
-    observed: watch::Receiver<Observed>,
-    /// How submissions and cancels keep asking the leader.
-    retry: LeaderRetry,
-}
-
-impl Shared {
-    fn seam(&self) -> MutexGuard<'_, Seam> {
-        self.seam.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Hands `report` to the driver. A driver that has stopped shows as the
-    /// worker leaving its shard, which every wait reports.
-    fn report(&self, report: Report) {
-        let _ = self.reports.report(report);
-    }
-
-    fn wake(&self) {
-        self.changed.notify_waiters();
-    }
-
-    /// Offers the driver the places `free` has that are neither offered nor
-    /// held by a run Python has not taken.
-    fn offer(&self, free: usize) {
-        let more = {
-            let mut seam = self.seam();
-            if seam.closed {
-                return;
-            }
-            let free = u32::try_from(free).unwrap_or(u32::MAX);
-            let waiting = u32::try_from(seam.handed.len()).unwrap_or(u32::MAX);
-            let more = free.saturating_sub(seam.offered.saturating_add(waiting));
-            seam.offered += more;
-            more
-        };
-        if more > 0 {
-            self.report(Report::Capacity(more));
-        }
-    }
-
-    fn on_work(&self, work: Work) {
-        let (report, wake) = {
-            let mut guard = self.seam();
-            // Through the guard once, so the arms borrow its fields apart.
-            let seam = &mut *guard;
-            match work {
-                Work::Run(wire) | Work::Compact(wire) => {
-                    seam.offered = seam.offered.saturating_sub(1);
-                    match Claim::try_from(&wire).ok() {
-                        Some(claim) if seam.closed => (Some(Report::Lost(claim.task_run_id)), false),
-                        Some(claim) => {
-                            seam.handed.push_back(claim);
-                            (None, true)
-                        }
-                        None => (
-                            wire.task_run_id.map(|run| Report::Failed {
-                                run: run.into(),
-                                reason: MALFORMED_KIND.into(),
-                            }),
-                            false,
-                        ),
-                    }
-                }
-                Work::Cancel(run) => {
-                    let unstarted = take_handed(&mut seam.handed, &run);
-                    match seam.held.remove(&run) {
-                        Some(task) => {
-                            seam.events.push_back(PyEvent::networked(
-                                PyEventKind::Cancelled,
-                                task.as_str(),
-                                run.as_str(),
-                            ));
-                            (
-                                Some(Report::Failed {
-                                    run,
-                                    reason: CANCELLED_KIND.into(),
-                                }),
-                                true,
-                            )
-                        }
-                        None if unstarted => (
-                            Some(Report::Failed {
-                                run,
-                                reason: CANCELLED_KIND.into(),
-                            }),
-                            false,
-                        ),
-                        None => (None, false),
-                    }
-                }
-                Work::Abort { run, deadline } => {
-                    if take_handed(&mut seam.handed, &run) {
-                        // Never started: nothing runs, so it is lost now.
-                        (Some(Report::Lost(run)), false)
-                    } else if let Some(task) = seam.held.get(&run) {
-                        let left = deadline
-                            .saturating_duration_since(StdInstant::now())
-                            .as_secs_f64();
-                        seam.events
-                            .push_back(PyEvent::abort(task.as_str(), run.as_str(), left));
-                        (None, true)
-                    } else {
-                        (None, false)
-                    }
-                }
-                Work::AbortWithdrawn(run) => match seam.held.get(&run) {
-                    Some(task) => {
-                        seam.events.push_back(PyEvent::networked(
-                            PyEventKind::AbortWithdrawn,
-                            task.as_str(),
-                            run.as_str(),
-                        ));
-                        (None, true)
-                    }
-                    None => (None, false),
-                },
-            }
-        };
-        if let Some(report) = report {
-            self.report(report);
-        }
-        if wake {
-            self.wake();
-        }
-    }
-
-    /// Up to `limit` runs handed over, now held by Python; `None` while
-    /// there are none, and none at all once nothing more is taken.
-    fn take_claims(&self, limit: usize) -> Option<Vec<PyClaim>> {
-        let mut seam = self.seam();
-        if seam.closed {
-            return Some(Vec::new());
-        }
-        if seam.handed.is_empty() {
-            return None;
-        }
-        let count = limit.min(seam.handed.len());
-        let claims: Vec<Claim> = seam.handed.drain(..count).collect();
-        for claim in &claims {
-            seam.held
-                .insert(claim.task_run_id.clone(), claim.task.task_id());
-        }
-        Some(claims.into_iter().map(PyClaim::from).collect())
-    }
-
-    fn take_events(&self) -> Option<Vec<PyEvent>> {
-        let mut seam = self.seam();
-        (!seam.events.is_empty()).then(|| seam.events.drain(..).collect())
-    }
-
-    fn holds(&self, run: &TaskRunId) -> bool {
-        self.seam().held.contains_key(run)
-    }
-
-    /// Ends a run Python held; `false` if it held none (the driver took it
-    /// back), and the report is then dropped.
-    fn end(&self, run: &TaskRunId) -> bool {
-        self.seam().held.remove(run).is_some()
-    }
-
-    /// Waits until `take` finds something, or the worker leaves its shard.
-    async fn until<T>(&self, take: impl Fn(&Shared) -> Option<T>) -> PyResult<T> {
-        let mut observed = self.observed.clone();
-        loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(found) = take(self) {
-                return Ok(found);
-            }
-            if observed.borrow_and_update().gone {
-                return Err(PyRuntimeError::new_err(GONE_MESSAGE));
-            }
-            tokio::select! {
-                () = &mut notified => {}
-                changed = observed.changed() => {
-                    if changed.is_err() {
-                        return Err(PyRuntimeError::new_err(GONE_MESSAGE));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Removes `run` from the runs not taken yet; whether it was there.
-fn take_handed(handed: &mut VecDeque<Claim>, run: &TaskRunId) -> bool {
-    let before = handed.len();
-    handed.retain(|claim| &claim.task_run_id != run);
-    handed.len() != before
-}
-
-/// Asks leaders to store `submitted` until one does or refuses it for
-/// good, and says which.
-async fn deliver(shared: Arc<Shared>, submitted: Submitted) {
-    let task = submitted.task_id.clone();
-    let answer = shared.net.submit_to_leader(submitted, shared.retry).await;
-    let event = answer.map(|response| match response.result {
-        Some(task_response::Result::Submitted(_)) => {
-            PyEvent::networked(PyEventKind::Accepted, task.as_str(), "")
-        }
-        Some(task_response::Result::Reject(reject)) => match TaskRejectReason::try_from(reject.reason) {
-            Ok(reason) => PyEvent::refused(task.as_str(), reason.as_str_name()),
-            Err(_) => PyEvent::refused(task.as_str(), "a reason this worker cannot read"),
-        },
-        _ => PyEvent::refused(task.as_str(), "an answer that is not about a submission"),
-    });
-    {
-        // Out of its shard, no leader will answer: nothing is said, but a
-        // cancel waiting for this submission must not wait for ever.
-        let mut seam = shared.seam();
-        seam.delivering.remove(&task);
-        seam.events.extend(event);
-    }
-    shared.wake();
-}
-
-/// Asks leaders to cancel `task` until one answers, once its own submission
-/// from here (if any) has been answered. How the cancel ended is not
-/// reported: a run it stopped is ended by the driver's `Cancel`, wherever
-/// it runs, and a task it found finished or unknown needs nothing.
-async fn cancel_at_leader(shared: Arc<Shared>, task: TaskId) {
-    while shared.seam().delivering.contains(&task) {
-        if shared.net.has_left_shard() {
-            return;
-        }
-        tokio::time::sleep(shared.retry.ask_again_after).await;
-    }
-    let _ = shared.net.cancel_at_leader(task, shared.retry).await;
-}
-
-fn publish(sender: &watch::Sender<Observed>, node: &WorkerNode<RealClock>) {
-    let now = Observed {
-        leader: node.known_leader(),
-        voters: node.voters().len(),
-        shard_id: node.shard_id().as_str().to_owned(),
-        gone: false,
-    };
-    sender.send_if_modified(|seen| {
-        let changed = *seen != now;
-        if changed {
-            *seen = now.clone();
-        }
-        changed
-    });
-}
-
-fn address(text: &str) -> PyResult<Multiaddr> {
-    text.parse()
-        .map_err(|error| PyValueError::new_err(format!("{text:?} is not an address: {error}")))
-}
-
-fn memory_limits(soft: Option<u64>, hard: Option<u64>) -> PyResult<Option<MemoryLimits>> {
-    match (soft, hard) {
-        (None, None) => Ok(None),
-        (Some(soft), Some(hard)) => Ok(Some(MemoryLimits { soft, hard })),
-        _ => Err(PyValueError::new_err("give both memory limits or neither")),
-    }
-}
 
 /// A worker of a networked shard, and the Tokio runtime it runs on.
 ///
@@ -370,13 +61,8 @@ fn memory_limits(soft: Option<u64>, hard: Option<u64>) -> PyResult<Option<Memory
 /// leaving its shard, and every awaitable still pending fails.
 #[pyclass(name = "NetworkedRuntime", frozen)]
 pub struct NetworkedRuntime {
-    tokio: Mutex<Option<Runtime>>,
-    handle: Handle,
-    bridge: Bridge,
+    host: Host,
     shared: Arc<Shared>,
-    observed: Arc<watch::Sender<Observed>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
-    pump: Mutex<Option<JoinHandle<()>>>,
     worker_id: String,
     address: String,
     clock: RealClock,
@@ -385,174 +71,54 @@ pub struct NetworkedRuntime {
 
 #[pymethods]
 impl NetworkedRuntime {
-    /// Starts a worker of the shard `shard` listening on `listen`, and
-    /// bootstraps it into the shard through `seeds`: with none, it founds
-    /// the shard alone. The heartbeat interval, heartbeat timeout and
-    /// reconnect timeout are the shard's election timings, the same on every
-    /// worker of it. `memory_soft_limit` and `memory_hard_limit` bound
-    /// pending task input while this worker leads, as for `NativeRuntime`.
-    /// `authority_url`, a `redis://` or `rediss://` server URL, with
-    /// `authority_key_prefix`, `authority_database` and `authority_ttl_ms`
-    /// (the authority's own default unless given), is the shard's
-    /// coordination authority: the worker then bootstraps through it, and its
-    /// timings come from the authority's TTL.
+    /// Starts a worker of a networked shard as `arguments` say (see
+    /// `kabudachi.native_protocol.NetworkedArguments`), and bootstraps it into
+    /// the shard: through its seeds, through its authority, or, with neither,
+    /// by founding the shard alone.
     ///
     /// Raises `ValueError` for an address that cannot be read, a timing or
     /// authority TTL of zero, only one memory limit, no worker threads or an
-    /// authority that cannot be used, and `RuntimeError` if it cannot listen on `listen`.
+    /// authority that cannot be used, and `RuntimeError` if it cannot listen
+    /// on its listen address.
     #[new]
-    #[pyo3(signature = (
-        shard,
-        listen,
-        *,
-        heartbeat_interval_ms,
-        heartbeat_timeout_ms,
-        reconnect_timeout_ms,
-        seeds = Vec::new(),
-        external_address = None,
-        authority_url = None,
-        authority_key_prefix = None,
-        authority_database = 0,
-        authority_ttl_ms = None,
-        result_ttl_ms = DEFAULT_RESULT_TTL_MS,
-        memory_soft_limit = None,
-        memory_hard_limit = None,
-        worker_threads = DEFAULT_WORKER_THREADS,
-    ))]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "each argument is a Python parameter"
-    )]
-    fn new(
-        py: Python<'_>,
-        shard: &str,
-        listen: &str,
-        heartbeat_interval_ms: u64,
-        heartbeat_timeout_ms: u64,
-        reconnect_timeout_ms: u64,
-        seeds: Vec<String>,
-        external_address: Option<String>,
-        authority_url: Option<String>,
-        authority_key_prefix: Option<String>,
-        authority_database: u16,
-        authority_ttl_ms: Option<u64>,
-        result_ttl_ms: u64,
-        memory_soft_limit: Option<u64>,
-        memory_hard_limit: Option<u64>,
-        worker_threads: usize,
-    ) -> PyResult<Self> {
-        if worker_threads == 0 {
-            return Err(PyValueError::new_err("worker_threads must be at least 1"));
-        }
-        for (name, value) in [
-            ("heartbeat_interval_ms", heartbeat_interval_ms),
-            ("heartbeat_timeout_ms", heartbeat_timeout_ms),
-            ("reconnect_timeout_ms", reconnect_timeout_ms),
-            ("authority_ttl_ms", authority_ttl_ms.unwrap_or(1)),
-        ] {
-            if value == 0 {
-                return Err(PyValueError::new_err(format!("{name} must be positive")));
-            }
-        }
-        let timings = ElectionTimings::new(
-            CoreDuration::from_millis(heartbeat_timeout_ms),
-            CoreDuration::from_millis(heartbeat_interval_ms),
-        )
-        .with_roll_call_deadline(CoreDuration::from_millis(
-            ROLL_CALL_DEADLINE_MS.min(heartbeat_timeout_ms / 4).max(1),
-        ))
-        .with_reconnect_timeout(CoreDuration::from_millis(reconnect_timeout_ms));
+    fn new(py: Python<'_>, arguments: NetworkedArguments) -> PyResult<Self> {
+        arguments.check()?;
         let (endpoint, executor) = executor_channel();
         let (source, reports) = executor.split();
-        let mut config = WorkerConfig::new(ShardName::new(shard), address(listen)?, timings)
-            .with_seeds(
-                seeds
-                    .iter()
-                    .map(|seed| address(seed))
-                    .collect::<PyResult<_>>()?,
-            )
-            .with_result_ttl(StdDuration::from_millis(result_ttl_ms))
-            .with_executor(endpoint);
-        if let Some(external) = external_address {
-            config = config.with_external_address(address(&external)?);
-        }
-        if let Some(limits) = memory_limits(memory_soft_limit, memory_hard_limit)? {
-            config = config.with_memory_limits(limits);
-        }
-        if let Some(url) = authority_url {
-            let mut redis = RedisAuthorityConfig::new(vec![url]);
-            if let Some(prefix) = authority_key_prefix {
-                redis.key_prefix = prefix;
-            }
-            redis.database = authority_database;
-            if let Some(ttl) = authority_ttl_ms {
-                redis = redis.with_ttl(CoreDuration::from_millis(ttl));
-            }
-            let authority = RedisAuthority::connect(redis).map_err(|error| {
-                PyValueError::new_err(format!("the authority cannot be used: {error}"))
-            })?;
-            config = config.with_authority(AuthorityConfig::new(Arc::new(authority)));
-        }
-
-        let tokio = Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .thread_name("kabudachi-native")
-            .enable_all()
-            .build()
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        let handle = tokio.handle().clone();
+        let config = arguments.worker_config(endpoint)?;
+        let tokio = arguments.tokio()?;
         let worker = py
             .detach(|| tokio.block_on(Worker::start(config)))
-            .map_err(|_| PyRuntimeError::new_err(format!("cannot listen on {listen:?}")))?;
+            .map_err(|_| {
+                PyRuntimeError::new_err(format!("cannot listen on {:?}", arguments.listen))
+            })?;
         let worker_id = worker.id().as_str().to_owned();
         let address = worker
             .address()
             .map(|address| address.to_string())
             .unwrap_or_default();
         let (sender, observed) = watch::channel(Observed::default());
-        let sender = Arc::new(sender);
-        let shared = Arc::new(Shared {
-            seam: Mutex::default(),
-            changed: Notify::new(),
+        let shared = Arc::new(Shared::new(
             reports,
-            net: worker.net(),
+            worker.net(),
             observed,
-            retry: LeaderRetry {
-                answer_within: StdDuration::from_millis(heartbeat_timeout_ms),
-                ask_again_after: StdDuration::from_millis(heartbeat_interval_ms),
-            },
-        });
-
-        let seen = Arc::clone(&sender);
-        let left = LeftOnDrop(Arc::clone(&sender));
-        let running = tokio.spawn(async move {
-            // Dropped however this ends, a panic or an abort included.
-            let _left = left;
-            let _ = worker
-                .run(move |node: &WorkerNode<RealClock>, _: Option<&Input>, _: &Step| {
-                    publish(&seen, node);
-                })
-                .await;
-        });
-        let pumped = Arc::clone(&shared);
-        let pump = tokio.spawn(async move {
-            let mut source: WorkSource = source;
-            while let Some(work) = source.next_work().await {
-                pumped.on_work(work);
-            }
-        });
+            arguments.retry(),
+        ));
+        let host = Host::start(
+            tokio,
+            worker,
+            source,
+            Arc::clone(&shared),
+            Arc::new(sender),
+            Arc::default(),
+        );
         Ok(NetworkedRuntime {
-            tokio: Mutex::new(Some(tokio)),
-            bridge: Bridge::new(handle.clone()),
-            handle,
+            host,
             shared,
-            observed: sender,
-            worker: Mutex::new(Some(running)),
-            pump: Mutex::new(Some(pump)),
             worker_id,
             address,
             clock: RealClock::new(),
-            reconnect_timeout: StdDuration::from_millis(reconnect_timeout_ms),
+            reconnect_timeout: StdDuration::from_millis(arguments.reconnect_timeout_ms),
         })
     }
 
@@ -596,7 +162,7 @@ impl NetworkedRuntime {
     /// first.
     fn wait_until_ready<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut observed = self.shared.observed.clone();
-        self.bridge.spawn_into_py(py, async move {
+        self.host.bridge().spawn_into_py(py, async move {
             let gone = observed
                 .wait_for(|seen| seen.gone || seen.leader.is_some())
                 .await
@@ -613,85 +179,21 @@ impl NetworkedRuntime {
 
     /// Mints a task and returns its id at once; the task is then delivered
     /// to the shard's leader, which `ACCEPTED` or `REFUSED` in
-    /// `next_events()` says the end of. Arguments as for `NativeRuntime.submit`.
+    /// `next_events()` says the end of. `submission` as for
+    /// `NativeRuntime.submit`.
     ///
-    /// Raises `ValueError` if `kind`, `key` and `drop_oldest` disagree or
-    /// `reconnect_timeout_ms` is zero, and `RuntimeError` once the runtime
-    /// has shut down.
-    #[pyo3(signature = (
-        definition_id,
-        source_version,
-        serialized_input,
-        queue,
-        kind,
-        key,
-        *,
-        retries = 0,
-        delay_ms = None,
-        expires_in_ms = None,
-        drop_oldest = false,
-        reconnect_timeout_ms = None,
-    ))]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "each argument is a Python parameter"
-    )]
-    fn submit(
-        &self,
-        definition_id: &str,
-        source_version: u32,
-        serialized_input: &[u8],
-        queue: &str,
-        kind: &str,
-        key: Option<String>,
-        retries: u32,
-        delay_ms: Option<u64>,
-        expires_in_ms: Option<u64>,
-        drop_oldest: bool,
-        reconnect_timeout_ms: Option<u64>,
-    ) -> PyResult<String> {
-        if !self.bridge.is_open() {
+    /// Raises `RuntimeError` once the runtime has shut down, and `ValueError`
+    /// if the submission's `kind`, `key` and `drop_oldest` disagree or its
+    /// `reconnect_timeout_ms` is zero.
+    fn submit(&self, py: Python<'_>, submission: SubmitArguments) -> PyResult<String> {
+        if !self.host.bridge().is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
-        let coalescing = coalescing(kind, key, drop_oldest).map_err(PyValueError::new_err)?;
-        let mut submission = Submission::new(
-            TaskDefinitionId::new(definition_id),
-            source_version,
-            serialized_input.to_vec(),
-            queue,
-        )
-        .with_retries(retries);
-        if kind == "ephemeral" {
-            submission = submission.ephemeral();
-        }
-        if let Some(delay_ms) = delay_ms {
-            submission = submission.with_delay(CoreDuration::from_millis(delay_ms));
-        }
-        if let Some(expires_in_ms) = expires_in_ms {
-            submission = submission.with_expiry(CoreDuration::from_millis(expires_in_ms));
-        }
-        if let Some(reconnect_timeout_ms) = reconnect_timeout_ms {
-            if reconnect_timeout_ms == 0 {
-                return Err(PyValueError::new_err("reconnect_timeout_ms must be positive"));
-            }
-            submission =
-                submission.with_reconnect_timeout(CoreDuration::from_millis(reconnect_timeout_ms));
-        }
-        if let Some((key, drop_oldest)) = coalescing {
-            submission = submission.with_coalescing_key(key);
-            if drop_oldest {
-                submission = submission.with_drop_oldest();
-            }
-        }
-        let submitted = mint(submission, &Uuid7Ids, &self.clock);
-        let task_id = submitted.task_id.as_str().to_owned();
-        self.shared
-            .seam()
-            .delivering
-            .insert(submitted.task_id.clone());
-        self.handle
-            .spawn(deliver(Arc::clone(&self.shared), submitted));
-        Ok(task_id)
+        Ok(send_submission(
+            &self.shared,
+            self.host.handle(),
+            mint(submission.into_submission(py)?, &Uuid7Ids, &self.clock),
+        ))
     }
 
     /// Offers the driver up to `limit` free places, and returns an
@@ -709,7 +211,7 @@ impl NetworkedRuntime {
         }
         self.shared.offer(limit);
         let shared = Arc::clone(&self.shared);
-        self.bridge.spawn_into_py(py, async move {
+        self.host.bridge().spawn_into_py(py, async move {
             shared.until(|shared| shared.take_claims(limit)).await
         })
     }
@@ -722,7 +224,8 @@ impl NetworkedRuntime {
     /// shutdown: events it took before the cancel are lost.
     fn next_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let shared = Arc::clone(&self.shared);
-        self.bridge
+        self.host
+            .bridge()
             .spawn_into_py(py, async move { shared.until(Shared::take_events).await })
     }
 
@@ -747,42 +250,37 @@ impl NetworkedRuntime {
         }
         let digest = Digest::new(DigestAlgorithm::Blake3, result_digest.to_vec())
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let run = TaskRunId::new(task_run_id);
-        if self.shared.end(&run) {
-            self.shared.report(Report::Completed { run, digest });
-        }
+        self.shared
+            .finish(TaskRunId::new(task_run_id), |run| Report::Completed {
+                run,
+                digest,
+            });
         Ok(())
     }
 
     /// Hands the leader a run's failure, by its error's type name.
     fn report_failure(&self, task_run_id: &str, failure_kind: &str) {
-        let run = TaskRunId::new(task_run_id);
-        if self.shared.end(&run) {
-            self.shared.report(Report::Failed {
+        self.shared
+            .finish(TaskRunId::new(task_run_id), |run| Report::Failed {
                 run,
                 reason: failure_kind.to_owned(),
             });
-        }
     }
 
     /// Hands the leader a run lost with the process that ran it, or stopped
     /// at its abort deadline.
     fn report_lost(&self, task_run_id: &str) {
-        let run = TaskRunId::new(task_run_id);
-        if self.shared.end(&run) {
-            self.shared.report(Report::Lost(run));
-        }
+        self.shared
+            .finish(TaskRunId::new(task_run_id), Report::Lost);
     }
 
     /// Hands the leader a compaction run's fold.
     fn complete_compaction(&self, task_run_id: &str, folded: &[u8]) {
-        let run = TaskRunId::new(task_run_id);
-        if self.shared.end(&run) {
-            self.shared.report(Report::Compacted {
+        self.shared
+            .finish(TaskRunId::new(task_run_id), |run| Report::Compacted {
                 run,
                 payload: folded.to_vec(),
             });
-        }
     }
 
     /// No continuation is ever certified here, so there is none to end.
@@ -795,10 +293,10 @@ impl NetworkedRuntime {
     /// and the task's record shows it. Raises `RuntimeError` once the
     /// runtime has shut down.
     fn cancel(&self, task_id: &str) -> PyResult<()> {
-        if !self.bridge.is_open() {
+        if !self.host.bridge().is_open() {
             return Err(PyRuntimeError::new_err(CLOSED_MESSAGE));
         }
-        self.handle.spawn(cancel_at_leader(
+        self.host.handle().spawn(cancel_at_leader(
             Arc::clone(&self.shared),
             TaskId::new(task_id),
         ));
@@ -809,7 +307,7 @@ impl NetworkedRuntime {
     /// shard holds, or `None` if no worker this one reaches holds it.
     fn task_record<'py>(&self, py: Python<'py>, task_id: String) -> PyResult<Bound<'py, PyAny>> {
         let net = Arc::clone(&self.shared.net);
-        self.bridge.spawn_into_py(py, async move {
+        self.host.bridge().spawn_into_py(py, async move {
             Ok(net
                 .get_record(TaskId::new(task_id))
                 .await
@@ -822,18 +320,7 @@ impl NetworkedRuntime {
     /// may still hand over up to the places already offered; each is
     /// reported lost as it arrives.
     fn stop_taking(&self) {
-        let unstarted: Vec<TaskRunId> = {
-            let mut seam = self.shared.seam();
-            seam.closed = true;
-            seam.handed
-                .drain(..)
-                .map(|claim| claim.task_run_id)
-                .collect()
-        };
-        for run in unstarted {
-            self.shared.report(Report::Lost(run));
-        }
-        self.shared.wake();
+        self.shared.stop_taking();
     }
 
     /// Returns an awaitable that resolves once the leader has taken the
@@ -843,7 +330,7 @@ impl NetworkedRuntime {
         let net = Arc::clone(&self.shared.net);
         let observed = self.shared.observed.clone();
         let within = self.reconnect_timeout;
-        self.bridge.spawn_into_py(py, async move {
+        self.host.bridge().spawn_into_py(py, async move {
             let deadline = tokio::time::Instant::now() + within;
             while !net.claimed_runs().snapshot().is_empty() {
                 if observed.borrow().gone || tokio::time::Instant::now() >= deadline {
@@ -858,41 +345,6 @@ impl NetworkedRuntime {
     /// Stops the worker at once and shuts the runtime down; awaitables
     /// still pending fail. Does nothing if already shut down.
     fn shutdown(&self, py: Python<'_>) {
-        // As for `NativeRuntime`: everything here blocks on Tokio work, and
-        // the tasks handing results to Python need the GIL.
-        py.detach(|| {
-            let mut slot = self.tokio.lock().unwrap_or_else(PoisonError::into_inner);
-            let Some(runtime) = slot.take() else {
-                return;
-            };
-            self.bridge.close();
-            // Every wait gives up, as it does when the worker leaves.
-            self.observed.send_modify(|seen| seen.gone = true);
-            self.shared.wake();
-            for task in [&self.worker, &self.pump] {
-                if let Some(task) = task.lock().unwrap_or_else(PoisonError::into_inner).take() {
-                    task.abort();
-                }
-            }
-            runtime.block_on(async {
-                let _ = tokio::time::timeout(SHUTDOWN_GRACE, self.bridge.drained()).await;
-            });
-            runtime.shutdown_timeout(SHUTDOWN_GRACE);
-        });
-    }
-}
-
-impl Drop for NetworkedRuntime {
-    /// As for `NativeRuntime`: a runtime never shut down abandons its tasks
-    /// rather than block its owner's thread.
-    fn drop(&mut self) {
-        let runtime = self
-            .tokio
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(runtime) = runtime {
-            runtime.shutdown_background();
-        }
+        self.host.shutdown(py, &self.shared);
     }
 }

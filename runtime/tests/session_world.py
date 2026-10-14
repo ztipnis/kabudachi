@@ -9,6 +9,7 @@ import weakref
 from kabudachi import _native
 
 from kabudachi.config import Configuration
+from kabudachi.native_protocol import OneNodeArguments
 from kabudachi.registry import TaskRegistry
 from kabudachi.serializers import SerializerRegistry
 from kabudachi.session import Session, activate, deactivate
@@ -36,7 +37,7 @@ class World:
                 "memory_soft_limit": memory_soft_limit,
                 "memory_hard_limit": memory_hard_limit,
             }
-        self.native = _native.NativeRuntime("worker-world", "incarnation-world", **limits)
+        self.native = _native.NativeRuntime("worker-world", "incarnation-world", OneNodeArguments(**limits))
         weakref.finalize(self, self.native.shutdown)
         self.runtime = FaultingRuntime(self.native)
         self.registry = TaskRegistry()

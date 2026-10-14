@@ -14,12 +14,14 @@ import pytest
 import kabudachi
 from kabudachi import _native
 from kabudachi._native import CancelOutcome, RunState
+from kabudachi.native_protocol import OneNodeArguments, SubmitArguments
+from kabudachi.options import SubmissionOptions, SubmissionSettings
 
 WAIT_LIMIT_SECONDS = 5
 
 
 def new_runtime(**options):
-    return _native.NativeRuntime("worker-1", "incarnation-1", **options)
+    return _native.NativeRuntime("worker-1", "incarnation-1", OneNodeArguments(**options))
 
 
 @pytest.fixture
@@ -302,12 +304,44 @@ async def _start_a_wait(native):
 DIGEST = _native.result_digest(b"the-result")
 
 
+def arguments(
+    definition_id, version, payload, kind, key=None, *, queue="default", reconnect_timeout_ms=None, **fields
+):
+    return SubmitArguments(
+        definition_id,
+        version,
+        payload,
+        kind,
+        key,
+        SubmissionOptions(),
+        SubmissionSettings(queue, reconnect_timeout_ms),
+        **fields,
+    )
+
+
 def submit(native, payload=b"input-bytes", queue="default"):
-    return native.submit("billing.charge", 3, payload, queue, "task", None)
+    return native.submit(arguments("billing.charge", 3, payload, "task", queue=queue))
 
 
 async def claim(native, limit=10):
     return await asyncio.wait_for(native.claim_pending(limit), WAIT_LIMIT_SECONDS)
+
+
+@pytest.mark.parametrize(
+    ("kind", "key", "options", "refusal"),
+    [
+        ("coalescing", None, {}, "needs a key"),
+        ("task", "a-key", {}, "takes no key"),
+        ("ephemeral", None, {"drop_oldest": True}, "only a coalescing task"),
+        ("batch", None, {}, "is not a task kind"),
+        ("task", None, {"reconnect_timeout_ms": 0}, "must be positive"),
+    ],
+)
+def test_a_submission_whose_kind_key_and_options_disagree_is_refused_before_it_is_recorded(
+    runtime, kind, key, options, refusal
+):
+    with pytest.raises(ValueError, match=refusal):
+        runtime.submit(arguments("billing.charge", 3, b"input-bytes", kind, key, **options))
 
 
 def test_a_submitted_task_can_be_claimed(runtime):
@@ -482,7 +516,7 @@ def test_shutdown_fails_a_wait_for_events():
 
 
 def generation(native, payload, key=""):
-    return native.submit("index.refresh", 0, payload, "default", "coalescing", key)
+    return native.submit(arguments("index.refresh", 0, payload, "coalescing", key))
 
 
 def test_a_task_completed_with_a_continuation_holds_its_coalescing_key_until_it_ends(runtime):

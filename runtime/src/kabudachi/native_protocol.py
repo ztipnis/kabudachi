@@ -5,9 +5,11 @@ satisfy them. They live apart from `session` so that `task_table` can name them
 without importing `session`, which imports `task_table`.
 """
 
+from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
 from kabudachi._native import CancelOutcome, EventKind
+from kabudachi.options import SubmissionOptions, SubmissionSettings
 
 
 class Claim(Protocol):
@@ -52,6 +54,106 @@ class Certification(Protocol):
     result_digest: bytes
 
 
+@dataclass(frozen=True)
+class SubmitArguments:
+    """One task for `Runtime.submit` to record.
+
+    `kind` is the task's `TaskKind` value. `key` is the coalescing key
+    resolved for that kind: a coalescing task always has one (`options.key`,
+    or "" by default), and no other kind has one. A run that fails is
+    replaced by a new attempt up to `retries` times. With `drop_oldest`, a
+    coalescing task that would pass the hard memory limit loses its key's
+    oldest retained payloads to fit instead of being refused.
+
+    `options` is what the caller asked: with `delay_ms` the task is not
+    claimed before that long has passed, and with `expires_in_ms` it
+    expires instead of running if it is still unclaimed after that long.
+    Its `key` is not read here; `key` above is. `settings` is what this
+    process resolved: the task's queue, and, with `reconnect_timeout_ms`
+    (which must be positive), how long after its worker goes a suspicion
+    timeout unheard a run of the task may be replayed, instead of after the
+    shard's reconnect timeout.
+    """
+
+    definition_id: str
+    source_version: int
+    serialized_input: bytes
+    kind: Literal["task", "ephemeral", "coalescing"]
+    key: str | None
+    options: SubmissionOptions
+    settings: SubmissionSettings
+    retries: int = 0
+    drop_oldest: bool = False
+
+
+_DEFAULT_WORKER_THREADS = 2
+_DEFAULT_RESULT_TTL_MS = 60 * 60 * 1000
+
+
+@dataclass(frozen=True)
+class OneNodeArguments:
+    """How a one-node runtime runs.
+
+    `worker_threads` sizes the native thread pool. `suspect_timeout_ms` is
+    how long the worker waits, with no leader to hear from, before it
+    elects itself. A lone worker has no peer to wait for, so with the
+    default of 0 it leads a millisecond after it starts, when its
+    one-voter roll call closes. `result_ttl_ms` is how long a finished
+    task is kept before it is forgotten. `memory_soft_limit` and
+    `memory_hard_limit` are in bytes of serialized task input: past the
+    soft one `next_events()` reports an `EventKind.SLOW_DOWN` event with
+    `active` set, and past the hard one `submit` raises
+    `BackpressureError`. Both or neither must be given, and the soft one
+    must not be above the hard one, which `kabudachi.configure` checks.
+    """
+
+    worker_threads: int = _DEFAULT_WORKER_THREADS
+    suspect_timeout_ms: int = 0
+    result_ttl_ms: int = _DEFAULT_RESULT_TTL_MS
+    memory_soft_limit: int | None = None
+    memory_hard_limit: int | None = None
+
+
+@dataclass(frozen=True)
+class AuthorityArguments:
+    """The shard's coordination authority: a `redis://` or `rediss://`
+    server `url`, with its key prefix, database and TTL (the authority's
+    own default unless given)."""
+
+    url: str
+    key_prefix: str | None = None
+    database: int = 0
+    ttl_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class NetworkedArguments:
+    """How a worker of the networked shard `shard` runs.
+
+    It listens on `listen` and bootstraps into the shard through `seeds`,
+    or, with none, founds the shard alone. The heartbeat interval,
+    heartbeat timeout and reconnect timeout are the shard's election
+    timings, the same on every worker of it. With an `authority`, the
+    worker bootstraps through it instead, and its timings come from the
+    authority's TTL. `memory_soft_limit` and `memory_hard_limit` bound
+    pending task input while this worker leads, as for
+    `OneNodeArguments`.
+    """
+
+    shard: str
+    listen: str
+    heartbeat_interval_ms: int
+    heartbeat_timeout_ms: int
+    reconnect_timeout_ms: int
+    seeds: tuple[str, ...] = ()
+    external_address: str | None = None
+    authority: AuthorityArguments | None = None
+    result_ttl_ms: int = _DEFAULT_RESULT_TTL_MS
+    memory_soft_limit: int | None = None
+    memory_hard_limit: int | None = None
+    worker_threads: int = _DEFAULT_WORKER_THREADS
+
+
 @runtime_checkable
 class Runtime(Protocol):
     """What a session needs of the native runtime."""
@@ -66,27 +168,10 @@ class Runtime(Protocol):
         """The incarnation of the shard this runtime founded at start."""
         ...
 
-    def submit(
-        self,
-        definition_id: str,
-        source_version: int,
-        serialized_input: bytes,
-        queue: str,
-        kind: Literal["task", "ephemeral", "coalescing"],
-        key: str | None,
-        *,
-        retries: int = 0,
-        delay_ms: int | None = None,
-        expires_in_ms: int | None = None,
-        drop_oldest: bool = False,
-        reconnect_timeout_ms: int | None = None,
-    ) -> str:
-        """Records a new task. `kind` is its `TaskKind` value; a coalescing
-        task always has a `key` (its default is ""), and no other kind has
-        one. Raises `ValueError` if `kind` and `key` disagree, or
-        `reconnect_timeout_ms` is 0, and `BackpressureError` past the hard
-        memory limit. `reconnect_timeout_ms`, when given, is the run's own
-        reconnect timeout."""
+    def submit(self, submission: SubmitArguments) -> str:
+        """Records a new task. Raises `ValueError` if the submission's kind
+        and key disagree, or its `reconnect_timeout_ms` is 0, and
+        `BackpressureError` past the hard memory limit."""
 
     async def claim_pending(self, limit: int) -> list[Claim]:
         ...
