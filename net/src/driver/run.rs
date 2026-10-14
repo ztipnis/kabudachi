@@ -134,6 +134,11 @@ where
         self.stepper
             .node
             .set_active_runs_digest(active_runs_digest(&self.net.claimed_runs().active_ids()));
+        // Every heartbeat this batch sends also carries the places the
+        // executor has free.
+        self.stepper
+            .node
+            .set_available_capacity(self.executing.as_ref().map_or(0, Executing::free_places));
         if let Some(first) = self.first.take() {
             self.next_deadline = self.stepper.carry(first, None);
         }

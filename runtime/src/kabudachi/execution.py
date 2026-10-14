@@ -22,6 +22,7 @@ from kabudachi.handle import TaskHandle, current_body
 from kabudachi.lifecycle import HookRegistry, RunContext, hooks_for_run, initialize_process
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import TaskRegistry
+from kabudachi.run_info import RunInfo, run_context
 from kabudachi.serializers import SerializerRegistry
 
 
@@ -34,6 +35,7 @@ class RunJob:
     """One claimed run to execute."""
 
     run_id: str
+    task_id: str
     definition_id: str
     source_version: int
     serialized_input: bytes
@@ -43,6 +45,9 @@ class RunJob:
     """The queue the task was sent to, which picks the run hooks."""
     attempt: int
     """1 for the task's first run, then one more for each retry."""
+    shard: str
+    """The name of the shard the worker serves."""
+    worker_id: str
     cancel_grace: timedelta
     """How long its body has to stop once asked."""
     after: "asyncio.Future[None] | None" = None
@@ -174,6 +179,10 @@ class InProcessExecutor:
         # A body that waits for a task it called gives its place back meanwhile.
         context = contextvars.copy_context()
         context.run(current_body.set, BodyWaits(self._places))
+        context.run(
+            run_context,
+            RunInfo(job.task_id, job.run_id, job.definition_id, job.attempt, job.shard, job.worker_id),
+        )
         hooks = hooks_for_run(
             self._hooks,
             RunContext(job.definition_id, job.run_id, job.attempt),

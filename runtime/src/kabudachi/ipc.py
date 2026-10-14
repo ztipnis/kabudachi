@@ -37,6 +37,10 @@ class Run:
     """The queue the task was sent to, which picks the run hooks."""
     attempt: int
     """1 for the task's first run, then one more for each retry."""
+    task_id: str
+    shard: str
+    """The name of the shard the worker serves."""
+    worker_id: str
 
 
 @dataclass(frozen=True)

@@ -6,10 +6,12 @@
 //! before it ends is reported lost. A follower's cancelled run reaches its
 //! executor through the leader's next ack.
 
+use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRunState;
+use kabudachi_core::scheduler::TraceContext;
 use kabudachi_net::executor::{Report, Work};
 
 use crate::support::deadline::within_deadline;
@@ -188,6 +190,7 @@ async fn a_run_that_fails_before_its_body_starts_ends_failed_at_the_leader() {
         executors[follower].report(Report::Failed {
             run: run.clone(),
             reason: "PayloadUnavailable".into(),
+            message: String::new(),
         });
         let follower_net = nets[follower].clone();
         shard
@@ -198,4 +201,109 @@ async fn a_run_that_fails_before_its_body_starts_ends_failed_at_the_leader() {
             .await;
     })
     .await
+}
+
+/// A follower says how many places it has free in its heartbeats, and the
+/// leader keeps the latest per member, its own included. A task's trace
+/// context reaches the follower's claim over the wire unchanged, and the
+/// follower's failure reaches the record with its message and run times,
+/// stored by a quorum.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn members_report_their_free_places_and_a_runs_trace_context_and_failure_message_cross_the_network() {
+    within_deadline(async {
+        let (mut shard, client) = ThreeVoters::start().await;
+        let mut executors: Vec<FakeExecutor> = (0..3)
+            .map(|voter| {
+                let (executor, endpoint) = FakeExecutor::new();
+                shard.set_executor(voter, endpoint);
+                executor
+            })
+            .collect();
+        let leader = shard.drive_until_a_leader().await;
+        let leader_id = shard.id(leader);
+        shard.join_as_pending(&client, leader).await;
+        let follower = shard.others(leader)[0];
+        let follower_id = shard.id(follower);
+        let nets = shard.nets.clone();
+
+        executors[follower].grant(2);
+        executors[leader].grant(3);
+        let mut seen = BTreeMap::new();
+        for _ in 0..200 {
+            seen = shard.with(leader, |node, _| node.member_capacities()).await;
+            if seen.get(&follower_id) == Some(&2) && seen.get(&leader_id) == Some(&3) {
+                break;
+            }
+            shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
+        }
+        assert_eq!((seen.get(&follower_id), seen.get(&leader_id)), (Some(&2), Some(&3)));
+
+        let trace = TraceContext {
+            trace_parent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
+            trace_state: "vendor=opaque".into(),
+            baggage: "tenant=acme".into(),
+        };
+        // The leader's executor takes no more: only the follower can claim.
+        executors[leader].stop_taking_work();
+        let failing = shard
+            .drive_until(submitted_through(
+                &client,
+                &leader_id,
+                plain_with(b"fails").with_trace_context(trace.clone()),
+            ))
+            .await;
+        let (run, claim) = shard.drive_until(executors[follower].next_claim()).await;
+        let task = claim.task.expect("a claim carries its task");
+        assert_eq!(
+            (task.trace_parent, task.trace_state, task.baggage),
+            (trace.trace_parent, trace.trace_state, trace.baggage)
+        );
+        executors[follower].report(Report::Started(run.clone()));
+        executors[follower].report(Report::Failed {
+            run,
+            reason: "ValueError".into(),
+            message: "card declined".into(),
+        });
+        shard
+            .drive_until(poll_until("a quorum stored the failure with its message and times", || {
+                nets.iter()
+                    .filter_map(|net| net.held_records().get(&failing))
+                    .filter(|record| {
+                        record.runs.first().is_some_and(|run| {
+                            run.failure_message == "card declined"
+                                && run.failure_kind == "ValueError"
+                                && run.claimed_at.is_some()
+                                && run.started_at.is_some_and(|started| {
+                                    started.unix_millis >= run.claimed_at.unwrap().unix_millis
+                                })
+                        })
+                    })
+                    .count()
+                    >= QUORUM
+            }))
+            .await;
+        // The follower's next heartbeats say the claim took one of its two
+        // places.
+        let mut after = None;
+        for _ in 0..200 {
+            let seen = shard.with(leader, |node, _| node.member_capacities()).await;
+            after = seen.get(&follower_id).copied();
+            if after == Some(1) {
+                break;
+            }
+            shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
+        }
+        assert_eq!(after, Some(1), "the claim took one of the follower's two places");
+        // It stays at one across several heartbeat periods: the run it holds
+        // is counted once, whatever the claim is doing, so the figure never
+        // dips while the claim and its report are in flight.
+        let mut sampled = Vec::new();
+        for _ in 0..30 {
+            let seen = shard.with(leader, |node, _| node.member_capacities()).await;
+            sampled.push(seen.get(&follower_id).copied());
+            shard.drive_until(tokio::time::sleep(StdDuration::from_millis(20))).await;
+        }
+        assert_eq!(sampled, vec![Some(1); 30], "the follower's free places never dipped");
+    })
+    .await;
 }

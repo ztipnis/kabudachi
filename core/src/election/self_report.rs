@@ -9,4 +9,7 @@ pub(super) struct SelfReport {
     pub(super) active_runs_digest: Vec<u8>,
     /// Whether this worker runs compaction, which its heartbeats say.
     pub(super) runs_compaction: bool,
+    /// The places this worker has free, which every heartbeat it sends
+    /// carries.
+    pub(super) available_capacity: u32,
 }

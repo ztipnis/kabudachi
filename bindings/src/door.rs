@@ -245,14 +245,15 @@ impl<C: Clock> SchedulerDoor<C> {
     }
 
     /// Reports that a run this worker claimed failed with an error of type
-    /// `failure_kind` (the type's name, never its message), whether or not its
-    /// body started. A run still `Claimed` is stepped through `Running`
-    /// first, under the same lock, so no other caller sees it started but not
-    /// failed.
+    /// `failure_kind` (the type's name) and `failure_message` (the error's
+    /// message, never its traceback), whether or not its body started. A run
+    /// still `Claimed` is stepped through `Running` first, under the same
+    /// lock, so no other caller sees it started but not failed.
     pub fn report_failure(
         &self,
         run: &TaskRunId,
         failure_kind: &str,
+        failure_message: &str,
     ) -> Result<Failure, Refusal<ReportRejection>> {
         refuse(self.change(Concerned::ClaimsAndTimers, |scheduler| {
             settled_change(scheduler, |scheduler| {
@@ -261,7 +262,12 @@ impl<C: Clock> SchedulerDoor<C> {
                 {
                     scheduler.report_started(&self.worker, run)?;
                 }
-                let failure = scheduler.fail(&self.worker, run, failure_kind)?;
+                let failure = scheduler.fail_with_message(
+                    &self.worker,
+                    run,
+                    failure_kind,
+                    failure_message,
+                )?;
                 if failure.retry.is_none() {
                     forget_blobs_if_finished(scheduler, &failure.task_id);
                 }

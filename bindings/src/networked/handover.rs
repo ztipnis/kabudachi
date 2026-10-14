@@ -153,10 +153,12 @@ impl Shared {
                 Err(Resolving::Unresolved) => Some(Report::Failed {
                     run,
                     reason: PAYLOAD_UNAVAILABLE_KIND.into(),
+                    message: String::new(),
                 }),
                 Err(Resolving::TooLarge) => Some(Report::Failed {
                     run,
                     reason: PAYLOAD_TOO_LARGE_KIND.into(),
+                    message: String::new(),
                 }),
             }
         };
@@ -183,6 +185,7 @@ impl Seam {
                 report: wire.task_run_id.map(|run| Report::Failed {
                     run: run.into(),
                     reason: MALFORMED_KIND.into(),
+                    message: String::new(),
                 }),
                 wake: false,
             },
@@ -265,5 +268,6 @@ fn cancelled(run: TaskRunId) -> Report {
     Report::Failed {
         run,
         reason: CANCELLED_KIND.into(),
+        message: String::new(),
     }
 }

@@ -334,6 +334,16 @@ pub struct PyRunRecord {
     /// The type name of the error that failed it; empty unless it failed.
     #[pyo3(get)]
     failure_kind: String,
+    /// The error's message; empty unless it failed.
+    #[pyo3(get)]
+    failure_message: String,
+    /// When a worker claimed it, in milliseconds since the Unix epoch by the
+    /// leader's clock; `None` until then.
+    #[pyo3(get)]
+    claimed_at_ms: Option<u64>,
+    /// When it started, as `claimed_at_ms`.
+    #[pyo3(get)]
+    started_at_ms: Option<u64>,
     result_digest: Option<Vec<u8>>,
     /// Which attempt this is: 1 for the first, then one more per retry.
     #[pyo3(get)]
@@ -401,6 +411,9 @@ impl PyRunRecord {
                 .clone()
                 .map(|worker| WorkerId::from(worker).as_str().to_owned()),
             failure_kind: run.failure_kind.clone(),
+            failure_message: run.failure_message.clone(),
+            claimed_at_ms: run.claimed_at.as_ref().map(|time| time.unix_millis),
+            started_at_ms: run.started_at.as_ref().map(|time| time.unix_millis),
             result_digest: run
                 .result_digest
                 .as_ref()

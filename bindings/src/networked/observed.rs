@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use kabudachi_core::election::WorkerNode;
 use kabudachi_core::protocol::ids::WorkerId;
+use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::time::RealClock;
 use tokio::sync::watch;
 
@@ -19,6 +20,11 @@ pub(super) struct Observed {
     pub(super) shard_id: String,
     /// The worker is out of its shard: `Worker::run` ended, however it did.
     pub(super) gone: bool,
+    /// The node's election state; `None` before the worker's first step.
+    pub(super) state: Option<WorkerState>,
+    /// A leader holding a grant has vouched for hearing this worker: the
+    /// gate its driver claims behind.
+    pub(super) contact_floor: bool,
 }
 
 /// Marks the worker out of its shard when dropped: when `Worker::run`
@@ -40,6 +46,8 @@ pub(super) fn publish(sender: &watch::Sender<Observed>, node: &WorkerNode<RealCl
             voters: node.voters().len(),
             shard_id: node.shard_id().as_str().to_owned(),
             gone: false,
+            state: Some(node.state()),
+            contact_floor: node.has_contact_floor(),
         };
         let changed = *seen != now;
         if changed {

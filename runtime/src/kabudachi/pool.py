@@ -798,6 +798,9 @@ def _frame_for(job: RunJob | CompactJob) -> ipc.Run | ipc.Compact:
         job.chain,
         job.queue,
         job.attempt,
+        job.task_id,
+        job.shard,
+        job.worker_id,
     )
 
 

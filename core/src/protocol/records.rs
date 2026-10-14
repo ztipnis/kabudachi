@@ -19,6 +19,7 @@ use crate::protocol::ids::{
 use crate::protocol::messages::prelude::*;
 use crate::protocol::messages::{Task, TaskRun, TaskRunIdentity};
 use crate::protocol::task::TaskRunState;
+use crate::scheduler::TraceContext;
 use crate::time::{Duration, WallTime};
 
 /// The attempt number of a Task's first run.
@@ -46,6 +47,8 @@ pub struct NewTask {
     /// The input as blobs, when it is too large to travel inline: then
     /// `serialized_input` is empty.
     pub input_manifest: Option<Manifest>,
+    /// The trace context the task carries; empty for none.
+    pub trace: TraceContext,
 }
 
 impl NewTask {
@@ -74,6 +77,7 @@ impl NewTask {
             reconnect_timeout: None,
             client: None,
             input_manifest: None,
+            trace: TraceContext::default(),
         }
     }
 }
@@ -98,6 +102,9 @@ pub fn new_task(new: NewTask) -> Task {
         reconnect_timeout_ms: new.reconnect_timeout.map_or(0, |timeout| timeout.as_ticks()),
         client: new.client.map(Into::into),
         input_manifest: new.input_manifest.map(Into::into),
+        trace_parent: new.trace.trace_parent,
+        trace_state: new.trace.trace_state,
+        baggage: new.trace.baggage,
     }
 }
 
@@ -135,6 +142,9 @@ pub fn first_attempt(
         result_digest: None,
         failure_kind: String::new(),
         delivered: false,
+        claimed_at: None,
+        started_at: None,
+        failure_message: String::new(),
     }
 }
 
@@ -157,6 +167,9 @@ pub fn retry_of(failed: &TaskRun, ids: &impl IdGenerator, at: WallTime) -> TaskR
         result_digest: None,
         failure_kind: String::new(),
         delivered: false,
+        claimed_at: None,
+        started_at: None,
+        failure_message: String::new(),
     }
 }
 

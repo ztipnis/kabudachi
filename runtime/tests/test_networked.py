@@ -16,10 +16,14 @@ import pytest
 from cluster import (
     HEARTBEAT_TIMEOUT,
     RECONNECT_TIMEOUT,
+    TIMINGS,
     Cluster,
+    Worker,
     certified_once,
     digest_of,
     eventually,
+    free_port,
+    probe,
     running_on,
     settled,
     states,
@@ -71,6 +75,10 @@ def test_a_cluster_delivers_results_compacts_and_keeps_its_runs_through_a_busy_t
     cluster, tmp_path
 ):
     leader = cluster.leader()
+    # Every worker of a led shard is alive and ready: the leader leads, and
+    # each follower has been heard by it.
+    for worker in cluster.workers:
+        assert (probe(worker.health, "/healthz"), probe(worker.health, "/readyz")) == (200, 200)
     delivered_to_its_submitter(cluster, leader)
     carried_as_blobs(cluster, leader)
     awaited_across_workers(cluster, leader)
@@ -78,6 +86,36 @@ def test_a_cluster_delivers_results_compacts_and_keeps_its_runs_through_a_busy_t
     task_process_killed(cluster, leader, tmp_path)
     cancelled_while_running(cluster, leader, tmp_path)
     worker_killed(cluster, leader)
+
+
+def test_a_worker_that_has_not_joined_its_shard_is_alive_but_not_ready(tmp_path):
+    """A worker whose only seed is silent keeps asking it (many seed rounds),
+    so it never founds a shard of its own: its health answers 200 and its
+    readiness 503 for as long as it waits."""
+    health = f"127.0.0.1:{free_port()}"
+    worker = Worker(
+        {
+            **TIMINGS,
+            "KABUDACHI_LISTEN": "/ip4/127.0.0.1/tcp/0",
+            "KABUDACHI_SEEDS": f"/ip4/127.0.0.1/tcp/{free_port()}",
+            "KABUDACHI_SEED_ROUNDS": "1000",
+            "KABUDACHI_HEALTH_LISTEN": health,
+            "KABUDACHI_PROCESSES": "1",
+            "KABUDACHI_CONCURRENCY": "1",
+            "KABUDACHI_TEST_MARKERS": str(tmp_path),
+        },
+        wait_until_ready=False,
+    )
+    try:
+        eventually("the health listener to answer", lambda: probe(health, "/healthz") == 200)
+        # Three silent seed rounds with the default would have founded the
+        # shard by now; a thousand keep it waiting.
+        until = time.monotonic() + 3.0
+        while time.monotonic() < until:
+            assert (probe(health, "/healthz"), probe(health, "/readyz")) == (200, 503)
+            time.sleep(0.1)
+    finally:
+        worker.close()
 
 
 def delivered_to_its_submitter(cluster, leader):
@@ -100,6 +138,18 @@ def delivered_to_its_submitter(cluster, leader):
     # The worker that ran it was told whom to deliver to.
     runner = cluster.by_id(record["runs"][0]["worker"])
     assert runner.ask(claimed=spun)["client"] == follower.id
+
+    # A body that fails: its run keeps the error's type and message (no
+    # traceback), and when it was claimed and started.
+    failing = follower.submit("fails", text="card declined")
+    record = finished(cluster, failing)
+    [run] = record["runs"]
+    assert (run["state"], run["failure_kind"], run["failure_message"]) == (
+        "FAILED",
+        "ValueError",
+        "card declined",
+    )
+    assert run["claimed_at"] is not None and run["started_at"] >= run["claimed_at"]
 
 
 def carried_as_blobs(cluster, leader):

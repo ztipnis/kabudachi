@@ -11,7 +11,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::messages::Claim as WireClaim;
 use kabudachi_core::reconcile::{ReportedRun, ReportedState};
-use kabudachi_core::scheduler::Claim;
+use kabudachi_core::scheduler::{Claim, MAX_FAILURE_MESSAGE_BYTES};
 
 /// The most bytes of a failure kind a reconciliation reports. A failure kind
 /// is an exception class name in practice; the cap keeps a pathological one
@@ -27,7 +27,7 @@ pub enum HeldRun {
     /// first if `delivered`, and no leader has certified it yet.
     Completed { result_digest: Digest, delivered: bool },
     /// It failed, and no leader has recorded the failure yet.
-    Failed { failure_kind: String },
+    Failed { failure_kind: String, failure_message: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,8 +88,12 @@ impl ClaimedRuns {
                     result_digest: result_digest.clone(),
                     delivered: *delivered,
                 },
-                HeldRun::Failed { failure_kind } => ReportedState::Failed {
+                HeldRun::Failed {
+                    failure_kind,
+                    failure_message,
+                } => ReportedState::Failed {
                     failure_kind: truncated(failure_kind, MAX_FAILURE_KIND_BYTES),
+                    failure_message: truncated(failure_message, MAX_FAILURE_MESSAGE_BYTES),
                 },
             };
             // The chain's generations have records of their own, and a

@@ -122,7 +122,8 @@ class OneNodeArguments:
     must not be above the hard one, which `kabudachi.configure` checks. An
     input larger than one message is kept in this runtime's own store as
     blobs and handed back whole with its claim; it counts against the
-    memory limits like any other input.
+    memory limits like any other input. With `health_listen` (`ip:port`;
+    port 0 picks one), the runtime serves `/healthz` and `/readyz` there.
     """
 
     worker_threads: int = _DEFAULT_WORKER_THREADS
@@ -130,6 +131,7 @@ class OneNodeArguments:
     result_ttl_ms: int = _DEFAULT_RESULT_TTL_MS
     memory_soft_limit: int | None = None
     memory_hard_limit: int | None = None
+    health_listen: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,7 +157,12 @@ class NetworkedArguments:
     worker bootstraps through it instead, and its timings come from the
     authority's TTL. `memory_soft_limit` and `memory_hard_limit` bound
     pending task input while this worker leads, as for
-    `OneNodeArguments`.
+    `OneNodeArguments`. `roll_call_deadline_ms` overrides the default
+    roll-call deadline; `replication_factor` voters store each record;
+    `seed_rounds` silent rounds pass before a worker with seeds founds the
+    shard alone; `routing_refresh_ms` is the period of the routing crawl
+    nothing prompted. With `health_listen`, the worker serves `/healthz` and
+    `/readyz` there, as for `OneNodeArguments`.
     """
 
     shard: str
@@ -170,6 +177,11 @@ class NetworkedArguments:
     memory_soft_limit: int | None = None
     memory_hard_limit: int | None = None
     worker_threads: int = _DEFAULT_WORKER_THREADS
+    roll_call_deadline_ms: int | None = None
+    replication_factor: int = 3
+    seed_rounds: int = 3
+    routing_refresh_ms: int | None = None
+    health_listen: str | None = None
 
 
 @runtime_checkable
@@ -191,6 +203,23 @@ class Runtime(Protocol):
         """The incarnation of the shard this runtime founded at start."""
         ...
 
+    def worker_id(self) -> str:
+        """This worker's id."""
+        ...
+
+    def shard_name(self) -> str:
+        """The name of this worker's shard: `local` for a one-node runtime."""
+        ...
+
+    def health_address(self) -> str | None:
+        """The `ip:port` the health endpoints are served on, or `None`
+        unless `health_listen` was given."""
+        ...
+
+    def registry_loaded(self) -> None:
+        """Says the worker is set up to take work, so `/readyz` can answer 200."""
+        ...
+
     def submit(self, submission: SubmitArguments) -> str:
         """Records a new task. Raises `ValueError` if the submission's kind
         and key disagree, or its `reconnect_timeout_ms` is 0, and
@@ -209,9 +238,13 @@ class Runtime(Protocol):
         """Cancels a task, and says how that ended. `None`: the cancel was
         sent, and the leader decides."""
 
-    def report_failure(self, task_run_id: str, failure_kind: str) -> bool | None:
-        """Reports that a claimed run failed, started or not; whether a retry
-        is now queued. `None` when the leader decides elsewhere."""
+    def report_failure(
+        self, task_run_id: str, failure_kind: str, failure_message: str = ""
+    ) -> bool | None:
+        """Reports that a claimed run failed, started or not, with the error's
+        type and message; whether a retry is now queued. The message is stored
+        in the task's replicated record, so it can contain task data. `None`
+        when the leader decides elsewhere."""
 
     def report_lost(self, task_run_id: str) -> bool | None:
         """Reports that a claimed run was lost with the process that ran it;

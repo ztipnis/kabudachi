@@ -70,6 +70,8 @@ message ReportedRun {
   // With REPORTED_RUN_SUCCEEDED: the result reached its task's client
   // before the run was reported, so a leader that adopts the run records it.
   bool delivered = 7;
+  // For a failed run: the error's message (see `ReportFailed.failure_message`).
+  string failure_message = 6;
 }
 
 message ReconcileReport {

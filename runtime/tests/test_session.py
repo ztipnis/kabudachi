@@ -841,7 +841,7 @@ def test_a_compaction_the_leader_refuses_to_take_is_not_reported_as_a_failed_mer
 
     world = World(echo)
     reported = []
-    world.runtime.report_failure = lambda run, kind: reported.append((run, kind))
+    world.runtime.report_failure = lambda run, kind, message="": reported.append((run, kind))
 
     def refuse(run, folded):
         raise RuntimeError("the leader refused the fold")

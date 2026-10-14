@@ -18,6 +18,7 @@ fn member_report(heartbeat: &Checked<WorkerHeartbeat>) -> MemberReport {
         routing_crawled: heartbeat.routing_crawled,
         admission: heartbeat.admission_generation(),
         runs_compaction: heartbeat.runs_compaction,
+        available_capacity: heartbeat.available_capacity,
     }
 }
 

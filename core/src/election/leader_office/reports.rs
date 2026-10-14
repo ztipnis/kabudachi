@@ -6,7 +6,8 @@ use crate::protocol::ids::WorkerId;
 use super::MemberReport;
 
 /// What each worker's latest heartbeat said of it: the admission it
-/// reported a routing crawl at, and whether it runs compaction.
+/// reported a routing crawl at, whether it runs compaction, and its free
+/// places.
 #[derive(Default)]
 pub(super) struct MemberReports {
     /// The workers whose latest heartbeat reported a routing crawl, with the
@@ -14,6 +15,8 @@ pub(super) struct MemberReports {
     crawled: BTreeMap<WorkerId, Generation>,
     /// The workers whose latest heartbeat said they run compaction.
     compaction_runners: BTreeSet<WorkerId>,
+    /// Each worker's free places, by its latest heartbeat.
+    capacities: BTreeMap<WorkerId, u32>,
 }
 
 impl MemberReports {
@@ -31,6 +34,7 @@ impl MemberReports {
         } else {
             self.compaction_runners.remove(from);
         }
+        self.capacities.insert(from.clone(), report.available_capacity);
         match report.admission.filter(|_| report.routing_crawled) {
             Some(admission) if Some(admission) == counted_by => {
                 self.crawled.insert(from.clone(), admission);
@@ -46,6 +50,16 @@ impl MemberReports {
         self.crawled
             .get(worker)
             .is_some_and(|crawled_at| Some(*crawled_at) == admission)
+    }
+
+    /// The free places each worker `roster` holds said it had in its latest
+    /// heartbeat.
+    pub(super) fn capacities(&self, roster: &Roster) -> BTreeMap<WorkerId, u32> {
+        self.capacities
+            .iter()
+            .filter(|(worker, _)| roster.holds(worker))
+            .map(|(worker, places)| (worker.clone(), *places))
+            .collect()
     }
 
     /// The workers `roster` holds whose latest heartbeat said they run compaction.

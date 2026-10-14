@@ -8,6 +8,8 @@ import logging
 import pickle
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import timedelta
 
 import pytest
@@ -15,8 +17,10 @@ import pytest
 import kabudachi
 from kabudachi import config as config_module
 from kabudachi import lifecycle as lifecycle_module
+from kabudachi import logging as kabudachi_logging
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
+from kabudachi import session as session_module
 from kabudachi.config import Configuration
 from kabudachi import Durability, TaskStatus
 from kabudachi._native import RunState
@@ -49,6 +53,27 @@ def fresh_process_state(monkeypatch):
 
 def declare(function, **options):
     return kabudachi.task(name=f"tests.{function.__name__}", **options)(function)
+
+
+def test_a_one_node_worker_serves_health_and_is_ready_once_it_leads():
+    kabudachi.configure(health_listen="127.0.0.1:0")
+
+    async def main():
+        address = session_module.current_session().runtime.health_address()
+        statuses = []
+        for path in ("/healthz", "/readyz", "/missing"):
+            statuses.append(await asyncio.to_thread(_status, f"http://{address}{path}"))
+        return statuses
+
+    assert kabudachi.run(main) == [200, 200, 404]
+
+
+def _status(url: str) -> int:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
 
 
 def test_a_synchronous_task_is_run_and_its_result_awaited():
@@ -836,6 +861,24 @@ def test_a_body_or_hook_that_raises_system_exit_or_keyboard_interrupt_or_cancels
     assert neighbour == "finished", "a body beside them ran to its end"
 
 
+def test_a_body_whose_error_cannot_be_turned_into_text_still_fails_its_run():
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("no text")
+
+    @declare
+    async def breaks(request: Greeting) -> Greeting:
+        raise Unprintable()
+
+    async def main():
+        async with asyncio.timeout(10):
+            return await asyncio.gather(breaks(Greeting()), return_exceptions=True)
+
+    (outcome,) = kabudachi.run(main)
+
+    assert type(outcome) is Unprintable
+
+
 def test_off_the_main_thread_what_is_not_an_exception_fails_only_what_raised_it():
     """No signal reaches a loop off the main thread, so a `KeyboardInterrupt`
     there is never a Ctrl-C, nor a `CancelledError` nobody asked for a stop:
@@ -877,3 +920,77 @@ def test_off_the_main_thread_what_is_not_an_exception_fails_only_what_raised_it(
         "CancelledError: no resources",
     ], failed
     assert (type(outcome), getattr(outcome, "kind", None)) == (TaskBodyError, "KeyboardInterrupt")
+
+
+def test_a_context_filter_puts_the_running_task_on_each_record_its_body_logs():
+    records = []
+
+    class Keep(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = Keep()
+    handler.addFilter(kabudachi_logging.ContextFilter())
+    logger = logging.getLogger("tests.context")
+    logger.addHandler(handler)
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+
+    @kabudachi.before_run
+    def hook_logs(context):
+        logger.info("before %s", context.task_name)
+
+    @declare
+    async def logs_async(request: Greeting) -> Greeting:
+        logger.info("in an async body")
+        return request
+
+    @declare
+    def logs_sync(request: Greeting) -> Greeting:
+        logger.info("in a sync body")
+        return request
+
+    async def main():
+        logger.info("outside any body")
+        first, second = logs_async(Greeting()), logs_sync(Greeting())
+        await asyncio.gather(first, second)
+        return first.task_id, second.task_id
+
+    try:
+        first, second = kabudachi.run(main)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    assert kabudachi.current_context() is None
+    by_message = {record.getMessage(): record for record in records}
+    assert by_message["outside any body"].task_id == ""
+    assert by_message["in an async body"].task_id == first
+    assert by_message["in a sync body"].task_id == second
+    assert by_message["in a sync body"].task_name == "tests.logs_sync"
+    assert by_message["in a sync body"].attempt == 1
+    assert by_message["before tests.logs_async"].task_id == first
+    assert by_message["before tests.logs_sync"].task_id == second
+
+
+def test_native_events_reach_python_logging_under_kabudachi_native(caplog):
+    caplog.set_level(logging.INFO, logger="kabudachi.native")
+
+    async def main():
+        return None
+
+    kabudachi.run(main)
+
+    def leads():
+        return [
+            record
+            for record in caplog.records
+            if record.name.startswith("kabudachi.native.") and "leads" in record.getMessage()
+        ]
+
+    deadline = time.monotonic() + 5
+    while not leads() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    [record] = leads()
+    assert record.name == "kabudachi.native.kabudachi_bindings.runtime"
+    assert record.levelno == logging.INFO

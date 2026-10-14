@@ -3,17 +3,19 @@
 //! and only the worker that claimed a run can report on it.
 
 use crate::support::grant::unbounded_grant;
-use crate::support::scheduler::{Fixture, TestScheduler};
+use crate::support::scheduler::{Fixture, TestScheduler, newest_records};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::scheduler::{
-    CancelRejection, ClaimRejection, Completion, LeadershipGrant, LeaseEnd, ReportRejection,
-    Submission,
+    CancelRejection, ClaimRejection, Completion, LeadershipGrant, LeaseEnd,
+    MAX_FAILURE_MESSAGE_BYTES, ReportRejection, Submission, TraceContext,
 };
+use kabudachi_core::task_record::MAX_RECORD_BYTES;
 use kabudachi_core::time::{Clock, Duration};
+use prost::Message as _;
 
 const RESULT: &[u8] = b"the-result";
 
@@ -326,4 +328,159 @@ fn the_queue_hands_out_in_order_and_up_to_the_limit() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn a_run_records_when_it_was_claimed_and_started_and_why_it_failed_in_at_most_a_kibibyte() {
+    let mut fixture = Fixture::leading();
+    let task_id = fixture
+        .scheduler
+        .submit(
+            Submission::new(
+                TaskDefinitionId::new("billing.charge"),
+                3,
+                b"input-bytes".to_vec(),
+                "default",
+            )
+            .with_retries(1),
+        )
+        .unwrap();
+    let claim = fixture
+        .scheduler
+        .request_claim(&worker("w1"), &task_id)
+        .unwrap();
+    let run = fixture.scheduler.task_run(&claim.task_run_id).unwrap();
+    let claimed_at = run.claimed_at.expect("a claimed run says when");
+    assert_eq!(run.started_at, None, "not started yet");
+
+    fixture
+        .scheduler
+        .report_started(&worker("w1"), &claim.task_run_id)
+        .unwrap();
+    // Three-byte characters, so a cut at a fixed byte count would split one.
+    let message = "\u{20ac}".repeat(1000);
+    let failure = fixture
+        .scheduler
+        .fail_with_message(
+            &worker("w1"),
+            &claim.task_run_id,
+            "ValueError",
+            message.clone(),
+        )
+        .unwrap();
+
+    let run = fixture.scheduler.task_run(&claim.task_run_id).unwrap();
+    let started_at = run.started_at.expect("a started run says when");
+    assert!(started_at.unix_millis >= claimed_at.unix_millis);
+    assert_eq!(run.failure_kind, "ValueError");
+    assert!(
+        !run.failure_message.is_empty() && run.failure_message.len() <= MAX_FAILURE_MESSAGE_BYTES
+    );
+    assert!(
+        message.starts_with(&run.failure_message),
+        "cut, not changed, and not through a character"
+    );
+
+    // The retry is a run of its own, with no times or message yet.
+    let retry = fixture
+        .scheduler
+        .task_run(&failure.retry.unwrap())
+        .unwrap();
+    assert_eq!((retry.claimed_at, retry.started_at), (None, None));
+    assert!(retry.failure_message.is_empty());
+}
+
+#[test]
+fn failure_messages_never_push_a_record_past_its_limit() {
+    let mut fixture = Fixture::leading();
+    // Input that nearly fills a claim, and more retries than the run
+    // history can hold with a full message on every run.
+    let input = vec![b'x'; 1_000_000];
+    let task_id = fixture
+        .scheduler
+        .submit(
+            Submission::new(TaskDefinitionId::new("demo.task"), 1, input, "default")
+                .with_retries(500),
+        )
+        .unwrap();
+    let message = "m".repeat(4096);
+    loop {
+        let claim = fixture
+            .scheduler
+            .request_claim(&worker("w1"), &task_id)
+            .unwrap();
+        fixture
+            .scheduler
+            .report_started(&worker("w1"), &claim.task_run_id)
+            .unwrap();
+        let failure = fixture
+            .scheduler
+            .fail_with_message(
+                &worker("w1"),
+                &claim.task_run_id,
+                "ValueError",
+                message.clone(),
+            )
+            .unwrap();
+        for record in newest_records(&fixture) {
+            assert!(
+                record.encoded_len() as u64 <= MAX_RECORD_BYTES,
+                "a record outgrew the limit"
+            );
+        }
+        if failure.retry.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture.state(&task_id),
+        TaskRunState::Failed,
+        "the history filled before the retries ran out"
+    );
+}
+
+#[test]
+fn a_tasks_trace_context_reaches_its_record_and_claim_unchanged_and_counts_toward_its_size() {
+    let mut fixture = Fixture::leading();
+    let trace = TraceContext {
+        trace_parent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
+        trace_state: "vendor=opaque".into(),
+        baggage: "tenant=acme".into(),
+    };
+    let plain_task = || {
+        Submission::new(
+            TaskDefinitionId::new("demo.task"),
+            1,
+            b"in".to_vec(),
+            "default",
+        )
+    };
+    let task_id = fixture
+        .scheduler
+        .submit(plain_task().with_trace_context(trace.clone()))
+        .unwrap();
+    let record = newest_records(&fixture)
+        .into_iter()
+        .find(|record| {
+            record
+                .task
+                .as_ref()
+                .is_some_and(|task| task.task_id() == task_id)
+        })
+        .unwrap();
+    let stored = record.task.unwrap();
+    assert_eq!(
+        (stored.trace_parent, stored.trace_state, stored.baggage),
+        (
+            trace.trace_parent.clone(),
+            trace.trace_state.clone(),
+            trace.baggage.clone()
+        )
+    );
+    let claim = fixture
+        .scheduler
+        .request_claim(&worker("w1"), &task_id)
+        .unwrap();
+    assert_eq!(claim.task.trace_parent, trace.trace_parent);
+    assert_eq!(claim.task.baggage, trace.baggage);
 }

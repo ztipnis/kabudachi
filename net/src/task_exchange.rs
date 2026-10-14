@@ -172,16 +172,19 @@ impl Net {
         .await
     }
 
-    /// Tells `leader` `run` failed with an error of type `failure_kind`.
+    /// Tells `leader` `run` failed with an error of type `failure_kind` and
+    /// message `failure_message`.
     pub async fn fail(
         &self,
         leader: WorkerId,
         run: TaskRunId,
         failure_kind: String,
+        failure_message: String,
     ) -> Result<TaskResponse, TaskFailure> {
         self.report(leader, task_request::Request::Failed(ReportFailed {
             task_run_id: Some(run.into()),
             failure_kind,
+            failure_message,
         }))
         .await
     }
@@ -257,6 +260,7 @@ impl Net {
                 &run,
                 HeldRun::Failed {
                     failure_kind: report.failure_kind.clone(),
+                    failure_message: report.failure_message.clone(),
                 },
             ),
             _ => {}
@@ -765,7 +769,12 @@ fn failed<C: Clock, I: IdGenerator, O: Observer>(
 ) -> Answered {
     let run = run_id(report.task_run_id.as_ref())?;
     scheduler
-        .fail(from, &run, report.failure_kind.clone())
+        .fail_with_message(
+            from,
+            &run,
+            report.failure_kind.clone(),
+            report.failure_message.clone(),
+        )
         .map(|failure| task_response::Result::Failed(wire::failed(failure)))
         .map_err(wire::report_reject)
 }

@@ -95,6 +95,26 @@ pub fn mint(submission: Submission, ids: &impl IdGenerator, clock: &impl Clock) 
     }
 }
 
+/// The W3C trace context a task carries from its submission to its record and
+/// every claim of it, unchanged. Filled by tracing; empty until then.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceContext {
+    pub trace_parent: String,
+    pub trace_state: String,
+    pub baggage: String,
+}
+
+impl TraceContext {
+    /// The bytes the three fields take.
+    pub fn len(&self) -> usize {
+        self.trace_parent.len() + self.trace_state.len() + self.baggage.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// What a task is submitted with. Start from [`Submission::new`] and add the
 /// options that differ from the defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +155,8 @@ pub struct Submission {
     /// `serialized_input` is then empty. The blobs are stored before the
     /// submission is made.
     pub input_manifest: Option<Manifest>,
+    /// The trace context to carry; empty for none.
+    pub trace: TraceContext,
 }
 
 impl Submission {
@@ -160,6 +182,7 @@ impl Submission {
             reconnect_timeout: None,
             client: None,
             input_manifest: None,
+            trace: TraceContext::default(),
         }
     }
 
@@ -228,6 +251,13 @@ impl Submission {
         self
     }
 
+    /// Carries `trace` unchanged to the task's record and every claim of it.
+    #[must_use]
+    pub fn with_trace_context(mut self, trace: TraceContext) -> Self {
+        self.trace = trace;
+        self
+    }
+
     /// What the input weighs: its whole length, inline or as blobs.
     pub fn payload_bytes(&self) -> u64 {
         self.input_manifest
@@ -238,13 +268,14 @@ impl Submission {
 
 impl Submission {
     /// What a claim of the submitted task weighs before its chain: its
-    /// input, queue, definition id and coalescing key.
+    /// input, queue, definition id, coalescing key and trace context.
     pub(super) fn claim_weight(&self) -> u64 {
         claim_weight_sum(
             self.carried_bytes(),
             &self.queue,
             self.definition_id.as_str(),
             self.coalescing_key.as_deref(),
+            self.trace.len() as u64,
         )
     }
 
@@ -293,8 +324,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 limit: MAX_SUBMISSION_BYTES,
             });
         }
-        // The carried input (bytes or encoded manifest), queue, definition id
-        // and key: the shared claim-weight sum.
+        // The carried input (bytes or encoded manifest), queue, definition id,
+        // key and trace context: the shared claim-weight sum.
         let size = submission.claim_weight();
         if size > MAX_SUBMISSION_BYTES {
             return Err(SubmitRejection::TooLarge {
@@ -490,5 +521,6 @@ fn task_of(task_id: TaskId, submitted_at: WallTime, submission: Submission) -> T
         reconnect_timeout: submission.reconnect_timeout,
         client: submission.client,
         input_manifest: submission.input_manifest,
+        trace: submission.trace,
     })
 }

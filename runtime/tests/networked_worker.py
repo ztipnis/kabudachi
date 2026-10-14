@@ -92,6 +92,9 @@ async def answer(native, command: dict) -> dict:
                 "state": _STATES[run.state],
                 "worker": run.worker,
                 "failure_kind": run.failure_kind,
+                "failure_message": run.failure_message,
+                "claimed_at": run.claimed_at_ms,
+                "started_at": run.started_at_ms,
                 "digest": None if run.result_digest is None else run.result_digest.hex(),
                 "delivered": run.delivered,
             }
@@ -131,6 +134,7 @@ async def main() -> None:
         "address": native.address(),
         "shard": native.shard_id(),
         "certifies_locally": native.certifies_locally,
+        "health": native.health_address(),
     })
     while line := await asyncio.to_thread(sys.stdin.readline):
         command = json.loads(line)

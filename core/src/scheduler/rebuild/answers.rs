@@ -152,8 +152,12 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                     out.certified.push(certified);
                 }
             }
-            ReportedState::Failed { failure_kind } => {
-                if let Ok(failed) = self.fail_owned(worker, run_id, failure_kind) {
+            ReportedState::Failed {
+                failure_kind,
+                failure_message,
+            } => {
+                if let Ok(failed) = self.fail_owned(worker, run_id, failure_kind, failure_message)
+                {
                     out.failed.push(failed);
                 }
             }
@@ -243,6 +247,9 @@ fn claimed_run(worker: &WorkerId, claim: &Claim, stamped_at: WallTime) -> TaskRu
         result_digest: None,
         failure_kind: String::new(),
         delivered: false,
+        claimed_at: None,
+        started_at: None,
+        failure_message: String::new(),
     };
     run.transition_to(TaskRunState::Claimed, stamped_at)
         .expect("a queued run can be claimed");

@@ -181,11 +181,11 @@ class FaultingRuntime:
             raise RuntimeError("not the leader")
         return self.native.report_started(task_run_id)
 
-    def report_failure(self, task_run_id, failure_kind):
+    def report_failure(self, task_run_id, failure_kind, failure_message=""):
         self.events.append(("fail", task_run_id, failure_kind))
         if self.refuse_failure:
             raise RuntimeError("the run does not belong to this worker")
-        return self.native.report_failure(task_run_id, failure_kind)
+        return self.native.report_failure(task_run_id, failure_kind, failure_message)
 
     def report_lost(self, task_run_id):
         self.events.append(("lost", task_run_id))

@@ -431,6 +431,7 @@ fn a_re_asked_workers_newer_run_state_replaces_the_earlier_one() {
     round.page(&w("a"), last(ReportedState::Running), Instant::at(0));
     let failed = ReportedState::Failed {
         failure_kind: "crash".into(),
+        failure_message: String::new(),
     };
     round.page(&w("a"), last(failed.clone()), Instant::at(7));
 

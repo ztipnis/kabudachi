@@ -43,12 +43,15 @@ mod results;
 mod seam;
 mod start;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::manifest::fits_inline;
 use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids};
+use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::mint;
 use kabudachi_core::time::RealClock;
 use kabudachi_net::executor::{Report, executor_channel};
@@ -60,6 +63,7 @@ use tokio::sync::watch;
 use crate::arguments::SubmitArguments;
 use crate::bridge::CLOSED_MESSAGE;
 use crate::errors::backpressure_error;
+use crate::health;
 use crate::work::PyTaskRecord;
 
 use self::delivery::{cancel_at_leader, send_submission};
@@ -83,6 +87,10 @@ pub struct NetworkedRuntime {
     address: String,
     clock: RealClock,
     reconnect_timeout: StdDuration,
+    shard_name: String,
+    /// Set once Python has loaded the worker's tasks and can take work.
+    registry: Arc<AtomicBool>,
+    health: Option<SocketAddr>,
 }
 
 #[pymethods]
@@ -93,12 +101,22 @@ impl NetworkedRuntime {
     /// by founding the shard alone.
     ///
     /// Raises `ValueError` for an address that cannot be read, a timing or
-    /// authority TTL of zero, only one memory limit, no worker threads or an
-    /// authority that cannot be used, and `RuntimeError` if it cannot listen
-    /// on its listen address.
+    /// authority TTL of zero, a replication factor or seed rounds of zero,
+    /// only one memory limit, no worker threads or an authority that cannot
+    /// be used, and `RuntimeError` if it cannot listen
+    /// on its listen address. `health_listen` raises `ValueError` for an
+    /// address that is not `ip:port` and `RuntimeError` when it cannot be
+    /// bound.
     #[new]
     fn new(py: Python<'_>, arguments: NetworkedArguments) -> PyResult<Self> {
         arguments.check()?;
+        // Bound before the worker bootstraps, so a port in use leaves nothing
+        // running.
+        let health_listener = arguments
+            .health_listen
+            .as_deref()
+            .map(health::bind)
+            .transpose()?;
         let (endpoint, executor) = executor_channel();
         let (source, reports) = executor.split();
         let config = arguments.worker_config(endpoint)?;
@@ -128,6 +146,37 @@ impl NetworkedRuntime {
             Arc::new(sender),
             Arc::default(),
         );
+        let registry = Arc::new(AtomicBool::new(false));
+        let health = match health_listener {
+            Some(listener) => {
+                let seen = shared.observed.clone();
+                let ready_seen = shared.observed.clone();
+                let pump_running = host.pumping();
+                let loaded = Arc::clone(&registry);
+                Some(health::serve(
+                    host.handle(),
+                    listener,
+                    health::Probe {
+                        alive: Box::new(move || {
+                            !seen.borrow().gone && pump_running.load(Ordering::Acquire)
+                        }),
+                        // A leader is ready once reconciled (`Leader`); a
+                        // follower once a leader holding a grant has heard
+                        // it, which is when its driver starts claiming.
+                        ready: Box::new(move || {
+                            let seen = ready_seen.borrow();
+                            loaded.load(Ordering::Acquire)
+                                && match seen.state {
+                                    Some(WorkerState::Leader) => true,
+                                    Some(WorkerState::Active) => seen.contact_floor,
+                                    _ => false,
+                                }
+                        }),
+                    },
+                )?)
+            }
+            None => None,
+        };
         Ok(NetworkedRuntime {
             host,
             shared,
@@ -135,7 +184,27 @@ impl NetworkedRuntime {
             address,
             clock: RealClock::new(),
             reconnect_timeout: StdDuration::from_millis(arguments.reconnect_timeout_ms),
+            shard_name: arguments.shard,
+            registry,
+            health,
         })
+    }
+
+    /// The address the health endpoints are served on, `ip:port`; `None`
+    /// unless `health_listen` was given.
+    fn health_address(&self) -> Option<String> {
+        self.health.map(|address| address.to_string())
+    }
+
+    /// Says the worker is set up to take work: `/readyz` answers 200 from
+    /// now on once the worker can take it.
+    fn registry_loaded(&self) {
+        self.registry.store(true, Ordering::Release);
+    }
+
+    /// The name of the shard this worker belongs to.
+    fn shard_name(&self) -> String {
+        self.shard_name.clone()
     }
 
     /// Whether a report's call returns the leader's decision: never, here;
@@ -338,12 +407,16 @@ impl NetworkedRuntime {
         Ok(())
     }
 
-    /// Hands the leader a run's failure, by its error's type name.
-    fn report_failure(&self, task_run_id: &str, failure_kind: &str) {
+    /// Hands the leader a run's failure, by its error's type name and
+    /// message (never its traceback). The message is stored in the task's
+    /// replicated record, so it can contain task data.
+    #[pyo3(signature = (task_run_id, failure_kind, failure_message = ""))]
+    fn report_failure(&self, task_run_id: &str, failure_kind: &str, failure_message: &str) {
         self.shared
             .finish(TaskRunId::new(task_run_id), |run| Report::Failed {
                 run,
                 reason: failure_kind.to_owned(),
+                message: failure_message.to_owned(),
             });
     }
 

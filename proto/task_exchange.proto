@@ -40,6 +40,10 @@ message SubmitTask {
   // message (see `Task.input_manifest`). Its blobs are stored before the
   // submission is sent.
   Manifest input_manifest = 16;
+  // The task's trace context (see `Task.trace_parent`).
+  string trace_parent = 17;
+  string trace_state = 18;
+  string baggage = 19;
 }
 
 message ReportStarted {
@@ -57,8 +61,10 @@ message ReportCompleted {
 
 message ReportFailed {
   TaskRunId task_run_id = 1;
-  // The error's type name, never its message.
+  // The error's type name; its message travels in `failure_message`.
   string failure_kind = 2;
+  // The error's message, never its traceback; the leader keeps at most 1 KiB.
+  string failure_message = 3;
 }
 
 // The fold of a compaction run: the payload its worker made by merging the

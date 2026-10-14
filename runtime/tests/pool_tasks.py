@@ -4,6 +4,8 @@ directory `KABUDACHI_TEST_MARKERS` names, which a test shares with its task
 processes."""
 
 import asyncio
+import dataclasses
+import json
 import os
 import signal
 import threading
@@ -369,3 +371,18 @@ def leaves(request: Greeting) -> Greeting:
 async def leaves_async(request: Greeting) -> Greeting:
     """Raises the exception `request.text` names, on its process's event loop."""
     raise LEAVING[request.text]("leaving")
+
+
+def _context_now() -> Greeting:
+    info = kabudachi.current_context()
+    return Greeting(text="null" if info is None else json.dumps(dataclasses.asdict(info)))
+
+
+@kabudachi.task(name="pool.context_async")
+async def context_async(request: Greeting) -> Greeting:
+    return _context_now()
+
+
+@kabudachi.task(name="pool.context_sync")
+def context_sync(request: Greeting) -> Greeting:
+    return _context_now()

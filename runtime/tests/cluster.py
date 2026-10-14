@@ -7,10 +7,13 @@ import json
 import os
 import queue
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from kabudachi import _native
@@ -27,6 +30,7 @@ TIMINGS = {
     "KABUDACHI_HEARTBEAT_TIMEOUT": "1",
     "KABUDACHI_RECONNECT_TIMEOUT": "2",
     "KABUDACHI_CANCEL_GRACE": "0.5",
+    "KABUDACHI_ROLL_CALL_DEADLINE": "0.2",
 }
 HEARTBEAT_TIMEOUT = 1.0
 RECONNECT_TIMEOUT = 2.0
@@ -45,10 +49,31 @@ def eventually(description, probe, timeout=20.0):
         time.sleep(POLL_SECONDS)
 
 
-class Worker:
-    """One worker process and its standard streams."""
+def probe(address: str | None, path: str) -> int | None:
+    """The HTTP status `GET path` answers at `address`, or `None` if nothing does."""
+    if address is None:
+        return None
+    try:
+        with urllib.request.urlopen(f"http://{address}{path}", timeout=2) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except OSError:
+        return None
 
-    def __init__(self, environment: dict) -> None:
+
+def free_port() -> int:
+    with socket.socket() as bound:
+        bound.bind(("127.0.0.1", 0))
+        return bound.getsockname()[1]
+
+
+class Worker:
+    """One worker process and its standard streams. With `wait_until_ready`
+    false it returns at once, before the worker has joined a shard, and its
+    `id`, `address`, `shard` and `health` are `None`."""
+
+    def __init__(self, environment: dict, wait_until_ready: bool = True) -> None:
         self.process = subprocess.Popen(
             [sys.executable, str(WORKER)],
             env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), **environment},
@@ -63,6 +88,10 @@ class Worker:
         self.notices: list[dict] = []
         self._ids = itertools.count()
         threading.Thread(target=self._read, daemon=True).start()
+        if not wait_until_ready:
+            self.id = self.address = self.shard = self.health = None
+            self.certifies_locally = None
+            return
         try:
             ready = self._next(lambda line: "ready" in line, STARTUP_SECONDS)["ready"]
         except BaseException:
@@ -70,6 +99,7 @@ class Worker:
             raise
         self.id, self.address, self.shard = ready["worker"], ready["address"], ready["shard"]
         self.certifies_locally = ready["certifies_locally"]
+        self.health = ready.get("health")
 
     def _read(self) -> None:
         for line in self.process.stdout:
@@ -150,6 +180,7 @@ class Cluster:
         environment = {
             **TIMINGS,
             "KABUDACHI_LISTEN": "/ip4/127.0.0.1/tcp/0",
+            "KABUDACHI_HEALTH_LISTEN": "127.0.0.1:0",
             "KABUDACHI_PROCESSES": "1",
             "KABUDACHI_CONCURRENCY": "1",
             # Past a few hundred bytes of pending input the leader compacts

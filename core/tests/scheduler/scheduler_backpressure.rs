@@ -8,6 +8,7 @@ use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::scheduler::{
     Completion, Event, MAX_SUBMISSION_BYTES, MemoryLimits, Submission, SubmitRejection,
+    TraceContext,
 };
 use kabudachi_core::time::Duration;
 use crate::support::scheduler::Fixture;
@@ -337,7 +338,7 @@ fn a_task_too_large_for_a_claim_frame_is_refused_with_no_limits_set_and_leaves_n
 }
 
 #[test]
-fn what_makes_a_task_too_large_for_a_claim_frame_is_its_queue_and_key_as_well_as_its_input() {
+fn what_makes_a_task_too_large_for_a_claim_frame_is_its_queue_key_and_trace_as_well_as_its_input() {
     let mut fixture = Fixture::leading();
     let long = "q".repeat(MAX_SUBMISSION_BYTES as usize);
 
@@ -350,6 +351,51 @@ fn what_makes_a_task_too_large_for_a_claim_frame_is_its_queue_and_key_as_well_as
 
     assert!(matches!(by_queue, Err(SubmitRejection::TooLarge { .. })));
     assert!(matches!(by_key, Err(SubmitRejection::TooLarge { .. })));
+
+    // A trace context fills the frame like any other part: exactly the limit
+    // is accepted, one byte more is refused.
+    let fixed = "default".len() + "bulk.load".len() + 1;
+    let room = MAX_SUBMISSION_BYTES as usize - fixed;
+    let traced = |baggage: usize| {
+        payload(1).with_trace_context(TraceContext {
+            baggage: "b".repeat(baggage),
+            ..TraceContext::default()
+        })
+    };
+    assert!(fixture.scheduler.submit(traced(room)).is_ok());
+    assert_eq!(
+        fixture.scheduler.submit(traced(room + 1)),
+        Err(SubmitRejection::TooLarge {
+            size: MAX_SUBMISSION_BYTES + 1,
+            limit: MAX_SUBMISSION_BYTES,
+        })
+    );
+}
+
+#[test]
+fn a_trace_context_that_tips_a_keys_retained_chain_over_the_claim_frame_is_key_backpressure() {
+    let mut fixture = Fixture::leading();
+    fixture.scheduler.submit(generation(100, "k")).unwrap();
+    // Alone, this claim fills the frame exactly; the key's retained payload
+    // would ride along with it.
+    let fixed = "default".len() + "index.refresh".len() + "k".len();
+    let filling = || {
+        generation(0, "k").with_trace_context(TraceContext {
+            baggage: "b".repeat(MAX_SUBMISSION_BYTES as usize - fixed),
+            ..TraceContext::default()
+        })
+    };
+
+    let rejected = fixture.scheduler.submit(filling());
+
+    assert!(matches!(
+        rejected,
+        Err(SubmitRejection::KeyBackpressure { limit, .. }) if limit == MAX_SUBMISSION_BYTES
+    ));
+    assert!(
+        fixture.scheduler.submit(generation(0, "k")).is_ok(),
+        "without the trace the same generation fits"
+    );
 }
 
 #[test]

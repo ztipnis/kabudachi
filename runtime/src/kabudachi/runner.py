@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import Any, TypeVar, overload
 
 from kabudachi import _native
+from kabudachi._native import refresh_logging
 from kabudachi.config import Configuration, Settings, authority_parts, process_configuration
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
@@ -50,7 +51,9 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     while it waits, and takes its place back as soon as it resumes, even if
     that briefly puts more than `concurrency` bodies in progress. The
     `processes`, `concurrency` and `imports` settings are read when `run`
-    starts.
+    starts. Native log records go to the `kabudachi.native` loggers; those
+    below the effective level of `kabudachi.native` itself when `run` starts
+    are not forwarded, whatever level a child logger is set to.
 
     When `main` returns, `run` waits for every task that was called to finish
     before it stops the worker. If `main` raises, or is cancelled, tasks
@@ -94,6 +97,7 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     if active_session() is not None:
         raise RuntimeError("kabudachi.run() is already running in this process")
     validate_definitions(default_registry(), process_serializers())
+    refresh_logging()
     executor = _executor_for(process_configuration())
 
     with asyncio.Runner() as runner:
@@ -122,6 +126,10 @@ def _millis(duration: timedelta) -> int:
     return round(duration.total_seconds() * 1000)
 
 
+def _optional_millis(duration: timedelta | None) -> int | None:
+    return None if duration is None else _millis(duration)
+
+
 def _native_runtime(settings: Settings) -> Any:
     """A one-node shard of this process's own, or, with `listen` set, a
     worker of the networked shard `settings.shard`."""
@@ -133,6 +141,7 @@ def _native_runtime(settings: Settings) -> Any:
                 result_ttl_ms=settings.result_ttl * 1000,
                 memory_soft_limit=settings.memory_soft_limit,
                 memory_hard_limit=settings.memory_hard_limit,
+                health_listen=settings.health_listen,
             ),
         )
     authority = None
@@ -154,6 +163,11 @@ def _native_runtime(settings: Settings) -> Any:
             result_ttl_ms=settings.result_ttl * 1000,
             memory_soft_limit=settings.memory_soft_limit,
             memory_hard_limit=settings.memory_hard_limit,
+            replication_factor=settings.replication_factor,
+            seed_rounds=settings.seed_rounds,
+            roll_call_deadline_ms=_optional_millis(settings.roll_call_deadline),
+            routing_refresh_ms=_optional_millis(settings.routing_refresh),
+            health_listen=settings.health_listen,
         )
     )
 
@@ -714,6 +728,9 @@ class _WorkerRun:
         await self._executor.start()
         try:
             native = _native_runtime(self._settings)
+            # The tasks are registered and the executor is up; whether the
+            # worker is ready now depends on its place in the shard alone.
+            native.registry_loaded()
             try:
                 return await self._serve(main, native)
             except BaseException as error:

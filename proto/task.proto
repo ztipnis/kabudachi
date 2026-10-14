@@ -78,6 +78,11 @@ message Task {
   // message: the blobs that hold it, in order. A claimant fetches them before
   // the body starts.
   Manifest input_manifest = 21;
+  // W3C trace context the submitter attached, carried unchanged to every
+  // claim of the task. Empty when none was attached.
+  string trace_parent = 22;
+  string trace_state = 23;
+  string baggage = 24;
 }
 
 // The front of a coalescing key's waiting chain a compaction run folds: each
@@ -106,7 +111,8 @@ message TaskRun {
   // accepts. Unset while the run is still pending.
   WorkerId selected_worker = 7;
   // The type name of the error that failed the run (for example
-  // "ValueError"), never its message. Empty unless the run is FAILED.
+  // "ValueError"); its message is in `failure_message`. Empty unless the run
+  // is FAILED.
   string failure_kind = 9;
   // When the leader created this run and last changed it, by its wall clock.
   WallTime created_at = 10;
@@ -116,4 +122,11 @@ message TaskRun {
   // The run's result reached its task's client before the run was reported
   // completed. False for a task with no client.
   bool delivered = 16;
+  // When a worker claimed this run, and when it reported it started, by the
+  // leader's wall clock. Unset until then.
+  WallTime claimed_at = 13;
+  WallTime started_at = 14;
+  // The error's message, cut to at most 1 KiB, never its traceback. Empty
+  // unless the run is FAILED.
+  string failure_message = 15;
 }

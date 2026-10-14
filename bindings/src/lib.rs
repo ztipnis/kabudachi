@@ -7,7 +7,9 @@ mod bridge;
 mod door;
 mod election;
 mod errors;
+mod health;
 mod local_node;
+mod native_log;
 mod networked;
 mod outcomes;
 mod runtime;
@@ -31,6 +33,8 @@ fn result_digest<'py>(py: Python<'py>, data: &[u8]) -> Bound<'py, PyBytes> {
 
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    native_log::install(m.py())?;
+    m.add_function(wrap_pyfunction!(native_log::refresh_logging, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(result_digest, m)?)?;
     m.add_class::<runtime::NativeRuntime>()?;
@@ -43,6 +47,10 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<outcomes::PyEventKind>()?;
     m.add_class::<outcomes::PyCancelOutcome>()?;
     m.add_class::<outcomes::PyRunState>()?;
+    m.add(
+        "MAX_FAILURE_MESSAGE_BYTES",
+        kabudachi_core::scheduler::MAX_FAILURE_MESSAGE_BYTES,
+    )?;
     m.add("KabudachiError", m.py().get_type::<errors::KabudachiError>())?;
     m.add("BackpressureError", errors::backpressure_error_type(m.py())?)?;
     Ok(())

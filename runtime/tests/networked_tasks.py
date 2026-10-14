@@ -100,6 +100,12 @@ def echo(request: Greeting) -> Greeting:
     return request
 
 
+@kabudachi.task(name="cluster.fails")
+async def fails(request: Greeting) -> Greeting:
+    """Fails with `text` as its error's message."""
+    raise ValueError(request.text)
+
+
 @kabudachi.task(name="cluster.inflate")
 def inflate(request: Greeting) -> Greeting:
     """Returns its input's text twice over."""
@@ -154,6 +160,7 @@ TASKS = {
     "awaits": awaits,
     "fleeting": fleeting,
     "echo": echo,
+    "fails": fails,
     "inflate": inflate,
     "weigh": weigh,
     "bulk": bulk,

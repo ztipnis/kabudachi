@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -20,6 +22,7 @@ use crate::bridge::{Bridge, CLOSED_MESSAGE};
 use crate::door::{Closed, Refusal, SchedulerDoor};
 use crate::election::{Publisher, run_election};
 use crate::errors;
+use crate::health;
 use crate::local_node::local_node;
 use crate::outcomes::{PyCancelOutcome, PyRunState};
 use crate::timers::run_timers;
@@ -40,6 +43,17 @@ pub(crate) struct OneNodeArguments {
     result_ttl_ms: u64,
     memory_soft_limit: Option<u64>,
     memory_hard_limit: Option<u64>,
+    health_listen: Option<String>,
+}
+
+/// Counts the runtime's native loops still running; each loop holds one and
+/// gives it back however it ends, a panic included.
+struct LoopRunning(Arc<AtomicUsize>);
+
+impl Drop for LoopRunning {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The native side of kabudachi for one worker: a Tokio runtime that keeps
@@ -69,6 +83,10 @@ pub struct NativeRuntime {
     /// The hard memory limit, which is the largest payload this runtime
     /// holds whole.
     payload_limit: Option<u64>,
+    worker_id: String,
+    /// Set once Python has loaded the worker's tasks and can take work.
+    registry: Arc<AtomicBool>,
+    health: Option<SocketAddr>,
 }
 
 #[pymethods]
@@ -80,7 +98,8 @@ impl NativeRuntime {
     /// which says how the runtime runs and what each of its fields means.
     ///
     /// Raises `ValueError` if `worker_threads` is zero or only one of the two
-    /// memory limits is given.
+    /// memory limits is given, or if `health_listen` is not an `ip:port`
+    /// address; `RuntimeError` if `health_listen` cannot be bound.
     #[new]
     fn new(
         worker_id: String,
@@ -95,11 +114,12 @@ impl NativeRuntime {
         let tokio = Builder::new_multi_thread()
             .worker_threads(arguments.worker_threads)
             .thread_name("kabudachi-native")
-            .enable_time()
+            .enable_all()
             .build()
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         let bridge = Bridge::new(tokio.handle().clone());
 
+        let worker_name = worker_id.clone();
         let worker_id = WorkerId::new(worker_id);
         // One clock for everything: the scheduler's and the election node's
         // deadlines are ticks of it, so the timer and election loops have to
@@ -126,15 +146,46 @@ impl NativeRuntime {
             state: state_sender,
             door: Arc::clone(&door),
         };
-        let election = tokio.spawn(run_election(
-            node,
-            first,
-            clock,
-            Arc::clone(&stop),
-            publisher,
-        ));
+        let running = Arc::new(AtomicUsize::new(2));
+        let registry = Arc::new(AtomicBool::new(false));
+        // Bound before the loops start, so a port in use leaves nothing running.
+        let health = match arguments.health_listen {
+            Some(listen) => {
+                let listener = health::bind(&listen)?;
+                let ready_state = state.clone();
+                let loaded = Arc::clone(&registry);
+                let alive = Arc::clone(&running);
+                Some(health::serve(
+                    tokio.handle(),
+                    listener,
+                    health::Probe {
+                        alive: Box::new(move || alive.load(Ordering::Acquire) == 2),
+                        ready: Box::new(move || {
+                            loaded.load(Ordering::Acquire)
+                                && *ready_state.borrow() == WorkerState::Leader
+                        }),
+                    },
+                )?)
+            }
+            None => None,
+        };
+        let election = tokio.spawn({
+            let guard = LoopRunning(Arc::clone(&running));
+            let stop = Arc::clone(&stop);
+            async move {
+                let _guard = guard;
+                run_election(node, first, clock, stop, publisher).await
+            }
+        });
 
-        let timers = tokio.spawn(run_timers(Arc::clone(&door), clock));
+        let timers = tokio.spawn({
+            let guard = LoopRunning(Arc::clone(&running));
+            let door = Arc::clone(&door);
+            async move {
+                let _guard = guard;
+                run_timers(door, clock).await
+            }
+        });
 
         Ok(NativeRuntime {
             tokio: Mutex::new(Some(tokio)),
@@ -146,7 +197,32 @@ impl NativeRuntime {
             shard_id,
             door,
             payload_limit: limits.map(|limits| limits.hard),
+            worker_id: worker_name,
+            registry,
+            health,
         })
+    }
+
+    /// The address the health endpoints are served on, `ip:port`; `None`
+    /// unless `health_listen` was given.
+    fn health_address(&self) -> Option<String> {
+        self.health.map(|address| address.to_string())
+    }
+
+    /// Says the worker is set up to take work: `/readyz` answers 200 from
+    /// now on while the worker leads.
+    fn registry_loaded(&self) {
+        self.registry.store(true, Ordering::Release);
+    }
+
+    /// This worker's id.
+    fn worker_id(&self) -> String {
+        self.worker_id.clone()
+    }
+
+    /// The name of this worker's shard: always `local`.
+    fn shard_name(&self) -> String {
+        LOCAL_SHARD_NAME.to_owned()
     }
 
     /// Whether a report's call returns the leader's decision (a
@@ -181,7 +257,12 @@ impl NativeRuntime {
             state
                 .wait_for(|current| *current == WorkerState::Leader)
                 .await
-                .map(|_| ())
+                .map(|_| {
+                    tracing::info!(
+                        target: "kabudachi_bindings::runtime",
+                        "this worker leads its shard of one"
+                    );
+                })
                 .map_err(|_| {
                     // The election only ends early on a shutdown, unless it panicked.
                     let reason = if bridge.is_open() {
@@ -344,17 +425,25 @@ impl NativeRuntime {
     }
 
     /// Reports that a claimed run failed with an error of type `failure_kind`
-    /// (the type's name, never the error's message), whether or not its body
-    /// started. Returns whether the task has retries left, so a new attempt
-    /// is now waiting to be claimed; `False` means the task has failed for
-    /// good.
+    /// (the type's name) and the error's message `failure_message` (never its
+    /// traceback; the leader keeps at most `MAX_FAILURE_MESSAGE_BYTES` of it),
+    /// whether or not its body started. The message is stored in the task's
+    /// replicated record, so it can contain task data. Returns whether the task has retries
+    /// left, so a new attempt is now waiting to be claimed; `False` means the
+    /// task has failed for good.
     ///
     /// Raises `RuntimeError` if the run is unknown, is not this worker's, or
     /// has already finished; the failure is then not recorded.
-    fn report_failure(&self, task_run_id: &str, failure_kind: &str) -> PyResult<bool> {
+    #[pyo3(signature = (task_run_id, failure_kind, failure_message = ""))]
+    fn report_failure(
+        &self,
+        task_run_id: &str,
+        failure_kind: &str,
+        failure_message: &str,
+    ) -> PyResult<bool> {
         let failure = self
             .door
-            .report_failure(&TaskRunId::new(task_run_id), failure_kind)
+            .report_failure(&TaskRunId::new(task_run_id), failure_kind, failure_message)
             .map_err(|refusal| refused(refusal, rejected))?;
         Ok(failure.retry.is_some())
     }

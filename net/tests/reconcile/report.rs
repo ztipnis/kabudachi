@@ -1,6 +1,6 @@
 //! Any worker tells a leader that asks what it holds, page by page, within
-//! the message limit: its runs, then its records. A failure kind it reports is
-//! cut to a bound.
+//! the message limit: its runs, then its records. A failure kind and message
+//! it reports are cut to a bound.
 
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::digest::Digest;
@@ -8,6 +8,7 @@ use kabudachi_core::protocol::ids::{TaskId, TaskRunId};
 use kabudachi_core::protocol::messages::claim_response;
 use kabudachi_core::reconcile::wire::held_key;
 use kabudachi_core::reconcile::{Cursor, ReconcileTerm, ReportedState};
+use kabudachi_core::scheduler::MAX_FAILURE_MESSAGE_BYTES;
 
 use crate::support::deadline::within_deadline;
 use crate::support::records::{ThreeVoters, plain_with, proof_of_office, wait_until_held};
@@ -41,6 +42,7 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
         // pathologically long, in three-byte characters, so that a cut at any
         // fixed number of bytes would split one.
         let long_kind = "\u{20ac}".repeat(300);
+        let long_message = "\u{20ac}".repeat(600);
         tasks.push(
             shard
                 .with(leader, |_, scheduler| scheduler.submit(plain_with(b"input")))
@@ -68,7 +70,12 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
         let succeeded_run = first_run.expect("another task was claimed");
         let bystander_id = shard.id(shard.others(leader)[1]);
         shard
-            .drive_until(worker_net.fail(bystander_id.clone(), failed_run.clone(), long_kind.clone()))
+            .drive_until(worker_net.fail(
+                bystander_id.clone(),
+                failed_run.clone(),
+                long_kind.clone(),
+                long_message.clone(),
+            ))
             .await
             .expect("the bystander answered");
         // Another run, started and then completed the same way: the worker still
@@ -118,13 +125,18 @@ async fn a_worker_reports_its_runs_then_every_record_it_holds_across_pages() {
         assert!(pages > 1, "nine runs, eight of them of 200 KiB, take more than one page");
         for run in &runs {
             if run.claim.task_run_id == failed_run {
-                let ReportedState::Failed { failure_kind } = &run.state else {
+                let ReportedState::Failed { failure_kind, failure_message } = &run.state else {
                     panic!("the run the worker failed was reported {:?}", run.state);
                 };
                 assert!(!failure_kind.is_empty() && failure_kind.len() < long_kind.len());
                 assert!(
                     long_kind.starts_with(failure_kind.as_str()),
                     "the kind is cut, not changed, and not through a character"
+                );
+                assert!(!failure_message.is_empty() && failure_message.len() <= MAX_FAILURE_MESSAGE_BYTES);
+                assert!(
+                    long_message.starts_with(failure_message.as_str()),
+                    "the message is cut, not changed, and not through a character"
                 );
             } else if run.claim.task_run_id == succeeded_run {
                 assert_eq!(

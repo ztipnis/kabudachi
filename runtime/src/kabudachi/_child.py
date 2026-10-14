@@ -39,6 +39,7 @@ from kabudachi.hosted_work import LoopHostedWork
 from kabudachi.lifecycle import RunContext, default_hooks, hooks_for_run, initialize_process
 from kabudachi.options import SubmissionOptions
 from kabudachi.registry import default_registry
+from kabudachi.run_info import RunInfo, run_context
 from kabudachi.serializers import process_serializers
 from kabudachi.session import activate, invoke_callback
 
@@ -232,6 +233,17 @@ class _TaskProcess:
         # A body that waits for a task it called gives its place back meanwhile.
         context = contextvars.copy_context()
         context.run(current_body.set, _BodyWaits(self, frame.run_id))
+        context.run(
+            run_context,
+            RunInfo(
+                frame.task_id,
+                frame.run_id,
+                frame.definition_id,
+                frame.attempt,
+                frame.shard,
+                frame.worker_id,
+            ),
+        )
         hooks = hooks_for_run(
             self._hooks,
             RunContext(frame.definition_id, frame.run_id, frame.attempt),
