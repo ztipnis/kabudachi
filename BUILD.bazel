@@ -13,6 +13,9 @@
 load("@aspect_gazelle_prebuilt//:def.bzl", "aspect_gazelle")
 load("@aspect_rules_py//uv/unstable:defs.bzl", "gazelle_python_manifest")
 
+# The wheel test reads the module's version, which must equal the package's.
+exports_files(["MODULE.bazel"])
+
 gazelle_python_manifest(
     name = "gazelle_python_manifest",
     hub = "pypi",

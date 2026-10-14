@@ -65,6 +65,8 @@ PROPTEST_CASES=5000 PROPTEST_RNG_SEED=7 bazel test //core:core_integration_test 
 
 **The Redis-backed tests run here unchanged.** The job builds valkey from the same module and runs the same three targets, with no service container.
 
+**The wheel is tested in the same job.** `//runtime/tests:test_wheel` builds `//runtime:kabudachi_wheel`, installs it with pip into a fresh virtual environment, and runs a flow from it, on a worker of its own and across a networked shard of two. On Linux it also checks the wheel's manylinux tag against the extension's symbols with `auditwheel`. The tag follows the glibc of the image that links the extension, so changing the executor image can change it, and this test then fails until the tag in `runtime/BUILD.bazel` matches. Like `_native_so`, the wheel is tagged `no-remote-cache`. The test reruns only when the wheel, pyproject.toml, MODULE.bazel or the test's own files change.
+
 **Incremental testing is Bazel's own.** Bazel reruns only the actions whose inputs changed, and third-party outputs come from a remote cache. There is no test-selection script.
 
 **What the job does:**
@@ -124,7 +126,7 @@ Put `[skip ci]` in a commit message to skip CI for that push.
 CI runs Linux only. Keep in mind what the Docker setup above does and doesn't cover:
 
 - **Linux**: fully covered by the `Dockerfile` above, regardless of which OS the CI runner's host is — this is the easy case.
-- **macOS**: Docker on macOS runs Linux containers under a VM (e.g. Colima, Docker Desktop), so it does **not** exercise macOS-native toolchains. A macOS CI job needs to run natively on a `macos-latest`-style runner, replicating the manual setup this project's history went through: `bazelisk`/`bazel` via Homebrew, a Rust toolchain (rustup or Homebrew), and `uv`. Run the Python tests through their Bazel targets there too: `uv run pytest` cannot import `kabudachi` without the Bazel-built extension, whatever the host.
+- **macOS**: Docker on macOS runs Linux containers under a VM (e.g. Colima, Docker Desktop), so it does **not** exercise macOS-native toolchains. A macOS CI job needs to run natively on a `macos-latest`-style runner, replicating the manual setup this project's history went through: `bazelisk`/`bazel` via Homebrew, a Rust toolchain (rustup or Homebrew), and `uv`. Run the Python tests through their Bazel targets there too: `uv run pytest` cannot import `kabudachi` without the Bazel-built extension, whatever the host. `//runtime/tests:test_wheel` builds and installs the macOS arm64 wheel on a local `bazel test //...`.
 - **Windows**: also not covered by this Linux-based Dockerfile (Docker Desktop can run Windows containers, but that's a separate, unexplored path). A Windows CI job would need Bazel's Windows-specific setup (which has real differences from Linux/macOS — symlink support requires enabling Developer Mode or running as Administrator, and long-path support may need enabling), plus a Windows Rust toolchain and `uv` build. This hasn't been attempted or verified anywhere in this project yet — treat it as the highest-risk platform when the time comes, the same way PyO3-through-Bazel was treated as the highest-risk step during initial scaffolding.
 
 ## PR review setup (CodeRabbit + branch protection on `main`)

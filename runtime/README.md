@@ -8,7 +8,7 @@ the shard submits (see "Networked workers"). Either way, task bodies run in task
 started with `spawn` and re-import your script, so put the call to `kabudachi.run(...)` under
 `if __name__ == "__main__":` whenever `processes` is above 0.
 
-Tasks take one input and return one result, both protobuf messages (`pip install kabudachi[protobuf]`),
+Tasks take one input and return one result, both protobuf messages (the `protobuf` extra, see "Installing"),
 or other types if you register a serializer.
 
 ## Example
@@ -45,6 +45,22 @@ print(kabudachi.run(main))  # (500, [100, 250])
 
 `kabudachi.run(main)` owns the event loop, waits for the worker to be leader, runs `main()` and
 returns what it returns. Tasks can only be called while it is running.
+
+## Installing
+
+kabudachi installs from a wheel built with Bazel. Wheels are built for Linux x86_64 (glibc 2.34 or
+newer) and macOS arm64 (11 or newer). One wheel serves every CPython from 3.12 on, since the native
+extension uses Python's stable ABI.
+
+```bash
+bazel build //runtime:kabudachi_wheel
+WHEEL="$(bazel cquery --output=files //runtime:kabudachi_wheel)"
+pip install "$WHEEL"               # the runtime alone
+pip install "$WHEEL[protobuf]"     # with protobuf messages as task input and output
+```
+
+The wheel holds the native extension, so nothing is compiled at install time. `pip install` pulls in
+`asgiref` and `wrapt`. The `protobuf` extra adds `protobuf`.
 
 ## Running
 
