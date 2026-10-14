@@ -52,6 +52,25 @@ fn keep_newest(runs: &mut Vec<ReportedRun>, run: ReportedRun) {
     }
 }
 
+/// Whether `page` is neither the last nor carries anything to continue from.
+fn is_malformed(page: &ReportPage) -> bool {
+    !page.last && page.keys.is_empty() && page.runs.is_empty()
+}
+
+/// Where the page after `page` starts: after its last key, or else its last
+/// run. `None` once `page` is the last.
+fn cursor_after(page: &ReportPage) -> Option<Cursor> {
+    if page.last {
+        return None;
+    }
+    if let Some(key) = page.keys.last() {
+        return Some(Cursor::AfterKey(key.task_id.clone()));
+    }
+    page.runs
+        .last()
+        .map(|run| Cursor::AfterRun(run.claim.task_run_id.clone()))
+}
+
 impl ReconcileRound {
     /// A round for `term`, asking `reconcilees` (the leader's voters and
     /// pending members, itself included), started at `now`. It may stop
@@ -107,26 +126,36 @@ impl ReconcileRound {
         // A page that is neither the last nor carries anything to continue from
         // is malformed: drop what was staged and leave the worker unanswered,
         // so that it is asked again from the start.
-        if !page.last && page.keys.is_empty() && page.runs.is_empty() {
+        if is_malformed(&page) {
             self.staged.remove(from);
             return None;
         }
-        let cursor = if page.last {
-            None
-        } else if let Some(key) = page.keys.last() {
-            Some(Cursor::AfterKey(key.task_id.clone()))
-        } else {
-            page.runs
-                .last()
-                .map(|run| Cursor::AfterRun(run.claim.task_run_id.clone()))
-        };
-        for key in page.keys {
+        let cursor = cursor_after(&page);
+        self.note_versions(page.keys);
+        self.note_runs(&page.runs);
+        self.stage(from, page.runs);
+        // A page with nothing to continue from ends the answer, whatever it
+        // says: there is no cursor to ask for the next one with.
+        if cursor.is_none() {
+            self.finish_answer(from, asked_at);
+        }
+        cursor
+    }
+
+    /// Keeps every version of a task `keys` reports that is not known yet,
+    /// with its placement.
+    fn note_versions(&mut self, keys: Vec<HeldKey>) {
+        for key in keys {
             let versions = self.reported.entry(key.task_id.clone()).or_default();
             if !versions.iter().any(|known| known.version == key.version) {
                 versions.push(key);
             }
         }
-        for run in &page.runs {
+    }
+
+    /// Notes the id of every run in `runs` under its task.
+    fn note_runs(&mut self, runs: &[ReportedRun]) {
+        for run in runs {
             if let Some(task_id) = run.claim.task.task_id.as_ref() {
                 self.reported_runs
                     .entry(TaskId::new(task_id.value.clone()))
@@ -134,22 +163,25 @@ impl ReconcileRound {
                     .insert(run.claim.task_run_id.clone());
             }
         }
-        // Runs are kept once, by run id; a run sent again replaces the earlier
-        // copy, since the worker's newer word on it is the one that counts.
+    }
+
+    /// Stages `runs` as part of `from`'s answer. Runs are kept once, by run id;
+    /// a run sent again replaces the earlier copy, since the worker's newer
+    /// word on it is the one that counts.
+    fn stage(&mut self, from: &WorkerId, runs: Vec<ReportedRun>) {
         let staged = self.staged.entry(from.clone()).or_default();
-        for run in page.runs {
+        for run in runs {
             keep_newest(&mut staged.runs, run);
         }
-        // A page with nothing to continue from ends the answer, whatever it
-        // says: there is no cursor to ask for the next one with.
-        if cursor.is_some() {
-            return cursor;
-        }
+    }
+
+    /// `from` has answered in full: what it staged becomes its answer, to be
+    /// handed over with when it was asked. A complete answer repeated before
+    /// the earlier one was handed over replaces it: it is the worker's newer
+    /// word on everything it holds, so a run it lacks is one it no longer has.
+    fn finish_answer(&mut self, from: &WorkerId, asked_at: Instant) {
         let staged = self.staged.remove(from).unwrap_or_default();
         self.answered.insert(from.clone());
-        // A complete answer repeated before the earlier one was handed over
-        // replaces it: it is the worker's newer word on everything it holds,
-        // so a run it lacks is one the worker no longer has.
         self.unhanded.insert(
             from.clone(),
             WorkerRuns {
@@ -157,7 +189,6 @@ impl ReconcileRound {
                 asked_at: Some(asked_at),
             },
         );
-        None
     }
 
     /// Whether the leader may stop collecting: every voter answered, or, once
@@ -225,40 +256,13 @@ impl ReconcileRound {
         let mut rebuild = Rebuild::default();
         for task in self.reported.keys() {
             if self.is_certain(task, &is_member) {
-                let record = &self.records[task];
-                let version = self
-                    .record_version(task)
-                    .expect("a held record is identified");
-                let new = self
-                    .handed
-                    .get(task)
-                    .is_none_or(|handed| handed.order(&version) == VersionOrder::Newer);
-                if new {
-                    rebuild.records.push(record.clone());
-                }
+                rebuild.records.extend(self.record_not_handed(task));
             } else {
-                rebuild.uncertain.insert(task.clone(), self.runs_of(task));
-                // A task's key never changes, so any reported version names it.
-                if let Some(key) = self.reported[task]
-                    .iter()
-                    .find_map(|held| held.coalescing.clone())
-                {
-                    rebuild.uncertain_keys.insert(task.clone(), key);
-                }
+                self.note_uncertain(task, &mut rebuild);
             }
         }
-        for record in &rebuild.records {
-            if let Ok((task, version)) = identify(record) {
-                self.handed.insert(task, version);
-            }
-        }
-        rebuild.reports = std::mem::take(&mut self.unhanded);
-        if !self.handed_first {
-            self.handed_first = true;
-            for runs in rebuild.reports.values_mut() {
-                runs.asked_at = None;
-            }
-        }
+        self.mark_handed(&rebuild.records);
+        rebuild.reports = self.take_answers();
         rebuild
     }
 
@@ -288,6 +292,56 @@ impl ReconcileRound {
                 .reported
                 .keys()
                 .all(|task| self.is_certain(task, &is_member))
+    }
+}
+
+impl ReconcileRound {
+    /// `task`'s record, which the round holds as the newest, unless that
+    /// version or a newer one was handed over already.
+    fn record_not_handed(&self, task: &TaskId) -> Option<TaskRecord> {
+        let version = self
+            .record_version(task)
+            .expect("a held record is identified");
+        self.handed
+            .get(task)
+            .is_none_or(|handed| handed.order(&version) == VersionOrder::Newer)
+            .then(|| self.records[task].clone())
+    }
+
+    /// Notes `task` as uncertain in `rebuild`, with every run reported for it
+    /// and its coalescing key, if it has one.
+    fn note_uncertain(&self, task: &TaskId, rebuild: &mut Rebuild) {
+        rebuild.uncertain.insert(task.clone(), self.runs_of(task));
+        // A task's key never changes, so any reported version names it.
+        if let Some(key) = self.reported[task]
+            .iter()
+            .find_map(|held| held.coalescing.clone())
+        {
+            rebuild.uncertain_keys.insert(task.clone(), key);
+        }
+    }
+
+    /// Notes the version of each of `records` as handed over.
+    fn mark_handed(&mut self, records: &[TaskRecord]) {
+        for record in records {
+            if let Ok((task, version)) = identify(record) {
+                self.handed.insert(task, version);
+            }
+        }
+    }
+
+    /// The complete answers not yet handed over. The first hand-over is the
+    /// rebuild, which takes every answer so far as one: none carries when it
+    /// was asked.
+    fn take_answers(&mut self) -> BTreeMap<WorkerId, WorkerRuns> {
+        let mut answers = std::mem::take(&mut self.unhanded);
+        if !self.handed_first {
+            self.handed_first = true;
+            for runs in answers.values_mut() {
+                runs.asked_at = None;
+            }
+        }
+        answers
     }
 
     /// The newest version reported for `task` that is not lost: one whose

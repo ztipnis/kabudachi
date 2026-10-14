@@ -31,10 +31,22 @@ use crate::protocol::records::{NewTask, TaskRunRecord, first_attempt, new_task};
 use crate::protocol::task::TaskRunState;
 use crate::time::{Clock, Instant, WallTime};
 
+use super::record_size::claim_weight_of;
 use super::{
-    COALESCED_PAYLOAD_TOO_LARGE, COMPACTION_SOFT_BYTES, Claim, ClaimRejection, Compacted, Event,
+    COALESCED_PAYLOAD_TOO_LARGE, COMPACTION_SOFT_BYTES, Claim, ClaimRejection, Event,
     MAX_SUBMISSION_BYTES, Observer, ReportRejection, Scheduler,
 };
+
+/// What a compaction run's result did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compacted {
+    pub task_id: TaskId,
+    pub task_run_id: TaskRunId,
+    /// Whether the fold replaced the front of the chain it was made for:
+    /// false when the key's waiting chain no longer starts with the entries
+    /// the run was given, and the result was discarded.
+    pub applied: bool,
+}
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// The workers that run compaction, as their node's heartbeats report
@@ -150,13 +162,8 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             return;
         };
         let task = &self.tasks[&waiting];
-        let claim_size = self.claim_bytes(
-            task.serialized_input.len(),
-            &task.queue,
-            task.task_definition_id().as_str(),
-            task.coalescing_key.as_deref(),
-            self.occupancy.chain(&waiting).iter(),
-        );
+        let claim_size =
+            self.claim_bytes(claim_weight_of(task), self.occupancy.chain(&waiting).iter());
         if claim_size <= MAX_SUBMISSION_BYTES {
             return;
         }

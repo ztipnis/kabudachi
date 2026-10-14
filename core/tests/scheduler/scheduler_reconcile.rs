@@ -23,6 +23,7 @@ use kabudachi_core::scheduler::{
 use kabudachi_core::task_record::RecordVersion;
 use kabudachi_core::time::{Clock, WallTime};
 
+use crate::support::grant::unbounded_grant;
 use crate::support::scheduler::{
     Fixture, OFFICE, grant_of, newest_records, reconciling, reconciling_after, ticks,
 };
@@ -34,6 +35,16 @@ fn plain(input: &[u8]) -> Submission {
         input.to_vec(),
         "default",
     )
+}
+
+/// The compaction claim `runner` is given from `fixture`, if one was made.
+fn claimed_compaction(fixture: &mut Fixture, runner: &WorkerId) -> Option<Claim> {
+    fixture
+        .scheduler
+        .claim_oldest(runner, 10)
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.task.compacts.is_some())
 }
 
 fn worker(id: &str) -> WorkerId {
@@ -218,7 +229,7 @@ fn a_worker_silent_while_reconciling_loses_its_runs_once_the_grant_arrives() {
 }
 
 #[test]
-fn occupancy_memory_use_and_losses_are_rebuilt_from_records() {
+fn occupancy_and_memory_use_are_rebuilt_from_records() {
     let limits = MemoryLimits {
         soft: 150,
         hard: 200,
@@ -1088,13 +1099,7 @@ fn a_claimed_compaction_still_holds_its_key_after_a_rebuild_and_its_fold_is_acce
     for letter in b'a'..b'g' {
         newest = old.scheduler.submit(generation(&[letter; 80])).unwrap();
     }
-    let compaction = old
-        .scheduler
-        .claim_oldest(&runner, 10)
-        .unwrap()
-        .into_iter()
-        .find(|claim| claim.task.compacts.is_some())
-        .expect("a compaction was made");
+    let compaction = claimed_compaction(&mut old, &runner).expect("a compaction was made");
     let mut new = reconciling_after(&old);
     new.scheduler.set_memory_limits(limits);
     new.scheduler.set_compaction_runners(BTreeSet::from([runner.clone()]));
@@ -1247,4 +1252,302 @@ fn a_successor_learns_a_worker_still_holds_a_run_stored_cancelled_and_names_it_o
         })
         .unwrap();
     assert_eq!(new.scheduler.take_held_cancels(), [told]);
+}
+
+#[test]
+fn a_claim_whose_key_another_installed_generation_holds_is_not_rebuilt() {
+    let mut old = Fixture::leading();
+    let holder = old
+        .scheduler
+        .submit(plain(b"h").with_coalescing_key("k"))
+        .unwrap();
+    let held = old.scheduler.request_claim(&worker("w1"), &holder).unwrap();
+    let holder_claimed = old.spy.revisions_of(&holder).last().cloned().unwrap();
+    old.scheduler
+        .report_started(&worker("w1"), &held.task_run_id)
+        .unwrap();
+    old.scheduler
+        .complete(&worker("w1"), &held.task_run_id, Digest::blake3(b"out"), Completion::Final)
+        .unwrap();
+    let later = old
+        .scheduler
+        .submit(plain(b"l").with_coalescing_key("k"))
+        .unwrap();
+    let later_claim = old.scheduler.request_claim(&worker("w2"), &later).unwrap();
+    let mut new = reconciling_after(&old);
+
+    new.scheduler
+        .reconcile(Rebuild {
+            records: vec![holder_claimed],
+            reports: report("w2", vec![reported(&later_claim, ReportedState::Claimed)]),
+            ..Rebuild::default()
+        })
+        .unwrap();
+
+    assert!(new.scheduler.holds(&holder));
+    assert!(
+        !new.scheduler.holds(&later),
+        "a generation claimed while the key's records say another holds it is not rebuilt"
+    );
+}
+
+#[test]
+fn a_compaction_claim_is_not_rebuilt_over_the_compaction_its_key_records_name() {
+    let limits = Some(MemoryLimits { soft: 300, hard: 10_000 });
+    let compaction_claimed_by = |fixture: &mut Fixture, runner: &WorkerId| {
+        fixture.scheduler.set_memory_limits(limits);
+        fixture
+            .scheduler
+            .set_compaction_runners(BTreeSet::from([runner.clone()]));
+        let holder = fixture
+            .scheduler
+            .submit(plain(b"h").with_coalescing_key("k"))
+            .unwrap();
+        fixture.scheduler.request_claim(&worker("w1"), &holder).unwrap();
+        for letter in b'a'..b'g' {
+            fixture
+                .scheduler
+                .submit(plain(&[letter; 80]).with_coalescing_key("k"))
+                .unwrap();
+        }
+        claimed_compaction(fixture, runner).expect("a compaction was made")
+    };
+    let mut first = Fixture::leading();
+    let stranger = compaction_claimed_by(&mut first, &worker("r1"));
+    let mut second = Fixture::successor_of(&first);
+    second.scheduler.set_leadership_grant(Some(unbounded_grant()));
+    compaction_claimed_by(&mut second, &worker("r2"));
+    let mut new = reconciling_after(&second);
+    new.scheduler.set_memory_limits(limits);
+    new.scheduler
+        .set_compaction_runners(BTreeSet::from([worker("r1"), worker("r2")]));
+
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&second),
+            reports: report("r1", vec![reported(&stranger, ReportedState::Claimed)]),
+            ..Rebuild::default()
+        })
+        .unwrap();
+
+    assert!(
+        !new.scheduler.holds(&stranger.task.task_id()),
+        "the key's compaction is the one its records name"
+    );
+}
+
+#[test]
+fn a_finished_generation_is_installed_though_the_record_of_the_one_it_absorbed_is_gone() {
+    let mut old = Fixture::leading();
+    old.scheduler
+        .submit(plain(b"o").with_coalescing_key("k"))
+        .unwrap();
+    let newer = old
+        .scheduler
+        .submit(plain(b"n").with_coalescing_key("k"))
+        .unwrap();
+    let claim = old.scheduler.request_claim(&worker("w1"), &newer).unwrap();
+    old.scheduler
+        .report_started(&worker("w1"), &claim.task_run_id)
+        .unwrap();
+    old.scheduler
+        .complete(&worker("w1"), &claim.task_run_id, Digest::blake3(b"out"), Completion::Final)
+        .unwrap();
+    let newer_record = old.spy.revisions_of(&newer).last().cloned().unwrap();
+    let mut new = reconciling_after(&old);
+
+    let rebuilt = new
+        .scheduler
+        .reconcile(Rebuild {
+            records: vec![newer_record],
+            ..Rebuild::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        rebuilt.uncertain, 0,
+        "a finished generation's supersession is over, whatever became of the older record"
+    );
+    assert!(new.scheduler.holds(&newer));
+}
+
+#[test]
+fn a_generation_whose_predecessor_a_compaction_folded_is_installed_without_that_record() {
+    let runner = worker("runner");
+    let mut old = Fixture::leading_with_limits(MemoryLimits { soft: 300, hard: 10_000 });
+    old.scheduler
+        .set_compaction_runners(BTreeSet::from([runner.clone()]));
+    let holder = old
+        .scheduler
+        .submit(plain(b"h").with_coalescing_key("k"))
+        .unwrap();
+    old.scheduler.request_claim(&worker("w1"), &holder).unwrap();
+    // Generations replace each other until the one waiting gets its whole
+    // chain, its predecessor included, compacted.
+    let (waiting, compaction) = (b'a'..=b'z')
+        .find_map(|letter| {
+            let waiting = old
+                .scheduler
+                .submit(plain(&[letter; 80]).with_coalescing_key("k"))
+                .unwrap();
+            let compaction = claimed_compaction(&mut old, &runner)?;
+            Some((waiting, compaction))
+        })
+        .expect("a compaction was made");
+    let folded = compaction.chain.concat();
+    assert!(
+        old.scheduler
+            .complete_compaction(&runner, &compaction.task_run_id, folded)
+            .unwrap()
+            .applied
+    );
+    let records = [&holder, &waiting]
+        .map(|task| old.spy.revisions_of(task).last().cloned().unwrap())
+        .to_vec();
+    let mut new = reconciling_after(&old);
+
+    let rebuilt = new
+        .scheduler
+        .reconcile(Rebuild {
+            records,
+            ..Rebuild::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        rebuilt.uncertain, 0,
+        "the folded generations were released with the compaction"
+    );
+    assert!(new.scheduler.holds(&waiting));
+}
+
+#[test]
+fn a_late_generation_over_an_installed_predecessor_recorded_finished_leaves_the_key_uncertain() {
+    let (old, _, newer, mut records) = interrupted_supersession();
+    // A supersession never absorbs a finished generation, so a pending
+    // record that says it finished cannot be trusted.
+    records[0].finished = true;
+    let mut new = reconciling_after(&old);
+    new.scheduler
+        .reconcile(Rebuild {
+            records: vec![records[0].clone()],
+            ..Rebuild::default()
+        })
+        .unwrap();
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+
+    new.scheduler
+        .adopt(Rebuild {
+            records: vec![records[1].clone()],
+            ..Rebuild::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        new.scheduler.request_claim(&worker("w1"), &newer),
+        Err(ClaimRejection::NotReady)
+    );
+}
+
+#[test]
+fn a_delayed_task_released_before_the_rebuild_is_not_delayed_again() {
+    let mut old = Fixture::leading();
+    old.clock.set_wall_clock_millis(100_000);
+    let task = old
+        .scheduler
+        .submit(plain(b"d").with_delay(ticks(5_000)))
+        .unwrap();
+    old.clock.advance(ticks(5_000));
+    old.scheduler.catch_up();
+    let mut new = reconciling_after(&old);
+    new.clock.set_wall_clock_millis(105_000);
+
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&old),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+
+    let handed_out: Vec<TaskId> = new
+        .scheduler
+        .claim_oldest(&worker("w1"), 1)
+        .unwrap()
+        .iter()
+        .map(|claim| claim.task.task_id())
+        .collect();
+    assert_eq!(
+        handed_out,
+        [task],
+        "only a task still scheduled waits out its delay: a released one is queued at once"
+    );
+}
+
+#[test]
+fn a_run_lost_before_the_rebuild_still_does_not_count_against_retries() {
+    let mut old = Fixture::leading();
+    let task = old.scheduler.submit(plain(b"t").with_retries(1)).unwrap();
+    old.scheduler.request_claim(&worker("w1"), &task).unwrap();
+    old.lose_silent(&worker("w1"));
+    let mut new = reconciling_after(&old);
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&old),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+    let replay = new.scheduler.request_claim(&worker("w2"), &task).unwrap();
+    new.scheduler
+        .report_started(&worker("w2"), &replay.task_run_id)
+        .unwrap();
+
+    let failure = new
+        .scheduler
+        .fail(&worker("w2"), &replay.task_run_id, "ValueError")
+        .unwrap();
+
+    assert!(
+        failure.retry.is_some(),
+        "the replay was the first try that failed, so its one retry is left"
+    );
+}
+
+#[test]
+fn a_generation_retried_before_the_rebuild_still_holds_its_key() {
+    let mut old = Fixture::leading();
+    let retried = old
+        .scheduler
+        .submit(plain(b"r").with_coalescing_key("k").with_retries(1))
+        .unwrap();
+    let claim = old.scheduler.request_claim(&worker("w1"), &retried).unwrap();
+    old.scheduler
+        .report_started(&worker("w1"), &claim.task_run_id)
+        .unwrap();
+    old.scheduler
+        .fail(&worker("w1"), &claim.task_run_id, "ValueError")
+        .unwrap();
+    let mut new = reconciling_after(&old);
+    new.scheduler
+        .reconcile(Rebuild {
+            records: newest_records(&old),
+            ..Rebuild::default()
+        })
+        .unwrap();
+    new.scheduler.set_leadership_grant(Some(grant_of(OFFICE)));
+
+    let later = new
+        .scheduler
+        .submit(plain(b"l").with_coalescing_key("k"))
+        .unwrap();
+
+    assert!(
+        new.scheduler.request_claim(&worker("w2"), &retried).is_ok(),
+        "a generation once claimed is not superseded: its retry still runs"
+    );
+    assert_eq!(
+        new.scheduler.request_claim(&worker("w2"), &later),
+        Err(ClaimRejection::KeyBusy)
+    );
 }

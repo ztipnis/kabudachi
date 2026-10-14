@@ -245,6 +245,32 @@ fn a_supersession_stores_the_newer_generation_before_marking_the_older_supersede
     assert!(!superseded_anywhere(&cluster, &newer));
 }
 
+#[test]
+fn a_call_waiting_on_a_superseded_mark_held_back_is_answered_not_leader_when_the_successor_is_refused() {
+    let (mut cluster, leader) = elected();
+    let older = submitted_with_key(&mut cluster, &leader, "k");
+    let claimant = cluster.node_ids().into_iter().find(|id| *id != leader).unwrap();
+    for holder in cluster.node_ids().into_iter().filter(|id| *id != leader) {
+        cluster.records().set_up(&holder, false);
+    }
+
+    let refused = cluster.submit(&leader, plain().with_coalescing_key("k"));
+    // A call about the older generation that writes nothing waits on the
+    // revision marking it superseded, which is held behind its successor's.
+    let waiting = cluster.claim(&leader, &claimant, &older);
+    assert_eq!(cluster.answer(waiting), None, "held until the mark's write settles");
+    cluster.advance(STEP);
+    cluster.advance(STEP);
+
+    assert_eq!(cluster.answer(refused), Some(&Answer::NotLeader));
+    assert_eq!(
+        cluster.answer(waiting),
+        Some(&Answer::NotLeader),
+        "the mark was never written, so the call waiting on it is refused too"
+    );
+    assert!(cluster.holds_valid_grant(&leader), "the lease did not end");
+}
+
 /// Claims `task` on `claimant` while every other holder is down, so the
 /// claim's revision misses its quorum, its outcome due after `claim_ack`;
 /// then, the holders up again, starts the run, whose later revision of the

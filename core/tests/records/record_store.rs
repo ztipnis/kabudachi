@@ -220,3 +220,22 @@ fn a_holder_that_a_record_moved_away_from_reports_where_it_went_until_the_task_f
     store.sweep(NOW + retention);
     assert_eq!(store.reported().count(), 0, "the stub does not outlive the finished task");
 }
+
+#[test]
+fn a_stub_of_a_revision_takes_the_same_revision_again_whether_it_names_this_holder_or_not() {
+    let task = TaskId::new("t");
+    let mut store = VersionedRecords::default().held_by(WorkerId::new("me"));
+    store.put(placed(record("t", version(0, 0, 1, 0), "q"), &["me", "a"]), NOW).unwrap();
+    let moved = placed(record("t", version(0, 0, 1, 1), "q"), &["a", "b"]);
+    assert_eq!(store.put(moved, NOW), Ok(Put::Retired));
+
+    // The same revision placed elsewhere again is the same stub, not a conflict.
+    let elsewhere_again = placed(record("t", version(0, 0, 1, 1), "q"), &["b", "c"]);
+    assert_eq!(store.put(elsewhere_again, NOW), Ok(Put::Retired));
+    assert!(store.get(&task).is_none());
+
+    // The same revision naming this holder now is the revision itself.
+    let back = placed(record("t", version(0, 0, 1, 1), "q"), &["me", "b"]);
+    assert_eq!(store.put(back.clone(), NOW), Ok(Put::Stored));
+    assert_eq!(store.get(&task), Some(&back));
+}
