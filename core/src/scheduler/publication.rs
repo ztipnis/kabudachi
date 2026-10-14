@@ -5,16 +5,41 @@
 use crate::coalescing::ChainItem;
 use crate::coordination_authority::RecoveryEpoch;
 use crate::protocol::generated::{
-    AbsorbedGeneration, ChainEntry, FoldedPayload, TaskRecord, chain_entry,
+    AbsorbedGeneration, ChainEntry, CompositePage, FoldedPayload, TaskRecord, chain_entry,
 };
-use crate::protocol::ids::{IdGenerator, TaskId};
+use crate::protocol::ids::{CompositeId, IdGenerator, TaskId};
 use crate::task_record::{RecordKey, RecordVersion};
 use crate::time::{Clock, Duration, WallTime};
 
-use super::composite::ITEM_PAGES;
+use super::composite::{ITEM_PAGES, PAGE_ENTRIES};
 use super::{Observer, Scheduler};
 
 impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
+    /// Republishes a released immutable item page fetched from its old
+    /// holders. A page no longer needed, from a finished reduce, or lacking
+    /// a full page of items is ignored. Its bytes pass straight to the
+    /// observer rather than being retained by the leader.
+    pub fn republish_item_page(&mut self, mut page: CompositePage) {
+        let Some(id) = page.composite_id.clone().map(CompositeId::from) else {
+            return;
+        };
+        let key = RecordKey::Page(id, page.index);
+        if !self.needs_item_page(&key)
+            || page.finished
+            || page.entries.len() as u64 != PAGE_ENTRIES
+        {
+            return;
+        }
+        let Some(grant) = self.leadership.grant().filter(|_| self.is_leader()) else {
+            return;
+        };
+        page.version = Some(
+            self.leadership.next_version(grant.recovery_epoch, grant.term).into(),
+        );
+        page.published_at = Some(WallTime::now(&self.clock).into());
+        self.observer.page_revision(page);
+    }
+
     pub(super) fn publish_changed(&mut self) {
         let Some(grant) = self.leadership.grant().filter(|_| self.is_leader()) else {
             return;

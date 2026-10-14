@@ -9,10 +9,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration as StdDuration;
 
 use kabudachi_core::election::{Input, Step, WorkerNode};
-use kabudachi_core::protocol::messages::Claim as WireClaim;
+use kabudachi_core::protocol::messages::{Claim as WireClaim, JoinResponseIds};
 use kabudachi_core::time::RealClock;
+use kabudachi_net::client::Client;
 use kabudachi_net::executor::{Work, WorkSource};
 use kabudachi_net::handoff::HandedOff;
+use kabudachi_net::messenger::Net;
 use kabudachi_net::worker::Worker;
 use pyo3::prelude::*;
 use tokio::runtime::{Handle, Runtime};
@@ -25,6 +27,20 @@ use super::seam::Shared;
 use crate::bridge::Bridge;
 
 const SHUTDOWN_GRACE: StdDuration = StdDuration::from_secs(1);
+
+pub(super) enum Peer {
+    Worker(Worker),
+    Client(Client),
+}
+
+impl Peer {
+    pub(super) fn net(&self) -> Arc<Net> {
+        match self {
+            Self::Worker(worker) => worker.net(),
+            Self::Client(client) => client.net(),
+        }
+    }
+}
 
 /// Dropped without `shutdown`, it abandons its tasks rather than block its
 /// owner's thread, as `NativeRuntime` does.
@@ -47,7 +63,7 @@ impl Host {
     /// and pumps the work its driver hands over from `source` into `shared`.
     pub(super) fn start(
         tokio: Runtime,
-        worker: Worker,
+        peer: Peer,
         source: WorkSource,
         shared: Arc<Shared>,
         observed: Arc<watch::Sender<Observed>>,
@@ -59,13 +75,40 @@ impl Host {
         let running = tokio.spawn(async move {
             // Dropped however this ends, a panic or an abort included.
             let _left = left;
-            let handed = worker
-                .run(
-                    move |node: &WorkerNode<RealClock>, _: Option<&Input>, _: &Step| {
-                        publish(&seen, node);
-                    },
-                )
-                .await;
+            let handed = match peer {
+                Peer::Worker(worker) => {
+                    worker
+                        .run(
+                            move |node: &WorkerNode<RealClock>, _: Option<&Input>, _: &Step| {
+                                publish(&seen, node);
+                            },
+                        )
+                        .await
+                }
+                Peer::Client(client) => {
+                    client
+                        .run(move |pointer| {
+                            seen.send_if_modified(|old| {
+                                let leader = pointer
+                                    .as_ref()
+                                    .and_then(|p| p.leader_id().map(|id| (id, p.term)));
+                                let changed = old.leader != leader;
+                                if changed {
+                                    old.leader_changes += 1;
+                                    old.leader = leader;
+                                }
+                                if let Some(pointer) = pointer
+                                    && let Some(id) = pointer.shard_id()
+                                {
+                                    old.shard_id = id.as_str().to_owned();
+                                }
+                                changed
+                            });
+                        })
+                        .await;
+                    return;
+                }
+            };
             *drained.lock().unwrap_or_else(PoisonError::into_inner) = Some(handed);
         });
         let results = tokio.spawn(read_results(Arc::clone(&shared)));

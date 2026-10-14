@@ -1,4 +1,4 @@
-"""`kabudachi.run`: start a worker in this process and run your program on it."""
+"""The worker entry point and its startup, drain, and shutdown lifecycle."""
 
 import _thread
 import asyncio
@@ -16,7 +16,7 @@ import traceback
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
-from typing import Any, TypeVar, overload
+from typing import Any, TypeVar
 
 from kabudachi import _native
 from kabudachi._native import refresh_logging
@@ -52,63 +52,22 @@ T = TypeVar("T")
 _log = logging.getLogger(__name__)
 
 
-@overload
-def run(main: Callable[[], Awaitable[T]]) -> T: ...
-@overload
-def run(main: None = None) -> None: ...
-def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
-    """Runs `main()` with a kabudachi worker running beside it, and returns
-    what it returns.
+def run() -> None:
+    """Serves as a worker until SIGINT or SIGTERM.
 
-    This owns the event loop: like `asyncio.run` it cannot be called from a
-    running loop, and Ctrl-C cancels `main`. While `main` runs, calling a task
-    queues it for the worker and gives back a handle to await. Task bodies
-    run in `processes` task processes (one per CPU by default), each with
-    `concurrency` places, or, with `processes=0`, in this process. A task that
-    waits for another task does not occupy one of the `concurrency` places
-    while it waits, and takes its place back as soon as it resumes, even if
-    that briefly puts more than `concurrency` bodies in progress. The
-    `processes`, `concurrency` and `imports` settings are read when `run`
-    starts. Native log records go to the `kabudachi.native` loggers; those
-    below the effective level of `kabudachi.native` itself when `run` starts
-    are not forwarded, whatever level a child logger is set to.
+    Import application task modules and configure this process before calling
+    this entry point on the main thread. The first signal drains outstanding
+    work and leaves the shard; a second stops task processes immediately.
+    A configured drain grace bounds how long the first signal waits.
 
-    When `main` returns, `run` waits for every task that was called to finish
-    before it stops the worker. If `main` raises, or is cancelled, tasks
-    already running are let finish, tasks that have not started fail with
-    `RunStoppedError`, and the error is raised. If the worker itself fails,
-    `main` is cancelled and the worker's error is raised.
-
-    Without `main`, `run` serves as a worker (on the main thread) until it
-    receives SIGINT or SIGTERM, then drains like the end of `main`: it waits
-    for every task that was called and returns `None`. A second signal stops
-    the waiting: task processes are stopped at once, tasks not finished are
-    abandoned, `run` raises
-    `KeyboardInterrupt`, and a synchronous task still in its thread keeps the
-    interpreter from exiting until it returns. With `drain_grace` set, tasks
-    still running that long after the first signal are stopped as a second
-    signal would stop them.
-
-    With `listen` set, the process is a worker of the networked shard
-    `shard`. It bootstraps from `seeds` or `authority`, `run` waits until it
-    has joined and knows its leader, and it runs the tasks the shard's leader
-    hands it, whoever submitted them. Awaiting a task's result there gets it
-    from the worker that ran it, once the leader has certified it, and
-    cancelling one asks the leader. When `main` returns, `run` waits until
-    every task called has settled; then, as at the first signal, the worker
-    also lets the runs it holds finish and waits until its leader has taken
-    their reports, and then leaves the shard: a leader first hands its
-    leadership to another worker.
-
-    Raises `TaskDefinitionError`, before `main` starts, if a registered task
-    cannot work with the serializers of this process, and if `processes` is
-    above 0 and a task is declared in the script being run. Raises
-    `StartupError` if the task processes cannot start.
+    Callers use ``async with kabudachi.client(...)`` and submit tasks on their
+    own event loop. This entry point neither accepts nor executes a caller
+    function. Raises RuntimeError inside an event loop or with an active
+    worker or client, TaskDefinitionError for invalid task declarations,
+    and StartupError if task processes cannot start.
     """
-    if main is None and threading.current_thread() is not threading.main_thread():
-        raise RuntimeError(
-            "kabudachi.run() without main handles signals, so it needs the main thread"
-        )
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("kabudachi.run() handles signals, so it needs the main thread")
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -116,21 +75,16 @@ def run(main: Callable[[], Awaitable[T]] | None = None) -> T | None:
     else:
         raise RuntimeError("kabudachi.run() cannot be called from a running event loop")
     if active_session() is not None:
-        raise RuntimeError("kabudachi.run() is already running in this process")
+        raise RuntimeError("a kabudachi worker or client is already running in this process")
     validate_definitions(default_registry(), process_serializers())
     refresh_logging()
     executor = _executor_for(process_configuration())
-
     with asyncio.Runner() as runner:
-        if main is None:
-            grace = process_configuration().settings().drain_grace
-            with _StopSignals(runner.get_loop(), grace=grace) as signals:
-
-                async def serve() -> None:
-                    await signals.stop.wait()
-
-                return runner.run(_run_with_worker(serve, executor, serving=True))
-        return runner.run(_run_with_worker(main, executor))
+        grace = process_configuration().settings().drain_grace
+        with _StopSignals(runner.get_loop(), grace=grace) as signals:
+            async def serve() -> None:
+                await signals.stop.wait()
+            runner.run(_run_with_worker(serve, executor, serving=True))
 
 
 def _executor_for(configuration: Configuration) -> Executor:
@@ -178,7 +132,7 @@ def _result_backend(settings: Settings) -> Any:
     return _native.PythonResultBackend(backend, asyncio.get_running_loop())
 
 
-def _native_runtime(settings: Settings) -> Any:
+def _native_runtime(settings: Settings, *, client_only: bool = False) -> Any:
     """A one-node shard of this process's own, or, with `listen` set, a
     worker of the networked shard `settings.shard`. Called on the run's event
     loop."""
@@ -233,6 +187,7 @@ def _native_runtime(settings: Settings) -> Any:
             runnable_versions=runnable_versions(default_registry(), process_schemas()),
         ),
         result_backend=result_backend,
+        **({"client_only": True} if client_only else {}),
     )
 
 

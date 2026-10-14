@@ -89,18 +89,18 @@ async fn a_worker_submits_claims_starts_and_completes_a_task_through_the_leader(
         let leader = shard.drive_until_a_leader().await;
         let leader_id = shard.id(leader);
 
-        // The leader's roster does not hold the client yet: it is refused, and
-        // nothing of the request takes effect. The delay is long enough for the
+        // A caller outside the worker roster may submit, but cannot claim
+        // work until it joins as a worker. The delay is long enough for the
         // quorum write, the answer and the checks below to finish while the task
         // is still held back, even if the runtime stalls for a while.
         let submitted = mint(plain(), &Uuid7Ids, &RealClock::new());
-        let refused = shard
+        let accepted = shard
             .drive_until(client.submit(leader_id.clone(), submitted.clone()))
             .await
             .expect("the leader answered");
-        assert_eq!(reject_reason(&refused), Some(TaskRejectReason::TaskRejectNotMember));
+        assert_eq!(reject_reason(&accepted), None);
         let task = submitted.task_id.clone();
-        assert!(shard.with(leader, move |_, scheduler| scheduler.runs_of(&task).is_empty()).await);
+        assert!(shard.with(leader, move |_, scheduler| !scheduler.runs_of(&task).is_empty()).await);
         let refused = shard
             .drive_until(client.request_claim(leader_id.clone(), submitted.task_id.clone()))
             .await

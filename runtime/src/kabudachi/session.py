@@ -739,6 +739,10 @@ class Session:
         if self._members_running == 0:
             await self._fail_stalled()
 
+    def close_caller(self, error: BaseException) -> None:
+        self._tasks.stop_unstarted()
+        self._composites.close_caller(error)
+
     async def wait_until_running_finish(self) -> None:
         """Waits for every task that is running now to finish."""
         while self._running:
@@ -1602,7 +1606,9 @@ def _outcome_error(event: Any, reason: str | None = None) -> BaseException:
             task_id,
         )
     if event.state == RunState.FAILED:
-        return _failure_error(task_id, event.failure_kind, reason)
+        return _leader_failure(
+            task_id, None, event.failure_kind, reason or getattr(event, "failure_message", "")
+        )
     if event.state == RunState.SUPERSEDED:
         newer = f" by {event.superseded_by}" if event.superseded_by else ""
         return TaskSupersededError(f"task {task_id} was superseded{newer}", event.superseded_by)
@@ -1751,7 +1757,7 @@ def current_session() -> Session:
     session = _active_session
     if session is None:
         raise RuntimeNotStartedError(
-            "tasks can only be submitted while kabudachi.run() is running"
+            "tasks need an active kabudachi.client() connection or worker task body"
         )
     return session
 

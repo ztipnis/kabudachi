@@ -17,6 +17,7 @@ import sys
 from google.protobuf.wrappers_pb2 import Int64Value
 
 import kabudachi
+from worker_run import run_with_worker
 from kabudachi import _native
 from wheel_smoke_tasks import double_then_add_one
 
@@ -43,4 +44,4 @@ async def serve() -> None:
 if __name__ == "__main__":
     # Task processes start with spawn and import this script again: only the
     # worker itself may run.
-    kabudachi.run(serve if sys.argv[1] == "serve" else flow)
+    run_with_worker(serve if sys.argv[1] == "serve" else flow)

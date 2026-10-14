@@ -421,6 +421,14 @@ class Composites:
         with self._lock:
             return bool(self._open)
 
+    def close_caller(self, error: BaseException) -> None:
+        with self._lock:
+            handles = list(self._open.values())
+            self._open.clear()
+        for handle in handles:
+            if not handle.done():
+                handle._fail(error)
+
     async def stopped(self) -> None:
         """The run stopped and nothing runs here any more: a composite still
         running can never go on, since nothing will claim what is left of it.

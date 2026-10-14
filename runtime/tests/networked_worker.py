@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import kabudachi
 from kabudachi import _native, runner, session
@@ -103,7 +104,7 @@ class NotingClaims:
         # been killed: the tasks a pipeline made, and so which records to read.
         markers = os.environ.get("KABUDACHI_TEST_MARKERS")
         for claim in claims:
-            if markers and claim.definition_id.startswith("cluster."):
+            if markers and claim.definition_id.startswith(("cluster.", "functional.")):
                 name = f"claimed.{claim.definition_id.removeprefix('cluster.')}.{claim.task_run_id}"
                 with open(os.path.join(markers, name), "w") as written:
                     written.write(claim.task_id)
@@ -226,6 +227,20 @@ if __name__ == "__main__":
     # Task processes are started with spawn, which imports this script again
     # in each of them: only the worker itself may run.
     die_with_parent()
+    if backend := os.environ.get("KABUDACHI_TEST_BACKEND"):
+        kabudachi.configure(result_backend=tasks.FileBackend(backend))
     native_runtime = runner._native_runtime
     runner._native_runtime = lambda settings: NotingClaims(native_runtime(settings))
-    kabudachi.run(main)
+    # Control belongs to the test harness. Production startup receives no
+    # caller function and the shard's workers execute work independently.
+    def control() -> None:
+        while (active := session.active_session()) is None:
+            time.sleep(0.01)
+        future = asyncio.run_coroutine_threadsafe(main(), active._hosted._loop)
+        try:
+            future.result()
+        finally:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=control, daemon=True).start()
+    kabudachi.run()

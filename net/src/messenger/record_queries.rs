@@ -3,7 +3,7 @@
 //! lookups. Each query's state lives here from the command that starts it to
 //! the event that ends it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 
@@ -21,10 +21,16 @@ use crate::swarm::Behaviour;
 
 mod blobs;
 
+// Leave half of kad's 32 streams per connection available for reads and
+// replies. A burst of admitted work must wait here instead of flooding a
+// holder and turning every write in the burst into a refusal.
+const MAX_RECORD_QUERIES: usize = 16;
+
 /// The record queries in flight, each keyed by what the swarm reports its
 /// outcome under.
 #[derive(Default)]
 pub(super) struct RecordQueries {
+    queued: VecDeque<PlacedWrite>,
     /// The `kad` queries of record writes in flight to other workers, each
     /// to the write it is part of.
     writes: HashMap<kad::QueryId, u64>,
@@ -53,7 +59,13 @@ impl RecordQueries {
         writes: Vec<PlacedWrite>,
         inbound: &Inbound,
     ) {
-        for placed in writes {
+        self.queued.extend(writes);
+        self.advance_writes(swarm, inbound);
+    }
+
+    pub(super) fn advance_writes(&mut self, swarm: &mut Swarm<Behaviour>, inbound: &Inbound) {
+        while self.writes.len() < MAX_RECORD_QUERIES {
+            let Some(placed) = self.queued.pop_front() else { break; };
             self.start_write(swarm, placed, inbound);
         }
     }

@@ -43,6 +43,10 @@ pub trait RecordPorts {
     /// `write` could not be placed: its outcome is to come back as not
     /// stored, like a write no holder stored.
     fn refuse(&mut self, write: Write);
+    /// Starts reading a released item page from its holders. The transport
+    /// returns it through `Scheduler::republish_item_page`. Ports that never
+    /// release pages need no read-back path.
+    fn fetch_item_page(&mut self, _key: RecordKey) {}
 }
 
 /// A scheduler observer that keeps every revision it is handed until a
@@ -328,16 +332,26 @@ impl<E> LeaderRecords<E> {
         };
         let keys = {
             let (scheduler, ports) = (&*scheduler, &*ports);
+            self.ledger.forget_unheld(|key| scheduler.retains_record(key));
             self.repair.check(
                 in_office,
                 scheduler.is_leader(),
                 &placeable,
-                |key| scheduler.holds(key),
+                |key| scheduler.retains_record(key),
                 |key| ports.place(key, &placeable).map(|placed| placed.holders),
                 now,
             )
         };
-        if !keys.is_empty() && scheduler.republish(&keys) > 0 {
+        let mut held = Vec::new();
+        for key in keys {
+            if scheduler.needs_item_page(&key) {
+                ports.fetch_item_page(key.clone());
+                self.repair.fetching(key, now);
+            } else {
+                held.push(key);
+            }
+        }
+        if !held.is_empty() && scheduler.republish(&held) > 0 {
             self.write(node, scheduler, ports);
         }
     }

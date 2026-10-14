@@ -203,14 +203,21 @@ pub(super) fn respond_to_task_requests<C: Clock, I: IdGenerator>(
 }
 
 /// Whether the leader refuses `handle` because its sender is neither a voter
-/// nor a pending member. How a task stands decides nothing, so it is
-/// answered for any asker, member or not, once that task's writes have
-/// settled.
+/// nor a pending member. Caller submissions, cancellations, and result
+/// queries are allowed without worker membership. Reports and claims still
+/// require a worker recognized by this leader.
 fn refused_as_no_member<C: Clock, I: IdGenerator>(
     deciding: &Deciding<'_, C, I>,
     handle: &TaskRequestHandle,
 ) -> bool {
-    if matches!(handle.request(), task_request::Request::QueryOutcome(_)) {
+    if matches!(
+        handle.request(),
+        task_request::Request::QueryOutcome(_)
+            | task_request::Request::Submit(_)
+            | task_request::Request::SubmitComposite(_)
+            | task_request::Request::SubmitMembers(_)
+            | task_request::Request::Cancel(_)
+    ) {
         return false;
     }
     deciding.scheduler.is_leader() && !deciding.node.is_voter_or_pending(&handle.from())

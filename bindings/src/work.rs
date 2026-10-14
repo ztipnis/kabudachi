@@ -183,8 +183,7 @@ pub struct PyEvent {
     /// the run or composite failed.
     #[pyo3(get)]
     failure_kind: String,
-    /// For `COMPOSITE_FINISHED`: the error's message, when the composite
-    /// failed.
+    /// For `OUTCOME` and `COMPOSITE_FINISHED`: the recorded error message.
     #[pyo3(get)]
     failure_message: String,
     /// For `COMPOSITE_FINISHED`: the Task whose run raised the error that
@@ -287,11 +286,13 @@ impl PyEvent {
         task_run_id: &str,
         state: Option<PyRunState>,
         failure_kind: String,
+        failure_message: String,
         superseded_by: Option<String>,
     ) -> Self {
         PyEvent {
             run_state: state,
             failure_kind,
+            failure_message,
             superseded_by,
             ..PyEvent::networked(PyEventKind::Outcome, task_id, task_run_id)
         }

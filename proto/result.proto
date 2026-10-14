@@ -65,6 +65,8 @@ message OutcomeAnswer {
   // The run returned a step instead of a result: `result_digest` names the
   // step, not a result, and the task is over when the step's composite is.
   bool continued = 9;
+  // The recorded error message, when the run failed.
+  string failure_message = 10;
 }
 
 message ResultMessage {

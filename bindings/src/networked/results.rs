@@ -218,6 +218,7 @@ impl Shared {
             run.as_str(),
             Some(DomainRunState::Failed.into()),
             RESULT_TOO_LARGE_KIND.into(),
+            String::new(),
             None,
         ));
         self.wake();
@@ -290,6 +291,7 @@ fn outcome_event(task: &TaskId, answer: &OutcomeAnswer) -> Option<PyEvent> {
             "",
             None,
             String::new(),
+            String::new(),
             None,
         ));
     }
@@ -313,6 +315,7 @@ fn outcome_event(task: &TaskId, answer: &OutcomeAnswer) -> Option<PyEvent> {
         &run,
         Some(state.into()),
         answer.failure_kind.clone(),
+        answer.failure_message.clone(),
         answer
             .superseded_by
             .clone()
@@ -335,32 +338,25 @@ pub(super) async fn read_results(shared: Arc<Shared>) {
     }
 }
 
-/// Whenever the leader this worker's node names changes to another, or the
-/// same worker leads in a later term, asks it how each task submitted here,
-/// stored and still awaited, stands: a certification or an ending the old
-/// leader decided may never have been told. A spell with no leader named
-/// counts as a change, even when the same leader is named after it, since
-/// what it told meanwhile may not have arrived; so does one that started
-/// and ended while asking. The answers come in as any conclusion does.
+/// Rechecks outstanding outcomes after a leader change and periodically.
+/// A certification push can expire during a short disconnect even when the
+/// same leader keeps office, so only watching leader changes can strand a
+/// handle whose task has already ended.
 pub(super) async fn ask_after_leader_change(shared: Arc<Shared>) {
     let mut observed = shared.observed.clone();
-    let (mut named, mut seen_changes) = {
-        let now = observed.borrow();
-        (now.leader.clone(), now.leader_changes)
-    };
-    while observed.changed().await.is_ok() {
-        let (leader, changes) = {
-            let now = observed.borrow_and_update();
-            (now.leader.clone(), now.leader_changes)
-        };
-        let Some(now) = leader else {
-            continue;
-        };
-        if changes == seen_changes {
-            continue;
+    loop {
+        tokio::select! {
+            changed = observed.changed() => {
+                if changed.is_err() { return; }
+            }
+            _ = tokio::time::sleep(shared.retry.answer_within) => {}
         }
-        seen_changes = changes;
-        if named.replace(now).is_some() {
+        let ready = {
+            let now = observed.borrow_and_update();
+            if now.gone { return; }
+            now.leader.is_some()
+        };
+        if ready {
             ask_about_awaited(&shared).await;
         }
     }
@@ -378,10 +374,10 @@ async fn ask_about_awaited(shared: &Shared) {
             .collect()
     };
     for task in tasks {
-        let answer = shared
-            .net
-            .query_outcome_at_leader(task.clone(), shared.retry)
-            .await;
+        let answer = tokio::time::timeout(
+            shared.retry.answer_within,
+            shared.net.query_outcome_at_leader(task.clone(), shared.retry),
+        ).await.ok().flatten();
         if let Some(TaskResponse {
             result: Some(task_response::Result::Outcome(outcome)),
         }) = answer

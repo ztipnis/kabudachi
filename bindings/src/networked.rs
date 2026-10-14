@@ -75,6 +75,7 @@ use kabudachi_net::executor::{Report, executor_channel};
 use kabudachi_net::handoff::HandedOff;
 use kabudachi_net::payload_memory::Taken;
 use kabudachi_net::worker::Worker;
+use kabudachi_net::client::Client;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::sync::watch;
@@ -97,7 +98,7 @@ use self::composites::{
     cancel_composite_at_leader, read_until, send_composite, send_members, stored_until,
 };
 use self::delivery::{cancel_at_leader, send_submission};
-use self::host::Host;
+use self::host::{Host, Peer};
 use self::observed::Observed;
 use self::results::{deliver_then_report, store_then_report_step};
 use self::seam::{GONE_MESSAGE, Shared};
@@ -152,11 +153,12 @@ impl NetworkedRuntime {
     /// is where this worker mirrors the results of runs the leader has
     /// certified; `TypeError` for anything else.
     #[new]
-    #[pyo3(signature = (arguments, result_backend = None))]
+    #[pyo3(signature = (arguments, result_backend = None, *, client_only = false))]
     fn new(
         py: Python<'_>,
         arguments: NetworkedArguments,
         result_backend: Option<&Bound<'_, PyAny>>,
+        client_only: bool,
     ) -> PyResult<Self> {
         let backend = backend_of(result_backend)?;
         arguments.check()?;
@@ -171,20 +173,27 @@ impl NetworkedRuntime {
         let (source, reports) = executor.split();
         let config = arguments.worker_config(endpoint)?;
         let tokio = arguments.tokio()?;
-        let worker = py
-            .detach(|| tokio.block_on(Worker::start(config)))
+        let peer = py
+            .detach(|| tokio.block_on(async {
+                if client_only {
+                    Client::start(config).await.map(Peer::Client)
+                } else {
+                    Worker::start(config).await.map(Peer::Worker)
+                }
+            }))
             .map_err(|_| {
                 PyRuntimeError::new_err(format!("cannot listen on {:?}", arguments.listen))
             })?;
-        let worker_id = worker.id().as_str().to_owned();
-        let address = worker
-            .address()
+        let net = peer.net();
+        let worker_id = net.local_worker_id().as_str().to_owned();
+        let address = net
+            .local_multiaddr()
             .map(|address| address.to_string())
             .unwrap_or_default();
         let (sender, observed) = watch::channel(Observed::default());
         let shared = Arc::new(Shared::new(
             reports,
-            worker.net(),
+            net,
             observed,
             arguments.retry(),
             backend.clone(),
@@ -194,7 +203,7 @@ impl NetworkedRuntime {
         let drained = Arc::default();
         let host = Host::start(
             tokio,
-            worker,
+            peer,
             source,
             Arc::clone(&shared),
             Arc::new(sender),

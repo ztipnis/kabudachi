@@ -120,6 +120,7 @@ py_test(
     deps = [
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "//runtime/tests:worker_run",
         "@pypi//pytest",  # keep
     ],
 )
@@ -148,6 +149,7 @@ py_test(
         ":proto_messages",  # keep
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",  # keep
+        "//runtime/tests:worker_run",  # keep
         "//runtime/tests:faulting_runtime",  # keep
         "//runtime/tests:pool_tasks",  # keep
         "@pypi//pytest",  # keep
@@ -166,6 +168,7 @@ py_test(
         "//runtime/src/kabudachi",
         "//runtime/tests:faulting_runtime",
         "//runtime/tests:proto_messages",
+        "//runtime/tests:worker_run",
         "@pypi//pytest",  # keep
     ],
 )
@@ -207,6 +210,7 @@ py_test(
         "//runtime/tests:pool_slow_import",  # keep
         "//runtime/tests:pool_tasks",
         "//runtime/tests:proto_messages",
+        "//runtime/tests:worker_run",
         "@pypi//pytest",  # keep
     ],
 )
@@ -227,6 +231,8 @@ py_library(
 
 # Starts and drives networked worker processes for the multi-process tests.
 # gazelle:resolve py cluster //runtime/tests:cluster
+# gazelle:resolve py functional_tasks //runtime/tests:functional_tasks
+# gazelle:resolve py worker_run //runtime/tests:worker_run
 py_library(
     name = "cluster",
     testonly = True,
@@ -295,6 +301,7 @@ py_test(
     data = [
         "wheel_smoke.py",
         "wheel_smoke_tasks.py",
+        "worker_run.py",
         "//:MODULE.bazel",
         "//runtime:kabudachi_wheel",
         "//runtime:pyproject.toml",
@@ -365,6 +372,52 @@ py_test(
         "//bindings/contract",  # keep
         "//runtime/src/kabudachi",
         "//runtime/tests:proto_messages",
+        "//runtime/tests:worker_run",
         "@pypi//pytest",  # keep
     ],
+)
+
+py_test(
+    name = "test_functionality",
+    size = "medium",
+    srcs = ["test_functionality.py"],
+    data = ["//runtime:kabudachi_wheel"],  # keep
+    env = {"WHEEL_FILE": "$(rlocationpath //runtime:kabudachi_wheel)"},  # keep
+    pytest_main = True,  # keep
+    venv = "dev",  # keep
+    deps = [
+        "//bindings:_native",  # keep
+        "//runtime/src/kabudachi",
+        "//runtime/tests:cluster",
+        "//runtime/tests:functional_tasks",
+        "//runtime/tests:networked_tasks",
+        "//runtime/tests:proto_messages",
+        "@pypi//iniconfig",  # keep
+        "@pypi//packaging",  # keep
+        "@pypi//pluggy",  # keep
+        "@pypi//pygments",  # keep
+        "@pypi//pytest",  # keep
+    ],
+)
+
+py_library(
+    name = "functional_tasks",
+    testonly = True,
+    srcs = ["functional_tasks.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//runtime/src/kabudachi",
+        "//runtime/tests:networked_tasks",
+        "//runtime/tests:proto_messages",
+    ],
+)
+
+py_library(
+    name = "worker_run",
+    testonly = True,
+    srcs = ["worker_run.py"],
+    imports = ["."],
+    visibility = ["//:__subpackages__"],
+    deps = ["//runtime/src/kabudachi"],
 )

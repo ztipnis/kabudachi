@@ -26,7 +26,7 @@ from packaging.requirements import Requirement
 WHEEL = Path(os.environ["TEST_SRCDIR"], os.environ["WHEEL_FILE"])
 PYPROJECT = Path(os.environ["TEST_SRCDIR"], os.environ["PYPROJECT_FILE"])
 MODULE = Path(os.environ["TEST_SRCDIR"], os.environ["MODULE_FILE"])
-PROGRAMS = [Path(__file__).with_name(name) for name in ("wheel_smoke.py", "wheel_smoke_tasks.py")]
+PROGRAMS = [Path(__file__).with_name(name) for name in ("wheel_smoke.py", "wheel_smoke_tasks.py", "worker_run.py")]
 # Distributions the installed package imports. The test has no network, so
 # they come from the test's own Bazel-installed copies, each in a directory
 # of its own.

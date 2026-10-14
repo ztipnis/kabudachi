@@ -25,7 +25,9 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use kabudachi_core::election::{AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode};
+use kabudachi_core::election::{
+    AuthorityTimings, ElectionTimings, Identity, Input, Step, WorkerNode,
+};
 use kabudachi_core::protocol::ids::{IncarnationId, ShardId, ShardName, Uuid7Ids, WorkerId};
 use kabudachi_core::queues::{QueuePolicy, Subscription};
 use kabudachi_core::scheduler::{MemoryLimits, Scheduler};
@@ -283,7 +285,9 @@ impl WorkerConfig {
 /// The retention `config` gives finished tasks, in the core's time.
 fn retention_of(config: &WorkerConfig) -> Option<kabudachi_core::time::Duration> {
     config.result_ttl.map(|ttl| {
-        kabudachi_core::time::Duration::from_millis(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+        kabudachi_core::time::Duration::from_millis(
+            u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
+        )
     })
 }
 
@@ -298,15 +302,7 @@ impl Worker {
     /// (see this module's "One identity per process"), and listens on
     /// `config.listen_on`, or fails if it cannot.
     pub async fn start(config: WorkerConfig) -> Result<Worker, ListenRejected> {
-        let net = Net::for_shard(config.shard_name.clone(), retention_of(&config));
-        let net = Arc::new(match config.input_limit {
-            Some(limit) => net.with_input_limit(limit),
-            None => net,
-        });
-        if let Some(address) = &config.external_address {
-            net.set_external_address(address.clone());
-        }
-        net.try_listen_on(config.listen_on.clone()).await?;
+        let net = listen(&config, false).await?;
         Ok(Worker { net, config })
     }
 
@@ -314,7 +310,6 @@ impl Worker {
     pub fn id(&self) -> WorkerId {
         self.net.local_worker_id()
     }
-
     /// The address this worker gives other workers to reach it: the external
     /// address if one was given (see `Net::local_multiaddr`).
     pub fn address(&self) -> Option<Multiaddr> {
@@ -444,6 +439,23 @@ impl Worker {
         )
         .await
     }
+}
+
+pub(crate) async fn listen(config: &WorkerConfig, caller: bool) -> Result<Arc<Net>, ListenRejected> {
+    let net = if caller {
+        Net::for_caller(config.shard_name.clone(), retention_of(config))
+    } else {
+        Net::for_shard(config.shard_name.clone(), retention_of(config))
+    };
+    let net = Arc::new(match config.input_limit {
+        Some(limit) => net.with_input_limit(limit),
+        None => net,
+    });
+    if let Some(address) = &config.external_address {
+        net.set_external_address(address.clone());
+    }
+    net.try_listen_on(config.listen_on.clone()).await?;
+    Ok(net)
 }
 
 /// Marks the worker out of its shard when dropped (see

@@ -9,6 +9,7 @@ py_library(
         "_checks.py",
         "_child.py",
         "body.py",
+        "client.py",
         "composites.py",
         "concurrency_places.py",
         "config.py",
