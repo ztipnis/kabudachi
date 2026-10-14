@@ -1,6 +1,7 @@
 """One acceptance scenario covering the Phase 6 shipping gate on real workers."""
 
 import asyncio
+import gc
 import inspect
 import multiprocessing
 import os
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import time
 import venv
+import weakref
 from datetime import timedelta
 from importlib import metadata
 from pathlib import Path
@@ -114,6 +116,15 @@ async def finish(handle, timeout, cluster):
         raise
 
 
+def collect_caller(configuration):
+    owner = weakref.ref(configuration._caller)
+    thread = configuration._caller.thread
+    configuration._caller = None
+    gc.collect()
+    assert owner() is None
+    assert not thread.is_alive(), "destroying the internal owner must stop its loop"
+
+
 def new_stage(markers, before, cluster, exclude=()):
     for marker in set(markers.glob("reduce-start.*")) - before:
         holder = next(worker for worker in cluster.workers if worker.pid == int(marker.read_text()))
@@ -181,135 +192,165 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
         for index in range(5)
     })
 
+    configuration.configure(seeds=[worker.address for worker in cluster.workers])
+
     async def scenario():
         children = {process.pid for process in multiprocessing.active_children()}
-        async with kabudachi.client(seeds=[worker.address for worker in cluster.workers]):
-            session = active_session()
-            runtime = session.runtime
-            assert {process.pid for process in multiprocessing.active_children()} == children
-            assert cluster.leader().voters() == 5
-            assert runtime.worker_id() not in {worker.id for worker in cluster.workers}
-            assert runtime.voters() == 0
-            assert len(list(tmp_path.glob("initialized.*"))) == 5
+        called = echo(Greeting(text="remote"))
+        session = configuration._caller.session
+        runtime = session.runtime
+        assert {process.pid for process in multiprocessing.active_children()} == children
+        assert cluster.leader().voters() == 5
+        assert runtime.worker_id() not in {worker.id for worker in cluster.workers}
+        assert runtime.voters() == 0
+        assert len(list(tmp_path.glob("initialized.*"))) == 5
 
-            called = echo(Greeting(text="remote"))
-            callback = []
-            called.callback(callback.append)
-            await called.durable(kabudachi.Durability.REPLICATED)
-            assert await called == Greeting(text="remote")
-            await wait_for("the certified callback", lambda: callback)
-            assert callback == [Greeting(text="remote")]
-            status = await called.status()
-            assert status.state == "succeeded" and status.delivered
-            assert await kabudachi.resume(called.task_id) == Greeting(text="remote")
-            assert await nothing(Greeting()) is None
-            assert await double(Number(21)) == Number(42)
-            assert await migrated(Order(quantity=21, note="dropped")) == Number(42)
-            with pytest.raises(TaskExpiredError):
-                await unsubscribed.options(expires=timedelta(milliseconds=200))(Greeting())
-            with pytest.raises(SerializationError):
-                echo(Number(1))
-            with pytest.raises(TaskBodyError, match="refused remote") as failed:
-                await refuse(Greeting(text="remote"))
-            assert failed.value.kind == "ValueError"
-            assert await retry(Greeting(text="retry-e2e")) == Greeting(text="retry-e2e")
-            try:
-                await timed_out(Greeting())
-            except Exception as error:
-                assert getattr(error, "kind", type(error).__name__) == "TaskTimeoutError"
-            else:
-                raise AssertionError("a timed-out task succeeded")
+        callback = []
+        called.callback(callback.append)
+        await called.durable(kabudachi.Durability.REPLICATED)
+        assert await called == Greeting(text="remote")
+        await wait_for("the certified callback", lambda: callback)
+        assert callback == [Greeting(text="remote")]
+        status = await called.status()
+        assert status.state == "succeeded" and status.delivered
+        assert await kabudachi.resume(called.task_id) == Greeting(text="remote")
+        assert await nothing(Greeting()) is None
+        assert await double(Number(21)) == Number(42)
+        assert await asyncio.to_thread(echo.s, Greeting(text="synchronous")) == Greeting(text="synchronous")
+        assert await asyncio.to_thread(echo.options().s, Greeting(text="optioned")) == Greeting(text="optioned")
+        assert await asyncio.to_thread(echo.bind(Greeting(text="bound synchronous")).s) == Greeting(text="bound synchronous")
+        with pytest.raises(TaskBodyError, match="refused synchronous"):
+            await asyncio.to_thread(refuse.s, Greeting(text="synchronous"))
+        assert await migrated(Order(quantity=21, note="dropped")) == Number(42)
+        with pytest.raises(TaskExpiredError):
+            await unsubscribed.options(expires=timedelta(milliseconds=200))(Greeting())
+        with pytest.raises(SerializationError):
+            echo(Number(1))
+        with pytest.raises(TaskBodyError, match="refused remote") as failed:
+            await refuse(Greeting(text="remote"))
+        assert failed.value.kind == "ValueError"
+        assert await retry(Greeting(text="retry-e2e")) == Greeting(text="retry-e2e")
+        try:
+            await timed_out(Greeting())
+        except Exception as error:
+            assert getattr(error, "kind", type(error).__name__) == "TaskTimeoutError"
+        else:
+            raise AssertionError("a timed-out task succeeded")
 
-            large = Greeting(text="blob" * 300_000)
-            assert await echo(large) == large
-            bound = echo.bind(text="bound")
-            assert await bound(Greeting(times=7)) == Greeting(text="bound", times=7)
-            flowed = await kabudachi.flow(load, shout)(Greeting(text="a"))
-            assert [value.text for value in flowed] == ["loaded a", "LOADED A"]
-            grouped = await kabudachi.group(
-                ordered.bind(Greeting(text="first", times=200)),
-                ordered.bind(Greeting(text="second", times=10)),
-            )()
-            assert [value.text for value in grouped] == ["first", "second"]
-            inputs = [Greeting(text=f"mapped-{index}", times=(8-index)*20) for index in range(8)]
-            mapped = ordered.map(inputs)
-            await wait_for("map members on different workers", lambda: len({
-                marker.read_text() for marker in tmp_path.glob("mapped-*.started")
-            }) >= 2)
-            (tmp_path / "mapped.go").touch()
-            values = await mapped
-            assert [value.text for value in values] == [f"mapped-{index}" for index in range(8)]
-            assert len({value.times for value in values}) >= 2
-            assert (await mapped.status()).state == "succeeded"
-            pages = echo.map([Greeting(text=f"{index},") for index in range(1100)])
-            paged = await finish(pages, 180, cluster)
-            assert [value.text for value in paged] == [f"{index}," for index in range(1100)]
-            collected = await kabudachi.group(echo, refuse, on_error="collect_all")(Greeting(text="collect"))
-            assert collected[0] == Greeting(text="collect")
-            assert isinstance(collected[1], TaskFailure) and collected[1].kind == "ValueError"
-            with pytest.raises(TaskBodyError):
-                await kabudachi.group(echo, refuse)(Greeting(text="fail fast"))
-            assert [value.text for value in await plan(Greeting(text="a"))] == ["loaded a", "LOADED A"]
-            assert [value.text for value in await returned_group(Greeting(text="a"))] == ["a", "loaded a"]
-            assert await returned_bound(Greeting(text="bound continuation")) == [Greeting(text="bound continuation")]
-            assert [value.text for value in await pipeline(Greeting(text="a"))] == [
-                "LOADED A", "loaded a", "A", "loaded a", "LOADED A", "abcde", "loaded aA", "ValueError: refused a",
-            ]
+        large = Greeting(text="blob" * 300_000)
+        assert await echo(large) == large
+        bound = echo.bind(text="bound")
+        assert await bound(Greeting(times=7)) == Greeting(text="bound", times=7)
+        flowed = await kabudachi.flow(load, shout)(Greeting(text="a"))
+        assert [value.text for value in flowed] == ["loaded a", "LOADED A"]
+        grouped = await kabudachi.group(
+            ordered.bind(Greeting(text="first", times=200)),
+            ordered.bind(Greeting(text="second", times=10)),
+        )()
+        assert [value.text for value in grouped] == ["first", "second"]
+        inputs = [Greeting(text=f"mapped-{index}", times=(8-index)*20) for index in range(8)]
+        mapped = ordered.map(inputs)
+        await wait_for("map members on different workers", lambda: len({
+            marker.read_text() for marker in tmp_path.glob("mapped-*.started")
+        }) >= 2)
+        (tmp_path / "mapped.go").touch()
+        values = await mapped
+        assert [value.text for value in values] == [f"mapped-{index}" for index in range(8)]
+        assert len({value.times for value in values}) >= 2
+        assert (await mapped.status()).state == "succeeded"
+        pages = echo.map([Greeting(text=f"{index},") for index in range(1100)])
+        paged = await finish(pages, 180, cluster)
+        assert [value.text for value in paged] == [f"{index}," for index in range(1100)]
+        collected = await kabudachi.group(echo, refuse, on_error="collect_all")(Greeting(text="collect"))
+        assert collected[0] == Greeting(text="collect")
+        assert isinstance(collected[1], TaskFailure) and collected[1].kind == "ValueError"
+        with pytest.raises(TaskBodyError):
+            await kabudachi.group(echo, refuse)(Greeting(text="fail fast"))
+        assert [value.text for value in await plan(Greeting(text="a"))] == ["loaded a", "LOADED A"]
+        assert [value.text for value in await returned_group(Greeting(text="a"))] == ["a", "loaded a"]
+        assert await returned_bound(Greeting(text="bound continuation")) == [Greeting(text="bound continuation")]
+        assert [value.text for value in await pipeline(Greeting(text="a"))] == [
+            "LOADED A", "loaded a", "A", "loaded a", "LOADED A", "abcde", "loaded aA", "ValueError: refused a",
+        ]
 
-            letters = [Greeting(text=letter) for letter in "abcd"]
-            assert (await subtract.reduce(letters, initial=Greeting(text="s"))).text == "((((s-a)-b)-c)-d)"
-            assert (await join.reduce(letters, chunk_size=2)).text == "abcd"
-            assert await subtract.reduce([], initial=Greeting(text="seed")) == Greeting(text="seed")
-            assert await join.reduce([Greeting(text="one")]) == Greeting(text="one")
-            assert (await concatenate.reduce(paged, chunk_size=64)).text == "".join(value.text for value in paged)
-            with pytest.raises(ReduceEmptyError):
-                join.reduce([])
-            staged = await kabudachi.flow(items, echo.map, join.reduce)(Greeting(text="abcd"))
-            assert staged[-1].text == "abcd"
+        letters = [Greeting(text=letter) for letter in "abcd"]
+        assert (await subtract.reduce(letters, initial=Greeting(text="s"))).text == "((((s-a)-b)-c)-d)"
+        assert (await join.reduce(letters, chunk_size=2)).text == "abcd"
+        assert await subtract.reduce([], initial=Greeting(text="seed")) == Greeting(text="seed")
+        assert await join.reduce([Greeting(text="one")]) == Greeting(text="one")
+        assert (await concatenate.reduce(paged, chunk_size=64)).text == "".join(value.text for value in paged)
+        with pytest.raises(ReduceEmptyError):
+            join.reduce([])
+        staged = await kabudachi.flow(items, echo.map, join.reduce)(Greeting(text="abcd"))
+        assert staged[-1].text == "abcd"
+        assert [value.text for value in await asyncio.to_thread(kabudachi.flow(load, shout).s, Greeting(text="s"))] == ["loaded s", "LOADED S"]
+        assert [value.text for value in await asyncio.to_thread(kabudachi.group(echo, load).s, Greeting(text="s"))] == ["s", "loaded s"]
+        assert await asyncio.to_thread(echo.map.s, letters) == letters
+        assert (await asyncio.to_thread(join.reduce.s, letters, chunk_size=2)).text == "abcd"
 
-            old = gather.options(key="acceptance", delay=timedelta(seconds=1))(Greeting(text="old"))
-            new = gather.options(key="acceptance", delay=timedelta(seconds=1))(Greeting(text="new"))
-            with pytest.raises(TaskSupersededError):
-                await old
-            assert (await new).text == "old+new"
-            cancelled = hold(Greeting(text="cancel-e2e", times=-1))
-            await wait_for("a cancellable body to start", lambda: list(tmp_path.glob("cancel-e2e.[0-9]*")))
-            assert cancelled.cancel()
-            with pytest.raises(TaskCancelledError):
-                await cancelled
+        old = gather.options(key="acceptance", delay=timedelta(seconds=1))(Greeting(text="old"))
+        new = gather.options(key="acceptance", delay=timedelta(seconds=1))(Greeting(text="new"))
+        with pytest.raises(TaskSupersededError):
+            await old
+        assert (await new).text == "old+new"
+        cancelled = hold(Greeting(text="cancel-e2e", times=-1))
+        await wait_for("a cancellable body to start", lambda: list(tmp_path.glob("cancel-e2e.[0-9]*")))
+        assert cancelled.cancel()
+        with pytest.raises(TaskCancelledError):
+            await cancelled
 
-            before = set(tmp_path.glob("reduce-start.*"))
-            claims = set(tmp_path.glob("claimed.*"))
-            leader = cluster.leader()
-            reducing = gated_concatenate.reduce(paged, chunk_size=64)
-            victim = await wait_for("a reducer on a follower", lambda: new_stage(tmp_path, before, cluster, (leader,)))
-            victim.kill()
-            (tmp_path / "reduce.go").touch()
-            assert (await finish(reducing, 120, cluster)).text == "".join(value.text for value in paged)
-            records = await certified_records(tmp_path, claims, runtime)
-            assert records and any(any(run.state == RunState.LOST for run in record.runs) for record in records)
+        before = set(tmp_path.glob("reduce-start.*"))
+        claims = set(tmp_path.glob("claimed.*"))
+        leader = cluster.leader()
+        reducing = gated_concatenate.reduce(paged, chunk_size=64)
+        victim = await wait_for("a reducer on a follower", lambda: new_stage(tmp_path, before, cluster, (leader,)))
+        victim.kill()
+        (tmp_path / "reduce.go").touch()
+        assert (await finish(reducing, 120, cluster)).text == "".join(value.text for value in paged)
+        records = await certified_records(tmp_path, claims, runtime)
+        assert records and any(any(run.state == RunState.LOST for run in record.runs) for record in records)
 
-            before = set(tmp_path.glob("shout.*"))
-            claims = set(tmp_path.glob("claimed.*"))
-            continuing = plan(Greeting(text="recovered"))
-            await wait_for("a returned continuation to start", lambda: set(tmp_path.glob("shout.*")) - before)
-            leader.kill()
-            recovered = await finish(continuing, 60, cluster)
-            assert [value.text for value in recovered] == ["loaded recovered", "LOADED RECOVERED"]
-            await certified_records(tmp_path, claims, runtime)
-            assert await echo(Greeting(text="after election")) == Greeting(text="after election")
-            assert await kabudachi.resume(continuing.task_id) == recovered
-            assert await kabudachi.resume(pages.task_id) == paged
-            assert session.decode_resolved(await runtime.composite_results(pages.task_id)) == paged
-            assert runtime.worker_id() not in {worker.id for worker in cluster.live()}
-            assert len(cluster.live()) == 3
+        before = set(tmp_path.glob("shout.*"))
+        claims = set(tmp_path.glob("claimed.*"))
+        continuing = plan(Greeting(text="recovered"))
+        await wait_for("a returned continuation to start", lambda: set(tmp_path.glob("shout.*")) - before)
+        leader.kill()
+        recovered = await finish(continuing, 60, cluster)
+        assert [value.text for value in recovered] == ["loaded recovered", "LOADED RECOVERED"]
+        await certified_records(tmp_path, claims, runtime)
+        assert await echo(Greeting(text="after election")) == Greeting(text="after election")
+        assert await kabudachi.resume(continuing.task_id) == recovered
+        assert await kabudachi.resume(pages.task_id) == paged
+        assert session.decode_resolved(await runtime.composite_results(pages.task_id)) == paged
+        assert runtime.worker_id() not in {worker.id for worker in cluster.live()}
+        assert len(cluster.live()) == 3
         assert active_session() is None
         assert {process.pid for process in multiprocessing.active_children()} == children
-        async with kabudachi.client(seeds=[worker.address for worker in cluster.live()]):
-            assert active_session().runtime.worker_id() != runtime.worker_id()
-            assert await kabudachi.resume(called.task_id) == Greeting(text="remote")
-            assert await kabudachi.resume(pages.task_id) == paged
-            assert await echo(Greeting(text="new caller")) == Greeting(text="new caller")
+        collect_caller(configuration)
+        assert await kabudachi.resume(called.task_id) == Greeting(text="remote")
+        assert configuration._caller.session.runtime.worker_id() != runtime.worker_id()
+        assert await kabudachi.resume(pages.task_id) == paged
+        assert await echo(Greeting(text="new caller")) == Greeting(text="new caller")
+        collect_caller(configuration)
+
+        program = """
+import asyncio
+from networked_tasks import echo
+from proto_messages import Greeting
+assert echo.s(Greeting(text="fresh synchronous caller")) == Greeting(text="fresh synchronous caller")
+async def call_async():
+    return await echo(Greeting(text="async after sync"))
+assert asyncio.run(call_async()) == Greeting(text="async after sync")
+assert echo.s(Greeting(text="after application loop closes")) == Greeting(text="after application loop closes")
+print("Synchronous caller exited without teardown", flush=True)
+"""
+        completed = await asyncio.to_thread(
+            subprocess.run, [sys.executable, "-c", program],
+            env={**os.environ, "KABUDACHI_SEEDS": ",".join(worker.address for worker in cluster.live())},
+            capture_output=True, text=True, timeout=60,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert "exited without teardown" in completed.stdout
 
     try:
         asyncio.run(asyncio.wait_for(scenario(), 420))

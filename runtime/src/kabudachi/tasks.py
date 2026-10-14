@@ -13,7 +13,8 @@ from kabudachi._checks import is_count, is_non_negative_timedelta, is_positive_t
 from kabudachi.config import UNSET, Unset
 from kabudachi.errors import TaskDefinitionError
 from kabudachi.flow import BoundTask, MapStep, ReduceStep, bind_task, is_step_type
-from kabudachi.handle import TaskHandle
+from kabudachi.handle import TaskHandle, call_sync
+from kabudachi.client import current_session
 from kabudachi.options import SubmissionOptions, submission_options
 from kabudachi.registry import (
     ReducerShape,
@@ -27,7 +28,6 @@ from kabudachi.serializers import (
     SerializerRegistry,
     process_serializers,
 )
-from kabudachi.session import current_session
 
 RESERVED_NAME_PREFIX = "kabudachi."
 
@@ -204,11 +204,13 @@ class Task(wrapt.ObjectProxy):
     def __call__(self, argument: Any) -> TaskHandle:
         """Queues the task on `argument` and returns its handle.
 
-        Only works while `kabudachi.run()` is running. A reducer is not
-        called: it is run with `.reduce(items)`, or here with `.local`.
+        Initializes a caller from process configuration on the first call
+        outside a worker. A reducer is run with `.reduce(items)` or `.local`.
         """
         self._refuse_reducer("run it with .reduce(items) or .local(item, previous)")
         return current_session().submit(self._self_definition, argument)
+
+    s = call_sync
 
     def _refuse_reducer(self, instead: str) -> None:
         if self._self_definition.reducer is not None:
@@ -586,6 +588,8 @@ class _OptionedTask:
 
     def __call__(self, argument: Any) -> TaskHandle:
         return current_session().submit(self._definition, argument, self._options)
+
+    s = call_sync
 
 
 @overload

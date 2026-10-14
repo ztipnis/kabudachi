@@ -16,11 +16,12 @@ from kabudachi import schemas
 from kabudachi.composites import FlowHandle, GroupHandle, ReduceHandle
 from kabudachi.config import UNSET
 from kabudachi.errors import ReduceEmptyError, TaskFailure
-from kabudachi.handle import TaskHandle
+from kabudachi.handle import TaskHandle, call_sync
+from kabudachi.client import current_session
 from kabudachi.registry import TaskDefinition, TaskKind
 from kabudachi.schemas import UNKNOWN, Each, Either, Items, OutputShape, Value
 from kabudachi.serializers import process_serializers
-from kabudachi.session import Session, current_session
+from kabudachi.session import Session
 
 
 def _message_fields(input_type: Any) -> dict[str, Any]:
@@ -72,6 +73,7 @@ class BoundTask:
     with a message, which gets those fields set on a copy.
     """
 
+    s = call_sync
     is_step = True
     is_task = True
     """Its handle gives the task's result itself, not a list of results."""
@@ -205,6 +207,7 @@ class Flow:
     is_step = True
     is_task = False
     handle_type = FlowHandle
+    s = call_sync
 
     def __init__(self, stages: list[Any]) -> None:
         self.stages = stages
@@ -273,6 +276,7 @@ class Group:
     is_step = True
     is_task = False
     handle_type = GroupHandle
+    s = call_sync
 
     def __init__(self, members: list[Any], on_error: str) -> None:
         self.members = members
@@ -346,6 +350,7 @@ class MapStep:
     is_task = False
     handle_type = GroupHandle
     needs_input = True
+    s = call_sync
 
     def __init__(self, definition: TaskDefinition, serializers: Any, on_error: str = "fail_fast") -> None:
         _refuse_coalescing(definition)
@@ -425,6 +430,7 @@ class ReduceStep:
     is_step = True
     is_task = False
     needs_input = True
+    s = call_sync
 
     def __init__(
         self,

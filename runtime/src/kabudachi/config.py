@@ -8,6 +8,7 @@ the environment), then the task's own explicit setting. A task setting of
 import functools
 import ipaddress
 import os
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
@@ -727,6 +728,8 @@ class Configuration:
     def __init__(self) -> None:
         self._configured: dict[str, Any] = {}
         self._settings: Settings | None = None
+        self._caller: Any = None
+        self._caller_lock = threading.Lock()
 
     def configure(self, **settings: Any) -> None:
         """Sets process-level settings, keeping any set by earlier calls.

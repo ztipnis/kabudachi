@@ -27,9 +27,9 @@ flowchart LR
 
 Callers submit tasks and receive results. Workers execute tasks. A caller connection starts no task processes and does not participate in worker membership or voting.
 
-`kabudachi.run()` starts a worker and takes no arguments. Callers must need no Kabudachi setup or teardown calls: the first task call initializes the connection, and its internal owner releases resources at destructor time. Call a task directly with `await task(input)` or synchronously with `task.s(input)`.
+`kabudachi.run()` starts a worker and takes no arguments. Callers need no Kabudachi setup or teardown calls: the first task call initializes the connection, and its internal owner releases resources when collected or when the process exits. Call a task directly with `await task(input)` or synchronously with `task.s(input)`.
 
-The current implementation still requires an explicit `kabudachi.client(...)` context and has no synchronous `.s(...)` entry point. These are Phase 6 functional defects, not the intended caller API. Remote results and reductions now work, but Phase 6 remains incomplete.
+Connection settings come from application configuration or environment variables. An explicit `kabudachi.client(...)` context remains available when an application wants to bound a connection's lifetime.
 
 ## Define a task
 
@@ -66,7 +66,7 @@ KABUDACHI_LISTEN=/ip4/127.0.0.1/tcp/4001 runtime/.venv/bin/python worker.py
 
 ## Call tasks
 
-The required caller API is a direct task call, using the same imported task definition as the worker:
+Call tasks directly, using the same imported task definition as the worker:
 
 ```python
 from google.protobuf.wrappers_pb2 import StringValue
@@ -79,9 +79,13 @@ result = await greet(StringValue(value="world"))
 result = greet.s(StringValue(value="world"))
 ```
 
-Both forms must return the worker's result without a caller connection call or context manager. Connection settings belong in application configuration, such as environment variables. Initialization happens on the first task call; destructor cleanup handles teardown.
+Both forms return the worker's certified result and propagate remote errors without a caller connection call or context manager. Use `.s(...)` from synchronous application code; use `await` on an event-loop thread. Initialization happens on the first task call, and the internally owned connection outlives individual application event loops.
 
-**This caller API is not yet complete.** Remote result delivery exists, but the current code requires an explicit connection context and lacks `.s(...)`. The example above describes the required API, not a working end-to-end walkthrough of the current release.
+For a synchronous caller, save the imports, the `greet.s(...)` call, and `print(result.value)` in `caller.py`, then connect it to the worker above:
+
+```sh
+KABUDACHI_SEEDS=/ip4/127.0.0.1/tcp/4001 runtime/.venv/bin/python caller.py
+```
 
 ## Choose the right kind of work
 
@@ -111,15 +115,15 @@ flowchart TB
 
 Redis or Valkey supplies coordination when configured; it is not the task broker. An optional result backend retains certified results for later lookup. See [Architecture and contributing](docs/architecture.md) for the component map and development checks.
 
-## Gaps against the system model
+## Caller API guarantees
 
-| Defect | Required behavior |
+| Behavior | Implementation |
 | --- | --- |
-| Explicit caller connection context required | Initialize connection resources automatically on the first task call |
-| Caller cleanup tied to context exit | Release internally owned resources at destructor time without manual teardown |
-| Missing synchronous `.s(...)` | Submit and receive the result directly from synchronous application code |
+| Automatic connection | The first task call initializes connection resources from process configuration |
+| Automatic cleanup | The internal owner's finalizer releases its transport and loop without manual teardown |
+| Synchronous `.s(...)` | Submit and receive the certified result directly from synchronous application code |
 
-Remote task results, the no-argument worker entry point, and `.reduce(...)` are implemented. Their acceptance tests currently use explicit caller contexts, so passing those tests does not establish the required caller ergonomics. Phase 6 remains incomplete until these caller API requirements are met.
+Remote task results, the no-argument worker entry point, reductions, and implicit callers are implemented. One comprehensive installed-wheel acceptance scenario exercises caller APIs without a connection context across five workers, including worker and leader loss. Production readiness remains a separate gate covering Phases 7/8 and final rigorous testing.
 
 ## Execution and recovery
 
