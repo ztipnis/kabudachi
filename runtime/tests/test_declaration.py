@@ -195,6 +195,7 @@ BAD_OPTIONS = (
     + [("retries", bad, "retries") for bad in [-1, True, 1.5, "2", None]]
     + [("timeout", bad, "timeout") for bad in [timedelta(0), timedelta(seconds=-1), 5, "5s", True]]
     + [("cancel_grace", bad, "cancel_grace") for bad in [timedelta(seconds=-1), 5, "5s", None, True]]
+    + [("result_ttl", bad, "result_ttl") for bad in [timedelta(0), timedelta(seconds=-1), 60, "1m", True]]
     + [("recycle_process", bad, "recycle_process") for bad in ["yes", 1, None]]
     + [("retriable", bad, "retriable") for bad in ["no", 0, None]]
     + [
@@ -697,6 +698,13 @@ def test_an_unknown_setting_is_refused():
         ({"result_ttl": 1.5}, "result_ttl"),
         ({"result_ttl": True}, "result_ttl"),
         ({"result_ttl": "1h"}, "result_ttl"),
+        ({"retries": -1}, "retries"),
+        ({"retries": True}, "retries"),
+        ({"timeout": timedelta(0)}, "timeout"),
+        ({"timeout": 5}, "timeout"),
+        ({"result_backend": "http://cache:6379/0"}, "result_backend"),
+        ({"result_backend": "redis://cache:6379/0?ttl=3"}, "result_backend"),
+        ({"result_backend": object()}, "result_backend"),
         ({"cancel_grace": timedelta(seconds=-1)}, "cancel_grace"),
         ({"cancel_grace": 5}, "cancel_grace"),
         ({"cancel_grace": "5"}, "cancel_grace"),
@@ -839,6 +847,7 @@ def test_configure_wins_over_the_environment(monkeypatch):
     "setting, raw",
     [
         ("concurrency", "many"),
+        ("timeout", "soon"),
         # Per-queue options have no text form.
         ("queue_options", "gpu=5"),
     ],
@@ -966,6 +975,9 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("KABUDACHI_DRAIN_GRACE", "4")
     monkeypatch.setenv("KABUDACHI_DRAIN_WAIT_LIMIT", "120")
     monkeypatch.setenv("KABUDACHI_VERSION_BLOCK_TTL", "2.5")
+    monkeypatch.setenv("KABUDACHI_RETRIES", "2")
+    monkeypatch.setenv("KABUDACHI_TIMEOUT", "1.5")
+    monkeypatch.setenv("KABUDACHI_RESULT_BACKEND", "redis://cache:6379/1?key_prefix=app:")
     configuration = Configuration()
 
     names = (
@@ -988,6 +1000,9 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         "drain_grace",
         "drain_wait_limit",
         "version_block_ttl",
+        "retries",
+        "timeout",
+        "result_backend",
     )
     assert [configuration.resolve(name) for name in names] == [
         2,
@@ -1009,6 +1024,9 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
         timedelta(seconds=4),
         timedelta(seconds=120),
         timedelta(seconds=2.5),
+        2,
+        timedelta(seconds=1.5),
+        "redis://cache:6379/1?key_prefix=app:",
     ]
     assert authority_parts(configuration.resolve("authority")) == (
         "rediss://user:secret@cache.example:6380/",
@@ -1035,6 +1053,10 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     assert Configuration().resolve("seeds") == ()
     monkeypatch.setenv("KABUDACHI_ROUTING_REFRESH", "")
     assert Configuration().resolve("routing_refresh") is None
+    monkeypatch.setenv("KABUDACHI_TIMEOUT", "")
+    assert Configuration().resolve("timeout") is None
+    monkeypatch.setenv("KABUDACHI_RESULT_BACKEND", "")
+    assert Configuration().resolve("result_backend") is None
 
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(
@@ -1439,8 +1461,8 @@ def test_the_reducer_decorator_declares_a_reducer_with_its_options(fresh_registr
         (found.reducer.associative, found.reducer.tree) for found in (bare, tree)
     ] == [(False, False), (True, True)]
     assert [(found.retries, found.retriable) for found in (bare, retried, orphaned)] == [
-        (0, True),
+        (UNSET, True),
         (2, True),
-        (0, False),
+        (UNSET, False),
     ]
     assert registry_module.default_registry().get("decorated.tree") is tree

@@ -131,7 +131,7 @@ pub use observer::{NoObserver, Observer};
 pub use outcome::{Conclusion, Outcome, OutcomeRejection};
 pub use rebuild::{Adopted, ReconcileRefused, ReconcileRejection, Reconciled};
 use reconciliation::Reconciliation;
-pub use reports::{Certification, Completion, ReportRejection};
+pub use reports::{Certification, Completion, ReportRejection, Reported};
 use retention::Retention;
 pub use submission::{Submission, SubmitRejection, Submitted, TraceContext, mint};
 use waiting_room::WaitingRoom;

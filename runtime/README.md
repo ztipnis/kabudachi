@@ -186,9 +186,10 @@ Set `listen` and the worker joins a networked shard instead of running one of it
 | `name` | how workers find the task; defaults to its module and name, which then must be at package scope |
 | `queue`, `serializer` | the queue, and the registered serializer name |
 | `raise_on_failed_migration` | `True` to leave a task whose input this worker cannot migrate for another worker instead of dropping it (see "Schemas and migrations") |
-| `retries` | how many more times a run that raises or times out is tried again (not for `@ephemeral_task`) |
-| `retriable` | `False` for a `@task` that is not safe to run twice: a run that was running when its worker or task process was lost ends with `TaskOrphanedError` instead of being run again. Takes no `retries` |
-| `timeout`, `cancel_grace` | ask the body to stop after `timeout`; fail the run if it has not stopped `cancel_grace` later |
+| `retries` | how many more times a run that raises or times out is tried again (not for `@ephemeral_task`); by default the process's `retries` |
+| `retriable` | `False` for a `@task` that is not safe to run twice: a run that was running when its worker or task process was lost ends with `TaskOrphanedError` instead of being run again. Takes no `retries`, and never inherits the process's |
+| `timeout`, `cancel_grace` | ask the body to stop after `timeout`; fail the run if it has not stopped `cancel_grace` later. By default the process's `timeout` and `cancel_grace`; `timeout=None` is no limit even when the process sets one |
+| `result_ttl` | a positive `timedelta`, or `None`: how long the finished task is kept; by default its queue's, else the process's (see "Configuration"). `None` keeps no result |
 | `reconnect_timeout` | on a networked shard, how long a run may go unheard, once its worker is suspected, before the leader runs it again elsewhere; by default its queue's, else the shard's |
 | `recycle_process` | replace the task process that ran it once the run ends |
 | `merge` | `@coalescing_task` only: a pure `(older, newer)` reducer for superseded payloads |
@@ -222,7 +223,8 @@ certified it, or raises what the task raised.
 - `await handle.status()` gives a `TaskStatus`: `state` (`"unknown"`, `"pending"`, `"running"`, or how
   the newest run ended: `"succeeded"`, `"failed"`, `"expired"`, `"superseded"`, `"cancelled"`,
   `"lost"` or `"orphaned"`), `run_state`, `attempt`, `submitted_at`, `updated_at` and `delivered`
-  (whether the result reached the worker awaiting it). It is read from the record the shard holds, not
+  (whether the result reached the worker awaiting it) and `persistence` (how mirroring its result to
+  the result backend went: see "Results after a restart"). It is read from the record the shard holds, not
   from the leader, so a change the leader has just made may not show yet. The handle of a flow or group
   gives a `CompositeStatus` instead: `kind`, `state` (`"running"`, `"succeeded"`, `"failed"` or
   `"cancelled"`), `counts` of its stages or members by state, and, for a flow, `stage`.
@@ -527,6 +529,88 @@ base of the next two), `TaskLostError` (a task's process died and the task is no
 task), `ResultTooLargeError` (a result larger than the hard memory limit of the worker that ran it or of its awaiter) and
 `DurabilityUnavailableError` (the durability asked for cannot be reached), all in `kabudachi.errors`.
 
+## Results after a restart
+
+Set `result_backend` and a result outlives the process that asked for it: a new process can get it back by
+its id with `kabudachi.resume(id)`.
+
+```python
+kabudachi.configure(result_backend="redis://cache.internal:6379/0?key_prefix=app:")
+handle = add(1)
+result_id = handle.task_id  # a flow or group handle has composite_id; keep it somewhere that survives
+...
+value = await kabudachi.resume(result_id)  # in any process of the run, later
+```
+
+`result_backend` is a Redis or Valkey URL (`redis://` or `rediss://`, the database as the path, and
+`?key_prefix=`, as for `authority`, but no `ttl`: each entry carries its own expiry), or an object with
+async `store` and `load` (a custom backend, below).
+
+- After the leader certifies a run, the worker that ran it mirrors the result to the backend. A client
+  mirrors the resolved results of a flow, group or map when they finish, in bounded pages and chunks.
+- `handle.status().persistence` says how that went: `"disabled"` (nothing is mirrored: no backend, a
+  task that keeps no result, or a member of a flow, group or map), `"pending"`, `"stored"` or `"failed"`.
+  It is `None` before the task succeeds, and for a run whose worker has not said yet.
+- A backend failure (an error, or a call past its limit) is logged by the logger `kabudachi.result_backend`,
+  never with a payload, and changes no task's outcome: the handle resolves as it would have.
+- An entry expires with the task's retention (see "Configuration"), counted from the moment it is
+  mirrored. A task that keeps no result is not mirrored.
+
+`await kabudachi.resume(id)` gives the result of the task or composite `id`, in any process of the run,
+waiting while it runs (and, for a task, while its result is being mirrored, for as long as a
+`reconnect_timeout`, since a worker that died before mirroring never will). Bound the wait with
+`asyncio.wait_for`. The process must declare the task, since the value is decoded with the serializer it
+was stored with.
+
+- A task that did not succeed raises an error of the kind a task run in another process would raise
+  (`TaskCancelledError`, `TaskExpiredError`, `TaskLostError`, `TaskOrphanedError`, a failure as
+  kabudachi's own error of its kind or else `TaskBodyError` naming the kind, with the message the leader
+  recorded; for a flow or group, that of the member that ended it). The exception object the task raised
+  in its own process is not kept.
+- It raises `ResultUnavailableError` when the shard has forgotten the id, when no backend is configured
+  or it holds no entry (the task kept nothing, the entry expired, or its worker died before mirroring), or
+  when the entry does not match the record: a result is never returned unless it matches what the leader
+  certified.
+- A backend that lost a plain task's result is not always fatal. On the networked runtime, if the
+  result was large and was delivered to an awaiting client, its worker stored it in the shard as blobs,
+  and `resume` reads it from there and mirrors it back to the backend (detached, never over an entry the
+  backend holds whole; with a fresh expiry from now). A task nobody awaited, and any one-node run, has
+  no shard copy, and a small result never does, so without the backend entry `resume` raises
+  `ResultUnavailableError`. A task that kept no result is not mirrored back.
+- A flow, group or map resumes from the backend alone, even after the shard has forgotten it. If the
+  backend has lost it, `resume` falls back to the pages the shard still holds, mirroring them again; once
+  the shard has dropped them too, it raises `ResultUnavailableError`.
+- `resume` runs only in the process that runs `kabudachi.run()`: elsewhere, and in a task process, it
+  raises `RuntimeNotStartedError`.
+
+### A custom backend
+
+An object with these coroutines is a backend (`kabudachi.ResultBackend` is the protocol):
+
+```python
+class MyBackend:
+    async def store(self, key: str, entry: bytes, expires_at: datetime) -> None: ...
+    async def load(self, key: str) -> bytes | None: ...
+```
+
+`store` keeps `entry` under `key` until `expires_at` (UTC), replacing what was there, and may drop it
+after; `load` returns what `key` holds, or `None`. An entry is opaque bytes: kabudachi encodes, checks and
+expires it, so the backend is a plain key-value store. Both calls
+run on the run's event loop, so they must not block it. A call that raises, or takes longer than 10
+seconds, is a failure, logged and never an outcome. Task processes are never given the backend: it is
+used only by the process running `kabudachi.run()`.
+
+### The Redis and Valkey backend
+
+It serves a standalone server only, not a cluster. It connects at its first use, so a server that is
+down at start is not an error. Its keys are `<key_prefix>result:` followed by the entry's key, and an
+entry expires on the server (`SET ... PX`), so a prefix may be shared with `authority`. Every call,
+connecting included, is bounded by a call timeout; past it the call fails and the connection is dropped.
+
+- An ACL user needs the commands `get`, `set` and `select`, and the keys `~<key_prefix>*`.
+- Use an eviction policy that evicts only keys with a TTL (`volatile-*`) or none (`noeviction`): every
+  key here has one.
+
 ## Configuration
 
 `kabudachi.configure(...)`, or `KABUDACHI_<NAME>` in the environment:
@@ -537,13 +621,27 @@ process), `concurrency` (places per process, 16 by default, at most 32 without
 declared a task or hook), `process_start_timeout` (how long a task process has to import its modules
 and report ready, default 60 s), `max_runs_per_process` (runs a task process takes before it is
 replaced; no limit by default; the fresh one starts once it has drained and exited, and until then it
-counts against `processes`), `queue`, `result_ttl` (seconds a finished task is kept), `cancel_grace`,
-`queues`, `queue_options` and `router` (see "Queues" below), `memory_soft_limit` and
+counts against `processes`), `queue`, `result_ttl` (seconds a finished task is kept), `retries` (how
+many more times a failed run is tried, 0 by default) and `timeout` (how long a run may take; none by
+default), both for the tasks that set no `retries` or `timeout` of their own, `result_backend` (where
+results are mirrored; see "Results after a restart"), `cancel_grace`, `queues`, `queue_options` and `router` (see "Queues" below), `memory_soft_limit` and
 `memory_hard_limit` (bytes), `version_block_ttl` (how long a task left for another worker waits before
 it fails with `MigrationError`, one hour by default; see "Schemas and migrations"), and the networked settings `listen`, `seeds`, `external_address`,
 `authority`, `shard`, `heartbeat_interval`, `heartbeat_timeout` and `reconnect_timeout` (see
 "Networked workers"). In the environment a duration is a number of seconds, and `seeds`, `imports`
-and `queues` are comma-separated lists.
+and `queues` are comma-separated lists. `KABUDACHI_RESULT_BACKEND` can give a backend URL, and
+`KABUDACHI_TIMEOUT` is seconds (empty is none); an object `result_backend` can only be configured in code.
+
+`result_ttl` is the process's retention. A task keeps its result for its own `result_ttl`, else its
+queue's (`QueueOptions.result_ttl`), else the process's; a task or queue that sets nothing (`UNSET`)
+inherits, and one that sets `None` keeps no result: nothing is mirrored to the result backend, and its
+record stays in the shard only the minute the shard needs. The shard keeps a finished record at least a
+minute whatever the value. Every worker of a shard should give the same `result_ttl`, as the leader's
+keeps the records and the worker that ran a task sets its mirrored entry's expiry.
+
+`retries` and `timeout` are the defaults of a task that sets none of its own; a task's own `timeout=None`
+means no limit. A task declared `retriable=False` never inherits `retries`, and an `@ephemeral_task` is
+never retried.
 
 ### Queues
 

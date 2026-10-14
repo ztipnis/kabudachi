@@ -14,14 +14,18 @@
 //! Per run, in order: `Started` once the body runs (a compaction run sends
 //! none; a run whose input this worker cannot run sends `Blocked` instead
 //! and nothing after it), then exactly one of `Completed` (with the digest of
-//! its result, and whether the result reached the task's client first),
+//! its result, whether the result reached the task's client first, and
+//! whether its worker will mirror the result: `PERSISTENCE_STATE_PENDING` or
+//! `PERSISTENCE_STATE_DISABLED`),
 //! `Failed` (with the error's type name and message), `Lost` (the process
 //! running it died or was killed at an abort deadline, so no outcome is
 //! known), or, for a compaction run, `Compacted` (the fold). The driver takes
 //! each report to the leader in that order, asking again as leaders change,
 //! until one takes it. An executor may report `Failed` with no `Started`, for
 //! a run whose body never started; the driver reports it started first, since
-//! a leader fails only a running run.
+//! a leader fails only a running run. After `Completed`, `Persisted` (how
+//! mirroring the certified result went) if the completion said
+//! `PERSISTENCE_STATE_PENDING`.
 //!
 //! ## What the driver sends: [`Work`]
 //!
@@ -50,6 +54,9 @@
 //! `AbortWithdrawn(run)`: the leader hears the worker again before the
 //! deadline; drop the pending abort and let the run go on.
 //!
+//! `Answered { run, certified }`: the leader answered the run's `Completed`
+//! report for good. `certified` says whether that answer certified this run.
+//!
 //! The driver claims nothing until some leader has vouched for hearing this
 //! worker (see `WorkerNode::has_contact_floor`), so every run it hands over
 //! has an abort deadline it could name, and nothing while an abort deadline
@@ -62,12 +69,13 @@ use std::time::{Duration, Instant};
 
 use kabudachi_core::election::AbortBy;
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::StepDescription;
+use kabudachi_core::protocol::generated::{self, StepDescription};
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    Claim, ClaimResponse, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted,
-    TaskRejectReason, TaskResponse, claim_response, task_request,
+    Claim, ClaimResponse, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed, ReportLost,
+    ReportPersisted, ReportStarted, TaskRejectReason, TaskResponse, claim_response, task_request, task_response,
 };
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::composite::Step;
 use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::{Clock, Duration as CoreDuration, Instant as NodeInstant, WallTime};
@@ -89,6 +97,11 @@ pub enum Work {
     Cancel(TaskRunId),
     Abort { run: TaskRunId, deadline: Instant },
     AbortWithdrawn(TaskRunId),
+    /// The leader answered this worker's `Completed` report of `run` for
+    /// good: `certified` when the answer certified this very run. A refusal
+    /// (the run is no longer this worker's, or a resent report of a run a
+    /// leader already certified) is `false`.
+    Answered { run: TaskRunId, certified: bool },
 }
 
 /// What the executor tells the driver (see the module doc).
@@ -105,7 +118,18 @@ pub enum Report {
     Blocked { task: TaskId, reason: String, incompatible: bool },
     /// The run succeeded. `continuation` is the step it returned: the run's
     /// result is that step's digest, and the step is certified with it.
-    Completed { run: TaskRunId, digest: Digest, delivered: bool, continuation: Option<Step> },
+    Completed {
+        run: TaskRunId,
+        digest: Digest,
+        delivered: bool,
+        continuation: Option<Step>,
+        persistence: PersistenceState,
+        /// The digest of the blob holding the result's manifest, when the
+        /// result was stored in the shard as blobs.
+        result_manifest: Option<Digest>,
+    },
+    /// How mirroring `run`'s certified result went: `Stored` or `Failed`.
+    Persisted { run: TaskRunId, state: PersistenceState },
     Failed { run: TaskRunId, reason: String, message: String },
     Lost(TaskRunId),
     Compacted { run: TaskRunId, payload: Vec<u8> },
@@ -606,15 +630,22 @@ impl<'n> Executing<'n> {
                     incompatible,
                 })
             }
-            Report::Completed { run, digest, delivered, continuation } => {
+            Report::Completed { run, digest, delivered, continuation, persistence, result_manifest } => {
                 self.ended(&run);
                 task_request::Request::Completed(ReportCompleted {
                     task_run_id: Some(run.into()),
                     result_digest: Some(digest.into()),
                     delivered,
                     continuation: continuation.as_ref().map(StepDescription::from),
+                    persistence: generated::PersistenceState::from(persistence) as i32,
+                    result_manifest: result_manifest.map(Into::into),
                 })
             }
+            // The run ended at `Completed`.
+            Report::Persisted { run, state } => task_request::Request::Persisted(ReportPersisted {
+                task_run_id: Some(run.into()),
+                state: generated::PersistenceState::from(state) as i32,
+            }),
             Report::Failed { run, reason, message } => {
                 let held = &self.endpoint.held;
                 // A leader fails only a running run: one that failed before its
@@ -690,6 +721,15 @@ impl<'n> Executing<'n> {
                 self.endpoint.held.blocked.remove(&TaskId::from(task));
             }
             self.net.claimed_runs().forget(&run);
+        }
+        if let task_request::Request::Completed(_) = &request {
+            let certified = matches!(
+                &reply,
+                Ok(TaskResponse { result: Some(task_response::Result::Certified(certified)) })
+                    if certified.task_run_id.clone().map(TaskRunId::from).as_ref() == Some(&run)
+            );
+            // The executor may be gone; then nothing waits for the answer.
+            let _ = self.endpoint.work.send(Work::Answered { run: run.clone(), certified });
         }
         let waiting = &mut self.endpoint.held.waiting;
         if let Some(reports) = waiting.get_mut(&run) {

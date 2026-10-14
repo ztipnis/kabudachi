@@ -7,7 +7,7 @@ use prost::Message;
 
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId};
 use crate::protocol::messages::prelude::*;
-use crate::protocol::records::{TaskRunRecord, retry_of};
+use crate::protocol::records::{TaskRunRecord, retry_of, task_retention};
 use crate::protocol::task::TaskRunState;
 use crate::task_record::HISTORY_TOO_LARGE_FAILURE_KIND;
 use crate::time::{Clock, Instant, WallTime};
@@ -41,10 +41,11 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
     /// name the blobs its members stored.
     pub(super) fn forget_later(&mut self, task_id: &TaskId, now: Instant) {
         let composite = self.tasks.get(task_id).and_then(|task| task.composite_id());
+        let own = self.tasks.get(task_id).and_then(task_retention);
         if composite.is_some_and(|composite| self.composites.held.contains_key(&composite)) {
-            self.retention.hold(task_id, now);
+            self.retention.hold(task_id, now, own);
         } else {
-            self.retention.record(task_id, now);
+            self.retention.record(task_id, now, own);
         }
         self.unpublished.insert(task_id.clone());
     }

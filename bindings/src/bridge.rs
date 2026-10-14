@@ -136,6 +136,14 @@ impl Bridge {
         admitted.then(|| InFlight(Arc::clone(&self.gate)))
     }
 
+    /// Runs `future` on the runtime, detached: nothing awaits it, and it is
+    /// not run once the bridge is closed.
+    pub fn spawn_detached(&self, future: impl Future<Output = ()> + Send + 'static) {
+        if self.is_open() {
+            self.runtime.spawn(future);
+        }
+    }
+
     /// Runs `future` on the runtime and returns an awaitable that resolves on
     /// the asyncio event loop that is running the caller.
     ///

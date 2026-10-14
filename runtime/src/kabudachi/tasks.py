@@ -57,13 +57,22 @@ class Task(wrapt.ObjectProxy):
         kind: The delivery semantics of the task.
         retries: How many more times a run that raises is replaced by a new
             attempt, at once. The handle only sees the last attempt's outcome.
+            Defaults to the process's `retries`; ignored, and 0, for a task
+            with `retriable=False`. An ephemeral task is never retried.
         retriable: `False` for a plain task that is not safe to run twice: a
             run that was running when its worker or task process was lost is
             orphaned instead of run again. Such a task takes no `retries`.
         timeout: How long a run may take before its body is asked to stop
             (cancelled, for an async body). A run that hits it fails with
             `TaskTimeoutError` and is retried per `retries`. `None` is no
-            limit. Ignored by `.local()`.
+            limit. Defaults to the process's `timeout`. Ignored by `.local()`.
+        result_ttl: How long the task's record and mirrored result are kept
+            once it finishes. The shard keeps the finished record for this
+            long but never less than a minute; the result backend's entry
+            expires after exactly this long. `None` keeps no result: nothing
+            is mirrored, and the shard keeps the record for that minute.
+            Must be positive. Defaults to the queue's `result_ttl`, else the
+            process's.
         cancel_grace: How long a run has to stop once asked, before it is
             failed anyway and its body abandoned. Defaults to
             the process's.
@@ -122,9 +131,10 @@ class Task(wrapt.ObjectProxy):
         queue: str | Unset = UNSET,
         serializer: str = DEFAULT_SERIALIZER,
         kind: TaskKind = TaskKind.TASK,
-        retries: int = 0,
+        retries: int | Unset = UNSET,
         retriable: bool = True,
-        timeout: timedelta | None = None,
+        timeout: timedelta | None | Unset = UNSET,
+        result_ttl: timedelta | None | Unset = UNSET,
         cancel_grace: timedelta | Unset = UNSET,
         merge: Callable[[Any, Any], Any] | None = None,
         drop_oldest: bool = False,
@@ -137,10 +147,11 @@ class Task(wrapt.ObjectProxy):
         serializers: SerializerRegistry | None = None,
     ) -> None:
         self._check_identity(func, queue, serializer)
-        self._require_non_negative_count("retries", retries)
+        if retries is not UNSET:
+            self._require_non_negative_count("retries", retries)
         self._check_retriable(retriable, retries, kind)
 
-        self._check_timing(timeout, cancel_grace, reconnect_timeout)
+        self._check_timing(timeout, cancel_grace, reconnect_timeout, result_ttl)
         self._check_drop_oldest(drop_oldest, kind)
         self._require_bool("recycle_process", recycle_process)
         self._require_bool("raise_on_failed_migration", raise_on_failed_migration)
@@ -162,9 +173,12 @@ class Task(wrapt.ObjectProxy):
             output_type=output_type,
             is_async=inspect.iscoroutinefunction(self._annotated_callable(func)),
             module=getattr(func, "__module__", None) or "",
-            retries=retries,
+            # An ephemeral task is never run again, so the process's `retries`
+            # does not apply to it.
+            retries=0 if kind is TaskKind.EPHEMERAL and retries is UNSET else retries,
             retriable=retriable,
             timeout=timeout,
+            result_ttl=result_ttl,
             cancel_grace=cancel_grace,
             merge=None if reducing else merge,
             drop_oldest=drop_oldest,
@@ -339,11 +353,11 @@ class Task(wrapt.ObjectProxy):
             raise TypeError("only a coalescing task takes drop_oldest")
 
     @staticmethod
-    def _check_retriable(retriable: Any, retries: int, kind: TaskKind) -> None:
+    def _check_retriable(retriable: Any, retries: int | Unset, kind: TaskKind) -> None:
         Task._require_bool("retriable", retriable)
         if retriable:
             return
-        if retries > 0:
+        if retries is not UNSET and retries > 0:
             raise TaskDefinitionError(
                 "a task that is not retriable takes no retries: running it again is what it must not do"
             )
@@ -354,10 +368,16 @@ class Task(wrapt.ObjectProxy):
             )
 
     @staticmethod
-    def _check_timing(timeout: Any, cancel_grace: Any, reconnect_timeout: Any) -> None:
-        if timeout is not None and not is_positive_timedelta(timeout):
+    def _check_timing(
+        timeout: Any, cancel_grace: Any, reconnect_timeout: Any, result_ttl: Any
+    ) -> None:
+        if timeout is not UNSET and timeout is not None and not is_positive_timedelta(timeout):
             raise TaskDefinitionError(
                 f"the task timeout must be a positive timedelta or None, not {timeout!r}"
+            )
+        if result_ttl is not UNSET and result_ttl is not None and not is_positive_timedelta(result_ttl):
+            raise TaskDefinitionError(
+                f"the task result_ttl must be a positive timedelta or None, not {result_ttl!r}"
             )
         if cancel_grace is not UNSET and not is_non_negative_timedelta(cancel_grace):
             raise TaskDefinitionError(
@@ -576,9 +596,10 @@ def task(
     name: str | Unset = ...,
     queue: str | Unset = ...,
     serializer: str = ...,
-    retries: int = ...,
+    retries: int | Unset = ...,
     retriable: bool = ...,
-    timeout: timedelta | None = ...,
+    timeout: timedelta | None | Unset = ...,
+    result_ttl: timedelta | None | Unset = ...,
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
     reconnect_timeout: timedelta | None = ...,
@@ -591,9 +612,10 @@ def task(
     name: str | Unset = UNSET,
     queue: str | Unset = UNSET,
     serializer: str = DEFAULT_SERIALIZER,
-    retries: int = 0,
+    retries: int | Unset = UNSET,
     retriable: bool = True,
-    timeout: timedelta | None = None,
+    timeout: timedelta | None | Unset = UNSET,
+    result_ttl: timedelta | None | Unset = UNSET,
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
     reconnect_timeout: timedelta | None = None,
@@ -633,6 +655,7 @@ def task(
         "retries": retries,
         "retriable": retriable,
         "timeout": timeout,
+        "result_ttl": result_ttl,
         "cancel_grace": cancel_grace,
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
@@ -652,9 +675,9 @@ def reducer(
     name: str | Unset = ...,
     queue: str | Unset = ...,
     serializer: str = ...,
-    retries: int = ...,
+    retries: int | Unset = ...,
     retriable: bool = ...,
-    timeout: timedelta | None = ...,
+    timeout: timedelta | None | Unset = ...,
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
     reconnect_timeout: timedelta | None = ...,
@@ -670,9 +693,9 @@ def reducer(
     name: str | Unset = UNSET,
     queue: str | Unset = UNSET,
     serializer: str = DEFAULT_SERIALIZER,
-    retries: int = 0,
+    retries: int | Unset = UNSET,
     retriable: bool = True,
-    timeout: timedelta | None = None,
+    timeout: timedelta | None | Unset = UNSET,
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
     reconnect_timeout: timedelta | None = None,
@@ -694,7 +717,9 @@ def reducer(
     concatenation); this is not checked. Every worker computes the same
     tree only if it imports the same reducer.
 
-    Takes the other options of `task`, with the same defaults, and raises
+    Takes the other options of `task`, with the same defaults (but no
+    `result_ttl`: a reducer runs only as the steps of a reduce, which are
+    kept with the result of the reduce), and raises
     `TaskDefinitionError` for a function that is not a reducer or an
     inconsistent combination. `raise_on_failed_migration=True` leaves a step
     of the reduce whose item this worker cannot migrate for another worker
@@ -727,7 +752,8 @@ def ephemeral_task(
     name: str | Unset = ...,
     queue: str | Unset = ...,
     serializer: str = ...,
-    timeout: timedelta | None = ...,
+    timeout: timedelta | None | Unset = ...,
+    result_ttl: timedelta | None | Unset = ...,
     cancel_grace: timedelta | Unset = ...,
     recycle_process: bool = ...,
     reconnect_timeout: timedelta | None = ...,
@@ -740,7 +766,8 @@ def ephemeral_task(
     name: str | Unset = UNSET,
     queue: str | Unset = UNSET,
     serializer: str = DEFAULT_SERIALIZER,
-    timeout: timedelta | None = None,
+    timeout: timedelta | None | Unset = UNSET,
+    result_ttl: timedelta | None | Unset = UNSET,
     cancel_grace: timedelta | Unset = UNSET,
     recycle_process: bool = False,
     reconnect_timeout: timedelta | None = None,
@@ -759,6 +786,7 @@ def ephemeral_task(
         "queue": queue,
         "serializer": serializer,
         "timeout": timeout,
+        "result_ttl": result_ttl,
         "cancel_grace": cancel_grace,
         "recycle_process": recycle_process,
         "reconnect_timeout": reconnect_timeout,
@@ -775,8 +803,9 @@ def coalescing_task(
     name: str | Unset = ...,
     queue: str | Unset = ...,
     serializer: str = ...,
-    retries: int = ...,
-    timeout: timedelta | None = ...,
+    retries: int | Unset = ...,
+    timeout: timedelta | None | Unset = ...,
+    result_ttl: timedelta | None | Unset = ...,
     cancel_grace: timedelta | Unset = ...,
     merge: Callable[[Any, Any], Any] | None = ...,
     drop_oldest: bool = ...,
@@ -791,8 +820,9 @@ def coalescing_task(
     name: str | Unset = UNSET,
     queue: str | Unset = UNSET,
     serializer: str = DEFAULT_SERIALIZER,
-    retries: int = 0,
-    timeout: timedelta | None = None,
+    retries: int | Unset = UNSET,
+    timeout: timedelta | None | Unset = UNSET,
+    result_ttl: timedelta | None | Unset = UNSET,
     cancel_grace: timedelta | Unset = UNSET,
     merge: Callable[[Any, Any], Any] | None = None,
     drop_oldest: bool = False,
@@ -827,6 +857,7 @@ def coalescing_task(
         "serializer": serializer,
         "retries": retries,
         "timeout": timeout,
+        "result_ttl": result_ttl,
         "cancel_grace": cancel_grace,
         "merge": merge,
         "drop_oldest": drop_oldest,

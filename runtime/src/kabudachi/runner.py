@@ -20,7 +20,13 @@ from typing import Any, TypeVar, overload
 
 from kabudachi import _native
 from kabudachi._native import refresh_logging
-from kabudachi.config import Configuration, Settings, authority_parts, process_configuration
+from kabudachi.config import (
+    Configuration,
+    Settings,
+    authority_parts,
+    backend_parts,
+    process_configuration,
+)
 from kabudachi.execution import Executor, InProcessExecutor
 from kabudachi.lifecycle import default_hooks
 from kabudachi.native_protocol import (
@@ -160,9 +166,23 @@ def _queue_options(settings: Settings) -> tuple[QueueOptionsArgument, ...]:
     )
 
 
+def _result_backend(settings: Settings) -> Any:
+    """The native form of `settings.result_backend`, or `None`. Called on
+    the run's event loop, which runs an object backend's coroutines."""
+    backend = settings.result_backend
+    if backend is None:
+        return None
+    if isinstance(backend, str):
+        url, prefix, database = backend_parts(backend)
+        return _native.RedisResultBackend(url, key_prefix=prefix, database=database)
+    return _native.PythonResultBackend(backend, asyncio.get_running_loop())
+
+
 def _native_runtime(settings: Settings) -> Any:
     """A one-node shard of this process's own, or, with `listen` set, a
-    worker of the networked shard `settings.shard`."""
+    worker of the networked shard `settings.shard`. Called on the run's event
+    loop."""
+    result_backend = _result_backend(settings)
     if settings.listen is None:
         return _native.NativeRuntime(
             uuid.uuid4().hex,
@@ -176,6 +196,7 @@ def _native_runtime(settings: Settings) -> Any:
                 queue_options=_queue_options(settings),
                 version_block_ttl_ms=max(1, _millis(settings.version_block_ttl)),
             ),
+            result_backend=result_backend,
         )
     authority = None
     if settings.authority is not None:
@@ -210,7 +231,8 @@ def _native_runtime(settings: Settings) -> Any:
             ),
             version_block_ttl_ms=max(1, _millis(settings.version_block_ttl)),
             runnable_versions=runnable_versions(default_registry(), process_schemas()),
-        )
+        ),
+        result_backend=result_backend,
     )
 
 

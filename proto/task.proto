@@ -21,6 +21,20 @@ enum TaskRunState {
   ORPHANED = 11;
 }
 
+// Whether a certified run's result was mirrored to a result backend:
+// PERSISTENCE_STATE_DISABLED (nothing is mirrored),
+// PERSISTENCE_STATE_PENDING (its worker is mirroring it),
+// PERSISTENCE_STATE_STORED, or PERSISTENCE_STATE_FAILED (the backend refused
+// or did not answer; the run's outcome stands). Unspecified on runs not
+// certified, and on runs certified before a worker could say.
+enum PersistenceState {
+  PERSISTENCE_STATE_UNSPECIFIED = 0;
+  PERSISTENCE_STATE_DISABLED = 1;
+  PERSISTENCE_STATE_PENDING = 2;
+  PERSISTENCE_STATE_STORED = 3;
+  PERSISTENCE_STATE_FAILED = 4;
+}
+
 // A moment by the wall clock of the worker that stamped it, in milliseconds
 // since the Unix epoch. Workers' clocks disagree, so compare two only as far
 // as their clocks are known to agree, and never measure a timeout with one.
@@ -90,6 +104,11 @@ message Task {
   uint64 composite_index = 20;
   // Set on a step of a reduce: where it sits in the reduce's chain or tree.
   ReduceNode reduce_node = 25;
+  // How long this task is kept once finished, overriding the shard's
+  // retention: in milliseconds, at least a minute. Zero keeps no result:
+  // nothing is mirrored to a result backend, and the record is kept only
+  // the minute. Unset keeps the shard's retention.
+  optional uint64 result_ttl_ms = 26;
 }
 
 // The front of a coalescing key's waiting chain a compaction run folds: each
@@ -140,4 +159,14 @@ message TaskRun {
   // the task's continuation. Written in the revision that certifies the
   // run, so storing that revision commits the continuation with it.
   StepDescription continuation = 18;
+  // Set when the run is certified, and again when its worker reports how
+  // mirroring went.
+  PersistenceState persistence = 17;
+  // Set on a SUCCEEDED run whose result its worker stored in the shard as
+  // blobs: the digest of the blob that holds the result's manifest, owned by
+  // the task. A reader who needs the result and finds it nowhere else fetches
+  // that blob, then the blobs it names, and checks the joined payload against
+  // `result_digest`. Unset for a result sent inline, and for runs certified
+  // before workers said.
+  Digest result_manifest = 19;
 }

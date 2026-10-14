@@ -85,6 +85,87 @@ def valkey(tmp_path):
         server.wait()
 
 
+RESULTS_PREFIX = "py-results:"
+
+
+def resumed(worker: Worker, task_id: str) -> dict:
+    """What `kabudachi.resume(task_id)` gave the worker: `{"resumed": text}`
+    (a list of texts for a composite's results) or
+    `{"resumed_error": <its type's name>}`."""
+    reply = worker.ask(resume=task_id)
+    del reply["id"]
+    return reply
+
+
+def test_a_client_killed_while_awaiting_has_its_result_resumed_from_valkey_by_a_fresh_process(
+    valkey, tmp_path
+):
+    """Two workers run tasks; a third only submits and awaits. It is
+    killed while a task and a composite run. The task still certifies,
+    with no one to deliver to, and its worker mirrors the result to
+    valkey. Nobody mirrors the composite when it finishes: its client is
+    dead. A process started afterwards resumes both: the task from valkey,
+    the composite from the shard, which it then mirrors as the client
+    would have. A task that keeps nothing leaves nothing to resume."""
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    environment = {
+        **TIMINGS,
+        "KABUDACHI_LISTEN": "/ip4/127.0.0.1/tcp/0",
+        "KABUDACHI_PROCESSES": "1",
+        "KABUDACHI_CONCURRENCY": "1",
+        "KABUDACHI_TEST_MARKERS": str(markers),
+        "KABUDACHI_RESULT_BACKEND": f"redis://127.0.0.1:{valkey}/0?key_prefix={RESULTS_PREFIX}",
+    }
+    # The client and the fresh process take no task of the default queue.
+    clients = {"KABUDACHI_QUEUES": "elsewhere"}
+    founder = Worker(environment)
+    workers = [founder]
+    try:
+        seeded = {**environment, "KABUDACHI_SEEDS": founder.address}
+        workers.append(Worker(seeded))
+        client = Worker({**seeded, **clients})
+        workers.append(client)
+        eventually("three voters to follow one leader", lambda: founder.voters() == 3 and client.leader())
+
+        quiet = client.submit("unkept", text="gone")
+        eventually("the unkept task to settle", lambda: settled(client, quiet))
+        kept = client.submit("hold", text="kept", times=1500)
+        relayed = client.submit("relay", text="flowing", times=1500)
+        eventually(
+            "both held runs to start",
+            lambda: any(markers.glob("kept.*")) and any(markers.glob("flowing.*")),
+        )
+        client.kill()
+
+        def mirrored():
+            runs = founder.record(kept)["runs"]
+            return runs[-1] if runs and runs[-1]["persistence"] == "stored" else None
+
+        run = eventually("the result to be certified and mirrored", mirrored, timeout=30)
+        assert run["state"] == "SUCCEEDED"
+        assert run["delivered"] is False, "the killed client could not take it"
+        assert command(valkey, "EXISTS", f"{RESULTS_PREFIX}result:task/{kept}") == b":1\r\n"
+        assert founder.record(quiet)["runs"][-1]["persistence"] == "disabled"
+
+        fresh = Worker({**seeded, **clients})
+        workers.append(fresh)
+        eventually("the fresh process to follow the leader", fresh.leader)
+        assert resumed(fresh, kept) == {"resumed": "kept"}
+        assert resumed(fresh, quiet) == {"resumed_error": "ResultUnavailableError"}
+
+        composites = f"{RESULTS_PREFIX}result:composite/*"
+        assert command(valkey, "KEYS", composites) == b"*0\r\n", "the dead client mirrored nothing"
+        assert resumed(fresh, relayed) == {"resumed": ["flowing", "flowing"]}
+        eventually(
+            "the resumer to mirror the composite",
+            lambda: command(valkey, "KEYS", composites) != b"*0\r\n",
+        )
+    finally:
+        for worker in workers:
+            worker.close()
+
+
 def test_a_worker_founds_its_shard_through_valkey_runs_a_task_that_calls_another_and_drains(
     valkey, tmp_path
 ):

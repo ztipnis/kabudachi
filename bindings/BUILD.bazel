@@ -1,6 +1,7 @@
 load("@aspect_rules_py//py:defs.bzl", "py_library")
 load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@rules_rust//rust:defs.bzl", "rust_shared_library")
+load("//bindings:defs.bzl", "PYTHON_EXTENSION_RUSTC_FLAGS")
 
 # The shared library in this package goes to CI's remote cache (CircleCI's
 # with_tool_cache, billed per GB stored), so a change that leaves it alone
@@ -16,31 +17,15 @@ rust_shared_library(
     srcs = glob(["src/**/*.rs"]),
     crate_name = "_native",
     edition = "2024",
-    rustc_flags = select({
-        # A macOS extension leaves the Python symbols to the interpreter that
-        # loads it, and needs the pre-chained-fixups Mach-O format
-        # (https://pyo3.rs/main/building-and-distribution#macos,
-        # https://github.com/PyO3/pyo3/issues/5035). The C toolchain links
-        # for the macOS of the building machine; the wheel's macOS tag
-        # (//runtime:kabudachi_wheel) promises 11.0, so say so.
-        "@platforms//os:macos": [
-            "-C",
-            "link-arg=-undefined",
-            "-C",
-            "link-arg=dynamic_lookup",
-            "-C",
-            "link-arg=-Wl,-no_fixup_chains",
-            "-C",
-            "link-arg=-mmacosx-version-min=11.0",
-        ],
-        "//conditions:default": [],
-    }),
+    rustc_flags = PYTHON_EXTENSION_RUSTC_FLAGS,
     visibility = ["//visibility:private"],
     # The networked runtime hosts a net worker, with a Redis authority.
     deps = [
+        "//bindings/py_backend",
         "//core:core",
         "//net",
         "//redis_authority",
+        "//redis_result_backend",
         "@crates//:axum",
         "@crates//:log",
         "@crates//:pyo3",

@@ -3,8 +3,9 @@
 //!
 //! [`codec`] frames the `/kabudachi/task/1` messages; `wire` maps them to and
 //! from `core::scheduler`'s types. The asking side is [`Net::submit`],
-//! [`Net::report_started`], [`Net::complete`], [`Net::fail`],
-//! [`Net::report_lost`], [`Net::report_blocked`] (a task, not a run, that this
+//! [`Net::report_started`], [`Net::complete`],
+//! [`Net::report_persisted`] (how mirroring a certified result went),
+//! [`Net::fail`], [`Net::report_lost`], [`Net::report_blocked`] (a task, not a run, that this
 //! worker cannot run at its input version), [`Net::cancel`] and
 //! [`Net::query_outcome`], each sent to the leader the caller names.
 //! [`Net::submit_to_leader`], [`Net::cancel_at_leader`] and
@@ -49,16 +50,19 @@ use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::manifest::Manifest;
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::{self, StepDescription};
-use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::{
-    BlockNoted, CancelTask, CompactionApplied, PlaceRecords, PlacedKey, PlacedWithAsker, QueryOutcome, QuerySlowDown,
-    RecordPlacements, ReportBlocked, ReportCompacted, ReportCompleted, ReportFailed, ReportLost, ReportStarted,
-    SlowDownState, StartAccepted, SubmitAccepted, SubmitComposite, SubmitMembers, SubmitTask, TaskReject,
+    BlockNoted, CancelTask, CompactionApplied, PersistenceNoted, PlaceRecords, PlacedKey,
+    PlacedWithAsker, QueryOutcome, QuerySlowDown, RecordPlacements, ReportBlocked, ReportCompacted,
+    ReportCompleted, ReportFailed, ReportLost, ReportPersisted, ReportStarted, SlowDownState,
+    StartAccepted, SubmitAccepted, SubmitComposite, SubmitMembers, SubmitTask, TaskReject,
     TaskRejectReason, TaskRequest, TaskResponse, task_request, task_response,
 };
-use kabudachi_core::protocol::ids::IdGenerator;
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::composite::{MemberBatch, Step, SubmittedComposite};
-use kabudachi_core::scheduler::{BlockRejection, Completion, Observer, Scheduler, Submitted};
+use kabudachi_core::scheduler::{
+    BlockRejection, Completion, Observer, Reported, Scheduler, Submitted,
+};
 use kabudachi_core::task_record::RecordKey;
 use kabudachi_core::time::Clock;
 use libp2p::PeerId;
@@ -210,18 +214,37 @@ impl Net {
 
     /// Tells `leader` `run` succeeded with a result of digest
     /// `result_digest`, for a run whose result went to no client. The
-    /// result itself is not sent.
+    /// result itself is not sent. `persistence` says whether this worker will
+    /// mirror the result (`Pending`) or not (`Disabled`).
     pub async fn complete(
         &self,
         leader: WorkerId,
         run: TaskRunId,
         result_digest: Digest,
+        persistence: PersistenceState,
     ) -> Result<TaskResponse, TaskFailure> {
         self.report(leader, task_request::Request::Completed(ReportCompleted {
             task_run_id: Some(run.into()),
             result_digest: Some(result_digest.into()),
             delivered: false,
             continuation: None,
+            persistence: generated::PersistenceState::from(persistence) as i32,
+            result_manifest: None,
+        }))
+        .await
+    }
+
+    /// Tells `leader` how mirroring `run`'s certified result went (`Stored`
+    /// or `Failed`).
+    pub async fn report_persisted(
+        &self,
+        leader: WorkerId,
+        run: TaskRunId,
+        state: PersistenceState,
+    ) -> Result<TaskResponse, TaskFailure> {
+        self.report(leader, task_request::Request::Persisted(ReportPersisted {
+            task_run_id: Some(run.into()),
+            state: generated::PersistenceState::from(state) as i32,
         }))
         .await
     }
@@ -239,6 +262,8 @@ impl Net {
             result_digest: Some(step.digest().into()),
             delivered: false,
             continuation: Some(StepDescription::from(step)),
+            persistence: generated::PersistenceState::Disabled as i32,
+            result_manifest: None,
         }))
         .await
     }
@@ -380,6 +405,8 @@ impl Net {
             | Request::SubmitMembers(_)
             | Request::QuerySlowDown(_)
             | Request::Blocked(_) => {}
+            // The ledger forgot the run when it was certified.
+            Request::Persisted(_) => {}
         }
     }
 
@@ -874,6 +901,7 @@ pub(crate) fn answer<C: Clock, I: IdGenerator, O: Observer>(
         Request::Failed(report) => failed(scheduler, from, report),
         Request::Lost(report) => lost(scheduler, from, report),
         Request::Blocked(report) => blocked(scheduler, from, report),
+        Request::Persisted(report) => persisted(scheduler, from, report),
         Request::Cancel(request) => cancel(scheduler, request),
         // Where records go is the driver's to say: it alone knows the voters.
         Request::Place(_) => Err(TaskRejectReason::TaskRejectMalformed),
@@ -991,9 +1019,33 @@ fn completed<C: Clock, I: IdGenerator, O: Observer>(
             _ => return Err(TaskRejectReason::TaskRejectMalformed),
         },
     };
+    let result_manifest = report
+        .result_manifest
+        .as_ref()
+        .map(|manifest| wire::digest(Some(manifest)))
+        .transpose()
+        .map_err(|Malformed| TaskRejectReason::TaskRejectMalformed)?;
+    let reported = Reported {
+        delivered: report.delivered,
+        persistence: PersistenceState::try_from(report.persistence()).unwrap_or(PersistenceState::Disabled),
+        result_manifest,
+    };
     scheduler
-        .complete_delivered(from, &run, digest, completion, report.delivered)
+        .complete_reported(from, &run, digest, completion, reported)
         .map(|certification| task_response::Result::Certified(wire::certified(certification)))
+        .map_err(wire::report_reject)
+}
+
+fn persisted<C: Clock, I: IdGenerator, O: Observer>(
+    scheduler: &mut Scheduler<C, I, O>,
+    from: &WorkerId,
+    report: &ReportPersisted,
+) -> Answered {
+    let run = run_id(report.task_run_id.as_ref())?;
+    let state = PersistenceState::try_from(report.state()).map_err(|_| TaskRejectReason::TaskRejectMalformed)?;
+    scheduler
+        .note_persistence(from, &run, state)
+        .map(|()| task_response::Result::Persisted(PersistenceNoted {}))
         .map_err(wire::report_reject)
 }
 
@@ -1086,6 +1138,7 @@ pub(crate) fn reported_run(request: &task_request::Request) -> Option<TaskRunId>
         Request::Failed(report) => &report.task_run_id,
         Request::Compacted(report) => &report.task_run_id,
         Request::Lost(report) => &report.task_run_id,
+        Request::Persisted(report) => &report.task_run_id,
         Request::Submit(_)
         | Request::Cancel(_)
         | Request::Place(_)

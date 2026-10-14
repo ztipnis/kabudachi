@@ -47,6 +47,7 @@ pub(crate) fn submit_task(submitted: &Submitted) -> SubmitTask {
         trace_parent: submission.trace.trace_parent.clone(),
         trace_state: submission.trace.trace_state.clone(),
         baggage: submission.trace.baggage.clone(),
+        result_ttl_ms: submission.result_ttl.map(|ttl| ttl.as_ticks()),
     }
 }
 
@@ -98,6 +99,7 @@ pub(crate) fn submitted(task: &SubmitTask, clock: &impl Clock) -> Result<Submitt
             },
             member_of: None,
             reduce_node: None,
+            result_ttl: task.result_ttl_ms.map(Duration::from_millis),
         },
         clock,
     ))

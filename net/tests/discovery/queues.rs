@@ -10,6 +10,7 @@ use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId};
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{ClaimRejectReason, ClaimResponse, claim_response};
 use kabudachi_core::queues::{QueueOptions, QueuePolicy, Subscription};
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::Submission;
 use kabudachi_net::executor::Report;
 
@@ -170,6 +171,8 @@ async fn a_gpu_worker_takes_only_gpu_tasks_a_cpu_worker_takes_none_and_a_full_qu
             digest: Digest::blake3(b"done"),
             delivered: false,
             continuation: None,
+            persistence: PersistenceState::Disabled,
+            result_manifest: None,
         });
         let (_, claim) = shard.drive_until(executors[gpu].next_claim()).await;
         assert_eq!(

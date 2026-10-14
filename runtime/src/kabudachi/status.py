@@ -60,8 +60,10 @@ class TaskStatus:
     "failed", "expired", "superseded", "cancelled", "lost", "orphaned").
     `run_state` is the newest run's state, `attempt` its attempt number
     (1 for the first), and `delivered` whether its result reached the worker
-    awaiting it. Times are UTC, by the clocks of the workers that stamped
-    them.
+    awaiting it. `persistence` is how mirroring its result to a result
+    backend went: "disabled", "pending", "stored" or "failed"; `None` before
+    the task succeeded, or with no word yet. Times are UTC, by the clocks of
+    the workers that stamped them.
     """
 
     task_id: str
@@ -71,6 +73,7 @@ class TaskStatus:
     submitted_at: datetime | None
     updated_at: datetime | None
     delivered: bool
+    persistence: str | None = None
 
     @classmethod
     def of(cls, task_id: str, record: Any) -> "TaskStatus":
@@ -87,6 +90,7 @@ class TaskStatus:
             _moment(record.submitted_at_ms),
             _moment(run.updated_at_ms),
             run.delivered,
+            run.persistence,
         )
 
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "bindings", "proto", "net", "testkit", "redis_authority", "redis_authority/tests/support"]
+members = ["core", "bindings", "proto", "net", "testkit", "redis_authority", "redis_authority/tests/support", "redis_result_backend", "bindings/py_backend", "bindings/contract"]
 
 # macOS defaults to split-debuginfo = "unpacked", which leaves every codegen
 # unit's object file in target/debug/deps as the binary's debug info. Codegen

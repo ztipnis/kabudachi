@@ -14,6 +14,7 @@ use kabudachi_core::protocol::generated::{Task, TaskRecord};
 use kabudachi_core::protocol::ids::{ShardId, TaskDefinitionId, TaskId, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::{TaskRejectReason, claim_response, task_response};
 use kabudachi_core::queues::Subscription;
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::{Claim, MemoryLimits, Submission, Submitted, mint};
 use kabudachi_core::task_record::{Placement, RecordKey, RecordVersion};
 use kabudachi_core::time::RealClock;
@@ -517,7 +518,12 @@ async fn a_tasks_input_leaves_every_holder_when_it_finishes_and_follows_its_reco
                     .await
                     .expect("answered");
                 nets[claimant]
-                    .complete(leader_id.clone(), claim.task_run_id.clone(), Digest::blake3(b"done"))
+                    .complete(
+                        leader_id.clone(),
+                        claim.task_run_id.clone(),
+                        Digest::blake3(b"done"),
+                        PersistenceState::Disabled,
+                    )
                     .await
                     .expect("answered");
                 wait_until(|| {

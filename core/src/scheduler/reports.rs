@@ -4,10 +4,12 @@
 use prost::Message as _;
 
 use crate::protocol::digest::Digest;
+use crate::protocol::generated;
 use crate::protocol::ids::{IdGenerator, TaskId, TaskRunId, WorkerId};
 use crate::protocol::messages::TaskRun;
 use crate::protocol::records::TaskRunRecord;
 use crate::protocol::task::TaskRunState;
+use crate::result_backend::PersistenceState;
 use crate::time::{Clock, WallTime};
 
 use super::composite::Step;
@@ -35,6 +37,39 @@ pub enum Completion {
     /// that run. The task keeps its coalescing key and its memory until that
     /// composite is over, and then finishes.
     Continues(Step),
+}
+
+/// What a worker reports with a run's success besides its digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    /// The result reached its task's client first.
+    pub delivered: bool,
+    /// Whether the worker will mirror the result (`Pending`) or not (`Disabled`).
+    pub persistence: PersistenceState,
+    /// The digest of the blob holding the result's manifest, when the worker
+    /// stored the result in the shard as blobs.
+    pub result_manifest: Option<Digest>,
+}
+
+impl Default for Reported {
+    fn default() -> Self {
+        Self {
+            delivered: false,
+            persistence: PersistenceState::Disabled,
+            result_manifest: None,
+        }
+    }
+}
+
+/// What certifying a run records on it besides its digest.
+pub(super) struct Recorded {
+    pub(super) delivered: bool,
+    /// What the run records about mirroring its result; `None` leaves it
+    /// unspecified, as when a rebuild adopts a result and cannot know whether
+    /// its worker mirrors.
+    pub(super) persistence: Option<PersistenceState>,
+    /// Recorded only for a final run.
+    pub(super) result_manifest: Option<Digest>,
 }
 
 /// Why a worker's report about a run was refused.
@@ -122,14 +157,10 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         result_digest: Digest,
         completion: Completion,
     ) -> Result<Certification, ReportRejection> {
-        self.complete_delivered(worker, run_id, result_digest, completion, false)
+        self.complete_reported(worker, run_id, result_digest, completion, Reported::default())
     }
 
-    /// The worker running `run_id` reports success with the digest of its
-    /// result, and whether it delivered the result to the task's client
-    /// first, which the run records. Only a `Running` run owned by that
-    /// worker can complete, so a stale or repeated report is refused and
-    /// certifies nothing. `completion` says whether that ends the task.
+    /// As [`Self::complete_reported`] for a worker that mirrors nothing.
     pub fn complete_delivered(
         &mut self,
         worker: &WorkerId,
@@ -138,7 +169,28 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         completion: Completion,
         delivered: bool,
     ) -> Result<Certification, ReportRejection> {
-        let outcome = self.certify(worker, run_id, result_digest, completion, delivered);
+        let reported = Reported {
+            delivered,
+            ..Reported::default()
+        };
+        self.complete_reported(worker, run_id, result_digest, completion, reported)
+    }
+
+    /// The worker running `run_id` reports success with the digest of its
+    /// result, whether it delivered the result to the task's client first,
+    /// and whether it will mirror the result, all of which the run records.
+    /// Only a `Running` run owned by that worker can complete, so a stale or
+    /// repeated report is refused and certifies nothing. `completion` says
+    /// whether that ends the task.
+    pub fn complete_reported(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        result_digest: Digest,
+        completion: Completion,
+        reported: Reported,
+    ) -> Result<Certification, ReportRejection> {
+        let outcome = self.certify(worker, run_id, result_digest, completion, reported);
         self.end_call();
         outcome
     }
@@ -150,7 +202,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         run_id: &TaskRunId,
         result_digest: Digest,
         completion: Completion,
-        delivered: bool,
+        reported: Reported,
     ) -> Result<Certification, ReportRejection> {
         self.require_leader()?;
         // A compaction run's result is its fold, reported by `complete_compaction`.
@@ -161,17 +213,33 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         {
             return Err(ReportRejection::NotAuthoritative);
         }
-        self.certify_owned(worker, run_id, result_digest, completion, delivered)
+        let Reported {
+            delivered,
+            persistence,
+            result_manifest,
+        } = reported;
+        let recorded = Recorded {
+            delivered,
+            persistence: Some(persistence),
+            result_manifest,
+        };
+        self.certify_owned(worker, run_id, result_digest, completion, recorded)
     }
 
+    /// Certifies `worker`'s running run, recording `recorded` on it.
     pub(super) fn certify_owned(
         &mut self,
         worker: &WorkerId,
         run_id: &TaskRunId,
         result_digest: Digest,
         completion: Completion,
-        delivered: bool,
+        recorded: Recorded,
     ) -> Result<Certification, ReportRejection> {
+        let Recorded {
+            delivered,
+            persistence,
+            result_manifest,
+        } = recorded;
         let now = self.clock.now();
         let stamped_at = WallTime::now(&self.clock);
         self.owned_run(worker, run_id, TaskRunState::Running)?;
@@ -190,6 +258,18 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("a Running run can always succeed");
         run.result_digest = Some(result_digest.clone().into());
         run.delivered = delivered;
+        // A step is not a value to mirror: its composite's results are
+        // mirrored by its client.
+        let persistence = match completion {
+            Completion::Continues(_) => persistence.map(|_| PersistenceState::Disabled),
+            Completion::Final => persistence,
+        };
+        if matches!(completion, Completion::Final) {
+            run.result_manifest = result_manifest.map(Into::into);
+        }
+        if let Some(state) = persistence {
+            run.persistence = generated::PersistenceState::from(state) as i32;
+        }
         // The step is part of the run, so the revision that certifies the run
         // commits the step with it: a leader that loses everything else still
         // finds it here.
@@ -234,7 +314,45 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             .expect("a Running run can always succeed");
         certified.result_digest = Some(result_digest.clone().into());
         certified.continuation = Some(step.into());
+        // Certifying a step records that nothing of it is mirrored.
+        certified.persistence = generated::PersistenceState::from(PersistenceState::Disabled) as i32;
         record.encoded_len() as u64 > Self::record_limit()
+    }
+
+    /// The worker that ran `run_id` says how mirroring its certified result
+    /// went (`Stored` or `Failed`). Only that worker's word is taken, and only
+    /// for a run that succeeded; the same word again changes nothing, and a
+    /// `Failed` word after `Stored` is ignored.
+    pub fn note_persistence(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        state: PersistenceState,
+    ) -> Result<(), ReportRejection> {
+        let outcome = self.note_persistence_owned(worker, run_id, state);
+        self.end_call();
+        outcome
+    }
+
+    fn note_persistence_owned(
+        &mut self,
+        worker: &WorkerId,
+        run_id: &TaskRunId,
+        state: PersistenceState,
+    ) -> Result<(), ReportRejection> {
+        self.require_leader()?;
+        if !matches!(state, PersistenceState::Stored | PersistenceState::Failed) {
+            return Err(ReportRejection::NotAuthoritative);
+        }
+        let run = self.owned_run(worker, run_id, TaskRunState::Succeeded)?;
+        let wire = generated::PersistenceState::from(state) as i32;
+        let stored = generated::PersistenceState::Stored as i32;
+        if run.persistence == wire || (run.persistence == stored && state == PersistenceState::Failed) {
+            return Ok(());
+        }
+        run.persistence = wire;
+        self.mark_decided(run_id);
+        Ok(())
     }
 
     /// The step a certified run returned, read from the run.

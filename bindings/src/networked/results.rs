@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use kabudachi_core::blob::BlobOwner;
+use kabudachi_core::blob::{BlobOwner, MAX_BLOB_BYTES};
 use kabudachi_core::manifest::{Manifest, fits_inline};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
@@ -14,6 +14,7 @@ use kabudachi_core::protocol::messages::{
     DeliverResult, OutcomeAnswer, TaskResponse, deliver_result, task_response,
 };
 use kabudachi_core::protocol::task::TaskRunState as DomainRunState;
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::Event;
 use kabudachi_core::scheduler::composite::{CompositeFinished, Step};
 use kabudachi_net::blobs::BlobRole;
@@ -42,8 +43,11 @@ pub(super) async fn deliver_then_report(
     run: TaskRunId,
     digest: Digest,
     payload: Vec<u8>,
+    persistence: PersistenceState,
 ) {
-    let Some(body) = result_body(&shared, &held, payload).await else {
+    let Some((body, result_manifest)) = result_body(&shared, &held, payload).await else {
+        // Never reported completed, so nothing will answer it.
+        shared.seam().mirroring.remove(&run);
         shared.report(Report::Lost(run));
         return;
     };
@@ -63,13 +67,19 @@ pub(super) async fn deliver_then_report(
         digest,
         delivered,
         continuation: None,
+        persistence,
+        result_manifest,
     });
 }
 
 /// What carries `payload` to the client: the payload itself, or, past one
 /// message, the manifest of blobs owned by the task, stored where its leader
-/// keeps the task's record, so they live, and move, with it. `None` if they
-/// could not be stored within the run's reconnect timeout.
+/// keeps the task's record, so they live, and move, with it. Beside the
+/// manifest goes the digest of the blob that holds it, which the run is
+/// certified with so a reader who finds the result nowhere else can fetch it
+/// from the shard; it is `None` for an inline payload, and for a manifest too
+/// large to be a blob itself. `None` if the blobs could not be stored within
+/// the run's reconnect timeout.
 ///
 /// The payload is in this process's memory already, so it is counted, not
 /// waited for, while it is stored: this worker claims no blob input
@@ -81,9 +91,9 @@ async fn result_body(
     shared: &Shared,
     held: &HeldRun,
     payload: Vec<u8>,
-) -> Option<deliver_result::Body> {
+) -> Option<(deliver_result::Body, Option<Digest>)> {
     if fits_inline(payload.len()) {
-        return Some(deliver_result::Body::Payload(payload));
+        return Some((deliver_result::Body::Payload(payload), None));
     }
     let _in_flight = shared
         .net
@@ -92,14 +102,24 @@ async fn result_body(
         .ok();
     let bound = tokio::time::Instant::now() + held.reconnect_timeout;
     let owner = BlobOwner::Task(held.task.clone());
+    let cut = Manifest::chunk(&payload);
+    let encoded = cut.manifest.encode();
+    // A manifest past one blob is still delivered to the client, but cannot be
+    // read back from the shard.
+    let stored_manifest = encoded.len() <= MAX_BLOB_BYTES;
+    let mut blobs = cut.chunks;
+    if stored_manifest {
+        blobs.push(encoded);
+    }
     // `None` once out of its shard, or past the bound.
-    let manifest = stored_until(shared, bound, || {
+    stored_until(shared, bound, || {
         shared
             .net
-            .store_payload_at_leader(BlobRole::Result, &owner, &payload, shared.retry)
+            .store_blobs_at_leader(BlobRole::Result, &owner, blobs.clone(), shared.retry)
     })
     .await?;
-    Some(deliver_result::Body::Manifest(manifest.into()))
+    let digest = stored_manifest.then(|| cut.manifest.digest());
+    Some((deliver_result::Body::Manifest(cut.manifest.into()), digest))
 }
 
 /// Stores the blobs a returned `step` names under the continuation it
@@ -133,6 +153,8 @@ pub(super) async fn store_then_report_step(
         digest: step.digest(),
         delivered: false,
         continuation: Some(step),
+        persistence: PersistenceState::Disabled,
+        result_manifest: None,
     });
 }
 

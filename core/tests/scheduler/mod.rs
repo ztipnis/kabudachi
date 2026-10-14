@@ -10,6 +10,7 @@ mod scheduler_composite_reconcile;
 mod scheduler_lifecycle;
 mod scheduler_loss;
 mod scheduler_outcome;
+mod scheduler_persistence;
 mod scheduler_queues;
 mod scheduler_reconcile;
 mod scheduler_records;

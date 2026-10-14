@@ -1,0 +1,38 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library")
+load("//bindings:defs.bzl", "PYTHON_EXTENSION_RUSTC_FLAGS")
+
+# Test-only: runs the result backend contract against Python objects
+# through the adapter `kabudachi._native` wraps them in.
+rust_shared_library(
+    name = "_kabudachi_contract_shared",
+    testonly = True,
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "_kabudachi_contract",
+    edition = "2024",
+    rustc_flags = PYTHON_EXTENSION_RUSTC_FLAGS,
+    deps = [
+        "//bindings/py_backend",
+        "//core",
+        "//testkit",
+        "@crates//:pyo3",
+    ],
+)
+
+copy_file(
+    name = "_kabudachi_contract_so",
+    testonly = True,
+    src = ":_kabudachi_contract_shared",
+    out = "_kabudachi_contract.so",
+    tags = ["no-remote-cache"],
+)
+
+py_library(
+    name = "contract",
+    testonly = True,
+    data = [":_kabudachi_contract_so"],
+    imports = ["."],
+    tags = ["no-remote-cache"],
+    visibility = ["//runtime/tests:__pkg__"],
+)

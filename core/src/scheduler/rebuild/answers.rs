@@ -14,6 +14,7 @@ use crate::reconcile::{ANSWER_IN_FLIGHT, ReportedRun, ReportedState, WorkerRuns}
 use crate::time::{Clock, WallTime};
 
 use super::super::composite::Step;
+use super::super::reports::Recorded;
 use super::super::{Claim, Completion, HeldCancel, Observer, Scheduler};
 use super::Adopted;
 
@@ -162,8 +163,13 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
                 delivered,
             } => {
                 let completion = continuation.map_or(Completion::Final, Completion::Continues);
+                let recorded = Recorded {
+                    delivered,
+                    persistence: None,
+                    result_manifest: None,
+                };
                 if let Ok(certified) =
-                    self.certify_owned(worker, run_id, result_digest, completion, delivered)
+                    self.certify_owned(worker, run_id, result_digest, completion, recorded)
                 {
                     out.certified.push(certified);
                 }
@@ -268,6 +274,8 @@ fn claimed_run(worker: &WorkerId, claim: &Claim, stamped_at: WallTime) -> TaskRu
         started_at: None,
         failure_message: String::new(),
         continuation: None,
+        persistence: generated::PersistenceState::Unspecified as i32,
+        result_manifest: None,
     };
     run.transition_to(TaskRunState::Claimed, stamped_at)
         .expect("a queued run can be claimed");

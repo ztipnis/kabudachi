@@ -1,0 +1,18 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+# A Python object as a result backend. Its own crate so the `kabudachi`
+# extension and the test-only contract extension share one adapter.
+rust_library(
+    name = "py_backend",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "kabudachi_py_result_backend",
+    edition = "2024",
+    visibility = [
+        "//bindings:__pkg__",
+        "//bindings/contract:__pkg__",
+    ],
+    deps = [
+        "//core",
+        "@crates//:pyo3",
+    ],
+)

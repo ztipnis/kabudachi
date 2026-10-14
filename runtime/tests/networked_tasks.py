@@ -60,6 +60,19 @@ async def _held(request: Greeting) -> None:
         await asyncio.sleep(0.01)
 
 
+@kabudachi.task(name="cluster.unkept", result_ttl=None)
+def unkept(request: Greeting) -> Greeting:
+    """Returns its input, and keeps no result."""
+    return request
+
+
+@kabudachi.task(name="cluster.relay")
+async def relay(request: Greeting) -> kabudachi.Flow:
+    """Holds as `hold` does, then holds again (at once: only a text's first
+    run holds); its result is the flow's."""
+    return kabudachi.flow(hold.bind(request), hold)
+
+
 @kabudachi.task(name="cluster.nests")
 async def nests(request: Greeting) -> Greeting:
     """Calls `hold` and awaits its result, and says what that did."""
@@ -241,4 +254,6 @@ TASKS = {
     "pipeline": pipeline,
     "plan": plan,
     "refuse": refuse,
+    "unkept": unkept,
+    "relay": relay,
 }

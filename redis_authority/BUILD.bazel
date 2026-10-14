@@ -21,8 +21,8 @@ rust_library(
     testonly = True,
     data = ["@valkey//:valkey-server"],
     rustc_env = {"VALKEY_SERVER": "$(rlocationpath @valkey//:valkey-server)"},
-    deps = [":redis_authority"] + all_crate_deps(normal = True, package_name = "redis_authority/tests/support"),
-    visibility = ["//net:__pkg__"],
+    deps = all_crate_deps(normal = True, package_name = "redis_authority/tests/support"),
+    visibility = ["//net:__pkg__", "//redis_result_backend:__pkg__"],
 )
 
 # Real-time tests against real servers: they sleep through TTLs of about a

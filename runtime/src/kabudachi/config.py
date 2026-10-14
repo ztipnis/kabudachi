@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any, get_args, get_type_hints
 from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from kabudachi._checks import (
@@ -24,6 +24,7 @@ from kabudachi._checks import (
     name_list,
 )
 from kabudachi.errors import ConfigurationError
+from kabudachi.result_backend import ResultBackend, is_backend
 
 
 class Unset:
@@ -215,8 +216,9 @@ class Settings:
     field as a number, a `timedelta | None` field as a number of seconds, and
     `queues` as a comma-separated list; an empty value leaves `seeds` empty and
     `imports`, `queues`, an `int | None` field, a `timedelta | None` field or a
-    `str | None` field unset. `queue_options` and `router` cannot come from
-    the environment.
+    `str | None` field unset. `KABUDACHI_TIMEOUT` is seconds, and empty is
+    unset; `KABUDACHI_RESULT_BACKEND` is a URL. `queue_options`, `router` and
+    an object `result_backend` cannot come from the environment.
     """
 
     processes: int = field(default_factory=_one_per_cpu)
@@ -333,7 +335,26 @@ class Settings:
 
     result_ttl: int = 3600
     """How many seconds a finished task is kept, so its result and state can
-    still be looked up, before it is forgotten."""
+    still be looked up, unless the task or its queue sets its own. Every
+    worker of a shard should give the same value: the leader's keeps records,
+    and the worker that ran a task sets its mirrored entry's expiry."""
+
+    result_backend: "str | ResultBackend | None" = None
+    """Where certified results are mirrored, so a process that lost its
+    handles can still `resume` them: a Redis or Valkey URL as for `authority`
+    (`redis://` or `rediss://`, the database as the path, `?key_prefix=`), or
+    an object with async `store` and `load` (`kabudachi.ResultBackend`).
+    `None` mirrors nothing. A backend failure is logged and changes no task's
+    outcome."""
+
+    retries: int = 0
+    """How many more times a failed run of a task that does not set its own
+    `retries` is tried. A task declared `retriable=False` is never retried."""
+
+    timeout: timedelta | None = None
+    """How long a run of a task that does not set its own `timeout` may take
+    before it is asked to stop; `None` is no limit. Read by the worker that
+    runs it."""
 
     memory_soft_limit: int | None = None
     """Bytes of task payload past which bulk submission pauses: a quarter of
@@ -459,6 +480,19 @@ class Settings:
         _require_count(
             "result_ttl", self.result_ttl, minimum=1, what="a positive number of seconds"
         )
+        _require_count("retries", self.retries, minimum=0, what="a non-negative integer")
+        if self.timeout is not None and not is_positive_timedelta(self.timeout):
+            raise ValueError(f"timeout must be a positive timedelta or None, not {self.timeout!r}")
+        if isinstance(self.result_backend, str):
+            try:
+                backend_parts(self.result_backend)
+            except ValueError as error:
+                raise ValueError(f"result_backend is not usable: {error}") from None
+        elif self.result_backend is not None and not is_backend(self.result_backend):
+            raise ValueError(
+                "result_backend must be a redis:// or rediss:// URL, an object with async "
+                f"store and load, or None, not {self.result_backend!r}"
+            )
 
     def _check_memory(self) -> None:
         for name in ("memory_soft_limit", "memory_hard_limit"):
@@ -557,6 +591,16 @@ def authority_parts(url: str) -> tuple[str, str, int, float | None]:
     if "{" in prefix or "}" in prefix:
         raise ValueError(f"the authority's key prefix may not contain braces: {prefix!r}")
     return f"{parts.scheme}://{parts.netloc}/", prefix, database, _authority_ttl(query)
+
+
+def backend_parts(url: str) -> tuple[str, str, int]:
+    """The server URL, key prefix and database a `result_backend` URL names.
+    Takes the same URLs as `authority`, without `ttl`: entries carry their
+    own expiry. Raises `ValueError` for any other."""
+    server, prefix, database, ttl = authority_parts(url)
+    if ttl is not None:
+        raise ValueError(f"a result backend URL takes no ttl, not {url!r}")
+    return server, prefix, database
 
 
 def health_address_parts(address: str) -> tuple[str, int]:
@@ -671,6 +715,8 @@ def _parse(value_type: Any, raw: str) -> Any:
         return timedelta(seconds=float(raw)) if raw.strip() else None  # empty is "not set"
     if value_type == int | None:
         return int(raw) if raw.strip() else None  # an empty value is "not set"
+    if type(None) in get_args(value_type) and not raw.strip():
+        return None  # an empty value is "not set" for any other optional text setting
     return raw
 
 
@@ -755,9 +801,13 @@ def configure(**settings: Any) -> None:
     timedelta a task process has to become ready, `queue`, the queue tasks
     are sent to unless they name their own, `result_ttl`, the seconds a
     finished task is kept, `cancel_grace`, the timedelta a task past its
-    timeout has to stop, `queues`, the queues this worker takes,
-    `queue_options`, each queue's `QueueOptions` (priority, weight, running
-    limit, reconnect timeout, result TTL, starvation age), `router`, which
+    timeout has to stop, `retries` and `timeout`, how many more times a
+    failed run is tried and how long a run may take for a task that sets
+    neither, `result_backend`, where certified results are mirrored (a Redis
+    or Valkey URL, or an object with async `store` and `load`), `queues`,
+    the queues this worker takes, `queue_options`, each queue's
+    `QueueOptions` (priority, weight, running limit, reconnect timeout,
+    result TTL, starvation age), `router`, which
     picks the queue of a task that names none, and `memory_soft_limit` and
     `memory_hard_limit`, in bytes of pending task payload (past the soft one
     `group` and `map` pause, past the hard one a submission raises

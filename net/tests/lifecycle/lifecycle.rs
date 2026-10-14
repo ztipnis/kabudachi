@@ -1,18 +1,19 @@
 //! A claimant's whole run over real sockets, as the one smoke test of the
 //! task exchange: refused while outside the leader's roster, then submitted
 //! through the leader with a delay, claimed once the leader's driver released
-//! it, started and completed. Each answer comes only once a majority of the
+//! it, started, completed and then told how its result was mirrored. Each answer comes only once a majority of the
 //! task's placement stored the decision, and only the result's digest reaches
 //! the leader. The cases of the exchange (retries, cancels, repeated
 //! submissions, answers withheld without a quorum) are the scheduler's and
 //! the simulator's.
 
 use kabudachi_core::protocol::digest::Digest;
-use kabudachi_core::protocol::generated::TaskRunState;
+use kabudachi_core::protocol::generated::{self, TaskRunState};
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, Uuid7Ids};
 use kabudachi_core::protocol::messages::{
     ClaimRejectReason, TaskRejectReason, TaskResponse, claim_response, task_response,
 };
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::{Submission, mint};
 use kabudachi_core::time::{Duration, RealClock};
 use kabudachi_net::claimed_runs::HeldRun;
@@ -33,6 +34,7 @@ fn plain() -> Submission {
         .with_coalescing_key("charge-1")
         .ephemeral()
         .non_retriable()
+        .with_result_ttl(Duration::from_secs(120))
 }
 
 fn reject_reason(response: &TaskResponse) -> Option<TaskRejectReason> {
@@ -50,6 +52,18 @@ fn holders_at(shard: &Voters, task: &TaskId, state: TaskRunState) -> usize {
         .iter()
         .filter_map(|net| net.held_records().get(task))
         .filter(|record| record.runs.last().map(|run| run.state()) == Some(state))
+        .count()
+}
+
+/// How many of the shard's workers hold `task` with its newest run's
+/// persistence `state`.
+fn persisted_at(shard: &Voters, task: &TaskId, state: PersistenceState) -> usize {
+    let wire = generated::PersistenceState::from(state);
+    shard
+        .nets
+        .iter()
+        .filter_map(|net| net.held_records().get(task))
+        .filter(|record| record.runs.last().map(|run| run.persistence()) == Some(wire))
         .count()
 }
 
@@ -131,6 +145,7 @@ async fn a_worker_submits_claims_starts_and_completes_a_task_through_the_leader(
         assert_eq!(task.non_retriable, wanted.non_retriable);
         assert_eq!(task.delay_millis, wanted.delay.map(|delay| delay.as_ticks()));
         assert_eq!(task.expiry_millis, wanted.expiry.map(|expiry| expiry.as_ticks()));
+        assert_eq!(task.result_ttl_ms, wanted.result_ttl.map(|ttl| ttl.as_ticks()));
         assert_eq!(task.submitted_at, Some(submitted.submitted_at.into()));
         assert_eq!(
             holders_at(&shard, &submitted.task_id, TaskRunState::Queued),
@@ -179,7 +194,12 @@ async fn a_worker_submits_claims_starts_and_completes_a_task_through_the_leader(
         );
 
         let completed = shard
-            .drive_until(client.complete(leader_id, run.clone(), Digest::blake3(RESULT)))
+            .drive_until(client.complete(
+                leader_id.clone(),
+                run.clone(),
+                Digest::blake3(RESULT),
+                PersistenceState::Pending,
+            ))
             .await
             .expect("the leader answered");
         let Some(task_response::Result::Certified(certified)) = completed.result else {
@@ -191,6 +211,19 @@ async fn a_worker_submits_claims_starts_and_completes_a_task_through_the_leader(
         );
         assert!(holders_at(&shard, &submitted.task_id, TaskRunState::Succeeded) >= QUORUM);
         assert_eq!(client.claimed_runs().get(&run), None, "a certified run leaves the ledger");
+        assert!(
+            persisted_at(&shard, &submitted.task_id, PersistenceState::Pending) >= QUORUM,
+            "the certifying revision says the result is being mirrored"
+        );
+        let noted = shard
+            .drive_until(client.report_persisted(leader_id, run.clone(), PersistenceState::Stored))
+            .await
+            .expect("the leader answered");
+        assert!(matches!(noted.result, Some(task_response::Result::Persisted(_))), "{noted:?}");
+        assert!(
+            persisted_at(&shard, &submitted.task_id, PersistenceState::Stored) >= QUORUM,
+            "the worker's word is stored before it is answered"
+        );
     })
     .await
 }

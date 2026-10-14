@@ -9,6 +9,7 @@ use kabudachi_core::blob::{BlobKey, BlobOwner};
 use kabudachi_core::protocol::generated::CompositeState as WireState;
 use kabudachi_core::protocol::ids::{CompositeId, IdGenerator, Uuid7Ids, WorkerId};
 use kabudachi_core::protocol::messages::{CancelOutcome, TaskRejectReason, task_response};
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::MemoryLimits;
 use kabudachi_core::scheduler::composite::{
     CompositeKind, CompositeState, Resolved, Stage, SubmittedComposite, Unresolved, member_input, results,
@@ -298,6 +299,8 @@ async fn a_run_that_returns_a_step_is_certified_with_it_and_its_task_ends_only_w
             digest: step.digest(),
             delivered: false,
             continuation: Some(step),
+            persistence: PersistenceState::Disabled,
+            result_manifest: None,
         });
 
         // The leader certifies the run and starts the step as a composite

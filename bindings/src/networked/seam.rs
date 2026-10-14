@@ -8,6 +8,7 @@ use std::time::Duration as StdDuration;
 use kabudachi_core::protocol::ids::{CompositeId, TaskId, TaskRunId, WorkerId};
 use kabudachi_core::protocol::messages::Task;
 use kabudachi_core::protocol::messages::prelude::*;
+use kabudachi_core::result_backend::ResultBackend;
 use kabudachi_core::scheduler::Claim;
 use kabudachi_net::executor::{Report, ReportSink};
 use kabudachi_net::messenger::Net;
@@ -15,11 +16,13 @@ use kabudachi_net::payload_memory::Taken;
 use kabudachi_net::task_exchange::LeaderRetry;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
 use super::observed::Observed;
 use super::slow_down::SlowDownWatch;
+use crate::result_backend::Mirror;
 use crate::work::{PyClaim, PyEvent};
 
 pub(super) const GONE_MESSAGE: &str = "the worker left its shard";
@@ -57,11 +60,20 @@ pub(super) struct Seam {
     pub(super) refused_composites: BTreeSet<CompositeId>,
     /// Nothing more is taken: a run handed over is reported lost at once.
     pub(super) closed: bool,
+    /// Runs reported completed whose result is mirrored once the leader
+    /// certifies them, until the leader answers the report.
+    /// Each holds a copy of the run's result until the leader answers, the
+    /// report is abandoned, or the run ends another way.
+    pub(super) mirroring: BTreeMap<TaskRunId, Mirror>,
+    /// Mirrors being stored now, after their report was answered.
+    pub(super) mirrors_running: usize,
 }
 
 /// A run Python took and has not ended: its task, and where its result goes.
 pub(super) struct HeldRun {
     pub(super) task: TaskId,
+    /// The task's own result retention in milliseconds (0: keep nothing).
+    pub(super) result_ttl_ms: Option<u64>,
     /// The worker awaiting the result; `None` for a task nobody awaits.
     pub(super) client: Option<WorkerId>,
     /// How long the result may take to reach the client: the run's reconnect timeout.
@@ -83,6 +95,13 @@ pub(super) struct Shared {
     /// What the leader last said about SlowDown, and the poll that waits for
     /// it to clear.
     pub(super) slow_down: Mutex<SlowDownWatch>,
+    /// Where certified results are mirrored; `None` mirrors nothing.
+    pub(super) backend: Option<Arc<dyn ResultBackend>>,
+    /// How long the shard keeps a finished task, which is how long a mirrored
+    /// result is kept unless its task chose its own.
+    pub(super) result_ttl_ms: u64,
+    /// The worker's runtime, for the mirrors it starts from the pump.
+    pub(super) handle: Handle,
 }
 
 impl Shared {
@@ -91,6 +110,9 @@ impl Shared {
         net: Arc<Net>,
         observed: watch::Receiver<Observed>,
         retry: LeaderRetry,
+        backend: Option<Arc<dyn ResultBackend>>,
+        result_ttl_ms: u64,
+        handle: Handle,
     ) -> Self {
         Shared {
             seam: Mutex::default(),
@@ -100,6 +122,9 @@ impl Shared {
             observed,
             retry,
             slow_down: Mutex::default(),
+            backend,
+            result_ttl_ms,
+            handle,
         }
     }
 
@@ -118,10 +143,26 @@ impl Shared {
         {
             // Dropped after the lock is released, which wakes the claims
             // waiting for room.
-            let freed = self.seam().inputs_in_flight.remove(run);
+            let freed = {
+                let mut seam = self.seam();
+                // A run that ends any way but certified has nothing to mirror.
+                if !matches!(&report, Report::Completed { .. }) {
+                    seam.mirroring.remove(run);
+                }
+                seam.inputs_in_flight.remove(run)
+            };
             drop(freed);
         }
-        let _ = self.reports.report(report);
+        let completed = match &report {
+            Report::Completed { run, .. } => Some(run.clone()),
+            _ => None,
+        };
+        // A report the driver cannot take is never answered: nothing to mirror.
+        if self.reports.report(report).is_err()
+            && let Some(run) = completed
+        {
+            self.seam().mirroring.remove(&run);
+        }
     }
 
     /// Hands the driver a report that this worker cannot run `task` at its
@@ -152,6 +193,13 @@ impl Shared {
         if seam.held.contains_key(run) {
             seam.inputs_in_flight.entry(run.clone()).or_default().extend(taken);
         }
+    }
+
+    /// Whether a result is waiting for its report's answer to be mirrored, or
+    /// is being mirrored now.
+    pub(super) fn mirrors_pending(&self) -> bool {
+        let seam = self.seam();
+        !seam.mirroring.is_empty() || seam.mirrors_running > 0
     }
 
     pub(super) fn wake(&self) {
@@ -192,6 +240,7 @@ impl Shared {
         for claim in &claims {
             let held = HeldRun {
                 task: claim.task.task_id(),
+                result_ttl_ms: claim.task.result_ttl_ms,
                 client: claim.task.client(),
                 reconnect_timeout: StdDuration::from_millis(claim.reconnect_timeout.as_ticks()),
                 member: claim.task.composite_id().is_some().then(|| claim.task.clone()),

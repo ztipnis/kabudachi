@@ -62,6 +62,7 @@ fn an_acl_user_limited_to_its_prefix_and_commands_keeps_the_contract_and_sees_no
         user: "kabudachi".into(),
         password: "secret".into(),
         key_pattern: "kabu:*".into(),
+        commands: kabudachi_redis_authority::COMMANDS,
     });
     let mut config = config(vec![server.url()]);
     config.key_prefix = "kabu:one:".into();

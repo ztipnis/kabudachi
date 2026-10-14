@@ -203,8 +203,8 @@ impl ShardRecord {
 
     /// The record's key fields, version, placement and whether it is
     /// finished, and nothing else: all a holder keeps of a revision the
-    /// leader placed elsewhere. A Task's stub also keeps its definition and
-    /// coalescing key.
+    /// leader placed elsewhere. A Task's stub also keeps its definition,
+    /// coalescing key and own retention.
     pub(crate) fn stub(&self) -> ShardRecord {
         match self {
             ShardRecord::Task(record) => ShardRecord::Task(TaskRecord {
@@ -212,6 +212,7 @@ impl ShardRecord {
                     task_id: task.task_id.clone(),
                     task_definition_id: task.task_definition_id.clone(),
                     coalescing_key: task.coalescing_key.clone(),
+                    result_ttl_ms: task.result_ttl_ms,
                     ..Default::default()
                 }),
                 version: record.version,

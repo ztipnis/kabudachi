@@ -37,7 +37,7 @@ pub(super) struct NetworkedArguments {
     seeds: Vec<String>,
     external_address: Option<String>,
     authority: Option<AuthorityArguments>,
-    result_ttl_ms: u64,
+    pub(super) result_ttl_ms: u64,
     memory_soft_limit: Option<u64>,
     memory_hard_limit: Option<u64>,
     worker_threads: usize,

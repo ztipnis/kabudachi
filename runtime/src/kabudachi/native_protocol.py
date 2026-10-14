@@ -42,6 +42,9 @@ class Claim(Protocol):
     reduce_node: tuple[int, int] | None
     """For a step of a reduce, its `(level, position)` in it: a step above
     level 0 combines two results. `None` for any other task."""
+    result_ttl_ms: int | None
+    """The task's own result retention in milliseconds (0: keep nothing);
+    `None` for the shard's."""
 
 
 class Event(Protocol):
@@ -126,6 +129,10 @@ class SubmitArguments:
     retries: int = 0
     drop_oldest: bool = False
     non_retriable: bool = False
+    result_ttl_ms: int | None = None
+    """How long the shard keeps the finished task, in milliseconds; `None`
+    keeps it as long as the shard's own result retention. With 0 it keeps no
+    result: nothing is mirrored to a result backend."""
 
 
 QueueOptionsArgument = tuple[str, int, int, int | None, int | None]
@@ -338,6 +345,23 @@ class Runtime(Protocol):
 
     async def task_record(self, task_id: str) -> Any:
         """The newest record of the task the runtime reaches, or None."""
+
+    async def resume_task(self, task_id: str) -> Any:
+        """What a task's record and the result backend say of it: its state
+        and, once it succeeded, its value checked against the record."""
+
+    async def resume_composite(self, composite_id: str) -> Any:
+        """What the shard's record and the result backend say of a composite:
+        its state and, once it succeeded, its results checked against the
+        record."""
+
+    async def mirror_composite(
+        self, composite_id: str, results: Any, expires_in_ms: int
+    ) -> None:
+        """Stores a finished composite's resolved results in the result
+        backend, if there is one, for `expires_in_ms`: `("value", producer,
+        serializer, bytes)`, `("failure", kind, message, task_id)` and nested
+        `("list", [...])`. A failure of the backend is logged, never raised."""
 
     def complete_compaction(self, task_run_id: str, folded: bytes) -> bool | None:
         """Reports the fold of a compaction run; whether the leader applied

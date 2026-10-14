@@ -54,14 +54,19 @@ class TaskDefinition:
     module: str
     """The module that declared the task, which a task process imports to
     find it; empty if the callable names none."""
-    retries: int = 0
-    """How many times a failed run is replaced by a new attempt."""
+    retries: int | Unset = UNSET
+    """How many times a failed run is replaced by a new attempt; `UNSET`
+    takes the process's `retries`."""
     retriable: bool = True
     """Whether a run that was running when its worker or task process was
     lost may be run again. `False` for a task not safe to run twice: such a
     run is orphaned instead, and the task is over."""
-    timeout: timedelta | None = None
-    """How long a run may take before it is asked to stop. `None` is no limit."""
+    timeout: timedelta | None | Unset = UNSET
+    """How long a run may take before it is asked to stop. `None` is no
+    limit; `UNSET` takes the process's `timeout`."""
+    result_ttl: timedelta | None | Unset = UNSET
+    """How long the task is kept once finished: `None` keeps no result,
+    `UNSET` takes its queue's `result_ttl`, else the process's."""
     cancel_grace: timedelta | Unset = UNSET
     """How long a run has to stop once asked, or `UNSET` for the process's."""
     continues: bool = False

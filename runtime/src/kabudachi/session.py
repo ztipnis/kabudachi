@@ -31,9 +31,11 @@ import inspect
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from kabudachi import _native
@@ -74,7 +76,7 @@ from kabudachi.errors import (
     UnknownTaskError,
     interrupted,
 )
-from kabudachi.config import Unset
+from kabudachi.config import UNSET, Unset
 from kabudachi.execution import (
     CompactJob,
     Executor,
@@ -107,6 +109,12 @@ WAIT_POLL_SECONDS = 0.005
 # How often a stream waiting out SlowDown asks the runtime again, so a change
 # no event announced (a networked leader's, say) is still seen.
 SLOW_DOWN_POLL_SECONDS = 0.05
+
+# How often `resume` reads a record again while its task has not finished or
+# its result is not mirrored yet: first, and the longest between reads, as the
+# wait doubles.
+RESUME_POLL_SECONDS = 0.1
+RESUME_POLL_LIMIT_SECONDS = 1.0
 
 _logger = logging.getLogger("kabudachi")
 
@@ -245,7 +253,12 @@ class Session:
                 limit,
             )
         queue = self._queue_of(definition, value)
-        settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
+        settings = SubmissionSettings(
+            queue,
+            self._reconnect_timeout_ms(definition, queue),
+            retries=self.retries_of(definition),
+            result_ttl_ms=self._result_ttl_ms(definition, queue),
+        )
         return self._tasks.submit(
             definition,
             payload,
@@ -253,6 +266,27 @@ class Session:
             settings,
             self._schemas.version_of(definition.input_type),
         )
+
+    def retries_of(self, definition: TaskDefinition) -> int:
+        """How many retries a submission of `definition` carries: its own,
+        else the process's; none for a task that must not run twice."""
+        if not definition.retriable:
+            return 0
+        return self._configuration.resolve("retries", definition.retries)
+
+    def _result_ttl_ms(self, definition: TaskDefinition, queue: str) -> int | None:
+        """The retention a submission of `definition` sent to `queue` carries,
+        in whole milliseconds rounded up: the task's own, else its queue's.
+        `None` leaves it to the shard; 0 keeps no result."""
+        ttl = definition.result_ttl
+        if ttl is UNSET:
+            options = self._configuration.resolve("queue_options").get(queue)
+            ttl = UNSET if options is None else options.result_ttl
+        if ttl is UNSET:
+            return None
+        if ttl is None:
+            return 0
+        return max(1, math.ceil(ttl / timedelta(milliseconds=1)))
 
     def _queue_of(self, definition: TaskDefinition, value: Callable[[], Any]) -> str:
         """The queue a task of `definition` goes to: its own, else the one
@@ -295,7 +329,7 @@ class Session:
             queue = self._configuration.resolve("queue")
         return {
             "queue": queue,
-            "retries": definition.retries,
+            "retries": self.retries_of(definition),
             "ephemeral": definition.kind is TaskKind.EPHEMERAL,
             "non_retriable": not definition.retriable,
             "reconnect_timeout_ms": self._reconnect_timeout_ms(definition, queue),
@@ -502,18 +536,21 @@ class Session:
     def continuation_finished(self, event: Any) -> None:
         """The composite a task's run returned as its step is over: settles
         the task's handle as the composite's would be."""
+        keeps_no_result = self._tasks.keeps_no_result(event.parent_task_id)
         handle = self._tasks.continuation_over(event.parent_task_id)
         if handle is not None:
-            self.settle_from_composite(handle, event)
+            # A task that keeps no result has none of its continuation mirrored either.
+            self.settle_from_composite(handle, event, mirror=not keeps_no_result)
 
-    def settle_from_composite(self, handle: TaskHandle, event: Any) -> None:
+    def settle_from_composite(self, handle: TaskHandle, event: Any, *, mirror: bool = True) -> None:
         """Settles `handle`, of a composite or of the task that returned it as
         its step, by how the composite `event` names ended: with its results,
-        with the failure that ended it, or as cancelled."""
+        with the failure that ended it, or as cancelled. The results are mirrored
+        to the result backend unless `mirror` is false."""
         match event.state:
             case "succeeded":
                 self._deliveries += 1
-                if not self._hosted.spawn(self._deliver(handle, event.composite_id)):
+                if not self._hosted.spawn(self._deliver(handle, event.composite_id, mirror)):
                     self._deliveries -= 1
                     handle._fail(RunStoppedError("the run ended before the results could be read"))
             case "failed":
@@ -536,15 +573,17 @@ class Session:
         if not self._awaits_composites():
             self._tasks.drop_member_errors()
 
-    async def _deliver(self, handle: TaskHandle, composite_id: str) -> None:
+    async def _deliver(self, handle: TaskHandle, composite_id: str, mirror: bool) -> None:
         """Resolves `handle` with the results of the finished composite."""
         try:
-            await self._resolve_with_results(handle, composite_id)
+            await self._resolve_with_results(handle, composite_id, mirror)
         finally:
             self._deliveries -= 1
             self._release_member_errors()
 
-    async def _resolve_with_results(self, handle: TaskHandle, composite_id: str) -> None:
+    async def _resolve_with_results(
+        self, handle: TaskHandle, composite_id: str, mirror: bool
+    ) -> None:
         try:
             resolved = await self._runtime.composite_results(composite_id)
         except Exception as error:
@@ -555,6 +594,8 @@ class Session:
                 )
             )
             return
+        if mirror:
+            self._mirror_composite(composite_id, resolved)
         try:
             value = self.decode_resolved(resolved, own_errors=True)
         except Exception as error:
@@ -566,23 +607,19 @@ class Session:
         """What a handle fails with when the composite `event` names failed:
         the error of the member that ended it if this process ran that member,
         else an error of the kind and message the leader gives."""
-        kind, message = event.failure_kind, event.failure_message
         held = self._tasks.member_error(event.failure_task_id)
         if held is not None:
             return held
-        if kind == "MigrationError":
-            return _failure_error(event.failure_task_id or subject, kind, message or None)
-        known = _KNOWN_FAILURES.get(kind)
-        if known is not None:
-            return known(message or f"{subject} failed with {kind}")
-        return TaskBodyError(message or f"{subject} failed with {kind}", kind)
+        return _leader_failure(
+            subject, event.failure_task_id, event.failure_kind, event.failure_message
+        )
 
     def decode_resolved(self, resolved: Any, *, own_errors: bool = False) -> Any:
         """The value a stage's `resolved` result stands for, each value decoded
         by the serializer of the task that produced it. A failure is a
         `TaskFailure`, or, with `own_errors`, the error this process's run of
         that member failed with, when it still has it."""
-        failure = self._own_failure if own_errors else TaskFailure
+        failure = self._own_failure if own_errors else _plain_failure
         return decode_resolved(self._registry, self._serializers, resolved, failure)
 
     def _own_failure(self, kind: str, message: str, task_id: str | None) -> BaseException:
@@ -1061,7 +1098,7 @@ class Session:
             await asyncio.wait({previous})
         outcome = await run_within(
             body,
-            definition.timeout,
+            self._configuration.resolve("timeout", definition.timeout),
             self._cancel_grace(definition),
             functools.partial(self._executor.condemn_host_of, claim.task_run_id),
         )
@@ -1096,7 +1133,9 @@ class Session:
             return
         if run.holds_handle:
             self._tasks.result_held(claim.task_id, claim.task_run_id, outcome)
-            certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
+            certification = self._runtime.complete(
+                claim.task_run_id, result_digest(outcome), result=outcome
+            )
         else:
             # Held for the shard: the result goes to the task's client first.
             certification = self._runtime.complete(
@@ -1412,6 +1451,115 @@ class Session:
         serializer = self._serializers.get(definition.serializer)
         return serializer.decode(payload, definition.output_type)
 
+    def _definition(self, name: str) -> TaskDefinition:
+        """The task this process declares as `name`. Raises
+        `UnknownTaskError` when it declares none."""
+        definition = self._registry.get(name)
+        if definition is None:
+            raise UnknownTaskError(f"this process has no task named {name!r}")
+        return definition
+
+    def _tree_of(self, resolved: Any) -> Any:
+        """A composite's resolved results with each value's serializer name,
+        as `mirror_composite` takes them. Raises `UnknownTaskError` for a
+        producer this process does not declare."""
+        match resolved:
+            case ("value", producer, data):
+                return ("value", producer, self._definition(producer).serializer, data)
+            case ("list", members):
+                return ("list", [self._tree_of(member) for member in members])
+        return resolved  # ("failure", kind, message, task_id)
+
+    def _decoded_tree(self, result_id: str, tree: Any) -> Any:
+        """A mirrored tree as the value its handle resolved to. Raises
+        `ResultUnavailableError` for a value stored with another serializer
+        than this process's for its producer, which cannot be decoded here."""
+
+        def plain(node: Any) -> Any:
+            match node:
+                case ("value", producer, serializer, data):
+                    if self._definition(producer).serializer != serializer:
+                        raise ResultUnavailableError(
+                            f"the result of {result_id} was stored with serializer {serializer!r}, "
+                            f"not this process's for {producer!r}",
+                            result_id,
+                        )
+                    return ("value", producer, data)
+                case ("list", members):
+                    return ("list", [plain(member) for member in members])
+            return node
+
+        return self.decode_resolved(plain(tree))
+
+    def _mirror_composite(self, composite_id: str, resolved: Any) -> None:
+        """Mirrors a finished composite's resolved results to the result
+        backend, if there is one, in the background. A run waits for it to end,
+        and a failure is only logged."""
+        if self._configuration.resolve("result_backend") is None:
+            return
+        try:
+            tree = self._tree_of(resolved)
+        except UnknownTaskError as error:
+            _logger.warning("composite %s is not mirrored: %s", composite_id, error)
+            return
+        expires_in_ms = self._configuration.resolve("result_ttl") * 1000
+        self._hosted.spawn(self._mirror(composite_id, tree, expires_in_ms))
+
+    async def _mirror(self, composite_id: str, tree: Any, expires_in_ms: int) -> None:
+        try:
+            await self._runtime.mirror_composite(composite_id, tree, expires_in_ms)
+        except Exception as error:
+            _logger.warning("composite %s is not mirrored: %s", composite_id, error)
+
+    async def resume(self, result_id: str) -> Any:
+        """The value of the task or composite `result_id`, from its record and
+        the result backend: see `kabudachi.resume`."""
+        resumed = await self._resumed(self._runtime.resume_task, result_id)
+        if resumed.state == "unknown":
+            resumed = await self._resumed(self._runtime.resume_composite, result_id)
+        if resumed.state == "succeeded" and resumed.unavailable is None:
+            if resumed.payload is not None:
+                self._definition(resumed.definition_id)
+                return self._decode_result(resumed.definition_id, resumed.payload)
+            if resumed.from_shard:
+                # Its client never mirrored it (it died first): do what it would have.
+                self._mirror_composite(resumed.composite_id, resumed.resolved)
+                return self.decode_resolved(resumed.resolved)
+            return self._decoded_tree(result_id, resumed.results)
+        if resumed.state in ("succeeded", "unknown"):
+            reason = resumed.unavailable or "the shard knows no task or composite by that id"
+            raise ResultUnavailableError(
+                f"the result of {result_id} cannot be had: {reason}", result_id
+            )
+        raise _concluded_error(result_id, resumed)
+
+    async def _resumed(self, read: Callable[[str], Any], result_id: str) -> Any:
+        """`read(result_id)`, read again while the task has not finished, or
+        while its result is still being mirrored, for up to the reconnect
+        timeout: a worker that died before mirroring never will."""
+        delay = RESUME_POLL_SECONDS
+        pending_since = None
+        while True:
+            resumed = await read(result_id)
+            # A persistence of `None` is a run a new leader adopted, whose
+            # worker has not said yet. A composite's entries are written by
+            # its client, not waited for.
+            pending = (
+                resumed.state == "succeeded"
+                and resumed.composite_id is None
+                and resumed.persistence in ("pending", None)
+                and resumed.unavailable is not None
+                and self._configuration.resolve("result_backend") is not None
+            )
+            if pending and pending_since is None:
+                pending_since = time.monotonic()
+            limit = self._configuration.resolve("reconnect_timeout").total_seconds()
+            waiting = pending and time.monotonic() - pending_since < limit
+            if resumed.state != "unfinished" and not waiting:
+                return resumed
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RESUME_POLL_LIMIT_SECONDS)
+
 
 # Failure kinds a leader reports that name kabudachi's own errors, including
 # the kinds the leader itself gives a task it ended. `MigrationError`, which it
@@ -1456,14 +1604,61 @@ def _outcome_error(event: Any, reason: str | None = None) -> BaseException:
     if event.state == RunState.FAILED:
         return _failure_error(task_id, event.failure_kind, reason)
     if event.state == RunState.SUPERSEDED:
-        return TaskSupersededError(
-            f"task {task_id} was superseded by {event.superseded_by}", event.superseded_by
-        )
+        newer = f" by {event.superseded_by}" if event.superseded_by else ""
+        return TaskSupersededError(f"task {task_id} was superseded{newer}", event.superseded_by)
     plain = _PLAIN_ENDINGS.get(event.state)
     if plain is None:
         return ResultUnavailableError(f"task {task_id} ended as {event.state!r} with no result", task_id)
     error_type, ending = plain
     return error_type(f"task {task_id} {ending}")
+
+
+_RESUMED_ENDINGS = {
+    "failed": RunState.FAILED,
+    "expired": RunState.EXPIRED,
+    "superseded": RunState.SUPERSEDED,
+    "cancelled": RunState.CANCELLED,
+    "lost": RunState.LOST,
+    "orphaned": RunState.ORPHANED,
+}
+
+
+def _leader_failure(subject: str, task_id: str | None, kind: str, message: str) -> BaseException:
+    """The error of a task or composite that failed, by the kind and message
+    its leader recorded: kabudachi's own kinds as their classes, any other as
+    a `TaskBodyError` naming the kind."""
+    if kind == "MigrationError":
+        return _failure_error(task_id or subject, kind, message or None)
+    known = _KNOWN_FAILURES.get(kind)
+    if known is not None:
+        return known(message or f"{subject} failed with {kind}")
+    return TaskBodyError(message or f"{subject} failed with {kind}", kind)
+
+
+def _concluded_error(result_id: str, resumed: Any) -> BaseException:
+    """An error of the kind a task or composite that ended without a value
+    would raise in another process, for a `Resumed` that says so: what is in
+    its record, so a failure has the leader's message, and not the exception
+    object its own process raised."""
+    state = _RESUMED_ENDINGS.get(resumed.state)
+    if state is None:
+        return ResultUnavailableError(
+            f"{result_id} ended as {resumed.state!r} with no result", result_id
+        )
+    if state == RunState.FAILED:
+        return _leader_failure(result_id, None, resumed.failure_kind, resumed.failure_message)
+    return _outcome_error(
+        SimpleNamespace(
+            task_id=result_id,
+            state=state,
+            failure_kind=resumed.failure_kind,
+            superseded_by=resumed.superseded_by,
+        )
+    )
+
+
+def _plain_failure(kind: str, message: str, task_id: str | None) -> TaskFailure:
+    return TaskFailure(kind, message)
 
 
 def _failure_error(task_id: str, kind: str, reason: str | None = None) -> BaseException:

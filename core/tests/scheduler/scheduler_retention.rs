@@ -5,6 +5,7 @@
 
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, TaskRunId, WorkerId};
+use kabudachi_core::protocol::records::MIN_TASK_RETENTION;
 use kabudachi_core::scheduler::{Completion, Submission};
 use kabudachi_core::time::Duration;
 
@@ -171,4 +172,40 @@ fn a_task_with_a_continuation_is_not_forgotten_until_it_ends() {
     // The task and the one stage member of the step it returned.
     assert_eq!(fixture.scheduler.catch_up().forgotten, 2);
     assert!(fixture.forgotten(&task));
+}
+
+fn finished_with(fixture: &mut Fixture, ttl: Option<Duration>) -> TaskId {
+    let mut submission = Submission::new(TaskDefinitionId::new("billing.charge"), 0, b"input".to_vec(), "default");
+    if let Some(ttl) = ttl {
+        submission = submission.with_result_ttl(ttl);
+    }
+    let task_id = fixture.scheduler.submit(submission).unwrap();
+    let run = start_attempt(fixture, &task_id);
+    complete(fixture, &run, Completion::Final);
+    task_id
+}
+
+#[test]
+fn a_task_that_chose_its_retention_is_kept_that_long_and_never_less_than_the_minimum() {
+    let mut fixture = Fixture::leading();
+    fixture.scheduler.set_result_ttl(Some(Duration::from_ticks(TTL)));
+    let shard_default = finished_with(&mut fixture, None);
+    let keeps_nothing = finished_with(&mut fixture, Some(Duration::from_ticks(0)));
+    let two_minutes = finished_with(&mut fixture, Some(Duration::from_secs(120)));
+
+    fixture.clock.advance(Duration::from_ticks(TTL));
+    fixture.scheduler.catch_up();
+    assert!(fixture.forgotten(&shard_default));
+    assert!(!fixture.forgotten(&keeps_nothing), "kept at least the minimum");
+
+    fixture
+        .clock
+        .advance(Duration::from_ticks(MIN_TASK_RETENTION.as_ticks() - TTL));
+    fixture.scheduler.catch_up();
+    assert!(fixture.forgotten(&keeps_nothing));
+    assert!(!fixture.forgotten(&two_minutes));
+
+    fixture.clock.advance(Duration::from_secs(60));
+    fixture.scheduler.catch_up();
+    assert!(fixture.forgotten(&two_minutes));
 }

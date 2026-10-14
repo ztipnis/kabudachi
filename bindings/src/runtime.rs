@@ -10,10 +10,12 @@ use kabudachi_core::protocol::digest::{Digest, DigestAlgorithm};
 use kabudachi_core::protocol::ids::{
     CompositeId, IncarnationId, ShardName, TaskId, TaskRunId, Uuid7Ids, WorkerId,
 };
+use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::worker_state::WorkerState;
 use kabudachi_core::scheduler::composite::{
     MEMBER_BATCH_BYTES, ReduceOperand, expansion_source, member_input, reduce_operands, results,
 };
+use kabudachi_core::result_backend::{PersistenceState, ResultBackend, ResultBounds, composite_entries};
 use kabudachi_core::scheduler::{Completion, ReportRejection, Scheduler, SubmitRejection};
 use kabudachi_core::task_record::LocalRecords;
 use kabudachi_core::time::{Duration as CoreDuration, RealClock};
@@ -36,6 +38,10 @@ use crate::health;
 use crate::local_node::local_node;
 use crate::outcomes::{PyCancelOutcome, PyRunState};
 use crate::queues::{QueueOptionsArgument, queue_policy, subscription};
+use crate::result_backend::{
+    Mirror, ResumedValue, backend_of, expiring_in, keep_for, mirror, persistence_for, resume_composite, resume_task,
+    tree_from_py,
+};
 use crate::timers::run_timers;
 use crate::work::{PyCertification, PyClaim, PyEvent, PyTaskRecord};
 
@@ -101,6 +107,11 @@ pub struct NativeRuntime {
     /// Set once Python has loaded the worker's tasks and can take work.
     registry: Arc<AtomicBool>,
     health: Option<SocketAddr>,
+    /// Where certified results are mirrored; `None` mirrors nothing.
+    backend: Option<Arc<dyn ResultBackend>>,
+    /// How long the shard keeps a finished task, which is how long a mirrored
+    /// result is kept unless its task chose its own.
+    result_ttl_ms: u64,
 }
 
 #[pymethods]
@@ -118,11 +129,14 @@ impl NativeRuntime {
     /// `health_listen` is not an `ip:port` address; `RuntimeError` if
     /// `health_listen` cannot be bound.
     #[new]
+    #[pyo3(signature = (worker_id, incarnation_id, arguments, result_backend = None))]
     fn new(
         worker_id: String,
         incarnation_id: String,
         arguments: OneNodeArguments,
+        result_backend: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let backend = backend_of(result_backend)?;
         if arguments.worker_threads == 0 {
             return Err(PyValueError::new_err("worker_threads must be at least 1"));
         }
@@ -229,6 +243,8 @@ impl NativeRuntime {
             worker_id: worker_name,
             registry,
             health,
+            backend,
+            result_ttl_ms: arguments.result_ttl_ms,
         })
     }
 
@@ -446,20 +462,49 @@ impl NativeRuntime {
     /// failed for good), and `RuntimeError` if the run is unknown,
     /// is not running, or is not this worker's; the result is then not
     /// certified.
-    #[pyo3(signature = (task_run_id, result_digest = None, continuation = None))]
+    ///
+    /// `result` is the result itself. With a result backend, a task that
+    /// keeps its result (and is not a composite's member) has it mirrored in
+    /// the background once this runtime has certified the run; a failure of
+    /// the backend is logged and changes nothing about the run.
+    #[pyo3(signature = (task_run_id, result_digest = None, continuation = None, *, result = None))]
     fn complete(
         &self,
         py: Python<'_>,
         task_run_id: &str,
         result_digest: Option<&[u8]>,
         continuation: Option<&Bound<'_, PyAny>>,
+        result: Option<Vec<u8>>,
     ) -> PyResult<PyCertification> {
         let run = TaskRunId::new(task_run_id);
         let certification = match (result_digest, continuation) {
             (Some(digest), None) => {
                 let digest = Digest::new(DigestAlgorithm::Blake3, digest.to_vec())
                     .map_err(|error| PyValueError::new_err(error.to_string()))?;
-                self.door.complete(&run, digest, Completion::Final)
+                let task = self.door.task_of_run(&run)?;
+                let persistence = task.as_ref().map_or(PersistenceState::Disabled, |task| {
+                    persistence_for(
+                        self.backend.is_some(),
+                        result.as_deref().map(|result| (result, &digest)),
+                        task.composite_id().is_some(),
+                        task.result_ttl_ms,
+                    )
+                });
+                let certification =
+                    self.door
+                        .complete(&run, digest.clone(), Completion::Final, persistence);
+                if let (Ok(_), PersistenceState::Pending, Some(task), Some(payload)) =
+                    (&certification, persistence, task, result)
+                {
+                    self.mirror_run(Mirror {
+                        keep_for: keep_for(task.result_ttl_ms, self.result_ttl_ms),
+                        task: task.task_id(),
+                        run,
+                        digest,
+                        payload,
+                    });
+                }
+                certification
             }
             (None, Some(tree)) => {
                 let step = step_from_tree(tree)?;
@@ -839,6 +884,67 @@ impl NativeRuntime {
         })
     }
 
+    /// Returns an awaitable that resolves, to `None`, once a finished
+    /// composite's resolved `results` (see `Resumed.results` for the tree's
+    /// form) are stored in the result backend, for `expires_in_ms` from now.
+    /// Resolves at once without a backend; a failure of the backend is logged,
+    /// never raised. The caller awaits it in the background: a backend that is
+    /// a Python object runs on the caller's event loop, so the loop must stay
+    /// free until it resolves.
+    ///
+    /// Raises `TypeError` if `results` is not a result tree.
+    fn mirror_composite<'py>(
+        &self,
+        py: Python<'py>,
+        composite_id: &str,
+        results: &Bound<'py, PyAny>,
+        expires_in_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let backend = self.backend.clone();
+        let tree = tree_from_py(results)?;
+        let id = CompositeId::new(composite_id);
+        let expires_at = expiring_in(Duration::from_millis(expires_in_ms));
+        self.bridge.spawn_into_py(py, async move {
+            if let Some(backend) = backend {
+                mirror(backend, move || {
+                    composite_entries(&ResultBounds::DEFAULT, &id, &tree, expires_at)
+                })
+                .await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Returns an awaitable that resolves to a `Resumed`: where the task
+    /// stands by the record this runtime holds, and, once it succeeded, its
+    /// value from the result backend, checked against the record. A task that
+    /// returned a step resumes as its composite.
+    fn resume_task<'py>(&self, py: Python<'py>, task_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let door = Arc::clone(&self.door);
+        let runtime_ttl_ms = self.result_ttl_ms;
+        let backend = self.backend.clone();
+        self.bridge.spawn_into_py(py, async move {
+            let task = TaskId::new(task_id);
+            let record = door.task_record(&task)?;
+            let (composite, resumption) = resume_task(task, record, &DoorSource(&door), backend, runtime_ttl_ms).await;
+            Ok(ResumedValue(composite, resumption))
+        })
+    }
+
+    /// Returns an awaitable that resolves to a `Resumed` for a composite, as
+    /// `resume_task` does for a task: the record if this runtime still holds
+    /// it, then the results reassembled from the backend, or else from the
+    /// runtime while it holds them.
+    fn resume_composite<'py>(&self, py: Python<'py>, composite_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let door = Arc::clone(&self.door);
+        let backend = self.backend.clone();
+        self.bridge.spawn_into_py(py, async move {
+            let id = CompositeId::new(composite_id);
+            let resumption = resume_composite(id.clone(), &DoorSource(&door), backend).await;
+            Ok(ResumedValue(Some(id), resumption))
+        })
+    }
+
     /// The worker's election state by name, for example `"Leader"`.
     fn worker_state(&self) -> String {
         format!("{:?}", *self.state.borrow())
@@ -914,6 +1020,22 @@ impl Drop for NativeRuntime {
 }
 
 impl NativeRuntime {
+    /// Mirrors a run this runtime has just certified, in the background, and
+    /// records how that went on the run. The door's lock is not held while the
+    /// backend is called.
+    fn mirror_run(&self, certified: Mirror) {
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let door = Arc::clone(&self.door);
+        self.bridge.spawn_detached(async move {
+            let run = certified.run.clone();
+            let state = mirror(backend, move || certified.entries()).await;
+            // A runtime that shut down meanwhile has nobody to tell.
+            let _ = door.note_persistence(&run, state);
+        });
+    }
+
     /// Takes one batch of members into its streamed composite, and says
     /// whether the composite is still taking more (see `submit_members`).
     fn send_members(

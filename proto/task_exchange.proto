@@ -46,6 +46,9 @@ message SubmitTask {
   string trace_parent = 17;
   string trace_state = 18;
   string baggage = 19;
+  // The task's own retention (see `Task.result_ttl_ms`); unset for the
+  // shard's.
+  optional uint64 result_ttl_ms = 20;
 }
 
 message ReportStarted {
@@ -75,7 +78,24 @@ message ReportCompleted {
   // Set when the run returned a step: the step to run as its continuation,
   // committed with this certification. `result_digest` is its digest.
   StepDescription continuation = 4;
+  // PERSISTENCE_STATE_DISABLED, or PERSISTENCE_STATE_PENDING when this
+  // worker will mirror the result once the run is certified, and report how
+  // that went with ReportPersisted.
+  PersistenceState persistence = 5;
+  // Set when the result was stored in the shard as blobs: the digest of the
+  // blob holding its manifest (see `TaskRun.result_manifest`).
+  Digest result_manifest = 6;
 }
+
+// How mirroring a certified run's result went: PERSISTENCE_STATE_STORED or
+// PERSISTENCE_STATE_FAILED. Only the run's own worker may say. Changes
+// nothing but the run's persistence.
+message ReportPersisted {
+  TaskRunId task_run_id = 1;
+  PersistenceState state = 2;
+}
+
+message PersistenceNoted {}
 
 message ReportFailed {
   TaskRunId task_run_id = 1;
@@ -129,6 +149,7 @@ message TaskRequest {
     SubmitMembers submit_members = 11;
     QuerySlowDown query_slow_down = 13;
     ReportBlocked blocked = 12;
+    ReportPersisted persisted = 14;
   }
 }
 
@@ -268,5 +289,6 @@ message TaskResponse {
     MembersAccepted members = 12;
     SlowDownState slow_down = 13;
     BlockNoted blocked = 14;
+    PersistenceNoted persisted = 15;
   }
 }

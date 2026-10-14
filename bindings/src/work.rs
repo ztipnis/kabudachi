@@ -6,6 +6,7 @@ use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::protocol::messages::{TaskRecord, TaskRun, chain_entry};
 use kabudachi_core::protocol::task::TaskRunState as DomainRunState;
 use kabudachi_core::manifest::Failure;
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_core::scheduler::composite::EXPANSION_DEFINITION;
 use kabudachi_core::scheduler::{Certification, Claim, Event};
 use pyo3::IntoPyObjectExt;
@@ -14,6 +15,7 @@ use pyo3::types::PyBytes;
 
 use crate::composite::state_name;
 use crate::outcomes::{PyEventKind, PyRunState};
+use crate::result_backend::persistence_name;
 
 /// A task handed to a worker to run, and the run that now belongs to it.
 #[pyclass(name = "Claim", frozen)]
@@ -61,6 +63,10 @@ pub struct PyClaim {
     /// above 0 combines two results. `None` for any other task.
     #[pyo3(get)]
     reduce_node: Option<(u32, u64)>,
+    /// The task's own result retention in milliseconds (0: keep nothing);
+    /// `None` for the shard's.
+    #[pyo3(get)]
+    result_ttl_ms: Option<u64>,
 }
 
 #[pymethods]
@@ -94,6 +100,7 @@ impl From<Claim> for PyClaim {
             composite_index: claim.task.composite_index,
             expansion,
             reduce_node: claim.task.reduce_node.as_ref().map(|node| (node.level, node.position)),
+            result_ttl_ms: claim.task.result_ttl_ms,
             task_id: claim.task.task_id().as_str().to_owned(),
             task_run_id: claim.task_run_id.as_str().to_owned(),
             definition_id: claim.task.task_definition_id().as_str().to_owned(),
@@ -417,6 +424,13 @@ pub struct PyTaskRecord {
     /// started the task.
     #[pyo3(get)]
     blocked_since_ms: Option<u64>,
+    /// The task's own result retention in milliseconds (0: keep nothing);
+    /// `None` for the shard's.
+    #[pyo3(get)]
+    result_ttl_ms: Option<u64>,
+    /// How many more attempts a failed run may be replaced by.
+    #[pyo3(get)]
+    max_retries: u32,
 }
 
 /// One run in a Task record.
@@ -458,6 +472,11 @@ pub struct PyRunRecord {
     /// was reported completed.
     #[pyo3(get)]
     delivered: bool,
+    /// How mirroring its certified result went: `"disabled"`, `"pending"`,
+    /// `"stored"` or `"failed"`; `None` before it is certified, and for a
+    /// run whose record does not say.
+    #[pyo3(get)]
+    persistence: Option<&'static str>,
     /// The version of the task's input the run was submitted with.
     #[pyo3(get)]
     source_version: u32,
@@ -497,6 +516,8 @@ impl From<TaskRecord> for PyTaskRecord {
                 .any(|entry| matches!(entry.entry, Some(chain_entry::Entry::Folded(_)))),
             blocked_reason: record.blocked_reason.clone(),
             blocked_since_ms: record.blocked_since.as_ref().map(|time| time.unix_millis),
+            result_ttl_ms: task.and_then(|task| task.result_ttl_ms),
+            max_retries: task.map_or(0, |task| task.max_retries),
         }
     }
 }
@@ -533,6 +554,9 @@ impl PyRunRecord {
             created_at_ms: run.created_at.as_ref().map_or(0, |time| time.unix_millis),
             updated_at_ms: run.updated_at.as_ref().map_or(0, |time| time.unix_millis),
             delivered: run.delivered,
+            persistence: PersistenceState::try_from(run.persistence())
+                .ok()
+                .map(persistence_name),
             source_version: run.source_version,
             execution_version: run.execution_version,
         })

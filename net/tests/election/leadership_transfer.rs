@@ -7,6 +7,7 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::generated::TaskRunState;
 use kabudachi_core::protocol::worker_state::WorkerState;
+use kabudachi_core::result_backend::PersistenceState;
 use kabudachi_net::executor::Report;
 
 use crate::support::deadline::within_deadline;
@@ -87,7 +88,14 @@ async fn a_draining_leader_hands_over_within_a_roll_call_and_its_successor_certi
         assert!(handed.abandoned.is_empty(), "{handed:?}");
         assert_eq!(watch.state(leader), WorkerState::Stopped);
 
-        executors[runner].report(Report::Completed { run, digest: Digest::blake3(b"done"), delivered: false, continuation: None });
+        executors[runner].report(Report::Completed {
+            run,
+            digest: Digest::blake3(b"done"),
+            delivered: false,
+            continuation: None,
+            persistence: PersistenceState::Disabled,
+            result_manifest: None,
+        });
         shard
             .drive_until(poll_until("the successor certified the run", || {
                 holding(&nets, &task, &[TaskRunState::Succeeded]) >= QUORUM

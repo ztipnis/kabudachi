@@ -2,7 +2,7 @@
 //! hold for Python, a run taken back, an abort deadline, or one withdrawn.
 
 use std::sync::Arc;
-use std::time::Instant as StdInstant;
+use std::time::{Duration, Instant as StdInstant};
 
 use kabudachi_core::blob::BlobOwner;
 use kabudachi_core::manifest::PAYLOAD_UNAVAILABLE_KIND;
@@ -10,12 +10,15 @@ use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::messages::Claim as WireClaim;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::Claim;
+use kabudachi_core::result_backend::{TaskStanding, task_standing};
 use kabudachi_net::discovery::Stage;
 use kabudachi_net::executor::{Report, Work};
+use kabudachi_net::messenger::Net;
 use kabudachi_net::payload_memory::{PAYLOAD_TOO_LARGE_KIND, Taken};
 
 use super::seam::{Seam, Shared};
 use crate::outcomes::PyEventKind;
+use crate::result_backend::{Mirror, mirror};
 use crate::work::PyEvent;
 
 /// How a run the driver took back is reported: its body is being stopped,
@@ -52,7 +55,11 @@ impl Handled {
 impl Shared {
     /// Applies `work` to the seam under its lock, then reports and wakes
     /// outside it.
-    pub(super) fn on_work(&self, work: Work) {
+    pub(super) fn on_work(self: &Arc<Self>, work: Work) {
+        let work = match work {
+            Work::Answered { run, certified } => return self.answered(run, certified),
+            work => work,
+        };
         let handled = {
             let mut seam = self.seam();
             match work {
@@ -60,9 +67,40 @@ impl Shared {
                 Work::Cancel(run) => seam.take_back(run),
                 Work::Abort { run, deadline } => seam.abort(run, deadline),
                 Work::AbortWithdrawn(run) => seam.withdraw_abort(&run),
+                Work::Answered { .. } => unreachable!("answered above"),
             }
         };
         self.settle(handled);
+    }
+
+    /// The leader answered the completion of `run` for good. If this worker
+    /// is to mirror the run's result and the answer certified that run, or
+    /// the task's record shows it certified under the digest the mirror
+    /// holds (the answer was a refusal of a resent report, or was lost), the
+    /// result is mirrored in the background and the leader told how that
+    /// went. A run the leader did not certify is never mirrored.
+    fn answered(self: &Arc<Self>, run: TaskRunId, certified: bool) {
+        let kept = {
+            let mut seam = self.seam();
+            let kept = seam.mirroring.remove(&run);
+            if kept.is_some() {
+                seam.mirrors_running += 1;
+            }
+            kept
+        };
+        let Some(kept) = kept else {
+            return;
+        };
+        let shared = Arc::clone(self);
+        self.handle.spawn(async move {
+            let _running = MirrorRunning(Arc::clone(&shared));
+            let certified = certified || certified_in_record(&shared.net, &kept).await;
+            if certified && let Some(backend) = shared.backend.clone() {
+                let run = kept.run.clone();
+                let state = mirror(backend, move || kept.entries()).await;
+                shared.report(Report::Persisted { run, state });
+            }
+        });
     }
 
     /// Reports, offers a place again and wakes, as `handled` says, outside
@@ -78,6 +116,43 @@ impl Shared {
             self.wake();
         }
     }
+}
+
+/// Counts a mirror out when dropped, however its task ends, a panic included.
+struct MirrorRunning(Arc<Shared>);
+
+impl Drop for MirrorRunning {
+    fn drop(&mut self) {
+        self.0.seam().mirrors_running -= 1;
+        self.0.wake();
+    }
+}
+
+/// How many times the record is read when it is missing or does not yet show
+/// the run's outcome, and the wait before the second read. The wait doubles
+/// each time, so the reads span about two seconds in all.
+const RECORD_READS: u32 = 4;
+const RECORD_READ_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Whether the task's record shows `kept`'s run certified under its digest:
+/// a leader certified it though this worker's report was refused, as a resent
+/// report of a certified run is. A record that cannot be read, or that still
+/// shows the run unfinished, may only be behind the leader's answer, so it is
+/// read again a few times; a record that shows any other outcome is final.
+async fn certified_in_record(net: &Net, kept: &Mirror) -> bool {
+    let mut backoff = RECORD_READ_BACKOFF;
+    for read in 1..=RECORD_READS {
+        let record = net.get_record(kept.task.clone()).await;
+        match task_standing(record.as_ref()) {
+            TaskStanding::Succeeded { run, digest, .. } => return run == kept.run && digest == kept.digest,
+            TaskStanding::Unknown | TaskStanding::Unfinished if read < RECORD_READS => {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Why a run whose input travels as blobs cannot be handed to Python.

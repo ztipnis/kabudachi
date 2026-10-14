@@ -26,6 +26,10 @@ pub(crate) struct SubmitArguments {
     non_retriable: bool,
     options: RequestedTiming,
     settings: ResolvedSettings,
+    /// How long the finished task is kept, in milliseconds: its own choice, or
+    /// `None` for the shard's. Zero keeps no result.
+    #[pyo3(default)]
+    result_ttl_ms: Option<u64>,
 }
 
 /// What the caller asked of this one submission, read from a
@@ -66,6 +70,9 @@ impl SubmitArguments {
         }
         if self.non_retriable {
             submission = submission.non_retriable();
+        }
+        if let Some(ttl_ms) = self.result_ttl_ms {
+            submission = submission.with_result_ttl(CoreDuration::from_millis(ttl_ms));
         }
         let submission = timed(
             submission,

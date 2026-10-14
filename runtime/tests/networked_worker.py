@@ -147,6 +147,7 @@ async def answer(native, command: dict) -> dict:
                 "started_at": run.started_at_ms,
                 "digest": None if run.result_digest is None else run.result_digest.hex(),
                 "delivered": run.delivered,
+                "persistence": run.persistence,
                 "source_version": run.source_version,
                 "execution_version": run.execution_version,
             }
@@ -160,6 +161,13 @@ async def answer(native, command: dict) -> dict:
                 "runs": runs,
             }
         }
+    if "resume" in command:
+        try:
+            value = await asyncio.wait_for(kabudachi.resume(command["resume"]), 30)
+        except Exception as error:
+            return {"resumed_error": type(error).__name__}
+        # A composite resumes as the list of its members' results.
+        return {"resumed": [item.text for item in value] if isinstance(value, list) else value.text}
     if "leader" in command:
         return {"leader": native.leader(), "voters": native.voters()}
     if "cancel" in command:

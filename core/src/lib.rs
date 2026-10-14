@@ -9,6 +9,7 @@ pub mod manifest;
 pub mod protocol;
 pub mod queues;
 pub mod reconcile;
+pub mod result_backend;
 pub mod scheduler;
 pub mod task_record;
 pub mod time;

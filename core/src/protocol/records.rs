@@ -54,6 +54,22 @@ pub struct NewTask {
     pub member_of: Option<(CompositeId, u64)>,
     /// Where the task sits in the reduce it is a step of.
     pub reduce_node: Option<ReduceNode>,
+    /// How long the task is kept once finished, overriding the shard's
+    /// retention; zero keeps it only as long as the shard must
+    /// ([`MIN_TASK_RETENTION`]). `None` keeps the shard's.
+    pub result_ttl: Option<Duration>,
+}
+
+/// The shortest time a shard keeps a finished task that chose its own
+/// retention. Shorter, and a holder that missed the finishing revision could
+/// keep an older, unfinished one past it, which a new leader would run again.
+pub const MIN_TASK_RETENTION: Duration = Duration::from_secs(60);
+
+/// How long `task` is kept once finished, if it chose: its `result_ttl_ms`,
+/// at least [`MIN_TASK_RETENTION`]. `None` keeps the shard's retention.
+pub fn task_retention(task: &Task) -> Option<Duration> {
+    task.result_ttl_ms
+        .map(|millis| Duration::from_millis(millis).max(MIN_TASK_RETENTION))
 }
 
 impl NewTask {
@@ -85,6 +101,7 @@ impl NewTask {
             trace: TraceContext::default(),
             member_of: None,
             reduce_node: None,
+            result_ttl: None,
         }
     }
 }
@@ -115,6 +132,7 @@ pub fn new_task(new: NewTask) -> Task {
         composite_id: new.member_of.as_ref().map(|(composite, _)| composite.clone().into()),
         composite_index: new.member_of.map_or(0, |(_, index)| index),
         reduce_node: new.reduce_node.map(generated::ReduceNode::from),
+        result_ttl_ms: new.result_ttl.map(|ttl| ttl.as_ticks()),
     }
 }
 
@@ -156,6 +174,8 @@ pub fn first_attempt(
         started_at: None,
         failure_message: String::new(),
         continuation: None,
+        persistence: generated::PersistenceState::Unspecified as i32,
+        result_manifest: None,
     }
 }
 
@@ -182,6 +202,8 @@ pub fn retry_of(failed: &TaskRun, ids: &impl IdGenerator, at: WallTime) -> TaskR
         started_at: None,
         failure_message: String::new(),
         continuation: None,
+        persistence: generated::PersistenceState::Unspecified as i32,
+        result_manifest: None,
     }
 }
 
