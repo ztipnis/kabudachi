@@ -1197,14 +1197,14 @@ def test_cancel_grace_comes_from_the_process_unless_the_task_chose_its_own():
 
         return await world.working(body)
 
+    # The task's own grace is a full second against the process's 50 ms: the
+    # slow case cannot finish before that second has passed, and the quick one
+    # has twenty times that margin for a loaded host to overrun.
+    own_grace = timedelta(seconds=1)
     quick = run(elapsed_until_timeout({}, timedelta(milliseconds=50)))
-    slow = run(
-        elapsed_until_timeout(
-            {"cancel_grace": timedelta(milliseconds=250)}, timedelta(milliseconds=50)
-        )
-    )
+    slow = run(elapsed_until_timeout({"cancel_grace": own_grace}, timedelta(milliseconds=50)))
 
-    assert quick < 0.2 <= slow
+    assert quick < own_grace.total_seconds() <= slow
 
 
 def test_a_running_task_that_fails_after_stopping_does_not_wait_for_a_retry_nobody_will_run():
