@@ -25,6 +25,7 @@ mod blobs;
 // replies. A burst of admitted work must wait here instead of flooding a
 // holder and turning every write in the burst into a refusal.
 const MAX_RECORD_QUERIES: usize = 16;
+const MAX_PEER_QUERIES: usize = 4;
 
 /// The record queries in flight, each keyed by what the swarm reports its
 /// outcome under.
@@ -33,7 +34,7 @@ pub(super) struct RecordQueries {
     queued: VecDeque<(u64, usize, kad::Record, PeerId)>,
     /// The `kad` queries of record writes in flight to other workers, each
     /// to the write it is part of.
-    writes: HashMap<kad::QueryId, (u64, usize)>,
+    writes: HashMap<kad::QueryId, (u64, usize, PeerId)>,
     /// The record writes with a query still in flight, by the number each is
     /// known by here.
     unfinished: HashMap<u64, UnfinishedWrite>,
@@ -67,7 +68,13 @@ impl RecordQueries {
 
     pub(super) fn advance_writes(&mut self, swarm: &mut Swarm<Behaviour>, inbound: &Inbound) {
         while self.writes.len() < MAX_RECORD_QUERIES {
-            let Some((number, placement, record, peer)) = self.queued.pop_front() else { break; };
+            // A silent holder must not occupy every slot and hold back
+            // quorum writes to the surviving peers during repair.
+            let Some(next) = self.queued.iter().position(|(number, _, _, peer)| {
+                !self.unfinished.contains_key(number)
+                    || self.writes.values().filter(|(_, _, target)| target == peer).count() < MAX_PEER_QUERIES
+            }) else { break; };
+            let Some((number, placement, record, peer)) = self.queued.remove(next) else { break; };
             if !self.unfinished.contains_key(&number) { continue; }
             let Some(records) = swarm.behaviour_mut().records.as_mut() else {
                 self.write_answered(number, placement, false, inbound);
@@ -77,7 +84,7 @@ impl RecordQueries {
             // reaches quorum, without delaying its acknowledgement for slow
             // holders. Each slot lives until its own request settles.
             let query = records.put_record_to(record, std::iter::once(peer), kad::Quorum::One);
-            self.writes.insert(query, (number, placement));
+            self.writes.insert(query, (number, placement, peer));
         }
     }
 
@@ -224,7 +231,7 @@ impl RecordQueries {
     }
 
     fn on_put(&mut self, id: kad::QueryId, result: &kad::PutRecordResult, inbound: &Inbound) {
-        if let Some((number, placement)) = self.writes.remove(&id) {
+        if let Some((number, placement, _)) = self.writes.remove(&id) {
             self.write_answered(number, placement, result.is_ok(), inbound);
         } else if let Some(respond_to) = self.hand_offs.remove(&id) {
             if let Err(error) = result {
