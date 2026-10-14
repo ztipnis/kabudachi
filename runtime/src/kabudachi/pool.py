@@ -38,6 +38,9 @@ _logger = logging.getLogger("kabudachi")
 # How long a child asked to stop (SIGTERM) has before it is killed (SIGKILL):
 # the grace after which it exits of its own accord.
 _TERMINATE_GRACE_SECONDS = _child.STOP_GRACE_SECONDS
+# How long, as the interpreter exits, the children asked to stop have in all
+# before the rest are killed.
+_EXIT_GRACE_SECONDS = 2.0
 # How long, once a child has died, the frames it wrote just before may still
 # take to be read.
 _LAST_FRAMES_SECONDS = 1.0
@@ -255,6 +258,23 @@ class ProcessPool:
         if children:
             await asyncio.wait({child.buried for child in children})
         self._fail_unsent()
+
+    def stop_at_exit(self) -> None:
+        """Stops every child from the calling thread, without the event loop:
+        SIGTERM, then SIGKILL for any still there after a short grace. For the
+        interpreter's exit, where the loop may never run again and a child
+        left running would be waited for forever. Safe to call again, or after
+        `stop`."""
+        processes = [child.process for child in (*self._children, *self._condemned)]
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        deadline = time.monotonic() + _EXIT_GRACE_SECONDS
+        for process in processes:
+            process.join(max(0.0, deadline - time.monotonic()))
+            if process.is_alive():
+                process.kill()
+                process.join(_EXIT_GRACE_SECONDS)
 
     async def _let_children_finish(self, children: list[_Child]) -> None:
         for child in children:

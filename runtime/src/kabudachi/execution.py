@@ -134,6 +134,10 @@ class Executor(Protocol):
     async def stop(self, *, kill: bool) -> None:
         """Releases what the executor holds; with `kill`, without waiting for bodies."""
 
+    def stop_at_exit(self) -> None:
+        """Stops what would keep the interpreter from exiting, from the calling
+        thread and without the event loop. Bounded; safe to call again."""
+
 
 class InProcessExecutor:
     """Runs bodies on the run's own event loop: an async body as a task, a
@@ -250,6 +254,9 @@ class InProcessExecutor:
 
     async def stop(self, *, kill: bool) -> None:
         self._threads.shutdown(wait=False, cancel_futures=True)
+
+    def stop_at_exit(self) -> None:
+        """Nothing here is a process the interpreter would wait for."""
 
 
 def _no_process_to_replace() -> None:

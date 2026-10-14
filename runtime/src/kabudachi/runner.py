@@ -2,8 +2,10 @@
 
 import _thread
 import asyncio
+import atexit
 import inspect
 import logging
+import multiprocessing.util  # noqa: F401  (its exit function must be registered first)
 import os
 import signal
 import socket
@@ -830,6 +832,11 @@ class _WorkerRun:
 
     async def run(self, main: Callable[[], Awaitable[T]]) -> T:
         await self._executor.start()
+        # The interpreter joins task processes as it exits, before any thread
+        # of this run is stopped, and they leave only when told to; so a run
+        # still going then would hang it. Registered after multiprocessing's
+        # own exit function (imported above), it runs before it.
+        atexit.register(self._executor.stop_at_exit)
         try:
             native = _native_runtime(self._settings)
             # The tasks are registered and the executor is up; whether the
@@ -843,6 +850,7 @@ class _WorkerRun:
             finally:
                 await self._end(native)
         finally:
+            atexit.unregister(self._executor.stop_at_exit)
             await self._stop_executor()
 
     async def _serve(self, main: Callable[[], Awaitable[T]], native: Any) -> T:
