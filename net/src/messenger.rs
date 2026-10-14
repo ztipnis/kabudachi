@@ -1384,21 +1384,22 @@ impl Net {
     }
 
     /// The bytes of the blob `digest` names, which `owner` stored. Looked
-    /// for, in turn, in this worker's own store; at the holders of `owner`'s
-    /// record, asked directly and all at once; and, if they all miss, by the
-    /// kad lookup of the blob's key. Every answer is checked against the
-    /// digest. `None` if no one reachable holds it.
+    /// for in this worker's own store, then by its immutable key, then at
+    /// the holders of `owner`'s record. The key lookup ends on the first
+    /// checked copy; reading a mutable owner record first would wait for
+    /// every peer for each chunk of a remote composite's results.
+    /// `None` if no one reachable holds it.
     pub async fn get_blob(&self, owner: BlobOwner, digest: &Digest) -> Option<Vec<u8>> {
         let key = BlobKey::from(digest);
         if let Some(here) = self.held.blob(&key) {
             return Some(here.value);
         }
-        if let Some(found) = self.ask_holders_of(&owner, digest, &key).await {
+        let (respond_to, answer) = oneshot::channel();
+        self.commands.send(Command::LookUpBlob { key: key.clone(), respond_to }).ok()?;
+        if let Some(found) = answer.await.ok().flatten() {
             return Some(found);
         }
-        let (respond_to, answer) = oneshot::channel();
-        self.commands.send(Command::LookUpBlob { key, respond_to }).ok()?;
-        answer.await.ok().flatten()
+        self.ask_holders_of(&owner, digest, &key).await
     }
 
     /// The blob `key` names, from the first holder of `owner`'s record to

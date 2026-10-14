@@ -33,7 +33,7 @@ pub(super) struct RecordQueries {
     queued: VecDeque<PlacedWrite>,
     /// The `kad` queries of record writes in flight to other workers, each
     /// to the write it is part of.
-    writes: HashMap<kad::QueryId, u64>,
+    writes: HashMap<kad::QueryId, (u64, usize)>,
     /// The record writes with a query still in flight, by the number each is
     /// known by here.
     unfinished: HashMap<u64, UnfinishedWrite>,
@@ -115,13 +115,15 @@ impl RecordQueries {
             },
         );
         for (remote, needed) in queries {
-            let quorum = kad::Quorum::N(NonZeroUsize::new(needed).expect("needed is not zero here"));
+            // Keep this budget until every targeted RPC settles. Kad's
+            // quorum shortcut leaves requests to slower holders in flight;
+            // releasing a slot then lets a burst exhaust their streams.
             let query = records.put_record_to(
                 kad::Record::new(key.clone(), value.clone()),
                 remote.into_iter(),
-                quorum,
+                kad::Quorum::All,
             );
-            self.writes.insert(query, number);
+            self.writes.insert(query, (number, needed));
         }
     }
 
@@ -215,8 +217,13 @@ impl RecordQueries {
     }
 
     fn on_put(&mut self, id: kad::QueryId, result: &kad::PutRecordResult, inbound: &Inbound) {
-        if let Some(number) = self.writes.remove(&id) {
-            self.write_answered(number, result, inbound);
+        if let Some((number, needed)) = self.writes.remove(&id) {
+            let stored = match result {
+                Ok(_) => true,
+                Err(kad::PutRecordError::QuorumFailed { success, .. }
+                    | kad::PutRecordError::Timeout { success, .. }) => success.len() >= needed,
+            };
+            self.write_answered(number, stored, inbound);
         } else if let Some(respond_to) = self.hand_offs.remove(&id) {
             if let Err(error) = result {
                 tracing::debug!(%error, "a record hand-off did not reach its quorum");
@@ -232,16 +239,15 @@ impl RecordQueries {
 
     /// One query of write `number` answered. A write already refused has no
     /// entry left: its other queries end unheard.
-    fn write_answered(&mut self, number: u64, result: &kad::PutRecordResult, inbound: &Inbound) {
+    fn write_answered(&mut self, number: u64, stored: bool, inbound: &Inbound) {
         let Some(mut unfinished) = self.unfinished.remove(&number) else {
             return;
         };
         unfinished.outstanding -= 1;
-        match result {
-            Err(error) => {
+        match stored {
+            false => {
                 tracing::debug!(
                     key = ?unfinished.write.key,
-                    %error,
                     "a record write did not reach its quorum"
                 );
                 inbound.queue_write(WriteOutcome {
@@ -249,13 +255,13 @@ impl RecordQueries {
                     stored: false,
                 });
             }
-            Ok(_) if unfinished.outstanding == 0 => {
+            true if unfinished.outstanding == 0 => {
                 inbound.queue_write(WriteOutcome {
                     write: unfinished.write,
                     stored: true,
                 });
             }
-            Ok(_) => {
+            true => {
                 self.unfinished.insert(number, unfinished);
             }
         }
