@@ -137,8 +137,8 @@ Conceptually:
 import kabudachi
 
 kabudachi.configure(
-    result_ttl="7d",
-    worker_processes=4,
+    result_ttl=7 * 24 * 3600,   # seconds
+    processes=4,
     concurrency=16,
 )
 ```
@@ -155,7 +155,7 @@ application/process configuration
 explicit task-level override
 ```
 
-An internal `UNSET` sentinel must be distinct from `None`. `None` can be an intentional override:
+An internal `UNSET` sentinel is distinct from `None`. A task, queue or option that leaves a setting out holds `UNSET` and inherits. `None` is an intentional override:
 
 ```python
 @task(result_ttl=None)
@@ -163,7 +163,9 @@ def transient_result(...):
     ...
 ```
 
-That task disables a process-wide result-retention policy.
+That task disables a process-wide result-retention policy: it keeps no result, and nothing is mirrored to the result backend (§9.3).
+
+`result_ttl` and `reconnect_timeout` resolve from the task, then its queue's `QueueOptions` (§5), then the process configuration. `retries`, `timeout` and `cancel_grace` resolve from the task, then the process configuration. A reducer (§3.4) takes no `result_ttl` of its own, since its steps are kept with the result of their reduce. The process-wide `result_ttl` is a whole number of seconds; the task and queue forms are a positive `timedelta`, `None` or left out.
 
 ### 3.2 Task decorators
 
@@ -181,7 +183,7 @@ Its baseline semantics are:
 
 - durable/recoverable logical Task;
 - Protobuf serializer/protocol;
-- version `0`;
+- input schema version `0` unless the schema declares another (§7);
 - automatic retry count `0`;
 - execution is considered safe to restart after infrastructure loss;
 - ordinary Python exception fails the task unless retry is explicitly requested/configured;
@@ -190,6 +192,10 @@ Its baseline semantics are:
 `@ephemeral_task` is explicitly best effort. It is never replayed after worker loss (the caller observes `LOST`), and complete cluster loss may lose it.
 
 `@coalescing_task` represents continuously replaced work. A newer pending generation supersedes older pending generations with the same coalescing key, but never cancels an already running generation. At most one running generation and one newest pending generation exist per coalescing key. The rules are in §3.2.1.
+
+`@task(retriable=False)` declares a task that is not safe to run twice. A run lost while it was running is `ORPHANED`, and its handle raises `TaskOrphanedError`. It cannot be combined with `retries`, and only a plain `@task` can be declared this way.
+
+Task names starting `kabudachi.` are reserved for kabudachi's own runs; declaring one raises `TaskDefinitionError`.
 
 The task class is a semantic choice and therefore requires an explicit decorator. Tunable policies remain inherited.
 
@@ -215,11 +221,11 @@ Until the claiming worker folds them, superseded payloads are retained as an ord
 
 **Bounded retention.** The retained chain is bounded by a memory budget derived from available memory, or from a configured target memory limit. Past a soft threshold (per key, or memory-wide) the leader schedules an internal compaction run on a worker that runs compaction, which folds the oldest payloads that fit one claim into one (§8.2). Past a hard threshold submission is backpressured. A task may opt in to lossy `drop_oldest` behavior instead; it is never the default.
 
-**One-node subset.** The two thresholds are absolute byte limits set with `configure(memory_soft_limit=..., memory_hard_limit=...)` and count the serialized bytes of every non-terminal Task payload, including retained chains. Past the soft limit the scheduler raises a `SlowDown` signal, cleared once usage falls a hysteresis margin below the limit; bulk submitters (`group`, `.map`) pause while it is raised, and a plain `task(x)` call proceeds. Past the hard limit `submit` raises `BackpressureError`, or, for a coalescing task that opted in to `drop_oldest`, drops that key's retained payloads oldest first until the new payload fits. If it still does not fit (the payload alone exceeds the limit, or the key has nothing left to drop), `submit` raises `BackpressureError` anyway, so `drop_oldest` never lets usage exceed the hard limit. Past the soft limit the one-node runtime compacts the key's chain on a free worker place, so a merge that shrinks its inputs keeps the key below the hard limit (a concatenating merge gets no such promise). `drop_oldest` does not relax the frame bound: a key whose claim would pass one message is refused with backpressure even with `drop_oldest`. `SlowDown` is a core-level event, so a later phase can carry it over the leader-to-client channel unchanged.
+**Memory limits.** By default the soft and hard limits are 25% and 50% of the memory the process may use at start: its cgroup limit when one is set, otherwise physical memory. `configure(memory_soft_limit=..., memory_hard_limit=...)` sets byte limits instead. They count the serialized bytes of every non-terminal Task payload, including retained chains. A networked process also counts the blob payloads that move through it (§8.6) and splits its hard limit between those and the blobs it stores for its shard. Past the soft limit the scheduler raises a `SlowDown` signal, cleared once usage falls a hysteresis margin below the limit; bulk submitters (`group`, `.map`, `.reduce`) pause while it is raised, and a plain `task(x)` call proceeds. `SlowDown` reaches every submitter: the leader's answer to a submission carries it, and a networked submitter that sees it asks the leader again at the heartbeat interval until it clears. Past the hard limit `submit` raises `BackpressureError`, or, for a coalescing task that opted in to `drop_oldest`, drops that key's retained payloads oldest first until the new payload fits. If it still does not fit because the key has nothing left to drop, `submit` raises `BackpressureError` anyway, so `drop_oldest` never lets usage exceed the hard limit. An input that alone is past the hard limit can never fit, so `submit` raises `PayloadTooLargeError` for it, `drop_oldest` or not; a result that alone is past the hard limit of the worker that ran it fails the run with `ResultTooLargeError` (§8.5). Past the soft limit the scheduler compacts the key's chain on a free worker place, so a merge that shrinks its inputs keeps the key below the hard limit (a concatenating merge gets no such promise). `drop_oldest` does not relax the frame bound: a key whose claim would pass one message is refused with backpressure even with `drop_oldest`.
 
 **Running generation and worker loss.** A running generation is never cancelled by a newer submission. If the worker running it is lost, the generation is replayed when it was the newest for its key (at-least-once for the latest state). If a newer pending generation already exists, that generation runs and the lost one stays `LOST` and is not replayed (`SUPERSEDED` is reserved for pending generations). A timeout is different: it is an ordinary task failure and is not requeued, so work does not grow through repeated requeue and timeout; the next submission creates the newest generation.
 
-**Flow lifetime.** When a coalescing task returns a task-like value (§3.4), its running generation covers the entire resulting flow: the key is held until the flow is terminal.
+**Flow lifetime.** When a coalescing task returns a task-like value (§3.4), its running generation covers the entire resulting flow: the key is held until the flow is terminal. A coalescing task cannot itself be a stage, member or map of a composite; composition refuses it with `TypeError`, because its generations would replace one another inside the composite.
 
 #### 3.2.2 Delivery semantics
 
@@ -241,6 +247,8 @@ result = await handle
 ```
 
 The TaskHandle is awaitable and retains task/shard metadata needed for result delivery and later recovery.
+
+A handle reports how durably its task is held (`handle.durability`) and can wait for a stronger level (`await handle.durable(Durability.REPLICATED)`, §8.1). `await handle.status()` returns the task's state, its current run's state, the attempt, its submit and update times, whether its result reached the awaiting worker, and how mirroring the result to the result backend went. A flow or group handle returns a composite status instead: its kind, state, the count of its stages or members in each state and, for a flow, the stage it is at. Both read the record the shard holds, not the leader, so a change the leader has just made may not show yet. A process that restarts has lost its handles: `kabudachi.resume(id)`, given a task id or a composite id, reads the state from the record and the value from the result backend, or from the shard while it still holds it (§9.3). It raises `ResultUnavailableError` when neither has the value.
 
 Submission is not idempotent: every call creates a distinct Task with its own `task_id` (§2.3). Applications that need deduplication implement it themselves; `@coalescing_task` is the only kind that supersedes earlier submissions, and it does so by key (§3.2.1).
 
@@ -287,7 +295,7 @@ pipeline = flow(
 )
 ```
 
-Each stage receives the prior stage's output as its remaining unbound input. Awaiting a flow gives the list of every stage's result in stage order (the last entry is the final output). `.bind(value)` fixes a task's whole input, so the bound task is called with no argument and, as a flow stage, ignores the output before it; `.bind(field=value)` sets scalar fields on the protobuf message the task is called with, or the prior stage's output. Stages are submitted one at a time by the client runtime once their predecessor has finished; an implicit flow, whose continuation is committed atomically with certification, comes with the continuation rules below. The framework should validate type compatibility when the active serializer/type backend exposes enough information to do so.
+Each stage receives the prior stage's output as its remaining unbound input. Awaiting a flow gives the list of every stage's result in stage order (the last entry is the final output). `.bind(value)` fixes a task's whole input, so the bound task is called with no argument and, as a flow stage, ignores the output before it; `.bind(field=value)` sets scalar fields on the protobuf message the task is called with, or the prior stage's output. The shard's leader drives every flow and group. It starts each flow stage once the stage before is certified, and the stage's input names that stage's stored result (§8.6). A flow therefore keeps going if the process that submitted it dies; an implicit flow, whose continuation is committed atomically with certification, comes with the continuation rules below. Composition checks every adjacency when the step is built. An output fits an input when both share a schema family and the output's version is not newer than the input's, unless the chain between them crosses a bump declared `migration=None` (§7). Otherwise composition raises `TypeError`. A serializer that cannot tell answers "unknown", and that adjacency is not checked. A failed stage fails the flow; the failure carries the error's `kind` and `message`.
 
 Parallel composition uses `group`. A group has an explicit failure policy:
 
@@ -303,7 +311,7 @@ Every member of a group gets the same input (a fully bound member ignores it), a
 - `fail_fast` (default): awaiting the group raises the first failure and the group is terminal `FAILED`. This matches the least-surprising behavior and Celery's chord semantics, where a failed header task does not run the chord body.
 - `collect_all`: like `gather(return_exceptions=True)`, awaiting returns the full array in which each entry is either a step's value or its failure.
 
-A continuation after a group is simply the next stage of a `flow`, for example `flow(group(a, b, c), cb)`; there is no separate `.then()` form. Under `fail_fast`, a failed group is terminal `FAILED`, the flow fails with it, and the following stage never starts. Under `collect_all` the following stage runs and receives the ordered array of per-member values and failures. The failures in that array reach the stage as input, so the stage's serializer has to be able to encode them; the protobuf serializer cannot, and a stage after a `collect_all` group then fails with a `SerializationError` unless it uses a serializer that can. That stage is an ordinary task and keeps what it was declared with: its own retry policy, timeout, queue and class (a `@task` stage is retried per its `retries`, an `@ephemeral_task` stage stays best-effort), and the group or flow imposes none of these on it (§3.4 "Independent tasks"). It runs as its own leader-certified TaskRun exactly once per group instance, across worker loss, leader change, and message reordering. "Exactly once" describes the certified completion run; side effects inside any TaskRun keep the at-least-once semantics of §3.6.
+A continuation after a group is simply the next stage of a `flow`, for example `flow(group(a, b, c), cb)`; there is no separate `.then()` form. Under `fail_fast`, a failed group is terminal `FAILED`, the flow fails with it, and the following stage never starts. Under `collect_all` the following stage runs and receives the ordered array of per-member values and failures. Each failure reaches the stage as a `kabudachi.TaskFailure` carrying the failure's `kind` and `message`, so a stage that follows a `collect_all` group must take `TaskFailure` entries in its input type; composition raises `TypeError` for one that cannot. That stage is an ordinary task and keeps what it was declared with: its own retry policy, timeout, queue and class (a `@task` stage is retried per its `retries`, an `@ephemeral_task` stage stays best-effort), and the group or flow imposes none of these on it (§3.4 "Independent tasks"). It runs as its own leader-certified TaskRun exactly once per group instance, across worker loss, leader change, and message reordering. "Exactly once" describes the certified completion run; side effects inside any TaskRun keep the at-least-once semantics of §3.6.
 
 Distributed functional operations use `task.map` and `task.reduce`.
 
@@ -313,7 +321,7 @@ result = await merge.reduce(results)                          # seedless: (T, T)
 report = await add_to_report.reduce(results, initial=Report())  # seeded:   (T, P) -> P
 ```
 
-`map` creates independent distributed Tasks per input item; this is not one worker looping locally through the list. The result preserves ordering. It is a `group` of one fully bound task per item (so it takes the group's `on_error` policy, `task.map(items, on_error=...)`), every item is checked against the task's serializer before any is submitted, and mapping an empty list returns `[]`. `task.map` is also a `flow` stage that takes the list the stage before it returns. Like any group, `map` submits its tasks one at a time and pauses while the scheduler's `SlowDown` signal is raised (memory use past `memory_soft_limit`, §3.2.1); a plain `task(x)` call is not paused, and past `memory_hard_limit` any submission raises `BackpressureError`.
+`map` creates independent distributed Tasks per input item; this is not one worker looping locally through the list. The result preserves ordering. It is a `group` of one fully bound task per item (so it takes the group's `on_error` policy, `task.map(items, on_error=...)`), every item is checked against the task's serializer before any is submitted, and mapping an empty list returns `[]`. `task.map` is also a `flow` stage that takes the list the stage before it returns. A group or map streams its members to the leader in batches of up to 1,024 members or 512 KiB. A batch is accepted or refused whole, and one asked again creates nothing twice. Batches pause while `SlowDown` is raised (memory use past `memory_soft_limit`, §3.2.1); a plain `task(x)` call is not paused. Past `memory_hard_limit` the stream stops, the members already accepted are cancelled and the handle fails with `BackpressureError`. The leader seals a streamed composite when its last batch arrives, and the composite finishes once it is sealed and every member has settled. A leader that finds the composite already finished refuses a later batch, and the client stops streaming. Member outcomes live in pages of 1,024 entries (§8.6), so a million-item map never sits whole in one record or in the leader's memory. A `.map` after a stage that returned a list is split by a worker in an expansion run, never by the leader: the run streams the list's items into the map, as a client would. The reserved definition `kabudachi.expand` names that run. A streamed group or map whose submitter dies before its last batch keeps running the members the leader has until it is cancelled (Phase 8, remote client liveness).
 
 `reduce` approximates the semantics of JavaScript's `Array.prototype.reduce`: a left fold over the items, in input order, with a reducer that takes the current item and the result so far.
 
@@ -329,15 +337,22 @@ def reduce(
     self: ReducerFunctionType,  # the reducer task the method is called on
     items: list[ThisType],
     initial: PrevType | Unset = UNSET,
+    chunk_size: int = 64,       # items per chunk of a tree reduce
 ) -> PrevType: ...
 ```
 
 - **Seeded.** With `initial`, the running result starts as `initial` and every item is folded in: `previous = reducer(item, previous)`. `PrevType` is inferred from `initial` and may differ from `ThisType`. An empty list returns `initial` without calling the reducer.
-- **Seedless.** Without `initial`, `PrevType` is `ThisType`: the first item is the starting result and the reducer is first called with the second item. A single item is returned as it is, without calling the reducer. An empty list with no `initial` fails the reduce with an error, as JavaScript throws a `TypeError`, rather than inventing a value.
+- **Seedless.** Without `initial`, `PrevType` is `ThisType`: the first item is the starting result and the reducer is first called with the second item. A single item is returned as it is, without calling the reducer. An empty list with no `initial` raises `ReduceEmptyError`, as JavaScript throws a `TypeError`, rather than inventing a value; `ReduceEmptyError` is also a `TypeError`.
 - **`None` is a value.** As in JavaScript, passing an initial value counts even when that value is `None`; only leaving `initial` out selects the seedless form (`UNSET`, §3.1).
 - **Order and determinism.** Items are folded strictly in input order and the reducer does not have to be associative. Given a deterministic reducer the result is deterministic.
 - **Two arguments only.** JavaScript's callback also receives the index and the whole array. A distributed reducer never holds the whole list, so it gets just the item and the result so far.
-- **A sequential chain.** Each step needs the previous step's result, so a fold runs as a chain: every step is an independent, retriable, leader-certified TaskRun whose input is the item and the serialized result so far. A step that fails after its retries fails the whole reduce and no later step starts, as an exception thrown by the callback ends a JavaScript reduce. Only a seedless reducer explicitly declared associative (illustrative spelling `associative=True` on its decorator) may be evaluated as a deterministic tree instead; that is an optimization that must give the same result as the chain.
+- **A sequential chain.** Each step needs the previous step's result, so a fold runs as a chain: every step is an independent, retriable, leader-certified TaskRun whose input is the item and the serialized result so far. A reducer declared as a tree (below) is evaluated as a deterministic tree instead; that is an optimization that must give the same result as the chain.
+- **Declaring a reducer.** A `@task` with exactly two parameters, `(item, previous)`, is a reducer, and `@reducer(associative=False, tree=None, merge=None, ...)` declares one with options. It takes the options of `@task` except `result_ttl`. It must be a plain durable task, so it cannot be an `@ephemeral_task` or a `@coalescing_task`; it must return the type of `previous` and cannot return a step. A direct call, `.bind`, `.map` and `.options` on a reducer raise `TypeError`; use `.reduce(items, initial=..., chunk_size=...)` or `.local(item, previous)`. As a flow stage, `.reduce` or `.reduce.options(initial=..., chunk_size=...)` takes the previous stage's list.
+- **Input.** A reduce streams its items like a map: in batches that pause under `SlowDown` and fail the reduce with `BackpressureError` past the hard limit, into item pages the reduce owns (§8.6). No reduce is bounded by a record's size. Steps start once the last item has arrived.
+- **A tree.** With `tree=True` the items are cut into chunks of `chunk_size` (64 by default). Each chunk folds its items in order as one certified step, from `initial` or from its first item. Adjacent chunk results then combine pairwise, in order, one certified step per combine, with `merge(left, right)` or, for an associative reducer with no `merge`, `reducer(item=right, previous=left)`; a result with no partner moves up a level unchanged. `tree` defaults to `associative`, and `tree=True` needs exactly one of `associative=True` or a `merge`. With a seed, `initial` must be the identity of the combiner, as in Spark's `treeAggregate`; this is documented, not checked.
+- **Empty and single-item reduces.** A reduce of no items with an `initial` gives `initial`, and a reduce of one item without one gives that item, each without running a step. A seedless reduce of no items raises `ReduceEmptyError`: at submit when the list is known, otherwise when the leader finds it empty.
+- **Failure.** A step is retried per the reducer's `retries`. A step that exhausts them fails the reduce with that step's error, and no later step starts, as an exception thrown by the callback ends a JavaScript reduce. Each step's task records its reduce and its place in the chain or tree, so the leader can rebuild the evaluation from the records alone (§13).
+- **Determinism.** The leader plans a reduce from item counts and digests only, and never runs the reducer or `merge`. Every worker must import the same reducer and `merge` for the result to be deterministic; the leader cannot check this.
 - **Not the coalescing reducer.** The `merge=` reducer of a coalescing task (§3.2.1) is a simpler seedless fold over superseded payloads whose arguments are (older, newer), the opposite order to the (item, previous) order above.
 
 A common pipeline becomes:
@@ -364,11 +379,11 @@ async def plan(req: Request) -> Flow:
 Rules:
 
 - **Tasks are registered at package scope.** A returned value may only reference registered tasks (and bound forms of them). Lambdas and closures cannot be serialized across the FFI boundary, and workers can only execute tasks they know.
-- **Atomic continuation.** The returned value is committed together with the returning task's certified completion (§8.5); the digest that certifies the run is the digest of the returned step's description, and the continuation starts only once the leader has certified it. The returning task is declared with the step type as its return annotation (`-> Flow`, `-> Group` or `-> BoundTask`), and the step must not need an input (bind its first stage). The task is not over until its continuation is, so its coalescing key stays held (§3.2.1) and its handle resolves only then, to the continuation's results (a returned bound task gives a list of one). A lost or uncertified TaskRun therefore leaves no continuation behind, and a failing continuation never re-runs the returning task. The flow's state becomes `FAILED` and the caller may resubmit.
+- **Atomic continuation.** The returned value is committed together with the returning task's certified completion (§8.5); the digest that certifies the run is the digest of the returned step's description, and the continuation starts only once the leader has certified it. The returned step is stored on the certifying run itself, so the one write that certifies the run commits the step. The returning task is declared with the step type as its return annotation (`-> Flow`, `-> Group` or `-> BoundTask`), and the step must not need an input (bind its first stage). The task is not over until its continuation is, so its coalescing key stays held (§3.2.1) and its handle resolves only then, to the continuation's results (a returned bound task gives a list of one). A lost or uncertified TaskRun therefore leaves no continuation behind, and a failing continuation never re-runs the returning task. The flow's state becomes `FAILED` and the caller may resubmit.
 - **Sequential stages.** A continuation stage starts only after its predecessor is terminal, so cancelling a flow targets the current stage; later stages never start. Cascading cancellation exists only for the members of a `group`.
 - **Independent tasks.** Each stage is an independent task with its own timeout, retry policy, and queue; nothing is inherited from the returning task. There is no flow-level deadline. If a stage has no timeout or a very long one, it holds any coalescing key of the flow until the flow is terminal (§3.2.1); this is a documented risk, not something the framework works around.
 - **Handle shape.** The handle of the original submission resolves to a flow handle whose result is an array with one entry per task or step, in step order. A step that itself returns a flow or group has its slot replaced by a nested array of that sub-flow's results, so nesting follows flow structure. Failures follow the group policy above.
-- **Orphans.** A flow with a non-retriable stage that ends `ORPHANED` is itself terminal `ORPHANED`.
+- **Orphans.** A flow whose stage ends `ORPHANED` fails. A composite has no `ORPHANED` state; a derived one needs remote client liveness (Phase 8).
 
 None of this adds workflow-engine semantics: there is no deterministic replay, no branching DSL, and no in-flow timers or signals (§2.3).
 
@@ -511,10 +526,15 @@ not_before
 deadline/expiration
 logical queue/routing class
 coalescing key if any (coalescing tasks only)
-flow lineage if any (root task, parent step, step index)
-trace context
-durability metadata
+client (the submitting worker, when it awaits the result)
+composite id and index (a flow, group, map or reduce stage or member)
+reduce node (level and position, on a step of a reduce)
+input_manifest (a large input, by blob digest; set instead of serialized_input)
+trace_parent, trace_state, baggage (carried unchanged; Phase 7 fills them)
+result_ttl
 ```
+
+A task has no durability field. Durability is a property of the handle (§8.1), and disaster-recovery storage is Phase 8.
 
 Tasks are disseminated through the DHT and, for durable tasks, copied to the disaster-recovery backend according to policy.
 
@@ -548,9 +568,14 @@ claimed_at
 started_at
 updated_at
 state
-failure
-result metadata
+failure (kind, and message)
+result metadata (result digest; result manifest, when a worker stored the result as blobs)
+delivered
+persistence
+continuation
 ```
+
+`delivered` says the result reached the task's client before the run was reported completed. `failure` carries the failing error's type name and its message. The message is bounded (1 KiB, cut further to the room the record has left) and never holds a traceback; it can hold task data. `persistence` is the result backend state of a certified run (§9.3): disabled, pending, stored or failed, and unset on a run not yet certified. `continuation` holds the step a succeeded run returned. It is written in the revision that certifies the run, so storing that revision commits the continuation with it.
 
 Both worker and leader may mutate legitimate state fields. The implementation must not use naive whole-record "last writer wins" semantics. Mutations should be state-machine constrained, event/field scoped, and reconciliation must be deterministic.
 
@@ -582,7 +607,18 @@ ORPHANED
 
 `SUPERSEDED` applies only to a pending coalescing generation replaced by a newer generation with the same key. A generation that is `CLAIMED` or later is never superseded.
 
-A flow (explicit or implicit, §3.4) has a terminal state derived from its stages: `SUCCEEDED` when every stage succeeded, `FAILED` under the group policy, `CANCELLED` when cancelled, and `ORPHANED` if a non-retriable stage ended `ORPHANED`.
+A flow, group, map or reduce (§3.4) has its own state in its composite record, which the shard's leader keeps and writes whole on every change, like a Task record. The states are:
+
+```text
+RUNNING
+SUCCEEDED
+FAILED
+CANCELLED
+```
+
+A composite is `RUNNING` until it ends. It is `SUCCEEDED` when every stage or member succeeded, and for a reduce when every step it plans has. It is `FAILED` under the group policy, or when any step of a reduce fails, and its record keeps the first failure that ended it. It is `CANCELLED` when cancelled. A member that is itself a composite counts as succeeded when that composite did.
+
+A stage or member whose task ends in any state but `SUCCEEDED` settles as a failure carrying that task's failure kind and message, so a stage that ends `ORPHANED` fails its flow. There is no `ORPHANED` composite state: a derived one needs remote client liveness (Phase 8). The record also keeps the stage that runs next (a flow), counts of members pending, running, succeeded, failed and cancelled, and where the outcomes are. The outcomes sit in pages of 1,024 entries, not in the composite record (§8.6).
 
 ### 4.5 Terms
 
@@ -612,6 +648,12 @@ emails
 ```
 
 A TaskDefinition or application routing policy may assign work to a logical queue. Workers advertise queue subscriptions, and the leader only accepts a claim if the requesting worker is subscribed to that Task's queue. There is no separate capability system: a scarce resource such as a GPU, a licensed library, or a heavyweight model is expressed as a queue, and only workers that have it subscribe.
+
+A worker sets its subscription with the `queues` setting. Left unset (`None`), a networked worker subscribes to its `queue` alone, and a one-node worker takes every queue, since nothing else could run the rest. Python refuses an empty `queues`. The subscription travels in the worker's heartbeats (the `MemberReport`), so the leader knows it. On the wire an empty list of queues means every queue, so a worker the leader has not yet heard from is held to no restriction. The leader refuses a claim for a queue the worker is not subscribed to (`CLAIM_REJECT_NOT_SUBSCRIBED`, §8.2).
+
+The `queue_options` setting maps a queue name to a `QueueOptions`. The leader orders and limits a queue by its `priority`, `weight`, `max_running` and `starvation_age`. The submitter stamps the other two, `reconnect_timeout` and `result_ttl`, on each task as it submits. Workers of one shard must give the same `queue_options`. The leader's options decide, and a worker that gives different ones is neither refused nor warned about: differing `queue_options` across workers is unsupported (mixed-version clusters are handled in release hardening, §27.2).
+
+The `router` setting is a function `router(task_name, value) -> str | None`. When a call names no `queue=`, the submitter calls it with the registered task name and the argument, and it returns the queue, or `None` for the `queue` setting. The router runs on the submitting process only: it is not sent to the leader or to task processes. It runs after the payload-limit check.
 
 A shard is an internal coordination/failure-domain unit containing a leader, a DHT peer set, and a worker electorate. A deployment may have one or many logical queues inside one shard. A deployment may also have multiple shards for scale.
 
@@ -683,28 +725,29 @@ The design does not encourage thousands of coroutines per worker process simply 
 
 Serializer/data backends are runtime-resolved and extensible.
 
-Potential package extras:
+kabudachi ships `protobuf`, `pydantic` and `dataclass` serializers, installed as the package extras `kabudachi[protobuf]`, `kabudachi[pydantic]` and `kabudachi[dataclass]`. The `dataclass` extra adds no dependency. `protobuf` is the default. The JSON serializers encode deterministically (sorted keys, compact separators, UTF-8), so equal values give equal bytes and results can be certified by digest.
+
+The base package does not fail to import when an optional serializer dependency is absent. A backend whose library is missing is still registered; asking for it raises `SerializerUnavailableError`, and asking for an unregistered name raises `UnknownSerializerError`.
+
+A backend provides:
 
 ```text
-package[protobuf]
-package[pydantic]
-package[dataclass]
-```
-
-The base package should not fail to import merely because an optional serializer dependency is absent.
-
-A conceptual backend interface provides:
-
-```text
-available()
-encode(value)
+name                                                     the name a task selects with serializer=
+available() -> bool                                      whether the backend can run here
+supports(value_type) -> bool                             whether it can hold this type
+encode(value, value_type) -> bytes
 decode(payload, target_type)
-extract_version(payload, task_definition)
-validate(...)
-type_compatibility(...)
+extract_version(payload, value_type) -> int | None       (None: the payload carries no version)
+validate(value)                                          raises SerializationError
+schema_family(value_type) -> str | None
+type_compatibility(produced, consumed) -> bool | None    (None: unknown, not checked)
+load_plain(payload, value_type) -> plain value           (what a migration takes)
+dump_plain(plain, value_type) -> bytes                   (conformed to value_type, then encoded)
 ```
 
-Users may register backends such as `msgspec` or application-specific protocols.
+Every method after `decode` is optional for a third-party serializer, and kabudachi falls back to a default when one is missing: a payload with no version, every decoded value valid, the family declared with `kabudachi.schema` (else the type's own), a compatibility check skipped. A backend without `load_plain` and `dump_plain` cannot migrate, so a task that needs a migration is refused.
+
+Users register backends such as `msgspec` or application-specific protocols with `kabudachi.register_serializer`. Every worker of a shard must register the same backend under the same name, since one worker encodes what another decodes.
 
 ---
 
@@ -712,21 +755,16 @@ Users may register backends such as `msgspec` or application-specific protocols.
 
 Versioning is explicit at the task-data boundary.
 
-Default:
+Tasks have no versions; data schemas do. `kabudachi.schema(Type, version=N, version_path=..., family=..., migration=...)` declares a type's current version. The version is 0 by default, so a type never declared is version 0 of its own family. `family=` makes separate classes versions of one family; by default a family is a protobuf message's full name, or `module.qualname` for any other class. A task's source and execution versions are its input schema's versions.
 
-```text
-version = 0
-```
-
-For protobuf, version semantics should use the authoritative protobuf contract/task metadata. For JSON-ish serializers, the task explicitly declares where the version lives:
+For the JSON serializers (`pydantic`, `dataclass`), `version_path` (for example `"$.version"`) says where the payload carries its version. For protobuf the payload carries none: a protobuf input is taken to be at the source version of the Task that holds it.
 
 ```python
-@task(
-    protocol="json",
-    serializer="pydantic",
-    version_path="$.version",
-)
+kabudachi.schema(OrderV1, version=1, version_path="$.version", family="shop.Order")
+kabudachi.schema(OrderV2, version=2, version_path="$.version", family="shop.Order")
 ```
+
+A bump from `n` to `n + 1` with no explicit migration takes the default one: fields the new version lacks are dropped, and fields new in it take their defaults. `schema(Type, version=N, migration=f)` or `@kabudachi.migration(Type, from_version=N - 1)` declares an explicit step, a function from the older payload's plain form to the newer's. `migration=None` declares the bump incompatible. A family has one `version_path`, one class per version and at most one migration per bump; a contradicting declaration raises `ValueError`. Every worker of a shard declares a family's bumps the same way.
 
 Original Tasks are immutable. Migration is transient:
 
@@ -738,11 +776,19 @@ stored Task v2
     -> create/execute TaskRun with source_version=2, execution_version=5
 ```
 
-The migrated Task is not written back over the original DHT record and is not persisted as a replacement Task.
+The claiming worker migrates in memory from the Task's `source_version` to its own version, one bump at a time, validates the result and records `execution_version` on the run. The migration runs before the run is reported started. The migrated Task is not written back over the original record and is not persisted as a replacement Task.
 
-If a worker cannot execute the current payload because no migration path exists, the Task remains queued/blocked rather than being destroyed immediately. A configurable TTL prevents permanent limbo. Expiry should alert and fail with an explicit version/migration reason.
+By default a migration that raises (the default one or an explicit one, `MigrateRejectError` included), or a bump declared `migration=None`, drops the Task. The worker logs a WARNING naming the Task, the family, both versions and the reason, never the input data. The Task ends failed with `MigrationError`, which names both versions. It is not retried.
 
-Mixed code versions during a rolling deployment are handled by this same migration schema. A migration may explicitly refuse an incompatible boundary by raising `MigrateRejectError`; the Task then stays queued for a worker that can execute it. Rollout policy beyond this (batch sizes, minimum shard size, election budgets) is left to the application and deployment tooling.
+`@task(raise_on_failed_migration=True)` keeps such a Task queued instead and reports it blocked to the leader, for a worker that can run it. `MigrateRejectError` is how a migration asks for that. A source version newer than the worker's always blocks, whatever the option. The leader records when and why the Task was first blocked (`TaskRecord.blocked_since` and `blocked_reason`), and a worker that blocked a Task is not handed it again by that leader. After `version_block_ttl` (`Settings.version_block_ttl`, one hour by default) a Task still waiting in the blocked state fails with `MigrationError`. Reporting a Task blocked releases a claimed run back to queued with no attempt spent.
+
+A worker that cannot run a Task's source version does not claim it: discovery's own-records stage skips such a Task and reports it. Steal and oldest-first claims do not filter by version in advance, so a worker can be handed a newer Task and block it, which costs one round trip.
+
+Mixed code versions during a rolling deployment are handled by this same migration schema. A migration may explicitly refuse an incompatible boundary by raising `MigrateRejectError`; with `raise_on_failed_migration=True` the Task then stays queued for a worker that can execute it. Rollout policy beyond this (batch sizes, minimum shard size, election budgets) is left to the application and deployment tooling.
+
+Open (mixed-version clusters, owner Release hardening, §27.2): a result of an older class of a family reaches a stage that takes a newer class as the producer's class, not converted; a protobuf stage input is migrated from the version of the member Task that takes it, not the producer's.
+
+Open (owner post-implementation testing): the leader remembers blocked Tasks only in memory, so after a leader change a worker may be handed a blocked Task once more and block it again; a compaction refuses a chain whose payloads are below the worker's version and fails it with `MigrationError`, and the leader skips that key until the waiting generation is replaced or the leader rebuilds.
 
 ---
 
@@ -766,10 +812,12 @@ Submission is not idempotent (§2.3): each new mint is a new Task. Resubmitting 
 A handle can report how durably its Task is held, and callers may await a stronger level before treating the submission as accepted:
 
 ```text
-in_memory            held by the receiving peer
-replicated           stored at a majority of the record's placement (§8.6)
-dr_store_written     written to the disaster-recovery store (§9.2); not yet implemented (Phase 8)
+in_memory     held by the receiving peer (the one-node runtime)
+replicated    stored at a majority of the record's placement (§8.6)
+dr_stored     written to the disaster-recovery store (§9.2; Phase 8)
 ```
+
+`handle.durable(level)` waits until the level holds. Asking for `replicated` on a shard of one, or for `dr_stored` anywhere, raises `DurabilityUnavailableError`.
 
 Submission is acknowledged only once its record is `replicated` in this sense.
 
@@ -793,22 +841,28 @@ A worker with room to run more finds work in stages, moving to the next until it
 2. `STEAL` requests to shard peers, by distance class from the worker's own key, nearest first, widening one class at a time; a peer answers with the waiting tasks it holds, oldest first, up to a limit;
 3. `CLAIM_OLDEST` at the leader, which hands back its oldest pending tasks.
 
+Within each stage, candidates go by queue priority, then nearness (own records) or the answering peer's order, then age. `CLAIM_OLDEST` answers in strict priority tiers. Within a tier it takes queues by weighted round robin, and a task that has waited longer than its queue's `starvation_age` rises above every tier. On a claim the leader checks only the subscription and the queue's `max_running`, so a worker still claims nearby work first. The leader is a worker too: it claims from the records it holds first, by queue priority, then nearest key, then age, then the shard's oldest, and asks no peer.
+
 A worker that finds nothing at every stage waits longer before it looks again, and finding work resets the wait. Every task found is claimed through `REQUEST_CLAIM`. A worker's view of a record can be stale, so the leader may refuse a claim for a task the worker saw waiting, and a refusal only moves discovery on. The leader answers a claim only for a worker that is a voter or a pending member of its shard.
 
 Leader response may include:
 
 ```text
 ACCEPT
-REJECT_ALREADY_SELECTED
-REJECT_NOT_READY
-REJECT_TASK_UNKNOWN
-REJECT_SUPERSEDED
-REJECT_NOT_LEADER
-REJECT_FINISHED
-REJECT_KEY_BUSY
-REJECT_NOT_MEMBER
-REJECT_CANNOT_RUN
+CLAIM_REJECT_ALREADY_SELECTED
+CLAIM_REJECT_NOT_READY
+CLAIM_REJECT_TASK_UNKNOWN
+CLAIM_REJECT_SUPERSEDED
+CLAIM_REJECT_NOT_LEADER
+CLAIM_REJECT_FINISHED
+CLAIM_REJECT_KEY_BUSY
+CLAIM_REJECT_NOT_MEMBER
+CLAIM_REJECT_CANNOT_RUN
+CLAIM_REJECT_NOT_SUBSCRIBED
+CLAIM_REJECT_QUEUE_FULL
 ```
+
+`NOT_SUBSCRIBED` means the claiming worker does not take the task's queue. `QUEUE_FULL` means the queue is already running its `max_running` tasks. Discovery counts `QUEUE_FULL` as a full queue and `NOT_SUBSCRIBED` as a stale view. A refused candidate spends no queue turn.
 
 Two workers racing for one Task are serialized at the leader:
 
@@ -825,13 +879,13 @@ The DHT handles data dissemination and discovery. The leader handles ownership s
 
 #### Supersession and payload folding
 
-For coalescing tasks (§3.2.1), the leader also serializes supersession. A newer submission with the same key marks the older pending generation `SUPERSEDED` (a claim for it is answered `REJECT_SUPERSEDED`); a generation that is already `CLAIMED` cannot be superseded.
+For coalescing tasks (§3.2.1), the leader also serializes supersession. A newer submission with the same key marks the older pending generation `SUPERSEDED` (a claim for it is answered `CLAIM_REJECT_SUPERSEDED`); a generation that is already `CLAIMED` cannot be superseded.
 
 The leader never executes the reducer. It keeps the superseded Tasks' payloads linked in order, in the retained chain of the newest generation's record; the worker that claims the newest generation folds the chain oldest to newest with the task's reducer before running the task body.
 
-Compaction keeps that chain short. When a waiting generation's chain holds more payload than the per-key soft threshold (half of what one claim may carry), or memory is past its soft limit, and some worker has said it runs compaction, the leader creates an internal compaction run naming the oldest entries that fit in one claim. The worker folds exactly those entries with the task's reducer, and the leader swaps them for one folded entry only while the chain still starts with them. Only a claimed compaction holds the newest generation back, and with no worker that runs compaction the newest generation folds its whole chain itself. No claim ever outgrows one message: a submission that would make its key's waiting claim too large is refused (backpressure), and a fold that grows past one message fails the newest generation with `CoalescedPayloadTooLarge`. Past the hard memory threshold, new submissions are backpressured (or dropped-oldest if the task opted in).
+Compaction keeps that chain short. When a waiting generation's chain holds more payload than the per-key soft threshold (half of what one claim may carry), or memory is past its soft limit, and some worker has said it runs compaction, the leader creates an internal compaction run naming the oldest entries that fit in one claim. The worker folds exactly those entries with the task's reducer, and the leader swaps them for one folded entry only while the chain still starts with them. A compaction run carries its key's queue, so only a worker subscribed to that queue folds it; `max_running` does not count it. Only a claimed compaction holds the newest generation back, and with no worker that runs compaction the newest generation folds its whole chain itself. No claim ever outgrows one message: a submission that would make its key's waiting claim too large is refused (backpressure), and a fold that grows past one message fails the newest generation with `CoalescedPayloadTooLarge`. Past the hard memory threshold, new submissions are backpressured (or dropped-oldest if the task opted in).
 
-After leader change, reconciliation (§13) rebuilds per-key occupancy, including the lifetime of any implicit flow, so a second running generation for the same key is never admitted. In core, the scheduler ends an implicit flow's lifetime through `Scheduler::end_continuation`; only the single-process runtime calls it today, and nothing over the network does yet, so a networked implicit flow holds its key and memory until then (Phase 6, durable flow continuations).
+After leader change, reconciliation (§13) rebuilds per-key occupancy, including the lifetime of any implicit flow, so a second running generation for the same key is never admitted. The leader ends a continuation when its composite is terminal, on one node and over the network, so an implicit flow frees its key and memory across leader changes.
 
 ### 8.3 Heartbeats
 
@@ -841,9 +895,9 @@ Heartbeats communicate:
 
 - worker identity/incarnation;
 - current term/recovery epoch observed;
-- available capacity;
-- active TaskRun digest/status;
-- other local health.
+- available capacity: free places across its task processes, which the leader records per member;
+- the queues it subscribes to;
+- active TaskRun digest/status.
 
 Missing heartbeat eventually causes the leader to question execution ownership.
 
@@ -878,7 +932,7 @@ reconnect_timeout     grace period after which a lost TaskRun is considered dead
 - A worker starts no TaskRun until a leader has heard from it, so every run it holds has an abort deadline. Before the deadline it cancels each run cooperatively, the run's cancel grace ahead of it. At the deadline it kills the task subprocess of any body still running, which also ends the other runs that subprocess hosts; they share the same lost contact, so the same deadline. A run stopped this way is reported lost once its body has exited. If a leader hears the worker again before the deadline, the pending aborts are withdrawn. A leader runs its own claims under the same rule.
 - The leader's replacement deadline is per TaskRun: the run's own `reconnect_timeout` after the leader suspects the silent worker. A worker heard again keeps every run whose deadline has not passed.
 
-The worst-case time from an abrupt kill (SIGKILL) to the replacement TaskRun starting is `heartbeat_timeout + reconnect_timeout`, plus an election if the leader was lost and the claim round trip. Defaults are on the order of tens of seconds (`heartbeat_timeout` 10 s, `reconnect_timeout` 30 s). `reconnect_timeout` is configurable per shard, per queue and per task: a task's own value wins, then its queue's, then the shard's. It is resolved when the task is submitted and stored in the Task record, so the leader's replacement deadline and the worker's abort deadline use the same value, and a successor leader reads it from the record. Heartbeats run in the native core, independent of the GIL and of any CPU-bound task subprocess, so a long native call cannot make a healthy worker look dead. If a task subprocess dies while its worker lives, the TaskRun is reported `LOST` as soon as the worker sees the subprocess exit, after waiting up to a second for the frames it sent last.
+The worst-case time from an abrupt kill (SIGKILL) to the replacement TaskRun starting is `heartbeat_timeout + reconnect_timeout`, plus an election if the leader was lost and the claim round trip. Defaults are on the order of tens of seconds (`heartbeat_timeout` 10 s, `reconnect_timeout` 30 s). `reconnect_timeout` is configurable per shard, per queue (`QueueOptions.reconnect_timeout`) and per task: a task's own value wins, then its queue's, then the shard's. It is resolved when the task is submitted and stored in the Task record, so the leader's replacement deadline and the worker's abort deadline use the same value, and a successor leader reads it from the record. Heartbeats run in the native core, independent of the GIL and of any CPU-bound task subprocess, so a long native call cannot make a healthy worker look dead. If a task subprocess dies while its worker lives, the TaskRun is reported `LOST` as soon as the worker sees the subprocess exit, after waiting up to a second for the frames it sent last.
 
 This bounds overlap; it does not fence external writes (§2.3).
 
@@ -898,21 +952,23 @@ Lifecycle examples:
 - worker-to-client result payload;
 - leader-to-client result certification.
 
+Result delivery and certification travel on their own request-response protocol, `/kabudachi/result/1`; each answer is the ACK, and a sender that hears none tries again within a bound (§8.5).
+
 Heartbeat traffic remains separate so event-bus backpressure cannot make healthy workers appear dead.
 
 ### 8.5 Result certification
 
 Result transport and result authority are intentionally distinct.
 
-Representative success flow:
+A successful run delivers and certifies its result like this:
 
 ```text
-1. worker -> client: RESULT(task_run_id, payload)
-2. client -> worker: ACK_RESULT
-3. worker -> leader: COMPLETE(task_run_id, result_digest)
-4. leader validates current authority and accepts/rejects completion
-5. leader -> client: CERTIFY(task_run_id, digest)
-6. client -> leader: ACK_CERTIFY
+1. worker -> client: DeliverResult(task_id, run_id, digest, payload | manifest)
+2. client -> worker: ResultAck            the client holds it, uncertified
+3. worker -> leader: ReportCompleted(run, digest, delivered)
+4. leader stores the certification at a quorum of the task's placement
+5. leader -> client: ResultCertified(task_id, run_id, digest)
+6. client -> leader: CertifiedAck         the client resolves the handle if the digests match
 ```
 
 The client may physically possess result bytes before certification, but it must not treat them as authoritative until the leader certifies the TaskRun.
@@ -922,6 +978,21 @@ This solves stale-worker result races at the scheduler level. If an old retriabl
 For a non-retriable TaskRun that survived leader replacement, the new leader may adopt the same TaskRun during reconciliation and certify its already-delivered result.
 
 When a task returns a task-like value (§3.4), the leader commits the continuation atomically with certification of the returning TaskRun. A TaskRun that is not certified therefore leaves no continuation behind.
+
+A task that ends without a result (failed, lost, orphaned, cancelled, expired or superseded) is pushed to its client as a conclusion, once the revision that ended it is stored. The leader pushes for 30 s. A client that missed it asks the next leader.
+
+A run that returns a step delivers no result. Its handle resolves when the leader reports the continuation's composite finished (`CompositeFinished`), naming the results in its pages.
+
+**Failure matrix.**
+
+| Case | Behaviour |
+|---|---|
+| Client dies or cannot be reached before ACK | The worker tries again until the run's `reconnect_timeout` ends, then reports `delivered=false`. The task certifies; its side effects happened. The awaiting handle raises `ResultUnavailableError`, and the value is reachable only through a result backend (§9.3). |
+| Leader dies after COMPLETE | The report is held as any report is. After a leader change, a client with uncertified results asks the new leader `QueryOutcome`; the answer is the same however often it is asked. |
+| Certification sent twice | The client keeps payloads by run id and settles a handle once. |
+| Worker dies after RESULT, before COMPLETE | A retriable task runs again after its reconnect timeout. The client drops the uncertified payload when a different run certifies. A non-retriable run is `ORPHANED`, and the handle raises `TaskOrphanedError`. |
+| Client restarts | It has a new identity and no handles. `kabudachi.resume(id)` reads the record, then the result backend or, while the shard holds it, the shard's blobs, and checks the digest. When neither has the value it raises `ResultUnavailableError`. |
+| Result too large for one message | It travels as a manifest of 256 KiB blobs (§8.6). A result alone past the hard memory limit of the worker that ran it fails the run with `ResultTooLargeError`, an ordinary body failure that is retried as the task's `retries` allow. One alone past the awaiting client's limit fails that handle only. |
 
 ### 8.6 Task records and placement
 
@@ -946,13 +1017,17 @@ A certified result carries its content digest the same way, so a reader can chec
 
 **Placement.** A record is written to the `r` placeable voters nearest its key by XOR distance (`r` defaults to 3 and is capped at the voters known), and a write counts once a majority of them has stored it. Any later read of `r - w + 1` of them then meets a holder of the newest revision. Records travel on a per-shard records protocol that only the shard's workers speak, so a record never lands in another shard.
 
-**Retention.** A finished record is dropped after the result TTL; an unfinished one never expires.
+**Retention.** A finished record, composite or page is dropped after its `result_ttl`; an unfinished one never expires.
 
 **Effects wait for storage.** Every answer that releases an effect (a submission acknowledgement, a claim, a certification, a failure answer, a cancel answer) is held until the writes that record it are stored and the leader's lease is still valid. If the writes miss their quorum, or the lease ended first, the answer is a retryable `NOT_LEADER`. A leader never acts on state that a successor could not find.
 
 **Moving a record.** When the placeable voters change (a worker is admitted, leaves or is lost), the leader writes the records whose placement moves, a bounded number at a time, to their new holders. A write that moves a record is a joint write: it counts only once a quorum of the new placement and of each earlier placement the record may still be known by (counting only holders still in the configuration) has stored it. A reader that hears most of an earlier placement therefore meets the new revision. A holder a record moved away from keeps a key-only stub (task, version, new placement), which reconciliation reports (§13), and a later plain write that names no earlier placement clears the carried placements. A write the store refused is kept by repair and published again after a delay until it is stored; while the scheduler is not leading nothing is published, the refusal is kept, and it is published once the scheduler leads (it is forgotten when the leader leaves office). Only the reconciling leader's republish of a rebuild retries before the grant. Repair places writes that are waiting on the voters that remain when a holder leaves.
 
 **One-node runtime.** The one-node runtime keeps its records in its own store with `r = 1`; the same writes happen, and each is stored at once.
+
+**Composite records.** A flow, group, map or reduce is a composite record written by the leader under `composite/<id>`, with outcome pages under `composite/<id>/<page>` of up to 1,024 entries each. They are placed, replicated, moved, handed off and reconciled exactly as Task records are. Member and stage ids derive from the composite's id and the index, so a new leader that drives a composite again makes the same ids and never a second task for one stage.
+
+**Blob records.** A payload of more than 956 KiB (a little under one message), and every stage's result, is stored as blobs under `blob/<blake3 hex>`, at a quorum of the owner's record placement, before the run is reported. The store checks each key against its value's digest. A blob expires with its owner's record. A blob whose owner the holder never sees expires after a grace (10 minutes). A manifest names a payload's blobs in order, with its total size; the leader reads only the size and the digests, never the bytes.
 
 **Trust.** The record store trusts the peers of its shard: it checks a record's key, size and version, not who sent it, and it does not cap how many unfinished records a holder keeps. Stopping a forged or flooding writer needs peer authentication, which is part of the production-readiness gate (§27.2, §28.10).
 
@@ -1001,7 +1076,7 @@ restore unfinished Task records
 
 Non-retriable tasks require conservative handling because the old execution may have performed irreversible work.
 
-### 9.3 Medium-term result backend
+### 9.3 Result backend
 
 Result retention is optional.
 
@@ -1013,9 +1088,13 @@ If enabled, certified results are mirrored into a queryable backend for:
 - recovery of completed result values;
 - operational tooling.
 
-A result-backend failure never changes `SUCCEEDED` back to `FAILED`.
+A result backend is optional. kabudachi defines the `ResultBackend` interface (`store`, `load`) and ships an in-memory backend and a Redis/Valkey backend. Nothing is forgotten by hand: each entry carries its own expiry, which every backend enforces. A Python object is a custom backend when it has `async store(key: str, entry: bytes, expires_at: datetime) -> None` and `async load(key: str) -> bytes | None`. It stores opaque bytes, and kabudachi decodes and checks them. `result_backend=` on `configure` selects one: a `redis://` URL or an object.
 
-Persistence is attempted only after leader certification. Suggested orthogonal persistence states are:
+After its report is certified, the worker that ran the task mirrors the task id, run id, digest, value (as chunks when large) and expiry to the backend. A composite's client mirrors the composite's resolved results when it finishes: each member's value or failure, in order, as pages when large.
+
+A result-backend failure is logged and never changes `SUCCEEDED` back to `FAILED`, or any other outcome.
+
+Persistence is attempted only after leader certification. The orthogonal persistence states are:
 
 ```text
 DISABLED
@@ -1024,7 +1103,13 @@ STORED
 FAILED
 ```
 
-`result_ttl` follows normal configuration inheritance and is not required on every task.
+Python reads them as the strings `"disabled"`, `"pending"`, `"stored"` and `"failed"` in `TaskStatus.persistence` (`handle.status()`). The field is `None` when the state is unspecified, as for an adopted run. A composite has no persistence state, and a task that returned a step shows `"disabled"`.
+
+`result_ttl` follows normal configuration inheritance and is not required on every task (§3.1).
+
+`kabudachi.resume(id)` takes a task id or a composite id. It reads the state from the shard's record, waits while the task or composite runs, and reads the value from the backend, checked against the certified digest. While the shard still holds the result, `resume` falls back to the shard's blobs or pages when the backend has no matching entry, and mirrors them. Once the shard has dropped the result, the backend alone answers. With neither, `resume` raises `ResultUnavailableError`.
+
+The Redis adapter shares the authority's connection settings type and ACL conventions, and nothing else. It serves a standalone server only and refuses `cluster = true`. The adapter ignores the `ttl` setting of its configuration, since each entry carries its own expiry. The Python `redis://` URL form refuses a `ttl` outright. The backend may point at another server than the authority.
 
 ### 9.4 External callbacks/event sinks
 
@@ -1126,6 +1211,8 @@ It:
 - emits irreversible `SELF_REMOVE`;
 - may finish existing work;
 - hands off the Task records it holds (§18.1).
+
+A draining leader hands leadership to its freshest voter first (§18.2). A node with no leader (`LEADER_SUSPECT`, `ROLL_CALL`, `NO_QUORUM`) drains too: it waits at most `drain_wait_limit` for a leader, then leaves and logs every record it could not hand off.
 
 #### `FENCED`
 
@@ -1315,7 +1402,7 @@ SELF_REMOVE {
 
 > This incarnation permanently withdraws from election participation.
 
-Only the leader applies it, and only if it is addressed to the leader's own term and the sender has seen no later term than the leader's (a worker that has may have voted in a later election whose quorum counted it, and shrinking the electorate as well could let two quorums of one term miss each other). The leader applies every removal that has passed this check and arrived since its last announcement together, in the one next generation it announces, with no commit round; until it does, the departing workers still count, which is conservative for quorums. A removal that fails the check leaves the worker in the roster until the next election founds a configuration without it, or the authority path counts it out. A draining leader announces its own departure on its final acks.
+Only the leader applies it, and only if it is addressed to the leader's own term and the sender has seen no later term than the leader's (a worker that has may have voted in a later election whose quorum counted it, and shrinking the electorate as well could let two quorums of one term miss each other). The leader applies every removal that has passed this check and arrived since its last announcement together, in the one next generation it announces, with no commit round; until it does, the departing workers still count, which is conservative for quorums. A removal that fails the check leaves the worker in the roster until the next election founds a configuration without it, or the authority path counts it out. A draining leader does not leave by announcement. It hands leadership over, then sends `SELF_REMOVE` to its successor like any follower (§18.2).
 
 This is particularly important during scale-down:
 
@@ -1331,7 +1418,7 @@ The remaining cluster does not depend on 51 soon-to-die pods.
 
 A restarted pod has a new incarnation ID and joins from scratch.
 
-A draining leader keeps leading until every other voter has reported a routing crawl since its admission, bounded by `drain_wait_limit` (ten suspicion timeouts by default), and then leaves. Leaving earlier would strand a worker that knows no one but this leader: workers find one another only through their routing crawl. A voter that never reports cannot hold the shutdown up beyond the limit.
+A draining leader keeps leading until every other voter has reported a routing crawl since its admission, bounded by `drain_wait_limit` (ten suspicion timeouts by default), and then leaves. Leaving earlier would strand a worker that knows no one but this leader: workers find one another only through their routing crawl. A voter that never reports cannot hold the shutdown up beyond the limit. The hand-over waits behind it.
 
 A node in `ROLL_CALL` or `NO_QUORUM` that has reached no shard peer for one suspicion timeout searches for a leader again: it reads the authority's registrations and then asks the seeds, so a node stranded without a leader reconnects to whoever leads.
 
@@ -1431,6 +1518,8 @@ Ordinary election does not need Redis if a quorum of returning voters exists.
 ## 13. Leader reconciliation
 
 A newly elected leader must not immediately assign work.
+
+Reconciliation rebuilds composites as it rebuilds tasks. A worker reports the composite records and pages it holds. A certified run that carries a returned step and has no composite yet gets one, derived from the run alone. A worker's report keeps `delivered` and any returned step for a run the new leader adopts. The new leader then drives each unfinished composite on, with the same derived ids.
 
 It asks its voters and pending members for reconciliation reports. A worker answers a requester only if it is the leader the worker follows, or presents an election certificate for a term at least the worker's; only the exit rule below counts voters. A report is paged and holds:
 
@@ -1833,24 +1922,28 @@ STOPPED
 
 The drained worker asks the leader it followed where each of its records goes now, writes each copy to the holders it names (as the record is held, naming the worker as its publisher, so the holder keeps it whatever holders the record names), waits for the acknowledgements, and writes again what was refused, until the drain wait limit. A copy a holder refuses because it holds a newer revision needs no handing over.
 
-Termination is soft and then hard, similar to a warm/cold shutdown in Celery. A soft terminate starts the drain above and lets running TaskRuns finish within a configured grace period; when the grace period elapses, running task subprocesses are cancelled cooperatively and then killed, and their TaskRuns follow the worker-loss semantics of §3.2.2. The Python runtime's grace period is `Settings.drain_grace` (`KABUDACHI_DRAIN_GRACE`): after the first SIGINT or SIGTERM starts the drain, the runtime escalates to a hard stop once that grace has passed. A second SIGINT or SIGTERM to the worker is its hard terminate at any time (§6.2).
+Termination is soft and then hard, similar to a warm/cold shutdown in Celery. A soft terminate starts the drain above and lets running TaskRuns finish within a configured grace period; when the grace period elapses, running task subprocesses are cancelled cooperatively and then killed, and their TaskRuns follow the worker-loss semantics of §3.2.2. `Settings.drain_grace` (`KABUDACHI_DRAIN_GRACE`, off by default) gives running runs that long to finish after the first signal; then the worker stops them as a second signal does. It applies while `run()` serves with no `main`. A second SIGINT or SIGTERM still stops at once (§6.2).
 
 ### 18.2 Leader shutdown
 
-A leader should proactively hand off instead of waiting for timeout:
+A leader hands off proactively instead of waiting for a timeout:
 
 ```text
 LEADER
-    -> announce LEADER_DRAINING
-    -> stop new claims
-    -> become ineligible for future leadership
-    -> accelerate roll call/election
-    -> remain reachable during reconciliation
-    -> successor becomes authoritative
-    -> self-remove
-    -> hand off its Task records
+    -> stop granting claims
+    -> ack every follower with leader_draining
+    -> TransferLeadership to the voter heard from most recently
+successor stands at once; voters that saw leader_draining vote for it
+    -> old leader stays reachable for reconciliation and record hand-off
+    -> once the successor is authoritative: SELF_REMOVE through it, hand off records
 STOPPED
 ```
+
+If no successor takes office within one suspicion timeout, the leader leaves as a follower would. A hand-over happens only under a committed single configuration. A transferring leader still answers roll calls and votes, so a shard of two can elect its successor.
+
+**Sole voter.** A sole voter that drains admits any pending member and hands over to it. With no one to hand to, it waits for another voter, at most `drain_wait_limit`, then leaves and logs, at error level, every record that leaves with it. `drain_wait_limit` is the operator's override.
+
+The one-node runtime drains with no wait.
 
 A draining leader waits for the other voters' routing crawls before it leaves (§12.3), and places its records among its other placeable voters.
 
@@ -1998,11 +2091,11 @@ retryability
 
 ### 19.5 Logging context
 
-Task execution should automatically expose context through Python `contextvars` or equivalent:
+Task execution exposes context through Python `contextvars`, set where the body runs (in its asyncio task for an async body, in its thread for a synchronous one):
 
 ```text
 task_id
-task_run_id
+run_id
 task_name
 attempt
 shard
@@ -2010,6 +2103,8 @@ worker_id
 trace_id
 span_id
 ```
+
+`kabudachi.current_context()` returns a `RunInfo` with these fields inside a task body, and `None` outside one. `kabudachi.logging.ContextFilter` adds them to log records. `trace_id` and `span_id` are empty strings until Phase 7. Native events reach Python `logging` under `kabudachi.native.<crate>.<module>`; `run()` reads their levels when it starts.
 
 Application logs can then correlate naturally with scheduler traces.
 
@@ -2085,9 +2180,7 @@ Baseline:
 /metrics
 ```
 
-Worker readiness should mean the runtime is healthy, task registry loaded, shard membership usable, and the worker can participate in work.
-
-Leader readiness should require reconciliation completion.
+`health_listen` (off by default) serves `/healthz` and `/readyz` from the native layer on their own listener. Each answers 503 when its condition does not hold. `/healthz` is 200 while the worker's loops are alive. `/readyz` is 200 once the task registry is loaded and the node will take work: a leader once it has reconciled and leads; a follower once a leader holding a grant has echoed one of its heartbeats, the same gate its claims wait behind. A follower of a leader still reconciling may read ready; its claims are refused as not ready until the leader finishes. The listener binds before the worker starts, and a port already in use fails `run()` at start. `/metrics` is Phase 7.
 
 ---
 
@@ -2367,10 +2460,10 @@ Keep distinct interfaces for:
 ```text
 CoordinationAuthority
 DisasterRecoveryStore
-ResultStore
+ResultBackend
 ```
 
-One Redis implementation may satisfy all three, but the interfaces should not be merged merely because a common backend can implement them.
+One Redis implementation may satisfy all three, but the interfaces are not merged merely because a common backend can implement them. The shipped result backend is the `ResultBackend` trait (`store` and `load` over opaque entries); the valkey adapter is a separate crate from the authority adapter.
 
 This prevents the hot coordination semantics from accidentally growing dependencies on result retention.
 
@@ -2642,18 +2735,15 @@ Potential use:
 /scaling (optional)
 ```
 
+The health endpoints use `axum` with default features off (`http1`, `tokio`), on the bindings' Tokio runtime.
+
 This is infrastructure convenience, not a protocol dependency.
 
-### 23.15 Packaging: maturin
+### 23.15 Packaging
 
-**Candidate:** Maturin
+Bazel's `py_wheel` builds the wheel (`//runtime:kabudachi_wheel`): the pure-Python package and the `_native` extension, built for the stable ABI (`abi3`, CPython 3.12 and later), with metadata that repeats `runtime/pyproject.toml`, extras included. The Linux wheel is set to the platform tag `manylinux_2_34_x86_64` in `runtime/BUILD.bazel`, and the macOS arm64 wheel to `macosx_11_0_arm64` (the extension is linked with a minimum macOS version of 11.0). Other platforms build no wheel. The Linux tag follows the glibc of the machine that links the extension; a Bazel test (`//runtime/tests:test_wheel`) compares it with the tag `auditwheel` finds in the extension's symbols and fails if they differ. The same test checks the wheel's metadata against `pyproject.toml`, installs the wheel into a clean virtual environment, and runs a flow on one worker and across a networked shard of two. It is a Bazel test, not a CI job. Maturin is not used: Bazel already builds the extension.
 
-Current docs:
-- https://www.maturin.rs/
-
-Maturin supports packaging PyO3-based Rust extensions into Python wheels and is the most obvious first choice for a mixed Rust/Python package.
-
-Packaging should be treated as part of the MVP, not something deferred until after the distributed system is written. If installation is painful, the project loses one of its primary ergonomic goals.
+Packaging is part of the MVP, not something deferred until after the distributed system is written. If installation is painful, the project loses one of its primary ergonomic goals.
 
 ---
 
@@ -2698,13 +2788,13 @@ Do not require users to define duplicate Python dataclasses around protobuf mess
 
 Pydantic is an optional serializer/backend extra. It is not a dependency of the core package.
 
-It should be dynamically imported only when selected.
+It is imported only when selected (the `pydantic` extra, `kabudachi[pydantic]`).
 
-The design should support Pydantic without making Pydantic semantics leak into the generic task protocol.
+The pydantic serializer handles a model, a list of models, or nothing, and reads a model's version through its family's `version_path` (§7). It encodes canonical JSON (sorted keys, no whitespace), so equal values are equal bytes; for that reason it refuses a model with a set field, which has no stable order. Pydantic semantics do not leak into the generic task protocol.
 
 ### 24.4 Dataclasses
 
-The standard-library dataclass backend can provide a lightweight JSON-oriented alternative. It should still require explicit version extraction semantics if versioning is used.
+The dataclass serializer encodes standard-library dataclasses as canonical JSON, a lightweight alternative that needs no extra package (the `dataclass` extra adds no dependencies). It handles a dataclass of plain fields (`str`, `int`, `float`, `bool`, `None`, other such dataclasses, `list`, `dict[str, ...]` and `X | None`), a list of them, or nothing. It reads a version through `version_path` the same way the pydantic serializer does.
 
 ### 24.5 OpenTelemetry Python
 
@@ -2770,7 +2860,7 @@ Peer review should focus heavily on invariants. If an implementation violates on
 3. A superseded pending payload is folded, never silently dropped (except under an explicit `drop_oldest` opt-in).
 4. The reducer fold is order-preserving and its result does not depend on chain length or compaction points (except under an explicit `drop_oldest` opt-in).
 5. A lost generation that was the newest for its key is replayed; a lost stale generation is not.
-6. Per-key occupancy, including an implicit flow's lifetime, is rebuilt at reconciliation without admitting a second running generation. (Core rebuilds it; over the network nothing ends a continuation yet, which is Phase 6.)
+6. Per-key occupancy, including an implicit flow's lifetime, is rebuilt at reconciliation without admitting a second running generation.
 7. A continuation is committed atomically with the returning TaskRun's certification, and a continuation failure never re-runs the returning task.
 8. The stage after a group runs as one certified TaskRun per group instance under any single fault.
 
@@ -2839,6 +2929,8 @@ gossip mesh fragmentation
 SELF_REMOVE messages delayed or duplicated
 ```
 
+The 50/50 partition is `scenario_no_quorum::a_50_50_partition_elects_and_grants_on_neither_side_and_heals_to_one_leader`. The 51/49 partition and the leader isolated with a minority are `scenario_partition::a_51_49_partition_keeps_the_majoritys_leader_and_heals_without_deposing_it` and `scenario_partition::a_leader_cut_off_with_a_minority_loses_its_lease_and_both_follow_the_majoritys_new_leader`. All three are in `core/tests/scenario/`, run by `//core:core_integration_test`.
+
 ### 26.3 Catastrophic authority tests
 
 Test:
@@ -2880,6 +2972,8 @@ Eventually run real deployment tests with:
 - Redis flush;
 - node/rack/zone-like partition simulation.
 
+These are part of release hardening (§27).
+
 ### 26.6 FFI stress tests
 
 Test:
@@ -2893,6 +2987,18 @@ Test:
 - sync functions in executor;
 - async functions and contextvars;
 - subprocess crashes.
+
+Each bullet names the test that covers it:
+
+- Python interpreter shutdown: `//runtime/tests:test_native::test_the_interpreter_exits_cleanly_while_run_and_its_native_threads_still_run`.
+- Callback GC behavior: `//runtime/tests:test_session::test_a_callback_is_kept_alive_by_the_run_even_if_the_handle_is_dropped`.
+- Weak lifecycle (observer) hooks arrive with the event API in Phase 7.
+- Task callable references: tracked under post-implementation testing.
+- Many concurrent Rust->Python scheduling events: `//runtime/tests:test_session::test_ten_thousand_expiries_decided_together_reach_every_waiting_handle` (one worker; the networked outcome queue under a burst is tracked under post-implementation testing).
+- Cancellation races: `//runtime/tests:test_session::test_a_task_cancelled_after_it_is_claimed_but_before_it_is_reported_started_says_cancelled` and `test_a_cancel_this_process_asked_for_suppresses_the_runs_outcome_before_the_leaders_notice`.
+- Sync functions in the executor: `//runtime/tests:test_session::test_synchronous_tasks_run_as_many_at_once_as_the_concurrency_allows`.
+- Async functions and contextvars: `//runtime/tests:test_run::test_a_context_filter_puts_the_running_task_on_each_record_its_body_logs` (async and sync bodies) and `//runtime/tests:test_pool::test_a_body_in_a_task_process_sees_its_run_in_context_variables_async_or_sync`.
+- Subprocess crashes: `//runtime/tests:test_pool::test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_is_ephemeral_or_not_retriable`.
 
 ---
 
@@ -2933,7 +3039,7 @@ Implement:
 
 The one-worker cluster has quorum one, runs the real election state machine, and makes debugging the programming model easy.
 
-Deferred out of Phase 1: compaction of retained coalescing chains (Phase 3), observer hooks `kabudachi.events.*` (Phase 7), `.reduce` and type-compatibility validation (Phase 6), migrations (§7), and queue-subscription enforcement (Phase 2).
+Deferred out of Phase 1: compaction of retained coalescing chains (Phase 3), observer hooks `kabudachi.events.*` (Phase 7), `.reduce`, type-compatibility validation, migrations (§7) and queue-subscription enforcement (all Phase 6).
 
 ### Phase 2: multi-worker ordinary election
 
@@ -2947,9 +3053,9 @@ Implement:
 
 Still avoid sharding.
 
-Phase 1 left `NoPeers` and `NoAuthority` (`core/src/single_node.rs`) and the election tick loop in place as single-node placeholders, each with one adapter until this phase. Phase 2 gave peer messaging and the coordination authority their second real adapter and resolved that question, as follows.
+Phase 1 left a no-peers message sink, a no-authority coordination authority and the election tick loop in place as single-node placeholders, each with one adapter until this phase. Phase 2 gave peer messaging and the coordination authority their second real adapter and resolved that question, as follows.
 
-`core/src/single_node.rs` is gone. Its message-sink placeholder became `core::election::DropMessages`, which drops every message for a node with no peers, and the single-process Python runtime's wiring lives in `bindings/src/local_node.rs`. That runtime's instant (zero suspicion timeout) self-election is a deliberate product choice for it, not the generic behaviour of a one-member electorate. The Phase 1 `NoAuthority` coordination authority was removed rather than moved: the single-process runtime starts its node with no authority timings, so the node never asks for an authority call. The name now belongs to `core::election::NoAuthority`, the authority performer that runtime hands `core::election::carry_out`, which answers any call at once as unavailable. The generic multi-node case is `net/src/bootstrap.rs`'s `bootstrap` cascade (seeds, then the coordination authority's registered peers, then ownership of the shard, or, with no authority, founding it alone once the seeds have stayed silent for `seed_rounds` rounds), where a lone node still waits out whatever suspicion timeout it was configured with. A worker with seeds that all stay silent can therefore found its own shard; the split that causes is bounded by `seed_rounds` and ends when the shards converge (§17).
+The module that held them is gone. Its message-sink placeholder became `core::election::DropMessages` (`core/src/election/carry_out.rs`), which drops every message for a node with no peers, and the single-process Python runtime's wiring lives in `bindings/src/local_node.rs`. That runtime's instant (zero suspicion timeout) self-election is a deliberate product choice for it, not the generic behaviour of a one-member electorate. The Phase 1 `NoAuthority` coordination authority was removed rather than moved: the single-process runtime starts its node with no authority timings, so the node never asks for an authority call. The name now belongs to `core::election::NoAuthority`, the authority performer that runtime hands `core::election::carry_out`, which answers any call at once as unavailable. The generic multi-node case is `net/src/bootstrap.rs`'s `bootstrap` cascade (seeds, then the coordination authority's registered peers, then ownership of the shard, or, with no authority, founding it alone once the seeds have stayed silent for `seed_rounds` rounds), where a lone node still waits out whatever suspicion timeout it was configured with. A worker with seeds that all stay silent can therefore found its own shard; the split that causes is bounded by `seed_rounds` and ends when the shards converge (§17).
 
 Both runtimes drive the node through `core::election::carry_out`: `bindings/src/election.rs`'s `run_election` on the single-process node, and `net/src/driver.rs`'s `run_driver` on a real-transport node, each on its own tick.
 
@@ -2990,7 +3096,7 @@ Implemented:
 
 The Python-hosted networked worker came in Phase 5; the task-to-shard cache, the client shard map and `ShardLostError` are Phase 8.
 
-Open: two Redis test flakes were seen once each and never reproduced or explained. `//redis_authority:redis_authority_integration_test` hung after its tests had passed, before the port-ownership fixes; and a cluster test's first call once answered `Unavailable`. The port-ownership fixes may have removed both. If either recurs, find the cause before rerunning.
+Open: two Redis test flakes were seen once each and never reproduced or explained. `//redis_authority:redis_authority_integration_test` hung after its tests had passed, before the port-ownership fixes; and a cluster test's first call once answered `Unavailable`. The port-ownership fixes may have removed both. If either recurs, find the cause before rerunning. Both are tracked under post-implementation testing.
 
 ### Phase 5: Python subprocess execution
 
@@ -3009,84 +3115,124 @@ Implemented:
 - the networked Python worker: `kabudachi.run()` with `listen` set (and `seeds`, `external_address`, `authority` as a `redis://` or `rediss://` URL with `?key_prefix=` and `?ttl=`, `shard`, and the shard's heartbeat and reconnect timings) hosts `kabudachi_net::worker::Worker`, starts once it has joined and knows its leader, runs whatever that leader hands it, submits through the leader, and on stopping lets its held runs finish and waits until the leader has taken their reports; it needs `processes` of at least 1, so it can kill a body at its abort deadline;
 - the multi-process SIGKILL harness (`//runtime/tests:test_networked`): a killed task subprocess, worker and leader, each run certified once, a CPU-bound body that leaves heartbeats and leadership alone, a networked compaction, a remote cancel, and a partitioned worker that stops its run by its abort deadline; and a Python worker cold-bootstrapped against valkey (`//runtime/tests:test_networked_valkey`).
 
-Awaiting a result on a networked worker raises `RemoteResultUnavailableError`, inside task bodies too; the handle's `cancel()` still reaches the leader. Delivering a result from the worker that ran a task back to the one that submitted it is networked client result delivery (§8.5, Phase 8).
+Phase 6 delivers results across workers (§8.5).
 
-### Phase 6: flow/group/map/reduce
+Phase 5 had a defect that Phase 6 fixed: a script that ended while `run()` was live with one or more task processes hung at interpreter exit, because the task processes were joined with no timeout. `run()` now registers an exit hook that stops its own task processes and kills any that remain after a short grace.
 
-Phase 1 already delivers `flow`, `group`, implicit flows and `.map` in a one-node shard. Add:
+### Phase 6: the production release
 
-- typed compatibility validation;
-- multi-worker distributed map (one-node `.map` is Phase 1);
-- `.reduce` (a sequential chain of certified steps; a reduction tree only for a seedless reducer declared associative);
-- group ordered result collection across workers and leader changes;
-- durable flow continuations: ending a continuation over the network, so that an implicit flow's lifetime holds across a leader change (§8.2).
+Implemented:
 
-Open (from Phase 5): on a networked worker, a task that returns a flow, group or bound task fails with `TaskDefinitionError`. Its continuation starts stages that run on other workers and awaits their results, then ends over the network: it needs the durable flow continuations and the result collection across workers above.
+- result delivery from the worker that ran a task to the one awaiting it: certification, conclusions, `QueryOutcome` and the failure matrix (§8.5); durability levels and status reads (§3.3, §8.1); `TaskOrphanedError` and `retriable=False` (§3.2);
+- blobs and manifests for payloads above one message, each counted against the memory limits of the processes that hold it, with no fixed cap (§8.6, §3.2.1);
+- leader-driven composites: flows, groups, maps and implicit flows as composite records with outcome pages, holding across worker, leader and submitter loss; expansion runs; `TaskFailure` (§3.4, §8.6, §13);
+- streaming `.map` with `SlowDown` reaching every submitter (§3.4, §3.2.1);
+- `.reduce` as a chain or a chunked tree, and `reducer` (§3.4);
+- schemas, migrations, version blocking and type compatibility, with the pydantic and dataclass serializers (§6.3, §7, §24);
+- the result backend seam with Redis/Valkey and Python backends, `resume`, and policy inheritance (§3.1, §9.3);
+- queue subscriptions, queue options, fair claiming and the router (§5, §8.2);
+- leadership transfer (model-checked), drain grace, leaderless drain and the sole voter's wait (§18);
+- health endpoints, derived memory limits, run context and native logs, capacity in heartbeats, run times and failure messages, reserved trace fields, and the networked tunables in Python (§19);
+- an installable wheel (§23.15);
+- DHT-locality load balancing, partition scenarios, submission immutability and FFI stress tests (§26).
 
-Open: a Task record read, and so `TaskHandle.status()`, waits out the 5 s kad query timeout while a shard peer is connected but unresponsive (stopped, say). The lookup should finish once the record's placement holders, or a quorum of them, have answered.
+Defects found and fixed during the phase:
+
+- The Phase 5 exit hang (see Phase 5): fixed with the FFI stress tests.
+- An executor place leak in `bindings/src/networked/handover.rs`: a run that was cancelled, aborted or failed before the executor took it never gave its place back, so later runs waited forever. A networked test that timed out waiting for all three runs to start exposed it. The seam now tracks runs the executor never took (`Seam::untaken`).
+- Repair retry starvation: repair retried refused writes in key order, so a composite's write starved behind Task retries and its refusal stayed in the ledger. Retries now go oldest due first.
+- An O(N^2) store sweep: expiry now comes from indexes (1,000 items took 1.5 s and now take 0.30 s; 4,000 items took 28 s and now take 1.22 s).
+- Result pages stamped unfinished and never rewritten, so holders could not retire them. A composite's end now rewrites every page as finished.
+- Test races: a results step in the first result-delivery test, a joiner race in the `led_shard` Redis end-to-end test, a wall-clock bound in the Phase 1 cancel-grace test and a placement race in `test_networked`.
+
+Known flake: `//runtime/tests:test_session::test_cancel_grace_comes_from_the_process_unless_the_task_chose_its_own` measured 0.265 s against a 0.2 s wall-clock bound with 18 targets running in parallel. The bound is a harness timing, not a product limit. Owner: post-implementation testing.
+
+The Open notes below each name an owner. Owners are post-implementation testing (load, engineered and flaky cases), Phase 8, or release hardening (the next section).
+
+Open: a Task record read, and so `TaskHandle.status()`, waits out the 5 s kad query timeout while a shard peer is connected but unresponsive (stopped, say). The lookup should finish once the record's placement holders, or a quorum of them, have answered. Owner: post-implementation testing.
 
 Open: large-input starvation. A claimant without room for a large blob input passes it over, and smaller inputs can keep taking that room, so a large input may wait indefinitely under steady load. Aging (raising a passed-over task's priority with its wait) is the known fix. For post-implementation load testing.
 
-Open: a task whose input is larger than every worker's in-flight share waits until its expiry, or indefinitely with none, in a shard where every voter holds every record. In a larger shard, a non-holder can steal it and fail it with `PayloadTooLarge`, so it can fail after its retries. One explicit memory limit per networked shard avoids both.
+Open: a task whose input is larger than every worker's in-flight share waits until its expiry, or indefinitely with none, in a shard where every voter holds every record. In a larger shard, a non-holder can steal it and fail it with `PayloadTooLarge`, so it can fail after its retries. One explicit memory limit per networked shard avoids both. Owner: post-implementation testing.
 
-Open: blob retention edges. (1) A holder that never saw an owner's record drops the owner's blobs only on a second answer of gone from the leader, a grace after the first, and a blob-carried submission is bounded to half a grace; what is left is a submission whose request is still in transit when the deadline cancels it: the leader may handle that request after answering the cancel with an unknown task, record the task, and run it though its handle was refused (no tombstone records the cancel), and the grace and the deadline are fixed constants, so no test can shorten them. (2) The tending task asks about due owners one at a time, each up to 5 s, so a dead named leader slows a tick and the blob re-puts in it; the asks should run concurrently. (3) An owner found finished is never asked about again, so its result blobs stay on a holder that never sees its record until the store drops them with the owner's retention elsewhere. (4) The store has no test seam for the orphan grace, so the leader-asked drop and the submission deadline are unproven by a test.
+Open: blob retention edges. (1) A holder that never saw an owner's record drops the owner's blobs only on a second answer of gone from the leader, a grace after the first, and a blob-carried submission is bounded to half a grace; what is left is a submission whose request is still in transit when the deadline cancels it: the leader may handle that request after answering the cancel with an unknown task, record the task, and run it though its handle was refused (no tombstone records the cancel), and the grace and the deadline are fixed constants, so no test can shorten them. (2) The tending task asks about due owners one at a time, each up to 5 s, so a dead named leader slows a tick and the blob re-puts in it; the asks should run concurrently. (3) An owner found finished is never asked about again, so its result blobs stay on a holder that never sees its record until the store drops them with the owner's retention elsewhere. (4) The store has no test seam for the orphan grace, so the leader-asked drop and the submission deadline are unproven by a test. Owner: post-implementation testing.
 
-Open: `//runtime/tests:test_networked` also failed intermittently under load with a result reported unavailable; that symptom is not shown fixed and is to be diagnosed before the phase closes.
+Open: `//runtime/tests:test_networked` also failed intermittently under load with a result reported unavailable; that symptom is not shown fixed. Owner: post-implementation testing, which diagnoses it.
 
-Open: a drained worker's record hand-off can wait about 5 s before it returns when its copy of a record was already superseded (the hand-off reports stored 0, superseded 1); about a third of runs of the networked leader hand-over test showed it. The hand-off should finish as soon as the superseding copy is confirmed rather than waiting out a timeout.
+Open: a drained worker's record hand-off can wait about 5 s before it returns when its copy of a record was already superseded (the hand-off reports stored 0, superseded 1); about a third of runs of the networked leader hand-over test showed it. The hand-off should finish as soon as the superseding copy is confirmed rather than waiting out a timeout. Owner: post-implementation testing.
 
-Open: a node drained while fenced, bootstrapping or joining keeps the request until it leaves that state, so a networked run whose node is fenced at exit stops waiting after four drain waits plus a heartbeat timeout and shuts down with the records it held. A drain in those states should end after the drain wait limit like the other leaderless states.
+Open: a node drained while fenced, bootstrapping or joining keeps the request until it leaves that state, so a networked run whose node is fenced at exit stops waiting after four drain waits plus a heartbeat timeout and shuts down with the records it held. A drain in those states should end after the drain wait limit like the other leaderless states. Owner: post-implementation testing.
 
-Open: `runtime/tests:test_networked` failed in 4 of 80 runs in one batch (a cut-off worker, a killed task-process worker, a compaction timeout) while the machine was loaded and passed 100 of 100 in baselines; the cause is not found. Rerun on a quiet machine and trace before relying on it.
+Open: `runtime/tests:test_networked` failed in 4 of 80 runs in one batch (a cut-off worker, a killed task-process worker, a compaction timeout) while the machine was loaded and passed 100 of 100 in baselines; the cause is not found. Rerun on a quiet machine and trace before relying on it. Owner: post-implementation testing.
 
-Open: an idle worker's claim backoff grows to 5 s (`IdleBackoff::MAX`) with no wake-up on new queued work, so work queued on an idle cluster can wait up to 5 s for a claimant. The fix is to clear the idle backoff when the leader announces pending work. `//runtime/tests:test_networked` failed intermittently under load because of it (a compaction run not claimed while the generation holding the key ran); its tests now hold the key until released and do not depend on the backoff.
+Open: an idle worker's claim backoff grows to 5 s (`IdleBackoff::MAX`) with no wake-up on new queued work, so work queued on an idle cluster can wait up to 5 s for a claimant. The fix is to clear the idle backoff when the leader announces pending work. `//runtime/tests:test_networked` failed intermittently under load because of it (a compaction run not claimed while the generation holding the key ran); its tests now hold the key until released and do not depend on the backoff. Owner: post-implementation testing.
 
-Open: aging restarts at a leader change: a task's waiting time is counted from its installation in the new leader's waiting room.
+Open: aging restarts at a leader change: a task's waiting time is counted from its installation in the new leader's waiting room. Owner: post-implementation testing.
 
-Open: workers whose `queue_options` differ from the leader's rank discovery differently, and the leader decides. This is unsupported and not detected.
+Open: a compaction run for a queue that no compaction runner takes waits until its key's newest generation is claimed whole. Owner: post-implementation testing.
 
-Open: a compaction run for a queue that no compaction runner takes waits until its key's newest generation is claimed whole.
+Open: a record that is re-placed off a killed voter stalls. The re-placement is a joint write that needs a majority of the prior placement, and a killed voter stays a member of the configuration until it leaves, so with replication 2 and a dead holder in the prior placement, every later write for that task (a claim included) cannot be acknowledged. The blobs of such a task do follow the new placement; the claim does not go through until the dead voter leaves the configuration. Owner: post-implementation testing.
 
-Open: `Subscription::Only` of an empty set maps to `Every` on the wire. Python refuses empty queues.
+Limit: with a replication factor of 2, writes stall while a record's holder is dead, until the record is placed again. A majority of two is both holders, so an even factor tolerates no more loss than the odd one below it. Use an odd factor; no fix is planned.
 
-Open: a record that is re-placed off a killed voter stalls. The re-placement is a joint write that needs a majority of the prior placement, and a killed voter stays a member of the configuration until it leaves, so with replication 2 and a dead holder in the prior placement, every later write for that task (a claim included) cannot be acknowledged. The blobs of such a task do follow the new placement; the claim does not go through until the dead voter leaves the configuration.
+Open: `//runtime/tests:test_networked` is intermittent under load in the composite scenarios: a stopped leader's hand-over sometimes outlasts its timeout. It is not shown fixed. Owner: post-implementation testing.
 
-Open: with a replication factor of 2, writes stall while a record's holder is dead, until the record is placed again. A majority of two is both holders, so an even factor tolerates no more loss than the odd one below it.
+Open: a leader killed between a pipeline's stages can replay the pipeline's body when the election outlasts the abort deadline of the follower running it: the follower aborts the body when it has been out of contact with a leader for too long, and the new leader replays it, so the body's first run is `LOST`. This is the at-least-once guarantee, not a defect, but the test must allow it. Also worth examining: leader failover sometimes needs a second term (the survivors log `no seed answered a round` and then rejoin), which can exceed that deadline. Owner: post-implementation testing.
 
-Open: `//runtime/tests:test_networked` is intermittent under load in the composite scenarios: a stopped leader's hand-over sometimes outlasts its timeout. It is not shown fixed.
+Open: a leader's refused write to a record it no longer holds is forgotten (`Repair::check` drops the retry), while the write ledger's refusal of that record stands until the scheduler stops leading. Answers naming such a record keep getting `NotLeader`. Exposure: needs a refusal and the record's removal before the retry falls due; rare. Impact: severe for the clients concerned, which spin on `NotLeader` for the leader's tenure. The fix is to clear the ledger's refusal when the retry is dropped. Owner: post-implementation testing.
 
-Open: a leader killed between a pipeline's stages can replay the pipeline's body when the election outlasts the abort deadline of the follower running it: the follower aborts the body when it has been out of contact with a leader for too long, and the new leader replays it, so the body's first run is `LOST`. This is the at-least-once guarantee, not a defect, but the test must allow it. Also worth examining: leader failover sometimes needs a second term (the survivors log `no seed answered a round` and then rejoin), which can exceed that deadline.
+Open: no per-peer budget on a leader's record writes (`net/src/messenger/record_queries.rs`), so a burst of writes to one holder is refused wholesale when kad's 32 streams per connection are taken or its 5 s query timeout passes. Exposure: plausible, a leader serving many concurrent completions, or a slow or overloaded holder. Impact: moderate. `Repair` publishes refused writes again, oldest due first, so a refused composite does not starve behind refused Task retries; answers naming a refused record are `NotLeader` until its retry lands. A per-peer budget would shrink the refusal wave. Owner: post-implementation testing.
 
-Open: the docs pass after composites. The description of an implicit flow's lifetime (`Scheduler::end_continuation`, in the sections on coalescing and on leader-change reconciliation) and the exit criterion that says nothing over the network ends a continuation still describe the previous design, in which a worker ended a continuation itself; now the leader derives a continuation from the run that returned the step and ends it with the step. `RemoteResultUnavailableError` is still described as raised by every await on a networked worker, though a flow, group or returned step awaited there now runs on the leader.
+Open: no net-level burst test of a large map's completion. Wanted: 300 members completed in one `with()`, after which `submit_members` must return `CompositeFinished` within a deadline. Exposure: the burst needs a map of hundreds of members completing together, plausible for any large map. Impact: severe if it regressed, because a composite's final revision could stay unstored and its answers `NotLeader`, and nothing would catch it. Owner: post-implementation testing.
 
-Open: a leader's refused write to a record it no longer holds is forgotten (`Repair::check` drops the retry), while the write ledger's refusal of that record stands until the scheduler stops leading. Answers naming such a record keep getting `NotLeader`. Exposure: needs a refusal and the record's removal before the retry falls due; rare. Impact: severe for the clients concerned, which spin on `NotLeader` for the leader's tenure. The fix is to clear the ledger's refusal when the retry is dropped.
+Open: `owners_to_check` (`core/src/task_record/store.rs`) still scans every blob owner on each call, and `tend_blobs` calls it once a second per worker. Fix: index the unseen, unfinished owners by `since`, so a call reads only those due. Exposure: every worker with many blob owners, which a large streamed map or many blob-carrying submissions produce. Impact: moderate, a per-second scan whose cost grows with the owners held. Owner: Phase 8 (scale).
 
-Open: no per-peer budget on a leader's record writes (`net/src/messenger/record_queries.rs`), so a burst of writes to one holder is refused wholesale when kad's 32 streams per connection are taken or its 5 s query timeout passes. Exposure: plausible, a leader serving many concurrent completions, or a slow or overloaded holder. Impact: moderate. `Repair` publishes refused writes again, oldest due first, so a refused composite does not starve behind refused Task retries; answers naming a refused record are `NotLeader` until its retry lands. A per-peer budget would shrink the refusal wave.
+Open: while a takeover has records not known yet, every member that settles in a composite re-checks its members for an uncertain record (`holds_composite_back`). The scan walks all the members (`0..members`) only while reconciliation still has unknown records, so in that worst case settling a large composite costs its member count each time until the records are known. Exposure: a leader change while a map of many thousand members runs, until reconciliation learns the late records. Impact: high at scale, not moderate: for a map of about a million members the quadratic work during a takeover or reconcile window could run long enough to stall the leader. Owner: release hardening, before any real workload runs maps of that size.
 
-Open: no net-level burst test of a large map's completion. Wanted: 300 members completed in one `with()`, after which `submit_members` must return `CompositeFinished` within a deadline. Exposure: the burst needs a map of hundreds of members completing together, plausible for any large map. Impact: severe if it regressed, because a composite's final revision could stay unstored and its answers `NotLeader`, and nothing would catch it.
+Open: a joiner whose leader dies before its first ack has no configuration yet, and with no other live member and an empty or flushed authority it stays `LeaderSuspect`: it neither abandons the shard nor runs a stranded search. An unconfigured node starts no roll call (`core/src/election/node/timers.rs`), and the empty authority read is not acted on for it (`core/src/election/authority_standing/replies.rs`); `StrandedWatch` (`net/src/leader_search.rs`) does not cover it. A restart recovers it. Exposure: rare, the join window plus loss of the leader plus a flushed authority. Impact: that node is stuck until restarted. Fix direction: let an unconfigured `LeaderSuspect` node act on an empty authority read, or extend `StrandedWatch` to cover it; either changes documented behaviour, so it needs a design ruling first. Owner: post-implementation testing, after that ruling.
 
-Open: `owners_to_check` (`core/src/task_record/store.rs`) still scans every blob owner on each call, and `tend_blobs` calls it once a second per worker. Fix: index the unseen, unfinished owners by `since`, so a call reads only those due. Exposure: every worker with many blob owners, which a large streamed map or many blob-carrying submissions produce. Impact: moderate, a per-second scan whose cost grows with the owners held.
-
-Open: while a takeover has records not known yet, every member that settles in a composite re-checks its members for an uncertain record (`holds_composite_back`). The scan walks all the members (`0..members`) only while reconciliation still has unknown records, so in that worst case settling a large composite costs its member count each time until the records are known. Exposure: a leader change while a map of many thousand members runs, until reconciliation learns the late records. Impact: high at scale, not moderate: for a map of about a million members the quadratic work during a takeover or reconcile window could run long enough to stall the leader.
-
-Open: a joiner whose leader dies before its first ack has no configuration yet, and with no other live member and an empty or flushed authority it stays `LeaderSuspect`: it neither abandons the shard nor runs a stranded search. An unconfigured node starts no roll call (`core/src/election/node/timers.rs`), and the empty authority read is not acted on for it (`core/src/election/authority_standing/replies.rs`); `StrandedWatch` (`net/src/leader_search.rs`) does not cover it. A restart recovers it. Exposure: rare, the join window plus loss of the leader plus a flushed authority. Impact: that node is stuck until restarted. Fix direction: let an unconfigured `LeaderSuspect` node act on an empty authority read, or extend `StrandedWatch` to cover it; either changes documented behaviour, so it needs a design ruling first.
-
-Open: a released page cannot be re-placed. After the acknowledgement of its stored write, the leader releases a full page (a reduce's item pages, and the full results pages of a large map or group), so `LeaderRecords::repair` (`core/src/task_record/leader_records.rs`) has nothing held to publish again when the voters change. Fix: a driver read-back path that reads a released page from its old holders and writes it to the new placement, through `RecordPorts`. Exposure: a voter change within `result_ttl` of the composite's completion; plausible but rare. Impact: the page is unavailable once its holders are lost, so the composite's results surface as unavailable; resubmitting the work recovers them.
+Open: a released page cannot be re-placed. After the acknowledgement of its stored write, the leader releases a full page (a reduce's item pages, and the full results pages of a large map or group), so `LeaderRecords::repair` (`core/src/task_record/leader_records.rs`) has nothing held to publish again when the voters change. Fix: a driver read-back path that reads a released page from its old holders and writes it to the new placement, through `RecordPorts`. Exposure: a voter change within `result_ttl` of the composite's completion; plausible but rare. Impact: the page is unavailable once its holders are lost, so the composite's results surface as unavailable; resubmitting the work recovers them. Owner: post-implementation testing.
 
 Open: no burst test of the networked runtime's outcome event queue. Wanted: 10 000 `RESULT`, `CERTIFIED` and `OUTCOME` events of a 10 000-task networked run reaching their waiting handles. The one-node burst is a regression test, but the networked queue is a separate path and nothing exercises it under that volume. Exposure: any large networked run. Impact: severe if an event were lost or misrouted, because a handle would wait for an outcome that was decided. For post-implementation load testing.
 
-Open: mixed schema versions in one shard can strand a task. A record's submission digest (`ShardRecord::submission_digest`, `core/src/task_record/key.rs`) is computed over the re-encoded protobuf of its `Task` or `StepDescription`, and prost drops fields it does not know. A shard whose members run two schema versions can therefore compute different digests for one submission, and a holder that has the first revision's digest refuses a later revision with `SubmissionChanged`, so the task cannot be rewritten (a claim or a result included). Exposure: rare, a rolling upgrade that adds a field to `Task` or `StepDescription` while such a record is live. Impact: severe for the task, which stays stuck until it expires. A shard must run one schema version today; this is part of the mixed-version gate in §27.2. Fix: make the digest ignore unknown fields, or tag it with the schema version.
+Open: mixed schema versions in one shard can strand a task. A record's submission digest (`ShardRecord::submission_digest`, `core/src/task_record/key.rs`) is computed over the re-encoded protobuf of its `Task` or `StepDescription`, and prost drops fields it does not know. A shard whose members run two schema versions can therefore compute different digests for one submission, and a holder that has the first revision's digest refuses a later revision with `SubmissionChanged`, so the task cannot be rewritten (a claim or a result included). Exposure: rare, a rolling upgrade that adds a field to `Task` or `StepDescription` while such a record is live. Impact: severe for the task, which stays stuck until it expires. A shard must run one schema version today. Fix: make the digest ignore unknown fields, or tag it with the schema version. Owner: release hardening (mixed-version clusters), with a rolling-upgrade test under post-implementation testing.
 
-Open: the Redis result backend holds one connection behind one mutex (`redis_result_backend/src/lib.rs`), taken for every round trip and bounded per call by `call_timeout`. Exposure: every backend call from one process serialises on that connection: the mirror of each certified plain-task result, composite mirrors and resume reads. Impact: throughput and latency under a burst; and during a server outage, N queued calls each wait up to `call_timeout` in turn (about N x 2 s, on blocking-pool threads), though no task outcome changes. Benign for correctness, degraded for resume latency. Fix direction: a small connection pool, or a connection per call when the single one is busy.
+Open: the Redis result backend holds one connection behind one mutex (`redis_result_backend/src/lib.rs`), taken for every round trip and bounded per call by `call_timeout`. Exposure: every backend call from one process serialises on that connection: the mirror of each certified plain-task result, composite mirrors and resume reads. Impact: throughput and latency under a burst; and during a server outage, N queued calls each wait up to `call_timeout` in turn (about N x 2 s, on blocking-pool threads), though no task outcome changes. Benign for correctness, degraded for resume latency. Fix direction: a small connection pool, or a connection per call when the single one is busy. Owner: post-implementation testing.
+
+Open: a result of an older class of a schema family that reaches a consumer taking a newer class is handed over as the producer's class, not converted through the migration chain. Owner: release hardening (mixed-version clusters).
+
+Open: protobuf stage inputs carry no version, so a migration reads the member Task's `source_version`, not the producer's. JSON inputs, which carry a `version_path`, are exact. Owner: release hardening (mixed-version clusters).
+
+Open: compaction refuses a chain whose payloads are below the worker's version and fails it with `MigrationError`; the leader skips that key until the waiting generation is replaced or the leader rebuilds. The blocked set lives only in the leader's memory, so a successor may hand a blocked task out again and its worker blocks it once more. Steal and `CLAIM_OLDEST` do not pre-filter versions, which costs one wasted round trip and no run. Owner: post-implementation testing.
+
+Open: `Seam.refused_composites` gains one id for each composite refused for good and is never cleared. Exposure: a process that serves very many refused composites. Impact: slow memory growth. Owner: post-implementation testing.
+
+Open: the result reader has head-of-line blocking, and it and a re-ask's answer can interleave on a multi-threaded runtime, so two remote results that arrive almost together can reach Python in swapped order. A client that misses the leader's push for 30 s and sees no leader change waits until one. Owner: post-implementation testing.
+
+Open: the networked runtime's drain can wait out a delivery's reconnect timeout (`wait_until_reported`); a roll call that outruns the draining acks is refused once; and a leader that leaves through its successor while a third voter is dead leaves one live voter of two (§28.6). Owner: post-implementation testing.
+
+Open: a run whose runner dies after certifying and before mirroring its result to the result backend stays `pending`; `resume` then waits one reconnect timeout and reads the shard, and a small result is lost if the client is gone too. A drain can cut mirrors short. A large composite costs one backend call per part. Owner: post-implementation testing.
+
+### Release hardening
+
+No real workload should adopt kabudachi until this phase is done. It holds the production-readiness gate (§27.2) and the rest of §28.10:
+
+- peer and client authentication and authorization (§28.10). The transport is TCP with Noise and Yamux, so channels are encrypted, but the Noise handshake authenticates only the peer id: nothing decides who may join a shard or submit work. Authenticating peers also closes the trust the Task record store places in its shard (§8.6): it accepts a record write from any peer that passes its key, size and version checks, with no check of the writer's authority and no cap on how many unfinished records a holder keeps;
+- authorization boundaries for queues and tasks, replay protection for identified control messages, and a safe serializer policy (§28.10);
+- a minimal orchestrator requirements document. The implementation minimizes what it demands of the deployment environment (no mandatory Kubernetes, §2.3) and then defines the small set that remains: how peers discover each other, behavior under address churn, reachability between peers, graceful-termination signals and health endpoints;
+- measured submit-to-start latency (§28.11), and the measured time from a worker becoming unreachable to its replacement claim (§8.3);
+- mixed-version clusters: rolling upgrades with workers of two versions in one shard. This covers detecting workers whose `queue_options` differ, converting an older-class value for a newer-class consumer, giving protobuf stage inputs a version, and a submission digest that ignores fields an older build drops (`SubmissionChanged`);
+- the leader's quadratic `holds_composite_back` scan during a reconcile window;
+- Kubernetes and chaos tests (§26.5).
 
 ### Phase 7: observability
 
 Prometheus and tracing should exist earlier for development, but this phase hardens:
 
-- documented metrics;
-- OTel propagation;
+- documented metrics, and the `/metrics` endpoint (§19.9);
+- OTel propagation, filling the reserved trace fields (`trace_parent`, `trace_state`, `baggage`) and `RunInfo.trace_id` and `span_id`;
 - dashboards;
-- lifecycle event API;
+- lifecycle event API, with hooks that watch a run's whole lifecycle (observer hooks);
 - plugin interface, including task-submitting plugins;
 - first-party cron scheduler plugin (§3.8);
 - shared custom metric registry;
@@ -3098,15 +3244,14 @@ Prometheus and tracing should exist earlier for development, but this phase hard
 
 Only after one shard is trustworthy:
 
-- 1,000-worker-scale load testing;
+- 1,000-worker-scale load testing, including whether three replicas are enough at that scale (§28.2), blob lookups in shards above kad's bucket size (20), the leader's memory for settled outcomes of a million-member map, the quorum write each member Task costs and its throughput, the DHT reads a member's claim costs, reduce latency (steps start at the seal; a small item above 64 bytes costs a blob), and the per-second scan of blob owners (`owners_to_check`);
 - client shard map;
 - task shard selection;
 - replacement shards;
 - `ShardLostError`;
 - `.resubmit()`;
 - automatic shard convergence;
-- remote client liveness and the derived `ORPHANED` flow state;
-- networked client result delivery (§8.5);
+- remote client liveness and the derived `ORPHANED` flow state (the leader drives composites, so a dead client no longer strands a flow; but a streamed group, map or reduce whose submitter dies before its last batch keeps running until cancelled);
 - the task-to-shard cache;
 - the disaster-recovery Task store (§9.2).
 
@@ -3124,15 +3269,11 @@ The coalescing, flow, and failure-detection invariants (§25.1 item 9 and §25.4
 | 3 | 25.4.5 under leader loss (a new leader can replay only what reconciliation rebuilds), retained-payload chain across DHT replicas and compaction (the one-node soft/hard-limit backpressure contract is a Phase 1 exit criterion) |
 | 4 | Cold bootstrap, flush with a live leader, restart, and quorum loss plus flush, each against a real Redis-compatible server, with one ShardId per incarnation |
 | 5 | Hard-timeout subprocess kill; heartbeats unaffected by a CPU-bound task subprocess; the multi-process SIGKILL harness (a killed task subprocess, worker and leader, each run certified once); a partitioned worker stopping its runs by their abort deadline |
+| 6 | 25.4.5-25.4.8 over the network under worker and leader loss (the `test_networked` kill scenarios); the §8.5 failure matrix, in the net and Python tests; a 100,000-item map in core, and 2,000 items one-node and 300 networked in Python, each member submitted once and results in input order; a reduce whose `join` step is replayed after its worker was killed; a killed client resuming its result from the result backend; leadership transfer model-checked at Bound A; partition scenarios (50/50, 51/49, a leader with a minority) and DHT-locality discovery in `net`; the installed wheel running a flow on one worker and across a shard of two (`//runtime/tests:test_wheel`) |
 
 ### 27.2 Production-readiness gate
 
-No real workload should adopt kabudachi until the following are closed:
-
-- peer and client authentication, and encrypted transport (§28.10). Authenticating peers also closes the trust the Task record store places in its shard (§8.6): it accepts a record write from any peer that passes its key, size and version checks, with no check of the writer's authority and no cap on how many unfinished records a holder keeps;
-- a minimal orchestrator requirements document. The implementation should minimize what it demands of the deployment environment (no mandatory Kubernetes, §2.3) and then define the small set that remains: how peers discover each other, behavior under address churn, reachability between peers, graceful-termination signals, and health endpoints;
-- measured submit-to-start latency (§28.11), and the measured time from a worker becoming unreachable to its replacement claim (§8.3);
-- mixed-version clusters: rolling upgrades of the worker fleet, with workers of two versions in one shard.
+The release-hardening phase (above) is this gate: no real workload should adopt kabudachi until it is done.
 
 ---
 
@@ -3142,11 +3283,11 @@ The architecture is intentionally prescriptive about semantics, but several impl
 
 ### 28.1 Exact peer transport
 
-Does libp2p simplify the product enough to justify its abstraction cost, or would a custom TLS/QUIC/gRPC peer protocol be easier to operate?
+Closed. The shard runs on rust-libp2p: TCP with Noise and Yamux, Kademlia for records, gossipsub for roll calls and request-response for control and results. It has carried every phase so far; its cost is the dependency, not operations.
 
 ### 28.2 DHT semantics
 
-Phase 3 settled the Task-record part of this question: three replicas by default, a majority write, no expiry for unfinished records, retention of finished ones for the result TTL, and no provider records (§8.6). What remains open is the content manifest structure for large payloads and whether three replicas give adequate durability without excessive chatter at scale.
+Phase 3 settled the Task-record part of this question: three replicas by default, a majority write, no expiry for unfinished records, retention of finished ones for the result TTL, and no provider records (§8.6). Large payloads are closed: they travel as manifests of 256 KiB content-addressed blobs stored with their owner's record (§8.6). Whether three replicas give enough durability without too much chatter at 1,000 workers is measured in Phase 8's load testing.
 
 The DHT should not quietly become a database.
 
@@ -3167,47 +3308,29 @@ Closed. One TTL governs registrations, the fence and the warm-up; it defaults to
 
 ### 28.5 Result-delivery failure matrix
 
-The worker/client/leader certification protocol should be enumerated as a full failure matrix:
-
-- client dies before ACK;
-- leader dies after COMPLETE;
-- certification retransmitted;
-- worker dies after client receives payload;
-- client reconnects through result backend;
-- result payload too large for direct delivery.
+Closed. §8.5 lists the protocol and its failure matrix.
 
 ### 28.6 DHT last-holder shutdown
 
-A draining worker hands its Task records to the holders its leader names and waits for their acknowledgements, bounded by the drain wait limit (§18.1). Every record the worker holds counts, an acknowledgement is a holder's stored-record answer to the write, and a record a holder refuses as older needs no handing over. What remains open:
+Closed. A draining worker hands its Task records to the holders its leader names and waits for their acknowledgements, bounded by the drain wait limit (§18.1). Every record the worker holds counts, an acknowledgement is a holder's stored-record answer to the write, and a record a holder refuses as older needs no handing over. Blobs and composite records are handed off with the Task records. The sole voter of a shard admits a pending member and hands over to it, or waits up to `drain_wait_limit` and logs what leaves. The operator override of the bound is `drain_wait_limit`.
 
-- an operator override of the bound;
-- handing off records that are not Task records, if any are ever kept;
-- draining the sole voter of a shard, a product limit today: a draining leader hands its records only to its other voters, and with none there is no holder to hand them to (a pending member is not a target), so the records leave with it. Whether such a drain should refuse, wait for a voter, or hand records to pending members is an open design question.
+Leaving through a successor while a third voter is dead can leave a quorum-less pair. That edge is tracked under post-implementation testing.
 
 ### 28.7 Map cardinality and backpressure
 
-A million-element `task.map()` cannot simply submit a million Tasks synchronously from one client without bounded fan-out/backpressure. The one-node contract (a `SlowDown` signal that bulk submitters honor, §3.2.1) is the Phase 1 answer; the distributed design remains open.
-
-Map should likely stream task creation while preserving ordered result semantics.
+Closed. `.map` streams batches under `SlowDown` and `BackpressureError`, and its results come back in input order from pages (§3.4).
 
 ### 28.8 Reduction failure behavior
 
-Define how a reduction reacts when a step fails and retries, and what metadata lets observability reconstruct the chain of steps, or the tree when a declared-associative reducer is evaluated as one. §3.4 fixes the outcome once a step has exhausted its retries: the reduce fails and no later step starts.
+Closed. A step is retried per the reducer's `retries`; one that exhausts them fails the reduce and starts nothing new. Each step's task records its reduce and its place (chain index, or tree level and position), which is what observability needs to rebuild the chain or tree (§3.4).
 
 ### 28.9 Logical queue fairness
 
-The leader should eventually define fairness/priority behavior across logical queues:
-
-- strict priority;
-- weighted fair scheduling;
-- starvation protection;
-- per-queue capacity restrictions.
-
-This should remain separate from shard selection.
+Closed. Strict priority tiers, weighted round robin within a tier, starvation aging and per-queue `max_running` (§8.2). Fairness is separate from shard selection.
 
 ### 28.10 Security
 
-Authentication, peer identity, TLS, authorization, and untrusted task submitters have not been fully specified in this brief.
+Authentication, peer identity, authorization, and untrusted task submitters have not been fully specified in this brief.
 
 Before production use, the protocol needs:
 
@@ -3215,8 +3338,11 @@ Before production use, the protocol needs:
 - authenticated clients;
 - authorization boundaries for queues/tasks;
 - replay protection for signed/identified control messages;
-- safe serializer policies;
-- encrypted transport.
+- safe serializer policies.
+
+The transport is encrypted already: Noise secures each connection between peers. It authenticates only the peer ids of the channel, so nothing yet decides who may join or what a peer may do.
+
+Owner: release hardening (§27).
 
 The Task record store checks a record's key, size and version, and trusts every peer of its shard to write it. It does not verify that a writer is the shard's leader or a member, and it does not cap how many unfinished records a holder keeps (the leader's memory budget bounds what an honest leader writes). A forged or flooding peer is stopped only by authenticated peers, so this is part of the gate in §27.2.
 
@@ -3225,6 +3351,8 @@ Do not use Python pickle as a production network serializer.
 ### 28.11 Submit-to-start latency
 
 No latency target is committed. The path is DHT dissemination, worker pull, and a leader claim round trip. Phase 2 prototype measurements should establish a realistic p50/p99 on a warm idle worker in one healthy shard before any target is stated; a leader push-offer to idle workers is a possible optimization if the pull path is too slow.
+
+Owner: release hardening (§27), which measures it.
 
 ### 28.12 Subprocess recycling
 
@@ -3236,7 +3364,7 @@ Closed. A non-retriable TaskRun killed at its hard limit is `FAILED` with a time
 
 ### 28.14 Thresholds and margins
 
-Soft and hard fractions of the retained-payload memory budget (§3.2.1; in Phase 1 they are absolute byte limits), and the clock-skew margin between a worker's abort deadline and the leader's replacement deadline (§8.3), are implementation details to fix with measurements.
+Soft and hard fractions of the retained-payload memory budget (§3.2.1; by default 25% and 50% of available memory), and the clock-skew margin between a worker's abort deadline and the leader's replacement deadline (§8.3), are implementation details to fix with measurements. Measured in post-implementation testing.
 
 ---
 
