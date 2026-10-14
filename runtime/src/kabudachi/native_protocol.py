@@ -355,6 +355,14 @@ class Runtime(Protocol):
         its state and, once it succeeded, its results checked against the
         record."""
 
+    async def mirror_composite(
+        self, composite_id: str, results: Any, expires_in_ms: int
+    ) -> None:
+        """Stores a finished composite's resolved results in the result
+        backend, if there is one, for `expires_in_ms`: `("value", producer,
+        serializer, bytes)`, `("failure", kind, message, task_id)` and nested
+        `("list", [...])`. A failure of the backend is logged, never raised."""
+
     def complete_compaction(self, task_run_id: str, folded: bytes) -> bool | None:
         """Reports the fold of a compaction run; whether the leader applied
         it. `None` when the leader decides elsewhere."""

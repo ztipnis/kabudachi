@@ -67,9 +67,12 @@ class Task(wrapt.ObjectProxy):
             `TaskTimeoutError` and is retried per `retries`. `None` is no
             limit. Defaults to the process's `timeout`. Ignored by `.local()`.
         result_ttl: How long the task's record and mirrored result are kept
-            once it finishes. `None` keeps no result: nothing is mirrored, and
-            the record is kept only the minute the shard needs. Defaults to
-            the queue's `result_ttl`, else the process's.
+            once it finishes. The shard keeps the finished record for this
+            long but never less than a minute; the result backend's entry
+            expires after exactly this long. `None` keeps no result: nothing
+            is mirrored, and the shard keeps the record for that minute.
+            Must be positive. Defaults to the queue's `result_ttl`, else the
+            process's.
         cancel_grace: How long a run has to stop once asked, before it is
             failed anyway and its body abandoned. Defaults to
             the process's.

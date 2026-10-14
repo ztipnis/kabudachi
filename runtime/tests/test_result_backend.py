@@ -9,10 +9,19 @@ import threading
 import time
 
 import _kabudachi_contract
+import pytest
 
+import kabudachi
 from kabudachi import _native
+from kabudachi import config as config_module
+from kabudachi import registry as registry_module
+from kabudachi.config import Configuration
+from kabudachi.errors import ResultUnavailableError, TaskBodyError
+from kabudachi.flow import Flow, flow
 from kabudachi.native_protocol import NetworkedArguments, OneNodeArguments, SubmitArguments
 from kabudachi.options import SubmissionOptions, SubmissionSettings
+from kabudachi.registry import TaskRegistry
+from proto_messages import Greeting
 
 
 class DictBackend:
@@ -271,3 +280,133 @@ def test_a_result_the_backend_lost_is_resumed_from_the_shards_blobs_and_mirrored
     assert lost == {}
     assert (resumed.state, resumed.payload, resumed.definition_id) == ("succeeded", result, "billing.charge")
     assert f"task/{task_id}" in backend.entries
+
+
+class FailingBackend(DictBackend):
+    async def store(self, key, entry, expires_at):
+        raise ConnectionError("the store is down")
+
+
+async def eventually_status(handle, persistence):
+    for _ in range(200):
+        status = await handle.status()
+        if status.persistence == persistence:
+            return status
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{handle.task_id} never reached persistence {persistence!r}: {status}")
+
+
+def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backend(monkeypatch, caplog):
+    monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
+    backend = DictBackend()
+    configuration = Configuration()
+    configuration.configure(processes=0, result_backend=backend)
+    monkeypatch.setattr(config_module, "_process_configuration", configuration)
+
+    @kabudachi.task(name="tests.echo")
+    def echo(request: Greeting) -> Greeting:
+        return Greeting(text=request.text.upper())
+
+    @kabudachi.task(name="tests.unkept", result_ttl=None)
+    def unkept(request: Greeting) -> Greeting:
+        return request
+
+    @kabudachi.task(name="tests.broken")
+    def broken(request: Greeting) -> Greeting:
+        raise ValueError("no")
+
+    @kabudachi.task(name="tests.relay")
+    def relay(request: Greeting) -> Flow:
+        return flow(echo.bind(request), echo)
+
+    async def main():
+        handle = echo(Greeting(text="kept"))
+        assert await handle == Greeting(text="KEPT")
+        await eventually_status(handle, "stored")
+        assert await kabudachi.resume(handle.task_id) == Greeting(text="KEPT")
+
+        # An entry that is not the certified run's value is never returned.
+        key = f"task/{handle.task_id}"
+        original = backend.entries[key]
+        backend.entries[key] = original.replace(b"KEPT", b"KEPS")
+        with pytest.raises(ResultUnavailableError):
+            await kabudachi.resume(handle.task_id)
+        backend.entries[key] = original
+
+        quiet = unkept(Greeting(text="gone"))
+        await quiet
+        assert (await quiet.status()).persistence == "disabled"
+        with pytest.raises(ResultUnavailableError):
+            await kabudachi.resume(quiet.task_id)
+
+        failed = broken(Greeting())
+        with pytest.raises(ValueError):
+            await failed
+        # Only the failure's kind is in the record, as for a task another process ran.
+        with pytest.raises(TaskBodyError) as raised:
+            await kabudachi.resume(failed.task_id)
+        assert raised.value.kind == "ValueError"
+
+        relayed = relay(Greeting(text="twice"))
+        # A task that returned a flow resolves to its stages' results, and so does resuming it.
+        assert await relayed == [Greeting(text="TWICE"), Greeting(text="TWICE")]
+        assert await asyncio.wait_for(kabudachi.resume(relayed.task_id), 5) == await relayed
+
+        with pytest.raises(ResultUnavailableError):
+            await kabudachi.resume("no-such-task")
+
+    kabudachi.run(main)
+
+    # A backend that fails changes no outcome; the failure is logged.
+    configuration.configure(result_backend=FailingBackend())
+
+    async def failing():
+        handle = echo(Greeting(text="still"))
+        assert await handle == Greeting(text="STILL")
+        await eventually_status(handle, "failed")
+
+    with caplog.at_level(logging.WARNING, logger="kabudachi.result_backend"):
+        kabudachi.run(failing)
+    assert any("the store is down" in record.getMessage() for record in caplog.records)
+
+
+def test_a_maps_results_are_resumed_from_the_backend_by_a_later_run_whose_shard_never_held_them(monkeypatch):
+    """A one-node shard lives and dies with its run: the second run's shard
+    has no record of the first run's map, its pages or its blobs, so only the
+    backend can give its results back. Large enough for several pages and
+    a value in chunks, with the default bounds."""
+    monkeypatch.setattr(registry_module, "_default_registry", TaskRegistry())
+    backend = DictBackend()
+    configuration = Configuration()
+    configuration.configure(processes=0, result_backend=backend)
+    monkeypatch.setattr(config_module, "_process_configuration", configuration)
+
+    @kabudachi.task(name="tests.label")
+    def label(request: Greeting) -> Greeting:
+        if request.times == 7:
+            raise ValueError("seven")
+        # About 1 KiB each, so 300 fill two default pages; one member past a
+        # default chunk, so its bytes go as chunks.
+        text = "x" * 300_000 if request.times == 0 else f"{request.times:04}" * 256
+        return Greeting(text=text, times=request.times)
+
+    items = [Greeting(times=n) for n in range(300)]
+
+    async def first():
+        handle = label.map(items, on_error="collect_all")
+        results = await handle
+        return (await handle.status()).composite_id, results
+
+    composite_id, expected = kabudachi.run(first)
+    assert any(key.startswith(f"composite/{composite_id}/page/1") for key in backend.entries), "several pages"
+    assert any("/chunk/" in key for key in backend.entries), "a value in chunks"
+
+    async def later():
+        return await asyncio.wait_for(kabudachi.resume(composite_id), 10)
+
+    resumed = kabudachi.run(later)
+    # The first run's handle gave back the error its own process raised; a
+    # later run has only the failure's kind and message.
+    assert isinstance(expected[7], ValueError)
+    assert isinstance(resumed[7], kabudachi.TaskFailure) and resumed[7].kind == "ValueError"
+    assert resumed[:7] + resumed[8:] == expected[:7] + expected[8:]

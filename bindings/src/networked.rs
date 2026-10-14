@@ -848,31 +848,35 @@ impl NetworkedRuntime {
         })
     }
 
-    /// Stores a finished composite's resolved `results` (see `Resumed.results`
-    /// for the tree's form) in the result backend for `expires_in_ms`, in the
-    /// background. Does nothing without a backend; a failure of the backend is
-    /// logged, never raised.
+    /// Returns an awaitable that resolves, to `None`, once a finished
+    /// composite's resolved `results` (see `Resumed.results` for the tree's
+    /// form) are stored in the result backend, for `expires_in_ms` from now.
+    /// Resolves at once without a backend; a failure of the backend is logged,
+    /// never raised. The caller awaits it in the background: a backend that is
+    /// a Python object runs on the caller's event loop, so the loop must stay
+    /// free until it resolves.
     ///
     /// Raises `TypeError` if `results` is not a result tree.
-    fn mirror_composite(
+    fn mirror_composite<'py>(
         &self,
+        py: Python<'py>,
         composite_id: &str,
-        results: &Bound<'_, PyAny>,
+        results: &Bound<'py, PyAny>,
         expires_in_ms: u64,
-    ) -> PyResult<()> {
-        let Some(backend) = self.shared.backend.clone() else {
-            return Ok(());
-        };
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let backend = self.shared.backend.clone();
         let tree = tree_from_py(results)?;
         let id = CompositeId::new(composite_id);
         let expires_at = expiring_in(StdDuration::from_millis(expires_in_ms));
-        self.host.bridge().spawn_detached(async move {
-            mirror(backend, move || {
-                composite_entries(&ResultBounds::DEFAULT, &id, &tree, expires_at)
-            })
-            .await;
-        });
-        Ok(())
+        self.host.bridge().spawn_into_py(py, async move {
+            if let Some(backend) = backend {
+                mirror(backend, move || {
+                    composite_entries(&ResultBounds::DEFAULT, &id, &tree, expires_at)
+                })
+                .await;
+            }
+            Ok(())
+        })
     }
 
     /// Returns an awaitable that resolves to a `Resumed`: where the task

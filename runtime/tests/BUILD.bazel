@@ -364,6 +364,7 @@ py_test(
         "//bindings:_native",  # keep
         "//bindings/contract",  # keep
         "//runtime/src/kabudachi",
+        "//runtime/tests:proto_messages",
         "@pypi//pytest",  # keep
     ],
 )

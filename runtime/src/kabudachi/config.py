@@ -802,9 +802,10 @@ def configure(**settings: Any) -> None:
     timeout has to stop, `retries` and `timeout`, how many more times a
     failed run is tried and how long a run may take for a task that sets
     neither, `result_backend`, where certified results are mirrored (a Redis
-    or Valkey URL, or an object with async `store` and `load`), `queues`, the queues this worker takes,
-    `queue_options`, each queue's `QueueOptions` (priority, weight, running
-    limit, reconnect timeout, result TTL, starvation age), `router`, which
+    or Valkey URL, or an object with async `store` and `load`), `queues`,
+    the queues this worker takes, `queue_options`, each queue's
+    `QueueOptions` (priority, weight, running limit, reconnect timeout,
+    result TTL, starvation age), `router`, which
     picks the queue of a task that names none, and `memory_soft_limit` and
     `memory_hard_limit`, in bytes of pending task payload (past the soft one
     `group` and `map` pause, past the hard one a submission raises

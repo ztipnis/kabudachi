@@ -28,6 +28,7 @@ py_library(
         "pydantic_serializer.py",
         "registry.py",
         "result_backend.py",
+        "resumption.py",
         "run_info.py",
         "runner.py",
         "schemas.py",
