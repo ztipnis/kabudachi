@@ -178,6 +178,12 @@ class ProcessPool:
         self._replacing: set[asyncio.Task[None]] = set()
         # Dead children are replaced only between a successful start and stop.
         self._serving = False
+        # Set by `stop_at_exit` and never cleared: no child is started after it.
+        self._exiting = False
+        # Held while a child is started and added to `_children`, and by
+        # `stop_at_exit` while it ends serving, so that it never looks at the
+        # children between a child's start and its being listed.
+        self._spawning = threading.Lock()
         self._quick_deaths = 0
 
     # places
@@ -220,13 +226,21 @@ class ProcessPool:
         """
         self._loop = asyncio.get_running_loop()
         try:
-            children = [self._spawn() for _ in range(self._settings.processes)]
+            children = []
+            for _ in range(self._settings.processes):
+                with self._spawning:
+                    if self._exiting:
+                        break
+                    children.append(self._spawn())
             for child in children:
                 self._accept(child, await self._until_ready(child))
         except BaseException:
             await self.stop(kill=True)
             raise
-        self._serving = True
+        with self._spawning:
+            if self._exiting:
+                return
+            self._serving = True
         # A child that died after it was ready, while a sibling was still
         # starting, was not replaced then.
         for _ in range(self._settings.processes - len(self._children)):
@@ -266,9 +280,11 @@ class ProcessPool:
         left running would be waited for forever. Safe to call again, or after
         `stop`."""
         # The loop's thread is still running: a child that dies now must not
-        # be replaced, and one started just before this is found by the next
-        # pass below.
-        self._serving = False
+        # be replaced. One being started holds the lock, so it is listed by the
+        # time this returns from taking it, and none starts after.
+        with self._spawning:
+            self._exiting = True
+            self._serving = False
         deadline = time.monotonic() + _EXIT_GRACE_SECONDS
         while True:
             processes = [
@@ -787,10 +803,11 @@ class ProcessPool:
 
     async def _replace_after(self, delay: float) -> None:
         await asyncio.sleep(delay)
-        if not self._serving:
-            return
         try:
-            child = self._spawn()
+            with self._spawning:
+                if not self._serving:
+                    return
+                child = self._spawn()
         except Exception as error:
             # Out of processes or file descriptors, say: a start that failed
             # at once, tried again later like a child that died at once.
