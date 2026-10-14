@@ -831,6 +831,31 @@ def test_a_task_the_runtime_says_expired_fails_its_handle_with_task_expired_erro
     run(with_events(world, body))
 
 
+BURST = 10_000
+# Submitting ten thousand tasks and settling them takes about a second on a
+# laptop; this is the backstop, not the expectation.
+BURST_WAIT = 30
+
+
+def test_ten_thousand_expiries_decided_together_reach_every_waiting_handle():
+    world = World(echo)
+    world.runtime.hold_claims = True
+    # Nothing is claimed, so the runtime expires every task. The submissions
+    # never yield to the loop, so the event watcher cannot run until all are
+    # made: the expiries pile up in the native runtime and reach Python
+    # together, in as few batches as it hands over.
+
+    async def body():
+        handles = [submit_expiring(world, str(n)) for n in range(BURST)]
+        outcomes = await asyncio.gather(*handles, return_exceptions=True)
+        assert len(outcomes) == BURST
+        unexpected = [outcome for outcome in outcomes if not isinstance(outcome, TaskExpiredError)]
+        assert unexpected == []
+        await world.session.wait_until_idle()
+
+    run(with_events(world, body, limit=BURST_WAIT))
+
+
 def test_a_task_the_runtime_says_has_a_full_record_fails_its_handle_with_task_record_full_error():
     world = World(echo)
 

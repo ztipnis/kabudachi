@@ -73,12 +73,13 @@ class World:
     def call(self, name, argument):
         return self.session.submit(self.tasks[name].definition, argument)
 
-    async def working(self, body):
-        """Runs `body` while the session's worker loop is claiming tasks."""
+    async def working(self, body, limit=WAIT):
+        """Runs `body` while the session's worker loop is claiming tasks,
+        failing it once `limit` seconds have passed."""
         await asyncio.wait_for(self.native.wait_until_leader(), WAIT)
         worker = asyncio.ensure_future(self.session.work())
         try:
-            return await asyncio.wait_for(body(), WAIT)
+            return await asyncio.wait_for(body(), limit)
         finally:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
@@ -97,11 +98,11 @@ def run(coroutine):
     return asyncio.run(coroutine)
 
 
-async def with_events(world, body):
+async def with_events(world, body, limit=WAIT):
     """Runs `body` with both the worker loop and the event watcher going."""
     events = asyncio.ensure_future(world.session.watch_events())
     try:
-        return await world.working(body)
+        return await world.working(body, limit)
     finally:
         events.cancel()
         await asyncio.gather(events, return_exceptions=True)
