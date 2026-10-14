@@ -17,8 +17,8 @@ use std::ops::Deref;
 use crate::protocol::generated;
 use crate::protocol::messages::{
     ElectionCertificate, ElectionMessage, ElectionReject, LeaderHeartbeatAck, RequiredIds,
-    RollCall, RollCallReply, SelfRemove, ValidConfigurations, VoteGrant, VoteRequest,
-    WorkerHeartbeat, election_message,
+    RollCall, RollCallReply, SelfRemove, TransferLeadership, ValidConfigurations, VoteGrant,
+    VoteRequest, WorkerHeartbeat, election_message,
 };
 
 /// An election message that decoding has proven well formed; the only kind
@@ -149,6 +149,11 @@ pub fn decode(message: ElectionMessage) -> Result<CheckedMessage, MalformedMessa
         Some(Payload::SelfRemove(m)) => {
             has_ids_and_configurations(m, "SelfRemove")?;
         }
+        Some(Payload::TransferLeadership(m)) => {
+            let name = "TransferLeadership";
+            check_ids(m, name)?;
+            check_term(m.term, name)?;
+        }
     }
     Ok(CheckedMessage(message))
 }
@@ -246,6 +251,7 @@ pub enum CheckedPayload {
     ElectionReject(Checked<ElectionReject>),
     SelfRemove(Checked<SelfRemove>),
     ElectionCertificate(Checked<ElectionCertificate>),
+    TransferLeadership(Checked<TransferLeadership>),
 }
 
 impl CheckedPayload {
@@ -262,6 +268,7 @@ impl CheckedPayload {
             Payload::ElectionReject(m) => Self::ElectionReject(Checked(m)),
             Payload::SelfRemove(m) => Self::SelfRemove(Checked(m)),
             Payload::ElectionCertificate(m) => Self::ElectionCertificate(Checked(m)),
+            Payload::TransferLeadership(m) => Self::TransferLeadership(Checked(m)),
         }
     }
 }

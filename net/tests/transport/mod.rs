@@ -2,6 +2,7 @@
 //! connects to peers over real sockets.
 
 mod addresses;
+mod flush;
 mod input_queue;
 mod message_limit;
 mod simultaneous_dial;

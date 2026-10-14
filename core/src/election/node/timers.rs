@@ -2,6 +2,7 @@ use crate::hashing::Field;
 use crate::protocol::worker_state::WorkerState;
 use crate::time::{Clock, Duration, Instant};
 
+use super::super::drain::DrainRequest;
 use super::super::{WorkerNode, lengthen_by_less_than_half};
 
 impl<C> WorkerNode<C>
@@ -32,12 +33,26 @@ where
     pub(super) fn tick(&mut self) {
         match self.state {
             WorkerState::Active => {
+                if self.drain_request.hands_over()
+                    && self.drain_request.gave_up_waiting(self.clock.now())
+                {
+                    self.drain_request = DrainRequest::NotAsked;
+                    self.drain();
+                    return;
+                }
                 if self.clock.now() - self.last_leader_contact > self.jittered_suspect_timeout() {
                     self.round.may_call_from(self.clock.now());
                     self.transition_to(WorkerState::LeaderSuspect);
                 }
             }
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
+                // A node that handed its leadership over and then lost the
+                // successor gives up here too, at its hand-over's end: with
+                // no leader to leave through, it leaves without one.
+                if self.drain_request.gave_up_waiting(self.clock.now()) {
+                    self.drain_without_a_leader();
+                    return;
+                }
                 if self.can_start_roll_call() {
                     let now = self.clock.now();
                     let timestamp_millis = self.clock.wall_clock_millis();
@@ -45,11 +60,18 @@ where
                 }
             }
             WorkerState::RollCall | WorkerState::Candidate => {
+                if self.state == WorkerState::RollCall
+                    && self.drain_request.gave_up_waiting(self.clock.now())
+                {
+                    self.drain_without_a_leader();
+                    return;
+                }
                 let now = self.clock.now();
                 self.decide(|round, view| round.on_deadline(view, now));
             }
             WorkerState::LeaderReconciling | WorkerState::Leader => {
-                self.drain_once_free();
+                self.end_transfer_if_due();
+                self.hand_over_once_free();
                 if self.holds_office() {
                     self.report_lost_workers();
                 }
@@ -88,7 +110,7 @@ where
     /// confirms this node's own epoch, or found the authority holding none:
     /// a node at an epoch the authority does not hold must rejoin, not elect
     /// a leader there that would pull the others off the authority's epoch.
-    fn may_stand(&self) -> bool {
+    pub(super) fn may_stand(&self) -> bool {
         match (self.authority.as_ref(), self.standing.epoch()) {
             (Some(authority), Some(own)) => authority.permits_standing(own),
             _ => true,
@@ -111,8 +133,13 @@ where
         lengthen_by_less_than_half(self.timings.suspect_timeout, share)
     }
 
+    /// Whether this node's leader still leads, against a roll call: heard
+    /// within a suspicion timeout and not handing its leadership over (nor
+    /// this node itself handing over).
     pub(super) fn current_leader_still_valid(&self) -> bool {
-        self.clock.now() - self.last_leader_contact <= self.timings.suspect_timeout
+        !self.leader_draining
+            && self.transfer.is_none()
+            && self.clock.now() - self.last_leader_contact <= self.timings.suspect_timeout
     }
 
     /// The latest term this node knows of: the highest it has seen, or that

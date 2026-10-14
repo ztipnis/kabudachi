@@ -22,7 +22,9 @@ use crate::support::worker::{spawn_worker, worker_config};
 async fn a_request_routed_to_the_leader_gets_its_decision_and_ends_once_the_worker_leaves() {
     within_deadline(async {
         let timings = ElectionTimings::new(Duration::from_millis(2_000), Duration::from_millis(100))
-            .with_roll_call_deadline(Duration::from_millis(100));
+            .with_roll_call_deadline(Duration::from_millis(100))
+            // Alone, it waits this long for another voter to hand over to before it leaves.
+            .with_drain_wait_limit(Duration::from_millis(500));
         let config = worker_config(ShardId::new("routed-requests"), "/ip4/127.0.0.1/tcp/0", timings, vec![])
             .with_memory_limits(MemoryLimits { soft: 1, hard: 1 });
         let mut worker = spawn_worker(config).await;

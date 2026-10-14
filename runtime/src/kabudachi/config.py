@@ -343,6 +343,22 @@ class Settings:
     run is failed and its body abandoned. `KABUDACHI_CANCEL_GRACE` gives it
     in seconds."""
 
+    drain_grace: timedelta | None = None
+    """While `run` serves, how long tasks still running after the first SIGINT
+    or SIGTERM have to finish before they are stopped as a second signal would
+    stop them. `None` waits for them however long they take.
+    `KABUDACHI_DRAIN_GRACE` gives it in seconds."""
+
+    drain_wait_limit: timedelta | None = None
+    """How long a networked worker that is leaving its shard waits at each step:
+    a leader for its voters to be ready to take over (and, alone, for another
+    voter to hand over to), a worker with no leader for one to appear, and every
+    worker for the Task records it holds to be stored by others. Records still
+    held then leave with it, and are logged. Shutdown gives up waiting for the
+    node to leave after four such waits plus a heartbeat timeout, and then shuts
+    down. `None` is ten heartbeat timeouts.
+    `KABUDACHI_DRAIN_WAIT_LIMIT` gives it in seconds."""
+
     def __post_init__(self) -> None:
         # In this order, so a value with several bad settings names the same
         # one first as it always has.
@@ -461,6 +477,15 @@ class Settings:
         if not is_non_negative_timedelta(self.cancel_grace):
             raise ValueError(
                 f"cancel_grace must be a non-negative timedelta, not {self.cancel_grace!r}"
+            )
+        if self.drain_grace is not None and not is_non_negative_timedelta(self.drain_grace):
+            raise ValueError(
+                f"drain_grace must be a non-negative timedelta or None, not {self.drain_grace!r}"
+            )
+        if self.drain_wait_limit is not None and not is_positive_timedelta(self.drain_wait_limit):
+            raise ValueError(
+                f"drain_wait_limit must be a positive timedelta or None, not "
+                f"{self.drain_wait_limit!r}"
             )
 
     def _check_queues(self) -> None:

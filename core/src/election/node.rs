@@ -15,4 +15,5 @@ mod queries;
 mod refusals;
 mod step;
 mod timers;
+mod transfer;
 mod voting;

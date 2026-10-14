@@ -4,6 +4,7 @@ reported instead of waited on, and the example in runtime/README.md runs and
 does what its comment says."""
 
 import asyncio
+import logging
 import os
 import re
 import signal
@@ -13,6 +14,7 @@ import threading
 import time
 import traceback
 import types
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -89,6 +91,10 @@ class StandInNetworked(FaultingNative):
     async def wait_until_reported(self):
         self.calls.append("reported")
 
+    async def drain(self):
+        self.calls.append("drain")
+        return (0, 0, [])
+
 
 @pytest.mark.parametrize("fails", [False, True], ids=["returns", "raises"])
 def test_a_networked_run_stops_taking_and_waits_for_its_reports_however_main_ends(
@@ -119,9 +125,51 @@ def test_a_networked_run_stops_taking_and_waits_for_its_reports_however_main_end
         assert kabudachi.run(main) == "done"
 
     native = only_native()
-    assert native.calls == ["ready", "stop_taking", "reported"]
+    assert native.calls == ["ready", "stop_taking", "reported", "drain"]
     assert native.shutdowns == 1
     assert session_module.active_session() is None
+
+
+class NeverLeaves(StandInNetworked):
+    """A networked node whose drain never finishes, as when it is fenced."""
+
+    async def drain(self):
+        self.calls.append("drain")
+        await asyncio.Event().wait()
+
+
+def test_a_networked_run_whose_node_never_finishes_leaving_still_returns(monkeypatch, caplog):
+    configuration = Configuration()
+    configuration.configure(
+        processes=1,
+        listen="/ip4/127.0.0.1/tcp/0",
+        heartbeat_interval=timedelta(milliseconds=10),
+        heartbeat_timeout=timedelta(milliseconds=50),
+        drain_wait_limit=timedelta(milliseconds=20),
+    )
+    monkeypatch.setattr(config_module, "_process_configuration", configuration)
+    monkeypatch.setattr(runner_module, "_native", SimpleNamespace(NetworkedRuntime=NeverLeaves))
+    monkeypatch.setattr(
+        runner_module,
+        "_executor_for",
+        lambda configuration: InProcessExecutor(
+            registry_module.default_registry(), process_serializers(), 1, HookRegistry()
+        ),
+    )
+
+    async def main():
+        return "done"
+
+    results = []
+    thread = threading.Thread(target=lambda: results.append(kabudachi.run(main)), daemon=True)
+    with caplog.at_level(logging.WARNING, logger=runner_module.__name__):
+        thread.start()
+        thread.join(timeout=30)
+
+    assert not thread.is_alive(), "run() waits for a drain that never finishes"
+    assert results == ["done"]
+    assert only_native().shutdowns == 1
+    assert "did not finish leaving its shard" in caplog.text
 
 
 def test_a_run_that_completes_shuts_the_native_runtime_down_and_ends_the_session():

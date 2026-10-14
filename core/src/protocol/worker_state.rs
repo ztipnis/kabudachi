@@ -58,7 +58,9 @@ impl WorkerState {
     /// quorum, `RollCall`
     /// for `NoQuorum`. A `NoQuorum` node
     /// leaves by a roll call of its own (`-> RollCall`) or by an ack from a
-    /// leader (`-> Active`).
+    /// leader (`-> Active`). A node asked to drain that has found no leader
+    /// within its drain wait leaves from `LeaderSuspect`, `RollCall` or
+    /// `NoQuorum` (`-> Draining`).
     ///
     /// With a coordination authority: a
     /// `NoQuorum` node whose authority path swaps the recovery epoch stands
@@ -97,7 +99,10 @@ impl WorkerState {
                 | (WorkerState::LeaderSuspect, WorkerState::NoQuorum)
                 | (WorkerState::LeaderSuspect, WorkerState::Bootstrapping)
                 | (WorkerState::LeaderSuspect, WorkerState::Fenced)
+                | (WorkerState::LeaderSuspect, WorkerState::Draining)
                 | (WorkerState::LeaderSuspect, WorkerState::Stopped)
+                | (WorkerState::RollCall, WorkerState::Draining)
+                | (WorkerState::NoQuorum, WorkerState::Draining)
                 | (WorkerState::RollCall, WorkerState::Active)
                 | (WorkerState::RollCall, WorkerState::LeaderSuspect)
                 | (WorkerState::RollCall, WorkerState::Candidate)

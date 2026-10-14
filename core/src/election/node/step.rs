@@ -40,6 +40,7 @@ where
             Input::AuthorityEpochAsked(token) => self.note_epoch_read_asked(token),
             Input::AuthorityEpochRead { token, held } => self.on_epoch_read(token, held),
             Input::Drain => self.request_drain(),
+            Input::TransferLeadership => self.transfer_leadership(),
             Input::RoutingCrawled => self.crawled_at_admission = self.admission(),
             Input::Reconciled(office) => self.on_reconciled(office),
             Input::WatchWorkers {
@@ -79,18 +80,23 @@ where
     ///
     /// - `Active`: the first instant past its jittered suspicion timeout
     ///   (see [`Self::jittered_suspect_timeout`]), or its next heartbeat to
-    ///   its leader if that comes first.
+    ///   its leader if that comes first, or the end of its wait for the
+    ///   leader it handed over to (see [`Input::Drain`](crate::election::Input::Drain)).
     /// - `LeaderSuspect` and `NoQuorum`: when it may start a roll call (see
     ///   [`Self::next_roll_call_due`]), or its next heartbeat to its leader
-    ///   if that comes first; `None` for a node with neither, a joiner with
-    ///   no configuration and no leader to heartbeat.
+    ///   if that comes first, or the end of a drain's wait for a leader;
+    ///   `None` for a node with none of these, a joiner with no
+    ///   configuration and no leader to heartbeat.
     /// - `RollCall`: its roll call's deadline, or its next heartbeat to its
-    ///   leader if that comes first.
+    ///   leader if that comes first, or the end of a drain's wait for a
+    ///   leader.
     /// - `Candidate`: its vote's deadline.
     /// - `LeaderReconciling` and `Leader`: when it goes `NoQuorum` unless
     ///   more confirmations arrive (never, for a leader that alone is a
-    ///   quorum), or when it next has a worker to report silent or lost,
-    ///   whichever comes first.
+    ///   quorum), when it next has a worker to report silent or lost, the
+    ///   end of a hand-over it began (a draining node then departs alone),
+    ///   or, with no hand-over under way, the end of a drain's wait to hand
+    ///   over, whichever comes first.
     /// - Every other state: `None`.
     ///
     /// With an authority, also the lease's next registration or fence
@@ -118,12 +124,19 @@ where
                 let suspicion = self.last_leader_contact
                     + self.jittered_suspect_timeout()
                     + Duration::from_ticks(1);
-                Some(next_heartbeat.map_or(suspicion, |at| at.min(suspicion)))
+                let waking = earliest(next_heartbeat, self.drain_request.wakes_at());
+                Some(waking.map_or(suspicion, |at| at.min(suspicion)))
             }
             WorkerState::LeaderSuspect | WorkerState::NoQuorum => {
-                earliest(next_heartbeat, self.next_roll_call_due())
+                earliest(
+                    earliest(next_heartbeat, self.next_roll_call_due()),
+                    self.drain_request.wakes_at(),
+                )
             }
-            WorkerState::RollCall => earliest(next_heartbeat, self.round.next_deadline()),
+            WorkerState::RollCall => earliest(
+                earliest(next_heartbeat, self.round.next_deadline()),
+                self.drain_request.wakes_at(),
+            ),
             WorkerState::Candidate => self.round.next_deadline(),
             WorkerState::LeaderReconciling | WorkerState::Leader => self.office_deadline(),
             _ => None,
@@ -131,8 +144,9 @@ where
     }
 
     /// What a node in office waits for: going `NoQuorum` unless more
-    /// confirmations arrive, its next worker to report lost or silent, and a
-    /// kept drain's wake-up, whichever comes first.
+    /// confirmations arrive, its next worker to report lost or silent, and the
+    /// end of a hand-over under way or, with none, of a drain's wait,
+    /// whichever comes first.
     fn office_deadline(&self) -> Option<Instant> {
         let office = self.office.as_ref();
         let no_quorum = office.and_then(|office| {
@@ -149,9 +163,17 @@ where
         let silent = office.and_then(|office| {
             office.next_silent_at(self.clock.now(), self.timings.suspect_timeout)
         });
+        let transfer_ends = self.transfer.as_ref().map(|transfer| transfer.until);
+        // While a hand-over lasts, a drain's wait ends no sooner than it
+        // does: a `Tick` before then moves nothing, so reporting the wait's
+        // end would leave the node due without end.
+        let drain_wakes = match self.transfer {
+            Some(_) => None,
+            None => self.drain_request.wakes_at(),
+        };
         earliest(
-            earliest(no_quorum, lost),
-            earliest(self.drain_request.wakes_at(), silent),
+            earliest(earliest(no_quorum, lost), transfer_ends),
+            earliest(drain_wakes, silent),
         )
     }
 
@@ -174,13 +196,19 @@ where
         if self.holds_office() && next != WorkerState::Leader {
             // Losing office mid-wait keeps the request: the node drains
             // when it next reaches `Active`, `LeaderReconciling` or `Leader`.
-            self.drain_request.office_lost();
+            self.drain_request
+                .office_lost(self.clock.now(), self.timings.drain_wait_limit);
             self.lease.withdraw_grant(self.clock.now());
             self.outputs.push(Output::Grant(None));
             self.leave_office();
         }
         if let Some(authority) = self.authority.as_mut() {
             authority.state_changed(next);
+        }
+        // The roll call a leader's hand-over asked for is over once the node
+        // leaves the states it runs in.
+        if !matches!(next, WorkerState::LeaderSuspect | WorkerState::RollCall) {
+            self.handed_over_by = None;
         }
         // Only a rejoining node keeps a read it awaits or a pointer it holds.
         if !matches!(next, WorkerState::Bootstrapping | WorkerState::Joining) {
@@ -200,6 +228,7 @@ where
     /// the standing while this node still leads, so what it writes is not
     /// overwritten by the configuration this node led.
     pub(super) fn leave_office(&mut self) {
+        self.transfer = None;
         if let Some(office) = self.office.take() {
             office.hand_back(&mut self.standing, &self.my_id);
         }
@@ -272,6 +301,9 @@ where
                 if certificate.leader_id() == from =>
             {
                 self.on_election_certificate(&from, &certificate);
+            }
+            Some(CheckedPayload::TransferLeadership(asked)) if asked.leader_id() == from => {
+                self.on_transfer_leadership(&from, &asked);
             }
             _ => {}
         }

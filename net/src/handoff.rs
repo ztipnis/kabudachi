@@ -69,7 +69,7 @@ struct Round {
 /// Hands every record this worker holds to the holders `to` says, writing
 /// again after `retry_after` any a holder refused or no one answered for, and
 /// stopping at `deadline`. Records still not stored then are abandoned and
-/// logged.
+/// logged, at error level, by id.
 pub(crate) async fn hand_off_held_records(
     net: &Net,
     to: HandOffTo,
@@ -95,8 +95,13 @@ pub(crate) async fn hand_off_held_records(
         }
     }
     done.abandoned.extend(waiting);
-    for task in &done.abandoned {
-        tracing::warn!(task = task.as_str(), "a drained worker could not hand a record over");
+    if !done.abandoned.is_empty() {
+        let records: Vec<&str> = done.abandoned.iter().map(TaskId::as_str).collect();
+        tracing::error!(
+            count = records.len(),
+            records = ?records,
+            "this worker is leaving its shard with Task records no other worker took; they leave with it"
+        );
     }
     hand_off_held_blobs(net, &to, factor, retry_after, deadline, &mut done).await;
     done

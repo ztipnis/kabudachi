@@ -67,7 +67,9 @@
 //! each goes, or, if it led, places them among its other voters, and writes
 //! each copy to those holders before it returns. A leader answers that
 //! question for any asker, a worker it has already taken out of its roster
-//! included, as it decides nothing.
+//! included, as it decides nothing. Before it returns it also waits until
+//! every election message it sent was answered or failed (see
+//! `Net::flush_sent`), so its departure is on the wire when the process exits.
 //!
 //! A node that takes office reconciles before it leads (see
 //! `crate::reconcile::leader`). The driver asks every worker of the office's
@@ -314,6 +316,7 @@ where
     C: Clock,
     I: IdGenerator,
 {
+    let flush_limit = Duration::from_millis(node.timings().drain_wait_limit.as_ticks());
     let mut run = DriverRun::start(
         node, first, net, scheduler, clock, authority, executor, config, observe,
     );
@@ -322,7 +325,22 @@ where
         // A node that drained has nothing more to do but hand its records
         // over; the worker may exit once that is done.
         if let Some(to) = run.drained() {
-            return run.hand_off(to).await;
+            let handed = run.hand_off(to).await;
+            // What the final steps sent (the departure announcement among
+            // it) is only queued for the network task; the worker may exit
+            // as soon as this returns, so wait until it was received, but no
+            // longer than the drain wait limit: a peer that never answers
+            // would otherwise hold the worker for libp2p's request timeout.
+            if tokio::time::timeout(flush_limit, net.flush_sent())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    limit_ms = flush_limit.as_millis() as u64,
+                    "gave up waiting for the last election messages to be answered"
+                );
+            }
+            return handed;
         }
         run.sleep().await;
     }

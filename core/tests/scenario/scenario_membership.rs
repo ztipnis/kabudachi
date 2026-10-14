@@ -425,18 +425,24 @@ fn a_draining_leader_waits_for_its_voters_routing_crawl_and_the_survivors_elect(
         let _ = cluster.routing_crawled(follower);
     }
     // The drain wait lasts ten suspicion timeouts, so only the crawl reports
-    // can release the leader this early: were they ignored, it would hold on
-    // for most of the remaining wait.
-    for _ in 0..2 * SUSPECT.as_ticks() {
-        if cluster.states()[&leader] == WorkerState::Stopped {
-            break;
-        }
-        cluster.advance(TICK);
-    }
-    assert_eq!(
-        cluster.states()[&leader],
-        WorkerState::Stopped,
+    // can release the leader this early: it hands over at once, and a
+    // follower takes office.
+    assert!(
+        (0..2 * SUSPECT.as_ticks()).any(|_| {
+            cluster.advance(TICK);
+            followers.iter().any(|follower| {
+                matches!(
+                    cluster.states()[follower],
+                    WorkerState::LeaderReconciling | WorkerState::Leader
+                )
+            })
+        }),
         "the crawl reports release the leader long before its drain wait ends"
+    );
+    assert!(
+        run_until(&mut cluster, |cluster| cluster.states()[&leader]
+            == WorkerState::Stopped),
+        "it leaves through its successor"
     );
     let survivors_elect = run_until(&mut cluster, |cluster| {
         cluster

@@ -81,7 +81,7 @@ where
             };
             office.take_heartbeat(from.clone(), heard, member_report(heartbeat), &duties);
         }
-        self.drain_once_free();
+        self.hand_over_once_free();
         if !self.holds_office() {
             return;
         }
@@ -168,15 +168,19 @@ where
             return;
         };
         let content = office.ack_for(&to);
-        self.send_ack_with(to, content, heartbeat_token);
+        let draining = self.transfer.is_some();
+        self.send_ack_with(to, content, heartbeat_token, draining);
     }
 
-    /// Sends `to` an ack carrying `content` from this leader.
+    /// Sends `to` an ack carrying `content` from this leader; `draining` when
+    /// the leader is handing its leadership over or leaving, so the ack
+    /// refreshes no contact and ends no suspicion.
     pub(super) fn send_ack_with(
         &mut self,
         to: WorkerId,
         content: AckContent,
         heartbeat_token: Option<u64>,
+        draining: bool,
     ) {
         let cancelled_runs = self
             .cancelled_runs
@@ -196,6 +200,7 @@ where
             heartbeat_token,
             recovery_epoch_lineage: self.standing.epoch().map_or(0, |epoch| epoch.lineage),
             cancelled_runs,
+            leader_draining: draining,
         };
         self.send(to, election_message::Payload::HeartbeatAck(ack));
     }
@@ -216,7 +221,7 @@ where
             return;
         };
         for (peer, content) in office.announce(&self.connected) {
-            self.send_ack_with(peer, content, None);
+            self.send_ack_with(peer, content, None, false);
         }
     }
 

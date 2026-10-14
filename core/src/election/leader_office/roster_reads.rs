@@ -78,6 +78,27 @@ impl LeaderOffice {
             .collect()
     }
 
+    /// The voter to hand leadership to: of the committed single
+    /// configuration's voters other than `me`, not reported lost and not
+    /// leaving, the one that confirmed an ack of this office last (or was
+    /// first heard last, having confirmed none); the lowest id among equals.
+    /// `None` under a joint configuration or with no such voter.
+    pub(crate) fn successor(&self, me: &WorkerId) -> Option<WorkerId> {
+        self.roster.configuration().voter_count()?;
+        self.placeable_voter_ids(me)
+            .into_iter()
+            .filter(|voter| voter != me && !self.pending_removals.contains(voter))
+            .filter_map(|voter| {
+                self.liveness
+                    .confirmed_at(&voter)
+                    .map(|at| (at, voter))
+            })
+            .max_by(|(at, voter), (other_at, other)| {
+                at.cmp(other_at).then_with(|| other.cmp(voter))
+            })
+            .map(|(_, voter)| voter)
+    }
+
     /// Whether the roster holds `worker` as a voter of the committed
     /// configuration or as a pending member. Removals pending are not applied
     /// first: a worker that has just asked to leave may be counted once more,

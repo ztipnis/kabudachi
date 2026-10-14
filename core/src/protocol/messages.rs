@@ -25,7 +25,7 @@ pub use generated::{
     ClaimResponse, ElectionCertificate, ElectionMessage, ElectionReject, ElectionRejectReason,
     JoinRequest, JoinResponse, KnownLeader, LeaderHeartbeatAck, RollCall, RollCallReply,
     AbsorbedGeneration, ChainEntry, CoalescingLink, SelfRemove, Task, TaskRecord, TaskRun,
-    TaskRunIdentity, VoteGrant, VoteRequest, WorkerHeartbeat, chain_entry,
+    TaskRunIdentity, TransferLeadership, VoteGrant, VoteRequest, WorkerHeartbeat, chain_entry,
     claim_request, claim_response, election_message,
 };
 pub use generated::{
@@ -145,6 +145,11 @@ id_accessors!(ElectionCertificateIds for Checked<ElectionCertificate>, of Electi
 });
 id_accessors!(SelfRemoveIds for Checked<SelfRemove>, of SelfRemove {
     required: [worker_id: WorkerId, incarnation_id: IncarnationId, shard_id: ShardId],
+    optional: [],
+    repeated: [],
+});
+id_accessors!(TransferLeadershipIds for Checked<TransferLeadership>, of TransferLeadership {
+    required: [shard_id: ShardId, leader_id: WorkerId, target_id: WorkerId],
     optional: [],
     repeated: [],
 });
@@ -386,7 +391,8 @@ pub mod prelude {
         ElectionRejectConfigurations, ElectionRejectIds, JoinResponseIds,
         LeaderHeartbeatAckConfigurations, LeaderHeartbeatAckIds, RollCallConfigurations,
         RollCallIds, RollCallReplyConfigurations, RollCallReplyIds, SelfRemoveConfigurations,
-        SelfRemoveIds, TaskIds, TaskRunIdentityIds, VoteGrantIds, VoteRequestConfigurations,
-        VoteRequestIds, WorkerHeartbeatConfigurations, WorkerHeartbeatIds,
+        SelfRemoveIds, TaskIds, TaskRunIdentityIds, TransferLeadershipIds, VoteGrantIds,
+        VoteRequestConfigurations, VoteRequestIds, WorkerHeartbeatConfigurations,
+        WorkerHeartbeatIds,
     };
 }

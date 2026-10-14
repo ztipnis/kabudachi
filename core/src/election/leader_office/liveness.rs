@@ -267,6 +267,12 @@ impl Liveness {
         lost
     }
 
+    /// When `worker` last confirmed an ack, or was first heard if it has
+    /// confirmed none; `None` for a worker not counted.
+    pub(super) fn confirmed_at(&self, worker: &WorkerId) -> Option<Instant> {
+        self.confirmed_at.get(worker).copied()
+    }
+
     /// Whether `worker` was reported lost and not heard since.
     pub(super) fn is_lost(&self, worker: &WorkerId) -> bool {
         self.lost.contains(worker)

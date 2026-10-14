@@ -458,3 +458,22 @@ def killed_while_running(cluster, tmp_path, leader, follower, texts):
 
     eventually("the leader and the follower to each run one", spread)
     leader.kill()
+
+
+def test_a_stopped_leader_hands_over_and_leaves_and_the_two_left_keep_certifying(cluster):
+    leader = cluster.leader()
+    others = [worker for worker in cluster.workers if worker is not leader]
+
+    assert leader.stop() == 0
+
+    def handed_over():
+        leaders = {worker.leader() for worker in others}
+        if len(leaders) != 1 or None in leaders:
+            return False
+        ((new_leader, _),) = leaders
+        # Two voters: it left through its successor rather than vanishing.
+        return new_leader != leader.id and cluster.by_id(new_leader).voters() == 2
+
+    eventually("the two left to follow a new leader of two voters", handed_over, timeout=10)
+    task_id = others[0].submit("spin", times=0)
+    certified_once(cluster, task_id, digest_of(spin, Greeting(text="spun")))

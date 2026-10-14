@@ -172,7 +172,9 @@ class NetworkedArguments:
     `seed_rounds` silent rounds pass before a worker with seeds founds the
     shard alone; `routing_refresh_ms` is the period of the routing crawl
     nothing prompted. With `health_listen`, the worker serves `/healthz` and
-    `/readyz` there, as for `OneNodeArguments`.
+    `/readyz` there, as for `OneNodeArguments`. `drain_wait_limit_ms` bounds
+    each wait of a worker that is leaving its shard (ten heartbeat timeouts
+    unless given).
     """
 
     shard: str
@@ -194,6 +196,7 @@ class NetworkedArguments:
     health_listen: str | None = None
     queues: tuple[str, ...] | None = None
     queue_options: tuple[QueueOptionsArgument, ...] = ()
+    drain_wait_limit_ms: int | None = None
 
 
 @runtime_checkable

@@ -305,6 +305,10 @@ enum Command {
     SetExternalAddress {
         address: Multiaddr,
     },
+    /// See `Net::flush_sent`.
+    FlushSent {
+        respond_to: oneshot::Sender<()>,
+    },
     /// See `Net::get_record`.
     GetRecord {
         task: TaskId,
@@ -1145,6 +1149,24 @@ impl Net {
         // being dropped), there is nowhere for the command to go, and that
         // is fine to drop.
         let _ = self.commands.send(Command::Send { to: peer, message });
+    }
+
+    /// Resolves once every message [`Self::send`] has been given so far was
+    /// answered by its peer (so it was received) or failed (no connection
+    /// could be made, the connection closed, or the peer did not answer within
+    /// libp2p's request timeout). Messages published to the shard's topic are
+    /// not waited for. A worker about to exit calls this so what it sent last
+    /// is on the wire before the process ends; a `Net` dropped first loses
+    /// whatever its swarm task had not yet written. Resolves at once if the
+    /// swarm task has stopped. It waits as long as the slowest message takes,
+    /// up to libp2p's request timeout (10 s) toward a peer that never answers;
+    /// a caller that must not wait that long bounds it with a timeout, as
+    /// `run_driver` does with the node's drain wait limit.
+    pub async fn flush_sent(&self) {
+        let (respond_to, flushed) = oneshot::channel();
+        if self.commands.send(Command::FlushSent { respond_to }).is_ok() {
+            let _ = flushed.await;
+        }
     }
 
     /// Subscribes this `Net` to `shard`'s gossip topic, so it receives what

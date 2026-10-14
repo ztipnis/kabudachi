@@ -70,6 +70,17 @@
 //! alone, the voters it places records on: those it has not reported lost
 //! and not heard since (see [`WorkerNode::placeable_voters`]).
 //!
+//! A leader can also hand its leadership over without leaving (see
+//! [`Input::TransferLeadership`]): it stops granting and vouching, tells every
+//! peer so on its acks, and asks the voter that confirmed its acks last to
+//! stand for election at once. Meanwhile it takes part in elections like a
+//! follower, so a shard whose other voters are few can still elect its
+//! successor, and granting a later term deposes it. A follower that accepts
+//! such an ack keeps its old leader-contact time and any roll call it runs,
+//! and refuses no roll call for a leader that is valid. If no leader of a
+//! later term is heard within one suspicion timeout, the hand-over ends and
+//! the leader leads again.
+//!
 //! A winner holds office from its win, in `LeaderReconciling`, and performs
 //! every election duty of a leader there: it announces itself, acks
 //! heartbeats, keeps its lease and watches the workers it leads. Only its
@@ -138,6 +149,7 @@ mod lease;
 mod node;
 mod self_report;
 mod standing;
+mod transfer;
 
 use std::collections::BTreeSet;
 
@@ -169,6 +181,7 @@ use lease::Lease;
 use self_report::SelfReport;
 pub use standing::JoinFloor;
 use standing::ShardStanding;
+use transfer::Transfer;
 pub(crate) use standing::EpochOrder;
 
 pub struct WorkerNode<C>
@@ -221,6 +234,18 @@ where
     /// A drain asked for and not yet carried out: kept until the node can
     /// drain, or, while it leads, waiting for its voters' routing crawls.
     drain_request: DrainRequest,
+    /// The hand-over this leader has under way, if any (see
+    /// [`Input::TransferLeadership`]).
+    transfer: Option<Transfer>,
+    /// Whether the newest ack this node accepted said its leader is handing
+    /// over: that leader no longer counts as valid against a roll call.
+    leader_draining: bool,
+    /// The leader and term that asked this node to take over, while the node
+    /// stays in `LeaderSuspect` or `RollCall`: that leader's ordinary acks of
+    /// that term are ignored, so one it sent before it handed over and that
+    /// arrives after (on another stream) cannot end the call. A roll call
+    /// that ends back in `LeaderSuspect` keeps it.
+    handed_over_by: Option<(WorkerId, u64)>,
     /// The admission generation this node held when its last routing crawl
     /// completed.
     crawled_at_admission: Option<Generation>,
@@ -335,12 +360,18 @@ pub struct ElectionTimings {
     /// while its worker still runs it. Usually
     /// [`Self::DEFAULT_RECONNECT_TIMEOUT`].
     pub reconnect_timeout: Duration,
-    /// The longest a leader asked to drain keeps leading while it waits for
-    /// every other voter to report a routing crawl since its admission (see
-    /// `WorkerHeartbeat::routing_crawled`). Leaving earlier can strand
-    /// workers that know no one but this leader; past this it leaves anyway,
-    /// so a voter that never reports cannot hold a shutdown up for ever.
-    /// Usually [`Self::DEFAULT_DRAIN_WAIT_SUSPICIONS`] suspicion timeouts.
+    /// The longest a draining worker waits at each step of leaving, so no
+    /// one that never answers can hold a shutdown up for ever. It bounds:
+    /// a leader's wait for every other voter to report a routing crawl since
+    /// its admission (see `WorkerHeartbeat::routing_crawled`; leaving earlier
+    /// can strand workers that know no one but this leader); its wait, once
+    /// it handed its leadership over, for the successor to vouch for hearing
+    /// it; a worker's wait for a leader when it has none; a leader's wait for
+    /// a voter to hand over to when it is the sole voter; the wait for the
+    /// records it holds to be stored or passed on; and the wait for its last
+    /// election messages to be answered (the flush). Each wait past this
+    /// gives way to the next step, so a leader that drains may spend it
+    /// several times over. Usually [`Self::DEFAULT_DRAIN_WAIT_SUSPICIONS`] suspicion timeouts.
     pub drain_wait_limit: Duration,
 }
 
@@ -474,25 +505,58 @@ pub enum Input {
     /// The coordination authority answered a call this node asked for (see
     /// [`Output::Authority`]). A node with no authority ignores it.
     Authority(AuthorityReply),
-    /// Leave the shard gracefully: send `SelfRemove` to the leader this node follows, if any, or as
-    /// the leader announce the configuration without itself on a final ack
-    /// to every connected peer, and end `Stopped`. From `Active` this happens
-    /// at once. A `Leader` keeps leading until every other voter has reported
-    /// a routing crawl since its admission, or `drain_wait_limit` has passed
-    /// (see [`ElectionTimings::drain_wait_limit`]), and then leaves; a leader
-    /// with no other voter leaves at once. From `Draining` or `Stopped` the request does
-    /// nothing; from any other state, `Fenced` among them, the node keeps it and
-    /// drains as soon as it reaches `Active`, `LeaderReconciling` or `Leader`,
-    /// in the same step. A leader that loses office while it waits keeps the
-    /// request, and the drain wait, its limit included, starts over when it
-    /// regains leadership. A driver asks once.
+    /// Leave the shard gracefully: send `SelfRemove` to the leader this node
+    /// follows, if any, or as the leader announce the configuration without
+    /// itself on a final ack to every connected peer, and end `Stopped`. From
+    /// `Active` this happens at once. A `Leader` keeps leading until every
+    /// other voter has reported a routing crawl since its admission, or
+    /// `drain_wait_limit` has passed (see
+    /// [`ElectionTimings::drain_wait_limit`]), and then hands its leadership
+    /// over to the voter that confirmed its acks last (see
+    /// [`Input::TransferLeadership`]). Where it leaves from then depends on
+    /// what becomes of the hand-over:
     ///
-    /// A drain kept in a state the node never leaves for `Active`,
-    /// `LeaderReconciling` or `Leader` waits for good: a node whose peers never return, which keeps
-    /// retrying roll calls from `NoQuorum`, or a `Bootstrapping` node that
-    /// never joins. A driver that waits for `Stopped` must not rely on it
-    /// there.
+    /// - It stays in office, no successor taking up the hand-over: it departs
+    ///   alone when the hand-over ends, a suspicion timeout after it began,
+    ///   whatever `drain_wait_limit` is.
+    /// - A successor takes office and the node, deposed, follows it: it
+    ///   leaves through that leader once the leader vouches for hearing it,
+    ///   or, if none does, `drain_wait_limit` after the hand-over began.
+    /// - The node ends up in `LeaderSuspect`, `RollCall` or `NoQuorum`
+    ///   without a leader: it leaves without one, at `drain_wait_limit` after
+    ///   the hand-over began.
+    ///
+    /// A leader with no other voter to hand over to keeps leading, so a
+    /// pending member can be admitted and become one, until `drain_wait_limit`
+    /// has passed, and then leaves alone.
+    ///
+    /// From `LeaderSuspect`, `RollCall` or `NoQuorum` the node keeps the
+    /// request and drains as soon as it reaches `Active`, `LeaderReconciling`
+    /// or `Leader`, in the same step; if it has found no leader by the time
+    /// `drain_wait_limit` has passed, it leaves without one, telling no one
+    /// and handing its records to no one (see [`HandOffTo::Nobody`]). From
+    /// `Draining` or `Stopped` the request does nothing; from any other state,
+    /// `Fenced` among them, the node keeps it and drains as soon as it
+    /// reaches `Active`, `LeaderReconciling` or `Leader`, in the same step. A
+    /// leader that loses office while it waits keeps the request, and the
+    /// drain wait, its limit included, starts over when it regains
+    /// leadership. A driver asks once.
+    ///
+    /// A drain kept in `Bootstrapping`, `Joining`, `Candidate` or `Fenced`
+    /// waits for good if the node never leaves it for a state that drains: a
+    /// `Bootstrapping` node that never joins, say. A driver that waits for
+    /// `Stopped` must not rely on it there.
     Drain,
+    /// Hand leadership over without leaving: a `Leader` stops granting, acks
+    /// every connected peer saying so, and asks the voter of its committed
+    /// configuration that confirmed its acks last to stand for election at
+    /// once (see [`Output::TransferLeadership`]). It keeps every other duty
+    /// of its office, answers roll calls and grants votes, and follows the
+    /// winner once it hears its ack; if no leader of a later term is heard
+    /// within one suspicion timeout it leads again. Ignored in any other
+    /// state, while a hand-over is under way, under a joint configuration, and
+    /// by a leader with no other voter.
+    TransferLeadership,
     /// The answer to this node's JOIN:
     /// the leader it names, with its term and recovery epoch. A node in
     /// `Bootstrapping` records that leader and moves through `Joining` to
@@ -672,6 +736,10 @@ pub enum Output {
     /// stored (no longer than the drain wait limit) before it lets the worker
     /// exit. Reported once, as the node drains, before it reports `Stopped`.
     HandOff(HandOffTo),
+    /// This leader stopped granting and asked `to` to stand for election at
+    /// once (see [`Input::TransferLeadership`]). Reported in the step that
+    /// sends `to` the request, once per hand-over.
+    TransferLeadership { to: WorkerId },
 }
 
 /// To whom a draining node hands the Task records it holds.
@@ -749,6 +817,7 @@ pub(crate) fn apply_to_scheduler<C: Clock, I: IdGenerator, O: Observer>(
             | Output::RunsHeard { .. }
             | Output::RunsCancelled(_)
             | Output::HandOff(_)
+            | Output::TransferLeadership { .. }
             | Output::ShardAbandoned => {}
         }
     }

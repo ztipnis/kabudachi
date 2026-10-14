@@ -8,7 +8,7 @@ use crate::support::builders::checked;
 use crate::support::builders::{
     ack_message, committed_from_g0, configuration_of, epoch, g0, heartbeat, heartbeat_message,
     leader_ack, past_any_suspicion, roll_call, roll_call_message, roll_call_reply, self_remove,
-    self_remove_message, single_at, vote_grant, vote_grant_message, vote_request,
+    self_remove_message, single_at, timings, vote_grant, vote_grant_message, vote_request,
     vote_request_message, worker,
 };
 use crate::support::clock::FakeClock;
@@ -137,6 +137,23 @@ fn crawled_at(
     deliver(leader, sender, heartbeat_message(beat))
 }
 
+/// The voter `outputs` hand leadership over to, if they do.
+fn handed_to(outputs: &[Output]) -> Option<WorkerId> {
+    outputs.iter().find_map(|output| match output {
+        Output::TransferLeadership { to } => Some(to.clone()),
+        _ => None,
+    })
+}
+
+/// `successor`, now leading term 2, acks the draining `leader` vouching for a
+/// heartbeat of its own, as a leader does only once it holds a grant.
+fn successor_vouches(clock: &FakeClock, leader: &mut TestNode, successor: &WorkerId) -> Vec<Output> {
+    let configuration = leader.configuration().cloned().expect("a configuration");
+    let mut ack = leader_ack(successor, leader.term() + 1, &configuration, Some(g0()));
+    ack.heartbeat_token = Some(clock.now().as_ticks());
+    deliver(leader, successor, ack_message(ack))
+}
+
 // ---- Draining ----
 
 /// A follower tells only its leader that it leaves, and the message carries
@@ -216,21 +233,112 @@ fn a_draining_follower_names_the_leader_it_followed_to_place_its_records() {
     assert!(alone.contains(&Output::HandOff(HandOffTo::Nobody)), "{alone:?}");
 }
 
-/// A leader that drains hands its records to its other voters, read from its
-/// own configuration before it leaves office.
+/// A leader that drains hands its leadership to one of its other voters, and
+/// leaves once that voter leads and vouches for hearing it, handing its
+/// records to that leader to place.
 #[test]
-fn a_draining_leader_names_its_other_voters_to_place_its_records() {
+fn a_draining_leader_hands_over_and_names_the_leader_that_took_over_to_place_its_records() {
     let clock = FakeClock::new();
     let mut leader = leader_of_three(&clock);
     let _ = leader.step(Input::Drain);
     let _ = crawled(&clock, &mut leader, &worker("p1"));
 
-    let drained = crawled(&clock, &mut leader, &worker("p2"));
+    let handed = crawled(&clock, &mut leader, &worker("p2"));
 
-    assert_eq!(leader.state(), WorkerState::Stopped, "setup invariant");
+    let successor = handed_to(&handed).expect("every other voter crawled, so it hands over");
+    assert!([worker("p1"), worker("p2")].contains(&successor));
+    assert_eq!(leader.state(), WorkerState::Leader, "it stays for its successor");
+
+    let left = successor_vouches(&clock, &mut leader, &successor);
+
+    assert_eq!(leader.state(), WorkerState::Stopped);
     assert!(
-        drained.contains(&Output::HandOff(HandOffTo::Voters(vec![worker("p1"), worker("p2")]))),
-        "{drained:?}"
+        left.contains(&Output::HandOff(HandOffTo::Leader(successor))),
+        "{left:?}"
+    );
+}
+
+/// A leader that handed over to a successor whose acks never vouch for a
+/// heartbeat of its own (it never reconciled) does not wait for it for ever:
+/// it leaves, through that successor, when its drain wait runs out.
+#[test]
+fn a_node_that_handed_leadership_over_leaves_at_its_deadline_when_its_successor_never_vouches() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let _ = leader.step(Input::Drain);
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+    let handed = crawled(&clock, &mut leader, &worker("p2"));
+    let successor = handed_to(&handed).expect("every other voter crawled, so it hands over");
+    let leaves_at =
+        clock.now() + timings(Duration::from_ticks(SUSPECT)).drain_wait_limit;
+    let configuration = leader.configuration().cloned().expect("a configuration");
+    let successors_term = leader.term() + 1;
+    let ack = || ack_message(leader_ack(&successor, successors_term, &configuration, Some(g0())));
+
+    deliver(&mut leader, &successor, ack());
+    assert_eq!(leader.state(), WorkerState::Active, "it follows its successor");
+    let beat_every = Duration::from_ticks(SUSPECT / 4);
+    while clock.now() + beat_every < leaves_at {
+        clock.advance(beat_every);
+        deliver(&mut leader, &successor, ack());
+        let _ = leader.step(Input::Tick);
+        assert_eq!(leader.state(), WorkerState::Active, "the drain wait has not run out");
+    }
+
+    clock.advance(leaves_at - clock.now());
+    let left = leader.step(Input::Tick).outputs;
+    assert_eq!(leader.state(), WorkerState::Stopped);
+    assert!(
+        left.contains(&Output::HandOff(HandOffTo::Leader(successor))),
+        "{left:?}"
+    );
+}
+
+/// A leader that handed over, then stops hearing its successor, has no leader
+/// to leave through: it suspects, and at its deadline leaves with nobody to
+/// hand its records to, not through the successor it lost.
+#[test]
+fn a_node_that_handed_leadership_over_and_lost_its_successor_leaves_without_a_leader_at_its_deadline() {
+    let clock = FakeClock::new();
+    let mut leader = leader_of_three(&clock);
+    let _ = leader.step(Input::Drain);
+    let _ = crawled(&clock, &mut leader, &worker("p1"));
+    let handed = crawled(&clock, &mut leader, &worker("p2"));
+    let successor = handed_to(&handed).expect("every other voter crawled, so it hands over");
+    let leaves_at =
+        clock.now() + timings(Duration::from_ticks(SUSPECT)).drain_wait_limit;
+    let configuration = leader.configuration().cloned().expect("a configuration");
+    let ack = leader_ack(&successor, leader.term() + 1, &configuration, Some(g0()));
+    deliver(&mut leader, &successor, ack_message(ack));
+    assert_eq!(leader.state(), WorkerState::Active, "it follows its successor");
+
+    // The successor never acks again.
+    let mut deadline = leader.step(Input::Tick).next_deadline;
+    let mut waited_in = Vec::new();
+    let mut outputs = Vec::new();
+    for _ in 0..500 {
+        if leader.state() == WorkerState::Stopped {
+            break;
+        }
+        let due = deadline.expect("a node waiting to leave reports a deadline");
+        assert!(due <= leaves_at, "{due:?} lies beyond its deadline {leaves_at:?}");
+        clock.advance(due - clock.now());
+        let ticked = leader.step(Input::Tick);
+        waited_in.push(leader.state());
+        outputs.extend(ticked.outputs);
+        deadline = ticked.next_deadline;
+    }
+
+    assert_eq!(leader.state(), WorkerState::Stopped, "it never left");
+    assert_eq!(clock.now(), leaves_at);
+    assert!(waited_in.contains(&WorkerState::LeaderSuspect), "{waited_in:?}");
+    assert!(
+        outputs.contains(&Output::HandOff(HandOffTo::Nobody)),
+        "{outputs:?}"
+    );
+    assert!(
+        !outputs.contains(&Output::HandOff(HandOffTo::Leader(successor))),
+        "{outputs:?}"
     );
 }
 
@@ -310,7 +418,7 @@ fn a_voter_that_confirms_no_ack_is_not_placeable_until_it_confirms_one() {
 
 // A heartbeat delayed from before a voter's re-admission can still say it
 // has crawled: only a crawl at the admission the leader counts the voter
-// by frees the leader to leave.
+// by frees the leader to hand its leadership over.
 #[test]
 fn a_draining_leader_ignores_a_crawl_report_from_an_earlier_admission() {
     let clock = FakeClock::new();
@@ -319,11 +427,11 @@ fn a_draining_leader_ignores_a_crawl_report_from_an_earlier_admission() {
     let _ = crawled(&clock, &mut leader, &worker("p1"));
 
     let stale = Generation::new(epoch(0), 0, 1);
-    let _ = crawled_at(&clock, &mut leader, &worker("p2"), stale);
-    assert_eq!(leader.state(), WorkerState::Leader, "p2's crawl is stale");
+    let held = crawled_at(&clock, &mut leader, &worker("p2"), stale);
+    assert_eq!(handed_to(&held), None, "p2's crawl is stale");
 
-    let _ = crawled(&clock, &mut leader, &worker("p2"));
-    assert_eq!(leader.state(), WorkerState::Stopped);
+    let freed = crawled(&clock, &mut leader, &worker("p2"));
+    assert!(handed_to(&freed).is_some());
 }
 
 // A crawl report naming an admission the roster does not yet count the voter
@@ -340,20 +448,20 @@ fn a_draining_leader_ignores_a_crawl_reported_ahead_of_the_admission_a_removal_t
     let _ = crawled_at(&clock, &mut leader, &p2, next);
     remove_having_seen(&mut leader, &p1, 1);
 
-    let _ = leader.step(Input::Tick);
+    let held = leader.step(Input::Tick).outputs;
     assert_eq!(
-        leader.state(),
-        WorkerState::Leader,
+        handed_to(&held),
+        None,
         "p2 reported its crawl before it held that admission"
     );
 
-    let _ = crawled(&clock, &mut leader, &p2);
-    assert_eq!(leader.state(), WorkerState::Stopped);
+    let freed = crawled(&clock, &mut leader, &p2);
+    assert_eq!(handed_to(&freed), Some(p2));
 }
 
 // A crawl reported while the founding configuration was still joint counted
 // at the admission the roster held then; the commit re-admits every voter,
-// so that crawl does not free the leader to leave.
+// so that crawl does not free the leader to hand over.
 #[test]
 fn a_draining_leader_ignores_a_crawl_counted_before_the_commit_re_admitted_everyone() {
     let clock = FakeClock::new();
@@ -369,22 +477,23 @@ fn a_draining_leader_ignores_a_crawl_counted_before_the_commit_re_admitted_every
     );
     let _ = leader.step(Input::Drain);
 
-    let _ = crawled(&clock, &mut leader, &worker("p2"));
+    let held = crawled(&clock, &mut leader, &worker("p2"));
     assert_eq!(
-        leader.state(),
-        WorkerState::Leader,
+        handed_to(&held),
+        None,
         "p1's crawl was made at its earlier admission"
     );
 
-    let _ = crawled(&clock, &mut leader, &worker("p1"));
-    assert_eq!(leader.state(), WorkerState::Stopped);
+    let freed = crawled(&clock, &mut leader, &worker("p1"));
+    assert!(handed_to(&freed).is_some());
 }
 
 /// A voter that never reports a crawl cannot hold a leader's shutdown up
 /// for ever: the leader keeps leading, its lease kept by both voters'
-/// confirmations, until its drain wait limit has passed, and then leaves.
+/// confirmations, until its drain wait limit has passed, and then hands its
+/// leadership over.
 #[test]
-fn a_draining_leader_leaves_once_its_drain_wait_runs_out_though_a_voter_never_crawls() {
+fn a_draining_leader_hands_over_once_its_drain_wait_runs_out_though_a_voter_never_crawls() {
     let clock = FakeClock::new();
     let mut leader = leader_of_three(&clock);
     let wait_limit =
@@ -396,34 +505,34 @@ fn a_draining_leader_leaves_once_its_drain_wait_runs_out_though_a_voter_never_cr
     let beat_every = Duration::from_ticks(SUSPECT / 4);
     while clock.now() + beat_every < wait_ends {
         clock.advance(beat_every);
-        let _ = crawled(&clock, &mut leader, &p1);
+        let mut outputs = crawled(&clock, &mut leader, &p1);
         let held = leader.configuration().map(Configuration::generation);
         let beat = confirming_heartbeat(&clock, &leader, &p2, held);
-        let _ = deliver(&mut leader, &p2, heartbeat_message(beat));
-        let _ = leader.step(Input::Tick);
+        outputs.extend(deliver(&mut leader, &p2, heartbeat_message(beat)));
+        outputs.extend(leader.step(Input::Tick).outputs);
         assert_eq!(
-            leader.state(),
-            WorkerState::Leader,
+            handed_to(&outputs),
+            None,
             "p2 has not crawled and the drain wait has not run out"
         );
     }
 
     clock.advance(wait_ends - clock.now());
-    let _ = leader.step(Input::Tick);
-    assert_eq!(leader.state(), WorkerState::Stopped);
+    let handed = leader.step(Input::Tick).outputs;
+    assert!(handed_to(&handed).is_some());
 }
 
 /// A leader asked to drain that loses its lease keeps the request, and when
 /// it wins office again it waits again: a crawl reported to the lost office
-/// frees nothing, and it leaves only on the crawls of the new one.
+/// frees nothing, and it hands over only on the crawls of the new one.
 #[test]
 fn a_leader_that_regains_office_after_a_kept_drain_request_waits_again() {
     let clock = FakeClock::new();
     let mut leader = leader_of_three(&clock);
     let peers = [worker("p1"), worker("p2")];
     let _ = leader.step(Input::Drain);
-    let _ = crawled(&clock, &mut leader, &peers[0]);
-    assert_eq!(leader.state(), WorkerState::Leader, "p2 has not crawled");
+    let held = crawled(&clock, &mut leader, &peers[0]);
+    assert_eq!(handed_to(&held), None, "p2 has not crawled");
 
     // The lease runs out with no confirmation: office is lost, the request kept.
     let lease_end = leader.step(Input::Tick).next_deadline.expect("a lease end");
@@ -464,14 +573,14 @@ fn a_leader_that_regains_office_after_a_kept_drain_request_waits_again() {
     // p2 alone commits the founding, so p1 sends the new office nothing.
     commit_founding(&mut leader, &clock, &peers[1..]);
 
-    let _ = crawled(&clock, &mut leader, &peers[1]);
+    let held = crawled(&clock, &mut leader, &peers[1]);
     assert_eq!(
-        leader.state(),
-        WorkerState::Leader,
+        handed_to(&held),
+        None,
         "p1's crawl was reported to the lost office"
     );
-    let outputs = crawled(&clock, &mut leader, &peers[0]);
-    assert_eq!(leader.state(), WorkerState::Stopped, "{outputs:?}");
+    let freed = crawled(&clock, &mut leader, &peers[0]);
+    assert!(handed_to(&freed).is_some(), "{freed:?}");
 }
 
 // ---- The leader applies a removal ----

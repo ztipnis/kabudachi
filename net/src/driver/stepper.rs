@@ -200,6 +200,12 @@ fn log_alerts<C: Clock>(node: &WorkerNode<C>, outputs: &[Output]) {
                 "the shard's recovery epoch is gone from the coordination authority; this \
                  worker has stopped"
             ),
+            Output::TransferLeadership { to } => tracing::info!(
+                shard = node.shard_id().as_str(),
+                to = to.as_str(),
+                "this leader stopped granting claims and asked another voter to stand for \
+                 election at once"
+            ),
             Output::Send { .. }
             | Output::Publish { .. }
             | Output::StateChanged(_)

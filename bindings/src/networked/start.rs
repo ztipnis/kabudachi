@@ -46,6 +46,7 @@ pub(super) struct NetworkedArguments {
     pub(super) health_listen: Option<String>,
     queues: Option<Vec<String>>,
     queue_options: Vec<QueueOptionsArgument>,
+    drain_wait_limit_ms: Option<u64>,
 }
 
 /// The shard's coordination authority: a `redis://` or `rediss://` server.
@@ -82,6 +83,7 @@ impl NetworkedArguments {
             ("roll_call_deadline_ms", self.roll_call_deadline_ms.unwrap_or(1)),
             ("routing_refresh_ms", self.routing_refresh_ms.unwrap_or(1)),
             ("authority_ttl_ms", authority_ttl_ms.unwrap_or(1)),
+            ("drain_wait_limit_ms", self.drain_wait_limit_ms.unwrap_or(1)),
         ] {
             if value == 0 {
                 return Err(PyValueError::new_err(format!("{name} must be positive")));
@@ -163,12 +165,16 @@ impl NetworkedArguments {
 
     /// The shard's election timings, the same on every worker of it.
     fn timings(&self) -> ElectionTimings {
-        ElectionTimings::new(
+        let timings = ElectionTimings::new(
             CoreDuration::from_millis(self.heartbeat_timeout_ms),
             CoreDuration::from_millis(self.heartbeat_interval_ms),
         )
         .with_roll_call_deadline(CoreDuration::from_millis(self.roll_call_deadline()))
-        .with_reconnect_timeout(CoreDuration::from_millis(self.reconnect_timeout_ms))
+        .with_reconnect_timeout(CoreDuration::from_millis(self.reconnect_timeout_ms));
+        match self.drain_wait_limit_ms {
+            Some(ms) => timings.with_drain_wait_limit(CoreDuration::from_millis(ms)),
+            None => timings,
+        }
     }
 }
 
