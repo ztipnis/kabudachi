@@ -30,7 +30,7 @@ const MAX_RECORD_QUERIES: usize = 16;
 /// outcome under.
 #[derive(Default)]
 pub(super) struct RecordQueries {
-    queued: VecDeque<PlacedWrite>,
+    queued: VecDeque<(u64, kad::Record, Vec<PeerId>, usize)>,
     /// The `kad` queries of record writes in flight to other workers, each
     /// to the write it is part of.
     writes: HashMap<kad::QueryId, (u64, usize)>,
@@ -59,14 +59,25 @@ impl RecordQueries {
         writes: Vec<PlacedWrite>,
         inbound: &Inbound,
     ) {
-        self.queued.extend(writes);
+        for placed in writes {
+            self.start_write(swarm, placed, inbound);
+        }
         self.advance_writes(swarm, inbound);
     }
 
     pub(super) fn advance_writes(&mut self, swarm: &mut Swarm<Behaviour>, inbound: &Inbound) {
         while self.writes.len() < MAX_RECORD_QUERIES {
-            let Some(placed) = self.queued.pop_front() else { break; };
-            self.start_write(swarm, placed, inbound);
+            let Some((number, record, remote, needed)) = self.queued.pop_front() else { break; };
+            if !self.unfinished.contains_key(&number) { continue; }
+            let Some(records) = swarm.behaviour_mut().records.as_mut() else {
+                self.write_answered(number, false, inbound);
+                continue;
+            };
+            // Keep this budget until every targeted RPC settles. Kad's
+            // quorum shortcut leaves requests to slower holders in flight;
+            // releasing a slot then lets a burst exhaust their streams.
+            let query = records.put_record_to(record, remote.into_iter(), kad::Quorum::All);
+            self.writes.insert(query, (number, needed));
         }
     }
 
@@ -115,15 +126,12 @@ impl RecordQueries {
             },
         );
         for (remote, needed) in queries {
-            // Keep this budget until every targeted RPC settles. Kad's
-            // quorum shortcut leaves requests to slower holders in flight;
-            // releasing a slot then lets a burst exhaust their streams.
-            let query = records.put_record_to(
+            self.queued.push_back((
+                number,
                 kad::Record::new(key.clone(), value.clone()),
-                remote.into_iter(),
-                kad::Quorum::All,
-            );
-            self.writes.insert(query, (number, needed));
+                remote,
+                needed,
+            ));
         }
     }
 
