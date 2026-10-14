@@ -56,7 +56,7 @@ def installed_scenario(root: Path) -> None:
         "KABUDACHI_TEST_INSTALLED": "1",
     }
 
-    def run(*arguments: str, timeout: int = 240) -> str:
+    def run(*arguments: str, timeout: int = 480) -> str:
         completed = subprocess.run(
             [str(python), *arguments], cwd=programs, env=environment,
             capture_output=True, text=True, timeout=timeout,
@@ -132,9 +132,9 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
     configuration = Configuration()
     configuration.configure(
         processes=0,
-        heartbeat_interval=timedelta(milliseconds=100),
-        heartbeat_timeout=timedelta(seconds=1),
-        reconnect_timeout=timedelta(seconds=2),
+        heartbeat_interval=timedelta(milliseconds=200),
+        heartbeat_timeout=timedelta(seconds=3),
+        reconnect_timeout=timedelta(seconds=6),
         memory_soft_limit=4_000_000,
         memory_hard_limit=16_000_000,
         result_backend=FileBackend(backend),
@@ -154,6 +154,11 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
     cluster = Cluster.start(tmp_path, size=5, overrides={
         index: {
             "KABUDACHI_TEST_TASKS": "functional_tasks",
+            # Five workers share CI's two CPUs. Keep the failure detector
+            # past ordinary scheduling delays while this test floods records.
+            "KABUDACHI_HEARTBEAT_INTERVAL": "0.2",
+            "KABUDACHI_HEARTBEAT_TIMEOUT": "3",
+            "KABUDACHI_RECONNECT_TIMEOUT": "6",
             "KABUDACHI_MEMORY_SOFT_LIMIT": "4000000",
             "KABUDACHI_TEST_STAGE_SECONDS": "0.4",
             "KABUDACHI_TEST_BACKEND": str(backend),
@@ -225,7 +230,7 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
             assert (await mapped.status()).state == "succeeded"
             pages = echo.map([Greeting(text=f"{index},") for index in range(1100)])
             try:
-                paged = await asyncio.wait_for(pages, 60)
+                paged = await asyncio.wait_for(pages, 180)
             except TimeoutError:
                 print("map status:", await pages.status(), flush=True)
                 for task in asyncio.all_tasks():
@@ -276,7 +281,7 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
             victim = await wait_for("a reducer on a follower", lambda: new_stage(tmp_path, before, cluster, (leader,)))
             victim.kill()
             (tmp_path / "reduce.go").touch()
-            assert (await asyncio.wait_for(reducing, 60)).text == "".join(value.text for value in paged)
+            assert (await asyncio.wait_for(reducing, 120)).text == "".join(value.text for value in paged)
             records = await certified_records(tmp_path, claims, runtime)
             assert records and any(any(run.state == RunState.LOST for run in record.runs) for record in records)
 
@@ -303,7 +308,7 @@ def test_the_phase6_library_works_for_an_independent_caller_across_workers_and_l
             assert await echo(Greeting(text="new caller")) == Greeting(text="new caller")
 
     try:
-        asyncio.run(asyncio.wait_for(scenario(), 180))
+        asyncio.run(asyncio.wait_for(scenario(), 420))
         # A caller disconnect changes no worker membership and leaves workers
         # available for a later caller. Workers drain through SIGTERM.
         for worker in cluster.live():

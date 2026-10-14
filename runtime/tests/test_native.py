@@ -319,6 +319,7 @@ UNFINISHED_RUN_PROGRAM = textwrap.dedent(
 
     import kabudachi
     from proto_messages import Greeting
+    from worker_run import run_with_worker
 
     running = threading.Event()
 
@@ -359,7 +360,7 @@ UNFINISHED_RUN_PROGRAM = textwrap.dedent(
             running.set()
             await asyncio.Event().wait()
 
-    threading.Thread(target=kabudachi.run, args=(main,), daemon=True).start()
+    threading.Thread(target=run_with_worker, args=(main,), daemon=True).start()
     if not running.wait(60):
         sys.exit("run() never got going")
     print("exiting", flush=True)

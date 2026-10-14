@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 
 import kabudachi
 from kabudachi import _native, runner, session
@@ -239,6 +240,9 @@ if __name__ == "__main__":
         future = asyncio.run_coroutine_threadsafe(main(), active._hosted._loop)
         try:
             future.result()
+        except BaseException:
+            traceback.print_exc()
+            raise
         finally:
             os.kill(os.getpid(), signal.SIGTERM)
 

@@ -508,7 +508,7 @@ def test_run_cannot_be_nested_and_does_not_start_a_second_runtime(monkeypatch):
 
     async def main():
         with pytest.raises(RuntimeError, match="already running"):
-            await asyncio.get_running_loop().run_in_executor(None, kabudachi.run, inner)
+            await asyncio.get_running_loop().run_in_executor(None, run_with_worker, inner)
         return "outer finished"
 
     assert run_with_worker(main) == "outer finished"

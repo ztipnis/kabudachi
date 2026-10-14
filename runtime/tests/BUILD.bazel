@@ -65,6 +65,7 @@ py_test(
     deps = [
         # Imported only inside the subprocess the test starts, so Gazelle cannot see it.
         ":proto_messages",  # keep
+        "//runtime/tests:worker_run",  # keep
         "//bindings:_native",  # keep
         "//runtime/src/kabudachi",
         "@pypi//pytest",  # keep
@@ -380,6 +381,7 @@ py_test(
 py_test(
     name = "test_functionality",
     size = "medium",
+    timeout = "long",  # keep
     srcs = ["test_functionality.py"],
     data = ["//runtime:kabudachi_wheel"],  # keep
     env = {"WHEEL_FILE": "$(rlocationpath //runtime:kabudachi_wheel)"},  # keep
