@@ -7,7 +7,7 @@ Use it for background jobs, parallel batch processing, multi-stage transformatio
 ## What you can do
 
 - Declare synchronous or asynchronous tasks with typed inputs and results.
-- Submit work from an independent caller and receive results from remote workers.
+- Call tasks directly from async or synchronous application code, with no caller setup or teardown.
 - Compose tasks with sequential flows, parallel groups, maps, and reductions.
 - Set retries, timeouts, delayed starts, and expiry for pending work.
 - Choose recoverable tasks, best-effort tasks, or tasks that combine pending updates by key.
@@ -29,7 +29,7 @@ Callers submit tasks and receive results. Workers execute tasks. A caller connec
 
 `kabudachi.run()` starts a worker and takes no arguments. Callers need no Kabudachi setup or teardown calls: the first task call initializes the connection, and its internal owner releases resources when collected or when the process exits. Call a task directly with `await task(input)` or synchronously with `task.s(input)`.
 
-Connection settings come from application configuration or environment variables. An explicit `kabudachi.client(...)` context remains available when an application wants to bound a connection's lifetime.
+Connection settings come from application configuration or environment variables. Supply worker seed addresses or a Redis/Valkey authority so the first task call can find an existing shard. Callers do not create shards, and workers must be able to reach them to deliver results.
 
 ## Define a task
 
@@ -79,9 +79,19 @@ result = await greet(StringValue(value="world"))
 result = greet.s(StringValue(value="world"))
 ```
 
-Both forms return the worker's certified result and propagate remote errors without a caller connection call or context manager. Use `.s(...)` from synchronous application code; use `await` on an event-loop thread. Initialization happens on the first task call, and the internally owned connection outlives individual application event loops.
+Both forms return the worker's certified result and propagate remote errors without a caller connection call or context manager. `.s(...)` blocks until the result arrives and is for synchronous application code; use `await` on an event-loop thread. Initialization happens on the first task call, and closing an application event loop does not close the shared caller connection.
 
-For a synchronous caller, save the imports, the `greet.s(...)` call, and `print(result.value)` in `caller.py`, then connect it to the worker above:
+For a complete synchronous caller, save this as `caller.py`:
+
+```python
+from google.protobuf.wrappers_pb2 import StringValue
+from my_tasks import greet
+
+result = greet.s(StringValue(value="world"))
+print(result.value)
+```
+
+Connect it to the worker above:
 
 ```sh
 KABUDACHI_SEEDS=/ip4/127.0.0.1/tcp/4001 runtime/.venv/bin/python caller.py
@@ -97,7 +107,7 @@ KABUDACHI_SEEDS=/ip4/127.0.0.1/tcp/4001 runtime/.venv/bin/python caller.py
 
 Coalescing keeps a running generation intact. By default, the newest pending payload wins; an optional merge function combines retained payloads. For ordinary tasks that must not replay after an uncertain execution, use `retriable=False`; worker loss can then leave the task orphaned rather than execute it again.
 
-Use `@kabudachi.reducer` and `.reduce(...)` to fold a list into one result. See [Use cases](docs/use-cases.md) for examples of reductions, maps, groups, and flows across workers.
+Use `@kabudachi.reducer` and `.reduce(...)` to fold a list into one result. Flows, groups, bound tasks, maps, and reductions also support blocking `.s(...)` calls. See [Use cases](docs/use-cases.md) for examples of reductions, maps, groups, and flows across workers.
 
 ## Basic architecture
 
@@ -115,15 +125,17 @@ flowchart TB
 
 Redis or Valkey supplies coordination when configured; it is not the task broker. An optional result backend retains certified results for later lookup. See [Architecture and contributing](docs/architecture.md) for the component map and development checks.
 
-## Caller API guarantees
+## Caller lifecycle
 
-| Behavior | Implementation |
+| Behavior | What happens |
 | --- | --- |
-| Automatic connection | The first task call initializes connection resources from process configuration |
-| Automatic cleanup | The internal owner's finalizer releases its transport and loop without manual teardown |
-| Synchronous `.s(...)` | Submit and receive the certified result directly from synchronous application code |
+| First task call | Connects automatically using application configuration |
+| Later calls | Reuse the caller connection across async and synchronous code |
+| Connection settings change | Release the previous connection; the next call uses the new settings |
+| Caller connection stops | The next task call establishes a fresh connection |
+| Internal owner is collected or the process exits | Release connection resources automatically, with no manual teardown |
 
-Remote task results, the no-argument worker entry point, reductions, and implicit callers are implemented. One comprehensive installed-wheel acceptance scenario exercises caller APIs without a connection context across five workers, including worker and leader loss. Production readiness remains a separate gate covering Phases 7/8 and final rigorous testing.
+Remote results, the no-argument worker entry point, reductions, automatic caller initialization and cleanup, and synchronous calls are implemented. The installed-wheel acceptance scenario covers direct calls across five workers, worker and leader loss, caller reconnection, and exit without manual teardown. Functional completeness remains separate from production readiness.
 
 ## Execution and recovery
 
