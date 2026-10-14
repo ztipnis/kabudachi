@@ -4,9 +4,11 @@
 use kabudachi_core::blob::{BlobKey, BlobOwner, BlobRecord};
 use kabudachi_core::coordination_authority::RecoveryEpoch;
 use kabudachi_core::protocol::generated::{Task, TaskRecord};
-use kabudachi_core::protocol::ids::{TaskDefinitionId, TaskId, WorkerId};
+use kabudachi_core::protocol::ids::{CompositeId, TaskDefinitionId, TaskId, WorkerId};
 use kabudachi_core::task_record::{Origin, Put, PutRefusal, RecordVersion, ShardRecord, VersionedRecords};
 use kabudachi_core::time::{Duration, Instant};
+
+use crate::support::composites::{composite_record, page};
 
 const NOW: Instant = Instant::at(0);
 
@@ -271,4 +273,85 @@ fn a_stub_of_a_revision_takes_the_same_revision_again_whether_it_names_this_hold
     let back = placed(record("t", version(0, 0, 1, 1), "q"), &["me", "b"]);
     assert_eq!(store.put(back.clone(), NOW), Ok(Put::Stored));
     assert_eq!(store.get(&task), Some(&back));
+}
+
+/// `record` with a different input: the same task submitted otherwise.
+fn resubmitted(mut record: TaskRecord) -> TaskRecord {
+    record.task.as_mut().expect("a record carries its task").serialized_input = b"other input".to_vec();
+    record
+}
+
+#[test]
+fn a_revision_that_changes_what_the_first_revision_fixed_is_refused_from_any_sender_even_after_a_stub() {
+    let (held, newer, newest) = (version(0, 0, 1, 7), version(0, 0, 2, 0), version(0, 0, 3, 0));
+
+    let mut store = VersionedRecords::default();
+    store.put(record("task-1", held, "q"), NOW).unwrap();
+    let mut with_a_run = record("task-1", newer, "q");
+    with_a_run.runs.push(Default::default());
+    assert_eq!(store.put(with_a_run, NOW), Ok(Put::Stored), "a later revision of the same submission");
+    assert_eq!(
+        store.put(resubmitted(record("task-1", newest, "q")), NOW),
+        Err(PutRefusal::SubmissionChanged),
+        "a later revision with another input"
+    );
+    assert_eq!(
+        store.put_from(record("task-1", newest, "other queue"), Origin::HandOff, NOW),
+        Err(PutRefusal::SubmissionChanged),
+        "a handed-off copy with another queue"
+    );
+    assert_eq!(store.get(&TaskId::new("task-1")).unwrap().runs.len(), 1, "the store kept what it had");
+    assert_eq!(
+        store.put(resubmitted(record("task-1", newer, "q")), NOW),
+        Err(PutRefusal::Conflicting),
+        "the same version with another input stays a conflict"
+    );
+    assert_eq!(
+        store.put(resubmitted(record("task-1", held, "q")), NOW),
+        Err(PutRefusal::Older),
+        "an older version stays older"
+    );
+
+    // A holder the leader moved the record away from keeps only a stub,
+    // which still knows what was submitted.
+    let mut holder = VersionedRecords::default().held_by(WorkerId::new("me"));
+    holder.put(placed(record("t", held, "q"), &["me"]), NOW).unwrap();
+    assert_eq!(holder.put(placed(record("t", newer, "q"), &["other"]), NOW), Ok(Put::Retired));
+    assert_eq!(
+        holder.put(placed(resubmitted(record("t", newer, "q")), &["me"]), NOW),
+        Err(PutRefusal::SubmissionChanged),
+        "the stub's own revision, resubmitted"
+    );
+    assert_eq!(
+        holder.put(placed(resubmitted(record("t", newest, "q")), &["me"]), NOW),
+        Err(PutRefusal::SubmissionChanged)
+    );
+    assert_eq!(holder.put(placed(record("t", newest, "q"), &["me"]), NOW), Ok(Put::Stored));
+
+    // A composite's step description is fixed the same way; its pages fill in.
+    let id = CompositeId::new("c1");
+    let mut composites = VersionedRecords::with_retention(None);
+    composites.put(composite_record(&id, 0, 1), NOW).unwrap();
+    let mut redescribed = composite_record(&id, 0, 2);
+    let description = redescribed.description.as_mut().expect("a composite record carries its step");
+    description.stages.push(description.stages[0].clone());
+    assert_eq!(composites.put(redescribed, NOW), Err(PutRefusal::SubmissionChanged));
+    assert_eq!(composites.put(composite_record(&id, 0, 2), NOW), Ok(Put::Stored));
+    composites.put(page(&id, 0, 0, 1), NOW).unwrap();
+    let mut filled = page(&id, 0, 0, 2);
+    filled.finished = true;
+    assert_eq!(composites.put(filled, NOW), Ok(Put::Stored), "a page is not fixed by its first revision");
+
+    // A first revision without a description fixed that too.
+    let bare = CompositeId::new("c2");
+    let mut undescribed = composite_record(&bare, 0, 1);
+    undescribed.description = None;
+    composites.put(undescribed.clone(), NOW).unwrap();
+    assert_eq!(
+        composites.put(composite_record(&bare, 0, 2), NOW),
+        Err(PutRefusal::SubmissionChanged),
+        "a description added after a first revision without one"
+    );
+    undescribed.version = composite_record(&bare, 0, 2).version;
+    assert_eq!(composites.put(undescribed, NOW), Ok(Put::Stored), "a later revision still without one");
 }

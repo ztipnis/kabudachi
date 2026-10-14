@@ -25,9 +25,15 @@
 //!
 //! ## What the driver sends: [`Work`]
 //!
-//! `Run(claim)` hands over a run the leader granted: run the task's body.
-//! `Compact(claim)` hands over a compaction run: fold the claim's chain,
-//! oldest first, with the task's merge. `Cancel(run)`: the run is no longer
+//! `Run { claim, stage }` hands over a run the leader granted: run the task's
+//! body. `Compact { claim, stage }` hands over a compaction run: fold the
+//! claim's chain, oldest first, with the task's merge. `stage` says where the
+//! task was found: in the records this worker holds, in a peer's (and how many
+//! distance classes out), or among the leader's oldest pending tasks. While
+//! this worker leads, its own scheduler grants its runs in the same order,
+//! less the peers: the records it holds first, then the shard's oldest. An
+//! executor may log or count the stage; nothing depends on it.
+//! `Cancel(run)`: the run is no longer
 //! this worker's to finish; stop its body cooperatively and report however it
 //! ends.
 //!
@@ -71,15 +77,15 @@ use libp2p::futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 
-use crate::discovery::{Found, IdleBackoff, Takes};
+use crate::discovery::{Found, IdleBackoff, Stage, Takes};
 use crate::messenger::Net;
 use crate::task_exchange::{self, TaskFailure, refused_for_now, rejection, reported_run};
 
 /// What the driver hands the executor (see the module doc).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Work {
-    Run(Claim),
-    Compact(Claim),
+    Run { claim: Claim, stage: Stage },
+    Compact { claim: Claim, stage: Stage },
     Cancel(TaskRunId),
     Abort { run: TaskRunId, deadline: Instant },
     AbortWithdrawn(TaskRunId),
@@ -265,7 +271,9 @@ impl HostAbort {
 /// while it leads, and held like a remote worker's until the writes the
 /// decision made are stored.
 pub(crate) enum OwnAnswer {
-    Claim { response: ClaimResponse, reserved: u32 },
+    /// The claims this leader's own scheduler granted it, each with the stage
+    /// that found its task, and the places the claim reserved.
+    Claim { claims: Vec<(Stage, Claim)>, reserved: u32 },
     Report { request: RunReport, response: TaskResponse },
 }
 
@@ -390,8 +398,7 @@ impl<'n> Executing<'n> {
             self.lose_handed();
         }
         if let Some((reserved, found)) = self.found.take() {
-            let claims = found.claims.into_iter().map(|(_, claim)| claim).collect();
-            self.claimed(reserved, claims);
+            self.claimed(reserved, found.claims);
         }
         for (request, reply) in std::mem::take(&mut self.replies) {
             self.on_reply(request, reply);
@@ -484,17 +491,17 @@ impl<'n> Executing<'n> {
     /// taken updates the ledger, as a remote leader's answer would.
     pub(crate) fn own_settled(&mut self, settled: Settled<OwnAnswer>) {
         match settled {
-            Settled::Released(OwnAnswer::Claim { response, reserved }) => {
+            Settled::Released(OwnAnswer::Claim { claims, reserved }) => {
                 // `decide_own_claim` entered these in the ledger when it
                 // decided them, as a remote claim is entered when it is answered.
                 self.own_claim = None;
-                self.claimed(reserved, granted(&response));
+                self.claimed(reserved, claims);
             }
-            Settled::NotLeader(OwnAnswer::Claim { response, reserved }) => {
+            Settled::NotLeader(OwnAnswer::Claim { claims, reserved }) => {
                 // Its own scheduler granted these, but the grant was never
                 // stored: none is handed over, and each is reported lost so
                 // whichever leader decides it replays it.
-                for claim in granted(&response) {
+                for (_, claim) in claims {
                     if let Some(run) = claim.task_run_id {
                         self.queue_lost(run.into());
                     }
@@ -696,18 +703,18 @@ impl<'n> Executing<'n> {
     /// A claim that reserved `reserved` places was granted `claims`: the
     /// places left over are offered again, the claims are handed over, and a
     /// claim that found nothing waits out the idle backoff.
-    fn claimed(&mut self, reserved: u32, claims: Vec<Claim>) {
+    fn claimed(&mut self, reserved: u32, claims: Vec<(Stage, Claim)>) {
         let taken = u32::try_from(claims.len()).unwrap_or(u32::MAX);
         let held = &mut self.endpoint.held;
         held.credits = held.credits.saturating_add(reserved.saturating_sub(taken));
         let wait = self.idle.after(claims.len());
         self.next_claim_at = (!wait.is_zero()).then(|| TokioInstant::now() + wait);
-        for claim in claims {
-            self.hand_over(claim);
+        for (stage, claim) in claims {
+            self.hand_over(stage, claim);
         }
     }
 
-    fn hand_over(&mut self, claim: Claim) {
+    fn hand_over(&mut self, stage: Stage, claim: Claim) {
         let Some(run) = claim.task_run_id.clone().map(TaskRunId::from) else {
             // Not a claim a leader grants: its place is offered again.
             let held = &mut self.endpoint.held;
@@ -719,7 +726,7 @@ impl<'n> Executing<'n> {
             ms => CoreDuration::from_millis(ms),
         };
         let compacts = claim.task.as_ref().is_some_and(|task| task.compacts.is_some());
-        let work = if compacts { Work::Compact(claim) } else { Work::Run(claim) };
+        let work = if compacts { Work::Compact { claim, stage } } else { Work::Run { claim, stage } };
         if self.endpoint.work.send(work).is_err() {
             // No executor is left to run it: the leader is told at once, so it
             // is replayed rather than held by a worker that will never run it,

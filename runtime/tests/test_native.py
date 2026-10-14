@@ -5,7 +5,12 @@ tasks through it without any of the Python task API on top."""
 
 import asyncio
 import gc
+import json
+import os
+import select
+import subprocess
 import sys
+import textwrap
 import threading
 import time
 
@@ -297,6 +302,106 @@ def test_a_result_for_a_closed_loop_is_dropped_without_a_report():
 
 async def _start_a_wait(native):
     native.wait_until_leader()
+
+
+# A script that leaves `run()` running when it ends: on a daemon thread, with
+# a body still awaiting. Either the one-node runtime, which holds a task
+# process too, or a networked worker that founded its shard alone.
+UNFINISHED_RUN_PROGRAM = textwrap.dedent(
+    """
+    import asyncio
+    import json
+    import sys
+    import textwrap
+    import threading
+
+    sys.path[:0] = json.loads(sys.argv[1])
+
+    import kabudachi
+    from proto_messages import Greeting
+
+    running = threading.Event()
+
+    if sys.argv[2] == "one-node":
+        # Declared in a module, which the task process can import.
+        module_directory = sys.argv[3]
+        with open(module_directory + "/unfinished_tasks.py", "w") as module:
+            module.write(
+                textwrap.dedent(
+                    '''
+                    import asyncio
+
+                    import kabudachi
+                    from proto_messages import Greeting
+
+
+                    @kabudachi.task(name="unfinished.forever")
+                    async def forever(request: Greeting) -> Greeting:
+                        await asyncio.sleep(3600)
+                        return request
+                    '''
+                )
+            )
+        sys.path.insert(0, module_directory)
+        from unfinished_tasks import forever
+
+        async def main():
+            call = forever(Greeting(text="never done"))
+            # A best-effort settle, so the task process has started by the time
+            # the script exits.
+            await asyncio.sleep(1)
+            running.set()
+            await call
+
+    else:
+
+        async def main():
+            running.set()
+            await asyncio.Event().wait()
+
+    threading.Thread(target=kabudachi.run, args=(main,), daemon=True).start()
+    if not running.wait(60):
+        sys.exit("run() never got going")
+    print("exiting", flush=True)
+    """
+)
+
+STARTUP_SECONDS = 60
+# Long enough for a loaded CI host to tear down a Tokio runtime and a task
+# process; an interpreter stuck on a native thread never gets there.
+EXIT_SECONDS = 15
+
+
+@pytest.mark.parametrize(
+    "kind, environment",
+    [
+        ("one-node", {"KABUDACHI_PROCESSES": "1"}),
+        ("networked", {"KABUDACHI_LISTEN": "/ip4/127.0.0.1/tcp/0", "KABUDACHI_PROCESSES": "1"}),
+    ],
+)
+def test_the_interpreter_exits_cleanly_while_run_and_its_native_threads_still_run(
+    kind, environment, tmp_path
+):
+    process = subprocess.Popen(
+        [sys.executable, "-c", UNFINISHED_RUN_PROGRAM, json.dumps(sys.path), kind, str(tmp_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, **environment},
+    )
+    try:
+        ready, _, _ = select.select([process.stdout], [], [], STARTUP_SECONDS)
+        assert ready, "the script did not get run() going in time"
+        assert process.stdout.readline().strip() == "exiting"
+        output, errors = process.communicate(timeout=EXIT_SECONDS)
+    finally:
+        process.kill()
+        process.communicate()
+
+    assert output == "", errors
+    assert process.returncode == 0, errors
+    for symptom in ("Fatal Python error", "panicked", "Traceback", "Segmentation fault"):
+        assert symptom not in errors, errors
 
 
 # --- scheduling ----------------------------------------

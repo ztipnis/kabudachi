@@ -3,5 +3,6 @@
 
 mod backoff;
 mod find;
+mod locality;
 mod queues;
 mod steal;

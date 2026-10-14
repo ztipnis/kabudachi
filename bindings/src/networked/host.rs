@@ -79,8 +79,8 @@ impl Host {
             while let Some(work) = source.next_work().await {
                 match work {
                     // Its input is fetched first, apart from the pump.
-                    Work::Run(wire) if input_is_blobs(&wire) => {
-                        Arc::clone(&shared).resolve_then_hand(wire);
+                    Work::Run { claim: wire, stage } if input_is_blobs(&wire) => {
+                        Arc::clone(&shared).resolve_then_hand(wire, stage);
                     }
                     work => shared.on_work(work),
                 }

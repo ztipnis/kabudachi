@@ -10,6 +10,7 @@ use kabudachi_core::protocol::ids::TaskRunId;
 use kabudachi_core::protocol::messages::Claim as WireClaim;
 use kabudachi_core::protocol::messages::prelude::*;
 use kabudachi_core::scheduler::Claim;
+use kabudachi_net::discovery::Stage;
 use kabudachi_net::executor::{Report, Work};
 use kabudachi_net::payload_memory::{PAYLOAD_TOO_LARGE_KIND, Taken};
 
@@ -55,7 +56,7 @@ impl Shared {
         let handled = {
             let mut seam = self.seam();
             match work {
-                Work::Run(wire) | Work::Compact(wire) => seam.hand_over(wire),
+                Work::Run { claim: wire, .. } | Work::Compact { claim: wire, .. } => seam.hand_over(wire),
                 Work::Cancel(run) => seam.take_back(run),
                 Work::Abort { run, deadline } => seam.abort(run, deadline),
                 Work::AbortWithdrawn(run) => seam.withdraw_abort(&run),
@@ -93,10 +94,10 @@ impl Shared {
     /// fails as `PayloadUnavailable`, and one whose input alone is past this
     /// worker's hard limit as `PayloadTooLarge` (the driver reports either
     /// started first); its task's retries apply.
-    pub(super) fn resolve_then_hand(self: Arc<Self>, wire: WireClaim) {
+    pub(super) fn resolve_then_hand(self: Arc<Self>, wire: WireClaim, stage: Stage) {
         let Ok(mut claim) = Claim::try_from(&wire) else {
             // The plain hand-over fails a claim this build cannot read.
-            return self.on_work(Work::Run(wire));
+            return self.on_work(Work::Run { claim: wire, stage });
         };
         {
             let mut seam = self.seam();

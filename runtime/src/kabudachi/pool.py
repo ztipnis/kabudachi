@@ -38,6 +38,9 @@ _logger = logging.getLogger("kabudachi")
 # How long a child asked to stop (SIGTERM) has before it is killed (SIGKILL):
 # the grace after which it exits of its own accord.
 _TERMINATE_GRACE_SECONDS = _child.STOP_GRACE_SECONDS
+# How long, as the interpreter exits, the children asked to stop have in all
+# before the rest are killed.
+_EXIT_GRACE_SECONDS = 2.0
 # How long, once a child has died, the frames it wrote just before may still
 # take to be read.
 _LAST_FRAMES_SECONDS = 1.0
@@ -175,6 +178,12 @@ class ProcessPool:
         self._replacing: set[asyncio.Task[None]] = set()
         # Dead children are replaced only between a successful start and stop.
         self._serving = False
+        # Set by `stop_at_exit` and never cleared: no child is started after it.
+        self._exiting = False
+        # Held while a child is started and added to `_children`, and by
+        # `stop_at_exit` while it ends serving, so that it never looks at the
+        # children between a child's start and its being listed.
+        self._spawning = threading.Lock()
         self._quick_deaths = 0
 
     # places
@@ -217,13 +226,21 @@ class ProcessPool:
         """
         self._loop = asyncio.get_running_loop()
         try:
-            children = [self._spawn() for _ in range(self._settings.processes)]
+            children = []
+            for _ in range(self._settings.processes):
+                with self._spawning:
+                    if self._exiting:
+                        break
+                    children.append(self._spawn())
             for child in children:
                 self._accept(child, await self._until_ready(child))
         except BaseException:
             await self.stop(kill=True)
             raise
-        self._serving = True
+        with self._spawning:
+            if self._exiting:
+                return
+            self._serving = True
         # A child that died after it was ready, while a sibling was still
         # starting, was not replaced then.
         for _ in range(self._settings.processes - len(self._children)):
@@ -255,6 +272,37 @@ class ProcessPool:
         if children:
             await asyncio.wait({child.buried for child in children})
         self._fail_unsent()
+
+    def stop_at_exit(self) -> None:
+        """Stops every child from the calling thread, without the event loop:
+        SIGTERM, then SIGKILL for any still there after a short grace. For the
+        interpreter's exit, where the loop may never run again and a child
+        left running would be waited for forever. Safe to call again, or after
+        `stop`."""
+        # The loop's thread is still running: a child that dies now must not
+        # be replaced. One being started holds the lock, so it is listed by the
+        # time this returns from taking it, and none starts after.
+        with self._spawning:
+            self._exiting = True
+            self._serving = False
+        deadline = time.monotonic() + _EXIT_GRACE_SECONDS
+        while True:
+            # The loop's thread may still add or bury a child: each tuple() is
+            # one step under the interpreter lock, so what is iterated below
+            # cannot change size under this thread.
+            listed = (*tuple(self._children), *tuple(self._condemned))
+            processes = [child.process for child in listed if child.process.is_alive()]
+            if not processes:
+                return
+            for process in processes:
+                process.terminate()
+            for process in processes:
+                process.join(max(0.0, deadline - time.monotonic()))
+                if process.is_alive():
+                    process.kill()
+                    process.join(_EXIT_GRACE_SECONDS)
+            if time.monotonic() > deadline + 2 * _EXIT_GRACE_SECONDS:
+                return
 
     async def _let_children_finish(self, children: list[_Child]) -> None:
         for child in children:
@@ -756,7 +804,10 @@ class ProcessPool:
     async def _replace_after(self, delay: float) -> None:
         await asyncio.sleep(delay)
         try:
-            child = self._spawn()
+            with self._spawning:
+                if not self._serving:
+                    return
+                child = self._spawn()
         except Exception as error:
             # Out of processes or file descriptors, say: a start that failed
             # at once, tried again later like a child that died at once.

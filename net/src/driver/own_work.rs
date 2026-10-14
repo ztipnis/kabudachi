@@ -1,12 +1,12 @@
 use kabudachi_core::protocol::ids::{IdGenerator, WorkerId};
-use kabudachi_core::protocol::messages::{ClaimOldest, claim_request};
-use kabudachi_core::queues::Subscription;
+use kabudachi_core::protocol::messages::{Claim, ClaimOldest, claim_request, claim_response};
 use kabudachi_core::task_record::Settled;
 use kabudachi_core::time::{Clock, WallTime};
 use tokio::time::Instant as TokioInstant;
 
 use super::answers::{Deciding, HeldAnswer, Local, record_named};
 use crate::claim;
+use crate::discovery::{Stage, Takes};
 use crate::executor::{Executing, OwnAnswer, RunReport, granted};
 use crate::task_exchange;
 
@@ -21,8 +21,9 @@ enum OwnLeader {
 /// reports got, sends each report the leader has yet to take, and claims
 /// more work while the executor has room and [`may_claim`] allows. While
 /// this worker leads, its own claims and reports are decided by its own
-/// scheduler, as a remote worker's are, and held until the writes they
-/// made are stored.
+/// scheduler, as a remote worker's are, its claims in a follower's order:
+/// the records it holds first, then the shard's oldest. Each is held until
+/// the writes it made are stored.
 pub(super) fn drive_executor<C: Clock, I: IdGenerator>(
     executing: &mut Executing<'_>,
     deciding: &mut Deciding<'_, C, I>,
@@ -88,7 +89,7 @@ fn claim_more<C: Clock, I: IdGenerator>(
     match to {
         OwnLeader::Itself => {
             executing.claiming_own(places);
-            decide_own_claim(places, &executing.takes().queues, deciding, local);
+            decide_own_claim(places, WallTime::now(clock), executing.takes(), deciding, local);
         }
         OwnLeader::Remote(leader) => {
             executing.discover(leader.clone(), places, WallTime::now(clock))
@@ -135,35 +136,70 @@ fn decide_own_report<C: Clock, I: IdGenerator>(
     );
 }
 
-/// Claims up to `places` of the oldest pending tasks in `queues` for this worker's own
-/// executor from its own scheduler, as [`super::answers::respond_to_claim_requests`] decides
-/// a remote worker's claim, and holds the answer until the writes it made
-/// are stored.
+/// Claims up to `places` tasks for this worker's own executor from its own
+/// scheduler, in the order a follower's discovery takes them, less the peers:
+/// first the pending tasks of the records this worker holds
+/// (`Net::own_candidates`, judged due by `now`), each decided as
+/// [`super::answers::respond_to_claim_requests`] decides a remote worker's
+/// claim of one task; then, for the places left, the shard's oldest pending
+/// tasks. Peers are not asked: every pending task is in this scheduler
+/// already, so its oldest stand for whatever peers hold. A task refused is
+/// passed over, as discovery passes over one its stale view showed. A held
+/// task whose input is newer than `takes.runnable` is never claimed: it is
+/// reported blocked first, as a follower reports it, so it stays queued for a
+/// worker that can run it and the oldest tasks pass it over here. The answer
+/// is held until the writes the claims and reports made are stored.
 fn decide_own_claim<C: Clock, I: IdGenerator>(
     places: u32,
-    queues: &Subscription,
+    now: WallTime,
+    takes: &Takes,
     deciding: &mut Deciding<'_, C, I>,
     local: &mut Local,
 ) {
-    let request = claim_request::Request::Oldest(ClaimOldest {
-        limit: places,
-        queues: queues.names(),
-        input_room: deciding.net.payload_memory().room(),
-    });
-    let response = claim::answer(
-        deciding.scheduler,
-        &deciding.net.local_worker_id(),
-        &request,
-    );
+    let me = deciding.net.local_worker_id();
+    let limit = usize::try_from(places).unwrap_or(usize::MAX);
+    let (candidates, newer) = deciding.net.own_candidates(now, takes);
+    for (task, reason) in newer {
+        // A rejection (the task ended or is not known for certain yet) leaves
+        // nothing to block; the task is not a candidate either way.
+        let _ = deciding.scheduler.report_blocked(&me, &task, reason, false);
+    }
+    let mut room = deciding.net.payload_memory().room();
+    let mut claims: Vec<(Stage, Claim)> = Vec::new();
+    for (task, input) in candidates {
+        if claims.len() >= limit {
+            break;
+        }
+        if matches!((input, room), (Some(input), Some(left)) if input > left) {
+            continue;
+        }
+        let request = claim_request::Request::TaskId(task.into());
+        if let Some(claim_response::Result::Accept(claim)) =
+            claim::answer(deciding.scheduler, &me, &request).result
+        {
+            room = room.map(|left| left.saturating_sub(input.unwrap_or(0)));
+            claims.push((Stage::Own, claim));
+        }
+    }
+    if claims.len() < limit {
+        let wanted = u32::try_from(limit - claims.len()).unwrap_or(u32::MAX);
+        let request = claim_request::Request::Oldest(ClaimOldest {
+            limit: wanted,
+            queues: takes.queues.names(),
+            input_room: room,
+        });
+        let response = claim::answer(deciding.scheduler, &me, &request);
+        claims.extend(granted(&response).into_iter().map(|claim| (Stage::Oldest, claim)));
+    }
     // The ledger takes each grant now, as a remote claim's is entered inside
     // its discovery, so a driver dropped before the grant is stored or handed
     // over still finds the runs when the next one starts.
-    for claim in granted(&response) {
-        deciding.net.claimed_runs().claimed(claim);
+    for (_, claim) in &claims {
+        deciding.net.claimed_runs().claimed(claim.clone());
     }
     deciding.hold(
         HeldAnswer::Own(OwnAnswer::Claim {
-            response,
+            claims,
             reserved: places,
         }),
         None,
