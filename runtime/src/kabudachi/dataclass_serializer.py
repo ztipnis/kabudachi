@@ -15,6 +15,7 @@ from typing import Any
 from kabudachi import schemas
 from kabudachi.config import UNSET
 from kabudachi.errors import SerializationError
+from kabudachi.json_serializer import JsonSerializer
 
 _NONE_TYPE = type(None)
 _SCALARS = (str, int, float, bool)
@@ -187,11 +188,13 @@ def _conform(plain: Any, annotation: Any) -> Any:
     return plain
 
 
-class DataclassSerializer:
+class DataclassSerializer(JsonSerializer):
     """Serializes dataclasses of plain fields. Uses only the standard library,
     so it is always available."""
 
     name = "dataclass"
+    classify = staticmethod(_classify)
+    conform = staticmethod(_conform)
 
     def available(self) -> bool:
         return True
@@ -205,21 +208,6 @@ class DataclassSerializer:
             return False
         return True
 
-    def encode(self, value: Any, value_type: Any) -> bytes:
-        """The canonical JSON of `value`, a dataclass or a list of dataclasses
-        of `value_type`, or `null` for `None`. Raises `SerializationError` if
-        it is not one, or cannot be encoded."""
-        kind, cls = _classify(value_type)
-        if kind is schemas.Shape.NOTHING:
-            if value is not None:
-                raise SerializationError(f"expected None, got {type(value).__name__}")
-            return schemas.json_bytes(None)
-        if kind is schemas.Shape.ONE:
-            return schemas.json_bytes(self._plain(value, cls))
-        if not isinstance(value, list):
-            raise SerializationError(f"expected a list, got {type(value).__name__}")
-        return schemas.json_bytes([self._plain(item, cls) for item in value])
-
     def _plain(self, value: Any, cls: Any) -> dict[str, Any]:
         if not isinstance(value, cls):
             raise SerializationError(f"expected a {cls.__name__}, got {type(value).__name__}")
@@ -229,36 +217,13 @@ class DataclassSerializer:
             schemas.set_path(plain, path, schemas.process_schemas().version_of(cls))
         return plain
 
-    def decode(self, payload: bytes, target_type: Any) -> Any:
-        """The dataclass, or list of dataclasses, of `target_type` that
-        `payload` holds. Raises `SerializationError` if the bytes are not a
-        valid one, naming the field and never its value."""
-        kind, cls = _classify(target_type)
-        plain = schemas.parse_json(payload)
-        if kind is schemas.Shape.NOTHING:
-            if plain is not None:
-                raise SerializationError("expected null for None")
-            return None
-        if kind is schemas.Shape.ONE:
-            return self._build(plain, cls, cls.__name__)
-        if not isinstance(plain, list):
-            raise SerializationError("expected a JSON array for a list")
-        return [self._build(item, cls, f"{cls.__name__}[{index}]") for index, item in enumerate(plain)]
-
-    def _build(self, plain: Any, cls: Any, where: str) -> Any:
+    def _build(self, plain: Any, cls: Any, index: int | None) -> Any:
         path = schemas.version_path_of(cls)
         names = {field.name for field in dataclasses.fields(cls)}
         if path is not None and isinstance(plain, dict) and path[0] not in names:
             schemas.drop_path(plain, path)
+        where = cls.__name__ if index is None else f"{cls.__name__}[{index}]"
         return _build_dataclass(plain, cls, where)
-
-    def extract_version(self, payload: bytes, value_type: Any) -> int | None:
-        """The version `payload` carries at its family's `version_path`, or
-        `None` for a type whose family has none. Raises `SerializationError`
-        if the payload should carry one and does not."""
-        kind, cls = _classify(value_type)
-        path = schemas.version_path_of(cls) if kind is schemas.Shape.ONE else None
-        return schemas.json_version(payload, path)
 
     def validate(self, value: Any) -> None:
         """Raises `SerializationError` if `value`, a dataclass or a list of
@@ -271,24 +236,3 @@ class DataclassSerializer:
             cls = type(item)
             if self.decode(self.encode(item, cls), cls) != item:
                 raise SerializationError(f"this {cls.__name__} does not survive being encoded")
-
-    def schema_family(self, value_type: Any) -> str | None:
-        """The family of `value_type`, or `None` for a type this does not support."""
-        return schemas.supported_family(self, value_type)
-
-    def type_compatibility(self, produced: Any, consumed: Any) -> bool | None:
-        """Whether a `produced` value fits where `consumed` is taken, judged
-        by family and version; `None` for a type this does not support."""
-        return schemas.compatibility(self, produced, consumed)
-
-    def load_plain(self, payload: bytes, value_type: Any) -> Any:
-        """What a migration takes: the parsed JSON of `payload`."""
-        return schemas.parse_json(payload)
-
-    def dump_plain(self, plain: Any, value_type: Any) -> bytes:
-        """`plain`, conformed to `value_type` by dropping the keys it lacks,
-        through nested dataclasses (the default migration), as canonical JSON.
-        The version at the family's `version_path` is kept."""
-        kind, cls = _classify(value_type)
-        path = schemas.version_path_of(cls) if kind is not schemas.Shape.NOTHING else None
-        return schemas.dump_conformed(plain, kind, path, lambda item: _conform(item, cls))
