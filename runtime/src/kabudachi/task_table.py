@@ -11,14 +11,15 @@ makes stay in `Session`.
 One lock guards the table. The native calls whose outcome the bookkeeping must
 agree with (submit and register, cancel routing, complete with a continuation)
 are made under it. Handles are resolved and failed outside it, because a
-callback on a handle may re-enter the table.
+callback on a handle may re-enter the table. A networked task's record is
+kept until a leader's word settles it, as a one-node task's is.
 """
 
 import asyncio
 import logging
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from kabudachi import _native
@@ -26,6 +27,7 @@ from kabudachi._native import CancelOutcome
 from kabudachi.body import RunningBody
 from kabudachi.errors import (
     CertificationError,
+    ResultUnavailableError,
     RunStoppedError,
     TaskCancelledError,
 )
@@ -33,6 +35,7 @@ from kabudachi.handle import TaskHandle
 from kabudachi.native_protocol import Certification, Runtime, SubmitArguments
 from kabudachi.options import SubmissionOptions, SubmissionSettings
 from kabudachi.registry import TaskDefinition, TaskKind
+from kabudachi.status import TaskStatus
 
 CallbackRunner = Callable[[Callable[[Any], Any], Any], None]
 ResultDecoder = Callable[[str, bytes], Any]
@@ -44,6 +47,18 @@ _logger = logging.getLogger("kabudachi")
 def result_digest(result: bytes) -> bytes:
     """The digest a run's result is certified by (BLAKE3)."""
     return _native.result_digest(result)
+
+
+def _run_stopped(handle: TaskHandle, unstarted: str) -> RunStoppedError:
+    """Why stopping the run failed `handle` before its task's result arrived:
+    a networked handle's task may be stored and running on another worker, so
+    it is not said not to have started."""
+    if handle._replicable:
+        return RunStoppedError(
+            "the run stopped before this task's result arrived here; the task may still run "
+            "elsewhere"
+        )
+    return RunStoppedError(f"the run stopped before {unstarted}")
 
 
 class _StartingContinuation:
@@ -67,8 +82,8 @@ class _Record:
     definition_name: str
     # Claimed here and not queued again for a retry.
     started: bool = False
-    # The result of the last run, held until the leader certifies it.
-    provisional_result: bytes | None = None
+    # Results delivered for runs of this task, by run id, until the leader certifies one.
+    provisional: dict[str, bytes] = field(default_factory=dict)
     # A run of this task is in progress here.
     active: bool = False
     # The leader told this process the task was cancelled while a run was in progress.
@@ -105,7 +120,8 @@ class Run:
     def holds_handle(self) -> bool:
         """Whether this run settles a handle of this process. A run a shard's
         leader handed a networked worker settles none, whoever submitted its
-        task: its result is never certified back here."""
+        task: its result goes to the task's client, whose handle settles
+        once the leader certifies it."""
         return self._holds_handle
 
     def abort(self) -> None:
@@ -198,6 +214,7 @@ class TaskTable:
                     settings,
                     retries=definition.retries,
                     drop_oldest=definition.drop_oldest,
+                    non_retriable=not definition.retriable,
                 )
             )
             handle = TaskHandle(
@@ -205,7 +222,8 @@ class TaskTable:
                 self.cancel,
                 self._run_callback,
                 shard_id=self._runtime.shard_id(),
-                results_delivered=self._runtime.delivers_results,
+                replicable=not self._runtime.certifies_locally,
+                status_reader=self.status,
             )
             self._records[task_id] = _Record(handle, definition.name)
         return handle
@@ -246,16 +264,34 @@ class TaskTable:
         # continuation, outside the lock because cancelling it takes the lock.
         return continuation.cancel()
 
-    # stored, detached
+    # replicated, refused, concluded, status
 
-    def stored(self, task_id: str) -> None:
-        """The shard's leader stored a task submitted here whose result will
-        not come back: nothing more settles its handle, so the table forgets
-        it, and waiting for the run's tasks no longer waits for it."""
+    def replicated(self, task_id: str) -> None:
+        """A networked leader stored the task on a quorum of its shard."""
         with self._lock:
             record = self._records.get(task_id)
-            if record is not None and not record.settled and not record.active:
-                self._records.pop(task_id)
+        if record is not None:
+            record.handle._mark_stored()
+
+    def refused(self, task_id: str, error: BaseException) -> None:
+        """The leader refused the task for good: it was never stored."""
+        with self._lock:
+            record = self._records.get(task_id)
+        if record is not None:
+            record.handle._mark_stored(error)
+        self.failed(task_id, error)
+
+    def concluded(self, task_id: str, error: BaseException) -> None:
+        """A networked leader decided the task ended without a result here,
+        so it was stored, and its handle fails with `error`."""
+        self.replicated(task_id)
+        self.failed(task_id, error)
+
+    async def status(self, task_id: str) -> TaskStatus:
+        """How the task stands, by the newest record its runtime reaches."""
+        return TaskStatus.of(task_id, await self._runtime.task_record(task_id))
+
+    # detached
 
     def detached(self, task_id: str) -> Run:
         """A run of `task_id` that a shard's leader handed this worker, which
@@ -307,24 +343,39 @@ class TaskTable:
 
     # result held, certified
 
-    def result_held(self, task_id: str, result: bytes) -> None:
-        """Keeps a run's result until the leader certifies it, while the task is open."""
+    def result_held(self, task_id: str, run_id: str, result: bytes) -> None:
+        """Keeps the result of the run `run_id` until the leader certifies a
+        run, while the task is open."""
         with self._lock:
             record = self._records.get(task_id)
             if record is not None and not record.settled:
-                record.provisional_result = result
+                record.provisional[run_id] = result
 
     def certified(self, certification: Certification) -> None:
-        """Settles the task with the held result if the leader certified that
-        result's digest; otherwise fails it with `CertificationError`."""
+        """Settles the task with the result held for the certified run if the
+        leader certified that result's digest. Fails it with
+        `ResultUnavailableError` if no result of that run reached this
+        process, and with `CertificationError` if the one held differs. A
+        certification of a task already settled changes nothing."""
         with self._lock:
             record = self._records.get(certification.task_id)
             if record is None or record.settled:
                 return
             record.settled = True
             self._retire(certification.task_id, record)
-        result = record.provisional_result
-        if result is None or result_digest(result) != certification.result_digest:
+        # A leader decided it, so it was stored: said before the handle settles.
+        record.handle._mark_stored()
+        result = record.provisional.get(certification.task_run_id)
+        if result is None:
+            record.handle._fail(
+                ResultUnavailableError(
+                    f"task {certification.task_id} succeeded, but its result did not reach this "
+                    "process",
+                    certification.task_id,
+                )
+            )
+            return
+        if result_digest(result) != certification.result_digest:
             _logger.warning(
                 "the leader certified a different result for %s", certification.task_id
             )
@@ -402,13 +453,13 @@ class TaskTable:
                 return
             if not self._stopping:
                 record.started = False
-                record.provisional_result = None
+                record.provisional.clear()
                 return
             # `stop_unstarted` had already failed everything not started, and
             # nothing will claim this retry.
             record.settled = True
             self._retire(task_id, record)
-        record.handle._fail(RunStoppedError("the run stopped before this task's retry could start"))
+        record.handle._fail(_run_stopped(record.handle, "this task's retry could start"))
 
     def failed(self, task_id: str, error: BaseException) -> None:
         """Settles the task, once, by failing its handle with `error`."""
@@ -444,7 +495,7 @@ class TaskTable:
                     dropped.append(record.handle)
                     self._retire(task_id, record)
         for handle in dropped:
-            handle._fail(RunStoppedError("the run stopped before this task could start"))
+            handle._fail(_run_stopped(handle, "this task could start"))
 
     @property
     def stopping(self) -> bool:

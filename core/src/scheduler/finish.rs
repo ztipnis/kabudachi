@@ -28,6 +28,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             }
         }
         self.update_pressure();
+        self.conclude(task_id);
     }
 
     /// `task_id` is over and holds no payload any more: the task is forgotten
@@ -85,6 +86,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             task_run_id: run_id,
             by: newer.clone(),
         });
+        self.conclude(older);
     }
 
     /// Queues the attempt that follows `previous`, a terminal run of

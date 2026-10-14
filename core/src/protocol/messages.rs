@@ -37,6 +37,10 @@ pub use generated::{
 pub use generated::{
     HeldKey, ReconcileReport, ReconcileRequest, ReportedRun, ReportedRunState, reconcile_request,
 };
+pub use generated::{
+    CertifiedAck, DeliverResult, OutcomeAnswer, QueryOutcome, ResultAck, ResultCertified,
+    ResultMessage, result_message,
+};
 pub use generated::{StealRequest, StealResponse};
 
 /// Whether every required ID field of a raw message is present. Nested
@@ -146,7 +150,7 @@ id_accessors!(SelfRemoveIds for Checked<SelfRemove>, of SelfRemove {
 });
 id_accessors!(TaskIds for Task, of Task {
     required: [task_id: TaskId, task_definition_id: TaskDefinitionId],
-    optional: [],
+    optional: [client: WorkerId],
     repeated: [],
 });
 id_accessors!(TaskRunIdentityIds for TaskRunIdentity, of TaskRunIdentity {

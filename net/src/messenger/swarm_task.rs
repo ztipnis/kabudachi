@@ -30,6 +30,7 @@ use crate::framing::decode_election;
 use crate::join_codec::JoinCodec;
 use crate::peers::{Carried, Observation, Peers, Side, is_dialable_listen_addr, worker_id_of};
 use crate::reconcile::codec::ReconcileCodec;
+use crate::result_transport::codec::ResultCodec;
 use crate::steal::codec::StealCodec;
 use crate::swarm::{Behaviour, BehaviourEvent, hide_listen_addresses};
 use crate::task_exchange::codec::TaskCodec;
@@ -650,27 +651,46 @@ fn settle_exchange(
 ) {
     let exchanges = &mut pending.exchanges;
     match event {
-        BehaviourEvent::Join(event) => settle::<JoinCodec>(exchanges, event, inbound, peers, now),
-        BehaviourEvent::Claim(event) => settle::<ClaimCodec>(exchanges, event, inbound, peers, now),
-        BehaviourEvent::Task(event) => settle::<TaskCodec>(exchanges, event, inbound, peers, now),
-        BehaviourEvent::Reconcile(event) => settle::<ReconcileCodec>(exchanges, event, inbound, peers, now),
-        BehaviourEvent::Steal(event) => settle::<StealCodec>(exchanges, event, inbound, peers, now),
+        BehaviourEvent::Join(event) => {
+            settle::<JoinCodec>(exchanges, event, inbound, peers, now);
+        }
+        BehaviourEvent::Claim(event) => {
+            settle::<ClaimCodec>(exchanges, event, inbound, peers, now);
+        }
+        BehaviourEvent::Task(event) => {
+            settle::<TaskCodec>(exchanges, event, inbound, peers, now);
+        }
+        BehaviourEvent::Reconcile(event) => {
+            settle::<ReconcileCodec>(exchanges, event, inbound, peers, now);
+        }
+        BehaviourEvent::Steal(event) => {
+            settle::<StealCodec>(exchanges, event, inbound, peers, now);
+        }
+        // Only a result message another worker sent is news to the client;
+        // the answer to one this worker sent, or its failure, is not.
+        BehaviourEvent::Result(event) => {
+            if settle::<ResultCodec>(exchanges, event, inbound, peers, now) {
+                inbound.results_arrived.notify_one();
+            }
+        }
         _ => {}
     }
 }
 
 /// Settles what `event` of protocol `C` settles (see `Exchange::on_event`),
 /// and queues an arriving request for the driver, counting it in the peer
-/// book's traffic.
+/// book's traffic; whether a request was queued.
 fn settle<C: Correlated>(
     exchanges: &mut Exchanges,
     event: request_response::Event<C::Request, C::Response>,
     inbound: &Inbound,
     peers: &mut Peers,
     now: Instant,
-) {
-    if let Some(asked) = C::exchange(exchanges).on_event(event) {
-        peers.observe(Observation::Carried(C::ARRIVAL), now);
-        inbound.queue_asked(C::queue(inbound), asked);
-    }
+) -> bool {
+    let Some(asked) = C::exchange(exchanges).on_event(event) else {
+        return false;
+    };
+    peers.observe(Observation::Carried(C::ARRIVAL), now);
+    inbound.queue_asked(C::queue(inbound), asked);
+    true
 }

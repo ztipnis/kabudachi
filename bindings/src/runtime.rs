@@ -23,7 +23,7 @@ use crate::errors;
 use crate::local_node::local_node;
 use crate::outcomes::{PyCancelOutcome, PyRunState};
 use crate::timers::run_timers;
-use crate::work::{PyCertification, PyClaim, PyEvent};
+use crate::work::{PyCertification, PyClaim, PyEvent, PyTaskRecord};
 
 /// The shard of a process that runs no cluster: just this worker.
 const LOCAL_SHARD_NAME: &str = "local";
@@ -145,10 +145,10 @@ impl NativeRuntime {
         })
     }
 
-    /// Whether a run's certification comes back to this process, so a
-    /// handle can be settled with its result: always, for a shard of one.
+    /// Whether a report's call returns the leader's decision (a
+    /// certification, a retry): always, here, where this process leads.
     #[getter]
-    fn delivers_results(&self) -> bool {
+    fn certifies_locally(&self) -> bool {
         true
     }
 
@@ -384,6 +384,17 @@ impl NativeRuntime {
             .iter()
             .map(|run_id| run_id.as_str().to_owned())
             .collect())
+    }
+
+    /// Returns an awaitable that resolves to the newest record of a task this
+    /// runtime holds, or `None` if it holds none (never submitted, or
+    /// forgotten after its result's time to live).
+    fn task_record<'py>(&self, py: Python<'py>, task_id: String) -> PyResult<Bound<'py, PyAny>> {
+        let door = Arc::clone(&self.door);
+        self.bridge.spawn_into_py(py, async move {
+            let record = door.task_record(&TaskId::new(task_id))?;
+            Ok(record.map(PyTaskRecord::from))
+        })
     }
 
     /// The worker's election state by name, for example `"Leader"`.

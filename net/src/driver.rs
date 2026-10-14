@@ -19,7 +19,8 @@
 //! leader grants a claim only to a voter or a pending member of its shard,
 //! and answers any other worker `NOT_MEMBER` without asking the scheduler;
 //! and a task-exchange request (a submission, a report on a run, a cancel)
-//! with the scheduler's decision, gated like a claim. Every worker, leader or
+//! with the scheduler's decision, gated like a claim, except a question of
+//! how a task stands, which decides nothing and is answered for any asker. Every worker, leader or
 //! not, also answers a reconcile request with a page of the runs and records it
 //! holds, whoever asks, and a steal request with the tasks whose records it
 //! holds that look claimable (see `crate::steal`). And it tells `Net` which leader the node
@@ -98,9 +99,12 @@
 //! expiry expires, a finished task is forgotten) and writes what that
 //! changed, and the driver sleeps no later than that deadline. The events the
 //! scheduler raises are drained each batch: they are logged and dropped, as
-//! no client lives on a networked worker to hear them, except a cancel of a
-//! running run, which is told to the run's worker in its leader's next ack,
-//! or to this worker's own executor, once stored. The revisions published
+//! they name no client to hear them, except a cancel of a running run, which
+//! is told to the run's worker in its leader's next ack, or to this worker's
+//! own executor, once stored. A task submitted with a client leaves a
+//! conclusion when it ends; once the revision that ended it is stored, the
+//! client is told, in the background: its run certified, or how it ended
+//! without a result (see `crate::result_transport`). The revisions published
 //! when draining ends the scheduler's call are written too.
 //!
 //! With a coordination authority configured, it is also the sole caller of

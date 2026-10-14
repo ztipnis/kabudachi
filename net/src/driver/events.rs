@@ -24,14 +24,16 @@ pub(super) fn catch_up_if_due<C: Clock, I: IdGenerator>(
     deciding.scheduler.next_deadline()
 }
 
-/// No client lives on a worker of a networked shard yet, so the events the
-/// scheduler raises for one are logged and dropped rather than kept for ever,
-/// except a cancel of a running run: it is held until the cancel is stored,
+/// The events the scheduler raises name no client of their own, so they are
+/// logged and dropped rather than kept for ever, except a cancel of a running run: it is held until the cancel is stored,
 /// then left in `local` for the run's worker to be told. So is a run stored
 /// as cancelled, perhaps by an earlier leader, that its worker reported it
-/// still holds. Taking the events ends the scheduler's call, which can
-/// publish the revisions the call made, so they are written first; nothing
-/// else waits on those writes.
+/// still holds. A task with a client that ended is told to the client the
+/// same way: once what ended it is stored. The scheduler hands those over
+/// only while it leads, so what a rebuild concluded waits until every
+/// revision the rebuild republished is stored. Taking the events ends the
+/// scheduler's call, which can publish the revisions the call made, so they
+/// are written first; nothing else waits on those writes.
 pub(super) fn drain_events<C: Clock, I: IdGenerator>(
     deciding: &mut Deciding<'_, C, I>,
     local: &mut Local,
@@ -48,6 +50,10 @@ pub(super) fn drain_events<C: Clock, I: IdGenerator>(
             run: held.task_run_id,
         };
         deciding.hold_unwritten(answer, Some(&held.task_id), local);
+    }
+    for conclusion in deciding.scheduler.take_conclusions() {
+        let task = conclusion.outcome.task_id.clone();
+        deciding.hold_unwritten(HeldAnswer::Concluded(conclusion), Some(&task), local);
     }
 }
 

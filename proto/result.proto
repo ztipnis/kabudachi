@@ -1,0 +1,67 @@
+syntax = "proto3";
+package kabudachi;
+
+import "ids.proto";
+import "task.proto";
+
+// `/kabudachi/result/1`: how a task's result reaches its client, the worker
+// that submitted the task and awaits it. The worker that ran the task
+// delivers the result, then reports the run to its leader. The leader, once
+// the report that ended the task is stored, tells the client the run is
+// certified, or how the task ended without a result. Every message is
+// answered with an acknowledgement.
+
+// A run's result, sent by the worker that ran it. The client holds it as
+// uncertified until the leader certifies the same digest.
+message DeliverResult {
+  TaskId task_id = 1;
+  TaskRunId task_run_id = 2;
+  Digest result_digest = 3;
+  bytes payload = 4;
+}
+
+message ResultAck {}
+
+// The leader's word that this run's result is its task's result.
+message ResultCertified {
+  TaskId task_id = 1;
+  TaskRunId task_run_id = 2;
+  Digest result_digest = 3;
+}
+
+message CertifiedAck {}
+
+// A client asks the leader how a task it awaits stands. Decides nothing.
+message QueryOutcome {
+  TaskId task_id = 1;
+}
+
+// How a task stands, by its current run: the answer to `QueryOutcome`, and
+// what the leader sends a task's client unasked when the task ends without
+// a result.
+message OutcomeAnswer {
+  TaskId task_id = 1;
+  // The leader holds the task: false for one it never stored or has
+  // forgotten, and then nothing below is set.
+  bool known = 2;
+  TaskRunId task_run_id = 3;
+  TaskRunState state = 4;
+  // No run of the task will change again.
+  bool finished = 5;
+  // Set when the run succeeded.
+  Digest result_digest = 6;
+  // The error's type name, when the run failed.
+  string failure_kind = 7;
+  // The newer generation that replaced it, when it was superseded.
+  TaskId superseded_by = 8;
+}
+
+message ResultMessage {
+  oneof message {
+    DeliverResult deliver = 1;
+    ResultAck delivered = 2;
+    ResultCertified certified = 3;
+    CertifiedAck certified_ack = 4;
+    OutcomeAnswer concluded = 5;
+  }
+}

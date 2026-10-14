@@ -13,7 +13,9 @@ import contextlib
 import contextvars
 import functools
 import itertools
-from collections.abc import AsyncIterator, Callable
+import weakref
+from collections.abc import AsyncIterator, Awaitable, Callable
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from kabudachi.errors import (
@@ -27,9 +29,29 @@ from kabudachi.errors import (
 from kabudachi.handle import TaskHandle, run_callback_inline
 
 from kabudachi.hosted_work import LoopHostedWork
+from kabudachi.status import CompositeStatus
 
 if TYPE_CHECKING:
     from kabudachi.session import Session
+
+
+def _state_of(handle: TaskHandle) -> str:
+    """How a started stage, member, flow or group stands, by its handle."""
+    if not handle.done():
+        return "running"
+    error = handle._outcome.exception()
+    if error is None:
+        return "succeeded"
+    if isinstance(error, TaskCancelledError):
+        return "cancelled"
+    return "failed"
+
+
+def _counts(states: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for state in states:
+        counts[state] = counts.get(state, 0) + 1
+    return counts
 
 
 class FlowHandle(TaskHandle):
@@ -43,9 +65,12 @@ class FlowHandle(TaskHandle):
     def __init__(
         self,
         flow_id: str,
+        stage_count: int,
         callback_runner: Callable[[Callable[[Any], Any], Any], None] = run_callback_inline,
     ) -> None:
         super().__init__(flow_id, self._cancel_stage, callback_runner)
+        self._stage_count = stage_count
+        self._stages: list[TaskHandle] = []
         # The stage now running and whether it is the last, published together
         # so a cancel from another thread never pairs one with the other's.
         self._current: tuple[TaskHandle, bool] | None = None
@@ -61,6 +86,21 @@ class FlowHandle(TaskHandle):
         """The stage now running, and whether it is the last one, so a cancel
         knows what to cancel and whether anything would follow it."""
         self._current = (stage, is_last)
+        self._stages.append(stage)
+
+    async def status(self) -> CompositeStatus:
+        """How the flow stands: its state, its stages by state, and the index
+        of the stage it is at or ended on."""
+        stages = list(self._stages)
+        states = [_state_of(stage) for stage in stages]
+        states += ["pending"] * (self._stage_count - len(stages))
+        return CompositeStatus(
+            self.task_id,
+            "flow",
+            _state_of(self),
+            MappingProxyType(_counts(states)),
+            max(len(stages) - 1, 0),
+        )
 
     def _cancel_stage(self, _flow_id: str) -> bool:
         # The flag first: a stage that is being submitted right now sees it.
@@ -107,6 +147,15 @@ class GroupHandle(TaskHandle):
         """One more member is running, so a cancel reaches it too."""
         self._members.append(member)
 
+    async def status(self) -> CompositeStatus:
+        """How the group stands: its state and its members by state."""
+        return CompositeStatus(
+            self.task_id,
+            "group",
+            _state_of(self),
+            MappingProxyType(_counts([_state_of(member) for member in self.members])),
+        )
+
     def _cancel_members(self, _group_id: str) -> bool:
         # The flag first: a member that is being submitted right now sees it.
         self._cancel_requested = True
@@ -151,11 +200,17 @@ class Composites:
         self._session = session
         self._hosted = hosted
         self._numbers = itertools.count(1)
+        self._live: weakref.WeakValueDictionary[str, FlowHandle | GroupHandle] = (
+            weakref.WeakValueDictionary()
+        )
 
     def submit_flow(self, flow: Any, previous: Any) -> FlowHandle:
         """Starts `flow`, whose stages run one after another, and returns its
         handle."""
-        handle = FlowHandle(self._identifier("flow"), self._session.callback_runner)
+        handle = FlowHandle(
+            self._identifier("flow"), len(flow.stages), self._session.callback_runner
+        )
+        self._live[handle.task_id] = handle
         self._host(self._run_flow(flow, previous, handle), handle)
         return handle
 
@@ -163,8 +218,15 @@ class Composites:
         """Starts every member of `group` on `previous`, and returns the
         group's handle."""
         handle = GroupHandle(self._identifier("group"), self._session.callback_runner)
+        self._live[handle.task_id] = handle
         self._host(self._run_group(group, previous, handle), handle)
         return handle
+
+    def status_of(self, task_id: str) -> Awaitable[CompositeStatus] | None:
+        """The status read of a flow or group this session is running; `None`
+        for any other id."""
+        handle = self._live.get(task_id)
+        return None if handle is None else handle.status()
 
     def _identifier(self, kind: str) -> str:
         return f"{kind}-{next(self._numbers)}"

@@ -21,6 +21,7 @@ mod leader_search;
 pub mod messenger;
 mod peers;
 pub mod reconcile;
+pub mod result_transport;
 mod routing_refresh;
 pub mod steal;
 pub mod swarm;

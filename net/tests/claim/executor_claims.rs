@@ -51,6 +51,7 @@ async fn a_leader_runs_its_own_claims_and_a_follower_hears_of_cancels_and_report
         executors[leader].report(Report::Completed {
             run: run.clone(),
             digest: Digest::blake3(RESULT),
+            delivered: false,
         });
         let leader_net = nets[leader].clone();
         shard

@@ -59,6 +59,13 @@ def ephemeral_dies(request: Greeting) -> Greeting:
     return request
 
 
+@kabudachi.task(name="pool.not_retriable_dies", retriable=False)
+def not_retriable_dies(request: Greeting) -> Greeting:
+    """Kills its own process while running: a task not safe to run twice."""
+    os.kill(os.getpid(), signal.SIGKILL)
+    return request
+
+
 @kabudachi.task(name="pool.sized")
 def sized(request: Greeting) -> Greeting:
     return Greeting(text="x" * request.times)
@@ -130,7 +137,12 @@ def declared_late(request: Greeting) -> Greeting:
 async def calls_others(request: Greeting) -> Greeting:
     # Still running when this body has returned: the process waits for it.
     leaf(Greeting(times=100)).callback(note_slowly)
-    one = await leaf(request)
+    leafed = leaf(request)
+    one = await leafed
+    # How a body in a task process sees a task it called: read through the worker.
+    inspected = await leafed.status()
+    assert isinstance(inspected, kabudachi.TaskStatus)
+    seen = f"{leafed.durability.name}:{inspected.state}:{inspected.attempt}"
     try:
         await refuses(Greeting(text="nested"))
     except ValueError as error:
@@ -141,7 +153,12 @@ async def calls_others(request: Greeting) -> Greeting:
         late(request)
     except UnknownTaskError as error:
         refused = type(error).__name__
-    stages = await kabudachi.flow(leaf, leaf)(request)
+    staged = kabudachi.flow(leaf, leaf)(request)
+    stages = await staged
+    # A flow's status crosses the pipe back to this process.
+    composite = await staged.status()
+    assert isinstance(composite, kabudachi.CompositeStatus)
+    seen += f":{composite.state}:{composite.counts['succeeded']}"
     mapped = await leaf.map([Greeting(times=10), Greeting(times=20)])
     later = leaf.options(delay=timedelta(seconds=30))(request)
     cancelled = later.cancel()
@@ -151,7 +168,7 @@ async def calls_others(request: Greeting) -> Greeting:
     except TaskCancelledError:
         ended = "cancelled"
     total = one.times + stages[-1].times + sum(result.times for result in mapped)
-    return Greeting(times=total, text=f"{cancelled} {ended} {failed} {refused}")
+    return Greeting(times=total, text=f"{cancelled} {ended} {failed} {refused} {seen}")
 
 
 LIMIT = {"timeout": timedelta(milliseconds=300), "cancel_grace": timedelta(milliseconds=200)}
@@ -215,14 +232,14 @@ async def outlives_its_deadline(request: Greeting) -> Greeting:
     than the abort deadline a test gives it, so a cancel that it ignores
     costs its process only after that deadline.
 
-    First it calls two tasks that will not start for 30 s, on a worker whose
-    results never come back, and cancels one: `nested` says whether the
-    cancel took, and how many handles this process still keeps for them."""
+    First it calls two tasks that will not start for 30 s and cancels one:
+    `nested` says whether the cancel took, whether this process keeps the
+    other's handle until its outcome comes, and that task's id."""
     later = leaf.options(delay=timedelta(seconds=30))
-    later(request)
+    waiting = later(request)
     cancelled = later(request).cancel()
-    kept = len(current_session()._process._handles)
-    marker("nested").write_text(f"{cancelled} {kept}")
+    kept = waiting.task_id in current_session()._process.requests._handles
+    marker("nested").write_text(f"{cancelled} {kept} {waiting.task_id}")
     marker("outliving").write_text(str(os.getpid()))
     end = time.monotonic() + 30
     while time.monotonic() < end:
@@ -230,6 +247,25 @@ async def outlives_its_deadline(request: Greeting) -> Greeting:
             await asyncio.sleep(end - time.monotonic())
         except asyncio.CancelledError:
             marker("asked to stop").touch()
+    return request
+
+
+@kabudachi.task(name="pool.reads_a_status")
+async def reads_a_status(request: Greeting) -> Greeting:
+    """Reads the status of a task it called once that task has ended,
+    leaving `reading` first and the type of the error the read ended with
+    in `read ended`. With `request.text` set, it reads only once that mark
+    has been left."""
+    called = leaf(request)
+    await called
+    marker("reading").touch()
+    while request.text and not marker(request.text).exists():
+        await asyncio.sleep(0.01)
+    try:
+        await called.status()
+    except Exception as error:
+        marker("read ended").write_text(type(error).__name__)
+        raise
     return request
 
 

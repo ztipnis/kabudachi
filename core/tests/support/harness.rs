@@ -888,6 +888,7 @@ impl Cluster {
         {
             held.state = ReportedState::Succeeded {
                 result_digest: digest.clone(),
+                delivered: false,
             };
         }
         let answer = match self

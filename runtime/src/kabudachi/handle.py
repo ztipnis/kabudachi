@@ -8,7 +8,8 @@ import logging
 from collections.abc import Awaitable, Callable, Generator
 from typing import Any, Protocol
 
-from kabudachi.errors import RemoteResultUnavailableError
+from kabudachi.errors import DurabilityUnavailableError, RuntimeNotStartedError
+from kabudachi.status import CompositeStatus, Durability, TaskStatus
 
 _logger = logging.getLogger("kabudachi")
 
@@ -23,6 +24,11 @@ async def _await_callback(outcome: Awaitable[Any]) -> None:
         await outcome
     except Exception as error:
         _logger.warning("a task callback failed with %s", type(error).__name__)
+
+
+def _read_error(future: "asyncio.Future[Any]") -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 def run_callback_inline(function: Callable[[Any], Any], value: Any) -> None:
@@ -76,10 +82,9 @@ class TaskHandle:
     `shard_id` names the incarnation of the shard that holds the task; `None`
     for a handle made outside a run.
 
-    On a networked worker (`results_delivered` false) the result is never
-    delivered: awaiting raises `RemoteResultUnavailableError`, unless the
-    leader refused the task, and `done()` stays false. `cancel()` still asks
-    the leader.
+    On a networked worker the result comes from the worker that ran the
+    task, once the leader has certified it. `durability` says where the task
+    is kept, and `status()` reads how it stands from its shard's record.
     """
 
     def __init__(
@@ -89,15 +94,80 @@ class TaskHandle:
         callback_runner: Callable[[Callable[[Any], Any], Any], None] = run_callback_inline,
         *,
         shard_id: str | None = None,
-        results_delivered: bool = True,
+        replicable: bool = False,
+        status_reader: Callable[[str], Awaitable[Any]] | None = None,
     ) -> None:
         self.task_id = task_id
         self.shard_id = shard_id
-        self._results_delivered = results_delivered
+        self._replicable = replicable
+        self._status_reader = status_reader
         self._canceller = canceller
         self._callback_runner = callback_runner
         # Thread-safe, because the result can arrive from any thread.
         self._outcome: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        # Settled once a networked leader has stored the task, or refused it.
+        self._stored: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+    @property
+    def durability(self) -> Durability:
+        """Where the task is kept now: `REPLICATED` once a networked leader
+        stored it on a quorum of its shard, `IN_MEMORY` until then and always
+        in the one-node runtime."""
+        if self._stored.done() and self._stored.exception() is None:
+            return Durability.REPLICATED
+        return Durability.IN_MEMORY
+
+    async def durable(self, level: Durability = Durability.REPLICATED) -> None:
+        """Returns once the task is kept at least as durably as `level`.
+
+        Raises `DurabilityUnavailableError` for a level this runtime can
+        never reach (`REPLICATED` in the one-node runtime, `DR_STORED`
+        anywhere), the leader's refusal (`BackpressureError`) if it refused
+        the task, and the handle's own error if the task ended before this
+        process heard it was stored. Cancelling the wait does not affect the
+        task.
+        """
+        if level >= Durability.DR_STORED:
+            raise DurabilityUnavailableError(
+                f"task {self.task_id} cannot be kept in a disaster-recovery store: none exists"
+            )
+        if level <= self.durability:
+            return
+        if not self._replicable:
+            raise DurabilityUnavailableError(
+                f"task {self.task_id} is kept only in this process's memory: the one-node runtime "
+                "replicates nothing"
+            )
+        stored = asyncio.wrap_future(self._stored)
+        # A waiter that gave up leaves the error to nobody: read it here, so
+        # it is not logged as never retrieved.
+        stored.add_done_callback(_read_error)
+        await asyncio.shield(stored)
+
+    async def status(self) -> TaskStatus | CompositeStatus:
+        """How the task stands, read from the record its shard holds. Not
+        authoritative: a change its leader has just made may not show yet.
+        A task's handle answers a `TaskStatus`; a flow's or group's a
+        `CompositeStatus`. Raises `RuntimeNotStartedError` for a handle made
+        outside a run."""
+        if self._status_reader is None:
+            raise RuntimeNotStartedError(f"task {self.task_id} has no run to read its status from")
+        return await self._status_reader(self.task_id)
+
+    def _mark_stored(self, error: BaseException | None = None) -> None:
+        """A networked leader stored the task, or refused it with `error`, or
+        the handle settled with `error` before this process heard either;
+        nothing for a handle whose task is never replicated. Only the first
+        word counts."""
+        if not self._replicable:
+            return
+        try:
+            if error is None:
+                self._stored.set_result(None)
+            else:
+                self._stored.set_exception(error)
+        except concurrent.futures.InvalidStateError:
+            pass
 
     def done(self) -> bool:
         """Whether the task has finished, successfully or not."""
@@ -145,12 +215,6 @@ class TaskHandle:
         return self._wait().__await__()
 
     async def _wait(self) -> Any:
-        if not self._results_delivered and not self._outcome.done():
-            raise RemoteResultUnavailableError(
-                f"task {self.task_id} runs in its shard, but its result cannot be awaited here: "
-                "results are not yet sent back across workers",
-                self.task_id,
-            )
         body = current_body.get()
         if body is None or self._outcome.done():
             return await self._outcome_future()
@@ -165,14 +229,19 @@ class TaskHandle:
         return asyncio.shield(asyncio.wrap_future(self._outcome))
 
     def _resolve(self, value: Any) -> None:
-        """Settles the handle with `value`, unless it is already settled."""
+        """Settles the handle with `value`, unless it is already settled. A
+        certified result was stored, so `durable()` answers too."""
+        self._mark_stored()
         try:
             self._outcome.set_result(value)
         except concurrent.futures.InvalidStateError:
             pass
 
     def _fail(self, error: BaseException) -> None:
-        """Settles the handle with `error`, unless it is already settled."""
+        """Settles the handle with `error`, unless it is already settled. A
+        `durable()` not answered yet raises `error` too: nothing more about
+        the task reaches this handle."""
+        self._mark_stored(error)
         try:
             self._outcome.set_exception(error)
         except concurrent.futures.InvalidStateError:

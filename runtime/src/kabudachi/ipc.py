@@ -62,11 +62,21 @@ class Drain:
 
 @dataclass(frozen=True)
 class Reply:
-    """The answer to a `Submit` (the new task's id and shard id) or to a
-    `CancelTask` (whether it cancelled), or the error it raised."""
+    """The answer to a `Submit` (the new task's id, shard id and whether it
+    can be replicated), to a `CancelTask` (whether it cancelled) or to an
+    `Inspect` (the task's status), or the error it raised."""
 
     request: int
     value: Any = None
+    error: BaseException | None = None
+
+
+@dataclass(frozen=True)
+class Stored:
+    """A task a body here called was stored by a networked leader, or refused
+    (`error`). Sent before the task's `WaitDone`."""
+
+    task_id: str
     error: BaseException | None = None
 
 
@@ -177,6 +187,14 @@ class CancelTask:
 
 
 @dataclass(frozen=True)
+class Inspect:
+    """A body here asks how a task it called stands."""
+
+    request: int
+    task_id: str
+
+
+@dataclass(frozen=True)
 class Compacted:
     """A compaction's folded payload."""
 
@@ -223,14 +241,26 @@ def outcome_of(task_id: str, outcome: "Future[Any]") -> WaitDone:
     if error is not None:
         return WaitDone(task_id, error=portable(error))
     value = outcome.result()
+    unsendable = _unsendable(value, f"the result of task {task_id}")
+    if unsendable is not None:
+        return WaitDone(task_id, error=unsendable)
+    return WaitDone(task_id, value)
+
+
+def answer_of(request: int, value: Any, what: str) -> Reply:
+    """The `Reply` carrying `value`, or a `TaskBodyError` the asking body
+    raises if `value` (described as `what`) would not arrive whole."""
+    unsendable = _unsendable(value, what)
+    if unsendable is not None:
+        return Reply(request, error=unsendable)
+    return Reply(request, value)
+
+
+def _unsendable(value: Any, what: str) -> TaskBodyError | None:
+    """Why `value` cannot be sent to a task process, or `None` if it can."""
     try:
         pickle.loads(pickle.dumps(value))
-    except Exception as unsendable:
-        kind = type(unsendable).__name__
-        return WaitDone(
-            task_id,
-            error=TaskBodyError(
-                f"the result of task {task_id} cannot be sent to a task process: {kind}", kind
-            ),
-        )
-    return WaitDone(task_id, value)
+    except Exception as error:
+        kind = type(error).__name__
+        return TaskBodyError(f"{what} cannot be sent to a task process: {kind}", kind)
+    return None

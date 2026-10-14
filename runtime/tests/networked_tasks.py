@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 import kabudachi
-from kabudachi.errors import RemoteResultUnavailableError
+from kabudachi.errors import ResultUnavailableError
 from proto_messages import Greeting
 
 
@@ -28,18 +28,35 @@ def spin(request: Greeting) -> Greeting:
 
 @kabudachi.task(name="cluster.hold")
 async def hold(request: Greeting) -> Greeting:
-    """Holds for `times` milliseconds the first time `text` runs; a later run
-    of the same text returns at once. A hold asked to stop leaves a
-    `<text>.stopped` marker."""
+    """Holds for `times` milliseconds the first time `text` runs, or, for a
+    negative `times`, until the test creates a `<text>.go` marker; a later
+    run of the same text returns at once. Its start marker holds the process
+    id of the worker running it. A hold asked to stop leaves a
+    `<text>.stopped` marker, and one that returns a `<text>.ended` marker."""
     first = not any(_markers().glob(f"{request.text}.*"))
-    (_markers() / f"{request.text}.{os.getpid()}").touch()
+    started = _markers() / f"{request.text}.{os.getpid()}"
+    # Written whole under a name nothing matches, then renamed: the test
+    # never reads a start marker without its worker.
+    written = _markers() / f"_{request.text}.{os.getpid()}"
+    written.write_text(str(os.getppid()))
+    written.rename(started)
     if first:
         try:
-            await asyncio.sleep(request.times / 1000)
+            await _held(request)
         except asyncio.CancelledError:
             (_markers() / f"{request.text}.stopped").touch()
             raise
+    (_markers() / f"{request.text}.ended").touch()
     return Greeting(text=request.text)
+
+
+async def _held(request: Greeting) -> None:
+    if request.times >= 0:
+        await asyncio.sleep(request.times / 1000)
+        return
+    go = _markers() / f"{request.text}.go"
+    while not go.exists():
+        await asyncio.sleep(0.01)
 
 
 @kabudachi.task(name="cluster.nests")
@@ -47,16 +64,39 @@ async def nests(request: Greeting) -> Greeting:
     """Calls `hold` and awaits its result, and says what that did."""
     try:
         await hold(Greeting(text=request.text))
-    except RemoteResultUnavailableError as error:
+    except ResultUnavailableError as error:
         return Greeting(text=type(error).__name__)
     return Greeting(text="delivered")
 
 
 @kabudachi.task(name="cluster.awaits")
 async def awaits(request: Greeting) -> Greeting:
-    """Calls `hold` and awaits its result; what that raises fails the run."""
-    await hold(Greeting(text=request.text))
-    return Greeting(text="delivered")
+    """Calls `hold`, held until its leader has stored it, then lets it go and
+    awaits its result; what that raises fails the run, as does a call never
+    heard stored. Says how durably the call is kept."""
+    called = hold(Greeting(text=request.text, times=-1))
+    # Before the call can settle: only the worker's word that its leader
+    # stored the task can answer this.
+    await asyncio.wait_for(called.durable(kabudachi.Durability.REPLICATED), 20)
+    (_markers() / f"{request.text}.go").touch()
+    await called
+    return Greeting(text=called.durability.name)
+
+
+@kabudachi.ephemeral_task(name="cluster.fleeting")
+async def fleeting(request: Greeting) -> Greeting:
+    """As `hold`, for a task that is never replayed once its worker is lost."""
+    first = not any(_markers().glob(f"{request.text}.*"))
+    (_markers() / f"{request.text}.{os.getpid()}").touch()
+    if first:
+        await asyncio.sleep(request.times / 1000)
+    return Greeting(text=request.text)
+
+
+@kabudachi.task(name="cluster.big")
+def big(request: Greeting) -> Greeting:
+    """Returns a result larger than one frame can carry."""
+    return Greeting(text="x" * (2 * 1024 * 1024))
 
 
 def _join(older: Greeting, newer: Greeting) -> Greeting:
@@ -71,4 +111,12 @@ async def gather(request: Greeting) -> Greeting:
     return request
 
 
-TASKS = {"spin": spin, "hold": hold, "nests": nests, "awaits": awaits, "gather": gather}
+TASKS = {
+    "spin": spin,
+    "hold": hold,
+    "nests": nests,
+    "awaits": awaits,
+    "fleeting": fleeting,
+    "big": big,
+    "gather": gather,
+}

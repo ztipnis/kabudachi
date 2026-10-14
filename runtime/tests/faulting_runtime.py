@@ -44,6 +44,8 @@ class FaultingRuntime:
         self.submit_lingers_for = 0
         self._claims_given = 0
         self._injected = asyncio.Queue()
+        # Injected events `next_events()` has not handed the session yet.
+        self._injected_untaken = 0
         self._native_events = None
 
     def __getattr__(self, name):
@@ -86,24 +88,43 @@ class FaultingRuntime:
         self._claims_given += len(claims)
         return claims
 
-    def inject_event(self, kind, task_id=""):
+    def inject_event(self, kind, task_id="", **fields):
         """Makes `next_events()` also return an event the real runtime did not
-        produce, for one it could never cause (such as one for another session's task)."""
-        self._injected.put_nowait(
+        produce, for one it could never cause (such as one for another
+        session's task, or what a networked leader tells a client). `fields`
+        set or override the event's attributes."""
+        self._inject(
             SimpleNamespace(
-                kind=kind,
-                task_id=task_id,
-                task_run_id="",
-                was_running=False,
-                superseded_by=None,
-                active=False,
+                **{
+                    "kind": kind,
+                    "task_id": task_id,
+                    "task_run_id": "",
+                    "was_running": False,
+                    "superseded_by": None,
+                    "active": False,
+                    "payload": b"",
+                    "result_digest": b"",
+                    "state": None,
+                    "failure_kind": "",
+                    **fields,
+                }
             )
         )
+
+    def _inject(self, event):
+        self._injected_untaken += 1
+        self._injected.put_nowait(event)
+
+    def injected_taken(self):
+        """Whether `next_events()` has returned every injected event. The
+        session handles a batch in the step it is returned in, so by then
+        every one of them has been handled."""
+        return self._injected_untaken == 0
 
     def inject_abort(self, task_run_id, seconds_left):
         """Makes `next_events()` also return the abort deadline a shard's
         leader would send a worker that lost contact with it."""
-        self._injected.put_nowait(
+        self._inject(
             SimpleNamespace(
                 kind=_native.EventKind.ABORT,
                 task_id="",
@@ -115,7 +136,7 @@ class FaultingRuntime:
     def inject_cancel(self, task_id, task_run_id):
         """Makes `next_events()` also return the cancellation a shard's leader
         would send the worker holding the task's run."""
-        self._injected.put_nowait(
+        self._inject(
             SimpleNamespace(
                 kind=_native.EventKind.CANCELLED,
                 task_id=task_id,
@@ -146,6 +167,7 @@ class FaultingRuntime:
             events.append(injected.result())
             while not self._injected.empty():
                 events.append(self._injected.get_nowait())
+            self._injected_untaken -= len(events)
         if self._native_events.done():
             events.extend(self._native_events.result())
             self._native_events = None
@@ -169,7 +191,8 @@ class FaultingRuntime:
         self.events.append(("lost", task_run_id))
         return self.native.report_lost(task_run_id)
 
-    def complete(self, task_run_id, result_digest, continues=False):
+    def complete(self, task_run_id, result_digest, continues=False, *, result=None):
+        # `result` goes to a networked task's client; one-node, nowhere.
         self.events.append(("complete", task_run_id))
         if self.on_complete is not None:
             self.on_complete(task_run_id)

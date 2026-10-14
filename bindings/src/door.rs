@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use kabudachi_core::election::{DropMessages, Input, NoAuthority, Step, WorkerNode, carry_out};
 use kabudachi_core::protocol::digest::Digest;
 use kabudachi_core::protocol::ids::{TaskId, TaskRunId, Uuid7Ids, WorkerId};
+use kabudachi_core::protocol::messages::TaskRecord;
 use kabudachi_core::protocol::records::TaskRunRecord;
 use kabudachi_core::protocol::task::TaskRunState;
 use kabudachi_core::reconcile::Rebuild;
@@ -283,18 +284,6 @@ impl<C: Clock> SchedulerDoor<C> {
         }))
     }
 
-    pub fn run_state(&self, run: &TaskRunId) -> Result<Option<TaskRunState>, Closed> {
-        self.read(|scheduler| {
-            scheduler
-                .task_run(run)
-                .map(|run| run.current_state())
-        })
-    }
-
-    pub fn run_ids(&self, task: &TaskId) -> Result<Vec<TaskRunId>, Closed> {
-        self.read(|scheduler| scheduler.runs_of(task))
-    }
-
     /// The timer loop's tick: `catch_up`, wake claims (never the timer loop
     /// itself), sweep the local store, and return the earlier of
     /// `next_deadline` and the store's `next_due`. The deadline is read after what
@@ -441,15 +430,6 @@ impl<C: Clock> SchedulerDoor<C> {
         Ok(outcome)
     }
 
-    /// Reads the scheduler under its lock, unless the door is closed.
-    fn read<T>(&self, read: impl FnOnce(&DoorScheduler<C>) -> T) -> Result<T, Closed> {
-        let inside = self.lock();
-        if inside.closed {
-            return Err(Closed);
-        }
-        Ok(read(&inside.scheduler))
-    }
-
     /// Locks the scheduler, which a panic in another holder does not make
     /// unusable.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inside<C>> {
@@ -463,6 +443,35 @@ impl<C: Clock> SchedulerDoor<C> {
         self.wakeups.claims.close();
         self.wakeups.events.close();
         self.wakeups.timers.notify_one();
+    }
+}
+
+/// Reads of the scheduler's runs and records, which change nothing.
+impl<C: Clock> SchedulerDoor<C> {
+    pub fn run_state(&self, run: &TaskRunId) -> Result<Option<TaskRunState>, Closed> {
+        self.read(|scheduler| {
+            scheduler
+                .task_run(run)
+                .map(|run| run.current_state())
+        })
+    }
+
+    pub fn run_ids(&self, task: &TaskId) -> Result<Vec<TaskRunId>, Closed> {
+        self.read(|scheduler| scheduler.runs_of(task))
+    }
+
+    /// The newest record of `task` the scheduler's store holds, if any.
+    pub fn task_record(&self, task: &TaskId) -> Result<Option<TaskRecord>, Closed> {
+        self.read(|scheduler| scheduler.observer().records().get(task).cloned())
+    }
+
+    /// Reads the scheduler under its lock, unless the door is closed.
+    fn read<T>(&self, read: impl FnOnce(&DoorScheduler<C>) -> T) -> Result<T, Closed> {
+        let inside = self.lock();
+        if inside.closed {
+            return Err(Closed);
+        }
+        Ok(read(&inside.scheduler))
     }
 }
 

@@ -9,9 +9,14 @@
 //! handed to the worker's driver, which takes it to whichever node leads, and
 //! returns at once; the leader's decision is not seen here. A submission
 //! returns its task id at once and is delivered the same way, until a leader
-//! stores it (`ACCEPTED`) or refuses it for good (`REFUSED`). A result never
-//! goes back to the process that submitted its task, so nothing here
-//! certifies a result for a handle.
+//! stores it (`ACCEPTED`) or refuses it for good (`REFUSED`).
+//!
+//! A task submitted here names this worker as its client. The worker that
+//! runs it delivers its result here before reporting it, and the leader
+//! tells this worker when the run is certified or how the task ended
+//! otherwise (`RESULT`, `CERTIFIED` and `OUTCOME` in `next_events()`). After
+//! a change of leader, every task still awaited is asked about again. A run
+//! held here delivers its result to its own client before it is reported.
 //!
 //! Places are offered to the driver as credits. Each claim Python asks for
 //! offers the places it has free that are neither offered already nor held
@@ -27,6 +32,7 @@ mod delivery;
 mod handover;
 mod host;
 mod observed;
+mod results;
 mod seam;
 mod start;
 
@@ -50,6 +56,7 @@ use crate::work::PyTaskRecord;
 use self::delivery::{cancel_at_leader, send_submission};
 use self::host::Host;
 use self::observed::Observed;
+use self::results::deliver_then_report;
 use self::seam::{GONE_MESSAGE, Shared};
 use self::start::NetworkedArguments;
 
@@ -122,10 +129,10 @@ impl NetworkedRuntime {
         })
     }
 
-    /// Whether a run's certification comes back to this process: never,
-    /// for a networked worker, whose leader may be another process.
+    /// Whether a report's call returns the leader's decision: never, here;
+    /// certifications and outcomes arrive as events.
     #[getter]
-    fn delivers_results(&self) -> bool {
+    fn certifies_locally(&self) -> bool {
         false
     }
 
@@ -192,7 +199,13 @@ impl NetworkedRuntime {
         Ok(send_submission(
             &self.shared,
             self.host.handle(),
-            mint(submission.into_submission(py)?, &Uuid7Ids, &self.clock),
+            mint(
+                submission
+                    .into_submission(py)?
+                    .with_client(self.shared.net.local_worker_id()),
+                &Uuid7Ids,
+                &self.clock,
+            ),
         ))
     }
 
@@ -238,23 +251,47 @@ impl NetworkedRuntime {
     }
 
     /// Hands the leader a run's success, with the digest of its result.
-    /// Raises `ValueError` for a digest of the wrong length, and for
+    /// `result`, the result itself, is first delivered to the task's client,
+    /// for up to the run's reconnect timeout, and the report says whether it
+    /// arrived. Raises `ValueError` for a digest of the wrong length, and for
     /// `continues`: a networked worker certifies no continuation.
-    #[pyo3(signature = (task_run_id, result_digest, continues = false))]
-    fn complete(&self, task_run_id: &str, result_digest: &[u8], continues: bool) -> PyResult<()> {
+    #[pyo3(signature = (task_run_id, result_digest, continues = false, *, result = None))]
+    fn complete(
+        &self,
+        task_run_id: &str,
+        result_digest: &[u8],
+        continues: bool,
+        result: Option<Vec<u8>>,
+    ) -> PyResult<()> {
         if continues {
             return Err(PyValueError::new_err(
-                "a networked worker certifies no continuation: the tasks it starts would need \
-                 their results delivered here",
+                "a networked worker certifies no continuation: its stages would be orchestrated \
+                 in this process",
             ));
         }
         let digest = Digest::new(DigestAlgorithm::Blake3, result_digest.to_vec())
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        self.shared
-            .finish(TaskRunId::new(task_run_id), |run| Report::Completed {
+        let run = TaskRunId::new(task_run_id);
+        let Some(held) = self.shared.end(&run) else {
+            return Ok(());
+        };
+        match (held.client.clone(), result) {
+            (Some(client), Some(payload)) => {
+                self.host.handle().spawn(deliver_then_report(
+                    Arc::clone(&self.shared),
+                    client,
+                    held,
+                    run,
+                    digest,
+                    payload,
+                ));
+            }
+            _ => self.shared.report(Report::Completed {
                 run,
                 digest,
-            });
+                delivered: false,
+            }),
+        }
         Ok(())
     }
 

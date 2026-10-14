@@ -60,7 +60,7 @@ impl From<&ReportedRun> for generated::ReportedRun {
                 None,
                 String::new(),
             ),
-            ReportedState::Succeeded { result_digest } => (
+            ReportedState::Succeeded { result_digest, .. } => (
                 generated::ReportedRunState::ReportedRunSucceeded,
                 Some(result_digest.clone().into()),
                 String::new(),
@@ -76,6 +76,13 @@ impl From<&ReportedRun> for generated::ReportedRun {
             state: state as i32,
             result_digest,
             failure_kind,
+            delivered: matches!(
+                &run.state,
+                ReportedState::Succeeded {
+                    delivered: true,
+                    ..
+                }
+            ),
         }
     }
 }
@@ -91,6 +98,7 @@ impl TryFrom<&generated::ReportedRun> for ReportedRun {
             Ok(generated::ReportedRunState::ReportedRunSucceeded) => ReportedState::Succeeded {
                 result_digest: Digest::try_from(run.result_digest.as_ref().ok_or(MalformedReport)?)
                     .map_err(|_| MalformedReport)?,
+                delivered: run.delivered,
             },
             Ok(generated::ReportedRunState::ReportedRunFailed) => ReportedState::Failed {
                 failure_kind: run.failure_kind.clone(),

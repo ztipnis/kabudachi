@@ -224,6 +224,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
             mut install,
             held_back,
             finish_live,
+            finished_in_batch,
         } = self.settle(records);
         let now = self.clock.now();
         let wall_now = WallTime::now(&self.clock);
@@ -240,6 +241,9 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.reconciliation.installed(&installed);
         for record in held_back {
             self.reconciliation.hold_back(record);
+        }
+        for older in finished_in_batch {
+            self.conclude(&older);
         }
         for (older, newer) in finish_live {
             self.supersede(&older, &newer);
@@ -274,6 +278,7 @@ impl<C: Clock, I: IdGenerator, O: Observer> Scheduler<C, I, O> {
         self.unpublished.clear();
         self.events.clear();
         self.held_cancels.clear();
+        self.conclusions.clear();
         self.run_decided_at.clear();
         self.failed_compactions.clear();
     }

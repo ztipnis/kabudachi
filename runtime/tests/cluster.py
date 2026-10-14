@@ -69,6 +69,7 @@ class Worker:
             self.close()
             raise
         self.id, self.address, self.shard = ready["worker"], ready["address"], ready["shard"]
+        self.certifies_locally = ready["certifies_locally"]
 
     def _read(self) -> None:
         for line in self.process.stdout:
@@ -212,6 +213,13 @@ def certified_once(shard, task_id: str, digest: str) -> dict:
     succeeded = [run for run in record["runs"] if run["state"] == "SUCCEEDED"]
     assert [run["digest"] for run in succeeded] == [digest], record
     return record
+
+
+def settled(worker: Worker, task_id: str) -> dict | None:
+    """The notice saying how the worker's handle to the task settled, once
+    it has: `{"settled": task_id, "error": <its type's name> or None}`."""
+    worker.leader()  # an answer reads the lines printed before it
+    return next((notice for notice in worker.notices if notice.get("settled") == task_id), None)
 
 
 def running_on(cluster: Cluster, task_id: str) -> Worker | None:

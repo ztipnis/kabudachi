@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
+import pickle
 import threading
 import time
 from datetime import timedelta
@@ -17,7 +18,15 @@ from kabudachi import lifecycle as lifecycle_module
 from kabudachi import registry as registry_module
 from kabudachi import runner as runner_module
 from kabudachi.config import Configuration
-from kabudachi.errors import RuntimeNotStartedError, StartupError, TaskBodyError, TaskDefinitionError
+from kabudachi import Durability, TaskStatus
+from kabudachi._native import RunState
+from kabudachi.errors import (
+    DurabilityUnavailableError,
+    RuntimeNotStartedError,
+    StartupError,
+    TaskBodyError,
+    TaskDefinitionError,
+)
 from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
 from proto_messages import Greeting, Receipt
@@ -49,6 +58,106 @@ def test_a_synchronous_task_is_run_and_its_result_awaited():
         return await greet(Greeting(text="world", times=1))
 
     assert kabudachi.run(main) == Greeting(text="hello world", times=2)
+
+
+def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_record():
+    @declare
+    def greet(request: Greeting) -> Greeting:
+        return request
+
+    async def main():
+        handle = greet(Greeting(text="status"))
+        await handle.durable(Durability.IN_MEMORY)
+        refusals = []
+        for level in (Durability.REPLICATED, Durability.DR_STORED):
+            try:
+                await handle.durable(level)
+            except DurabilityUnavailableError as refusal:
+                refusals.append(refusal)
+        await handle
+        return handle.durability, len(refusals), await handle.status()
+
+    durability, refused, after = kabudachi.run(main)
+
+    assert durability is Durability.IN_MEMORY
+    assert refused == 2
+    assert isinstance(after, TaskStatus)
+    assert (after.state, after.attempt, after.delivered) == ("succeeded", 1, False)
+    assert after.submitted_at is not None and after.updated_at >= after.submitted_at
+    # A status crosses process boundaries (a task process reads it through
+    # its worker), so every native run state it may hold pickles as itself.
+    variants = [getattr(RunState, name) for name in dir(RunState) if name.isupper()]
+    assert len(variants) == 11
+    assert all(pickle.loads(pickle.dumps(variant)) is variant for variant in variants)
+
+
+def test_a_flow_and_a_group_report_their_stages_and_members():
+    @declare
+    def shout(request: Greeting) -> Greeting:
+        return Greeting(text=request.text.upper())
+
+    @declare
+    def explode(request: Greeting) -> Greeting:
+        raise ValueError("no")
+
+    started = threading.Semaphore(0)
+    gate = threading.Event()
+
+    @declare
+    def held(request: Greeting) -> Greeting:
+        started.release()
+        gate.wait(10)
+        return request
+
+    async def group_counts_reach(grouped, counts):
+        status = await grouped.status()
+        for _ in range(500):
+            if dict(status.counts) == counts:
+                break
+            await asyncio.sleep(0.01)
+            status = await grouped.status()
+        return status
+
+    async def main():
+        flowed = kabudachi.flow(held.bind(Greeting(text="a")), shout)()
+        grouped = kabudachi.group(shout, explode, held, on_error="collect_all")(Greeting(text="g"))
+        for _ in range(2):
+            assert await asyncio.to_thread(started.acquire, timeout=10)
+        # Both held bodies are running: the flow is at its first stage, the
+        # group waits on one member while the others have ended.
+        in_flight = await flowed.status(), await group_counts_reach(
+            grouped, {"succeeded": 1, "failed": 1, "running": 1}
+        )
+        gate.set()
+        await flowed
+        await grouped
+        return in_flight, (await flowed.status(), await grouped.status())
+
+    (flowing, grouping), (flowed, grouped) = kabudachi.run(main)
+
+    assert (flowing.kind, flowing.state, flowing.stage, dict(flowing.counts)) == (
+        "flow",
+        "running",
+        0,
+        {"running": 1, "pending": 1},
+    )
+    assert (grouping.kind, grouping.state, dict(grouping.counts)) == (
+        "group",
+        "running",
+        {"succeeded": 1, "failed": 1, "running": 1},
+    )
+    assert (flowed.kind, flowed.state, flowed.stage, dict(flowed.counts)) == (
+        "flow",
+        "succeeded",
+        1,
+        {"succeeded": 2},
+    )
+    assert (grouped.kind, grouped.state, grouped.stage, dict(grouped.counts)) == (
+        "group",
+        "succeeded",
+        None,
+        {"succeeded": 2, "failed": 1},
+    )
 
 
 def test_a_task_that_returns_nothing_gives_none():

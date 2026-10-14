@@ -26,6 +26,7 @@ from kabudachi.errors import (
     TaskCancelledError,
     TaskDefinitionError,
     TaskLostError,
+    TaskOrphanedError,
     TaskTimeoutError,
 )
 from kabudachi.lifecycle import HookRegistry
@@ -207,11 +208,11 @@ def test_a_body_in_a_task_process_calls_tasks_flows_and_groups_and_gives_its_pla
     result = kabudachi.run(main)
 
     assert result.times == 1 + 2 + 11 + 21
-    assert result.text == "True cancelled ValueError UnknownTaskError"
+    assert result.text == "True cancelled ValueError UnknownTaskError IN_MEMORY:succeeded:1:succeeded:2"
     assert (markers / "called-back").read_text() == "101", "the task process ran the callback out"
 
 
-def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_is_ephemeral():
+def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_is_ephemeral_or_not_retriable():
     kabudachi.configure(processes=1)
 
     async def main():
@@ -219,6 +220,10 @@ def test_a_body_whose_process_dies_is_replayed_in_a_replacement_unless_its_task_
             replayed = await pool_tasks.dies_once(Greeting(text="a"))
             with pytest.raises(TaskLostError):
                 await pool_tasks.ephemeral_dies(Greeting())
+            # Running when its process died, and not safe to run twice: its
+            # outcome is unknown, so it is orphaned, not lost.
+            with pytest.raises(TaskOrphanedError):
+                await pool_tasks.not_retriable_dies(Greeting())
             after = await pool_tasks.where_async(Greeting())
             return replayed.times, after.times
 
@@ -304,7 +309,7 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
         native = _native.NativeRuntime("worker", "incarnation", OneNodeArguments())
         runtime = FaultingRuntime(native)
         # Runs a shard's leader hands this worker, which settle no handle here.
-        runtime.delivers_results = False
+        runtime.certifies_locally = False
         serving = None
         await pool.start()
         try:
@@ -315,8 +320,8 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
                 session.submit(pool_tasks.outlives_its_deadline.definition, Greeting())
                 while not (markers / "outliving").exists():
                     await asyncio.sleep(0.01)
-                # The calls it made settle nothing here, so nothing keeps them.
-                kept = [dict(child.handles) for child in pool._children]
+                # The calls it made are kept on both sides until their outcomes come.
+                kept = [set(child.handles) for child in pool._children]
                 [run_id] = [event[1] for event in runtime.events if event[0] == "started"]
                 # As the leader would once this worker lost contact with it.
                 runtime.inject_abort(run_id, seconds_left)
@@ -337,10 +342,69 @@ def test_a_run_handed_over_by_a_shard_still_running_at_its_abort_deadline_is_kil
     assert seconds_left <= lost < seconds_left + 2.0, lost
     assert [event[0] for event in events] == ["started", "lost"], events
     assert (markers / "asked to stop").exists(), "the body was asked to stop first"
-    assert (markers / "nested").read_text() == "True 0", "a nested cancel took, and no handle was kept"
-    assert kept == [{}], kept
+    cancelled, kept_there, waiting = (markers / "nested").read_text().split()
+    assert (cancelled, kept_there) == ("True", "True"), "a nested cancel took, and the other handle was kept"
+    assert [waiting in handles for handles in kept] == [True], kept
     with pytest.raises(ProcessLookupError):
         os.kill(int((markers / "outliving").read_text()), 0)
+
+
+@pytest.mark.parametrize("asked", ["before the pool stops", "once the pool is stopping"])
+def test_a_body_whose_status_read_is_still_unanswered_when_the_pool_stops_gently_ends_with_a_stopped_run(
+    markers, asked
+):
+    kabudachi.configure(processes=1, concurrency=1)
+    configuration = config_module.process_configuration()
+    settings = configuration.settings()
+    registry = registry_module.default_registry()
+    hooks = lifecycle_module.default_hooks()
+    reading = asyncio.Event()
+
+    async def never_read(task_id):
+        reading.set()
+        await asyncio.Event().wait()
+
+    async def stop_gently(pool, session):
+        if asked == "before the pool stops":
+            session.submit(pool_tasks.reads_a_status.definition, Greeting())
+            await reading.wait()
+            await pool.stop(kill=False)
+            return
+        session.submit(pool_tasks.reads_a_status.definition, Greeting(text="stopping"))
+        while not (markers / "reading").exists():
+            await asyncio.sleep(0.01)
+        stopping = asyncio.ensure_future(pool.stop(kill=False))
+        # The pool has begun stopping before the body asks.
+        await asyncio.sleep(0)
+        (markers / "stopping").touch()
+        await stopping
+
+    async def main():
+        pool = ProcessPool(settings, task_modules(registry, hooks, settings.imports), registry, hooks)
+        native = _native.NativeRuntime("worker", "incarnation", OneNodeArguments())
+        runtime = FaultingRuntime(native)
+        # A record nobody can reach: the status read waits for good.
+        runtime.task_record = never_read
+        await pool.start()
+        session = Session(runtime, registry, process_serializers(), configuration, executor=pool)
+        serving = asyncio.ensure_future(session.serve())
+        try:
+            async with asyncio.timeout(30):
+                await native.wait_until_leader()
+                started = time.monotonic()
+                await stop_gently(pool, session)
+                return time.monotonic() - started
+        finally:
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
+            await pool.stop(kill=True)
+            native.shutdown()
+
+    stopped_after = asyncio.run(main())
+
+    # Answered as stopped, so the body ended and its process exited on its own.
+    assert (markers / "read ended").read_text() == "RunStoppedError"
+    assert stopped_after < 5.0, stopped_after
 
 
 @pytest.mark.parametrize(
@@ -367,7 +431,7 @@ def test_a_compaction_handed_over_by_a_shard_ends_as_the_leader_says(markers, en
         )
         runtime = FaultingRuntime(native)
         # Runs a shard's leader hands this worker, which settle no handle here.
-        runtime.delivers_results = False
+        runtime.certifies_locally = False
         compactions = []
         claim_pending = runtime.claim_pending
 

@@ -3021,7 +3021,9 @@ Phase 1 already delivers `flow`, `group`, implicit flows and `.map` in a one-nod
 - group ordered result collection across workers and leader changes;
 - durable flow continuations: ending a continuation over the network, so that an implicit flow's lifetime holds across a leader change (§8.2).
 
-Open (from Phase 5): on a networked worker, a task that returns a flow, group or bound task fails with `RemoteResultUnavailableError`. Its continuation starts stages that run on other workers and awaits their results, then ends over the network: it needs the durable flow continuations and the result collection across workers above.
+Open (from Phase 5): on a networked worker, a task that returns a flow, group or bound task fails with `TaskDefinitionError`. Its continuation starts stages that run on other workers and awaits their results, then ends over the network: it needs the durable flow continuations and the result collection across workers above.
+
+Open: a Task record read, and so `TaskHandle.status()`, waits out the 5 s kad query timeout while a shard peer is connected but unresponsive (stopped, say). The lookup should finish once the record's placement holders, or a quorum of them, have answered.
 
 ### Phase 7: observability
 

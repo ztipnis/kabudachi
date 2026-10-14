@@ -23,6 +23,7 @@ pub(crate) struct SubmitArguments {
     key: Option<String>,
     retries: u32,
     drop_oldest: bool,
+    non_retriable: bool,
     options: RequestedTiming,
     settings: ResolvedSettings,
 }
@@ -62,6 +63,9 @@ impl SubmitArguments {
         .with_retries(self.retries);
         if self.kind == "ephemeral" {
             submission = submission.ephemeral();
+        }
+        if self.non_retriable {
+            submission = submission.non_retriable();
         }
         let submission = timed(
             submission,
