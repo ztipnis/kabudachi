@@ -1899,6 +1899,57 @@ def test_a_run_carries_its_tasks_reconnect_timeout_or_else_its_queues():
     }
 
 
+def stamped(request: Greeting) -> Greeting:
+    return request
+
+
+def test_a_submission_carries_its_tasks_retention_and_retries_or_else_its_queues_or_the_processes():
+    """The submitter stamps what the task chose, else its queue's, else
+    leaves retention to the shard; retries fall back to the process's, and a
+    task that must not run twice is never retried."""
+    world = World()
+    world.configuration.configure(
+        retries=1, queue_options={"kept": QueueOptions(result_ttl=timedelta(minutes=5))}
+    )
+    declared = {
+        "tests.own_ttl": {"result_ttl": timedelta(minutes=2), "retries": 2},
+        "tests.queue_ttl": {"queue": "kept"},
+        "tests.keeps_nothing": {"result_ttl": None},
+        "tests.no_retry": {"retriable": False},
+    }
+    for name, options in declared.items():
+        task = Task(
+            stamped,
+            registry=world.registry,
+            serializers=world.serializers,
+            name=name,
+            **options,
+        )
+        world.session.submit(task.definition, Greeting(text="hi"))
+
+    async def claimed():
+        await asyncio.wait_for(world.native.wait_until_leader(), WAIT)
+        claims = await asyncio.wait_for(world.native.claim_pending(10), WAIT)
+        records = {
+            claim.definition_id: await world.native.task_record(claim.task_id) for claim in claims
+        }
+        return claims, records
+
+    claims, records = run(claimed())
+    assert {claim.definition_id: claim.result_ttl_ms for claim in claims} == {
+        "tests.own_ttl": 120_000,
+        "tests.queue_ttl": 300_000,
+        "tests.keeps_nothing": 0,
+        "tests.no_retry": None,
+    }
+    assert {name: record.max_retries for name, record in records.items()} == {
+        "tests.own_ttl": 2,
+        "tests.queue_ttl": 1,
+        "tests.keeps_nothing": 1,
+        "tests.no_retry": 0,
+    }
+
+
 def routed(request: Greeting) -> Greeting:
     return request
 

@@ -26,6 +26,13 @@ class SubmissionSettings:
     queue: str
     reconnect_timeout_ms: int | None = None
     """The reconnect timeout its runs carry; `None` leaves it to the shard."""
+    retries: int = 0
+    """How many times a failed run is replaced by a new attempt: the task's
+    own, else the process's, and 0 for a task that must not run twice."""
+    result_ttl_ms: int | None = None
+    """How long the shard keeps the finished task, in milliseconds: the
+    task's own, else its queue's; `None` leaves it to the shard, 0 keeps no
+    result."""
 
 
 def submission_options(

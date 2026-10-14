@@ -32,6 +32,7 @@ from kabudachi.errors import (
     StartupError,
     TaskBodyError,
     TaskDefinitionError,
+    TaskTimeoutError,
 )
 from kabudachi.lifecycle import HookRegistry
 from kabudachi.registry import TaskRegistry
@@ -87,6 +88,50 @@ def test_a_synchronous_task_is_run_and_its_result_awaited():
     assert kabudachi.run(main) == Greeting(text="hello world", times=2)
 
 
+def test_tasks_take_the_processes_retries_and_timeout_unless_they_choose_their_own():
+    attempts = []
+    folds = []
+
+    @declare
+    def flaky(request: Greeting) -> Greeting:
+        attempts.append(request.text)
+        if len(attempts) == 1:
+            raise ValueError("first attempt")
+        return request
+
+    @declare
+    async def slow(request: Greeting) -> Greeting:
+        await asyncio.sleep(5)
+        return request
+
+    @kabudachi.task(name="tests.patient", timeout=None)
+    async def patient(request: Greeting) -> Greeting:
+        await asyncio.sleep(0.4)
+        return request
+
+    @kabudachi.reducer(name="tests.flaky_fold")
+    def flaky_fold(item: Greeting, previous: Greeting) -> Greeting:
+        folds.append(item.text)
+        if len(folds) == 1:
+            raise ValueError("first fold")
+        return Greeting(text=previous.text + item.text)
+
+    config_module.process_configuration().configure(retries=1, timeout=timedelta(seconds=0.2))
+
+    async def main():
+        assert await flaky(Greeting(text="again")) == Greeting(text="again")
+        with pytest.raises(TaskTimeoutError):
+            await slow(Greeting())
+        assert await flaky_fold.reduce([Greeting(text="a"), Greeting(text="b")]) == Greeting(
+            text="ab"
+        )
+        return await patient(Greeting(text="waited"))
+
+    assert kabudachi.run(main) == Greeting(text="waited")
+    assert attempts == ["again", "again"]
+    assert folds == ["b", "b"]
+
+
 def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_record():
     @declare
     def greet(request: Greeting) -> Greeting:
@@ -110,6 +155,7 @@ def test_a_handle_says_how_durable_its_task_is_and_reads_its_status_from_its_rec
     assert refused == 2
     assert isinstance(after, TaskStatus)
     assert (after.state, after.attempt, after.delivered) == ("succeeded", 1, False)
+    assert after.persistence == "disabled"
     assert after.submitted_at is not None and after.updated_at >= after.submitted_at
     # A status crosses process boundaries (a task process reads it through
     # its worker), so every native run state it may hold pickles as itself.

@@ -202,9 +202,10 @@ class TaskTable:
                     (options.key or "") if definition.kind is TaskKind.COALESCING else None,
                     options,
                     settings,
-                    retries=definition.retries,
+                    retries=settings.retries,
                     drop_oldest=definition.drop_oldest,
                     non_retriable=not definition.retriable,
+                    result_ttl_ms=settings.result_ttl_ms,
                 )
             )
             handle = TaskHandle(

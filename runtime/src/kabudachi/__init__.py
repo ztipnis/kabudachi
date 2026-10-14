@@ -23,6 +23,7 @@ from kabudachi.errors import (
 from kabudachi.flow import BoundTask, Flow, Group, flow, group
 from kabudachi.handle import TaskHandle
 from kabudachi.lifecycle import RunContext, after_run, before_run, process_init
+from kabudachi.result_backend import ResultBackend
 from kabudachi.run_info import RunInfo, current_context
 from kabudachi.runner import run
 from kabudachi.schemas import migration, schema
@@ -59,6 +60,7 @@ __all__ = [
     "ReduceEmptyError",
     "reducer",
     "register_serializer",
+    "ResultBackend",
     "ResultTooLargeError",
     "ResultUnavailableError",
     "run",

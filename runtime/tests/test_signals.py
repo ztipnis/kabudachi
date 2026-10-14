@@ -382,11 +382,12 @@ SERVE_SLOW_START_PROGRAM = textwrap.dedent(
     class SlowToLead(FaultingNative):
         # The real runtime, built to wait out a suspicion timeout before it
         # leads, so a signal sent once it exists lands before leadership.
-        def __init__(self, worker_id, incarnation_id, arguments):
+        def __init__(self, worker_id, incarnation_id, arguments, result_backend=None):
             super().__init__(
                 worker_id,
                 incarnation_id,
                 dataclasses.replace(arguments, suspect_timeout_ms=SUSPECT_TIMEOUT_MS),
+                result_backend,
             )
             print("started", flush=True)
 
@@ -509,11 +510,12 @@ INTERRUPT_BEFORE_LEADERSHIP_PROGRAM = textwrap.dedent(
 
 
     class SlowToLead(FaultingNative):
-        def __init__(self, worker_id, incarnation_id, arguments):
+        def __init__(self, worker_id, incarnation_id, arguments, result_backend=None):
             super().__init__(
                 worker_id,
                 incarnation_id,
                 dataclasses.replace(arguments, suspect_timeout_ms=2000),
+                result_backend,
             )
             print("started", flush=True)
 

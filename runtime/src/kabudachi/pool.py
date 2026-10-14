@@ -487,8 +487,13 @@ class ProcessPool:
         process = self._context.Process(
             target=_child.main,
             # The router runs where tasks are submitted from, in this process;
-            # a body's own calls come back here to be routed.
-            args=(child_end, dataclasses.replace(self._settings, router=None), self._modules),
+            # a body's own calls come back here to be routed. An object
+            # backend may not pickle, and a task process mirrors nothing.
+            args=(
+                child_end,
+                dataclasses.replace(self._settings, router=None, result_backend=None),
+                self._modules,
+            ),
             name=f"kabudachi-task-{number}",
         )
         try:

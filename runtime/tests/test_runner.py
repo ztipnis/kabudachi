@@ -58,7 +58,7 @@ class StandInNetworked(FaultingNative):
     """Stands in for the `NetworkedRuntime` class: a shard of one that records
     the calls a networked run makes on its way out."""
 
-    def __init__(self, arguments):
+    def __init__(self, arguments, result_backend=None):
         super().__init__(
             arguments=OneNodeArguments(
                 result_ttl_ms=arguments.result_ttl_ms,

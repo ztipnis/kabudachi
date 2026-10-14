@@ -74,7 +74,7 @@ from kabudachi.errors import (
     UnknownTaskError,
     interrupted,
 )
-from kabudachi.config import Unset
+from kabudachi.config import UNSET, Unset
 from kabudachi.execution import (
     CompactJob,
     Executor,
@@ -245,7 +245,12 @@ class Session:
                 limit,
             )
         queue = self._queue_of(definition, value)
-        settings = SubmissionSettings(queue, self._reconnect_timeout_ms(definition, queue))
+        settings = SubmissionSettings(
+            queue,
+            self._reconnect_timeout_ms(definition, queue),
+            retries=self.retries_of(definition),
+            result_ttl_ms=self._result_ttl_ms(definition, queue),
+        )
         return self._tasks.submit(
             definition,
             payload,
@@ -253,6 +258,27 @@ class Session:
             settings,
             self._schemas.version_of(definition.input_type),
         )
+
+    def retries_of(self, definition: TaskDefinition) -> int:
+        """How many retries a submission of `definition` carries: its own,
+        else the process's; none for a task that must not run twice."""
+        if not definition.retriable:
+            return 0
+        return self._configuration.resolve("retries", definition.retries)
+
+    def _result_ttl_ms(self, definition: TaskDefinition, queue: str) -> int | None:
+        """The retention a submission of `definition` sent to `queue` carries,
+        in whole milliseconds rounded up: the task's own, else its queue's.
+        `None` leaves it to the shard; 0 keeps no result."""
+        ttl = definition.result_ttl
+        if ttl is UNSET:
+            options = self._configuration.resolve("queue_options").get(queue)
+            ttl = UNSET if options is None else options.result_ttl
+        if ttl is UNSET:
+            return None
+        if ttl is None:
+            return 0
+        return max(1, math.ceil(ttl / timedelta(milliseconds=1)))
 
     def _queue_of(self, definition: TaskDefinition, value: Callable[[], Any]) -> str:
         """The queue a task of `definition` goes to: its own, else the one
@@ -295,7 +321,7 @@ class Session:
             queue = self._configuration.resolve("queue")
         return {
             "queue": queue,
-            "retries": definition.retries,
+            "retries": self.retries_of(definition),
             "ephemeral": definition.kind is TaskKind.EPHEMERAL,
             "non_retriable": not definition.retriable,
             "reconnect_timeout_ms": self._reconnect_timeout_ms(definition, queue),
@@ -1061,7 +1087,7 @@ class Session:
             await asyncio.wait({previous})
         outcome = await run_within(
             body,
-            definition.timeout,
+            self._configuration.resolve("timeout", definition.timeout),
             self._cancel_grace(definition),
             functools.partial(self._executor.condemn_host_of, claim.task_run_id),
         )
@@ -1096,7 +1122,9 @@ class Session:
             return
         if run.holds_handle:
             self._tasks.result_held(claim.task_id, claim.task_run_id, outcome)
-            certification = self._runtime.complete(claim.task_run_id, result_digest(outcome))
+            certification = self._runtime.complete(
+                claim.task_run_id, result_digest(outcome), result=outcome
+            )
         else:
             # Held for the shard: the result goes to the task's client first.
             certification = self._runtime.complete(

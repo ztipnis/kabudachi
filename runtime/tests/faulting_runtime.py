@@ -271,6 +271,12 @@ class FaultingRuntime:
     async def reduce_operands(self, task_run_id):
         return await self.native.reduce_operands(task_run_id)
 
+    async def resume_task(self, task_id):
+        return await self.native.resume_task(task_id)
+
+    async def resume_composite(self, composite_id):
+        return await self.native.resume_composite(composite_id)
+
     def cancel(self, task_id):
         # Forwarded unchanged, but named here: `isinstance` against a runtime
         # protocol looks only at the class, so `__getattr__` alone is not enough.
@@ -283,10 +289,15 @@ class FaultingNative(FaultingRuntime):
 
     instances = []
 
-    def __init__(self, worker_id="worker", incarnation_id="incarnation", arguments=None):
+    def __init__(
+        self, worker_id="worker", incarnation_id="incarnation", arguments=None, result_backend=None
+    ):
         arguments = arguments or OneNodeArguments()
-        super().__init__(_native.NativeRuntime(worker_id, incarnation_id, arguments))
+        super().__init__(
+            _native.NativeRuntime(worker_id, incarnation_id, arguments, result_backend)
+        )
         self.arguments = arguments
+        self.result_backend = result_backend
         self.leader_error = None
         self.shutdowns = 0
         FaultingNative.instances.append(self)
