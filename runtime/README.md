@@ -215,7 +215,8 @@ Set `health_listen` to an IP address and port, such as `0.0.0.0:8081` (port 0 pi
 worker serves two endpoints from its start. A port already in use fails `kabudachi.run()` at start.
 
 - `/healthz` answers 200 while the worker's native loops run, and 503 otherwise.
-- `/readyz` answers 200 once the worker can take work, and 503 otherwise. A leader is ready once it has
+- `/readyz` answers 200 once the worker is alive, its task registry is loaded and it can take work, and 503
+  otherwise. A leader is ready once it has
   finished reconciling its records after winning. A follower is ready once a leader holding a grant has
   answered one of its heartbeats.
 
@@ -334,8 +335,8 @@ worker that splits the prior stage's list sends the items in batches.
 `@reducer` declares a durable task of two parameters, `(item, previous) -> previous`: it folds one
 item into the result so far. A plain `@task` of two parameters is the same as a bare `@reducer`.
 Both parameters and the return value are annotated, and the return type must be the type of
-`previous`. It takes the options of `@task` except `result_ttl` (a reduce takes its retention from its
-queue, then the process), plus `associative`, `tree` and `merge` below. It must be durable, so it cannot
+`previous`. It takes the options of `@task`, but its `result_ttl` is not used and is ignored if given (a reduce takes
+its retention from its queue, then the process), plus `associative`, `tree` and `merge` below. It must be durable, so it cannot
 be an `@ephemeral_task` or a `@coalescing_task`, and it cannot return a step. Calling it, or using
 `.bind`, `.map` or `.options(...)` on it, raises `TypeError`;
 `reducer.local(item, previous)` runs the function here, like `task.local`.
