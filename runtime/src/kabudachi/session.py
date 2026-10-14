@@ -536,18 +536,21 @@ class Session:
     def continuation_finished(self, event: Any) -> None:
         """The composite a task's run returned as its step is over: settles
         the task's handle as the composite's would be."""
+        keeps_no_result = self._tasks.keeps_no_result(event.parent_task_id)
         handle = self._tasks.continuation_over(event.parent_task_id)
         if handle is not None:
-            self.settle_from_composite(handle, event)
+            # A task that keeps no result has none of its continuation mirrored either.
+            self.settle_from_composite(handle, event, mirror=not keeps_no_result)
 
-    def settle_from_composite(self, handle: TaskHandle, event: Any) -> None:
+    def settle_from_composite(self, handle: TaskHandle, event: Any, *, mirror: bool = True) -> None:
         """Settles `handle`, of a composite or of the task that returned it as
         its step, by how the composite `event` names ended: with its results,
-        with the failure that ended it, or as cancelled."""
+        with the failure that ended it, or as cancelled. The results are mirrored
+        to the result backend unless `mirror` is false."""
         match event.state:
             case "succeeded":
                 self._deliveries += 1
-                if not self._hosted.spawn(self._deliver(handle, event.composite_id)):
+                if not self._hosted.spawn(self._deliver(handle, event.composite_id, mirror)):
                     self._deliveries -= 1
                     handle._fail(RunStoppedError("the run ended before the results could be read"))
             case "failed":
@@ -570,15 +573,17 @@ class Session:
         if not self._awaits_composites():
             self._tasks.drop_member_errors()
 
-    async def _deliver(self, handle: TaskHandle, composite_id: str) -> None:
+    async def _deliver(self, handle: TaskHandle, composite_id: str, mirror: bool) -> None:
         """Resolves `handle` with the results of the finished composite."""
         try:
-            await self._resolve_with_results(handle, composite_id)
+            await self._resolve_with_results(handle, composite_id, mirror)
         finally:
             self._deliveries -= 1
             self._release_member_errors()
 
-    async def _resolve_with_results(self, handle: TaskHandle, composite_id: str) -> None:
+    async def _resolve_with_results(
+        self, handle: TaskHandle, composite_id: str, mirror: bool
+    ) -> None:
         try:
             resolved = await self._runtime.composite_results(composite_id)
         except Exception as error:
@@ -589,7 +594,8 @@ class Session:
                 )
             )
             return
-        self._mirror_composite(composite_id, resolved)
+        if mirror:
+            self._mirror_composite(composite_id, resolved)
         try:
             value = self.decode_resolved(resolved, own_errors=True)
         except Exception as error:

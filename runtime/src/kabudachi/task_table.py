@@ -87,6 +87,8 @@ class _Record:
     # Bumped by each claim, so a retry's run cannot be undone by an abandoned
     # earlier run ending later (both await the same future).
     generation: int = 0
+    # The task keeps no result (`result_ttl` of `None`), so nothing of it is mirrored.
+    keeps_no_result: bool = False
 
 
 class Run:
@@ -216,7 +218,9 @@ class TaskTable:
                 replicable=not self._runtime.certifies_locally,
                 status_reader=self.status,
             )
-            self._records[task_id] = _Record(handle, definition.name)
+            self._records[task_id] = _Record(
+                handle, definition.name, keeps_no_result=settings.result_ttl_ms == 0
+            )
         return handle
 
     @staticmethod
@@ -406,6 +410,12 @@ class TaskTable:
             if record is not None:
                 record.continuation = None
         return self._settle(task_id)
+
+    def keeps_no_result(self, task_id: str) -> bool:
+        """Whether the task `task_id`, submitted here, keeps no result."""
+        with self._lock:
+            record = self._records.get(task_id)
+            return record is not None and record.keeps_no_result
 
     def continuations(self) -> list[tuple[str, str]]:
         """The (task id, composite id) of every task still waiting for its continuation."""

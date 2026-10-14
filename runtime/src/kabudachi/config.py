@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import Any, get_args, get_type_hints
 from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from kabudachi._checks import (
@@ -715,6 +715,8 @@ def _parse(value_type: Any, raw: str) -> Any:
         return timedelta(seconds=float(raw)) if raw.strip() else None  # empty is "not set"
     if value_type == int | None:
         return int(raw) if raw.strip() else None  # an empty value is "not set"
+    if type(None) in get_args(value_type) and not raw.strip():
+        return None  # an empty value is "not set" for any other optional text setting
     return raw
 
 

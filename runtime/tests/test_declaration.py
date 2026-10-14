@@ -1055,6 +1055,8 @@ def test_worker_settings_are_read_from_the_environment(monkeypatch):
     assert Configuration().resolve("routing_refresh") is None
     monkeypatch.setenv("KABUDACHI_TIMEOUT", "")
     assert Configuration().resolve("timeout") is None
+    monkeypatch.setenv("KABUDACHI_RESULT_BACKEND", "")
+    assert Configuration().resolve("result_backend") is None
 
 
 def test_environment_values_are_parsed_by_the_resolved_type_even_with_deferred_annotations(

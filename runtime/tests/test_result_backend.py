@@ -220,6 +220,10 @@ def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backen
     def relay(request: Greeting) -> Flow:
         return flow(echo.bind(request), echo)
 
+    @kabudachi.task(name="tests.unkept_relay", result_ttl=None)
+    def unkept_relay(request: Greeting) -> Flow:
+        return flow(echo.bind(request), echo)
+
     @kabudachi.task(name="tests.explode")
     def explode(request: Greeting) -> Flow:
         return flow(echo.bind(request), broken)
@@ -262,10 +266,15 @@ def test_a_run_mirrors_each_result_once_certified_and_resumes_it_from_the_backen
             await asyncio.wait_for(kabudachi.resume(exploded.task_id), 5)
         assert raised.value.kind == "ValueError" and str(raised.value) == "no"
 
+        # A task that keeps no result has none of its continuation mirrored either.
+        assert await unkept_relay(Greeting(text="once")) == [Greeting(text="ONCE")] * 2
+
         relayed = relay(Greeting(text="twice"))
         # A task that returned a flow resolves to its stages' results, and so does resuming it.
         assert await relayed == [Greeting(text="TWICE"), Greeting(text="TWICE")]
         assert await asyncio.wait_for(kabudachi.resume(relayed.task_id), 5) == await relayed
+        mirrored = {key.split("/")[1] for key in backend.entries if key.startswith("composite/")}
+        assert len(mirrored) == 1, "only the flow of the task that kept its result"
 
         with pytest.raises(ResultUnavailableError):
             await kabudachi.resume("no-such-task")
